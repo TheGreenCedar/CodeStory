@@ -11,6 +11,11 @@
 //
 //   node .github/scripts/publish-marketplace-catalog.mjs \
 //     --source-repository DIR --commit SHA --version X.Y.Z [--github-output FILE]
+//
+// Automatic restore supplies the just-pushed catalog revision, plugin SHA, and version through
+// the three --expected-current-* arguments. The target --commit/--version is the recorded prior
+// pin. All three fences are required together so restore cannot overwrite an independently moved
+// catalog.
 
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -41,6 +46,16 @@ const args = parseArgs(process.argv.slice(2));
 for (const key of ["source_repository", "commit", "version"]) {
   if (!args[key]) fail(`--${key.replaceAll("_", "-")} is required`);
 }
+const restoreCoordinates = [
+  "expected_current_revision",
+  "expected_current_plugin_sha",
+  "expected_current_plugin_version",
+];
+const restoreCoordinateCount = restoreCoordinates.filter((key) => args[key]).length;
+if (restoreCoordinateCount !== 0 && restoreCoordinateCount !== restoreCoordinates.length) {
+  fail("automatic restore requires the expected current catalog revision, plugin SHA, and plugin version together");
+}
+const restoring = restoreCoordinateCount === restoreCoordinates.length;
 const token = process.env.GH_TOKEN;
 if (!token) fail("GH_TOKEN must carry a marketplace-scoped installation token");
 
@@ -99,10 +114,10 @@ if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$/u.test(previousVersion)) {
 }
 const previousRevision = git("rev-parse", "HEAD");
 
-const output = (revision, published) => {
+const output = (revision, changed) => {
   console.log(
-    published
-      ? `Catalog now pins codestory ${args.version} at ${commit} (${revision}).`
+    changed
+      ? `Catalog ${restoring ? "restored" : "now pins"} codestory ${args.version} at ${commit} (${revision}).`
       : `Catalog already pins codestory ${args.version} at ${commit} (${revision}); nothing to push.`,
   );
   console.log(
@@ -114,7 +129,9 @@ const output = (revision, published) => {
       `marketplace_revision=${revision}\n`
         + `previous_marketplace_revision=${previousRevision}\n`
         + `previous_plugin_sha=${previousSha}\n`
-        + `previous_plugin_version=${previousVersion}\n`,
+        + `previous_plugin_version=${previousVersion}\n`
+        + `catalog_changed=${changed}\n`
+        + `catalog_operation=${restoring ? "restore" : "publish"}\n`,
     );
   }
 };
@@ -124,6 +141,21 @@ if (entry.source.sha === commit && entry.version === args.version) {
   process.exit(0);
 }
 
+if (restoring) {
+  const expectedRevision = String(args.expected_current_revision);
+  const expectedSha = String(args.expected_current_plugin_sha);
+  const expectedVersion = String(args.expected_current_plugin_version);
+  if (
+    previousRevision !== expectedRevision
+    || previousSha !== expectedSha
+    || previousVersion !== expectedVersion
+  ) {
+    fail(
+      `catalog no longer names the just-published rollback source ${expectedVersion} at ${expectedSha} (${expectedRevision}); refusing automatic restore`,
+    );
+  }
+}
+
 entry.version = args.version;
 entry.source.sha = commit;
 writeFileSync(catalogPath, `${JSON.stringify(catalog, null, 2)}\n`);
@@ -131,6 +163,6 @@ writeFileSync(catalogPath, `${JSON.stringify(catalog, null, 2)}\n`);
 git("config", "user.email", "release@codestory.invalid");
 git("config", "user.name", "CodeStory release");
 git("add", CATALOG);
-git("commit", "--message", `codestory ${args.version}`);
+git("commit", "--message", `${restoring ? "restore" : "codestory"} ${args.version}`);
 git("push", "origin", "HEAD:main");
 output(git("rev-parse", "HEAD"), true);

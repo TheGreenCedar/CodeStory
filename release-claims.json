@@ -1516,6 +1516,11 @@
           "id": "deferred",
           "installer": "codex_marketplace_deferred_fixture",
           "live_catalog_revision": false
+        },
+        {
+          "id": "restored",
+          "installer": "codex_marketplace_restored_fixture",
+          "live_catalog_revision": false
         }
       ],
       "recovery": {
@@ -1525,7 +1530,8 @@
           "previous_plugin_sha",
           "previous_plugin_version"
         ],
-        "automatic_restore": false
+        "automatic_restore": true,
+        "restored_state": "restored"
       }
     },
     "lost_runner_rerun": {

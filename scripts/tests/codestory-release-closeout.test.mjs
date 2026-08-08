@@ -1558,6 +1558,25 @@ test("the post-publish closeout resolves and records which catalog served the re
   // warning in a log that expires.
   assert.notDeepEqual(deferred.ledger.catalog_delivery, published.ledger.catalog_delivery);
 
+  // A successful automatic restore proves the released plugin through its candidate-pinned
+  // fixture, but the ledger must say the public catalog was rolled back. It may never retain the
+  // provisional published state from before the failed live-catalog smoke.
+  const restoredManifests = manifestsFor("post_publish", prePublish.ledger);
+  for (const manifest of restoredManifests) {
+    if (manifest.cell_id.startsWith("installed_runtime_behavior:")) {
+      manifest.evidence.identity.installer = "codex_marketplace_restored_fixture";
+    }
+  }
+  const restored = evaluate("post_publish", restoredManifests, prePublish.ledger);
+  assert.equal(restored.decision, "accept");
+  assert.deepEqual(restored.ledger.catalog_delivery, {
+    state: "restored",
+    installer: "codex_marketplace_restored_fixture",
+    live_catalog_revision: false,
+  });
+  assert.deepEqual(restored.summary.catalog_delivery, restored.ledger.catalog_delivery);
+  assert.notEqual(restored.ledger.catalog_delivery.state, "published");
+
   // The pre-publish closeout has no post-publish installed cells, so it states nothing here
   // rather than inventing a delivery state.
   assert.equal(prePublish.ledger.catalog_delivery, undefined);
@@ -1568,7 +1587,12 @@ test("a post-publish closeout that cannot resolve one catalog delivery state is 
 
   // An installer identity no delivery state declares -- including the pre-publish lane's own
   // candidate installer, which would otherwise sail through as a plausible-looking string.
-  for (const installer of ["candidate_managed_plugin", "managed_plugin", ""]) {
+  for (const installer of [
+    "candidate_managed_plugin",
+    "managed_plugin",
+    "codex_marketplace_restored_fixture_v2",
+    "",
+  ]) {
     const manifests = manifestsFor("post_publish", prePublish.ledger);
     for (const manifest of manifests) {
       if (manifest.cell_id.startsWith("installed_runtime_behavior:")) {

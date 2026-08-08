@@ -806,6 +806,7 @@ jobs:
     environment: marketplace-publish
     outputs:
       catalog_published: ${{ steps.delivery.outputs.catalog_published }}
+      catalog_delivery_state: ${{ steps.delivery.outputs.catalog_delivery_state }}
       marketplace_revision: ${{ steps.delivery.outputs.marketplace_revision }}
       # What the catalog served before this run moved it. A catalog move with no recorded
       # predecessor is a move nobody can undo, so the rollback target travels with the state.
@@ -817,6 +818,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
 
       - name: Mint a scoped marketplace token
         id: token
@@ -846,6 +848,56 @@ jobs:
             --version "$RELEASE_VERSION" \
             --github-output "$GITHUB_OUTPUT"
 
+      # Probe the exact live revision before the release records `published`. The scoped token is
+      # not exposed to this step. A failure is data for the restore step, not a release failure.
+      - name: Smoke the published live catalog
+        id: live-catalog-smoke
+        if: steps.publish.outcome == 'success'
+        continue-on-error: true
+        env:
+          CODEX_CLI_VERSION: "0.144.5"
+          MARKETPLACE_REVISION: ${{ steps.publish.outputs.marketplace_revision }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/codestory-live-catalog-smoke"
+          codex_package_root="$RUNNER_TEMP/codex-cli-${CODEX_CLI_VERSION}"
+          rm -rf "$install_root"
+          npm install --prefix "$codex_package_root" --no-audit --no-fund "@openai/codex@$CODEX_CLI_VERSION"
+          node .github/scripts/install-codestory-marketplace-proof.mjs \
+            --codex-package-root "$codex_package_root" \
+            --codex-home "$install_root/codex-home" \
+            --plugin-data "$install_root/codex-home/plugin-data" \
+            --marketplace-source TheGreenCedar/AgentPluginMarketplace \
+            --marketplace-name TheGreenCedar \
+            --marketplace-revision "$MARKETPLACE_REVISION" \
+            --local-fixture false \
+            --expected-version "$RELEASE_VERSION" \
+            --source-repository "$GITHUB_WORKSPACE" \
+            --attestation "$install_root/install-attestation-v2.json"
+
+      - name: Restore the previous catalog pin
+        id: restore
+        if: steps.publish.outcome == 'success' && steps.publish.outputs.catalog_changed == 'true' && steps.live-catalog-smoke.outcome == 'failure'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          PUBLISHED_REVISION: ${{ steps.publish.outputs.marketplace_revision }}
+          PUBLISHED_PLUGIN_SHA: ${{ github.sha }}
+          PUBLISHED_PLUGIN_VERSION: ${{ needs.preflight.outputs.version }}
+          PREVIOUS_PLUGIN_SHA: ${{ steps.publish.outputs.previous_plugin_sha }}
+          PREVIOUS_PLUGIN_VERSION: ${{ steps.publish.outputs.previous_plugin_version }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/publish-marketplace-catalog.mjs \
+            --source-repository "$GITHUB_WORKSPACE" \
+            --commit "$PREVIOUS_PLUGIN_SHA" \
+            --version "$PREVIOUS_PLUGIN_VERSION" \
+            --expected-current-revision "$PUBLISHED_REVISION" \
+            --expected-current-plugin-sha "$PUBLISHED_PLUGIN_SHA" \
+            --expected-current-plugin-version "$PUBLISHED_PLUGIN_VERSION" \
+            --github-output "$GITHUB_OUTPUT"
+
       # The only place the "catalog was updated" claim is ever minted. It requires the token, the
       # push, AND an immutable revision to have all landed; anything else records deferred, so an
       # unknown or half-finished state can never read as published.
@@ -855,6 +907,9 @@ jobs:
         env:
           TOKEN_OUTCOME: ${{ steps.token.outcome }}
           PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          LIVE_SMOKE_OUTCOME: ${{ steps.live-catalog-smoke.outcome }}
+          RESTORE_OUTCOME: ${{ steps.restore.outcome }}
+          RESTORED_REVISION: ${{ steps.restore.outputs.marketplace_revision }}
           PUBLISHED_REVISION: ${{ steps.publish.outputs.marketplace_revision }}
           PREVIOUS_REVISION: ${{ steps.publish.outputs.previous_marketplace_revision }}
           PREVIOUS_PLUGIN_SHA: ${{ steps.publish.outputs.previous_plugin_sha }}
@@ -863,18 +918,29 @@ jobs:
         run: |
           set -euo pipefail
           catalog_published=false
+          catalog_delivery_state=deferred
           marketplace_revision=""
           if [ "$TOKEN_OUTCOME" = "success" ] \
             && [ "$PUBLISH_OUTCOME" = "success" ] \
+            && [ "$LIVE_SMOKE_OUTCOME" = "success" ] \
             && printf '%s' "$PUBLISHED_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
             catalog_published=true
+            catalog_delivery_state=published
             marketplace_revision="$PUBLISHED_REVISION"
+          elif [ "$PUBLISH_OUTCOME" = "success" ] \
+            && [ "$LIVE_SMOKE_OUTCOME" = "failure" ] \
+            && [ "$RESTORE_OUTCOME" = "success" ] \
+            && printf '%s' "$RESTORED_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+            catalog_delivery_state=restored
+          elif [ "$PUBLISH_OUTCOME" = "success" ]; then
+            catalog_delivery_state=unresolved
           fi
           # The rollback target is recorded whatever happened. On a published run it names the
           # release a restore would return to; on a deferred run it names the release the catalog
           # is still serving.
           {
             echo "catalog_published=$catalog_published"
+            echo "catalog_delivery_state=$catalog_delivery_state"
             echo "marketplace_revision=$marketplace_revision"
             echo "previous_marketplace_revision=$PREVIOUS_REVISION"
             echo "previous_plugin_sha=$PREVIOUS_PLUGIN_SHA"
@@ -883,6 +949,16 @@ jobs:
           if [ "$catalog_published" = "true" ]; then
             echo "Catalog delivery: published at $marketplace_revision." >> "$GITHUB_STEP_SUMMARY"
             echo "Rollback target: codestory $PREVIOUS_PLUGIN_VERSION at $PREVIOUS_PLUGIN_SHA (catalog $PREVIOUS_REVISION), restorable with $RECOVERY_WORKFLOW." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$catalog_delivery_state" = "restored" ]; then
+            echo "::warning::The live-catalog smoke failed after publication. Automatic restore returned the public catalog to codestory $PREVIOUS_PLUGIN_VERSION at $PREVIOUS_PLUGIN_SHA (catalog $RESTORED_REVISION); the release stands."
+            echo "Catalog delivery: RESTORED after a failed live-catalog smoke. The release is published; the public catalog serves the previous release." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$catalog_delivery_state" = "unresolved" ]; then
+            echo "::error::The live-catalog smoke failed and automatic restore did not complete. The release stands, but catalog delivery is unresolved."
+            echo "Catalog delivery: UNRESOLVED. The release remains published; automatic restore did not complete." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           # $RECOVERY_WORKFLOW mints the SAME credential from the SAME environment, so it recovers a
@@ -909,6 +985,7 @@ jobs:
     with:
       version: ${{ needs.preflight.outputs.version }}
       catalog_published: ${{ needs.marketplace-publish.outputs.catalog_published == 'true' }}
+      catalog_delivery_state: ${{ needs.marketplace-publish.outputs.catalog_delivery_state }}
       marketplace_revision: ${{ needs.marketplace-publish.outputs.marketplace_revision }}
       pre_publish_closeout_artifact: release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
       emit_release_cells: true

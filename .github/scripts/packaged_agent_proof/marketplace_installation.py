@@ -1,7 +1,8 @@
 """Marketplace checkout and installed-plugin provenance.
 
-Two delivery states resolve a released plugin through a Codex marketplace, and this module
-accepts exactly two correspondingly distinct shapes:
+Three delivery states resolve a released plugin through a Codex marketplace. Published uses the
+live checkout; deferred and restored use distinct identities over the same candidate-pinned local
+fixture shape:
 
 * ``codex_marketplace_install`` -- the live public catalog. The resolver clones
   ``TheGreenCedar/AgentPluginMarketplace`` over Git into the isolated Codex home at a pinned
@@ -43,10 +44,12 @@ _PLUGIN_ID = f"codestory@{_MARKETPLACE_NAME}"
 
 LIVE_INSTALLATION_SOURCE = "codex_marketplace_install"
 DEFERRED_INSTALLATION_SOURCE = "codex_marketplace_deferred_fixture"
+RESTORED_INSTALLATION_SOURCE = "codex_marketplace_restored_fixture"
 # Mirrors DEFERRED_MARKETPLACE_REPOSITORY in
 # .github/scripts/marketplace-delivery-identity.mjs. Deliberately not a filesystem path and
 # deliberately not shaped like "owner/repo": it can never be confused with the live catalog.
 _DEFERRED_MARKETPLACE_REPOSITORY = "local:candidate-pinned-marketplace-fixture"
+_RESTORED_MARKETPLACE_REPOSITORY = "local:candidate-pinned-marketplace-restored-fixture"
 _FIXTURE_MARKER_FILENAME = ".codestory-marketplace-fixture.json"
 _FIXTURE_MARKER_PURPOSE = "codestory-candidate-pinned-marketplace-fixture"
 
@@ -74,8 +77,16 @@ _DEFERRED = _DeliveryState(
     source_type="local",
     checkout_inside_codex_home=False,
 )
+_RESTORED = _DeliveryState(
+    installation_source=RESTORED_INSTALLATION_SOURCE,
+    repository=_RESTORED_MARKETPLACE_REPOSITORY,
+    source_type="local",
+    checkout_inside_codex_home=False,
+)
 
-_DELIVERY_STATES = {state.installation_source: state for state in (_LIVE, _DEFERRED)}
+_DELIVERY_STATES = {
+    state.installation_source: state for state in (_LIVE, _DEFERRED, _RESTORED)
+}
 
 
 def delivery_state(installation_source: object) -> _DeliveryState | None:
@@ -352,7 +363,7 @@ def _validate_fixture_identity(
     marker_path = marketplace_root / _FIXTURE_MARKER_FILENAME
     require(
         marker_path.is_file(),
-        "deferred catalog resolve did not use a candidate-pinned marketplace fixture",
+        "local catalog resolve did not use a candidate-pinned marketplace fixture",
     )
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     require_exact_keys(
@@ -404,7 +415,7 @@ def _validate_marketplace_checkout(
     # Checked before the Git probes, not after: the marker is committed into the fixture, so a
     # missing or altered one also dirties the tree. Ordering it first means the failure names
     # the actual defect instead of passing for an unrelated reason.
-    if state is _DEFERRED:
+    if state is not _LIVE:
         _validate_fixture_identity(marketplace_root, plugin_source_sha, manifest)
     marketplace_commit = _git_output(marketplace_root, "rev-parse", "HEAD")
     origin = _git_origin_url(marketplace_root)
