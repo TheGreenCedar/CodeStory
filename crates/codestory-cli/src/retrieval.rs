@@ -153,9 +153,15 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
             Some(&runtime.storage_path),
             runtime.sidecar.clone(),
         )
-    }
-    .context("retrieval status")?;
+    };
+    let report = retrieval_status_result(report)?;
     emit_retrieval_status(cmd.format, &report, cmd.output_file.as_deref())
+}
+
+fn retrieval_status_result(
+    result: anyhow::Result<RetrievalStatusReport>,
+) -> anyhow::Result<RetrievalStatusReport> {
+    result.context("retrieval status")
 }
 
 pub(crate) fn run_retrieval_inventory(cmd: RetrievalInventoryCommand) -> Result<()> {
@@ -501,11 +507,75 @@ mod tests {
     use super::*;
     #[cfg(not(windows))]
     use crate::args::ProjectArgs;
+    use crate::status_wire_test_support as wire;
     use anyhow::anyhow;
     #[cfg(not(windows))]
     use std::fs;
     #[cfg(not(windows))]
     use tempfile::tempdir;
+
+    fn rendered_status_case(report: &RetrievalStatusReport) -> serde_json::Value {
+        let output = tempfile::tempdir().expect("status output");
+        let json_path = output.path().join("status.json");
+        let markdown_path = output.path().join("status.md");
+        emit_retrieval_status(OutputFormat::Json, report, Some(&json_path))
+            .expect("emit status json");
+        emit_retrieval_status(OutputFormat::Markdown, report, Some(&markdown_path))
+            .expect("emit status markdown");
+        let json_text = std::fs::read_to_string(json_path).expect("read status json");
+        let markdown = std::fs::read_to_string(markdown_path).expect("read status markdown");
+        serde_json::json!({
+            "json": serde_json::from_str::<serde_json::Value>(&json_text)
+                .expect("parse status json"),
+            "markdown": markdown,
+        })
+    }
+
+    #[test]
+    fn pre_change_status_wire_retrieval_json_and_markdown_are_non_vacuous() {
+        let healthy = wire::healthy_status_report();
+        let degraded = wire::degraded_status_report();
+        let unavailable = wire::unavailable_status_report();
+        assert!(healthy.is_live_ready());
+        assert!(
+            !degraded.is_live_ready(),
+            "full plus a degraded reason must not be live-ready"
+        );
+        let cases = serde_json::json!({
+            "healthy": rendered_status_case(&healthy),
+            "degraded": rendered_status_case(&degraded),
+            "unavailable": rendered_status_case(&unavailable),
+            "probe_error": {
+                "error": retrieval_status_result(Err(wire::probe_error()))
+                    .expect_err("probe error must remain an error")
+                    .chain()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            },
+        });
+        let raw_cases = cases
+            .as_object()
+            .expect("retrieval cases")
+            .values()
+            .filter_map(|case| case.get("json").cloned())
+            .collect::<Vec<_>>();
+        wire::assert_non_null_coverage(
+            &raw_cases,
+            &wire::RAW_STATUS_FIELDS,
+            "raw retrieval status",
+        );
+        let union = raw_cases
+            .iter()
+            .flat_map(|case| case.as_object().expect("raw status object").keys())
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            union,
+            wire::RAW_STATUS_FIELDS.into_iter().collect(),
+            "raw retrieval status field set drifted"
+        );
+        wire::assert_json_golden(&cases, wire::RETRIEVAL_GOLDEN, "retrieval status");
+    }
 
     #[cfg(not(windows))]
     #[test]

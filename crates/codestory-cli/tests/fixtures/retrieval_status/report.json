@@ -1,0 +1,387 @@
+{
+  "degraded": {
+    "handoff": {
+      "degraded_reason": "semantic_store_degraded",
+      "next_command": "codestory-cli retrieval index --project \"/golden/project\" --profile agent --refresh auto --format json",
+      "readiness": [
+        {
+          "full_repair": [
+            "codestory-cli ground --project \"/golden/project\""
+          ],
+          "goal": "local_navigation",
+          "index": {
+            "changed_file_count": 0,
+            "checked_file_count": 0,
+            "error_count": 0,
+            "fatal_error_count": 0,
+            "freshness_unknown": true,
+            "freshness_unknown_cause": "observation_unavailable",
+            "indexed_file_count": 1,
+            "new_file_count": 0,
+            "removed_file_count": 0
+          },
+          "minimum_next": [
+            "codestory-cli ground --project \"/golden/project\""
+          ],
+          "sidecar": {
+            "degraded_reason": "semantic_store_degraded",
+            "embedding_accelerator_request_device": "gpu:0",
+            "embedding_accelerator_request_provider": "metal",
+            "embedding_accelerator_requested": true,
+            "embedding_cpu_allowed": false,
+            "embedding_detected_gpu": "golden-gpu",
+            "embedding_detected_provider": "metal",
+            "embedding_device_observation_source": "per_user_server",
+            "embedding_device_policy": "accelerator_required",
+            "embedding_device_state": "degraded",
+            "manifest_generation": "golden-generation",
+            "manifest_input_hash": "golden-input",
+            "profile": "local",
+            "retrieval_mode": "full"
+          },
+          "status": "ready",
+          "summary": "Local navigation can use the current index."
+        },
+        {
+          "full_repair": [
+            "codestory-cli retrieval index --project \"/golden/project\" --profile agent --refresh auto --format json",
+            "codestory-cli retrieval status --project \"/golden/project\" --profile agent --format json",
+            "codestory-cli doctor --project \"/golden/project\" --format markdown"
+          ],
+          "goal": "agent_packet_search",
+          "index": {
+            "changed_file_count": 0,
+            "checked_file_count": 0,
+            "error_count": 0,
+            "fatal_error_count": 0,
+            "freshness_unknown": true,
+            "freshness_unknown_cause": "observation_unavailable",
+            "indexed_file_count": 1,
+            "new_file_count": 0,
+            "removed_file_count": 0
+          },
+          "minimum_next": [
+            "codestory-cli retrieval index --project \"/golden/project\" --profile agent --refresh auto --format json"
+          ],
+          "sidecar": {
+            "degraded_reason": "semantic_store_degraded",
+            "embedding_accelerator_request_device": "gpu:0",
+            "embedding_accelerator_request_provider": "metal",
+            "embedding_accelerator_requested": true,
+            "embedding_cpu_allowed": false,
+            "embedding_detected_gpu": "golden-gpu",
+            "embedding_detected_provider": "metal",
+            "embedding_device_observation_source": "per_user_server",
+            "embedding_device_policy": "accelerator_required",
+            "embedding_device_state": "degraded",
+            "manifest_generation": "golden-generation",
+            "manifest_input_hash": "golden-input",
+            "profile": "local",
+            "retrieval_mode": "full"
+          },
+          "status": "blocked",
+          "summary": "Agent packet/search is waiting for full retrieval; current profile is `local`, mode is `full`, and reason is `semantic_store_degraded`."
+        }
+      ],
+      "sidecar_retrieval_mode": "full",
+      "trust_caveat": "Readiness is not fully green; run the next command before trusting agent packet/search output."
+    },
+    "projection": {
+      "degraded_reason": "semantic_store_degraded",
+      "embedding_accelerator_request_device": "gpu:0",
+      "embedding_accelerator_request_provider": "metal",
+      "embedding_accelerator_requested": true,
+      "embedding_cpu_allowed": false,
+      "embedding_detected_gpu": "golden-gpu",
+      "embedding_detected_provider": "metal",
+      "embedding_device_observation_source": "per_user_server",
+      "embedding_device_policy": "accelerator_required",
+      "embedding_device_state": "degraded",
+      "manifest_generation": "golden-generation",
+      "manifest_input_hash": "golden-input",
+      "retrieval_mode": "full"
+    }
+  },
+  "healthy": {
+    "handoff": {
+      "next_command": "codestory-cli retrieval index --project \"/golden/project\" --profile agent --refresh auto --format json",
+      "readiness": [
+        {
+          "full_repair": [
+            "codestory-cli ground --project \"/golden/project\""
+          ],
+          "goal": "local_navigation",
+          "index": {
+            "changed_file_count": 0,
+            "checked_file_count": 0,
+            "error_count": 0,
+            "fatal_error_count": 0,
+            "freshness_unknown": true,
+            "freshness_unknown_cause": "observation_unavailable",
+            "indexed_file_count": 1,
+            "new_file_count": 0,
+            "removed_file_count": 0
+          },
+          "minimum_next": [
+            "codestory-cli ground --project \"/golden/project\""
+          ],
+          "sidecar": {
+            "embedding_accelerator_request_device": "gpu:0",
+            "embedding_accelerator_request_provider": "metal",
+            "embedding_accelerator_requested": true,
+            "embedding_cpu_allowed": false,
+            "embedding_detected_gpu": "golden-gpu",
+            "embedding_detected_provider": "metal",
+            "embedding_device_observation_source": "per_user_server",
+            "embedding_device_policy": "accelerator_required",
+            "embedding_device_state": "accelerated",
+            "manifest_generation": "golden-generation",
+            "manifest_input_hash": "golden-input",
+            "profile": "local",
+            "retrieval_mode": "full"
+          },
+          "status": "ready",
+          "summary": "Local navigation can use the current index."
+        },
+        {
+          "full_repair": [
+            "codestory-cli retrieval index --project \"/golden/project\" --profile agent --refresh auto --format json",
+            "codestory-cli retrieval status --project \"/golden/project\" --profile agent --format json",
+            "codestory-cli doctor --project \"/golden/project\" --format markdown"
+          ],
+          "goal": "agent_packet_search",
+          "index": {
+            "changed_file_count": 0,
+            "checked_file_count": 0,
+            "error_count": 0,
+            "fatal_error_count": 0,
+            "freshness_unknown": true,
+            "freshness_unknown_cause": "observation_unavailable",
+            "indexed_file_count": 1,
+            "new_file_count": 0,
+            "removed_file_count": 0
+          },
+          "minimum_next": [
+            "codestory-cli retrieval index --project \"/golden/project\" --profile agent --refresh auto --format json"
+          ],
+          "sidecar": {
+            "embedding_accelerator_request_device": "gpu:0",
+            "embedding_accelerator_request_provider": "metal",
+            "embedding_accelerator_requested": true,
+            "embedding_cpu_allowed": false,
+            "embedding_detected_gpu": "golden-gpu",
+            "embedding_detected_provider": "metal",
+            "embedding_device_observation_source": "per_user_server",
+            "embedding_device_policy": "accelerator_required",
+            "embedding_device_state": "accelerated",
+            "manifest_generation": "golden-generation",
+            "manifest_input_hash": "golden-input",
+            "profile": "local",
+            "retrieval_mode": "full"
+          },
+          "status": "blocked",
+          "summary": "Agent packet/search is waiting for full retrieval; current profile is `local`, mode is `full`, and reason is `none`."
+        }
+      ],
+      "sidecar_retrieval_mode": "full",
+      "trust_caveat": "Readiness is not fully green; run the next command before trusting agent packet/search output."
+    },
+    "projection": {
+      "degraded_reason": null,
+      "embedding_accelerator_request_device": "gpu:0",
+      "embedding_accelerator_request_provider": "metal",
+      "embedding_accelerator_requested": true,
+      "embedding_cpu_allowed": false,
+      "embedding_detected_gpu": "golden-gpu",
+      "embedding_detected_provider": "metal",
+      "embedding_device_observation_source": "per_user_server",
+      "embedding_device_policy": "accelerator_required",
+      "embedding_device_state": "accelerated",
+      "manifest_generation": "golden-generation",
+      "manifest_input_hash": "golden-input",
+      "retrieval_mode": "full"
+    }
+  },
+  "probe_error": {
+    "handoff": {
+      "degraded_reason": "retrieval_status_error: golden retrieval probe failed",
+      "next_command": "codestory-cli retrieval index --project \"/golden/project\" --profile agent --refresh auto --format json",
+      "readiness": [
+        {
+          "full_repair": [
+            "codestory-cli ground --project \"/golden/project\""
+          ],
+          "goal": "local_navigation",
+          "index": {
+            "changed_file_count": 0,
+            "checked_file_count": 0,
+            "error_count": 0,
+            "fatal_error_count": 0,
+            "freshness_unknown": true,
+            "freshness_unknown_cause": "observation_unavailable",
+            "indexed_file_count": 1,
+            "new_file_count": 0,
+            "removed_file_count": 0
+          },
+          "minimum_next": [
+            "codestory-cli ground --project \"/golden/project\""
+          ],
+          "sidecar": {
+            "degraded_reason": "retrieval_status_error: golden retrieval probe failed",
+            "embedding_accelerator_requested": false,
+            "embedding_cpu_allowed": false,
+            "embedding_device_observation_source": "retrieval_unobserved",
+            "embedding_device_policy": "accelerator_required",
+            "embedding_device_state": "unknown",
+            "profile": "local",
+            "retrieval_mode": "unavailable"
+          },
+          "status": "ready",
+          "summary": "Local navigation can use the current index."
+        },
+        {
+          "full_repair": [
+            "codestory-cli retrieval index --project \"/golden/project\" --profile agent --refresh auto --format json",
+            "codestory-cli retrieval status --project \"/golden/project\" --profile agent --format json",
+            "codestory-cli doctor --project \"/golden/project\" --format markdown"
+          ],
+          "goal": "agent_packet_search",
+          "index": {
+            "changed_file_count": 0,
+            "checked_file_count": 0,
+            "error_count": 0,
+            "fatal_error_count": 0,
+            "freshness_unknown": true,
+            "freshness_unknown_cause": "observation_unavailable",
+            "indexed_file_count": 1,
+            "new_file_count": 0,
+            "removed_file_count": 0
+          },
+          "minimum_next": [
+            "codestory-cli retrieval index --project \"/golden/project\" --profile agent --refresh auto --format json"
+          ],
+          "sidecar": {
+            "degraded_reason": "retrieval_status_error: golden retrieval probe failed",
+            "embedding_accelerator_requested": false,
+            "embedding_cpu_allowed": false,
+            "embedding_device_observation_source": "retrieval_unobserved",
+            "embedding_device_policy": "accelerator_required",
+            "embedding_device_state": "unknown",
+            "profile": "local",
+            "retrieval_mode": "unavailable"
+          },
+          "status": "blocked",
+          "summary": "Agent packet/search is waiting for full retrieval; current profile is `local`, mode is `unavailable`, and reason is `retrieval_status_error: golden retrieval probe failed`."
+        }
+      ],
+      "sidecar_retrieval_mode": "unavailable",
+      "trust_caveat": "Readiness is not fully green; run the next command before trusting agent packet/search output."
+    },
+    "projection": {
+      "degraded_reason": "retrieval_status_error: golden retrieval probe failed",
+      "embedding_accelerator_request_device": null,
+      "embedding_accelerator_request_provider": null,
+      "embedding_accelerator_requested": false,
+      "embedding_cpu_allowed": false,
+      "embedding_detected_gpu": null,
+      "embedding_detected_provider": null,
+      "embedding_device_observation_source": "retrieval_unobserved",
+      "embedding_device_policy": "accelerator_required",
+      "embedding_device_state": "unknown",
+      "manifest_generation": null,
+      "manifest_input_hash": null,
+      "retrieval_mode": "unavailable"
+    }
+  },
+  "unavailable": {
+    "handoff": {
+      "degraded_reason": "retrieval_manifest_missing",
+      "next_command": "codestory-cli retrieval index --project \"/golden/project\" --profile agent --refresh auto --format json",
+      "readiness": [
+        {
+          "full_repair": [
+            "codestory-cli ground --project \"/golden/project\""
+          ],
+          "goal": "local_navigation",
+          "index": {
+            "changed_file_count": 0,
+            "checked_file_count": 0,
+            "error_count": 0,
+            "fatal_error_count": 0,
+            "freshness_unknown": true,
+            "freshness_unknown_cause": "observation_unavailable",
+            "indexed_file_count": 1,
+            "new_file_count": 0,
+            "removed_file_count": 0
+          },
+          "minimum_next": [
+            "codestory-cli ground --project \"/golden/project\""
+          ],
+          "sidecar": {
+            "degraded_reason": "retrieval_manifest_missing",
+            "embedding_accelerator_requested": false,
+            "embedding_cpu_allowed": false,
+            "embedding_device_observation_source": "retrieval_unobserved",
+            "embedding_device_policy": "accelerator_required",
+            "embedding_device_state": "unknown",
+            "profile": "local",
+            "retrieval_mode": "unavailable"
+          },
+          "status": "ready",
+          "summary": "Local navigation can use the current index."
+        },
+        {
+          "full_repair": [
+            "codestory-cli retrieval index --project \"/golden/project\" --profile agent --refresh auto --format json",
+            "codestory-cli retrieval status --project \"/golden/project\" --profile agent --format json",
+            "codestory-cli doctor --project \"/golden/project\" --format markdown"
+          ],
+          "goal": "agent_packet_search",
+          "index": {
+            "changed_file_count": 0,
+            "checked_file_count": 0,
+            "error_count": 0,
+            "fatal_error_count": 0,
+            "freshness_unknown": true,
+            "freshness_unknown_cause": "observation_unavailable",
+            "indexed_file_count": 1,
+            "new_file_count": 0,
+            "removed_file_count": 0
+          },
+          "minimum_next": [
+            "codestory-cli retrieval index --project \"/golden/project\" --profile agent --refresh auto --format json"
+          ],
+          "sidecar": {
+            "degraded_reason": "retrieval_manifest_missing",
+            "embedding_accelerator_requested": false,
+            "embedding_cpu_allowed": false,
+            "embedding_device_observation_source": "retrieval_unobserved",
+            "embedding_device_policy": "accelerator_required",
+            "embedding_device_state": "unknown",
+            "profile": "local",
+            "retrieval_mode": "unavailable"
+          },
+          "status": "blocked",
+          "summary": "Agent packet/search is waiting for full retrieval; current profile is `local`, mode is `unavailable`, and reason is `retrieval_manifest_missing`."
+        }
+      ],
+      "sidecar_retrieval_mode": "unavailable",
+      "trust_caveat": "Readiness is not fully green; run the next command before trusting agent packet/search output."
+    },
+    "projection": {
+      "degraded_reason": "retrieval_manifest_missing",
+      "embedding_accelerator_request_device": null,
+      "embedding_accelerator_request_provider": null,
+      "embedding_accelerator_requested": false,
+      "embedding_cpu_allowed": false,
+      "embedding_detected_gpu": null,
+      "embedding_detected_provider": null,
+      "embedding_device_observation_source": "retrieval_unobserved",
+      "embedding_device_policy": "accelerator_required",
+      "embedding_device_state": "unknown",
+      "manifest_generation": null,
+      "manifest_input_hash": null,
+      "retrieval_mode": "unavailable"
+    }
+  }
+}

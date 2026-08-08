@@ -140,3 +140,55 @@ pub(in crate::app::diagnostics) fn doctor_sidecar_status_error(
         precise_semantic_import_producer: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::status_wire_test_support as wire;
+    use serde_json::{Value, json};
+
+    fn observed_status_cases() -> Value {
+        let runtime = wire::status_runtime_config();
+        json!({
+            "healthy": doctor_sidecar_status_from_report(
+                wire::healthy_status_report(),
+                Some(&runtime),
+            ),
+            "degraded": doctor_sidecar_status_from_report(
+                wire::degraded_status_report(),
+                Some(&runtime),
+            ),
+            "unavailable": doctor_sidecar_status_from_report(
+                wire::unavailable_status_report(),
+                Some(&runtime),
+            ),
+            "probe_error": doctor_sidecar_status_error(wire::probe_error(), Some(&runtime)),
+        })
+    }
+
+    #[test]
+    fn pre_change_status_wire_doctor_surface_is_non_vacuous() {
+        let cases = observed_status_cases();
+        let cases = cases.as_object().expect("doctor cases");
+        let union = cases
+            .values()
+            .flat_map(|case| case.as_object().expect("doctor status object").keys())
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            union,
+            wire::DOCTOR_STATUS_FIELDS.into_iter().collect(),
+            "doctor status field set drifted"
+        );
+        wire::assert_non_null_coverage(
+            &cases.values().cloned().collect::<Vec<_>>(),
+            &wire::DOCTOR_STATUS_FIELDS,
+            "doctor status",
+        );
+        wire::assert_json_golden(
+            &Value::Object(cases.clone()),
+            wire::DOCTOR_GOLDEN,
+            "doctor status",
+        );
+    }
+}
