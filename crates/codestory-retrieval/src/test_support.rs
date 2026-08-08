@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::EmbeddingVectorPublicationIdentityDto;
+use codestory_contracts::owned_artifacts::embedded_model_digest_root;
 use codestory_store::{RetrievalIndexManifest, SourcePolicyExclusionPolicyIdentity, Store};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -77,6 +78,87 @@ pub fn retrieval_manifest_fixture(
         precise_semantic_import_revision: None,
         precise_semantic_import_producer: None,
     }
+}
+
+pub const CACHE_CLEAN_OTHER_MODEL_DIGEST: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
+pub const CACHE_CLEAN_LIVE_WORKSPACE: &str = "aaaa000000000001";
+pub const CACHE_CLEAN_DEAD_WORKSPACE: &str = "bbbb000000000002";
+pub const CACHE_CLEAN_UNREGISTERED_WORKSPACE: &str = "cccc000000000003";
+
+/// Populate the complete process-cache cleanup matrix for boundary tests.
+///
+/// The fixture deliberately uses the retrieval owner's real Store and
+/// retention-marker writers. External crates cannot otherwise construct the
+/// positive evidence that distinguishes a retired cache from an unregistered
+/// one.
+pub fn populate_cache_clean_fixture(cache_root: &Path, worktrees_root: &Path) -> Result<()> {
+    std::fs::create_dir_all(cache_root).context("create cache-clean fixture root")?;
+    std::fs::create_dir_all(worktrees_root).context("create cache-clean worktrees root")?;
+    let live_root = worktrees_root.join("live");
+    let dead_root = worktrees_root.join("dead");
+    std::fs::create_dir_all(&live_root).context("create live fixture worktree")?;
+    std::fs::create_dir_all(&dead_root).context("create dead fixture worktree")?;
+
+    register_cache_clean_workspace(
+        cache_root,
+        CACHE_CLEAN_LIVE_WORKSPACE,
+        &live_root,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )?;
+    register_cache_clean_workspace(
+        cache_root,
+        CACHE_CLEAN_DEAD_WORKSPACE,
+        &dead_root,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )?;
+
+    let unregistered = cache_root.join(CACHE_CLEAN_UNREGISTERED_WORKSPACE);
+    std::fs::create_dir_all(&unregistered).context("create unregistered fixture cache")?;
+    std::fs::write(unregistered.join("codestory.db"), b"unregistered")
+        .context("write unregistered fixture cache")?;
+
+    write_cache_clean_model(cache_root, codestory_llama_sys::MODEL_SHA256, 8)?;
+    write_cache_clean_model(cache_root, CACHE_CLEAN_OTHER_MODEL_DIGEST, 12)?;
+    let unrecognized = embedded_model_digest_root(cache_root).join("not-a-digest");
+    std::fs::create_dir_all(&unrecognized).context("create unrecognized model fixture")?;
+    std::fs::write(unrecognized.join("model.gguf"), b"unrecognized")
+        .context("write unrecognized model fixture")?;
+
+    std::fs::remove_dir_all(dead_root).context("retire dead fixture worktree")?;
+    Ok(())
+}
+
+fn register_cache_clean_workspace(
+    cache_root: &Path,
+    workspace_id: &str,
+    project_root: &Path,
+    input_hash: &str,
+) -> Result<()> {
+    let cache_dir = cache_root.join(workspace_id);
+    std::fs::create_dir_all(&cache_dir).context("create registered fixture cache")?;
+    drop(Store::open(cache_dir.join("codestory.db")).context("create fixture core store")?);
+
+    let mut manifest = retrieval_manifest_fixture("cache-clean-project", input_hash);
+    manifest.built_at_epoch_ms = 1;
+    let marker = crate::retention::GenerationRetentionMarker::next(
+        workspace_id,
+        project_root,
+        manifest,
+        None,
+        1,
+    )?;
+    let state_file = cache_root.join(crate::config::RETRIEVAL_STATE_FILE);
+    crate::retention::write_retention_marker(&state_file, &marker)?;
+    Ok(())
+}
+
+fn write_cache_clean_model(cache_root: &Path, digest: &str, bytes: usize) -> Result<PathBuf> {
+    let directory = embedded_model_digest_root(cache_root).join(digest);
+    std::fs::create_dir_all(&directory).context("create fixture model digest")?;
+    let path = directory.join("model.gguf");
+    std::fs::write(&path, vec![b'm'; bytes]).context("write fixture model bytes")?;
+    Ok(path)
 }
 
 /// Publish a strict, zero-dense query fixture with the same vector-generation evidence required

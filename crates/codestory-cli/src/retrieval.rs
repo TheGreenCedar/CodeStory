@@ -239,6 +239,41 @@ fn ensure_retrieval_index_embedding_policy(sidecar: &SidecarRuntimeConfig) -> Re
         .context("retrieval index embedding device policy")
 }
 
+#[cfg(test)]
+mod embedding_preflight_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn retrieval_index_embedding_preflight_preserves_cli_error_text() {
+        let fixture = tempdir().expect("embedding preflight fixture");
+        let cache_root = fixture.path().join("unavailable");
+        std::fs::create_dir_all(&cache_root).expect("create embedding cache root");
+        std::fs::write(
+            cache_root.join(codestory_retrieval::TEST_EMBEDDING_UNAVAILABLE_MARKER),
+            b"unavailable",
+        )
+        .expect("write embedding unavailable marker");
+        let sidecar = codestory_retrieval::with_test_cache_root(&cache_root, || {
+            crate::sidecar_runtime::for_project_with_run_id(
+                fixture.path(),
+                codestory_retrieval::SidecarProfile::Agent,
+                Some("preflight-run"),
+            )
+        });
+
+        let error = ensure_retrieval_index_embedding_policy(&sidecar)
+            .expect_err("unavailable embedding backend must block retrieval index");
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "retrieval index embedding device policy: embedding backend unavailable by test marker in {}",
+                cache_root.display()
+            )
+        );
+    }
+}
+
 fn run_retrieval_index_refresh(
     runtime: &RuntimeContext,
     requested_refresh: RefreshMode,
