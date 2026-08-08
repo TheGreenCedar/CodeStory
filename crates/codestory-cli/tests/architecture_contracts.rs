@@ -316,6 +316,117 @@ fn cli_transport_adapters_do_not_probe_retrieval_directly() {
     }
 }
 
+/// The CLI routes retrieval work through `codestory_runtime`; only these
+/// providers implement retrieval-owned traits or supply qualification-proof
+/// operations. Routing providers through `ActivationService` would invert that
+/// dependency.
+///
+/// The fixture list is temporary: S2-7 deletes it by teaching classification
+/// to honor module-level `#[cfg(test)]` gates.
+#[test]
+fn cli_owns_no_direct_retrieval_consumers_outside_providers() {
+    let source_root = repo_root().join("crates/codestory-cli/src");
+    let provider_allowlist = BTreeSet::from([
+        "embedding_server_transport.rs",
+        "embedding_qualification/worker.rs",
+        "embedding_qualification/worker/gate.rs",
+        "embedding_qualification/worker/protocol.rs",
+        "embedding_qualification/worker/operations/absence.rs",
+        "embedding_qualification/worker/operations/activation.rs",
+        "embedding_qualification/worker/operations/dead_client.rs",
+        "embedding_qualification/worker/operations/measure.rs",
+        "embedding_qualification/worker/operations/owner_exit.rs",
+        "embedding_qualification/worker/operations/queue.rs",
+        "sidecar_runtime.rs",
+    ]);
+    let module_gated_fixture_exemptions = BTreeSet::from(["status_wire_test_support.rs"]);
+
+    let transport = production_source(&read(
+        "crates/codestory-cli/src/embedding_server_transport.rs",
+    ));
+    for provider_trait in [
+        "impl codestory_retrieval::AwakeMonotonicClock for",
+        "impl codestory_retrieval::EmbeddingServerStream for",
+        "impl codestory_retrieval::EmbeddingClientTransport for",
+        "impl codestory_retrieval::EmbeddingServerTransport for",
+        "impl codestory_retrieval::EmbeddingServerListener for",
+    ] {
+        assert!(
+            transport.contains(provider_trait),
+            "embedding_server_transport.rs must retain its retrieval provider trait impl: {provider_trait}"
+        );
+    }
+    let qualification_worker = production_source(&read(
+        "crates/codestory-cli/src/embedding_qualification/worker.rs",
+    ));
+    assert!(
+        qualification_worker.contains("codestory_retrieval::run_per_user_embedding_qualification("),
+        "embedding qualification provider must retain run_per_user_embedding_qualification"
+    );
+
+    let app = read("crates/codestory-cli/src/app.rs");
+    assert!(
+        app.contains("#[cfg(test)]\nmod tests;"),
+        "app/tests/ is exempt only while app.rs keeps its module-level #[cfg(test)] gate"
+    );
+    let lib = read("crates/codestory-cli/src/lib.rs");
+    assert!(
+        lib.contains("#[cfg(test)]\nmod status_wire_test_support;"),
+        "status_wire_test_support.rs is exempt only while lib.rs keeps its module-level #[cfg(test)] gate"
+    );
+
+    let mut files = Vec::new();
+    collect_rs_files(&source_root, &mut files);
+    files.sort();
+    let mut scanned = 0_usize;
+    let mut violations = Vec::new();
+    let mut provider_references = BTreeSet::new();
+    for path in files {
+        let relative = path
+            .strip_prefix(&source_root)
+            .expect("CLI source lives below source root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative.starts_with("app/tests/")
+            || module_gated_fixture_exemptions.contains(relative.as_str())
+        {
+            continue;
+        }
+
+        scanned += 1;
+        let source = production_source(&fs::read_to_string(&path).expect("read CLI source"));
+        let has_retrieval_reference = source.contains("codestory_retrieval");
+        if provider_allowlist.contains(relative.as_str()) {
+            if has_retrieval_reference {
+                provider_references.insert(relative);
+            }
+            continue;
+        }
+        for line in source
+            .lines()
+            .filter(|line| line.contains("codestory_retrieval"))
+        {
+            violations.push(format!("{}: {}", path.display(), line.trim()));
+        }
+    }
+
+    assert!(
+        scanned > 20,
+        "CLI retrieval-consumer scan must cover more than 20 release-compiled files; scanned {scanned}"
+    );
+    assert!(
+        violations.is_empty(),
+        "CLI retrieval consumers must route through codestory_runtime outside enumerated providers:\n{}",
+        violations.join("\n")
+    );
+    for provider in &provider_allowlist {
+        assert!(
+            provider_references.contains(*provider),
+            "provider allowlist entry {provider} has no release-compiled codestory_retrieval reference; remove the stale allowlist entry"
+        );
+    }
+}
+
 #[test]
 fn workspace_crate_stays_decoupled_from_store_and_runtime() {
     let dependencies = dependency_names("crates/codestory-workspace/Cargo.toml");
