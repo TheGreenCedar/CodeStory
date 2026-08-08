@@ -397,6 +397,7 @@ test("claim graph owns the universal architecture and path-scoped durability flo
     "cargo test --locked -p codestory-store",
     "cargo test --locked -p codestory-indexer --test fidelity_regression",
     "cargo test --locked -p codestory-indexer --test tictactoe_language_coverage",
+    "cargo test --locked -p codestory-agent",
   ]);
   assert.deepEqual(floor.crate_durability.paths.slice(0, 3), [
     "Cargo.toml",

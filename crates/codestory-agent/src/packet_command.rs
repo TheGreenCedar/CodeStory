@@ -88,3 +88,62 @@ pub fn next_deeper_packet_argv(
         next,
     ]))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_contracts::api::PacketBudgetModeDto;
+    use std::path::Path;
+
+    #[test]
+    fn packet_argv_and_rendering_preserve_argv_and_quote_shell_values() {
+        let argv = packet_argv(&[
+            "packet",
+            "--project",
+            "/tmp/project with space",
+            "--question",
+            "it's ready",
+        ]);
+
+        assert_eq!(
+            argv,
+            vec![
+                "codestory-cli".to_string(),
+                "packet".to_string(),
+                "--project".to_string(),
+                "/tmp/project with space".to_string(),
+                "--question".to_string(),
+                "it's ready".to_string(),
+            ],
+        );
+        assert_eq!(
+            render_packet_command(&argv),
+            "codestory-cli packet --project '/tmp/project with space' --question 'it'\\''s ready'",
+        );
+    }
+
+    #[test]
+    fn deeper_packet_argv_advances_budget_and_stops_at_deep() {
+        let project = Path::new("/tmp/project with space");
+        let argv = next_deeper_packet_argv(project, "show $HOME", PacketBudgetModeDto::Tiny)
+            .expect("tiny has a deeper retry");
+
+        assert_eq!(
+            argv,
+            vec![
+                "codestory-cli".to_string(),
+                "packet".to_string(),
+                "--project".to_string(),
+                "/tmp/project with space".to_string(),
+                "--question".to_string(),
+                "show $HOME".to_string(),
+                "--budget".to_string(),
+                "compact".to_string(),
+            ],
+        );
+        assert_eq!(
+            next_deeper_packet_argv(project, "question", PacketBudgetModeDto::Deep),
+            None,
+        );
+    }
+}

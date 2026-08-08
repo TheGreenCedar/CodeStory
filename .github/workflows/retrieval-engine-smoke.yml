@@ -172,6 +172,7 @@ jobs:
           cargo test --locked -p codestory-runtime --lib services::
           cargo test --locked -p codestory-cli --lib
           cargo test --locked -p codestory-workspace
+          cargo test --locked -p codestory-agent
 
       - name: Stdio protocol contract tests
         run: cargo test --locked -p codestory-cli --test stdio_protocol_contracts
