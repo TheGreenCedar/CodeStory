@@ -1,7 +1,7 @@
 use super::{
-    ApiError, AppController, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse,
-    NodeId, NodeKind, TrailConfigDto, app_graph_flags, graph_canonical, graph_edge_dto,
-    is_structural_kind, member_access_dto, node_display_name,
+    ApiError, AppController, GraphNodeDto, GraphRequest, GraphResponse, NodeId, NodeKind,
+    TrailConfigDto, app_graph_flags, graph_canonical, graph_edge_dto, is_structural_kind,
+    member_access_dto, node_display_name,
 };
 pub(crate) use codestory_agent::trail::is_speculative_trail_edge;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -454,6 +454,7 @@ mod tests {
     use codestory_contracts::api::{
         CanonicalEdgeDto, CanonicalEdgeFamily, CanonicalLayoutDto, CanonicalRouteKind,
     };
+    use codestory_contracts::api::{EdgeKind, GraphEdgeDto};
 
     fn edge(id: i64, source: &str, target: &str) -> GraphEdgeDto {
         GraphEdgeDto {
