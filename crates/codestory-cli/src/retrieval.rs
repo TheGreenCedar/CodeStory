@@ -2,11 +2,10 @@ use anyhow::{Context, Result, bail};
 use codestory_contracts::api::IndexMode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use codestory_retrieval::{
-    FinalizeIndexOutcome, QueryRequest, RetrievalIndexManifest,
-    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, SidecarRuntimeConfig,
+use codestory_runtime::{
+    FinalizeIndexOutcome, RetrievalIndexManifest, RetrievalStatusReport, RuntimeRetrievalConfig,
+    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
 };
-use codestory_runtime::RetrievalStatusReport;
 
 use crate::args::{
     CliSidecarProfile, OutputFormat, RefreshMode, RetrievalAction,
@@ -35,13 +34,14 @@ pub(crate) fn run_retrieval(cmd: RetrievalCommand) -> Result<()> {
 fn run_retrieval_activate_rollback(cmd: RetrievalActivateRollbackCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    let outcome = codestory_retrieval::activate_retained_rollback_generation(
-        &runtime.project_root,
-        &runtime.storage_path,
-        &runtime.sidecar,
-        !cmd.dry_run,
-    )
-    .map_err(annotate_rollback_activation_error)?;
+    let outcome = runtime
+        .activation
+        .activate_retained_rollback_generation(
+            &runtime.project_root,
+            &runtime.storage_path,
+            !cmd.dry_run,
+        )
+        .map_err(annotate_rollback_activation_error)?;
     let project = crate::display::clean_path_string(&runtime.project_root.to_string_lossy());
     let next_commands = rollback_activation_next_commands(&project, &outcome);
     let markdown = render_rollback_activation_markdown(&project, &outcome, &next_commands);
@@ -58,7 +58,7 @@ fn run_retrieval_activate_rollback(cmd: RetrievalActivateRollbackCommand) -> Res
 /// The refusal is the product answer, not an internal failure, so the code has
 /// to survive into stderr and into any wrapping context a caller adds.
 fn annotate_rollback_activation_error(
-    error: codestory_retrieval::RollbackActivationError,
+    error: codestory_runtime::RollbackActivationError,
 ) -> anyhow::Error {
     let code = error.code();
     anyhow::anyhow!("{error}").context(format!("retrieval activate-rollback refused: {code}"))
@@ -66,7 +66,7 @@ fn annotate_rollback_activation_error(
 
 fn rollback_activation_next_commands(
     project: &str,
-    outcome: &codestory_retrieval::RollbackActivationOutcome,
+    outcome: &codestory_runtime::RollbackActivationOutcome,
 ) -> Vec<String> {
     if outcome.applied {
         return vec![
@@ -81,7 +81,7 @@ fn rollback_activation_next_commands(
 
 fn render_rollback_activation_markdown(
     project: &str,
-    outcome: &codestory_retrieval::RollbackActivationOutcome,
+    outcome: &codestory_runtime::RollbackActivationOutcome,
     next_commands: &[String],
 ) -> String {
     let mut markdown = format!(
@@ -173,36 +173,31 @@ pub(crate) fn run_retrieval_inventory(cmd: RetrievalInventoryCommand) -> Result<
     preflight_output(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     if cmd.apply {
-        let report = codestory_retrieval::sidecar_gc_apply_with_storage(
-            &runtime.project_root,
-            &runtime.storage_path,
-        )
-        .context("retrieval inventory apply")?;
+        let report = runtime
+            .activation
+            .apply_retrieval_gc(&runtime.project_root, &runtime.storage_path)
+            .context("retrieval inventory apply")?;
         return emit_retrieval_gc(cmd.format, &report, cmd.output_file.as_deref());
     }
-    let report = codestory_retrieval::sidecar_inventory_with_storage(
-        &runtime.project_root,
-        &runtime.storage_path,
-    )
-    .context("retrieval inventory")?;
+    let report = runtime
+        .activation
+        .retrieval_inventory(&runtime.project_root, &runtime.storage_path)
+        .context("retrieval inventory")?;
     emit_retrieval_inventory(cmd.format, &report, cmd.output_file.as_deref())
 }
 
 fn run_retrieval_query(cmd: RetrievalQueryCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    let result = codestory_retrieval::execute_retrieval_query_with_cache_for_runtime(
-        QueryRequest {
-            project_root: &runtime.project_root,
-            storage_path: &runtime.storage_path,
-            query: &cmd.query,
-            budget_ms: cmd.budget_ms,
-            cancelled: None,
-        },
-        &mut codestory_retrieval::RetrievalCache::new(),
-        &runtime.sidecar,
-    )
-    .context("retrieval query")?;
+    let result = runtime
+        .activation
+        .execute_retrieval_query(
+            &runtime.project_root,
+            &runtime.storage_path,
+            &cmd.query,
+            cmd.budget_ms,
+        )
+        .context("retrieval query")?;
     emit_retrieval_query(cmd.format, &result, cmd.output_file.as_deref())
 }
 
@@ -234,9 +229,8 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     emit_retrieval_index(cmd.format, &outcome, cmd.output_file.as_deref())
 }
 
-fn ensure_retrieval_index_embedding_policy(sidecar: &SidecarRuntimeConfig) -> Result<()> {
-    let retrieval_config = codestory_runtime::RuntimeRetrievalConfig::from(sidecar.clone());
-    codestory_runtime::ensure_product_embedding_backend_for_runtime(&retrieval_config)
+fn ensure_retrieval_index_embedding_policy(sidecar: &RuntimeRetrievalConfig) -> Result<()> {
+    codestory_runtime::ensure_product_embedding_backend_for_runtime(sidecar)
         .context("retrieval index embedding device policy")
 }
 
@@ -258,7 +252,7 @@ mod embedding_preflight_tests {
         let sidecar = codestory_retrieval::with_test_cache_root(&cache_root, || {
             crate::sidecar_runtime::for_project_with_run_id(
                 fixture.path(),
-                codestory_retrieval::SidecarProfile::Agent,
+                codestory_runtime::RuntimeRetrievalProfile::Agent,
                 Some("preflight-run"),
             )
         });
@@ -316,7 +310,7 @@ pub(crate) fn finalize_retrieval_index_for_runtime(
 
 pub(crate) fn finalize_retrieval_index_for_sidecar_runtime(
     runtime: &RuntimeContext,
-    sidecar: &SidecarRuntimeConfig,
+    sidecar: &RuntimeRetrievalConfig,
 ) -> Result<FinalizeIndexOutcome> {
     let cancelled = AtomicBool::new(false);
     finalize_retrieval_index_for_sidecar_runtime_with_cancel(runtime, sidecar, &cancelled)
@@ -324,7 +318,7 @@ pub(crate) fn finalize_retrieval_index_for_sidecar_runtime(
 
 pub(crate) fn finalize_retrieval_index_for_sidecar_runtime_with_cancel(
     runtime: &RuntimeContext,
-    sidecar: &SidecarRuntimeConfig,
+    sidecar: &RuntimeRetrievalConfig,
     cancelled: &AtomicBool,
 ) -> Result<FinalizeIndexOutcome> {
     if cancelled.load(Ordering::Acquire) {
@@ -332,13 +326,15 @@ pub(crate) fn finalize_retrieval_index_for_sidecar_runtime_with_cancel(
     }
     let opened = runtime.ensure_open(crate::args::RefreshMode::None)?;
     ensure_index_ready(&opened, "retrieval index")?;
-    codestory_retrieval::finalize_index_for_runtime_with_cancel(
-        &runtime.project_root,
-        &runtime.storage_path,
-        sidecar,
-        cancelled,
-    )
-    .context("retrieval index finalize")
+    runtime
+        .activation
+        .finalize_retrieval_index_with_cancel(
+            &runtime.project_root,
+            &runtime.storage_path,
+            sidecar,
+            cancelled,
+        )
+        .context("retrieval index finalize")
 }
 
 fn retrieval_index_should_retry_full_refresh(
@@ -367,8 +363,8 @@ struct RetrievalIndexOutput<'a> {
     manifest: &'a RetrievalIndexManifest,
     degraded_modes: &'a [String],
     scip_stubbed: bool,
-    generation_retention_plan: &'a codestory_retrieval::GenerationRetentionPlan,
-    generation_retention: &'a codestory_retrieval::GenerationRetentionApplyReport,
+    generation_retention_plan: &'a codestory_runtime::GenerationRetentionPlan,
+    generation_retention: &'a codestory_runtime::GenerationRetentionApplyReport,
 }
 
 fn emit_retrieval_index(
@@ -401,7 +397,7 @@ fn emit_retrieval_index(
 
 fn emit_retrieval_query(
     format: OutputFormat,
-    result: &codestory_retrieval::QueryResult,
+    result: &codestory_runtime::QueryResult,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
     let top_hit = result
@@ -485,7 +481,7 @@ fn emit_retrieval_status(
 
 fn emit_retrieval_inventory(
     format: OutputFormat,
-    report: &codestory_retrieval::SidecarInventoryReport,
+    report: &codestory_runtime::SidecarInventoryReport,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
     let mut markdown = format!(
@@ -514,7 +510,7 @@ fn emit_retrieval_inventory(
 
 fn emit_retrieval_gc(
     format: OutputFormat,
-    report: &codestory_retrieval::SidecarGcReport,
+    report: &codestory_runtime::SidecarGcReport,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
     let mut markdown = format!(
@@ -584,7 +580,7 @@ mod tests {
             codestory_retrieval::test_support::publish_retained_rollback_fixture(
                 &runtime.project_root,
                 &runtime.storage_path,
-                &runtime.sidecar,
+                runtime.sidecar.as_raw_config_for_test(),
             )
             .expect("publish retained rollback fixture");
         let project_id = current.project_id.clone();
@@ -629,7 +625,7 @@ mod tests {
             let fixture = live_operation_fixture();
             let stale_paths =
                 codestory_retrieval::test_support::write_reclaimable_generation_fixture(
-                    &fixture.runtime.sidecar,
+                    fixture.runtime.sidecar.as_raw_config_for_test(),
                     &fixture.project_id,
                     "cccccccccccccccc",
                 )
@@ -694,7 +690,7 @@ mod tests {
                     cancelled: None,
                 },
                 &mut codestory_retrieval::RetrievalCache::new(),
-                &fixture.runtime.sidecar,
+                fixture.runtime.sidecar.as_raw_config_for_test(),
             )
             .expect("execute direct zero-dense query");
             assert!(
@@ -742,7 +738,7 @@ mod tests {
             let before = codestory_retrieval::observe_retained_rollback_generation(
                 &fixture.runtime.project_root,
                 &fixture.runtime.storage_path,
-                &fixture.runtime.sidecar,
+                fixture.runtime.sidecar.as_raw_config_for_test(),
             )
             .expect("observe retained rollback")
             .expect("retained rollback exists");
@@ -776,7 +772,7 @@ mod tests {
                 codestory_retrieval::observe_retained_rollback_generation(
                     &fixture.runtime.project_root,
                     &fixture.runtime.storage_path,
-                    &fixture.runtime.sidecar,
+                    fixture.runtime.sidecar.as_raw_config_for_test(),
                 )
                 .expect("re-observe retained rollback after dry-run"),
                 Some(before)
@@ -803,7 +799,7 @@ mod tests {
                 codestory_retrieval::observe_retained_rollback_generation(
                     &fixture.runtime.project_root,
                     &fixture.runtime.storage_path,
-                    &fixture.runtime.sidecar,
+                    fixture.runtime.sidecar.as_raw_config_for_test(),
                 )
                 .expect("observe after rollback activation")
                 .is_none(),

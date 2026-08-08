@@ -139,14 +139,12 @@ pub(in crate::app) fn build_doctor_output(
 /// point so inspecting a project can never migrate or recover it.
 fn observe_retained_rollback(
     runtime: &RuntimeContext,
-) -> Option<codestory_retrieval::RetainedRollbackObservation> {
-    codestory_retrieval::observe_retained_rollback_generation(
-        &runtime.project_root,
-        &runtime.storage_path,
-        &runtime.sidecar,
-    )
-    .ok()
-    .flatten()
+) -> Option<codestory_runtime::RetainedRollbackObservation> {
+    runtime
+        .activation
+        .observe_retained_rollback_generation(&runtime.project_root, &runtime.storage_path)
+        .ok()
+        .flatten()
 }
 
 /// Report the rollback lever, and recommend it only when it could help.
@@ -158,7 +156,7 @@ fn observe_retained_rollback(
 fn doctor_rollback_check(
     project: &str,
     sidecar_retrieval: &RetrievalStatusOutput,
-    retained: Option<&codestory_retrieval::RetainedRollbackObservation>,
+    retained: Option<&codestory_runtime::RetainedRollbackObservation>,
     next_commands: &mut Vec<String>,
 ) -> Option<crate::args::DoctorCheckOutput> {
     let retained = retained?;

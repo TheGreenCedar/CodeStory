@@ -13,7 +13,7 @@ use codestory_contracts::config_registry;
 use codestory_runtime::{
     ActivationService, BookmarkService, GroundingService, IndexService, ProjectService,
     PublicOperation, PublicOperationService, ReadOnlyBrowserService, Runtime, RuntimeProcessConfig,
-    TargetResolution,
+    RuntimeRetrievalConfig, RuntimeRetrievalProfile, TargetResolution,
 };
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
@@ -76,7 +76,7 @@ pub(crate) struct RuntimeContext {
     pub(crate) context_key: ProjectContextKey,
     pub(crate) cache_root: PathBuf,
     pub(crate) storage_path: PathBuf,
-    pub(crate) sidecar: codestory_retrieval::SidecarRuntimeConfig,
+    pub(crate) sidecar: RuntimeRetrievalConfig,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) source_index_policy: codestory_contracts::workspace::SourceIndexPolicy,
 }
@@ -95,7 +95,7 @@ struct RuntimeContextConfiguration {
     context_key: ProjectContextKey,
     cache_root: PathBuf,
     storage_path: PathBuf,
-    sidecar: codestory_retrieval::SidecarRuntimeConfig,
+    sidecar: RuntimeRetrievalConfig,
     source_index_policy: codestory_contracts::workspace::SourceIndexPolicy,
 }
 
@@ -159,7 +159,7 @@ impl RuntimeContextConfiguration {
 
     fn with_profile_and_run_id(
         mut self,
-        profile: codestory_retrieval::SidecarProfile,
+        profile: RuntimeRetrievalProfile,
         run_id: Option<&str>,
     ) -> Self {
         self.sidecar =
@@ -171,10 +171,11 @@ impl RuntimeContextConfiguration {
     }
 
     fn build(self) -> RuntimeContext {
-        let runtime = Runtime::new_with_process_config(RuntimeProcessConfig::new(
-            self.sidecar.clone(),
-            self.source_index_policy.clone(),
-        ));
+        let runtime =
+            Runtime::new_with_process_config(RuntimeProcessConfig::new_with_retrieval_config(
+                self.sidecar.clone(),
+                self.source_index_policy.clone(),
+            ));
         let events = runtime.events();
         RuntimeContext {
             activation: runtime.activation_service(),
@@ -299,7 +300,7 @@ impl RuntimeContext {
     ) -> Result<Self> {
         let selected = profile
             .map(Into::into)
-            .unwrap_or(codestory_retrieval::SidecarProfile::Agent);
+            .unwrap_or(RuntimeRetrievalProfile::Agent);
         Ok(
             RuntimeContextConfiguration::resolve(args, startup, None, None)?
                 .with_profile_and_run_id(selected, run_id)
@@ -327,7 +328,7 @@ impl RuntimeContext {
                 Some(&retained.project_identity),
                 Some(&logical),
             )?
-            .with_profile_and_run_id(codestory_retrieval::SidecarProfile::Agent, None)
+            .with_profile_and_run_id(RuntimeRetrievalProfile::Agent, None)
             .context_key,
         ))
     }
@@ -678,10 +679,10 @@ pub(crate) fn map_public_operation<T, U>(
 
 fn runtime_configuration_id(
     cache_root: &Path,
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    sidecar: &RuntimeRetrievalConfig,
     source_index_policy: &codestory_contracts::workspace::SourceIndexPolicy,
 ) -> String {
-    RuntimeProcessConfig::new(sidecar.clone(), source_index_policy.clone())
+    RuntimeProcessConfig::new_with_retrieval_config(sidecar.clone(), source_index_policy.clone())
         .configuration_id(cache_root)
 }
 
@@ -1525,7 +1526,8 @@ mod tests {
 
         let assert_isolated_paths =
             |runtime: &RuntimeContext, expected_root: &Path, other_root: &Path| {
-                assert_eq!(runtime.sidecar.cache_root.as_path(), expected_root);
+                let sidecar = runtime.sidecar.as_raw_config_for_test();
+                assert_eq!(sidecar.cache_root.as_path(), expected_root);
                 assert_eq!(
                     runtime.storage_path,
                     runtime.cache_root.join("codestory.db")
@@ -1533,11 +1535,11 @@ mod tests {
                 for path in [
                     runtime.cache_root.as_path(),
                     runtime.storage_path.as_path(),
-                    runtime.sidecar.cache_root.as_path(),
-                    runtime.sidecar.layout.lexical_data_dir.as_path(),
-                    runtime.sidecar.layout.semantic_data_dir.as_path(),
-                    runtime.sidecar.layout.scip_artifacts_root.as_path(),
-                    runtime.sidecar.layout.state_file.as_path(),
+                    sidecar.cache_root.as_path(),
+                    sidecar.layout.lexical_data_dir.as_path(),
+                    sidecar.layout.semantic_data_dir.as_path(),
+                    sidecar.layout.scip_artifacts_root.as_path(),
+                    sidecar.layout.state_file.as_path(),
                 ] {
                     assert!(
                         path.starts_with(expected_root),
@@ -1592,6 +1594,7 @@ mod tests {
 
         let retained = runtime
             .sidecar
+            .as_raw_config_for_test()
             .project_identity
             .as_ref()
             .expect("sidecar retains observed project identity");
@@ -1940,13 +1943,13 @@ mod tests {
         codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
             &project,
             &reader.storage_path,
-            &reader.sidecar,
+            reader.sidecar.as_raw_config_for_test(),
         )
         .expect("publish retrieval generation A");
         let retrieval_a = codestory_retrieval::strict_sidecar_status_for_runtime(
             &project,
             Some(&reader.storage_path),
-            reader.sidecar.clone(),
+            reader.sidecar.as_raw_config_for_test().clone(),
         )
         .expect("inspect retrieval generation A");
         assert!(retrieval_a.is_live_ready(), "{retrieval_a:?}");
@@ -1965,7 +1968,7 @@ mod tests {
         let replacement_run_id = "between-pins-run-b".to_string();
         let publisher_project = project.clone();
         let publisher_storage = reader.storage_path.clone();
-        let publisher_runtime = reader.sidecar.clone();
+        let publisher_runtime = reader.sidecar.as_raw_config_for_test().clone();
         let publisher_generation_id = replacement_generation_id.clone();
         let publisher_run_id = replacement_run_id.clone();
         codestory_runtime::set_before_retrieval_pin_test_hook(move || {
@@ -2004,7 +2007,7 @@ mod tests {
         let retrieval_b = codestory_retrieval::strict_sidecar_status_for_runtime(
             &project,
             Some(&reader.storage_path),
-            reader.sidecar.clone(),
+            reader.sidecar.as_raw_config_for_test().clone(),
         )
         .expect("inspect retrieval generation B");
         assert!(retrieval_b.is_live_ready(), "{retrieval_b:?}");

@@ -91,8 +91,7 @@ pub(super) fn open_agent_surface(
     let runtime = new_agent_surface_runtime(project, profile, run_id)?;
     let (before, opened) = runtime.ensure_open_with_before(refresh)?;
     ensure_index_ready(&opened, surface)?;
-    let retrieval_config = codestory_runtime::RuntimeRetrievalConfig::from(runtime.sidecar.clone());
-    codestory_runtime::ensure_product_embedding_backend_for_runtime(&retrieval_config)
+    codestory_runtime::ensure_product_embedding_backend_for_runtime(&runtime.sidecar)
         .map_err(map_embedding_preflight_error)
         .with_context(|| format!("initialize retrieval for {surface}"))?;
     Ok(OpenedAgentSurface {
