@@ -179,6 +179,33 @@ test("the catalog move records the pin it replaced, and that pin is a working ro
   }
 });
 
+test("a restore refuses to overwrite a catalog that has moved past its published pin", () => {
+  const env = scratch();
+  try {
+    const { repo, commits } = sourceRepository(env.root, ["0.1.0", "0.2.0", "0.3.0"]);
+    const bare = marketplaceRepository(env.root, catalogEntry("0.1.0", commits["0.1.0"]));
+
+    const published = runPublisher(env, repo, { commit: commits["0.2.0"], version: "0.2.0" });
+    assert.equal(published.status, 0, `${published.stdout}${published.stderr}`);
+
+    const newer = runPublisher(env, repo, { commit: commits["0.3.0"], version: "0.3.0" });
+    assert.equal(newer.status, 0, `${newer.stdout}${newer.stderr}`);
+
+    const restore = runPublisher(env, repo, {
+      commit: commits["0.1.0"],
+      version: "0.1.0",
+      expected_current_revision: published.outputs.marketplace_revision,
+      expected_current_plugin_sha: commits["0.2.0"],
+      expected_current_plugin_version: "0.2.0",
+    });
+    assert.equal(restore.status, 1, `${restore.stdout}${restore.stderr}`);
+    assert.match(restore.stderr, /refusing automatic restore/u);
+    assert.deepEqual(readCatalog(bare).plugins[0], catalogEntry("0.3.0", commits["0.3.0"]));
+  } finally {
+    fs.rmSync(env.root, { recursive: true, force: true });
+  }
+});
+
 test("an already-synced catalog reports the pin it is serving without pushing", () => {
   const env = scratch();
   try {
