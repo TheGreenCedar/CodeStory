@@ -1,20 +1,20 @@
 use super::{
-    ApiError, AppController, HashSet, Instant, NodeId, Path, RepoTextScanStatsDto, SearchHit,
-    SearchMatchQualityDto, Storage, clamp_u128_to_u32, clamp_usize_to_u32,
+    ApiError, AppController, BoundedTextRead, HashSet, Instant, NodeId, Path, RepoTextScanStatsDto,
+    SearchHit, SearchMatchQualityDto, Storage, clamp_u128_to_u32, clamp_usize_to_u32,
     compare_search_hits_with_project_root, extract_symbol_search_terms, file_text_match_line,
-    read_searchable_file_contents,
+    read_searchable_file_contents_limited,
 };
 #[cfg(test)]
 use super::{SearchRepoTextMode, looks_like_repo_text_query};
 #[cfg(test)]
 use crate::search_intent::repo_text_auto_fallback_reason;
 use crate::search_intent::text_contains_query_term;
+use codestory_workspace::SourceIndexPolicy;
 
 pub(super) const REPO_TEXT_SCAN_FILE_CAP: usize = 2_000;
 pub(super) const REPO_TEXT_SCAN_BYTE_CAP: usize = 32 * 1024 * 1024;
 pub(super) const REPO_TEXT_SCAN_TIME_CAP_MS: u128 = 500;
-/// Derived from the source cap, for the same reason as the lexical and
-/// semantic lanes: an admitted file must stay searchable.
+/// Default repo-text cap. Product scans use the active source-index policy.
 pub(super) const REPO_TEXT_MAX_FILE_BYTES: u64 =
     codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP;
 #[derive(Debug, Clone)]
@@ -22,6 +22,44 @@ pub(super) struct RepoTextScan {
     pub(super) hits: Vec<SearchHit>,
     #[cfg(test)]
     pub(super) stats: RepoTextScanStatsDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RepoTextFileReadOutcome {
+    Contents(String),
+    FileTooLarge,
+    ByteBudgetExceeded,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RepoTextFileRead {
+    pub(super) outcome: RepoTextFileReadOutcome,
+    pub(super) bytes_read: u64,
+}
+
+pub(super) fn read_repo_text_file(
+    path: &str,
+    max_file_bytes: u64,
+    remaining_total_bytes: u64,
+) -> RepoTextFileRead {
+    let read_limit = max_file_bytes.min(remaining_total_bytes);
+    let read = read_searchable_file_contents_limited(path, read_limit);
+    let bytes_read = read.bytes_read();
+    let outcome = match read {
+        BoundedTextRead::Contents { contents, .. } => RepoTextFileReadOutcome::Contents(contents),
+        BoundedTextRead::LimitExceeded { .. }
+            if bytes_read > remaining_total_bytes || remaining_total_bytes < max_file_bytes =>
+        {
+            RepoTextFileReadOutcome::ByteBudgetExceeded
+        }
+        BoundedTextRead::LimitExceeded { .. } => RepoTextFileReadOutcome::FileTooLarge,
+        BoundedTextRead::Unreadable { .. } => RepoTextFileReadOutcome::Unreadable,
+    };
+    RepoTextFileRead {
+        outcome,
+        bytes_read,
+    }
 }
 
 impl AppController {
@@ -45,10 +83,12 @@ impl AppController {
     pub(super) fn collect_repo_text_hits(
         storage: &Storage,
         project_root: Option<&Path>,
+        source_index_policy: &SourceIndexPolicy,
         query: &str,
         limit: usize,
         indexed_hit_ids: &HashSet<NodeId>,
     ) -> Result<RepoTextScan, ApiError> {
+        let max_file_bytes = source_index_policy.byte_cap;
         let started_at = Instant::now();
         let mut stats = RepoTextScanStatsDto {
             scanned_file_count: 0,
@@ -72,6 +112,7 @@ impl AppController {
 
         let mut hits = Vec::new();
         let mut seen = indexed_hit_ids.clone();
+        let mut read_byte_count = 0_u64;
         let terms = extract_symbol_search_terms(query);
         let normalized_query = query.trim().to_ascii_lowercase();
         for file in storage
@@ -87,13 +128,13 @@ impl AppController {
             let Ok(metadata) = std::fs::metadata(&file.path) else {
                 continue;
             };
-            if metadata.len() > REPO_TEXT_MAX_FILE_BYTES {
+            if metadata.len() > max_file_bytes {
                 stats.skipped_large_file_count = stats.skipped_large_file_count.saturating_add(1);
                 continue;
             }
-            let projected_bytes =
-                u64::from(stats.scanned_byte_count).saturating_add(metadata.len());
-            if projected_bytes > REPO_TEXT_SCAN_BYTE_CAP as u64 {
+            let remaining_total_bytes = (REPO_TEXT_SCAN_BYTE_CAP as u64)
+                .saturating_sub(read_byte_count.min(REPO_TEXT_SCAN_BYTE_CAP as u64));
+            if metadata.len() > remaining_total_bytes {
                 Self::mark_repo_text_scan_truncated(
                     &mut stats,
                     format!(
@@ -103,13 +144,27 @@ impl AppController {
                 );
                 break;
             }
-            let Some(contents) = read_searchable_file_contents(&path_string) else {
-                continue;
+            let read = read_repo_text_file(&path_string, max_file_bytes, remaining_total_bytes);
+            read_byte_count = read_byte_count.saturating_add(read.bytes_read);
+            let contents = match read.outcome {
+                RepoTextFileReadOutcome::Contents(contents) => contents,
+                RepoTextFileReadOutcome::FileTooLarge => {
+                    stats.skipped_large_file_count =
+                        stats.skipped_large_file_count.saturating_add(1);
+                    continue;
+                }
+                RepoTextFileReadOutcome::ByteBudgetExceeded => {
+                    Self::mark_repo_text_scan_truncated(
+                        &mut stats,
+                        format!(
+                            "repo-text scan stopped before reading more than {} bytes",
+                            REPO_TEXT_SCAN_BYTE_CAP
+                        ),
+                    );
+                    break;
+                }
+                RepoTextFileReadOutcome::Unreadable => continue,
             };
-            if contents.len() as u64 > REPO_TEXT_MAX_FILE_BYTES {
-                stats.skipped_large_file_count = stats.skipped_large_file_count.saturating_add(1);
-                continue;
-            }
             stats.scanned_byte_count = stats
                 .scanned_byte_count
                 .saturating_add(clamp_usize_to_u32(contents.len()));
@@ -331,8 +386,7 @@ impl AppController {
     }
 }
 
-/// Same parity the lexical lane asserts. These constants are what make an
-/// admitted file readable; any of them lagging the source cap is silent.
+/// Keep the default fallback aligned if the default source policy changes.
 const _: () = assert!(
     REPO_TEXT_MAX_FILE_BYTES >= codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
     "repo-text scanning must admit every file the indexer does"

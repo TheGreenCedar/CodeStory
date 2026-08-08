@@ -2,10 +2,11 @@ use super::{
     AppController, CoreNodeId, FileInfo, HashMap, HashSet, Instant, Node, NodeKind,
     REPO_TEXT_MAX_FILE_BYTES, REPO_TEXT_SCAN_BYTE_CAP, REPO_TEXT_SCAN_FILE_CAP,
     REPO_TEXT_SCAN_TIME_CAP_MS, RepoTextScanStatsDto, SearchHitOrigin,
-    SearchPlanPromotionStatusDto, SearchRepoTextMode, SearchRequest, Storage,
+    SearchPlanPromotionStatusDto, SearchRepoTextMode, SearchRequest, SourceIndexPolicy, Storage,
     assert_mandatory_retrieval_unavailable, fs, search_plan_anchor_groups,
     search_plan_next_actions, search_plan_terms, search_plan_test_hit, tempdir,
 };
+use crate::repo_text::{RepoTextFileReadOutcome, read_repo_text_file};
 
 #[test]
 fn search_plan_repo_text_owner_identifier_does_not_promote_member_symbol() {
@@ -303,6 +304,7 @@ fn repo_text_ranking_uses_path_and_query_tokens_for_svelte_surfaces() {
     let scan = AppController::collect_repo_text_hits(
         &storage,
         Some(temp.path()),
+        &SourceIndexPolicy::default(),
         "readSnapshot get_snapshot App.svelte invoke",
         5,
         &HashSet::new(),
@@ -368,6 +370,7 @@ fn repo_text_partial_matches_surface_public_page_wiring() {
     let scan = AppController::collect_repo_text_hits(
         &storage,
         Some(temp.path()),
+        &SourceIndexPolicy::default(),
         "how posts comments auth and elsewhere feed connect to public pages",
         10,
         &HashSet::new(),
@@ -412,6 +415,7 @@ fn repo_text_partial_match_requires_distinct_query_terms() {
     let scan = AppController::collect_repo_text_hits(
         &storage,
         Some(temp.path()),
+        &SourceIndexPolicy::default(),
         "posts comments auth",
         10,
         &HashSet::new(),
@@ -458,6 +462,7 @@ fn repo_text_scan_reports_file_cap_on_large_low_match_fixture() {
     let scan = AppController::collect_repo_text_hits(
         &storage,
         Some(temp.path()),
+        &SourceIndexPolicy::default(),
         "needle that is not present",
         10,
         &HashSet::new(),
@@ -541,6 +546,7 @@ fn repo_text_scan_skips_large_files_before_reading_contents() {
     let scan = AppController::collect_repo_text_hits(
         &storage,
         Some(temp.path()),
+        &SourceIndexPolicy::default(),
         "needle",
         10,
         &HashSet::new(),
@@ -552,4 +558,46 @@ fn repo_text_scan_skips_large_files_before_reading_contents() {
     assert_eq!(scan.stats.scanned_byte_count, 0);
     assert_eq!(scan.stats.skipped_large_file_count, 1);
     assert!(!scan.stats.truncated);
+
+    let widened_policy = SourceIndexPolicy::oversized(REPO_TEXT_MAX_FILE_BYTES + 1_024);
+    let scan = AppController::collect_repo_text_hits(
+        &storage,
+        Some(temp.path()),
+        &widened_policy,
+        "needle",
+        10,
+        &HashSet::new(),
+    )
+    .expect("repo text scan with widened source policy");
+
+    assert_eq!(
+        scan.hits.len(),
+        1,
+        "widened admitted source must be searchable"
+    );
+    assert_eq!(scan.stats.skipped_large_file_count, 0);
+}
+
+#[test]
+fn repo_text_file_read_is_bounded_by_remaining_aggregate_budget() {
+    let temp = tempdir().expect("temp dir");
+    let source_path = temp.path().join("grew-after-metadata.rs");
+    fs::write(&source_path, "x".repeat(4_096)).expect("write source");
+
+    let result = read_repo_text_file(source_path.to_string_lossy().as_ref(), 8_192, 31);
+
+    assert_eq!(result.outcome, RepoTextFileReadOutcome::ByteBudgetExceeded);
+    assert_eq!(result.bytes_read, 0);
+}
+
+#[test]
+fn repo_text_file_read_charges_invalid_utf8() {
+    let temp = tempdir().expect("temp dir");
+    let source_path = temp.path().join("invalid.rs");
+    fs::write(&source_path, vec![0xff; 19]).expect("write invalid source");
+
+    let result = read_repo_text_file(source_path.to_string_lossy().as_ref(), 64, 31);
+
+    assert_eq!(result.outcome, RepoTextFileReadOutcome::Unreadable);
+    assert_eq!(result.bytes_read, 19);
 }

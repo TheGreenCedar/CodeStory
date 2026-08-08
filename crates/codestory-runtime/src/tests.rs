@@ -833,7 +833,7 @@ fn dense_policy_keeps_low_degree_local_functions_and_variables_sparse() {
                 node,
                 &node.serialized_name,
                 Some("src/internal/local.rs"),
-                "semantic_doc_version: 6\nkind: local\n",
+                "semantic_doc_version: 7\nkind: local\n",
                 Some(AccessKind::Private),
             ),
             None
@@ -4068,6 +4068,95 @@ fn semantic_projection_republish_fails_closed_when_stored_document_is_missing() 
         Some(before)
     );
     assert_no_staged_publication_artifacts(&storage_path);
+}
+
+#[test]
+fn previous_semantic_body_contract_requires_source_refresh_before_republish() {
+    const UNPROVEN_SOURCE_BODY_DOC_VERSION: u32 = 6;
+
+    let _env = hybrid_test_env();
+    let workspace = copy_tictactoe_workspace();
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish current semantic core");
+
+    let mut storage = Storage::open(&storage_path).expect("open current semantic core");
+    let before = storage
+        .get_complete_index_publication()
+        .expect("read current publication")
+        .expect("complete current publication");
+    let mut retained_docs = storage
+        .get_symbol_search_docs_batch_after(None, 10_000)
+        .expect("read current semantic documents");
+    assert!(
+        !retained_docs.is_empty(),
+        "fixture must contain semantic documents"
+    );
+    for doc in &mut retained_docs {
+        assert_eq!(doc.doc_hash, llm_symbol_doc_hash(&doc.doc_text));
+        assert_eq!(doc.policy_version, SEMANTIC_POLICY_VERSION);
+        doc.doc_version = UNPROVEN_SOURCE_BODY_DOC_VERSION;
+    }
+    let retained_count = retained_docs.len();
+    storage
+        .upsert_symbol_search_docs_batch(&retained_docs)
+        .expect("persist retained pre-cap-provenance semantic documents");
+    drop(storage);
+
+    assert!(
+        controller
+            .complete_core_requires_publication_repair(&storage_path)
+            .expect("inspect retained semantic contract"),
+        "a core whose semantic documents cannot prove the active source cap must require repair"
+    );
+    let error = controller
+        .republish_semantic_projections_blocking()
+        .expect_err("StoredCore republish must not restamp the unproven document contract");
+    assert_eq!(error.code, "semantic_projection_migration_required");
+    assert_eq!(
+        Storage::database_complete_index_publication(&storage_path)
+            .expect("read publication after rejected republish"),
+        Some(before)
+    );
+    assert_no_staged_publication_artifacts(&storage_path);
+
+    let repair = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("repair retained semantic documents from source");
+    let probe = repair
+        .incremental_plan_probe
+        .as_ref()
+        .expect("source-backed repair must report its plan decision");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::SemanticDocContractDrift
+    );
+    assert!(
+        repair.symbol_search_docs_written.unwrap_or(0) >= clamp_usize_to_u32(retained_count),
+        "contract drift must rebuild every semantic document from source"
+    );
+    let repaired = Storage::open(&storage_path).expect("open repaired semantic core");
+    assert!(
+        repaired
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("read repaired semantic documents")
+            .iter()
+            .all(|doc| doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION)
+    );
+    drop(repaired);
+    assert!(
+        !controller
+            .complete_core_requires_publication_repair(&storage_path)
+            .expect("inspect repaired semantic contract")
+    );
 }
 
 #[test]

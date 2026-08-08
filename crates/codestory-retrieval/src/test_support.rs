@@ -15,6 +15,34 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Publish the minimum complete core identity required by retrieval fixtures
+/// that hash lexical source input from a pinned store.
+pub fn publish_complete_core_fixture(
+    storage: &mut Store,
+    project_root: &Path,
+    publication: &codestory_store::IndexPublicationRecord,
+) -> Result<()> {
+    let identity = codestory_workspace::project_identity_v3(project_root);
+    let source_policy = codestory_contracts::workspace::SourceIndexPolicy::default();
+    storage
+        .publish_source_policy_exclusion_generation(
+            publication,
+            &identity.project_id,
+            &identity.workspace_id,
+            SourcePolicyExclusionPolicyIdentity::new(
+                &source_policy.policy_version,
+                source_policy.byte_cap,
+                source_policy.structural_unit_cap,
+            ),
+            &[],
+        )
+        .context("publish empty source policy exclusion fixture")?;
+    storage
+        .put_index_publication(publication)
+        .context("publish complete core fixture")?;
+    Ok(())
+}
+
 pub fn retrieval_manifest_fixture(
     project_id: &str,
     sidecar_input_hash: &str,

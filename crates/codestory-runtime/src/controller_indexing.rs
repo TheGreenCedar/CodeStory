@@ -23,8 +23,8 @@ use crate::search_state_cache::{
     rebuild_search_state_from_storage_for_runtime, refresh_caches, workspace_refresh_inputs,
 };
 use crate::semantic_projection::{
-    CacheRefreshStats, SEMANTIC_POLICY_VERSION, SemanticProjectionRepublishOutcome,
-    apply_cache_refresh_stats, summarize_symbol_doc,
+    CacheRefreshStats, LLM_SYMBOL_DOC_SCHEMA_VERSION, SEMANTIC_POLICY_VERSION,
+    SemanticProjectionRepublishOutcome, apply_cache_refresh_stats, summarize_symbol_doc,
 };
 use crate::semantic_republish::semantic_projection_republish_for_runtime;
 use crate::support::{clamp_i64_to_u32, clamp_u128_to_u32};
@@ -731,12 +731,12 @@ impl AppController {
         }
         let storage = Store::open_read_only(storage_path).map_err(|error| {
             ApiError::internal(format!(
-                "Failed to inspect dense-anchor publication readiness: {error}"
+                "Failed to inspect core publication readiness: {error}"
             ))
         })?;
         let Some(publication) = storage.get_complete_index_publication().map_err(|error| {
             ApiError::internal(format!(
-                "Failed to inspect dense-anchor core publication: {error}"
+                "Failed to inspect complete core publication: {error}"
             ))
         })?
         else {
@@ -748,6 +748,19 @@ impl AppController {
             || storage
                 .validate_structural_text_unit_publication(&publication)
                 .is_err()
+        {
+            return Ok(true);
+        }
+        if storage
+            .has_symbol_search_doc_contract_mismatch(
+                LLM_SYMBOL_DOC_SCHEMA_VERSION,
+                SEMANTIC_POLICY_VERSION,
+            )
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to inspect semantic document publication readiness: {error}"
+                ))
+            })?
         {
             return Ok(true);
         }

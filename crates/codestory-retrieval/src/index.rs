@@ -2446,7 +2446,7 @@ mod tests {
         }
         let error = finalize_index(project.path(), &storage_path)
             .expect_err("empty stores cannot satisfy mandatory sidecar indexing");
-        let message = error.to_string();
+        let message = format!("{error:#}");
         assert!(
             message.contains("mandatory")
                 || message.contains("embedding_device_unverified")
@@ -2957,9 +2957,22 @@ mod tests {
         let project = TempDir::new().expect("project");
         std::fs::write(project.path().join("lib.rs"), "pub fn do_work() {}\n")
             .expect("write source");
-        let mut storage = Store::new_in_memory().expect("storage");
         let storage_path = project.path().join("codestory.db");
+        let mut storage = Store::open(&storage_path).expect("storage");
         insert_matching_semantic_doc(&mut storage, project.path());
+        let publication = codestory_store::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "core-generation".into(),
+            run_id: "core-run".into(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        crate::test_support::publish_complete_core_fixture(
+            &mut storage,
+            project.path(),
+            &publication,
+        )
+        .expect("complete core fixture");
 
         assert_eq!(
             storage
@@ -3014,6 +3027,25 @@ mod tests {
         let mut second_storage = Store::open(&second_storage_path).expect("second store");
         insert_matching_semantic_doc(&mut first_storage, first_project.path());
         insert_matching_semantic_doc(&mut second_storage, second_project.path());
+        let publication = codestory_store::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "core-generation".into(),
+            run_id: "core-run".into(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        crate::test_support::publish_complete_core_fixture(
+            &mut first_storage,
+            first_project.path(),
+            &publication,
+        )
+        .expect("first complete core fixture");
+        crate::test_support::publish_complete_core_fixture(
+            &mut second_storage,
+            second_project.path(),
+            &publication,
+        )
+        .expect("second complete core fixture");
 
         let first_project_id = sidecar_project_id_for_root(first_project.path());
         let second_project_id = sidecar_project_id_for_root(second_project.path());
@@ -3055,17 +3087,21 @@ mod tests {
     fn producer_compatibility_change_selects_a_distinct_immutable_generation() {
         let project = TempDir::new().expect("project");
         std::fs::write(project.path().join("lib.rs"), "pub fn stable() {}\n").expect("source");
-        let storage = Store::new_in_memory().expect("storage");
         let storage_path = project.path().join("codestory.db");
-        storage
-            .put_index_publication(&codestory_store::IndexPublicationRecord {
-                generation: 1,
-                generation_id: "core-generation".into(),
-                run_id: "core-run".into(),
-                mode: codestory_store::IndexPublicationMode::Full,
-                published_at_epoch_ms: 1,
-            })
-            .expect("core publication");
+        let mut storage = Store::open(&storage_path).expect("storage");
+        let publication = codestory_store::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "core-generation".into(),
+            run_id: "core-run".into(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        crate::test_support::publish_complete_core_fixture(
+            &mut storage,
+            project.path(),
+            &publication,
+        )
+        .expect("complete core fixture");
         let project_id = "project";
         let package_a = compute_sidecar_input_fingerprint(
             &storage,
@@ -3157,15 +3193,19 @@ mod tests {
         storage
             .upsert_dense_anchor_inputs_batch(&[doc.clone()])
             .expect("first doc");
-        storage
-            .put_index_publication(&codestory_store::IndexPublicationRecord {
-                generation: 1,
-                generation_id: "g1".into(),
-                run_id: "r1".into(),
-                mode: codestory_store::IndexPublicationMode::Full,
-                published_at_epoch_ms: 1,
-            })
-            .expect("first core publication");
+        let first_publication = codestory_store::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "g1".into(),
+            run_id: "r1".into(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        crate::test_support::publish_complete_core_fixture(
+            &mut storage,
+            project.path(),
+            &first_publication,
+        )
+        .expect("first complete core fixture");
         let first = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
@@ -3180,15 +3220,19 @@ mod tests {
         storage
             .upsert_dense_anchor_inputs_batch(&[doc.clone()])
             .expect("rebind unchanged doc");
-        storage
-            .put_index_publication(&codestory_store::IndexPublicationRecord {
-                generation: 2,
-                generation_id: "g2".into(),
-                run_id: "r2".into(),
-                mode: codestory_store::IndexPublicationMode::Full,
-                published_at_epoch_ms: 2,
-            })
-            .expect("second core publication");
+        let second_publication = codestory_store::IndexPublicationRecord {
+            generation: 2,
+            generation_id: "g2".into(),
+            run_id: "r2".into(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 2,
+        };
+        crate::test_support::publish_complete_core_fixture(
+            &mut storage,
+            project.path(),
+            &second_publication,
+        )
+        .expect("second complete core fixture");
         let rebound = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
@@ -3695,16 +3739,20 @@ mod tests {
         let storage_dir = TempDir::new().expect("storage");
         let cache = TempDir::new().expect("cache");
         let storage_path = storage_dir.path().join("codestory.db");
-        let store = Store::open(&storage_path).expect("open storage");
-        store
-            .put_index_publication(&IndexPublicationRecord {
-                generation: 1,
-                generation_id: "11111111-1111-4111-8111-111111111111".into(),
-                run_id: "run-one".into(),
-                mode: IndexPublicationMode::Full,
-                published_at_epoch_ms: 1,
-            })
-            .expect("publish core identity");
+        let mut store = Store::open(&storage_path).expect("open storage");
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        crate::test_support::publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &publication,
+        )
+        .expect("publish complete core fixture");
         drop(store);
         let runtime = crate::config::with_test_cache_root(cache.path(), || {
             SidecarRuntimeConfig::for_project_profile(
@@ -4096,16 +4144,20 @@ mod tests {
         let storage_dir = TempDir::new().expect("storage");
         let cache = TempDir::new().expect("cache");
         let storage_path = storage_dir.path().join("codestory.db");
-        let store = Store::open(&storage_path).expect("open storage");
-        store
-            .put_index_publication(&IndexPublicationRecord {
-                generation: 1,
-                generation_id: "11111111-1111-4111-8111-111111111111".into(),
-                run_id: "run-one".into(),
-                mode: IndexPublicationMode::Full,
-                published_at_epoch_ms: 1,
-            })
-            .expect("publish core identity");
+        let mut store = Store::open(&storage_path).expect("open storage");
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        crate::test_support::publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &publication,
+        )
+        .expect("publish complete core fixture");
         drop(store);
         let runtime = crate::config::with_test_cache_root(cache.path(), || {
             SidecarRuntimeConfig::for_project_profile(

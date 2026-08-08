@@ -388,12 +388,14 @@ pub use target_resolution::{
 
 pub(crate) use services::active_public_operation_cancellation;
 pub(crate) use support::{
-    FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES,
-    SEMANTIC_FILE_TEXT_MAX_BYTES, aggregate_symbol_matches, clamp_i64_to_u32, clamp_u64_to_u32,
-    clamp_u128_to_u32, clamp_usize_to_u32, extract_symbol_search_terms, file_text_match_line,
-    hybrid_retrieval_enabled, looks_like_repo_text_query, node_display_name, preferred_occurrence,
-    query_has_symbol_or_literal_signal, read_file_text_limited, read_searchable_file_contents,
-    should_expand_symbol_query, source_freshness_telemetry_for_operation,
+    BoundedTextRead, FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV,
+    SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES, SEMANTIC_FILE_TEXT_MAX_BYTES, aggregate_symbol_matches,
+    clamp_i64_to_u32, clamp_u64_to_u32, clamp_u128_to_u32, clamp_usize_to_u32,
+    extract_symbol_search_terms, file_text_match_line, hybrid_retrieval_enabled,
+    looks_like_repo_text_query, node_display_name, preferred_occurrence,
+    query_has_symbol_or_literal_signal, read_file_text_limited,
+    read_searchable_file_contents_limited, should_expand_symbol_query,
+    source_freshness_telemetry_for_operation,
 };
 #[cfg(test)]
 pub(crate) use support::{apply_hybrid_limits, normalized_hybrid_weights};

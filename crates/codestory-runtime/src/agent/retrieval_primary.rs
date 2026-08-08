@@ -2125,6 +2125,19 @@ mod tests {
         controller: AppController,
     }
 
+    fn publish_test_complete_core(
+        store: &mut Store,
+        project_root: &Path,
+        publication: &codestory_store::IndexPublicationRecord,
+    ) {
+        codestory_retrieval::test_support::publish_complete_core_fixture(
+            store,
+            project_root,
+            publication,
+        )
+        .expect("publish complete core generation");
+    }
+
     fn pinned_operation_fixture() -> PinnedOperationFixture {
         use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
 
@@ -2132,16 +2145,15 @@ mod tests {
         let storage = tempfile::tempdir().expect("storage");
         let retrieval_cache = tempfile::tempdir().expect("retrieval cache");
         let storage_path = storage.path().join("codestory.db");
-        let store = Store::open(&storage_path).expect("open storage");
-        store
-            .put_index_publication(&IndexPublicationRecord {
-                generation: 1,
-                generation_id: "11111111-1111-4111-8111-111111111111".into(),
-                run_id: "run-one".into(),
-                mode: IndexPublicationMode::Full,
-                published_at_epoch_ms: 1,
-            })
-            .expect("publish initial core generation");
+        let mut store = Store::open(&storage_path).expect("open storage");
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        publish_test_complete_core(&mut store, project.path(), &publication);
         drop(store);
         let runtime = codestory_retrieval::with_test_cache_root(retrieval_cache.path(), || {
             SidecarRuntimeConfig::for_project_profile(
@@ -2243,16 +2255,23 @@ mod tests {
                     "response assembly must retain the operation pin"
                 );
                 if build_calls == 1 {
-                    let writer = Store::open(&fixture.storage_path).expect("open drift writer");
-                    writer
-                        .put_index_publication(&IndexPublicationRecord {
-                            generation: 2,
-                            generation_id: "22222222-2222-4222-8222-222222222222".into(),
-                            run_id: "run-two".into(),
-                            mode: IndexPublicationMode::Full,
-                            published_at_epoch_ms: 2,
-                        })
-                        .expect("publish concurrent core generation");
+                    let mut writer = Store::open(&fixture.storage_path).expect("open drift writer");
+                    let publication = IndexPublicationRecord {
+                        generation: 2,
+                        generation_id: "22222222-2222-4222-8222-222222222222".into(),
+                        run_id: "run-two".into(),
+                        mode: IndexPublicationMode::Full,
+                        published_at_epoch_ms: 2,
+                    };
+                    publish_test_complete_core(
+                        &mut writer,
+                        fixture
+                            .controller
+                            .require_project_root()
+                            .expect("project root")
+                            .as_path(),
+                        &publication,
+                    );
                 }
                 Ok(TestPublicationResponse::default())
             },
@@ -2325,16 +2344,23 @@ mod tests {
         PinnedRetrievalRead::begin(&fixture.controller).expect("first pin");
         assert_eq!(canonical_stream_count(&fixture.controller), 1);
 
-        let writer = Store::open(&fixture.storage_path).expect("open publication writer");
-        writer
-            .put_index_publication(&IndexPublicationRecord {
-                generation: 2,
-                generation_id: "22222222-2222-4222-8222-222222222222".into(),
-                run_id: "run-two".into(),
-                mode: IndexPublicationMode::Full,
-                published_at_epoch_ms: 2,
-            })
-            .expect("publish a second core generation");
+        let mut writer = Store::open(&fixture.storage_path).expect("open publication writer");
+        let publication = IndexPublicationRecord {
+            generation: 2,
+            generation_id: "22222222-2222-4222-8222-222222222222".into(),
+            run_id: "run-two".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 2,
+        };
+        publish_test_complete_core(
+            &mut writer,
+            fixture
+                .controller
+                .require_project_root()
+                .expect("project root")
+                .as_path(),
+            &publication,
+        );
         drop(writer);
         publish_zero_dense_pinned_query_fixture(
             fixture
@@ -4013,15 +4039,14 @@ mod tests {
                 original_node,
             ])
             .expect("insert nodes");
-        storage
-            .put_index_publication(&IndexPublicationRecord {
-                generation: 1,
-                generation_id: "11111111-1111-4111-8111-111111111111".into(),
-                run_id: "run-one".into(),
-                mode: IndexPublicationMode::Full,
-                published_at_epoch_ms: 1,
-            })
-            .expect("publish first identity");
+        let first_publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        publish_test_complete_core(&mut storage, project.path(), &first_publication);
         drop(storage);
 
         let runtime = codestory_retrieval::with_test_cache_root(retrieval_cache.path(), || {
@@ -4052,15 +4077,14 @@ mod tests {
                 ..Default::default()
             }])
             .expect("reuse numeric id in replacement generation");
-        writer
-            .put_index_publication(&IndexPublicationRecord {
-                generation: 2,
-                generation_id: "22222222-2222-4222-8222-222222222222".into(),
-                run_id: "run-two".into(),
-                mode: IndexPublicationMode::Full,
-                published_at_epoch_ms: 2,
-            })
-            .expect("publish replacement identity");
+        let replacement_publication = IndexPublicationRecord {
+            generation: 2,
+            generation_id: "22222222-2222-4222-8222-222222222222".into(),
+            run_id: "run-two".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 2,
+        };
+        publish_test_complete_core(&mut writer, project.path(), &replacement_publication);
         let replacement_manifest = retrieval_manifest_fixture(&project_id, "second");
         writer
             .upsert_retrieval_index_manifest(&replacement_manifest)

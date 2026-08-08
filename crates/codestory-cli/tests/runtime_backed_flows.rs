@@ -209,6 +209,77 @@ fn assert_publication_metadata(json: &Value, surface: &str, retrieval_expected: 
 }
 
 #[test]
+fn raised_source_file_cap_preserves_lexical_recall() {
+    let workspace = tempdir().expect("create widened source workspace");
+    let core_cache = tempdir().expect("create widened source core cache");
+    let retrieval_cache = tempdir().expect("create widened source retrieval cache");
+    let needle = "active_policy_lexical_recall_needle";
+    let default_cap = codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP;
+    let file_bytes = default_cap + 1_024;
+    let widened_cap = file_bytes + 1_024;
+    let prefix = format!("// {needle}\n// ");
+    let mut contents = prefix.clone();
+    contents.push_str(&"x".repeat(file_bytes as usize - prefix.len()));
+    assert_eq!(contents.len() as u64, file_bytes);
+    fs::write(workspace.path().join("large.rs"), contents).expect("write widened source");
+
+    let mut command = test_support::cli_command();
+    let index = command
+        .args(["index", "--refresh", "full", "--format", "json"])
+        .arg("--project")
+        .arg(workspace.path())
+        .arg("--cache-dir")
+        .arg(core_cache.path())
+        .env(
+            "CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP",
+            widened_cap.to_string(),
+        )
+        .output()
+        .expect("index widened source");
+    assert!(
+        index.status.success(),
+        "widened source index failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&index.stderr),
+        String::from_utf8_lossy(&index.stdout)
+    );
+
+    let project = fs::canonicalize(workspace.path()).expect("canonical widened workspace");
+    let storage_path = core_cache.path().join("codestory.db");
+    let runtime = codestory_retrieval::with_test_cache_root(retrieval_cache.path(), || {
+        codestory_retrieval::SidecarRuntimeConfig::for_project_profile(
+            Some(&project),
+            codestory_retrieval::SidecarProfile::Local,
+        )
+    });
+    let manifest = codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+        &project,
+        &storage_path,
+        &runtime,
+    )
+    .expect("publish widened source lexical fixture");
+    let generation = manifest
+        .sidecar_generation
+        .as_deref()
+        .expect("widened source sidecar generation");
+    let input_hash = manifest
+        .sidecar_input_hash
+        .as_deref()
+        .expect("widened source sidecar input hash");
+    let hits = codestory_retrieval::LexicalClient::new(&runtime.layout)
+        .search(&runtime.layout, generation, input_hash, needle, 10)
+        .expect("search widened source lexical shard");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file_path == "large.rs"
+                && hit.source == codestory_retrieval::CandidateSource::Lexical
+                && hit.provenance.iter().any(|value| value == "lexical_source")
+        }),
+        "over-default policy-admitted source was absent from lexical recall: {hits:#?}"
+    );
+}
+
+#[test]
 #[ignore = "builds indexed runtime fixtures; run explicitly when touching CLI/runtime read-command flows"]
 fn read_commands_support_explicit_auto_refresh_after_indexing() {
     let workspace = copy_tictactoe_workspace();
