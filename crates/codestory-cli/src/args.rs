@@ -2461,6 +2461,8 @@ pub(crate) struct RetrievalStatusOutput {
     pub(crate) precise_semantic_import_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) precise_semantic_import_producer: Option<String>,
+    #[serde(flatten)]
+    pub(crate) ready_lease: codestory_runtime::ReadyLeaseEvidence,
 }
 
 #[derive(Debug, Clone, Serialize)]

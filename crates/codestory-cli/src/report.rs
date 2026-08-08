@@ -112,6 +112,8 @@ struct ReportSidecarStatus {
     embedding_cpu_allowed: bool,
     manifest_generation: Option<String>,
     manifest_input_hash: Option<String>,
+    #[cfg_attr(test, serde(flatten))]
+    ready_lease: codestory_runtime::ReadyLeaseEvidence,
 }
 
 fn report_sidecar_status(runtime: &RuntimeContext) -> ReportSidecarStatus {
@@ -119,23 +121,31 @@ fn report_sidecar_status(runtime: &RuntimeContext) -> ReportSidecarStatus {
         .activation
         .retrieval_status(&runtime.project_root, &runtime.storage_path)
     {
-        Ok(observation) => report_sidecar_status_from_report(observation.into_parts().1),
-        Err(error) => report_sidecar_status_from_error(error),
+        Ok(observation) => {
+            let ready_lease = observation.ready_lease().clone();
+            report_sidecar_status_from_report(observation.into_parts().1, ready_lease)
+        }
+        Err(error) => {
+            let ready_lease = error.ready_lease().clone();
+            report_sidecar_status_from_error(error, ready_lease)
+        }
     }
 }
 
 #[cfg(test)]
 fn report_sidecar_status_from_result(
     result: anyhow::Result<codestory_runtime::RetrievalStatusReport>,
+    ready_lease: codestory_runtime::ReadyLeaseEvidence,
 ) -> ReportSidecarStatus {
     match result {
-        Ok(report) => report_sidecar_status_from_report(report),
-        Err(error) => report_sidecar_status_from_error(error),
+        Ok(report) => report_sidecar_status_from_report(report, ready_lease),
+        Err(error) => report_sidecar_status_from_error(error, ready_lease),
     }
 }
 
 fn report_sidecar_status_from_report(
     report: codestory_runtime::RetrievalStatusReport,
+    ready_lease: codestory_runtime::ReadyLeaseEvidence,
 ) -> ReportSidecarStatus {
     let manifest_generation = report
         .manifest
@@ -159,10 +169,14 @@ fn report_sidecar_status_from_report(
         embedding_cpu_allowed: report.embedding_cpu_allowed,
         manifest_generation,
         manifest_input_hash,
+        ready_lease,
     }
 }
 
-fn report_sidecar_status_from_error(error: impl std::fmt::Display) -> ReportSidecarStatus {
+fn report_sidecar_status_from_error(
+    error: impl std::fmt::Display,
+    ready_lease: codestory_runtime::ReadyLeaseEvidence,
+) -> ReportSidecarStatus {
     ReportSidecarStatus {
         retrieval_mode: "unavailable".to_string(),
         degraded_reason: Some(format!("retrieval_status_error: {error}")),
@@ -177,6 +191,7 @@ fn report_sidecar_status_from_error(error: impl std::fmt::Display) -> ReportSide
         embedding_cpu_allowed: false,
         manifest_generation: None,
         manifest_input_hash: None,
+        ready_lease,
     }
 }
 
@@ -238,6 +253,7 @@ fn attach_report_handoff(
         top_entry_point: output.entry_points.first().map(report_node_label),
         top_risk: output.hotspots.first().map(report_node_label),
         next_command,
+        ready_lease: sidecar.ready_lease.clone(),
     });
 }
 
@@ -296,6 +312,14 @@ fn append_handoff_header(markdown: &mut String, output: &RepoReport) {
     if let Some(command) = handoff.next_command.as_deref() {
         let _ = writeln!(markdown, "- next_command: `{}`", markdown_escape(command));
     }
+    let _ = writeln!(
+        markdown,
+        "- ready_lease: present={} admission_basis=`{}` observer_epoch_coherence=`{}` memo_holds_observations={}",
+        handoff.ready_lease.ready_lease_present,
+        handoff.ready_lease.ready_lease_admission_basis,
+        handoff.ready_lease.ready_lease_observer_epoch_coherence,
+        handoff.ready_lease.ready_lease_memo_holds_observations,
+    );
     let _ = writeln!(markdown);
 }
 
@@ -474,8 +498,11 @@ mod tests {
         }
     }
 
-    fn observed_case(result: anyhow::Result<codestory_runtime::RetrievalStatusReport>) -> Value {
-        let status = report_sidecar_status_from_result(result);
+    fn observed_case(
+        result: anyhow::Result<codestory_runtime::RetrievalStatusReport>,
+        ready_lease: codestory_runtime::ReadyLeaseEvidence,
+    ) -> Value {
+        let status = report_sidecar_status_from_result(result, ready_lease);
         let projection = serde_json::to_value(&status).expect("report status projection");
         let mut report = empty_report();
         attach_report_handoff(&mut report, &summary(), &status);
@@ -488,10 +515,10 @@ mod tests {
     #[test]
     fn pre_change_status_wire_report_and_handoff_surfaces_are_non_vacuous() {
         let cases = json!({
-            "healthy": observed_case(Ok(wire::healthy_status_report())),
-            "degraded": observed_case(Ok(wire::degraded_status_report())),
-            "unavailable": observed_case(Ok(wire::unavailable_status_report())),
-            "probe_error": observed_case(Err(wire::probe_error())),
+            "healthy": observed_case(Ok(wire::healthy_status_report()), wire::ready_lease_evidence()),
+            "degraded": observed_case(Ok(wire::degraded_status_report()), wire::stale_ready_lease_evidence()),
+            "unavailable": observed_case(Ok(wire::unavailable_status_report()), codestory_runtime::ReadyLeaseEvidence::default()),
+            "probe_error": observed_case(Err(wire::probe_error()), wire::unproven_ready_lease_evidence()),
         });
         let projections = cases
             .as_object()

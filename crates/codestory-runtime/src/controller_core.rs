@@ -393,6 +393,29 @@ impl AppController {
         })
     }
 
+    /// Read the current epoch only when an observer is already armed for `root`.
+    ///
+    /// Status and doctor use this path because asking for evidence must never
+    /// create the observer whose existence they are trying to report.
+    pub(crate) fn observed_source_epoch_if_armed(
+        &self,
+        root: &Path,
+    ) -> Option<ObservedSourceEpoch> {
+        let state = self.source_observer.lock();
+        if state.root.as_deref() != Some(root) {
+            return None;
+        }
+        let session = state.session.as_ref()?;
+        if session.gap().is_some() {
+            return None;
+        }
+        Some(ObservedSourceEpoch {
+            session_id: session.identity().session_id().to_string(),
+            backend: session.identity().backend().id(),
+            epoch: session.epoch(),
+        })
+    }
+
     /// Install a caller-driven observer session so a test can script the racing window.
     #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]

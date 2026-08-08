@@ -74,25 +74,48 @@ fn doctor_sidecar_status_from_observation(
 ) -> RetrievalStatusOutput {
     match observation {
         Ok(observation) => {
+            let ready_lease = observation.ready_lease().clone();
             let (selection, report) = observation.into_parts();
-            doctor_sidecar_status_from_report(
+            doctor_sidecar_status_from_report_with_lease(
                 report,
                 Some(selection.profile().as_str()),
                 selection.run_id(),
+                ready_lease,
             )
         }
         Err(error) => {
+            let ready_lease = error.ready_lease().clone();
             let profile = error.selection().profile().as_str();
             let run_id = error.selection().run_id().map(str::to_string);
-            doctor_sidecar_status_error(error, Some(profile), run_id.as_deref())
+            doctor_sidecar_status_error_with_lease(
+                error,
+                Some(profile),
+                run_id.as_deref(),
+                ready_lease,
+            )
         }
     }
 }
 
+#[cfg(test)]
 pub(in crate::app::diagnostics) fn doctor_sidecar_status_from_report(
     report: codestory_runtime::RetrievalStatusReport,
     profile: Option<&str>,
     run_id: Option<&str>,
+) -> RetrievalStatusOutput {
+    doctor_sidecar_status_from_report_with_lease(
+        report,
+        profile,
+        run_id,
+        codestory_runtime::ReadyLeaseEvidence::default(),
+    )
+}
+
+fn doctor_sidecar_status_from_report_with_lease(
+    report: codestory_runtime::RetrievalStatusReport,
+    profile: Option<&str>,
+    run_id: Option<&str>,
+    ready_lease: codestory_runtime::ReadyLeaseEvidence,
 ) -> RetrievalStatusOutput {
     let manifest_generation = report
         .manifest
@@ -138,13 +161,15 @@ pub(in crate::app::diagnostics) fn doctor_sidecar_status_from_report(
         precise_semantic_import_reason,
         precise_semantic_import_revision,
         precise_semantic_import_producer,
+        ready_lease,
     }
 }
 
-pub(in crate::app::diagnostics) fn doctor_sidecar_status_error(
+fn doctor_sidecar_status_error_with_lease(
     error: impl std::fmt::Display,
     profile: Option<&str>,
     run_id: Option<&str>,
+    ready_lease: codestory_runtime::ReadyLeaseEvidence,
 ) -> RetrievalStatusOutput {
     RetrievalStatusOutput {
         profile: profile.map(str::to_string),
@@ -166,6 +191,7 @@ pub(in crate::app::diagnostics) fn doctor_sidecar_status_error(
         precise_semantic_import_reason: None,
         precise_semantic_import_revision: None,
         precise_semantic_import_producer: None,
+        ready_lease,
     }
 }
 
@@ -177,25 +203,28 @@ mod tests {
 
     fn observed_status_cases() -> Value {
         json!({
-            "healthy": doctor_sidecar_status_from_report(
+            "healthy": doctor_sidecar_status_from_report_with_lease(
                 wire::healthy_status_report(),
                 Some("agent"),
                 Some("golden-run"),
+                wire::ready_lease_evidence(),
             ),
-            "degraded": doctor_sidecar_status_from_report(
+            "degraded": doctor_sidecar_status_from_report_with_lease(
                 wire::degraded_status_report(),
                 Some("agent"),
                 Some("golden-run"),
+                wire::stale_ready_lease_evidence(),
             ),
             "unavailable": doctor_sidecar_status_from_report(
                 wire::unavailable_status_report(),
                 Some("agent"),
                 Some("golden-run"),
             ),
-            "probe_error": doctor_sidecar_status_error(
+            "probe_error": doctor_sidecar_status_error_with_lease(
                 wire::probe_error(),
                 Some("agent"),
                 Some("golden-run"),
+                wire::unproven_ready_lease_evidence(),
             ),
         })
     }

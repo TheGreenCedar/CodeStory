@@ -312,9 +312,9 @@ mod tests;
 mod trail_story;
 
 pub use activation_status::{
-    RetrievalEngineDiagnostics, RetrievalEngineDiagnosticsError, RetrievalEngineDiagnosticsStage,
-    RetrievalStatusObservation, RetrievalStatusObservationError, RetrievalStatusSelection,
-    process_owner_state, process_start_identity,
+    ReadyLeaseEvidence, RetrievalEngineDiagnostics, RetrievalEngineDiagnosticsError,
+    RetrievalEngineDiagnosticsStage, RetrievalStatusObservation, RetrievalStatusObservationError,
+    RetrievalStatusSelection, process_owner_state, process_start_identity,
 };
 pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
 pub use cache_rehydrate::{CacheRehydrateOutput, CacheRehydrateRequest, rehydrate_cache};

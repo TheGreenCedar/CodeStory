@@ -71,6 +71,10 @@
       "manifest_vector_embedding_backend": "manifest-backend",
       "manifest_vector_embedding_dim": 768,
       "query_embedding_backend": "query-backend",
+      "ready_lease_admission_basis": "bounded_source_inventory",
+      "ready_lease_memo_holds_observations": true,
+      "ready_lease_observer_epoch_coherence": "stale",
+      "ready_lease_present": true,
       "retrieval_mode": "full",
       "scip": {
         "capabilities": {
@@ -99,7 +103,7 @@
       "stored_doc_vector_mixed_backends": false,
       "stored_doc_vector_producer_backend": "stored-backend"
     },
-    "markdown": "# Retrieval status\n\n- retrieval_mode: `full`\n- degraded_reason: Some(\"semantic_store_degraded\")\n- query_embedding_backend: `query-backend`\n- embedding_device_policy: `accelerator_required` observed_device=`degraded` observation_source=`per_user_server` detected_provider=Some(\"metal\") detected_gpu=Some(\"golden-gpu\") accelerator_requested=true accelerator_request_provider=Some(\"metal\") accelerator_request_device=Some(\"gpu:0\") cpu_allowed=false\n- manifest_vector_embedding_backend: `manifest-backend` dim=Some(768)\n- stored_doc_vector_producer: `stored-backend` dim=Some(768) mixed_backends=Some(false)\n- manifest_contract: generation=Some(\"golden-generation\") input_hash=Some(\"golden-input\") lanes=`semantic:golden-producer:ready`\n- lexical: Healthy (\"lexical ready\") capabilities: lexical=true\n- semantic: Degraded (\"semantic degraded\") capabilities: semantic=true\n- scip: Healthy (\"scip ready\") capabilities: graph=true\n"
+    "markdown": "# Retrieval status\n\n- retrieval_mode: `full`\n- degraded_reason: Some(\"semantic_store_degraded\")\n- query_embedding_backend: `query-backend`\n- embedding_device_policy: `accelerator_required` observed_device=`degraded` observation_source=`per_user_server` detected_provider=Some(\"metal\") detected_gpu=Some(\"golden-gpu\") accelerator_requested=true accelerator_request_provider=Some(\"metal\") accelerator_request_device=Some(\"gpu:0\") cpu_allowed=false\n- manifest_vector_embedding_backend: `manifest-backend` dim=Some(768)\n- stored_doc_vector_producer: `stored-backend` dim=Some(768) mixed_backends=Some(false)\n- manifest_contract: generation=Some(\"golden-generation\") input_hash=Some(\"golden-input\") lanes=`semantic:golden-producer:ready`\n- lexical: Healthy (\"lexical ready\") capabilities: lexical=true\n- semantic: Degraded (\"semantic degraded\") capabilities: semantic=true\n- scip: Healthy (\"scip ready\") capabilities: graph=true\n- ready_lease: present=true admission_basis=`bounded_source_inventory` observer_epoch_coherence=`stale` memo_holds_observations=true\n"
   },
   "healthy": {
     "json": {
@@ -172,6 +176,10 @@
       "manifest_vector_embedding_backend": "manifest-backend",
       "manifest_vector_embedding_dim": 768,
       "query_embedding_backend": "query-backend",
+      "ready_lease_admission_basis": "complete_source_observation",
+      "ready_lease_memo_holds_observations": true,
+      "ready_lease_observer_epoch_coherence": "coherent",
+      "ready_lease_present": true,
       "retrieval_mode": "full",
       "scip": {
         "capabilities": {
@@ -199,7 +207,7 @@
       "stored_doc_vector_mixed_backends": false,
       "stored_doc_vector_producer_backend": "stored-backend"
     },
-    "markdown": "# Retrieval status\n\n- retrieval_mode: `full`\n- degraded_reason: None\n- query_embedding_backend: `query-backend`\n- embedding_device_policy: `accelerator_required` observed_device=`accelerated` observation_source=`per_user_server` detected_provider=Some(\"metal\") detected_gpu=Some(\"golden-gpu\") accelerator_requested=true accelerator_request_provider=Some(\"metal\") accelerator_request_device=Some(\"gpu:0\") cpu_allowed=false\n- manifest_vector_embedding_backend: `manifest-backend` dim=Some(768)\n- stored_doc_vector_producer: `stored-backend` dim=Some(768) mixed_backends=Some(false)\n- manifest_contract: generation=Some(\"golden-generation\") input_hash=Some(\"golden-input\") lanes=`semantic:golden-producer:ready`\n- lexical: Healthy (\"lexical ready\") capabilities: lexical=true\n- semantic: Healthy (\"semantic ready\") capabilities: semantic=true\n- scip: Healthy (\"scip ready\") capabilities: graph=true\n"
+    "markdown": "# Retrieval status\n\n- retrieval_mode: `full`\n- degraded_reason: None\n- query_embedding_backend: `query-backend`\n- embedding_device_policy: `accelerator_required` observed_device=`accelerated` observation_source=`per_user_server` detected_provider=Some(\"metal\") detected_gpu=Some(\"golden-gpu\") accelerator_requested=true accelerator_request_provider=Some(\"metal\") accelerator_request_device=Some(\"gpu:0\") cpu_allowed=false\n- manifest_vector_embedding_backend: `manifest-backend` dim=Some(768)\n- stored_doc_vector_producer: `stored-backend` dim=Some(768) mixed_backends=Some(false)\n- manifest_contract: generation=Some(\"golden-generation\") input_hash=Some(\"golden-input\") lanes=`semantic:golden-producer:ready`\n- lexical: Healthy (\"lexical ready\") capabilities: lexical=true\n- semantic: Healthy (\"semantic ready\") capabilities: semantic=true\n- scip: Healthy (\"scip ready\") capabilities: graph=true\n- ready_lease: present=true admission_basis=`complete_source_observation` observer_epoch_coherence=`coherent` memo_holds_observations=true\n"
   },
   "probe_error": {
     "error": [
@@ -222,6 +230,10 @@
         "status": "unavailable"
       },
       "query_embedding_backend": "query-backend",
+      "ready_lease_admission_basis": "none",
+      "ready_lease_memo_holds_observations": false,
+      "ready_lease_observer_epoch_coherence": "not_applicable",
+      "ready_lease_present": false,
       "retrieval_mode": "unavailable",
       "scip": {
         "degraded_reason": "retrieval_manifest_missing",
@@ -236,6 +248,6 @@
         "status": "unavailable"
       }
     },
-    "markdown": "# Retrieval status\n\n- retrieval_mode: `unavailable`\n- degraded_reason: Some(\"retrieval_manifest_missing\")\n- query_embedding_backend: `query-backend`\n- embedding_device_policy: `accelerator_required` observed_device=`unknown` observation_source=`retrieval_unobserved` detected_provider=None detected_gpu=None accelerator_requested=false accelerator_request_provider=None accelerator_request_device=None cpu_allowed=false\n- manifest_vector_embedding_backend: `<none>` dim=None\n- stored_doc_vector_producer: `<none>` dim=None mixed_backends=None\n- lexical: Unavailable (\"lexical unavailable\") capabilities: lexical=false\n- semantic: Unavailable (\"semantic unavailable\") capabilities: semantic=false\n- scip: Unavailable (\"scip unavailable\") capabilities: graph=false\n"
+    "markdown": "# Retrieval status\n\n- retrieval_mode: `unavailable`\n- degraded_reason: Some(\"retrieval_manifest_missing\")\n- query_embedding_backend: `query-backend`\n- embedding_device_policy: `accelerator_required` observed_device=`unknown` observation_source=`retrieval_unobserved` detected_provider=None detected_gpu=None accelerator_requested=false accelerator_request_provider=None accelerator_request_device=None cpu_allowed=false\n- manifest_vector_embedding_backend: `<none>` dim=None\n- stored_doc_vector_producer: `<none>` dim=None mixed_backends=None\n- lexical: Unavailable (\"lexical unavailable\") capabilities: lexical=false\n- semantic: Unavailable (\"semantic unavailable\") capabilities: semantic=false\n- scip: Unavailable (\"scip unavailable\") capabilities: graph=false\n- ready_lease: present=false admission_basis=`none` observer_epoch_coherence=`not_applicable` memo_holds_observations=false\n"
   }
 }

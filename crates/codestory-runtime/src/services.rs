@@ -307,6 +307,17 @@ impl ReadySourceIdentity {
             IndexFreshnessStatusDto::Stale => false,
         }
     }
+
+    fn admission_basis(&self) -> &'static str {
+        match (self.status, self.not_checked_cause) {
+            (IndexFreshnessStatusDto::Fresh, None) => "complete_source_observation",
+            (
+                IndexFreshnessStatusDto::NotChecked,
+                Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory),
+            ) => "bounded_source_inventory",
+            _ => "inadmissible_source_observation",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,6 +447,63 @@ impl ActivationService {
             .expect("activation coordinator poisoned")
             .current
             .clone()
+    }
+
+    /// Report the evidence retained by the matching ready lease without
+    /// probing, renewing, or otherwise touching that lease.
+    pub(crate) fn ready_lease_evidence(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+    ) -> crate::activation_status::ReadyLeaseEvidence {
+        let requested = ActivationTarget::new(project_root, storage_path);
+        let state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        let bound_storage_matches = self
+            .controller
+            .require_storage_path()
+            .is_ok_and(|bound| bound == storage_path);
+        let Some(lease) = state
+            .target
+            .as_ref()
+            .filter(|target| {
+                target.matches(&requested)
+                    || (target.project_id == requested.project_id
+                        && target.workspace_id == requested.workspace_id
+                        && target.repository_instance == requested.repository_instance
+                        && bound_storage_matches)
+            })
+            .and_then(|_| state.ready_lease.as_ref())
+        else {
+            return crate::activation_status::ReadyLeaseEvidence::absent();
+        };
+        let observer_epoch_coherence = match lease.source_observer.as_ref() {
+            None => "unproven",
+            Some(recorded) => {
+                if self
+                    .controller
+                    .observed_source_epoch_if_armed(project_root)
+                    .as_ref()
+                    == Some(recorded)
+                {
+                    "coherent"
+                } else {
+                    "stale"
+                }
+            }
+        };
+        crate::activation_status::ReadyLeaseEvidence {
+            ready_lease_present: true,
+            ready_lease_admission_basis: lease.source.admission_basis().to_string(),
+            ready_lease_observer_epoch_coherence: observer_epoch_coherence.to_string(),
+            // The memo is lease-owned. Reporting its attachment is deliberately
+            // structural: inspecting its private caches would itself couple
+            // status to freshness implementation details.
+            ready_lease_memo_holds_observations: true,
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2915,6 +2983,219 @@ mod activation_tests {
             storage_path,
             lease,
         }
+    }
+
+    fn tree_snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+            let mut children = fs::read_dir(path)
+                .expect("read snapshot directory")
+                .map(|entry| entry.expect("read snapshot entry").path())
+                .collect::<Vec<_>>();
+            children.sort();
+            for child in children {
+                let relative = child
+                    .strip_prefix(root)
+                    .expect("snapshot path stays below root")
+                    .to_path_buf();
+                if child.is_dir() {
+                    entries.push((relative, None));
+                    visit(root, &child, entries);
+                } else {
+                    entries.push((
+                        relative,
+                        Some(fs::read(&child).expect("read snapshot file")),
+                    ));
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CoordinatorSnapshot {
+        target: Option<(String, String, PathBuf)>,
+        current: Option<ActivationSnapshot>,
+        ready_lease: Option<ReadyLease>,
+        running: bool,
+        has_cancel: bool,
+    }
+
+    fn coordinator_snapshot(service: &ActivationService) -> CoordinatorSnapshot {
+        let state = service
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator");
+        CoordinatorSnapshot {
+            target: state.target.as_ref().map(|target| {
+                (
+                    target.project_id.clone(),
+                    target.workspace_id.clone(),
+                    target.storage_path.clone(),
+                )
+            }),
+            current: state.current.clone(),
+            ready_lease: state.ready_lease.clone(),
+            running: state.running,
+            has_cancel: state.current_cancel.is_some(),
+        }
+    }
+
+    /// Status and doctor must report hostile lease states without trying to
+    /// improve any of them. The full cache snapshot catches SQLite, sidecar,
+    /// and generation writes; the counters catch activation, refresh, and
+    /// observer arming even when those attempts leave no durable residue.
+    #[test]
+    fn status_and_doctor_report_hostile_lease_evidence_without_mutation() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        let cache_root = fixture
+            .storage_path
+            .parent()
+            .expect("fixture cache root")
+            .to_path_buf();
+
+        let assert_observational = |label: &str,
+                                    expected: crate::activation_status::ReadyLeaseEvidence,
+                                    expected_mode: &str| {
+            let state_before = coordinator_snapshot(&service);
+            let files_before = tree_snapshot(&cache_root);
+            let observer_requests_before = service.controller.source_observer_requests_for_test();
+            let workers_before = service.worker_start_count_for_test();
+            let preparation_before = service.preparation_counts_for_test();
+
+            let status = service
+                .retrieval_status(fixture.project.path(), &fixture.storage_path)
+                .unwrap_or_else(|error| panic!("{label} status failed: {error}"));
+            assert_eq!(status.ready_lease(), &expected, "{label} status golden");
+            assert_eq!(
+                status.report().retrieval_mode,
+                expected_mode,
+                "{label} status mode"
+            );
+
+            let doctor = service
+                .retrieval_engine_diagnostics(fixture.project.path(), &fixture.storage_path)
+                .unwrap_or_else(|error| panic!("{label} doctor failed: {error}"));
+            assert_eq!(doctor.ready_lease, expected, "{label} doctor golden");
+            assert_eq!(doctor.retrieval_mode, expected_mode, "{label} doctor mode");
+
+            assert_eq!(
+                coordinator_snapshot(&service),
+                state_before,
+                "{label} status/doctor changed or extended the ready lease"
+            );
+            assert_eq!(
+                service.controller.source_observer_requests_for_test(),
+                observer_requests_before,
+                "{label} status/doctor armed or requested a source observer"
+            );
+            assert_eq!(
+                service.worker_start_count_for_test(),
+                workers_before,
+                "{label} status/doctor started activation or refresh work"
+            );
+            assert_eq!(
+                service.preparation_counts_for_test(),
+                preparation_before,
+                "{label} status/doctor ran sidecar preparation"
+            );
+            assert_eq!(
+                codestory_workspace::source_freshness_counts(),
+                None,
+                "{label} status/doctor armed a source scan scope"
+            );
+            assert_eq!(
+                tree_snapshot(&cache_root),
+                files_before,
+                "{label} status/doctor wrote cache, SQLite, or sidecar state"
+            );
+        };
+
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            state.ready_lease = None;
+        }
+        assert_observational(
+            "no lease",
+            crate::activation_status::ReadyLeaseEvidence::default(),
+            "full",
+        );
+
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            let mut stale = fixture.lease.clone();
+            stale.source.status = IndexFreshnessStatusDto::Stale;
+            state.ready_lease = Some(stale);
+        }
+        assert_observational(
+            "stale lease",
+            crate::activation_status::ReadyLeaseEvidence {
+                ready_lease_present: true,
+                ready_lease_admission_basis: "inadmissible_source_observation".to_string(),
+                ready_lease_observer_epoch_coherence: "coherent".to_string(),
+                ready_lease_memo_holds_observations: true,
+            },
+            "full",
+        );
+
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            let mut unproven = fixture.lease.clone();
+            unproven.source_observer = None;
+            state.ready_lease = Some(unproven);
+        }
+        assert_observational(
+            "unproven observer",
+            crate::activation_status::ReadyLeaseEvidence {
+                ready_lease_present: true,
+                ready_lease_admission_basis: "complete_source_observation".to_string(),
+                ready_lease_observer_epoch_coherence: "unproven".to_string(),
+                ready_lease_memo_holds_observations: true,
+            },
+            "full",
+        );
+
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            state.ready_lease = Some(fixture.lease.clone());
+        }
+        assert!(
+            service
+                .ready_lease_evidence(fixture.project.path(), &fixture.storage_path)
+                .ready_lease_present,
+            "the restored lease must match before publication removal"
+        );
+        fs::remove_file(&fixture.storage_path).expect("remove publication for hostile state");
+        assert_observational(
+            "missing publication",
+            crate::activation_status::ReadyLeaseEvidence {
+                ready_lease_present: true,
+                ready_lease_admission_basis: "complete_source_observation".to_string(),
+                ready_lease_observer_epoch_coherence: "coherent".to_string(),
+                ready_lease_memo_holds_observations: true,
+            },
+            "unavailable",
+        );
     }
 
     fn initialize_identifiable_git_project(project: &Path) {
