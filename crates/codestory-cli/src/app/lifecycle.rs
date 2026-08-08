@@ -91,7 +91,8 @@ pub(super) fn open_agent_surface(
     let runtime = new_agent_surface_runtime(project, profile, run_id)?;
     let (before, opened) = runtime.ensure_open_with_before(refresh)?;
     ensure_index_ready(&opened, surface)?;
-    codestory_retrieval::ensure_product_embedding_backend_for_runtime(&runtime.sidecar)
+    let retrieval_config = codestory_runtime::RuntimeRetrievalConfig::from(runtime.sidecar.clone());
+    codestory_runtime::ensure_product_embedding_backend_for_runtime(&retrieval_config)
         .map_err(map_embedding_preflight_error)
         .with_context(|| format!("initialize retrieval for {surface}"))?;
     Ok(OpenedAgentSurface {
@@ -120,16 +121,16 @@ fn run_cache_clean(cmd: args::CacheCleanCommand) -> Result<()> {
     preflight_output_file(cmd.output_file.as_deref())?;
     crate::sidecar_runtime::prepare_cache_access();
     if cmd.apply {
-        let report = codestory_retrieval::apply_cache_clean().context("cache clean apply")?;
+        let report = codestory_runtime::apply_cache_clean().context("cache clean apply")?;
         let markdown = render_cache_clean_report_markdown(&report);
         return emit(cmd.format, &report, markdown, cmd.output_file.as_deref());
     }
-    let plan = codestory_retrieval::plan_cache_clean().context("cache clean plan")?;
+    let plan = codestory_runtime::plan_cache_clean().context("cache clean plan")?;
     let markdown = render_cache_clean_plan_markdown(&plan);
     emit(cmd.format, &plan, markdown, cmd.output_file.as_deref())
 }
 
-fn render_cache_clean_plan_markdown(plan: &codestory_retrieval::CacheCleanPlan) -> String {
+fn render_cache_clean_plan_markdown(plan: &codestory_runtime::CacheCleanPlan) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Cache Clean");
     let _ = writeln!(markdown, "dry_run: `{}`", plan.dry_run);
@@ -167,7 +168,7 @@ fn render_cache_clean_plan_markdown(plan: &codestory_retrieval::CacheCleanPlan) 
     markdown
 }
 
-fn render_cache_clean_report_markdown(report: &codestory_retrieval::CacheCleanReport) -> String {
+fn render_cache_clean_report_markdown(report: &codestory_runtime::CacheCleanReport) -> String {
     let mut markdown = render_cache_clean_plan_markdown(&report.plan);
     let _ = writeln!(markdown, "\n## Removed");
     let _ = writeln!(markdown, "removed_bytes: {}", report.removed_bytes);
