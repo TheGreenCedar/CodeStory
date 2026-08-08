@@ -1,5 +1,5 @@
+use crate::RuntimeRetrievalConfig;
 use codestory_contracts::workspace::SourceIndexPolicy;
-use codestory_retrieval::SidecarRuntimeConfig;
 use std::path::Path;
 
 /// Immutable process-owned defaults injected into one runtime.
@@ -9,12 +9,24 @@ use std::path::Path;
 /// evaluation controls remain owned by their respective subsystems.
 #[derive(Debug, Clone)]
 pub struct RuntimeProcessConfig {
-    pub sidecar: SidecarRuntimeConfig,
+    pub sidecar: RuntimeRetrievalConfig,
     pub source_index_policy: SourceIndexPolicy,
 }
 
 impl RuntimeProcessConfig {
-    pub fn new(sidecar: SidecarRuntimeConfig, source_index_policy: SourceIndexPolicy) -> Self {
+    /// Preserve the existing retrieval-config constructor while adapters move
+    /// to the runtime-owned wrapper in staged S2 slices.
+    pub fn new(
+        sidecar: codestory_retrieval::SidecarRuntimeConfig,
+        source_index_policy: SourceIndexPolicy,
+    ) -> Self {
+        Self::new_with_retrieval_config(sidecar.into(), source_index_policy)
+    }
+
+    pub fn new_with_retrieval_config(
+        sidecar: RuntimeRetrievalConfig,
+        source_index_policy: SourceIndexPolicy,
+    ) -> Self {
         Self {
             sidecar,
             source_index_policy,
@@ -22,7 +34,10 @@ impl RuntimeProcessConfig {
     }
 
     pub fn local() -> Self {
-        Self::new(SidecarRuntimeConfig::local(), SourceIndexPolicy::default())
+        Self::new_with_retrieval_config(
+            RuntimeRetrievalConfig::local(),
+            SourceIndexPolicy::default(),
+        )
     }
 
     /// Return the non-secret identity of the immutable project runtime
@@ -36,7 +51,7 @@ impl RuntimeProcessConfig {
         // Credentials never enter the digest. Their presence participates in
         // the immutable boundary, while secret material remains outside logs
         // and diagnostic identifiers.
-        let sidecar = &self.sidecar;
+        let sidecar = self.sidecar.as_inner();
         let source_index_policy = &self.source_index_policy;
         let mut identity = format!(
             "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",

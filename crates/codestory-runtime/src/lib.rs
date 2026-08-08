@@ -291,6 +291,7 @@ mod process_config;
 pub use process_config::RuntimeProcessConfig;
 mod query_language;
 mod repository_identity;
+mod retrieval_boundary;
 mod search;
 mod search_runtime;
 #[cfg(feature = "benchmark-support")]
@@ -325,6 +326,11 @@ use path_identity::{OperationPathIdentityResolver, PathIdentityUnavailable};
 pub use query_language::{GraphQueryParseError, parse_graph_query};
 pub use repository_identity::{
     REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentityReport, inspect_repository_identity,
+};
+pub use retrieval_boundary::{
+    CacheCleanPlan, CacheCleanReport, ProcessStartProbe, RetrievalProcessDefaults,
+    RetrievalRuntimeDefaults, RetrievalRuntimeOverrides, RetrievalStatusReport,
+    RuntimeRetrievalConfig, RuntimeRetrievalProfile,
 };
 pub(crate) use search_runtime::SearchEngine;
 
