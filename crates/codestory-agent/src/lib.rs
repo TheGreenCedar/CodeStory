@@ -19,10 +19,12 @@ pub mod packet_citations;
 pub mod packet_evidence_carriers;
 pub mod packet_evidence_roles;
 pub mod packet_flow_requirements;
+pub mod packet_probes;
 pub mod packet_scoring;
 pub mod packet_terms;
 pub mod pinned_reader;
 pub mod planning;
 pub mod text;
+pub mod trail;
 
 pub use pinned_reader::{ContinuationRefusal, PinnedReader, admit_continuation_probe};
