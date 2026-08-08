@@ -18,6 +18,17 @@ pub enum RuntimeRetrievalProfile {
     Agent,
 }
 
+impl RuntimeRetrievalProfile {
+    /// Stable adapter-facing profile label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Agent => "agent",
+        }
+    }
+}
+
 impl From<RuntimeRetrievalProfile> for codestory_retrieval::SidecarProfile {
     fn from(profile: RuntimeRetrievalProfile) -> Self {
         match profile {
@@ -374,18 +385,21 @@ mod tests {
 
     #[test]
     fn profile_wrapper_preserves_both_profile_variants() {
-        for (wrapped, direct) in [
+        for (wrapped, direct, label) in [
             (
                 RuntimeRetrievalProfile::Local,
                 codestory_retrieval::SidecarProfile::Local,
+                "local",
             ),
             (
                 RuntimeRetrievalProfile::Agent,
                 codestory_retrieval::SidecarProfile::Agent,
+                "agent",
             ),
         ] {
             assert_eq!(codestory_retrieval::SidecarProfile::from(wrapped), direct);
             assert_eq!(RuntimeRetrievalProfile::from(direct), wrapped);
+            assert_eq!(wrapped.as_str(), label);
         }
     }
 }

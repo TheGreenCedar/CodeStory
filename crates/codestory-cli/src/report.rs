@@ -115,58 +115,68 @@ struct ReportSidecarStatus {
 }
 
 fn report_sidecar_status(runtime: &RuntimeContext) -> ReportSidecarStatus {
-    report_sidecar_status_from_result(codestory_retrieval::strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        runtime.sidecar.clone(),
-    ))
+    match runtime
+        .activation
+        .retrieval_status(&runtime.project_root, &runtime.storage_path)
+    {
+        Ok(observation) => report_sidecar_status_from_report(observation.into_parts().1),
+        Err(error) => report_sidecar_status_from_error(error),
+    }
 }
 
+#[cfg(test)]
 fn report_sidecar_status_from_result(
-    result: anyhow::Result<codestory_retrieval::RetrievalStatusReport>,
+    result: anyhow::Result<codestory_runtime::RetrievalStatusReport>,
 ) -> ReportSidecarStatus {
     match result {
-        Ok(report) => {
-            let manifest_generation = report
-                .manifest
-                .as_ref()
-                .and_then(|manifest| manifest.sidecar_generation.clone());
-            let manifest_input_hash = report
-                .manifest
-                .as_ref()
-                .and_then(|manifest| manifest.sidecar_input_hash.clone());
-            ReportSidecarStatus {
-                retrieval_mode: report.retrieval_mode,
-                degraded_reason: report.degraded_reason,
-                embedding_device_policy: report.embedding_device_policy,
-                embedding_device_state: report.embedding_device_state,
-                embedding_device_observation_source: report.embedding_device_observation_source,
-                embedding_detected_provider: report.embedding_detected_provider,
-                embedding_detected_gpu: report.embedding_detected_gpu,
-                embedding_accelerator_requested: report.embedding_accelerator_requested,
-                embedding_accelerator_request_provider: report
-                    .embedding_accelerator_request_provider,
-                embedding_accelerator_request_device: report.embedding_accelerator_request_device,
-                embedding_cpu_allowed: report.embedding_cpu_allowed,
-                manifest_generation,
-                manifest_input_hash,
-            }
-        }
-        Err(error) => ReportSidecarStatus {
-            retrieval_mode: "unavailable".to_string(),
-            degraded_reason: Some(format!("retrieval_status_error: {error}")),
-            embedding_device_policy: "accelerator_required".to_string(),
-            embedding_device_state: "unknown".to_string(),
-            embedding_device_observation_source: "retrieval_unobserved".to_string(),
-            embedding_detected_provider: None,
-            embedding_detected_gpu: None,
-            embedding_accelerator_requested: false,
-            embedding_accelerator_request_provider: None,
-            embedding_accelerator_request_device: None,
-            embedding_cpu_allowed: false,
-            manifest_generation: None,
-            manifest_input_hash: None,
-        },
+        Ok(report) => report_sidecar_status_from_report(report),
+        Err(error) => report_sidecar_status_from_error(error),
+    }
+}
+
+fn report_sidecar_status_from_report(
+    report: codestory_runtime::RetrievalStatusReport,
+) -> ReportSidecarStatus {
+    let manifest_generation = report
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.sidecar_generation.clone());
+    let manifest_input_hash = report
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.sidecar_input_hash.clone());
+    ReportSidecarStatus {
+        retrieval_mode: report.retrieval_mode,
+        degraded_reason: report.degraded_reason,
+        embedding_device_policy: report.embedding_device_policy,
+        embedding_device_state: report.embedding_device_state,
+        embedding_device_observation_source: report.embedding_device_observation_source,
+        embedding_detected_provider: report.embedding_detected_provider,
+        embedding_detected_gpu: report.embedding_detected_gpu,
+        embedding_accelerator_requested: report.embedding_accelerator_requested,
+        embedding_accelerator_request_provider: report.embedding_accelerator_request_provider,
+        embedding_accelerator_request_device: report.embedding_accelerator_request_device,
+        embedding_cpu_allowed: report.embedding_cpu_allowed,
+        manifest_generation,
+        manifest_input_hash,
+    }
+}
+
+fn report_sidecar_status_from_error(error: impl std::fmt::Display) -> ReportSidecarStatus {
+    ReportSidecarStatus {
+        retrieval_mode: "unavailable".to_string(),
+        degraded_reason: Some(format!("retrieval_status_error: {error}")),
+        embedding_device_policy: "accelerator_required".to_string(),
+        embedding_device_state: "unknown".to_string(),
+        embedding_device_observation_source: "retrieval_unobserved".to_string(),
+        embedding_detected_provider: None,
+        embedding_detected_gpu: None,
+        embedding_accelerator_requested: false,
+        embedding_accelerator_request_provider: None,
+        embedding_accelerator_request_device: None,
+        embedding_cpu_allowed: false,
+        manifest_generation: None,
+        manifest_input_hash: None,
     }
 }
 
@@ -464,7 +474,7 @@ mod tests {
         }
     }
 
-    fn observed_case(result: anyhow::Result<codestory_retrieval::RetrievalStatusReport>) -> Value {
+    fn observed_case(result: anyhow::Result<codestory_runtime::RetrievalStatusReport>) -> Value {
         let status = report_sidecar_status_from_result(result);
         let projection = serde_json::to_value(&status).expect("report status projection");
         let mut report = empty_report();

@@ -254,14 +254,6 @@ pub(crate) fn unavailable_status_report() -> RetrievalStatusReport {
     }
 }
 
-pub(crate) fn status_runtime_config() -> codestory_retrieval::SidecarRuntimeConfig {
-    crate::sidecar_runtime::local().with_profile_and_run_id(
-        None,
-        codestory_retrieval::SidecarProfile::Agent,
-        Some("golden-run"),
-    )
-}
-
 pub(crate) fn probe_error() -> anyhow::Error {
     anyhow::anyhow!("golden retrieval probe failed")
 }

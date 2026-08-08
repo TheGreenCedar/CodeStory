@@ -568,6 +568,7 @@ mod rollback_recommendation_tests {
         doctor_sidecar_status_from_report(
             codestory_retrieval::probe_sidecar_health(&layout, "doctor-rollback-fixture", None),
             None,
+            None,
         )
     }
 
