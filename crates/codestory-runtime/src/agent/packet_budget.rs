@@ -1,5 +1,7 @@
 use crate::agent::packet_capping::cap_packet_citations;
-use crate::agent::packet_claims::packet_flow_claims_markdown;
+use crate::agent::packet_claims::{
+    packet_flow_claims_markdown, packet_supported_claims_with_telemetry,
+};
 use crate::agent::packet_command_profiles::packet_command_exact_probe_queries;
 use crate::agent::packet_obligations::{
     bind_claims_to_packet_obligations, finalize_packet_obligation_plan,
@@ -10,7 +12,6 @@ use crate::agent::packet_probe::exact_packet_probe_paths;
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries_with_extra;
 use crate::agent::packet_sufficiency::{
     PACKET_MARKDOWN_TRUNCATION_SUFFIX, build_packet_sufficiency_with_obligation_context,
-    packet_argv, packet_display_project_arg, render_packet_command,
 };
 use crate::agent::trace_export::packet_retrieval_trace_summary;
 use codestory_contracts::api::{
@@ -20,6 +21,10 @@ use codestory_contracts::api::{
 };
 use std::collections::HashSet;
 use std::path::Path;
+
+#[allow(unused_imports)]
+pub(crate) use codestory_agent::packet_command::next_deeper_packet_argv;
+pub(crate) use codestory_agent::packet_command::next_deeper_packet_command;
 
 const MARKDOWN_TRUNCATION_FLOOR_BYTES: usize = 256;
 const AVOID_OPENING_OMISSION: &str = "avoid_opening";
@@ -293,8 +298,12 @@ fn rebuild_packet_budget_dependents(
 }
 
 fn refresh_packet_claim_markdown(packet: &mut AgentPacketDto) {
-    let mut claims =
-        packet_claims_with_obligation_receipts(&packet.answer, &packet.plan.obligations);
+    let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&packet.answer);
+    let mut claims = packet_claims_with_obligation_receipts(
+        &packet.answer,
+        &packet.plan.obligations,
+        supported_claims_with_telemetry,
+    );
     bind_claims_to_packet_obligations(&packet.plan.obligations, &mut claims);
     let Some(markdown) = packet
         .answer
@@ -562,40 +571,6 @@ pub(crate) fn packet_budget_usage(answer: &AgentAnswerDto) -> PacketBudgetUsageD
     }
 }
 
-pub(crate) fn next_deeper_packet_command(
-    project_root: &Path,
-    question: &str,
-    requested: PacketBudgetModeDto,
-) -> Option<String> {
-    next_deeper_packet_argv(project_root, question, requested)
-        .map(|argv| render_packet_command(&argv))
-}
-
-/// The deeper-budget retry as executable argv; the displayed command renders
-/// from this, never the other way round.
-pub(crate) fn next_deeper_packet_argv(
-    project_root: &Path,
-    question: &str,
-    requested: PacketBudgetModeDto,
-) -> Option<Vec<String>> {
-    let next = match requested {
-        PacketBudgetModeDto::Tiny => "compact",
-        PacketBudgetModeDto::Compact => "standard",
-        PacketBudgetModeDto::Standard => "deep",
-        PacketBudgetModeDto::Deep => return None,
-    };
-    let project = packet_display_project_arg(project_root);
-    Some(packet_argv(&[
-        "packet",
-        "--project",
-        project.as_str(),
-        "--question",
-        question,
-        "--budget",
-        next,
-    ]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,8 +777,13 @@ mod tests {
             &packet.answer,
             &packet.budget,
         );
-        let mut initial_claims =
-            packet_claims_with_obligation_receipts(&packet.answer, &packet.plan.obligations);
+        let supported_claims_with_telemetry =
+            packet_supported_claims_with_telemetry(&packet.answer);
+        let mut initial_claims = packet_claims_with_obligation_receipts(
+            &packet.answer,
+            &packet.plan.obligations,
+            supported_claims_with_telemetry,
+        );
         bind_claims_to_packet_obligations(&packet.plan.obligations, &mut initial_claims);
         let full_initial_markdown = packet_flow_claims_markdown(&initial_claims);
         let proven_marker_end = full_initial_markdown
