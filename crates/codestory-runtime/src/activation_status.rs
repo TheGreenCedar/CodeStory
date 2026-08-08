@@ -16,6 +16,32 @@ use std::path::Path;
 use crate::services::ActivationService;
 use crate::{ProcessOwnerState, ProcessStartProbe, RetrievalStatusReport, RuntimeRetrievalProfile};
 
+/// Ready-lease evidence retained by the runtime for observational surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReadyLeaseEvidence {
+    pub ready_lease_present: bool,
+    pub ready_lease_admission_basis: String,
+    pub ready_lease_observer_epoch_coherence: String,
+    pub ready_lease_memo_holds_observations: bool,
+}
+
+impl ReadyLeaseEvidence {
+    pub(crate) fn absent() -> Self {
+        Self {
+            ready_lease_present: false,
+            ready_lease_admission_basis: "none".to_string(),
+            ready_lease_observer_epoch_coherence: "not_applicable".to_string(),
+            ready_lease_memo_holds_observations: false,
+        }
+    }
+}
+
+impl Default for ReadyLeaseEvidence {
+    fn default() -> Self {
+        Self::absent()
+    }
+}
+
 /// Observe one PID's platform start identity without collapsing uncertainty.
 #[must_use]
 pub fn process_start_identity(pid: u32) -> ProcessStartProbe {
@@ -80,6 +106,7 @@ impl RetrievalStatusSelection {
 pub struct RetrievalStatusObservation {
     selection: RetrievalStatusSelection,
     report: RetrievalStatusReport,
+    ready_lease: ReadyLeaseEvidence,
 }
 
 impl RetrievalStatusObservation {
@@ -95,6 +122,12 @@ impl RetrievalStatusObservation {
         &self.report
     }
 
+    /// Evidence retained by the matching ready lease at observation time.
+    #[must_use]
+    pub fn ready_lease(&self) -> &ReadyLeaseEvidence {
+        &self.ready_lease
+    }
+
     /// Consume the observation without losing its effective selection.
     #[must_use]
     pub fn into_parts(self) -> (RetrievalStatusSelection, RetrievalStatusReport) {
@@ -106,6 +139,7 @@ impl RetrievalStatusObservation {
 #[derive(Debug)]
 pub struct RetrievalStatusObservationError {
     selection: RetrievalStatusSelection,
+    ready_lease: ReadyLeaseEvidence,
     source: anyhow::Error,
 }
 
@@ -114,6 +148,12 @@ impl RetrievalStatusObservationError {
     #[must_use]
     pub fn selection(&self) -> &RetrievalStatusSelection {
         &self.selection
+    }
+
+    /// Evidence retained by the matching ready lease at observation time.
+    #[must_use]
+    pub fn ready_lease(&self) -> &ReadyLeaseEvidence {
+        &self.ready_lease
     }
 
     /// Recover the original retrieval error and its complete context chain.
@@ -152,6 +192,8 @@ pub struct RetrievalEngineDiagnostics {
     /// Serialized per-user embedding server snapshot, `null` when no server is
     /// observable, or a typed observation-failure object.
     pub embedding_server: serde_json::Value,
+    /// Evidence retained by the matching ready lease.
+    pub ready_lease: ReadyLeaseEvidence,
 }
 
 /// Which observation failed while building [`RetrievalEngineDiagnostics`].
@@ -279,13 +321,22 @@ impl ActivationService {
         runtime: codestory_retrieval::SidecarRuntimeConfig,
     ) -> Result<RetrievalStatusObservation, RetrievalStatusObservationError> {
         let selection = RetrievalStatusSelection::from_runtime(&runtime);
+        let ready_lease = self.ready_lease_evidence(project_root, storage_path);
         match codestory_retrieval::strict_sidecar_status_for_runtime(
             project_root,
             Some(storage_path),
             runtime,
         ) {
-            Ok(report) => Ok(RetrievalStatusObservation { selection, report }),
-            Err(source) => Err(RetrievalStatusObservationError { selection, source }),
+            Ok(report) => Ok(RetrievalStatusObservation {
+                selection,
+                report,
+                ready_lease,
+            }),
+            Err(source) => Err(RetrievalStatusObservationError {
+                selection,
+                ready_lease,
+                source,
+            }),
         }
     }
 
@@ -344,6 +395,7 @@ impl ActivationService {
             degraded_reason: status.report.degraded_reason,
             engine,
             embedding_server,
+            ready_lease: status.ready_lease,
         })
     }
 }

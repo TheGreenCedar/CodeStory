@@ -16,6 +16,14 @@ use crate::args::{
 use crate::output::{emit, validate_output_file_parent};
 use crate::runtime::{RuntimeContext, annotate_refresh_error, ensure_index_ready, map_api_error};
 
+#[derive(serde::Serialize)]
+struct ObservedRetrievalStatus<'a> {
+    #[serde(flatten)]
+    report: &'a RetrievalStatusReport,
+    #[serde(flatten)]
+    ready_lease: &'a codestory_runtime::ReadyLeaseEvidence,
+}
+
 pub(crate) fn run_retrieval(cmd: RetrievalCommand) -> Result<()> {
     match cmd.action {
         RetrievalAction::Status(status_cmd) => run_retrieval_status(status_cmd),
@@ -149,8 +157,13 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
             .activation
             .retrieval_status(&runtime.project_root, &runtime.storage_path)
     };
-    let report = retrieval_status_result(observation)?;
-    emit_retrieval_status(cmd.format, &report, cmd.output_file.as_deref())
+    let (report, ready_lease) = retrieval_status_result(observation)?;
+    emit_retrieval_status(
+        cmd.format,
+        &report,
+        &ready_lease,
+        cmd.output_file.as_deref(),
+    )
 }
 
 fn retrieval_status_result(
@@ -158,14 +171,17 @@ fn retrieval_status_result(
         codestory_runtime::RetrievalStatusObservation,
         codestory_runtime::RetrievalStatusObservationError,
     >,
-) -> anyhow::Result<RetrievalStatusReport> {
+) -> anyhow::Result<(RetrievalStatusReport, codestory_runtime::ReadyLeaseEvidence)> {
     match result {
-        Ok(observation) => Ok(observation.into_parts().1),
+        Ok(observation) => {
+            let ready_lease = observation.ready_lease().clone();
+            Ok((observation.into_parts().1, ready_lease))
+        }
         Err(error) => retrieval_status_error(error.into_parts().1),
     }
 }
 
-fn retrieval_status_error(error: anyhow::Error) -> anyhow::Result<RetrievalStatusReport> {
+fn retrieval_status_error<T>(error: anyhow::Error) -> anyhow::Result<T> {
     Err(error).context("retrieval status")
 }
 
@@ -420,6 +436,7 @@ fn emit_retrieval_query(
 fn emit_retrieval_status(
     format: OutputFormat,
     report: &RetrievalStatusReport,
+    ready_lease: &codestory_runtime::ReadyLeaseEvidence,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
     let manifest_vector_embedding_backend = report
@@ -447,7 +464,7 @@ fn emit_retrieval_status(
         })
         .unwrap_or_default();
     let markdown = format!(
-        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_embedding_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}- lexical: {:?} ({:?}) capabilities: lexical={}\n- semantic: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
+        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_embedding_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}- lexical: {:?} ({:?}) capabilities: lexical={}\n- semantic: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n- ready_lease: present={} admission_basis=`{}` observer_epoch_coherence=`{}` memo_holds_observations={}\n",
         report.retrieval_mode,
         report.degraded_reason,
         report.query_embedding_backend,
@@ -475,8 +492,20 @@ fn emit_retrieval_status(
         report.scip.status,
         report.scip.detail,
         report.scip.capabilities.graph,
+        ready_lease.ready_lease_present,
+        ready_lease.ready_lease_admission_basis,
+        ready_lease.ready_lease_observer_epoch_coherence,
+        ready_lease.ready_lease_memo_holds_observations,
     );
-    emit(format, report, markdown, output_file)
+    emit(
+        format,
+        &ObservedRetrievalStatus {
+            report,
+            ready_lease,
+        },
+        markdown,
+        output_file,
+    )
 }
 
 fn emit_retrieval_inventory(
@@ -1109,14 +1138,22 @@ mod tests {
         );
     }
 
-    fn rendered_status_case(report: &RetrievalStatusReport) -> serde_json::Value {
+    fn rendered_status_case(
+        report: &RetrievalStatusReport,
+        ready_lease: &codestory_runtime::ReadyLeaseEvidence,
+    ) -> serde_json::Value {
         let output = tempfile::tempdir().expect("status output");
         let json_path = output.path().join("status.json");
         let markdown_path = output.path().join("status.md");
-        emit_retrieval_status(OutputFormat::Json, report, Some(&json_path))
+        emit_retrieval_status(OutputFormat::Json, report, ready_lease, Some(&json_path))
             .expect("emit status json");
-        emit_retrieval_status(OutputFormat::Markdown, report, Some(&markdown_path))
-            .expect("emit status markdown");
+        emit_retrieval_status(
+            OutputFormat::Markdown,
+            report,
+            ready_lease,
+            Some(&markdown_path),
+        )
+        .expect("emit status markdown");
         let json_text = std::fs::read_to_string(json_path).expect("read status json");
         let markdown = std::fs::read_to_string(markdown_path).expect("read status markdown");
         serde_json::json!({
@@ -1137,11 +1174,11 @@ mod tests {
             "full plus a degraded reason must not be live-ready"
         );
         let cases = serde_json::json!({
-            "healthy": rendered_status_case(&healthy),
-            "degraded": rendered_status_case(&degraded),
-            "unavailable": rendered_status_case(&unavailable),
+            "healthy": rendered_status_case(&healthy, &wire::ready_lease_evidence()),
+            "degraded": rendered_status_case(&degraded, &wire::stale_ready_lease_evidence()),
+            "unavailable": rendered_status_case(&unavailable, &codestory_runtime::ReadyLeaseEvidence::default()),
             "probe_error": {
-                "error": retrieval_status_error(wire::probe_error())
+                "error": retrieval_status_error::<RetrievalStatusReport>(wire::probe_error())
                     .expect_err("probe error must remain an error")
                     .chain()
                     .map(ToString::to_string)

@@ -4383,6 +4383,10 @@ fn read_stdio_retrieval_engine_diagnostics(runtime: &RuntimeContext) -> Result<s
         "degraded_reason": diagnostics.degraded_reason,
         "engine": diagnostics.engine,
         "embedding_server": diagnostics.embedding_server,
+        "ready_lease_present": diagnostics.ready_lease.ready_lease_present,
+        "ready_lease_admission_basis": diagnostics.ready_lease.ready_lease_admission_basis,
+        "ready_lease_observer_epoch_coherence": diagnostics.ready_lease.ready_lease_observer_epoch_coherence,
+        "ready_lease_memo_holds_observations": diagnostics.ready_lease.ready_lease_memo_holds_observations,
     }))
 }
 
@@ -8807,6 +8811,10 @@ version = "0.11.20"
                 "degraded_reason",
                 "embedding_server",
                 "engine",
+                "ready_lease_admission_basis",
+                "ready_lease_memo_holds_observations",
+                "ready_lease_observer_epoch_coherence",
+                "ready_lease_present",
                 "retrieval_mode"
             ],
         );

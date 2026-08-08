@@ -14,7 +14,7 @@ pub(crate) const RETRIEVAL_GOLDEN: &str =
 pub(crate) const STDIO_GOLDEN: &str =
     include_str!("../tests/fixtures/retrieval_status/stdio-diagnostics.json");
 
-pub(crate) const RAW_STATUS_FIELDS: [&str; 22] = [
+pub(crate) const RAW_STATUS_FIELDS: [&str; 26] = [
     "degraded_reason",
     "embedding_accelerator_request_device",
     "embedding_accelerator_request_provider",
@@ -31,6 +31,10 @@ pub(crate) const RAW_STATUS_FIELDS: [&str; 22] = [
     "manifest_vector_embedding_backend",
     "manifest_vector_embedding_dim",
     "query_embedding_backend",
+    "ready_lease_admission_basis",
+    "ready_lease_memo_holds_observations",
+    "ready_lease_observer_epoch_coherence",
+    "ready_lease_present",
     "retrieval_mode",
     "scip",
     "semantic",
@@ -39,7 +43,7 @@ pub(crate) const RAW_STATUS_FIELDS: [&str; 22] = [
     "stored_doc_vector_producer_backend",
 ];
 
-pub(crate) const DOCTOR_STATUS_FIELDS: [&str; 19] = [
+pub(crate) const DOCTOR_STATUS_FIELDS: [&str; 23] = [
     "degraded_reason",
     "embedding_accelerator_request_device",
     "embedding_accelerator_request_provider",
@@ -57,11 +61,15 @@ pub(crate) const DOCTOR_STATUS_FIELDS: [&str; 19] = [
     "precise_semantic_import_revision",
     "precise_semantic_import_status",
     "profile",
+    "ready_lease_admission_basis",
+    "ready_lease_memo_holds_observations",
+    "ready_lease_observer_epoch_coherence",
+    "ready_lease_present",
     "retrieval_mode",
     "run_id",
 ];
 
-pub(crate) const REPORT_STATUS_FIELDS: [&str; 13] = [
+pub(crate) const REPORT_STATUS_FIELDS: [&str; 17] = [
     "degraded_reason",
     "embedding_accelerator_request_device",
     "embedding_accelerator_request_provider",
@@ -74,15 +82,50 @@ pub(crate) const REPORT_STATUS_FIELDS: [&str; 13] = [
     "embedding_device_state",
     "manifest_generation",
     "manifest_input_hash",
+    "ready_lease_admission_basis",
+    "ready_lease_memo_holds_observations",
+    "ready_lease_observer_epoch_coherence",
+    "ready_lease_present",
     "retrieval_mode",
 ];
 
-pub(crate) const DIAGNOSTIC_FIELDS: [&str; 4] = [
+pub(crate) const DIAGNOSTIC_FIELDS: [&str; 8] = [
     "degraded_reason",
     "embedding_server",
     "engine",
+    "ready_lease_admission_basis",
+    "ready_lease_memo_holds_observations",
+    "ready_lease_observer_epoch_coherence",
+    "ready_lease_present",
     "retrieval_mode",
 ];
+
+pub(crate) fn ready_lease_evidence() -> codestory_runtime::ReadyLeaseEvidence {
+    codestory_runtime::ReadyLeaseEvidence {
+        ready_lease_present: true,
+        ready_lease_admission_basis: "complete_source_observation".to_string(),
+        ready_lease_observer_epoch_coherence: "coherent".to_string(),
+        ready_lease_memo_holds_observations: true,
+    }
+}
+
+pub(crate) fn stale_ready_lease_evidence() -> codestory_runtime::ReadyLeaseEvidence {
+    codestory_runtime::ReadyLeaseEvidence {
+        ready_lease_present: true,
+        ready_lease_admission_basis: "bounded_source_inventory".to_string(),
+        ready_lease_observer_epoch_coherence: "stale".to_string(),
+        ready_lease_memo_holds_observations: true,
+    }
+}
+
+pub(crate) fn unproven_ready_lease_evidence() -> codestory_runtime::ReadyLeaseEvidence {
+    codestory_runtime::ReadyLeaseEvidence {
+        ready_lease_present: true,
+        ready_lease_admission_basis: "complete_source_observation".to_string(),
+        ready_lease_observer_epoch_coherence: "unproven".to_string(),
+        ready_lease_memo_holds_observations: true,
+    }
+}
 
 pub(crate) fn healthy_status_report() -> RetrievalStatusReport {
     let mut manifest = codestory_retrieval::test_support::retrieval_manifest_fixture(

@@ -17,6 +17,10 @@
     "precise_semantic_import_revision": "golden-import-revision",
     "precise_semantic_import_status": "fresh",
     "profile": "agent",
+    "ready_lease_admission_basis": "bounded_source_inventory",
+    "ready_lease_memo_holds_observations": true,
+    "ready_lease_observer_epoch_coherence": "stale",
+    "ready_lease_present": true,
     "retrieval_mode": "full",
     "run_id": "golden-run"
   },
@@ -37,6 +41,10 @@
     "precise_semantic_import_revision": "golden-import-revision",
     "precise_semantic_import_status": "fresh",
     "profile": "agent",
+    "ready_lease_admission_basis": "complete_source_observation",
+    "ready_lease_memo_holds_observations": true,
+    "ready_lease_observer_epoch_coherence": "coherent",
+    "ready_lease_present": true,
     "retrieval_mode": "full",
     "run_id": "golden-run"
   },
@@ -48,6 +56,10 @@
     "embedding_device_policy": "accelerator_required",
     "embedding_device_state": "unknown",
     "profile": "agent",
+    "ready_lease_admission_basis": "complete_source_observation",
+    "ready_lease_memo_holds_observations": true,
+    "ready_lease_observer_epoch_coherence": "unproven",
+    "ready_lease_present": true,
     "retrieval_mode": "unavailable",
     "run_id": "golden-run"
   },
@@ -59,6 +71,10 @@
     "embedding_device_policy": "accelerator_required",
     "embedding_device_state": "unknown",
     "profile": "agent",
+    "ready_lease_admission_basis": "none",
+    "ready_lease_memo_holds_observations": false,
+    "ready_lease_observer_epoch_coherence": "not_applicable",
+    "ready_lease_present": false,
     "retrieval_mode": "unavailable",
     "run_id": "golden-run"
   }

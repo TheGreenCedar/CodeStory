@@ -4436,6 +4436,7 @@ mod tests {
                 precise_semantic_import_reason: None,
                 precise_semantic_import_revision: None,
                 precise_semantic_import_producer: None,
+                ready_lease: codestory_runtime::ReadyLeaseEvidence::default(),
             },
             retrieval: None,
             freshness: None,

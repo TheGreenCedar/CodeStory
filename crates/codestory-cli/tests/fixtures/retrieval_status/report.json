@@ -83,6 +83,10 @@
           "summary": "Agent packet/search is waiting for full retrieval; current profile is `local`, mode is `full`, and reason is `semantic_store_degraded`."
         }
       ],
+      "ready_lease_admission_basis": "bounded_source_inventory",
+      "ready_lease_memo_holds_observations": true,
+      "ready_lease_observer_epoch_coherence": "stale",
+      "ready_lease_present": true,
       "sidecar_retrieval_mode": "full",
       "trust_caveat": "Readiness is not fully green; run the next command before trusting agent packet/search output."
     },
@@ -99,6 +103,10 @@
       "embedding_device_state": "degraded",
       "manifest_generation": "golden-generation",
       "manifest_input_hash": "golden-input",
+      "ready_lease_admission_basis": "bounded_source_inventory",
+      "ready_lease_memo_holds_observations": true,
+      "ready_lease_observer_epoch_coherence": "stale",
+      "ready_lease_present": true,
       "retrieval_mode": "full"
     }
   },
@@ -183,6 +191,10 @@
           "summary": "Agent packet/search is waiting for full retrieval; current profile is `local`, mode is `full`, and reason is `none`."
         }
       ],
+      "ready_lease_admission_basis": "complete_source_observation",
+      "ready_lease_memo_holds_observations": true,
+      "ready_lease_observer_epoch_coherence": "coherent",
+      "ready_lease_present": true,
       "sidecar_retrieval_mode": "full",
       "trust_caveat": "Readiness is not fully green; run the next command before trusting agent packet/search output."
     },
@@ -199,6 +211,10 @@
       "embedding_device_state": "accelerated",
       "manifest_generation": "golden-generation",
       "manifest_input_hash": "golden-input",
+      "ready_lease_admission_basis": "complete_source_observation",
+      "ready_lease_memo_holds_observations": true,
+      "ready_lease_observer_epoch_coherence": "coherent",
+      "ready_lease_present": true,
       "retrieval_mode": "full"
     }
   },
@@ -274,6 +290,10 @@
           "summary": "Agent packet/search is waiting for full retrieval; current profile is `local`, mode is `unavailable`, and reason is `retrieval_status_error: golden retrieval probe failed`."
         }
       ],
+      "ready_lease_admission_basis": "complete_source_observation",
+      "ready_lease_memo_holds_observations": true,
+      "ready_lease_observer_epoch_coherence": "unproven",
+      "ready_lease_present": true,
       "sidecar_retrieval_mode": "unavailable",
       "trust_caveat": "Readiness is not fully green; run the next command before trusting agent packet/search output."
     },
@@ -290,6 +310,10 @@
       "embedding_device_state": "unknown",
       "manifest_generation": null,
       "manifest_input_hash": null,
+      "ready_lease_admission_basis": "complete_source_observation",
+      "ready_lease_memo_holds_observations": true,
+      "ready_lease_observer_epoch_coherence": "unproven",
+      "ready_lease_present": true,
       "retrieval_mode": "unavailable"
     }
   },
@@ -365,6 +389,10 @@
           "summary": "Agent packet/search is waiting for full retrieval; current profile is `local`, mode is `unavailable`, and reason is `retrieval_manifest_missing`."
         }
       ],
+      "ready_lease_admission_basis": "none",
+      "ready_lease_memo_holds_observations": false,
+      "ready_lease_observer_epoch_coherence": "not_applicable",
+      "ready_lease_present": false,
       "sidecar_retrieval_mode": "unavailable",
       "trust_caveat": "Readiness is not fully green; run the next command before trusting agent packet/search output."
     },
@@ -381,6 +409,10 @@
       "embedding_device_state": "unknown",
       "manifest_generation": null,
       "manifest_input_hash": null,
+      "ready_lease_admission_basis": "none",
+      "ready_lease_memo_holds_observations": false,
+      "ready_lease_observer_epoch_coherence": "not_applicable",
+      "ready_lease_present": false,
       "retrieval_mode": "unavailable"
     }
   }
