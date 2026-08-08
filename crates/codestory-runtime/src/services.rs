@@ -2873,6 +2873,7 @@ mod activation_tests {
         runtime: Runtime,
         storage_path: PathBuf,
         lease: ReadyLease,
+        sidecar: codestory_retrieval::SidecarRuntimeConfig,
     }
 
     fn ready_activation_fixture() -> ReadyActivationFixture {
@@ -2982,6 +2983,7 @@ mod activation_tests {
             runtime,
             storage_path,
             lease,
+            sidecar,
         }
     }
 
@@ -3195,6 +3197,53 @@ mod activation_tests {
                 ready_lease_memo_holds_observations: true,
             },
             "unavailable",
+        );
+    }
+
+    #[test]
+    fn status_and_doctor_do_not_resurrect_a_lease_after_observing_one() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+
+        assert!(
+            service
+                .retrieval_status(fixture.project.path(), &fixture.storage_path)
+                .expect("status with a ready lease")
+                .ready_lease()
+                .ready_lease_present,
+            "the observational matrix must first see the lease it is about to remove"
+        );
+        assert!(
+            service
+                .retrieval_engine_diagnostics(fixture.project.path(), &fixture.storage_path)
+                .expect("doctor with a ready lease")
+                .ready_lease
+                .ready_lease_present,
+            "doctor must see the same initial lease"
+        );
+
+        service
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator")
+            .ready_lease = None;
+
+        assert!(
+            !service
+                .retrieval_status(fixture.project.path(), &fixture.storage_path)
+                .expect("status after lease removal")
+                .ready_lease()
+                .ready_lease_present,
+            "status must report no lease after the coordinator drops it"
+        );
+        assert!(
+            !service
+                .retrieval_engine_diagnostics(fixture.project.path(), &fixture.storage_path)
+                .expect("doctor after lease removal")
+                .ready_lease
+                .ready_lease_present,
+            "doctor must not resurrect a previously observed lease"
         );
     }
 
@@ -3495,6 +3544,58 @@ mod activation_tests {
                 .readiness_fingerprint_passes,
             1,
             "a new ready lease must compute its own fingerprint"
+        );
+    }
+
+    #[test]
+    fn an_admission_refusal_drops_the_lease_fingerprint_memo() {
+        let fixture = ready_activation_fixture();
+        let browser = fixture.runtime.browser_service();
+        let source = fixture.project.path().join("metadata.rs");
+        let original = fs::read(&source).expect("read indexed source");
+
+        let first = browser
+            .packet(warm_packet_request())
+            .expect("prime the ready lease fingerprint memo");
+        assert_eq!(
+            first
+                .answer
+                .retrieval_trace
+                .source_freshness_telemetry
+                .expect("priming packet telemetry")
+                .readiness_fingerprint_passes,
+            1,
+            "the fixture must first populate the ready lease fingerprint memo"
+        );
+
+        fs::write(&source, "// ADMISSION_REFUSAL_DRIFT\n").expect("make source stale");
+        let mut builds = 0;
+        let refusal = fixture
+            .runtime
+            .public_operation_service()
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                builds += 1;
+                Ok(())
+            })
+            .expect_err("stale source must refuse retrieval at admission");
+        assert_eq!(refusal.code, "project_unavailable");
+        assert_eq!(builds, 0, "a refused admission must not enter the build");
+        fs::write(&source, &original).expect("restore source after the refusal");
+        let _lease_scope = codestory_workspace::SourceFreshnessScope::enter_with_memo(
+            fixture.lease.source_freshness_memo.clone(),
+        );
+        codestory_retrieval::strict_sidecar_status_for_runtime(
+            fixture.project.path(),
+            Some(&fixture.storage_path),
+            fixture.sidecar.clone(),
+        )
+        .expect("readiness after the admission refusal");
+        assert_eq!(
+            codestory_workspace::source_freshness_counts()
+                .expect("post-refusal readiness telemetry")
+                .readiness_fingerprint_passes,
+            1,
+            "the next readiness pass must recompute after admission refused freshness"
         );
     }
 
