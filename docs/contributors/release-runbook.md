@@ -117,8 +117,13 @@ full workspace source proof exactly once on this unchanged frozen candidate.
 Run package, protected hardware, installed-candidate, and qualification lanes
 from artifacts built from that same head. Qualification is a program gate; the
 live release workflow does not yet authenticate an earlier qualification run,
-so the planned release-driver receipt must carry it rather than implying the
-workflow already does.
+so record its complete run identity in the release-driver receipt rather than
+implying the workflow already carries it:
+
+```sh
+node .github/scripts/release-driver-receipt.mjs record qualification \
+  --receipt release-driver-receipt.json --data-file qualification.json
+```
 
 Use the testing matrix and workflow inputs as the command authority. Do not copy
 a target checklist from this page; `release-claims.json` declares the current
@@ -126,8 +131,28 @@ inventory.
 
 ## Evidence handoff
 
-Keep one release record. For v0.17.0, #1179 owns the operator handoff until the
-release driver emits its receipt.
+Keep one release record. Initialize it once, record each field group from a JSON
+file or inline JSON, and inspect it without reconstructing state from workflow
+pages:
+
+```sh
+node .github/scripts/release-driver-receipt.mjs init \
+  --version 0.17.0 --receipt release-driver-receipt.json
+node .github/scripts/release-driver-receipt.mjs record <field-group> \
+  --receipt release-driver-receipt.json --data-file <field-group>.json
+node .github/scripts/release-driver-receipt.mjs show \
+  --receipt release-driver-receipt.json
+```
+
+The field-group names are `calibration-source`, `pull-requests`,
+`calibration-source-acceptance`, `calibration`, `frozen-candidate`,
+`frozen-candidate-acceptance`, `source-proof`, `package`, `hardware`,
+`installed-candidate`, `qualification`, `pre-publish-ledger`, `evidence`,
+`promotion`, `publication`, `native-release-manifest`,
+`post-publish-ledger`, `catalog-delivery`, and `next-action`. Run evidence uses
+`lane`, `run_id`, `attempt`, immutable `artifact`, `digest`, `identity`,
+`commit`, `tree`, and `conclusion`. Calibration records exactly three such
+rows. For v0.17.0, #1179 owns this operator handoff.
 
 The record must carry:
 
@@ -155,6 +180,16 @@ evidence handoff. A failed newer attempt cannot fall back to an older successful
 attempt. Reuse is valid only when the machine policy accepts the exact commit,
 tree, artifact, identity, and evidence window.
 
+Validate the record before each transition. Validation is cumulative, requires
+exactly the groups available at that phase, and rejects later-phase groups when
+checking an earlier phase:
+
+```sh
+node .github/scripts/release-driver-receipt.mjs validate \
+  --phase <pre-freeze|frozen|published|closeout> \
+  --receipt release-driver-receipt.json
+```
+
 ## Invalidation
 
 Any unplanned commit after calibration-source acceptance invalidates that
@@ -174,6 +209,21 @@ When invalidated:
 3. Return to the earliest state whose entry condition remains true.
 4. Recalibrate when any path other than the generated constant-set file differs
    from the accepted calibration source.
+
+Record the invalidation before replacing evidence. Repeat `--changed-path` for
+every changed path; if the changed-path list is omitted, the tool conservatively
+requires recalibration. Use `--event evidence --group <field-group>` for an
+identity, expiry, attempt, host, or promotion invalidation that is not a source
+commit:
+
+```sh
+node .github/scripts/release-driver-receipt.mjs invalidate \
+  --event <post-calibration-commit|post-freeze-commit|evidence> \
+  --receipt release-driver-receipt.json \
+  --reason <reason> --replacing-sha <sha> --changed-path <path>
+```
+
+Invalidated groups remain unusable until `record` replaces each affected group.
 
 Do not reorder history or widen the allowed calibration path to preserve old
 proof.
