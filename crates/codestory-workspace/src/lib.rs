@@ -33,8 +33,10 @@ pub mod owned_deletion;
 pub mod paths;
 pub mod source_freshness;
 pub use source_freshness::{
-    SourceFreshnessCounts, SourceFreshnessScope, record_readiness_fingerprint_pass,
+    SourceFreshnessCounts, SourceFreshnessMemo, SourceFreshnessScope,
+    invalidate_lease_memoized_values, record_readiness_fingerprint_pass,
     reverify_from_content as reverify_source_freshness_from_content, source_freshness_counts,
+    with_lease_memoized_value,
 };
 mod repo_metadata;
 mod repository_hooks;
@@ -1732,6 +1734,8 @@ fn read_content_identity(path: &Path) -> Result<ContentIdentity> {
         }
         hasher.update(&buffer[..read]);
     }
+    #[cfg(test)]
+    run_torn_read_mutation_for_test(path)?;
     let after = file.metadata()?;
     if before.len() != after.len() || before.modified()? != after.modified()? {
         bail!("source metadata changed while hashing {}", path.display());
@@ -1740,6 +1744,31 @@ fn read_content_identity(path: &Path) -> Result<ContentIdentity> {
         content_hash: format!("{:x}", hasher.finalize()),
         len: before.len(),
         modified_ms: clamp_system_time_to_epoch_millis(before.modified()?),
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TORN_READ_MUTATION: std::cell::RefCell<Option<(PathBuf, Vec<u8>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_torn_read_mutation_for_test(path: PathBuf, contents: Vec<u8>) {
+    TORN_READ_MUTATION.with(|mutation| mutation.replace(Some((path, contents))));
+}
+
+#[cfg(test)]
+fn run_torn_read_mutation_for_test(path: &Path) -> Result<()> {
+    TORN_READ_MUTATION.with(|mutation| {
+        let Some((target, contents)) = mutation.borrow_mut().take() else {
+            return Ok(());
+        };
+        if target != path {
+            mutation.replace(Some((target, contents)));
+            return Ok(());
+        }
+        fs::write(path, contents).map_err(Into::into)
     })
 }
 
@@ -3004,10 +3033,11 @@ mod tests {
         Ok(())
     }
 
-    /// The memo must not survive the operation that produced it: the next
-    /// operation re-verifies from content.
+    /// Replacement for the pre-change operation-lifetime oracle: a ready
+    /// lease carries the verdict across scopes, while a new lease starts with
+    /// no observations and re-verifies from content.
     #[test]
-    fn a_new_scope_reverifies_content_instead_of_reusing_the_previous_verdict() -> Result<()> {
+    fn a_ready_lease_reuses_verdicts_and_a_new_lease_reverifies_content() -> Result<()> {
         let temp = tempdir()?;
         let root = temp.path().join("repo");
         fs::create_dir_all(&root)?;
@@ -3016,8 +3046,9 @@ mod tests {
         let inputs = indexed_inputs_for(std::slice::from_ref(&file))?;
         let manifest = WorkspaceManifest::open(root)?;
 
+        let first_lease = SourceFreshnessMemo::default();
         {
-            let _first = SourceFreshnessScope::enter();
+            let _first = SourceFreshnessScope::enter_with_memo(first_lease.clone());
             WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
             assert_eq!(
                 source_freshness_counts()
@@ -3027,12 +3058,22 @@ mod tests {
             );
         }
         {
-            let _second = SourceFreshnessScope::enter();
+            let _same_lease = SourceFreshnessScope::enter_with_memo(first_lease);
+            WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+            let counts = source_freshness_counts().expect("armed scope");
+            assert_eq!(
+                counts.content_hash_reads, 0,
+                "the same ready lease must not hash the file again"
+            );
+            assert_eq!(counts.verdict_reuses, 1);
+        }
+        {
+            let _new_lease = SourceFreshnessScope::enter_with_memo(SourceFreshnessMemo::default());
             WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
             let counts = source_freshness_counts().expect("armed scope");
             assert_eq!(
                 counts.content_hash_reads, 1,
-                "a new operation must hash the file again"
+                "a new ready lease must hash the file again"
             );
             assert_eq!(counts.verdict_reuses, 0);
         }
@@ -3118,6 +3159,51 @@ mod tests {
             vec![file],
             "reverification must re-read content, which is the only thing that \
              sees same-mtime same-length drift"
+        );
+        Ok(())
+    }
+
+    /// Oracle for the torn-read guard: a write between the content read and
+    /// the closing metadata sample refuses the observation and must not leave
+    /// a reusable verdict behind.
+    #[test]
+    fn a_torn_read_is_refused_and_not_memoized() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}\n")?;
+        let inputs = indexed_inputs_for(std::slice::from_ref(&file))?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let original_mtime = fs::metadata(&file)?.modified()?;
+
+        let _scope = SourceFreshnessScope::enter();
+        arm_torn_read_mutation_for_test(
+            file.clone(),
+            b"fn main() { let write_raced_the_reader = true; }\n".to_vec(),
+        );
+        let refused = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert_eq!(refused.files_to_index, vec![file.clone()]);
+        assert_eq!(
+            source_freshness_counts().expect("armed scope"),
+            SourceFreshnessCounts {
+                content_hash_reads: 1,
+                verdict_reuses: 0,
+                readiness_fingerprint_passes: 0,
+            },
+            "the raced read must be counted but must not publish a reusable verdict"
+        );
+
+        fs::write(&file, "fn maim() {}\n")?;
+        fs::File::open(&file)?.set_modified(original_mtime)?;
+        let retried = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert_eq!(retried.files_to_index, vec![file]);
+        assert_eq!(
+            source_freshness_counts()
+                .expect("armed scope")
+                .content_hash_reads,
+            2,
+            "the next derivation must read content again after a torn read"
         );
         Ok(())
     }

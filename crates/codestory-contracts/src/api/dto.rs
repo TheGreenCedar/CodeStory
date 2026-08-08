@@ -2650,13 +2650,12 @@ pub struct PacketClaimProfileTelemetryDto {
 pub struct SourceFreshnessTelemetryDto {
     /// Stored files whose content was read and hashed for a freshness verdict.
     pub content_hash_reads: u32,
-    /// Freshness verdicts served from the operation-scoped verdict memo.
+    /// Freshness verdicts served from the ready-lease-scoped verdict memo.
     pub verdict_reuses: u32,
     /// Strict-readiness fingerprint passes. Each reads the repository's
     /// lexical source live off disk and streams both projection tables. This
-    /// is a measurement, not a bound: a warm packet over an unchanged
-    /// repository was measured at six passes, so treat any single-pass
-    /// expectation as unproven until it is enforced.
+    /// is a measurement, not a bound: the first warm packet on one ready lease
+    /// performs exactly one pass, and later operations reuse that fingerprint.
     pub readiness_fingerprint_passes: u32,
 }
 
