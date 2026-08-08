@@ -6,17 +6,17 @@ use codestory_contracts::api::{
 };
 const OPENAPI_ENDPOINT_SCHEMA_PRODUCER: &str = "openapi_endpoint_schema";
 
-pub(crate) type PacketEvidenceTier = PacketEvidenceTierDto;
-pub(crate) type PacketEvidenceResolution = PacketEvidenceResolutionDto;
+pub type PacketEvidenceTier = PacketEvidenceTierDto;
+pub type PacketEvidenceResolution = PacketEvidenceResolutionDto;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DiagnosticSourceEvidence {
-    pub(crate) tier: PacketEvidenceTier,
-    pub(crate) producer: &'static str,
-    pub(crate) resolution: PacketEvidenceResolution,
+pub struct DiagnosticSourceEvidence {
+    pub tier: PacketEvidenceTier,
+    pub producer: &'static str,
+    pub resolution: PacketEvidenceResolution,
 }
 
-pub(crate) fn diagnostic_source_evidence(
+pub fn diagnostic_source_evidence(
     _path: Option<&str>,
     canonical_id: Option<&str>,
 ) -> Option<DiagnosticSourceEvidence> {
@@ -30,7 +30,7 @@ pub(crate) fn diagnostic_source_evidence(
     None
 }
 
-pub(crate) fn decorate_search_hit_evidence(hit: &mut SearchHit) {
+pub fn decorate_search_hit_evidence(hit: &mut SearchHit) {
     let diagnostic_source_proof = hit_is_diagnostic_source_proof(hit);
     let tier = evidence_tier_for_hit(hit);
     let resolution = evidence_resolution_for_hit(hit);
@@ -42,7 +42,7 @@ pub(crate) fn decorate_search_hit_evidence(hit: &mut SearchHit) {
         Some(!diagnostic_source_proof && evidence_is_sufficiency_eligible(tier, resolution));
 }
 
-pub(crate) fn decorate_lexical_search_hit_evidence(hit: &mut SearchHit) {
+pub fn decorate_lexical_search_hit_evidence(hit: &mut SearchHit) {
     hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
         lexical: hit.score,
         semantic: 0.0,
@@ -57,7 +57,7 @@ pub(crate) fn decorate_lexical_search_hit_evidence(hit: &mut SearchHit) {
     decorate_search_hit_evidence(hit);
 }
 
-pub(crate) fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &SearchHit) {
+pub fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &SearchHit) {
     citation.target = hit.target.clone();
     citation.evidence_tier = hit
         .evidence_tier
@@ -94,7 +94,7 @@ pub(crate) fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &
     });
 }
 
-pub(crate) fn evidence_is_sufficiency_eligible(
+pub fn evidence_is_sufficiency_eligible(
     tier: PacketEvidenceTier,
     resolution: PacketEvidenceResolution,
 ) -> bool {
@@ -110,7 +110,7 @@ pub(crate) fn evidence_is_sufficiency_eligible(
     )
 }
 
-pub(crate) fn citation_sufficiency_eligible(citation: &AgentCitationDto) -> bool {
+pub fn citation_sufficiency_eligible(citation: &AgentCitationDto) -> bool {
     if citation_is_diagnostic_source_proof(citation) {
         return false;
     }
@@ -126,7 +126,7 @@ pub(crate) fn citation_sufficiency_eligible(citation: &AgentCitationDto) -> bool
     citation.eligible_for_sufficiency.unwrap_or(true)
 }
 
-pub(crate) fn evidence_tier_for_hit(hit: &SearchHit) -> PacketEvidenceTier {
+pub fn evidence_tier_for_hit(hit: &SearchHit) -> PacketEvidenceTier {
     if hit_is_diagnostic_source_proof(hit) {
         return if hit_is_structural_source_proof(hit) {
             PacketEvidenceTier::StructuralText
@@ -158,7 +158,7 @@ pub(crate) fn evidence_tier_for_hit(hit: &SearchHit) -> PacketEvidenceTier {
     PacketEvidenceTier::GeneratedSummary
 }
 
-pub(crate) fn evidence_resolution_for_hit(hit: &SearchHit) -> PacketEvidenceResolution {
+pub fn evidence_resolution_for_hit(hit: &SearchHit) -> PacketEvidenceResolution {
     if hit_is_diagnostic_source_proof(hit) {
         return if hit.file_path.is_some() && hit.line.is_some() {
             PacketEvidenceResolution::SourceRangeOnly
@@ -181,7 +181,7 @@ pub(crate) fn evidence_resolution_for_hit(hit: &SearchHit) -> PacketEvidenceReso
     }
 }
 
-pub(crate) fn evidence_producer_for_hit(hit: &SearchHit) -> String {
+pub fn evidence_producer_for_hit(hit: &SearchHit) -> String {
     if hit_is_openapi_endpoint_schema(hit) {
         return OPENAPI_ENDPOINT_SCHEMA_PRODUCER.to_string();
     }
@@ -202,7 +202,7 @@ pub(crate) fn evidence_producer_for_hit(hit: &SearchHit) -> String {
     }
 }
 
-pub(crate) fn evidence_tier_for_citation(citation: &AgentCitationDto) -> PacketEvidenceTier {
+pub fn evidence_tier_for_citation(citation: &AgentCitationDto) -> PacketEvidenceTier {
     if citation_is_diagnostic_source_proof(citation) {
         return if citation_is_structural_source_proof(citation) {
             PacketEvidenceTier::StructuralText
@@ -234,9 +234,7 @@ pub(crate) fn evidence_tier_for_citation(citation: &AgentCitationDto) -> PacketE
     PacketEvidenceTier::GeneratedSummary
 }
 
-pub(crate) fn evidence_resolution_for_citation(
-    citation: &AgentCitationDto,
-) -> PacketEvidenceResolution {
+pub fn evidence_resolution_for_citation(citation: &AgentCitationDto) -> PacketEvidenceResolution {
     if citation_is_diagnostic_source_proof(citation) {
         return if citation.file_path.is_some() && citation.line.is_some() {
             PacketEvidenceResolution::SourceRangeOnly

@@ -1,10 +1,10 @@
-#[cfg(test)]
-use crate::agent::eval_probes::eval_probes_enabled;
-use crate::agent::packet_citations::{
+#[cfg(any(test, feature = "test-support"))]
+use crate::eval_probes::eval_probes_enabled;
+use crate::packet_citations::{
     packet_citation_matching_display, packet_citation_matching_path_and_display,
     packet_command_crate_sources_contain_all,
 };
-use crate::agent::packet_scoring::normalize_identifier;
+use crate::packet_scoring::normalize_identifier;
 use codestory_contracts::api::{AgentCitationDto, PacketClaimDto, PacketTaskClassDto};
 use std::collections::HashSet;
 
@@ -47,17 +47,17 @@ fn packet_command_descriptors(question: &str) -> Vec<PacketCommandDescriptor> {
     descriptors
 }
 
-pub(crate) fn packet_command_exact_probe_queries(
+pub fn packet_command_exact_probe_queries(
     question: &str,
     task_class: PacketTaskClassDto,
 ) -> Vec<String> {
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         let _ = (question, task_class);
         Vec::new()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         if !eval_probes_enabled() || !packet_allows_command_probe_queries(question, task_class) {
             return Vec::new();
@@ -76,7 +76,7 @@ pub(crate) fn packet_command_exact_probe_queries(
     }
 }
 
-pub(crate) fn packet_command_role_probe_queries(
+pub fn packet_command_role_probe_queries(
     question: &str,
     task_class: PacketTaskClassDto,
 ) -> Vec<String> {
@@ -123,7 +123,7 @@ fn packet_allows_command_probe_queries(question: &str, task_class: PacketTaskCla
     )
 }
 
-pub(crate) fn packet_append_command_flow_template_claims(
+pub fn packet_append_command_flow_template_claims(
     prompt: &str,
     citations: &[AgentCitationDto],
     claims: &mut Vec<PacketClaimDto>,

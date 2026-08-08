@@ -4,7 +4,6 @@ use super::packet_evidence::citation_sufficiency_eligible;
 use super::packet_flow_requirements::{
     CoverageMode, EvidencePredicate, FlowRequirement, FlowRole, packet_flow_requirements_for_terms,
 };
-use super::packet_profile_telemetry::PacketClaimTelemetry;
 use super::packet_required_probes::{
     packet_prompt_exact_symbol_probe_queries, packet_sufficiency_required_probe_queries_from_terms,
 };
@@ -13,7 +12,11 @@ use super::packet_scoring::{
     packet_query_stop_term,
 };
 use super::packet_terms::packet_probe_terms;
-use codestory_agent::packet_execution_graphs::packet_execution_graphs;
+use crate::packet_execution_graphs::packet_execution_graphs;
+#[cfg(test)]
+use crate::text::exact_symbol_query_terms;
+use crate::text::symbol_query_tokens;
+use crate::trail::is_speculative_trail_edge;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
     EdgeKind, NodeKind, PACKET_OBLIGATION_PLAN_VERSION, PacketBudgetDto, PacketClaimDto,
@@ -30,9 +33,9 @@ const PACKET_OBLIGATION_BINDING_TERM_CHAR_LIMIT: usize = 160;
 const PACKET_SUPPLEMENTAL_QUERY_OBLIGATION_LIMIT: usize = 16;
 const PACKET_SUPPLEMENTAL_QUERY_CHAR_LIMIT: usize = 240;
 const REQUESTED_CLAIM_OVERFLOW_ID: &str = "requested_claim_overflow";
-pub(crate) const PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE: &str = "obligation receipt";
+pub const PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE: &str = "obligation receipt";
 
-pub(crate) fn build_packet_obligation_plan(
+pub fn build_packet_obligation_plan(
     question: &str,
     task_class: PacketTaskClassDto,
     planned_queries: &[PacketPlanQueryDto],
@@ -142,7 +145,7 @@ pub(crate) fn build_packet_obligation_plan(
     }
 }
 
-pub(crate) fn append_packet_probe_obligations(
+pub fn append_packet_probe_obligations(
     plan: &mut PacketObligationPlanDto,
     resolutions: &[PacketProbeResolutionDto],
 ) {
@@ -364,7 +367,7 @@ fn requested_claim_binding_terms(
         for segment in symbol_identity_segments(term) {
             exact_symbol_components.insert(segment);
         }
-        for component in crate::symbol_query_tokens(term) {
+        for component in symbol_query_tokens(term) {
             exact_symbol_components.insert(normalize_identifier(&component));
         }
         push_exact_requested_claim_binding_candidate(&mut candidates, term);
@@ -565,7 +568,7 @@ fn push_query_obligation(
     });
 }
 
-pub(crate) fn finalize_packet_obligation_plan(
+pub fn finalize_packet_obligation_plan(
     question: &str,
     task_class: PacketTaskClassDto,
     plan: &mut PacketObligationPlanDto,
@@ -980,7 +983,7 @@ fn citation_matches_default_profile_binding(
 
 #[cfg(test)]
 fn citation_display_matches_requested_identity(display_name: &str, requested: &str) -> bool {
-    let exact_case = crate::exact_symbol_query_terms(requested)
+    let exact_case = exact_symbol_query_terms(requested)
         .iter()
         .any(|candidate| candidate == requested.trim());
     citation_display_matches_requested_identity_with_case(display_name, requested, exact_case)
@@ -1108,7 +1111,7 @@ fn citation_satisfies_edge_requirement(
                 edge.kind == required_edge_kind
                     && cited_edge_ids.contains(&edge.id)
                     && (edge.source == citation.node_id || edge.target == citation.node_id)
-                    && !crate::graph_builders::is_speculative_trail_edge(edge)
+                    && !is_speculative_trail_edge(edge)
             })
         })
 }
@@ -1161,7 +1164,7 @@ fn finalize_query_obligations(
     }
 }
 
-pub(crate) fn bind_claims_to_packet_obligations(
+pub fn bind_claims_to_packet_obligations(
     plan: &PacketObligationPlanDto,
     claims: &mut [PacketClaimDto],
 ) {
@@ -1261,10 +1264,10 @@ fn packet_unproven_claim_status(
     }
 }
 
-pub(crate) fn packet_claims_with_obligation_receipts(
+pub fn packet_claims_with_obligation_receipts<T>(
     answer: &AgentAnswerDto,
     plan: &PacketObligationPlanDto,
-    supported_claims_with_telemetry: (Vec<PacketClaimDto>, PacketClaimTelemetry),
+    supported_claims_with_telemetry: (Vec<PacketClaimDto>, T),
 ) -> Vec<PacketClaimDto> {
     packet_claims_with_obligation_receipts_and_telemetry(
         answer,
@@ -1274,11 +1277,11 @@ pub(crate) fn packet_claims_with_obligation_receipts(
     .0
 }
 
-pub(crate) fn packet_claims_with_obligation_receipts_and_telemetry(
+pub fn packet_claims_with_obligation_receipts_and_telemetry<T>(
     answer: &AgentAnswerDto,
     plan: &PacketObligationPlanDto,
-    (mut claims, telemetry): (Vec<PacketClaimDto>, PacketClaimTelemetry),
-) -> (Vec<PacketClaimDto>, PacketClaimTelemetry) {
+    (mut claims, telemetry): (Vec<PacketClaimDto>, T),
+) -> (Vec<PacketClaimDto>, T) {
     append_packet_obligation_receipt_claims(answer, plan, &mut claims);
     (claims, telemetry)
 }
@@ -1373,7 +1376,7 @@ fn packet_obligation_receipt_text(
     )
 }
 
-pub(crate) fn material_packet_obligations_are_proven(plan: &PacketObligationPlanDto) -> bool {
+pub fn material_packet_obligations_are_proven(plan: &PacketObligationPlanDto) -> bool {
     plan.claim_obligations
         .iter()
         .filter(|obligation| obligation.material)
@@ -1390,9 +1393,7 @@ pub(crate) fn material_packet_obligations_are_proven(plan: &PacketObligationPlan
             })
 }
 
-pub(crate) fn packet_obligation_open_next_candidates(
-    plan: &PacketObligationPlanDto,
-) -> Vec<String> {
+pub fn packet_obligation_open_next_candidates(plan: &PacketObligationPlanDto) -> Vec<String> {
     let has_missing_material_claim = plan.claim_obligations.iter().any(|obligation| {
         obligation.material && obligation.proof_status != PacketObligationProofStatusDto::Proven
     });
@@ -1433,9 +1434,7 @@ fn packet_obligation_requested_paths(plan: &PacketObligationPlanDto) -> Vec<Stri
         .collect()
 }
 
-pub(crate) fn packet_proven_obligation_carrier_paths(
-    plan: &PacketObligationPlanDto,
-) -> Vec<String> {
+pub fn packet_proven_obligation_carrier_paths(plan: &PacketObligationPlanDto) -> Vec<String> {
     plan.claim_obligations
         .iter()
         .filter(|obligation| obligation.proof_status == PacketObligationProofStatusDto::Proven)
@@ -1554,19 +1553,31 @@ fn packet_discovery_subject_has_negator(tokens: &[String], subject_index: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::packet_claims::packet_supported_claims_with_telemetry;
-    use crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context;
     use codestory_contracts::api::{
         AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto, EdgeId,
-        GraphArtifactDto, GraphEdgeDto, GraphResponse, NodeId, PACKET_PROBE_CONTRACT_VERSION,
-        PacketBudgetLimitsDto, PacketBudgetModeDto, PacketBudgetUsageDto,
-        PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketProbeAmbiguityCandidateDto,
-        PacketProbeRejectionDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyStatusDto,
+        GraphArtifactDto, GraphEdgeDto, GraphResponse, IndexFreshnessDto, IndexFreshnessStatusDto,
+        NodeId, PACKET_PROBE_CONTRACT_VERSION, PacketBudgetLimitsDto, PacketBudgetModeDto,
+        PacketBudgetUsageDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
+        PacketProbeAmbiguityCandidateDto, PacketProbeRejectionDto, PacketSidecarQueryDiagnosticDto,
         SearchHitOrigin,
     };
-    use std::path::Path;
 
     const INDEXING_QUESTION: &str = "Explain the indexing runtime, persistence, and snapshot flow.";
+
+    fn fresh_index_observation() -> IndexFreshnessDto {
+        IndexFreshnessDto {
+            status: IndexFreshnessStatusDto::Fresh,
+            changed_file_count: 0,
+            new_file_count: 0,
+            removed_file_count: 0,
+            checked_file_count: 8,
+            indexed_file_count: 8,
+            duration_ms: 1,
+            reason: None,
+            not_checked_cause: None,
+            samples: Vec::new(),
+        }
+    }
 
     fn citation(name: &str, path: &str, kind: NodeKind) -> AgentCitationDto {
         AgentCitationDto {
@@ -1597,7 +1608,7 @@ mod tests {
             answer_id: "obligation-test".to_string(),
             prompt: INDEXING_QUESTION.to_string(),
             summary: "test".to_string(),
-            freshness: Some(crate::agent::packet_freshness::fresh_index_observation()),
+            freshness: Some(fresh_index_observation()),
             sections: Vec::new(),
             citations,
             subgraph_ids: Vec::new(),
@@ -1645,36 +1656,6 @@ mod tests {
             truncated: false,
             omitted_sections: Vec::new(),
             next_deeper_command: None,
-        }
-    }
-
-    fn finalized_obligation(
-        id: &str,
-        kind: PacketClaimObligationKindDto,
-        proof_status: PacketObligationProofStatusDto,
-        carrier: Option<&AgentCitationDto>,
-        reason: Option<&str>,
-    ) -> PacketClaimObligationDto {
-        PacketClaimObligationDto {
-            id: id.to_string(),
-            kind,
-            binding_terms: Vec::new(),
-            probe_binding: None,
-            material: true,
-            allowed_node_kinds: Vec::new(),
-            required_edge_kind: None,
-            requires_complete_discovery: false,
-            proof_status,
-            reason: reason.map(str::to_string),
-            carrier_node_ids: carrier
-                .into_iter()
-                .map(|citation| citation.node_id.clone())
-                .collect(),
-            carrier_paths: carrier
-                .and_then(|citation| citation.file_path.clone())
-                .into_iter()
-                .collect(),
-            open_next_candidates: Vec::new(),
         }
     }
 
@@ -1934,181 +1915,6 @@ mod tests {
         assert!(plan.query_obligations.iter().any(|obligation| {
             obligation.query == "shell installer bootstrap" && obligation.material
         }));
-    }
-
-    #[test]
-    fn cancelled_diagnostic_query_does_not_block_a_complete_material_ledger() {
-        let question = "Explain shell installer function dispatch and completion.";
-        let mut plan = build_packet_obligation_plan(
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &[],
-        );
-        let mut answer = answer(vec![
-            lexical_citation("nvm_download", "install.sh", NodeKind::FUNCTION),
-            lexical_citation("nvm_use", "nvm.sh", NodeKind::FUNCTION),
-            citation("Helper::noop", "src/helper.rs", NodeKind::METHOD),
-        ]);
-        answer.prompt = question.to_string();
-        let material_queries = plan
-            .query_obligations
-            .iter()
-            .filter(|obligation| obligation.material)
-            .map(|obligation| obligation.query.clone())
-            .collect::<Vec<_>>();
-        for query in material_queries {
-            answer
-                .retrieval_trace
-                .packet_sidecar_diagnostics
-                .push(query_diagnostic(
-                    &query,
-                    PacketQueryCompletionDto::Completed,
-                ));
-        }
-        answer
-            .retrieval_trace
-            .packet_sidecar_diagnostics
-            .push(query_diagnostic(
-                "shell completion",
-                PacketQueryCompletionDto::Cancelled {
-                    reason: "diagnostic_deadline".to_string(),
-                },
-            ));
-
-        finalize_packet_obligation_plan(
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &mut plan,
-            &answer,
-            &budget(),
-        );
-
-        assert!(plan.query_obligations.iter().any(|obligation| {
-            !obligation.material
-                && obligation.query == "shell completion"
-                && matches!(
-                    obligation.completion,
-                    Some(PacketQueryCompletionDto::Cancelled { ref reason })
-                        if reason == "diagnostic_deadline"
-                )
-        }));
-        assert!(material_packet_obligations_are_proven(&plan), "{plan:#?}");
-        let sufficiency = build_packet_sufficiency_with_obligation_context(
-            Path::new("/workspace/example"),
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &answer,
-            &budget(),
-            &[],
-            &[],
-            &plan,
-        );
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
-        assert!(
-            sufficiency
-                .coverage_report
-                .as_ref()
-                .is_some_and(|coverage| coverage.unresolved == ["shell completion"]),
-            "diagnostic cancellation stays visible without changing the verdict: {sufficiency:?}"
-        );
-    }
-
-    /// EV-8. A required query whose semantic stage timed out with zero hits reaches the ledger as
-    /// a typed cancellation, and the ledger is what demotes the verdict. The demotion lands on
-    /// the obligation that lost its evidence rather than on the packet as an undifferentiated
-    /// whole, so the caller is told which query to re-run.
-    #[test]
-    fn a_required_query_whose_semantic_stage_timed_out_demotes_through_its_obligation() {
-        let question = "Explain shell installer function dispatch and completion.";
-        let mut plan = build_packet_obligation_plan(
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &[],
-        );
-        let mut answer = answer(vec![
-            lexical_citation("nvm_download", "install.sh", NodeKind::FUNCTION),
-            lexical_citation("nvm_use", "nvm.sh", NodeKind::FUNCTION),
-            citation("Helper::noop", "src/helper.rs", NodeKind::METHOD),
-        ]);
-        answer.prompt = question.to_string();
-        let material_queries = plan
-            .query_obligations
-            .iter()
-            .filter(|obligation| obligation.material)
-            .map(|obligation| obligation.query.clone())
-            .collect::<Vec<_>>();
-        let (timed_out_query, completed_queries) = material_queries
-            .split_first()
-            .expect("architecture explanation plans at least one material query");
-        for query in completed_queries {
-            answer
-                .retrieval_trace
-                .packet_sidecar_diagnostics
-                .push(query_diagnostic(query, PacketQueryCompletionDto::Completed));
-        }
-        let mut timed_out = query_diagnostic(
-            timed_out_query,
-            PacketQueryCompletionDto::Cancelled {
-                reason: "semantic_stage_timeout_zero_hits".to_string(),
-            },
-        );
-        timed_out.semantic_stage_timeout_zero_hits = true;
-        answer
-            .retrieval_trace
-            .packet_sidecar_diagnostics
-            .push(timed_out);
-
-        finalize_packet_obligation_plan(
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &mut plan,
-            &answer,
-            &budget(),
-        );
-
-        assert!(
-            plan.query_obligations.iter().any(|obligation| {
-                obligation.material
-                    && &obligation.query == timed_out_query
-                    && matches!(
-                        obligation.completion,
-                        Some(PacketQueryCompletionDto::Cancelled { ref reason })
-                            if reason == "semantic_stage_timeout_zero_hits"
-                    )
-            }),
-            "the typed cancellation must reach the ledger: {plan:#?}"
-        );
-
-        let sufficiency = build_packet_sufficiency_with_obligation_context(
-            Path::new("/workspace/example"),
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &answer,
-            &budget(),
-            &[],
-            &[],
-            &plan,
-        );
-
-        assert_eq!(
-            sufficiency.status,
-            PacketSufficiencyStatusDto::Partial,
-            "{sufficiency:?}"
-        );
-        assert!(
-            sufficiency.gaps.iter().any(|gap| {
-                gap.contains("query obligation") && gap.contains("semantic_stage_timeout_zero_hits")
-            }),
-            "the gap must name the query obligation that lost its lane: {:?}",
-            sufficiency.gaps
-        );
-        assert!(
-            sufficiency
-                .follow_up_commands
-                .iter()
-                .any(|command| command.contains(timed_out_query.as_str())),
-            "the caller is told which query to re-run: {sufficiency:?}"
-        );
     }
 
     #[test]
@@ -2398,232 +2204,6 @@ mod tests {
     }
 
     #[test]
-    fn indexing_storage_claim_cannot_borrow_a_proven_runtime_entrypoint() {
-        let question = "Explain how a full indexing run moves from the CLI into runtime orchestration, workspace file discovery, symbol extraction, persistence, and snapshot refresh.";
-        let mut runtime = citation(
-            "IndexService::run_indexing_blocking_without_runtime_refresh",
-            "crates/codestory-runtime/src/services.rs",
-            NodeKind::METHOD,
-        );
-        runtime.evidence_edge_ids = vec![EdgeId("indexing-entry-call".to_string())];
-        let target = citation(
-            "Worker::execute",
-            "crates/example/src/worker.rs",
-            NodeKind::METHOD,
-        );
-        let mut answer = answer(vec![runtime.clone(), target.clone()]);
-        answer.prompt = question.to_string();
-        answer.graphs.push(GraphArtifactDto::Uml {
-            id: "indexing-entrypoint-flow".to_string(),
-            title: "Indexing entrypoint flow".to_string(),
-            graph: GraphResponse {
-                center_id: runtime.node_id.clone(),
-                nodes: Vec::new(),
-                edges: vec![GraphEdgeDto {
-                    id: EdgeId("indexing-entry-call".to_string()),
-                    source: runtime.node_id.clone(),
-                    target: target.node_id,
-                    kind: EdgeKind::CALL,
-                    confidence: Some(1.0),
-                    certainty: Some("certain".to_string()),
-                    callsite_identity: Some("test:1".to_string()),
-                    candidate_targets: Vec::new(),
-                }],
-                truncated: false,
-                omitted_edge_count: 0,
-                canonical_layout: None,
-            },
-        });
-        let mut plan = build_packet_obligation_plan(
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &[],
-        );
-        finalize_packet_obligation_plan(
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &mut plan,
-            &answer,
-            &budget(),
-        );
-        assert_eq!(
-            plan.claim_obligations
-                .iter()
-                .find(|obligation| obligation.id == "indexing_entrypoint")
-                .map(|obligation| obligation.proof_status),
-            Some(PacketObligationProofStatusDto::Proven)
-        );
-        let storage_obligation = plan
-            .claim_obligations
-            .iter()
-            .find(|obligation| obligation.id == "indexing_storage")
-            .expect("indexing storage obligation");
-        assert_eq!(
-            storage_obligation.proof_status,
-            PacketObligationProofStatusDto::Unsupported
-        );
-        assert_eq!(
-            storage_obligation.reason.as_deref(),
-            Some("required_carrier_missing")
-        );
-
-        let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&answer);
-        let mut claims =
-            packet_claims_with_obligation_receipts(&answer, &plan, supported_claims_with_telemetry);
-        bind_claims_to_packet_obligations(&plan, &mut claims);
-        let storage_claim = claims
-            .iter()
-            .find(|claim| claim.required_obligation_ids == ["indexing_storage"])
-            .expect("material storage row emits an exact receipt claim");
-        assert_eq!(storage_claim.required_obligation_ids, ["indexing_storage"]);
-        assert_eq!(
-            storage_claim.proof_status,
-            Some(PacketProofStatusDto::Unsupported)
-        );
-        assert_eq!(storage_claim.eligible_for_sufficiency, Some(false));
-        assert!(storage_claim.claim.contains("required_carrier_missing"));
-        let entrypoint_claim = claims
-            .iter()
-            .find(|claim| claim.required_obligation_ids == ["indexing_entrypoint"])
-            .expect("material entrypoint row emits an exact receipt claim");
-        assert_eq!(
-            entrypoint_claim.proof_status,
-            Some(PacketProofStatusDto::Proven)
-        );
-        assert_eq!(entrypoint_claim.citations.len(), 1);
-    }
-
-    #[test]
-    fn obligation_receipts_use_only_their_exact_rows_own_carriers() {
-        let entrypoint = citation("Cli::run", "src/cli.rs", NodeKind::METHOD);
-        let storage = citation("Store::write", "src/store.rs", NodeKind::METHOD);
-        let answer = answer(vec![entrypoint.clone(), storage.clone()]);
-        let plan = PacketObligationPlanDto {
-            version: PACKET_OBLIGATION_PLAN_VERSION,
-            binding_terms: Vec::new(),
-            claim_obligations: vec![
-                finalized_obligation(
-                    "flow_entrypoint",
-                    PacketClaimObligationKindDto::Entrypoint,
-                    PacketObligationProofStatusDto::Proven,
-                    Some(&entrypoint),
-                    None,
-                ),
-                finalized_obligation(
-                    "flow_storage",
-                    PacketClaimObligationKindDto::StateWrite,
-                    PacketObligationProofStatusDto::Proven,
-                    Some(&storage),
-                    None,
-                ),
-            ],
-            query_obligations: Vec::new(),
-        };
-
-        let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&answer);
-        let mut claims =
-            packet_claims_with_obligation_receipts(&answer, &plan, supported_claims_with_telemetry);
-        bind_claims_to_packet_obligations(&plan, &mut claims);
-        let receipts = claims
-            .iter()
-            .filter(|claim| {
-                claim.coverage_role.as_deref() == Some(PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(receipts.len(), 2);
-        let entrypoint_receipt = receipts
-            .iter()
-            .find(|claim| claim.required_obligation_ids == ["flow_entrypoint"])
-            .expect("entrypoint receipt");
-        assert_eq!(entrypoint_receipt.citations.len(), 1);
-        assert_eq!(entrypoint_receipt.citations[0].node_id, entrypoint.node_id);
-        let storage_receipt = receipts
-            .iter()
-            .find(|claim| claim.required_obligation_ids == ["flow_storage"])
-            .expect("storage receipt");
-        assert_eq!(storage_receipt.citations.len(), 1);
-        assert_eq!(storage_receipt.citations[0].node_id, storage.node_id);
-
-        let mut borrowed = vec![PacketClaimDto {
-            claim: "The entrypoint row is proven.".to_string(),
-            required_obligation_ids: vec!["flow_entrypoint".to_string()],
-            required_obligation_kinds: vec![PacketClaimObligationKindDto::Entrypoint],
-            proof_status: Some(PacketProofStatusDto::Proven),
-            required_evidence_role: None,
-            citations: vec![storage],
-            coverage_role: Some("fixture".to_string()),
-            eligible_for_sufficiency: Some(true),
-        }];
-        bind_claims_to_packet_obligations(&plan, &mut borrowed);
-        assert_eq!(
-            borrowed[0].proof_status,
-            Some(PacketProofStatusDto::Reported)
-        );
-        assert_eq!(borrowed[0].eligible_for_sufficiency, Some(false));
-    }
-
-    #[test]
-    fn receipt_rows_preserve_non_proven_status_reason_and_deduplicate_ids() {
-        let reported_carrier = citation("MaybeStore", "src/store.rs", NodeKind::METHOD);
-        let plan = PacketObligationPlanDto {
-            version: PACKET_OBLIGATION_PLAN_VERSION,
-            binding_terms: Vec::new(),
-            claim_obligations: vec![
-                finalized_obligation(
-                    "reported_storage",
-                    PacketClaimObligationKindDto::StateWrite,
-                    PacketObligationProofStatusDto::Reported,
-                    Some(&reported_carrier),
-                    Some("required_evidence_edge_missing"),
-                ),
-                finalized_obligation(
-                    "reported_storage",
-                    PacketClaimObligationKindDto::StateWrite,
-                    PacketObligationProofStatusDto::Reported,
-                    Some(&reported_carrier),
-                    Some("duplicate_row"),
-                ),
-                finalized_obligation(
-                    "unsupported_dispatch",
-                    PacketClaimObligationKindDto::Dispatch,
-                    PacketObligationProofStatusDto::Unsupported,
-                    None,
-                    Some("required_carrier_missing"),
-                ),
-            ],
-            query_obligations: Vec::new(),
-        };
-        let answer = answer(vec![reported_carrier]);
-        let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&answer);
-        let mut claims =
-            packet_claims_with_obligation_receipts(&answer, &plan, supported_claims_with_telemetry);
-        bind_claims_to_packet_obligations(&plan, &mut claims);
-        let receipts = claims
-            .iter()
-            .filter(|claim| {
-                claim.coverage_role.as_deref() == Some(PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(receipts.len(), 2, "duplicate row IDs emit one receipt");
-        let reported = receipts
-            .iter()
-            .find(|claim| claim.required_obligation_ids == ["reported_storage"])
-            .expect("reported receipt");
-        assert_eq!(reported.proof_status, Some(PacketProofStatusDto::Reported));
-        assert_eq!(reported.eligible_for_sufficiency, Some(false));
-        assert!(reported.claim.contains("required_evidence_edge_missing"));
-        let unsupported = receipts
-            .iter()
-            .find(|claim| claim.required_obligation_ids == ["unsupported_dispatch"])
-            .expect("unsupported receipt");
-        assert_eq!(
-            unsupported.proof_status,
-            Some(PacketProofStatusDto::Unsupported)
-        );
-        assert!(unsupported.claim.contains("required_carrier_missing"));
-    }
-
-    #[test]
     fn eligible_claim_without_an_exact_row_id_is_demoted_even_for_an_empty_plan() {
         let mut claims = vec![PacketClaimDto {
             claim: "A generic role claim.".to_string(),
@@ -2719,151 +2299,6 @@ mod tests {
     }
 
     #[test]
-    fn sufficient_profile_closes_incidental_nonmaterial_guard_path() {
-        let question = "Find RuntimeService::run.";
-        let mut carrier = citation(
-            "RuntimeService::run",
-            "src/runtime_service.rs",
-            NodeKind::METHOD,
-        );
-        carrier.evidence_edge_ids = vec![EdgeId("generic-call".to_string())];
-        let target = citation("Worker::run", "src/worker.rs", NodeKind::METHOD);
-        let incidental_guard_carrier = citation(
-            "HttpTransport::send",
-            "src/incidental_transport.rs",
-            NodeKind::METHOD,
-        );
-        let mut answer = answer(vec![
-            carrier.clone(),
-            target.clone(),
-            incidental_guard_carrier.clone(),
-        ]);
-        answer.prompt = question.to_string();
-        answer
-            .retrieval_trace
-            .packet_sidecar_diagnostics
-            .push(query_diagnostic(
-                "RuntimeService::run",
-                PacketQueryCompletionDto::Completed,
-            ));
-        answer.graphs.push(GraphArtifactDto::Uml {
-            id: "generic-flow".to_string(),
-            title: "Generic flow".to_string(),
-            graph: GraphResponse {
-                center_id: carrier.node_id.clone(),
-                nodes: Vec::new(),
-                edges: vec![GraphEdgeDto {
-                    id: EdgeId("generic-call".to_string()),
-                    source: carrier.node_id,
-                    target: target.node_id,
-                    kind: EdgeKind::CALL,
-                    confidence: Some(1.0),
-                    certainty: Some("certain".to_string()),
-                    callsite_identity: Some("test:1".to_string()),
-                    candidate_targets: Vec::new(),
-                }],
-                truncated: false,
-                omitted_edge_count: 0,
-                canonical_layout: None,
-            },
-        });
-        let mut plan =
-            build_packet_obligation_plan(question, PacketTaskClassDto::SymbolOwnership, &[]);
-        plan.claim_obligations.push(PacketClaimObligationDto {
-            id: "incidental_external_io_guard".to_string(),
-            kind: PacketClaimObligationKindDto::ExternalIo,
-            binding_terms: vec![incidental_guard_carrier.display_name.clone()],
-            probe_binding: None,
-            material: false,
-            allowed_node_kinds: allowed_node_kinds_for_obligation(
-                PacketClaimObligationKindDto::ExternalIo,
-            ),
-            required_edge_kind: Some(EdgeKind::CALL),
-            requires_complete_discovery: false,
-            proof_status: PacketObligationProofStatusDto::Planned,
-            reason: None,
-            carrier_node_ids: Vec::new(),
-            carrier_paths: Vec::new(),
-            open_next_candidates: Vec::new(),
-        });
-        finalize_packet_obligation_plan(
-            question,
-            PacketTaskClassDto::SymbolOwnership,
-            &mut plan,
-            &answer,
-            &budget(),
-        );
-
-        assert_eq!(
-            plan.claim_obligations[0].proof_status,
-            PacketObligationProofStatusDto::Proven
-        );
-        assert_eq!(plan.claim_obligations[0].reason, None);
-        assert!(material_packet_obligations_are_proven(&plan), "{plan:#?}");
-        assert!(plan.query_obligations.iter().any(|obligation| {
-            obligation.material
-                && obligation.query == "RuntimeService::run"
-                && obligation.completion == Some(PacketQueryCompletionDto::Completed)
-        }));
-        let incidental_guard = plan
-            .claim_obligations
-            .iter()
-            .find(|obligation| obligation.id == "incidental_external_io_guard")
-            .expect("incidental guard remains in the finalized ledger");
-        assert!(!incidental_guard.material);
-        assert_eq!(
-            incidental_guard.proof_status,
-            PacketObligationProofStatusDto::Reported
-        );
-        assert_eq!(
-            incidental_guard.carrier_paths,
-            vec!["src/incidental_transport.rs".to_string()]
-        );
-        assert!(
-            packet_obligation_open_next_candidates(&plan)
-                .contains(&"src/incidental_transport.rs".to_string()),
-            "the raw unproven guard receipt must exercise the terminal open-next gate"
-        );
-        let sufficiency = build_packet_sufficiency_with_obligation_context(
-            Path::new("/workspace/example"),
-            question,
-            PacketTaskClassDto::SymbolOwnership,
-            &answer,
-            &budget(),
-            &[],
-            &[],
-            &plan,
-        );
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
-        assert!(
-            sufficiency
-                .covered_claims
-                .iter()
-                .any(|claim| claim.proof_status == Some(PacketProofStatusDto::Proven))
-        );
-        assert!(
-            !sufficiency
-                .avoid_opening_paths
-                .contains(&"src/incidental_transport.rs".to_string()),
-            "an unproven incidental guard carrier cannot become avoid-opening"
-        );
-        let coverage = sufficiency
-            .coverage_report
-            .as_ref()
-            .expect("sufficiency publishes claim-level blockers");
-        assert!(
-            coverage.ineligible.iter().any(|entry| {
-                entry.contains("RuntimeService::run") && entry.contains("claim marked diagnostic")
-            }),
-            "the per-file safety blocker must remain visible: {coverage:?}"
-        );
-        assert!(
-            sufficiency.open_next.is_empty(),
-            "Sufficient is terminal even when a nonmaterial Reported guard carries a path: {sufficiency:?}"
-        );
-    }
-
-    #[test]
     fn qualified_binding_requires_the_requested_owner_and_member() {
         assert!(citation_display_matches_requested_identity(
             "RuntimeService::run",
@@ -2913,129 +2348,6 @@ mod tests {
             "Widget::~Widget",
             "Widget::Widget"
         ));
-    }
-
-    #[test]
-    fn case_distinct_exact_symbols_need_separate_carriers() {
-        let question = "Find Foo::run and foo::run.";
-        let mut answer = answer_with_call_edge(question, "Foo::run", "src/runtime.rs");
-        for query in ["Foo::run", "foo::run"] {
-            answer
-                .retrieval_trace
-                .packet_sidecar_diagnostics
-                .push(query_diagnostic(query, PacketQueryCompletionDto::Completed));
-        }
-        let mut plan =
-            build_packet_obligation_plan(question, PacketTaskClassDto::SymbolOwnership, &[]);
-
-        assert!(
-            plan.query_obligations
-                .iter()
-                .any(|obligation| { obligation.material && obligation.query == "Foo::run" })
-        );
-        assert!(
-            plan.query_obligations
-                .iter()
-                .any(|obligation| { obligation.material && obligation.query == "foo::run" })
-        );
-        finalize_packet_obligation_plan(
-            question,
-            PacketTaskClassDto::SymbolOwnership,
-            &mut plan,
-            &answer,
-            &budget(),
-        );
-
-        let upper = plan
-            .claim_obligations
-            .iter()
-            .find(|obligation| obligation.binding_terms == ["Foo::run"])
-            .unwrap();
-        let lower = plan
-            .claim_obligations
-            .iter()
-            .find(|obligation| obligation.binding_terms == ["foo::run"])
-            .unwrap();
-        assert_eq!(upper.proof_status, PacketObligationProofStatusDto::Proven);
-        assert_eq!(
-            lower.proof_status,
-            PacketObligationProofStatusDto::Unsupported
-        );
-        assert!(lower.carrier_node_ids.is_empty());
-        assert!(!material_packet_obligations_are_proven(&plan));
-
-        let sufficiency = build_packet_sufficiency_with_obligation_context(
-            Path::new("/workspace/example"),
-            question,
-            PacketTaskClassDto::SymbolOwnership,
-            &answer,
-            &budget(),
-            &[],
-            &[],
-            &plan,
-        );
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
-    }
-
-    #[test]
-    fn case_distinct_slash_qualified_symbols_need_separate_carriers() {
-        let question = "Find Foo/run and foo/run.";
-        let mut answer = answer_with_call_edge(question, "Foo/run", "src/runtime.rs");
-        for query in ["Foo/run", "foo/run"] {
-            answer
-                .retrieval_trace
-                .packet_sidecar_diagnostics
-                .push(query_diagnostic(query, PacketQueryCompletionDto::Completed));
-        }
-        let mut plan =
-            build_packet_obligation_plan(question, PacketTaskClassDto::SymbolOwnership, &[]);
-
-        for expected in ["Foo/run", "foo/run"] {
-            assert!(
-                plan.query_obligations
-                    .iter()
-                    .any(|obligation| { obligation.material && obligation.query == expected })
-            );
-            assert!(plan.claim_obligations.iter().any(|obligation| {
-                obligation.material && obligation.binding_terms == [expected]
-            }));
-        }
-        finalize_packet_obligation_plan(
-            question,
-            PacketTaskClassDto::SymbolOwnership,
-            &mut plan,
-            &answer,
-            &budget(),
-        );
-
-        let upper = plan
-            .claim_obligations
-            .iter()
-            .find(|obligation| obligation.binding_terms == ["Foo/run"])
-            .unwrap();
-        let lower = plan
-            .claim_obligations
-            .iter()
-            .find(|obligation| obligation.binding_terms == ["foo/run"])
-            .unwrap();
-        assert_eq!(upper.proof_status, PacketObligationProofStatusDto::Proven);
-        assert_eq!(
-            lower.proof_status,
-            PacketObligationProofStatusDto::Unsupported
-        );
-        assert!(lower.carrier_node_ids.is_empty());
-
-        let sufficiency = build_packet_sufficiency_with_obligation_context(
-            Path::new("/workspace/example"),
-            question,
-            PacketTaskClassDto::SymbolOwnership,
-            &answer,
-            &budget(),
-            &[],
-            &[],
-            &plan,
-        );
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
     }
 
     #[test]
@@ -3126,165 +2438,6 @@ mod tests {
             PacketObligationProofStatusDto::Unsupported
         );
         assert!(missing.carrier_node_ids.is_empty());
-    }
-
-    #[test]
-    fn one_proven_claim_cannot_hide_an_unproven_claim_in_the_same_file() {
-        let question = "Find RuntimeService::run and CliErrorBody.";
-        let shared_path = "src/runtime_service.rs";
-        let mut carrier = citation("RuntimeService::run", shared_path, NodeKind::METHOD);
-        carrier.evidence_edge_ids = vec![EdgeId("generic-call".to_string())];
-        let false_carrier = citation("CliErrorBody", shared_path, NodeKind::STRUCT);
-        let target = citation("Worker::run", "src/worker.rs", NodeKind::METHOD);
-        let mut answer = answer(vec![carrier.clone(), false_carrier, target.clone()]);
-        answer.prompt = question.to_string();
-        answer.graphs.push(GraphArtifactDto::Uml {
-            id: "generic-flow".to_string(),
-            title: "Generic flow".to_string(),
-            graph: GraphResponse {
-                center_id: carrier.node_id.clone(),
-                nodes: Vec::new(),
-                edges: vec![GraphEdgeDto {
-                    id: EdgeId("generic-call".to_string()),
-                    source: carrier.node_id,
-                    target: target.node_id,
-                    kind: EdgeKind::CALL,
-                    confidence: Some(1.0),
-                    certainty: Some("certain".to_string()),
-                    callsite_identity: Some("test:1".to_string()),
-                    candidate_targets: Vec::new(),
-                }],
-                truncated: false,
-                omitted_edge_count: 0,
-                canonical_layout: None,
-            },
-        });
-        let mut plan =
-            build_packet_obligation_plan(question, PacketTaskClassDto::SymbolOwnership, &[]);
-        finalize_packet_obligation_plan(
-            question,
-            PacketTaskClassDto::SymbolOwnership,
-            &mut plan,
-            &answer,
-            &budget(),
-        );
-        assert!(plan.claim_obligations.iter().any(|obligation| {
-            obligation.proof_status == PacketObligationProofStatusDto::Proven
-                && obligation
-                    .carrier_paths
-                    .iter()
-                    .any(|path| path == shared_path)
-        }));
-        assert!(plan.claim_obligations.iter().any(|obligation| {
-            obligation.proof_status == PacketObligationProofStatusDto::Reported
-                && obligation
-                    .carrier_paths
-                    .iter()
-                    .any(|path| path == shared_path)
-        }));
-
-        let sufficiency = build_packet_sufficiency_with_obligation_context(
-            Path::new("/workspace/example"),
-            question,
-            PacketTaskClassDto::SymbolOwnership,
-            &answer,
-            &budget(),
-            &[],
-            &[],
-            &plan,
-        );
-
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
-        assert!(!material_packet_obligations_are_proven(&plan));
-        assert!(
-            !sufficiency
-                .avoid_opening_paths
-                .iter()
-                .any(|path| path == shared_path),
-            "a file with an unproven claim must remain openable: {sufficiency:?}"
-        );
-        assert!(
-            sufficiency
-                .open_next
-                .iter()
-                .any(|command| command.contains(shared_path)),
-            "the unproven same-file claim must stay open-next: {sufficiency:?}"
-        );
-    }
-
-    #[test]
-    fn missing_requested_claim_gets_a_material_unsupported_obligation() {
-        let question = "Find RuntimeService::run and MissingWidget.";
-        let mut carrier = citation(
-            "RuntimeService::run",
-            "src/runtime_service.rs",
-            NodeKind::METHOD,
-        );
-        carrier.evidence_edge_ids = vec![EdgeId("generic-call".to_string())];
-        let target = citation("Worker::run", "src/worker.rs", NodeKind::METHOD);
-        let mut answer = answer(vec![carrier.clone(), target.clone()]);
-        answer.prompt = question.to_string();
-        answer.graphs.push(GraphArtifactDto::Uml {
-            id: "generic-flow".to_string(),
-            title: "Generic flow".to_string(),
-            graph: GraphResponse {
-                center_id: carrier.node_id.clone(),
-                nodes: Vec::new(),
-                edges: vec![GraphEdgeDto {
-                    id: EdgeId("generic-call".to_string()),
-                    source: carrier.node_id,
-                    target: target.node_id,
-                    kind: EdgeKind::CALL,
-                    confidence: Some(1.0),
-                    certainty: Some("certain".to_string()),
-                    callsite_identity: Some("test:1".to_string()),
-                    candidate_targets: Vec::new(),
-                }],
-                truncated: false,
-                omitted_edge_count: 0,
-                canonical_layout: None,
-            },
-        });
-        let mut plan =
-            build_packet_obligation_plan(question, PacketTaskClassDto::SymbolOwnership, &[]);
-        finalize_packet_obligation_plan(
-            question,
-            PacketTaskClassDto::SymbolOwnership,
-            &mut plan,
-            &answer,
-            &budget(),
-        );
-
-        let missing = plan
-            .claim_obligations
-            .iter()
-            .find(|obligation| obligation.binding_terms == ["MissingWidget"])
-            .expect("material obligation for the missing requested claim");
-        assert!(missing.material);
-        assert_eq!(
-            missing.proof_status,
-            PacketObligationProofStatusDto::Unsupported
-        );
-        assert!(missing.carrier_node_ids.is_empty());
-        assert!(!material_packet_obligations_are_proven(&plan));
-
-        let sufficiency = build_packet_sufficiency_with_obligation_context(
-            Path::new("/workspace/example"),
-            question,
-            PacketTaskClassDto::SymbolOwnership,
-            &answer,
-            &budget(),
-            &[],
-            &[],
-            &plan,
-        );
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
-        assert!(
-            sufficiency
-                .open_next
-                .iter()
-                .any(|command| command.contains("MissingWidget"))
-        );
     }
 
     #[test]
@@ -3496,110 +2649,6 @@ mod tests {
                     "{obligation_kind:?} {rejected:?}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn false_shape_carrier_stays_reported_partial_and_open_next() {
-        let false_carrier = citation(
-            "CliErrorBody",
-            "crates/example/src/indexer/runtime.rs",
-            NodeKind::STRUCT,
-        );
-        let answer = answer(vec![false_carrier]);
-        let budget = budget();
-        let mut plan = indexing_entrypoint_plan();
-        finalize_packet_obligation_plan(
-            INDEXING_QUESTION,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &mut plan,
-            &answer,
-            &budget,
-        );
-
-        assert_eq!(
-            plan.claim_obligations[0].proof_status,
-            PacketObligationProofStatusDto::Reported
-        );
-        assert_eq!(
-            plan.claim_obligations[0].reason.as_deref(),
-            Some("carrier_does_not_satisfy_role_contract")
-        );
-        let sufficiency = build_packet_sufficiency_with_obligation_context(
-            Path::new("/workspace/example"),
-            INDEXING_QUESTION,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &answer,
-            &budget,
-            &[],
-            &[],
-            &plan,
-        );
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
-        assert!(sufficiency.avoid_opening_paths.is_empty());
-        assert!(
-            sufficiency
-                .open_next
-                .iter()
-                .any(|command| command.contains("crates/example/src/indexer/runtime.rs"))
-        );
-    }
-
-    #[test]
-    fn known_false_carriers_publish_no_proven_claims_and_stay_open_next() {
-        let question =
-            "Explain CliErrorBody, runtime_path, and CompilationDatabase responsibilities.";
-        let false_carriers = vec![
-            citation("CliErrorBody", "src/cli/errors.rs", NodeKind::STRUCT),
-            citation("runtime_path", "src/runtime/config.rs", NodeKind::VARIABLE),
-            citation(
-                "CompilationDatabase",
-                "src/store/database.rs",
-                NodeKind::CLASS,
-            ),
-        ];
-        let mut answer = answer(false_carriers.clone());
-        answer.prompt = question.to_string();
-        let budget = budget();
-        let mut plan =
-            build_packet_obligation_plan(question, PacketTaskClassDto::SymbolOwnership, &[]);
-        finalize_packet_obligation_plan(
-            question,
-            PacketTaskClassDto::SymbolOwnership,
-            &mut plan,
-            &answer,
-            &budget,
-        );
-
-        let sufficiency = build_packet_sufficiency_with_obligation_context(
-            Path::new("/workspace/example"),
-            question,
-            PacketTaskClassDto::SymbolOwnership,
-            &answer,
-            &budget,
-            &[],
-            &[],
-            &plan,
-        );
-
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
-        assert!(
-            sufficiency
-                .covered_claims
-                .iter()
-                .all(|claim| { claim.proof_status != Some(PacketProofStatusDto::Proven) })
-        );
-        assert!(sufficiency.avoid_opening_paths.is_empty());
-        for carrier in false_carriers {
-            let path = carrier.file_path.expect("false carrier path");
-            assert!(
-                sufficiency
-                    .open_next
-                    .iter()
-                    .any(|command| command.contains(&path)),
-                "{path} must remain open-next: {:?}",
-                sufficiency.open_next
-            );
         }
     }
 
@@ -3822,47 +2871,6 @@ mod tests {
         assert_eq!(
             packet_proven_obligation_carrier_paths(&plan),
             vec!["crates/example/src/indexer.rs".to_string()]
-        );
-    }
-
-    #[test]
-    fn missing_carrier_keeps_requested_path_as_open_next_candidate() {
-        let queries = [PacketPlanQueryDto {
-            query: "src/indexer.rs".to_string(),
-            purpose: "explicit symbol probe from packet request".to_string(),
-        }];
-        let mut plan = build_packet_obligation_plan(
-            INDEXING_QUESTION,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &queries,
-        );
-        plan.claim_obligations
-            .retain(|obligation| obligation.id == "indexing_entrypoint");
-        let answer = answer(Vec::new());
-        let budget = budget();
-        finalize_packet_obligation_plan(
-            INDEXING_QUESTION,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &mut plan,
-            &answer,
-            &budget,
-        );
-        let sufficiency = build_packet_sufficiency_with_obligation_context(
-            Path::new("/workspace/example"),
-            INDEXING_QUESTION,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &answer,
-            &budget,
-            &[],
-            &[],
-            &plan,
-        );
-
-        assert!(
-            sufficiency
-                .open_next
-                .iter()
-                .any(|command| command.contains("src/indexer.rs"))
         );
     }
 

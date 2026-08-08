@@ -1,4 +1,4 @@
-//! Packet planning, extracted from `codestory-runtime`.
+//! Packet planning contracts and policy.
 //!
 //! This crate decides *what to ask for*: the terms a prompt carries, the flow
 //! requirements a task class implies, the evidence roles and carriers a
@@ -17,11 +17,16 @@
 pub mod eval_probes;
 pub mod packet_citations;
 pub mod packet_command;
+pub mod packet_command_profiles;
+pub mod packet_evidence;
 pub mod packet_evidence_carriers;
 pub mod packet_evidence_roles;
 pub mod packet_execution_graphs;
 pub mod packet_flow_requirements;
+pub mod packet_obligations;
+pub mod packet_plan;
 pub mod packet_probes;
+pub mod packet_required_probes;
 pub mod packet_scoring;
 pub mod packet_terms;
 pub mod pinned_reader;
