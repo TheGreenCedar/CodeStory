@@ -1118,6 +1118,27 @@ const structuralPinMessages = {
     row => `${row.file} must cancel superseded proof runs before starting release work`,
   release_pull_requests_read:
     row => `${row.file} must grant the exact source resolver pull-request metadata access`,
+  packaged_platform_pr_actions_write:
+    row => `${row.file} must cancel superseded proof runs before package or hardware work`,
+  packaged_platform_pr_contents_read:
+    row => `${row.file} must use read-only contents permission`,
+  packaged_platform_pr_macos_metal_proof_needs:
+    row => `${row.file} Metal proof must wait only for routing and package proof`,
+  packaged_platform_pr_windows_vulkan_proof_needs:
+    row => `${row.file} Windows qualification must run independently of optional Metal quality`,
+  packaged_platform_pr_linux_vulkan_proof_needs:
+    row => `${row.file} Linux Vulkan proof must wait only for routing and package proof`,
+  packaged_platform_pr_closeout_needs:
+    row => `${row.file} closeout must wait for every selected platform proof`,
+  freeze_barrier_source_proof_statuses_write:
+    () => "[freeze_barrier] source-proof.yml acceptance must publish an exact-head commit status",
+  freeze_barrier_source_proof_actions_write:
+    row => `[freeze_barrier] ${row.file} must be able to cancel superseded runs`,
+  freeze_barrier_packaged_platform_pr_statuses_read:
+    () =>
+      "[freeze_barrier] packaged-platform-pr.yml must authenticate the exact-head freeze status without broad workflow authority",
+  freeze_barrier_packaged_platform_pr_actions_write:
+    row => `[freeze_barrier] ${row.file} must be able to cancel superseded runs`,
 };
 
 export function structuralPinViolations(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
@@ -5422,33 +5443,24 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     `${file} dispatch scopes changed`,
   );
   add(violations, trigger(workflow, "pull_request_target") === undefined, `${file} must not use pull_request_target`);
-  add(
-    violations,
-    object(workflow.permissions).actions === "write",
-    `${file} must cancel superseded proof runs before package or hardware work`,
-  );
-  add(violations, object(workflow.permissions).contents === "read", `${file} must use read-only contents permission`);
-  const route = requireJob(violations, file, workflow, "route");
+  // The workflow-scoped permission grants (actions write for superseded-run
+  // cancellation, read-only contents) are rule instances and live in
+  // release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates them with their reviewed violation text.
+  // The route job's structural pin (job existence) is a rule instance and
+  // lives in the same block. Its step fragments - the trusted-head resolver
+  // conjuncts, the freeze verification, the exact-head source proof, the
+  // change-aware scope selection, and the calibration producer authentication
+  // - are rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const route = object(object(workflow.jobs).route);
   add(
     violations,
     route.if === undefined,
     `${file} route job must execute only explicit dispatches`,
   );
-  requireStepRun(violations, file, route, "Resolve trusted exact head", [
-    'test "$head_repo" = "$GITHUB_REPOSITORY"',
-    'test "$current_head" = "$EVENT_HEAD_SHA"',
-    'test "$INPUT_HEAD_SHA" = "$current_head"',
-    'test "$GITHUB_REF" = "refs/heads/$head_ref"',
-    'test "$GITHUB_SHA" = "$INPUT_HEAD_SHA"',
-    'test "$base_ref" = "dev/codestory-next"',
-    'test "$INPUT_HEAD_SHA" = "$dev_head"',
-    'test "$GITHUB_REF" = "refs/heads/dev/codestory-next"',
-    'test "$GITHUB_SHA" = "$dev_head"',
-    'elif [ "$mode" = "qualification" ]; then',
-    'test -n "$INPUT_CALIBRATION_ARTIFACT"',
-    'test -n "$INPUT_CALIBRATION_RUN_ID"',
-    "--ref $head_ref",
-  ]);
+  // DISPOSITION: step env bindings have no graph evaluator, so the resolver's
+  // calibration input bindings stay code.
   requireStepEnv(violations, file, route, "Resolve trusted exact head", {
     INPUT_CALIBRATION_ARTIFACT: "${{ inputs.calibration_bundle_artifact }}",
     INPUT_CALIBRATION_RUN_ID: "${{ inputs.calibration_bundle_run_id }}",
@@ -5458,16 +5470,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     namedStep(route, "Require executable release freeze")?.if === undefined,
     `${file} every broad proof mode must authenticate its exact candidate head`,
   );
-  requireStepRun(violations, file, route, "Require executable release freeze", [
-    "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA",
-    "release-freeze-barrier.mjs verify-status",
-    '--commit "$HEAD_SHA"',
-    'if [ "$RESOLVED_MODE" = calibration ]; then',
-    "freeze_phase=calibration_source",
-    "freeze_phase=frozen_candidate",
-    '--phase "$freeze_phase"',
-    '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
-  ]);
+  // DISPOSITION: step env bindings have no graph evaluator, so the freeze
+  // step's resolved-mode binding stays code.
   requireStepEnv(violations, file, route, "Require executable release freeze", {
     RESOLVED_MODE: "${{ steps.resolve.outputs.mode }}",
   });
@@ -5478,25 +5482,10 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       === "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'",
     `${file} calibration must precede the sole frozen-candidate source proof`,
   );
-  requireStepRun(violations, file, route, "Require successful exact-head source proof", [
-    "actions/runs?head_sha=$HEAD_SHA",
-    '.path == ".github/workflows/source-proof.yml"',
-    '.event == "workflow_dispatch" and .conclusion == "success"',
-    '.name == "full-source-gate" and .conclusion == "success"',
-  ]);
-  requireStepRun(violations, file, route, "Select change-aware proof scope", [
-    'if [ "$REQUESTED_SCOPE" = none ] || [ "$REQUESTED_SCOPE" = linux ]; then',
-    'elif [ "$RESOLVED_MODE" = "package" ]; then',
-    'test "$REQUESTED_SCOPE" != none',
-    'if [ "$REQUESTED_SCOPE" = auto ]; then',
-    'elif [ "$RESOLVED_MODE" = "qualification" ]; then',
-    'test "$REQUESTED_SCOPE" = auto || test "$REQUESTED_SCOPE" = full',
-    'scope="$REQUESTED_SCOPE"',
-    "scope=full",
-    "node .github/scripts/route-ci-proof.mjs --stdin",
-  ]);
   // The mode the scope selector branches on now arrives as a variable, so the branch text alone no
   // longer says which mode it read. This binds the variable back to the resolver's own output.
+  // DISPOSITION: step env bindings have no graph evaluator, so the binding
+  // stays code.
   requireStepEnv(violations, file, route, "Select change-aware proof scope", {
     RESOLVED_MODE: "${{ steps.resolve.outputs.mode }}",
   });
@@ -5518,7 +5507,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       ),
     `${file} standard coordinator must not gate release proof on constant-set freeze state`,
   );
-  requireCalibrationProducerAuthentication(violations, file, route);
   const routeSteps = list(route.steps).map(object);
   add(
     violations,
@@ -5531,7 +5519,10 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     at(workflow, "jobs", "calibration-linux") === undefined,
     `${file} calibration must not schedule hosted Linux CPU or wait for optional Linux Vulkan evidence`,
   );
-  const calibrationMacos = requireJob(violations, file, workflow, "calibration-macos");
+  // The calibration-macos job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const calibrationMacos = object(object(workflow.jobs)["calibration-macos"]);
   add(
     violations,
     calibrationMacos.uses === "./.github/workflows/macos-metal-proof.yml"
@@ -5543,12 +5534,13 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     at(workflow, "jobs", "macos-source") === undefined,
     `${file} standard coordinator must not add a macOS source hard gate`,
   );
-  const calibrationAssemble = requireJob(
-    violations,
-    file,
-    workflow,
-    "calibration-assemble",
-  );
+  // The calibration-assemble job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it. The
+  // assembler's step fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  const calibrationAssemble = object(object(workflow.jobs)["calibration-assemble"]);
   add(
     violations,
     sameMembers(needs(calibrationAssemble), ["route", "calibration-macos"])
@@ -5611,28 +5603,14 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     calibrationAssemble,
     "Assemble frozen calibration candidate",
   );
-  requireStepRun(
-    violations,
-    file,
-    calibrationAssemble,
-    "Assemble frozen calibration candidate",
-    [
-      "--assemble-calibration-bundle",
-      "find target/calibration-inputs/macos",
-      'test "${#runs[@]}" = 3',
-      ".run_count == 3",
-      ".matrix_cell_count == 1",
-      "--calibration-producer-workflow-path",
-      "--calibration-producer-run-id",
-      "--calibration-producer-artifact",
-    ],
-  );
   add(
     violations,
     !scalarStrings(calibrationAssemble).some(value => value.toLowerCase().includes("linux"))
       && !calibrationAssemblyRun.includes("find target/calibration-inputs -type"),
     `${file} calibration assembly must not select, discover, or gate on Linux evidence`,
   );
+  // DISPOSITION: step uses pins have no graph evaluator, so the upload action
+  // pin stays code.
   requireStepUses(
     violations,
     file,
@@ -5649,7 +5627,10 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       === "embedding-calibration-bundle-${{ needs.route.outputs.head_sha }}",
     `${file} calibration artifact name must bind the exact source head`,
   );
-  const packaged = requireJob(violations, file, workflow, "packaged-proof");
+  // The packaged-proof job's structural pin (job existence) is a rule instance
+  // and lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it.
+  const packaged = object(object(workflow.jobs)["packaged-proof"]);
   add(violations, packaged.uses === "./.github/workflows/packaged-platform-proof.yml", `${file} must call packaged proof`);
   add(
     violations,
@@ -5688,12 +5669,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     `${file} package proof must not depend on optional release evidence`,
   );
   violations.push(...packagedPrSigningViolations(workflow));
-  const metal = requireJob(violations, file, workflow, "macos-metal-proof");
-  add(
-    violations,
-    sameMembers(needs(metal), ["route", "packaged-proof"]),
-    `${file} Metal proof must wait only for routing and package proof`,
-  );
+  // The macos-metal-proof job's structural pin (job existence) and its needs
+  // edge are rule instances and live in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates them
+  // with their reviewed violation text.
+  const metal = object(object(workflow.jobs)["macos-metal-proof"]);
   add(
     violations,
     String(metal.if ?? "").includes("needs.route.outputs.mode != 'package'"),
@@ -5713,12 +5693,13 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && object(metal.with).quality_evidence_artifact === undefined,
     `${file} qualification must run one full Metal lifecycle proof without optional quality inputs`,
   );
-  const qualityCaller = requireJob(
-    violations,
-    file,
-    workflow,
-    "frozen-candidate-quality",
-  );
+  // The frozen-candidate-quality job's structural pin (job existence) is a
+  // rule instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  // DISPOSITION: the caller's needs edge stays code because it is one conjunct
+  // of the single reviewed isolated-owner message below, which a needs pin
+  // could not reproduce without splitting the verdict.
+  const qualityCaller = object(object(workflow.jobs)["frozen-candidate-quality"]);
   add(
     violations,
     sameMembers(needs(qualityCaller), [
@@ -5761,7 +5742,13 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       ]),
     `${qualityFile} must remain a reusable-only, read-only evaluation owner`,
   );
-  const quality = requireJob(violations, qualityFile, qualityWorkflow, "quality");
+  // The quality job's structural pin (job existence) is a rule instance and
+  // lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it. Its candidate cache restore and
+  // miss-only transfer step fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  const quality = object(object(qualityWorkflow.jobs).quality);
   add(
     violations,
     JSON.stringify(quality["runs-on"])
@@ -5851,26 +5838,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && qualityCacheRestore?.["continue-on-error"] === undefined,
     `${qualityFile} cache lookup must consume only the exact small candidate record`,
   );
-  requireStepRun(
-    violations,
-    qualityFile,
-    quality,
-    "Restore exact candidate archive from protected host",
-    [
-      "--arg repository \"$GITHUB_REPOSITORY\"",
-      "--arg source_sha \"$(git rev-parse HEAD)\"",
-      "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
-      "--arg target macos-arm64",
-      ".source.commit == $source_sha",
-      ".source.tree == $source_tree",
-      ".target == $target",
-      "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
-      "candidate-archive-store.mjs restore",
-      "--record \"$record\"",
-      "--output-dir target/release-dist",
-      "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\"",
-    ],
-  );
   add(
     violations,
     qualityCacheMiss?.if === "steps.candidate-cache.outputs.hit != 'true'"
@@ -5890,23 +5857,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
         === "${{ steps.candidate-artifacts.outputs.package-sha256 }}"
       && object(qualityCacheMiss?.env).GH_TOKEN === "${{ github.token }}",
     `${qualityFile} archive transfer must be cache-miss-only and outer-digest authenticated`,
-  );
-  requireStepRun(
-    violations,
-    qualityFile,
-    quality,
-    "Download, authenticate, and admit candidate archive on miss",
-    [
-      "actions/artifacts/$ARTIFACT_ID/zip",
-      "--continue-at -",
-      "--max-time 120",
-      'test "$actual_size" = "$EXPECTED_SIZE"',
-      'test "$actual_digest" = "$EXPECTED_SHA256"',
-      "extract-candidate-actions-artifact.py",
-      "candidate-archive-store.mjs admit",
-      "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
-      "--output-dir target/release-dist",
-    ],
   );
   const qualityProducer = qualitySteps.find(step => step.id === "quality");
   const qualityProducerRun = shellLiteralNormalizedText(
@@ -6013,12 +5963,10 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       ),
     `${qualityFile} must report both outcomes without becoming a qualification or release gate`,
   );
-  const windowsQuality = requireJob(
-    violations,
-    qualityFile,
-    qualityWorkflow,
-    "windows-quality",
-  );
+  // The windows-quality job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const windowsQuality = object(object(qualityWorkflow.jobs)["windows-quality"]);
   const windowsQualitySteps = list(windowsQuality.steps).map(object);
   const windowsQualityProducer = windowsQualitySteps.find(
     step => step.id === "windows-quality",
@@ -6063,7 +6011,10 @@ function validatePackagedCoordinator(workflows, violations, graph) {
         === "always()",
     `${qualityFile} optional Windows x64 Ripgrep quality must retain isolated non-gating measurement and upload boundaries`,
   );
-  const linuxQuality = requireJob(violations, qualityFile, qualityWorkflow, "linux-quality");
+  // The linux-quality job's structural pin (job existence) is a rule instance
+  // and lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it.
+  const linuxQuality = object(object(qualityWorkflow.jobs)["linux-quality"]);
   const linuxQualitySteps = list(linuxQuality.steps).map(object);
   const linuxQualityProducer = linuxQualitySteps.find(step => step.id === "linux-quality");
   const linuxQualityRun = shellLiteralNormalizedText(String(linuxQualityProducer?.run ?? ""));
@@ -6096,12 +6047,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && !linuxQualityRun.includes("--task-ids"),
     `${qualityFile} optional Linux x64 quality must run the same isolated Axios v2 smoke entrypoint`,
   );
-  const vulkan = requireJob(violations, file, workflow, "windows-vulkan-proof");
-  add(
-    violations,
-    sameMembers(needs(vulkan), ["route", "packaged-proof"]),
-    `${file} Windows qualification must run independently of optional Metal quality`,
-  );
+  // The windows-vulkan-proof job's structural pin (job existence) and its
+  // needs edge are rule instances and live in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates them
+  // with their reviewed violation text.
+  const vulkan = object(object(workflow.jobs)["windows-vulkan-proof"]);
   add(
     violations,
     String(vulkan.if ?? "").includes("needs.route.outputs.mode != 'package'")
@@ -6126,12 +6076,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       === "${{ needs.route.outputs.mode != 'qualification' }}",
     `${file} qualification must run full Windows lifecycle and fault proof`,
   );
-  const linuxVulkan = requireJob(violations, file, workflow, "linux-vulkan-proof");
-  add(
-    violations,
-    sameMembers(needs(linuxVulkan), ["route", "packaged-proof"]),
-    `${file} Linux Vulkan proof must wait only for routing and package proof`,
-  );
+  // The linux-vulkan-proof job's structural pin (job existence) and its needs
+  // edge are rule instances and live in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates them
+  // with their reviewed violation text.
+  const linuxVulkan = object(object(workflow.jobs)["linux-vulkan-proof"]);
   add(
     violations,
     String(linuxVulkan.if ?? "").includes("needs.route.outputs.mode != 'package'")
@@ -6153,19 +6102,13 @@ function validatePackagedCoordinator(workflows, violations, graph) {
         === ".github/workflows/packaged-platform-pr.yml",
     `${file} Linux proof must close Vulkan and candidate-installed claims without optional evaluation`,
   );
-  const closeout = requireJob(violations, file, workflow, "closeout");
-  add(
-    violations,
-    sameMembers(needs(closeout), [
-      "route",
-      "source-proof",
-      "packaged-proof",
-      "macos-metal-proof",
-      "windows-vulkan-proof",
-      "linux-vulkan-proof",
-    ]),
-    `${file} closeout must wait for every selected platform proof`,
-  );
+  // The closeout job's structural pin (job existence) and its needs edge are
+  // rule instances and live in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates them
+  // with their reviewed violation text. The closeout's mode-shape proof
+  // fragments are rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const closeout = object(object(workflow.jobs).closeout);
   add(
     violations,
     closeout.if
@@ -6217,19 +6160,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       ),
     `${file} closeout proof must bind every route and platform result from the reviewed jobs exactly`,
   );
-  requireStepRun(violations, file, closeout, "Require one coherent accepted proof", [
-    'if [ "$MODE" = package ]',
-    'require_result "$PACKAGE_RESULT" success packaged-proof',
-    'require_result "$METAL_RESULT" skipped macos-metal-proof',
-    'if [ "$SCOPE" = none ]',
-    '[ "$SCOPE" = linux ]',
-    "WINDOWS_VULKAN_RESULT",
-    "LINUX_VULKAN_RESULT",
-    'if [ "$MODE" = qualification ]; then',
-    'require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof',
-    'require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof',
-    "dev/codestory-next moved from proved head",
-  ]);
   add(
     violations,
     /if\s+\[\s*"\$MODE"\s*=\s*qualification\s*\];\s*then\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+skipped\s+linux-vulkan-proof\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+fi/um
@@ -8298,12 +8228,14 @@ export function releaseFreezeBarrierWorkflowViolations(
       && at(invalidation, "concurrency", "cancel-in-progress") === true,
     "[freeze_barrier] release freeze invalidation must run automatically when a candidate head is superseded",
   );
-  const invalidationJob = requireJob(
-    violations,
-    invalidationFile,
-    invalidation,
-    "invalidate",
-  );
+  // The invalidate job's structural pin (job existence) is a rule instance and
+  // lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it. Its revocation step fragments (both
+  // the required superseded-head revocation conjuncts and the forbidden
+  // pending-state reuse) are rule instances and live in release-claims.json
+  // under workflow_policy.step_fragments; stepFragmentViolations evaluates
+  // them.
+  const invalidationJob = object(object(invalidation.jobs).invalidate);
   add(
     violations,
     invalidationJob["runs-on"] === "ubuntu-latest"
@@ -8317,39 +8249,8 @@ export function releaseFreezeBarrierWorkflowViolations(
       ),
     "[freeze_barrier] release freeze invalidation must remain one bounded cancellation job",
   );
-  requireStepRun(
-    violations,
-    invalidationFile,
-    invalidationJob,
-    "Invalidate a superseded release freeze",
-    [
-      'test "$BEFORE_SHA" != "$AFTER_SHA"',
-      "commits/$BEFORE_SHA/statuses?per_page=100",
-      '.state == "success"',
-      'startswith("codestory/release-freeze/")',
-      'if [ -z "$freeze_contexts" ]; then',
-      '"repos/$GITHUB_REPOSITORY/statuses/$BEFORE_SHA"',
-      "-f state=error",
-      '-f "context=$context"',
-      '-f "description=superseded-by=$AFTER_SHA"',
-      "release-freeze-barrier.mjs invalidate-superseded",
-      '--commit "$AFTER_SHA"',
-      '--broad-workflow "Exact-head source proof"',
-      '--broad-workflow "Platform and integration proof"',
-      '--broad-workflow "Release"',
-      '--broad-workflow "Auto Release"',
-    ],
-  );
-  forbidStepRun(
-    violations,
-    invalidationFile,
-    invalidationJob,
-    "Invalidate a superseded release freeze",
-    [
-      '.state == "pending"',
-      ".state == 'pending'",
-    ],
-  );
+  // DISPOSITION: step env bindings have no graph evaluator, so the
+  // invalidation step's event bindings stay code.
   requireStepEnv(
     violations,
     invalidationFile,
@@ -8466,38 +8367,23 @@ export function releaseFreezeBarrierWorkflowViolations(
             === undefined,
         "[freeze_barrier] source-proof.yml must separate acceptance from broad proof",
       );
-      add(
-        violations,
-        object(workflow.permissions).statuses === "write",
-        "[freeze_barrier] source-proof.yml acceptance must publish an exact-head commit status",
-      );
-    } else {
-      add(
-        violations,
-        object(workflow.permissions).statuses === "read",
-        "[freeze_barrier] packaged-platform-pr.yml must authenticate the exact-head freeze status without broad workflow authority",
-      );
     }
-    add(
-      violations,
-      object(workflow.permissions).actions === "write",
-      `[freeze_barrier] ${file} must be able to cancel superseded runs`,
-    );
+    // The freeze family's workflow-scoped permission pins (statuses write for
+    // the acceptance publisher, statuses read for the packaged authenticator,
+    // actions write for superseded-run cancellation on both coordinators) are
+    // rule instances and live in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates them
+    // with their reviewed violation text. The cancel-superseded step fragments
+    // for both coordinator jobs are rule instances and live in
+    // release-claims.json under workflow_policy.step_fragments;
+    // stepFragmentViolations evaluates them.
+    // DISPOSITION: the retired inline call re-required each coordinator job,
+    // so a workflow without one reported that violation beside the family
+    // pin's own occurrence. The job-existence rules live in their structural
+    // pins; this duplicate occurrence stays code so the reviewed verdict
+    // multiset is unchanged.
     const coordinatorJob = file === "source-proof.yml" ? "resolve" : "route";
-    requireStepRun(
-      violations,
-      file,
-      requireJob(violations, file, workflow, coordinatorJob),
-      "Cancel superseded proof runs",
-      [
-        "release-freeze-barrier.mjs cancel-superseded",
-        '--commit "$HEAD_SHA"',
-        '--broad-workflow "Exact-head source proof"',
-        '--broad-workflow "Platform and integration proof"',
-        '--broad-workflow "Release"',
-        '--broad-workflow "Auto Release"',
-      ],
-    );
+    requireJob(violations, file, workflow, coordinatorJob);
   }
 
   const sourceWorkflow = workflows.get("source-proof.yml");
@@ -8533,6 +8419,9 @@ export function releaseFreezeBarrierWorkflowViolations(
       `[freeze_barrier] source-proof.yml ${jobName} must match the canonical acceptance job manifest`,
     );
   }
+  // DISPOSITION: the receipt producer's job-existence rule lives in the
+  // source family's structural pin; this duplicate occurrence stays code so
+  // the reviewed verdict multiset is unchanged.
   const sourceResolve = requireJob(
     violations,
     "source-proof.yml",
@@ -8553,31 +8442,11 @@ export function releaseFreezeBarrierWorkflowViolations(
     recordReceipt?.if === "${{ inputs.acceptance_only }}",
     "[freeze_barrier] Actions may generate a release freeze receipt only in acceptance mode",
   );
-  requireStepRun(
-    violations,
-    "source-proof.yml",
-    sourceResolve,
-    "Record executable release freeze",
-    [
-      'test -z "$CALLER_FREEZE_RECEIPT_DIGEST"',
-      "release-freeze-barrier.mjs record-actions-receipt",
-      '--repository "$GITHUB_REPOSITORY"',
-      '--repo "$GITHUB_WORKSPACE"',
-      '--branch "$GITHUB_REF_NAME"',
-      '--commit "$HEAD_SHA"',
-      '--tree "$tree"',
-      '--release-pr "$PR_NUMBER"',
-      '--support-prs-json "$SUPPORT_PRS_JSON"',
-      '--reusable-evidence-json "$REUSABLE_EVIDENCE_JSON"',
-      '--invalidated-evidence-json "$INVALIDATED_EVIDENCE_JSON"',
-      '--cancelled-runs-json "$CANCELLED_RUNS_JSON"',
-      '--run-id "$GITHUB_RUN_ID"',
-      '--run-attempt "$GITHUB_RUN_ATTEMPT"',
-      '--phase "$ACCEPTANCE_PHASE"',
-      '--output "$RUNNER_TEMP/release-freeze-receipt.json"',
-      '--github-output "$GITHUB_OUTPUT"',
-    ],
-  );
+  // The receipt-recording step fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  // DISPOSITION: step env bindings have no graph evaluator, so the receipt
+  // step's input bindings stay code.
   requireStepEnv(
     violations,
     "source-proof.yml",
@@ -8620,19 +8489,12 @@ export function releaseFreezeBarrierWorkflowViolations(
     broadFreeze?.if === "${{ !inputs.acceptance_only }}",
     "[freeze_barrier] broad source proof must authenticate the accepted freeze",
   );
-  requireStepRun(
-    violations,
-    "source-proof.yml",
-    sourceResolve,
-    "Require executable release freeze",
-    [
-      "release-freeze-barrier.mjs verify-status",
-      '--commit "$HEAD_SHA"',
-      '--tree "$tree"',
-      "--phase frozen_candidate",
-      '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
-    ],
-  );
+  // The freeze family's verify-status fragments for this step are a rule
+  // instance and live in release-claims.json under
+  // workflow_policy.step_fragments beside the source family's own wider pin;
+  // stepFragmentViolations evaluates both.
+  // DISPOSITION: step env bindings have no graph evaluator, so the freeze
+  // step's digest and head bindings stay code.
   requireStepEnv(
     violations,
     "source-proof.yml",
@@ -8648,12 +8510,13 @@ export function releaseFreezeBarrierWorkflowViolations(
     !scalarStrings(sourceWorkflow).some(value => value.includes("verify-pending")),
     "[freeze_barrier] source proof must never accept a caller-authored pending status",
   );
-  const hostileJob = requireJob(
-    violations,
-    "source-proof.yml",
-    sourceWorkflow,
-    acceptance.hostile_job,
-  );
+  // The hostile mutation job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it. Its
+  // blocking suite fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  const hostileJob = object(object(sourceWorkflow.jobs)[acceptance.hostile_job]);
   add(
     violations,
     hostileJob.if === "inputs.acceptance_only"
@@ -8663,26 +8526,14 @@ export function releaseFreezeBarrierWorkflowViolations(
       && namedStep(hostileJob, acceptance.hostile_step)?.["continue-on-error"] !== true,
     "[freeze_barrier] source acceptance must execute the exact blocking hostile mutation job",
   );
-  requireStepRun(
-    violations,
-    "source-proof.yml",
-    hostileJob,
-    acceptance.hostile_step,
-    [
-      "node --test",
-      ".github/scripts/check-workflow-policy.test.mjs",
-      ".github/scripts/release-freeze-barrier.test.mjs",
-      ".github/scripts/cargo-build-artifacts.test.mjs",
-      ".github/scripts/candidate-archive-store.test.mjs",
-    ],
-  );
 
-  const windowsJob = requireJob(
-    violations,
-    "source-proof.yml",
-    sourceWorkflow,
-    acceptance.windows_job,
-  );
+  // The Windows probe job's structural pin (job existence) is a rule instance
+  // and lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it. Its probe step fragments (both the
+  // required hard-link identity legs and the forbidden inline-script variant)
+  // are rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const windowsJob = object(object(sourceWorkflow.jobs)[acceptance.windows_job]);
   const windowsProbePowerShell
     = `powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"`;
   add(
@@ -8696,44 +8547,13 @@ export function releaseFreezeBarrierWorkflowViolations(
       && namedStep(windowsJob, acceptance.windows_step)?.["continue-on-error"] !== true,
     "[freeze_barrier] source acceptance must execute the protected blocking Windows native probe",
   );
-  requireStepRun(
-    violations,
-    "source-proof.yml",
-    windowsJob,
-    acceptance.windows_step,
-    [
-      "cargo new --quiet --bin",
-      "cargo build --release --quiet",
-      "node --test .github/scripts/cargo-build-artifacts.test.mjs",
-      "const [root, deps] = process.argv.slice(2);",
-      "left.dev !== right.dev",
-      "left.ino !== right.ino",
-      "left.nlink !== 2n",
-      "right.nlink !== 2n",
-      '$identityScriptPath = Join-Path $probeRoot "verify-hardlink-identity.cjs"',
-      "Set-Content -LiteralPath $identityScriptPath -Value $identityScript -Encoding UTF8",
-      "node $identityScriptPath $rootExe $depsExe",
-      "Elapsed.TotalSeconds -ge 90",
-      "Remove-Item -LiteralPath $probeRoot -Recurse -Force",
-    ],
-  );
-  forbidStepRun(
-    violations,
-    "source-proof.yml",
-    windowsJob,
-    acceptance.windows_step,
-    [
-      "node -e $identityScript",
-      "process.argv.slice(1)",
-    ],
-  );
-
-  const publisherJob = requireJob(
-    violations,
-    "source-proof.yml",
-    sourceWorkflow,
-    acceptance.publisher_job,
-  );
+  // The acceptance publisher's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it. Its
+  // publication step fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  const publisherJob = object(object(sourceWorkflow.jobs)[acceptance.publisher_job]);
   add(
     violations,
     sameMembers(needs(publisherJob), [
@@ -8766,28 +8586,8 @@ export function releaseFreezeBarrierWorkflowViolations(
         < stepIndex(publisherJob, acceptance.publisher_step),
     "[freeze_barrier] acceptance publisher must download the exact Actions receipt before publication",
   );
-  requireStepRun(
-    violations,
-    "source-proof.yml",
-    publisherJob,
-    acceptance.publisher_step,
-    [
-      "release-freeze-barrier.mjs verify-file",
-      '--receipt "$RUNNER_TEMP/release-freeze-receipt/release-freeze-receipt.json"',
-      '--repository "$GITHUB_REPOSITORY"',
-      '--commit "$HEAD_SHA"',
-      '--tree "$tree"',
-      '--run-id "$GITHUB_RUN_ID"',
-      '--run-attempt "$GITHUB_RUN_ATTEMPT"',
-      '--phase "$ACCEPTANCE_PHASE"',
-      'test "$verified_digest" = "$FREEZE_RECEIPT_DIGEST"',
-      "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA",
-      "-f state=success",
-      "-f \"context=codestory/release-freeze/$FREEZE_RECEIPT_DIGEST\"",
-      "-f \"description=tree=$tree\"",
-      "actions/runs/$GITHUB_RUN_ID",
-    ],
-  );
+  // DISPOSITION: step env bindings have no graph evaluator, so the
+  // publisher's digest, head, and phase bindings stay code.
   requireStepEnv(
     violations,
     "source-proof.yml",
@@ -8811,27 +8611,21 @@ export function releaseFreezeBarrierWorkflowViolations(
   }
 
   const coordinator = workflows.get("packaged-platform-pr.yml");
+  // DISPOSITION: the route job-existence rule lives in the coordinator
+  // family's structural pin; this duplicate occurrence stays code so the
+  // reviewed verdict multiset is unchanged. The freeze family's own
+  // verify-status and exact-head source-proof fragments for the route job are
+  // rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments beside the coordinator family's wider
+  // pins; stepFragmentViolations evaluates them all.
   const route = requireJob(violations, "packaged-platform-pr.yml", coordinator, "route");
   add(
     violations,
     namedStep(route, "Require executable release freeze")?.if === undefined,
     "[freeze_barrier] every packaged proof mode must authenticate the exact candidate head",
   );
-  requireStepRun(
-    violations,
-    "packaged-platform-pr.yml",
-    route,
-    "Require executable release freeze",
-    [
-      "release-freeze-barrier.mjs verify-status",
-      '--commit "$HEAD_SHA"',
-      'if [ "$RESOLVED_MODE" = calibration ]; then',
-      "freeze_phase=calibration_source",
-      "freeze_phase=frozen_candidate",
-      '--phase "$freeze_phase"',
-      '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
-    ],
-  );
+  // DISPOSITION: step env bindings have no graph evaluator, so the freeze
+  // step's resolved-mode binding stays code.
   requireStepEnv(
     violations,
     "packaged-platform-pr.yml",
@@ -8848,23 +8642,10 @@ export function releaseFreezeBarrierWorkflowViolations(
       === "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'",
     "[freeze_barrier] calibration must precede the sole frozen-candidate source proof",
   );
-  requireStepRun(
-    violations,
-    "packaged-platform-pr.yml",
-    route,
-    "Require successful exact-head source proof",
-    [
-      "actions/runs?head_sha=$HEAD_SHA",
-      '.event == "workflow_dispatch" and .conclusion == "success"',
-      '.name == "full-source-gate" and .conclusion == "success"',
-    ],
-  );
-  const packagedSourceJob = requireJob(
-    violations,
-    "packaged-platform-pr.yml",
-    coordinator,
-    "source-proof",
-  );
+  // The coordinator source-proof job's structural pin (job existence) is a
+  // rule instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const packagedSourceJob = object(object(coordinator.jobs)["source-proof"]);
   add(
     violations,
     permissionMapMatches(packagedSourceJob.permissions, {
@@ -8890,33 +8671,14 @@ export function releaseFreezeBarrierWorkflowViolations(
       && object(at(auto, "jobs", "release", "permissions")).statuses === undefined,
     "[freeze_barrier] publication must reuse accepted frozen-candidate proof without an active status",
   );
+  // DISPOSITION: the preflight and source-proof job-existence rules live in
+  // the release family's structural pins; these duplicate occurrences stay
+  // code so the reviewed verdict multiset is unchanged. The freeze family's
+  // reuse-resolution fragments (both the required conjuncts and the forbidden
+  // freeze-status replay) are rule instances and live in release-claims.json
+  // under workflow_policy.step_fragments beside the release family's own
+  // pins; stepFragmentViolations evaluates them all.
   const preflight = requireJob(violations, "release.yml", release, "preflight");
-  requireStepRun(
-    violations,
-    "release.yml",
-    preflight,
-    "Resolve reusable prior evidence",
-    [
-      'release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"',
-      'test "$(git rev-parse "$head_sha^{tree}")" = "$release_tree"',
-      'git merge-base --is-ancestor "$head_sha" "$GITHUB_SHA"',
-      'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
-      ".expired == false",
-      'test "$artifact_count" = 1 || continue',
-      "The release workflow will not start a broad proof",
-      "source_proof_reused=true",
-    ],
-  );
-  forbidStepRun(
-    violations,
-    "release.yml",
-    preflight,
-    "Resolve reusable prior evidence",
-    [
-      "release-freeze-barrier.mjs verify-status",
-      "freeze_receipt_digest",
-    ],
-  );
   const sourceJob = requireJob(violations, "release.yml", release, "source-proof");
   add(
     violations,
