@@ -715,7 +715,7 @@ test("pinned programs are an exact fail-closed membership with graph-owned diges
 
 test("step fragments are an exact fail-closed membership with graph-owned rule data", () => {
   const rules = graph.workflow_policy.step_fragments;
-  assert.equal(Object.keys(rules).length, 6);
+  assert.equal(Object.keys(rules).length, 35);
   for (const row of Object.values(rules)) {
     assert.ok(row.kind === "require" || row.kind === "forbid");
     assert.ok(row.fragments.length > 0);
@@ -750,6 +750,12 @@ test("step fragments are an exact fail-closed membership with graph-owned rule d
       draft.workflow_policy.step_fragments.marketplace_sync_dispatch_guard_line_tests.kind =
         "require";
     }, /marketplace_sync_dispatch_guard_line_tests\.kind must be forbid/u],
+    [draft => {
+      delete draft.workflow_policy.step_fragments.plugin_static_workflow_policy;
+    }, /step_fragments must declare plugin_static_workflow_policy/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.source_proof_full_gate_workspace_tests.fragments = [];
+    }, /source_proof_full_gate_workspace_tests\.fragments must be a non-empty array/u],
   ];
   for (const [mutate, expected] of mutations) {
     const draft = structuredClone(graph);
@@ -760,13 +766,17 @@ test("step fragments are an exact fail-closed membership with graph-owned rule d
 
 test("structural pins are an exact fail-closed membership with graph-owned rule data", () => {
   const pins = graph.workflow_policy.structural_pins;
-  assert.equal(Object.keys(pins).length, 7);
+  assert.equal(Object.keys(pins).length, 14);
   for (const row of Object.values(pins)) {
-    assert.ok(row.kind === "job" || row.kind === "permission");
+    assert.ok(row.kind === "job" || row.kind === "permission" || row.kind === "needs");
     if (row.kind === "permission") {
       assert.ok(row.access === "read" || row.access === "write");
     }
+    if (row.kind === "needs") {
+      assert.ok(row.needs.length > 0);
+    }
   }
+  assert.equal(pins.source_proof_full_source_gate_needs_resolve.kind, "needs");
   const mutations = [
     [draft => {
       delete draft.workflow_policy.structural_pins.close_dev_issues_job;
@@ -803,6 +813,20 @@ test("structural pins are an exact fail-closed membership with graph-owned rule 
     [draft => {
       draft.workflow_policy.structural_pins.post_publish_smoke_actions_read.kind = "job";
     }, /post_publish_smoke_actions_read\.kind must be permission/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.plugin_static_job;
+    }, /structural_pins must declare plugin_static_job/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.source_proof_full_source_gate_needs_resolve.kind =
+        "job";
+    }, /source_proof_full_source_gate_needs_resolve\.kind must be needs/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.source_proof_full_source_gate_needs_resolve
+        .needs;
+    }, /source_proof_full_source_gate_needs_resolve must carry exactly kind, file, job, needs, reason/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.source_proof_full_source_gate_needs_resolve.needs = [];
+    }, /source_proof_full_source_gate_needs_resolve\.needs must be a non-empty array/u],
   ];
   for (const [mutate, expected] of mutations) {
     const draft = structuredClone(graph);

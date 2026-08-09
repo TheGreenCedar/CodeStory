@@ -117,10 +117,40 @@ const STEP_FRAGMENT_CONTRACTS = new Map([
   ["marketplace_sync_dispatch_guard_line_tests", { kind: "forbid" }],
   ["marketplace_sync_catalog_push", { kind: "require" }],
   ["marketplace_sync_recovery_identity", { kind: "require" }],
+  ["plugin_static_install_dependencies", { kind: "require" }],
+  ["plugin_static_workflow_policy", { kind: "require" }],
+  ["plugin_static_plugin_wiring", { kind: "require" }],
+  ["plugin_static_embedded_model", { kind: "require" }],
+  ["plugin_static_pinned_provision_proof", { kind: "require" }],
+  ["plugin_static_marketplace_evidence_contracts", { kind: "require" }],
+  ["plugin_static_workflow_syntax", { kind: "require" }],
+  ["plugin_static_release_claim_contracts", { kind: "require" }],
+  ["plugin_static_ci_proof_routing", { kind: "require" }],
+  ["plugin_static_packaged_proof_harness", { kind: "require" }],
+  ["plugin_static_marketplace_install", { kind: "require" }],
+  ["source_proof_resolve_trusted_head", { kind: "require" }],
+  ["source_proof_resolve_reuse_gate", { kind: "require" }],
+  ["source_proof_resolve_release_freeze", { kind: "require" }],
+  ["source_proof_windows_native_qualification_harness", { kind: "require" }],
+  ["source_proof_windows_native_rust_stable", { kind: "require" }],
+  ["source_proof_windows_native_short_target", { kind: "require" }],
+  ["source_proof_windows_native_embedded_model", { kind: "require" }],
+  ["source_proof_windows_native_vulkan_sdk", { kind: "require" }],
+  ["source_proof_windows_native_source_contracts", { kind: "require" }],
+  ["source_proof_full_gate_compiler_cache_env", { kind: "require" }],
+  ["source_proof_full_gate_dependency_cache_bound", { kind: "require" }],
+  ["source_proof_full_gate_compile", { kind: "require" }],
+  ["source_proof_full_gate_cache_restore_report", { kind: "require" }],
+  ["source_proof_full_gate_cache_save_report", { kind: "require" }],
+  ["source_proof_full_gate_compilation_outcome", { kind: "require" }],
+  ["source_proof_full_gate_workspace_tests", { kind: "require" }],
+  ["source_proof_full_gate_clippy", { kind: "require" }],
+  ["source_proof_full_gate_release_cell", { kind: "require" }],
 ]);
-// The graph owns every structural-pin rule instance (job existence and permission
-// scopes) for workflow families migrated off inline requireJob and permission
-// checks; the checker owns only those two predicates and their message shapes.
+// The graph owns every structural-pin rule instance (job existence, needs edges,
+// and permission scopes) for workflow families migrated off inline requireJob,
+// needs, and permission checks; the checker owns only those three predicates and
+// their message shapes.
 // Membership is exact and fail-closed: a graph that drops, renames, or invents a
 // structural pin must not load, so a rule instance cannot disappear by data edit.
 // Kind names the predicate a row binds.
@@ -132,6 +162,13 @@ const STRUCTURAL_PIN_CONTRACTS = new Map([
   ["close_dev_issues_pull_requests_read", { kind: "permission" }],
   ["post_publish_smoke_job", { kind: "job" }],
   ["post_publish_smoke_actions_read", { kind: "permission" }],
+  ["plugin_static_job", { kind: "job" }],
+  ["rust_ci_linux_draft_job", { kind: "job" }],
+  ["source_proof_resolve_job", { kind: "job" }],
+  ["source_proof_full_source_gate_job", { kind: "job" }],
+  ["source_proof_full_source_gate_needs_resolve", { kind: "needs" }],
+  ["source_proof_retrieval_generalization_job", { kind: "job" }],
+  ["source_proof_windows_native_contracts_job", { kind: "job" }],
 ]);
 // The graph owns every cross-file constant-mirror rule instance (a repository file
 // that must repeat a reviewed constant verbatim) for families migrated off inline
@@ -949,7 +986,9 @@ function validateStructuralPins(policy) {
     const row = object(pins[name], label);
     const expectedKeys = contract.kind === "job"
       ? ["kind", "file", "job", "reason"]
-      : ["kind", "file", "scope", "access", "reason"];
+      : contract.kind === "needs"
+        ? ["kind", "file", "job", "needs", "reason"]
+        : ["kind", "file", "scope", "access", "reason"];
     if (
       JSON.stringify([...Object.keys(row)].sort())
         !== JSON.stringify([...expectedKeys].sort())
@@ -962,6 +1001,9 @@ function validateStructuralPins(policy) {
     nonEmptyText(row.file, `${label}.file`);
     if (contract.kind === "job") {
       nonEmptyText(row.job, `${label}.job`);
+    } else if (contract.kind === "needs") {
+      nonEmptyText(row.job, `${label}.job`);
+      stringArray(row.needs, `${label}.needs`, { nonEmpty: true });
     } else {
       nonEmptyText(row.scope, `${label}.scope`);
       if (row.access !== "read" && row.access !== "write") {
