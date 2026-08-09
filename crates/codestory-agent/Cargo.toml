@@ -4,10 +4,8 @@ version = "0.16.3"
 edition = "2024"
 
 [features]
-# Compiles the eval/holdout probe hooks that used to ride `#[cfg(test)]` inside
-# `codestory-runtime`. `codestory-runtime` turns it on as a dev-dependency so its
-# own unit tests keep seeing the same hooks they saw before the extraction; no
-# product build enables it.
+# Compiles the eval/holdout probe hooks for downstream unit tests. No product
+# build enables it.
 test-support = []
 
 [dependencies]

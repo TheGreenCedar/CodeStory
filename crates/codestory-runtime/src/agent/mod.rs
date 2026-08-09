@@ -8,16 +8,13 @@ pub(crate) mod packet_claim_profile_registry;
 
 pub(crate) mod packet_claim_profiles;
 pub(crate) mod packet_claims;
-pub(crate) mod packet_command_profiles;
 pub(crate) mod packet_coverage;
 pub(crate) mod packet_degradation;
-pub(crate) mod packet_evidence;
 pub(crate) mod packet_freshness;
-pub(crate) mod packet_obligations;
-pub(crate) mod packet_plan;
+#[cfg(test)]
+mod packet_obligations_runtime_tests;
 pub(crate) mod packet_probe;
 pub(crate) mod packet_profile_telemetry;
-pub(crate) mod packet_required_probes;
 pub(crate) mod packet_search;
 pub(crate) mod packet_source_patterns;
 pub(crate) mod packet_sufficiency;
@@ -32,9 +29,11 @@ pub(crate) mod trace_export;
 // crate move rather than a rename of every call site.
 #[cfg(test)]
 pub(crate) use codestory_agent::eval_probes;
+#[allow(unused_imports)]
 pub(crate) use codestory_agent::{
-    packet_citations, packet_evidence_roles, packet_flow_requirements, packet_scoring,
-    packet_terms, planning,
+    packet_citations, packet_command_profiles, packet_evidence, packet_evidence_roles,
+    packet_flow_requirements, packet_obligations, packet_plan, packet_required_probes,
+    packet_scoring, packet_terms, planning,
 };
 
 pub(crate) use orchestrator::{agent_ask, agent_packet};

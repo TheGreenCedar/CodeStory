@@ -90,6 +90,47 @@ mod source_coverage;
 mod workspace_state;
 use affected::{AffectedOperationIdentityIndex, IndexFreshnessObservation};
 pub use agent::{packet_step_trace_json, plan_packet};
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod agent_test_support {
+    use codestory_contracts::api::{
+        AgentAnswerDto, IndexFreshnessDto, PacketBudgetDto, PacketClaimDto,
+        PacketObligationPlanDto, PacketSufficiencyDto, PacketTaskClassDto,
+    };
+    use std::path::Path;
+
+    pub fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
+        crate::agent::packet_claims::packet_supported_claims_with_telemetry(answer).0
+    }
+
+    pub fn fresh_index_observation() -> IndexFreshnessDto {
+        crate::agent::packet_freshness::fresh_index_observation()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_packet_sufficiency_with_obligation_context(
+        project_root: &Path,
+        question: &str,
+        task_class: PacketTaskClassDto,
+        answer: &AgentAnswerDto,
+        budget: &PacketBudgetDto,
+        extra_probes: &[String],
+        exact_probe_paths: &[String],
+        obligations: &PacketObligationPlanDto,
+    ) -> PacketSufficiencyDto {
+        crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context(
+            project_root,
+            question,
+            task_class,
+            answer,
+            budget,
+            extra_probes,
+            exact_probe_paths,
+            obligations,
+        )
+    }
+}
 use index_commit::*;
 pub(crate) use index_coverage::{
     current_epoch_ms, file_coverage_retryable, full_refresh_execution_plan_with_coverage,
@@ -409,6 +450,7 @@ pub use symbol_query::{
     normalize_symbol_query, retrieval_file_role_for_hit, retrieval_file_role_from_path,
     symbol_name_match_rank, symbol_query_tokens, terminal_symbol_segment,
 };
+#[allow(unused_imports)]
 pub(crate) use symbol_query::{
     compare_search_hits_with_project_root, exact_symbol_query_terms, is_non_primary_source_term,
     looks_like_standalone_symbol_query, query_mentions_non_primary_source,

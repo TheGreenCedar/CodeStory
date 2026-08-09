@@ -82,7 +82,7 @@ impl PacketFreshnessInput {
 /// Test answers default to no freshness observation, which this module correctly reads as
 /// `Unknown`. Fixtures that are exercising claim or route behavior have to opt in to an observed
 /// publication or every one of them would be testing the freshness cap instead.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn fresh_index_observation() -> IndexFreshnessDto {
     IndexFreshnessDto {
         status: IndexFreshnessStatusDto::Fresh,

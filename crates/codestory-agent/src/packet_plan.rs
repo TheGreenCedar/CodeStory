@@ -1,23 +1,23 @@
-#[cfg(test)]
-use crate::agent::eval_probes::{
+#[cfg(any(test, feature = "test-support"))]
+use crate::eval_probes::{
     eval_probes_enabled, push_eval_architecture_flow_probe_terms,
     push_eval_flow_hint_packet_queries, push_prompt_named_file_probe_queries,
 };
-use crate::agent::packet_command_profiles::{
+use crate::packet_command_profiles::{
     packet_command_exact_probe_queries, packet_command_role_probe_queries,
 };
-use crate::agent::packet_flow_requirements::packet_flow_requirement_queries_for_terms;
-use crate::agent::packet_obligations::build_packet_obligation_plan;
-use crate::agent::packet_required_probes::{
+use crate::packet_flow_requirements::packet_flow_requirement_queries_for_terms;
+use crate::packet_obligations::build_packet_obligation_plan;
+use crate::packet_required_probes::{
     packet_concrete_file_probe_queries_from_required, packet_prompt_exact_symbol_probe_queries,
     packet_sufficiency_required_probe_queries_from_terms,
     push_command_loop_source_probe_queries_for_terms, push_indexing_flow_required_probe_queries,
     push_search_flow_probe_queries, push_sql_schema_required_probe_queries,
 };
-use crate::agent::packet_scoring::{
+use crate::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_query_stop_term,
 };
-use crate::agent::packet_terms::{
+use crate::packet_terms::{
     packet_probe_terms, packet_terms_have, packet_terms_have_any,
     packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
     packet_terms_indicate_command_dispatch_flow, packet_terms_indicate_command_event_loop_flow,
@@ -37,19 +37,19 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow, prompt_search_terms,
 };
-use crate::agent::planning::{
+use crate::planning::{
     PACKET_EXACT_SYMBOL_QUERY_PURPOSE, dedupe_packet_plan_queries,
     packet_plan_query_is_exact_symbol_identity,
 };
-use crate::{
+use crate::text::{
     exact_symbol_query_terms, is_non_primary_source_term, looks_like_standalone_symbol_query,
     query_mentions_non_primary_source,
 };
 use codestory_contracts::api::{
     PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto, PacketTaskClassDto,
 };
-#[cfg(test)]
-pub(crate) fn build_packet_plan(
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_packet_plan(
     question: &str,
     requested: Option<PacketTaskClassDto>,
     budget: PacketBudgetModeDto,
@@ -57,7 +57,7 @@ pub(crate) fn build_packet_plan(
     build_packet_plan_with_extra(question, requested, budget, &[])
 }
 
-pub(crate) fn build_packet_plan_with_extra(
+pub fn build_packet_plan_with_extra(
     question: &str,
     requested: Option<PacketTaskClassDto>,
     budget: PacketBudgetModeDto,
@@ -148,9 +148,9 @@ pub(crate) fn build_packet_plan_with_extra(
     };
     dedupe_packet_plan_queries(&mut plan);
     plan.obligations = build_packet_obligation_plan(question, task_class, &plan.queries);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let eval_probes = eval_probes_enabled();
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let eval_probes = false;
     plan.trace.push(format!(
         "deduped_queries={} eval_probes={eval_probes}",
@@ -165,7 +165,7 @@ pub(crate) fn build_packet_plan_with_extra(
     plan
 }
 
-pub(crate) fn packet_rank_terms(question: &str) -> Vec<String> {
+pub fn packet_rank_terms(question: &str) -> Vec<String> {
     let mut terms = prompt_search_terms(question);
     for term in extract_packet_query_terms(question) {
         push_unique_term(&mut terms, &term);
@@ -180,7 +180,7 @@ pub(crate) fn packet_rank_terms(question: &str) -> Vec<String> {
     terms
 }
 
-pub(crate) fn packet_explicit_request_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
+pub fn packet_explicit_request_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
     plan.queries
         .iter()
         .filter(|query| query.purpose.contains("explicit symbol probe"))
@@ -197,7 +197,7 @@ fn packet_plan_query_cap(budget: PacketBudgetModeDto) -> usize {
     }
 }
 
-pub(crate) fn packet_symbol_probe_queries(
+pub fn packet_symbol_probe_queries(
     question: &str,
     task_class: PacketTaskClassDto,
     budget: PacketBudgetModeDto,
@@ -221,7 +221,7 @@ pub(crate) fn packet_symbol_probe_queries(
         &mut queries,
         &packet_prompt_exact_symbol_probe_queries(question, &terms, task_class),
     );
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if eval_probes_enabled() {
         push_prompt_named_file_probe_queries(&terms, &mut queries);
     }
@@ -252,13 +252,13 @@ pub(crate) fn packet_symbol_probe_queries(
 
 fn push_flow_hint_packet_queries(terms: &[String], queries: &mut Vec<String>) {
     push_prompt_derived_flow_hint_packet_queries(terms, queries);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         push_eval_flow_hint_packet_queries(terms, queries);
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let use_index_derived = !eval_probes_enabled();
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let use_index_derived = true;
     if use_index_derived {
         push_index_derived_architecture_probes(
@@ -1317,7 +1317,7 @@ fn push_adjacent_packet_term_queries(
     }
 }
 
-pub(crate) fn packet_concept_queries(question: &str) -> Vec<String> {
+pub fn packet_concept_queries(question: &str) -> Vec<String> {
     let include_non_primary_terms = query_mentions_non_primary_source(question);
     prompt_search_terms(question)
         .into_iter()
@@ -1355,7 +1355,7 @@ fn packet_camel_case(words: &[&str]) -> String {
     value
 }
 
-pub(crate) fn infer_packet_task_class(question: &str) -> PacketTaskClassDto {
+pub fn infer_packet_task_class(question: &str) -> PacketTaskClassDto {
     let lower = question.to_ascii_lowercase();
     if contains_any(
         &lower,
@@ -1414,7 +1414,7 @@ fn risk_of_change_prompt(lower: &str) -> bool {
         || lower.contains("risk in changing")
 }
 
-pub(crate) fn extract_packet_query_terms(question: &str) -> Vec<String> {
+pub fn extract_packet_query_terms(question: &str) -> Vec<String> {
     let mut terms = Vec::new();
     let mut quoted = false;
     let mut quote = '\0';
@@ -1519,7 +1519,7 @@ fn is_packet_code_like_term(token: &str) -> bool {
         || token.chars().skip(1).any(|ch| ch.is_ascii_uppercase())
 }
 
-pub(crate) fn push_unique_term(terms: &mut Vec<String>, value: &str) {
+pub fn push_unique_term(terms: &mut Vec<String>, value: &str) {
     let value = value.trim();
     if value.len() < 3 {
         return;
@@ -1606,7 +1606,7 @@ fn push_exact_symbol_packet_query(queries: &mut Vec<PacketPlanQueryDto>, query: 
     });
 }
 
-pub(crate) fn packet_plan_annotation(plan: &PacketPlanDto) -> String {
+pub fn packet_plan_annotation(plan: &PacketPlanDto) -> String {
     let queries = plan
         .queries
         .iter()
@@ -1634,7 +1634,7 @@ fn packet_architecture_flow_probe_terms(prompt: &str) -> Vec<String> {
             push_unique_term(&mut terms, term);
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     push_eval_architecture_flow_probe_terms(&lower, &mut terms);
     terms
 }

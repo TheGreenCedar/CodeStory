@@ -1,10 +1,10 @@
 //! Pure lexical and path classification used by packet planning.
 //!
-//! These helpers were `codestory-runtime`'s `symbol_query` internals. They read
-//! nothing: no controller, no store, no publication, no filesystem. Planning
-//! needs them on every prompt, so they move with planning rather than staying
-//! behind a runtime import that would make `codestory-agent` depend on the
-//! crate it was extracted from.
+//! These helpers read nothing: no controller, no store, no publication, no
+//! filesystem. Planning needs them on every prompt, so they live alongside the
+//! policy that consumes them.
+
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetrievalFileRole {
@@ -24,6 +24,144 @@ impl RetrievalFileRole {
 
 pub fn normalize_symbol_query(value: &str) -> String {
     value.trim().to_ascii_lowercase()
+}
+
+pub fn exact_symbol_query_terms(query: &str) -> Vec<String> {
+    let trimmed = trim_symbol_candidate(query);
+    if looks_like_standalone_symbol_query(trimmed) {
+        let mut terms = Vec::new();
+        let mut seen = HashSet::new();
+        push_exact_symbol_query_term(trimmed, &mut terms, &mut seen);
+        if let Some((_, terminal)) = qualified_symbol_query_parts(trimmed) {
+            push_exact_symbol_query_term(terminal, &mut terms, &mut seen);
+        }
+        return terms;
+    }
+
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    let mut candidate = String::new();
+    let mut chars = query.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '!' && chars.peek().is_some_and(|next| *next == '=') {
+            // `!=` and `!==` terminate the left operand. Keeping this bang would fabricate a
+            // Ruby-style suffix identity (`foo_bar!`) from an ordinary comparison expression.
+            push_embedded_symbol_candidate(&candidate, &mut terms, &mut seen);
+            candidate.clear();
+            continue;
+        }
+        if is_symbol_query_char(ch) {
+            candidate.push(ch);
+            continue;
+        }
+        push_embedded_symbol_candidate(&candidate, &mut terms, &mut seen);
+        candidate.clear();
+    }
+    push_embedded_symbol_candidate(&candidate, &mut terms, &mut seen);
+    terms
+}
+
+fn push_exact_symbol_query_term(raw: &str, terms: &mut Vec<String>, seen: &mut HashSet<String>) {
+    let candidate = trim_symbol_candidate(raw);
+    if !looks_like_standalone_symbol_query(candidate) {
+        return;
+    }
+    // Exact symbol requests are case-bearing identities. `Foo::run` and `foo::run` may be two
+    // distinct symbols in the same project and must survive as separate requested candidates.
+    if seen.insert(candidate.to_string()) {
+        terms.push(candidate.to_string());
+    }
+}
+
+pub fn looks_like_standalone_symbol_query(query: &str) -> bool {
+    let trimmed = trim_symbol_candidate(query);
+    !trimmed.is_empty()
+        && !trimmed.chars().any(char::is_whitespace)
+        && trimmed.chars().any(|ch| ch.is_ascii_alphabetic())
+        && trimmed.chars().all(is_symbol_query_char)
+        && symbol_identity_punctuation_is_lawful(trimmed)
+}
+
+fn push_embedded_symbol_candidate(raw: &str, terms: &mut Vec<String>, seen: &mut HashSet<String>) {
+    let candidate = trim_symbol_candidate(raw);
+    if !looks_like_standalone_symbol_query(candidate)
+        || !has_embedded_exact_symbol_signal(candidate)
+    {
+        return;
+    }
+
+    // Embedded exact symbols carry the same case-sensitive identity as standalone exact probes.
+    // Java-style `Foo.run` and `foo.run`, for example, may resolve to different owners.
+    if seen.insert(candidate.to_string()) {
+        terms.push(candidate.to_string());
+    }
+}
+
+fn trim_symbol_candidate(value: &str) -> &str {
+    value.trim().trim_matches(|ch: char| {
+        !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '?' | '!' | '~'))
+    })
+}
+
+fn is_symbol_query_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '/' | '$' | '?' | '!' | '~')
+}
+
+fn symbol_identity_punctuation_is_lawful(value: &str) -> bool {
+    let ruby_suffix_count = value.chars().filter(|ch| matches!(ch, '?' | '!')).count();
+    if ruby_suffix_count > 0 {
+        let Some(stem) = value.strip_suffix('?').or_else(|| value.strip_suffix('!')) else {
+            return false;
+        };
+        let terminal = stem.rsplit([':', '.', '/']).next().unwrap_or_default();
+        return ruby_suffix_count == 1
+            && !value.contains('~')
+            && symbol_identity_component_is_lawful(terminal);
+    }
+
+    let destructor_count = value.chars().filter(|ch| *ch == '~').count();
+    if destructor_count == 0 {
+        return true;
+    }
+    if destructor_count != 1 {
+        return false;
+    }
+
+    let Some((owner_path, destructor_name)) = value.rsplit_once("::~") else {
+        return false;
+    };
+    let owner_name = owner_path.rsplit("::").next().unwrap_or_default();
+    symbol_identity_component_is_lawful(owner_name)
+        && owner_name == destructor_name
+        && symbol_identity_component_is_lawful(destructor_name)
+}
+
+fn symbol_identity_component_is_lawful(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().any(|ch| ch.is_ascii_alphabetic())
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
+}
+
+fn has_embedded_exact_symbol_signal(value: &str) -> bool {
+    value.contains('_')
+        || value.contains("::")
+        || value.contains('.')
+        || value.contains('/')
+        || value.contains('$')
+        || value.chars().skip(1).any(|ch| ch.is_ascii_uppercase())
+}
+
+fn qualified_symbol_query_parts(query: &str) -> Option<(&str, &str)> {
+    let trimmed = trim_symbol_candidate(query);
+    let index = trimmed.rfind("::")?;
+    let prefix = trimmed[..index].trim();
+    let terminal = trimmed[index + 2..].trim();
+    if prefix.is_empty() || terminal.is_empty() {
+        return None;
+    }
+    Some((prefix, terminal))
 }
 
 pub fn terminal_symbol_segment(value: &str) -> String {

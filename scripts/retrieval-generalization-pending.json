@@ -103,14 +103,6 @@
         "json_output": 2
       }
     },
-    "crates/codestory-runtime/src/agent/packet_command_profiles.rs": {
-      "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
-      "reason": "Command-flow profiling recognises holdout command dispatch symbols by spelling. Replacing that with structural command detection is separate work.",
-      "markers": {
-        "run_main": 10,
-        "runmain": 2
-      }
-    },
     "crates/codestory-agent/src/packet_evidence_carriers.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
       "reason": "The stylesheet carrier lists the words a CSS animation is written with, and one of them collides with a benchmark marker: `animated` is the class name Animate.css and its imitators ship, so a stylesheet whose only anchor is that class would stop closing the animation structure step without it. It goes when a stylesheet requirement is decided from the at-rules the indexer already extracts rather than from a word list.",
@@ -144,58 +136,6 @@
         "formaterror": 1,
         "mapperconfiguration": 1,
         "sessionrequest": 1
-      }
-    },
-    "crates/codestory-runtime/src/agent/packet_plan.rs": {
-      "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
-      "reason": "Packet planning still expands questions with holdout symbol and library names. This is the same class of steering as the search-plan tables this branch deletes, and it needs its own change because the packet path has separate quality coverage.",
-      "markers": {
-        "FOREIGN KEY": 3,
-        "dispatchrequest": 1,
-        "dynamicformatargstore": 1,
-        "formatargstore": 1,
-        "interceptormanager": 1,
-        "isBlank": 1,
-        "isEmpty": 1,
-        "isblank": 1,
-        "isempty": 1,
-        "mapperconfiguration": 2,
-        "regionMatches": 4,
-        "regionmatches": 1,
-        "routergroup": 2,
-        "sessionrequest": 1,
-        "sessionsend": 1,
-        "siteread": 1,
-        "siterender": 1,
-        "sitewrite": 1,
-        "wsgiapp": 1
-      }
-    },
-    "crates/codestory-runtime/src/agent/packet_required_probes.rs": {
-      "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
-      "reason": "Required-probe selection names holdout languages, files, and APIs so a packet is forced to fetch them. Probes have to be built from the asked question before these can be removed.",
-      "markers": {
-        "FOREIGN KEY": 2,
-        "RouterGroup": 1,
-        "TypeMap": 1,
-        "_vars\\.css": 2,
-        "addRecord": 1,
-        "addRoute": 3,
-        "addrecord": 1,
-        "addroute": 1,
-        "buildindex": 1,
-        "dynamicformatargstore": 1,
-        "foreignkey": 7,
-        "formatargstore": 1,
-        "formvalidation": 1,
-        "mapperconfiguration": 2,
-        "persistentstorage": 1,
-        "routergroup": 3,
-        "sessionrequest": 1,
-        "sessionsend": 1,
-        "storageaccess": 1,
-        "typemap": 2,
-        "wsgiapp": 1
       }
     },
     "crates/codestory-agent/src/packet_scoring.rs": {
@@ -319,6 +259,66 @@
         "(?:^|[^A-Za-z0-9])gin(?![A-Za-z0-9])": 1,
         "flask": 1,
         "gin": 1
+      }
+    },
+    "crates/codestory-agent/src/packet_command_profiles.rs": {
+      "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
+      "reason": "Command-flow profiling recognises holdout command dispatch symbols by spelling. Replacing that with structural command detection is separate work.",
+      "markers": {
+        "run_main": 10,
+        "runmain": 2
+      }
+    },
+    "crates/codestory-agent/src/packet_plan.rs": {
+      "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
+      "reason": "Packet planning still expands questions with holdout symbol and library names. This is the same class of steering as the search-plan tables this branch deletes, and it needs its own change because the packet path has separate quality coverage.",
+      "markers": {
+        "FOREIGN KEY": 3,
+        "dispatchrequest": 1,
+        "dynamicformatargstore": 1,
+        "formatargstore": 1,
+        "interceptormanager": 1,
+        "isBlank": 1,
+        "isEmpty": 1,
+        "isblank": 1,
+        "isempty": 1,
+        "mapperconfiguration": 2,
+        "regionMatches": 4,
+        "regionmatches": 1,
+        "routergroup": 2,
+        "sessionrequest": 1,
+        "sessionsend": 1,
+        "siteread": 1,
+        "siterender": 1,
+        "sitewrite": 1,
+        "wsgiapp": 1
+      }
+    },
+    "crates/codestory-agent/src/packet_required_probes.rs": {
+      "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
+      "reason": "Required-probe selection names holdout languages, files, and APIs so a packet is forced to fetch them. Probes have to be built from the asked question before these can be removed.",
+      "markers": {
+        "FOREIGN KEY": 2,
+        "RouterGroup": 1,
+        "TypeMap": 1,
+        "_vars\\.css": 2,
+        "addRecord": 1,
+        "addRoute": 3,
+        "addrecord": 1,
+        "addroute": 1,
+        "buildindex": 1,
+        "dynamicformatargstore": 1,
+        "foreignkey": 7,
+        "formatargstore": 1,
+        "formvalidation": 1,
+        "mapperconfiguration": 2,
+        "persistentstorage": 1,
+        "routergroup": 3,
+        "sessionrequest": 1,
+        "sessionsend": 1,
+        "storageaccess": 1,
+        "typemap": 2,
+        "wsgiapp": 1
       }
     }
   }

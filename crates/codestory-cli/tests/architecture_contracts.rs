@@ -563,9 +563,14 @@ fn agent_planning_crate_owns_planning_and_depends_on_contracts_only() {
 
     for module in [
         "packet_citations.rs",
+        "packet_command_profiles.rs",
+        "packet_evidence.rs",
         "packet_evidence_carriers.rs",
         "packet_evidence_roles.rs",
         "packet_flow_requirements.rs",
+        "packet_obligations.rs",
+        "packet_plan.rs",
+        "packet_required_probes.rs",
         "packet_scoring.rs",
         "packet_terms.rs",
         "pinned_reader.rs",

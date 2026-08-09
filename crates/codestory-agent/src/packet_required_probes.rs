@@ -1,19 +1,19 @@
-#[cfg(test)]
-use crate::agent::eval_probes::{
+#[cfg(any(test, feature = "test-support"))]
+use crate::eval_probes::{
     eval_probes_enabled, push_eval_required_probe_queries,
     push_prompt_concept_derived_symbol_probes,
 };
-use crate::agent::packet_batch::packet_file_stem_matches_query;
-use crate::agent::packet_evidence_roles::{
+use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management,
     packet_citation_owns_request_pipeline, packet_citation_owns_transport_adapter,
     packet_evidence_role,
 };
-use crate::agent::packet_flow_requirements::packet_flow_requirement_queries_for_terms;
-use crate::agent::packet_scoring::{
-    normalize_identifier, packet_display_path, packet_query_stop_term,
+use crate::packet_flow_requirements::packet_flow_requirement_queries_for_terms;
+use crate::packet_scoring::{
+    normalize_identifier, packet_display_path, packet_file_stem_matches_query,
+    packet_query_stop_term,
 };
-use crate::agent::packet_terms::{
+use crate::packet_terms::{
     packet_probe_terms, packet_terms_have, packet_terms_have_any,
     packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
     packet_terms_indicate_command_dispatch_flow, packet_terms_indicate_command_event_loop_flow,
@@ -32,12 +32,13 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
-use crate::exact_symbol_query_terms;
+use crate::text::exact_symbol_query_terms;
+use crate::text::{RetrievalFileRole, retrieval_file_role_from_path};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, NodeKind, PacketClaimDto, PacketTaskClassDto, SearchHitOrigin,
 };
 
-pub(crate) fn packet_missing_sufficiency_probe_queries_with_extra(
+pub fn packet_missing_sufficiency_probe_queries_with_extra(
     question: &str,
     task_class: PacketTaskClassDto,
     answer: &AgentAnswerDto,
@@ -63,10 +64,7 @@ fn packet_probe_query_is_covered(
         || packet_probe_query_is_claimed(query, supported_claims)
 }
 
-pub(crate) fn packet_probe_query_is_claimed(
-    query: &str,
-    supported_claims: &[PacketClaimDto],
-) -> bool {
+pub fn packet_probe_query_is_claimed(query: &str, supported_claims: &[PacketClaimDto]) -> bool {
     if let Some(parts) = packet_file_scoped_symbol_probe_parts(query) {
         return supported_claims
             .iter()
@@ -376,15 +374,15 @@ fn packet_required_probe_requires_citation(query: &str) -> bool {
     )
 }
 
-#[cfg(test)]
-pub(crate) fn packet_sufficiency_required_probe_queries(
+#[cfg(any(test, feature = "test-support"))]
+pub fn packet_sufficiency_required_probe_queries(
     question: &str,
     task_class: PacketTaskClassDto,
 ) -> Vec<String> {
     packet_sufficiency_required_probe_queries_with_extra(question, task_class, &[])
 }
 
-pub(crate) fn packet_sufficiency_required_probe_queries_with_extra(
+pub fn packet_sufficiency_required_probe_queries_with_extra(
     question: &str,
     task_class: PacketTaskClassDto,
     extra_probes: &[String],
@@ -399,7 +397,7 @@ pub(crate) fn packet_sufficiency_required_probe_queries_with_extra(
     queries
 }
 
-pub(crate) fn packet_sufficiency_required_probe_queries_from_terms(
+pub fn packet_sufficiency_required_probe_queries_from_terms(
     terms: &[String],
     task_class: PacketTaskClassDto,
 ) -> Vec<String> {
@@ -422,7 +420,7 @@ pub(crate) fn packet_sufficiency_required_probe_queries_from_terms(
         &packet_flow_requirement_queries_for_terms(terms, task_class),
     );
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if eval_probes_enabled() {
         push_eval_required_probe_queries(terms, &mut queries);
     }
@@ -812,7 +810,7 @@ fn push_prompt_concept_role_probe_queries(terms: &[String], queries: &mut Vec<St
     }
 }
 
-pub(crate) fn packet_prompt_exact_symbol_probe_queries(
+pub fn packet_prompt_exact_symbol_probe_queries(
     question: &str,
     terms: &[String],
     task_class: PacketTaskClassDto,
@@ -836,9 +834,9 @@ pub(crate) fn packet_prompt_exact_symbol_probe_queries(
             push_unique_exact_symbol_term(&mut queries, &term);
         }
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let _ = terms;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if eval_probes_enabled() {
         push_prompt_concept_derived_symbol_probes(terms, &mut queries);
     }
@@ -871,7 +869,7 @@ fn packet_prompt_exact_symbol_term_is_source_path(term: &str) -> bool {
     codestory_contracts::language_support::language_support_profile_for_path(Some(term)).is_some()
 }
 
-pub(crate) fn packet_concrete_file_probe_queries_from_required(
+pub fn packet_concrete_file_probe_queries_from_required(
     required_queries: &[String],
 ) -> Vec<String> {
     let mut queries = Vec::new();
@@ -897,7 +895,7 @@ fn packet_required_probe_file_query(query: &str) -> Option<String> {
         .then(|| format!("{query}.rs"))
 }
 
-pub(crate) fn push_indexing_flow_required_probe_queries(queries: &mut Vec<String>) {
+pub fn push_indexing_flow_required_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
         &[
@@ -911,7 +909,7 @@ pub(crate) fn push_indexing_flow_required_probe_queries(queries: &mut Vec<String
     );
 }
 
-pub(crate) fn push_search_flow_probe_queries(queries: &mut Vec<String>) {
+pub fn push_search_flow_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
         &[
@@ -926,17 +924,14 @@ pub(crate) fn push_search_flow_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
-pub(crate) fn packet_probe_query_is_cited(query: &str, answer: &AgentAnswerDto) -> bool {
+pub fn packet_probe_query_is_cited(query: &str, answer: &AgentAnswerDto) -> bool {
     answer
         .citations
         .iter()
         .any(|citation| packet_citation_satisfies_required_probe(query, citation))
 }
 
-pub(crate) fn packet_citation_satisfies_required_probe(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> bool {
+pub fn packet_citation_satisfies_required_probe(query: &str, citation: &AgentCitationDto) -> bool {
     if packet_citation_matches_required_coverage_role(query, citation) {
         return true;
     }
@@ -989,7 +984,7 @@ pub(crate) fn packet_citation_satisfies_required_probe(
     !packet_required_probe_needs_exact_match(query) || match_rank >= 4
 }
 
-pub(crate) fn packet_required_probe_needs_exact_match(query: &str) -> bool {
+pub fn packet_required_probe_needs_exact_match(query: &str) -> bool {
     let normalized_query = normalize_identifier(query);
     query.contains("::")
         || query.contains('.')
@@ -1029,10 +1024,7 @@ fn packet_citation_probe_has_exact_identifier_match(
     normalized_display == normalized_query || normalized_display.ends_with(&normalized_query)
 }
 
-pub(crate) fn packet_citation_probe_match_rank(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> Option<u8> {
+pub fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto) -> Option<u8> {
     let normalized_query = normalize_identifier(query);
     if normalized_query.is_empty() {
         return Some(0);
@@ -1101,9 +1093,10 @@ fn packet_citation_is_exact_primary_file_probe_match(
     citation.kind == NodeKind::FILE
         && citation.origin == SearchHitOrigin::IndexedSymbol
         && citation.resolvable
-        && citation.file_path.as_deref().is_some_and(|path| {
-            crate::retrieval_file_role_from_path(path) == crate::RetrievalFileRole::Source
-        })
+        && citation
+            .file_path
+            .as_deref()
+            .is_some_and(|path| retrieval_file_role_from_path(path) == RetrievalFileRole::Source)
         && packet_file_stem_matches_query(query, citation.file_path.as_deref())
 }
 
@@ -1576,14 +1569,14 @@ fn packet_display_tail_has_interface_prefix(display_tail: &str) -> bool {
     chars.next().is_some_and(|ch| ch.is_ascii_uppercase())
 }
 
-pub(crate) fn packet_required_probe_needs_buffered_wrapper_implementation(query: &str) -> bool {
+pub fn packet_required_probe_needs_buffered_wrapper_implementation(query: &str) -> bool {
     matches!(
         normalize_identifier(query).as_str(),
         "sourcereadbuffer" | "sinkwritebuffer"
     )
 }
 
-pub(crate) fn packet_citation_matches_buffered_wrapper_implementation(
+pub fn packet_citation_matches_buffered_wrapper_implementation(
     query: &str,
     citation: &AgentCitationDto,
 ) -> bool {
@@ -1714,10 +1707,7 @@ fn packet_file_scoped_short_symbol_matches(display_name: &str, symbol: &str) -> 
         .is_some_and(|tail| tail == symbol)
 }
 
-pub(crate) fn packet_probe_file_name_matches(
-    query_file_name: &str,
-    candidate_file_name: &str,
-) -> bool {
+pub fn packet_probe_file_name_matches(query_file_name: &str, candidate_file_name: &str) -> bool {
     let query_stem = packet_probe_file_stem(query_file_name);
     let candidate_stem = packet_probe_file_stem(candidate_file_name);
     if query_stem.is_empty() || candidate_stem.is_empty() {
@@ -1753,16 +1743,14 @@ fn packet_probe_role_file_stem_matches(query_stem: &str, candidate_stem: &str) -
     }
 }
 
-pub(crate) struct PacketFileScopedSymbolProbe {
-    pub(crate) query_path: String,
-    pub(crate) file_name: String,
-    pub(crate) raw_symbols: Vec<String>,
-    pub(crate) symbols: Vec<String>,
+pub struct PacketFileScopedSymbolProbe {
+    pub query_path: String,
+    pub file_name: String,
+    pub raw_symbols: Vec<String>,
+    pub symbols: Vec<String>,
 }
 
-pub(crate) fn packet_file_scoped_symbol_probe_parts(
-    query: &str,
-) -> Option<PacketFileScopedSymbolProbe> {
+pub fn packet_file_scoped_symbol_probe_parts(query: &str) -> Option<PacketFileScopedSymbolProbe> {
     let mut parts = query.split_whitespace();
     let file_part = parts
         .next()?
@@ -1805,10 +1793,7 @@ fn packet_extensionless_source_file_name(file_name: &str) -> bool {
         || file_name.contains("completion")
 }
 
-pub(crate) fn packet_citation_probe_token_coverage(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> usize {
+pub fn packet_citation_probe_token_coverage(query: &str, citation: &AgentCitationDto) -> usize {
     let tokens = packet_probe_match_tokens(query);
     if tokens.len() < 2 {
         return 0;
@@ -1950,7 +1935,7 @@ fn push_client_send_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
-pub(crate) fn push_command_loop_source_probe_queries_for_terms(
+pub fn push_command_loop_source_probe_queries_for_terms(
     terms: &[String],
     queries: &mut Vec<String>,
 ) {
@@ -2047,7 +2032,7 @@ fn push_html_css_template_structure_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
-pub(crate) fn push_sql_schema_required_probe_queries(terms: &[String], queries: &mut Vec<String>) {
+pub fn push_sql_schema_required_probe_queries(terms: &[String], queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
         &[

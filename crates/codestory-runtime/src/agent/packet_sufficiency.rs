@@ -382,10 +382,10 @@ fn assemble_packet_sufficiency_with_probe_context(
     // fell off the end instead. Interleaving keeps a path in front and starves neither kind.
     let mut blocking_follow_up_probe_query_seeds = Vec::new();
     for query in &blocking_probe_queries {
-        push_unique_term(&mut blocking_follow_up_probe_query_seeds, query);
+        push_unique_sufficiency_term(&mut blocking_follow_up_probe_query_seeds, query);
     }
     for query in &blocking_route_probe_queries {
-        push_unique_term(&mut blocking_follow_up_probe_query_seeds, query);
+        push_unique_sufficiency_term(&mut blocking_follow_up_probe_query_seeds, query);
     }
     // The legacy no-ledger path may still report uncovered planner probes whose flow requirement
     // is already covered. Those are hints, not repair work. Production ledgers put every
@@ -399,11 +399,11 @@ fn assemble_packet_sufficiency_with_probe_context(
             .iter()
             .filter(|query| packet_missing_probe_requires_compact_proof(query))
         {
-            push_unique_term(&mut blocking_follow_up_probe_query_seeds, query);
+            push_unique_sufficiency_term(&mut blocking_follow_up_probe_query_seeds, query);
         }
     }
     for query in &route_proof.follow_up_queries {
-        push_unique_term(&mut blocking_follow_up_probe_query_seeds, query);
+        push_unique_sufficiency_term(&mut blocking_follow_up_probe_query_seeds, query);
     }
     let terminally_sufficient = status == PacketSufficiencyStatusDto::Sufficient;
     let obligation_open_next_paths = if terminally_sufficient {
@@ -450,10 +450,10 @@ fn assemble_packet_sufficiency_with_probe_context(
         missing_exact_path_claims.clone()
     };
     for path in obligation_open_next_paths {
-        push_unique_term(&mut open_next_paths, &path);
+        push_unique_sufficiency_term(&mut open_next_paths, &path);
     }
     for path in &reported_claim_open_next_paths {
-        push_unique_term(&mut open_next_paths, path);
+        push_unique_sufficiency_term(&mut open_next_paths, path);
     }
     // Filtered once, after every source has contributed, because leads arrive
     // from three of them. Capping on coverage flips `terminally_sufficient`
@@ -546,7 +546,7 @@ fn assemble_packet_sufficiency_with_probe_context(
             packet_follow_up_trail_argv(&project, &open_next_paths)
         };
         for command in candidate_commands {
-            push_unique_term(&mut open_next, &render_packet_command(&command));
+            push_unique_sufficiency_term(&mut open_next, &render_packet_command(&command));
         }
         open_next.truncate(12);
     }
@@ -1490,7 +1490,7 @@ fn append_packet_obligation_gaps(gaps: &mut Vec<String>, obligations: &PacketObl
         obligation.proof_status != PacketObligationProofStatusDto::Proven
             && (obligation.material || !obligation.carrier_node_ids.is_empty())
     }) {
-        push_unique_term(
+        push_unique_sufficiency_term(
             gaps,
             &format!(
                 "obligation {} ({:?}) is {:?}: {}",
@@ -1517,7 +1517,7 @@ fn append_packet_obligation_gaps(gaps: &mut Vec<String>, obligations: &PacketObl
             Some(PacketQueryCompletionDto::Completed) => continue,
             None => "completion_missing",
         };
-        push_unique_term(
+        push_unique_sufficiency_term(
             gaps,
             &format!(
                 "query obligation {} ({:?}) is cancelled: {}",
@@ -2182,10 +2182,10 @@ fn packet_coverage_report(input: PacketCoverageReportInput<'_>) -> PacketCoverag
         .into_iter()
         .collect::<Vec<_>>();
     for route_gap in &route_proof.missing {
-        push_unique_term(&mut missing, route_gap);
+        push_unique_sufficiency_term(&mut missing, route_gap);
     }
     for path in missing_exact_path_claims {
-        push_unique_term(&mut missing, &format!("exact path: {path}"));
+        push_unique_sufficiency_term(&mut missing, &format!("exact path: {path}"));
     }
     let budget_omitted = if has_sufficiency_blocking_budget_omission {
         budget.omitted_sections.clone()
@@ -8547,10 +8547,10 @@ fn packet_interleave_follow_up_queries(paths: &[String], probes: &[String]) -> V
             break;
         }
         if let Some(path) = path {
-            push_unique_term(&mut merged, path);
+            push_unique_sufficiency_term(&mut merged, path);
         }
         if let Some(probe) = probe {
-            push_unique_term(&mut merged, probe);
+            push_unique_sufficiency_term(&mut merged, probe);
         }
     }
     merged
@@ -8578,7 +8578,7 @@ fn push_unique_argv(commands: &mut Vec<Vec<String>>, argv: Vec<String>) {
     }
 }
 
-fn push_unique_term(terms: &mut Vec<String>, value: &str) {
+fn push_unique_sufficiency_term(terms: &mut Vec<String>, value: &str) {
     let value = value.trim();
     if value.is_empty() {
         return;
