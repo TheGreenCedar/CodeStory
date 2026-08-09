@@ -394,8 +394,8 @@ test("the full hostile matrix shares one policy load and never writes into the c
   // The claim-profile registry is a required production *data* file: the `.rs` walk never
   // reaches it, so the lint seeds it by name and refuses to run when it is absent.
   write(
-    rustRoot,
-    path.join("agent", "data", "claim_profiles.v2.json"),
+    agentRoot,
+    path.join("data", "claim_profiles.v2.json"),
     '{ "schema_version": 2, "pending_ratchet": 0, "profiles": [] }\n',
   );
   write(retrievalRoot, "lib.rs", "pub fn neutral_retrieval_surface() {}\n");
