@@ -148,7 +148,7 @@ fn exact_path_probe_source_carrier_citation(
 ) -> Option<AgentCitationDto> {
     let project_root = controller.require_project_root().ok()?;
     let requested = resolution.path.as_deref()?;
-    let ProjectRelativePathResolution::Existing { absolute, .. } =
+    let ProjectRelativePathResolution::Existing { absolute, relative } =
         resolve_project_relative_path(&project_root, Path::new(requested)).ok()?
     else {
         return None;
@@ -184,6 +184,7 @@ fn exact_path_probe_source_carrier_citation(
     if !same_workspace_path(&absolute, &project_root.join(cited_path)) {
         return None;
     }
+    citation.file_path = Some(display_relative_path(&relative));
     citation.eligible_for_sufficiency = Some(true);
     Some(citation)
 }
@@ -794,7 +795,7 @@ mod tests {
         storage
             .insert_file(&FileInfo {
                 id: 20,
-                path: PathBuf::from("scripts/entry.cjs"),
+                path: script_path.clone(),
                 language: "javascript".to_string(),
                 modification_time: 1,
                 indexed: true,
@@ -849,7 +850,7 @@ mod tests {
                 Node {
                     id: CoreNodeId(20),
                     kind: CoreNodeKind::FILE,
-                    serialized_name: "scripts/entry.cjs".to_string(),
+                    serialized_name: script_path.to_string_lossy().to_string(),
                     file_node_id: Some(CoreNodeId(20)),
                     start_line: Some(1),
                     ..Default::default()
