@@ -1081,6 +1081,39 @@ export function stepFragmentViolations(workflows, graph = loadReleaseClaimGraph(
   return violations;
 }
 
+// Every structural-pin rule INSTANCE for a migrated workflow family lives in
+// release-claims.json under workflow_policy.structural_pins; scripts/
+// codestory-release-claims.mjs fails graph loading unless that block names exactly
+// the reviewed pin rows, so membership cannot drift by data edit. The checker keeps
+// only what stays code: the job-existence and permission-scope predicates each row's
+// kind selects, whose violation text is byte-identical to the retired inline calls.
+// A missing workflow is reported by the structural validator that owns the file, so
+// each row evaluates only when its subject workflow parsed; a missing job or an
+// absent, weaker, or wider permission scope fails the pin predicates exactly as the
+// retired inline checks did.
+export function structuralPinViolations(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
+  const violations = [];
+  for (const value of Object.values(object(object(graph.workflow_policy).structural_pins))) {
+    const row = object(value);
+    const workflow = workflows.get(row.file);
+    if (!workflow) continue;
+    if (row.kind === "job") {
+      add(
+        violations,
+        object(workflow.jobs)[row.job] !== undefined,
+        `${row.file} must contain job ${row.job}`,
+      );
+    } else {
+      add(
+        violations,
+        object(workflow.permissions)[row.scope] === row.access,
+        `${row.file} must ${row.access} ${String(row.scope).replaceAll("-", " ")}`,
+      );
+    }
+  }
+  return violations;
+}
+
 const draftProofCommands = [
   "cargo test --locked -p codestory-llama-sys --test native_staging",
   "cargo test --locked -p codestory-llama-sys --test model_staging",
@@ -2257,8 +2290,10 @@ function validateIssueWorkflows(workflows, violations) {
     violations.push(`${sagaFile} must exist`);
   } else {
     add(violations, trigger(saga, "pull_request_target") !== undefined, `${sagaFile} must use pull_request_target`);
-    add(violations, object(saga.permissions)["pull-requests"] === "read", `${sagaFile} must read pull requests`);
-    const job = requireJob(violations, sagaFile, saga, "require-closing-issue-link");
+    // The guard's structural pins (job existence and its permission scope) are rule
+    // instances and live in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates them.
+    const job = object(object(saga.jobs)["require-closing-issue-link"]);
     for (const fragment of ["codex/", "review/codestory-saga-", "[codex]", "saga:codestory-intelligence"]) {
       add(violations, String(job.if ?? "").includes(fragment), `${sagaFile} guarded condition must include ${fragment}`);
     }
@@ -2272,9 +2307,9 @@ function validateIssueWorkflows(workflows, violations) {
     violations.push(`${closeFile} must exist`);
   } else {
     add(violations, includesAll(at(close, "on", "push", "branches"), ["dev/codestory-next"]), `${closeFile} must run on dev/codestory-next pushes`);
-    add(violations, object(close.permissions).issues === "write", `${closeFile} must write issues`);
-    add(violations, object(close.permissions)["pull-requests"] === "read", `${closeFile} must read pull requests`);
-    requireJob(violations, closeFile, close, "close-linked-issues");
+    // The close automation's structural pins (job existence and both permission
+    // scopes) are rule instances and live in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates them.
     // The close automation's step fragments are rule instances and live in
     // release-claims.json under workflow_policy.step_fragments;
     // stepFragmentViolations evaluates them.
@@ -11184,6 +11219,7 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   violations.push(...releaseWorkflowContractViolations(workflows, graph));
   violations.push(...pinnedProgramViolations(workflows, graph));
   violations.push(...stepFragmentViolations(workflows, graph));
+  violations.push(...structuralPinViolations(workflows, graph));
   return violations;
 }
 
