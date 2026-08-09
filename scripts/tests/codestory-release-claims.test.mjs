@@ -797,6 +797,51 @@ test("structural pins are an exact fail-closed membership with graph-owned rule 
   }
 });
 
+test("constant mirrors are an exact fail-closed membership with graph-owned rule data", () => {
+  const mirrors = graph.workflow_policy.constant_mirrors;
+  assert.equal(Object.keys(mirrors).length, 4);
+  for (const row of Object.values(mirrors)) {
+    assert.ok(typeof row.file === "string" && row.file.length > 0);
+    assert.ok(Array.isArray(row.fragments) && row.fragments.length > 0);
+  }
+  const mutations = [
+    [draft => {
+      delete draft.workflow_policy.constant_mirrors.codex_worktree_setup;
+    }, /constant_mirrors must declare codex_worktree_setup/u],
+    [draft => {
+      draft.workflow_policy.constant_mirrors.unowned_extra = structuredClone(
+        draft.workflow_policy.constant_mirrors.codex_worktree_setup,
+      );
+    }, /names unknown constant mirror unowned_extra/u],
+    [draft => {
+      delete draft.workflow_policy.constant_mirrors.cargo_config_retrieval_aliases.fragments;
+    }, /cargo_config_retrieval_aliases must carry exactly file, fragments, reason/u],
+    [draft => {
+      draft.workflow_policy.constant_mirrors.grounding_setup_sh.job = "setup";
+    }, /grounding_setup_sh must carry exactly file, fragments, reason/u],
+    [draft => {
+      draft.workflow_policy.constant_mirrors.grounding_setup_sh.fragments = [];
+    }, /grounding_setup_sh\.fragments must be a non-empty array/u],
+    [draft => {
+      draft.workflow_policy.constant_mirrors.grounding_setup_ps1.fragments = [
+        "prepare-embedded-model.mjs",
+        "prepare-embedded-model.mjs",
+      ];
+    }, /grounding_setup_ps1\.fragments must not contain duplicates/u],
+    [draft => {
+      draft.workflow_policy.constant_mirrors.cargo_config_retrieval_aliases.file = "";
+    }, /cargo_config_retrieval_aliases\.file must be a non-empty string/u],
+    [draft => {
+      draft.workflow_policy.constant_mirrors.grounding_setup_ps1.reason = "";
+    }, /grounding_setup_ps1\.reason must be a non-empty string/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
 test("benchmark leakage names only the one-process Node contract", () => {
   const benchmarkLeakage = graph.failure_controls
     .find(({ id }) => id === "benchmark_leakage");
