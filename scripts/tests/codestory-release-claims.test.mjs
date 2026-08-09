@@ -2001,6 +2001,12 @@ test("a version-only release bump leaves the native fingerprint unchanged", () =
   // pull requests run (#1673).
   const repository = versionSurfaceRepository("HEAD");
   try {
+    const currentVersion = JSON.parse(readFileSync(
+      path.join(repository, "plugins/codestory/cli-version.json"),
+      "utf8",
+    )).cli_version;
+    const [major, minor, patch] = currentVersion.split(".").map(Number);
+    const nextVersion = `${major}.${minor}.${patch + 1}`;
     const members = workspaceMemberManifests(
       readFileSync(path.join(repository, "Cargo.toml"), "utf8"),
     );
@@ -2013,16 +2019,16 @@ test("a version-only release bump leaves the native fingerprint unchanged", () =
     // cannot run against a manifest-only checkout. Cargo's own effect on the lock -- the recorded
     // version of each workspace crate -- is applied here in its place, and the owner's own
     // `--check` then certifies that the result is a complete release bump and nothing more.
-    runBump(repository, ["--version", "0.17.0"]);
+    runBump(repository, ["--version", nextVersion]);
     const lockPath = path.join(repository, "Cargo.lock");
     writeFileSync(
       lockPath,
       readFileSync(lockPath, "utf8").replace(
         /(name = "codestory-[a-z-]+"\nversion = ")[^"]+(")/gu,
-        "$10.17.0$2",
+        `$1${nextVersion}$2`,
       ),
     );
-    const certified = runBump(repository, ["--version", "0.17.0", "--check"]);
+    const certified = runBump(repository, ["--version", nextVersion, "--check"]);
     assert.equal(
       certified.status,
       0,

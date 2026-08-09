@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.17.0
+
 ### Fixed
 
 - Raising the source-file size limit no longer leaves newly admitted files
