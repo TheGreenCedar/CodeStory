@@ -103,33 +103,89 @@ pub(crate) fn exact_packet_probe_citations(
 ) -> Vec<AgentCitationDto> {
     let mut citations = Vec::new();
     for resolution in resolutions {
-        let citation = match resolution.status {
-            PacketProbeResolutionStatusDto::ExactPath
-            | PacketProbeResolutionStatusDto::ValidUncoveredPath => {
-                exact_path_probe_citation(controller, resolution)
+        let mut append = |citation: Option<AgentCitationDto>| {
+            let Some(citation) = citation else {
+                return;
+            };
+            if !citations.iter().any(|existing: &AgentCitationDto| {
+                existing.node_id == citation.node_id && existing.file_path == citation.file_path
+            }) {
+                citations.push(citation);
+            }
+        };
+        match resolution.status {
+            PacketProbeResolutionStatusDto::ExactPath => {
+                append(exact_path_probe_citation(controller, resolution));
+                append(exact_path_probe_source_carrier_citation(
+                    controller,
+                    resolution,
+                    include_evidence,
+                ));
+            }
+            PacketProbeResolutionStatusDto::ValidUncoveredPath => {
+                append(exact_path_probe_citation(controller, resolution));
             }
             PacketProbeResolutionStatusDto::IndexedSymbol
             | PacketProbeResolutionStatusDto::FileScopedSymbol
             | PacketProbeResolutionStatusDto::TextHit
             | PacketProbeResolutionStatusDto::Continuation => {
-                resolution.symbol_id.as_deref().and_then(|symbol_id| {
+                append(resolution.symbol_id.as_deref().and_then(|symbol_id| {
                     exact_symbol_probe_citation(controller, symbol_id, include_evidence)
-                })
+                }));
             }
             PacketProbeResolutionStatusDto::FreeQuery
             | PacketProbeResolutionStatusDto::Ambiguous
-            | PacketProbeResolutionStatusDto::Rejected => None,
-        };
-        let Some(citation) = citation else {
-            continue;
-        };
-        if !citations.iter().any(|existing: &AgentCitationDto| {
-            existing.node_id == citation.node_id && existing.file_path == citation.file_path
-        }) {
-            citations.push(citation);
+            | PacketProbeResolutionStatusDto::Rejected => {}
         }
     }
     citations
+}
+
+fn exact_path_probe_source_carrier_citation(
+    controller: &AppController,
+    resolution: &PacketProbeResolutionDto,
+    include_evidence: bool,
+) -> Option<AgentCitationDto> {
+    let project_root = controller.require_project_root().ok()?;
+    let requested = resolution.path.as_deref()?;
+    let ProjectRelativePathResolution::Existing { absolute, .. } =
+        resolve_project_relative_path(&project_root, Path::new(requested)).ok()?
+    else {
+        return None;
+    };
+    let storage = controller.open_storage_read_only().ok()?;
+    let file_id = storage
+        .get_files()
+        .ok()?
+        .into_iter()
+        .find(|file| {
+            file.indexed
+                && file.complete
+                && same_workspace_path(
+                    &absolute,
+                    &if file.path.is_absolute() {
+                        file.path.clone()
+                    } else {
+                        project_root.join(&file.path)
+                    },
+                )
+        })?
+        .id;
+    let symbol_id = storage
+        .get_grounding_top_symbols_for_files(&[file_id], 1)
+        .ok()?
+        .into_iter()
+        .next()?
+        .node
+        .id;
+    let mut citation =
+        exact_symbol_probe_citation(controller, &symbol_id.to_string(), include_evidence)?;
+    let cited_path = citation.file_path.as_deref()?;
+    if !same_workspace_path(&absolute, &project_root.join(cited_path)) {
+        return None;
+    }
+    citation.eligible_for_sufficiency = Some(true);
+    Some(citation)
 }
 
 fn exact_symbol_probe_citation(
@@ -902,6 +958,31 @@ mod tests {
             Some("packet_exact_path_probe")
         );
         assert_eq!(citations[0].eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn indexed_exact_path_keeps_diagnostic_and_adds_distinct_source_carrier() {
+        let project = TempDir::new().expect("project");
+        let controller = controller_with_indexed_fixture(&project);
+        let resolutions = resolve_packet_probes(
+            &controller,
+            vec![PacketProbeDto::ExactPath {
+                path: "src/lib.rs".into(),
+            }],
+        );
+
+        let citations = exact_packet_probe_citations(&controller, &resolutions, true);
+
+        assert_eq!(citations.len(), 2);
+        assert_eq!(citations[0].file_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(citations[0].eligible_for_sufficiency, Some(false));
+        assert_eq!(citations[1].file_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(citations[1].eligible_for_sufficiency, Some(true));
+        assert_eq!(
+            citations[1].coverage_role.as_deref(),
+            Some("explicit exact probe")
+        );
+        assert_ne!(citations[0].node_id, citations[1].node_id);
     }
 
     #[test]

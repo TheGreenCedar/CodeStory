@@ -1,15 +1,15 @@
 {
   "calibration_required_values": {
     "capacity_retry_policy": {
-      "retry_after_ms": 53,
+      "retry_after_ms": 44,
       "retry_class": "after_capacity_change",
       "retry_condition_source": "named_condition_from_typed_capacity_response"
     },
     "connect_timeout_ms": 2000,
     "election_backoff_policy": {
-      "initial_backoff_ms": 8,
+      "initial_backoff_ms": 7,
       "jitter": "sha256(process_start_id||attempt) modulo inclusive [initial_backoff_ms,maximum_backoff_ms]",
-      "maximum_backoff_ms": 111
+      "maximum_backoff_ms": 122
     },
     "hard_native_no_progress_ms": 385431,
     "request_deadlines_ms": {
@@ -43,22 +43,7 @@
     "query_queue_capacity": 64,
     "true_idle_observation_grace_ms": 2500
   },
-  "freeze_record": {
-    "calibration_bundle_sha256": "ff22e85099b294e71dbb4bce739ca044beeee105c2ffa834df766b181fbc56ee",
-    "calibration_freeze_digest": "55b7a29456565f2f7463b8d288253f1697329f9f3a11c9e92905bce104c3bf1b",
-    "input_constant_set_sha256": "5017b90db395f5208b8e8cb61888f5498e8ea563909b7951cf79fde227f15241",
-    "measurement_protocol_sha256": "d1bb9b2c7eb354fe98990aa32eedc0e165b0cf804212966e0a2ee362a2f5bf8e",
-    "protocol_sha256": "f4a3fa4afb4d5bcd8e707a5e21b687cdd023dc3398b28ff6891a2318e89c5ec7",
-    "run_artifact_sha256s": [
-      "1dca090005291ef6dc5c0d24d0f9d5e8ce2b4d798661474b3a68c888341851d8",
-      "242382e890bbacae009fd3f91ad0e1233a9a03dba068c9a5a431f07108b1884a",
-      "ba03f74de77c04923de462734b48b2da6b5ec900f2dc12ba514d5c35d0d6398b"
-    ],
-    "selected_at": "github-actions-run:31321887658:1",
-    "selection_rule": "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
-    "selection_source_commit": "44237e5598e48569b45a0c3b371555a381994bca",
-    "selection_source_tree": "d0ecb51a527228b0fd323b2db561c016a5c06e16"
-  },
+  "freeze_record": null,
   "qualification_thresholds": {
     "backend_observed_accelerator_residency": 1,
     "bulk_documents_per_second": 2,
@@ -75,5 +60,5 @@
   },
   "schema_version": 1,
   "selection_protocol": "codestory-per-user-embedding-server-v1",
-  "status": "frozen"
+  "status": "unfrozen"
 }

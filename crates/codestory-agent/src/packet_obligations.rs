@@ -678,6 +678,8 @@ fn finalize_exact_probe_obligation(
         .iter()
         .filter(|citation| {
             citation.coverage_role.as_deref() == Some("explicit exact probe")
+                && (!matches!(&binding.probe, PacketProbeDto::ExactPath { .. })
+                    || citation_sufficiency_eligible(citation))
                 && citation_matches_exact_probe_binding(citation, &binding)
         })
         .collect::<Vec<_>>();
@@ -2113,6 +2115,65 @@ mod tests {
         assert!(foo.carrier_node_ids.is_empty());
         assert_eq!(bar.proof_status, PacketObligationProofStatusDto::Proven);
         assert_eq!(bar.carrier_node_ids, vec![NodeId("node-bar".to_string())]);
+    }
+
+    #[test]
+    fn exact_path_obligation_requires_same_path_eligible_carrier() {
+        let resolution = PacketProbeResolutionDto {
+            input_index: 0,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/lib.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/lib.rs".to_string()),
+            path: Some("src/lib.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+        let mut plan = PacketObligationPlanDto {
+            version: PACKET_OBLIGATION_PLAN_VERSION,
+            ..Default::default()
+        };
+        append_packet_probe_obligations(&mut plan, std::slice::from_ref(&resolution));
+        let mut diagnostic = citation("src/lib.rs", "src/lib.rs", NodeKind::FILE);
+        diagnostic.coverage_role = Some("explicit exact probe".to_string());
+        diagnostic.eligible_for_sufficiency = Some(false);
+
+        finalize_packet_obligation_plan(
+            "Explain this exact path.",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer(vec![diagnostic.clone()]),
+            &budget(),
+        );
+        assert_eq!(
+            plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Unsupported
+        );
+        assert_eq!(
+            plan.claim_obligations[0].reason.as_deref(),
+            Some("exact_probe_carrier_missing")
+        );
+
+        let mut carrier = citation("indexed_target", "src/lib.rs", NodeKind::FUNCTION);
+        carrier.coverage_role = Some("explicit exact probe".to_string());
+        carrier.eligible_for_sufficiency = Some(true);
+        finalize_packet_obligation_plan(
+            "Explain this exact path.",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer(vec![diagnostic, carrier.clone()]),
+            &budget(),
+        );
+        assert_eq!(
+            plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Proven
+        );
+        assert_eq!(
+            plan.claim_obligations[0].carrier_node_ids,
+            vec![carrier.node_id]
+        );
     }
 
     #[test]

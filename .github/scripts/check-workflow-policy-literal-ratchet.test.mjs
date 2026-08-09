@@ -334,7 +334,7 @@ const EXPECTED_LITERAL_SITES = {
   validateIssueWorkflows: { workflowNames: 2 },
   validateMarketplaceSync: { stepNames: 5, workflowNames: 1 },
   validatePackageMatrixExpression: { workflowNames: 3 },
-  validatePackagedCoordinator: { permissionTuples: 2, stepNames: 34, workflowNames: 11 },
+  validatePackagedCoordinator: { permissionTuples: 2, stepNames: 35, workflowNames: 11 },
   validatePackagedProof: { digests: 2, permissionTuples: 2, stepNames: 106, workflowNames: 2 },
   validatePluginAndDraftWorkflows: { stepNames: 29, workflowNames: 12 },
   validatePluginRelease: { permissionTuples: 1, stepNames: 13, workflowNames: 6 },
