@@ -21,6 +21,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -118,6 +119,35 @@ def _commit_all(root: Path, message: str) -> str:
     return _git(root, "rev-parse", "HEAD")
 
 
+def _render_codex_config(origin: dict[str, str], revision: str, deferred: bool) -> str:
+    """Render the isolated Codex config with TOML-safe string values."""
+    config = [f"[marketplaces.{_MARKETPLACE_NAME}]"]
+    config.append(
+        f"source_type = {json.dumps(origin['sourceType'], ensure_ascii=False)}"
+    )
+    config.append(f"source = {json.dumps(origin['source'], ensure_ascii=False)}")
+    if not deferred:
+        config.append(f"ref = {json.dumps(revision, ensure_ascii=False)}")
+    config.append("")
+    config.append(f'[plugins."{_PLUGIN_ID}"]')
+    config.append("enabled = true")
+    return "\n".join(config) + "\n"
+
+
+def _run_codex_config_serialization_self_test() -> None:
+    windows_source = r"C:\Users\Albert\AppData\Local\Codex\marketplaces\TheGreenCedar"
+    rendered = _render_codex_config(
+        {"sourceType": "local", "source": windows_source},
+        "f" * 40,
+        deferred=True,
+    )
+    parsed = tomllib.loads(rendered)
+    require(
+        parsed["marketplaces"][_MARKETPLACE_NAME]["source"] == windows_source,
+        "isolated Codex config did not preserve a native Windows marketplace path",
+    )
+
+
 def _build_world(root: Path, deferred: bool, manifest: dict) -> dict:
     """A complete, valid installed-runtime world on disk for one delivery state."""
     commit = manifest["source"]["commit"]
@@ -162,15 +192,9 @@ def _build_world(root: Path, deferred: bool, manifest: dict) -> dict:
         if deferred
         else {"sourceType": "git", "source": _LIVE_URL}
     )
-    config = [f"[marketplaces.{_MARKETPLACE_NAME}]"]
-    config.append(f'source_type = "{origin["sourceType"]}"')
-    config.append(f'source = "{origin["source"]}"')
-    if not deferred:
-        config.append(f'ref = "{revision}"')
-    config.append("")
-    config.append(f'[plugins."{_PLUGIN_ID}"]')
-    config.append("enabled = true")
-    (codex_home / "config.toml").write_text("\n".join(config) + "\n", encoding="utf-8")
+    (codex_home / "config.toml").write_text(
+        _render_codex_config(origin, revision, deferred), encoding="utf-8"
+    )
 
     installed_entry = {
         "pluginId": _PLUGIN_ID,
@@ -585,6 +609,7 @@ def _run_shared_identity_self_tests() -> None:
 
 
 def run_marketplace_delivery_self_tests() -> None:
+    _run_codex_config_serialization_self_test()
     manifest = _manifest()
     with tempfile.TemporaryDirectory(prefix="codestory-marketplace-delivery-") as raw:
         root = Path(raw).resolve()
