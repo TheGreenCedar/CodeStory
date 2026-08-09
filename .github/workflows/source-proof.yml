@@ -328,6 +328,15 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Run packaged proof self-test
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = "Stop"
+          python .github/scripts/check-packaged-agent-proof.py --self-test
+          if ($LASTEXITCODE -ne 0) {
+            throw "packaged proof self-test failed on the protected Windows runner"
+          }
+
       - name: Run exact-head Windows native probe
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
@@ -339,10 +348,6 @@ jobs:
             throw "native probe root already exists: $probeRoot"
           }
           try {
-            python .github/scripts/check-packaged-agent-proof.py --self-test
-            if ($LASTEXITCODE -ne 0) {
-              throw "packaged proof self-test failed on the protected Windows runner"
-            }
             cargo new --quiet --bin --name cargo-hardlink-probe $probeRoot
             if ($LASTEXITCODE -ne 0) {
               throw "cargo new failed"

@@ -3607,6 +3607,19 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         "Execute exact-head hostile mutation matrix",
       )["continue-on-error"] = true;
     }, /exact blocking hostile mutation job/u],
+    ["Windows packaged proof self-test is recombined with the timed probe", workflows => {
+      const job = workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"];
+      const selfTest = draftStep(job, "Run packaged proof self-test");
+      const probe = draftStep(job, "Run exact-head Windows native probe");
+      probe.run = `${selfTest.run}\n${probe.run}`;
+      job.steps = job.steps.filter(step => step.name !== "Run packaged proof self-test");
+    }, /canonical acceptance job manifest/u],
+    ["Windows packaged proof self-test becomes advisory", workflows => {
+      draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],
+        "Run packaged proof self-test",
+      )["continue-on-error"] = true;
+    }, /canonical acceptance job manifest/u],
     ["Windows probe leaves the protected runner", workflows => {
       workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"]["runs-on"]
         = ["self-hosted", "Windows", "X64"];

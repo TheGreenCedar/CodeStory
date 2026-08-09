@@ -5,7 +5,7 @@
   "jobs": {
     "resolve": "da6c955c944644cd714728bf67d43aabd4ad049d5fde943ce7b1739f3d7cd8e5",
     "freeze-hostile-mutations": "ebc27d28a1c087f848be090d2a2a458acee0177f06048c4d357e0724cf38be1a",
-    "freeze-windows-native-probe": "8afa4fd6b8c376c39d47f9752c5a9e7f2a928346f09a5d8ccc03d068bf92d0bf",
+    "freeze-windows-native-probe": "e4570bb9d0ae34da43965d49c02b34276b43ad6b6e2a492435dedb1f254e454a",
     "freeze-acceptance": "544688894a77c9f95ef5799e3070ec3bea4e199b5ed650f9aa62d35a54e83ca4"
   }
 }
