@@ -584,6 +584,7 @@ fn agent_planning_crate_owns_planning_and_depends_on_contracts_only() {
         "pinned_reader.rs",
         "planning.rs",
         "text.rs",
+        "workspace_path_identity.rs",
     ] {
         assert!(
             repo_root()
@@ -618,6 +619,51 @@ fn agent_planning_crate_owns_planning_and_depends_on_contracts_only() {
             !agent_source.contains(forbidden),
             "codestory-agent must not spell {forbidden}: planning owns no persisted state"
         );
+    }
+}
+
+/// The `WorkspacePathIdentity` seam is threaded into packet sufficiency as a
+/// REQUIRED argument, and the requirement only holds while nothing can stand
+/// in for it. A defaulted seam is exactly the LanguageExtraction defect: a
+/// sibling construction site compiles against the default and silently runs
+/// without the real dependency. Neither the trait's home in `codestory-agent`
+/// nor the runtime adapter that closes it over
+/// `codestory_workspace::same_workspace_path` may ever spell a `Default`, so
+/// every new construction site stays a compile error until it threads the
+/// seam explicitly.
+#[test]
+fn workspace_path_identity_seam_never_grows_a_default() {
+    let seam = read("crates/codestory-agent/src/workspace_path_identity.rs");
+    assert!(
+        seam.contains("pub trait WorkspacePathIdentity"),
+        "the WorkspacePathIdentity seam trait must live in codestory-agent"
+    );
+    let adapter = read("crates/codestory-runtime/src/agent/path_identity.rs");
+    assert!(
+        adapter.contains("impl WorkspacePathIdentity for RuntimeWorkspacePathIdentity"),
+        "the runtime must close the WorkspacePathIdentity seam over same_workspace_path"
+    );
+
+    for (path, source) in [
+        (
+            "crates/codestory-agent/src/workspace_path_identity.rs",
+            &seam,
+        ),
+        (
+            "crates/codestory-runtime/src/agent/path_identity.rs",
+            &adapter,
+        ),
+    ] {
+        for line in source.lines() {
+            let spells_default = line.contains("impl Default")
+                || (line.contains("derive") && line.contains("Default"));
+            assert!(
+                !spells_default,
+                "{path} must not give the path identity seam a Default; keep it a required \
+                 argument so sibling construction sites fail to compile without it \
+                 (offending line: {line:?})"
+            );
+        }
     }
 }
 

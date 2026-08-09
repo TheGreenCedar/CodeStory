@@ -11,6 +11,7 @@ pub(crate) mod packet_probe;
 pub(crate) mod packet_search;
 pub(crate) mod packet_sufficiency;
 pub(crate) mod packet_trace;
+pub(crate) mod path_identity;
 pub(crate) mod profiles;
 pub(crate) mod retrieval_primary;
 pub(crate) mod trace;

@@ -24,6 +24,8 @@ use crate::agent::packet_scoring::{
     packet_display_path,
 };
 use crate::agent::packet_terms::packet_probe_terms;
+#[cfg(test)]
+use crate::agent::path_identity::RuntimeWorkspacePathIdentity;
 use codestory_agent::packet_command::next_deeper_packet_argv;
 #[allow(unused_imports)]
 pub(crate) use codestory_agent::packet_command::quote_packet_command_value;
@@ -31,6 +33,7 @@ pub(crate) use codestory_agent::packet_command::{
     packet_argv, packet_display_project_arg, packet_follow_up_invocation, render_packet_command,
 };
 pub(crate) use codestory_agent::packet_execution_graphs::packet_execution_graphs;
+use codestory_agent::workspace_path_identity::WorkspacePathIdentity;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepStatusDto, EdgeKind, GraphResponse,
     NodeKind, PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto, PacketClaimObligationDto,
@@ -98,6 +101,7 @@ pub(crate) fn build_packet_sufficiency_with_probe_context(
     exact_probe_paths: &[String],
 ) -> PacketSufficiencyDto {
     build_packet_sufficiency_with_optional_obligation_context(
+        &RuntimeWorkspacePathIdentity,
         project_root,
         question,
         task_class,
@@ -111,6 +115,7 @@ pub(crate) fn build_packet_sufficiency_with_probe_context(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_packet_sufficiency_with_obligation_context(
+    path_identity: &dyn WorkspacePathIdentity,
     project_root: &Path,
     question: &str,
     task_class: PacketTaskClassDto,
@@ -121,6 +126,7 @@ pub(crate) fn build_packet_sufficiency_with_obligation_context(
     obligations: &PacketObligationPlanDto,
 ) -> PacketSufficiencyDto {
     build_packet_sufficiency_with_optional_obligation_context(
+        path_identity,
         project_root,
         question,
         task_class,
@@ -134,6 +140,7 @@ pub(crate) fn build_packet_sufficiency_with_obligation_context(
 
 #[allow(clippy::too_many_arguments)]
 fn build_packet_sufficiency_with_optional_obligation_context(
+    path_identity: &dyn WorkspacePathIdentity,
     project_root: &Path,
     question: &str,
     task_class: PacketTaskClassDto,
@@ -157,6 +164,7 @@ fn build_packet_sufficiency_with_optional_obligation_context(
         extra_probes,
     );
     assemble_packet_sufficiency_with_probe_context(
+        path_identity,
         PacketSufficiencyInput {
             project_root,
             question,
@@ -175,7 +183,13 @@ fn build_packet_sufficiency_with_optional_obligation_context(
 
 #[cfg(test)]
 fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSufficiencyDto {
-    assemble_packet_sufficiency_with_probe_context(input, &[], &[], None)
+    assemble_packet_sufficiency_with_probe_context(
+        &RuntimeWorkspacePathIdentity,
+        input,
+        &[],
+        &[],
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -183,7 +197,13 @@ fn assemble_packet_sufficiency_with_route_probes(
     input: PacketSufficiencyInput<'_>,
     selected_probes: &[String],
 ) -> PacketSufficiencyDto {
-    assemble_packet_sufficiency_with_probe_context(input, selected_probes, &[], None)
+    assemble_packet_sufficiency_with_probe_context(
+        &RuntimeWorkspacePathIdentity,
+        input,
+        selected_probes,
+        &[],
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -191,10 +211,17 @@ fn assemble_packet_sufficiency_with_exact_paths(
     input: PacketSufficiencyInput<'_>,
     exact_probe_paths: &[String],
 ) -> PacketSufficiencyDto {
-    assemble_packet_sufficiency_with_probe_context(input, &[], exact_probe_paths, None)
+    assemble_packet_sufficiency_with_probe_context(
+        &RuntimeWorkspacePathIdentity,
+        input,
+        &[],
+        exact_probe_paths,
+        None,
+    )
 }
 
 fn assemble_packet_sufficiency_with_probe_context(
+    path_identity: &dyn WorkspacePathIdentity,
     input: PacketSufficiencyInput<'_>,
     selected_probes: &[String],
     exact_probe_paths: &[String],
@@ -253,8 +280,12 @@ fn assemble_packet_sufficiency_with_probe_context(
     let has_minimum_claims = sufficiency_claims.len() >= min_claims;
     let claim_family_count = packet_supported_claim_family_count(&sufficiency_claims);
     let has_minimum_claim_families = claim_family_count >= min_claim_families;
-    let missing_exact_path_claims =
-        packet_missing_exact_path_claims(project_root, exact_probe_paths, &sufficiency_claims);
+    let missing_exact_path_claims = packet_missing_exact_path_claims(
+        path_identity,
+        project_root,
+        exact_probe_paths,
+        &sufficiency_claims,
+    );
     // Legacy/unit callers without an obligation ledger retain the pre-EV-5 route-probe contract.
     // Production claims must survive typed binding; route stages may additionally use the exact
     // Proven carrier rows from that same plan below.
@@ -482,7 +513,7 @@ fn assemble_packet_sufficiency_with_probe_context(
                 .iter()
                 .any(|unprovable| unprovable == &display)
                 && !unprovable_paths.iter().any(|unprovable| {
-                    packet_paths_match_exact_probe(project_root, unprovable, path)
+                    packet_paths_match_exact_probe(path_identity, project_root, unprovable, path)
                 })
         });
     }
@@ -2024,6 +2055,7 @@ fn packet_claim_is_generic_navigation_or_source_evidence(claim: &PacketClaimDto)
 /// Every resolved in-project path the caller named must be carried by its own proof-bearing claim,
 /// whatever the task class: a packet that answers around a requested path has not answered about it.
 fn packet_missing_exact_path_claims(
+    path_identity: &dyn WorkspacePathIdentity,
     project_root: &Path,
     exact_probe_paths: &[String],
     sufficiency_claims: &[PacketClaimDto],
@@ -2033,7 +2065,12 @@ fn packet_missing_exact_path_claims(
             .iter()
             .fold(Vec::<&String>::new(), |mut unique_paths, path| {
                 if !unique_paths.iter().any(|existing| {
-                    packet_paths_match_exact_probe(project_root, existing.as_str(), path)
+                    packet_paths_match_exact_probe(
+                        path_identity,
+                        project_root,
+                        existing.as_str(),
+                        path,
+                    )
                 }) {
                     unique_paths.push(path);
                 }
@@ -2053,6 +2090,7 @@ fn packet_missing_exact_path_claims(
                             citation_sufficiency_eligible(citation)
                                 && citation.file_path.as_deref().is_some_and(|citation_path| {
                                     packet_paths_match_exact_probe(
+                                        path_identity,
                                         project_root,
                                         citation_path,
                                         path.as_str(),
@@ -2116,6 +2154,7 @@ fn packet_assign_exact_path_claim(
 }
 
 fn packet_paths_match_exact_probe(
+    path_identity: &dyn WorkspacePathIdentity,
     project_root: &Path,
     citation_path: &str,
     exact_probe_path: &str,
@@ -2128,7 +2167,7 @@ fn packet_paths_match_exact_probe(
             project_root.join(path)
         }
     };
-    codestory_workspace::same_workspace_path(
+    path_identity.same_workspace_path(
         absolute(citation_path).as_path(),
         absolute(exact_probe_path).as_path(),
     )
@@ -3069,6 +3108,7 @@ mod tests {
             supported_claims_with_telemetry,
         );
         let sufficiency = build_packet_sufficiency_with_obligation_context(
+            &RuntimeWorkspacePathIdentity,
             Path::new("C:/workspace/project"),
             question,
             PacketTaskClassDto::RouteTracing,
@@ -4361,8 +4401,13 @@ mod tests {
             stdio_path.to_string(),
             runtime_path.to_string(),
         ];
-        let sufficiency =
-            assemble_packet_sufficiency_with_probe_context(input(), &[], &exact_paths, None);
+        let sufficiency = assemble_packet_sufficiency_with_probe_context(
+            &RuntimeWorkspacePathIdentity,
+            input(),
+            &[],
+            &exact_paths,
+            None,
+        );
 
         assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
         assert!(
@@ -4401,12 +4446,18 @@ mod tests {
         let project_root = Path::new("C:/workspace/project");
 
         assert!(packet_paths_match_exact_probe(
+            &RuntimeWorkspacePathIdentity,
             project_root,
             "crates/foo/src/lib.rs",
             "crates/foo/src/lib.rs"
         ));
         assert!(
-            !packet_paths_match_exact_probe(project_root, "src/lib.rs", "crates/foo/src/lib.rs"),
+            !packet_paths_match_exact_probe(
+                &RuntimeWorkspacePathIdentity,
+                project_root,
+                "src/lib.rs",
+                "crates/foo/src/lib.rs"
+            ),
             "a shorter same-suffix citation must not satisfy a different exact path"
         );
     }
@@ -4436,6 +4487,7 @@ mod tests {
         );
 
         let missing = packet_missing_exact_path_claims(
+            &RuntimeWorkspacePathIdentity,
             project_root,
             &paths.map(str::to_string),
             &[overlapping_claim, launcher_claim],
@@ -4467,6 +4519,7 @@ mod tests {
         broad_claim.citations = citations.to_vec();
 
         let missing = packet_missing_exact_path_claims(
+            &RuntimeWorkspacePathIdentity,
             project_root,
             &paths.map(str::to_string),
             &[broad_claim],
@@ -4533,6 +4586,7 @@ mod tests {
         let exact_paths = paths.map(str::to_string);
 
         let sufficiency = assemble_packet_sufficiency_with_probe_context(
+            &RuntimeWorkspacePathIdentity,
             PacketSufficiencyInput {
                 project_root: Path::new("C:/workspace/project"),
                 question,
@@ -7725,6 +7779,7 @@ mod tests {
             answer.citations = vec![covered.clone()];
 
             let sufficiency = assemble_packet_sufficiency_with_probe_context(
+                &RuntimeWorkspacePathIdentity,
                 PacketSufficiencyInput {
                     project_root: Path::new("C:/workspace/project"),
                     question,
@@ -7781,6 +7836,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let sufficiency = assemble_packet_sufficiency_with_probe_context(
+            &RuntimeWorkspacePathIdentity,
             PacketSufficiencyInput {
                 project_root: Path::new("C:/workspace/project"),
                 question,
@@ -8069,6 +8125,7 @@ mod tests {
         ];
 
         let sufficiency = assemble_packet_sufficiency_with_probe_context(
+            &RuntimeWorkspacePathIdentity,
             PacketSufficiencyInput {
                 project_root: Path::new("C:/workspace/project"),
                 question,

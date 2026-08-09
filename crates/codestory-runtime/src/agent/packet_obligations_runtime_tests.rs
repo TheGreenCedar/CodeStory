@@ -4,6 +4,7 @@ use crate::agent::packet_claims::packet_supported_claims;
 use crate::agent::packet_freshness::fresh_index_observation;
 use crate::agent::packet_obligations::*;
 use crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context;
+use crate::agent::path_identity::RuntimeWorkspacePathIdentity;
 use codestory_contracts::api::*;
 use std::path::Path;
 
@@ -251,6 +252,7 @@ fn cancelled_diagnostic_query_does_not_block_a_complete_material_ledger() {
     }));
     assert!(material_packet_obligations_are_proven(&plan), "{plan:#?}");
     let sufficiency = build_packet_sufficiency_with_obligation_context(
+        &RuntimeWorkspacePathIdentity,
         Path::new("/workspace/example"),
         question,
         PacketTaskClassDto::ArchitectureExplanation,
@@ -334,6 +336,7 @@ fn a_required_query_whose_semantic_stage_timed_out_demotes_through_its_obligatio
     );
 
     let sufficiency = build_packet_sufficiency_with_obligation_context(
+        &RuntimeWorkspacePathIdentity,
         Path::new("/workspace/example"),
         question,
         PacketTaskClassDto::ArchitectureExplanation,
@@ -692,6 +695,7 @@ fn sufficient_profile_closes_incidental_nonmaterial_guard_path() {
         "the raw unproven guard receipt must exercise the terminal open-next gate"
     );
     let sufficiency = build_packet_sufficiency_with_obligation_context(
+        &RuntimeWorkspacePathIdentity,
         Path::new("/workspace/example"),
         question,
         PacketTaskClassDto::SymbolOwnership,
@@ -779,6 +783,7 @@ fn case_distinct_exact_symbols_need_separate_carriers() {
     assert!(!material_packet_obligations_are_proven(&plan));
 
     let sufficiency = build_packet_sufficiency_with_obligation_context(
+        &RuntimeWorkspacePathIdentity,
         Path::new("/workspace/example"),
         question,
         PacketTaskClassDto::SymbolOwnership,
@@ -841,6 +846,7 @@ fn case_distinct_slash_qualified_symbols_need_separate_carriers() {
     assert!(lower.carrier_node_ids.is_empty());
 
     let sufficiency = build_packet_sufficiency_with_obligation_context(
+        &RuntimeWorkspacePathIdentity,
         Path::new("/workspace/example"),
         question,
         PacketTaskClassDto::SymbolOwnership,
@@ -908,6 +914,7 @@ fn one_proven_claim_cannot_hide_an_unproven_claim_in_the_same_file() {
     }));
 
     let sufficiency = build_packet_sufficiency_with_obligation_context(
+        &RuntimeWorkspacePathIdentity,
         Path::new("/workspace/example"),
         question,
         PacketTaskClassDto::SymbolOwnership,
@@ -992,6 +999,7 @@ fn missing_requested_claim_gets_a_material_unsupported_obligation() {
     assert!(!material_packet_obligations_are_proven(&plan));
 
     let sufficiency = build_packet_sufficiency_with_obligation_context(
+        &RuntimeWorkspacePathIdentity,
         Path::new("/workspace/example"),
         question,
         PacketTaskClassDto::SymbolOwnership,
@@ -1037,6 +1045,7 @@ fn false_shape_carrier_stays_reported_partial_and_open_next() {
         Some("carrier_does_not_satisfy_role_contract")
     );
     let sufficiency = build_packet_sufficiency_with_obligation_context(
+        &RuntimeWorkspacePathIdentity,
         Path::new("/workspace/example"),
         INDEXING_QUESTION,
         PacketTaskClassDto::ArchitectureExplanation,
@@ -1081,6 +1090,7 @@ fn known_false_carriers_publish_no_proven_claims_and_stay_open_next() {
     );
 
     let sufficiency = build_packet_sufficiency_with_obligation_context(
+        &RuntimeWorkspacePathIdentity,
         Path::new("/workspace/example"),
         question,
         PacketTaskClassDto::SymbolOwnership,
@@ -1135,6 +1145,7 @@ fn missing_carrier_keeps_requested_path_as_open_next_candidate() {
         &budget,
     );
     let sufficiency = build_packet_sufficiency_with_obligation_context(
+        &RuntimeWorkspacePathIdentity,
         Path::new("/workspace/example"),
         INDEXING_QUESTION,
         PacketTaskClassDto::ArchitectureExplanation,

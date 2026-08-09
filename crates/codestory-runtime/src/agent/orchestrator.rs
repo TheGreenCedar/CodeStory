@@ -89,6 +89,7 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow, prompt_search_terms,
 };
+use crate::agent::path_identity::RuntimeWorkspacePathIdentity;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
     RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome, maybe_run_retrieval_shadow,
@@ -566,6 +567,7 @@ pub(crate) fn agent_packet(
     append_packet_non_trace_phase(&mut answer, "evidence_sections", phase_started);
     let phase_started = Instant::now();
     let sufficiency = build_packet_sufficiency_with_obligation_context(
+        &RuntimeWorkspacePathIdentity,
         &project_root,
         &question,
         plan.task_class,
@@ -5437,6 +5439,7 @@ mod tests {
         finalize_packet_obligation_plan(question, task_class, &mut obligations, &answer, &budget);
         append_packet_evidence_sections(&mut answer, task_class, &limits, Some(&obligations));
         let sufficiency = build_packet_sufficiency_with_obligation_context(
+            &RuntimeWorkspacePathIdentity,
             packet_fixture_project_root(),
             question,
             task_class,
@@ -10632,6 +10635,7 @@ mod tests {
             &budget,
         );
         let sufficiency = build_packet_sufficiency_with_obligation_context(
+            &RuntimeWorkspacePathIdentity,
             packet_fixture_project_root(),
             question,
             PacketTaskClassDto::ArchitectureExplanation,
@@ -10870,6 +10874,7 @@ mod tests {
             &budget,
         );
         let sufficiency = build_packet_sufficiency_with_obligation_context(
+            &RuntimeWorkspacePathIdentity,
             packet_fixture_project_root(),
             question,
             PacketTaskClassDto::ArchitectureExplanation,
@@ -10941,6 +10946,7 @@ mod tests {
             &budget,
         );
         let sufficiency = build_packet_sufficiency_with_obligation_context(
+            &RuntimeWorkspacePathIdentity,
             packet_fixture_project_root(),
             question,
             PacketTaskClassDto::ArchitectureExplanation,
