@@ -15,6 +15,7 @@ use super::{
 use crate::agent::packet_evidence::decorate_lexical_search_hit_evidence;
 #[cfg(test)]
 use crate::agent::packet_evidence::decorate_search_hit_evidence;
+use crate::controller_symbols::node_names_for_ids;
 #[cfg(test)]
 use crate::search_publication::{
     retrieval_state_from_engine, retrieval_state_from_engine_with_storage_contract,
@@ -449,10 +450,9 @@ impl AppController {
             }
         }
 
-        Ok(Some((
-            aggregate_symbol_matches(direct_matches, expanded),
-            s.node_names.clone(),
-        )))
+        let matches = aggregate_symbol_matches(direct_matches, expanded);
+        let node_names = node_names_for_ids(&s.node_names, matches.iter().map(|(id, _)| *id));
+        Ok(Some((matches, node_names)))
     }
 
     fn search_hybrid_results(
@@ -650,7 +650,8 @@ impl AppController {
                 "hybrid_search_instrumentation"
             );
 
-            (hits, s.node_names.clone(), retrieval)
+            let node_names = node_names_for_ids(&s.node_names, hits.iter().map(|hit| hit.node_id));
+            (hits, node_names, retrieval)
         };
 
         let mut out = Vec::with_capacity(hybrid.len());

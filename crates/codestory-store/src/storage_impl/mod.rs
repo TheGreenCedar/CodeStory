@@ -73,7 +73,8 @@ const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id,
 /// an unpinned planner reads `resolved_source_node_id IS NULL` as the more
 /// selective term and seeks every unresolved CALL edge in the repository.
 /// `raw_call_edges_by_effective_source_plan_seeks_both_branches` holds the shape.
-/// Every pinned index is created for any live store (schema.rs:396,415).
+/// `INDEXED BY` makes both indexes hard `prepare()` dependencies; storage_impl/schema.rs
+/// guarantees them with `CREATE INDEX IF NOT EXISTS` for every live store.
 const RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL: &str = "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, e.callsite_identity, e.certainty, e.candidate_target_node_ids
      FROM edge e INDEXED BY idx_edge_resolved_source
      WHERE e.resolved_source_node_id = ?1

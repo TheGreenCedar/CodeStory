@@ -1224,6 +1224,7 @@ pub(crate) fn sidecar_rejection_diagnostic(
 ) -> String {
     let project_root = controller.require_project_root().ok();
     let storage = controller.open_storage_read_only().ok();
+    // Deliberate full-map copy: resolution discovers node ids mid-walk from storage, so an upfront candidate bound would change diagnostic labels.
     let node_names = controller.state.lock().node_names.clone();
     let candidate_summaries: Vec<String> = query_result
         .hits
@@ -1292,6 +1293,7 @@ fn sidecar_candidate_resolution_labels(
 ) -> Vec<String> {
     let project_root = controller.require_project_root().ok();
     let storage = controller.open_storage_read_only().ok();
+    // Deliberate full-map copy: resolution discovers node ids mid-walk from storage, so an upfront candidate bound would change diagnostic labels.
     let node_names = controller.state.lock().node_names.clone();
     candidates
         .iter()
@@ -1329,6 +1331,7 @@ fn sidecar_candidate_admission_labels(
 ) -> Vec<SidecarCandidateAdmissionLabel> {
     let project_root = controller.require_project_root().ok();
     let storage = controller.open_storage_read_only().ok();
+    // Deliberate full-map copy: resolution discovers node ids mid-walk from storage, so an upfront candidate bound would change diagnostic labels.
     let node_names = controller.state.lock().node_names.clone();
     let search_nodes = ranked_hit_nodes(search_hits);
     let search_paths = project_root
