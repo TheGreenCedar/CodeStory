@@ -1,9 +1,9 @@
 //! Citation construction from search hits for agent retrieval.
 
-use crate::agent::packet_evidence::decorate_citation_from_hit;
+use crate::packet_evidence::decorate_citation_from_hit;
 use codestory_contracts::api::{AgentCitationDto, EdgeId, GraphResponse, NodeId, SearchHit};
 
-pub(crate) fn to_citation_from_hit(
+pub fn to_citation_from_hit(
     hit: &SearchHit,
     subgraph_id: Option<&str>,
     primary_graph: Option<&GraphResponse>,
@@ -39,7 +39,7 @@ pub(crate) fn to_citation_from_hit(
     citation
 }
 
-pub(crate) fn evidence_edge_ids_for_node(
+pub fn evidence_edge_ids_for_node(
     primary_graph: Option<&GraphResponse>,
     node_id: &NodeId,
 ) -> Vec<EdgeId> {

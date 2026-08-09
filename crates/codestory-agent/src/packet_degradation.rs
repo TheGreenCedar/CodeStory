@@ -44,11 +44,11 @@ const STAGE_COMPLETED_LATE: &str = "completed_late";
 
 /// How one query's semantic stage behaved.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct SemanticStageDegradation {
+pub struct SemanticStageDegradation {
     /// The semantic stage lost its budget and merged no candidate.
-    pub(crate) timed_out_zero_hits: bool,
+    pub timed_out_zero_hits: bool,
     /// The semantic stage declined to run, or produced only stub candidates.
-    pub(crate) abstained: bool,
+    pub abstained: bool,
 }
 
 /// Whether a stage record means the stage's candidates were lost to a deadline.
@@ -64,9 +64,7 @@ fn is_semantic_stage(stage: &RetrievalStageTimingDto) -> bool {
 }
 
 /// Read one query's stage record for semantic degradation.
-pub(crate) fn semantic_stage_degradation(
-    stages: &[RetrievalStageTimingDto],
-) -> SemanticStageDegradation {
+pub fn semantic_stage_degradation(stages: &[RetrievalStageTimingDto]) -> SemanticStageDegradation {
     let mut degradation = SemanticStageDegradation::default();
     for stage in stages.iter().filter(|stage| is_semantic_stage(stage)) {
         if stage_lost_to_deadline(stage) && stage.candidates_added == 0 {
@@ -83,7 +81,7 @@ pub(crate) fn semantic_stage_degradation(
 ///
 /// Fails closed on the shapes that lose candidates and stays quiet on the planned marginal-gain
 /// stop, so a healthy packet is not permanently demoted by normal early termination.
-pub(crate) fn primary_retrieval_truncated(shadow: &RetrievalShadowDto) -> bool {
+pub fn primary_retrieval_truncated(shadow: &RetrievalShadowDto) -> bool {
     if shadow.error.is_some() {
         return true;
     }
@@ -98,7 +96,7 @@ pub(crate) fn primary_retrieval_truncated(shadow: &RetrievalShadowDto) -> bool {
 }
 
 /// Whether this packet's primary retrieval run is verdict-visibly truncated.
-pub(crate) fn packet_primary_retrieval_truncated(answer: &AgentAnswerDto) -> bool {
+pub fn packet_primary_retrieval_truncated(answer: &AgentAnswerDto) -> bool {
     answer
         .retrieval_trace
         .retrieval_shadow
@@ -111,7 +109,7 @@ pub(crate) fn packet_primary_retrieval_truncated(answer: &AgentAnswerDto) -> boo
 /// The counters are recomputed from the answer rather than accumulated during retrieval so that
 /// budget enforcement, which may drop diagnostics and the primary shadow, cannot leave a counter
 /// describing evidence the packet no longer carries.
-pub(crate) fn apply_packet_semantic_degradation_counters(answer: &mut AgentAnswerDto) {
+pub fn apply_packet_semantic_degradation_counters(answer: &mut AgentAnswerDto) {
     let primary = answer
         .retrieval_trace
         .retrieval_shadow

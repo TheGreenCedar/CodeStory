@@ -28,8 +28,8 @@ use codestory_contracts::api::{
 /// version, so the number is published beside the counts and pinned by contract tests. There
 /// is one number: it is the schema version of the checked-in registry document, so a trace
 /// cannot claim a contract shape the loaded data was not written against.
-pub(crate) const PACKET_CLAIM_PROFILE_CONTRACT_VERSION: u32 =
-    crate::agent::packet_claim_profile_registry::PACKET_CLAIM_PROFILE_SCHEMA_VERSION;
+pub const PACKET_CLAIM_PROFILE_CONTRACT_VERSION: u32 =
+    crate::packet_claim_profile_registry::PACKET_CLAIM_PROFILE_SCHEMA_VERSION;
 
 /// Which layer produced a packet claim.
 ///
@@ -37,7 +37,7 @@ pub(crate) const PACKET_CLAIM_PROFILE_CONTRACT_VERSION: u32 =
 /// different facts. Counting them apart is what lets a field trace answer "did the fitted
 /// layer fire, or did this packet degrade to naming?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum PacketClaimSource {
+pub enum PacketClaimSource {
     /// Source-text-derived claims from the versioned product claim-profile registry.
     SourceProfile,
     /// Claims templated from a command/subcommand shape in the question.
@@ -51,7 +51,7 @@ pub(crate) enum PacketClaimSource {
 }
 
 impl PacketClaimSource {
-    pub(crate) const ALL: [Self; 5] = [
+    pub const ALL: [Self; 5] = [
         Self::SourceProfile,
         Self::CommandProfile,
         Self::FlowTemplate,
@@ -72,33 +72,33 @@ impl PacketClaimSource {
 
 /// Per-profile fire counts for one packet.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PacketProfileFireCount {
+pub struct PacketProfileFireCount {
     /// Citations this profile was offered.
-    pub(crate) evaluated: u32,
+    pub evaluated: u32,
     /// Citations for which this profile emitted at least one claim.
-    pub(crate) fired: u32,
+    pub fired: u32,
     /// Claims this profile emitted.
-    pub(crate) claims: u32,
+    pub claims: u32,
     /// Citations where a runtime contract violation skipped this profile before it ran.
-    pub(crate) skipped_invalid: u32,
+    pub skipped_invalid: u32,
     /// Typed code of the violation that caused the skip, when there was one.
-    pub(crate) skip_reason: Option<&'static str>,
+    pub skip_reason: Option<&'static str>,
 }
 
 /// Fire-rate and claim-source counters accumulated while assembling one packet's claims.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PacketClaimTelemetry {
+pub struct PacketClaimTelemetry {
     citations_considered: u32,
     profiles: BTreeMap<&'static str, PacketProfileFireCount>,
     sources: BTreeMap<PacketClaimSource, u32>,
 }
 
 impl PacketClaimTelemetry {
-    pub(crate) fn record_citation_considered(&mut self) {
+    pub fn record_citation_considered(&mut self) {
         self.citations_considered = self.citations_considered.saturating_add(1);
     }
 
-    pub(crate) fn record_profile_evaluated(&mut self, profile_id: &'static str, claims: usize) {
+    pub fn record_profile_evaluated(&mut self, profile_id: &'static str, claims: usize) {
         let entry = self.profiles.entry(profile_id).or_default();
         entry.evaluated = entry.evaluated.saturating_add(1);
         if claims > 0 {
@@ -109,7 +109,7 @@ impl PacketClaimTelemetry {
         }
     }
 
-    pub(crate) fn record_profile_skipped(
+    pub fn record_profile_skipped(
         &mut self,
         profile_id: &'static str,
         violation_code: &'static str,
@@ -120,7 +120,7 @@ impl PacketClaimTelemetry {
         entry.skip_reason = Some(violation_code);
     }
 
-    pub(crate) fn record_claim_source(&mut self, source: PacketClaimSource, claims: usize) {
+    pub fn record_claim_source(&mut self, source: PacketClaimSource, claims: usize) {
         if claims == 0 {
             return;
         }
@@ -128,17 +128,17 @@ impl PacketClaimTelemetry {
         *entry = entry.saturating_add(u32::try_from(claims).unwrap_or(u32::MAX));
     }
 
-    #[cfg(test)]
-    pub(crate) fn citations_considered(&self) -> u32 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn citations_considered(&self) -> u32 {
         self.citations_considered
     }
 
-    #[cfg(test)]
-    pub(crate) fn profile_fire_count(&self, profile_id: &str) -> PacketProfileFireCount {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn profile_fire_count(&self, profile_id: &str) -> PacketProfileFireCount {
         self.profiles.get(profile_id).copied().unwrap_or_default()
     }
 
-    pub(crate) fn claim_source_count(&self, source: PacketClaimSource) -> u32 {
+    pub fn claim_source_count(&self, source: PacketClaimSource) -> u32 {
         self.sources.get(&source).copied().unwrap_or(0)
     }
 
@@ -161,7 +161,7 @@ impl PacketClaimTelemetry {
     /// This is deliberately *not* a `Vec<String>` appended to `retrieval_trace.annotations`.
     /// Annotations are scanned as evidence, so an always-on telemetry line published there is
     /// classified as an evidence gap on every packet and permanently downgrades confidence.
-    pub(crate) fn to_dto(
+    pub fn to_dto(
         &self,
         registry: PacketClaimProfileRegistrySummary,
     ) -> PacketClaimProfileTelemetryDto {
@@ -216,16 +216,16 @@ fn saturating_count(value: usize) -> u32 {
 /// and a packet that quietly answered from a smaller registry would otherwise look identical to
 /// one that answered from the whole registry and found nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PacketClaimProfileRegistrySummary {
-    pub(crate) registered: usize,
-    pub(crate) contracted: usize,
-    pub(crate) pending: usize,
-    pub(crate) pending_ratchet: usize,
-    pub(crate) rejected: usize,
+pub struct PacketClaimProfileRegistrySummary {
+    pub registered: usize,
+    pub contracted: usize,
+    pub pending: usize,
+    pub pending_ratchet: usize,
+    pub rejected: usize,
     /// Distinct static codes for the refused rows.
-    pub(crate) rejection_codes: Vec<&'static str>,
+    pub rejection_codes: Vec<&'static str>,
     /// Static code of the whole-document refusal, when the registry loaded empty.
-    pub(crate) document_rejection: Option<&'static str>,
+    pub document_rejection: Option<&'static str>,
 }
 
 #[cfg(test)]

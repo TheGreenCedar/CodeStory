@@ -27,20 +27,20 @@ use std::collections::BTreeSet;
 
 use serde::Deserialize;
 
-use crate::agent::packet_flow_requirements::{CoverageMode, FlowRole};
+use crate::packet_flow_requirements::{CoverageMode, FlowRole};
 
 /// Schema version of the checked-in claim-profile document this binary implements.
 ///
 /// Published in the packet trace beside the counters, so a field trace records the contract
 /// shape its numbers were taken under.
-pub(crate) const PACKET_CLAIM_PROFILE_SCHEMA_VERSION: u32 = 2;
+pub const PACKET_CLAIM_PROFILE_SCHEMA_VERSION: u32 = 2;
 
 /// Compile-time ceiling on registry profiles still allowed to ship without an anti-overfit
 /// contract.
 ///
 /// The ratchet only ever falls: a new profile has to arrive contracted, and migrating a pending
 /// profile has to lower this number and the document's `pending_ratchet` in the same diff.
-pub(crate) const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize = 13;
+pub const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize = 13;
 
 /// Typed reasons a contracted profile is not runtime-valid.
 ///
@@ -48,7 +48,7 @@ pub(crate) const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize = 13;
 /// enters the registry, and again per citation at collect time, so a contract constructed in
 /// process still cannot serve claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClaimProfileContractViolation {
+pub enum ClaimProfileContractViolation {
     NonProductScope,
     DomainIsNotProfileIdentity,
     DiagnosticOnlyEvidenceTier,
@@ -62,7 +62,7 @@ pub(crate) enum ClaimProfileContractViolation {
 }
 
 impl ClaimProfileContractViolation {
-    pub(crate) const fn code(self) -> &'static str {
+    pub const fn code(self) -> &'static str {
         match self {
             Self::NonProductScope => "non_product_scope",
             Self::DomainIsNotProfileIdentity => "domain_is_not_profile_identity",
@@ -80,7 +80,7 @@ impl ClaimProfileContractViolation {
 
 /// Typed reasons the loader refused one document row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClaimProfileRowRejection {
+pub enum ClaimProfileRowRejection {
     /// The document names a profile no compiled matcher implements.
     UnknownProfileId,
     /// The document lists the same profile twice.
@@ -107,7 +107,7 @@ pub(crate) enum ClaimProfileRowRejection {
 }
 
 impl ClaimProfileRowRejection {
-    pub(crate) const fn code(self) -> &'static str {
+    pub const fn code(self) -> &'static str {
         match self {
             Self::UnknownProfileId => "unknown_profile_id",
             Self::DuplicateProfileId => "duplicate_profile_id",
@@ -128,7 +128,7 @@ impl ClaimProfileRowRejection {
 ///
 /// Every one of these empties the registry: an unreadable contract serves nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClaimProfileDocumentRejection {
+pub enum ClaimProfileDocumentRejection {
     Malformed,
     SchemaVersionMismatch,
     RatchetAboveCeiling,
@@ -136,7 +136,7 @@ pub(crate) enum ClaimProfileDocumentRejection {
 }
 
 impl ClaimProfileDocumentRejection {
-    pub(crate) const fn code(self) -> &'static str {
+    pub const fn code(self) -> &'static str {
         match self {
             Self::Malformed => "malformed_document",
             Self::SchemaVersionMismatch => "schema_version_mismatch",
@@ -147,33 +147,33 @@ impl ClaimProfileDocumentRejection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClaimProfileScope {
+pub enum ClaimProfileScope {
     Product,
 }
 
 /// Anti-overfit contract for one profile, as loaded from the document.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ClaimProfileContract {
-    pub(crate) domain: String,
-    pub(crate) scope: ClaimProfileScope,
-    pub(crate) allowed_evidence_tier: CoverageMode,
-    pub(crate) allowed_proof_roles: Vec<FlowRole>,
-    pub(crate) positive_fixture_id: String,
-    pub(crate) false_positive_fixture_id: String,
+pub struct ClaimProfileContract {
+    pub domain: String,
+    pub scope: ClaimProfileScope,
+    pub allowed_evidence_tier: CoverageMode,
+    pub allowed_proof_roles: Vec<FlowRole>,
+    pub positive_fixture_id: String,
+    pub false_positive_fixture_id: String,
     /// Fixture from a different language family than `positive_fixture_id`, proving the profile
     /// fires somewhere other than the corpus shape it was written against.
-    pub(crate) generalization_fixture_id: String,
+    pub generalization_fixture_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ClaimProfileStatus {
+pub enum ClaimProfileStatus {
     Contracted(ClaimProfileContract),
     PendingMigration,
 }
 
 impl ClaimProfileStatus {
     /// EV-6 runtime validation, reused as the document loader's row validator.
-    pub(crate) fn validate(&self, profile_id: &str) -> Result<(), ClaimProfileContractViolation> {
+    pub fn validate(&self, profile_id: &str) -> Result<(), ClaimProfileContractViolation> {
         let Self::Contracted(contract) = self else {
             return Ok(());
         };
@@ -220,24 +220,24 @@ impl ClaimProfileStatus {
 
 /// One accepted document row, bound to the compiled matcher identity it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RegisteredClaimProfile {
+pub struct RegisteredClaimProfile {
     /// Interned against the compiled matcher list, never a string from the document.
-    pub(crate) id: &'static str,
-    pub(crate) status: ClaimProfileStatus,
+    pub id: &'static str,
+    pub status: ClaimProfileStatus,
     /// Tracking issue number that owns this profile. A number, not a URL: the generalization
     /// lint bans this repository's own identity from production paths, and attribution does
     /// not need the host to be routable.
-    pub(crate) owner_issue: u32,
+    pub owner_issue: u32,
 }
 
 /// One refused document row. Refused rows never serve claims.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RejectedClaimProfile {
-    pub(crate) reason: ClaimProfileRowRejection,
+pub struct RejectedClaimProfile {
+    pub reason: ClaimProfileRowRejection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ClaimProfileRegistry {
+pub struct ClaimProfileRegistry {
     profiles: Vec<RegisteredClaimProfile>,
     rejected: Vec<RejectedClaimProfile>,
     declared_ratchet: usize,
@@ -254,11 +254,11 @@ impl ClaimProfileRegistry {
         }
     }
 
-    pub(crate) fn profiles(&self) -> &[RegisteredClaimProfile] {
+    pub fn profiles(&self) -> &[RegisteredClaimProfile] {
         &self.profiles
     }
 
-    pub(crate) fn rejected(&self) -> &[RejectedClaimProfile] {
+    pub fn rejected(&self) -> &[RejectedClaimProfile] {
         &self.rejected
     }
 
@@ -266,7 +266,7 @@ impl ClaimProfileRegistry {
     ///
     /// A count alone says the registry shrank; the codes say why, which is the difference
     /// between "the document has a typo" and "the document was written for another binary".
-    pub(crate) fn rejection_codes(&self) -> Vec<&'static str> {
+    pub fn rejection_codes(&self) -> Vec<&'static str> {
         let codes: BTreeSet<&'static str> = self
             .rejected
             .iter()
@@ -275,22 +275,22 @@ impl ClaimProfileRegistry {
         codes.into_iter().collect()
     }
 
-    pub(crate) fn declared_ratchet(&self) -> usize {
+    pub fn declared_ratchet(&self) -> usize {
         self.declared_ratchet
     }
 
-    pub(crate) fn document_rejection(&self) -> Option<ClaimProfileDocumentRejection> {
+    pub fn document_rejection(&self) -> Option<ClaimProfileDocumentRejection> {
         self.document_rejection
     }
 
-    pub(crate) fn pending(&self) -> usize {
+    pub fn pending(&self) -> usize {
         self.profiles
             .iter()
             .filter(|entry| matches!(entry.status, ClaimProfileStatus::PendingMigration))
             .count()
     }
 
-    pub(crate) fn contracted(&self) -> usize {
+    pub fn contracted(&self) -> usize {
         self.profiles.len() - self.pending()
     }
 }
@@ -373,7 +373,7 @@ fn parse_proof_role(value: &str) -> Option<FlowRole> {
 /// `known_ids` is the compiled matcher list. A row is accepted only when the document identity
 /// matches one of them, and the accepted row carries the *compiled* `&'static str`, so no
 /// document string ever reaches a telemetry key.
-pub(crate) fn load_claim_profile_registry(
+pub fn load_claim_profile_registry(
     document: &str,
     known_ids: &[&'static str],
 ) -> ClaimProfileRegistry {

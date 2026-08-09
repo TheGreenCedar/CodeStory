@@ -562,16 +562,23 @@ fn agent_planning_crate_owns_planning_and_depends_on_contracts_only() {
     );
 
     for module in [
+        "citation.rs",
         "packet_citations.rs",
+        "packet_claim_profile_registry.rs",
         "packet_command_profiles.rs",
+        "packet_coverage.rs",
+        "packet_degradation.rs",
         "packet_evidence.rs",
         "packet_evidence_carriers.rs",
         "packet_evidence_roles.rs",
         "packet_flow_requirements.rs",
+        "packet_freshness.rs",
         "packet_obligations.rs",
         "packet_plan.rs",
+        "packet_profile_telemetry.rs",
         "packet_required_probes.rs",
         "packet_scoring.rs",
+        "packet_source_patterns.rs",
         "packet_terms.rs",
         "pinned_reader.rs",
         "planning.rs",
@@ -2069,7 +2076,7 @@ fn packet_claim_profile_contracts_are_enforced_at_runtime_not_only_in_debug_buil
     // run in the shipped build and skip the profile it rejects.
     let profiles = read("crates/codestory-runtime/src/agent/packet_claim_profiles.rs");
     let production = production_source_prefix(&profiles);
-    let registry = read("crates/codestory-runtime/src/agent/packet_claim_profile_registry.rs");
+    let registry = read("crates/codestory-agent/src/packet_claim_profile_registry.rs");
     let registry_production = production_source_prefix(&registry);
     for source in [&production, &registry_production] {
         assert!(
@@ -2102,7 +2109,7 @@ fn packet_claim_profile_contracts_are_enforced_at_runtime_not_only_in_debug_buil
         );
     }
 
-    let telemetry = read("crates/codestory-runtime/src/agent/packet_profile_telemetry.rs");
+    let telemetry = read("crates/codestory-agent/src/packet_profile_telemetry.rs");
     assert!(
         production_source_prefix(&telemetry).contains("PACKET_CLAIM_PROFILE_CONTRACT_VERSION"),
         "packet claim-profile telemetry must publish a contract version"
@@ -2115,7 +2122,7 @@ fn packet_profile_telemetry_travels_on_a_typed_field_not_the_evidence_annotation
     // confidence. Always-on telemetry published there was classified as a gap on every packet and
     // moved every answer from high/ready to medium/review. The counters must therefore be
     // structurally separated from evidence text, not merely reclassified as observations.
-    let telemetry = read("crates/codestory-runtime/src/agent/packet_profile_telemetry.rs");
+    let telemetry = read("crates/codestory-agent/src/packet_profile_telemetry.rs");
     let telemetry_production = production_source_prefix(&telemetry);
     assert!(
         telemetry_production.contains("-> PacketClaimProfileTelemetryDto"),

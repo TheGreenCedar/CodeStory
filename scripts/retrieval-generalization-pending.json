@@ -204,7 +204,7 @@
         "wsgiapp": 1
       }
     },
-    "crates/codestory-runtime/src/agent/packet_source_patterns.rs": {
+    "crates/codestory-agent/src/packet_source_patterns.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
       "reason": "Source-pattern matching keeps holdout identifiers as example words. They are small enough to delete with the callers that supply them, not on their own.",
       "markers": {
