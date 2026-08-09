@@ -842,6 +842,58 @@ test("constant mirrors are an exact fail-closed membership with graph-owned rule
   }
 });
 
+test("command lists are an exact fail-closed membership with graph-owned rule data", () => {
+  const lists = graph.workflow_policy.command_lists;
+  assert.equal(Object.keys(lists).length, 2);
+  for (const row of Object.values(lists)) {
+    assert.ok(typeof row.file === "string" && row.file.length > 0);
+    assert.ok(typeof row.job === "string" && row.job.length > 0);
+    assert.ok(typeof row.step === "string" && row.step.length > 0);
+    assert.ok(Array.isArray(row.commands) && row.commands.length > 0);
+  }
+  assert.equal(lists.draft_proof_commands.commands.length, 6);
+  assert.equal(lists.draft_seed_commands.commands.length, 5);
+  const mutations = [
+    [draft => {
+      delete draft.workflow_policy.command_lists.draft_seed_commands;
+    }, /command_lists must declare draft_seed_commands/u],
+    [draft => {
+      draft.workflow_policy.command_lists.unowned_extra = structuredClone(
+        draft.workflow_policy.command_lists.draft_proof_commands,
+      );
+    }, /names unknown command list unowned_extra/u],
+    [draft => {
+      delete draft.workflow_policy.command_lists.draft_proof_commands.commands;
+    }, /draft_proof_commands must carry exactly file, job, step, commands, reason/u],
+    [draft => {
+      draft.workflow_policy.command_lists.draft_seed_commands.kind = "require";
+    }, /draft_seed_commands must carry exactly file, job, step, commands, reason/u],
+    [draft => {
+      draft.workflow_policy.command_lists.draft_seed_commands.commands = [];
+    }, /draft_seed_commands\.commands must be a non-empty array/u],
+    [draft => {
+      draft.workflow_policy.command_lists.draft_proof_commands.commands = [
+        "cargo test --locked -p codestory-llama-sys --test native_staging",
+        "cargo test --locked -p codestory-llama-sys --test native_staging",
+      ];
+    }, /draft_proof_commands\.commands must not contain duplicates/u],
+    [draft => {
+      draft.workflow_policy.command_lists.draft_proof_commands.file = "";
+    }, /draft_proof_commands\.file must be a non-empty string/u],
+    [draft => {
+      draft.workflow_policy.command_lists.draft_seed_commands.step = "";
+    }, /draft_seed_commands\.step must be a non-empty string/u],
+    [draft => {
+      draft.workflow_policy.command_lists.draft_seed_commands.reason = "";
+    }, /draft_seed_commands\.reason must be a non-empty string/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
 test("benchmark leakage names only the one-process Node contract", () => {
   const benchmarkLeakage = graph.failure_controls
     .find(({ id }) => id === "benchmark_leakage");
