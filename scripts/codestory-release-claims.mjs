@@ -2,7 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -81,6 +81,30 @@ const REQUIRED_FAILURE_CONTROLS = [
 ];
 const BENCHMARK_LEAKAGE_COMMAND =
   "node --test scripts/tests/lint-retrieval-generalization.test.mjs";
+// The graph owns every exact program pin the workflow-policy checker enforces; the
+// checker owns only the hashing predicates and their reviewed violation messages.
+// Membership is exact and fail-closed: a graph that drops, renames, or invents a
+// pinned program must not load, so a rule instance cannot disappear by data edit.
+// Subject kinds name what the checker actually hashes for that row.
+const PINNED_PROGRAM_CONTRACTS = new Map([
+  ["nextest_linux_archive", { subject: "downloaded_archive", job: true, step: true }],
+  ["source_proof_resolver", { subject: "step_script_raw_text", job: true, step: true }],
+  ["packaged_platform_pr_resolver", { subject: "step_script_raw_text", job: true, step: true }],
+  ["marketplace_sync_dispatch_guard", { subject: "step_script_executable_text", job: true, step: true }],
+  ["packaged_platform_pr_closeout", { subject: "step_script_executable_text", job: true, step: true }],
+  ["packaged_platform_proof_workflow", { subject: "parsed_workflow_json", job: false, step: false }],
+  ["packaged_platform_pr_workflow", { subject: "parsed_workflow_json", job: false, step: false }],
+  ["frozen_candidate_quality_workflow", { subject: "parsed_workflow_json", job: false, step: false }],
+  ["macos_metal_proof_workflow", { subject: "parsed_workflow_json", job: false, step: false }],
+  ["windows_vulkan_proof_workflow", { subject: "parsed_workflow_json", job: false, step: false }],
+  ["linux_vulkan_proof_workflow", { subject: "parsed_workflow_json", job: false, step: false }],
+  ["release_source_proof_sentinel", { subject: "parsed_job_json", job: true, step: false }],
+  ["packaged_sccache_identity", { subject: "step_script_raw_text", job: true, step: true }],
+  ["packaged_linux_build", { subject: "step_script_raw_text", job: true, step: true }],
+  ["packaged_compile_clock_stop", { subject: "step_script_raw_text", job: true, step: true }],
+  ["packaged_host_compiler_finalizer", { subject: "step_script_raw_text", job: true, step: true }],
+  ["qualification_driver_artifact", { subject: "helper_file_text", job: false, step: false }],
+]);
 const FAILURE_ORDER = new Map([
   ["unsupported_claim", 0],
   ["missing", 1],
@@ -785,7 +809,48 @@ function validateCalibrationPolicy(value) {
   }
 }
 
-function validateQualificationPolicy(value) {
+function validatePinnedPrograms(policy) {
+  const programs = object(policy.pinned_programs, "workflow_policy.pinned_programs");
+  for (const name of Object.keys(programs)) {
+    if (!PINNED_PROGRAM_CONTRACTS.has(name)) {
+      fail(`workflow_policy.pinned_programs names unknown pinned program ${name}`);
+    }
+  }
+  for (const [name, contract] of PINNED_PROGRAM_CONTRACTS) {
+    if (programs[name] === undefined) {
+      fail(`workflow_policy.pinned_programs must declare ${name}`);
+    }
+    const label = `workflow_policy.pinned_programs.${name}`;
+    const row = object(programs[name], label);
+    const expectedKeys = [
+      "subject",
+      "file",
+      ...(contract.job ? ["job"] : []),
+      ...(contract.step ? ["step"] : []),
+      "sha256",
+      "reason",
+    ];
+    if (
+      JSON.stringify([...Object.keys(row)].sort())
+        !== JSON.stringify([...expectedKeys].sort())
+    ) {
+      fail(`${label} must carry exactly ${expectedKeys.join(", ")}`);
+    }
+    if (row.subject !== contract.subject) {
+      fail(`${label}.subject must be ${contract.subject}`);
+    }
+    nonEmptyText(row.file, `${label}.file`);
+    if (contract.job) nonEmptyText(row.job, `${label}.job`);
+    if (contract.step) nonEmptyText(row.step, `${label}.step`);
+    if (typeof row.sha256 !== "string" || !SHA256.test(row.sha256)) {
+      fail(`${label}.sha256 must be a 64-hex sha256 digest`);
+    }
+    nonEmptyText(row.reason, `${label}.reason`);
+  }
+  return programs;
+}
+
+function validateQualificationPolicy(value, pinnedPrograms) {
   const qualification = object(value, "workflow_policy.qualification");
   if (
     qualification.coordinator_workflow !== "packaged-platform-pr.yml"
@@ -898,8 +963,14 @@ function validateQualificationPolicy(value) {
     archive_cache_contract: "candidate_archive_cache",
     archive_transfer: "authenticated_miss_only",
     evaluation_owner: "isolated_reusable_workflow",
+    // The graph is its own digest authority here: the quality contract must cite the
+    // same evaluation-owner pin the pinned_programs block carries, so the two rows
+    // cannot drift apart and the workflow-policy checker enforces the single value.
     evaluation_owner_sha256:
-      "b7a17c66c4cc4275b369f39fdc1fcdb375b334ba908d31577b910ea10e7eb54e",
+      object(
+        pinnedPrograms.frozen_candidate_quality_workflow,
+        "workflow_policy.pinned_programs.frozen_candidate_quality_workflow",
+      ).sha256,
     evaluation_contract: "publishable-three-repeat-packet/v1",
     task_count: 1,
     repeats_per_task: 3,
@@ -1743,6 +1814,7 @@ export function validateReleaseClaimGraph(graph) {
   if (!Number.isInteger(policy.artifact_retention_days) || policy.artifact_retention_days <= 0) {
     fail("workflow_policy.artifact_retention_days must be a positive integer");
   }
+  const pinnedPrograms = validatePinnedPrograms(policy);
   validateProofFloor(policy.proof_floor);
   if (!Array.isArray(policy.package_matrix) || policy.package_matrix.length !== 3) {
     fail("workflow_policy.package_matrix must define three release package rows");
@@ -1764,7 +1836,7 @@ export function validateReleaseClaimGraph(graph) {
   validateCandidateArchiveCache(policy.candidate_archive_cache);
   validateModelMaterialCache(policy.model_material_cache);
   validateCalibrationPolicy(policy.calibration);
-  validateQualificationPolicy(policy.qualification);
+  validateQualificationPolicy(policy.qualification, pinnedPrograms);
   validatePublicSupport(graph, targets, cellGroups);
   if (!Array.isArray(policy.protected_jobs) || policy.protected_jobs.length === 0) {
     fail("workflow_policy.protected_jobs must be a non-empty array");
@@ -2029,7 +2101,19 @@ export function loadReleaseClaimGraph(repoRoot = path.resolve(path.dirname(fileU
   } catch (error) {
     fail(`failed to read release claim graph ${graphPath}: ${error.message}`);
   }
-  return validateReleaseClaimGraph(graph);
+  const validated = validateReleaseClaimGraph(graph);
+  // Shape validation is filesystem-free so hostile-graph tests stay hermetic; loading
+  // a graph for this repository additionally requires every pinned program's subject
+  // file to exist, so a pin cannot outlive or predate the program it vouches for.
+  for (const [name, row] of Object.entries(validated.workflow_policy.pinned_programs)) {
+    const relative = row.subject === "helper_file_text"
+      ? row.file
+      : path.join(".github", "workflows", row.file);
+    if (!existsSync(path.join(repoRoot, relative))) {
+      fail(`workflow_policy.pinned_programs.${name} pins missing file ${relative}`);
+    }
+  }
+  return validated;
 }
 
 const PUBLIC_SUPPORT_START = "<!-- codestory-public-support:start -->";

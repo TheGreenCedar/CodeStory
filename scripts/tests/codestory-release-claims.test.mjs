@@ -669,6 +669,50 @@ test("claim graph freezes one GPU-only qualification run per available platform"
   }
 });
 
+test("pinned programs are an exact fail-closed membership with graph-owned digests", () => {
+  const programs = graph.workflow_policy.pinned_programs;
+  assert.equal(Object.keys(programs).length, 17);
+  for (const row of Object.values(programs)) {
+    assert.match(row.sha256, /^[0-9a-f]{64}$/u);
+  }
+  assert.equal(
+    graph.workflow_policy.qualification.quality_contract.evaluation_owner_sha256,
+    programs.frozen_candidate_quality_workflow.sha256,
+  );
+  const mutations = [
+    [draft => {
+      delete draft.workflow_policy.pinned_programs.packaged_linux_build;
+    }, /pinned_programs must declare packaged_linux_build/u],
+    [draft => {
+      draft.workflow_policy.pinned_programs.unpinned_extra = structuredClone(
+        draft.workflow_policy.pinned_programs.packaged_linux_build,
+      );
+    }, /names unknown pinned program unpinned_extra/u],
+    [draft => {
+      draft.workflow_policy.pinned_programs.marketplace_sync_dispatch_guard.sha256 = "not-a-digest";
+    }, /marketplace_sync_dispatch_guard\.sha256 must be a 64-hex sha256 digest/u],
+    [draft => {
+      draft.workflow_policy.pinned_programs.packaged_platform_proof_workflow.subject =
+        "step_script_raw_text";
+    }, /packaged_platform_proof_workflow\.subject must be parsed_workflow_json/u],
+    [draft => {
+      delete draft.workflow_policy.pinned_programs.source_proof_resolver.step;
+    }, /source_proof_resolver must carry exactly subject, file, job, step, sha256, reason/u],
+    [draft => {
+      draft.workflow_policy.pinned_programs.release_source_proof_sentinel.reason = "";
+    }, /release_source_proof_sentinel\.reason must be a non-empty string/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.evaluation_owner_sha256 =
+        "0".repeat(64);
+    }, /quality contract must bind the optional isolated exact-package adjunct/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
 test("benchmark leakage names only the one-process Node contract", () => {
   const benchmarkLeakage = graph.failure_controls
     .find(({ id }) => id === "benchmark_leakage");
