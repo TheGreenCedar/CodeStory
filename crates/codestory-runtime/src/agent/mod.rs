@@ -1,3 +1,43 @@
+// Deliberate residuals of the S4 agent-planning extraction (#1673). Planning
+// moved to `codestory-agent`, which depends on `codestory-contracts` and
+// nothing else in this workspace. Everything still declared below stays in the
+// runtime on purpose, because each module needs a power the contracts-only
+// planning crate must never have. The six execution residuals the epic
+// ratchets:
+//
+// - `orchestrator`: takes `&AppController` and runs the ask/packet loop —
+//   resolves targets, executes trails and searches, reads sources, and
+//   assembles the answer from live retrieval results.
+// - `retrieval_primary`: executes pinned-publication retrieval; reaches
+//   `codestory_store::Store`, `codestory_retrieval`, and the controller's
+//   active publication state.
+// - `packet_batch`: batch search execution over `&AppController`, including
+//   wall-clock step recording into the retrieval trace.
+// - `packet_probe`: resolves probe requests against `&AppController`,
+//   `target_resolution`, and `codestory_workspace` path checks.
+// - `packet_search`: `impl AppController` — the batch-search entry points the
+//   packet path calls on the controller itself.
+// - `nucleo_policy`: thread-local execution policy read by
+//   `crate::search::engine` to suppress the Nucleo full-table scan while
+//   sidecar-primary retrieval runs.
+//
+// Runtime-owned for reasons beside `AppController` reach:
+//
+// - `packet_budget`: composition site that closes the workspace path-identity
+//   seam (`RuntimeWorkspacePathIdentity`) and folds the runtime's step-trace
+//   summary into the budget verdict.
+// - `packet_capping`: leans on `packet_batch` matching and the runtime's
+//   retrieval file-role classification; a confidence-pin contract names its
+//   runtime path as a gap-marker producer.
+// - `trace`, `trace_export`, `packet_trace` (the trace surfaces): they record
+//   and export what retrieval *executed* — wall-clock steps, shadow output,
+//   and the `CODESTORY_PACKET_STEP_TRACE_OUT` file write, which the planning
+//   crate is forbidden to spell (`fs::write` is contract-banned there).
+// - `path_identity`: the runtime half of the `WorkspacePathIdentity` seam,
+//   closing it over `codestory_workspace::same_workspace_path`.
+// - `packet_obligations_runtime_tests`, `packet_sufficiency_runtime_tests`:
+//   `cfg(test)` suites that exercise moved planning composed with runtime
+//   state the planning crate cannot construct.
 pub(crate) mod nucleo_policy;
 pub(crate) mod orchestrator;
 pub(crate) mod packet_batch;
@@ -12,7 +52,6 @@ pub(crate) mod packet_search;
 mod packet_sufficiency_runtime_tests;
 pub(crate) mod packet_trace;
 pub(crate) mod path_identity;
-pub(crate) mod profiles;
 pub(crate) mod retrieval_primary;
 pub(crate) mod trace;
 pub(crate) mod trace_export;
@@ -28,7 +67,7 @@ pub(crate) use codestory_agent::{
     packet_claims, packet_command_profiles, packet_coverage, packet_degradation, packet_evidence,
     packet_evidence_roles, packet_flow_requirements, packet_freshness, packet_obligations,
     packet_plan, packet_profile_telemetry, packet_required_probes, packet_scoring,
-    packet_source_patterns, packet_sufficiency, packet_terms, planning,
+    packet_source_patterns, packet_sufficiency, packet_terms, planning, profiles,
 };
 
 pub(crate) use orchestrator::{agent_ask, agent_packet};

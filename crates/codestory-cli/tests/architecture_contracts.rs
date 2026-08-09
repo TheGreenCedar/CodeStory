@@ -532,6 +532,59 @@ fn indexer_crate_stays_decoupled_from_runtime_and_cli() {
     );
 }
 
+/// The moved planning modules `codestory-agent` owns: the allowlist the
+/// location, count, and import-DAG contracts below all read.
+///
+/// Everything under `crates/codestory-agent/src` must appear here except the
+/// named exclusions in [`AGENT_MODULE_ALLOWLIST_EXCLUSIONS`];
+/// `agent_module_allowlist_stays_in_sync_with_the_agent_source_tree` enforces
+/// that, so adding a module to the crate without extending this list fails
+/// loudly instead of silently escaping every contract built on it.
+const AGENT_PLANNING_MODULES: [&str; 30] = [
+    "citation.rs",
+    "packet_citations.rs",
+    "packet_claim_profile_registry.rs",
+    "packet_claim_profiles.rs",
+    "packet_claims.rs",
+    "packet_command.rs",
+    "packet_command_profiles.rs",
+    "packet_coverage.rs",
+    "packet_degradation.rs",
+    "packet_evidence.rs",
+    "packet_evidence_carriers.rs",
+    "packet_evidence_roles.rs",
+    "packet_execution_graphs.rs",
+    "packet_flow_requirements.rs",
+    "packet_freshness.rs",
+    "packet_obligations.rs",
+    "packet_plan.rs",
+    "packet_probes.rs",
+    "packet_profile_telemetry.rs",
+    "packet_required_probes.rs",
+    "packet_scoring.rs",
+    "packet_source_patterns.rs",
+    "packet_sufficiency.rs",
+    "packet_terms.rs",
+    "pinned_reader.rs",
+    "planning.rs",
+    "profiles.rs",
+    "text.rs",
+    "trail.rs",
+    "workspace_path_identity.rs",
+];
+
+/// Agent-crate source files that are deliberately not planning modules.
+///
+/// - `lib.rs` is the crate root: module wiring and re-exports, not a planning
+///   surface of its own.
+/// - `eval_probes.rs` is the eval-only production file: `lib.rs` gates it
+///   behind `cfg(any(test, feature = "test-support"))`, the generalization
+///   lint classifies it as eval-only, and
+///   `agent_eval_hooks_stay_on_for_runtime_tests_and_off_for_product_builds`
+///   pins how it compiles. Listing it as a planning module would hand the
+///   import-DAG guard a file no product build links.
+const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 2] = ["lib.rs", "eval_probes.rs"];
+
 /// Packet planning lives in `codestory-agent`, and the crate DAG is what keeps
 /// it from growing the powers it was extracted away from.
 ///
@@ -561,33 +614,7 @@ fn agent_planning_crate_owns_planning_and_depends_on_contracts_only() {
          runtime state through PinnedReader, never through a producer crate"
     );
 
-    for module in [
-        "citation.rs",
-        "packet_citations.rs",
-        "packet_claim_profile_registry.rs",
-        "packet_claim_profiles.rs",
-        "packet_claims.rs",
-        "packet_command_profiles.rs",
-        "packet_coverage.rs",
-        "packet_degradation.rs",
-        "packet_evidence.rs",
-        "packet_evidence_carriers.rs",
-        "packet_evidence_roles.rs",
-        "packet_flow_requirements.rs",
-        "packet_freshness.rs",
-        "packet_obligations.rs",
-        "packet_plan.rs",
-        "packet_profile_telemetry.rs",
-        "packet_required_probes.rs",
-        "packet_scoring.rs",
-        "packet_source_patterns.rs",
-        "packet_sufficiency.rs",
-        "packet_terms.rs",
-        "pinned_reader.rs",
-        "planning.rs",
-        "text.rs",
-        "workspace_path_identity.rs",
-    ] {
+    for module in AGENT_PLANNING_MODULES {
         assert!(
             repo_root()
                 .join("crates/codestory-agent/src")
@@ -620,6 +647,194 @@ fn agent_planning_crate_owns_planning_and_depends_on_contracts_only() {
         assert!(
             !agent_source.contains(forbidden),
             "codestory-agent must not spell {forbidden}: planning owns no persisted state"
+        );
+    }
+}
+
+/// A list that must stay in sync with a directory cannot be trusted to drift
+/// silently: this pins `AGENT_PLANNING_MODULES` to the actual contents of
+/// `crates/codestory-agent/src`, so a module added to the crate without a
+/// matching allowlist entry — and therefore invisible to the location and
+/// import-DAG contracts — fails here by name.
+#[test]
+fn agent_module_allowlist_stays_in_sync_with_the_agent_source_tree() {
+    let mut files = Vec::new();
+    collect_rs_files(&repo_root().join("crates/codestory-agent/src"), &mut files);
+    let source_root = repo_root().join("crates/codestory-agent/src");
+    let found = files
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&source_root)
+                .expect("agent source file lives below the agent src root")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<BTreeSet<_>>();
+
+    let allowlist = AGENT_PLANNING_MODULES
+        .iter()
+        .map(|module| (*module).to_string())
+        .collect::<BTreeSet<_>>();
+    let exclusions = AGENT_MODULE_ALLOWLIST_EXCLUSIONS
+        .iter()
+        .map(|module| (*module).to_string())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        allowlist.is_disjoint(&exclusions),
+        "a module cannot be both an allowlisted planning module and a named exclusion"
+    );
+    for exclusion in &exclusions {
+        assert!(
+            found.contains(exclusion),
+            "stale exclusion: {exclusion} is named but no longer exists under \
+             crates/codestory-agent/src"
+        );
+    }
+
+    let expected = allowlist
+        .union(&exclusions)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let unlisted = found.difference(&expected).cloned().collect::<Vec<_>>();
+    let missing = allowlist.difference(&found).cloned().collect::<Vec<_>>();
+    assert!(
+        unlisted.is_empty(),
+        "agent-crate source files missing from AGENT_PLANNING_MODULES (add each one, or name it \
+         in AGENT_MODULE_ALLOWLIST_EXCLUSIONS with a reason): {unlisted:?}"
+    );
+    assert!(
+        missing.is_empty(),
+        "AGENT_PLANNING_MODULES entries with no file under crates/codestory-agent/src: {missing:?}"
+    );
+    assert_eq!(
+        AGENT_PLANNING_MODULES.len(),
+        found.len() - exclusions.len(),
+        "the agent module allowlist length must equal the .rs file count under \
+         crates/codestory-agent/src minus the named exclusions"
+    );
+}
+
+/// Scan one line of release-compiled planning source for sibling-module
+/// references (`crate::<module>` / `super::<module>`), recording each hit as an
+/// import edge for the DAG guard below.
+fn record_planning_import_edges<'a>(
+    code: &str,
+    module_names: &BTreeSet<&'a str>,
+    edges: &mut BTreeSet<&'a str>,
+) {
+    for prefix in ["crate::", "super::"] {
+        let mut rest = code;
+        while let Some(position) = rest.find(prefix) {
+            rest = &rest[position + prefix.len()..];
+            let end = rest
+                .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .unwrap_or(rest.len());
+            if let Some(name) = module_names.get(&rest[..end]) {
+                edges.insert(name);
+            }
+        }
+    }
+}
+
+/// Walk the planning import graph depth-first; returns the module path of the
+/// first release-code import cycle found, if any.
+fn find_planning_import_cycle<'a>(
+    graph: &BTreeMap<&'a str, BTreeSet<&'a str>>,
+) -> Option<Vec<&'a str>> {
+    fn visit<'a>(
+        module: &'a str,
+        graph: &BTreeMap<&'a str, BTreeSet<&'a str>>,
+        finished: &mut BTreeSet<&'a str>,
+        stack: &mut Vec<&'a str>,
+    ) -> Option<Vec<&'a str>> {
+        if let Some(position) = stack.iter().position(|entry| *entry == module) {
+            let mut cycle = stack[position..].to_vec();
+            cycle.push(module);
+            return Some(cycle);
+        }
+        if finished.contains(module) {
+            return None;
+        }
+        stack.push(module);
+        if let Some(imports) = graph.get(module) {
+            for import in imports {
+                if let Some(cycle) = visit(import, graph, finished, stack) {
+                    return Some(cycle);
+                }
+            }
+        }
+        stack.pop();
+        finished.insert(module);
+        None
+    }
+
+    let mut finished = BTreeSet::new();
+    for module in graph.keys() {
+        let mut stack = Vec::new();
+        if let Some(cycle) = visit(module, graph, &mut finished, &mut stack) {
+            return Some(cycle);
+        }
+    }
+    None
+}
+
+/// S4-10a dissolved the planning strongly-connected component: in release code
+/// the moved planning modules import each other along a DAG
+/// (obligations ≺ plan ≺ claims ≺ sufficiency ≺ budget was the dissolving
+/// order). Until now that order was conventional — the M2 mutation recorded on
+/// #1865 reintroduced a release-code back-edge (obligations importing
+/// sufficiency) and nothing failed, because rustc is perfectly happy to compile
+/// a module cycle inside one crate.
+///
+/// This is the assertion that mutation must fail by name: the release-compiled
+/// source of every allowlisted planning module (top-level `#[cfg(test)]` items
+/// stripped by the same helper the other source contracts use; line comments
+/// dropped so prose mentioning a module path is not an edge) is scanned for
+/// `crate::`/`super::` sibling references, and the resulting import graph must
+/// stay acyclic.
+#[test]
+fn agent_planning_import_graph_stays_acyclic() {
+    let module_names = AGENT_PLANNING_MODULES
+        .iter()
+        .map(|module| {
+            module
+                .strip_suffix(".rs")
+                .expect("allowlist entries are .rs file names")
+        })
+        .collect::<BTreeSet<_>>();
+
+    let mut graph: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for module in &module_names {
+        let source = read(&format!("crates/codestory-agent/src/{module}.rs"));
+        let production = production_source(&source);
+        let mut imports = BTreeSet::new();
+        for line in production.lines() {
+            // Cut line comments (`//`, `///`, `//!`) so rustdoc links and
+            // prose naming a module path do not become edges.
+            let code = line.split("//").next().unwrap_or_default();
+            record_planning_import_edges(code, &module_names, &mut imports);
+        }
+        imports.remove(*module);
+        graph.insert(module, imports);
+    }
+
+    // Scanner self-check: packet_sufficiency imports packet_claims in release
+    // code today. If the reference extraction regresses to matching nothing,
+    // the acyclicity assertion below would pass vacuously; fail here instead.
+    assert!(
+        graph
+            .get("packet_sufficiency")
+            .is_some_and(|imports| imports.contains("packet_claims")),
+        "planning import scan lost the known packet_sufficiency -> packet_claims edge; \
+         the DAG guard is no longer reading real imports"
+    );
+
+    if let Some(cycle) = find_planning_import_cycle(&graph) {
+        panic!(
+            "agent planning modules must import each other along a DAG; a release-code \
+             import cycle was reintroduced: {}. Break the cycle instead of extending it — \
+             this is the boundary S4-10a's seam breaks established (#1673, M2 on #1865).",
+            cycle.join(" -> ")
         );
     }
 }

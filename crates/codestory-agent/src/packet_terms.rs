@@ -1,5 +1,6 @@
-use crate::packet_scoring::normalize_identifier;
-use crate::text::{is_non_primary_source_term, query_mentions_non_primary_source};
+use crate::text::{
+    is_non_primary_source_term, normalize_identifier, query_mentions_non_primary_source,
+};
 use std::collections::HashSet;
 
 pub fn prompt_search_terms(prompt: &str) -> Vec<String> {

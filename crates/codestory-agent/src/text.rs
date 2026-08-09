@@ -26,6 +26,14 @@ pub fn normalize_symbol_query(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
+pub fn normalize_identifier(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
 pub fn exact_symbol_query_terms(query: &str) -> Vec<String> {
     let trimmed = trim_symbol_candidate(query);
     if looks_like_standalone_symbol_query(trimmed) {

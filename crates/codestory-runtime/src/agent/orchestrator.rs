@@ -8670,6 +8670,75 @@ mod tests {
         }
     }
 
+    /// M1 coverage recorded on #1865: every pair-shaped claim call site is
+    /// generic over the telemetry half, so an orchestrator that degrades to the
+    /// telemetry-free `packet_supported_claims` plus a defaulted
+    /// `PacketClaimTelemetry` still compiles — and ships an all-zero
+    /// claim-source breakdown that looks exactly like a packet whose fitted
+    /// layers never fired. Both `append_packet_evidence_sections` branches (the
+    /// obligations branch threads the pair through
+    /// `packet_claims_with_obligation_receipts_and_telemetry`, which must pass
+    /// the telemetry through untouched) have to publish the telemetry that was
+    /// computed WITH the claims: the full DTO, not a default.
+    #[test]
+    fn packet_evidence_sections_publish_the_claim_telemetry_computed_with_the_claims() {
+        let question = "Explain the packet evidence roles.";
+        let citations = vec![
+            test_packet_citation("CliCommand", "crates/tool-cli/src/main.rs", 0.8),
+            test_packet_citation("RuntimeCoordinator", "crates/core/src/runtime.rs", 0.8),
+            test_packet_citation("WorkspacePlan", "crates/core/src/workspace/plan.rs", 0.8),
+            test_packet_citation("GraphIndexer", "crates/indexer/src/lib.rs", 0.8),
+            test_packet_citation("ProjectionStore", "crates/store/src/projection.rs", 0.8),
+        ];
+        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
+        let answer = packet_answer_fixture(question, citations);
+
+        let (expected_claims, expected_telemetry) = packet_supported_claims_with_telemetry(&answer);
+        assert!(
+            !expected_claims.is_empty(),
+            "fixture citations must produce claims, or a telemetry-free mutant is invisible"
+        );
+        let expected = expected_telemetry.to_dto(packet_claim_profile_registry_summary());
+        let counted_claims: u32 = expected
+            .claim_sources
+            .iter()
+            .map(|entry| entry.claims)
+            .sum();
+        assert!(
+            counted_claims > 0,
+            "the expected claim-source breakdown must be non-zero, or it cannot be told \
+             apart from the defaulted telemetry of a telemetry-free claims pair"
+        );
+
+        let obligations = build_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        for (label, obligations) in [
+            ("without obligations", None),
+            ("with obligations", Some(&obligations)),
+        ] {
+            let mut published_answer = answer.clone();
+            append_packet_evidence_sections(
+                &mut published_answer,
+                PacketTaskClassDto::ArchitectureExplanation,
+                &limits,
+                obligations,
+            );
+            let published = published_answer
+                .retrieval_trace
+                .packet_claim_profile_telemetry
+                .expect("packet evidence sections must publish typed claim telemetry");
+            assert_eq!(
+                published, expected,
+                "the {label} branch must publish the telemetry computed with the claims; \
+                 a call site passing a telemetry-free claims pair (packet_supported_claims \
+                 plus a defaulted telemetry) ships this all-zero breakdown instead (#1865 M1)"
+            );
+        }
+    }
+
     #[test]
     fn packet_claim_profile_telemetry_stays_out_of_the_evidence_annotation_channel() {
         // Regression: the fire-rate counters were appended to `retrieval_trace.annotations`,

@@ -7,7 +7,7 @@ use codestory_contracts::api::{
 const CUSTOM_ASK_TRAIL_MAX_NODES: u32 = 2_000;
 
 #[derive(Debug, Clone)]
-pub(crate) struct TrailPlan {
+pub struct TrailPlan {
     pub mode: TrailMode,
     pub depth: u32,
     pub direction: TrailDirection,
@@ -18,7 +18,7 @@ pub(crate) struct TrailPlan {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ResolvedProfile {
+pub struct ResolvedProfile {
     pub preset: AgentRetrievalPresetDto,
     pub policy_mode: AgentRetrievalPolicyModeDto,
     pub trail_plans: Vec<TrailPlan>,
@@ -28,7 +28,7 @@ pub(crate) struct ResolvedProfile {
     pub max_source_bytes: usize,
 }
 
-pub(crate) fn resolve_profile(
+pub fn resolve_profile(
     prompt: &str,
     selection: &AgentRetrievalProfileSelectionDto,
 ) -> ResolvedProfile {
@@ -42,7 +42,7 @@ pub(crate) fn resolve_profile(
     }
 }
 
-pub(crate) fn route_auto_preset(prompt: &str) -> AgentRetrievalPresetDto {
+pub fn route_auto_preset(prompt: &str) -> AgentRetrievalPresetDto {
     let normalized = prompt.to_ascii_lowercase();
 
     if contains_any(&normalized, &["inherit", "override", "base class", "trait"]) {
