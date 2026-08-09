@@ -87,21 +87,19 @@ sys.stderr.flush()
             str(release_path),
             str(stopped_path),
         ]
-        started = time.perf_counter()
         result = run(
             command,
             env=os.environ.copy(),
             cwd=root,
             timeout=10,
         )
-        elapsed = time.perf_counter() - started
+        require(
+            not stopped_path.exists(),
+            "synchronous capture waited for an inheriting descendant instead "
+            "of only the direct child",
+        )
         release_path.write_text("release\n", encoding="utf-8")
         _wait_for_path(stopped_path, 2)
-        require(
-            elapsed < 1.5,
-            "synchronous capture waited for an inheriting descendant instead "
-            f"of only the direct child ({elapsed:.3f}s)",
-        )
         require(
             result["stdout"] == _DIRECT_STDOUT
             and result["stderr"] == _DIRECT_STDERR,
