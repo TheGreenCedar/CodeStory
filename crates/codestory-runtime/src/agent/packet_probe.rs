@@ -208,7 +208,6 @@ fn exact_path_probe_source_carrier_citation(
 
     candidates
         .into_iter()
-        .take(24)
         .filter_map(|(term_hits, record)| {
             let mut citation = exact_symbol_probe_citation(
                 controller,
@@ -1094,6 +1093,49 @@ mod tests {
         );
         assert_eq!(citations[1].display_name, "run_stdio_server");
         assert_ne!(citations[0].node_id, citations[1].node_id);
+    }
+
+    #[test]
+    fn exact_path_carrier_selection_filters_non_semantic_matches_before_bounding() {
+        let project = TempDir::new().expect("project");
+        let controller = controller_with_indexed_fixture(&project);
+        let storage_path = project.path().join(".cache").join("codestory.db");
+        let mut storage = Store::open(&storage_path).expect("open store");
+        let decoys = (0..32)
+            .map(|index| Node {
+                id: CoreNodeId(1_000 + index),
+                kind: CoreNodeKind::FUNCTION,
+                serialized_name: format!("request_retrieval_publication_{index}"),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(1),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        storage
+            .insert_nodes_batch(&decoys)
+            .expect("insert lexical decoys");
+        drop(storage);
+        let resolutions = resolve_packet_probes(
+            &controller,
+            vec![PacketProbeDto::ExactPath {
+                path: "src/lib.rs".into(),
+            }],
+        );
+
+        let citations = exact_packet_probe_citations(
+            &controller,
+            &resolutions,
+            "Explain the request through stdio retrieval publication.",
+            true,
+        );
+
+        assert_eq!(citations.len(), 2);
+        assert_eq!(citations[1].display_name, "run_stdio_server");
+        assert_eq!(
+            citations[1].coverage_role.as_deref(),
+            Some("command entrypoint")
+        );
+        assert_eq!(citations[1].eligible_for_sufficiency, Some(true));
     }
 
     #[test]

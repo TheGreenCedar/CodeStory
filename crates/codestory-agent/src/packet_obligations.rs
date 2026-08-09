@@ -14,9 +14,9 @@ use super::packet_scoring::{
 };
 use super::packet_terms::packet_probe_terms;
 use crate::packet_execution_graphs::packet_execution_graphs;
-#[cfg(test)]
-use crate::text::exact_symbol_query_terms;
-use crate::text::symbol_query_tokens;
+use crate::text::{
+    exact_symbol_query_terms, looks_like_standalone_symbol_query, symbol_query_tokens,
+};
 use crate::trail::is_speculative_trail_edge;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
@@ -46,7 +46,7 @@ pub fn build_packet_obligation_plan(
     let requires_complete_discovery =
         packet_question_requires_complete_discovery(question, task_class);
     let exact_symbol_queries =
-        packet_prompt_exact_symbol_probe_queries(question, &terms, task_class);
+        packet_prioritized_exact_symbol_queries(question, &terms, task_class);
     let (binding_terms, omitted_binding_term_count) =
         requested_claim_binding_terms(question, &exact_symbol_queries, !requirements.is_empty());
     let mut claim_obligations = requirements
@@ -149,7 +149,10 @@ pub fn build_packet_obligation_plan(
 pub fn append_packet_probe_obligations(
     plan: &mut PacketObligationPlanDto,
     resolutions: &[PacketProbeResolutionDto],
+    question: &str,
+    task_class: PacketTaskClassDto,
 ) {
+    scope_generic_fallback_obligations_to_exact_paths(plan, resolutions, question, task_class);
     plan.claim_obligations
         .retain(|obligation| obligation.probe_binding.is_none());
     plan.claim_obligations.extend(
@@ -158,6 +161,147 @@ pub fn append_packet_probe_obligations(
             .filter(|resolution| packet_probe_is_exact_typed(&resolution.probe))
             .map(packet_probe_obligation),
     );
+}
+
+fn scope_generic_fallback_obligations_to_exact_paths(
+    plan: &mut PacketObligationPlanDto,
+    resolutions: &[PacketProbeResolutionDto],
+    question: &str,
+    task_class: PacketTaskClassDto,
+) {
+    let has_resolved_exact_path = resolutions.iter().any(|resolution| {
+        matches!(&resolution.probe, PacketProbeDto::ExactPath { .. })
+            && matches!(
+                resolution.status,
+                PacketProbeResolutionStatusDto::ExactPath
+                    | PacketProbeResolutionStatusDto::ValidUncoveredPath
+            )
+    });
+    if !has_resolved_exact_path {
+        return;
+    }
+    if packet_question_requires_complete_discovery(question, task_class) {
+        return;
+    }
+
+    let terms = packet_probe_terms(question);
+    let has_recognized_flow = !packet_flow_requirements_for_terms(&terms, task_class).is_empty();
+    let detected_exact_symbol_queries =
+        packet_prioritized_exact_symbol_queries(question, &terms, task_class);
+    // A resolved exact-path set is the explicit evidence scope. Preserve an independent symbol
+    // requirement only when the prompt carries unambiguous symbol syntax; a bare PascalCase word
+    // embedded in prose is also a common product or project name and cannot safely add a row.
+    let exact_symbol_queries = detected_exact_symbol_queries
+        .iter()
+        .filter(|query| packet_exact_symbol_query_is_explicit(question, query))
+        .cloned()
+        .collect::<Vec<_>>();
+    let exact_symbol_binding_terms = exact_symbol_queries
+        .iter()
+        .map(|query| {
+            query
+                .chars()
+                .take(PACKET_OBLIGATION_BINDING_TERM_CHAR_LIMIT)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let exact_symbol_bounded_identity_loss = exact_symbol_queries
+        .iter()
+        .any(|query| query.chars().count() > PACKET_OBLIGATION_BINDING_TERM_CHAR_LIMIT)
+        || exact_symbol_binding_terms
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            < exact_symbol_queries.len();
+    if !has_recognized_flow {
+        for obligation in &mut plan.query_obligations {
+            if obligation.kind == PacketQueryObligationKindDto::RequiredProbe
+                && detected_exact_symbol_queries
+                    .iter()
+                    .any(|query| query == &obligation.query)
+                && !exact_symbol_queries
+                    .iter()
+                    .any(|query| query == &obligation.query)
+            {
+                obligation.material = false;
+            }
+        }
+    }
+    for obligation in &mut plan.claim_obligations {
+        if !has_recognized_flow
+            && exact_symbol_queries.is_empty()
+            && obligation.id == default_profile_obligation_id(task_class)
+        {
+            obligation.material = false;
+            continue;
+        }
+        if obligation.id == REQUESTED_CLAIM_OVERFLOW_ID {
+            obligation.material = exact_symbol_bounded_identity_loss
+                || exact_symbol_queries.len() > PACKET_OBLIGATION_BINDING_TERM_LIMIT;
+            continue;
+        }
+        if !obligation.id.starts_with("requested_claim:") {
+            continue;
+        }
+        let preserves_explicit_symbol = obligation.binding_terms.iter().any(|binding_term| {
+            exact_symbol_binding_terms
+                .iter()
+                .any(|query| query.eq_ignore_ascii_case(binding_term))
+        });
+        if !preserves_explicit_symbol {
+            obligation.material = false;
+        }
+    }
+}
+
+fn packet_prioritized_exact_symbol_queries(
+    question: &str,
+    terms: &[String],
+    task_class: PacketTaskClassDto,
+) -> Vec<String> {
+    let mut queries = packet_prompt_exact_symbol_probe_queries(question, terms, task_class);
+    // Strong syntax is unambiguous and must survive the bounded requested-claim/query ledger even
+    // when earlier prose contains many ambiguous PascalCase names.
+    queries.sort_by_key(|query| !packet_exact_symbol_query_is_explicit(question, query));
+    queries
+}
+
+fn packet_exact_symbol_query_is_explicit(question: &str, query: &str) -> bool {
+    packet_question_has_backticked_exact_symbol(question, query)
+        || packet_question_has_invoked_exact_symbol(question, query)
+        || (looks_like_standalone_symbol_query(question)
+            && exact_symbol_query_terms(question)
+                .iter()
+                .any(|candidate| candidate == query))
+        || query.contains("::")
+        || query.contains('/')
+        || query.contains('.')
+        || query.contains('_')
+        || query.contains('$')
+}
+
+fn packet_question_has_invoked_exact_symbol(question: &str, query: &str) -> bool {
+    question.match_indices(query).any(|(start, _)| {
+        let before_is_symbol = question[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+        let after = &question[start + query.len()..];
+        !before_is_symbol
+            && after
+                .chars()
+                .next()
+                .is_some_and(|character| matches!(character, '(' | '<' | '['))
+    })
+}
+
+fn packet_question_has_backticked_exact_symbol(question: &str, query: &str) -> bool {
+    question
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .flat_map(exact_symbol_query_terms)
+        .any(|candidate| candidate == query)
 }
 
 fn packet_probe_is_exact_typed(probe: &PacketProbeDto) -> bool {
@@ -361,6 +505,7 @@ fn requested_claim_binding_terms(
 ) -> (Vec<String>, usize) {
     let mut candidates = Vec::new();
     let mut exact_symbol_components = HashSet::new();
+    let mut omitted_exact_symbol_count = 0;
     for term in exact_symbol_queries {
         // Consume a qualified exact symbol atomically. The ordinary prompt tokenizer may retain a
         // CamelCase owner as one token while `symbol_query_tokens` splits it, so record both forms
@@ -371,7 +516,14 @@ fn requested_claim_binding_terms(
         for component in symbol_query_tokens(term) {
             exact_symbol_components.insert(normalize_identifier(&component));
         }
-        push_exact_requested_claim_binding_candidate(&mut candidates, term);
+        let bounded_identity_loss =
+            term.chars().count() > PACKET_OBLIGATION_BINDING_TERM_CHAR_LIMIT;
+        let inserted = push_exact_requested_claim_binding_candidate(&mut candidates, term);
+        if bounded_identity_loss || !inserted {
+            // Distinct exact identities can share the same bounded receipt key. Keep that loss
+            // visible so an identity beyond the query cap cannot silently disappear.
+            omitted_exact_symbol_count += 1;
+        }
     }
 
     // A recognized flow's ordinary nouns describe the flow profile; code-shaped exact symbols
@@ -388,9 +540,10 @@ fn requested_claim_binding_terms(
         }
     }
 
-    let omitted = candidates
-        .len()
-        .saturating_sub(PACKET_OBLIGATION_BINDING_TERM_LIMIT);
+    let omitted = omitted_exact_symbol_count
+        + candidates
+            .len()
+            .saturating_sub(PACKET_OBLIGATION_BINDING_TERM_LIMIT);
     candidates.truncate(PACKET_OBLIGATION_BINDING_TERM_LIMIT);
     (candidates, omitted)
 }
@@ -409,13 +562,16 @@ fn push_requested_claim_binding_candidate(candidates: &mut Vec<String>, term: &s
     }
 }
 
-fn push_exact_requested_claim_binding_candidate(candidates: &mut Vec<String>, term: &str) {
+fn push_exact_requested_claim_binding_candidate(candidates: &mut Vec<String>, term: &str) -> bool {
     let bounded = term
         .chars()
         .take(PACKET_OBLIGATION_BINDING_TERM_CHAR_LIMIT)
         .collect::<String>();
     if !bounded.is_empty() && !candidates.iter().any(|candidate| candidate == &bounded) {
         candidates.push(bounded);
+        true
+    } else {
+        false
     }
 }
 
@@ -1301,8 +1457,60 @@ pub fn packet_claims_with_obligation_receipts_and_telemetry<T>(
     plan: &PacketObligationPlanDto,
     (mut claims, telemetry): (Vec<PacketClaimDto>, T),
 ) -> (Vec<PacketClaimDto>, T) {
+    bind_role_claims_to_exact_path_obligations(plan, &mut claims);
     append_packet_obligation_receipt_claims(answer, plan, &mut claims);
     (claims, telemetry)
+}
+
+fn bind_role_claims_to_exact_path_obligations(
+    plan: &PacketObligationPlanDto,
+    claims: &mut [PacketClaimDto],
+) {
+    for obligation in plan.claim_obligations.iter().filter(|obligation| {
+        obligation.material
+            && obligation.proof_status == PacketObligationProofStatusDto::Proven
+            && obligation
+                .probe_binding
+                .as_ref()
+                .is_some_and(|binding| matches!(&binding.probe, PacketProbeDto::ExactPath { .. }))
+    }) {
+        let Some(claim) = claims.iter_mut().find(|claim| {
+            claim.required_obligation_ids.is_empty()
+                && exact_path_role_claim_matches_obligation(claim, obligation)
+        }) else {
+            continue;
+        };
+        claim.required_obligation_ids = vec![obligation.id.clone()];
+        claim.required_obligation_kinds = vec![PacketClaimObligationKindDto::ExactProbe];
+        claim.eligible_for_sufficiency = Some(true);
+    }
+}
+
+fn exact_path_role_claim_matches_obligation(
+    claim: &PacketClaimDto,
+    obligation: &PacketClaimObligationDto,
+) -> bool {
+    let Some(claim_role) = claim.coverage_role.as_deref() else {
+        return false;
+    };
+    !claim.citations.is_empty()
+        && claim.citations.iter().all(|citation| {
+            obligation.carrier_node_ids.contains(&citation.node_id)
+                && citation_sufficiency_eligible(citation)
+                && matches!(
+                    citation.kind,
+                    NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+                )
+                && citation.evidence_producer.as_deref() != Some("packet_exact_path_probe")
+                && citation.coverage_role.as_deref() != Some("explicit exact probe")
+                && packet_evidence_role(citation).is_some_and(|role| {
+                    !matches!(
+                        role,
+                        PacketEvidenceRole::SourceEvidence
+                            | PacketEvidenceRole::TestsAndRegressionCoverage
+                    ) && role.as_str() == claim_role
+                })
+        })
 }
 
 fn append_packet_obligation_receipt_claims(
@@ -2041,7 +2249,12 @@ mod tests {
             ..Default::default()
         };
 
-        append_packet_probe_obligations(&mut plan, &resolutions);
+        append_packet_probe_obligations(
+            &mut plan,
+            &resolutions,
+            "Find the exact probes.",
+            PacketTaskClassDto::SymbolOwnership,
+        );
 
         assert_eq!(
             plan.claim_obligations
@@ -2109,7 +2322,12 @@ mod tests {
             version: PACKET_OBLIGATION_PLAN_VERSION,
             ..Default::default()
         };
-        append_packet_probe_obligations(&mut plan, &resolutions);
+        append_packet_probe_obligations(
+            &mut plan,
+            &resolutions,
+            "Find the exact symbols.",
+            PacketTaskClassDto::SymbolOwnership,
+        );
         let mut carrier = citation("Foo/run", "src/bar.rs", NodeKind::METHOD);
         carrier.node_id = NodeId("node-bar".to_string());
         carrier.coverage_role = Some("explicit exact probe".to_string());
@@ -2160,7 +2378,12 @@ mod tests {
             version: PACKET_OBLIGATION_PLAN_VERSION,
             ..Default::default()
         };
-        append_packet_probe_obligations(&mut plan, std::slice::from_ref(&resolution));
+        append_packet_probe_obligations(
+            &mut plan,
+            std::slice::from_ref(&resolution),
+            "Explain this exact path.",
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
         let mut diagnostic = citation("src/lib.rs", "src/lib.rs", NodeKind::FILE);
         diagnostic.coverage_role = Some("explicit exact probe".to_string());
         diagnostic.eligible_for_sufficiency = Some(false);
@@ -2232,13 +2455,614 @@ mod tests {
         );
         assert_eq!(
             plan.claim_obligations[0].carrier_node_ids,
-            vec![carrier.node_id]
+            vec![carrier.node_id.clone()]
         );
-        let claims =
-            packet_claims_with_obligation_receipts(&carried_answer, &plan, (Vec::new(), ()));
-        assert_eq!(claims.len(), 1);
+        let role_claim = PacketClaimDto {
+            claim: "The command entrypoint starts the stdio server.".to_string(),
+            required_obligation_ids: Vec::new(),
+            required_obligation_kinds: Vec::new(),
+            proof_status: Some(PacketProofStatusDto::Likely),
+            required_evidence_role: Some(PacketEvidenceTierDto::ResolvedGraph),
+            citations: vec![carrier],
+            coverage_role: Some("command entrypoint".to_string()),
+            eligible_for_sufficiency: Some(false),
+        };
+        let mut claims =
+            packet_claims_with_obligation_receipts(&carried_answer, &plan, (vec![role_claim], ()));
+        bind_claims_to_packet_obligations(&plan, &mut claims);
+        assert_eq!(claims.len(), 2);
+        assert_eq!(
+            claims[0].required_obligation_ids,
+            ["exact_probe:0".to_string()]
+        );
         assert_eq!(claims[0].proof_status, Some(PacketProofStatusDto::Proven));
-        assert_eq!(claims[0].eligible_for_sufficiency, Some(false));
+        assert_eq!(claims[0].eligible_for_sufficiency, Some(true));
+        assert_eq!(
+            claims[1].coverage_role.as_deref(),
+            Some(PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE)
+        );
+        assert_eq!(claims[1].proof_status, Some(PacketProofStatusDto::Proven));
+        assert_eq!(claims[1].eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn resolved_exact_paths_scope_only_generic_fallback_claim_rows() {
+        let question = "Explain alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo ownership.";
+        let mut plan = build_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        assert!(plan.claim_obligations.iter().any(|obligation| {
+            obligation.id.starts_with("requested_claim:") && obligation.material
+        }));
+        assert!(plan.claim_obligations.iter().any(|obligation| {
+            obligation.id == REQUESTED_CLAIM_OVERFLOW_ID && obligation.material
+        }));
+        let resolution = PacketProbeResolutionDto {
+            input_index: 0,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/lib.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/lib.rs".to_string()),
+            path: Some("src/lib.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+
+        append_packet_probe_obligations(
+            &mut plan,
+            &[resolution],
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+
+        assert!(plan.claim_obligations.iter().all(|obligation| {
+            !obligation.id.starts_with("requested_claim:") || !obligation.material
+        }));
+        assert!(plan.claim_obligations.iter().any(|obligation| {
+            obligation.id == REQUESTED_CLAIM_OVERFLOW_ID && !obligation.material
+        }));
+        assert!(
+            plan.claim_obligations
+                .iter()
+                .any(|obligation| { obligation.id == "exact_probe:0" && obligation.material })
+        );
+
+        let product_question = "Explain the ownership boundary from the packaged CodeStory plugin request through stdio transport, runtime grounding orchestration, retrieval, and evidence publication. Identify uncertainty or gaps.";
+        let mut product_plan = build_packet_obligation_plan(
+            product_question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        assert!(product_plan.claim_obligations.iter().any(|obligation| {
+            obligation.id == "requested_claim:0:CodeStory" && obligation.material
+        }));
+        assert!(
+            product_plan
+                .query_obligations
+                .iter()
+                .any(|obligation| { obligation.query == "CodeStory" && obligation.material })
+        );
+        let product_resolution = PacketProbeResolutionDto {
+            input_index: 2,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/transport.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/transport.rs".to_string()),
+            path: Some("src/transport.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+        append_packet_probe_obligations(
+            &mut product_plan,
+            &[product_resolution],
+            product_question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        assert!(product_plan.claim_obligations.iter().any(|obligation| {
+            obligation.id == "requested_claim:0:CodeStory" && !obligation.material
+        }));
+        assert!(
+            product_plan
+                .query_obligations
+                .iter()
+                .any(|obligation| { obligation.query == "CodeStory" && !obligation.material })
+        );
+
+        let absence_question = "Is this runtime implementation unused?";
+        let mut absence_plan = build_packet_obligation_plan(
+            absence_question,
+            PacketTaskClassDto::SymbolOwnership,
+            &[],
+        );
+        let discovery_required_ids = absence_plan
+            .claim_obligations
+            .iter()
+            .filter(|obligation| obligation.requires_complete_discovery && obligation.material)
+            .map(|obligation| obligation.id.clone())
+            .collect::<Vec<_>>();
+        assert!(!discovery_required_ids.is_empty(), "{absence_plan:#?}");
+        let absence_resolution = PacketProbeResolutionDto {
+            input_index: 3,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/runtime.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/runtime.rs".to_string()),
+            path: Some("src/runtime.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+        append_packet_probe_obligations(
+            &mut absence_plan,
+            &[absence_resolution],
+            absence_question,
+            PacketTaskClassDto::SymbolOwnership,
+        );
+        for id in discovery_required_ids {
+            assert!(absence_plan.claim_obligations.iter().any(|obligation| {
+                obligation.id == id && obligation.material && obligation.requires_complete_discovery
+            }));
+        }
+
+        let fallback_question = "?";
+        let mut fallback_plan = build_packet_obligation_plan(
+            fallback_question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        assert!(
+            fallback_plan.claim_obligations.iter().any(|obligation| {
+                obligation.id
+                    == default_profile_obligation_id(PacketTaskClassDto::ArchitectureExplanation)
+                    && obligation.material
+            }),
+            "{fallback_plan:#?}"
+        );
+        let fallback_resolution = PacketProbeResolutionDto {
+            input_index: 1,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/entry.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/entry.rs".to_string()),
+            path: Some("src/entry.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+        append_packet_probe_obligations(
+            &mut fallback_plan,
+            &[fallback_resolution],
+            fallback_question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        assert!(fallback_plan.claim_obligations.iter().any(|obligation| {
+            obligation.id
+                == default_profile_obligation_id(PacketTaskClassDto::ArchitectureExplanation)
+                && !obligation.material
+        }));
+    }
+
+    #[test]
+    fn exact_path_scope_preserves_flow_and_explicit_symbol_obligations() {
+        assert!(packet_exact_symbol_query_is_explicit(
+            "Explain RuntimeService() behavior.",
+            "RuntimeService"
+        ));
+        assert!(!packet_exact_symbol_query_is_explicit(
+            "Explain RuntimeService behavior.",
+            "RuntimeService"
+        ));
+        let question = "Explain the indexing runtime and RuntimeService::run.";
+        let task_class = PacketTaskClassDto::ArchitectureExplanation;
+        let mut plan = build_packet_obligation_plan(question, task_class, &[]);
+        let material_before = plan
+            .claim_obligations
+            .iter()
+            .filter(|obligation| obligation.material)
+            .map(|obligation| obligation.id.clone())
+            .collect::<Vec<_>>();
+        assert!(material_before.iter().any(|id| id.starts_with("indexing_")));
+        assert!(material_before.iter().any(|id| {
+            id.starts_with("requested_claim:") && id.contains("RuntimeService::run")
+        }));
+        let resolution = PacketProbeResolutionDto {
+            input_index: 4,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/runtime.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/runtime.rs".to_string()),
+            path: Some("src/runtime.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+
+        append_packet_probe_obligations(&mut plan, &[resolution], question, task_class);
+
+        for id in material_before {
+            let obligation = plan
+                .claim_obligations
+                .iter()
+                .find(|obligation| obligation.id == id)
+                .expect("pre-existing obligation");
+            assert!(obligation.material, "{id} must remain material");
+        }
+
+        let mixed_question = "Explain RuntimeService::run alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo.";
+        let mixed_task_class = PacketTaskClassDto::SymbolOwnership;
+        let mut mixed_plan = build_packet_obligation_plan(mixed_question, mixed_task_class, &[]);
+        assert!(mixed_plan.claim_obligations.iter().any(|obligation| {
+            obligation.id == REQUESTED_CLAIM_OVERFLOW_ID && obligation.material
+        }));
+        let mixed_resolution = PacketProbeResolutionDto {
+            input_index: 5,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/runtime.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/runtime.rs".to_string()),
+            path: Some("src/runtime.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+        append_packet_probe_obligations(
+            &mut mixed_plan,
+            &[mixed_resolution],
+            mixed_question,
+            mixed_task_class,
+        );
+        assert!(mixed_plan.claim_obligations.iter().any(|obligation| {
+            obligation.id.starts_with("requested_claim:")
+                && obligation.id.contains("RuntimeService::run")
+                && obligation.material
+        }));
+        assert!(mixed_plan.claim_obligations.iter().any(|obligation| {
+            obligation.id == REQUESTED_CLAIM_OVERFLOW_ID && !obligation.material
+        }));
+
+        let long_owner = "A".repeat(PACKET_OBLIGATION_BINDING_TERM_CHAR_LIMIT + 24);
+        let long_question = format!("Explain {long_owner}::run.");
+        let mut long_plan = build_packet_obligation_plan(&long_question, mixed_task_class, &[]);
+        assert!(long_plan.claim_obligations.iter().any(|obligation| {
+            obligation.id.starts_with("requested_claim:") && obligation.material
+        }));
+        let long_resolution = PacketProbeResolutionDto {
+            input_index: 6,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/long.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/long.rs".to_string()),
+            path: Some("src/long.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+        append_packet_probe_obligations(
+            &mut long_plan,
+            &[long_resolution],
+            &long_question,
+            mixed_task_class,
+        );
+        assert!(long_plan.claim_obligations.iter().any(|obligation| {
+            obligation.id.starts_with("requested_claim:") && obligation.material
+        }));
+
+        let bare_question = "Explain RuntimeService. System behavior follows.";
+        let mut bare_plan = build_packet_obligation_plan(
+            bare_question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        let bare_resolution = PacketProbeResolutionDto {
+            input_index: 7,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/service.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/service.rs".to_string()),
+            path: Some("src/service.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+        append_packet_probe_obligations(
+            &mut bare_plan,
+            &[bare_resolution],
+            bare_question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        assert!(bare_plan.claim_obligations.iter().any(|obligation| {
+            obligation.id.starts_with("requested_claim:")
+                && obligation.id.contains("RuntimeService")
+                && !obligation.material
+        }));
+
+        let standalone_question = "RuntimeService";
+        let mut standalone_plan = build_packet_obligation_plan(
+            standalone_question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        let standalone_resolution = PacketProbeResolutionDto {
+            input_index: 8,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/standalone.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/standalone.rs".to_string()),
+            path: Some("src/standalone.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+        append_packet_probe_obligations(
+            &mut standalone_plan,
+            &[standalone_resolution],
+            standalone_question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        assert!(standalone_plan.claim_obligations.iter().any(|obligation| {
+            obligation.id.starts_with("requested_claim:")
+                && obligation.id.contains("RuntimeService")
+                && obligation.material
+        }));
+
+        let quoted_question = "Explain the `RuntimeService()` system.";
+        let mut quoted_plan = build_packet_obligation_plan(
+            quoted_question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        let quoted_resolution = PacketProbeResolutionDto {
+            input_index: 8,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/quoted.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/quoted.rs".to_string()),
+            path: Some("src/quoted.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+        append_packet_probe_obligations(
+            &mut quoted_plan,
+            &[quoted_resolution],
+            quoted_question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        assert!(quoted_plan.claim_obligations.iter().any(|obligation| {
+            obligation.id.starts_with("requested_claim:")
+                && obligation.id.contains("RuntimeService")
+                && obligation.material
+        }));
+    }
+
+    #[test]
+    fn exact_symbol_syntax_precedes_ambiguous_names_at_the_obligation_cap() {
+        let question = "Explain AlphaName BravoName CharlieName DeltaName EchoName FoxtrotName GolfName HotelName RuntimeService::run.";
+        let task_class = PacketTaskClassDto::ArchitectureExplanation;
+        let mut plan = build_packet_obligation_plan(question, task_class, &[]);
+
+        let explicit_claim = plan
+            .claim_obligations
+            .iter()
+            .find(|obligation| {
+                obligation.id.starts_with("requested_claim:")
+                    && obligation.id.contains("RuntimeService::run")
+            })
+            .expect("qualified symbol must survive the bounded claim ledger");
+        assert!(explicit_claim.material, "{plan:#?}");
+        assert!(
+            plan.query_obligations.iter().any(|obligation| {
+                obligation.query == "RuntimeService::run" && obligation.material
+            }),
+            "{plan:#?}"
+        );
+
+        let resolution = PacketProbeResolutionDto {
+            input_index: 7,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/runtime.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/runtime.rs".to_string()),
+            path: Some("src/runtime.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+        append_packet_probe_obligations(&mut plan, &[resolution], question, task_class);
+
+        assert!(plan.claim_obligations.iter().any(|obligation| {
+            obligation.id.starts_with("requested_claim:")
+                && obligation.id.contains("RuntimeService::run")
+                && obligation.material
+        }));
+        for ambiguous in [
+            "AlphaName",
+            "BravoName",
+            "CharlieName",
+            "DeltaName",
+            "EchoName",
+            "FoxtrotName",
+            "GolfName",
+            "HotelName",
+        ] {
+            assert!(
+                plan.claim_obligations.iter().all(|obligation| {
+                    !obligation.id.starts_with("requested_claim:")
+                        || !obligation.id.contains(ambiguous)
+                        || !obligation.material
+                }),
+                "{ambiguous} remained material: {plan:#?}"
+            );
+        }
+        assert!(plan.claim_obligations.iter().any(|obligation| {
+            obligation.id == REQUESTED_CLAIM_OVERFLOW_ID && !obligation.material
+        }));
+        assert!(plan.query_obligations.iter().any(|obligation| {
+            obligation.query == "RuntimeService::run" && obligation.material
+        }));
+    }
+
+    #[test]
+    fn bounded_exact_symbol_collisions_keep_an_overflow_guard() {
+        let shared_prefix = "A".repeat(PACKET_OBLIGATION_BINDING_TERM_CHAR_LIMIT);
+        let symbols = (0..9)
+            .map(|index| format!("{shared_prefix}::run{index}"))
+            .collect::<Vec<_>>();
+        let question = format!("Explain {}.", symbols.join(" "));
+        let task_class = PacketTaskClassDto::ArchitectureExplanation;
+        let mut plan = build_packet_obligation_plan(&question, task_class, &[]);
+
+        assert_eq!(
+            plan.query_obligations
+                .iter()
+                .filter(|obligation| {
+                    obligation.kind == PacketQueryObligationKindDto::RequiredProbe
+                        && symbols.contains(&obligation.query)
+                })
+                .count(),
+            PACKET_OBLIGATION_BINDING_TERM_LIMIT
+        );
+        assert!(plan.claim_obligations.iter().any(|obligation| {
+            obligation.id == REQUESTED_CLAIM_OVERFLOW_ID && obligation.material
+        }));
+
+        let resolution = PacketProbeResolutionDto {
+            input_index: 8,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/runtime.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/runtime.rs".to_string()),
+            path: Some("src/runtime.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+        append_packet_probe_obligations(&mut plan, &[resolution], &question, task_class);
+
+        assert!(plan.claim_obligations.iter().any(|obligation| {
+            obligation.id == REQUESTED_CLAIM_OVERFLOW_ID && obligation.material
+        }));
+
+        let pair_question = format!("Explain {} {}.", symbols[0], symbols[1]);
+        let mut pair_plan = build_packet_obligation_plan(&pair_question, task_class, &[]);
+        assert!(pair_plan.claim_obligations.iter().any(|obligation| {
+            obligation.id == REQUESTED_CLAIM_OVERFLOW_ID && obligation.material
+        }));
+        let pair_resolution = PacketProbeResolutionDto {
+            input_index: 9,
+            probe: PacketProbeDto::ExactPath {
+                path: "src/pair.rs".to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some("src/pair.rs".to_string()),
+            path: Some("src/pair.rs".to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        };
+        append_packet_probe_obligations(
+            &mut pair_plan,
+            &[pair_resolution],
+            &pair_question,
+            task_class,
+        );
+        assert!(pair_plan.claim_obligations.iter().any(|obligation| {
+            obligation.id == REQUESTED_CLAIM_OVERFLOW_ID && obligation.material
+        }));
+    }
+
+    #[test]
+    fn exact_path_scoped_packet_binds_three_distinct_semantic_claims() {
+        let question = "Explain the ownership boundary from the packaged GraphForge plugin request through stdio transport, runtime orchestration, retrieval, and evidence publication.";
+        let task_class = PacketTaskClassDto::ArchitectureExplanation;
+        let paths = ["src/launch.rs", "src/stdio.rs", "src/runtime.rs"];
+        let mut citations = [
+            citation("spawn_runtime", paths[0], NodeKind::FUNCTION),
+            citation("run_stdio_server", paths[1], NodeKind::FUNCTION),
+            citation("coordinate_packet", paths[2], NodeKind::METHOD),
+        ];
+        for (citation, role) in citations.iter_mut().zip([
+            "request dispatch",
+            "command entrypoint",
+            "runtime orchestration",
+        ]) {
+            citation.coverage_role = Some(role.to_string());
+            citation.evidence_producer = Some("symbol_doc".to_string());
+        }
+        let resolutions = paths
+            .iter()
+            .enumerate()
+            .map(|(input_index, path)| PacketProbeResolutionDto {
+                input_index: input_index as u32,
+                probe: PacketProbeDto::ExactPath {
+                    path: (*path).to_string(),
+                },
+                status: PacketProbeResolutionStatusDto::ExactPath,
+                normalized_query: Some((*path).to_string()),
+                path: Some((*path).to_string()),
+                symbol_id: None,
+                candidates: Vec::new(),
+                rejection: None,
+            })
+            .collect::<Vec<_>>();
+        let mut plan = build_packet_obligation_plan(question, task_class, &[]);
+        append_packet_probe_obligations(&mut plan, &resolutions, question, task_class);
+        let mut carried_answer = answer(citations.to_vec());
+        carried_answer.prompt = question.to_string();
+        finalize_packet_obligation_plan(
+            question,
+            task_class,
+            &mut plan,
+            &carried_answer,
+            &budget(),
+        );
+        let supported =
+            crate::packet_claims::packet_supported_claims_with_telemetry(&carried_answer);
+        let mut claims = packet_claims_with_obligation_receipts(&carried_answer, &plan, supported);
+        bind_claims_to_packet_obligations(&plan, &mut claims);
+
+        let bound = claims
+            .iter()
+            .filter(|claim| {
+                claim.eligible_for_sufficiency == Some(true)
+                    && claim.proof_status == Some(PacketProofStatusDto::Proven)
+                    && claim.required_obligation_kinds == [PacketClaimObligationKindDto::ExactProbe]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bound.len(), 3, "{claims:#?}");
+        assert_eq!(
+            bound
+                .iter()
+                .flat_map(|claim| claim.required_obligation_ids.iter())
+                .collect::<HashSet<_>>()
+                .len(),
+            3
+        );
+        assert!(
+            claims
+                .iter()
+                .filter(|claim| {
+                    claim.coverage_role.as_deref() == Some(PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE)
+                })
+                .all(|claim| claim.eligible_for_sufficiency == Some(false))
+        );
+        assert!(material_packet_obligations_are_proven(&plan));
     }
 
     #[test]

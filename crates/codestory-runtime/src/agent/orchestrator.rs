@@ -407,7 +407,13 @@ pub(crate) fn agent_packet(
     let extra_probes = resolved_packet_probe_queries(&probe_resolutions);
     let mut plan =
         build_packet_plan_with_extra(&question, req.task_class, req.budget, &extra_probes);
-    append_packet_probe_obligations(&mut plan.obligations, &probe_resolutions);
+    let task_class = plan.task_class;
+    append_packet_probe_obligations(
+        &mut plan.obligations,
+        &probe_resolutions,
+        &question,
+        task_class,
+    );
     plan.probe_resolutions = probe_resolutions;
     let limits = packet_budget_limits(req.budget);
     let packet_latency = PacketLatencyBudget::new(req.latency_budget_ms);
