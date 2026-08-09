@@ -1,22 +1,15 @@
-pub(crate) mod citation;
 pub(crate) mod nucleo_policy;
 pub(crate) mod orchestrator;
 pub(crate) mod packet_batch;
 pub(crate) mod packet_budget;
 pub(crate) mod packet_capping;
-pub(crate) mod packet_claim_profile_registry;
 
 pub(crate) mod packet_claim_profiles;
 pub(crate) mod packet_claims;
-pub(crate) mod packet_coverage;
-pub(crate) mod packet_degradation;
-pub(crate) mod packet_freshness;
 #[cfg(test)]
 mod packet_obligations_runtime_tests;
 pub(crate) mod packet_probe;
-pub(crate) mod packet_profile_telemetry;
 pub(crate) mod packet_search;
-pub(crate) mod packet_source_patterns;
 pub(crate) mod packet_sufficiency;
 pub(crate) mod packet_trace;
 pub(crate) mod profiles;
@@ -31,9 +24,11 @@ pub(crate) mod trace_export;
 pub(crate) use codestory_agent::eval_probes;
 #[allow(unused_imports)]
 pub(crate) use codestory_agent::{
-    packet_citations, packet_command_profiles, packet_evidence, packet_evidence_roles,
-    packet_flow_requirements, packet_obligations, packet_plan, packet_required_probes,
-    packet_scoring, packet_terms, planning,
+    citation, packet_citations, packet_claim_profile_registry, packet_command_profiles,
+    packet_coverage, packet_degradation, packet_evidence, packet_evidence_roles,
+    packet_flow_requirements, packet_freshness, packet_obligations, packet_plan,
+    packet_profile_telemetry, packet_required_probes, packet_scoring, packet_source_patterns,
+    packet_terms, planning,
 };
 
 pub(crate) use orchestrator::{agent_ask, agent_packet};

@@ -22,11 +22,11 @@ use codestory_contracts::api::{
 
 /// Machine-readable prefix every freshness gap carries, so callers can match the gap class
 /// without parsing prose.
-pub(crate) const PACKET_FRESHNESS_GAP_PREFIX: &str = "freshness";
+pub const PACKET_FRESHNESS_GAP_PREFIX: &str = "freshness";
 
 /// Freshness as packet sufficiency must consume it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PacketFreshnessInput {
+pub enum PacketFreshnessInput {
     /// The full planned inventory was compared and matched.
     Fresh,
     /// Drift was never established. The publication may still be servable; it is not provable.
@@ -41,7 +41,7 @@ impl PacketFreshnessInput {
     /// The absent observation is `Unknown`, not `Fresh`: on the production path `None` means the
     /// freshness call itself failed, and defaulting a failed check to "fresh" is precisely the
     /// CR-001 exposure.
-    pub(crate) fn from_observation(freshness: Option<&IndexFreshnessDto>) -> Self {
+    pub fn from_observation(freshness: Option<&IndexFreshnessDto>) -> Self {
         if let Some(cause) = FreshnessUnknownCauseDto::for_observation(freshness) {
             return Self::Unknown { cause };
         }
@@ -54,12 +54,12 @@ impl PacketFreshnessInput {
     }
 
     /// Whether this input forbids reporting broad evidence as sufficient.
-    pub(crate) fn caps_sufficiency(self) -> bool {
+    pub fn caps_sufficiency(self) -> bool {
         !matches!(self, Self::Fresh)
     }
 
     /// The typed gap this input publishes on the packet verdict, if any.
-    pub(crate) fn gap(self) -> Option<String> {
+    pub fn gap(self) -> Option<String> {
         match self {
             Self::Fresh => None,
             Self::Unknown { cause } => Some(format!(
@@ -83,7 +83,7 @@ impl PacketFreshnessInput {
 /// `Unknown`. Fixtures that are exercising claim or route behavior have to opt in to an observed
 /// publication or every one of them would be testing the freshness cap instead.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn fresh_index_observation() -> IndexFreshnessDto {
+pub fn fresh_index_observation() -> IndexFreshnessDto {
     IndexFreshnessDto {
         status: IndexFreshnessStatusDto::Fresh,
         changed_file_count: 0,

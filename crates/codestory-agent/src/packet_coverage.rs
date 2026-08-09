@@ -16,7 +16,7 @@ use codestory_contracts::api::{
 };
 
 /// Prefix every coverage gap sentence shares, so callers can partition them.
-pub(crate) const PACKET_COVERAGE_GAP_PREFIX: &str = "source coverage";
+pub const PACKET_COVERAGE_GAP_PREFIX: &str = "source coverage";
 
 /// One file this packet rested on that the index could not prove it covered.
 #[derive(Debug, Clone)]
@@ -29,12 +29,12 @@ struct UnprovableFile {
 
 /// The coverage facts for the files one packet touched.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PacketCoverageInput {
+pub struct PacketCoverageInput {
     unprovable: Vec<UnprovableFile>,
 }
 
 impl PacketCoverageInput {
-    pub(crate) fn from_observations(observations: &[SourceCoverageObservationDto]) -> Self {
+    pub fn from_observations(observations: &[SourceCoverageObservationDto]) -> Self {
         let unprovable = observations
             .iter()
             .filter_map(|observation| {
@@ -62,13 +62,13 @@ impl PacketCoverageInput {
     }
 
     /// Whether any file this packet rested on could not be proven covered.
-    pub(crate) fn caps_sufficiency(&self) -> bool {
+    pub fn caps_sufficiency(&self) -> bool {
         !self.unprovable.is_empty()
     }
 
     /// One sentence per unprovable file, naming the cause and, where the index
     /// recorded them, the numbers that produced it.
-    pub(crate) fn gaps(&self) -> Vec<String> {
+    pub fn gaps(&self) -> Vec<String> {
         self.unprovable
             .iter()
             .map(|file| match file.sizes {
@@ -89,7 +89,7 @@ impl PacketCoverageInput {
     }
 
     /// The paths that could not be proven covered.
-    pub(crate) fn unprovable_paths(&self) -> Vec<&str> {
+    pub fn unprovable_paths(&self) -> Vec<&str> {
         self.unprovable
             .iter()
             .map(|file| file.path.as_str())

@@ -1,20 +1,20 @@
-use crate::agent::packet_scoring::normalize_identifier;
+use crate::packet_scoring::normalize_identifier;
 
-pub(crate) fn packet_source_has_all(source: &str, terms: &[&str]) -> bool {
+pub fn packet_source_has_all(source: &str, terms: &[&str]) -> bool {
     let lower = source.to_ascii_lowercase();
     terms
         .iter()
         .all(|term| lower.contains(&term.to_ascii_lowercase()))
 }
 
-pub(crate) fn packet_source_has_any(source: &str, terms: &[&str]) -> bool {
+pub fn packet_source_has_any(source: &str, terms: &[&str]) -> bool {
     let lower = source.to_ascii_lowercase();
     terms
         .iter()
         .any(|term| lower.contains(&term.to_ascii_lowercase()))
 }
 
-pub(crate) fn packet_source_identifier_with_words(source: &str, words: &[&str]) -> Option<String> {
+pub fn packet_source_identifier_with_words(source: &str, words: &[&str]) -> Option<String> {
     if words.is_empty() {
         return None;
     }
@@ -31,7 +31,7 @@ pub(crate) fn packet_source_identifier_with_words(source: &str, words: &[&str]) 
     None
 }
 
-pub(crate) fn packet_source_identifier_with_words_shortest(
+pub fn packet_source_identifier_with_words_shortest(
     source: &str,
     words: &[&str],
 ) -> Option<String> {
@@ -59,7 +59,7 @@ pub(crate) fn packet_source_identifier_with_words_shortest(
     best
 }
 
-pub(crate) fn packet_source_identifier_exact(source: &str, word: &str) -> Option<String> {
+pub fn packet_source_identifier_exact(source: &str, word: &str) -> Option<String> {
     for token in source.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
         let token = token.trim();
         if token.eq_ignore_ascii_case(word) {
@@ -69,7 +69,7 @@ pub(crate) fn packet_source_identifier_exact(source: &str, word: &str) -> Option
     None
 }
 
-pub(crate) fn packet_source_identifier_ending_with(
+pub fn packet_source_identifier_ending_with(
     source: &str,
     suffix: &str,
     excluded: &str,
@@ -86,7 +86,7 @@ pub(crate) fn packet_source_identifier_ending_with(
     None
 }
 
-pub(crate) fn packet_source_constructed_type(source: &str) -> Option<String> {
+pub fn packet_source_constructed_type(source: &str) -> Option<String> {
     let bytes = source.as_bytes();
     let needle = b"new ";
     let mut index = 0;
@@ -118,7 +118,7 @@ pub(crate) fn packet_source_constructed_type(source: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn packet_display_owner(display: &str) -> Option<String> {
+pub fn packet_display_owner(display: &str) -> Option<String> {
     let owner = display
         .split(['.', ':', '#', '_'])
         .find(|part| {
@@ -134,7 +134,7 @@ pub(crate) fn packet_display_owner(display: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn packet_sql_create_table_names(source: &str) -> Vec<String> {
+pub fn packet_sql_create_table_names(source: &str) -> Vec<String> {
     let mut names = Vec::new();
     for line in source.lines() {
         if let Some(name) = packet_sql_identifier_after(line, "create table")
@@ -149,7 +149,7 @@ pub(crate) fn packet_sql_create_table_names(source: &str) -> Vec<String> {
     names
 }
 
-pub(crate) fn packet_sql_foreign_key_claims(source: &str) -> Vec<String> {
+pub fn packet_sql_foreign_key_claims(source: &str) -> Vec<String> {
     let mut links = Vec::new();
     let mut current_table: Option<String> = None;
     for line in source.lines() {
@@ -228,7 +228,7 @@ fn packet_sql_identifier_between(line: &str, start: &str, end: &str) -> Option<S
     packet_first_sql_identifier(&line[start_at..end_at])
 }
 
-pub(crate) fn packet_sql_identifier_after(line: &str, needle: &str) -> Option<String> {
+pub fn packet_sql_identifier_after(line: &str, needle: &str) -> Option<String> {
     let lower = line.to_ascii_lowercase();
     let at = lower.find(needle)? + needle.len();
     if needle == "create table"
@@ -289,7 +289,7 @@ fn packet_first_sql_identifier(input: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn packet_human_join(items: &[String]) -> String {
+pub fn packet_human_join(items: &[String]) -> String {
     match items {
         [] => String::new(),
         [one] => one.clone(),
