@@ -491,7 +491,7 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "request_dispatch",
         role: FlowRole::Dispatch,
-        query_seeds: &["request dispatch", "handler dispatch", "transport adapter"],
+        query_seeds: &["request dispatch", "handler dispatch"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_server_request,
@@ -1156,6 +1156,7 @@ mod tests {
             "request method",
             "interceptor handlers",
             "adapters",
+            "transport adapter",
         ] {
             assert!(
                 !queries.contains(&client_only),
@@ -1188,10 +1189,14 @@ mod tests {
                 "server route flow should probe {expected}"
             );
         }
-        for response_only in ["response finalization", "transport send"] {
+        for out_of_scope in [
+            "response finalization",
+            "transport send",
+            "transport adapter",
+        ] {
             assert!(
-                !queries.contains(&response_only),
-                "route-to-handler prompt should not require {response_only}"
+                !queries.contains(&out_of_scope),
+                "route-to-handler prompt should not require {out_of_scope}"
             );
         }
     }
