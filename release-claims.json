@@ -1721,6 +1721,129 @@
           "sha256": "cadcf7ea4efe3a68728893813643cebe1185e5b1d4be5b96245f65c9a4d5ea41"
         }
       }
+    },
+    "pinned_programs": {
+      "nextest_linux_archive": {
+        "subject": "downloaded_archive",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Install pinned cargo-nextest",
+        "sha256": "7d07712519615722b19ffe3b3d1097b7d4fa390995e3cac1f9d6dda1ba61b2a7",
+        "reason": "The pinned test runner is fetched over the network, so the install step must verify this exact cargo-nextest 0.9.98 Linux x64 archive with sha256sum --check --strict before it executes."
+      },
+      "source_proof_resolver": {
+        "subject": "step_script_raw_text",
+        "file": "source-proof.yml",
+        "job": "resolve",
+        "step": "Resolve trusted exact head",
+        "sha256": "2fe869b675010f5db29259aff38d83456c01dbc9885989afbf7c92a2826791af",
+        "reason": "The trusted-head resolver authenticates which commit the broad source proof runs against; fragment checks alone cannot prove the authentication logic was not rewritten around them."
+      },
+      "packaged_platform_pr_resolver": {
+        "subject": "step_script_raw_text",
+        "file": "packaged-platform-pr.yml",
+        "job": "route",
+        "step": "Resolve trusted exact head",
+        "sha256": "14015fd938e7dc2bafd50bef2d85d6934ee4658bd86b5560729edb4be7c14679",
+        "reason": "The coordinator's trusted-head resolver authenticates the exact frozen-candidate head for every broad proof mode; its executable text must match the reviewed contract, not merely contain its tokens."
+      },
+      "marketplace_sync_dispatch_guard": {
+        "subject": "step_script_executable_text",
+        "file": "marketplace-sync.yml",
+        "job": "sync",
+        "step": "Validate the dispatched release coordinates",
+        "sha256": "6380c916a1b3566b4b9d6545b63fbc9c7db12b54fb328b5c89316daae0162d84",
+        "reason": "check-workflow-policy.test.mjs runs this exact script against hostile dispatch values and proves it exits non-zero, so the digest stands for a rejection that was measured, not merely read."
+      },
+      "packaged_platform_pr_closeout": {
+        "subject": "step_script_executable_text",
+        "file": "packaged-platform-pr.yml",
+        "job": "closeout",
+        "step": "Require one coherent accepted proof",
+        "sha256": "ce7a7f5aa99f5fcbc037d4c1f06de5d841e4a4d114208820592a84c41c797b1a",
+        "reason": "The closeout is a small shell control-flow program. Substring checks can be satisfied by parking the accepted qualification branch in dead code while the live branch blocks on optional Linux hardware, so its reviewed executable text is pinned as well as its reader-facing invariants."
+      },
+      "packaged_platform_proof_workflow": {
+        "subject": "parsed_workflow_json",
+        "file": "packaged-platform-proof.yml",
+        "sha256": "443c65ea54f92260e664bdeaceabb43e57ac1dc9cb5d15f2783690f6102823fa",
+        "reason": "This workflow builds release archives on three operating systems and carries state between many shell steps through GITHUB_ENV and GITHUB_PATH. Its parsed executable structure is pinned so an unreviewed earlier step cannot replace an owner binary while leaving the locally digested finalizer unchanged."
+      },
+      "packaged_platform_pr_workflow": {
+        "subject": "parsed_workflow_json",
+        "file": "packaged-platform-pr.yml",
+        "sha256": "ca70707ba924b57848d92e8b7a3490e8e18623dce4d1afec393212a78bce110a",
+        "reason": "The frozen-candidate coordinator is a small release-control program, not a loose collection of independently safe fragments. Its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
+      },
+      "frozen_candidate_quality_workflow": {
+        "subject": "parsed_workflow_json",
+        "file": "frozen-candidate-quality.yml",
+        "sha256": "b7a17c66c4cc4275b369f39fdc1fcdb375b334ba908d31577b910ea10e7eb54e",
+        "reason": "The isolated evaluation owner runs optional quality evidence against the exact frozen candidate; pinning its complete parsed structure keeps the adjunct from acquiring authority or losing its isolation unreviewed. The qualification quality contract cites this same pin as evaluation_owner_sha256."
+      },
+      "macos_metal_proof_workflow": {
+        "subject": "parsed_workflow_json",
+        "file": "macos-metal-proof.yml",
+        "sha256": "55581330f6a035b84e1224dbd5469d812ab2fa444914157e22a39cccc64f4627",
+        "reason": "The protected Metal proof is a release-control program on protected hardware; its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
+      },
+      "windows_vulkan_proof_workflow": {
+        "subject": "parsed_workflow_json",
+        "file": "windows-vulkan-proof.yml",
+        "sha256": "c2272dbf4c550ba4a21372e772a87f6df3307f5f4f709b216473f85958157ffe",
+        "reason": "The protected Windows Vulkan proof is a release-control program on protected hardware; its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
+      },
+      "linux_vulkan_proof_workflow": {
+        "subject": "parsed_workflow_json",
+        "file": "linux-vulkan-proof.yml",
+        "sha256": "b2efe3dec20a466cb798752c714f50e64e265856e80ffafc15b28ea2390367d3",
+        "reason": "The standalone Linux Vulkan evidence workflow is a release-control program on protected hardware; its complete parsed structure is pinned so a nonblocking evidence lane cannot quietly acquire blocking authority or leak beyond its reviewed scope."
+      },
+      "release_source_proof_sentinel": {
+        "subject": "parsed_job_json",
+        "file": "release.yml",
+        "job": "source-proof",
+        "sha256": "91ee8bc1a6a055e9297e81747c37d167b123d0a2e5dc60d5c6e2bdcfbef9c351",
+        "reason": "The release chain's source-proof job is a fail-closed placeholder that must refuse to run a second source proof; its complete parsed job body is pinned so the refusal cannot be disabled, made conditional, or made advisory."
+      },
+      "packaged_sccache_identity": {
+        "subject": "step_script_raw_text",
+        "file": "packaged-platform-proof.yml",
+        "job": "build",
+        "step": "Capture pinned sccache identity",
+        "sha256": "f844b8a3b2e0f0013b43f4ec661c237fb090a01c49316d8c2b301ba01cac4342",
+        "reason": "The identity capture binds later compiler-cache assertions to the exact installed sccache binary; raw text is hashed because a line that begins with # is not necessarily a comment when the preceding line opened a quote."
+      },
+      "packaged_linux_build": {
+        "subject": "step_script_raw_text",
+        "file": "packaged-platform-proof.yml",
+        "job": "build",
+        "step": "Build Linux x64 at the glibc 2.31 baseline",
+        "sha256": "f101cc525f52f75686acbb1cf240412409f3f388793890993cefae9175685a6f",
+        "reason": "Linux owns its compiler server inside Docker while macOS and Windows own one in the host shell; both executable programs are pinned so a swallowed stop or a dead-code copy cannot satisfy the ownership fragments."
+      },
+      "packaged_compile_clock_stop": {
+        "subject": "step_script_raw_text",
+        "file": "packaged-platform-proof.yml",
+        "job": "build",
+        "step": "Stop compilation clock",
+        "sha256": "ef9f7ee4636c3466830447e2ed8a10c2030ca3949bca082652d9262848d258a5",
+        "reason": "The compiler clock stop is a strict telemetry-only boundary; its raw text is pinned so the timing boundary cannot absorb build or reporting authority unreviewed."
+      },
+      "packaged_host_compiler_finalizer": {
+        "subject": "step_script_raw_text",
+        "file": "packaged-platform-proof.yml",
+        "job": "build",
+        "step": "Finalize compiler objects",
+        "sha256": "b77d8bb12c2748bfe016ab65ccb2f4581356f3ccf1d666e747306caffd6c0c46",
+        "reason": "The host finalizer must strictly stop only the host package-build compiler server; its raw text is pinned so a swallowed stop or a dead-code copy cannot satisfy the ownership fragments."
+      },
+      "qualification_driver_artifact": {
+        "subject": "helper_file_text",
+        "file": ".github/scripts/qualification-driver-artifact.mjs",
+        "sha256": "efc5126e24162d52f9da8bac38c3414b3a7492fb17eed5ff19867fadad69623e",
+        "reason": "The companion qualification driver is intentionally retained only inside the private Actions package artifact. This digest pins both sides of that contract: the producer may read Cargo's trusted hard-linked build output but retains only a new singly linked copy bound to the exact candidate archive, and the consumer rejects symlinks, retained hardlinks, extra files, identity drift, and byte drift before restoring execute permission. Any helper edit therefore requires policy and mutation-test review in the same PR."
+      }
     }
   }
 }

@@ -43,7 +43,6 @@ const fullSha = /^[0-9a-f]{40}$/iu;
 const sccacheAction = "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696";
 const sccacheVersion = "v0.16.0";
 const nextestVersion = "0.9.98";
-const nextestLinuxSha256 = "7d07712519615722b19ffe3b3d1097b7d4fa390995e3cac1f9d6dda1ba61b2a7";
 const sccacheCacheSize = "1G";
 const windowsSccacheCacheSize = "2G";
 
@@ -906,10 +905,16 @@ export function qualificationDriverArtifactViolations(
     "release-claims.json must bind the private archive-qualified driver contract exactly",
   );
   const normalized = String(source ?? "").replace(/\r\n/gu, "\n");
+  // The pinned digest holds both sides of the private-artifact contract: the producer
+  // may read Cargo's trusted hard-linked build output but retains only a new singly
+  // linked copy bound to the exact candidate archive, and the consumer rejects
+  // symlinks, retained hardlinks, extra files, identity drift, and byte drift before
+  // restoring execute permission. Any helper edit therefore requires policy and
+  // mutation-test review in the same PR.
   add(
     violations,
     createHash("sha256").update(normalized).digest("hex")
-      === qualificationDriverArtifactDigest,
+      === pinnedProgramRow(graph, "qualification_driver_artifact").sha256,
     "qualification-driver-artifact.mjs must match the reviewed archive-bound producer and verifier contract",
   );
   for (const fragment of [
@@ -975,61 +980,84 @@ const draftCachePaths = [
   "~/.cargo/git",
   "target",
 ];
-const sourceResolverContractDigest = "2fe869b675010f5db29259aff38d83456c01dbc9885989afbf7c92a2826791af";
-const platformResolverContractDigest = "14015fd938e7dc2bafd50bef2d85d6934ee4658bd86b5560729edb4be7c14679";
-// check-workflow-policy.test.mjs runs this exact script against hostile dispatch values and proves
-// it exits non-zero, so the digest stands for a rejection that was measured, not merely read.
-const marketplaceGuardDigest = "6380c916a1b3566b4b9d6545b63fbc9c7db12b54fb328b5c89316daae0162d84";
-// This closeout is a small shell control-flow program. Substring checks can be
-// satisfied by parking the accepted qualification branch in dead code while
-// the live branch blocks on optional Linux hardware, so pin its reviewed
-// executable text as well as its reader-facing invariants.
-const packagedPlatformCloseoutDigest =
-  "ce7a7f5aa99f5fcbc037d4c1f06de5d841e4a4d114208820592a84c41c797b1a";
-// This workflow builds release archives on three operating systems and carries
-// state between many shell steps through GITHUB_ENV and GITHUB_PATH. Pin its
-// parsed executable structure so an unreviewed earlier step cannot replace an
-// owner binary while leaving the locally digested finalizer unchanged.
-const packagedPlatformWorkflowDigest =
-  "443c65ea54f92260e664bdeaceabb43e57ac1dc9cb5d15f2783690f6102823fa";
-// The frozen-candidate coordinator and protected GPU workflows are small
-// release-control programs, not loose collections of independently safe
-// fragments. Pin their complete parsed structure so a required check cannot be
-// made advisory, parked in dead code, or followed by a payload substitution
-// while leaving the expected tokens in place.
-const packagedPlatformCoordinatorWorkflowDigest =
-  "ca70707ba924b57848d92e8b7a3490e8e18623dce4d1afec393212a78bce110a";
-const releaseSourceProofSentinelDigest =
-  "91ee8bc1a6a055e9297e81747c37d167b123d0a2e5dc60d5c6e2bdcfbef9c351";
-const frozenCandidateQualityWorkflowDigest =
-  "b7a17c66c4cc4275b369f39fdc1fcdb375b334ba908d31577b910ea10e7eb54e";
-const macosMetalWorkflowDigest =
-  "55581330f6a035b84e1224dbd5469d812ab2fa444914157e22a39cccc64f4627";
-const windowsVulkanWorkflowDigest =
-  "c2272dbf4c550ba4a21372e772a87f6df3307f5f4f709b216473f85958157ffe";
-const linuxVulkanWorkflowDigest =
-  "b2efe3dec20a466cb798752c714f50e64e265856e80ffafc15b28ea2390367d3";
-// Linux owns its compiler server inside Docker, while macOS and Windows own one
-// in the host shell. Pin both executable programs so a swallowed stop or a
-// dead-code copy cannot satisfy the ownership fragments below.
-const packagedSccacheIdentityDigest =
-  "f844b8a3b2e0f0013b43f4ec661c237fb090a01c49316d8c2b301ba01cac4342";
-const packagedLinuxBuildDigest =
-  "f101cc525f52f75686acbb1cf240412409f3f388793890993cefae9175685a6f";
-const packagedCompileClockStopDigest =
-  "ef9f7ee4636c3466830447e2ed8a10c2030ca3949bca082652d9262848d258a5";
-const packagedHostCompilerFinalizerDigest =
-  "b77d8bb12c2748bfe016ab65ccb2f4581356f3ccf1d666e747306caffd6c0c46";
-// The companion qualification driver is intentionally retained only inside
-// the private Actions package artifact. This digest pins both sides of that
-// contract: the producer may read Cargo's trusted hard-linked build output,
-// but retains only a new singly linked copy bound to the exact candidate
-// archive. The consumer rejects symlinks, retained hardlinks, extra files,
-// identity drift, and byte drift before restoring execute permission.
-// Any helper edit therefore requires policy and mutation-test review in the
-// same PR.
-const qualificationDriverArtifactDigest =
-  "efc5126e24162d52f9da8bac38c3414b3a7492fb17eed5ff19867fadad69623e";
+// Every exact sha256 pin is a rule INSTANCE and lives in release-claims.json under
+// workflow_policy.pinned_programs; scripts/codestory-release-claims.mjs fails graph
+// loading unless that block names exactly the reviewed pinned set. This table keeps
+// only what stays code: the predicate implementation per subject kind and the
+// reviewed violation message for each pinned program. Adding or re-pinning a program
+// is a graph edit plus one row here; the digests themselves never return to code.
+const pinnedProgramContracts = {
+  packaged_platform_proof_workflow: {
+    violation: row => `${row.file} must match the reviewed canonical workflow structure`,
+  },
+  packaged_platform_pr_workflow: {
+    violation: row => `${row.file} must match the reviewed frozen-candidate coordinator structure`,
+  },
+  frozen_candidate_quality_workflow: {
+    violation: row => `${row.file} must match the reviewed isolated evaluation-owner structure`,
+  },
+  macos_metal_proof_workflow: {
+    violation: row => `${row.file} must match the reviewed protected Metal workflow structure`,
+  },
+  windows_vulkan_proof_workflow: {
+    violation: row => `${row.file} must match the reviewed protected Windows Vulkan workflow structure`,
+  },
+  linux_vulkan_proof_workflow: {
+    violation: row => `${row.file} must match the reviewed protected Linux Vulkan workflow structure`,
+  },
+  release_source_proof_sentinel: {
+    violation: row => `${row.file} source proof placeholder must match the reviewed fail-closed sentinel`,
+  },
+  source_proof_resolver: { resolver: true },
+  packaged_platform_pr_resolver: { resolver: true },
+  marketplace_sync_dispatch_guard: { script: "dispatch coordinate guard" },
+  packaged_platform_pr_closeout: { script: "coordinator closeout" },
+  packaged_sccache_identity: { script: "pinned sccache identity capture" },
+  packaged_linux_build: { script: "Linux container build and compiler-server ownership" },
+  packaged_compile_clock_stop: { script: "compiler clock stop" },
+  packaged_host_compiler_finalizer: { script: "host compiler-server finalizer" },
+};
+
+function pinnedProgramRow(graph, name) {
+  return object(object(object(graph.workflow_policy).pinned_programs)[name]);
+}
+
+// One generic evaluator walks the graph-owned digest pins. A missing workflow is
+// reported by the structural validator that owns the file, so each row evaluates
+// only when its subject workflow parsed; every other absence (missing job, missing
+// step, empty script) hashes to a mismatch exactly as the retired inline checks did.
+export function pinnedProgramViolations(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
+  const violations = [];
+  for (const [name, contract] of Object.entries(pinnedProgramContracts)) {
+    const row = pinnedProgramRow(graph, name);
+    const workflow = workflows.get(row.file);
+    if (!workflow) continue;
+    if (row.subject === "parsed_workflow_json") {
+      add(
+        violations,
+        createHash("sha256").update(JSON.stringify(workflow)).digest("hex") === row.sha256,
+        contract.violation(row),
+      );
+      continue;
+    }
+    const job = object(object(workflow.jobs)[row.job]);
+    if (row.subject === "parsed_job_json") {
+      add(
+        violations,
+        createHash("sha256").update(JSON.stringify(job)).digest("hex") === row.sha256,
+        contract.violation(row),
+      );
+    } else if (row.subject === "step_script_executable_text") {
+      requireExactStepScript(violations, row.file, job, row.step, row.sha256, contract.script);
+    } else if (contract.resolver) {
+      requireExactResolverContract(violations, row.file, job, row.sha256);
+    } else {
+      requireExactRawStepScript(violations, row.file, job, row.step, row.sha256, contract.script);
+    }
+  }
+  return violations;
+}
+
 const draftProofCommands = [
   "cargo test --locked -p codestory-llama-sys --test native_staging",
   "cargo test --locked -p codestory-llama-sys --test model_staging",
@@ -2431,7 +2459,6 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       'test "$GITHUB_SHA" = "$CALLER_REF"',
       "--ref $head_ref",
     ]);
-    requireExactResolverContract(violations, sourceFile, resolve, sourceResolverContractDigest);
     requireStepRun(violations, sourceFile, resolve, "Reuse a completed gate for this exact head", [
       '.path == ".github/workflows/source-proof.yml"',
       '.event == "workflow_dispatch" and .conclusion == "success"',
@@ -2799,7 +2826,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     ]);
     requireStepRun(violations, sourceFile, full, "Install pinned cargo-nextest", [
       `cargo-nextest-${nextestVersion}-x86_64-unknown-linux-gnu.tar.gz`,
-      `${nextestLinuxSha256}  $RUNNER_TEMP/cargo-nextest.tar.gz`,
+      `${pinnedProgramRow(graph, "nextest_linux_archive").sha256}  $RUNNER_TEMP/cargo-nextest.tar.gz`,
       "sha256sum --check --strict",
       "cargo nextest --version",
     ]);
@@ -3235,12 +3262,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   );
 
   const source = requireJob(violations, releaseFile, release, "source-proof");
-  add(
-    violations,
-    createHash("sha256").update(JSON.stringify(source)).digest("hex")
-      === releaseSourceProofSentinelDigest,
-    `${releaseFile} source proof placeholder must match the reviewed fail-closed sentinel`,
-  );
   add(
     violations,
     source.uses === undefined
@@ -3782,12 +3803,6 @@ function validatePackagedProof(workflows, violations, graph) {
     violations.push(`${file} must exist`);
     return;
   }
-  add(
-    violations,
-    createHash("sha256").update(JSON.stringify(workflow)).digest("hex")
-      === packagedPlatformWorkflowDigest,
-    `${file} must match the reviewed canonical workflow structure`,
-  );
   add(violations, trigger(workflow, "workflow_call") !== undefined, `${file} must be reusable`);
   const refInput = object(at(workflow, "on", "workflow_call", "inputs", "ref"));
   add(
@@ -3906,14 +3921,6 @@ function validatePackagedProof(workflows, violations, graph) {
       && stepIndex(job, "Capture pinned sccache identity")
         === stepIndex(job, "Install pinned sccache") + 1,
     `${file} must capture the pinned sccache identity immediately after installation`,
-  );
-  requireExactRawStepScript(
-    violations,
-    file,
-    job,
-    "Capture pinned sccache identity",
-    packagedSccacheIdentityDigest,
-    "pinned sccache identity capture",
   );
   requireStepRun(violations, file, job, "Capture pinned sccache identity", [
     'sccache_path="$(command -v sccache)"',
@@ -4118,14 +4125,6 @@ function validatePackagedProof(workflows, violations, graph) {
       && linuxBuild?.["continue-on-error"] === undefined,
     `${file} Linux container must strictly report and stop its owned compiler server`,
   );
-  requireExactRawStepScript(
-    violations,
-    file,
-    job,
-    "Build Linux x64 at the glibc 2.31 baseline",
-    packagedLinuxBuildDigest,
-    "Linux container build and compiler-server ownership",
-  );
   const stopCompilationClock = namedStep(job, "Stop compilation clock");
   add(
     violations,
@@ -4134,14 +4133,6 @@ function validatePackagedProof(workflows, violations, graph) {
       && stopCompilationClock?.env === undefined
       && stopCompilationClock?.["continue-on-error"] === undefined,
     `${file} compiler clock stop must remain a strict telemetry-only boundary`,
-  );
-  requireExactRawStepScript(
-    violations,
-    file,
-    job,
-    "Stop compilation clock",
-    packagedCompileClockStopDigest,
-    "compiler clock stop",
   );
   const finalizeCompilerObjects = namedStep(job, "Finalize compiler objects");
   add(
@@ -4159,14 +4150,6 @@ function validatePackagedProof(workflows, violations, graph) {
       && finalizeCompilerObjects?.["continue-on-error"] === undefined
       && packageBuild?.if === "matrix.asset_target != 'linux-x64'",
     `${file} host finalizer must strictly stop only the host package-build compiler server`,
-  );
-  requireExactRawStepScript(
-    violations,
-    file,
-    job,
-    "Finalize compiler objects",
-    packagedHostCompilerFinalizerDigest,
-    "host compiler-server finalizer",
   );
   add(
     violations,
@@ -5475,12 +5458,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations.push(`${file} must exist`);
     return;
   }
-  add(
-    violations,
-    createHash("sha256").update(JSON.stringify(workflow)).digest("hex")
-      === packagedPlatformCoordinatorWorkflowDigest,
-    `${file} must match the reviewed frozen-candidate coordinator structure`,
-  );
   const promotion = graph.workflow_policy.promotion;
   const calibrationPolicy = object(graph.workflow_policy.calibration);
   const qualificationPolicy = object(graph.workflow_policy.qualification);
@@ -5569,7 +5546,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
           archive_cache_contract: "candidate_archive_cache",
           archive_transfer: "authenticated_miss_only",
           evaluation_owner: "isolated_reusable_workflow",
-          evaluation_owner_sha256: frozenCandidateQualityWorkflowDigest,
+          evaluation_owner_sha256:
+            pinnedProgramRow(graph, "frozen_candidate_quality_workflow").sha256,
           evaluation_contract: "publishable-three-repeat-packet/v1",
           task_count: 1,
           repeats_per_task: 3,
@@ -5672,7 +5650,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     INPUT_CALIBRATION_ARTIFACT: "${{ inputs.calibration_bundle_artifact }}",
     INPUT_CALIBRATION_RUN_ID: "${{ inputs.calibration_bundle_run_id }}",
   });
-  requireExactResolverContract(violations, file, route, platformResolverContractDigest);
   add(
     violations,
     namedStep(route, "Require executable release freeze")?.if === undefined,
@@ -5962,12 +5939,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations.push(`${qualityFile} must exist`);
     return;
   }
-  add(
-    violations,
-    createHash("sha256").update(JSON.stringify(qualityWorkflow)).digest("hex")
-      === frozenCandidateQualityWorkflowDigest,
-    `${qualityFile} must match the reviewed isolated evaluation-owner structure`,
-  );
   const qualityCall = object(trigger(qualityWorkflow, "workflow_call"));
   const qualityInputs = object(qualityCall.inputs);
   add(
@@ -6456,14 +6427,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     'require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof',
     "dev/codestory-next moved from proved head",
   ]);
-  requireExactStepScript(
-    violations,
-    file,
-    closeout,
-    "Require one coherent accepted proof",
-    packagedPlatformCloseoutDigest,
-    "coordinator closeout",
-  );
   add(
     violations,
     /if\s+\[\s*"\$MODE"\s*=\s*qualification\s*\];\s*then\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+skipped\s+linux-vulkan-proof\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+fi/um
@@ -6533,12 +6496,6 @@ function validateRemainingWorkflows(workflows, violations) {
   if (!metal) {
     violations.push(`${metalFile} must exist`);
   } else {
-    add(
-      violations,
-      createHash("sha256").update(JSON.stringify(metal)).digest("hex")
-        === macosMetalWorkflowDigest,
-      `${metalFile} must match the reviewed protected Metal workflow structure`,
-    );
     add(
       violations,
       trigger(metal, "workflow_call") !== undefined
@@ -7198,12 +7155,6 @@ function validateRemainingWorkflows(workflows, violations) {
   } else {
     add(
       violations,
-      createHash("sha256").update(JSON.stringify(vulkan)).digest("hex")
-        === windowsVulkanWorkflowDigest,
-      `${vulkanFile} must match the reviewed protected Windows Vulkan workflow structure`,
-    );
-    add(
-      violations,
       trigger(vulkan, "workflow_call") !== undefined
         && trigger(vulkan, "workflow_dispatch") === undefined,
       `${vulkanFile} must be coordinator-only and not directly dispatchable`,
@@ -7829,12 +7780,6 @@ function validateRemainingWorkflows(workflows, violations) {
   if (!linuxVulkan) {
     violations.push(`${linuxVulkanFile} must exist`);
   } else {
-    add(
-      violations,
-      createHash("sha256").update(JSON.stringify(linuxVulkan)).digest("hex")
-        === linuxVulkanWorkflowDigest,
-      `${linuxVulkanFile} must match the reviewed protected Linux Vulkan workflow structure`,
-    );
     add(
       violations,
       trigger(linuxVulkan, "workflow_call") !== undefined
@@ -11114,7 +11059,6 @@ export function validateMarketplaceSync(workflows, violations, graph) {
   // well formed. The guard must match whole values; the digest keeps that property from being
   // quietly traded back for a line-oriented test.
   forbidStepRun(violations, file, job, guard, ["grep"]);
-  requireExactStepScript(violations, file, job, guard, marketplaceGuardDigest, "dispatch coordinate guard");
   add(
     violations,
     stepIndex(job, guard) === 0,
@@ -11237,6 +11181,7 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   violations.push(...lostRunnerRecoveryViolations(workflows, graph));
   violations.push(...protectedRunnerReservationViolations(workflows, graph));
   violations.push(...releaseWorkflowContractViolations(workflows, graph));
+  violations.push(...pinnedProgramViolations(workflows, graph));
   return violations;
 }
 
