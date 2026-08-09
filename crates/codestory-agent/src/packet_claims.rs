@@ -1,27 +1,28 @@
-#[cfg(test)]
-use crate::agent::eval_probes::{
-    eval_citation_shaped_claim, eval_flow_template_claims, eval_probes_enabled,
+#[cfg(any(test, feature = "test-support"))]
+use crate::eval_probes::{
+    eval_citation_shaped_claim, eval_flow_template_claims,
+    eval_indexing_storage_flow_template_claims, eval_probes_enabled,
     eval_supporting_claim_flow_sentence,
 };
-use crate::agent::packet_citations::packet_citation_source_text;
-use crate::agent::packet_claim_profiles::{
+use crate::packet_citations::packet_citation_source_text;
+use crate::packet_claim_profiles::{
     packet_source_derived_claim_for_role, packet_source_derived_claims_for_citation_counted,
 };
-use crate::agent::packet_command_profiles::packet_append_command_flow_template_claims;
-use crate::agent::packet_evidence::{
+use crate::packet_command_profiles::packet_append_command_flow_template_claims;
+use crate::packet_evidence::{
     citation_sufficiency_eligible, evidence_resolution_for_citation, evidence_tier_for_citation,
 };
-use crate::agent::packet_evidence_roles::{
+use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
 };
-use crate::agent::packet_plan::packet_rank_terms;
-use crate::agent::packet_profile_telemetry::{PacketClaimSource, PacketClaimTelemetry};
-use crate::agent::packet_scoring::{
+use crate::packet_plan::packet_rank_terms;
+use crate::packet_profile_telemetry::{PacketClaimSource, PacketClaimTelemetry};
+use crate::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_claim_carry_rank,
     packet_display_path, packet_query_stop_term, sort_by_cached_rank_desc,
 };
-use crate::agent::packet_terms::{packet_probe_terms, packet_terms_indicate_sql_schema_flow};
-use crate::query_mentions_non_primary_source;
+use crate::packet_terms::{packet_probe_terms, packet_terms_indicate_sql_schema_flow};
+use crate::text::query_mentions_non_primary_source;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, PacketClaimDto, PacketEvidenceResolutionDto,
     PacketEvidenceTierDto, PacketProofStatusDto,
@@ -31,7 +32,7 @@ use std::fmt::Write as _;
 
 const PACKET_SOURCE_DEFINITION_CLAIM_LIMIT: usize = 6;
 
-pub(crate) fn packet_flow_claims_markdown(claims: &[PacketClaimDto]) -> String {
+pub fn packet_flow_claims_markdown(claims: &[PacketClaimDto]) -> String {
     let mut markdown = String::new();
     markdown.push_str(
         "Packet claim status: `P` proven, `R` reported lead, `L` likely, `D` diagnostic, `U` unsupported or unclassified. Only `P` claims support sufficiency.\n",
@@ -55,11 +56,11 @@ pub(crate) fn packet_flow_claims_markdown(claims: &[PacketClaimDto]) -> String {
     markdown
 }
 
-pub(crate) fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
+pub fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
     packet_supported_claims_with_telemetry(answer).0
 }
 
-pub(crate) fn packet_supported_claims_with_telemetry(
+pub fn packet_supported_claims_with_telemetry(
     answer: &AgentAnswerDto,
 ) -> (Vec<PacketClaimDto>, PacketClaimTelemetry) {
     let mut claims = Vec::new();
@@ -93,7 +94,7 @@ pub(crate) fn packet_supported_claims_with_telemetry(
     (claims, telemetry)
 }
 
-pub(crate) fn decorate_packet_claims_proof_metadata(claims: &mut [PacketClaimDto]) {
+pub fn decorate_packet_claims_proof_metadata(claims: &mut [PacketClaimDto]) {
     for claim in claims {
         decorate_packet_claim_proof_metadata(claim);
     }
@@ -145,7 +146,7 @@ fn packet_citation_is_diagnostic_only(citation: &AgentCitationDto) -> bool {
     )
 }
 
-pub(crate) fn append_flow_template_claims(
+pub fn append_flow_template_claims(
     prompt: &str,
     citations: &[AgentCitationDto],
     claims: &mut Vec<PacketClaimDto>,
@@ -171,10 +172,14 @@ pub(crate) fn append_flow_template_claims(
     packet_append_sql_schema_file_claims(prompt, citations, claims, seen);
     phase.finish(PacketClaimSource::FlowTemplate, claims, telemetry);
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if eval_probes_enabled() {
         let phase = ClaimSourcePhase::start(claims);
-        packet_append_indexing_storage_flow_template_claims(prompt, citations, claims, seen);
+        for (claim, claim_citations) in
+            eval_indexing_storage_flow_template_claims(prompt, citations)
+        {
+            packet_push_flow_template_claim_with_citations(claims, seen, &claim, claim_citations);
+        }
         for (claim, citation) in eval_flow_template_claims(&normalized_prompt, citations) {
             packet_push_flow_template_claim(claims, seen, &claim, Some(citation));
         }
@@ -570,54 +575,6 @@ fn packet_sql_schema_prompt_subject(prompt: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-#[cfg(test)]
-fn packet_append_indexing_storage_flow_template_claims(
-    prompt: &str,
-    citations: &[AgentCitationDto],
-    claims: &mut Vec<PacketClaimDto>,
-    seen: &mut HashSet<String>,
-) {
-    let normalized_prompt = normalize_identifier(prompt);
-    let indexing_prompt = normalized_prompt.contains("indexing")
-        || normalized_prompt.contains("indexed")
-        || normalized_prompt.contains("indexer");
-    let storage_prompt = normalized_prompt.contains("storage")
-        || normalized_prompt.contains("persistent")
-        || normalized_prompt.contains("sourcegroup")
-        || normalized_prompt.contains("sourcegroupconfiguration");
-    if !(indexing_prompt && storage_prompt) {
-        return;
-    }
-
-    let source_group = citations.iter().find(|citation| {
-        packet_evidence_role(citation) == Some(PacketEvidenceRole::SourceGroupConfiguration)
-    });
-    let indexing_work = citations.iter().find(|citation| {
-        packet_evidence_role(citation) == Some(PacketEvidenceRole::IndexingWorkQueue)
-    });
-    if let Some(source_group) = source_group
-        && let Some(indexing_work) = indexing_work
-    {
-        packet_push_flow_template_claim_with_citations(
-            claims,
-            seen,
-            "Source-group configuration and indexing command evidence describe how repository configuration becomes indexing work.",
-            vec![source_group.clone(), indexing_work.clone()],
-        );
-    }
-
-    if let Some(persistence) = citations.iter().find(|citation| {
-        packet_evidence_role(citation) == Some(PacketEvidenceRole::PersistenceAndSearchProjection)
-    }) {
-        packet_push_flow_template_claim(
-            claims,
-            seen,
-            "Persistence/search-projection evidence describes how indexed data remains available to later application reads.",
-            Some(persistence.clone()),
-        );
-    }
-}
-
 fn packet_push_flow_template_claim(
     claims: &mut Vec<PacketClaimDto>,
     seen: &mut HashSet<String>,
@@ -676,7 +633,7 @@ fn packet_push_unbound_reported_claim(
     });
 }
 
-pub(crate) fn append_ranked_citation_claims(
+pub fn append_ranked_citation_claims(
     prompt: &str,
     citations: &[AgentCitationDto],
     rank_terms: &[String],
@@ -744,7 +701,7 @@ pub(crate) fn append_ranked_citation_claims(
     }
 }
 
-pub(crate) fn packet_claim_for_role(
+pub fn packet_claim_for_role(
     role: PacketEvidenceRole,
     citation: &AgentCitationDto,
     prompt: &str,
@@ -857,7 +814,7 @@ pub(crate) fn packet_claim_for_role(
 }
 
 fn packet_source_evidence_flow_sentence(prompt: &str, focus: &str) -> String {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         let normalized_prompt = normalize_identifier(prompt);
         if let Some(sentence) = eval_supporting_claim_flow_sentence(&normalized_prompt, focus) {
@@ -893,7 +850,7 @@ fn packet_claim_flow_terms(rank_terms: &[String], citation: &AgentCitationDto) -
 }
 
 fn packet_citation_shaped_claim(citation: &AgentCitationDto, prompt: &str) -> Option<String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         let path = citation
             .file_path
@@ -902,7 +859,7 @@ fn packet_citation_shaped_claim(citation: &AgentCitationDto, prompt: &str) -> Op
             .unwrap_or_default();
         eval_citation_shaped_claim(citation, prompt, &path)
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         let _ = (citation, prompt);
         None

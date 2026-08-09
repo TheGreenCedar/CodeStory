@@ -22,3 +22,50 @@ pub trait WorkspacePathIdentity {
     /// file identity, however differently they are spelled.
     fn same_workspace_path(&self, left: &Path, right: &Path) -> bool;
 }
+
+/// Missing-path spelling identity for planning fixtures: two spellings name
+/// the same file exactly when their dot-segment-normalized components are
+/// equal.
+///
+/// Planning fixtures name files that never exist on disk, and for a missing
+/// path `codestory_workspace::same_workspace_path` falls back to comparing the
+/// normalized lexical spelling — which is the verdict this adapter reproduces
+/// without linking the workspace crate. It compiles for tests and
+/// `test-support` builds only and is never a production stand-in: every
+/// production construction site still threads the runtime adapter explicitly,
+/// and this type deliberately has no `Default`.
+#[cfg(any(test, feature = "test-support"))]
+pub struct MissingPathSpellingIdentity;
+
+#[cfg(any(test, feature = "test-support"))]
+impl WorkspacePathIdentity for MissingPathSpellingIdentity {
+    fn same_workspace_path(&self, left: &Path, right: &Path) -> bool {
+        normalize_missing_path_spelling(left) == normalize_missing_path_spelling(right)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn normalize_missing_path_spelling(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized
+                    .file_name()
+                    .is_some_and(|name| name != std::ffi::OsStr::new(".."))
+                {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
