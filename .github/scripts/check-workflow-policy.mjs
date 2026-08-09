@@ -5442,6 +5442,16 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     ),
     `${file} dispatch scopes changed`,
   );
+  const linuxQualificationInput = object(
+    at(workflow, "on", "workflow_dispatch", "inputs", "qualify_linux_vulkan"),
+  );
+  add(
+    violations,
+    linuxQualificationInput.required === false
+      && linuxQualificationInput.default === false
+      && linuxQualificationInput.type === "boolean",
+    `${file} Linux lifecycle qualification must remain an explicit non-default dispatch opt-in`,
+  );
   add(violations, trigger(workflow, "pull_request_target") === undefined, `${file} must not use pull_request_target`);
   // The workflow-scoped permission grants (actions write for superseded-run
   // cancellation, read-only contents) are rule instances and live in
@@ -5464,7 +5474,15 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   requireStepEnv(violations, file, route, "Resolve trusted exact head", {
     INPUT_CALIBRATION_ARTIFACT: "${{ inputs.calibration_bundle_artifact }}",
     INPUT_CALIBRATION_RUN_ID: "${{ inputs.calibration_bundle_run_id }}",
+    INPUT_QUALIFY_LINUX_VULKAN: "${{ inputs.qualify_linux_vulkan }}",
   });
+  add(
+    violations,
+    stepRun(route, "Resolve trusted exact head").includes(
+      'if [ "$qualify_linux_vulkan" = true ] && [ "$mode" != qualification ]; then',
+    ),
+    `${file} Linux lifecycle qualification opt-in must fail outside qualification mode`,
+  );
   add(
     violations,
     namedStep(route, "Require executable release freeze")?.if === undefined,
@@ -6085,9 +6103,9 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations,
     String(linuxVulkan.if ?? "").includes("needs.route.outputs.mode != 'package'")
       && String(linuxVulkan.if ?? "").includes(
-        "needs.route.outputs.mode != 'qualification'",
+        "needs.route.outputs.mode != 'qualification' || inputs.qualify_linux_vulkan",
       ),
-    `${file} package-only and qualification modes must skip coordinator Linux proof`,
+    `${file} package mode must skip Linux proof; qualification must schedule Linux proof only when the explicit lifecycle opt-in is true`,
   );
   add(
     violations,
@@ -6096,11 +6114,17 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    object(linuxVulkan.with).candidate_installed_proof === true
-      && object(linuxVulkan.with).server_behavior_only === true
+    object(linuxVulkan.with).calibration_bundle_artifact
+        === "${{ inputs.calibration_bundle_artifact || '' }}"
+      && object(linuxVulkan.with).calibration_bundle_run_id
+        === "${{ inputs.calibration_bundle_run_id || '' }}"
+      && object(linuxVulkan.with).candidate_installed_proof
+        === "${{ needs.route.outputs.mode != 'qualification' }}"
+      && object(linuxVulkan.with).server_behavior_only
+        === "${{ needs.route.outputs.mode != 'qualification' }}"
       && object(linuxVulkan.with).candidate_producer_workflow_path
         === ".github/workflows/packaged-platform-pr.yml",
-    `${file} Linux proof must close Vulkan and candidate-installed claims without optional evaluation`,
+    `${file} Linux proof must keep platform mode candidate-installed and run full lifecycle only in qualification with the authenticated calibration bundle`,
   );
   // The closeout job's structural pin (job existence) and its needs edge are
   // rule instances and live in release-claims.json under
@@ -6143,6 +6167,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     GH_TOKEN: "${{ github.token }}",
     HEAD_SHA: "${{ needs.route.outputs.head_sha }}",
     MODE: "${{ needs.route.outputs.mode }}",
+    QUALIFY_LINUX_VULKAN: "${{ inputs.qualify_linux_vulkan }}",
     SCOPE: "${{ needs.route.outputs.scope }}",
     ROUTE_RESULT: "${{ needs.route.result }}",
     SOURCE_RESULT: "${{ needs.source-proof.result }}",
@@ -6162,9 +6187,9 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    /if\s+\[\s*"\$MODE"\s*=\s*qualification\s*\];\s*then\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+skipped\s+linux-vulkan-proof\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+fi/um
+    /if\s+\[\s*"\$MODE"\s*=\s*qualification\s*\];\s*then\s+if\s+\[\s*"\$QUALIFY_LINUX_VULKAN"\s*=\s*true\s*\];\s*then\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+skipped\s+linux-vulkan-proof\s+fi\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+fi/um
       .test(closeoutRun),
-    `${file} qualification closeout must accept skipped optional Linux proof without blocking`,
+    `${file} qualification closeout must require Linux success exactly when the explicit lifecycle opt-in is true`,
   );
   add(violations, !scalarStrings(workflow).some(value => value === "./.github/workflows/release.yml"), `${file} must not publish releases`);
 }

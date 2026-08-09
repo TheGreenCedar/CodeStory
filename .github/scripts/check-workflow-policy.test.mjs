@@ -1312,42 +1312,42 @@ test("frozen-candidate quality stays optional, exact, and archive-authenticated"
     ["Windows qualification becomes server-behavior only", coordinatorFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].with.server_behavior_only = true;
     }, /qualification must run full Windows lifecycle and fault proof/u],
-    ["coordinator schedules Linux during qualification", coordinatorFile, workflow => {
+    ["coordinator schedules Linux during qualification without the opt-in", coordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].if
         = workflow.jobs["linux-vulkan-proof"].if.replace(
-          "needs.route.outputs.mode != 'qualification' &&",
-          "",
+          "(needs.route.outputs.mode != 'qualification' || inputs.qualify_linux_vulkan)",
+          "true",
         );
-    }, /qualification modes must skip coordinator Linux proof/u],
-    ["qualification closeout blocks on Linux", coordinatorFile, workflow => {
+    }, /qualification must schedule Linux proof only when the explicit lifecycle opt-in is true/u],
+    ["qualification closeout requires Linux without the opt-in", coordinatorFile, workflow => {
       const closeout = draftStep(
         workflow.jobs.closeout,
         "Require one coherent accepted proof",
       );
       closeout.run = closeout.run.replace(
-        `if [ "$MODE" = qualification ]; then
-      require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
-    else`,
-        `if [ "$MODE" = qualification ]; then
-      require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
-    else`,
+        'if [ "$QUALIFY_LINUX_VULKAN" = true ]; then',
+        "if true; then",
       );
-    }, /qualification closeout must accept skipped optional Linux proof without blocking/u],
+    }, /qualification closeout must require Linux success exactly when the explicit lifecycle opt-in is true/u],
     ["qualification closeout hides the accepted Linux branch in dead code", coordinatorFile, workflow => {
       const closeout = draftStep(
         workflow.jobs.closeout,
         "Require one coherent accepted proof",
       );
       const accepted = `if [ "$MODE" = qualification ]; then
-      require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
+      if [ "$QUALIFY_LINUX_VULKAN" = true ]; then
+        require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
+      else
+        require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
+      fi
     else
       require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
     fi`;
       closeout.run = closeout.run.replace(
         accepted,
         accepted.replace(
-          'require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof',
-          'require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof',
+          'if [ "$QUALIFY_LINUX_VULKAN" = true ]; then',
+          "if true; then",
         ),
       );
       closeout.run += `\nif false; then\n${accepted}\nfi\n`;
@@ -3157,9 +3157,22 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
     ["protected Linux proof removed", packagedCoordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].uses = "./.github/workflows/packaged-platform-proof.yml";
     }, /Linux proof must use the protected Vulkan workflow/u],
+    ["Linux lifecycle qualification becomes implicit", packagedCoordinatorFile, workflow => {
+      workflow.on.workflow_dispatch.inputs.qualify_linux_vulkan.default = true;
+    }, /Linux lifecycle qualification must remain an explicit non-default dispatch opt-in/u],
+    ["Linux lifecycle qualification is admitted outside qualification mode", packagedCoordinatorFile, workflow => {
+      const resolver = packagedResolver(workflow);
+      resolver.run = resolver.run.replace(
+        'if [ "$qualify_linux_vulkan" = true ] && [ "$mode" != qualification ]; then',
+        'if [ "$qualify_linux_vulkan" = true ] && false; then',
+      );
+    }, /Linux lifecycle qualification opt-in must fail outside qualification mode/u],
     ["protected Linux candidate proof disabled", packagedCoordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].with.candidate_installed_proof = false;
-    }, /Linux proof must close Vulkan and candidate-installed claims/u],
+    }, /Linux proof must keep platform mode candidate-installed and run full lifecycle only in qualification/u],
+    ["protected Linux lifecycle proof loses calibration binding", packagedCoordinatorFile, workflow => {
+      delete workflow.jobs["linux-vulkan-proof"].with.calibration_bundle_artifact;
+    }, /full lifecycle only in qualification with the authenticated calibration bundle/u],
     ["Linux direct dispatch returns", linuxVulkanFile, workflow => {
       workflow.on.workflow_dispatch = { inputs: {} };
     }, /coordinator-only and not directly dispatchable/u],
@@ -4550,7 +4563,7 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     ["package mode enables protected Linux proof", coordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].if = workflow.jobs["linux-vulkan-proof"].if
         .replace("needs.route.outputs.mode != 'package' &&", "");
-    }, /package-only and qualification modes must skip coordinator Linux proof/u],
+    }, /package mode must skip Linux proof/u],
     ["calibration mode restores hosted Linux CPU calibration", coordinatorFile, workflow => {
       workflow.jobs["calibration-linux"] = {
         if: "needs.route.outputs.mode == 'calibration'",
