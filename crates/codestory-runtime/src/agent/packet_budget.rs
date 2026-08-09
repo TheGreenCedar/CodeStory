@@ -13,6 +13,7 @@ use crate::agent::packet_required_probes::packet_sufficiency_required_probe_quer
 use crate::agent::packet_sufficiency::{
     PACKET_MARKDOWN_TRUNCATION_SUFFIX, build_packet_sufficiency_with_obligation_context,
 };
+use crate::agent::path_identity::RuntimeWorkspacePathIdentity;
 use crate::agent::trace_export::packet_retrieval_trace_summary;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, AgentResponseBlockDto, AgentRetrievalStepKindDto,
@@ -260,6 +261,7 @@ fn rebuild_packet_budget_dependents(
     );
     refresh_packet_claim_markdown(packet);
     packet.sufficiency = build_packet_sufficiency_with_obligation_context(
+        &RuntimeWorkspacePathIdentity,
         project_root,
         &packet.question,
         task_class,

@@ -41,5 +41,7 @@ pub mod pinned_reader;
 pub mod planning;
 pub mod text;
 pub mod trail;
+pub mod workspace_path_identity;
 
 pub use pinned_reader::{ContinuationRefusal, PinnedReader, admit_continuation_probe};
+pub use workspace_path_identity::WorkspacePathIdentity;

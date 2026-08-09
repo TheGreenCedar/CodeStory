@@ -120,6 +120,7 @@ pub mod agent_test_support {
         obligations: &PacketObligationPlanDto,
     ) -> PacketSufficiencyDto {
         crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context(
+            &crate::agent::path_identity::RuntimeWorkspacePathIdentity,
             project_root,
             question,
             task_class,
