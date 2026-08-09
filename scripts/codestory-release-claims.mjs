@@ -113,6 +113,10 @@ const PINNED_PROGRAM_CONTRACTS = new Map([
 const STEP_FRAGMENT_CONTRACTS = new Map([
   ["saga_issue_link_guard", { kind: "require" }],
   ["close_dev_issues", { kind: "require" }],
+  ["marketplace_sync_dispatch_guard", { kind: "require" }],
+  ["marketplace_sync_dispatch_guard_line_tests", { kind: "forbid" }],
+  ["marketplace_sync_catalog_push", { kind: "require" }],
+  ["marketplace_sync_recovery_identity", { kind: "require" }],
 ]);
 // The graph owns every structural-pin rule instance (job existence and permission
 // scopes) for workflow families migrated off inline requireJob and permission

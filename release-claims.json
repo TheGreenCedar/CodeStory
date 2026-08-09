@@ -1886,6 +1886,51 @@
           "https://github\\.com/TheGreenCedar/CodeStory/issues/(\\d+)"
         ],
         "reason": "The close automation decides which issues a push to dev/codestory-next may close as completed. Each fragment pins one authentication, stack-integrity, or pagination check inside the inline Python program - merge-commit identity, base-branch and stack verification, cursor-loop and repository guards, and the completed state_reason - so none of those checks can be deleted without a reviewed graph edit."
+      },
+      "marketplace_sync_dispatch_guard": {
+        "kind": "require",
+        "file": "marketplace-sync.yml",
+        "job": "sync",
+        "step": "Validate the dispatched release coordinates",
+        "fragments": [
+          "commit_shape='^[0-9a-fA-F]{7,40}$'",
+          "version_shape='^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?$'",
+          "if [[ ! \"$INPUT_COMMIT\" =~ $commit_shape ]]; then",
+          "if [[ ! \"$INPUT_VERSION\" =~ $version_shape ]]; then"
+        ],
+        "reason": "The manual catalog sync executes whatever coordinates a human dispatches, beside a marketplace token. Each fragment pins an anchored shape together with the [[ =~ ]] test that consumes it, so neither the closing anchor nor the comparison can go missing on its own; a prefix pin alone would be satisfied by an unanchored rewrite that accepts '0.16.3; id'."
+      },
+      "marketplace_sync_dispatch_guard_line_tests": {
+        "kind": "forbid",
+        "file": "marketplace-sync.yml",
+        "job": "sync",
+        "step": "Validate the dispatched release coordinates",
+        "fragments": [
+          "grep"
+        ],
+        "reason": "grep anchors per line, so a printf-into-grep rewrite passes any dispatched value whose first line is well formed. The guard must match whole values with the shell's own [[ =~ ]] test; this ban keeps that property from being quietly traded back for a line-oriented test."
+      },
+      "marketplace_sync_catalog_push": {
+        "kind": "require",
+        "file": "marketplace-sync.yml",
+        "job": "sync",
+        "step": "Point the catalog at the published release",
+        "fragments": [
+          "publish-marketplace-catalog.mjs",
+          "--github-output \"$GITHUB_OUTPUT\""
+        ],
+        "reason": "A catalog moved by this workflow is a recovery, and the rollback it performs is only undoable if the pin it replaced is recorded with it. The push must delegate to publish-marketplace-catalog.mjs and write the replaced pin to $GITHUB_OUTPUT, because the recovery-identity step reads exactly those recorded outputs."
+      },
+      "marketplace_sync_recovery_identity": {
+        "kind": "require",
+        "file": "marketplace-sync.yml",
+        "job": "sync",
+        "step": "Record catalog recovery identity",
+        "fragments": [
+          "printf '%s' \"$MARKETPLACE_REVISION\" | grep -Eq '^[0-9a-f]{40}$'",
+          "echo \"Catalog delivery state: $CATALOG_DELIVERY"
+        ],
+        "reason": "A recovery that cannot name the immutable catalog revision it produced has not recorded a distinguishable identity, only a claim that one happened. The first fragment pins the whole-value revision check; the second pins the delivery-state record that keeps this recovery lane distinguishable from the publication that shipped the plugin."
       }
     },
     "structural_pins": {

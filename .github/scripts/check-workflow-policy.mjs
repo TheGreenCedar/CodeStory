@@ -11068,19 +11068,10 @@ export function validateMarketplaceSync(workflows, violations, graph) {
   }
   // Shape is proven before the checkout resolves the ref and before any marketplace token exists.
   const guard = "Validate the dispatched release coordinates";
-  // Each fragment pins an anchored regex together with the test that consumes it, so neither the
-  // closing anchor nor the comparison can go missing on its own. A prefix here would be satisfied
-  // by an unanchored rewrite that accepts `0.16.3; id`.
-  requireStepRun(violations, file, job, guard, [
-    "commit_shape='^[0-9a-fA-F]{7,40}$'",
-    "version_shape='^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?$'",
-    'if [[ ! "$INPUT_COMMIT" =~ $commit_shape ]]; then',
-    'if [[ ! "$INPUT_VERSION" =~ $version_shape ]]; then',
-  ]);
-  // grep anchors per line, so `printf | grep -Eq '^...$'` passes any value whose *first* line is
-  // well formed. The guard must match whole values; the digest keeps that property from being
-  // quietly traded back for a line-oriented test.
-  forbidStepRun(violations, file, job, guard, ["grep"]);
+  // The guard's step fragments - the anchored shapes with their consuming tests, and
+  // the grep ban that keeps the match whole-value - are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments; stepFragmentViolations
+  // evaluates them.
   add(
     violations,
     stepIndex(job, guard) === 0,
@@ -11103,10 +11094,9 @@ export function validateMarketplaceSync(workflows, violations, graph) {
   // performs is only undoable if the pin it replaced is recorded with it.
   const recovery = object(object(graph?.workflow_policy?.catalog_delivery).recovery);
   const recoveryStep = "Record catalog recovery identity";
-  requireStepRun(violations, file, job, "Point the catalog at the published release", [
-    "publish-marketplace-catalog.mjs",
-    '--github-output "$GITHUB_OUTPUT"',
-  ]);
+  // The catalog push's step fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
   add(
     violations,
     namedStep(job, "Point the catalog at the published release")?.id === "publish",
@@ -11126,12 +11116,9 @@ export function validateMarketplaceSync(workflows, violations, graph) {
       `${file} ${recoveryStep} must carry the recorded ${name}`,
     );
   }
-  requireStepRun(violations, file, job, recoveryStep, [
-    // A recovery that cannot name the immutable catalog revision it produced has not recorded a
-    // distinguishable identity, only a claim that one happened.
-    `printf '%s' "$MARKETPLACE_REVISION" | grep -Eq '^[0-9a-f]{40}$'`,
-    'echo "Catalog delivery state: $CATALOG_DELIVERY',
-  ]);
+  // The recovery identity's step fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
   add(
     violations,
     stepIndex(job, recoveryStep) > stepIndex(job, "Point the catalog at the published release"),
