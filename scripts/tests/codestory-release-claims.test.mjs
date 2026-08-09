@@ -715,7 +715,7 @@ test("pinned programs are an exact fail-closed membership with graph-owned diges
 
 test("step fragments are an exact fail-closed membership with graph-owned rule data", () => {
   const rules = graph.workflow_policy.step_fragments;
-  assert.equal(Object.keys(rules).length, 109);
+  assert.equal(Object.keys(rules).length, 132);
   for (const row of Object.values(rules)) {
     assert.ok(row.kind === "require" || row.kind === "forbid");
     assert.ok(row.fragments.length > 0);
@@ -779,6 +779,23 @@ test("step fragments are an exact fail-closed membership with graph-owned rule d
     [draft => {
       delete draft.workflow_policy.step_fragments.linux_vulkan_release_cell_ids;
     }, /step_fragments must declare linux_vulkan_release_cell_ids/u],
+    [draft => {
+      delete draft.workflow_policy.step_fragments.packaged_platform_pr_route_release_freeze;
+    }, /step_fragments must declare packaged_platform_pr_route_release_freeze/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.freeze_invalidation_no_pending_reuse.kind =
+        "require";
+    }, /freeze_invalidation_no_pending_reuse\.kind must be forbid/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.packaged_platform_pr_closeout_proof.fragments = [];
+    }, /packaged_platform_pr_closeout_proof\.fragments must be a non-empty array/u],
+    [draft => {
+      delete draft.workflow_policy.step_fragments.source_proof_freeze_acceptance_publication;
+    }, /step_fragments must declare source_proof_freeze_acceptance_publication/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.freeze_barrier_release_no_freeze_replay.kind =
+        "require";
+    }, /freeze_barrier_release_no_freeze_replay\.kind must be forbid/u],
   ];
   for (const [mutate, expected] of mutations) {
     const draft = structuredClone(graph);
@@ -789,7 +806,7 @@ test("step fragments are an exact fail-closed membership with graph-owned rule d
 
 test("structural pins are an exact fail-closed membership with graph-owned rule data", () => {
   const pins = graph.workflow_policy.structural_pins;
-  assert.equal(Object.keys(pins).length, 40);
+  assert.equal(Object.keys(pins).length, 67);
   for (const row of Object.values(pins)) {
     assert.ok(
       row.kind === "job" || row.kind === "permission" || row.kind === "needs"
@@ -883,6 +900,23 @@ test("structural pins are an exact fail-closed membership with graph-owned rule 
     [draft => {
       delete draft.workflow_policy.structural_pins.release_publish_job;
     }, /structural_pins must declare release_publish_job/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.packaged_platform_pr_route_job;
+    }, /structural_pins must declare packaged_platform_pr_route_job/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.packaged_platform_pr_closeout_needs.kind = "job";
+    }, /packaged_platform_pr_closeout_needs\.kind must be needs/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.freeze_barrier_source_proof_statuses_write.access =
+        "admin";
+    }, /freeze_barrier_source_proof_statuses_write\.access must be read or write/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.release_freeze_invalidation_invalidate_job;
+    }, /structural_pins must declare release_freeze_invalidation_invalidate_job/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.freeze_barrier_packaged_platform_pr_statuses_read
+        .kind = "job_permission";
+    }, /freeze_barrier_packaged_platform_pr_statuses_read\.kind must be permission/u],
   ];
   for (const [mutate, expected] of mutations) {
     const draft = structuredClone(graph);
