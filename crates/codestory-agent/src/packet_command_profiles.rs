@@ -65,12 +65,11 @@ pub fn packet_command_exact_probe_queries(
 
         let mut queries = Vec::new();
         for descriptor in packet_command_descriptors(question) {
-            push_unique_term(
+            crate::eval_probes::push_eval_command_exact_probe_queries(
                 &mut queries,
-                &format!("Subcommand::{}", descriptor.subcommand_title),
+                &descriptor.subcommand_title,
+                &descriptor.module,
             );
-            push_unique_term(&mut queries, &format!("{}::Cli", descriptor.module));
-            push_unique_term(&mut queries, &format!("{}::run_main", descriptor.module));
         }
         queries
     }

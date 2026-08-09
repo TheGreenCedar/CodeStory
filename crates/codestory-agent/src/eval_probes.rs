@@ -152,6 +152,22 @@ pub fn push_eval_required_probe_queries(terms: &[String], queries: &mut Vec<Stri
     }
 }
 
+/// Eval-only exact symbol probes for a backtick command prompt. The holdout
+/// CLI spelling (`Subcommand::<Title>`, `<module>::Cli`, `<module>::run_main`)
+/// stays in this eval-only module so production planning never carries it.
+pub fn push_eval_command_exact_probe_queries(
+    queries: &mut Vec<String>,
+    subcommand_title: &str,
+    module: &str,
+) {
+    if !eval_probes_enabled() {
+        return;
+    }
+    push_unique_term(queries, &format!("Subcommand::{subcommand_title}"));
+    push_unique_term(queries, &format!("{module}::Cli"));
+    push_unique_term(queries, &format!("{module}::run_main"));
+}
+
 pub fn push_prompt_concept_derived_symbol_probes(terms: &[String], queries: &mut Vec<String>) {
     if !eval_probes_enabled() {
         return;
