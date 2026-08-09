@@ -311,10 +311,7 @@ fn a_write_that_races_the_scan_is_reported_stale_instead_of_fresh() {
             .iter()
             .map(|sample| (sample.kind, sample.path.as_str()))
             .collect::<Vec<_>>(),
-        vec![(
-            IndexFreshnessChangeKindDto::Changed,
-            "src/lib.rs"
-        )]
+        vec![(IndexFreshnessChangeKindDto::Changed, "src/lib.rs")]
     );
 }
 
