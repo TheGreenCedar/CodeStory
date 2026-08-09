@@ -199,7 +199,7 @@ fn packet_probe_obligation(resolution: &PacketProbeResolutionDto) -> PacketClaim
         kind: PacketClaimObligationKindDto::ExactProbe,
         binding_terms: resolution.normalized_query.iter().cloned().collect(),
         probe_binding: Some(resolution.clone()),
-        material: true,
+        material: resolution.status != PacketProbeResolutionStatusDto::Rejected,
         allowed_node_kinds: Vec::new(),
         required_edge_kind: None,
         requires_complete_discovery: false,
@@ -2034,11 +2034,14 @@ mod tests {
             ]
         );
         assert!(plan.claim_obligations.iter().all(|obligation| {
-            obligation.material
-                && obligation.probe_binding.as_ref().is_some_and(|binding| {
-                    obligation.id == format!("exact_probe:{}", binding.input_index)
-                })
+            obligation.probe_binding.as_ref().is_some_and(|binding| {
+                obligation.id == format!("exact_probe:{}", binding.input_index)
+            })
         }));
+        assert!(plan.claim_obligations[0].material);
+        assert!(!plan.claim_obligations[1].material);
+        assert!(plan.claim_obligations[2].material);
+        assert!(plan.claim_obligations[3].material);
         assert_eq!(
             plan.claim_obligations[1].reason.as_deref(),
             Some("exact_probe_rejected:stale_symbol_id")

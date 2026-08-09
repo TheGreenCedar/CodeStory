@@ -171,15 +171,15 @@ fn exact_path_probe_source_carrier_citation(
                 )
         })?
         .id;
-    let symbol_id = storage
+    let carrier_id = storage
         .get_grounding_top_symbols_for_files(&[file_id], 1)
         .ok()?
         .into_iter()
-        .next()?
-        .node
-        .id;
+        .next()
+        .map(|record| record.node.id)
+        .unwrap_or(codestory_contracts::graph::NodeId(file_id));
     let mut citation =
-        exact_symbol_probe_citation(controller, &symbol_id.to_string(), include_evidence)?;
+        exact_symbol_probe_citation(controller, &carrier_id.to_string(), include_evidence)?;
     let cited_path = citation.file_path.as_deref()?;
     if !same_workspace_path(&absolute, &project_root.join(cited_path)) {
         return None;
@@ -758,6 +758,10 @@ mod tests {
         .expect("write source");
         let duplicate_path = project.path().join("src").join("duplicate.rs");
         std::fs::write(&duplicate_path, "pub fn indexed_target() {}\n").expect("write duplicate");
+        let script_path = project.path().join("scripts").join("entry.cjs");
+        std::fs::create_dir_all(script_path.parent().expect("script parent"))
+            .expect("create script parent");
+        std::fs::write(&script_path, "module.exports = {};\n").expect("write script");
 
         let storage_path = project.path().join(".cache").join("codestory.db");
         std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
@@ -787,6 +791,18 @@ mod tests {
                 file_role: FileRole::Source,
             })
             .expect("insert duplicate file");
+        storage
+            .insert_file(&FileInfo {
+                id: 20,
+                path: PathBuf::from("scripts/entry.cjs"),
+                language: "javascript".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert symbol-free script file");
         storage
             .insert_nodes_batch(&[
                 Node {
@@ -827,6 +843,14 @@ mod tests {
                     kind: CoreNodeKind::FUNCTION,
                     serialized_name: "indexed_target".to_string(),
                     file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(20),
+                    kind: CoreNodeKind::FILE,
+                    serialized_name: "scripts/entry.cjs".to_string(),
+                    file_node_id: Some(CoreNodeId(20)),
                     start_line: Some(1),
                     ..Default::default()
                 },
@@ -983,6 +1007,30 @@ mod tests {
             Some("explicit exact probe")
         );
         assert_ne!(citations[0].node_id, citations[1].node_id);
+    }
+
+    #[test]
+    fn indexed_symbol_free_path_uses_its_stored_file_node_as_carrier() {
+        let project = TempDir::new().expect("project");
+        let controller = controller_with_indexed_fixture(&project);
+        let resolutions = resolve_packet_probes(
+            &controller,
+            vec![PacketProbeDto::ExactPath {
+                path: "scripts/entry.cjs".into(),
+            }],
+        );
+
+        let citations = exact_packet_probe_citations(&controller, &resolutions, true);
+
+        assert_eq!(citations.len(), 2);
+        assert_eq!(citations[1].node_id.0, "20");
+        assert_eq!(citations[1].kind, NodeKind::FILE);
+        assert_eq!(citations[1].file_path.as_deref(), Some("scripts/entry.cjs"));
+        assert_eq!(citations[1].eligible_for_sufficiency, Some(true));
+        assert_eq!(
+            citations[1].coverage_role.as_deref(),
+            Some("explicit exact probe")
+        );
     }
 
     #[test]
