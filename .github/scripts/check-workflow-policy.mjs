@@ -1114,6 +1114,10 @@ const structuralPinMessages = {
     row => `${row.file} release caller must grant actions write for superseded-run cancellation`,
   auto_release_release_pull_requests_read:
     row => `${row.file} release caller must pass pull-request metadata access to exact source proof`,
+  release_actions_write:
+    row => `${row.file} must cancel superseded proof runs before starting release work`,
+  release_pull_requests_read:
+    row => `${row.file} must grant the exact source resolver pull-request metadata access`,
 };
 
 export function structuralPinViolations(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
@@ -2983,16 +2987,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     JSON.stringify(releaseCallers) === JSON.stringify(["auto-release.yml"]),
     `${releaseFile} publication authority must have only the trusted auto-release.yml caller`,
   );
-  add(
-    violations,
-    object(release.permissions).actions === "write",
-    `${releaseFile} must cancel superseded proof runs before starting release work`,
-  );
-  add(
-    violations,
-    object(release.permissions)["pull-requests"] === "read",
-    `${releaseFile} must grant the exact source resolver pull-request metadata access`,
-  );
+  // The coordinator's workflow-scoped permission grants (actions write for
+  // superseded-run cancellation, pull-requests read for the exact source
+  // resolver) are rule instances and live in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates them
+  // with their reviewed violation text.
   const callExpectedHead = object(at(release, "on", "workflow_call", "inputs", "expected_head_sha"));
   add(
     violations,
@@ -3030,7 +3029,14 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     release.env === undefined && release.defaults === undefined,
     `${releaseFile} release workflow must not override the release-head calibration execution environment`,
   );
-  const policy = requireJob(violations, releaseFile, release, "workflow-policy");
+  // The workflow-policy job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it. The
+  // job's step fragments - the dependency install, the syntax gate, the claim
+  // and evidence contract suites, and the policy enforcement commands - are
+  // rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const policy = object(object(release.jobs)["workflow-policy"]);
   // The reuse-binding contracts resolve real release commits, which a depth-1
   // clone does not carry: it answered only while the referenced commit happened
   // to be HEAD.
@@ -3043,33 +3049,15 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     ),
     `${releaseFile} workflow-policy must check out full history for the reuse-binding contracts`,
   );
-  requireStepRun(violations, releaseFile, policy, "Install workflow policy dependencies", ["npm ci --ignore-scripts"]);
-  requireStepRun(violations, releaseFile, policy, "Check workflow syntax", [
-    "node --test .github/scripts/run-actionlint.test.mjs",
-    "node .github/scripts/run-actionlint.mjs",
-  ]);
-  requireStepRun(violations, releaseFile, policy, "Check release claim and evidence contracts", [
-    ".github/scripts/build-marketplace-fixture.test.mjs",
-    // The catalog publisher records the pin a rollback would restore and refuses to move a
-    // catalog it cannot name a rollback target for. Both are release behaviour, so the suite
-    // runs on the release lane's own policy job.
-    ".github/scripts/publish-marketplace-catalog.test.mjs",
-    "scripts/tests/codestory-release-claims.test.mjs",
-    "scripts/tests/codestory-release-cell-manifest.test.mjs",
-    "scripts/tests/codestory-release-closeout.test.mjs",
-    "scripts/tests/codestory-release-evidence-gate.test.mjs",
-    // The publish job generates the release manifest with scripts/build-release-manifest.mjs, so
-    // the suite that proves the generator refuses drifted archives runs before any proof does.
-    "scripts/tests/prove-plugin-pinned-provision.test.mjs",
-  ]);
-  requireStepRun(violations, releaseFile, policy, "Enforce workflow policy", [
-    "node .github/scripts/check-workflow-policy.mjs",
-    // The recovery contract decides whether a lost host may withhold a claim, so the release's own
-    // policy gate must execute its tests before any proof runs.
-    "node --test .github/scripts/lost-runner-recovery.test.mjs",
-  ]);
 
-  const preflight = requireJob(violations, releaseFile, release, "preflight");
+  // The preflight job's structural pin (job existence) is a rule instance and
+  // lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it. Its step fragments - the release
+  // authority refusal, the calibration lineage command, the changelog and tag
+  // gates, the marketplace install proof, and the reusable-evidence resolver -
+  // are rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const preflight = object(object(release.jobs).preflight);
   add(
     violations,
     hasExactKeys(
@@ -3081,20 +3069,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && preflight["timeout-minutes"] === 10,
     `${releaseFile} preflight must retain the exact trusted job environment`,
   );
+  // DISPOSITION: the needs edge stays code because it already consults the
+  // graph-owned release_chain dependencies; converting it to a structural
+  // needs pin would duplicate that block's data under a second name.
   add(violations, sameMembers(needs(preflight), releaseChain.dependencies.preflight), `${releaseFile} preflight dependencies must match the release claim graph`);
-  requireStepRun(violations, releaseFile, preflight, "Validate release authority", [
-    'if [ "$PUBLISH_RELEASE" = "true" ]; then',
-    '"$GITHUB_EVENT_NAME" != "push"',
-    '"$GITHUB_REF" != "refs/heads/main"',
-    '$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main',
-    '"$GITHUB_WORKFLOW_REF" != "$expected_caller"',
-    'repos/$GITHUB_REPOSITORY/git/ref/heads/main',
-    '"$GITHUB_EVENT_NAME" != "workflow_dispatch"',
-    '"$GITHUB_REF" != "refs/heads/dev/codestory-next"',
-    '"$EXPECTED_HEAD_SHA" != "$GITHUB_SHA"',
-    'repos/$GITHUB_REPOSITORY/git/ref/heads/dev/codestory-next',
-    "dev/codestory-next moved from proved head",
-  ]);
   const releaseLineage = namedStep(preflight, releaseLineageStepName);
   add(
     violations,
@@ -3112,15 +3090,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && releaseLineage?.["working-directory"] === "${{ github.workspace }}",
     `${releaseFile} release-head calibration lineage must be unconditional and fail closed`,
   );
-  requireStepRun(violations, releaseFile, preflight, releaseLineageStepName, [
-    "/usr/bin/python3 -E -s",
-    '"$GITHUB_WORKSPACE/.github/scripts/check-calibration-release-lineage.py"',
-    '--repo "$GITHUB_WORKSPACE"',
-    '--expected-sha "$GITHUB_SHA"',
-    "--allow-promotion-commit",
-    "selection_commit",
-    "selection_tree",
-  ]);
   const preflightCheckout = namedStep(preflight, "Checkout");
   add(
     violations,
@@ -3141,15 +3110,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
         < stepIndex(preflight, "Verify release version"),
     `${releaseFile} release-head calibration lineage must run immediately after checkout and before other release work`,
   );
-  requireStepRun(violations, releaseFile, preflight, "Validate versioned changelog notes", [
-    "node .github/scripts/extract-codestory-release-notes.mjs",
-    '--version "$VERSION"',
-  ]);
-  requireStepRun(violations, releaseFile, preflight, "Refuse existing tag or release", [
-    'git ls-remote --exit-code --tags origin "refs/tags/$TAG"',
-    'gh release view "$TAG"',
-    "exit 1",
-  ]);
   const marketplacePreflight = namedStep(
     preflight,
     "Prove the public marketplace install path",
@@ -3160,28 +3120,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && marketplacePreflight?.["continue-on-error"] === undefined,
     `${releaseFile} public marketplace preflight must run before publication and fail closed`,
   );
-  requireStepRun(
-    violations,
-    releaseFile,
-    preflight,
-    "Prove the public marketplace install path",
-    [
-      "git ls-remote",
-      "refs/heads/main",
-      '"@openai/codex@$CODEX_CLI_VERSION"',
-      "install-codestory-marketplace-proof.mjs",
-      '--source-repository "$GITHUB_WORKSPACE"',
-      "marketplace_revision=$marketplace_revision",
-      `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
-      `printf '%s' "$fixture_revision" | grep -Eq '^[0-9a-f]{40}$'`,
-      // Fixture mode resolves from the locally built catalog, so provenance is
-      // checked against that repository's own revision. Checking it against the
-      // live revision can never match, which is how the fixture path shipped
-      // unexercised.
-      'fixture_revision="$(git -C "$fixture_root" rev-parse HEAD)"',
-      '--marketplace-revision "$fixture_revision"',
-    ],
-  );
   add(
     violations,
     object(preflight.outputs).marketplace_revision
@@ -3189,7 +3127,12 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     `${releaseFile} preflight must publish the proved immutable marketplace revision`,
   );
 
-  const source = requireJob(violations, releaseFile, release, "source-proof");
+  // The source-proof job's structural pin (job existence) is a rule instance
+  // and lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it. The placeholder's refusal step
+  // fragments are rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const source = object(object(release.jobs)["source-proof"]);
   add(
     violations,
     source.uses === undefined
@@ -3200,17 +3143,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     `${releaseFile} source proof placeholder must fail closed without calling the broad source workflow`,
   );
   add(violations, sameMembers(needs(source), releaseChain.dependencies["source-proof"]), `${releaseFile} source proof dependencies must match the release claim graph`);
-  requireStepRun(
-    violations,
-    releaseFile,
-    source,
-    "Refuse a second source proof",
-    [
-      'test "$SOURCE_SHA" = "$GITHUB_SHA"',
-      "Preflight did not resolve reusable exact-head source proof",
-      "exit 1",
-    ],
-  );
   // Reuse is admissible only through the authenticated closeout binding, never by simply
   // dropping the gate: the job may be skipped, and only when preflight resolved reusable
   // evidence for this exact tree.
@@ -3219,32 +3151,23 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     String(source.if ?? "") === "needs.preflight.outputs.source_proof_reused != 'true'",
     `${releaseFile} source proof may be skipped only when preflight resolved reusable evidence`,
   );
-  requireStepRun(violations, releaseFile, requireJob(violations, releaseFile, release, "preflight"), "Resolve reusable prior evidence", [
-    'release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"',
-    'test "$(git rev-parse "$head_sha^{tree}")" = "$release_tree"',
-    'git merge-base --is-ancestor "$head_sha" "$GITHUB_SHA"',
-    "full-source-gate",
-    '.path == ".github/workflows/source-proof.yml"',
-    '.event == "workflow_dispatch" and .conclusion == "success"',
-    "The release workflow will not start a broad proof",
-    'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
-    ".expired == false",
-    'test "$artifact_count" = 1 || continue',
-  ]);
-  forbidStepRun(
-    violations,
-    releaseFile,
-    requireJob(violations, releaseFile, release, "preflight"),
-    "Resolve reusable prior evidence",
-    [
-      "release-freeze-barrier.mjs verify-status",
-      "freeze_receipt_digest",
-    ],
-  );
-  const closeout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
-  requireStepRun(violations, releaseFile, closeout, "Authenticate pre-publish Actions provenance", [
-    '--reuse "$REUSE_SELECTION"',
-  ]);
+  // The resolve-reusable-evidence fragments (both the required resolution
+  // conjuncts and the forbidden freeze-status replay) are rule instances and
+  // live in release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  // DISPOSITION: the retired inline calls each re-required the preflight job,
+  // so a release.yml without one reported that violation three times. The
+  // job-existence rule lives in its structural pin; these two duplicate
+  // occurrences stay code so the reviewed verdict multiset is unchanged.
+  requireJob(violations, releaseFile, release, "preflight");
+  requireJob(violations, releaseFile, release, "preflight");
+  // The pre-publish-closeout job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it. The
+  // closeout's reuse-binding fragment is a rule instance and lives in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates it.
+  const closeout = object(object(release.jobs)["pre-publish-closeout"]);
   add(
     violations,
     String(closeout.if ?? "").includes("needs.source-proof.result == 'skipped'")
@@ -3259,7 +3182,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     `${releaseFile} unreachable source fallback must remain a one-step fail-closed sentinel`,
   );
 
-  const packaged = requireJob(violations, releaseFile, release, "packaged-proof");
+  // The packaged-proof job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const packaged = object(object(release.jobs)["packaged-proof"]);
   add(violations, packaged.uses === "./.github/workflows/packaged-platform-proof.yml", `${releaseFile} packaged-proof must call the package workflow`);
   add(violations, sameMembers(needs(packaged), releaseChain.dependencies["packaged-proof"]), `${releaseFile} packaged-proof dependencies must match the release claim graph`);
   add(violations, object(packaged.with).sign_macos === true, `${releaseFile} packaged-proof must sign Mac assets`);
@@ -3297,7 +3223,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     `${releaseFile} must not make optional performance or answer-quality evaluation release-blocking`,
   );
 
-  const metal = requireJob(violations, releaseFile, release, "macos-metal-proof");
+  // The macos-metal-proof job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const metal = object(object(release.jobs)["macos-metal-proof"]);
   add(violations, metal.uses === "./.github/workflows/macos-metal-proof.yml", `${releaseFile} must call protected Metal proof`);
   add(violations, sameMembers(needs(metal), releaseChain.dependencies["macos-metal-proof"]), `${releaseFile} Metal proof dependencies must match the release claim graph`);
   add(violations, object(metal.with).use_packaged_cli_artifact === true, `${releaseFile} Metal proof must use the packaged CLI`);
@@ -3310,12 +3239,16 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && object(metal.with).quality_evidence_artifact === undefined,
     `${releaseFile} Mac proof must close Metal and candidate-installed claims without optional quality evidence`,
   );
-  requireStepRun(violations, "macos-metal-proof.yml", at(workflows.get("macos-metal-proof.yml"), "jobs", "packaged-metal"), "Emit authenticated macOS retrieval-readiness release cell", [
-    "--cell-id retrieval_readiness:macos-arm64",
-    "release-cell-postpublish-retrieval-macos-arm64-attempt-$GITHUB_RUN_ATTEMPT",
-  ]);
+  // The release chain's exact --cell-id and post-publish artifact-name
+  // fragments for the macOS retrieval-readiness cell are a rule instance and
+  // live in release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them beside the proof workflow's own
+  // cell-emission rows.
 
-  const vulkan = requireJob(violations, releaseFile, release, "windows-vulkan-proof");
+  // The windows-vulkan-proof job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const vulkan = object(object(release.jobs)["windows-vulkan-proof"]);
   add(violations, vulkan.uses === "./.github/workflows/windows-vulkan-proof.yml", `${releaseFile} must call protected Vulkan proof`);
   add(violations, sameMembers(needs(vulkan), releaseChain.dependencies["windows-vulkan-proof"]), `${releaseFile} Vulkan proof dependencies must match the release claim graph`);
   add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${releaseFile} Vulkan proof must use the packaged CLI`);
@@ -3328,10 +3261,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && object(vulkan.with).quality_evidence_artifact === undefined,
     `${releaseFile} Windows proof must close Vulkan and candidate-installed claims without optional quality evidence`,
   );
-  requireStepRun(violations, "windows-vulkan-proof.yml", at(workflows.get("windows-vulkan-proof.yml"), "jobs", "packaged-vulkan"), "Emit authenticated Windows retrieval-readiness release cell", [
-    "--cell-id retrieval_readiness:windows-x64",
-    "release-cell-postpublish-retrieval-windows-x64-attempt-$GITHUB_RUN_ATTEMPT",
-  ]);
+  // The release chain's exact --cell-id and post-publish artifact-name
+  // fragments for the Windows retrieval-readiness cell are a rule instance
+  // and live in release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them beside the proof workflow's own
+  // cell-emission rows.
   // The self-hosted Windows service account runs under the default Restricted execution
   // policy, so a run step left on the default shell dies before executing anything:
   // every step must pick bash or a powershell invocation that bypasses the policy.
@@ -3345,7 +3279,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     );
   }
 
-  const linuxVulkan = requireJob(violations, releaseFile, release, "linux-vulkan-proof");
+  // The linux-vulkan-proof job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const linuxVulkan = object(object(release.jobs)["linux-vulkan-proof"]);
   add(violations, linuxVulkan.uses === "./.github/workflows/linux-vulkan-proof.yml", `${releaseFile} must call protected Linux Vulkan proof`);
   add(violations, sameMembers(needs(linuxVulkan), releaseChain.dependencies["linux-vulkan-proof"]), `${releaseFile} Linux Vulkan proof dependencies must match the release claim graph`);
   add(
@@ -3355,22 +3292,21 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && object(linuxVulkan.with).emit_release_cells === true,
     `${releaseFile} Linux proof must close Vulkan, retrieval, and candidate-installed claims`,
   );
-  requireStepRun(violations, "linux-vulkan-proof.yml", at(workflows.get("linux-vulkan-proof.yml"), "jobs", "packaged-vulkan"), "Emit authenticated Linux Vulkan release cells", [
-    "--cell-id accelerator_execution:linux-x64-vulkan",
-    "--cell-id retrieval_readiness:linux-x64",
-    "--cell-id candidate_installed_behavior:linux-x64",
-  ]);
+  // The release chain's exact --cell-id fragments for the three Linux cells
+  // are a rule instance and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them
+  // beside the proof workflow's own cell-emission rows.
 
-  const preCloseout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
+  // DISPOSITION: the retired inline code required the pre-publish-closeout
+  // job twice. The job-existence rule lives in its structural pin; this
+  // duplicate occurrence stays code so the reviewed verdict multiset is
+  // unchanged. The closeout's step fragments - provenance collection, the
+  // cell download chain, the evaluation, and the dev-head revalidation - are
+  // rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  requireJob(violations, releaseFile, release, "pre-publish-closeout");
+  const preCloseout = object(object(release.jobs)["pre-publish-closeout"]);
   add(violations, sameMembers(needs(preCloseout), releaseChain.dependencies["pre-publish-closeout"]), `${releaseFile} pre-publish closeout dependencies must match the release claim graph`);
-  // The producer map is the trust boundary between a real proof and a non-claim, so the closeout
-  // collects the lost-runner evidence itself instead of inheriting the non-claim producer's verdict.
-  requireStepRun(violations, releaseFile, preCloseout, "Authenticate pre-publish Actions provenance", [
-    "producer-map",
-    "--phase pre_publish",
-    "bash .github/scripts/collect-actions-job-evidence.sh",
-    "--job-evidence target/release-closeout/job-evidence.json",
-  ]);
   const preDownload = namedStep(
     preCloseout,
     "Download and verify selected pre-publish release cells",
@@ -3380,23 +3316,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     preDownload?.uses === undefined && preDownload?.shell === "bash",
     `${releaseFile} pre-publish closeout must materialize exact Actions artifact ids in blocking shell`,
   );
-  requireStepRun(
-    violations,
-    releaseFile,
-    preCloseout,
-    "Download and verify selected pre-publish release cells",
-    [
-      "test \"$(jq -r '.artifacts | length' \"$producer_map\")\" -gt 0",
-      ".artifacts[] | [.id, .name, .digest] | @tsv",
-      'destination="target/release-cell-manifests/$artifact_name"',
-      "test ! -e \"$destination\"",
-      "/actions/artifacts/$artifact_id/zip",
-      "sha256sum",
-      "test \"$actual_digest\" = \"$expected_digest\"",
-      "unzip -q \"$archive\" -d \"$destination\"",
-      "test -d \"target/release-cell-manifests/$artifact_name\"",
-    ],
-  );
   add(
     violations,
     !list(preCloseout.steps).some(
@@ -3405,13 +3324,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     ),
     `${releaseFile} pre-publish closeout must not filter mixed-run artifact ids through one Actions run`,
   );
-  requireStepRun(violations, releaseFile, preCloseout, "Evaluate authenticated pre-publish closeout", [
-    "--trusted-producers",
-    "codestory-release-closeout.mjs evaluate",
-    '--version "$RELEASE_VERSION"',
-  ]);
   // The version the ledger is filed under reaches the evaluator as a variable, so the command text
   // alone no longer says which release it closed out.
+  // DISPOSITION: step env bindings and step uses pins have no graph evaluator,
+  // so these predicates stay code.
   requireStepEnv(violations, releaseFile, preCloseout, "Evaluate authenticated pre-publish closeout", {
     RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
   });
@@ -3421,14 +3337,16 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     devRevalidation?.if === "${{ !inputs.publish_release }}",
     `${releaseFile} proof-only ledger upload must revalidate only the dev head`,
   );
-  requireStepRun(violations, releaseFile, preCloseout, "Revalidate proof-only dev head", [
-    "repos/$GITHUB_REPOSITORY/git/ref/heads/dev/codestory-next",
-    '"$live_head" != "$GITHUB_SHA"',
-    "dev/codestory-next moved from accepted ledger head",
-  ]);
   requireStepUses(violations, releaseFile, preCloseout, "Upload accepted pre-publish closeout", "actions/upload-artifact@v7.0.1");
 
-  const publish = requireJob(violations, releaseFile, release, "publish");
+  // The publish job's structural pin (job existence) is a rule instance and
+  // lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it. Its step fragments - the ledger-fed
+  // release notes, the manifest generation, the shipped closeout summary, the
+  // tag refusal, and the release creation - are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  const publish = object(object(release.jobs).publish);
   add(violations, publish.if === "inputs.publish_release", `${releaseFile} publish must require trusted publication authority`);
   add(violations, sameMembers(needs(publish), releaseChain.dependencies.publish), `${releaseFile} publish dependencies must match the release claim graph`);
   // The published platform table is a claim about this release, so it is rendered from the accepted
@@ -3441,24 +3359,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "Download the accepted pre-publish closeout",
     "actions/download-artifact@v8.0.1",
   );
-  requireStepRun(violations, releaseFile, publish, "Compose versioned GitHub release notes", [
-    "node .github/scripts/extract-codestory-release-notes.mjs",
-    "--output target/release-assets/release-notes.md",
-    "node scripts/codestory-release-claims.mjs release-platform-notes",
-    "--ledger target/release-closeout/pre_publish/ledger.json",
-  ]);
-  // The native lane's archive digests. The frozen source cannot carry them, so they are generated
-  // here from the built archives and shipped with the release. The generation has to happen after
-  // the checksums exist -- it cross-checks against them -- and before the release is created, or
-  // the launcher fetches a manifest that describes bytes nobody published.
-  requireStepRun(violations, releaseFile, publish, "Generate the release manifest", [
-    "node scripts/build-release-manifest.mjs",
-    '--version "$VERSION"',
-    '--tag "$TAG"',
-    '--commit "$GITHUB_SHA"',
-    "--assets target/release-assets",
-    "--output target/release-assets/codestory-release-manifest.json",
-  ]);
+  // The manifest generation has to happen after the checksums exist -- it
+  // cross-checks against them -- and before the release is created, or the
+  // launcher fetches a manifest that describes bytes nobody published; the
+  // ordering pins below stay code.
   requireStepEnv(violations, releaseFile, publish, "Generate the release manifest", {
     TAG: "${{ needs.preflight.outputs.tag }}",
     VERSION: "${{ needs.preflight.outputs.version }}",
@@ -3469,27 +3373,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && stepIndex(publish, "Generate the release manifest") < stepIndex(publish, "Create GitHub release"),
     `${releaseFile} must generate the release manifest from verified checksums before creating the release`,
   );
-  // The ledger the README tells readers to consult has to be reachable from the release itself.
-  requireStepRun(violations, releaseFile, publish, "Ship the accepted closeout summary with the release", [
-    "target/release-closeout/pre_publish/summary.json",
-    '"$(jq -r .decision "$summary")" = accept',
-    "target/release-assets/release-closeout-summary.json",
-  ]);
-  requireStepRun(violations, releaseFile, publish, "Refuse existing tag or release", [
-    'git ls-remote --exit-code --tags origin "refs/tags/$TAG"',
-    'gh release view "$TAG"',
-    "exit 1",
-  ]);
-  requireStepRun(violations, releaseFile, publish, "Create GitHub release", [
-    "--notes-file target/release-assets/release-notes.md",
-    "node scripts/codestory-release-claims.mjs release-assets",
-    'for name in "${expected_names[@]}"; do',
-    'if [ ! -f "$asset" ]; then',
-    "Release assets differ from the release claim graph",
-    "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
-    '"$live_head" != "$GITHUB_SHA"',
-    "main moved from publishable head",
-  ]);
   const publishRun = shellLiteralNormalizedText(stepRun(
     publish,
     "Create GitHub release",
@@ -3504,7 +3387,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   );
   add(violations, !scalarStrings(release).some(value => value.includes("--generate-notes")), `${releaseFile} must use curated release notes`);
 
-  const marketplacePublish = requireJob(violations, releaseFile, release, "marketplace-publish");
+  // The marketplace-publish job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const marketplacePublish = object(object(release.jobs)["marketplace-publish"]);
   add(
     violations,
     marketplacePublish.if === "inputs.publish_release",
@@ -3538,19 +3424,17 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   );
   violations.push(...catalogDeliveryOutcomeViolations(releaseFile, marketplacePublish, catalogDelivery));
   // The version the catalog is pointed at reaches the push as a variable, so the command text no
-  // longer says which release it published. Both halves are pinned, as in the plugin lane.
-  requireStepRun(violations, releaseFile, marketplacePublish, "Point the catalog at the published release", [
-    '--version "$RELEASE_VERSION"',
-  ]);
+  // longer says which release it published. Both halves are pinned, as in the plugin lane: the
+  // run fragment lives in release-claims.json under workflow_policy.step_fragments and the env
+  // binding stays code because env bindings have no graph evaluator.
   requireStepEnv(violations, releaseFile, marketplacePublish, "Point the catalog at the published release", {
     RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
   });
-  requireStepRun(violations, releaseFile, preflight, "Prove the public marketplace install path", [
-    "build-marketplace-fixture.mjs",
-    "--local-fixture true",
-  ]);
 
-  const post = requireJob(violations, releaseFile, release, "post-publish-smoke");
+  // The post-publish-smoke job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const post = object(object(release.jobs)["post-publish-smoke"]);
   add(violations, post.uses === "./.github/workflows/post-publish-release-smoke.yml", `${releaseFile} must call post-publish smoke`);
   add(violations, sameMembers(needs(post), releaseChain.dependencies["post-publish-smoke"]), `${releaseFile} post-publish dependencies must match the release claim graph`);
   // The smoke still needs publication authority and a real published release, but a deferred
@@ -3592,7 +3476,13 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && String(object(post.with).pre_publish_closeout_artifact ?? "").startsWith("release-closeout-pre-publish-"),
     `${releaseFile} post-publish smoke must consume the proved marketplace revision and accepted pre-publish ledger`,
   );
-  const postCloseout = requireJob(violations, releaseFile, release, "post-publish-closeout");
+  // The post-publish-closeout job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it. Its
+  // step fragments - provenance collection, the container digest checks, and
+  // the evaluation - are rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const postCloseout = object(object(release.jobs)["post-publish-closeout"]);
   add(violations, postCloseout.if === "inputs.publish_release", `${releaseFile} post-publish closeout must require trusted publication authority`);
   add(violations, sameMembers(needs(postCloseout), releaseChain.dependencies["post-publish-closeout"]), `${releaseFile} post-publish closeout dependencies must match the release claim graph`);
   // The closeout reached marketplace-publish only through the smoke, so removing the smoke's gate
@@ -3603,13 +3493,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && !String(postCloseout.if ?? "").includes(`needs.${catalogDelivery.publish_job}`),
     `${releaseFile} post-publish closeout must not gate on ${catalogDelivery.publish_job} succeeding`,
   );
-  requireStepRun(violations, releaseFile, postCloseout, "Authenticate post-publish Actions provenance", [
-    "producer-map",
-    "--phase post_publish",
-    "artifact_ids",
-    "bash .github/scripts/collect-actions-job-evidence.sh",
-    "--job-evidence target/release-closeout/job-evidence.json",
-  ]);
   const postDownload = namedStep(postCloseout, "Download selected release cells without flattening");
   add(
     violations,
@@ -3618,17 +3501,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && object(postDownload.with)["merge-multiple"] === false,
     `${releaseFile} post-publish closeout must download selected Actions artifact ids without flattening`,
   );
-  requireStepRun(violations, releaseFile, postCloseout, "Verify selected post-publish artifact container digests", [
-    "/actions/artifacts/$artifact_id/zip",
-    "sha256sum",
-    "test \"$actual_digest\" = \"$expected_digest\"",
-  ]);
-  requireStepRun(violations, releaseFile, postCloseout, "Evaluate authenticated post-publish closeout", [
-    "--trusted-producers",
-    "--pre-publish-ledger",
-    "codestory-release-closeout.mjs evaluate",
-    '--version "$RELEASE_VERSION"',
-  ]);
   requireStepEnv(violations, releaseFile, postCloseout, "Evaluate authenticated post-publish closeout", {
     RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
   });

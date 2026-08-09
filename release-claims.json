@@ -2931,6 +2931,402 @@
           "--out-dir target/calibration-proof/linux-vulkan"
         ],
         "reason": "Optional calibration must gate on its explicit mode and collect constants through the dedicated collector with the accelerated Vulkan engine on the protected matrix cell, writing runs and proof to the reviewed directories; each fragment pins one flag of that single collector invocation."
+      },
+      "release_policy_install_dependencies": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "workflow-policy",
+        "step": "Install workflow policy dependencies",
+        "fragments": [
+          "npm ci --ignore-scripts"
+        ],
+        "reason": "The release lane's policy job depends only on the locked yaml parser; installing it with scripts disabled keeps the release supply chain at exactly the reviewed lockfile."
+      },
+      "release_policy_workflow_syntax": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "workflow-policy",
+        "step": "Check workflow syntax",
+        "fragments": [
+          "node --test .github/scripts/run-actionlint.test.mjs",
+          "node .github/scripts/run-actionlint.mjs"
+        ],
+        "reason": "actionlint parses every workflow the policy checker reasons about, and the wrapper's own suite runs wherever the syntax gate runs, so the release lane carries both commands."
+      },
+      "release_policy_claim_contracts": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "workflow-policy",
+        "step": "Check release claim and evidence contracts",
+        "fragments": [
+          ".github/scripts/build-marketplace-fixture.test.mjs",
+          ".github/scripts/publish-marketplace-catalog.test.mjs",
+          "scripts/tests/codestory-release-claims.test.mjs",
+          "scripts/tests/codestory-release-cell-manifest.test.mjs",
+          "scripts/tests/codestory-release-closeout.test.mjs",
+          "scripts/tests/codestory-release-evidence-gate.test.mjs",
+          "scripts/tests/prove-plugin-pinned-provision.test.mjs"
+        ],
+        "reason": "The catalog publisher records the pin a rollback would restore and refuses to move a catalog it cannot name a rollback target for, and the publish job generates the release manifest with a generator that must refuse drifted archives. Both are release behaviour, so their suites and the claim, manifest, closeout, and evidence-gate contracts all run on the release lane's own policy job before any proof does."
+      },
+      "release_policy_enforce_workflow_policy": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "workflow-policy",
+        "step": "Enforce workflow policy",
+        "fragments": [
+          "node .github/scripts/check-workflow-policy.mjs",
+          "node --test .github/scripts/lost-runner-recovery.test.mjs"
+        ],
+        "reason": "The recovery contract decides whether a lost host may withhold a claim, so the release's own policy gate must execute its tests before any proof runs."
+      },
+      "release_preflight_release_authority": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Validate release authority",
+        "fragments": [
+          "if [ \"$PUBLISH_RELEASE\" = \"true\" ]; then",
+          "\"$GITHUB_EVENT_NAME\" != \"push\"",
+          "\"$GITHUB_REF\" != \"refs/heads/main\"",
+          "$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main",
+          "\"$GITHUB_WORKFLOW_REF\" != \"$expected_caller\"",
+          "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
+          "\"$GITHUB_EVENT_NAME\" != \"workflow_dispatch\"",
+          "\"$GITHUB_REF\" != \"refs/heads/dev/codestory-next\"",
+          "\"$EXPECTED_HEAD_SHA\" != \"$GITHUB_SHA\"",
+          "repos/$GITHUB_REPOSITORY/git/ref/heads/dev/codestory-next",
+          "dev/codestory-next moved from proved head"
+        ],
+        "reason": "Publication authority is admissible only from the trusted auto-release caller on a live main head, and a proof-only dispatch only from the dev head it names while that head still stands; each fragment pins one conjunct of that refusal."
+      },
+      "release_preflight_calibration_lineage": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Verify release-head calibration lineage",
+        "fragments": [
+          "/usr/bin/python3 -E -s",
+          "\"$GITHUB_WORKSPACE/.github/scripts/check-calibration-release-lineage.py\"",
+          "--repo \"$GITHUB_WORKSPACE\"",
+          "--expected-sha \"$GITHUB_SHA\"",
+          "--allow-promotion-commit",
+          "selection_commit",
+          "selection_tree"
+        ],
+        "reason": "Calibration lineage must be proved by the hermetic system interpreter against the exact release head, allowing only the promotion commit, so the frozen constant selection cannot be swapped between proof and publication."
+      },
+      "release_preflight_changelog_notes": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Validate versioned changelog notes",
+        "fragments": [
+          "node .github/scripts/extract-codestory-release-notes.mjs",
+          "--version \"$VERSION\""
+        ],
+        "reason": "A release whose notes cannot be extracted for its exact version would publish an empty or mismatched announcement, so preflight proves the extraction before any proof runs."
+      },
+      "release_preflight_refuse_existing_tag": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Refuse existing tag or release",
+        "fragments": [
+          "git ls-remote --exit-code --tags origin \"refs/tags/$TAG\"",
+          "gh release view \"$TAG\"",
+          "exit 1"
+        ],
+        "reason": "An existing tag or release means this version already shipped, so preflight must refuse rather than overwrite published history."
+      },
+      "release_preflight_marketplace_install_path": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Prove the public marketplace install path",
+        "fragments": [
+          "git ls-remote",
+          "refs/heads/main",
+          "\"@openai/codex@$CODEX_CLI_VERSION\"",
+          "install-codestory-marketplace-proof.mjs",
+          "--source-repository \"$GITHUB_WORKSPACE\"",
+          "marketplace_revision=$marketplace_revision",
+          "printf '%s' \"$marketplace_revision\" | grep -Eq '^[0-9a-f]{40}$'",
+          "printf '%s' \"$fixture_revision\" | grep -Eq '^[0-9a-f]{40}$'",
+          "fixture_revision=\"$(git -C \"$fixture_root\" rev-parse HEAD)\"",
+          "--marketplace-revision \"$fixture_revision\""
+        ],
+        "reason": "The public install proof must run the pinned Codex CLI against this repository and record an immutable forty-hex revision. Fixture mode resolves from the locally built catalog, so provenance is checked against that repository's own revision; checking it against the live revision can never match, which is how the fixture path shipped unexercised."
+      },
+      "release_preflight_marketplace_fixture": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Prove the public marketplace install path",
+        "fragments": [
+          "build-marketplace-fixture.mjs",
+          "--local-fixture true"
+        ],
+        "reason": "The marketplace proof must build its fixture catalog locally so preflight exercises the real fixture install path rather than the live catalog alone."
+      },
+      "release_preflight_resolve_reusable_evidence": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Resolve reusable prior evidence",
+        "fragments": [
+          "release_tree=\"$(git rev-parse \"$GITHUB_SHA^{tree}\")\"",
+          "test \"$(git rev-parse \"$head_sha^{tree}\")\" = \"$release_tree\"",
+          "git merge-base --is-ancestor \"$head_sha\" \"$GITHUB_SHA\"",
+          "full-source-gate",
+          ".path == \".github/workflows/source-proof.yml\"",
+          ".event == \"workflow_dispatch\" and .conclusion == \"success\"",
+          "The release workflow will not start a broad proof",
+          "artifact_name=\"release-cell-prepublish-source-attempt-$run_attempt\"",
+          ".expired == false",
+          "test \"$artifact_count\" = 1 || continue"
+        ],
+        "reason": "Prior source evidence is reusable only from a successful dispatched source-proof run whose head is an ancestor with this exact tree and whose unexpired attempt-qualified evidence artifact exists exactly once; each fragment pins one conjunct of that resolution."
+      },
+      "release_preflight_resolve_no_freeze_replay": {
+        "kind": "forbid",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Resolve reusable prior evidence",
+        "fragments": [
+          "release-freeze-barrier.mjs verify-status",
+          "freeze_receipt_digest"
+        ],
+        "reason": "The release resolver reuses proof evidence, not the freeze acceptance: replaying the freeze-status verification here would let a stale receipt stand in for the source proof's own live check."
+      },
+      "release_source_proof_refusal": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "source-proof",
+        "step": "Refuse a second source proof",
+        "fragments": [
+          "test \"$SOURCE_SHA\" = \"$GITHUB_SHA\"",
+          "Preflight did not resolve reusable exact-head source proof",
+          "exit 1"
+        ],
+        "reason": "The placeholder's only step must fail closed when preflight did not resolve reusable exact-head evidence, so the release chain can never quietly start a second broad source proof."
+      },
+      "release_pre_publish_closeout_reuse_binding": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "pre-publish-closeout",
+        "step": "Authenticate pre-publish Actions provenance",
+        "fragments": [
+          "--reuse \"$REUSE_SELECTION\""
+        ],
+        "reason": "The closeout must receive exactly the reuse selection preflight resolved, or a skipped source gate would enter the ledger without its authenticated binding."
+      },
+      "release_pre_publish_closeout_provenance": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "pre-publish-closeout",
+        "step": "Authenticate pre-publish Actions provenance",
+        "fragments": [
+          "producer-map",
+          "--phase pre_publish",
+          "bash .github/scripts/collect-actions-job-evidence.sh",
+          "--job-evidence target/release-closeout/job-evidence.json"
+        ],
+        "reason": "The producer map is the trust boundary between a real proof and a non-claim, so the closeout collects the lost-runner evidence itself instead of inheriting the non-claim producer's verdict."
+      },
+      "release_pre_publish_closeout_cell_download": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "pre-publish-closeout",
+        "step": "Download and verify selected pre-publish release cells",
+        "fragments": [
+          "test \"$(jq -r '.artifacts | length' \"$producer_map\")\" -gt 0",
+          ".artifacts[] | [.id, .name, .digest] | @tsv",
+          "destination=\"target/release-cell-manifests/$artifact_name\"",
+          "test ! -e \"$destination\"",
+          "/actions/artifacts/$artifact_id/zip",
+          "sha256sum",
+          "test \"$actual_digest\" = \"$expected_digest\"",
+          "unzip -q \"$archive\" -d \"$destination\"",
+          "test -d \"target/release-cell-manifests/$artifact_name\""
+        ],
+        "reason": "Every selected release cell must be fetched by exact Actions artifact id, digest-verified, and unpacked into a fresh per-artifact destination; each fragment pins one link of that authenticated chain."
+      },
+      "release_pre_publish_closeout_evaluation": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "pre-publish-closeout",
+        "step": "Evaluate authenticated pre-publish closeout",
+        "fragments": [
+          "--trusted-producers",
+          "codestory-release-closeout.mjs evaluate",
+          "--version \"$RELEASE_VERSION\""
+        ],
+        "reason": "The closeout evaluation must run against the trusted producer set and the exact release version; the version reaches the evaluator as a variable, so the flag spelling is what binds the ledger to this release."
+      },
+      "release_pre_publish_closeout_dev_revalidation": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "pre-publish-closeout",
+        "step": "Revalidate proof-only dev head",
+        "fragments": [
+          "repos/$GITHUB_REPOSITORY/git/ref/heads/dev/codestory-next",
+          "\"$live_head\" != \"$GITHUB_SHA\"",
+          "dev/codestory-next moved from accepted ledger head"
+        ],
+        "reason": "A proof-only ledger is only valid for the dev head it proved, so the upload must refuse when dev/codestory-next has moved from the accepted head."
+      },
+      "release_publish_release_notes": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "publish",
+        "step": "Compose versioned GitHub release notes",
+        "fragments": [
+          "node .github/scripts/extract-codestory-release-notes.mjs",
+          "--output target/release-assets/release-notes.md",
+          "node scripts/codestory-release-claims.mjs release-platform-notes",
+          "--ledger target/release-closeout/pre_publish/ledger.json"
+        ],
+        "reason": "The published platform table is a claim about this release, so it is rendered from the accepted ledger. Rendering it from the static graph is how a release whose accelerator proof was withheld still announced that accelerator as supported."
+      },
+      "release_publish_manifest_generation": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "publish",
+        "step": "Generate the release manifest",
+        "fragments": [
+          "node scripts/build-release-manifest.mjs",
+          "--version \"$VERSION\"",
+          "--tag \"$TAG\"",
+          "--commit \"$GITHUB_SHA\"",
+          "--assets target/release-assets",
+          "--output target/release-assets/codestory-release-manifest.json"
+        ],
+        "reason": "The native lane's archive digests cannot be carried by the frozen source, so the manifest is generated here from the built archives and shipped with the release; the generator cross-checks the verified checksums, so every coordinate of its invocation is pinned."
+      },
+      "release_publish_closeout_summary": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "publish",
+        "step": "Ship the accepted closeout summary with the release",
+        "fragments": [
+          "target/release-closeout/pre_publish/summary.json",
+          "\"$(jq -r .decision \"$summary\")\" = accept",
+          "target/release-assets/release-closeout-summary.json"
+        ],
+        "reason": "The ledger the README tells readers to consult has to be reachable from the release itself, and only an accepted closeout decision may ship as that summary."
+      },
+      "release_publish_refuse_existing_tag": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "publish",
+        "step": "Refuse existing tag or release",
+        "fragments": [
+          "git ls-remote --exit-code --tags origin \"refs/tags/$TAG\"",
+          "gh release view \"$TAG\"",
+          "exit 1"
+        ],
+        "reason": "The publish job re-checks for an existing tag or release immediately before creating one, so a racing publication fails closed instead of overwriting."
+      },
+      "release_publish_create_release": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "publish",
+        "step": "Create GitHub release",
+        "fragments": [
+          "--notes-file target/release-assets/release-notes.md",
+          "node scripts/codestory-release-claims.mjs release-assets",
+          "for name in \"${expected_names[@]}\"; do",
+          "if [ ! -f \"$asset\" ]; then",
+          "Release assets differ from the release claim graph",
+          "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
+          "\"$live_head\" != \"$GITHUB_SHA\"",
+          "main moved from publishable head"
+        ],
+        "reason": "The release is created only with the curated notes file, exactly the graph-declared asset set, and a final live check that main still points at the publishable head; each fragment pins one conjunct of that creation."
+      },
+      "release_catalog_push": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "marketplace-publish",
+        "step": "Point the catalog at the published release",
+        "fragments": [
+          "--version \"$RELEASE_VERSION\""
+        ],
+        "reason": "The version the catalog is pointed at reaches the push as a variable, so the command text no longer says which release it published; the flag spelling is pinned here and the env binding stays a code-owned check, as in the plugin lane."
+      },
+      "release_post_publish_closeout_provenance": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "post-publish-closeout",
+        "step": "Authenticate post-publish Actions provenance",
+        "fragments": [
+          "producer-map",
+          "--phase post_publish",
+          "artifact_ids",
+          "bash .github/scripts/collect-actions-job-evidence.sh",
+          "--job-evidence target/release-closeout/job-evidence.json"
+        ],
+        "reason": "The post-publish producer map must be collected by the closeout itself, scoped to its phase, and must publish the exact artifact ids the download step later consumes."
+      },
+      "release_post_publish_container_digests": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "post-publish-closeout",
+        "step": "Verify selected post-publish artifact container digests",
+        "fragments": [
+          "/actions/artifacts/$artifact_id/zip",
+          "sha256sum",
+          "test \"$actual_digest\" = \"$expected_digest\""
+        ],
+        "reason": "Each downloaded artifact container must be digest-verified against the provenance record before any cell inside it is trusted."
+      },
+      "release_post_publish_closeout_evaluation": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "post-publish-closeout",
+        "step": "Evaluate authenticated post-publish closeout",
+        "fragments": [
+          "--trusted-producers",
+          "--pre-publish-ledger",
+          "codestory-release-closeout.mjs evaluate",
+          "--version \"$RELEASE_VERSION\""
+        ],
+        "reason": "The post-publish evaluation must run against the trusted producer set, the accepted pre-publish ledger, and the exact release version, closing the ledger over what actually shipped."
+      },
+      "macos_metal_release_retrieval_cell_id": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Emit authenticated macOS retrieval-readiness release cell",
+        "fragments": [
+          "--cell-id retrieval_readiness:macos-arm64",
+          "release-cell-postpublish-retrieval-macos-arm64-attempt-$GITHUB_RUN_ATTEMPT"
+        ],
+        "reason": "The release chain consumes the macOS retrieval-readiness cell under its exact --cell-id spelling and attempt-qualified post-publish artifact name, so the emitting step must pin both coordinates."
+      },
+      "windows_vulkan_release_retrieval_cell_id": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Windows retrieval-readiness release cell",
+        "fragments": [
+          "--cell-id retrieval_readiness:windows-x64",
+          "release-cell-postpublish-retrieval-windows-x64-attempt-$GITHUB_RUN_ATTEMPT"
+        ],
+        "reason": "The release chain consumes the Windows retrieval-readiness cell under its exact --cell-id spelling and attempt-qualified post-publish artifact name, so the emitting step must pin both coordinates."
+      },
+      "linux_vulkan_release_cell_ids": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Linux Vulkan release cells",
+        "fragments": [
+          "--cell-id accelerator_execution:linux-x64-vulkan",
+          "--cell-id retrieval_readiness:linux-x64",
+          "--cell-id candidate_installed_behavior:linux-x64"
+        ],
+        "reason": "The release chain requires the single Linux cell step to emit all three Linux cells under their exact --cell-id spellings, so a renamed or dropped cell id cannot masquerade as coverage."
       }
     },
     "structural_pins": {
@@ -3105,6 +3501,92 @@
         "file": "main-branch-source-guard.yml",
         "job": "enforce-source-branch",
         "reason": "The source-branch guard is the only check standing between an arbitrary branch and a main merge. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the checker's identity and branch rules then constrain what the surviving job must compare."
+      },
+      "release_actions_write": {
+        "kind": "permission",
+        "file": "release.yml",
+        "scope": "actions",
+        "access": "write",
+        "reason": "Cancelling superseded proof runs before starting release work is an Actions-surface write, so the coordinator must hold exactly actions write at the workflow scope."
+      },
+      "release_pull_requests_read": {
+        "kind": "permission",
+        "file": "release.yml",
+        "scope": "pull-requests",
+        "access": "read",
+        "reason": "The exact source resolver authenticates the head it proves by reading pull-request metadata, so the coordinator must grant exactly pull-requests read."
+      },
+      "release_workflow_policy_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "workflow-policy",
+        "reason": "The release lane's own policy gate exists only through this job: it re-proves the workflow policy and the claim contracts before any release proof runs."
+      },
+      "release_preflight_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "preflight",
+        "reason": "Preflight is the trusted entry of the release chain: it validates publication authority, calibration lineage, the version, and the marketplace path before any proof starts."
+      },
+      "release_source_proof_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "source-proof",
+        "reason": "The source-proof placeholder is the fail-closed sentinel standing where the broad source workflow would otherwise re-run; deleting it would silently reshape evidence reuse."
+      },
+      "release_packaged_proof_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "packaged-proof",
+        "reason": "The packaged-proof call is the only producer of the release archives every later proof and the publication itself consume."
+      },
+      "release_macos_metal_proof_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "macos-metal-proof",
+        "reason": "The Metal proof call is the only lane that closes the macOS accelerator and candidate-installed claims for a release."
+      },
+      "release_windows_vulkan_proof_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "windows-vulkan-proof",
+        "reason": "The Windows Vulkan proof call is the only lane that closes the Windows accelerator and candidate-installed claims for a release."
+      },
+      "release_linux_vulkan_proof_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "linux-vulkan-proof",
+        "reason": "The Linux Vulkan proof call is the only lane that closes the Linux accelerator, retrieval, and candidate-installed claims for a release."
+      },
+      "release_pre_publish_closeout_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "pre-publish-closeout",
+        "reason": "The pre-publish closeout is the sole authenticated evaluator standing between the proofs and publication; without it the publish gate would rest on job results alone."
+      },
+      "release_publish_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "publish",
+        "reason": "The publish job is the one writer of the tag, the GitHub release, and its assets."
+      },
+      "release_marketplace_publish_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "marketplace-publish",
+        "reason": "Marketplace publication is the one delivery job holding the scoped cross-repository credential, isolated from every job that runs release code."
+      },
+      "release_post_publish_smoke_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "post-publish-smoke",
+        "reason": "The post-publish smoke call is the only check that proves the assets that actually shipped install and run."
+      },
+      "release_post_publish_closeout_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "post-publish-closeout",
+        "reason": "The post-publish closeout is the sole authenticated evaluator that closes the ledger over what shipped."
       }
     },
     "constant_mirrors": {
