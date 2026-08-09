@@ -386,7 +386,7 @@ fn grounding_root_subsystem_key(
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct GroundingRootSortKey {
-    import_like: bool,
+    architecture_band: u8,
     entry: Reverse<EntryEvidence>,
     file_role_rank: u8,
     helper_like: bool,
@@ -412,11 +412,18 @@ impl GroundingRootSortKey {
         let role = grounding_root_file_role(record, file_roles);
         let relative = grounding_root_relative_path(root, record);
         let call_degrees = degrees.get(&record.node.id).copied().unwrap_or_default();
+        let entry = grounding_entry_evidence(record, file_roles, call_degrees);
         Self {
-            import_like: is_import_like_symbol(&record.node),
-            // Role stays the band frame; directed graph evidence refines within
-            // the band; structure only breaks ties.
-            entry: Reverse(grounding_entry_evidence(record, file_roles, call_degrees)),
+            // Repository structure is the band frame. Directed graph evidence
+            // refines within a band, so a topological tool script cannot crowd
+            // a shallow production ownership boundary out of compact output.
+            architecture_band: grounding_root_architecture_band(
+                record,
+                role,
+                relative.as_deref(),
+                entry,
+            ),
+            entry: Reverse(entry),
             file_role_rank: grounding_root_file_role_rank(role),
             helper_like: helper_like_name_or_path(&record.display_name, relative.as_deref()),
             reference_tier: Reverse(degree_tier(call_degrees.production_in_calls)),
@@ -432,6 +439,43 @@ impl GroundingRootSortKey {
     }
 }
 
+fn grounding_root_architecture_band(
+    record: &GroundingNodeRecord,
+    role: Option<FileRole>,
+    relative_path: Option<&str>,
+    entry: EntryEvidence,
+) -> u8 {
+    if is_import_like_symbol(&record.node) {
+        return 5;
+    }
+    if role == Some(FileRole::Entrypoint) && entry != EntryEvidence::None {
+        return 0;
+    }
+    match role {
+        Some(FileRole::Entrypoint | FileRole::Source) => {
+            if grounding_root_tooling_path(relative_path) {
+                return 3;
+            }
+            match structural_path_rank(role, relative_path) {
+                0 | 1 => 1,
+                2 => 2,
+                _ => 3,
+            }
+        }
+        _ => 4,
+    }
+}
+
+fn grounding_root_tooling_path(relative_path: Option<&str>) -> bool {
+    let Some(path) = relative_path else {
+        return false;
+    };
+    let normalized = format!("/{}", path.replace('\\', "/").to_ascii_lowercase());
+    ["/scripts/", "/tools/", "/tooling/", "/build/", "/ci/"]
+        .iter()
+        .any(|segment| normalized.contains(segment))
+}
+
 fn diversify_grounding_root_records(
     mut records: Vec<GroundingNodeRecord>,
     root: &Path,
@@ -443,31 +487,37 @@ fn diversify_grounding_root_records(
     records.sort_by_cached_key(|record| {
         GroundingRootSortKey::new(record, root, file_roles, degrees, member_counts)
     });
-    let (production, secondary): (Vec<_>, Vec<_>) = records
-        .into_iter()
-        .partition(|record| is_production_file_role(grounding_root_file_role(record, file_roles)));
-
-    // Spend the compact budget on distinct production language/subsystem
-    // surfaces, then distinct names, before compatibility-only candidates.
-    // Every budget truncates this one stable order.
+    // Spend the compact budget on distinct language/subsystem surfaces inside
+    // each architecture band. Sharing diversity state across bands preserves
+    // duplicate-name suppression without letting a novel tool language jump
+    // ahead of a production ownership boundary. Every budget truncates this
+    // one stable order.
     let surface_key = |record: &GroundingNodeRecord| {
         (
             grounding_root_subsystem_key(root, record, file_languages),
             grounding_root_terminal_name(record),
         )
     };
-    // One diversity state across both tiers: a secondary candidate whose name a
-    // production root already spent must not consume a novel-name slot of its
-    // own, which is the duplicate-name diversity #1338 requires stay intact.
     let mut state = RootDiversityState::default();
-    let mut diversified =
-        diversify_root_order_within(production, |_| false, surface_key, &mut state);
-    diversified.extend(diversify_root_order_within(
-        secondary,
-        |_| false,
-        surface_key,
-        &mut state,
-    ));
+    let mut bands = std::array::from_fn::<_, 6, _>(|_| Vec::new());
+    for record in records {
+        let role = grounding_root_file_role(&record, file_roles);
+        let relative = grounding_root_relative_path(root, &record);
+        let call_degrees = degrees.get(&record.node.id).copied().unwrap_or_default();
+        let entry = grounding_entry_evidence(&record, file_roles, call_degrees);
+        let band =
+            grounding_root_architecture_band(&record, role, relative.as_deref(), entry) as usize;
+        bands[band].push(record);
+    }
+    let mut diversified = Vec::new();
+    for band in bands {
+        diversified.extend(diversify_root_order_within(
+            band,
+            |_| false,
+            surface_key,
+            &mut state,
+        ));
+    }
     diversified
 }
 
@@ -2084,6 +2134,136 @@ mod tests {
                 .map(|record| record.display_name.as_str())
                 .collect::<Vec<_>>(),
             ["aaSubsystemRoot", "zzHelperAlias"]
+        );
+    }
+
+    #[test]
+    fn topological_tool_scripts_do_not_crowd_out_production_architecture_bands() {
+        let root = Path::new("/repo");
+        let record = |node_id, file_id, name: &str, path: &str, kind| GroundingNodeRecord {
+            node: Node {
+                id: CoreNodeId(node_id),
+                kind,
+                serialized_name: name.to_string(),
+                file_node_id: Some(CoreNodeId(file_id)),
+                start_line: Some(1),
+                ..Default::default()
+            },
+            display_name: name.to_string(),
+            file_path: Some(root.join(path)),
+        };
+        let records = vec![
+            record(
+                101,
+                10,
+                "ApplicationMain",
+                "src/main.ts",
+                NodeKind::FUNCTION,
+            ),
+            record(
+                201,
+                20,
+                "CoreLibrary",
+                "src/lib/bridge.ts",
+                NodeKind::STRUCT,
+            ),
+            record(
+                301,
+                30,
+                "HostBoundary",
+                "src-tauri/src/runtime.rs",
+                NodeKind::STRUCT,
+            ),
+            record(
+                401,
+                40,
+                "RubyPackaging",
+                "tools/release/src/main.rb",
+                NodeKind::FUNCTION,
+            ),
+            record(
+                501,
+                50,
+                "PythonSigning",
+                "scripts/sign.py",
+                NodeKind::FUNCTION,
+            ),
+            record(
+                601,
+                60,
+                "ShellInstaller",
+                "scripts/install.sh",
+                NodeKind::FUNCTION,
+            ),
+            record(
+                701,
+                70,
+                "JavascriptRelease",
+                "scripts/release.js",
+                NodeKind::FUNCTION,
+            ),
+        ];
+        let file_roles = [
+            (10, FileRole::Entrypoint),
+            (20, FileRole::Source),
+            (30, FileRole::Source),
+            (40, FileRole::Source),
+            (50, FileRole::Source),
+            (60, FileRole::Source),
+            (70, FileRole::Source),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let file_languages = [
+            (10, "typescript"),
+            (20, "typescript"),
+            (30, "rust"),
+            (40, "ruby"),
+            (50, "python"),
+            (60, "shell"),
+            (70, "javascript"),
+        ]
+        .into_iter()
+        .map(|(id, language)| (id, language.to_string()))
+        .collect::<HashMap<_, _>>();
+        let degrees = [401, 501, 601, 701]
+            .into_iter()
+            .map(|id| {
+                (
+                    CoreNodeId(id),
+                    CallDegrees {
+                        production_in_calls: 0,
+                        out_calls: 6,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let ordered = diversify_grounding_root_records(
+            records,
+            root,
+            &file_roles,
+            &file_languages,
+            &degrees,
+            &HashMap::new(),
+        );
+        let names = ordered
+            .iter()
+            .map(|record| record.display_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names[0], "ApplicationMain");
+        assert!(names[..3].contains(&"CoreLibrary"), "{names:?}");
+        assert!(names[..3].contains(&"HostBoundary"), "{names:?}");
+        assert_eq!(
+            names[3..].iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([
+                "RubyPackaging",
+                "PythonSigning",
+                "ShellInstaller",
+                "JavascriptRelease",
+            ]),
+            "tool scripts must remain behind production architecture: {names:?}"
         );
     }
 

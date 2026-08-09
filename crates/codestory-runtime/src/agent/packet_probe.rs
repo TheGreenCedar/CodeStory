@@ -1,5 +1,8 @@
 use crate::AppController;
 use crate::agent::citation::to_citation_from_hit;
+use crate::agent::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
+use crate::agent::packet_scoring::normalize_identifier;
+use crate::agent::packet_terms::prompt_search_terms;
 use crate::agent::retrieval_primary::active_pinned_retrieval_publication;
 use crate::target_resolution::{TargetResolution, TargetSelection, search_hit_matches_exact_file};
 pub(crate) use codestory_agent::packet_probes::exact_packet_probe_paths;
@@ -99,6 +102,7 @@ pub(crate) fn resolve_packet_probes(
 pub(crate) fn exact_packet_probe_citations(
     controller: &AppController,
     resolutions: &[PacketProbeResolutionDto],
+    question: &str,
     include_evidence: bool,
 ) -> Vec<AgentCitationDto> {
     let mut citations = Vec::new();
@@ -119,6 +123,7 @@ pub(crate) fn exact_packet_probe_citations(
                 append(exact_path_probe_source_carrier_citation(
                     controller,
                     resolution,
+                    question,
                     include_evidence,
                 ));
             }
@@ -144,6 +149,7 @@ pub(crate) fn exact_packet_probe_citations(
 fn exact_path_probe_source_carrier_citation(
     controller: &AppController,
     resolution: &PacketProbeResolutionDto,
+    question: &str,
     include_evidence: bool,
 ) -> Option<AgentCitationDto> {
     let project_root = controller.require_project_root().ok()?;
@@ -171,22 +177,83 @@ fn exact_path_probe_source_carrier_citation(
                 )
         })?
         .id;
-    let carrier_id = storage
-        .get_grounding_top_symbols_for_files(&[file_id], 1)
+    let question_terms = prompt_search_terms(question)
+        .into_iter()
+        .map(|term| normalize_identifier(&term))
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    let mut candidates = storage
+        .get_grounding_root_symbols_for_files(&[file_id], 256)
         .ok()?
         .into_iter()
-        .next()
-        .map(|record| record.node.id)
-        .unwrap_or(codestory_contracts::graph::NodeId(file_id));
-    let mut citation =
-        exact_symbol_probe_citation(controller, &carrier_id.to_string(), include_evidence)?;
-    let cited_path = citation.file_path.as_deref()?;
-    if !same_workspace_path(&absolute, &project_root.join(cited_path)) {
-        return None;
-    }
-    citation.file_path = Some(display_relative_path(&relative));
-    citation.eligible_for_sufficiency = Some(true);
-    Some(citation)
+        .filter_map(|record| {
+            let display = normalize_identifier(&record.display_name);
+            let term_hits = question_terms
+                .iter()
+                .filter(|term| {
+                    display.contains(term.as_str())
+                        || (display.len() >= 4 && term.len() >= 4 && term.contains(&display))
+                })
+                .count();
+            (!display.is_empty() && term_hits > 0).then_some((term_hits, record))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(left_hits, left), (right_hits, right)| {
+        right_hits
+            .cmp(left_hits)
+            .then_with(|| left.node.start_line.cmp(&right.node.start_line))
+            .then_with(|| left.display_name.cmp(&right.display_name))
+            .then_with(|| left.node.id.cmp(&right.node.id))
+    });
+
+    candidates
+        .into_iter()
+        .take(24)
+        .filter_map(|(term_hits, record)| {
+            let mut citation = exact_symbol_probe_citation(
+                controller,
+                &record.node.id.to_string(),
+                include_evidence,
+            )?;
+            let cited_path = citation.file_path.as_deref()?;
+            if !same_workspace_path(&absolute, &project_root.join(cited_path)) {
+                return None;
+            }
+            if !matches!(
+                citation.kind,
+                NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+            ) {
+                return None;
+            }
+            citation.file_path = Some(display_relative_path(&relative));
+            citation.coverage_role = None;
+            let role = packet_evidence_role(&citation)?;
+            if matches!(
+                role,
+                PacketEvidenceRole::SourceEvidence | PacketEvidenceRole::TestsAndRegressionCoverage
+            ) {
+                return None;
+            }
+            let role_rank = match role {
+                PacketEvidenceRole::CommandEntrypoint => 5,
+                PacketEvidenceRole::RequestDispatch
+                | PacketEvidenceRole::TransportAdapter
+                | PacketEvidenceRole::BufferedIo => 4,
+                PacketEvidenceRole::RuntimeOrchestration => 3,
+                _ => 2,
+            };
+            citation.coverage_role = Some(role.as_str().to_string());
+            citation.eligible_for_sufficiency = Some(true);
+            citation.score = 99.0;
+            Some((role_rank, term_hits, citation))
+        })
+        .max_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| right.2.display_name.cmp(&left.2.display_name))
+        })
+        .map(|(_, _, citation)| citation)
 }
 
 fn exact_symbol_probe_citation(
@@ -754,7 +821,7 @@ mod tests {
             .expect("create source parent");
         std::fs::write(
             &source_path,
-            "pub fn indexed_target() {}\n// textual_target\n",
+            "pub fn indexed_target() {}\npub fn run_stdio_server() {}\n// textual_target\n",
         )
         .expect("write source");
         let duplicate_path = project.path().join("src").join("duplicate.rs");
@@ -776,7 +843,7 @@ mod tests {
                 modification_time: 1,
                 indexed: true,
                 complete: true,
-                line_count: 2,
+                line_count: 3,
                 file_role: FileRole::Source,
             })
             .expect("insert file");
@@ -827,6 +894,14 @@ mod tests {
                     kind: CoreNodeKind::FUNCTION,
                     serialized_name: "textual_target".to_string(),
                     canonical_id: Some("openapi:endpoint:get:/textual".to_string()),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(3),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(4),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: "run_stdio_server".to_string(),
                     file_node_id: Some(CoreNodeId(1)),
                     start_line: Some(2),
                     ..Default::default()
@@ -975,7 +1050,12 @@ mod tests {
             vec!["assets/desk.svg".to_string()],
             "only resolved in-project exact paths should constrain architecture sufficiency"
         );
-        let citations = exact_packet_probe_citations(&controller, &resolutions, true);
+        let citations = exact_packet_probe_citations(
+            &controller,
+            &resolutions,
+            "Explain this exact asset.",
+            true,
+        );
         assert_eq!(citations.len(), 1);
         assert_eq!(citations[0].file_path.as_deref(), Some("assets/desk.svg"));
         assert_eq!(
@@ -996,7 +1076,12 @@ mod tests {
             }],
         );
 
-        let citations = exact_packet_probe_citations(&controller, &resolutions, true);
+        let citations = exact_packet_probe_citations(
+            &controller,
+            &resolutions,
+            "Explain the stdio server architecture.",
+            true,
+        );
 
         assert_eq!(citations.len(), 2);
         assert_eq!(citations[0].file_path.as_deref(), Some("src/lib.rs"));
@@ -1005,13 +1090,14 @@ mod tests {
         assert_eq!(citations[1].eligible_for_sufficiency, Some(true));
         assert_eq!(
             citations[1].coverage_role.as_deref(),
-            Some("explicit exact probe")
+            Some("command entrypoint")
         );
+        assert_eq!(citations[1].display_name, "run_stdio_server");
         assert_ne!(citations[0].node_id, citations[1].node_id);
     }
 
     #[test]
-    fn indexed_symbol_free_path_uses_its_stored_file_node_as_carrier() {
+    fn indexed_symbol_free_path_remains_diagnostic_only() {
         let project = TempDir::new().expect("project");
         let controller = controller_with_indexed_fixture(&project);
         let resolutions = resolve_packet_probes(
@@ -1021,17 +1107,44 @@ mod tests {
             }],
         );
 
-        let citations = exact_packet_probe_citations(&controller, &resolutions, true);
-
-        assert_eq!(citations.len(), 2);
-        assert_eq!(citations[1].node_id.0, "20");
-        assert_eq!(citations[1].kind, NodeKind::FILE);
-        assert_eq!(citations[1].file_path.as_deref(), Some("scripts/entry.cjs"));
-        assert_eq!(citations[1].eligible_for_sufficiency, Some(true));
-        assert_eq!(
-            citations[1].coverage_role.as_deref(),
-            Some("explicit exact probe")
+        let citations = exact_packet_probe_citations(
+            &controller,
+            &resolutions,
+            "Explain the plugin stdio server architecture.",
+            true,
         );
+
+        assert_eq!(citations.len(), 1);
+        assert_eq!(
+            citations[0].node_id.0,
+            "packet::exact_path::scripts/entry.cjs"
+        );
+        assert_eq!(citations[0].kind, NodeKind::FILE);
+        assert_eq!(citations[0].file_path.as_deref(), Some("scripts/entry.cjs"));
+        assert_eq!(citations[0].eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn indexed_exact_path_does_not_promote_an_unrelated_symbol() {
+        let project = TempDir::new().expect("project");
+        let controller = controller_with_indexed_fixture(&project);
+        let resolutions = resolve_packet_probes(
+            &controller,
+            vec![PacketProbeDto::ExactPath {
+                path: "src/lib.rs".into(),
+            }],
+        );
+
+        let citations = exact_packet_probe_citations(
+            &controller,
+            &resolutions,
+            "Explain the frobnicator ownership boundary.",
+            true,
+        );
+
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].file_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(citations[0].eligible_for_sufficiency, Some(false));
     }
 
     #[test]
@@ -1190,7 +1303,12 @@ mod tests {
             },
         ];
 
-        let citations = exact_packet_probe_citations(&controller, &resolutions, true);
+        let citations = exact_packet_probe_citations(
+            &controller,
+            &resolutions,
+            "Find the exact indexed targets.",
+            true,
+        );
         assert_eq!(
             citations
                 .iter()

@@ -1,6 +1,7 @@
 //! Versioned packet obligations planned before retrieval and finalized from carried evidence.
 
 use super::packet_evidence::citation_sufficiency_eligible;
+use super::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 use super::packet_flow_requirements::{
     CoverageMode, EvidencePredicate, FlowRequirement, FlowRole, packet_flow_requirements_for_terms,
 };
@@ -673,14 +674,30 @@ fn finalize_exact_probe_obligation(
         obligation.reason = Some("exact_probe_resolution_binding_missing".to_string());
         return;
     }
+    let exact_path_binding = matches!(&binding.probe, PacketProbeDto::ExactPath { .. });
     let matching_citations = answer
         .citations
         .iter()
         .filter(|citation| {
-            citation.coverage_role.as_deref() == Some("explicit exact probe")
-                && (!matches!(&binding.probe, PacketProbeDto::ExactPath { .. })
-                    || citation_sufficiency_eligible(citation))
-                && citation_matches_exact_probe_binding(citation, &binding)
+            let admissible_carrier = if exact_path_binding {
+                citation_sufficiency_eligible(citation)
+                    && matches!(
+                        citation.kind,
+                        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+                    )
+                    && citation.evidence_producer.as_deref() != Some("packet_exact_path_probe")
+                    && citation.coverage_role.as_deref() != Some("explicit exact probe")
+                    && packet_evidence_role(citation).is_some_and(|role| {
+                        !matches!(
+                            role,
+                            PacketEvidenceRole::SourceEvidence
+                                | PacketEvidenceRole::TestsAndRegressionCoverage
+                        )
+                    })
+            } else {
+                citation.coverage_role.as_deref() == Some("explicit exact probe")
+            };
+            admissible_carrier && citation_matches_exact_probe_binding(citation, &binding)
         })
         .collect::<Vec<_>>();
     if matching_citations.is_empty() {
@@ -1312,7 +1329,12 @@ fn append_packet_obligation_receipt_claims(
             .collect::<Vec<_>>();
         let has_carried_citation = !citations.is_empty();
         let status = packet_obligation_receipt_proof_status(obligation, has_carried_citation);
-        let eligible = obligation.proof_status == PacketObligationProofStatusDto::Proven
+        let exact_path_obligation = obligation
+            .probe_binding
+            .as_ref()
+            .is_some_and(|binding| matches!(&binding.probe, PacketProbeDto::ExactPath { .. }));
+        let eligible = !exact_path_obligation
+            && obligation.proof_status == PacketObligationProofStatusDto::Proven
             && has_carried_citation;
         claims.push(PacketClaimDto {
             claim: packet_obligation_receipt_text(obligation, &citations),
@@ -2159,14 +2181,49 @@ mod tests {
             Some("exact_probe_carrier_missing")
         );
 
-        let mut carrier = citation("indexed_target", "src/lib.rs", NodeKind::FUNCTION);
-        carrier.coverage_role = Some("explicit exact probe".to_string());
-        carrier.eligible_for_sufficiency = Some(true);
+        let mut synthetic_carrier = citation("indexed_target", "src/lib.rs", NodeKind::FUNCTION);
+        synthetic_carrier.coverage_role = Some("explicit exact probe".to_string());
+        synthetic_carrier.eligible_for_sufficiency = Some(true);
         finalize_packet_obligation_plan(
             "Explain this exact path.",
             PacketTaskClassDto::ArchitectureExplanation,
             &mut plan,
-            &answer(vec![diagnostic, carrier.clone()]),
+            &answer(vec![diagnostic.clone(), synthetic_carrier]),
+            &budget(),
+        );
+        assert_eq!(
+            plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Unsupported,
+            "a synthetic exact-probe citation must not prove semantic coverage"
+        );
+
+        let mut non_behavioral = citation("HttpTransportAdapter", "src/lib.rs", NodeKind::CLASS);
+        non_behavioral.evidence_producer = Some("symbol_doc".to_string());
+        non_behavioral.coverage_role = Some("transport adapter".to_string());
+        non_behavioral.eligible_for_sufficiency = Some(true);
+        finalize_packet_obligation_plan(
+            "Explain this exact path.",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer(vec![diagnostic.clone(), non_behavioral]),
+            &budget(),
+        );
+        assert_eq!(
+            plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Unsupported,
+            "a named type must not stand in for behavioral path evidence"
+        );
+
+        let mut carrier = citation("run_stdio_server", "src/lib.rs", NodeKind::FUNCTION);
+        carrier.evidence_producer = Some("symbol_doc".to_string());
+        carrier.coverage_role = Some("command entrypoint".to_string());
+        carrier.eligible_for_sufficiency = Some(true);
+        let carried_answer = answer(vec![diagnostic, carrier.clone()]);
+        finalize_packet_obligation_plan(
+            "Explain this exact path.",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &carried_answer,
             &budget(),
         );
         assert_eq!(
@@ -2177,6 +2234,11 @@ mod tests {
             plan.claim_obligations[0].carrier_node_ids,
             vec![carrier.node_id]
         );
+        let claims =
+            packet_claims_with_obligation_receipts(&carried_answer, &plan, (Vec::new(), ()));
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].proof_status, Some(PacketProofStatusDto::Proven));
+        assert_eq!(claims[0].eligible_for_sufficiency, Some(false));
     }
 
     #[test]

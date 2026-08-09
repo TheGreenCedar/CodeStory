@@ -190,10 +190,11 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
         Some(PacketEvidenceRole::IndexingWorkQueue)
     } else if normalized_display.contains("interceptor") || path.contains("interceptor") {
         Some(PacketEvidenceRole::InterceptorManagement)
-    } else if (normalized_display.contains("dispatch")
-        || path.contains("/dispatch")
-        || path.contains("_dispatch"))
-        && !normalized_display.contains("event")
+    } else if (behavioral_node && display_is_process_transport_dispatch(&normalized_display))
+        || ((normalized_display.contains("dispatch")
+            || path.contains("/dispatch")
+            || path.contains("_dispatch"))
+            && !normalized_display.contains("event"))
     {
         Some(PacketEvidenceRole::RequestDispatch)
     } else if packet_citation_owns_transport_adapter(citation) {
@@ -264,7 +265,8 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
     {
         Some(PacketEvidenceRole::SearchDriver)
     } else if behavioral_node
-        && display_is_command_entrypoint(&citation.display_name, &normalized_display, &path)
+        && (display_is_command_entrypoint(&citation.display_name, &normalized_display, &path)
+            || display_is_process_transport_entrypoint(&normalized_display))
     {
         Some(PacketEvidenceRole::CommandEntrypoint)
     } else if (display.contains("event") && display.contains("processor"))
@@ -449,6 +451,30 @@ fn display_is_command_entrypoint(display: &str, normalized_display: &str, path: 
     lower.contains("commands") && !lower.contains("process")
 }
 
+fn display_is_process_transport_dispatch(normalized_display: &str) -> bool {
+    normalized_display_starts_with_any(normalized_display, &["spawn", "launch", "handoff"])
+        && normalized_display_contains_any(normalized_display, &["stdio", "stdin", "stdout", "ipc"])
+        && normalized_display_contains_any(normalized_display, &["runtime", "server", "process"])
+}
+
+fn display_is_process_transport_entrypoint(normalized_display: &str) -> bool {
+    normalized_display_starts_with_any(normalized_display, &["run", "serve", "start"])
+        && normalized_display_contains_any(normalized_display, &["stdio", "stdin", "stdout", "ipc"])
+        && normalized_display_contains_any(normalized_display, &["runtime", "server", "process"])
+}
+
+fn normalized_display_starts_with_any(normalized_display: &str, needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|needle| normalized_display.starts_with(needle))
+}
+
+fn normalized_display_contains_any(normalized_display: &str, needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|needle| normalized_display.contains(needle))
+}
+
 fn path_contains_test_segment(path: &str) -> bool {
     path.starts_with("test/")
         || path.starts_with("tests/")
@@ -569,6 +595,25 @@ mod tests {
         assert_eq!(
             packet_evidence_role(&citation("Application::Cli::run", "src/commands.rs")),
             Some(PacketEvidenceRole::CommandEntrypoint)
+        );
+    }
+
+    #[test]
+    fn process_transport_symbols_have_behavioral_dispatch_and_entrypoint_roles() {
+        assert_eq!(
+            packet_evidence_role(&citation("spawnStdioRuntime", "src/plugin/launcher.js")),
+            Some(PacketEvidenceRole::RequestDispatch)
+        );
+        assert_eq!(
+            packet_evidence_role(&citation("run_stdio_server", "src/transport.rs")),
+            Some(PacketEvidenceRole::CommandEntrypoint)
+        );
+        assert!(
+            !matches!(
+                packet_evidence_role(&citation("stdioRuntimeConfig", "src/config.rs")),
+                Some(PacketEvidenceRole::RequestDispatch | PacketEvidenceRole::CommandEntrypoint)
+            ),
+            "configuration names must not claim process-launch behavior"
         );
     }
 

@@ -398,8 +398,12 @@ pub(crate) fn agent_packet(
 
     let probes = normalize_packet_probe_request(&req.probes, &req.extra_probes);
     let probe_resolutions = resolve_packet_probes(controller, probes);
-    let exact_probe_citations =
-        exact_packet_probe_citations(controller, &probe_resolutions, req.include_evidence);
+    let exact_probe_citations = exact_packet_probe_citations(
+        controller,
+        &probe_resolutions,
+        &question,
+        req.include_evidence,
+    );
     let extra_probes = resolved_packet_probe_queries(&probe_resolutions);
     let mut plan =
         build_packet_plan_with_extra(&question, req.task_class, req.budget, &extra_probes);

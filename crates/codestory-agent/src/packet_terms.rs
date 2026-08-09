@@ -226,6 +226,11 @@ pub fn packet_terms_indicate_indexing_flow(terms: &[String]) -> bool {
 pub fn packet_terms_indicate_request_dispatch_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+    if packet_terms_indicate_process_transport_flow(terms)
+        && !packet_terms_have_explicit_client_http_intent(terms)
+    {
+        return false;
+    }
     let explicit_client_transport = has_any(&[
         "adapter",
         "adapters",
@@ -551,6 +556,11 @@ pub fn packet_terms_indicate_hook_cache_flow(terms: &[String]) -> bool {
 }
 
 pub fn packet_terms_indicate_client_send_flow(terms: &[String]) -> bool {
+    if packet_terms_indicate_process_transport_flow(terms)
+        && !packet_terms_have_explicit_client_http_intent(terms)
+    {
+        return false;
+    }
     let explicit_client_or_http_intent =
         packet_terms_have_any(terms, &["client", "clients", "http", "httpclient"]);
     let request_intent = packet_terms_have_any(terms, &["request", "requests"]);
@@ -563,6 +573,18 @@ pub fn packet_terms_indicate_client_send_flow(terms: &[String]) -> bool {
 
     (explicit_client_or_http_intent && (send_or_transport_intent || convenience_or_helper_intent))
         || (request_intent && send_or_transport_intent)
+}
+
+fn packet_terms_indicate_process_transport_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["stdio", "stdin", "stdout", "ipc"])
+        && packet_terms_have_any(
+            terms,
+            &["plugin", "process", "runtime", "server", "transport"],
+        )
+}
+
+fn packet_terms_have_explicit_client_http_intent(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["client", "clients", "http", "httpclient"])
 }
 
 pub fn packet_terms_indicate_form_validation_flow(terms: &[String]) -> bool {
@@ -783,6 +805,22 @@ mod tests {
             "Trace how Express creates an application, registers middleware routes, and handles an incoming request through the router and response helpers.",
         );
         assert!(!packet_terms_indicate_client_send_flow(&route_terms));
+    }
+
+    #[test]
+    fn process_transport_prompts_do_not_activate_http_client_flows() {
+        let terms = packet_probe_terms(
+            "Explain the plugin request through stdio transport and runtime orchestration.",
+        );
+
+        assert!(!packet_terms_indicate_request_dispatch_flow(&terms));
+        assert!(!packet_terms_indicate_client_send_flow(&terms));
+
+        let adapter_terms = packet_probe_terms(
+            "Explain the plugin request through the stdio process transport adapter.",
+        );
+        assert!(!packet_terms_indicate_request_dispatch_flow(&adapter_terms));
+        assert!(!packet_terms_indicate_client_send_flow(&adapter_terms));
     }
 
     #[test]
