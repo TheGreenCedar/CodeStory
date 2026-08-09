@@ -1,33 +1,31 @@
+#[cfg(any(test, feature = "test-support"))]
+use crate::eval_probes::eval_probes_enabled;
+use crate::packet_citations::packet_citation_source_text;
 #[cfg(test)]
-use crate::agent::eval_probes::eval_probes_enabled;
-use crate::agent::packet_citations::packet_citation_source_text;
-#[cfg(test)]
-use crate::agent::packet_claim_profile_registry::{
+use crate::packet_claim_profile_registry::{
     ClaimProfileContract, ClaimProfileContractViolation, ClaimProfileScope,
     PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET,
 };
-use crate::agent::packet_claim_profile_registry::{
+use crate::packet_claim_profile_registry::{
     ClaimProfileRegistry, ClaimProfileStatus, load_claim_profile_registry,
 };
-use crate::agent::packet_evidence_roles::{
+use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management,
     packet_citation_owns_request_pipeline, packet_evidence_role,
 };
 #[cfg(test)]
-use crate::agent::packet_flow_requirements::{CoverageMode, FlowRole};
+use crate::packet_flow_requirements::{CoverageMode, FlowRole};
 #[cfg(test)]
-use crate::agent::packet_profile_telemetry::PacketProfileFireCount;
-use crate::agent::packet_profile_telemetry::{
-    PacketClaimProfileRegistrySummary, PacketClaimTelemetry,
-};
-use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
-use crate::agent::packet_source_patterns::{
+use crate::packet_profile_telemetry::PacketProfileFireCount;
+use crate::packet_profile_telemetry::{PacketClaimProfileRegistrySummary, PacketClaimTelemetry};
+use crate::packet_scoring::{normalize_identifier, packet_display_path};
+use crate::packet_source_patterns::{
     packet_display_owner, packet_human_join, packet_source_constructed_type, packet_source_has_all,
     packet_source_has_any, packet_source_identifier_ending_with, packet_source_identifier_exact,
     packet_source_identifier_with_words, packet_source_identifier_with_words_shortest,
     packet_sql_create_table_names, packet_sql_foreign_key_claims,
 };
-use crate::agent::packet_terms::{
+use crate::packet_terms::{
     packet_probe_terms, packet_terms_indicate_buffered_io_flow,
     packet_terms_indicate_client_send_flow, packet_terms_indicate_event_loop_command_flow,
     packet_terms_indicate_form_validation_flow, packet_terms_indicate_hook_cache_flow,
@@ -90,7 +88,7 @@ fn source_claim_profile_matcher_ids() -> &'static [&'static str] {
     })
 }
 
-pub(crate) fn claim_profile_registry() -> &'static ClaimProfileRegistry {
+pub fn claim_profile_registry() -> &'static ClaimProfileRegistry {
     static REGISTRY: OnceLock<ClaimProfileRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         load_claim_profile_registry(CLAIM_PROFILE_DOCUMENT, source_claim_profile_matcher_ids())
@@ -145,7 +143,7 @@ impl SourceClaimProductProfile {
     }
 }
 
-pub(crate) fn packet_claim_profile_registry_summary() -> PacketClaimProfileRegistrySummary {
+pub fn packet_claim_profile_registry_summary() -> PacketClaimProfileRegistrySummary {
     let registry = claim_profile_registry();
     PacketClaimProfileRegistrySummary {
         registered: registry.profiles().len(),
@@ -185,7 +183,7 @@ enum SourceClaimProfile {
 impl SourceClaimProfile {
     /// Stable telemetry identity. Counters are keyed by this, never by anything read out of a
     /// citation, so a published fire rate cannot carry repository text.
-    pub(crate) const fn id(self) -> &'static str {
+    pub const fn id(self) -> &'static str {
         match self {
             Self::ServerRoute => "server-route",
             Self::ServerRequestDispatch => "server-request-dispatch",
@@ -384,8 +382,8 @@ impl<'a> SourceClaimContext<'a> {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn packet_source_derived_claims_for_citation(
+#[cfg(any(test, feature = "test-support"))]
+pub fn packet_source_derived_claims_for_citation(
     prompt: &str,
     citation: &AgentCitationDto,
     source: &str,
@@ -394,7 +392,7 @@ pub(crate) fn packet_source_derived_claims_for_citation(
     packet_source_derived_claims_for_citation_counted(prompt, citation, source, &mut telemetry)
 }
 
-pub(crate) fn packet_source_derived_claims_for_citation_counted(
+pub fn packet_source_derived_claims_for_citation_counted(
     prompt: &str,
     citation: &AgentCitationDto,
     source: &str,
@@ -404,11 +402,11 @@ pub(crate) fn packet_source_derived_claims_for_citation_counted(
     let ctx = SourceClaimContext::new(prompt, citation, source);
     telemetry.record_citation_considered();
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if eval_probes_enabled() {
-        claims.extend(
-            crate::agent::eval_probes::source_derived_claims_for_citation(prompt, citation, source),
-        );
+        claims.extend(crate::eval_probes::source_derived_claims_for_citation(
+            prompt, citation, source,
+        ));
     }
 
     for profile in generic_product_claim_profiles() {
@@ -418,7 +416,7 @@ pub(crate) fn packet_source_derived_claims_for_citation_counted(
     claims
 }
 
-pub(crate) fn packet_source_derived_claim_for_role(
+pub fn packet_source_derived_claim_for_role(
     _role: PacketEvidenceRole,
     citation: &AgentCitationDto,
     prompt: &str,
@@ -439,7 +437,7 @@ pub(crate) fn packet_source_derived_claim_for_role(
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         let eval_diagnostics = eval_probes_enabled();
         let command_flow = packet_terms_indicate_event_loop_command_flow(&ctx.prompt_terms);
@@ -1256,10 +1254,7 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
     claims
 }
 
-pub(crate) fn packet_generic_string_predicate_flow_claims(
-    symbol: &str,
-    source: &str,
-) -> Vec<String> {
+pub fn packet_generic_string_predicate_flow_claims(symbol: &str, source: &str) -> Vec<String> {
     let normalized_symbol = normalize_identifier(symbol);
     let source_lower = source.to_ascii_lowercase();
     let mut claims = Vec::new();
@@ -1359,7 +1354,7 @@ fn packet_source_method_block(
     None
 }
 
-pub(crate) fn packet_generic_css_animation_flow_claims(source: &str) -> Vec<String> {
+pub fn packet_generic_css_animation_flow_claims(source: &str) -> Vec<String> {
     let mut claims = Vec::new();
     let custom_properties = packet_css_custom_property_names(source);
     let duration = packet_css_custom_property_with_fragment(&custom_properties, "duration");
@@ -1406,7 +1401,7 @@ pub(crate) fn packet_generic_css_animation_flow_claims(source: &str) -> Vec<Stri
     claims
 }
 
-pub(crate) fn packet_generic_html_css_template_structure_claims(
+pub fn packet_generic_html_css_template_structure_claims(
     file_name: &str,
     source: &str,
 ) -> Vec<String> {
@@ -2329,7 +2324,7 @@ fn packet_mapper_plan_symbol(symbol: &str, file_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::eval_probes::EVAL_PROBES_ENV;
+    use crate::eval_probes::EVAL_PROBES_ENV;
     use codestory_contracts::api::{NodeId, NodeKind, RetrievalScoreBreakdownDto, SearchHitOrigin};
 
     fn test_packet_citation(display_name: &str, file_path: &str) -> AgentCitationDto {
@@ -2369,14 +2364,14 @@ mod tests {
 
     impl EvalProbesGuard {
         fn enabled() -> Self {
-            crate::agent::eval_probes::push_eval_probes_test_override();
+            crate::eval_probes::push_eval_probes_test_override();
             Self
         }
     }
 
     impl Drop for EvalProbesGuard {
         fn drop(&mut self) {
-            crate::agent::eval_probes::pop_eval_probes_test_override();
+            crate::eval_probes::pop_eval_probes_test_override();
         }
     }
 

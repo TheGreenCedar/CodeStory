@@ -18,6 +18,7 @@ pub mod citation;
 pub mod eval_probes;
 pub mod packet_citations;
 pub mod packet_claim_profile_registry;
+pub mod packet_claim_profiles;
 pub mod packet_command;
 pub mod packet_command_profiles;
 pub mod packet_coverage;

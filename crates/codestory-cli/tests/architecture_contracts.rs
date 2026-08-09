@@ -565,6 +565,7 @@ fn agent_planning_crate_owns_planning_and_depends_on_contracts_only() {
         "citation.rs",
         "packet_citations.rs",
         "packet_claim_profile_registry.rs",
+        "packet_claim_profiles.rs",
         "packet_command_profiles.rs",
         "packet_coverage.rs",
         "packet_degradation.rs",
@@ -2074,7 +2075,7 @@ fn packet_claim_profile_contracts_are_enforced_at_runtime_not_only_in_debug_buil
     // ARCH-005 shipped the claim-profile contract behind `debug_assert!`, so a release
     // binary answered from a profile whose calibration no longer held. Validation has to
     // run in the shipped build and skip the profile it rejects.
-    let profiles = read("crates/codestory-runtime/src/agent/packet_claim_profiles.rs");
+    let profiles = read("crates/codestory-agent/src/packet_claim_profiles.rs");
     let production = production_source_prefix(&profiles);
     let registry = read("crates/codestory-agent/src/packet_claim_profile_registry.rs");
     let registry_production = production_source_prefix(&registry);

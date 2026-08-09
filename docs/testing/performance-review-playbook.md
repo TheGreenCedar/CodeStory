@@ -319,7 +319,7 @@ lines they occupy can move without a reviewable diff that restates both numbers.
 The same file carries the `pending_claim_profiles` ratchet: how many product
 claim profiles still ship without an anti-overfit contract and fixture triple.
 The registry itself is checked-in, schema-versioned data
-(`crates/codestory-runtime/src/agent/data/claim_profiles.v2.json`), seeded into
+(`crates/codestory-agent/src/data/claim_profiles.v2.json`), seeded into
 the lint by name because the directory walk collects Rust only — so the document
 carries the same banned-marker pass as the code beside it. The lint counts the
 pending rows in that document, so a new uncontracted profile cannot land without

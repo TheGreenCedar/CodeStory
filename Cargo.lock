@@ -527,6 +527,7 @@ dependencies = [
  "codestory-contracts",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
