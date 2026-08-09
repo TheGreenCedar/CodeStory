@@ -324,6 +324,10 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.ref }}
 
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+
       - name: Run exact-head Windows native probe
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
