@@ -1931,6 +1931,350 @@
           "echo \"Catalog delivery state: $CATALOG_DELIVERY"
         ],
         "reason": "A recovery that cannot name the immutable catalog revision it produced has not recorded a distinguishable identity, only a claim that one happened. The first fragment pins the whole-value revision check; the second pins the delivery-state record that keeps this recovery lane distinguishable from the publication that shipped the plugin."
+      },
+      "plugin_static_install_dependencies": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Install workflow policy dependencies",
+        "fragments": [
+          "npm ci --ignore-scripts"
+        ],
+        "reason": "The policy checker's only dependency is the locked yaml parser, and installing it with npm ci --ignore-scripts keeps the lockfile authoritative and keeps install-time scripts out of the lane that evaluates every other workflow. This fragment pins that exact install so it cannot degrade into an unlocked or script-running npm install."
+      },
+      "plugin_static_workflow_policy": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check workflow policy",
+        "fragments": [
+          "node .github/scripts/check-workflow-policy.mjs",
+          "node --test .github/scripts/check-workflow-policy.test.mjs",
+          "node --test .github/scripts/cargo-cache-contract.test.mjs",
+          "node --test .github/scripts/windows-link-timing.test.mjs"
+        ],
+        "reason": "This step is where the workflow policy proves itself: the checker must run against the real tree with its own hostile-fixture suite beside it, and the Cargo cache contract suite rides along. The Windows linker-timing selector is the only thing standing between a reported msvc_link duration and a substring match over the build log, so its hostile-fixture suite runs wherever the policy itself runs."
+      },
+      "plugin_static_plugin_wiring": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check plugin static wiring",
+        "fragments": [
+          "node --test plugins/codestory/tests/plugin-static.test.mjs"
+        ],
+        "reason": "The plugin's static wiring suite is the only check that proves the shipped plugin manifest, skills, and generated catalog stay mutually consistent; this fragment pins its execution in the lane that gates plugin changes."
+      },
+      "plugin_static_embedded_model": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check embedded model preparation",
+        "fragments": [
+          "node --test scripts/tests/prepare-embedded-model.test.mjs"
+        ],
+        "reason": "The embedded model preparation script stages checksum-pinned model material for every proof lane; its suite must run in the plugin lane so a preparation regression is caught before any lane that downloads a model executes."
+      },
+      "plugin_static_pinned_provision_proof": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check the pinned provision proof",
+        "fragments": [
+          "node --test scripts/tests/prove-plugin-pinned-provision.test.mjs"
+        ],
+        "reason": "The pinned-provision proof is the plugin lane's tag gate. Its own suite has to run somewhere, or a gate that exits 0 without proving anything reads as a pass; this fragment pins that suite to the lane the gate protects."
+      },
+      "plugin_static_marketplace_evidence_contracts": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check release claim and evidence contracts",
+        "fragments": [
+          ".github/scripts/publish-marketplace-catalog.test.mjs",
+          "scripts/tests/release-evidence-runner-contract.test.mjs"
+        ],
+        "reason": "The catalog publisher and the release-evidence runner contract are the two delivery-side programs whose regressions otherwise surface only at publish time; their suites are pinned into the pre-merge lane so a delivery break is caught while it is still recoverable."
+      },
+      "plugin_static_workflow_syntax": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check workflow syntax",
+        "fragments": [
+          "node --test .github/scripts/run-actionlint.test.mjs",
+          "node .github/scripts/run-actionlint.mjs"
+        ],
+        "reason": "actionlint parses every workflow the policy checker reasons about, and the wrapper's own suite proves the pinned binary and the hostile fixture still fail loudly. Both fragments are pinned so syntax checking cannot silently become a no-op wrapper."
+      },
+      "plugin_static_release_claim_contracts": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check release claim and evidence contracts",
+        "fragments": [
+          "scripts/tests/codestory-release-claims.test.mjs",
+          "scripts/tests/codestory-release-closeout.test.mjs",
+          "scripts/tests/codestory-release-evidence-gate.test.mjs"
+        ],
+        "reason": "The release claim graph, the closeout, and the evidence gate are the programs that decide whether a release may ship; their suites must run in the lane that gates every policy and graph edit, so a claims regression cannot merge unproven."
+      },
+      "plugin_static_ci_proof_routing": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check CI proof routing fixtures",
+        "fragments": [
+          "node .github/scripts/route-ci-proof.mjs --self-test"
+        ],
+        "reason": "Proof routing decides which lanes a change must prove itself in; the router's self-test replays its fixture table so a routing edit that silently drops a required lane fails this pinned step."
+      },
+      "plugin_static_packaged_proof_harness": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check packaged proof harness",
+        "fragments": [
+          "python .github/scripts/check-packaged-agent-proof.py --self-test"
+        ],
+        "reason": "The packaged-agent proof harness authenticates candidate archives on protected hosts; its self-test is pinned here so a harness edit cannot merge without replaying its own contract fixtures."
+      },
+      "plugin_static_marketplace_install": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check real Codex marketplace installation",
+        "fragments": [
+          "node --test .github/scripts/install-codestory-marketplace-proof.test.mjs"
+        ],
+        "reason": "The marketplace installation proof is the only check that exercises the real Codex install path end to end against the local fixture; this fragment pins its suite so the shipped install flow cannot drift from the one the proof validates."
+      },
+      "source_proof_resolve_trusted_head": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "resolve",
+        "step": "Resolve trusted exact head",
+        "fragments": [
+          "test \"$EVENT_HEAD_REPO\" = \"$GITHUB_REPOSITORY\"",
+          "test \"$current_head\" = \"$EVENT_HEAD_SHA\"",
+          "head_ref=\"$(jq -r '.head.ref'",
+          "test \"$GITHUB_REF\" = \"refs/heads/$head_ref\"",
+          "test \"$GITHUB_SHA\" = \"$EXPECTED_HEAD_SHA\"",
+          "test \"$GITHUB_SHA\" = \"$CALLER_REF\"",
+          "--ref $head_ref"
+        ],
+        "reason": "The resolve job turns an untrusted dispatch input into the one exact head every downstream gate proves. Each fragment pins one authentication step - the same-repository head, current-head, branch-to-ref, expected-SHA, and caller-ref equality tests, plus the jq head-ref extraction and the --ref checkout binding - so none of the identity checks can be deleted without a reviewed graph edit."
+      },
+      "source_proof_resolve_reuse_gate": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "resolve",
+        "step": "Reuse a completed gate for this exact head",
+        "fragments": [
+          ".path == \".github/workflows/source-proof.yml\"",
+          ".event == \"workflow_dispatch\" and .conclusion == \"success\"",
+          ".name == \"full-source-gate\" and .conclusion == \"success\"",
+          "artifact_name=\"release-cell-prepublish-source-attempt-$run_attempt\"",
+          ".expired == false",
+          "test \"$artifact_count\" = 1 || continue"
+        ],
+        "reason": "Reuse is only sound when the prior run is this workflow, dispatched, successful, and carrying exactly one unexpired source release cell for the same attempt. Each fragment pins one of those conjuncts so a reuse rewrite cannot quietly accept a partial or foreign proof."
+      },
+      "source_proof_resolve_release_freeze": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "resolve",
+        "step": "Require executable release freeze",
+        "fragments": [
+          "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA",
+          "release-freeze-barrier.mjs",
+          "verify-status",
+          "--receipt-digest \"$FREEZE_RECEIPT_DIGEST\""
+        ],
+        "reason": "A frozen head must be proven against the commit the API reports, through the freeze barrier's verify-status path, with the receipt digest bound in - otherwise a freeze claim is a log line, not a gate. The fragments pin that verification chain."
+      },
+      "source_proof_windows_native_qualification_harness": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "step": "Prove the Windows-native qualification harness contracts",
+        "fragments": [
+          "python .github/scripts/check-packaged-agent-proof.py --self-test",
+          "Windows-native qualification harness contracts failed",
+          "past their 90000 ms budget",
+          "Windows-native qualification harness contracts:"
+        ],
+        "reason": "A Windows-native reproduction of the control-directory mismatch is worth nothing if it only reports after a Vulkan SDK install and a release Cargo test have already spent the job. The harness self-test, its failure banner, its 90000 ms budget message, and its report prefix are pinned so the pre-build proof cannot silently weaken."
+      },
+      "source_proof_windows_native_rust_stable": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "step": "Install Rust stable",
+        "fragments": [
+          "rustup toolchain install stable --profile minimal",
+          "rustup default stable"
+        ],
+        "reason": "The Windows contracts compile against the stable toolchain this step installs and selects; pinning both rustup commands keeps the job from silently inheriting whatever toolchain the runner image ships."
+      },
+      "source_proof_windows_native_short_target": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "step": "Configure short Windows Cargo target",
+        "fragments": [
+          "$workspaceTarget = Join-Path $env:GITHUB_WORKSPACE \"target\"",
+          "$shortTarget = Join-Path $runnerRoot \"t\"",
+          "New-Item -ItemType Junction -Path $shortTarget -Target $workspaceTarget",
+          "\"CARGO_TARGET_DIR=$shortTarget\""
+        ],
+        "reason": "Windows path-length limits are exactly what this job exists to exercise, so the Cargo target directory is junctioned to a short root before any build. Each fragment pins one link in that setup - the workspace target, the short target, the junction, and the CARGO_TARGET_DIR export."
+      },
+      "source_proof_windows_native_embedded_model": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "step": "Prepare checksum-pinned embedded model",
+        "fragments": [
+          "node scripts/prepare-embedded-model.mjs"
+        ],
+        "reason": "The native-staging contract stages the embedded model, so the checksum-pinned preparation script must run before the Cargo proof; the fragment pins that invocation."
+      },
+      "source_proof_windows_native_vulkan_sdk": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "step": "Install checksum-pinned Windows Vulkan SDK",
+        "fragments": [
+          ".github/scripts/install-windows-vulkan-sdk.ps1"
+        ],
+        "reason": "The Vulkan SDK reaches the job over the network, so installation must go through the checksum-pinned installer script; the fragment pins that path so an inline download cannot replace it."
+      },
+      "source_proof_windows_native_source_contracts": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "step": "Prove Windows path and native-staging source contracts",
+        "fragments": [
+          "cargo test --release --locked",
+          "-p codestory-workspace --test windows_path_identity",
+          "-p codestory-llama-sys --test native_staging",
+          "Windows native source contracts failed",
+          "Windows path and native-staging source contracts:"
+        ],
+        "reason": "The one release-mode Cargo invocation proves both the Windows path identity and the native staging contracts and must say so when it fails. The fragments pin the locked release test, both -p test selectors, the failure banner, and the report prefix."
+      },
+      "source_proof_full_gate_compiler_cache_env": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Configure bounded compiler cache",
+        "fragments": [
+          "CARGO_HOME=$RUNNER_TEMP/codestory-source-cargo",
+          "SCCACHE_DIR=$RUNNER_TEMP/codestory-source-sccache",
+          "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE",
+          "RUSTC_WRAPPER=sccache",
+          "CARGO_INCREMENTAL=0",
+          "CMAKE_C_COMPILER_LAUNCHER=sccache",
+          "CMAKE_CXX_COMPILER_LAUNCHER=sccache"
+        ],
+        "reason": "The full gate's caches are only sound while every compiler write lands under the runner-temp roots with sccache wrapping both rustc and CMake and incremental compilation off. Each fragment pins one of those environment bindings so the cache contract cannot drift by a step edit."
+      },
+      "source_proof_full_gate_dependency_cache_bound": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Bound Cargo dependency cache",
+        "fragments": [
+          "--max-bytes \"$CARGO_DEPENDENCY_CACHE_MAX_BYTES\"",
+          "--path \"$CARGO_HOME/registry\"",
+          "--path \"$CARGO_HOME/git\""
+        ],
+        "reason": "An unbounded dependency cache grows until restores are slower than cold installs; the bound step must measure exactly the registry and git paths against the declared byte limit. The fragments pin the limit flag and both measured paths."
+      },
+      "source_proof_full_gate_compile": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Compile the complete workspace test suite",
+        "fragments": [
+          "cargo test --workspace --locked --no-run"
+        ],
+        "reason": "Compilation is separated from execution so cache state can be saved even when tests later fail; the fragment pins the locked --no-run workspace compile that staging relies on."
+      },
+      "source_proof_full_gate_cache_restore_report": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Report compiler cache restore",
+        "fragments": [
+          "--requested-key",
+          "--matched-key",
+          "--compatibility-prefix",
+          "--cache-hit",
+          "--path \"$SCCACHE_DIR\""
+        ],
+        "reason": "A cache that degrades silently is indistinguishable from one that works; the restore report must record the requested and matched keys, the compatibility prefix, the hit flag, and the measured path. Each fragment pins one of those recorded facts."
+      },
+      "source_proof_full_gate_cache_save_report": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Report compiler cache save",
+        "fragments": [
+          "--restored-bytes",
+          "--started-ms",
+          "--ended-ms",
+          "--save-started-ms",
+          "--save-result",
+          "--path \"$SCCACHE_DIR\""
+        ],
+        "reason": "The save report closes the cache ledger: restored bytes, the compile clock, the save clock, the save result, and the measured path. Each fragment pins one recorded fact so cache health stays observable across runs."
+      },
+      "source_proof_full_gate_compilation_outcome": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Require successful source compilation",
+        "fragments": [
+          "test \"$COMPILE_OUTCOME\" = success",
+          "test \"$LINT_OUTCOME\" = success"
+        ],
+        "reason": "Compile and lint run with continue-on-error so cache state survives a failure, which is only honest if a later step turns their real outcomes back into the job's verdict; the fragments pin both outcome tests."
+      },
+      "source_proof_full_gate_workspace_tests": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Test the complete workspace once",
+        "fragments": [
+          "cargo nextest run --workspace --locked",
+          "cargo test --workspace --doc --locked"
+        ],
+        "reason": "nextest owns unit and integration execution; the doc pass rides along so a future doctest can never silently stop being run, because nextest does not execute doctests. Both locked invocations are pinned."
+      },
+      "source_proof_full_gate_clippy": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Lint every workspace target and feature once",
+        "fragments": [
+          "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"
+        ],
+        "reason": "The single clippy pass covers every target and feature with warnings promoted to errors; the fragment pins that exact locked invocation so lint coverage cannot quietly narrow."
+      },
+      "source_proof_full_gate_release_cell": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Emit authenticated source release cell",
+        "fragments": [
+          "codestory-release-cell-manifest.mjs produce",
+          "--cell-id source_behavior",
+          "--producer-job full-source-gate",
+          "--expected-sha \"$RESOLVED_REF\""
+        ],
+        "reason": "The source release cell is the proof the release chain later consumes, so it must be produced by the manifest tool, name the source_behavior cell and this producer job, and bind the resolved SHA. Each fragment pins one of those identity conjuncts."
       }
     },
     "structural_pins": {
@@ -1979,6 +2323,51 @@
         "scope": "actions",
         "access": "read",
         "reason": "The smoke verifies a release that already shipped, and its only trusted input from the release run is the accepted pre-publish closeout artifact. Downloading that artifact needs exactly actions: read, pinned here so the reusable workflow's token cannot silently widen toward write access on the Actions surface it merely reads, and cannot silently drop the scope and leave the closeout unreadable."
+      },
+      "plugin_static_job": {
+        "kind": "job",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "reason": "The plugin lane exists only through this job: it is the sole pre-merge gate that runs the policy checker, the claim-graph suites, and the plugin proofs. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments then constrain what the surviving job must run."
+      },
+      "rust_ci_linux_draft_job": {
+        "kind": "job",
+        "file": "rust-ci.yml",
+        "job": "linux-draft",
+        "reason": "The draft lane exists only through this job: it is the serial Linux proof every pull request must pass before review. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the checker's draft-source rules and the graph-owned command lists then constrain what the surviving job must run."
+      },
+      "source_proof_resolve_job": {
+        "kind": "job",
+        "file": "source-proof.yml",
+        "job": "resolve",
+        "reason": "Every other job in the source proof checks out the ref this job resolves, so deleting or renaming it would sever the trusted-head chain the whole workflow exists to enforce. Its existence is pinned here; the graph-owned step fragments then constrain the authentication checks the surviving job must run."
+      },
+      "source_proof_full_source_gate_job": {
+        "kind": "job",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "reason": "The full source gate is the one job that compiles, lints, and tests the complete workspace and emits the authenticated source release cell. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments and the checker's cache rules then constrain what the surviving job must run."
+      },
+      "source_proof_full_source_gate_needs_resolve": {
+        "kind": "needs",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "needs": [
+          "resolve"
+        ],
+        "reason": "The full source gate proves exactly the head the resolve job authenticated, so its needs edge must name resolve and nothing else - an added dependency would let another job influence when the gate runs, and a dropped one would let it run on an unresolved ref. The edge is pinned here so it cannot change by a workflow edit alone."
+      },
+      "source_proof_retrieval_generalization_job": {
+        "kind": "job",
+        "file": "source-proof.yml",
+        "job": "retrieval-generalization",
+        "reason": "The generalization lint runs as its own blocking job so a lint failure is attributable and cannot hide inside a larger gate. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the checker's exact-shape rules then constrain the surviving job's steps."
+      },
+      "source_proof_windows_native_contracts_job": {
+        "kind": "job",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "reason": "The Windows-native contracts job is the only place the path-identity and native-staging tests run on a real Windows toolchain before merge. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments and the checker's shape rules then constrain what the surviving job must run."
       }
     },
     "constant_mirrors": {

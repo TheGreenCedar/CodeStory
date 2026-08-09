@@ -1086,12 +1086,13 @@ export function stepFragmentViolations(workflows, graph = loadReleaseClaimGraph(
 // release-claims.json under workflow_policy.structural_pins; scripts/
 // codestory-release-claims.mjs fails graph loading unless that block names exactly
 // the reviewed pin rows, so membership cannot drift by data edit. The checker keeps
-// only what stays code: the job-existence and permission-scope predicates each row's
-// kind selects, whose violation text is byte-identical to the retired inline calls.
+// only what stays code: the job-existence, needs-edge, and permission-scope
+// predicates each row's kind selects, whose violation text is byte-identical to the
+// retired inline calls.
 // A missing workflow is reported by the structural validator that owns the file, so
-// each row evaluates only when its subject workflow parsed; a missing job or an
-// absent, weaker, or wider permission scope fails the pin predicates exactly as the
-// retired inline checks did.
+// each row evaluates only when its subject workflow parsed; a missing job, a
+// missing or widened needs edge, or an absent, weaker, or wider permission scope
+// fails the pin predicates exactly as the retired inline checks did.
 //
 // Some retired inline checks named the artifact a scope protects rather than the
 // scope itself; that reviewed violation text stays code, keyed by pin name, and the
@@ -1112,6 +1113,12 @@ export function structuralPinViolations(workflows, graph = loadReleaseClaimGraph
         violations,
         object(workflow.jobs)[row.job] !== undefined,
         `${row.file} must contain job ${row.job}`,
+      );
+    } else if (row.kind === "needs") {
+      add(
+        violations,
+        sameMembers(needs(object(object(workflow.jobs)[row.job])), list(row.needs)),
+        `${row.file} ${String(row.job).replaceAll("-", " ")} must need ${list(row.needs).join(", ")}`,
       );
     } else {
       const message = structuralPinMessages[name];
@@ -2380,42 +2387,12 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       add(violations, includesAll(at(plugin, "on", event, "paths"), requiredPaths), `${pluginFile} ${event} paths must cover policy and release surfaces`);
     }
     add(violations, includesAll(at(plugin, "on", "push", "branches"), ["dev/codestory-next"]), `${pluginFile} must run on dev pushes`);
-    const job = requireJob(violations, pluginFile, plugin, "plugin-static");
-    requireStepRun(violations, pluginFile, job, "Install workflow policy dependencies", ["npm ci --ignore-scripts"]);
-    requireStepRun(violations, pluginFile, job, "Check workflow policy", [
-      "node .github/scripts/check-workflow-policy.mjs",
-      "node --test .github/scripts/check-workflow-policy.test.mjs",
-      "node --test .github/scripts/cargo-cache-contract.test.mjs",
-      // The Windows linker-timing selector is the only thing standing between a
-      // reported `msvc_link` duration and a substring match over the build log,
-      // so its hostile-fixture suite runs wherever the policy itself runs.
-      "node --test .github/scripts/windows-link-timing.test.mjs",
-    ]);
-    requireStepRun(violations, pluginFile, job, "Check plugin static wiring", ["node --test plugins/codestory/tests/plugin-static.test.mjs"]);
-    requireStepRun(violations, pluginFile, job, "Check embedded model preparation", ["node --test scripts/tests/prepare-embedded-model.test.mjs"]);
-    // The pinned-provision proof is the plugin lane's tag gate. Its own suite has to run
-    // somewhere, or a gate that exits 0 without proving anything reads as a pass.
-    requireStepRun(violations, pluginFile, job, "Check the pinned provision proof", [
-      "node --test scripts/tests/prove-plugin-pinned-provision.test.mjs",
-    ]);
-    requireStepRun(violations, pluginFile, job, "Check release claim and evidence contracts", [
-      ".github/scripts/publish-marketplace-catalog.test.mjs",
-      "scripts/tests/release-evidence-runner-contract.test.mjs",
-    ]);
-    requireStepRun(violations, pluginFile, job, "Check workflow syntax", [
-      "node --test .github/scripts/run-actionlint.test.mjs",
-      "node .github/scripts/run-actionlint.mjs",
-    ]);
-    requireStepRun(violations, pluginFile, job, "Check release claim and evidence contracts", [
-      "scripts/tests/codestory-release-claims.test.mjs",
-      "scripts/tests/codestory-release-closeout.test.mjs",
-      "scripts/tests/codestory-release-evidence-gate.test.mjs",
-    ]);
-    requireStepRun(violations, pluginFile, job, "Check CI proof routing fixtures", ["node .github/scripts/route-ci-proof.mjs --self-test"]);
-    requireStepRun(violations, pluginFile, job, "Check packaged proof harness", ["python .github/scripts/check-packaged-agent-proof.py --self-test"]);
-    requireStepRun(violations, pluginFile, job, "Check real Codex marketplace installation", [
-      "node --test .github/scripts/install-codestory-marketplace-proof.test.mjs",
-    ]);
+    // The plugin lane's structural pin (job existence) is a rule instance and
+    // lives in release-claims.json under workflow_policy.structural_pins;
+    // structuralPinViolations evaluates it. The lane's step fragments - the
+    // policy, wiring, proof, and contract suites the surviving job must run -
+    // are rule instances and live in release-claims.json under
+    // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
   }
 
   const rustFile = "rust-ci.yml";
@@ -2435,7 +2412,10 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "plugins/codestory/skills/codestory-grounding/**",
       "scripts/generate-codestory-skill-syntax.mjs",
     ]), `${rustFile} must cover workspace source and generated catalog changes`);
-    const job = requireJob(violations, rustFile, rust, "linux-draft");
+    // The draft lane's structural pin (job existence) is a rule instance and
+    // lives in release-claims.json under workflow_policy.structural_pins;
+    // structuralPinViolations evaluates it.
+    const job = object(object(rust.jobs)["linux-draft"]);
     const retrievalWorkflow = workflows.get(retrievalFile);
     for (const violation of retrievalProducerTriggerPolicyViolations(retrievalWorkflow)) {
       violations.push(`${retrievalFile} ${violation}`);
@@ -2478,48 +2458,32 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       `${sourceFile} manual PR input must require ${promotion.manual_pr_ref_hint}`,
     );
     add(violations, trigger(source, "pull_request_target") === undefined, `${sourceFile} must not execute pull-request code through pull_request_target`);
-    const resolve = requireJob(violations, sourceFile, source, "resolve");
+    // The resolve job's structural pin (job existence) is a rule instance and
+    // lives in release-claims.json under workflow_policy.structural_pins;
+    // structuralPinViolations evaluates it.
+    const resolve = object(object(source.jobs).resolve);
     add(
       violations,
       resolve.if === undefined,
       `${sourceFile} resolve job must execute only explicit dispatch and reusable calls`,
     );
-    requireStepRun(violations, sourceFile, resolve, "Resolve trusted exact head", [
-      'test "$EVENT_HEAD_REPO" = "$GITHUB_REPOSITORY"',
-      'test "$current_head" = "$EVENT_HEAD_SHA"',
-      'head_ref="$(jq -r \'.head.ref\'',
-      'test "$GITHUB_REF" = "refs/heads/$head_ref"',
-      'test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA"',
-      'test "$GITHUB_SHA" = "$CALLER_REF"',
-      "--ref $head_ref",
-    ]);
-    requireStepRun(violations, sourceFile, resolve, "Reuse a completed gate for this exact head", [
-      '.path == ".github/workflows/source-proof.yml"',
-      '.event == "workflow_dispatch" and .conclusion == "success"',
-      '.name == "full-source-gate" and .conclusion == "success"',
-      'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
-      ".expired == false",
-      'test "$artifact_count" = 1 || continue',
-    ]);
-    requireStepRun(violations, sourceFile, resolve, "Require executable release freeze", [
-      "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA",
-      "release-freeze-barrier.mjs",
-      "verify-status",
-      '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
-    ]);
-    const full = requireJob(violations, sourceFile, source, "full-source-gate");
-    add(violations, sameMembers(needs(full), ["resolve"]), `${sourceFile} full source gate must need resolve`);
+    // The resolve job's step fragments - the trusted-head resolution, the
+    // exact-head gate reuse, and the executable release freeze - are rule
+    // instances and live in release-claims.json under
+    // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+    // The full source gate's structural pins (job existence and its needs edge
+    // to resolve) are rule instances and live in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates them.
+    const full = object(object(source.jobs)["full-source-gate"]);
     add(
       violations,
       full.if === "${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}",
       `${sourceFile} full source gate may skip only a completed exact-head proof`,
     );
-    const generalization = requireJob(
-      violations,
-      sourceFile,
-      source,
-      "retrieval-generalization",
-    );
+    // The retrieval generalization job's structural pin (job existence) is a
+    // rule instance and lives in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+    const generalization = object(object(source.jobs)["retrieval-generalization"]);
     add(
       violations,
       hasExactKeys(generalization, [
@@ -2584,12 +2548,10 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         `${sourceFile} retrieval generalization ${name} must run its exact blocking Node command`,
       );
     }
-    const windowsNative = requireJob(
-      violations,
-      sourceFile,
-      source,
-      "windows-native-contracts",
-    );
+    // The Windows native contracts job's structural pin (job existence) is a
+    // rule instance and lives in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+    const windowsNative = object(object(source.jobs)["windows-native-contracts"]);
     add(
       violations,
       hasExactKeys(windowsNative, [
@@ -2630,61 +2592,11 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         === "Prove the Windows-native qualification harness contracts",
       `${sourceFile} Windows native source contracts must prove the qualification harness before any build step`,
     );
-    requireStepRun(
-      violations,
-      sourceFile,
-      windowsNative,
-      "Prove the Windows-native qualification harness contracts",
-      [
-        "python .github/scripts/check-packaged-agent-proof.py --self-test",
-        "Windows-native qualification harness contracts failed",
-        "past their 90000 ms budget",
-        "Windows-native qualification harness contracts:",
-      ],
-    );
-    requireStepRun(violations, sourceFile, windowsNative, "Install Rust stable", [
-      "rustup toolchain install stable --profile minimal",
-      "rustup default stable",
-    ]);
-    requireStepRun(
-      violations,
-      sourceFile,
-      windowsNative,
-      "Configure short Windows Cargo target",
-      [
-        '$workspaceTarget = Join-Path $env:GITHUB_WORKSPACE "target"',
-        '$shortTarget = Join-Path $runnerRoot "t"',
-        "New-Item -ItemType Junction -Path $shortTarget -Target $workspaceTarget",
-        '"CARGO_TARGET_DIR=$shortTarget"',
-      ],
-    );
-    requireStepRun(
-      violations,
-      sourceFile,
-      windowsNative,
-      "Prepare checksum-pinned embedded model",
-      ["node scripts/prepare-embedded-model.mjs"],
-    );
-    requireStepRun(
-      violations,
-      sourceFile,
-      windowsNative,
-      "Install checksum-pinned Windows Vulkan SDK",
-      [".github/scripts/install-windows-vulkan-sdk.ps1"],
-    );
-    requireStepRun(
-      violations,
-      sourceFile,
-      windowsNative,
-      "Prove Windows path and native-staging source contracts",
-      [
-        "cargo test --release --locked",
-        "-p codestory-workspace --test windows_path_identity",
-        "-p codestory-llama-sys --test native_staging",
-        "Windows native source contracts failed",
-        "Windows path and native-staging source contracts:",
-      ],
-    );
+    // The Windows native contracts job's step fragments - the qualification
+    // harness, toolchain, short-target, embedded-model, Vulkan SDK, and
+    // source-contract steps - are rule instances and live in release-claims.json
+    // under workflow_policy.step_fragments; stepFragmentViolations evaluates
+    // them.
     const windowsNativeRun = shellLiteralNormalizedText(stepRun(
       windowsNative,
       "Prove Windows path and native-staging source contracts",
@@ -2710,15 +2622,11 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && object(sccacheSetup?.with).version === "${{ env.SCCACHE_VERSION }}",
       `${sourceFile} must install the pinned sccache action and binary`,
     );
-    requireStepRun(violations, sourceFile, full, "Configure bounded compiler cache", [
-      "CARGO_HOME=$RUNNER_TEMP/codestory-source-cargo",
-      "SCCACHE_DIR=$RUNNER_TEMP/codestory-source-sccache",
-      "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE",
-      "RUSTC_WRAPPER=sccache",
-      "CARGO_INCREMENTAL=0",
-      "CMAKE_C_COMPILER_LAUNCHER=sccache",
-      "CMAKE_CXX_COMPILER_LAUNCHER=sccache",
-    ]);
+    // The full source gate's step fragments - the bounded cache environment, the
+    // cache-bound and reporting steps, the compile, test, lint, and outcome
+    // steps, and the source release cell - are rule instances and live in
+    // release-claims.json under workflow_policy.step_fragments;
+    // stepFragmentViolations evaluates them.
     const identity = namedStep(full, "Capture reusable build cache contract");
     const identityRun = executableRunText(String(identity?.run ?? ""));
     add(
@@ -2772,11 +2680,6 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     );
     const dependencySave = namedStep(full, "Save Cargo dependency inputs");
     const compilerSave = namedStep(full, "Save compiler objects after compilation");
-    requireStepRun(violations, sourceFile, full, "Bound Cargo dependency cache", [
-      "--max-bytes \"$CARGO_DEPENDENCY_CACHE_MAX_BYTES\"",
-      "--path \"$CARGO_HOME/registry\"",
-      "--path \"$CARGO_HOME/git\"",
-    ]);
     add(
       violations,
       dependencySave?.uses === "actions/cache/save@v5"
@@ -2821,28 +2724,6 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && compilerSaveIndex < stepIndex(full, "Emit authenticated source release cell"),
       `${sourceFile} compiler cache must save before test execution or release-cell failure`,
     );
-    requireStepRun(violations, sourceFile, full, "Compile the complete workspace test suite", [
-      "cargo test --workspace --locked --no-run",
-    ]);
-    requireStepRun(violations, sourceFile, full, "Report compiler cache restore", [
-      "--requested-key",
-      "--matched-key",
-      "--compatibility-prefix",
-      "--cache-hit",
-      "--path \"$SCCACHE_DIR\"",
-    ]);
-    requireStepRun(violations, sourceFile, full, "Report compiler cache save", [
-      "--restored-bytes",
-      "--started-ms",
-      "--ended-ms",
-      "--save-started-ms",
-      "--save-result",
-      "--path \"$SCCACHE_DIR\"",
-    ]);
-    requireStepRun(violations, sourceFile, full, "Require successful source compilation", [
-      'test "$COMPILE_OUTCOME" = success',
-      'test "$LINT_OUTCOME" = success',
-    ]);
     const compile = namedStep(full, "Compile the complete workspace test suite");
     const lint = namedStep(full, "Lint every workspace target and feature once");
     add(
@@ -2852,12 +2733,6 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && lint?.if === "steps.compile-workspace.outcome == 'success'",
       `${sourceFile} compilation and lint must preserve cache state before reporting failure`,
     );
-    // nextest owns unit/integration execution; the doc pass rides along so a future doctest can
-    // never silently stop being run (nextest does not execute doctests).
-    requireStepRun(violations, sourceFile, full, "Test the complete workspace once", [
-      "cargo nextest run --workspace --locked",
-      "cargo test --workspace --doc --locked",
-    ]);
     requireStepRun(violations, sourceFile, full, "Install pinned cargo-nextest", [
       `cargo-nextest-${nextestVersion}-x86_64-unknown-linux-gnu.tar.gz`,
       `${pinnedProgramRow(graph, "nextest_linux_archive").sha256}  $RUNNER_TEMP/cargo-nextest.tar.gz`,
@@ -2871,13 +2746,6 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
           < stepIndex(full, "Test the complete workspace once"),
       `${sourceFile} must install the pinned test runner before the workspace test step`,
     );
-    requireStepRun(violations, sourceFile, full, "Lint every workspace target and feature once", ["cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"]);
-    requireStepRun(violations, sourceFile, full, "Emit authenticated source release cell", [
-      "codestory-release-cell-manifest.mjs produce",
-      "--cell-id source_behavior",
-      "--producer-job full-source-gate",
-      '--expected-sha "$RESOLVED_REF"',
-    ]);
     requireStepEnv(violations, sourceFile, full, "Emit authenticated source release cell", {
       RESOLVED_REF: "${{ needs.resolve.outputs.ref }}",
     });
