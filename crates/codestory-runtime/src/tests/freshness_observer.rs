@@ -313,7 +313,7 @@ fn a_write_that_races_the_scan_is_reported_stale_instead_of_fresh() {
             .collect::<Vec<_>>(),
         vec![(
             IndexFreshnessChangeKindDto::Changed,
-            Path::new("src").join("lib.rs").to_string_lossy().as_ref()
+            "src/lib.rs"
         )]
     );
 }
@@ -353,7 +353,7 @@ fn the_scan_runs_inside_the_window_the_observer_sealed() {
             .iter()
             .map(|sample| sample.path.as_str())
             .collect::<Vec<_>>(),
-        vec![Path::new("src").join("lib.rs").to_string_lossy().as_ref()]
+        vec!["src/lib.rs"]
     );
 }
 

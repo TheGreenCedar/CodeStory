@@ -835,7 +835,7 @@ fn observer_escalation(
         .take(INDEX_FRESHNESS_SAMPLE_LIMIT)
         .map(|(kind, relative)| IndexFreshnessSampleDto {
             kind,
-            path: relative.to_string_lossy().to_string(),
+            path: relative.to_string_lossy().replace('\\', "/"),
         })
         .collect();
     Some(ObserverEscalation {

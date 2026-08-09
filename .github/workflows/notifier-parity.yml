@@ -89,10 +89,24 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
       # The WSL runner service does not inherit the interactive shell's user
-      # Cargo path even though the pinned rustup installation lives there.
-      - name: Expose the protected-host Rust toolchain
+      # toolchain paths even though the pinned Rust and native build dependencies
+      # live there.
+      - name: Expose the protected-host toolchain
         shell: bash
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        run: |
+          set -euo pipefail
+          brew_prefix=/home/linuxbrew/.linuxbrew
+          test -f "$brew_prefix/include/spirv/unified1/spirv.hpp"
+          test -f "$brew_prefix/lib/libclang.so"
+          {
+            echo "$HOME/.cargo/bin"
+            echo "$brew_prefix/bin"
+          } >> "$GITHUB_PATH"
+          {
+            echo "CPLUS_INCLUDE_PATH=$brew_prefix/include"
+            echo "LIBCLANG_PATH=$brew_prefix/lib"
+            echo "BINDGEN_EXTRA_CLANG_ARGS=-resource-dir=$($brew_prefix/opt/llvm/bin/clang -print-resource-dir)"
+          } >> "$GITHUB_ENV"
       - name: Install pinned Rust
         shell: bash
         run: |
