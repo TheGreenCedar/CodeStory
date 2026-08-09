@@ -1966,6 +1966,19 @@
         "scope": "pull-requests",
         "access": "read",
         "reason": "The automation authenticates a close request by reading the merged pull request - merge commit, base branch, and stack metadata - before it touches any issue. That verification needs only pull-requests: read, pinned here so the read-side scope cannot widen into write access on the automation's token."
+      },
+      "post_publish_smoke_job": {
+        "kind": "job",
+        "file": "post-publish-release-smoke.yml",
+        "job": "smoke",
+        "reason": "The post-publish check exists only through this job: it is the sole matrix that proves the published release still installs and answers on every platform after publication. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the checker's step and toolchain pins then constrain what the surviving job must run."
+      },
+      "post_publish_smoke_actions_read": {
+        "kind": "permission",
+        "file": "post-publish-release-smoke.yml",
+        "scope": "actions",
+        "access": "read",
+        "reason": "The smoke verifies a release that already shipped, and its only trusted input from the release run is the accepted pre-publish closeout artifact. Downloading that artifact needs exactly actions: read, pinned here so the reusable workflow's token cannot silently widen toward write access on the Actions surface it merely reads, and cannot silently drop the scope and leave the closeout unreadable."
       }
     },
     "constant_mirrors": {

@@ -1092,9 +1092,18 @@ export function stepFragmentViolations(workflows, graph = loadReleaseClaimGraph(
 // each row evaluates only when its subject workflow parsed; a missing job or an
 // absent, weaker, or wider permission scope fails the pin predicates exactly as the
 // retired inline checks did.
+//
+// Some retired inline checks named the artifact a scope protects rather than the
+// scope itself; that reviewed violation text stays code, keyed by pin name, and the
+// derived scope wording remains the default for every other permission row.
+const structuralPinMessages = {
+  post_publish_smoke_actions_read:
+    row => `${row.file} must read the accepted pre-publish closeout`,
+};
+
 export function structuralPinViolations(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
-  for (const value of Object.values(object(object(graph.workflow_policy).structural_pins))) {
+  for (const [name, value] of Object.entries(object(object(graph.workflow_policy).structural_pins))) {
     const row = object(value);
     const workflow = workflows.get(row.file);
     if (!workflow) continue;
@@ -1105,10 +1114,13 @@ export function structuralPinViolations(workflows, graph = loadReleaseClaimGraph
         `${row.file} must contain job ${row.job}`,
       );
     } else {
+      const message = structuralPinMessages[name];
       add(
         violations,
         object(workflow.permissions)[row.scope] === row.access,
-        `${row.file} must ${row.access} ${String(row.scope).replaceAll("-", " ")}`,
+        message === undefined
+          ? `${row.file} must ${row.access} ${String(row.scope).replaceAll("-", " ")}`
+          : message(row),
       );
     }
   }
@@ -4950,7 +4962,9 @@ function validatePostPublish(workflows, violations, graph) {
     return;
   }
   add(violations, trigger(workflow, "workflow_call") !== undefined, `${file} must be reusable`);
-  add(violations, object(workflow.permissions).actions === "read", `${file} must read the accepted pre-publish closeout`);
+  // The smoke workflow's structural pins (job existence and its permission scope)
+  // are rule instances and live in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates them.
   requireNoCalibrationReferences(violations, file, workflow);
   for (const event of ["workflow_call", "workflow_dispatch"]) {
     // The catalog revision is now empty exactly when publication was deferred, so the required
@@ -4979,7 +4993,7 @@ function validatePostPublish(workflows, violations, graph) {
     const closeoutInput = object(at(workflow, "on", event, "inputs", "pre_publish_closeout_artifact"));
     add(violations, closeoutInput.type === "string", `${file} ${event} pre_publish_closeout_artifact must be a string`);
   }
-  const job = requireJob(violations, file, workflow, "smoke");
+  const job = object(object(workflow.jobs).smoke);
   const pythonSetup = namedStep(job, "Install pinned Python");
   add(
     violations,

@@ -130,6 +130,8 @@ const STRUCTURAL_PIN_CONTRACTS = new Map([
   ["close_dev_issues_job", { kind: "job" }],
   ["close_dev_issues_issues_write", { kind: "permission" }],
   ["close_dev_issues_pull_requests_read", { kind: "permission" }],
+  ["post_publish_smoke_job", { kind: "job" }],
+  ["post_publish_smoke_actions_read", { kind: "permission" }],
 ]);
 // The graph owns every cross-file constant-mirror rule instance (a repository file
 // that must repeat a reviewed constant verbatim) for families migrated off inline
