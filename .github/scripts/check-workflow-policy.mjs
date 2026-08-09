@@ -1137,57 +1137,22 @@ export function constantMirrorViolations(graph = loadReleaseClaimGraph(repositor
   return violations;
 }
 
-const draftProofCommands = [
-  "cargo test --locked -p codestory-llama-sys --test native_staging",
-  "cargo test --locked -p codestory-llama-sys --test model_staging",
-  "cargo test --locked -p codestory-cli --test native_launcher_contracts",
-  "cargo test --locked -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
-  "cargo test --locked -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture",
-  "cargo test --locked -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture",
-];
-const draftSeedCommands = [
-  "cargo test --locked -p codestory-llama-sys --test native_staging --no-run",
-  "cargo test --locked -p codestory-llama-sys --test model_staging --no-run",
-  "cargo test --locked -p codestory-cli --test stdio_protocol_contracts --no-run two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
-  "cargo test --locked -p codestory-runtime --no-run publication_transitions_fail_or_cancel_atomically -- --nocapture",
-  "cargo test --locked -p codestory-store --no-run staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture",
-];
-const draftProofTopologyDigest = createHash("sha256")
-  .update(draftSeedCommands.join("\n"))
-  .digest("hex");
-const draftProofTopology = `proof5-v1-${draftProofTopologyDigest}`;
+// Every draft command-list rule INSTANCE (the exact serial proof commands the
+// draft lane must run and the exact seed commands the retrieval producer must
+// build) lives in release-claims.json under workflow_policy.command_lists;
+// scripts/codestory-release-claims.mjs fails graph loading unless that block names
+// exactly the reviewed list rows, so membership cannot drift by data edit. The
+// checker keeps only what stays code: the one sequence-equality predicate every
+// row binds, its reviewed violation messages, and the cache-key composition that
+// digests the graph-declared seed commands into the shared proof topology.
+function commandListRow(graph, name) {
+  return object(object(object(graph.workflow_policy).command_lists)[name]);
+}
 const cacheRunner = "${{ runner.os }}";
 const cacheRustVersion = "${{ steps.rust-cache-key.outputs.version }}";
 const cacheTarget = "${{ steps.rust-cache-key.outputs.target }}";
 const cacheManifests = "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}";
 const cacheLock = "${{ hashFiles('Cargo.lock') }}";
-const draftCachePrefix = [
-  cacheRunner,
-  "draft-v2",
-  cacheRustVersion,
-  cacheTarget,
-  "workspace",
-  draftProofTopology,
-  "default-features",
-  cacheManifests,
-].join("-");
-const retrievalCachePrefix = [
-  cacheRunner,
-  "cargo-stable",
-  cacheRustVersion,
-  cacheTarget,
-  "retrieval-contracts",
-  draftProofTopology,
-  "default-features",
-  cacheManifests,
-].join("-");
-const draftCachePrimary = `${draftCachePrefix}-${cacheLock}`;
-const retrievalCachePrimary = `${retrievalCachePrefix}-${cacheLock}`;
-const draftCacheRestoreKeys = [
-  retrievalCachePrimary,
-  `${draftCachePrefix}-`,
-  `${retrievalCachePrefix}-`,
-];
 const cacheSaveCondition = "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''";
 const draftCompilerCachePath = "${{ runner.temp }}/codestory-draft-sccache";
 const draftCompilerCachePrefix =
@@ -1356,7 +1321,6 @@ const draftRunCommands = new Map([
   ["Lint workspace libraries", [
     "cargo clippy --workspace --lib --locked -- -D warnings",
   ]],
-  ["Prove focused publication contracts", draftProofCommands],
 ]);
 
 function nonCommentLines(value) {
@@ -1921,11 +1885,49 @@ export function windowsManifestProofPolicyViolations(workflowValue) {
   return violations;
 }
 
-export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
+export function draftSourcePolicyViolations(
+  jobValue,
+  retrievalJobValue,
+  graph = loadReleaseClaimGraph(repositoryRoot),
+) {
   const violations = [];
   const job = object(jobValue);
   const retrievalJob = object(retrievalJobValue);
   const steps = list(job.steps).map(object);
+  const proofRow = commandListRow(graph, "draft_proof_commands");
+  const seedRow = commandListRow(graph, "draft_seed_commands");
+  const proofCommands = list(proofRow.commands).map(String);
+  const seedCommands = list(seedRow.commands).map(String);
+  const draftProofTopology = `proof5-v1-${createHash("sha256")
+    .update(seedCommands.join("\n"))
+    .digest("hex")}`;
+  const draftCachePrefix = [
+    cacheRunner,
+    "draft-v2",
+    cacheRustVersion,
+    cacheTarget,
+    "workspace",
+    draftProofTopology,
+    "default-features",
+    cacheManifests,
+  ].join("-");
+  const retrievalCachePrefix = [
+    cacheRunner,
+    "cargo-stable",
+    cacheRustVersion,
+    cacheTarget,
+    "retrieval-contracts",
+    draftProofTopology,
+    "default-features",
+    cacheManifests,
+  ].join("-");
+  const draftCachePrimary = `${draftCachePrefix}-${cacheLock}`;
+  const retrievalCachePrimary = `${retrievalCachePrefix}-${cacheLock}`;
+  const draftCacheRestoreKeys = [
+    retrievalCachePrimary,
+    `${draftCachePrefix}-`,
+    `${retrievalCachePrefix}-`,
+  ];
 
   add(
     violations,
@@ -1960,7 +1962,10 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
     );
   }
 
-  for (const [name, commands] of draftRunCommands) {
+  for (const [name, commands] of [
+    ...draftRunCommands,
+    [String(proofRow.step), proofCommands],
+  ]) {
     const step = namedStep(job, name);
     add(violations, step !== undefined, `draft source job must contain one ${name} step`);
     add(violations, sameStrings(nonCommentLines(step?.run), commands), `draft source step ${name} must keep its exact serial command sequence`);
@@ -2028,7 +2033,7 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   add(violations, sameStrings(nonCommentLines(retrievalRestoreWith.path), draftCachePaths), "retrieval cache producer must retain the proof-compatible path set");
   add(violations, retrievalRestoreWith.key === retrievalCachePrimary, "retrieval cache producer key must match the draft exact-lock, manifest, feature, and proof-topology fallback");
 
-  const retrievalSeed = namedStep(retrievalJob, "Seed draft proof test-profile artifacts");
+  const retrievalSeed = namedStep(retrievalJob, String(seedRow.step));
   add(
     violations,
     hasExactKeys(retrievalSeed, ["name", "run"]),
@@ -2036,7 +2041,7 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   );
   add(
     violations,
-    sameStrings(nonCommentLines(retrievalSeed?.run), draftSeedCommands),
+    sameStrings(nonCommentLines(retrievalSeed?.run), seedCommands),
     "retrieval cache producer must seed the exact five test-profile targets in serial order",
   );
 
@@ -2428,7 +2433,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "jobs",
       "linux-contracts",
     ));
-    for (const violation of draftSourcePolicyViolations(job, retrievalJob)) {
+    for (const violation of draftSourcePolicyViolations(job, retrievalJob, graph)) {
       violations.push(`${rustFile} ${violation}`);
     }
   }

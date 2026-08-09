@@ -140,6 +140,17 @@ const CONSTANT_MIRROR_ROWS = new Set([
   "grounding_setup_sh",
   "grounding_setup_ps1",
 ]);
+// The graph owns every command-list rule instance (an exact serial command sequence
+// a reviewed workflow step must run) for families migrated off inline checker
+// constants; the checker owns only the sequence-equality predicate, its message
+// shapes, and the cache-key composition digested from the declared seed commands.
+// All rows bind that one predicate, so membership carries names alone. Membership
+// is exact and fail-closed: a graph that drops, renames, or invents a command-list
+// row must not load, so a rule instance cannot disappear by data edit.
+const COMMAND_LIST_ROWS = new Set([
+  "draft_proof_commands",
+  "draft_seed_commands",
+]);
 const FAILURE_ORDER = new Map([
   ["unsupported_claim", 0],
   ["missing", 1],
@@ -981,6 +992,35 @@ function validateConstantMirrors(policy) {
     nonEmptyText(row.reason, `${label}.reason`);
   }
   return mirrors;
+}
+
+function validateCommandLists(policy) {
+  const lists = object(policy.command_lists, "workflow_policy.command_lists");
+  for (const name of Object.keys(lists)) {
+    if (!COMMAND_LIST_ROWS.has(name)) {
+      fail(`workflow_policy.command_lists names unknown command list ${name}`);
+    }
+  }
+  for (const name of COMMAND_LIST_ROWS) {
+    if (lists[name] === undefined) {
+      fail(`workflow_policy.command_lists must declare ${name}`);
+    }
+    const label = `workflow_policy.command_lists.${name}`;
+    const row = object(lists[name], label);
+    const expectedKeys = ["file", "job", "step", "commands", "reason"];
+    if (
+      JSON.stringify([...Object.keys(row)].sort())
+        !== JSON.stringify([...expectedKeys].sort())
+    ) {
+      fail(`${label} must carry exactly ${expectedKeys.join(", ")}`);
+    }
+    nonEmptyText(row.file, `${label}.file`);
+    nonEmptyText(row.job, `${label}.job`);
+    nonEmptyText(row.step, `${label}.step`);
+    stringArray(row.commands, `${label}.commands`, { nonEmpty: true });
+    nonEmptyText(row.reason, `${label}.reason`);
+  }
+  return lists;
 }
 
 function validateQualificationPolicy(value, pinnedPrograms) {
@@ -1951,6 +1991,7 @@ export function validateReleaseClaimGraph(graph) {
   validateStepFragments(policy);
   validateStructuralPins(policy);
   validateConstantMirrors(policy);
+  validateCommandLists(policy);
   validateProofFloor(policy.proof_floor);
   if (!Array.isArray(policy.package_matrix) || policy.package_matrix.length !== 3) {
     fail("workflow_policy.package_matrix must define three release package rows");
@@ -2264,6 +2305,12 @@ export function loadReleaseClaimGraph(repoRoot = path.resolve(path.dirname(fileU
   for (const [name, row] of Object.entries(validated.workflow_policy.constant_mirrors)) {
     if (!existsSync(path.join(repoRoot, row.file))) {
       fail(`workflow_policy.constant_mirrors.${name} binds missing file ${row.file}`);
+    }
+  }
+  for (const [name, row] of Object.entries(validated.workflow_policy.command_lists)) {
+    const relative = path.join(".github", "workflows", row.file);
+    if (!existsSync(path.join(repoRoot, relative))) {
+      fail(`workflow_policy.command_lists.${name} binds missing file ${relative}`);
     }
   }
   return validated;

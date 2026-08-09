@@ -1959,6 +1959,35 @@
         ],
         "reason": "The Windows skill setup is the same bootstrap spelled for PowerShell. It must mirror the locked release build argument vector and the embedded-model staging pair verbatim, so the Windows install path cannot quietly diverge from the POSIX and worktree surfaces it mirrors."
       }
+    },
+    "command_lists": {
+      "draft_proof_commands": {
+        "file": "rust-ci.yml",
+        "job": "linux-draft",
+        "step": "Prove focused publication contracts",
+        "commands": [
+          "cargo test --locked -p codestory-llama-sys --test native_staging",
+          "cargo test --locked -p codestory-llama-sys --test model_staging",
+          "cargo test --locked -p codestory-cli --test native_launcher_contracts",
+          "cargo test --locked -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
+          "cargo test --locked -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture",
+          "cargo test --locked -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture"
+        ],
+        "reason": "The draft lane's publication proof is this exact serial command sequence: the two locked llama-sys staging harnesses, the CLI native-launcher and stdio-protocol contracts, and the runtime and store publication-atomicity proofs. The sequence is owned here so a workflow edit alone cannot drop, reorder, or dilute a proof target; the checker keeps only the sequence-equality predicate and its reviewed messages."
+      },
+      "draft_seed_commands": {
+        "file": "retrieval-engine-smoke.yml",
+        "job": "linux-contracts",
+        "step": "Seed draft proof test-profile artifacts",
+        "commands": [
+          "cargo test --locked -p codestory-llama-sys --test native_staging --no-run",
+          "cargo test --locked -p codestory-llama-sys --test model_staging --no-run",
+          "cargo test --locked -p codestory-cli --test stdio_protocol_contracts --no-run two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
+          "cargo test --locked -p codestory-runtime --no-run publication_transitions_fail_or_cancel_atomically -- --nocapture",
+          "cargo test --locked -p codestory-store --no-run staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture"
+        ],
+        "reason": "The retrieval producer seeds the draft proof's test-profile artifacts with the --no-run counterparts of the focused targets, and this list is also the digest input for the shared proof5 cache topology: the checker derives the draft and retrieval cache keys from these graph-declared seed commands, so cache identity and seeded content cannot drift apart through a checker edit alone."
+      }
     }
   }
 }
