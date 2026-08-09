@@ -85,6 +85,17 @@ class AutoReleaseDecisionTest(unittest.TestCase):
                 release_exists=False,
             )
 
+    def test_refuses_prerelease_and_build_versions(self) -> None:
+        for version in ("0.17.0-rc.1", "0.17.0+build.1", "00.17.0"):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(ValueError, "stable release version"):
+                    detector.decide_release(
+                        old_version="0.16.3",
+                        new_version=version,
+                        tag_exists=False,
+                        release_exists=False,
+                    )
+
 
 class ReleaseLaneTest(unittest.TestCase):
     def test_equal_versions_are_the_native_lane(self) -> None:
@@ -104,8 +115,27 @@ class ReleaseLaneTest(unittest.TestCase):
             detector.classify_release_lane(cli_version="0.16.2", plugin_version="0.16.1")
         self.assertIn("bump-version.mjs", str(caught.exception))
 
+    def test_release_lanes_require_stable_versions(self) -> None:
+        for cli_version, plugin_version in (
+            ("0.17.0-rc.1", "0.17.0-rc.1"),
+            ("0.17.0", "0.17.1-rc.1"),
+        ):
+            with self.subTest(cli_version=cli_version, plugin_version=plugin_version):
+                with self.assertRaisesRegex(ValueError, "stable release version"):
+                    detector.classify_release_lane(
+                        cli_version=cli_version,
+                        plugin_version=plugin_version,
+                    )
+
 
 class ReleaseSynchronizationTest(unittest.TestCase):
+    def test_release_validator_requires_a_stable_version(self) -> None:
+        self.assertEqual(checker.stable_release_version("v0.17.0"), "0.17.0")
+        for version in ("0.17.0-rc.1", "0.17.0+build.1", "00.17.0"):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(ValueError, "stable release version"):
+                    checker.stable_release_version(version)
+
     def test_refuses_embedded_model_producer_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             contract = Path(directory) / checker.MODEL_CONTRACT

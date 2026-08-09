@@ -244,11 +244,16 @@ test("--check rejects a stale Cargo.lock when every source manifest is current",
   }
 });
 
-test("a bad version is rejected before anything is written", () => {
+test("non-stable versions are rejected before anything is written", () => {
   const root = fixtureRoot("0.16.1");
   try {
-    assert.throws(() => bump(root, ["--version", "0.17"]), /strict semver/u);
-    assert.throws(() => bump(root, ["--version", "not-a-version"]), /strict semver/u);
+    for (const version of ["0.17", "not-a-version", "0.17.0-rc.1", "0.17.0+build.1", "00.17.0"]) {
+      assert.throws(
+        () => bump(root, ["--version", version]),
+        /stable release version/u,
+        `admitted ${version}`,
+      );
+    }
     assert.throws(
       () => bump(root, ["--version", "0.16.2", "--lane", "plugin", "--archive-checksums"]),
       /--archive-checksums requires a value/u,
