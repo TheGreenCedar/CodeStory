@@ -61,8 +61,8 @@ def _preservation_unit_tests() -> None:
             encoding="utf-8",
         )
         (root / "qualification").mkdir()
-        (root / "qualification" / "gate.json").write_text(
-            '{"state": "open"}\n', encoding="utf-8"
+        (root / "qualification" / "gate.json").write_bytes(
+            b'{"state": "open"}\n'
         )
         symlink_supported = True
         try:
