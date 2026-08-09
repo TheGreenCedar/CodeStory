@@ -8,7 +8,7 @@ pub(super) use packet::run_packet;
 pub(super) use task::run_task;
 
 #[cfg(test)]
-pub(crate) use packet::enforce_packet_cli_json_output_budget;
+pub(in crate::app) use packet::enforce_packet_cli_json_output_budget;
 
 #[cfg(test)]
 pub(super) use packet::{
