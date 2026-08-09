@@ -12,11 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SEMVER_RE = re.compile(
-    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
-    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
-)
+STABLE_RELEASE_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 SEMVER_PARTS_RE = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
@@ -133,8 +129,11 @@ def decide_release(
     tag_exists: bool,
     release_exists: bool,
 ) -> ReleaseDecision:
-    if not SEMVER_RE.fullmatch(new_version):
-        raise ValueError(f"codestory-cli version must be strict semver, got {new_version!r}.")
+    if not STABLE_RELEASE_RE.fullmatch(new_version):
+        raise ValueError(
+            "codestory-cli version must be a stable release version like X.Y.Z, "
+            f"got {new_version!r}."
+        )
 
     if tag_exists != release_exists:
         raise ValueError(
@@ -195,6 +194,11 @@ def classify_release_lane(*, cli_version: str, plugin_version: str) -> str:
     the plugin fast lane: the plugin ships alone and runs the already-published CLI named by
     its pin. A plugin behind the CLI is always a synchronization error.
     """
+    for name, version in (("codestory-cli", cli_version), ("plugin", plugin_version)):
+        if not STABLE_RELEASE_RE.fullmatch(version):
+            raise ValueError(
+                f"{name} version must be a stable release version like X.Y.Z, got {version!r}."
+            )
     if plugin_version == cli_version:
         return "native"
     if compare_semver(plugin_version, cli_version) > 0:

@@ -1752,7 +1752,7 @@
         "file": "marketplace-sync.yml",
         "job": "sync",
         "step": "Validate the dispatched release coordinates",
-        "sha256": "6380c916a1b3566b4b9d6545b63fbc9c7db12b54fb328b5c89316daae0162d84",
+        "sha256": "3935d34bb0922b6d8489699693f504369068f7590fa2cf4372b6e7945ef6f00f",
         "reason": "check-workflow-policy.test.mjs runs this exact script against hostile dispatch values and proves it exits non-zero, so the digest stands for a rejection that was measured, not merely read."
       },
       "packaged_platform_pr_closeout": {
@@ -1894,7 +1894,7 @@
         "step": "Validate the dispatched release coordinates",
         "fragments": [
           "commit_shape='^[0-9a-fA-F]{7,40}$'",
-          "version_shape='^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?$'",
+          "version_shape='^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$'",
           "if [[ ! \"$INPUT_COMMIT\" =~ $commit_shape ]]; then",
           "if [[ ! \"$INPUT_VERSION\" =~ $version_shape ]]; then"
         ],

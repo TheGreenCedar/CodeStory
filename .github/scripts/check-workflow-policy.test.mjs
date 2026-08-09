@@ -6602,14 +6602,17 @@ test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
     }, /must run commit_shape='\^\[0-9a-fA-F\]\{7,40\}\$'/u],
     ["the version shape check disappears", workflow => {
       const step = draftStep(workflow.jobs.sync, guard);
-      step.run = step.run.replace("^[0-9]+\\.[0-9]+\\.[0-9]+", "^.+");
+      step.run = step.run.replace(
+        "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)",
+        "^.+",
+      );
     }, /must run version_shape=/u],
     // A prefix fragment cannot see a dropped closing anchor, and an unanchored version regex admits
     // `0.16.3; id`. The pinned fragment carries the anchor, so the truncation is a violation.
     ["the version regex loses its closing anchor", workflow => {
       const step = draftStep(workflow.jobs.sync, guard);
-      step.run = step.run.replace("(-[0-9A-Za-z.]+)?$'", "'");
-    }, /must run version_shape='\^\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\(-\[0-9A-Za-z\.\]\+\)\?\$'/u],
+      step.run = step.run.replace("(0|[1-9][0-9]*)$'", "(0|[1-9][0-9]*)'");
+    }, /must run version_shape=/u],
     // Substring assertions prove a string is present, not that it is consulted. This body satisfies
     // every fragment above -- both anchored regexes, both comparisons, no grep -- and refuses
     // nothing, so only a pin over the whole script can see it.
@@ -7429,6 +7432,9 @@ test("the marketplace dispatch guard refuses whole values, not first lines", asy
     ["an empty commit", { INPUT_COMMIT: "", INPUT_VERSION: version }],
     ["an empty version", { INPUT_COMMIT: commit, INPUT_VERSION: "" }],
     ["a v-prefixed version", { INPUT_COMMIT: commit, INPUT_VERSION: "v0.16.3" }],
+    ["a prerelease version", { INPUT_COMMIT: commit, INPUT_VERSION: "0.16.3-rc.1" }],
+    ["a build version", { INPUT_COMMIT: commit, INPUT_VERSION: "0.16.3+build.1" }],
+    ["a version with a leading zero", { INPUT_COMMIT: commit, INPUT_VERSION: "00.16.3" }],
   ];
   for (const [name, environment] of refused) {
     await t.test(`refuses ${name}`, () => {
@@ -7440,7 +7446,6 @@ test("the marketplace dispatch guard refuses whole values, not first lines", asy
   const admitted = [
     ["an abbreviated sha", { INPUT_COMMIT: "abc1234", INPUT_VERSION: version }],
     ["a full sha", { INPUT_COMMIT: commit, INPUT_VERSION: "1.0.0" }],
-    ["a prerelease version", { INPUT_COMMIT: commit, INPUT_VERSION: "0.16.3-rc.1" }],
     ["an uppercase sha", { INPUT_COMMIT: "ABC1234DEF", INPUT_VERSION: version }],
   ];
   for (const [name, environment] of admitted) {

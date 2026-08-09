@@ -19,7 +19,7 @@ import { parsePublishedArchiveDigests } from "./lib/pinned-archive-digests.mjs";
 import { workspaceMemberNames } from "./lib/workspace-members.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
+const STABLE_RELEASE_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
 
 /// Every codestory-* crate, in workspace order, read from the workspace itself.
 ///
@@ -69,8 +69,8 @@ function parseArguments(argv) {
   }
   if (!values.version) fail("--version is required");
   values.version = values.version.replace(/^v/u, "");
-  if (!SEMVER.test(values.version)) {
-    fail(`--version must be strict semver like 0.17.0, got ${values.version}`);
+  if (!STABLE_RELEASE_VERSION.test(values.version)) {
+    fail(`--version must be a stable release version like 0.17.0, got ${values.version}`);
   }
   if (!new Set(["native", "plugin"]).has(values.lane)) {
     fail(`--lane must be native or plugin, got ${values.lane}`);
@@ -169,7 +169,7 @@ async function publishedArchiveDigests(pin, checksumSource) {
   if (
     !pin ||
     typeof pin.cli_version !== "string" ||
-    !SEMVER.test(pin.cli_version) ||
+    !STABLE_RELEASE_VERSION.test(pin.cli_version) ||
     pin.release_tag !== `v${pin.cli_version}`
   ) {
     fail(`${CLI_VERSION_PIN} does not name a valid published CLI release`);
