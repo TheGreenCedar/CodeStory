@@ -1844,6 +1844,49 @@
         "sha256": "efc5126e24162d52f9da8bac38c3414b3a7492fb17eed5ff19867fadad69623e",
         "reason": "The companion qualification driver is intentionally retained only inside the private Actions package artifact. This digest pins both sides of that contract: the producer may read Cargo's trusted hard-linked build output but retains only a new singly linked copy bound to the exact candidate archive, and the consumer rejects symlinks, retained hardlinks, extra files, identity drift, and byte drift before restoring execute permission. Any helper edit therefore requires policy and mutation-test review in the same PR."
       }
+    },
+    "step_fragments": {
+      "saga_issue_link_guard": {
+        "kind": "require",
+        "file": "saga-issue-link-guard.yml",
+        "job": "require-closing-issue-link",
+        "step": "Check PR issue relationship",
+        "fragments": [
+          "close[sd]?|fix(?:e[sd])?|resolve[sd]?",
+          "#\\d+|https://github\\.com/TheGreenCedar/CodeStory/issues/\\d+"
+        ],
+        "reason": "Every codex pull request must name the issue it closes before review. The guard's matcher must keep recognizing both the closing keywords and both issue-reference spellings; each fragment is one reviewed half of that grep, owned here so it cannot be weakened by a checker edit alone."
+      },
+      "close_dev_issues": {
+        "kind": "require",
+        "file": "close-dev-issues.yml",
+        "job": "close-linked-issues",
+        "step": "Close issues referenced by the merged PR",
+        "fragments": [
+          "commit = event[\"after\"]",
+          "pull_request.get(\"merged_at\")",
+          "pull_request.get(\"merge_commit_sha\") == commit",
+          "pull_request.get(\"base\", {}).get(\"ref\") == \"dev/codestory-next\"",
+          "pullRequest(number: $number)",
+          "entries(first: 100, after: $cursor)",
+          "if stack_response.get(\"errors\")",
+          "if \"stack\" not in pull_request_node",
+          "stack.get(\"baseRefName\") != \"dev/codestory-next\"",
+          "metadata != expected_stack",
+          "expected_stack[2] != len(entries)",
+          "if next_cursor == cursor or next_cursor in seen_cursors",
+          "if stack_repository != repository",
+          "existing = merged_pull_requests_by_number.get(number)",
+          "stacked_pull_request.get(\"merged\")",
+          "stacked_pull_request.get(\"mergedAt\")",
+          "merge_commit.get(\"oid\") == commit",
+          "anchor.get(\"body\") != pull_request.get(\"body\")",
+          "if \"pull_request\" in issue:",
+          "\"state_reason=completed\"",
+          "https://github\\.com/TheGreenCedar/CodeStory/issues/(\\d+)"
+        ],
+        "reason": "The close automation decides which issues a push to dev/codestory-next may close as completed. Each fragment pins one authentication, stack-integrity, or pagination check inside the inline Python program - merge-commit identity, base-branch and stack verification, cursor-loop and repository guards, and the completed state_reason - so none of those checks can be deleted without a reviewed graph edit."
+      }
     }
   }
 }

@@ -105,6 +105,15 @@ const PINNED_PROGRAM_CONTRACTS = new Map([
   ["packaged_host_compiler_finalizer", { subject: "step_script_raw_text", job: true, step: true }],
   ["qualification_driver_artifact", { subject: "helper_file_text", job: false, step: false }],
 ]);
+// The graph owns every step-fragment rule instance for workflow families migrated
+// off inline requireStepRun/forbidStepRun calls; the checker owns only those two
+// predicates and their message shapes. Membership is exact and fail-closed: a graph
+// that drops, renames, or invents a step-fragment rule must not load, so a rule
+// instance cannot disappear by data edit. Kind names the predicate a row binds.
+const STEP_FRAGMENT_CONTRACTS = new Map([
+  ["saga_issue_link_guard", { kind: "require" }],
+  ["close_dev_issues", { kind: "require" }],
+]);
 const FAILURE_ORDER = new Map([
   ["unsupported_claim", 0],
   ["missing", 1],
@@ -848,6 +857,38 @@ function validatePinnedPrograms(policy) {
     nonEmptyText(row.reason, `${label}.reason`);
   }
   return programs;
+}
+
+function validateStepFragments(policy) {
+  const rules = object(policy.step_fragments, "workflow_policy.step_fragments");
+  for (const name of Object.keys(rules)) {
+    if (!STEP_FRAGMENT_CONTRACTS.has(name)) {
+      fail(`workflow_policy.step_fragments names unknown step fragment rule ${name}`);
+    }
+  }
+  for (const [name, contract] of STEP_FRAGMENT_CONTRACTS) {
+    if (rules[name] === undefined) {
+      fail(`workflow_policy.step_fragments must declare ${name}`);
+    }
+    const label = `workflow_policy.step_fragments.${name}`;
+    const row = object(rules[name], label);
+    const expectedKeys = ["kind", "file", "job", "step", "fragments", "reason"];
+    if (
+      JSON.stringify([...Object.keys(row)].sort())
+        !== JSON.stringify([...expectedKeys].sort())
+    ) {
+      fail(`${label} must carry exactly ${expectedKeys.join(", ")}`);
+    }
+    if (row.kind !== contract.kind) {
+      fail(`${label}.kind must be ${contract.kind}`);
+    }
+    nonEmptyText(row.file, `${label}.file`);
+    nonEmptyText(row.job, `${label}.job`);
+    nonEmptyText(row.step, `${label}.step`);
+    stringArray(row.fragments, `${label}.fragments`, { nonEmpty: true });
+    nonEmptyText(row.reason, `${label}.reason`);
+  }
+  return rules;
 }
 
 function validateQualificationPolicy(value, pinnedPrograms) {
@@ -1815,6 +1856,7 @@ export function validateReleaseClaimGraph(graph) {
     fail("workflow_policy.artifact_retention_days must be a positive integer");
   }
   const pinnedPrograms = validatePinnedPrograms(policy);
+  validateStepFragments(policy);
   validateProofFloor(policy.proof_floor);
   if (!Array.isArray(policy.package_matrix) || policy.package_matrix.length !== 3) {
     fail("workflow_policy.package_matrix must define three release package rows");
@@ -2111,6 +2153,12 @@ export function loadReleaseClaimGraph(repoRoot = path.resolve(path.dirname(fileU
       : path.join(".github", "workflows", row.file);
     if (!existsSync(path.join(repoRoot, relative))) {
       fail(`workflow_policy.pinned_programs.${name} pins missing file ${relative}`);
+    }
+  }
+  for (const [name, row] of Object.entries(validated.workflow_policy.step_fragments)) {
+    const relative = path.join(".github", "workflows", row.file);
+    if (!existsSync(path.join(repoRoot, relative))) {
+      fail(`workflow_policy.step_fragments.${name} binds missing file ${relative}`);
     }
   }
   return validated;

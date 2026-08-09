@@ -1058,6 +1058,29 @@ export function pinnedProgramViolations(workflows, graph = loadReleaseClaimGraph
   return violations;
 }
 
+// Every step-fragment rule INSTANCE for a migrated workflow family lives in
+// release-claims.json under workflow_policy.step_fragments; scripts/
+// codestory-release-claims.mjs fails graph loading unless that block names exactly
+// the reviewed rule rows, so membership cannot drift by data edit. The checker keeps
+// only what stays code: the requireStepRun/forbidStepRun predicates each row's kind
+// selects, whose violation text is byte-identical to the retired inline calls.
+// A missing workflow is reported by the structural validator that owns the file, so
+// each row evaluates only when its subject workflow parsed; every other absence
+// (missing job, missing step, empty script) fails the fragment predicates exactly as
+// the retired inline checks did.
+export function stepFragmentViolations(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
+  const violations = [];
+  for (const value of Object.values(object(object(graph.workflow_policy).step_fragments))) {
+    const row = object(value);
+    const workflow = workflows.get(row.file);
+    if (!workflow) continue;
+    const job = object(object(workflow.jobs)[row.job]);
+    const evaluate = row.kind === "forbid" ? forbidStepRun : requireStepRun;
+    evaluate(violations, row.file, job, row.step, list(row.fragments));
+  }
+  return violations;
+}
+
 const draftProofCommands = [
   "cargo test --locked -p codestory-llama-sys --test native_staging",
   "cargo test --locked -p codestory-llama-sys --test model_staging",
@@ -2239,10 +2262,8 @@ function validateIssueWorkflows(workflows, violations) {
     for (const fragment of ["codex/", "review/codestory-saga-", "[codex]", "saga:codestory-intelligence"]) {
       add(violations, String(job.if ?? "").includes(fragment), `${sagaFile} guarded condition must include ${fragment}`);
     }
-    requireStepRun(violations, sagaFile, job, "Check PR issue relationship", [
-      "close[sd]?|fix(?:e[sd])?|resolve[sd]?",
-      "#\\d+|https://github\\.com/TheGreenCedar/CodeStory/issues/\\d+",
-    ]);
+    // The guard's step fragments are rule instances and live in release-claims.json
+    // under workflow_policy.step_fragments; stepFragmentViolations evaluates them.
   }
 
   const closeFile = "close-dev-issues.yml";
@@ -2253,30 +2274,10 @@ function validateIssueWorkflows(workflows, violations) {
     add(violations, includesAll(at(close, "on", "push", "branches"), ["dev/codestory-next"]), `${closeFile} must run on dev/codestory-next pushes`);
     add(violations, object(close.permissions).issues === "write", `${closeFile} must write issues`);
     add(violations, object(close.permissions)["pull-requests"] === "read", `${closeFile} must read pull requests`);
-    const job = requireJob(violations, closeFile, close, "close-linked-issues");
-    requireStepRun(violations, closeFile, job, "Close issues referenced by the merged PR", [
-      'commit = event["after"]',
-      'pull_request.get("merged_at")',
-      'pull_request.get("merge_commit_sha") == commit',
-      'pull_request.get("base", {}).get("ref") == "dev/codestory-next"',
-      'pullRequest(number: $number)',
-      'entries(first: 100, after: $cursor)',
-      'if stack_response.get("errors")',
-      'if "stack" not in pull_request_node',
-      'stack.get("baseRefName") != "dev/codestory-next"',
-      'metadata != expected_stack',
-      'expected_stack[2] != len(entries)',
-      'if next_cursor == cursor or next_cursor in seen_cursors',
-      'if stack_repository != repository',
-      'existing = merged_pull_requests_by_number.get(number)',
-      'stacked_pull_request.get("merged")',
-      'stacked_pull_request.get("mergedAt")',
-      'merge_commit.get("oid") == commit',
-      'anchor.get("body") != pull_request.get("body")',
-      'if "pull_request" in issue:',
-      '"state_reason=completed"',
-      "https://github\\.com/TheGreenCedar/CodeStory/issues/(\\d+)",
-    ]);
+    requireJob(violations, closeFile, close, "close-linked-issues");
+    // The close automation's step fragments are rule instances and live in
+    // release-claims.json under workflow_policy.step_fragments;
+    // stepFragmentViolations evaluates them.
   }
 }
 
@@ -11182,6 +11183,7 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   violations.push(...protectedRunnerReservationViolations(workflows, graph));
   violations.push(...releaseWorkflowContractViolations(workflows, graph));
   violations.push(...pinnedProgramViolations(workflows, graph));
+  violations.push(...stepFragmentViolations(workflows, graph));
   return violations;
 }
 
