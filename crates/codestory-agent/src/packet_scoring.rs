@@ -22,6 +22,12 @@ use codestory_contracts::api::{
 };
 use std::cmp::Ordering;
 
+// `normalize_identifier` was hoisted to the leaf `text` module to dissolve the
+// packet_terms <-> packet_scoring release-code import cycle
+// (`agent_planning_import_graph_stays_acyclic`); the re-export keeps every
+// existing `packet_scoring::normalize_identifier` call site valid.
+pub use crate::text::normalize_identifier;
+
 /// Sort descending on a rank that is evaluated exactly once per element.
 ///
 /// `packet_citation_rank` and `packet_claim_carry_rank` allocate and rescan every
@@ -1212,14 +1218,6 @@ pub fn packet_terms_contain(terms: &[String], needle: &str) -> bool {
     terms
         .iter()
         .any(|term| term.eq_ignore_ascii_case(needle) || normalize_identifier(term) == needle)
-}
-
-pub fn normalize_identifier(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(|ch| ch.to_lowercase())
-        .collect()
 }
 
 pub fn packet_file_stem_matches_query(query: &str, path: Option<&str>) -> bool {

@@ -41,6 +41,7 @@ pub mod packet_sufficiency;
 pub mod packet_terms;
 pub mod pinned_reader;
 pub mod planning;
+pub mod profiles;
 pub mod text;
 pub mod trail;
 pub mod workspace_path_identity;
