@@ -713,6 +713,46 @@ test("pinned programs are an exact fail-closed membership with graph-owned diges
   }
 });
 
+test("step fragments are an exact fail-closed membership with graph-owned rule data", () => {
+  const rules = graph.workflow_policy.step_fragments;
+  assert.equal(Object.keys(rules).length, 2);
+  for (const row of Object.values(rules)) {
+    assert.equal(row.kind, "require");
+    assert.ok(row.fragments.length > 0);
+  }
+  const mutations = [
+    [draft => {
+      delete draft.workflow_policy.step_fragments.close_dev_issues;
+    }, /step_fragments must declare close_dev_issues/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.unowned_extra = structuredClone(
+        draft.workflow_policy.step_fragments.close_dev_issues,
+      );
+    }, /names unknown step fragment rule unowned_extra/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.saga_issue_link_guard.kind = "forbid";
+    }, /saga_issue_link_guard\.kind must be require/u],
+    [draft => {
+      delete draft.workflow_policy.step_fragments.saga_issue_link_guard.step;
+    }, /saga_issue_link_guard must carry exactly kind, file, job, step, fragments, reason/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.close_dev_issues.fragments = [];
+    }, /close_dev_issues\.fragments must be a non-empty array/u],
+    [draft => {
+      const fragments = draft.workflow_policy.step_fragments.close_dev_issues.fragments;
+      fragments.push(fragments[0]);
+    }, /close_dev_issues\.fragments must not contain duplicates/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.saga_issue_link_guard.reason = "";
+    }, /saga_issue_link_guard\.reason must be a non-empty string/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
 test("benchmark leakage names only the one-process Node contract", () => {
   const benchmarkLeakage = graph.failure_controls
     .find(({ id }) => id === "benchmark_leakage");
