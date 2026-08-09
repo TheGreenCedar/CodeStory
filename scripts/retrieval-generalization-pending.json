@@ -94,7 +94,7 @@
         "wsgiapp": 1
       }
     },
-    "crates/codestory-runtime/src/agent/packet_claims.rs": {
+    "crates/codestory-agent/src/packet_claims.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
       "reason": "Claim assembly names holdout storage engines when it decides a claim is source-backed. The check has to move to what the indexed file says about itself.",
       "markers": {
@@ -212,7 +212,7 @@
         "foreignkey": 2
       }
     },
-    "crates/codestory-runtime/src/agent/packet_sufficiency.rs": {
+    "crates/codestory-agent/src/packet_sufficiency.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
       "reason": "Sufficiency checks assert that a packet covers named holdout surfaces before it is allowed to answer. The check has to be expressed against the question and the index rather than against corpus spellings. Nine of these markers are gone and thirteen occur less often than they did: sufficiency now decides coverage from a citation's own structure, so the assertions that spelled out corpus symbols were replaced by ones that state the shape a step's evidence has to have.",
       "markers": {

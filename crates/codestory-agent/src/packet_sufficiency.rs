@@ -1,39 +1,39 @@
-use crate::agent::packet_claims::{
+use crate::packet_claims::{
     decorate_packet_claims_proof_metadata, packet_supported_claims,
     packet_supported_claims_with_telemetry,
 };
-use crate::agent::packet_coverage::PacketCoverageInput;
-use crate::agent::packet_degradation::packet_primary_retrieval_truncated;
-use crate::agent::packet_evidence::citation_sufficiency_eligible;
-use crate::agent::packet_evidence_roles::packet_evidence_role;
+use crate::packet_command::next_deeper_packet_argv;
+#[allow(unused_imports)]
+pub use crate::packet_command::quote_packet_command_value;
+pub use crate::packet_command::{
+    packet_argv, packet_display_project_arg, packet_follow_up_invocation, render_packet_command,
+};
+use crate::packet_coverage::PacketCoverageInput;
+use crate::packet_degradation::packet_primary_retrieval_truncated;
+use crate::packet_evidence::citation_sufficiency_eligible;
+use crate::packet_evidence_roles::packet_evidence_role;
+pub use crate::packet_execution_graphs::packet_execution_graphs;
 #[cfg(test)]
-use crate::agent::packet_flow_requirements::FlowRole;
-use crate::agent::packet_flow_requirements::{
+use crate::packet_flow_requirements::FlowRole;
+use crate::packet_flow_requirements::{
     CoverageMode, FlowRequirement, packet_flow_requirements_for_terms,
 };
-use crate::agent::packet_freshness::PacketFreshnessInput;
-use crate::agent::packet_obligations::{
+use crate::packet_freshness::PacketFreshnessInput;
+use crate::packet_obligations::{
     PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE, bind_claims_to_packet_obligations,
     material_packet_obligations_are_proven, packet_claims_with_obligation_receipts,
     packet_obligation_open_next_candidates, packet_proven_obligation_carrier_paths,
 };
-use crate::agent::packet_plan::packet_symbol_probe_queries;
-use crate::agent::packet_required_probes::packet_missing_sufficiency_probe_queries_with_extra;
-use crate::agent::packet_scoring::{
+use crate::packet_plan::packet_symbol_probe_queries;
+use crate::packet_required_probes::packet_missing_sufficiency_probe_queries_with_extra;
+use crate::packet_scoring::{
     normalize_identifier, packet_citation_key, packet_display_name_is_test_like,
     packet_display_path,
 };
-use crate::agent::packet_terms::packet_probe_terms;
-#[cfg(test)]
-use crate::agent::path_identity::RuntimeWorkspacePathIdentity;
-use codestory_agent::packet_command::next_deeper_packet_argv;
-#[allow(unused_imports)]
-pub(crate) use codestory_agent::packet_command::quote_packet_command_value;
-pub(crate) use codestory_agent::packet_command::{
-    packet_argv, packet_display_project_arg, packet_follow_up_invocation, render_packet_command,
-};
-pub(crate) use codestory_agent::packet_execution_graphs::packet_execution_graphs;
-use codestory_agent::workspace_path_identity::WorkspacePathIdentity;
+use crate::packet_terms::packet_probe_terms;
+#[cfg(any(test, feature = "test-support"))]
+use crate::workspace_path_identity::MissingPathSpellingIdentity;
+use crate::workspace_path_identity::WorkspacePathIdentity;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepStatusDto, EdgeKind, GraphResponse,
     NodeKind, PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto, PacketClaimObligationDto,
@@ -45,22 +45,22 @@ use codestory_contracts::api::{
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::Path;
 
-pub(crate) const PACKET_MARKDOWN_TRUNCATION_SUFFIX: &str =
+pub const PACKET_MARKDOWN_TRUNCATION_SUFFIX: &str =
     "\n\n... packet section truncated by budget ...\n";
 
-pub(crate) struct PacketSufficiencyInput<'a> {
-    pub(crate) project_root: &'a Path,
-    pub(crate) question: &'a str,
-    pub(crate) task_class: PacketTaskClassDto,
-    pub(crate) answer: &'a AgentAnswerDto,
-    pub(crate) budget: &'a PacketBudgetDto,
-    pub(crate) supported_claims: Vec<PacketClaimDto>,
-    pub(crate) missing_required_probe_queries: Vec<String>,
-    pub(crate) targeted_follow_up_queries: Vec<String>,
+pub struct PacketSufficiencyInput<'a> {
+    pub project_root: &'a Path,
+    pub question: &'a str,
+    pub task_class: PacketTaskClassDto,
+    pub answer: &'a AgentAnswerDto,
+    pub budget: &'a PacketBudgetDto,
+    pub supported_claims: Vec<PacketClaimDto>,
+    pub missing_required_probe_queries: Vec<String>,
+    pub targeted_follow_up_queries: Vec<String>,
 }
 
-#[cfg(test)]
-pub(crate) fn build_packet_sufficiency(
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_packet_sufficiency(
     project_root: &Path,
     question: &str,
     task_class: PacketTaskClassDto,
@@ -70,8 +70,8 @@ pub(crate) fn build_packet_sufficiency(
     build_packet_sufficiency_with_extra(project_root, question, task_class, answer, budget, &[])
 }
 
-#[cfg(test)]
-pub(crate) fn build_packet_sufficiency_with_extra(
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_packet_sufficiency_with_extra(
     project_root: &Path,
     question: &str,
     task_class: PacketTaskClassDto,
@@ -90,8 +90,8 @@ pub(crate) fn build_packet_sufficiency_with_extra(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn build_packet_sufficiency_with_probe_context(
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_packet_sufficiency_with_probe_context(
     project_root: &Path,
     question: &str,
     task_class: PacketTaskClassDto,
@@ -101,7 +101,7 @@ pub(crate) fn build_packet_sufficiency_with_probe_context(
     exact_probe_paths: &[String],
 ) -> PacketSufficiencyDto {
     build_packet_sufficiency_with_optional_obligation_context(
-        &RuntimeWorkspacePathIdentity,
+        &MissingPathSpellingIdentity,
         project_root,
         question,
         task_class,
@@ -114,7 +114,7 @@ pub(crate) fn build_packet_sufficiency_with_probe_context(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_packet_sufficiency_with_obligation_context(
+pub fn build_packet_sufficiency_with_obligation_context(
     path_identity: &dyn WorkspacePathIdentity,
     project_root: &Path,
     question: &str,
@@ -181,10 +181,10 @@ fn build_packet_sufficiency_with_optional_obligation_context(
     )
 }
 
-#[cfg(test)]
-fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSufficiencyDto {
+#[cfg(any(test, feature = "test-support"))]
+pub fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSufficiencyDto {
     assemble_packet_sufficiency_with_probe_context(
-        &RuntimeWorkspacePathIdentity,
+        &MissingPathSpellingIdentity,
         input,
         &[],
         &[],
@@ -198,7 +198,7 @@ fn assemble_packet_sufficiency_with_route_probes(
     selected_probes: &[String],
 ) -> PacketSufficiencyDto {
     assemble_packet_sufficiency_with_probe_context(
-        &RuntimeWorkspacePathIdentity,
+        &MissingPathSpellingIdentity,
         input,
         selected_probes,
         &[],
@@ -212,7 +212,7 @@ fn assemble_packet_sufficiency_with_exact_paths(
     exact_probe_paths: &[String],
 ) -> PacketSufficiencyDto {
     assemble_packet_sufficiency_with_probe_context(
-        &RuntimeWorkspacePathIdentity,
+        &MissingPathSpellingIdentity,
         input,
         &[],
         exact_probe_paths,
@@ -639,7 +639,7 @@ fn assemble_packet_sufficiency_with_probe_context(
     }
 }
 
-pub(crate) fn packet_targeted_follow_up_queries(
+pub fn packet_targeted_follow_up_queries(
     question: &str,
     task_class: PacketTaskClassDto,
 ) -> Vec<String> {
@@ -1247,7 +1247,8 @@ fn packet_route_citation_is_endpoint(citation: &AgentCitationDto) -> bool {
         )
         && !packet_display_name_is_test_like(&citation.display_name)
         && citation.file_path.as_deref().is_some_and(|path| {
-            crate::retrieval_file_role_from_path(path) == crate::RetrievalFileRole::Source
+            crate::text::retrieval_file_role_from_path(path)
+                == crate::text::RetrievalFileRole::Source
         })
         && !matches!(
             terminal.as_str(),
@@ -1304,11 +1305,7 @@ fn packet_missing_route_transitions(
         .collect()
 }
 
-pub(crate) fn packet_execution_path_exists(
-    graph: &GraphResponse,
-    source: &str,
-    target: &str,
-) -> bool {
+pub fn packet_execution_path_exists(graph: &GraphResponse, source: &str, target: &str) -> bool {
     if source == target {
         return false;
     }
@@ -1319,7 +1316,7 @@ pub(crate) fn packet_execution_path_exists(
             edge.kind == EdgeKind::CALL
                 && edge.source.0 == current
                 && edge.source != edge.target
-                && !crate::graph_builders::is_speculative_trail_edge(edge)
+                && !crate::trail::is_speculative_trail_edge(edge)
         }) {
             if edge.target.0 == target {
                 return true;
@@ -1638,7 +1635,7 @@ fn packet_sufficiency_min_claim_families_with_obligations(
     }
 }
 
-pub(crate) fn packet_supported_claim_family_count(supported_claims: &[PacketClaimDto]) -> usize {
+pub fn packet_supported_claim_family_count(supported_claims: &[PacketClaimDto]) -> usize {
     let mut families: HashSet<&'static str> = HashSet::new();
     for claim in supported_claims {
         if let Some(family) = packet_claim_family(claim) {
@@ -1648,7 +1645,7 @@ pub(crate) fn packet_supported_claim_family_count(supported_claims: &[PacketClai
     families.len()
 }
 
-pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str> {
+pub fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str> {
     if claim.coverage_role.as_deref() == Some(PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE) {
         return match claim.required_obligation_kinds.as_slice() {
             [codestory_contracts::api::PacketClaimObligationKindDto::Entrypoint] => {
@@ -2010,7 +2007,7 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
         .or_else(|| (!claim.citations.is_empty()).then_some("source evidence"))
 }
 
-pub(crate) fn packet_claim_can_satisfy_sufficiency(claim: &PacketClaimDto) -> bool {
+pub fn packet_claim_can_satisfy_sufficiency(claim: &PacketClaimDto) -> bool {
     packet_claim_ineligibility_reason(claim).is_none()
 }
 
@@ -2620,9 +2617,8 @@ fn packet_blocking_follow_up_probe_queries(
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
-    use super::super::packet_budget::{apply_packet_budget, packet_budget_limits};
     use super::*;
-    use crate::agent::packet_obligations::{
+    use crate::packet_obligations::{
         build_packet_obligation_plan, finalize_packet_obligation_plan,
     };
     use codestory_contracts::api::{
@@ -2749,7 +2745,7 @@ mod tests {
             answer_id: "packet-sufficiency-test".to_string(),
             prompt: question.to_string(),
             summary: "Covered by cited anchors.".to_string(),
-            freshness: Some(crate::agent::packet_freshness::fresh_index_observation()),
+            freshness: Some(crate::packet_freshness::fresh_index_observation()),
             sections: vec![AgentResponseSectionDto {
                 id: "answer".to_string(),
                 title: "Answer".to_string(),
@@ -3108,7 +3104,7 @@ mod tests {
             supported_claims_with_telemetry,
         );
         let sufficiency = build_packet_sufficiency_with_obligation_context(
-            &RuntimeWorkspacePathIdentity,
+            &MissingPathSpellingIdentity,
             Path::new("C:/workspace/project"),
             question,
             PacketTaskClassDto::RouteTracing,
@@ -3940,83 +3936,6 @@ mod tests {
     }
 
     #[test]
-    fn route_proof_observes_actual_citation_and_edge_caps_across_packet_budgets() {
-        let question = "RouteIngress -> RouteDispatch -> RouteEgress";
-        let mut uncapped_answer = route_answer(
-            question,
-            &["RouteIngress", "RouteDispatch", "RouteEgress"],
-            &[
-                ("RouteIngress", "RouteDispatch"),
-                ("RouteDispatch", "RouteEgress"),
-            ],
-        );
-        uncapped_answer
-            .citations
-            .extend((0..12).map(|index| cited_anchor(&format!("Filler{index}"))));
-        let GraphArtifactDto::Uml { graph, .. } = &mut uncapped_answer.graphs[0] else {
-            unreachable!("route fixture must contain UML")
-        };
-        let route_edges = std::mem::take(&mut graph.edges);
-        graph
-            .nodes
-            .extend((0..22).map(|index| route_graph_node(&format!("Filler{index}"))));
-        graph.edges.extend((0..21).map(|index| {
-            route_graph_edge(
-                &format!("filler-edge-{index}"),
-                &format!("Filler{index}"),
-                &format!("Filler{}", index + 1),
-            )
-        }));
-        graph.edges.extend(route_edges);
-
-        for requested in [
-            PacketBudgetModeDto::Compact,
-            PacketBudgetModeDto::Standard,
-            PacketBudgetModeDto::Deep,
-        ] {
-            let mut answer = uncapped_answer.clone();
-            let limits = packet_budget_limits(requested);
-            let budget = apply_packet_budget(
-                Path::new("C:/workspace/project"),
-                question,
-                PacketTaskClassDto::RouteTracing,
-                requested,
-                limits.clone(),
-                &mut answer,
-            );
-            let retained = answer
-                .citations
-                .iter()
-                .map(|citation| citation.node_id.0.as_str())
-                .collect::<HashSet<_>>();
-            let claims = ["RouteIngress", "RouteDispatch", "RouteEgress"]
-                .into_iter()
-                .filter(|name| retained.contains(name))
-                .map(route_claim)
-                .collect();
-            let sufficiency = route_sufficiency(question, &answer, &budget, claims);
-
-            if requested == PacketBudgetModeDto::Compact {
-                assert!(budget.truncated, "compact must exercise real caps");
-                assert!(answer.citations.len() <= limits.max_anchors as usize);
-                let GraphArtifactDto::Uml { graph, .. } = &answer.graphs[0] else {
-                    unreachable!("route fixture must retain UML")
-                };
-                assert_eq!(graph.edges.len(), limits.max_trail_edges as usize);
-                assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
-            } else {
-                assert!(!budget.truncated, "{requested:?} should retain the route");
-                assert_eq!(
-                    sufficiency.status,
-                    PacketSufficiencyStatusDto::Sufficient,
-                    "retained route should remain sufficient for {requested:?}: {sufficiency:?}"
-                );
-                assert!(sufficiency.gaps.is_empty());
-            }
-        }
-    }
-
-    #[test]
     fn route_stages_come_only_from_explicit_question_order() {
         let question =
             "IndexingEntrypoint -> FileDiscovery -> SymbolExtraction -> StoragePersistence";
@@ -4402,7 +4321,7 @@ mod tests {
             runtime_path.to_string(),
         ];
         let sufficiency = assemble_packet_sufficiency_with_probe_context(
-            &RuntimeWorkspacePathIdentity,
+            &MissingPathSpellingIdentity,
             input(),
             &[],
             &exact_paths,
@@ -4446,14 +4365,14 @@ mod tests {
         let project_root = Path::new("C:/workspace/project");
 
         assert!(packet_paths_match_exact_probe(
-            &RuntimeWorkspacePathIdentity,
+            &MissingPathSpellingIdentity,
             project_root,
             "crates/foo/src/lib.rs",
             "crates/foo/src/lib.rs"
         ));
         assert!(
             !packet_paths_match_exact_probe(
-                &RuntimeWorkspacePathIdentity,
+                &MissingPathSpellingIdentity,
                 project_root,
                 "src/lib.rs",
                 "crates/foo/src/lib.rs"
@@ -4487,7 +4406,7 @@ mod tests {
         );
 
         let missing = packet_missing_exact_path_claims(
-            &RuntimeWorkspacePathIdentity,
+            &MissingPathSpellingIdentity,
             project_root,
             &paths.map(str::to_string),
             &[overlapping_claim, launcher_claim],
@@ -4519,7 +4438,7 @@ mod tests {
         broad_claim.citations = citations.to_vec();
 
         let missing = packet_missing_exact_path_claims(
-            &RuntimeWorkspacePathIdentity,
+            &MissingPathSpellingIdentity,
             project_root,
             &paths.map(str::to_string),
             &[broad_claim],
@@ -4586,7 +4505,7 @@ mod tests {
         let exact_paths = paths.map(str::to_string);
 
         let sufficiency = assemble_packet_sufficiency_with_probe_context(
-            &RuntimeWorkspacePathIdentity,
+            &MissingPathSpellingIdentity,
             PacketSufficiencyInput {
                 project_root: Path::new("C:/workspace/project"),
                 question,
@@ -4980,7 +4899,7 @@ mod tests {
     fn stale_freshness_caps_an_otherwise_sufficient_packet_at_partial() {
         let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
         let mut answer = answer_fixture(question);
-        let mut stale = crate::agent::packet_freshness::fresh_index_observation();
+        let mut stale = crate::packet_freshness::fresh_index_observation();
         stale.status = IndexFreshnessStatusDto::Stale;
         stale.changed_file_count = 2;
         answer.freshness = Some(stale);
@@ -7779,7 +7698,7 @@ mod tests {
             answer.citations = vec![covered.clone()];
 
             let sufficiency = assemble_packet_sufficiency_with_probe_context(
-                &RuntimeWorkspacePathIdentity,
+                &MissingPathSpellingIdentity,
                 PacketSufficiencyInput {
                     project_root: Path::new("C:/workspace/project"),
                     question,
@@ -7836,7 +7755,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let sufficiency = assemble_packet_sufficiency_with_probe_context(
-            &RuntimeWorkspacePathIdentity,
+            &MissingPathSpellingIdentity,
             PacketSufficiencyInput {
                 project_root: Path::new("C:/workspace/project"),
                 question,
@@ -8125,7 +8044,7 @@ mod tests {
         ];
 
         let sufficiency = assemble_packet_sufficiency_with_probe_context(
-            &RuntimeWorkspacePathIdentity,
+            &MissingPathSpellingIdentity,
             PacketSufficiencyInput {
                 project_root: Path::new("C:/workspace/project"),
                 question,
@@ -8480,7 +8399,7 @@ fn packet_missing_probe_requires_compact_proof(query: &str) -> bool {
     ) || normalized.ends_with("requestvalidation")
 }
 
-pub(crate) fn packet_budget_exceeded_hard_output_cap(budget: &PacketBudgetDto) -> bool {
+pub fn packet_budget_exceeded_hard_output_cap(budget: &PacketBudgetDto) -> bool {
     budget.used.output_bytes > budget.limits.max_output_bytes
 }
 

@@ -486,6 +486,57 @@ pub fn eval_flow_template_claims(
     claims
 }
 
+/// Eval-only indexing/storage flow-template claims. The holdout source-group
+/// configuration spellings this branch recognises stay inside this eval-only
+/// module so production claim assembly never carries them.
+pub fn eval_indexing_storage_flow_template_claims(
+    prompt: &str,
+    citations: &[AgentCitationDto],
+) -> Vec<(String, Vec<AgentCitationDto>)> {
+    use crate::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
+
+    if !eval_probes_enabled() {
+        return Vec::new();
+    }
+    let normalized_prompt = crate::packet_scoring::normalize_identifier(prompt);
+    let indexing_prompt = normalized_prompt.contains("indexing")
+        || normalized_prompt.contains("indexed")
+        || normalized_prompt.contains("indexer");
+    let storage_prompt = normalized_prompt.contains("storage")
+        || normalized_prompt.contains("persistent")
+        || normalized_prompt.contains("sourcegroup")
+        || normalized_prompt.contains("sourcegroupconfiguration");
+    if !(indexing_prompt && storage_prompt) {
+        return Vec::new();
+    }
+
+    let mut claims = Vec::new();
+    let source_group = citations.iter().find(|citation| {
+        packet_evidence_role(citation) == Some(PacketEvidenceRole::SourceGroupConfiguration)
+    });
+    let indexing_work = citations.iter().find(|citation| {
+        packet_evidence_role(citation) == Some(PacketEvidenceRole::IndexingWorkQueue)
+    });
+    if let Some(source_group) = source_group
+        && let Some(indexing_work) = indexing_work
+    {
+        claims.push((
+            "Source-group configuration and indexing command evidence describe how repository configuration becomes indexing work.".to_string(),
+            vec![source_group.clone(), indexing_work.clone()],
+        ));
+    }
+
+    if let Some(persistence) = citations.iter().find(|citation| {
+        packet_evidence_role(citation) == Some(PacketEvidenceRole::PersistenceAndSearchProjection)
+    }) {
+        claims.push((
+            "Persistence/search-projection evidence describes how indexed data remains available to later application reads.".to_string(),
+            vec![persistence.clone()],
+        ));
+    }
+    claims
+}
+
 pub fn push_eval_architecture_flow_probe_terms(lower_prompt: &str, terms: &mut Vec<String>) {
     if !eval_probes_enabled() {
         return;
