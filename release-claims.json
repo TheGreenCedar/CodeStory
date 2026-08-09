@@ -1922,6 +1922,43 @@
         "access": "read",
         "reason": "The automation authenticates a close request by reading the merged pull request - merge commit, base branch, and stack metadata - before it touches any issue. That verification needs only pull-requests: read, pinned here so the read-side scope cannot widen into write access on the automation's token."
       }
+    },
+    "constant_mirrors": {
+      "cargo_config_retrieval_aliases": {
+        "file": ".cargo/config.toml",
+        "fragments": [
+          "retrieval-setup = \"run --locked -p codestory-cli",
+          "retrieval-status = \"run --locked -p codestory-cli"
+        ],
+        "reason": "The cargo aliases are the human entry points into retrieval setup and status. Each alias must keep running the codestory-cli binary with --locked so a hand-typed `cargo retrieval-setup` resolves the exact dependency set the lockfile reviewed, mirroring the same locked invocation the setup scripts pin - one surface cannot drift to an unlocked build while the others stay locked."
+      },
+      "codex_worktree_setup": {
+        "file": "scripts/codex-worktree-setup.mjs",
+        "fragments": [
+          "[\"build\", \"--release\", \"--locked\", \"-p\", \"codestory-cli\"]",
+          "prepare-embedded-model.mjs",
+          "CODESTORY_EMBED_MODEL_SOURCE"
+        ],
+        "reason": "The worktree bootstrap is the agent-facing setup surface. It must keep the exact locked release build of codestory-cli and the embedded-model staging pair - the prepare script and its source override variable - so a fresh worktree reproduces the reviewed toolchain instead of resolving new dependency versions or skipping model provisioning."
+      },
+      "grounding_setup_sh": {
+        "file": "plugins/codestory/skills/codestory-grounding/scripts/setup.sh",
+        "fragments": [
+          "cargo build --release --locked -p codestory-cli",
+          "prepare-embedded-model.mjs",
+          "CODESTORY_EMBED_MODEL_SOURCE"
+        ],
+        "reason": "The POSIX skill setup is the shipped plugin's own bootstrap. It must mirror the same locked release build of codestory-cli and the embedded-model staging pair the worktree setup pins, so an installed skill and a development worktree provision identical binaries from identical dependency sets."
+      },
+      "grounding_setup_ps1": {
+        "file": "plugins/codestory/skills/codestory-grounding/scripts/setup.ps1",
+        "fragments": [
+          "@(\"build\", \"--release\", \"--locked\", \"-p\", \"codestory-cli\"",
+          "prepare-embedded-model.mjs",
+          "CODESTORY_EMBED_MODEL_SOURCE"
+        ],
+        "reason": "The Windows skill setup is the same bootstrap spelled for PowerShell. It must mirror the locked release build argument vector and the embedded-model staging pair verbatim, so the Windows install path cannot quietly diverge from the POSIX and worktree surfaces it mirrors."
+      }
     }
   }
 }

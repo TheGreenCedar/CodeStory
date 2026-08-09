@@ -197,6 +197,7 @@ export function retrievalGeneralizationSuitePolicyViolations(
     "root",
     "rustRoot",
     "retrievalRoot",
+    "agentRoot",
     "extraRustRoot",
     "nonRustRoot",
     "taskRoot",
@@ -1109,6 +1110,28 @@ export function structuralPinViolations(workflows, graph = loadReleaseClaimGraph
         object(workflow.permissions)[row.scope] === row.access,
         `${row.file} must ${row.access} ${String(row.scope).replaceAll("-", " ")}`,
       );
+    }
+  }
+  return violations;
+}
+
+// Every cross-file constant-mirror rule INSTANCE (a repository file that must repeat
+// a reviewed constant verbatim) lives in release-claims.json under
+// workflow_policy.constant_mirrors; scripts/codestory-release-claims.mjs fails graph
+// loading unless that block names exactly the reviewed mirror rows, so membership
+// cannot drift by data edit. The checker keeps only what stays code: the one
+// source-inclusion predicate every row binds and its reviewed violation message,
+// byte-identical to the retired inline file/fragment table. Each mirror file is read
+// exactly as the retired table read it - relative to the process working directory -
+// so a missing mirror file still throws out of the validator instead of degrading
+// into a softer violation.
+export function constantMirrorViolations(graph = loadReleaseClaimGraph(repositoryRoot)) {
+  const violations = [];
+  for (const value of Object.values(object(object(graph.workflow_policy).constant_mirrors))) {
+    const row = object(value);
+    const source = fs.readFileSync(String(row.file), "utf8");
+    for (const fragment of list(row.fragments)) {
+      add(violations, source.includes(fragment), `${row.file} must preserve locked Cargo contract ${fragment}`);
     }
   }
   return violations;
@@ -2239,48 +2262,6 @@ export function notaryStepViolations(step) {
     .some(line => /^\s*--wait(?:\s|\\|$)/u.test(line) || /notarytool\s+submit.*\s--wait(?:\s|$)/u.test(line))
     ? ["notarization must poll explicitly instead of using notarytool --wait"]
     : [];
-}
-
-function validateLockedSetupSurfaces(violations) {
-  const contracts = new Map([
-    [
-      path.join(".cargo", "config.toml"),
-      [
-        'retrieval-setup = "run --locked -p codestory-cli',
-        'retrieval-status = "run --locked -p codestory-cli',
-      ],
-    ],
-    [
-      path.join("scripts", "codex-worktree-setup.mjs"),
-      [
-        '["build", "--release", "--locked", "-p", "codestory-cli"]',
-        "prepare-embedded-model.mjs",
-        "CODESTORY_EMBED_MODEL_SOURCE",
-      ],
-    ],
-    [
-      path.join("plugins", "codestory", "skills", "codestory-grounding", "scripts", "setup.sh"),
-      [
-        "cargo build --release --locked -p codestory-cli",
-        "prepare-embedded-model.mjs",
-        "CODESTORY_EMBED_MODEL_SOURCE",
-      ],
-    ],
-    [
-      path.join("plugins", "codestory", "skills", "codestory-grounding", "scripts", "setup.ps1"),
-      [
-        '@("build", "--release", "--locked", "-p", "codestory-cli"',
-        "prepare-embedded-model.mjs",
-        "CODESTORY_EMBED_MODEL_SOURCE",
-      ],
-    ],
-  ]);
-  for (const [file, fragments] of contracts) {
-    const source = fs.readFileSync(file, "utf8");
-    for (const fragment of fragments) {
-      add(violations, source.includes(fragment), `${file} must preserve locked Cargo contract ${fragment}`);
-    }
-  }
 }
 
 function validateIssueWorkflows(workflows, violations) {
@@ -11199,7 +11180,9 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   validateCargoTestFilters(workflows, violations);
   validatePluginRelease(workflows, violations, graph);
   validateMarketplaceSync(workflows, violations, graph);
-  validateLockedSetupSurfaces(violations);
+  // The locked-setup constant mirrors are rule instances and live in
+  // release-claims.json under workflow_policy.constant_mirrors;
+  // constantMirrorViolations evaluates them.
   validateIssueWorkflows(workflows, violations);
   validatePluginAndDraftWorkflows(workflows, violations, graph);
   validateReleaseCoordinator(workflows, violations, graph);
@@ -11220,6 +11203,7 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   violations.push(...pinnedProgramViolations(workflows, graph));
   violations.push(...stepFragmentViolations(workflows, graph));
   violations.push(...structuralPinViolations(workflows, graph));
+  violations.push(...constantMirrorViolations(graph));
   return violations;
 }
 

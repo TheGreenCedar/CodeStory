@@ -127,6 +127,19 @@ const STRUCTURAL_PIN_CONTRACTS = new Map([
   ["close_dev_issues_issues_write", { kind: "permission" }],
   ["close_dev_issues_pull_requests_read", { kind: "permission" }],
 ]);
+// The graph owns every cross-file constant-mirror rule instance (a repository file
+// that must repeat a reviewed constant verbatim) for families migrated off inline
+// file/fragment tables; the checker owns only the source-inclusion predicate and its
+// message shape. All rows bind that one predicate, so membership carries names
+// alone. Membership is exact and fail-closed: a graph that drops, renames, or
+// invents a mirror row must not load, so a rule instance cannot disappear by data
+// edit.
+const CONSTANT_MIRROR_ROWS = new Set([
+  "cargo_config_retrieval_aliases",
+  "codex_worktree_setup",
+  "grounding_setup_sh",
+  "grounding_setup_ps1",
+]);
 const FAILURE_ORDER = new Map([
   ["unsupported_claim", 0],
   ["missing", 1],
@@ -941,6 +954,33 @@ function validateStructuralPins(policy) {
     nonEmptyText(row.reason, `${label}.reason`);
   }
   return pins;
+}
+
+function validateConstantMirrors(policy) {
+  const mirrors = object(policy.constant_mirrors, "workflow_policy.constant_mirrors");
+  for (const name of Object.keys(mirrors)) {
+    if (!CONSTANT_MIRROR_ROWS.has(name)) {
+      fail(`workflow_policy.constant_mirrors names unknown constant mirror ${name}`);
+    }
+  }
+  for (const name of CONSTANT_MIRROR_ROWS) {
+    if (mirrors[name] === undefined) {
+      fail(`workflow_policy.constant_mirrors must declare ${name}`);
+    }
+    const label = `workflow_policy.constant_mirrors.${name}`;
+    const row = object(mirrors[name], label);
+    const expectedKeys = ["file", "fragments", "reason"];
+    if (
+      JSON.stringify([...Object.keys(row)].sort())
+        !== JSON.stringify([...expectedKeys].sort())
+    ) {
+      fail(`${label} must carry exactly ${expectedKeys.join(", ")}`);
+    }
+    nonEmptyText(row.file, `${label}.file`);
+    stringArray(row.fragments, `${label}.fragments`, { nonEmpty: true });
+    nonEmptyText(row.reason, `${label}.reason`);
+  }
+  return mirrors;
 }
 
 function validateQualificationPolicy(value, pinnedPrograms) {
@@ -1910,6 +1950,7 @@ export function validateReleaseClaimGraph(graph) {
   const pinnedPrograms = validatePinnedPrograms(policy);
   validateStepFragments(policy);
   validateStructuralPins(policy);
+  validateConstantMirrors(policy);
   validateProofFloor(policy.proof_floor);
   if (!Array.isArray(policy.package_matrix) || policy.package_matrix.length !== 3) {
     fail("workflow_policy.package_matrix must define three release package rows");
@@ -2218,6 +2259,11 @@ export function loadReleaseClaimGraph(repoRoot = path.resolve(path.dirname(fileU
     const relative = path.join(".github", "workflows", row.file);
     if (!existsSync(path.join(repoRoot, relative))) {
       fail(`workflow_policy.structural_pins.${name} binds missing file ${relative}`);
+    }
+  }
+  for (const [name, row] of Object.entries(validated.workflow_policy.constant_mirrors)) {
+    if (!existsSync(path.join(repoRoot, row.file))) {
+      fail(`workflow_policy.constant_mirrors.${name} binds missing file ${row.file}`);
     }
   }
   return validated;
