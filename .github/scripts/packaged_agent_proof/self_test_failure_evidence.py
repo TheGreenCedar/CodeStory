@@ -158,8 +158,8 @@ def _scripted_driver_failure_tests(fixture: FullStackFixture) -> None:
             ),
             encoding="utf-8",
         )
-        (artifact_root / "measurement-samples.partial.jsonl").write_text(
-            '{"sample_index": 0}\n', encoding="utf-8"
+        (artifact_root / "measurement-samples.partial.jsonl").write_bytes(
+            b'{"sample_index": 0}\n'
         )
         raise ProofFailure(_SCRIPTED_FAILURE)
 

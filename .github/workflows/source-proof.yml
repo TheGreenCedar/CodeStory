@@ -335,6 +335,10 @@ jobs:
             throw "native probe root already exists: $probeRoot"
           }
           try {
+            python .github/scripts/check-packaged-agent-proof.py --self-test
+            if ($LASTEXITCODE -ne 0) {
+              throw "packaged proof self-test failed on the protected Windows runner"
+            }
             cargo new --quiet --bin --name cargo-hardlink-probe $probeRoot
             if ($LASTEXITCODE -ne 0) {
               throw "cargo new failed"
