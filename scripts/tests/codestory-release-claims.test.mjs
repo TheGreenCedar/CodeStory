@@ -715,11 +715,12 @@ test("pinned programs are an exact fail-closed membership with graph-owned diges
 
 test("step fragments are an exact fail-closed membership with graph-owned rule data", () => {
   const rules = graph.workflow_policy.step_fragments;
-  assert.equal(Object.keys(rules).length, 2);
+  assert.equal(Object.keys(rules).length, 6);
   for (const row of Object.values(rules)) {
-    assert.equal(row.kind, "require");
+    assert.ok(row.kind === "require" || row.kind === "forbid");
     assert.ok(row.fragments.length > 0);
   }
+  assert.equal(rules.marketplace_sync_dispatch_guard_line_tests.kind, "forbid");
   const mutations = [
     [draft => {
       delete draft.workflow_policy.step_fragments.close_dev_issues;
@@ -745,6 +746,10 @@ test("step fragments are an exact fail-closed membership with graph-owned rule d
     [draft => {
       draft.workflow_policy.step_fragments.saga_issue_link_guard.reason = "";
     }, /saga_issue_link_guard\.reason must be a non-empty string/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.marketplace_sync_dispatch_guard_line_tests.kind =
+        "require";
+    }, /marketplace_sync_dispatch_guard_line_tests\.kind must be forbid/u],
   ];
   for (const [mutate, expected] of mutations) {
     const draft = structuredClone(graph);
