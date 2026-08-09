@@ -89,7 +89,9 @@ mod snippets;
 mod source_coverage;
 mod workspace_state;
 use affected::{AffectedOperationIdentityIndex, IndexFreshnessObservation};
-pub use agent::{packet_step_trace_json, plan_packet};
+pub use agent::{
+    enforce_packet_output_budget_for_representation, packet_step_trace_json, plan_packet,
+};
 
 #[cfg(feature = "test-support")]
 #[doc(hidden)]

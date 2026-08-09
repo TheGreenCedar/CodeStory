@@ -567,7 +567,7 @@ test("claim graph freezes one GPU-only qualification run per available platform"
     archive_transfer: "authenticated_miss_only",
     evaluation_owner: "isolated_reusable_workflow",
     evaluation_owner_sha256:
-      "b7a17c66c4cc4275b369f39fdc1fcdb375b334ba908d31577b910ea10e7eb54e",
+      "5b97ee71393c5f72ef106d0d1e238cb1323e930204a06a4557f8e63725b0f8cd",
     evaluation_contract: "publishable-three-repeat-packet/v1",
     task_count: 1,
     repeats_per_task: 3,
@@ -715,12 +715,36 @@ test("pinned programs are an exact fail-closed membership with graph-owned diges
 
 test("step fragments are an exact fail-closed membership with graph-owned rule data", () => {
   const rules = graph.workflow_policy.step_fragments;
-  assert.equal(Object.keys(rules).length, 132);
+  assert.equal(Object.keys(rules).length, 133);
   for (const row of Object.values(rules)) {
     assert.ok(row.kind === "require" || row.kind === "forbid");
     assert.ok(row.fragments.length > 0);
   }
   assert.equal(rules.marketplace_sync_dispatch_guard_line_tests.kind, "forbid");
+  assert.deepEqual(rules.release_post_publish_closeout_provenance.fragments, [
+    "producer-map",
+    "--phase post_publish",
+    "--reuse \"$REUSE_SELECTION\"",
+    "bash .github/scripts/collect-actions-job-evidence.sh",
+    "--job-evidence target/release-closeout/job-evidence.json",
+  ]);
+  assert.equal(
+    rules.release_post_publish_container_digests.step,
+    "Download and verify selected cumulative release cells",
+  );
+  assert.deepEqual(rules.release_post_publish_container_digests.fragments, [
+    "/actions/artifacts/$artifact_id/zip",
+    "sha256sum",
+    "test \"$actual_digest\" = \"$expected_digest\"",
+  ]);
+  assert.ok(!JSON.stringify([
+    rules.release_post_publish_closeout_provenance,
+    rules.release_post_publish_container_digests,
+  ]).includes("artifact_ids"));
+  assert.notEqual(
+    rules.release_post_publish_container_digests.step,
+    "Verify selected post-publish artifact container digests",
+  );
   const mutations = [
     [draft => {
       delete draft.workflow_policy.step_fragments.close_dev_issues;

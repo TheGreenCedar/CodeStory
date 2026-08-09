@@ -624,6 +624,29 @@ fn grounding_root_candidate_files(
         .collect()
 }
 
+/// Resolve file-role evidence against the selected project rather than its
+/// checkout ancestors.
+///
+/// The stored role is classified when the file is indexed. An otherwise
+/// ordinary project copied below a directory such as `target` or `build` can
+/// therefore inherit that ancestor's generated role and lose every production
+/// candidate. Grounding already owns the explicit project root, so use the
+/// same role classifier on the project-relative path and retain stored evidence
+/// only for records that are not beneath that root.
+fn grounding_file_role_for_project(
+    root: &Path,
+    summary: &codestory_store::GroundingFileSummary,
+) -> Option<FileRole> {
+    let stored_role = summary.file_role?;
+    summary
+        .file
+        .path
+        .strip_prefix(root)
+        .ok()
+        .map(FileRole::classify_path)
+        .or(Some(stored_role))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn grounding_orientation(
     root: &Path,
@@ -1069,7 +1092,9 @@ impl AppController {
             .collect::<HashMap<_, _>>();
         let file_roles = file_summaries
             .iter()
-            .filter_map(|summary| summary.file_role.map(|role| (summary.file.id, role)))
+            .filter_map(|summary| {
+                grounding_file_role_for_project(&root, summary).map(|role| (summary.file.id, role))
+            })
             .collect::<HashMap<_, _>>();
         let architecture_root_file_ids =
             grounding_root_candidate_files(&root, &file_summaries, &file_roles, &file_languages);
@@ -2397,6 +2422,241 @@ mod tests {
             );
         }
         assert!(universe.len() <= ARCHITECTURE_ROOT_FILE_LIMIT);
+    }
+
+    #[test]
+    fn large_mixed_project_keeps_entrypoint_and_ui_host_boundaries_above_decoys() {
+        let temp = tempdir().expect("temp dir");
+        let project_root = temp.path().join("target/acceptance/project");
+        let db_path = temp.path().join("cache/codestory.db");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+
+            // More type roots than the global 224-candidate window can hold.
+            // Each is member-rich and test-owned relative to the project, but
+            // its absolute path is contaminated by the generated-path prefix.
+            for index in 0..225_i64 {
+                let file_id = 10_000 + index;
+                let root_id = 100_000 + index * 10;
+                let path = project_root.join(format!("tests/corpus/decoy_{index}.rs"));
+                let persisted_role = FileRole::classify_path(&path);
+                assert_eq!(persisted_role, FileRole::Generated);
+                insert_file_node_with_role_and_language(
+                    &mut storage,
+                    file_id,
+                    &path,
+                    persisted_role,
+                    "rust",
+                    Node {
+                        id: CoreNodeId(root_id),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: format!("DecoyType{index:03}"),
+                        file_node_id: Some(CoreNodeId(file_id)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .expect("insert decoy root");
+
+                let members = (1..=4_i64)
+                    .map(|offset| Node {
+                        id: CoreNodeId(root_id + offset),
+                        kind: NodeKind::METHOD,
+                        serialized_name: format!("member_{offset}"),
+                        file_node_id: Some(CoreNodeId(file_id)),
+                        start_line: Some(offset as u32 + 1),
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>();
+                storage
+                    .insert_nodes_batch(&members)
+                    .expect("insert decoy members");
+                storage
+                    .insert_edges_batch(
+                        &(1..=4_i64)
+                            .map(|offset| Edge {
+                                id: EdgeId(200_000 + index * 10 + offset),
+                                source: CoreNodeId(root_id),
+                                target: CoreNodeId(root_id + offset),
+                                kind: EdgeKind::MEMBER,
+                                file_node_id: Some(CoreNodeId(file_id)),
+                                line: Some(offset as u32 + 1),
+                                resolved_source: None,
+                                resolved_target: None,
+                                confidence: None,
+                                certainty: None,
+                                callsite_identity: None,
+                                candidate_targets: Vec::new(),
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .expect("insert decoy membership");
+            }
+
+            let architecture = [
+                (
+                    101,
+                    1_001,
+                    "src/main.ts",
+                    "typescript",
+                    "LaunchWorkspace",
+                    NodeKind::FUNCTION,
+                ),
+                (
+                    201,
+                    2_001,
+                    "apps/desktop/ui/src/App.svelte",
+                    "svelte",
+                    "ApplicationShell",
+                    NodeKind::STRUCT,
+                ),
+                (
+                    301,
+                    3_001,
+                    "apps/desktop/src-tauri/src/lib.rs",
+                    "rust",
+                    "HostRuntime",
+                    NodeKind::STRUCT,
+                ),
+                (
+                    401,
+                    4_001,
+                    "packages/shared/src/lib.rs",
+                    "rust",
+                    "SharedLibrary",
+                    NodeKind::STRUCT,
+                ),
+                (
+                    501,
+                    5_001,
+                    "services/api/src/service.go",
+                    "go",
+                    "ApiBoundary",
+                    NodeKind::STRUCT,
+                ),
+            ];
+            for (file_id, node_id, relative, language, name, kind) in architecture {
+                let path = project_root.join(relative);
+                let persisted_role = FileRole::classify_path(&path);
+                assert_eq!(persisted_role, FileRole::Generated);
+                insert_file_node_with_role_and_language(
+                    &mut storage,
+                    file_id,
+                    &path,
+                    persisted_role,
+                    language,
+                    Node {
+                        id: CoreNodeId(node_id),
+                        kind,
+                        serialized_name: name.to_string(),
+                        file_node_id: Some(CoreNodeId(file_id)),
+                        start_line: Some(500),
+                        ..Default::default()
+                    },
+                )
+                .expect("insert architecture root");
+            }
+            storage
+                .insert_edges_batch(&[
+                    Edge {
+                        id: EdgeId(9_001),
+                        source: CoreNodeId(1_001),
+                        target: CoreNodeId(2_001),
+                        kind: EdgeKind::CALL,
+                        file_node_id: Some(CoreNodeId(101)),
+                        line: Some(501),
+                        resolved_source: None,
+                        resolved_target: None,
+                        confidence: None,
+                        certainty: None,
+                        callsite_identity: None,
+                        candidate_targets: Vec::new(),
+                    },
+                    Edge {
+                        id: EdgeId(9_002),
+                        source: CoreNodeId(1_001),
+                        target: CoreNodeId(3_001),
+                        kind: EdgeKind::CALL,
+                        file_node_id: Some(CoreNodeId(101)),
+                        line: Some(502),
+                        resolved_source: None,
+                        resolved_target: None,
+                        confidence: None,
+                        certainty: None,
+                        callsite_identity: None,
+                        candidate_targets: Vec::new(),
+                    },
+                ])
+                .expect("insert entrypoint topology");
+
+            storage
+                .snapshots()
+                .refresh_summary()
+                .expect("refresh summary snapshot");
+            storage
+                .snapshots()
+                .refresh_detail()
+                .expect("refresh detail snapshot");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(project_root, db_path)
+            .expect("open project");
+        let strict = controller
+            .grounding_snapshot(GroundingBudgetDto::Strict)
+            .expect("strict snapshot");
+        let balanced = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("balanced snapshot");
+        let max = controller
+            .grounding_snapshot(GroundingBudgetDto::Max)
+            .expect("max snapshot");
+        let strict_again = controller
+            .grounding_snapshot(GroundingBudgetDto::Strict)
+            .expect("repeat strict snapshot");
+
+        let names = strict
+            .root_symbols
+            .iter()
+            .map(grounding_symbol_name)
+            .collect::<Vec<_>>();
+        assert_eq!(names.first().map(String::as_str), Some("LaunchWorkspace"));
+        for boundary in [
+            "ApplicationShell",
+            "HostRuntime",
+            "SharedLibrary",
+            "ApiBoundary",
+        ] {
+            assert!(
+                names.iter().any(|name| name == boundary),
+                "strict grounding omitted {boundary}: {names:?}"
+            );
+        }
+        assert!(strict.orientation.evaluated_root_candidates > 224);
+        assert_eq!(strict.orientation.selected_entrypoint_roots, 1);
+        assert!(strict.orientation.candidate_subsystems >= 5);
+        assert!(strict.orientation.selected_subsystems >= 5);
+
+        let root_refs = |snapshot: &GroundingSnapshotDto| {
+            snapshot
+                .root_symbols
+                .iter()
+                .map(|symbol| symbol.node_ref.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(root_refs(&strict), root_refs(&strict_again));
+        assert_eq!(
+            root_refs(&strict),
+            root_refs(&balanced)[..strict.root_symbols.len()]
+        );
+        assert_eq!(
+            root_refs(&balanced),
+            root_refs(&max)[..balanced.root_symbols.len()]
+        );
     }
 
     #[test]

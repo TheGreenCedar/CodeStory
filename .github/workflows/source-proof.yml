@@ -845,3 +845,67 @@ jobs:
           }
           "- Windows path and native-staging source contracts: ${elapsed} ms" |
             Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Emit authenticated Windows-native source receipt
+        id: windows-native-source-proof
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.resolve.outputs.ref }}
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo metadata failed with exit code $LASTEXITCODE"
+          }
+          $cliPackages = @($metadata.packages | Where-Object { $_.name -eq "codestory-cli" })
+          if ($cliPackages.Count -ne 1) {
+            throw "expected exactly one codestory-cli package, found $($cliPackages.Count)"
+          }
+          $commit = (git rev-parse HEAD).Trim()
+          $sourceTree = (git rev-parse "HEAD^{tree}").Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "git identity resolution failed with exit code $LASTEXITCODE"
+          }
+          if ($commit -ne $env:EXPECTED_HEAD_SHA) {
+            throw "Windows-native source receipt head $commit differs from routed head $env:EXPECTED_HEAD_SHA"
+          }
+          $dirty = @(git status --porcelain=v1)
+          if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {
+            throw "Windows-native source receipt requires a clean exact-head checkout"
+          }
+          $receipt = [ordered]@{
+            schema = "codestory.windows-native-source-proof/v1"
+            status = "pass"
+            repository = $env:GITHUB_REPOSITORY
+            commit = $commit
+            source_tree = $sourceTree
+            version = $cliPackages[0].version
+            producer = [ordered]@{
+              workflow_path = ".github/workflows/source-proof.yml"
+              job = "windows-native-contracts"
+              run_id = [Int64]$env:GITHUB_RUN_ID
+              run_attempt = [Int64]$env:GITHUB_RUN_ATTEMPT
+            }
+            contracts = [ordered]@{
+              qualification_harness_self_test = $true
+              control_directory_inflight = $true
+              windows_path_identity = $true
+              native_staging = $true
+            }
+          }
+          New-Item -ItemType Directory -Force -Path target/windows-native-source-proof | Out-Null
+          $json = $receipt | ConvertTo-Json -Depth 4 -Compress
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::WriteAllText(
+            (Join-Path $env:GITHUB_WORKSPACE "target/windows-native-source-proof/windows-native-source-proof.json"),
+            "$json`n",
+            $utf8NoBom
+          )
+          "commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload authenticated Windows-native source receipt
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows-native-source-proof-${{ steps.windows-native-source-proof.outputs.commit }}-attempt-${{ github.run_attempt }}
+          path: target/windows-native-source-proof/windows-native-source-proof.json
+          if-no-files-found: error
+          retention-days: 30

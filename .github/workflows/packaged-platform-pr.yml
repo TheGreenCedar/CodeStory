@@ -544,7 +544,7 @@ jobs:
       - windows-vulkan-proof
       - linux-vulkan-proof
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 65
     steps:
       - name: Require one coherent accepted proof
         shell: bash
@@ -619,3 +619,129 @@ jobs:
               exit 1
             }
           fi
+
+      - name: Validate opted-in Linux quality evidence
+        if: inputs.qualify_linux_vulkan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.route.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          artifact_name="frozen-candidate-linux-x64-quality-$HEAD_SHA-attempt-$GITHUB_RUN_ATTEMPT"
+          evidence_root=target/strict-linux-quality
+          rm -rf "$evidence_root"
+          mkdir -p "$evidence_root"
+
+          artifact=""
+          for _ in $(seq 1 300); do
+            artifacts="$({ gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100"; } 2>/dev/null || true)"
+            if [ -z "$artifacts" ]; then artifacts='{"artifacts":[]}'; fi
+            artifact="$(jq -c \
+              --arg name "$artifact_name" \
+              --arg sha "$HEAD_SHA" \
+              --argjson run_id "$GITHUB_RUN_ID" \
+              '[.artifacts[]? | select(
+                .name == $name
+                and .expired == false
+                and .workflow_run.id == $run_id
+                and .workflow_run.head_sha == $sha
+              )] | if length == 1 then .[0] else empty end' \
+              <<<"$artifacts")"
+            if [ -n "$artifact" ]; then break; fi
+            sleep 10
+          done
+          test -n "$artifact" || {
+            echo "::error::Exact Linux quality artifact $artifact_name was not retained."
+            exit 1
+          }
+          artifact_id="$(jq -r .id <<<"$artifact")"
+          artifact_digest="$(jq -r .digest <<<"$artifact")"
+          [[ "$artifact_id" =~ ^[0-9]+$ ]]
+          [[ "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$artifact_name" \
+            --dir "$evidence_root/artifact"
+
+          summary="$(find "$evidence_root/artifact" -type f -name packet-runtime-summary.json -print)"
+          runs="$(find "$evidence_root/artifact" -type f -name packet-runtime-runs.jsonl -print)"
+          test "$(printf '%s\n' "$summary" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          test "$(printf '%s\n' "$runs" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          source_tree="$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA" --jq .tree.sha)"
+          jq -e \
+            --arg commit "$HEAD_SHA" \
+            --arg tree "$source_tree" \
+            '.modes == ["cold-cli"]
+              and .repeats == 3
+              and .release_evidence.commit == $commit
+              and .release_evidence.source_tree == $tree
+              and .release_evidence.evaluation_contract == "publishable-three-repeat-packet/v1"
+              and .release_evidence.profile == "optional-linux-x64-quality"
+              and .release_evidence.evidence_identity.corpus_id == "codestory-release-corpus-v0.16-axios-js-ts-v2"
+              and .release_evidence.evidence_identity.cache_id == "frozen-candidate-linux-x64-axios-js-ts-v2"
+              and (.release_evidence.evidence_identity.machine_fingerprint | test("^[0-9a-f]{64}$"))
+              and .release_evidence.publishable == true
+              and .release_evidence.repeats == 3
+              and .release_evidence.quality_gate_status == "pass"
+              and .release_evidence.publishable_blockers == []
+              and (.release_evidence.rows | length) == 3' \
+            "$summary" >/dev/null
+          jq -s -e '
+            length == 3
+            and ([.[].repeat] | sort) == [1, 2, 3]
+            and all(.[];
+              .repo == "axios"
+              and .task_id == "axios-request-dispatch-v2"
+              and .mode == "cold_cli_packet"
+              and .status == "pass"
+              and .quality.pass == true
+              and .sufficiency.status == "sufficient"
+              and .sufficiency.gaps_count == 0
+              and .sufficiency.open_next_count == 0
+              and .sufficiency.follow_up_commands_count == 0
+              and (.sufficiency.coverage_unresolved_blocking_count // .sufficiency.coverage_unresolved_count // 0) == 0
+              and ((.sufficiency.unresolved_candidate_count // 0) == 0 or .sufficiency.unresolved_candidate_diagnostic_only == true)
+              and .sufficiency.retrieval_mode == "full"
+              and .sufficiency.degraded_reason == null
+              and .packet_latency.sla_missed == false
+              and .packet_latency.retrieval_shadow.retrieval_mode == "full"
+              and .packet_extra_probe_strategy == null
+              and .repo_provenance.git_dirty == false
+              and .codestory_cache_provenance.local_only == true
+            )' "$runs" >/dev/null
+          jq -S '.release_evidence.rows' "$summary" > "$evidence_root/summary-rows.json"
+          jq -sS '.' "$runs" > "$evidence_root/raw-rows.json"
+          cmp "$evidence_root/summary-rows.json" "$evidence_root/raw-rows.json"
+          summary_sha256="$(sha256sum "$summary" | awk '{print $1}')"
+          runs_sha256="$(sha256sum "$runs" | awk '{print $1}')"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg commit "$HEAD_SHA" \
+            --arg source_tree "$source_tree" \
+            --argjson producer_run_id "$GITHUB_RUN_ID" \
+            --argjson producer_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --argjson source_artifact_id "$artifact_id" \
+            --arg source_artifact "$artifact_name" \
+            --arg source_artifact_digest "$artifact_digest" \
+            --arg summary_sha256 "$summary_sha256" \
+            --arg runs_sha256 "$runs_sha256" \
+            '{schema:"codestory.strict-linux-quality-validation/v1", status:"pass",
+              repository:$repository, commit:$commit, source_tree:$source_tree,
+              producer_run_id:$producer_run_id, producer_run_attempt:$producer_run_attempt,
+              source_artifact_id:$source_artifact_id, source_artifact:$source_artifact,
+              source_artifact_digest:$source_artifact_digest,
+              evaluation_contract:"publishable-three-repeat-packet/v1",
+              corpus_id:"codestory-release-corpus-v0.16-axios-js-ts-v2",
+              repeats:3, rows:3, summary_sha256:$summary_sha256, runs_sha256:$runs_sha256}' \
+            > "$evidence_root/receipt.json"
+
+      - name: Upload opted-in Linux quality validation
+        if: inputs.qualify_linux_vulkan
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: strict-linux-quality-validation-${{ needs.route.outputs.head_sha }}-attempt-${{ github.run_attempt }}
+          path: target/strict-linux-quality/receipt.json
+          if-no-files-found: error
+          retention-days: 30

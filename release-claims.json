@@ -1365,7 +1365,7 @@
         "archive_cache_contract": "candidate_archive_cache",
         "archive_transfer": "authenticated_miss_only",
         "evaluation_owner": "isolated_reusable_workflow",
-          "evaluation_owner_sha256": "b7a17c66c4cc4275b369f39fdc1fcdb375b334ba908d31577b910ea10e7eb54e",
+        "evaluation_owner_sha256": "5b97ee71393c5f72ef106d0d1e238cb1323e930204a06a4557f8e63725b0f8cd",
         "evaluation_contract": "publishable-three-repeat-packet/v1",
         "task_count": 1,
         "repeats_per_task": 3,
@@ -1772,13 +1772,13 @@
       "packaged_platform_pr_workflow": {
         "subject": "parsed_workflow_json",
         "file": "packaged-platform-pr.yml",
-        "sha256": "012a140f8843267b4604e8a3ad446e6bf81cc2f25d6d56a896dd352121b43e64",
+        "sha256": "f8b1694f36a4ee1892ea00e4336a382e04d768c1afa4254c354048b7e8d0f289",
         "reason": "The frozen-candidate coordinator is a small release-control program, not a loose collection of independently safe fragments. Its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
       },
       "frozen_candidate_quality_workflow": {
         "subject": "parsed_workflow_json",
         "file": "frozen-candidate-quality.yml",
-        "sha256": "b7a17c66c4cc4275b369f39fdc1fcdb375b334ba908d31577b910ea10e7eb54e",
+        "sha256": "5b97ee71393c5f72ef106d0d1e238cb1323e930204a06a4557f8e63725b0f8cd",
         "reason": "The isolated evaluation owner runs optional quality evidence against the exact frozen candidate; pinning its complete parsed structure keeps the adjunct from acquiring authority or losing its isolation unreviewed. The qualification quality contract cites this same pin as evaluation_owner_sha256."
       },
       "macos_metal_proof_workflow": {
@@ -3256,6 +3256,37 @@
         ],
         "reason": "The version the catalog is pointed at reaches the push as a variable, so the command text no longer says which release it published; the flag spelling is pinned here and the env binding stays a code-owned check, as in the plugin lane."
       },
+      "post_publish_smoke_restart_survival": {
+        "kind": "require",
+        "file": "post-publish-release-smoke.yml",
+        "job": "smoke",
+        "step": "Prove the catalog-resolved published runtime",
+        "fragments": [
+          "common=(",
+          "python .github/scripts/check-packaged-agent-proof.py",
+          "--expected-backend \"$EXPECTED_BACKEND\"",
+          "\"${common[@]}\" --out-dir \"$proof_root/session-1\"",
+          "\"${common[@]}\" --out-dir \"$proof_root/session-2\"",
+          "time.time_ns() // 1_000_000",
+          "node .github/scripts/restart-survival-receipt.mjs",
+          "--session-1-summary \"$proof_root/session-1/summary.json\"",
+          "--session-2-summary \"$proof_root/session-2/summary.json\"",
+          "--install-attestation \"$INSTALLED_ATTESTATION\"",
+          "--catalog-delivery-state \"$CATALOG_DELIVERY_STATE\"",
+          "--expected-installer-identity \"$DELIVERED_INSTALLER\"",
+          "--expected-source-commit \"$source_sha\"",
+          "--expected-source-tree \"$source_tree\"",
+          "--expected-version \"$RELEASE_VERSION\"",
+          "--expected-archive-sha256 \"$archive_sha256\"",
+          "--expected-binary-sha256 \"$binary_sha256\"",
+          "--session-1-start-ms \"$session_1_started_ms\"",
+          "--session-1-finished-ms \"$session_1_finished_ms\"",
+          "--session-2-start-ms \"$session_2_started_ms\"",
+          "--session-2-finished-ms \"$session_2_finished_ms\"",
+          "--out \"$proof_root/restart-survival.json\""
+        ],
+        "reason": "Each post-publish target must reuse one catalog installation across two ordered fresh installed-runtime sessions, prove distinct runtime identities and full accelerated retrieval after restart, and retain a hashed restart-survival receipt before release cells are emitted."
+      },
       "release_post_publish_closeout_provenance": {
         "kind": "require",
         "file": "release.yml",
@@ -3264,23 +3295,23 @@
         "fragments": [
           "producer-map",
           "--phase post_publish",
-          "artifact_ids",
+          "--reuse \"$REUSE_SELECTION\"",
           "bash .github/scripts/collect-actions-job-evidence.sh",
           "--job-evidence target/release-closeout/job-evidence.json"
         ],
-        "reason": "The post-publish producer map must be collected by the closeout itself, scoped to its phase, and must publish the exact artifact ids the download step later consumes."
+        "reason": "The post-publish producer map must be collected by the closeout itself, scoped to its phase, and must consume the preflight-authenticated reuse selection so the cumulative ledger retains an earlier exact-tree source proof."
       },
       "release_post_publish_container_digests": {
         "kind": "require",
         "file": "release.yml",
         "job": "post-publish-closeout",
-        "step": "Verify selected post-publish artifact container digests",
+        "step": "Download and verify selected cumulative release cells",
         "fragments": [
           "/actions/artifacts/$artifact_id/zip",
           "sha256sum",
           "test \"$actual_digest\" = \"$expected_digest\""
         ],
-        "reason": "Each downloaded artifact container must be digest-verified against the provenance record before any cell inside it is trusted."
+        "reason": "Each same-run or reused artifact container selected by the cumulative producer map must be downloaded by authenticated artifact id and digest-verified against that provenance before any cell inside it is trusted."
       },
       "release_post_publish_closeout_evaluation": {
         "kind": "require",

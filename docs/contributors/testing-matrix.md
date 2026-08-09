@@ -228,10 +228,11 @@ it does not feed or block the frozen calibration bundle.
 
 Frozen-candidate qualification is a separate one-run-per-platform lane.
 Metal and Windows Vulkan each run the full lifecycle, fault, true-idle, memory,
-and accelerator suite once. Protected Linux Vulkan may run that same
-qualification through a standalone dispatch when its GPU runner is online; it
-is not a coordinator closeout dependency and cannot block qualification when
-that runner is absent.
+and accelerator suite once. A full coordinator dispatch with
+`qualify_linux_vulkan=true` runs the same qualification on the protected Linux
+Vulkan host and requires that job to pass before closeout. The default remains
+false, so the standard release can still qualify Metal and Windows without
+turning an unavailable Linux runner into a new claim or release gate.
 
 Answer quality is a separate, optional frozen-candidate adjunct. After the
 protected Metal package proof, it runs the checksum-bound Axios JavaScript and
@@ -240,6 +241,11 @@ macOS archive. Its failure or absence cannot block Metal, Windows, Linux, or
 closeout, and the standard release makes no answer-quality claim. Promotion and
 release decisions consume the coordinator's `closeout` job result directly;
 they do not wait for this optional job or for workflow-wide completion.
+The explicit Linux qualification opt-in is stricter: it also requires the
+current run attempt's exact-head Linux Axios artifact to contain three
+publishable cold-CLI rows with no blockers, gaps, degraded retrieval, or missed
+SLA. That receipt closes the issue-specific acceptance contract; it does not
+broaden the standard release's public answer-quality or performance claims.
 
 ### Packaged proof
 
@@ -549,6 +555,15 @@ hosts must match the OS and architecture derived from the package matrix's Rust
 target. Do not use `matrix`, `mixed`, or another
 aggregate placeholder for a host, runner, backend, installer, or native-engine
 identity.
+
+Each post-publish target performs one catalog installation and then launches
+two ordered fresh installed-runtime proof sessions against that same install.
+The retained restart-survival receipt hashes both summaries and the install
+attestation, requires stable package and managed-runtime identity, distinct
+server/process/engine identities, project-bound ground and search in both
+sessions, and full backend-observed accelerated retrieval in the second. This
+proves visibility after a fresh host/runtime launch; it does not claim the
+server persists after every client exits.
 
 Production producers use `scripts/codestory-release-cell-manifest.mjs`. They
 emit cells only after their job succeeds and bind workflow, job, run, attempt

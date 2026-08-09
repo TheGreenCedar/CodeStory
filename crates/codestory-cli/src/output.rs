@@ -148,6 +148,14 @@ pub(crate) fn emit_public_operation(
     emit_rendered_public_operation(format, &operation, &operation.value, output_file)
 }
 
+pub(crate) fn render_public_operation_json_content<T, V: Serialize>(
+    operation: &codestory_runtime::PublicOperation<T>,
+    response: &V,
+) -> Result<String> {
+    let json = crate::runtime::public_operation_json_value(operation, response)?;
+    render_output_content(OutputFormat::Json, &json, "")
+}
+
 pub(crate) fn emit_rendered_public_operation<T>(
     format: OutputFormat,
     operation: &codestory_runtime::PublicOperation<T>,
@@ -157,8 +165,8 @@ pub(crate) fn emit_rendered_public_operation<T>(
     match rendered {
         RenderedPublicOutput::Structured { json, markdown } => match format {
             OutputFormat::Json => {
-                let json = crate::runtime::public_operation_json_value(operation, json)?;
-                emit(format, &json, markdown.clone(), output_file)
+                let content = render_public_operation_json_content(operation, json)?;
+                emit_content(&content, output_file)
             }
             OutputFormat::Markdown => emit(format, json, markdown.clone(), output_file),
             OutputFormat::Dot => bail!("--format dot is only supported by `trail`"),

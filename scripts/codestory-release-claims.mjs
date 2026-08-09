@@ -214,6 +214,7 @@ const STEP_FRAGMENT_CONTRACTS = new Map([
   ["release_publish_refuse_existing_tag", { kind: "require" }],
   ["release_publish_create_release", { kind: "require" }],
   ["release_catalog_push", { kind: "require" }],
+  ["post_publish_smoke_restart_survival", { kind: "require" }],
   ["release_post_publish_closeout_provenance", { kind: "require" }],
   ["release_post_publish_container_digests", { kind: "require" }],
   ["release_post_publish_closeout_evaluation", { kind: "require" }],

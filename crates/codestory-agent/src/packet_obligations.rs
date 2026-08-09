@@ -2063,6 +2063,29 @@ mod tests {
     }
 
     #[test]
+    fn server_route_prompt_uses_flow_obligations_instead_of_prose_tokens() {
+        let plan = build_packet_obligation_plan(
+            "Trace how an Express application registers middleware and routes, then dispatches an incoming request through router layers to a route handler.",
+            PacketTaskClassDto::RouteTracing,
+            &[],
+        );
+        let material_ids = plan
+            .claim_obligations
+            .iter()
+            .filter(|obligation| obligation.material)
+            .map(|obligation| obligation.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(plan.binding_terms.is_empty(), "{plan:#?}");
+        assert_eq!(material_ids, ["request_entrypoint", "request_dispatch"]);
+        assert!(
+            plan.claim_obligations
+                .iter()
+                .all(|obligation| { !obligation.id.starts_with("requested_claim:") })
+        );
+    }
+
+    #[test]
     fn filtered_generic_request_gets_one_material_fallback_guard() {
         let plan = build_packet_obligation_plan(
             "Explain architecture and behavior.",

@@ -326,7 +326,8 @@ After publication:
   summary; verify the release manifest only after W8.11 has landed and the
   machine policy declares it;
 - run the graph-declared post-publish proof against downloaded bytes and fresh
-  installed runtimes;
+  installed runtimes, including two ordered fresh runtime sessions that reuse
+  one catalog installation and retain the restart-survival receipt;
 - record the catalog-delivery state without upgrading `deferred` or `restored`
   to `published`;
 - fast-forward `dev/codestory-next` from `F` to the published promotion `P`, or

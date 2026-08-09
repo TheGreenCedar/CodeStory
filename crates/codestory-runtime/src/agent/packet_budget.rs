@@ -136,9 +136,22 @@ pub(crate) fn apply_packet_budget_with_extra(
 }
 
 pub(crate) fn enforce_packet_output_budget(project_root: &Path, packet: &mut AgentPacketDto) {
+    enforce_packet_output_budget_for_representation(project_root, packet, serialized_packet_len);
+}
+
+/// Enforce the packet cap against one adapter's complete serialized representation.
+///
+/// The default runtime path measures compact packet JSON. Adapters whose public wire shape adds
+/// formatting or an envelope can supply that exact measurement without duplicating packet
+/// trimming or changing the representation reported by other adapters.
+pub fn enforce_packet_output_budget_for_representation(
+    project_root: &Path,
+    packet: &mut AgentPacketDto,
+    representation_len: impl Fn(&AgentPacketDto) -> usize,
+) {
     let extra_probes = packet_explicit_request_probe_queries(&packet.plan);
     for _ in 0..8 {
-        let output_bytes = refresh_packet_output_bytes(packet);
+        let output_bytes = refresh_packet_output_bytes(packet, &representation_len);
         if output_bytes <= packet.budget.limits.max_output_bytes as usize {
             break;
         }
@@ -177,18 +190,18 @@ pub(crate) fn enforce_packet_output_budget(project_root: &Path, packet: &mut Age
         break;
     }
 
-    let output_bytes = refresh_packet_output_bytes(packet);
+    let output_bytes = refresh_packet_output_bytes(packet, &representation_len);
     if output_bytes > packet.budget.limits.max_output_bytes as usize {
         packet.budget.truncated = true;
         push_omitted_section(&mut packet.budget, "output_bytes");
         push_omitted_section(&mut packet.budget, "packet_payload");
         rebuild_packet_budget_dependents(project_root, packet, &extra_probes);
-        let _ = refresh_packet_output_bytes(packet);
+        let _ = refresh_packet_output_bytes(packet, &representation_len);
     } else {
         remove_omitted_section(&mut packet.budget, "output_bytes");
         remove_omitted_section(&mut packet.budget, "packet_payload");
         rebuild_packet_budget_dependents(project_root, packet, &extra_probes);
-        let _ = refresh_packet_output_bytes(packet);
+        let _ = refresh_packet_output_bytes(packet, &representation_len);
     }
 }
 
@@ -339,16 +352,19 @@ fn refresh_packet_claim_markdown(packet: &mut AgentPacketDto) {
     *markdown = refreshed;
 }
 
-fn refresh_packet_output_bytes(packet: &mut AgentPacketDto) -> usize {
+fn refresh_packet_output_bytes(
+    packet: &mut AgentPacketDto,
+    representation_len: &impl Fn(&AgentPacketDto) -> usize,
+) -> usize {
     for _ in 0..4 {
-        let output_bytes = serialized_packet_len(packet);
+        let output_bytes = representation_len(packet);
         let output_bytes_u32 = output_bytes.try_into().unwrap_or(u32::MAX);
         if packet.budget.used.output_bytes == output_bytes_u32 {
             return output_bytes;
         }
         packet.budget.used.output_bytes = output_bytes_u32;
     }
-    serialized_packet_len(packet)
+    representation_len(packet)
 }
 
 fn serialized_packet_len(packet: &AgentPacketDto) -> usize {
@@ -1015,6 +1031,70 @@ mod tests {
                 .ineligible
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn representation_budget_does_not_change_default_compact_accounting() {
+        let mut packet = test_packet("Explain packet output accounting.", u32::MAX);
+        packet.answer.sections.push(AgentResponseSectionDto {
+            id: "representation-padding".to_string(),
+            title: "Representation padding".to_string(),
+            blocks: (0..8)
+                .map(|index| AgentResponseBlockDto::Markdown {
+                    markdown: format!("diagnostic {index} {}", "padding ".repeat(128)),
+                })
+                .collect(),
+        });
+
+        enforce_packet_output_budget(test_project_root(), &mut packet);
+
+        let compact_len = serde_json::to_vec(&packet)
+            .expect("serialize compact packet")
+            .len();
+        let pretty_len = serde_json::to_vec_pretty(&packet)
+            .expect("serialize pretty packet")
+            .len()
+            + 1;
+        let public_cap = compact_len + ((pretty_len - compact_len) / 2);
+        packet.budget.limits.max_output_bytes =
+            u32::try_from(public_cap).expect("fixture cap fits u32");
+
+        enforce_packet_output_budget(test_project_root(), &mut packet);
+
+        let compact_len = serde_json::to_vec(&packet)
+            .expect("serialize compact packet at bounded cap")
+            .len();
+        let pretty_len = serde_json::to_vec_pretty(&packet)
+            .expect("serialize pretty packet at bounded cap")
+            .len()
+            + 1;
+        assert!(
+            compact_len <= public_cap,
+            "default compact encoding should fit: {compact_len} > {public_cap}"
+        );
+        assert!(
+            pretty_len > public_cap,
+            "pretty encoding plus its newline must still exceed the cap"
+        );
+        assert_eq!(packet.budget.used.output_bytes as usize, compact_len);
+
+        enforce_packet_output_budget_for_representation(
+            test_project_root(),
+            &mut packet,
+            |packet| {
+                serde_json::to_vec_pretty(packet)
+                    .expect("serialize represented packet")
+                    .len()
+                    + 1
+            },
+        );
+
+        let rendered_len = serde_json::to_vec_pretty(&packet)
+            .expect("serialize budgeted represented packet")
+            .len()
+            + 1;
+        assert!(rendered_len <= public_cap, "{rendered_len} > {public_cap}");
+        assert_eq!(packet.budget.used.output_bytes as usize, rendered_len);
     }
 
     #[test]

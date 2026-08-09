@@ -2627,11 +2627,11 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     const windowsNativeSteps = list(windowsNative.steps).map(object);
     add(
       violations,
-      windowsNativeSteps.length === 7
+      windowsNativeSteps.length === 9
         && windowsNativeSteps[0]?.uses === "actions/checkout@v5"
         && object(windowsNativeSteps[0]?.with).ref === "${{ needs.resolve.outputs.ref }}"
         && windowsNativeSteps.every(step => step?.["continue-on-error"] === undefined),
-      `${sourceFile} Windows native source contracts must keep the exact blocking seven-step shape`,
+      `${sourceFile} Windows native source contracts must keep the exact blocking nine-step shape`,
     );
     // The qualification harness regression runs before the toolchain steps: it
     // needs no build, and a Windows-native reproduction of the control
@@ -2658,6 +2658,74 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && jobShellInvocationsContaining(windowsNative, "cargo build").length === 0
         && jobShellInvocationsContaining(windowsNative, "cargo check").length === 0,
       `${sourceFile} Windows path and native-staging contracts must share one source-only Cargo invocation`,
+    );
+    const windowsNativeReceiptName = "Emit authenticated Windows-native source receipt";
+    const windowsNativeReceipt = namedStep(windowsNative, windowsNativeReceiptName);
+    const windowsNativeReceiptRun = executableRunText(
+      stepRun(windowsNative, windowsNativeReceiptName),
+    );
+    add(
+      violations,
+      windowsNativeSteps[7]?.name === windowsNativeReceiptName
+        && windowsNativeReceipt?.id === "windows-native-source-proof"
+        && windowsNativeReceipt?.shell === "pwsh"
+        && windowsNativeReceipt?.["continue-on-error"] === undefined
+        && hasExactKeys(windowsNativeReceipt, ["name", "id", "shell", "env", "run"]),
+      `${sourceFile} Windows-native source receipt must be the blocking terminal evidence producer`,
+    );
+    requireStepEnv(
+      violations,
+      sourceFile,
+      windowsNative,
+      windowsNativeReceiptName,
+      { EXPECTED_HEAD_SHA: "${{ needs.resolve.outputs.ref }}" },
+    );
+    add(
+      violations,
+      [
+        "$commit = (git rev-parse HEAD).Trim()",
+        '$sourceTree = (git rev-parse "HEAD^{tree}").Trim()',
+        "if ($commit -ne $env:EXPECTED_HEAD_SHA) {",
+        "git status --porcelain=v1",
+        "if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {",
+        'schema = "codestory.windows-native-source-proof/v1"',
+        'status = "pass"',
+        "repository = $env:GITHUB_REPOSITORY",
+        "commit = $commit",
+        "source_tree = $sourceTree",
+        'workflow_path = ".github/workflows/source-proof.yml"',
+        'job = "windows-native-contracts"',
+        "run_id = [Int64]$env:GITHUB_RUN_ID",
+        "run_attempt = [Int64]$env:GITHUB_RUN_ATTEMPT",
+        "qualification_harness_self_test = $true",
+        "control_directory_inflight = $true",
+        "windows_path_identity = $true",
+        "native_staging = $true",
+        '"commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT',
+      ].every(fragment => windowsNativeReceiptRun.includes(fragment)),
+      `${sourceFile} Windows-native source receipt must bind the clean routed head and every proved contract`,
+    );
+    const windowsNativeUploadName = "Upload authenticated Windows-native source receipt";
+    const windowsNativeUpload = namedStep(windowsNative, windowsNativeUploadName);
+    add(
+      violations,
+      windowsNativeSteps[8]?.name === windowsNativeUploadName
+        && windowsNativeUpload?.uses === "actions/upload-artifact@v7.0.1"
+        && windowsNativeUpload?.["continue-on-error"] === undefined
+        && hasExactKeys(windowsNativeUpload, ["name", "uses", "with"])
+        && hasExactKeys(object(windowsNativeUpload?.with), [
+          "name",
+          "path",
+          "if-no-files-found",
+          "retention-days",
+        ])
+        && object(windowsNativeUpload?.with).name
+          === "windows-native-source-proof-${{ steps.windows-native-source-proof.outputs.commit }}-attempt-${{ github.run_attempt }}"
+        && object(windowsNativeUpload?.with).path
+          === "target/windows-native-source-proof/windows-native-source-proof.json"
+        && object(windowsNativeUpload?.with)["if-no-files-found"] === "error"
+        && object(windowsNativeUpload?.with)["retention-days"] === 30,
+      `${sourceFile} Windows-native source receipt upload must retain one exact-head attempt-qualified JSON artifact`,
     );
     add(
       violations,
@@ -3514,13 +3582,78 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && !String(postCloseout.if ?? "").includes(`needs.${catalogDelivery.publish_job}`),
     `${releaseFile} post-publish closeout must not gate on ${catalogDelivery.publish_job} succeeding`,
   );
-  const postDownload = namedStep(postCloseout, "Download selected release cells without flattening");
+  const postProvenanceName = "Authenticate post-publish Actions provenance";
+  const postProvenanceRun = executableRunText(stepRun(postCloseout, postProvenanceName));
+  requireStepEnv(violations, releaseFile, postCloseout, postProvenanceName, {
+    GH_TOKEN: "${{ github.token }}",
+    REUSE_SELECTION: "${{ needs.preflight.outputs.reuse }}",
+  });
+  requireFlagOnInvocation(
+    violations,
+    `${releaseFile} post-publish producer map must consume the preflight reuse selection`,
+    postProvenanceRun,
+    "codestory-release-cell-manifest.mjs producer-map",
+    '--reuse "$REUSE_SELECTION"',
+  );
+  const postDownloadName = "Download and verify selected cumulative release cells";
+  const postDownload = namedStep(postCloseout, postDownloadName);
+  const postDownloadRun = executableRunText(stepRun(postCloseout, postDownloadName));
+  const postDigestCheck = 'test "$actual_digest" = "$expected_digest"';
+  const postDestinationCreate = 'mkdir "$destination"';
+  const postContainerExtract = 'unzip -q "$archive" -d "$destination"';
+  const postDirectoryCheck = 'test -d "target/release-cell-manifests/$artifact_name"';
   add(
     violations,
-    postDownload?.uses === "actions/download-artifact@v8.0.1"
-      && object(postDownload.with)["artifact-ids"] === "${{ steps.post-publish-provenance.outputs.artifact_ids }}"
-      && object(postDownload.with)["merge-multiple"] === false,
-    `${releaseFile} post-publish closeout must download selected Actions artifact ids without flattening`,
+    postDownload?.uses === undefined
+      && postDownload?.shell === "bash"
+      && postDownload?.["continue-on-error"] === undefined
+      && object(postDownload?.env).GH_TOKEN === "${{ github.token }}",
+    `${releaseFile} post-publish closeout must materialize cumulative release cells in blocking Bash`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(
+      ".artifacts[] | [.id, .name, .digest] | @tsv",
+    ),
+    `${releaseFile} post-publish closeout must iterate every selected artifact id, name, and digest`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(
+      "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip",
+    ),
+    `${releaseFile} post-publish closeout must fetch every selected artifact by authenticated artifact id`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes('sha256sum "$archive"')
+      && postDownloadRun.includes(postDigestCheck),
+    `${releaseFile} post-publish closeout must reject a selected artifact container digest mismatch`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(
+      'destination="target/release-cell-manifests/$artifact_name"',
+    )
+      && postDownloadRun.includes(postDestinationCreate),
+    `${releaseFile} post-publish closeout must create one exact artifact-name directory per selected container`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(postContainerExtract)
+      && postDownloadRun.indexOf(postDigestCheck)
+        < postDownloadRun.indexOf(postDestinationCreate)
+      && postDownloadRun.indexOf(postDestinationCreate)
+        < postDownloadRun.indexOf(postContainerExtract),
+    `${releaseFile} post-publish closeout must extract each verified container into its exact artifact-name directory`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(".artifacts[].name")
+      && postDownloadRun.includes(postDirectoryCheck)
+      && postDownloadRun.indexOf(postContainerExtract)
+        < postDownloadRun.indexOf(postDirectoryCheck),
+    `${releaseFile} post-publish closeout must verify every selected artifact-name directory exists`,
   );
   requireStepEnv(violations, releaseFile, postCloseout, "Evaluate authenticated post-publish closeout", {
     RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
@@ -5171,6 +5304,7 @@ function validatePostPublish(workflows, violations, graph) {
   add(
     violations,
     installed?.if === undefined
+      && installed?.shell === "bash"
       && installed?.["continue-on-error"] === undefined,
     `${file} installed runtime proof must be unconditional and fail closed`,
   );
@@ -5185,7 +5319,7 @@ function validatePostPublish(workflows, violations, graph) {
     '--archive "$ASSET_ARCHIVE"',
     "--plugin-handoff",
     "--engine-policy accelerated",
-    '--expected-backend "${{ matrix.backend }}"',
+    '--expected-backend "$EXPECTED_BACKEND"',
     "--proof-tier installed_runtime",
     "--server-behavior-only",
     "--installed-plugin-attestation",
@@ -5208,7 +5342,124 @@ function validatePostPublish(workflows, violations, graph) {
     INSTALLED_PLUGIN_ROOT: "${{ steps.installed.outputs.plugin_root }}",
     INSTALLED_ATTESTATION: "${{ steps.installed.outputs.attestation }}",
     INSTALLED_PLUGIN_DATA: "${{ steps.installed.outputs.plugin_data }}",
+    CATALOG_DELIVERY_STATE: "${{ steps.delivery.outputs.state }}",
+    DELIVERED_INSTALLER: "${{ steps.delivery.outputs.installer }}",
+    EXPECTED_BACKEND: "${{ matrix.backend }}",
   });
+  add(
+    violations,
+    hasExactKeys(object(installed?.env), [
+      "ASSET_ARCHIVE",
+      "ASSET_CHECKSUM",
+      "CATALOG_DELIVERY_STATE",
+      "CODESTORY_EMBED_ALLOW_CPU",
+      "DELIVERED_INSTALLER",
+      "EXPECTED_BACKEND",
+      "INSTALLED_ATTESTATION",
+      "INSTALLED_PLUGIN_DATA",
+      "INSTALLED_PLUGIN_ROOT",
+      "RELEASE_VERSION",
+    ]),
+    `${file} installed runtime restart proof must bind only the reviewed package, install, delivery, and backend identities`,
+  );
+  const commonStart = installedRun.indexOf("common=(");
+  const commonEnd = commonStart < 0 ? -1 : installedRun.indexOf("\n)", commonStart);
+  const installedCommon = commonStart >= 0 && commonEnd > commonStart
+    ? installedRun.slice(commonStart, commonEnd + 2)
+    : "";
+  const commonExpansion = '"${common[@]}"';
+  add(
+    violations,
+    occurrenceCount(installedRun, "common=(") === 1
+      && occurrenceCount(installedCommon, "python .github/scripts/check-packaged-agent-proof.py") === 1
+      && [
+        '--archive "$ASSET_ARCHIVE"',
+        '--checksum-file "$ASSET_CHECKSUM"',
+        '--expected-version "$RELEASE_VERSION"',
+        '--plugin-root "$INSTALLED_PLUGIN_ROOT"',
+        '--installed-plugin-attestation "$INSTALLED_ATTESTATION"',
+        '--installed-plugin-data "$INSTALLED_PLUGIN_DATA"',
+        '--expected-source-sha "$source_sha"',
+        '--expected-source-tree "$source_tree"',
+        '--expected-backend "$EXPECTED_BACKEND"',
+      ].every(fragment => installedCommon.includes(fragment)),
+    `${file} installed runtime restart proof must define one common exact-package and installed-runtime invocation`,
+  );
+  const session1Proof = `${commonExpansion} --out-dir "$proof_root/session-1"`;
+  const session2Proof = `${commonExpansion} --out-dir "$proof_root/session-2"`;
+  add(
+    violations,
+    occurrenceCount(installedRun, commonExpansion) === 2
+      && occurrenceCount(installedRun, session1Proof) === 1
+      && occurrenceCount(installedRun, session2Proof) === 1,
+    `${file} installed runtime restart proof must execute exactly two distinct sessions through the common invocation`,
+  );
+  const timingAndSessionOrder = [
+    'session_1_started_ms="$(now_ms)"',
+    session1Proof,
+    'session_1_finished_ms="$(now_ms)"',
+    'session_2_started_ms="$(now_ms)"',
+    session2Proof,
+    'session_2_finished_ms="$(now_ms)"',
+  ].map(fragment => installedRun.indexOf(fragment));
+  add(
+    violations,
+    installedRun.includes("time.time_ns() // 1_000_000")
+      && timingAndSessionOrder.every(index => index >= 0)
+      && timingAndSessionOrder.every(
+        (index, position) => position === 0 || timingAndSessionOrder[position - 1] < index,
+      ),
+    `${file} installed runtime restart proof must record two monotonically ordered session intervals`,
+  );
+  add(
+    violations,
+    installedRun.includes('hashlib.file_digest(source, "sha256").hexdigest()')
+      && installedRun.includes(
+        'binary_sha256="$(jq -er \'.package_contract.manifest.binary.sha256\' "$proof_root/session-1/summary.json")"',
+      ),
+    `${file} installed runtime restart proof must derive the actual archive and packaged binary hashes`,
+  );
+  const restartInvocations = shellInvocationsContaining(
+    installedRun,
+    "node .github/scripts/restart-survival-receipt.mjs",
+  );
+  const restartInvocation = restartInvocations.length === 1 ? restartInvocations[0] : "";
+  add(
+    violations,
+    restartInvocations.length === 1
+      && [
+        '--session-1-summary "$proof_root/session-1/summary.json"',
+        '--session-2-summary "$proof_root/session-2/summary.json"',
+        '--install-attestation "$INSTALLED_ATTESTATION"',
+        '--catalog-delivery-state "$CATALOG_DELIVERY_STATE"',
+        '--expected-installer-identity "$DELIVERED_INSTALLER"',
+        '--expected-source-commit "$source_sha"',
+        '--expected-source-tree "$source_tree"',
+        '--expected-version "$RELEASE_VERSION"',
+        '--expected-archive-sha256 "$archive_sha256"',
+        '--expected-binary-sha256 "$binary_sha256"',
+        '--expected-backend "$EXPECTED_BACKEND"',
+        '--session-1-start-ms "$session_1_started_ms"',
+        '--session-1-finished-ms "$session_1_finished_ms"',
+        '--session-2-start-ms "$session_2_started_ms"',
+        '--session-2-finished-ms "$session_2_finished_ms"',
+        '--out "$proof_root/restart-survival.json"',
+      ].every(fragment => restartInvocation.includes(fragment))
+      && !restartInvocation.includes("|| true"),
+    `${file} installed runtime restart receipt must bind both sessions, one install, delivery, release, package, backend, and timing identities`,
+  );
+  const proofUpload = namedStep(job, "Upload post-publish proof artifacts");
+  add(
+    violations,
+    proofUpload?.if === "always()"
+      && proofUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && String(object(proofUpload?.with).path).split(/\r?\n/u)
+        .map(value => value.trim())
+        .filter(Boolean)
+        .includes("target/post-publish-installed-proof")
+      && object(proofUpload?.with)["if-no-files-found"] === "error",
+    `${file} post-publish proof artifact must retain the complete installed-runtime restart root`,
+  );
   for (const fragment of ["--engine-policy cpu_explicit", "--expected-backend CPU", "--ground-only"]) {
     add(
       violations,
@@ -6036,6 +6287,10 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   const linuxQualitySteps = list(linuxQuality.steps).map(object);
   const linuxQualityProducer = linuxQualitySteps.find(step => step.id === "linux-quality");
   const linuxQualityRun = shellLiteralNormalizedText(String(linuxQualityProducer?.run ?? ""));
+  const optionalLinuxQualityUpload = namedStep(
+    linuxQuality,
+    "Upload optional Linux x64 Axios v2 quality evidence",
+  );
   add(
     violations,
     linuxQuality.name === "Optional frozen-candidate Linux x64 Axios v2 quality"
@@ -6062,7 +6317,12 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && linuxQualityRun.includes("--repeats 3")
       && linuxQualityRun.includes("--publishable")
       && !linuxQualityRun.includes("--task-suite")
-      && !linuxQualityRun.includes("--task-ids"),
+      && !linuxQualityRun.includes("--task-ids")
+      && optionalLinuxQualityUpload?.if === "steps.linux-quality.outcome == 'success'"
+      && optionalLinuxQualityUpload?.["continue-on-error"] === true
+      && object(optionalLinuxQualityUpload?.with).name
+        === "frozen-candidate-linux-x64-quality-${{ inputs.ref }}-attempt-${{ github.run_attempt }}"
+      && object(optionalLinuxQualityUpload?.with).overwrite === true,
     `${qualityFile} optional Linux x64 quality must run the same isolated Axios v2 smoke entrypoint`,
   );
   // The windows-vulkan-proof job's structural pin (job existence) and its
@@ -6138,7 +6398,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     closeout.if
       === "always() && needs.route.result != 'skipped' && needs.route.outputs.mode != 'calibration'"
       && closeout["runs-on"] === "ubuntu-latest"
-      && closeout["timeout-minutes"] === 20
+      && closeout["timeout-minutes"] === 65
       && closeout["continue-on-error"] === undefined,
     `${file} closeout job must retain its reviewed unconditional result-checking activation`,
   );
@@ -6156,12 +6416,12 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   const closeoutRun = executableRunText(stepRun(closeout, closeoutProofName));
   add(
     violations,
-    list(closeout.steps).length === 1
+    list(closeout.steps).length === 3
       && closeoutProof?.if === undefined
       && closeoutProof?.["continue-on-error"] === undefined
       && closeoutProof?.shell === "bash"
       && closeoutProof?.["working-directory"] === undefined,
-    `${file} closeout must run one unconditional proof step under the reviewed Bash interpreter`,
+    `${file} closeout must retain one unconditional result proof plus the two opted-in Linux quality receipt steps`,
   );
   const expectedCloseoutEnv = {
     GH_TOKEN: "${{ github.token }}",
@@ -6190,6 +6450,66 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     /if\s+\[\s*"\$MODE"\s*=\s*qualification\s*\];\s*then\s+if\s+\[\s*"\$QUALIFY_LINUX_VULKAN"\s*=\s*true\s*\];\s*then\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+skipped\s+linux-vulkan-proof\s+fi\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+fi/um
       .test(closeoutRun),
     `${file} qualification closeout must require Linux success exactly when the explicit lifecycle opt-in is true`,
+  );
+  const linuxQualityProofName = "Validate opted-in Linux quality evidence";
+  const linuxQualityProof = namedStep(closeout, linuxQualityProofName);
+  const strictLinuxQualityRun = executableRunText(stepRun(closeout, linuxQualityProofName));
+  add(
+    violations,
+    linuxQualityProof?.if === "inputs.qualify_linux_vulkan"
+      && linuxQualityProof?.shell === "bash"
+      && linuxQualityProof?.["continue-on-error"] === undefined
+      && hasExactKeys(object(linuxQualityProof?.env), ["GH_TOKEN", "HEAD_SHA"])
+      && object(linuxQualityProof?.env).GH_TOKEN === "${{ github.token }}"
+      && object(linuxQualityProof?.env).HEAD_SHA === "${{ needs.route.outputs.head_sha }}",
+    `${file} opted-in Linux quality validation must fail closed on the routed frozen head`,
+  );
+  add(
+    violations,
+    [
+      "frozen-candidate-linux-x64-quality-$HEAD_SHA-attempt-$GITHUB_RUN_ATTEMPT",
+      "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100",
+      ".workflow_run.id == $run_id",
+      ".workflow_run.head_sha == $sha",
+      "gh run download \"$GITHUB_RUN_ID\"",
+      "packet-runtime-summary.json",
+      "packet-runtime-runs.jsonl",
+      "publishable-three-repeat-packet/v1",
+      "optional-linux-x64-quality",
+      "codestory-release-corpus-v0.16-axios-js-ts-v2",
+      'and .release_evidence.quality_gate_status == "pass"',
+      "and .release_evidence.publishable_blockers == []",
+      "and (.release_evidence.rows | length) == 3",
+      'and .task_id == "axios-request-dispatch-v2"',
+      'and .sufficiency.status == "sufficient"',
+      'and .sufficiency.retrieval_mode == "full"',
+      "and .packet_latency.sla_missed == false",
+      'and .packet_latency.retrieval_shadow.retrieval_mode == "full"',
+      "and .repo_provenance.git_dirty == false",
+      "and .codestory_cache_provenance.local_only == true",
+      "cmp \"$evidence_root/summary-rows.json\" \"$evidence_root/raw-rows.json\"",
+      "codestory.strict-linux-quality-validation/v1",
+    ].every(fragment => strictLinuxQualityRun.includes(fragment)),
+    `${file} opted-in Linux quality validation must authenticate and inspect every three-repeat publishable predicate`,
+  );
+  const linuxQualityUpload = namedStep(closeout, "Upload opted-in Linux quality validation");
+  add(
+    violations,
+    linuxQualityUpload?.if === "inputs.qualify_linux_vulkan"
+      && linuxQualityUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && hasExactKeys(object(linuxQualityUpload?.with), [
+        "name",
+        "path",
+        "if-no-files-found",
+        "retention-days",
+      ])
+      && object(linuxQualityUpload?.with).name
+        === "strict-linux-quality-validation-${{ needs.route.outputs.head_sha }}-attempt-${{ github.run_attempt }}"
+      && object(linuxQualityUpload?.with).path
+        === "target/strict-linux-quality/receipt.json"
+      && object(linuxQualityUpload?.with)["if-no-files-found"] === "error"
+      && object(linuxQualityUpload?.with)["retention-days"] === 30,
+    `${file} opted-in Linux quality validation must retain its exact-head receipt`,
   );
   add(violations, !scalarStrings(workflow).some(value => value === "./.github/workflows/release.yml"), `${file} must not publish releases`);
 }

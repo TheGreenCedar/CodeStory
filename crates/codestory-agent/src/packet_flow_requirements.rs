@@ -34,6 +34,7 @@ use crate::packet_terms::{
     packet_terms_indicate_network_command_input_flow, packet_terms_indicate_request_dispatch_flow,
     packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
     packet_terms_indicate_server_request_dispatch_flow,
+    packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
     packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
@@ -242,9 +243,20 @@ pub fn packet_flow_requirements_for_terms(
         requirements.extend_from_slice(INDEXING_FLOW);
     }
     let server_request_dispatch = packet_terms_indicate_server_request_dispatch_flow(terms);
+    let server_route_dispatch = packet_terms_indicate_server_route_dispatch_flow(terms);
     let client_request_dispatch = packet_terms_indicate_request_dispatch_flow(terms);
     if server_request_dispatch {
         requirements.extend_from_slice(SERVER_REQUEST_DISPATCH_FLOW);
+    } else if server_route_dispatch {
+        let response_terminal_requested = packet_terms_have_any(terms, &["response", "responses"]);
+        requirements.extend(
+            SERVER_REQUEST_DISPATCH_FLOW
+                .iter()
+                .copied()
+                .filter(|requirement| {
+                    requirement.role != FlowRole::TerminalBoundary || response_terminal_requested
+                }),
+        );
     } else if client_request_dispatch {
         requirements.extend_from_slice(CLIENT_REQUEST_DISPATCH_FLOW);
         if packet_terms_have_any(terms, &["interceptor", "interceptors"]) {
@@ -1148,6 +1160,67 @@ mod tests {
             assert!(
                 !queries.contains(&client_only),
                 "server request flow should not probe {client_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_route_flow_requires_registration_and_dispatch_without_response_terminal() {
+        let requirements = packet_flow_requirements_for_terms(
+            &packet_probe_terms(
+                "Trace how an Express application registers middleware and routes, then dispatches an incoming request through router layers to a route handler.",
+            ),
+            PacketTaskClassDto::RouteTracing,
+        );
+        let ids = requirements
+            .iter()
+            .map(|requirement| requirement.id)
+            .collect::<Vec<_>>();
+        let queries = requirements
+            .iter()
+            .flat_map(|requirement| requirement.query_seeds.iter().copied())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, ["request_entrypoint", "request_dispatch"]);
+        for expected in ["route registration", "handler dispatch"] {
+            assert!(
+                queries.contains(&expected),
+                "server route flow should probe {expected}"
+            );
+        }
+        for response_only in ["response finalization", "transport send"] {
+            assert!(
+                !queries.contains(&response_only),
+                "route-to-handler prompt should not require {response_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_route_flow_includes_response_terminal_when_explicitly_requested() {
+        let requirements = packet_flow_requirements_for_terms(
+            &packet_probe_terms(
+                "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.",
+            ),
+            PacketTaskClassDto::RouteTracing,
+        );
+        let ids = requirements
+            .iter()
+            .map(|requirement| requirement.id)
+            .collect::<Vec<_>>();
+        let queries = requirements
+            .iter()
+            .flat_map(|requirement| requirement.query_seeds.iter().copied())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            ["request_entrypoint", "request_dispatch", "request_terminal"]
+        );
+        for expected in ["response finalization", "transport send"] {
+            assert!(
+                queries.contains(&expected),
+                "response-helper route flow should probe {expected}"
             );
         }
     }

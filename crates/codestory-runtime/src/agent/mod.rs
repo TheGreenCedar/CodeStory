@@ -71,6 +71,7 @@ pub(crate) use codestory_agent::{
 };
 
 pub(crate) use orchestrator::{agent_ask, agent_packet};
+pub use packet_budget::enforce_packet_output_budget_for_representation;
 pub use trace_export::packet_step_trace_json;
 
 /// Build the same bounded query plan used by `agent_packet` without executing retrieval.

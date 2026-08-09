@@ -4,7 +4,7 @@ use crate::args;
 use crate::args::PacketCommand;
 use crate::output::{
     REPO_CONTENT_BOUNDARY_LINE, RenderedPublicOutput, emit_public_operation, render_agent_citation,
-    render_context_markdown,
+    render_context_markdown, render_public_operation_json_content,
 };
 use crate::runtime;
 use crate::runtime::map_api_error;
@@ -28,8 +28,8 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
         "packet",
     )?;
 
-    let operation = runtime.run_public_operation("packet", || {
-        let packet = runtime
+    let mut operation = runtime.run_public_operation("packet", || {
+        runtime
             .browser
             .packet(AgentPacketRequestDto {
                 question: cmd.question.clone(),
@@ -40,24 +40,49 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
                 include_evidence: !cmd.no_evidence,
                 latency_budget_ms: cmd.latency_budget_ms,
             })
-            .map_err(map_api_error)?;
-        let step_trace = if cmd.step_trace_out.is_some() {
-            let trace = codestory_runtime::packet_step_trace_json(&packet.answer);
-            Some(serde_json::to_string_pretty(&trace)?)
-        } else {
-            None
-        };
-        let markdown = render_packet_markdown(&runtime.project_root, &packet);
-        Ok((
-            RenderedPublicOutput::structured(&packet, markdown)?,
-            step_trace,
-        ))
+            .map_err(map_api_error)
     })?;
-    if let (Some(path), Some(trace)) = (&cmd.step_trace_out, &operation.value.1) {
+
+    let step_trace = if cmd.step_trace_out.is_some() {
+        let trace = codestory_runtime::packet_step_trace_json(&operation.value.answer);
+        Some(serde_json::to_string_pretty(&trace)?)
+    } else {
+        None
+    };
+    if cmd.format == args::OutputFormat::Json {
+        enforce_packet_cli_json_output_budget(&runtime.project_root, &mut operation)?;
+    }
+    if let (Some(path), Some(trace)) = (&cmd.step_trace_out, step_trace) {
         std::fs::write(path, trace)?;
     }
-    let operation = runtime::map_public_operation(operation, |(rendered, _)| rendered);
+    let markdown = render_packet_markdown(&runtime.project_root, &operation.value);
+    let rendered = RenderedPublicOutput::structured(&operation.value, markdown)?;
+    let operation = runtime::map_public_operation(operation, |_| rendered);
     emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
+}
+
+pub(in crate::app) fn enforce_packet_cli_json_output_budget(
+    project_root: &std::path::Path,
+    operation: &mut codestory_runtime::PublicOperation<AgentPacketDto>,
+) -> Result<()> {
+    let envelope = codestory_runtime::PublicOperation {
+        value: (),
+        core_publication: operation.core_publication.clone(),
+        retrieval_publication: operation.retrieval_publication.clone(),
+        operation_id: operation.operation_id.clone(),
+        attempt: operation.attempt,
+    };
+    let _ = render_public_operation_json_content(&envelope, &operation.value)?;
+    codestory_runtime::enforce_packet_output_budget_for_representation(
+        project_root,
+        &mut operation.value,
+        |packet| {
+            render_public_operation_json_content(&envelope, packet)
+                .expect("packet public JSON rendering was validated before budget enforcement")
+                .len()
+        },
+    );
+    Ok(())
 }
 
 pub(in crate::app) fn render_packet_markdown(

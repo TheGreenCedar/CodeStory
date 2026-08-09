@@ -6,6 +6,14 @@
 
 ### Fixed
 
+- Large repositories keep real entrypoints and architecture boundaries in
+  bounded grounding results even when the checkout itself sits under a folder
+  named `target` or `build`; generated-looking parent directories no longer
+  reclassify every project file.
+- Route packets now follow registration through dispatch and any requested
+  response boundary, preserve typed capacity/backpressure failures instead of
+  suggesting a reindex, and enforce the CLI JSON byte limit against its actual
+  pretty output and publication metadata while stdio keeps compact accounting.
 - Raising the source-file size limit no longer leaves newly admitted files
   missing from lexical, repository-text, or semantic search. Unsupported binary
   images are now classified by file type instead of being reported as oversized

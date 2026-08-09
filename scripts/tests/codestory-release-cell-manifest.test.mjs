@@ -380,6 +380,35 @@ test("a reuse-bound group accepts binding-verified evidence from a prior run", (
   assert.equal(packaged.producer_run_id, "12345");
 });
 
+test("the cumulative 22-cell post-publish map retains the preflight source reuse", () => {
+  const metadata = actionsMetadata("post_publish");
+  metadata.jobsByAttempt["1"] = metadata.jobsByAttempt["1"].filter(
+    (job) => !job.name.endsWith("full-source-gate"),
+  );
+  metadata.artifacts = metadata.artifacts.filter(
+    ({ name }) => !name.startsWith("release-cell-prepublish-source"),
+  );
+  const map = buildTrustedProducerMap({
+    graph,
+    gitIdentity,
+    phase: "post_publish",
+    runId: "12345",
+    currentRunAttempt: "1",
+    ...metadata,
+    reuse: { source_behavior: reusedRunMetadata("source_behavior") },
+  });
+  assert.equal(map.producers.length, 22);
+  assert.equal(new Set(map.producers.map(({ cell_id: cellId }) => cellId)).size, 22);
+  const source = map.producers.find(({ cell_id: cellId }) => cellId === "source_behavior");
+  assert.equal(source.producer_run_id, "777");
+  assert.equal(source.reused_from.binding, "source_tree");
+  assert.equal(source.artifact.workflow_run_id, "777");
+  assert.ok(map.artifacts.some(({ id }) => id === source.artifact.id));
+  assert.ok(map.producers
+    .filter(({ cell_id: cellId }) => cellId !== "source_behavior")
+    .every(({ producer_run_id: runId }) => runId === "12345"));
+});
+
 test("cross-run evidence is refused for groups without a reuse binding", () => {
   const metadata = actionsMetadata("pre_publish");
   assert.throws(() => buildTrustedProducerMap({

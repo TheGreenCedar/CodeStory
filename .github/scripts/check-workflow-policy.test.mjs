@@ -1329,6 +1329,54 @@ test("frozen-candidate quality stays optional, exact, and archive-authenticated"
         "if true; then",
       );
     }, /qualification closeout must require Linux success exactly when the explicit lifecycle opt-in is true/u],
+    ["opted-in Linux quality validation becomes advisory", coordinatorFile, workflow => {
+      draftStep(
+        workflow.jobs.closeout,
+        "Validate opted-in Linux quality evidence",
+      )["continue-on-error"] = true;
+    }, /Linux quality validation must fail closed on the routed frozen head/u],
+    ["opted-in Linux quality accepts a green wrapper without publishable rows", coordinatorFile, workflow => {
+      const validation = draftStep(
+        workflow.jobs.closeout,
+        "Validate opted-in Linux quality evidence",
+      );
+      validation.run = validation.run.replace(
+        "and .release_evidence.publishable_blockers == []",
+        "and true",
+      );
+    }, /authenticate and inspect every three-repeat publishable predicate/u],
+    ["opted-in Linux quality accepts an artifact from another head", coordinatorFile, workflow => {
+      const validation = draftStep(
+        workflow.jobs.closeout,
+        "Validate opted-in Linux quality evidence",
+      );
+      validation.run = validation.run.replace(
+        ".workflow_run.head_sha == $sha",
+        ".workflow_run.head_sha != $sha",
+      );
+    }, /authenticate and inspect every three-repeat publishable predicate/u],
+    ["opted-in Linux quality accepts an artifact from another attempt", coordinatorFile, workflow => {
+      const validation = draftStep(
+        workflow.jobs.closeout,
+        "Validate opted-in Linux quality evidence",
+      );
+      validation.run = validation.run.replace(
+        "-$GITHUB_RUN_ATTEMPT",
+        "-1",
+      );
+    }, /authenticate and inspect every three-repeat publishable predicate/u],
+    ["Linux quality publishes one reusable head-only artifact", qualityFile, workflow => {
+      draftStep(
+        workflow.jobs["linux-quality"],
+        "Upload optional Linux x64 Axios v2 quality evidence",
+      ).with.name = "frozen-candidate-linux-x64-quality-${{ inputs.ref }}";
+    }, /must run the same isolated Axios v2 smoke entrypoint/u],
+    ["opted-in Linux quality receipt is not retained", coordinatorFile, workflow => {
+      draftStep(
+        workflow.jobs.closeout,
+        "Upload opted-in Linux quality validation",
+      ).if = "false";
+    }, /must retain its exact-head receipt/u],
     ["qualification closeout hides the accepted Linux branch in dead code", coordinatorFile, workflow => {
       const closeout = draftStep(
         workflow.jobs.closeout,
@@ -1360,13 +1408,13 @@ test("frozen-candidate quality stays optional, exact, and archive-authenticated"
         workflow.jobs.closeout,
         "Require one coherent accepted proof",
       ).if = "${{ false }}";
-    }, /closeout must run one unconditional proof step under the reviewed Bash interpreter/u],
+    }, /closeout must retain one unconditional result proof plus the two opted-in Linux quality receipt steps/u],
     ["qualification closeout shell ignores the reviewed script", coordinatorFile, workflow => {
       draftStep(
         workflow.jobs.closeout,
         "Require one coherent accepted proof",
       ).shell = "bash -c 'true' {0}";
-    }, /closeout must run one unconditional proof step under the reviewed Bash interpreter/u],
+    }, /closeout must retain one unconditional result proof plus the two opted-in Linux quality receipt steps/u],
     ["qualification closeout mode is rebound away from the route", coordinatorFile, workflow => {
       draftStep(
         workflow.jobs.closeout,
@@ -4272,6 +4320,59 @@ test("exact-head source proof owns Windows path and native-staging harnesses", a
   }
 });
 
+test("Windows-native source receipt stays exact-head and contract-complete", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "source-proof.yml";
+  const receiptName = "Emit authenticated Windows-native source receipt";
+  const uploadName = "Upload authenticated Windows-native source receipt";
+  const receiptMutation = (workflow, from, to, label) => {
+    const step = draftStep(workflow.jobs["windows-native-contracts"], receiptName);
+    const before = step.run;
+    step.run = step.run.replace(from, to);
+    assert.notEqual(step.run, before, `${label} mutation did not apply`);
+  };
+  const mutations = [
+    ["dirty checkout is accepted", workflow => {
+      receiptMutation(workflow, "$dirty.Count -ne 0", "$dirty.Count -lt 0", "dirty checkout");
+    }, /Windows-native source receipt must bind the clean routed head and every proved contract/u],
+    ["routed-head mismatch is accepted", workflow => {
+      receiptMutation(
+        workflow,
+        "$commit -ne $env:EXPECTED_HEAD_SHA",
+        "$false",
+        "routed head",
+      );
+    }, /Windows-native source receipt must bind the clean routed head and every proved contract/u],
+    ["receipt schema is changed", workflow => {
+      receiptMutation(
+        workflow,
+        'schema = "codestory.windows-native-source-proof/v1"',
+        'schema = "codestory.windows-native-source-proof/v0"',
+        "schema",
+      );
+    }, /Windows-native source receipt must bind the clean routed head and every proved contract/u],
+    ["one proved contract is recorded false", workflow => {
+      receiptMutation(
+        workflow,
+        "native_staging = $true",
+        "native_staging = $false",
+        "contract boolean",
+      );
+    }, /Windows-native source receipt must bind the clean routed head and every proved contract/u],
+    ["artifact name drops the exact head", workflow => {
+      const step = draftStep(workflow.jobs["windows-native-contracts"], uploadName);
+      step.with.name = "windows-native-source-proof-attempt-${{ github.run_attempt }}";
+    }, /Windows-native source receipt upload must retain one exact-head attempt-qualified JSON artifact/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
 test("exact-head source proof owns the Windows-native qualification harness regression", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
   const file = "source-proof.yml";
@@ -5753,6 +5854,91 @@ test("post-publish proof uses an immutable real Codex marketplace install", asyn
   }
 });
 
+test("post-publish installed runtime proof survives one real restart", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "post-publish-release-smoke.yml";
+  const proofName = "Prove the catalog-resolved published runtime";
+  const mutateRun = (workflow, from, to, label) => {
+    const step = draftStep(workflow.jobs.smoke, proofName);
+    const before = step.run;
+    step.run = step.run.replace(from, to);
+    assert.notEqual(step.run, before, `${label} mutation did not apply`);
+  };
+  const mutations = [
+    ["second installed-runtime session is omitted", workflow => {
+      mutateRun(
+        workflow,
+        '"${common[@]}" --out-dir "$proof_root/session-2"',
+        "true",
+        "second proof",
+      );
+    }, /must execute exactly two distinct sessions through the common invocation/u],
+    ["both installed-runtime sessions share one output directory", workflow => {
+      mutateRun(
+        workflow,
+        '"${common[@]}" --out-dir "$proof_root/session-2"',
+        '"${common[@]}" --out-dir "$proof_root/session-1"',
+        "session output",
+      );
+    }, /must execute exactly two distinct sessions through the common invocation/u],
+    ["restart receipt helper is omitted", workflow => {
+      mutateRun(
+        workflow,
+        "node .github/scripts/restart-survival-receipt.mjs",
+        "node --version",
+        "receipt helper",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt helper becomes advisory", workflow => {
+      mutateRun(
+        workflow,
+        '--out "$proof_root/restart-survival.json"',
+        '--out "$proof_root/restart-survival.json" || true',
+        "advisory receipt",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt omits catalog delivery state", workflow => {
+      mutateRun(
+        workflow,
+        '--catalog-delivery-state "$CATALOG_DELIVERY_STATE"',
+        '--catalog-delivery-state omitted',
+        "catalog state",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt omits delivered installer identity", workflow => {
+      mutateRun(
+        workflow,
+        '--expected-installer-identity "$DELIVERED_INSTALLER"',
+        '--expected-installer-identity omitted',
+        "installer identity",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt omits source-tree identity", workflow => {
+      mutateRun(
+        workflow,
+        '--expected-source-commit "$source_sha" \\\n  --expected-source-tree "$source_tree"',
+        '--expected-source-commit "$source_sha" \\\n  --expected-source-tree omitted',
+        "source identity",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt omits the final session timestamp", workflow => {
+      mutateRun(
+        workflow,
+        '--session-2-finished-ms "$session_2_finished_ms"',
+        '--session-2-finished-ms omitted',
+        "session timing",
+      );
+    }, /restart receipt must bind both sessions/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
 test("post-publish proof keeps every release asset on its protected accelerator", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 
@@ -6560,6 +6746,54 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
     const workflows = loadWorkflows();
     mutate(workflows);
     assert.notDeepEqual(validateWorkflows(workflows), [], label);
+  }
+});
+
+test("post-publish closeout authenticates cumulative reused release cells", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "release.yml";
+  const closeout = workflow => workflow.jobs["post-publish-closeout"];
+  const mutations = [
+    ["container digest comparison is omitted", workflow => {
+      const step = draftStep(
+        closeout(workflow),
+        "Download and verify selected cumulative release cells",
+      );
+      const before = step.run;
+      step.run = step.run.replace(
+        'test "$actual_digest" = "$expected_digest"',
+        'echo "$actual_digest $expected_digest"',
+      );
+      assert.notEqual(step.run, before, "digest mutation did not apply");
+    }, /must reject a selected artifact container digest mismatch/u],
+    ["selected containers are flattened during extraction", workflow => {
+      const step = draftStep(
+        closeout(workflow),
+        "Download and verify selected cumulative release cells",
+      );
+      const before = step.run;
+      step.run = step.run.replace(
+        'destination="target/release-cell-manifests/$artifact_name"',
+        'destination="target/release-cell-manifests"',
+      );
+      assert.notEqual(step.run, before, "flattening mutation did not apply");
+    }, /must create one exact artifact-name directory per selected container/u],
+    ["post-publish producer map omits the preflight reuse selection", workflow => {
+      const step = draftStep(
+        closeout(workflow),
+        "Authenticate post-publish Actions provenance",
+      );
+      const before = step.run;
+      step.run = step.run.replace('  --reuse "$REUSE_SELECTION" \\\n', "");
+      assert.notEqual(step.run, before, "reuse mutation did not apply");
+    }, /post-publish producer map must consume the preflight reuse selection/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
   }
 });
 
