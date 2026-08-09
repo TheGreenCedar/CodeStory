@@ -2275,6 +2275,662 @@
           "--expected-sha \"$RESOLVED_REF\""
         ],
         "reason": "The source release cell is the proof the release chain later consumes, so it must be produced by the manifest tool, name the source_behavior cell and this producer job, and bind the resolved SHA. Each fragment pins one of those identity conjuncts."
+      },
+      "macos_metal_validate_candidate_installed_mode": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Validate candidate-installed mode",
+        "fragments": [
+          "test \"$SERVER_BEHAVIOR_ONLY\" = true",
+          "test \"$CALIBRATION_MODE\" = false"
+        ],
+        "reason": "Candidate-installed mode on the Metal host is only sound as a server-behavior claim outside calibration; the fragments pin both mode tests so the validation cannot silently accept a wider claim scope."
+      },
+      "macos_metal_embedded_model": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Prepare checksum-pinned embedded model",
+        "fragments": [
+          "node scripts/prepare-embedded-model.mjs",
+          "--cache-root \"$RUNNER_TOOL_CACHE/codestory/model-material\""
+        ],
+        "reason": "Model material reaches the protected Metal host only through the checksum-pinned preparation script and the runner tool cache root; the fragments pin that invocation and its cache root."
+      },
+      "macos_metal_host_evidence": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Capture host evidence",
+        "fragments": [
+          "python3 --version",
+          "test \"$macos_major\" -ge 15"
+        ],
+        "reason": "Host evidence must record the interpreter the proof depends on and refuse a macOS older than the qualified floor; the fragments pin the version capture and the major-version gate."
+      },
+      "macos_metal_candidate_authentication": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Authenticate exact candidate artifacts",
+        "fragments": [
+          "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100",
+          ".github/workflows/auto-release.yml",
+          ".github/workflows/release.yml",
+          ".github/workflows/packaged-platform-pr.yml",
+          "if [ \"$SERVER_BEHAVIOR_ONLY\" != true ]; then",
+          "test \"$CANDIDATE_PRODUCER_WORKFLOW_PATH\" =",
+          ".head_repository.full_name",
+          ".path' <<<\"$producer_run\")\" = \"$CANDIDATE_PRODUCER_WORKFLOW_PATH\"",
+          ".head_sha' <<<\"$producer_run\")\" = \"$(git rev-parse HEAD)\"",
+          ".run_attempt' <<<\"$producer_run\")\" = \"$GITHUB_RUN_ATTEMPT\"",
+          ".workflow_run.id == $run_id",
+          ".workflow_run.head_sha == $sha",
+          "expected one exact candidate artifact",
+          "artifact=\"$(select_artifact \"$ARTIFACT_NAME\")\"",
+          "record_artifact=\"$(select_artifact \"$CANDIDATE_RECORD_ARTIFACT\")\"",
+          "select_artifact \"$QUALIFICATION_ARTIFACT\"",
+          "package-id=$artifact_id",
+          "package-bytes=$expected_size",
+          "package-sha256=${expected_digest#sha256:}"
+        ],
+        "reason": "The packaged proof consumes exactly the artifacts its own run produced from an allowlisted producer at this head and attempt. Each fragment pins one authentication conjunct - the run-scoped artifact listing, the producer allowlist, the same-repository, path, head-SHA, and attempt tests, the run-bound artifact filters, the one-artifact expectation, the three exact artifact selections, and the recorded package identity outputs."
+      },
+      "macos_metal_candidate_cache_restore": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Restore exact candidate archive from protected host",
+        "fragments": [
+          "--arg repository \"$GITHUB_REPOSITORY\"",
+          "--arg source_sha \"$(git rev-parse HEAD)\"",
+          "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
+          "--arg target macos-arm64",
+          "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
+          "candidate-archive-store.mjs restore",
+          "--record \"$record\"",
+          "--output-dir target/release-dist",
+          "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\""
+        ],
+        "reason": "A protected-host cache hit is only the reviewed archive when the record binds this repository, source commit and tree, and the macOS target, and the restore goes through the archive store into the exact output directory; the fragments pin those bindings and the recorded hit output."
+      },
+      "macos_metal_candidate_cache_miss": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Download, authenticate, and admit candidate archive on miss",
+        "fragments": [
+          "actions/artifacts/$ARTIFACT_ID/zip",
+          "--continue-at -",
+          "--max-time 120",
+          "test \"$actual_size\" = \"$EXPECTED_SIZE\"",
+          "test \"$actual_digest\" = \"$EXPECTED_SHA256\"",
+          "extract-candidate-actions-artifact.py",
+          "candidate-archive-store.mjs admit",
+          "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
+          "--output-dir target/release-dist"
+        ],
+        "reason": "A cache miss may transfer the large Actions artifact only through the resumable bounded download, must prove the outer size and digest before extraction, and must admit the archive through the store into the exact output directory; the fragments pin that authenticated admission chain."
+      },
+      "macos_metal_calibration_producer_authentication": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Authenticate calibration bundle producer",
+        "fragments": [
+          "actions/runs/",
+          ".github/workflows/packaged-platform-pr.yml",
+          "workflow_dispatch",
+          "success",
+          "embedding-calibration-bundle-",
+          "artifacts?per_page=100",
+          "expired"
+        ],
+        "reason": "A calibration bundle is trusted only when its producer run is the frozen-candidate coordinator's dispatched, successful run and the bundle artifact is the unexpired one it named; the fragments pin the producer-run lookup, the coordinator path, the dispatch event, the success conclusion, the bundle name prefix, the artifact listing, and the expiry check."
+      },
+      "macos_metal_constant_calibration_runs": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Collect three independent Metal constant calibration runs",
+        "fragments": [
+          "--proof-tier calibration",
+          "--engine-policy accelerated",
+          "--expected-backend Metal",
+          "--qualification-matrix-cell protected_macos_arm64_metal",
+          "--collect-constant-calibration",
+          "--constant-calibration-output-dir target/calibration-runs/macos",
+          "--qualification-driver target/release/codestory_embedding_constant_calibration",
+          "--out-dir target/calibration-proof/macos"
+        ],
+        "reason": "Calibration collects constants through the dedicated collector with the accelerated Metal engine on the protected matrix cell and writes runs and proof to the reviewed directories; each fragment pins one flag of that single collector invocation."
+      },
+      "macos_metal_protected_runtime_proof": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Prove protected Metal runtime",
+        "fragments": [
+          "--engine-policy accelerated",
+          "--expected-backend Metal",
+          "--offline",
+          "--proof-tier protected_hardware",
+          "--qualification-matrix-cell protected_macos_arm64_metal",
+          "--calibration-producer-run-id",
+          "--calibration-producer-artifact",
+          "--server-behavior-only"
+        ],
+        "reason": "The protected Metal proof must run the accelerated offline harness against the protected matrix cell with the calibration producer bound and the server-behavior scope explicit; each fragment pins one flag of that invocation."
+      },
+      "macos_metal_candidate_staging": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Stage isolated candidate-managed macOS install",
+        "fragments": [
+          "--prepare-candidate-installed-proof",
+          "--candidate-plugin-root-output",
+          "--candidate-plugin-data-output",
+          "--installed-plugin-attestation-output",
+          "--candidate-producer-workflow-path",
+          "gh api",
+          ".head_repository.full_name",
+          ".path",
+          ".head_sha",
+          ".run_attempt",
+          "$CANDIDATE_PRODUCER_WORKFLOW_PATH",
+          "$RUNNER_TEMP/codestory-candidate-installed-macos.",
+          "candidate_root=\"$(cd \"$candidate_root\" && pwd -P)\"",
+          "\"$GITHUB_WORKSPACE/\"*",
+          "CODESTORY_CANDIDATE_MACOS_ROOT="
+        ],
+        "reason": "Candidate-managed staging must go through the harness staging flags, authenticate the producer run by repository, path, head SHA, and attempt, and land in an isolated runner-temp root outside the workspace; the fragments pin that staging chain and the exported root."
+      },
+      "macos_metal_candidate_installed_proof": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Prove candidate-installed macOS Metal runtime",
+        "fragments": [
+          "--engine-policy accelerated",
+          "--expected-backend Metal",
+          "--proof-tier installed_runtime",
+          "--installed-plugin-attestation",
+          "--installed-plugin-data",
+          "$CANDIDATE_PRODUCER_WORKFLOW_PATH",
+          "--server-behavior-only",
+          "$CODESTORY_CANDIDATE_MACOS_ROOT/plugin",
+          "$CODESTORY_CANDIDATE_MACOS_ROOT/data"
+        ],
+        "reason": "The candidate-installed proof must run the accelerated Metal harness at the installed-runtime tier against the staged plugin root and data with the producer path and server-behavior scope bound; each fragment pins one of those conjuncts."
+      },
+      "macos_metal_release_cell": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Emit authenticated Metal release cell",
+        "fragments": [
+          "codestory-release-cell-manifest.mjs produce",
+          "accelerator_execution:macos-arm64-metal",
+          "--producer-job packaged-metal",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The Metal release cell must be produced by the manifest tool, name the accelerator-execution macOS cell and this producer job, and bind the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "macos_metal_retrieval_readiness_cell": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Emit authenticated macOS retrieval-readiness release cell",
+        "fragments": [
+          "retrieval_readiness:macos-arm64",
+          "--producer-job packaged-metal",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The macOS retrieval-readiness cell must name its cell, this producer job, and the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "macos_metal_candidate_installed_cell": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Emit authenticated candidate-installed macOS release cell",
+        "fragments": [
+          "candidate_installed_behavior:macos-arm64",
+          "--producer-job packaged-metal",
+          "candidate_managed_plugin",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The candidate-installed macOS cell must name its cell, this producer job, the candidate-managed plugin claim, and the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "macos_metal_release_cell_no_calibration": {
+        "kind": "forbid",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Emit authenticated Metal release cell",
+        "fragments": [
+          "calibration"
+        ],
+        "reason": "The Metal release cell is a qualification artifact; a calibration reference inside it would let calibration evidence leak into the release chain, so the fragment forbids the word outright."
+      },
+      "macos_metal_candidate_installed_cell_no_calibration": {
+        "kind": "forbid",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Emit authenticated candidate-installed macOS release cell",
+        "fragments": [
+          "calibration"
+        ],
+        "reason": "The candidate-installed macOS cell must stay a runtime-behavior artifact; the fragment forbids any calibration reference so the candidate lane cannot smuggle calibration claims."
+      },
+      "windows_vulkan_validate_candidate_installed_mode": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Validate candidate-installed mode",
+        "fragments": [
+          "if ($env:SERVER_BEHAVIOR_ONLY -ne \"true\")",
+          "candidate_installed_proof requires server_behavior_only"
+        ],
+        "reason": "Candidate-installed mode on the Windows host is only sound as a server-behavior claim; the fragments pin the PowerShell mode test and its failure message so the validation cannot widen the claim scope."
+      },
+      "windows_vulkan_source_build_tools": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Capture source build tool evidence",
+        "fragments": [
+          "CMAKE_GENERATOR=Ninja",
+          "cmake --version",
+          "ninja --version"
+        ],
+        "reason": "The source fallback builds native code with the Ninja generator, so the evidence step must export that generator and record the exact cmake and ninja versions; the fragments pin all three."
+      },
+      "windows_vulkan_embedded_model": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Prepare checksum-pinned embedded model",
+        "fragments": [
+          "node scripts/prepare-embedded-model.mjs",
+          "--cache-root \"$env:RUNNER_TOOL_CACHE/codestory/model-material\""
+        ],
+        "reason": "Model material reaches the protected Windows host only through the checksum-pinned preparation script and the runner tool cache root; the fragments pin that invocation and its cache root."
+      },
+      "windows_vulkan_candidate_cache_restore": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Restore exact candidate archive from protected host",
+        "fragments": [
+          "$record.source.commit -ne $sourceSha",
+          "$record.source.tree -ne $sourceTree",
+          "$record.target -ne \"windows-x64\"",
+          "codestory/candidate-archives",
+          "candidate-archive-store.mjs restore",
+          "--record $recordPath",
+          "--output-dir target/release-dist",
+          "\"hit=$hit\"",
+          "$env:GITHUB_OUTPUT"
+        ],
+        "reason": "A protected-host cache hit is only the reviewed archive when the record matches this source commit and tree and the Windows target, and the restore goes through the archive store into the exact output directory; the fragments pin those checks and the recorded hit output."
+      },
+      "windows_vulkan_candidate_cache_miss": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Download, authenticate, and admit candidate archive on miss",
+        "fragments": [
+          "actions/artifacts/$env:ARTIFACT_ID/zip",
+          "--continue-at -",
+          "--max-time 120",
+          "$actualSize -ne [long]$env:EXPECTED_SIZE",
+          "$actualDigest -ne $env:EXPECTED_SHA256",
+          "extract-candidate-actions-artifact.py",
+          "candidate-archive-store.mjs admit",
+          "--store-root $store",
+          "--output-dir target/release-dist"
+        ],
+        "reason": "A cache miss may transfer the large Actions artifact only through the resumable bounded download, must prove the outer size and digest before extraction, and must admit the archive through the store into the exact output directory; the fragments pin that authenticated admission chain."
+      },
+      "windows_vulkan_calibration_producer_authentication": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Authenticate calibration bundle producer",
+        "fragments": [
+          "actions/runs/",
+          ".github/workflows/packaged-platform-pr.yml",
+          "workflow_dispatch",
+          "success",
+          "embedding-calibration-bundle-",
+          "artifacts?per_page=100",
+          "expired"
+        ],
+        "reason": "A calibration bundle is trusted only when its producer run is the frozen-candidate coordinator's dispatched, successful run and the bundle artifact is the unexpired one it named; the fragments pin the producer-run lookup, the coordinator path, the dispatch event, the success conclusion, the bundle name prefix, the artifact listing, and the expiry check."
+      },
+      "windows_vulkan_protected_runtime_proof": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Prove protected Windows Vulkan runtime",
+        "fragments": [
+          "--engine-policy accelerated",
+          "--expected-backend Vulkan",
+          "--offline",
+          "--proof-tier protected_hardware",
+          "--qualification-matrix-cell protected_windows_x64_vulkan",
+          "--calibration-producer-run-id",
+          "--calibration-producer-artifact",
+          "--server-behavior-only"
+        ],
+        "reason": "The protected Windows Vulkan proof must run the accelerated offline harness against the protected matrix cell with the calibration producer bound and the server-behavior scope explicit; each fragment pins one flag of that invocation."
+      },
+      "windows_vulkan_candidate_staging": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Stage isolated candidate-managed Windows install",
+        "fragments": [
+          "--prepare-candidate-installed-proof",
+          "--candidate-plugin-root-output",
+          "--candidate-plugin-data-output",
+          "--installed-plugin-attestation-output",
+          "--candidate-producer-workflow-path",
+          "gh api",
+          "$run.head_repository.full_name",
+          "$run.path",
+          "$run.head_sha",
+          "$run.run_attempt",
+          "$env:CANDIDATE_PRODUCER_WORKFLOW_PATH",
+          "[IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)",
+          "cs-ci-",
+          "Substring(0, 12)",
+          "[IO.Path]::GetFullPath",
+          "$env:GITHUB_WORKSPACE",
+          "CODESTORY_CANDIDATE_WINDOWS_ROOT="
+        ],
+        "reason": "Candidate-managed staging must go through the harness staging flags, authenticate the producer run by repository, path, head SHA, and attempt, and land in a short isolated root on the workspace drive outside the workspace tree; the fragments pin that staging chain and the exported root."
+      },
+      "windows_vulkan_candidate_installed_proof": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Prove candidate-installed Windows Vulkan runtime",
+        "fragments": [
+          "--proof-tier installed_runtime",
+          "--engine-policy accelerated",
+          "--expected-backend Vulkan",
+          "--installed-plugin-attestation",
+          "--installed-plugin-data",
+          "--candidate-producer-workflow-path",
+          "$env:CANDIDATE_PRODUCER_WORKFLOW_PATH",
+          "--server-behavior-only",
+          "--expected-source-sha",
+          "--expected-source-tree",
+          "$env:CODESTORY_CANDIDATE_WINDOWS_ROOT",
+          "$env:TEMP = $proofTemp",
+          "$env:TMP = $proofTemp",
+          "$env:TMPDIR = $proofTemp"
+        ],
+        "reason": "The candidate-installed proof must run the accelerated Vulkan harness at the installed-runtime tier against the staged install with the producer path, server-behavior scope, and expected source identity bound, and must redirect every temp root into the proof's own directory; each fragment pins one of those conjuncts."
+      },
+      "windows_vulkan_release_cell": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Vulkan release cell",
+        "fragments": [
+          "codestory-release-cell-manifest.mjs produce",
+          "accelerator_execution:windows-x64-vulkan",
+          "--producer-job packaged-vulkan",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The Vulkan release cell must be produced by the manifest tool, name the accelerator-execution Windows cell and this producer job, and bind the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "windows_vulkan_candidate_installed_cell": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated candidate-installed Windows release cell",
+        "fragments": [
+          "candidate_installed_behavior:windows-x64",
+          "--producer-job packaged-vulkan",
+          "candidate_managed_plugin",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The candidate-installed Windows cell must name its cell, this producer job, the candidate-managed plugin claim, and the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "windows_vulkan_retrieval_readiness_cell": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Windows retrieval-readiness release cell",
+        "fragments": [
+          "retrieval_readiness:windows-x64",
+          "--producer-job packaged-vulkan",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The Windows retrieval-readiness cell must name its cell, this producer job, and the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "windows_vulkan_release_cell_no_calibration": {
+        "kind": "forbid",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Vulkan release cell",
+        "fragments": [
+          "calibration"
+        ],
+        "reason": "The Vulkan release cell is a qualification artifact; the fragment forbids any calibration reference so calibration evidence cannot leak into the release chain."
+      },
+      "windows_vulkan_candidate_installed_cell_no_calibration": {
+        "kind": "forbid",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated candidate-installed Windows release cell",
+        "fragments": [
+          "calibration"
+        ],
+        "reason": "The candidate-installed Windows cell must stay a runtime-behavior artifact; the fragment forbids any calibration reference so the candidate lane cannot smuggle calibration claims."
+      },
+      "linux_vulkan_route_upstream_package": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "route",
+        "step": "Require an upstream package for standalone protected proof",
+        "fragments": [
+          "if [ \"$EVENT_NAME\" = workflow_dispatch ] && [ \"$CONSTANT_CALIBRATION_MODE\" != true ]; then",
+          "test -n \"$PACKAGE_RUN_ID\""
+        ],
+        "reason": "A standalone dispatch without an upstream package would rebuild the candidate on the protected host; the fragments pin the dispatch-mode test and the package-run requirement so standalone proofs always consume a prior package."
+      },
+      "linux_vulkan_host_evidence": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Capture Linux Vulkan host evidence",
+        "fragments": [
+          "uname -m",
+          "vulkaninfo --summary",
+          "test \"$(uname -m)\" = x86_64"
+        ],
+        "reason": "Host evidence must prove the machine is the x86_64 Vulkan host the claim names; the fragments pin the architecture capture, the Vulkan summary, and the architecture test."
+      },
+      "linux_vulkan_validate_candidate_installed_mode": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Validate candidate-installed mode",
+        "fragments": [
+          "test \"$SERVER_BEHAVIOR_ONLY\" = true"
+        ],
+        "reason": "Candidate-installed mode on the Linux host is only sound as a server-behavior claim; the fragment pins the mode test so the validation cannot widen the claim scope."
+      },
+      "linux_vulkan_candidate_cache_restore": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Restore exact candidate archive from protected host",
+        "fragments": [
+          "--arg repository \"$GITHUB_REPOSITORY\"",
+          "--arg source_sha \"$(git rev-parse HEAD)\"",
+          "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
+          "--arg target linux-x64",
+          "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
+          "candidate-archive-store.mjs restore",
+          "--record \"$record\"",
+          "--output-dir target/release-dist",
+          "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\""
+        ],
+        "reason": "A protected-host cache hit is only the reviewed archive when the record binds this repository, source commit and tree, and the Linux target, and the restore goes through the archive store into the exact output directory; the fragments pin those bindings and the recorded hit output."
+      },
+      "linux_vulkan_candidate_cache_miss": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Download, authenticate, and admit candidate archive on miss",
+        "fragments": [
+          "actions/artifacts/$ARTIFACT_ID/zip",
+          "--continue-at -",
+          "--max-time 120",
+          "test \"$actual_size\" = \"$EXPECTED_SIZE\"",
+          "test \"$actual_digest\" = \"$EXPECTED_SHA256\"",
+          "extract-candidate-actions-artifact.py",
+          "candidate-archive-store.mjs admit",
+          "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
+          "--output-dir target/release-dist"
+        ],
+        "reason": "A cache miss may transfer the large Actions artifact only through the resumable bounded download, must prove the outer size and digest before extraction, and must admit the archive through the store into the exact output directory; the fragments pin that authenticated admission chain."
+      },
+      "linux_vulkan_calibration_producer_authentication": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Authenticate calibration bundle producer",
+        "fragments": [
+          "actions/runs/",
+          ".github/workflows/packaged-platform-pr.yml",
+          "workflow_dispatch",
+          "success",
+          "embedding-calibration-bundle-",
+          "artifacts?per_page=100",
+          "expired"
+        ],
+        "reason": "A calibration bundle is trusted only when its producer run is the frozen-candidate coordinator's dispatched, successful run and the bundle artifact is the unexpired one it named; the fragments pin the producer-run lookup, the coordinator path, the dispatch event, the success conclusion, the bundle name prefix, the artifact listing, and the expiry check."
+      },
+      "linux_vulkan_offline_retrieval_proof": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Prove offline Linux Vulkan retrieval",
+        "fragments": [
+          "--engine-policy accelerated",
+          "--expected-backend Vulkan",
+          "--offline",
+          "--proof-tier protected_hardware",
+          "--qualification-matrix-cell protected_linux_x64_vulkan",
+          "--calibration-producer-run-id",
+          "--calibration-producer-artifact",
+          "--server-behavior-only"
+        ],
+        "reason": "The offline Linux Vulkan proof must run the accelerated offline harness against the protected matrix cell with the calibration producer bound and the server-behavior scope explicit; each fragment pins one flag of that invocation."
+      },
+      "linux_vulkan_candidate_staging": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Stage isolated candidate-managed Linux install",
+        "fragments": [
+          "--prepare-candidate-installed-proof",
+          "--candidate-plugin-root-output",
+          "--candidate-plugin-data-output",
+          "--installed-plugin-attestation-output",
+          "--candidate-producer-workflow-path",
+          "gh api",
+          "$RUNNER_TEMP/codestory-candidate-installed-linux.",
+          "CODESTORY_CANDIDATE_LINUX_ROOT="
+        ],
+        "reason": "Candidate-managed staging must go through the harness staging flags, authenticate the producer run, and land in an isolated runner-temp root; the fragments pin that staging chain and the exported root."
+      },
+      "linux_vulkan_candidate_installed_proof": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Prove candidate-installed Linux Vulkan runtime",
+        "fragments": [
+          "--engine-policy accelerated",
+          "--expected-backend Vulkan",
+          "--proof-tier installed_runtime",
+          "--installed-plugin-attestation",
+          "--installed-plugin-data",
+          "--server-behavior-only"
+        ],
+        "reason": "The candidate-installed proof must run the accelerated Vulkan harness at the installed-runtime tier against the staged plugin attestation and data with the server-behavior scope explicit; each fragment pins one of those conjuncts."
+      },
+      "linux_vulkan_candidate_installed_proof_scope": {
+        "kind": "forbid",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Prove candidate-installed Linux Vulkan runtime",
+        "fragments": [
+          "calibration",
+          "--ground-only",
+          "--engine-policy cpu_explicit"
+        ],
+        "reason": "The candidate-installed lane is a bounded accelerated runtime proof; the fragments forbid calibration, ground-only retrieval, and the explicit CPU engine so the lane cannot quietly become a weaker or different claim."
+      },
+      "linux_vulkan_release_cells": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Linux Vulkan release cells",
+        "fragments": [
+          "accelerator_execution:linux-x64-vulkan",
+          "retrieval_readiness:linux-x64",
+          "candidate_installed_behavior:linux-x64",
+          "--producer-job packaged-vulkan",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The single Linux cell step must name all three Linux cells and this producer job and bind the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "linux_vulkan_release_cells_no_calibration": {
+        "kind": "forbid",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Linux Vulkan release cells",
+        "fragments": [
+          "calibration"
+        ],
+        "reason": "The Linux release cells are qualification artifacts; the fragment forbids any calibration reference so calibration evidence cannot leak into the release chain."
+      },
+      "linux_vulkan_optional_calibration_embedded_model": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "optional-constant-calibration",
+        "step": "Prepare checksum-pinned embedded model",
+        "fragments": [
+          "node scripts/prepare-embedded-model.mjs",
+          "--cache-root \"$RUNNER_TOOL_CACHE/codestory/model-material\""
+        ],
+        "reason": "Model material reaches the optional calibration job only through the checksum-pinned preparation script and the runner tool cache root; the fragments pin that invocation and its cache root."
+      },
+      "linux_vulkan_optional_calibration_collector": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "optional-constant-calibration",
+        "step": "Collect optional Linux Vulkan constant calibration",
+        "fragments": [
+          "test \"$CONSTANT_CALIBRATION_MODE\" = true",
+          "--engine-policy accelerated",
+          "--expected-backend Vulkan",
+          "--proof-tier calibration",
+          "--qualification-matrix-cell protected_linux_x64_vulkan",
+          "--collect-constant-calibration",
+          "--constant-calibration-output-dir target/calibration-runs/linux-vulkan",
+          "--qualification-driver target/release/codestory_embedding_constant_calibration",
+          "--out-dir target/calibration-proof/linux-vulkan"
+        ],
+        "reason": "Optional calibration must gate on its explicit mode and collect constants through the dedicated collector with the accelerated Vulkan engine on the protected matrix cell, writing runs and proof to the reviewed directories; each fragment pins one flag of that single collector invocation."
       }
     },
     "structural_pins": {
@@ -2368,6 +3024,87 @@
         "file": "source-proof.yml",
         "job": "windows-native-contracts",
         "reason": "The Windows-native contracts job is the only place the path-identity and native-staging tests run on a real Windows toolchain before merge. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments and the checker's shape rules then constrain what the surviving job must run."
+      },
+      "auto_release_detect_version_job": {
+        "kind": "job",
+        "file": "auto-release.yml",
+        "job": "detect-version",
+        "reason": "Version detection is the job that decides whether a main push is a release at all. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the checker's shape rules then constrain what the surviving job must not do."
+      },
+      "auto_release_release_job": {
+        "kind": "job",
+        "file": "auto-release.yml",
+        "job": "release",
+        "reason": "The release job is the one trusted caller of the reusable release workflow on main. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned needs edge and permission grants then constrain how the surviving job calls it."
+      },
+      "auto_release_release_needs_detect_version": {
+        "kind": "needs",
+        "file": "auto-release.yml",
+        "job": "release",
+        "needs": [
+          "detect-version"
+        ],
+        "reason": "The trusted main caller may invoke the release workflow only after version detection has decided a release is due, and nothing else may gate it - an added dependency would let another job influence publication and a dropped one would release undetected versions. The edge is pinned here so it cannot change by a workflow edit alone."
+      },
+      "auto_release_release_contents_write": {
+        "kind": "job_permission",
+        "file": "auto-release.yml",
+        "job": "release",
+        "scope": "contents",
+        "access": "write",
+        "reason": "The release caller publishes tags and release assets, which requires exactly contents write on the caller side; the grant is pinned here so it cannot silently widen or drop by a workflow edit alone."
+      },
+      "auto_release_release_actions_write": {
+        "kind": "job_permission",
+        "file": "auto-release.yml",
+        "job": "release",
+        "scope": "actions",
+        "access": "write",
+        "reason": "Superseded-run cancellation is an Actions-surface write, so the caller must grant actions write; the grant is pinned here so it cannot silently widen or drop by a workflow edit alone."
+      },
+      "auto_release_release_pull_requests_read": {
+        "kind": "job_permission",
+        "file": "auto-release.yml",
+        "job": "release",
+        "scope": "pull-requests",
+        "access": "read",
+        "reason": "The exact source proof reads pull-request metadata to authenticate the head it releases, which requires exactly pull-requests read from the caller; the grant is pinned here so it cannot silently widen or drop by a workflow edit alone."
+      },
+      "macos_metal_packaged_metal_job": {
+        "kind": "job",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "reason": "The packaged-metal job is the only lane that proves accelerated execution on protected Apple Silicon. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments and the checker's shape rules then constrain what the surviving job must run."
+      },
+      "windows_vulkan_packaged_vulkan_job": {
+        "kind": "job",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "reason": "The packaged-vulkan job is the only lane that proves accelerated execution on the protected Windows Vulkan host. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments and the checker's shape rules then constrain what the surviving job must run."
+      },
+      "linux_vulkan_route_job": {
+        "kind": "job",
+        "file": "linux-vulkan-proof.yml",
+        "job": "route",
+        "reason": "The route job is the bounded hosted gate that validates a standalone dispatch before anything reaches the protected Linux host. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments then constrain what the surviving job must run."
+      },
+      "linux_vulkan_packaged_vulkan_job": {
+        "kind": "job",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "reason": "The packaged-vulkan job is the only lane that proves accelerated execution on the protected Linux Vulkan host. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments and the checker's shape rules then constrain what the surviving job must run."
+      },
+      "linux_vulkan_optional_constant_calibration_job": {
+        "kind": "job",
+        "file": "linux-vulkan-proof.yml",
+        "job": "optional-constant-calibration",
+        "reason": "Optional Linux constant calibration runs as its own coordinator-gated job so calibration can never share a lane with release proof. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments and the checker's shape rules then constrain what the surviving job must run."
+      },
+      "main_branch_source_guard_enforce_source_branch_job": {
+        "kind": "job",
+        "file": "main-branch-source-guard.yml",
+        "job": "enforce-source-branch",
+        "reason": "The source-branch guard is the only check standing between an arbitrary branch and a main merge. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the checker's identity and branch rules then constrain what the surviving job must compare."
       }
     },
     "constant_mirrors": {

@@ -833,13 +833,18 @@ function requireCalibrationProducerAuthentication(violations, file, job) {
   ]);
 }
 
+// The protected proof files' producer-authentication step fragments are rule
+// instances and live in release-claims.json under workflow_policy.step_fragments;
+// stepFragmentViolations evaluates them, so this boundary pins only the download
+// action and the condition and binding contract. Callers outside that migrated
+// family still pin authentication through
+// requireCalibrationProducerAuthentication.
 function requireCalibrationProducerBoundary(
   violations,
   file,
   job,
   expectedCondition,
 ) {
-  requireCalibrationProducerAuthentication(violations, file, job);
   requireStepUses(
     violations,
     file,
@@ -1086,20 +1091,29 @@ export function stepFragmentViolations(workflows, graph = loadReleaseClaimGraph(
 // release-claims.json under workflow_policy.structural_pins; scripts/
 // codestory-release-claims.mjs fails graph loading unless that block names exactly
 // the reviewed pin rows, so membership cannot drift by data edit. The checker keeps
-// only what stays code: the job-existence, needs-edge, and permission-scope
-// predicates each row's kind selects, whose violation text is byte-identical to the
-// retired inline calls.
+// only what stays code: the job-existence, needs-edge, and workflow- or job-scoped
+// permission predicates each row's kind selects, whose violation text is
+// byte-identical to the retired inline calls.
 // A missing workflow is reported by the structural validator that owns the file, so
 // each row evaluates only when its subject workflow parsed; a missing job, a
 // missing or widened needs edge, or an absent, weaker, or wider permission scope
 // fails the pin predicates exactly as the retired inline checks did.
 //
-// Some retired inline checks named the artifact a scope protects rather than the
-// scope itself; that reviewed violation text stays code, keyed by pin name, and the
-// derived scope wording remains the default for every other permission row.
+// Some retired inline checks named the artifact a scope protects or the role a job
+// plays rather than the scope or edge itself; that reviewed violation text stays
+// code, keyed by pin name, and the derived wording remains the default for every
+// other row.
 const structuralPinMessages = {
   post_publish_smoke_actions_read:
     row => `${row.file} must read the accepted pre-publish closeout`,
+  auto_release_release_needs_detect_version:
+    row => `${row.file} release must need version detection`,
+  auto_release_release_contents_write:
+    row => `${row.file} release caller must grant contents write`,
+  auto_release_release_actions_write:
+    row => `${row.file} release caller must grant actions write for superseded-run cancellation`,
+  auto_release_release_pull_requests_read:
+    row => `${row.file} release caller must pass pull-request metadata access to exact source proof`,
 };
 
 export function structuralPinViolations(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
@@ -1115,10 +1129,22 @@ export function structuralPinViolations(workflows, graph = loadReleaseClaimGraph
         `${row.file} must contain job ${row.job}`,
       );
     } else if (row.kind === "needs") {
+      const message = structuralPinMessages[name];
       add(
         violations,
         sameMembers(needs(object(object(workflow.jobs)[row.job])), list(row.needs)),
-        `${row.file} ${String(row.job).replaceAll("-", " ")} must need ${list(row.needs).join(", ")}`,
+        message === undefined
+          ? `${row.file} ${String(row.job).replaceAll("-", " ")} must need ${list(row.needs).join(", ")}`
+          : message(row),
+      );
+    } else if (row.kind === "job_permission") {
+      const message = structuralPinMessages[name];
+      add(
+        violations,
+        object(object(object(workflow.jobs)[row.job]).permissions)[row.scope] === row.access,
+        message === undefined
+          ? `${row.file} ${String(row.job).replaceAll("-", " ")} must ${row.access} ${String(row.scope).replaceAll("-", " ")}`
+          : message(row),
       );
     } else {
       const message = structuralPinMessages[name];
@@ -4510,6 +4536,7 @@ function validatePackagedProof(workflows, violations, graph) {
       && namedStep(job, "Upload packaged agent proof artifacts") === undefined,
     `${file} package workflow must not add a second driver build, calibration, or hosted qualification`,
   );
+  requireCalibrationProducerAuthentication(violations, file, job);
   requireCalibrationProducerBoundary(
     violations,
     file,
@@ -6362,7 +6389,11 @@ function validateRemainingWorkflows(workflows, violations) {
       object(auto.jobs)["workflow-policy"] === undefined,
       `${autoFile} must delegate the release policy gate to release.yml exactly once`,
     );
-    const detectVersion = requireJob(violations, autoFile, auto, "detect-version");
+    // The version-detection and release jobs' structural pins - their existence,
+    // the release job's needs edge, and the release caller's permission grants -
+    // are rule instances and live in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates them.
+    const detectVersion = object(object(auto.jobs)["detect-version"]);
     add(
       violations,
       needs(detectVersion).length === 0,
@@ -6373,20 +6404,8 @@ function validateRemainingWorkflows(workflows, violations) {
       namedStep(detectVersion, "Validate synchronized release version") === undefined,
       `${autoFile} must delegate synchronized version validation to release.yml`,
     );
-    const release = requireJob(violations, autoFile, auto, "release");
+    const release = object(object(auto.jobs).release);
     add(violations, release.uses === "./.github/workflows/release.yml", `${autoFile} must call the release workflow`);
-    add(violations, sameMembers(needs(release), ["detect-version"]), `${autoFile} release must need version detection`);
-    add(violations, object(release.permissions).contents === "write", `${autoFile} release caller must grant contents write`);
-    add(
-      violations,
-      object(release.permissions).actions === "write",
-      `${autoFile} release caller must grant actions write for superseded-run cancellation`,
-    );
-    add(
-      violations,
-      object(release.permissions)["pull-requests"] === "read",
-      `${autoFile} release caller must pass pull-request metadata access to exact source proof`,
-    );
     add(violations, object(release.with).publish_release === true, `${autoFile} trusted main caller must explicitly authorize publication`);
     add(
       violations,
@@ -6465,7 +6484,15 @@ function validateRemainingWorkflows(workflows, violations) {
         && serverBehaviorInput.default === false,
       `${metalFile} server-behavior-only claim scope must be an explicit opt-in`,
     );
-    const job = requireJob(violations, metalFile, metal, "packaged-metal");
+    // The packaged-metal job's structural pin (job existence) is a rule instance
+    // and lives in release-claims.json under workflow_policy.structural_pins;
+    // structuralPinViolations evaluates it. The lane's step fragments - mode
+    // validation, model preparation, host evidence, candidate authentication and
+    // cache handling, calibration-producer authentication, the calibration
+    // collector, the protected and candidate-installed proofs, and the release
+    // cells - are rule instances and live in release-claims.json under
+    // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+    const job = object(object(metal.jobs)["packaged-metal"]);
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "macOS", "ARM64", "codestory-metal"]), `${metalFile} must use the protected Apple Silicon runner`);
     add(violations, job.environment === "macos-metal-release", `${metalFile} must use the protected Metal environment`);
     const validateCandidate = namedStep(job, "Validate candidate-installed mode");
@@ -6475,19 +6502,10 @@ function validateRemainingWorkflows(workflows, violations) {
         && validateCandidate?.shell === "bash",
       `${metalFile} candidate-installed validation must be an explicit Bash boundary`,
     );
-    requireStepRun(violations, metalFile, job, "Validate candidate-installed mode", [
-      'test "$SERVER_BEHAVIOR_ONLY" = true',
-      'test "$CALIBRATION_MODE" = false',
-    ]);
     requireStepEnv(violations, metalFile, job, "Validate candidate-installed mode", {
       SERVER_BEHAVIOR_ONLY: "${{ inputs.server_behavior_only }}",
       CALIBRATION_MODE: "${{ inputs.calibration_mode }}",
     });
-    requireStepRun(violations, metalFile, job, "Prepare checksum-pinned embedded model", [
-      "node scripts/prepare-embedded-model.mjs",
-      '--cache-root "$RUNNER_TOOL_CACHE/codestory/model-material"',
-    ]);
-    requireStepRun(violations, metalFile, job, "Capture host evidence", ["python3 --version", 'test "$macos_major" -ge 15']);
     const calibrationClock = namedStep(
       job,
       "Start Metal constant calibration clock",
@@ -6631,27 +6649,6 @@ function validateRemainingWorkflows(workflows, violations) {
           === "${{ inputs.server_behavior_only }}",
       `${metalFile} packaged candidate authentication must bind all exact artifacts before cache lookup`,
     );
-    requireStepRun(violations, metalFile, job, "Authenticate exact candidate artifacts", [
-      "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100",
-      ".github/workflows/auto-release.yml",
-      ".github/workflows/release.yml",
-      ".github/workflows/packaged-platform-pr.yml",
-      'if [ "$SERVER_BEHAVIOR_ONLY" != true ]; then',
-      'test "$CANDIDATE_PRODUCER_WORKFLOW_PATH" =',
-      ".head_repository.full_name",
-      '.path\' <<<"$producer_run")" = "$CANDIDATE_PRODUCER_WORKFLOW_PATH"',
-      '.head_sha\' <<<"$producer_run")" = "$(git rev-parse HEAD)"',
-      '.run_attempt\' <<<"$producer_run")" = "$GITHUB_RUN_ATTEMPT"',
-      ".workflow_run.id == $run_id",
-      ".workflow_run.head_sha == $sha",
-      "expected one exact candidate artifact",
-      'artifact="$(select_artifact "$ARTIFACT_NAME")"',
-      'record_artifact="$(select_artifact "$CANDIDATE_RECORD_ARTIFACT")"',
-      'select_artifact "$QUALIFICATION_ARTIFACT"',
-      "package-id=$artifact_id",
-      "package-bytes=$expected_size",
-      "package-sha256=${expected_digest#sha256:}",
-    ]);
     add(
       violations,
       recordDownload?.if === "inputs.use_packaged_cli_artifact"
@@ -6666,23 +6663,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && cacheRestore?.shell === "bash"
         && cacheRestore?.["continue-on-error"] === undefined,
       `${metalFile} protected cache lookup must consume only the exact small candidate record`,
-    );
-    requireStepRun(
-      violations,
-      metalFile,
-      job,
-      "Restore exact candidate archive from protected host",
-      [
-        "--arg repository \"$GITHUB_REPOSITORY\"",
-        "--arg source_sha \"$(git rev-parse HEAD)\"",
-        "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
-        "--arg target macos-arm64",
-        "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
-        "candidate-archive-store.mjs restore",
-        "--record \"$record\"",
-        "--output-dir target/release-dist",
-        "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\"",
-      ],
     );
     add(
       violations,
@@ -6704,23 +6684,6 @@ function validateRemainingWorkflows(workflows, violations) {
           === "${{ steps.candidate-artifacts.outputs.package-sha256 }}"
         && object(cacheMiss?.env).GH_TOKEN === "${{ github.token }}",
       `${metalFile} large Actions artifact transfer must be a cache-miss-only authenticated boundary`,
-    );
-    requireStepRun(
-      violations,
-      metalFile,
-      job,
-      "Download, authenticate, and admit candidate archive on miss",
-      [
-        "actions/artifacts/$ARTIFACT_ID/zip",
-      "--continue-at -",
-      "--max-time 120",
-        'test "$actual_size" = "$EXPECTED_SIZE"',
-        'test "$actual_digest" = "$EXPECTED_SHA256"',
-        "extract-candidate-actions-artifact.py",
-        "candidate-archive-store.mjs admit",
-        "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
-        "--output-dir target/release-dist",
-      ],
     );
     add(
       violations,
@@ -6813,16 +6776,6 @@ function validateRemainingWorkflows(workflows, violations) {
       `${metalFile} must reject a frozen or stale calibration source immediately after checkout and before setup or compilation`,
     );
     const calibrationStepName = "Collect three independent Metal constant calibration runs";
-    requireStepRun(violations, metalFile, job, calibrationStepName, [
-      "--proof-tier calibration",
-      "--engine-policy accelerated",
-      "--expected-backend Metal",
-      "--qualification-matrix-cell protected_macos_arm64_metal",
-      "--collect-constant-calibration",
-      "--constant-calibration-output-dir target/calibration-runs/macos",
-      "--qualification-driver target/release/codestory_embedding_constant_calibration",
-      "--out-dir target/calibration-proof/macos",
-    ]);
     const calibrationRun = shellLiteralNormalizedText(
       stepRun(job, calibrationStepName),
     );
@@ -6894,16 +6847,6 @@ function validateRemainingWorkflows(workflows, violations) {
       `${metalFile} calibration must publish shared build/package and five-phase collector timing, including model preparation and an under-ten-minute total`,
     );
     const engine = namedStep(job, "Prove protected Metal runtime");
-    requireStepRun(violations, metalFile, job, "Prove protected Metal runtime", [
-      "--engine-policy accelerated",
-      "--expected-backend Metal",
-      "--offline",
-      "--proof-tier protected_hardware",
-      "--qualification-matrix-cell protected_macos_arm64_metal",
-      "--calibration-producer-run-id",
-      "--calibration-producer-artifact",
-      "--server-behavior-only",
-    ]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${metalFile} engine proof must reject CPU fallback`);
     const engineRun = stepRun(
       job,
@@ -6947,40 +6890,12 @@ function validateRemainingWorkflows(workflows, violations) {
       candidateStage?.if === "${{ inputs.candidate_installed_proof && !inputs.calibration_mode }}",
       `${metalFile} candidate-managed staging must require candidate mode outside calibration`,
     );
-    requireStepRun(violations, metalFile, job, "Stage isolated candidate-managed macOS install", [
-      "--prepare-candidate-installed-proof",
-      "--candidate-plugin-root-output",
-      "--candidate-plugin-data-output",
-      "--installed-plugin-attestation-output",
-      "--candidate-producer-workflow-path",
-      "gh api",
-      ".head_repository.full_name",
-      ".path",
-      ".head_sha",
-      ".run_attempt",
-      "$CANDIDATE_PRODUCER_WORKFLOW_PATH",
-      "$RUNNER_TEMP/codestory-candidate-installed-macos.",
-      'candidate_root="$(cd "$candidate_root" && pwd -P)"',
-      '"$GITHUB_WORKSPACE/"*',
-      "CODESTORY_CANDIDATE_MACOS_ROOT=",
-    ]);
     const candidateProof = namedStep(job, "Prove candidate-installed macOS Metal runtime");
     add(
       violations,
       candidateProof?.if === "${{ inputs.candidate_installed_proof && !inputs.calibration_mode }}",
       `${metalFile} candidate-installed Metal proof must require candidate mode outside calibration`,
     );
-    requireStepRun(violations, metalFile, job, "Prove candidate-installed macOS Metal runtime", [
-      "--engine-policy accelerated",
-      "--expected-backend Metal",
-      "--proof-tier installed_runtime",
-      "--installed-plugin-attestation",
-      "--installed-plugin-data",
-      "$CANDIDATE_PRODUCER_WORKFLOW_PATH",
-      "--server-behavior-only",
-      "$CODESTORY_CANDIDATE_MACOS_ROOT/plugin",
-      "$CODESTORY_CANDIDATE_MACOS_ROOT/data",
-    ]);
     const candidateProofRun = stepRun(
       job,
       "Prove candidate-installed macOS Metal runtime",
@@ -6997,17 +6912,6 @@ function validateRemainingWorkflows(workflows, violations) {
       object(candidateProof?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
       `${metalFile} candidate-installed proof must reject CPU fallback`,
     );
-    requireStepRun(violations, metalFile, job, "Emit authenticated Metal release cell", [
-      "codestory-release-cell-manifest.mjs produce",
-      "accelerator_execution:macos-arm64-metal",
-      "--producer-job packaged-metal",
-      '--expected-sha "$INPUT_REF"',
-    ]);
-    requireStepRun(violations, metalFile, job, "Emit authenticated macOS retrieval-readiness release cell", [
-      "retrieval_readiness:macos-arm64",
-      "--producer-job packaged-metal",
-      '--expected-sha "$INPUT_REF"',
-    ]);
     for (const cell of [
       "Emit authenticated Metal release cell",
       "Emit authenticated macOS retrieval-readiness release cell",
@@ -7022,26 +6926,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && String(metalCellUpload?.if ?? "").includes("success()")
         && String(metalCellUpload?.if ?? "").includes("inputs.emit_release_cells"),
       `${metalFile} Metal release cell must be a success-only retained artifact`,
-    );
-    requireStepRun(violations, metalFile, job, "Emit authenticated candidate-installed macOS release cell", [
-      "candidate_installed_behavior:macos-arm64",
-      "--producer-job packaged-metal",
-      "candidate_managed_plugin",
-      '--expected-sha "$INPUT_REF"',
-    ]);
-    forbidStepRun(
-      violations,
-      metalFile,
-      job,
-      "Emit authenticated Metal release cell",
-      ["calibration"],
-    );
-    forbidStepRun(
-      violations,
-      metalFile,
-      job,
-      "Emit authenticated candidate-installed macOS release cell",
-      ["calibration"],
     );
     requireStepUses(
       violations,
@@ -7122,7 +7006,15 @@ function validateRemainingWorkflows(workflows, violations) {
         && serverBehaviorInput.default === false,
       `${vulkanFile} server-behavior-only claim scope must be an explicit opt-in`,
     );
-    const job = requireJob(violations, vulkanFile, vulkan, "packaged-vulkan");
+    // The packaged-vulkan job's structural pin (job existence) is a rule instance
+    // and lives in release-claims.json under workflow_policy.structural_pins;
+    // structuralPinViolations evaluates it. The lane's step fragments - mode
+    // validation, build-tool evidence, model preparation, candidate cache
+    // handling, calibration-producer authentication, the protected and
+    // candidate-installed proofs, and the release cells - are rule instances and
+    // live in release-claims.json under workflow_policy.step_fragments;
+    // stepFragmentViolations evaluates them.
+    const job = object(object(vulkan.jobs)["packaged-vulkan"]);
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Windows", "X64", "codestory-vulkan"]), `${vulkanFile} must use the protected Windows Vulkan runner`);
     add(violations, job.environment === "windows-vulkan-proof", `${vulkanFile} must use the protected Vulkan environment`);
     const pythonSetup = namedStep(job, "Install pinned Python");
@@ -7175,10 +7067,6 @@ function validateRemainingWorkflows(workflows, violations) {
       validateCandidate?.if === "inputs.candidate_installed_proof",
       `${vulkanFile} candidate-installed validation must require explicit candidate mode`,
     );
-    requireStepRun(violations, vulkanFile, job, "Validate candidate-installed mode", [
-      'if ($env:SERVER_BEHAVIOR_ONLY -ne "true")',
-      "candidate_installed_proof requires server_behavior_only",
-    ]);
     requireStepEnv(violations, vulkanFile, job, "Validate candidate-installed mode", {
       SERVER_BEHAVIOR_ONLY: "${{ inputs.server_behavior_only }}",
     });
@@ -7190,15 +7078,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && sourceBuildTools?.shell === windowsPowerShellShell,
       `${vulkanFile} source build tool evidence must remain source-only and fail closed`,
     );
-    requireStepRun(violations, vulkanFile, job, "Capture source build tool evidence", [
-      "CMAKE_GENERATOR=Ninja",
-      "cmake --version",
-      "ninja --version",
-    ]);
-    requireStepRun(violations, vulkanFile, job, "Prepare checksum-pinned embedded model", [
-      "node scripts/prepare-embedded-model.mjs",
-      '--cache-root "$env:RUNNER_TOOL_CACHE/codestory/model-material"',
-    ]);
     const nativeBuild = namedStep(job, "Build and package native CLI");
     const nativeBuildRun = shellLiteralNormalizedText(String(nativeBuild?.run ?? ""));
     add(
@@ -7360,23 +7239,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && windowsCacheRestore?.["continue-on-error"] === undefined,
       `${vulkanFile} protected cache lookup must consume only the exact small Windows candidate record`,
     );
-    requireStepRun(
-      violations,
-      vulkanFile,
-      job,
-      "Restore exact candidate archive from protected host",
-      [
-        "$record.source.commit -ne $sourceSha",
-        "$record.source.tree -ne $sourceTree",
-        "$record.target -ne \"windows-x64\"",
-        "codestory/candidate-archives",
-        "candidate-archive-store.mjs restore",
-        "--record $recordPath",
-        "--output-dir target/release-dist",
-        "\"hit=$hit\"",
-        "$env:GITHUB_OUTPUT",
-      ],
-    );
     add(
       violations,
       windowsCacheMiss?.if
@@ -7397,23 +7259,6 @@ function validateRemainingWorkflows(workflows, violations) {
           === "${{ steps.candidate-artifacts.outputs.package-sha256 }}"
         && object(windowsCacheMiss?.env).GH_TOKEN === "${{ github.token }}",
       `${vulkanFile} large Windows Actions artifact transfer must be cache-miss-only and outer-digest authenticated`,
-    );
-    requireStepRun(
-      violations,
-      vulkanFile,
-      job,
-      "Download, authenticate, and admit candidate archive on miss",
-      [
-        "actions/artifacts/$env:ARTIFACT_ID/zip",
-        "--continue-at -",
-        "--max-time 120",
-        "$actualSize -ne [long]$env:EXPECTED_SIZE",
-        "$actualDigest -ne $env:EXPECTED_SHA256",
-        "extract-candidate-actions-artifact.py",
-        "candidate-archive-store.mjs admit",
-        "--store-root $store",
-        "--output-dir target/release-dist",
-      ],
     );
     add(
       violations,
@@ -7490,16 +7335,6 @@ function validateRemainingWorkflows(workflows, violations) {
       "${{ !inputs.server_behavior_only }}",
     );
     const engine = namedStep(job, "Prove protected Windows Vulkan runtime");
-    requireStepRun(violations, vulkanFile, job, "Prove protected Windows Vulkan runtime", [
-      "--engine-policy accelerated",
-      "--expected-backend Vulkan",
-      "--offline",
-      "--proof-tier protected_hardware",
-      "--qualification-matrix-cell protected_windows_x64_vulkan",
-      "--calibration-producer-run-id",
-      "--calibration-producer-artifact",
-      "--server-behavior-only",
-    ]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${vulkanFile} engine proof must reject CPU fallback`);
     const engineRun = stepRun(job, "Prove protected Windows Vulkan runtime");
     add(
@@ -7548,47 +7383,12 @@ function validateRemainingWorkflows(workflows, violations) {
       candidateStage?.if === "inputs.candidate_installed_proof",
       `${vulkanFile} candidate-managed staging must require explicit candidate mode`,
     );
-    requireStepRun(violations, vulkanFile, job, "Stage isolated candidate-managed Windows install", [
-      "--prepare-candidate-installed-proof",
-      "--candidate-plugin-root-output",
-      "--candidate-plugin-data-output",
-      "--installed-plugin-attestation-output",
-      "--candidate-producer-workflow-path",
-      "gh api",
-      "$run.head_repository.full_name",
-      "$run.path",
-      "$run.head_sha",
-      "$run.run_attempt",
-      "$env:CANDIDATE_PRODUCER_WORKFLOW_PATH",
-      "[IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)",
-      "cs-ci-",
-      "Substring(0, 12)",
-      "[IO.Path]::GetFullPath",
-      "$env:GITHUB_WORKSPACE",
-      "CODESTORY_CANDIDATE_WINDOWS_ROOT=",
-    ]);
     const candidateProof = namedStep(job, "Prove candidate-installed Windows Vulkan runtime");
     add(
       violations,
       candidateProof?.if === "inputs.candidate_installed_proof",
       `${vulkanFile} candidate-installed Vulkan proof must require explicit candidate mode`,
     );
-    requireStepRun(violations, vulkanFile, job, "Prove candidate-installed Windows Vulkan runtime", [
-      "--proof-tier installed_runtime",
-      "--engine-policy accelerated",
-      "--expected-backend Vulkan",
-      "--installed-plugin-attestation",
-      "--installed-plugin-data",
-      "--candidate-producer-workflow-path",
-      "$env:CANDIDATE_PRODUCER_WORKFLOW_PATH",
-      "--server-behavior-only",
-      "--expected-source-sha",
-      "--expected-source-tree",
-      "$env:CODESTORY_CANDIDATE_WINDOWS_ROOT",
-      "$env:TEMP = $proofTemp",
-      "$env:TMP = $proofTemp",
-      "$env:TMPDIR = $proofTemp",
-    ]);
     const candidateProofRun = stepRun(
       job,
       "Prove candidate-installed Windows Vulkan runtime",
@@ -7617,12 +7417,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && object(candidateUpload?.with)["if-no-files-found"] === "error",
       `${vulkanFile} candidate-installed proof must retain one attempt-scoped artifact`,
     );
-    requireStepRun(violations, vulkanFile, job, "Emit authenticated Vulkan release cell", [
-      "codestory-release-cell-manifest.mjs produce",
-      "accelerator_execution:windows-x64-vulkan",
-      "--producer-job packaged-vulkan",
-      '--expected-sha "$INPUT_REF"',
-    ]);
     for (const cell of [
       "Emit authenticated Vulkan release cell",
       "Emit authenticated Windows retrieval-readiness release cell",
@@ -7644,31 +7438,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && String(vulkanCellUpload?.if ?? "").includes("inputs.emit_release_cells")
         && !String(vulkanCellUpload?.if ?? "").includes("!inputs.server_behavior_only"),
       `${vulkanFile} Vulkan release cell must be a success-only retained artifact`,
-    );
-    requireStepRun(violations, vulkanFile, job, "Emit authenticated candidate-installed Windows release cell", [
-      "candidate_installed_behavior:windows-x64",
-      "--producer-job packaged-vulkan",
-      "candidate_managed_plugin",
-      '--expected-sha "$INPUT_REF"',
-    ]);
-    requireStepRun(violations, vulkanFile, job, "Emit authenticated Windows retrieval-readiness release cell", [
-      "retrieval_readiness:windows-x64",
-      "--producer-job packaged-vulkan",
-      '--expected-sha "$INPUT_REF"',
-    ]);
-    forbidStepRun(
-      violations,
-      vulkanFile,
-      job,
-      "Emit authenticated Vulkan release cell",
-      ["calibration"],
-    );
-    forbidStepRun(
-      violations,
-      vulkanFile,
-      job,
-      "Emit authenticated candidate-installed Windows release cell",
-      ["calibration"],
     );
     requireStepUses(
       violations,
@@ -7740,22 +7509,21 @@ function validateRemainingWorkflows(workflows, violations) {
       trigger(linuxVulkan, "workflow_dispatch") === undefined,
       `${linuxVulkanFile} standalone proof must not bypass the coordinator`,
     );
-    const route = requireJob(violations, linuxVulkanFile, linuxVulkan, "route");
+    // The route, packaged-vulkan, and optional-constant-calibration jobs'
+    // structural pins (job existence) are rule instances and live in
+    // release-claims.json under workflow_policy.structural_pins;
+    // structuralPinViolations evaluates them. The lanes' step fragments - the
+    // route gate, host evidence, mode validation, candidate cache handling,
+    // calibration-producer authentication, the protected and candidate-installed
+    // proofs, the release cells, and the optional calibration collector - are
+    // rule instances and live in release-claims.json under
+    // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+    const route = object(object(linuxVulkan.jobs).route);
     add(
       violations,
       JSON.stringify(route["runs-on"]) === JSON.stringify("ubuntu-latest")
         && route["timeout-minutes"] === 5,
       `${linuxVulkanFile} standalone dispatch validation must stay on a bounded hosted route job`,
-    );
-    requireStepRun(
-      violations,
-      linuxVulkanFile,
-      route,
-      "Require an upstream package for standalone protected proof",
-      [
-        'if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$CONSTANT_CALIBRATION_MODE" != true ]; then',
-        'test -n "$PACKAGE_RUN_ID"',
-      ],
     );
     requireStepEnv(
       violations,
@@ -7768,7 +7536,7 @@ function validateRemainingWorkflows(workflows, violations) {
         PACKAGE_RUN_ID: "${{ inputs.package_run_id }}",
       },
     );
-    const job = requireJob(violations, linuxVulkanFile, linuxVulkan, "packaged-vulkan");
+    const job = object(object(linuxVulkan.jobs)["packaged-vulkan"]);
     add(
       violations,
       job.if === "${{ !inputs.constant_calibration_mode }}"
@@ -7782,11 +7550,6 @@ function validateRemainingWorkflows(workflows, violations) {
       "Install pinned Python",
       "actions/setup-python@v7.0.0",
     );
-    requireStepRun(violations, linuxVulkanFile, job, "Capture Linux Vulkan host evidence", [
-      "uname -m",
-      "vulkaninfo --summary",
-      "test \"$(uname -m)\" = x86_64",
-    ]);
     const validateCandidate = namedStep(job, "Validate candidate-installed mode");
     add(
       violations,
@@ -7794,9 +7557,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && validateCandidate?.shell === "bash",
       `${linuxVulkanFile} candidate-installed validation must require explicit candidate mode`,
     );
-    requireStepRun(violations, linuxVulkanFile, job, "Validate candidate-installed mode", [
-      'test "$SERVER_BEHAVIOR_ONLY" = true',
-    ]);
     requireStepEnv(violations, linuxVulkanFile, job, "Validate candidate-installed mode", {
       SERVER_BEHAVIOR_ONLY: "${{ inputs.server_behavior_only }}",
     });
@@ -7922,23 +7682,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && linuxCacheRestore?.["continue-on-error"] === undefined,
       `${linuxVulkanFile} protected cache lookup must consume only the exact small Linux candidate record`,
     );
-    requireStepRun(
-      violations,
-      linuxVulkanFile,
-      job,
-      "Restore exact candidate archive from protected host",
-      [
-        "--arg repository \"$GITHUB_REPOSITORY\"",
-        "--arg source_sha \"$(git rev-parse HEAD)\"",
-        "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
-        "--arg target linux-x64",
-        "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
-        "candidate-archive-store.mjs restore",
-        "--record \"$record\"",
-        "--output-dir target/release-dist",
-        "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\"",
-      ],
-    );
     add(
       violations,
       linuxCacheMiss?.if === "steps.candidate-cache.outputs.hit != 'true'"
@@ -7958,23 +7701,6 @@ function validateRemainingWorkflows(workflows, violations) {
           === "${{ steps.candidate-artifacts.outputs.package-sha256 }}"
         && object(linuxCacheMiss?.env).GH_TOKEN === "${{ github.token }}",
       `${linuxVulkanFile} large Linux Actions artifact transfer must be cache-miss-only and outer-digest authenticated`,
-    );
-    requireStepRun(
-      violations,
-      linuxVulkanFile,
-      job,
-      "Download, authenticate, and admit candidate archive on miss",
-      [
-        "actions/artifacts/$ARTIFACT_ID/zip",
-        "--continue-at -",
-        "--max-time 120",
-        'test "$actual_size" = "$EXPECTED_SIZE"',
-        'test "$actual_digest" = "$EXPECTED_SHA256"',
-        "extract-candidate-actions-artifact.py",
-        "candidate-archive-store.mjs admit",
-        "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
-        "--output-dir target/release-dist",
-      ],
     );
     add(
       violations,
@@ -8071,16 +7797,6 @@ function validateRemainingWorkflows(workflows, violations) {
       `${linuxVulkanFile} must not replace the verified qualification driver before execution`,
     );
     const engine = namedStep(job, "Prove offline Linux Vulkan retrieval");
-    requireStepRun(violations, linuxVulkanFile, job, "Prove offline Linux Vulkan retrieval", [
-      "--engine-policy accelerated",
-      "--expected-backend Vulkan",
-      "--offline",
-      "--proof-tier protected_hardware",
-      "--qualification-matrix-cell protected_linux_x64_vulkan",
-      "--calibration-producer-run-id",
-      "--calibration-producer-artifact",
-      "--server-behavior-only",
-    ]);
     add(
       violations,
       object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
@@ -8120,16 +7836,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && occurrenceCount(engineRun, "check-packaged-agent-proof.py") === 1,
       `${linuxVulkanFile} server-behavior proof must omit calibration while standalone qualification runs one lifecycle proof without optional quality`,
     );
-    requireStepRun(violations, linuxVulkanFile, job, "Stage isolated candidate-managed Linux install", [
-      "--prepare-candidate-installed-proof",
-      "--candidate-plugin-root-output",
-      "--candidate-plugin-data-output",
-      "--installed-plugin-attestation-output",
-      "--candidate-producer-workflow-path",
-      "gh api",
-      "$RUNNER_TEMP/codestory-candidate-installed-linux.",
-      "CODESTORY_CANDIDATE_LINUX_ROOT=",
-    ]);
     add(
       violations,
       namedStep(job, "Stage isolated candidate-managed Linux install")?.if
@@ -8137,14 +7843,6 @@ function validateRemainingWorkflows(workflows, violations) {
       `${linuxVulkanFile} candidate-managed staging must require explicit candidate mode`,
     );
     const candidate = namedStep(job, "Prove candidate-installed Linux Vulkan runtime");
-    requireStepRun(violations, linuxVulkanFile, job, "Prove candidate-installed Linux Vulkan runtime", [
-      "--engine-policy accelerated",
-      "--expected-backend Vulkan",
-      "--proof-tier installed_runtime",
-      "--installed-plugin-attestation",
-      "--installed-plugin-data",
-      "--server-behavior-only",
-    ]);
     add(
       violations,
       candidate?.if === "inputs.candidate_installed_proof",
@@ -8155,35 +7853,11 @@ function validateRemainingWorkflows(workflows, violations) {
       object(candidate?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
       `${linuxVulkanFile} candidate-installed proof must reject CPU fallback`,
     );
-    forbidStepRun(
-      violations,
-      linuxVulkanFile,
-      job,
-      "Prove candidate-installed Linux Vulkan runtime",
-      ["calibration", "--ground-only", "--engine-policy cpu_explicit"],
-    );
-    requireStepRun(violations, linuxVulkanFile, job, "Emit authenticated Linux Vulkan release cells", [
-      "accelerator_execution:linux-x64-vulkan",
-      "retrieval_readiness:linux-x64",
-      "candidate_installed_behavior:linux-x64",
-      "--producer-job packaged-vulkan",
-      '--expected-sha "$INPUT_REF"',
-    ]);
     requireStepEnv(violations, linuxVulkanFile, job, "Emit authenticated Linux Vulkan release cells", {
       INPUT_REF: "${{ inputs.ref }}",
     });
-    forbidStepRun(
-      violations,
-      linuxVulkanFile,
-      job,
-      "Emit authenticated Linux Vulkan release cells",
-      ["calibration"],
-    );
-    const optionalCalibration = requireJob(
-      violations,
-      linuxVulkanFile,
-      linuxVulkan,
-      "optional-constant-calibration",
+    const optionalCalibration = object(
+      object(linuxVulkan.jobs)["optional-constant-calibration"],
     );
     add(
       violations,
@@ -8194,28 +7868,7 @@ function validateRemainingWorkflows(workflows, violations) {
         && optionalCalibration.environment === "linux-vulkan-proof",
       `${linuxVulkanFile} optional calibration must be a standalone protected coordinator-only Vulkan job`,
     );
-    requireStepRun(
-      violations,
-      linuxVulkanFile,
-      optionalCalibration,
-      "Prepare checksum-pinned embedded model",
-      [
-        "node scripts/prepare-embedded-model.mjs",
-        '--cache-root "$RUNNER_TOOL_CACHE/codestory/model-material"',
-      ],
-    );
     const optionalCollectorName = "Collect optional Linux Vulkan constant calibration";
-    requireStepRun(violations, linuxVulkanFile, optionalCalibration, optionalCollectorName, [
-      'test "$CONSTANT_CALIBRATION_MODE" = true',
-      "--engine-policy accelerated",
-      "--expected-backend Vulkan",
-      "--proof-tier calibration",
-      "--qualification-matrix-cell protected_linux_x64_vulkan",
-      "--collect-constant-calibration",
-      "--constant-calibration-output-dir target/calibration-runs/linux-vulkan",
-      "--qualification-driver target/release/codestory_embedding_constant_calibration",
-      "--out-dir target/calibration-proof/linux-vulkan",
-    ]);
     const optionalCollector = namedStep(optionalCalibration, optionalCollectorName);
     const optionalCollectorRun = shellLiteralNormalizedText(
       stepRun(optionalCalibration, optionalCollectorName),
@@ -8322,7 +7975,10 @@ function validateRemainingWorkflows(workflows, violations) {
     violations.push(`${guardFile} must exist`);
   } else {
     add(violations, includesAll(at(guard, "on", "pull_request", "branches"), ["main"]), `${guardFile} must guard main`);
-    const job = requireJob(violations, guardFile, guard, "enforce-source-branch");
+    // The enforce-source-branch job's structural pin (job existence) is a rule
+    // instance and lives in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+    const job = object(object(guard.jobs)["enforce-source-branch"]);
     const step = namedStep(job, "Require dev/codestory-next source branch");
     add(violations, object(step?.env).HEAD_REPO !== undefined && object(step?.env).BASE_REPO !== undefined, `${guardFile} must compare source and base repository identity`);
     add(violations, String(step?.run ?? "").includes("dev/codestory-next"), `${guardFile} must require the dev source branch`);
