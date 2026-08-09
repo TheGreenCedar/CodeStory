@@ -114,6 +114,19 @@ const STEP_FRAGMENT_CONTRACTS = new Map([
   ["saga_issue_link_guard", { kind: "require" }],
   ["close_dev_issues", { kind: "require" }],
 ]);
+// The graph owns every structural-pin rule instance (job existence and permission
+// scopes) for workflow families migrated off inline requireJob and permission
+// checks; the checker owns only those two predicates and their message shapes.
+// Membership is exact and fail-closed: a graph that drops, renames, or invents a
+// structural pin must not load, so a rule instance cannot disappear by data edit.
+// Kind names the predicate a row binds.
+const STRUCTURAL_PIN_CONTRACTS = new Map([
+  ["saga_issue_link_guard_job", { kind: "job" }],
+  ["saga_issue_link_guard_pull_requests_read", { kind: "permission" }],
+  ["close_dev_issues_job", { kind: "job" }],
+  ["close_dev_issues_issues_write", { kind: "permission" }],
+  ["close_dev_issues_pull_requests_read", { kind: "permission" }],
+]);
 const FAILURE_ORDER = new Map([
   ["unsupported_claim", 0],
   ["missing", 1],
@@ -889,6 +902,45 @@ function validateStepFragments(policy) {
     nonEmptyText(row.reason, `${label}.reason`);
   }
   return rules;
+}
+
+function validateStructuralPins(policy) {
+  const pins = object(policy.structural_pins, "workflow_policy.structural_pins");
+  for (const name of Object.keys(pins)) {
+    if (!STRUCTURAL_PIN_CONTRACTS.has(name)) {
+      fail(`workflow_policy.structural_pins names unknown structural pin ${name}`);
+    }
+  }
+  for (const [name, contract] of STRUCTURAL_PIN_CONTRACTS) {
+    if (pins[name] === undefined) {
+      fail(`workflow_policy.structural_pins must declare ${name}`);
+    }
+    const label = `workflow_policy.structural_pins.${name}`;
+    const row = object(pins[name], label);
+    const expectedKeys = contract.kind === "job"
+      ? ["kind", "file", "job", "reason"]
+      : ["kind", "file", "scope", "access", "reason"];
+    if (
+      JSON.stringify([...Object.keys(row)].sort())
+        !== JSON.stringify([...expectedKeys].sort())
+    ) {
+      fail(`${label} must carry exactly ${expectedKeys.join(", ")}`);
+    }
+    if (row.kind !== contract.kind) {
+      fail(`${label}.kind must be ${contract.kind}`);
+    }
+    nonEmptyText(row.file, `${label}.file`);
+    if (contract.kind === "job") {
+      nonEmptyText(row.job, `${label}.job`);
+    } else {
+      nonEmptyText(row.scope, `${label}.scope`);
+      if (row.access !== "read" && row.access !== "write") {
+        fail(`${label}.access must be read or write`);
+      }
+    }
+    nonEmptyText(row.reason, `${label}.reason`);
+  }
+  return pins;
 }
 
 function validateQualificationPolicy(value, pinnedPrograms) {
@@ -1857,6 +1909,7 @@ export function validateReleaseClaimGraph(graph) {
   }
   const pinnedPrograms = validatePinnedPrograms(policy);
   validateStepFragments(policy);
+  validateStructuralPins(policy);
   validateProofFloor(policy.proof_floor);
   if (!Array.isArray(policy.package_matrix) || policy.package_matrix.length !== 3) {
     fail("workflow_policy.package_matrix must define three release package rows");
@@ -2159,6 +2212,12 @@ export function loadReleaseClaimGraph(repoRoot = path.resolve(path.dirname(fileU
     const relative = path.join(".github", "workflows", row.file);
     if (!existsSync(path.join(repoRoot, relative))) {
       fail(`workflow_policy.step_fragments.${name} binds missing file ${relative}`);
+    }
+  }
+  for (const [name, row] of Object.entries(validated.workflow_policy.structural_pins)) {
+    const relative = path.join(".github", "workflows", row.file);
+    if (!existsSync(path.join(repoRoot, relative))) {
+      fail(`workflow_policy.structural_pins.${name} binds missing file ${relative}`);
     }
   }
   return validated;

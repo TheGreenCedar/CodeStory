@@ -1887,6 +1887,41 @@
         ],
         "reason": "The close automation decides which issues a push to dev/codestory-next may close as completed. Each fragment pins one authentication, stack-integrity, or pagination check inside the inline Python program - merge-commit identity, base-branch and stack verification, cursor-loop and repository guards, and the completed state_reason - so none of those checks can be deleted without a reviewed graph edit."
       }
+    },
+    "structural_pins": {
+      "saga_issue_link_guard_job": {
+        "kind": "job",
+        "file": "saga-issue-link-guard.yml",
+        "job": "require-closing-issue-link",
+        "reason": "The guard exists only through this job: it is the sole gate that refuses a codex pull request whose body names no closing issue. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments then constrain what the surviving job must run."
+      },
+      "saga_issue_link_guard_pull_requests_read": {
+        "kind": "permission",
+        "file": "saga-issue-link-guard.yml",
+        "scope": "pull-requests",
+        "access": "read",
+        "reason": "The guard runs on pull_request_target, where the token can reach repository secrets. Reading the pull request body is the only scope its check needs, so the workflow-level grant is pinned to exactly pull-requests: read - any widening toward write access on a fork-triggered workflow requires a reviewed graph edit."
+      },
+      "close_dev_issues_job": {
+        "kind": "job",
+        "file": "close-dev-issues.yml",
+        "job": "close-linked-issues",
+        "reason": "The close automation exists only through this job: it is the sole writer that marks issues completed after a dev/codestory-next push. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments then constrain the authentication and stack-integrity checks the surviving job must run."
+      },
+      "close_dev_issues_issues_write": {
+        "kind": "permission",
+        "file": "close-dev-issues.yml",
+        "scope": "issues",
+        "access": "write",
+        "reason": "Closing an issue as completed is a write to the tracker, so the automation must hold exactly issues: write - enough to close what a merged pull request names, pinned here so the grant cannot silently widen or silently drop and leave the automation failing open."
+      },
+      "close_dev_issues_pull_requests_read": {
+        "kind": "permission",
+        "file": "close-dev-issues.yml",
+        "scope": "pull-requests",
+        "access": "read",
+        "reason": "The automation authenticates a close request by reading the merged pull request - merge commit, base branch, and stack metadata - before it touches any issue. That verification needs only pull-requests: read, pinned here so the read-side scope cannot widen into write access on the automation's token."
+      }
     }
   }
 }

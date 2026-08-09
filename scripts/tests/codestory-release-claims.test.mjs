@@ -753,6 +753,50 @@ test("step fragments are an exact fail-closed membership with graph-owned rule d
   }
 });
 
+test("structural pins are an exact fail-closed membership with graph-owned rule data", () => {
+  const pins = graph.workflow_policy.structural_pins;
+  assert.equal(Object.keys(pins).length, 5);
+  for (const row of Object.values(pins)) {
+    assert.ok(row.kind === "job" || row.kind === "permission");
+    if (row.kind === "permission") {
+      assert.ok(row.access === "read" || row.access === "write");
+    }
+  }
+  const mutations = [
+    [draft => {
+      delete draft.workflow_policy.structural_pins.close_dev_issues_job;
+    }, /structural_pins must declare close_dev_issues_job/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.unowned_extra = structuredClone(
+        draft.workflow_policy.structural_pins.close_dev_issues_job,
+      );
+    }, /names unknown structural pin unowned_extra/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.saga_issue_link_guard_job.kind = "permission";
+    }, /saga_issue_link_guard_job\.kind must be job/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.saga_issue_link_guard_job.job;
+    }, /saga_issue_link_guard_job must carry exactly kind, file, job, reason/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.close_dev_issues_issues_write.scope;
+    }, /close_dev_issues_issues_write must carry exactly kind, file, scope, access, reason/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.close_dev_issues_issues_write.access = "admin";
+    }, /close_dev_issues_issues_write\.access must be read or write/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.saga_issue_link_guard_pull_requests_read.access = "";
+    }, /saga_issue_link_guard_pull_requests_read\.access must be read or write/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.close_dev_issues_pull_requests_read.reason = "";
+    }, /close_dev_issues_pull_requests_read\.reason must be a non-empty string/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
 test("benchmark leakage names only the one-process Node contract", () => {
   const benchmarkLeakage = graph.failure_controls
     .find(({ id }) => id === "benchmark_leakage");
