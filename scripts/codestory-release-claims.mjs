@@ -146,11 +146,55 @@ const STEP_FRAGMENT_CONTRACTS = new Map([
   ["source_proof_full_gate_workspace_tests", { kind: "require" }],
   ["source_proof_full_gate_clippy", { kind: "require" }],
   ["source_proof_full_gate_release_cell", { kind: "require" }],
+  ["macos_metal_validate_candidate_installed_mode", { kind: "require" }],
+  ["macos_metal_embedded_model", { kind: "require" }],
+  ["macos_metal_host_evidence", { kind: "require" }],
+  ["macos_metal_candidate_authentication", { kind: "require" }],
+  ["macos_metal_candidate_cache_restore", { kind: "require" }],
+  ["macos_metal_candidate_cache_miss", { kind: "require" }],
+  ["macos_metal_calibration_producer_authentication", { kind: "require" }],
+  ["macos_metal_constant_calibration_runs", { kind: "require" }],
+  ["macos_metal_protected_runtime_proof", { kind: "require" }],
+  ["macos_metal_candidate_staging", { kind: "require" }],
+  ["macos_metal_candidate_installed_proof", { kind: "require" }],
+  ["macos_metal_release_cell", { kind: "require" }],
+  ["macos_metal_retrieval_readiness_cell", { kind: "require" }],
+  ["macos_metal_candidate_installed_cell", { kind: "require" }],
+  ["macos_metal_release_cell_no_calibration", { kind: "forbid" }],
+  ["macos_metal_candidate_installed_cell_no_calibration", { kind: "forbid" }],
+  ["windows_vulkan_validate_candidate_installed_mode", { kind: "require" }],
+  ["windows_vulkan_source_build_tools", { kind: "require" }],
+  ["windows_vulkan_embedded_model", { kind: "require" }],
+  ["windows_vulkan_candidate_cache_restore", { kind: "require" }],
+  ["windows_vulkan_candidate_cache_miss", { kind: "require" }],
+  ["windows_vulkan_calibration_producer_authentication", { kind: "require" }],
+  ["windows_vulkan_protected_runtime_proof", { kind: "require" }],
+  ["windows_vulkan_candidate_staging", { kind: "require" }],
+  ["windows_vulkan_candidate_installed_proof", { kind: "require" }],
+  ["windows_vulkan_release_cell", { kind: "require" }],
+  ["windows_vulkan_candidate_installed_cell", { kind: "require" }],
+  ["windows_vulkan_retrieval_readiness_cell", { kind: "require" }],
+  ["windows_vulkan_release_cell_no_calibration", { kind: "forbid" }],
+  ["windows_vulkan_candidate_installed_cell_no_calibration", { kind: "forbid" }],
+  ["linux_vulkan_route_upstream_package", { kind: "require" }],
+  ["linux_vulkan_host_evidence", { kind: "require" }],
+  ["linux_vulkan_validate_candidate_installed_mode", { kind: "require" }],
+  ["linux_vulkan_candidate_cache_restore", { kind: "require" }],
+  ["linux_vulkan_candidate_cache_miss", { kind: "require" }],
+  ["linux_vulkan_calibration_producer_authentication", { kind: "require" }],
+  ["linux_vulkan_offline_retrieval_proof", { kind: "require" }],
+  ["linux_vulkan_candidate_staging", { kind: "require" }],
+  ["linux_vulkan_candidate_installed_proof", { kind: "require" }],
+  ["linux_vulkan_candidate_installed_proof_scope", { kind: "forbid" }],
+  ["linux_vulkan_release_cells", { kind: "require" }],
+  ["linux_vulkan_release_cells_no_calibration", { kind: "forbid" }],
+  ["linux_vulkan_optional_calibration_embedded_model", { kind: "require" }],
+  ["linux_vulkan_optional_calibration_collector", { kind: "require" }],
 ]);
 // The graph owns every structural-pin rule instance (job existence, needs edges,
-// and permission scopes) for workflow families migrated off inline requireJob,
-// needs, and permission checks; the checker owns only those three predicates and
-// their message shapes.
+// and workflow- or job-scoped permission grants) for workflow families migrated
+// off inline requireJob, needs, and permission checks; the checker owns only those
+// predicates and their message shapes.
 // Membership is exact and fail-closed: a graph that drops, renames, or invents a
 // structural pin must not load, so a rule instance cannot disappear by data edit.
 // Kind names the predicate a row binds.
@@ -169,6 +213,18 @@ const STRUCTURAL_PIN_CONTRACTS = new Map([
   ["source_proof_full_source_gate_needs_resolve", { kind: "needs" }],
   ["source_proof_retrieval_generalization_job", { kind: "job" }],
   ["source_proof_windows_native_contracts_job", { kind: "job" }],
+  ["auto_release_detect_version_job", { kind: "job" }],
+  ["auto_release_release_job", { kind: "job" }],
+  ["auto_release_release_needs_detect_version", { kind: "needs" }],
+  ["auto_release_release_contents_write", { kind: "job_permission" }],
+  ["auto_release_release_actions_write", { kind: "job_permission" }],
+  ["auto_release_release_pull_requests_read", { kind: "job_permission" }],
+  ["macos_metal_packaged_metal_job", { kind: "job" }],
+  ["windows_vulkan_packaged_vulkan_job", { kind: "job" }],
+  ["linux_vulkan_route_job", { kind: "job" }],
+  ["linux_vulkan_packaged_vulkan_job", { kind: "job" }],
+  ["linux_vulkan_optional_constant_calibration_job", { kind: "job" }],
+  ["main_branch_source_guard_enforce_source_branch_job", { kind: "job" }],
 ]);
 // The graph owns every cross-file constant-mirror rule instance (a repository file
 // that must repeat a reviewed constant verbatim) for families migrated off inline
@@ -988,7 +1044,9 @@ function validateStructuralPins(policy) {
       ? ["kind", "file", "job", "reason"]
       : contract.kind === "needs"
         ? ["kind", "file", "job", "needs", "reason"]
-        : ["kind", "file", "scope", "access", "reason"];
+        : contract.kind === "job_permission"
+          ? ["kind", "file", "job", "scope", "access", "reason"]
+          : ["kind", "file", "scope", "access", "reason"];
     if (
       JSON.stringify([...Object.keys(row)].sort())
         !== JSON.stringify([...expectedKeys].sort())
@@ -1005,6 +1063,9 @@ function validateStructuralPins(policy) {
       nonEmptyText(row.job, `${label}.job`);
       stringArray(row.needs, `${label}.needs`, { nonEmpty: true });
     } else {
+      if (contract.kind === "job_permission") {
+        nonEmptyText(row.job, `${label}.job`);
+      }
       nonEmptyText(row.scope, `${label}.scope`);
       if (row.access !== "read" && row.access !== "write") {
         fail(`${label}.access must be read or write`);

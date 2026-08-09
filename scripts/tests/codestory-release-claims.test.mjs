@@ -715,7 +715,7 @@ test("pinned programs are an exact fail-closed membership with graph-owned diges
 
 test("step fragments are an exact fail-closed membership with graph-owned rule data", () => {
   const rules = graph.workflow_policy.step_fragments;
-  assert.equal(Object.keys(rules).length, 35);
+  assert.equal(Object.keys(rules).length, 79);
   for (const row of Object.values(rules)) {
     assert.ok(row.kind === "require" || row.kind === "forbid");
     assert.ok(row.fragments.length > 0);
@@ -756,6 +756,16 @@ test("step fragments are an exact fail-closed membership with graph-owned rule d
     [draft => {
       draft.workflow_policy.step_fragments.source_proof_full_gate_workspace_tests.fragments = [];
     }, /source_proof_full_gate_workspace_tests\.fragments must be a non-empty array/u],
+    [draft => {
+      delete draft.workflow_policy.step_fragments.macos_metal_protected_runtime_proof;
+    }, /step_fragments must declare macos_metal_protected_runtime_proof/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.linux_vulkan_release_cells_no_calibration.kind =
+        "require";
+    }, /linux_vulkan_release_cells_no_calibration\.kind must be forbid/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.windows_vulkan_candidate_installed_proof.fragments = [];
+    }, /windows_vulkan_candidate_installed_proof\.fragments must be a non-empty array/u],
   ];
   for (const [mutate, expected] of mutations) {
     const draft = structuredClone(graph);
@@ -766,17 +776,25 @@ test("step fragments are an exact fail-closed membership with graph-owned rule d
 
 test("structural pins are an exact fail-closed membership with graph-owned rule data", () => {
   const pins = graph.workflow_policy.structural_pins;
-  assert.equal(Object.keys(pins).length, 14);
+  assert.equal(Object.keys(pins).length, 26);
   for (const row of Object.values(pins)) {
-    assert.ok(row.kind === "job" || row.kind === "permission" || row.kind === "needs");
-    if (row.kind === "permission") {
+    assert.ok(
+      row.kind === "job" || row.kind === "permission" || row.kind === "needs"
+      || row.kind === "job_permission",
+    );
+    if (row.kind === "permission" || row.kind === "job_permission") {
       assert.ok(row.access === "read" || row.access === "write");
+    }
+    if (row.kind === "job_permission") {
+      assert.ok(typeof row.job === "string" && row.job.length > 0);
     }
     if (row.kind === "needs") {
       assert.ok(row.needs.length > 0);
     }
   }
   assert.equal(pins.source_proof_full_source_gate_needs_resolve.kind, "needs");
+  assert.equal(pins.auto_release_release_needs_detect_version.kind, "needs");
+  assert.equal(pins.auto_release_release_contents_write.kind, "job_permission");
   const mutations = [
     [draft => {
       delete draft.workflow_policy.structural_pins.close_dev_issues_job;
@@ -827,6 +845,19 @@ test("structural pins are an exact fail-closed membership with graph-owned rule 
     [draft => {
       draft.workflow_policy.structural_pins.source_proof_full_source_gate_needs_resolve.needs = [];
     }, /source_proof_full_source_gate_needs_resolve\.needs must be a non-empty array/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.macos_metal_packaged_metal_job;
+    }, /structural_pins must declare macos_metal_packaged_metal_job/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.auto_release_release_contents_write.kind =
+        "permission";
+    }, /auto_release_release_contents_write\.kind must be job_permission/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.auto_release_release_contents_write.job;
+    }, /auto_release_release_contents_write must carry exactly kind, file, job, scope, access, reason/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.auto_release_release_actions_write.access = "admin";
+    }, /auto_release_release_actions_write\.access must be read or write/u],
   ];
   for (const [mutate, expected] of mutations) {
     const draft = structuredClone(graph);
