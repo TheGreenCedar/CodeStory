@@ -7865,8 +7865,14 @@ fn incremental_publication_ignores_changed_files_without_graph_collectors() {
         "pub fn first_value() -> i32 { 1 }\n",
     )
     .expect("write source");
-    let unsupported = workspace.path().join("notes.txt");
-    fs::write(&unsupported, "Initial notes\n").expect("write unsupported file");
+    // `.scss` is a companion extension: the policy-aware inventory admits it
+    // into the refresh plan (`has_supported_source_route`), but no parser,
+    // template, structural, or text-only collector claims it, so indexing it
+    // is required to invent no graph structure. A `.txt` fixture cannot prove
+    // this: unsupported extensions are filtered from discovery before the
+    // plan, so the file never appears in `files_to_index` at all.
+    let collectorless = workspace.path().join("styles.scss");
+    fs::write(&collectorless, ".initial { color: red; }\n").expect("write collectorless file");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
     let controller = AppController::new();
     controller
@@ -7884,20 +7890,33 @@ fn incremental_publication_ignores_changed_files_without_graph_collectors() {
         .expect("read first publication")
         .expect("first publication identity");
 
-    fs::write(&unsupported, "Updated notes\n").expect("update unsupported file");
+    // A different byte length plus an explicitly advanced mtime keeps the
+    // change visible even where filesystem timestamp granularity would let a
+    // same-length same-instant rewrite go unnoticed.
+    fs::write(&collectorless, ".updated { color: rebeccapurple; }\n")
+        .expect("update collectorless file");
+    fs::File::options()
+        .write(true)
+        .open(&collectorless)
+        .expect("open changed collectorless file")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() + Duration::from_secs(2)),
+        )
+        .expect("advance changed collectorless mtime");
     let dry_run = controller
         .dry_run_index(IndexMode::Incremental)
-        .expect("plan unsupported file refresh");
+        .expect("plan collectorless file refresh");
     assert!(
         dry_run
             .sample_files_to_index
             .iter()
-            .any(|path| path == "notes.txt"),
+            .any(|path| path == "styles.scss"),
         "the regression must exercise a discovered file in the refresh plan: {dry_run:?}"
     );
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-        .expect("incremental publication after unsupported file change");
+        .expect("incremental publication after collectorless file change");
     let second = controller
         .index_publication()
         .expect("read second publication")
@@ -7908,8 +7927,8 @@ fn incremental_publication_ignores_changed_files_without_graph_collectors() {
     assert!(
         Storage::open(&storage_path)
             .expect("open published storage")
-            .get_file_by_path(&unsupported)
-            .expect("look up unsupported file")
+            .get_file_by_path(&collectorless)
+            .expect("look up collectorless file")
             .is_none(),
         "files without graph collectors should not be invented in semantic scope"
     );
