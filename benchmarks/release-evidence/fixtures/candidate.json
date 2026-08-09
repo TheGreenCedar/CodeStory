@@ -62,9 +62,9 @@
   },
   "release_claims": {
     "graph_schema": "codestory.release-claims/v1",
-    "graph_sha256": "a6411f2ab0fcb008dc35ebfb6c1951fd39abd2e9aa17dfd594fde5cfc0f88b0d",
-    "observed_at": "2026-08-08T19:19:24.395Z",
-    "expires_at": "2026-08-09T19:19:24.395Z",
+    "graph_sha256": "e838f43c6ce9ee8000fe1765df9e18eef2756b126769a98e10c750f0d103493b",
+    "observed_at": "2026-08-09T12:50:08.593Z",
+    "expires_at": "2026-08-10T12:50:08.593Z",
     "requested_claims": [
       {
         "id": "performance",
@@ -85,9 +85,9 @@
         "type": "performance",
         "tier": "live_behavior",
         "status": "measured",
-        "graph_sha256": "a6411f2ab0fcb008dc35ebfb6c1951fd39abd2e9aa17dfd594fde5cfc0f88b0d",
-        "observed_at": "2026-08-08T19:19:24.395Z",
-        "expires_at": "2026-08-09T19:19:24.395Z",
+        "graph_sha256": "e838f43c6ce9ee8000fe1765df9e18eef2756b126769a98e10c750f0d103493b",
+        "observed_at": "2026-08-09T12:50:08.593Z",
+        "expires_at": "2026-08-10T12:50:08.593Z",
         "identity": {
           "repository": "TheGreenCedar/CodeStory",
           "commit": "2222222222222222222222222222222222222222",
@@ -106,9 +106,9 @@
         "type": "answer_quality",
         "tier": "answer_quality",
         "status": "pass",
-        "graph_sha256": "a6411f2ab0fcb008dc35ebfb6c1951fd39abd2e9aa17dfd594fde5cfc0f88b0d",
-        "observed_at": "2026-08-08T19:19:24.395Z",
-        "expires_at": "2026-08-09T19:19:24.395Z",
+        "graph_sha256": "e838f43c6ce9ee8000fe1765df9e18eef2756b126769a98e10c750f0d103493b",
+        "observed_at": "2026-08-09T12:50:08.593Z",
+        "expires_at": "2026-08-10T12:50:08.593Z",
         "identity": {
           "repository": "TheGreenCedar/CodeStory",
           "commit": "2222222222222222222222222222222222222222",

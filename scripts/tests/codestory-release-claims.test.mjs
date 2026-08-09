@@ -1992,6 +1992,15 @@ function runBump(repository, args) {
   );
 }
 
+function nextPatchVersion(repository) {
+  const currentVersion = JSON.parse(readFileSync(
+    path.join(repository, "plugins/codestory/cli-version.json"),
+    "utf8",
+  )).cli_version;
+  const [major, minor, patch] = currentVersion.split(".").map(Number);
+  return `${major}.${minor}.${patch + 1}`;
+}
+
 test("a version-only release bump leaves the native fingerprint unchanged", () => {
   // release-claims.json binds `native_fingerprint` admissibility to this equality, and
   // `evidence_policy.native_reuse = "version_only_delta"` is the whole justification for
@@ -2001,6 +2010,7 @@ test("a version-only release bump leaves the native fingerprint unchanged", () =
   // pull requests run (#1673).
   const repository = versionSurfaceRepository("HEAD");
   try {
+    const nextVersion = nextPatchVersion(repository);
     const members = workspaceMemberManifests(
       readFileSync(path.join(repository, "Cargo.toml"), "utf8"),
     );
@@ -2013,16 +2023,16 @@ test("a version-only release bump leaves the native fingerprint unchanged", () =
     // cannot run against a manifest-only checkout. Cargo's own effect on the lock -- the recorded
     // version of each workspace crate -- is applied here in its place, and the owner's own
     // `--check` then certifies that the result is a complete release bump and nothing more.
-    runBump(repository, ["--version", "0.17.0"]);
+    runBump(repository, ["--version", nextVersion]);
     const lockPath = path.join(repository, "Cargo.lock");
     writeFileSync(
       lockPath,
       readFileSync(lockPath, "utf8").replace(
         /(name = "codestory-[a-z-]+"\nversion = ")[^"]+(")/gu,
-        "$10.17.0$2",
+        `$1${nextVersion}$2`,
       ),
     );
-    const certified = runBump(repository, ["--version", "0.17.0", "--check"]);
+    const certified = runBump(repository, ["--version", nextVersion, "--check"]);
     assert.equal(
       certified.status,
       0,
@@ -2056,12 +2066,16 @@ test("every workspace crate is version-normalized and content-bound by the finge
     const basePrint = nativeFingerprint(repository, base);
     const probe = (relative, edit, message) => {
       const absolute = path.join(repository, relative);
-      writeFileSync(absolute, edit(readFileSync(absolute, "utf8")));
+      const before = readFileSync(absolute, "utf8");
+      const after = edit(before);
+      assert.notEqual(after, before, `${message} must change the probe input`);
+      writeFileSync(absolute, after);
       const commit = commitEverything(repository, message);
       const print = nativeFingerprint(repository, commit);
       gitIn(repository, ["reset", "--hard", "--quiet", base]);
       return print;
     };
+    const nextVersion = nextPatchVersion(repository);
     const members = workspaceMemberManifests(
       readFileSync(path.join(repository, "Cargo.toml"), "utf8"),
     );
@@ -2071,7 +2085,10 @@ test("every workspace crate is version-normalized and content-bound by the finge
         probe(
           manifest,
           (source) =>
-            source.replace(/(^\[package\][\s\S]*?^version\s*=\s*")[^"]+(")/mu, "$10.17.0$2"),
+            source.replace(
+              /(^\[package\][\s\S]*?^version\s*=\s*")[^"]+(")/mu,
+              `$1${nextVersion}$2`,
+            ),
           `bump ${manifest}`,
         ),
         basePrint,

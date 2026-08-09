@@ -15,7 +15,7 @@
     "answer_quality"
   ],
   "public_support": {
-    "release_line": "0.16",
+    "release_line": "0.17",
     "packages": [
       {
         "target": "macos-arm64",
