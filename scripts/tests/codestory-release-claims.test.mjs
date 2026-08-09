@@ -760,7 +760,7 @@ test("step fragments are an exact fail-closed membership with graph-owned rule d
 
 test("structural pins are an exact fail-closed membership with graph-owned rule data", () => {
   const pins = graph.workflow_policy.structural_pins;
-  assert.equal(Object.keys(pins).length, 5);
+  assert.equal(Object.keys(pins).length, 7);
   for (const row of Object.values(pins)) {
     assert.ok(row.kind === "job" || row.kind === "permission");
     if (row.kind === "permission") {
@@ -794,6 +794,15 @@ test("structural pins are an exact fail-closed membership with graph-owned rule 
     [draft => {
       draft.workflow_policy.structural_pins.close_dev_issues_pull_requests_read.reason = "";
     }, /close_dev_issues_pull_requests_read\.reason must be a non-empty string/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.post_publish_smoke_actions_read;
+    }, /structural_pins must declare post_publish_smoke_actions_read/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.post_publish_smoke_job.kind = "permission";
+    }, /post_publish_smoke_job\.kind must be job/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.post_publish_smoke_actions_read.kind = "job";
+    }, /post_publish_smoke_actions_read\.kind must be permission/u],
   ];
   for (const [mutate, expected] of mutations) {
     const draft = structuredClone(graph);
