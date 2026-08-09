@@ -14,6 +14,7 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/check-workflow-policy-literal-ratchet.test.mjs
       - .github/scripts/collect-actions-job-evidence.sh
       - .github/scripts/lost-runner-recovery.mjs
       - .github/scripts/lost-runner-recovery.test.mjs
@@ -96,6 +97,7 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/check-workflow-policy-literal-ratchet.test.mjs
       - .github/scripts/collect-actions-job-evidence.sh
       - .github/scripts/lost-runner-recovery.mjs
       - .github/scripts/lost-runner-recovery.test.mjs
@@ -217,6 +219,7 @@ jobs:
         run: |
           node .github/scripts/check-workflow-policy.mjs
           node --test .github/scripts/check-workflow-policy.test.mjs
+          node --test .github/scripts/check-workflow-policy-literal-ratchet.test.mjs
           node --test .github/scripts/lost-runner-recovery.test.mjs
           node --test .github/scripts/cargo-cache-contract.test.mjs
           node --test .github/scripts/windows-link-timing.test.mjs

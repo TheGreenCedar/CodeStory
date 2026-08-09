@@ -1950,10 +1950,11 @@
         "fragments": [
           "node .github/scripts/check-workflow-policy.mjs",
           "node --test .github/scripts/check-workflow-policy.test.mjs",
+          "node --test .github/scripts/check-workflow-policy-literal-ratchet.test.mjs",
           "node --test .github/scripts/cargo-cache-contract.test.mjs",
           "node --test .github/scripts/windows-link-timing.test.mjs"
         ],
-        "reason": "This step is where the workflow policy proves itself: the checker must run against the real tree with its own hostile-fixture suite beside it, and the Cargo cache contract suite rides along. The Windows linker-timing selector is the only thing standing between a reported msvc_link duration and a substring match over the build log, so its hostile-fixture suite runs wherever the policy itself runs."
+        "reason": "This step is where the workflow policy proves itself: the checker must run against the real tree with its own hostile-fixture suite beside it, and the Cargo cache contract suite rides along. The Windows linker-timing selector is the only thing standing between a reported msvc_link duration and a substring match over the build log, so its hostile-fixture suite runs wherever the policy itself runs. The literal ratchet freezes the migrated checker's residual policy literals, so a rule cannot quietly move back from the graph into checker source without review."
       },
       "plugin_static_plugin_wiring": {
         "kind": "require",
