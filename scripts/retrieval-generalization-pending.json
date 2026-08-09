@@ -3,7 +3,7 @@
   "total_markers": 203,
   "total_marker_occurrences": 293,
   "pending_claim_profiles": {
-    "file": "crates/codestory-runtime/src/agent/data/claim_profiles.v2.json",
+    "file": "crates/codestory-agent/src/data/claim_profiles.v2.json",
     "declaration": "\"status\": \"pending_migration\"",
     "count": 13,
     "ratchet_ceiling": 16,
@@ -55,7 +55,7 @@
         "runmain": 1
       }
     },
-    "crates/codestory-runtime/src/agent/packet_claim_profiles.rs": {
+    "crates/codestory-agent/src/packet_claim_profiles.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
       "reason": "Claim templates are written against holdout call graphs, and the word-part lookups that build them still spell out corpus symbols such as search/parallel and process/input/buffer. Each template needs a source-derived replacement before it can be deleted.",
       "markers": {

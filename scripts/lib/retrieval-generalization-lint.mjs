@@ -603,9 +603,8 @@ const requiredProductionDataFiles = [
   path.join(
     productionRepoRoot,
     "crates",
-    "codestory-runtime",
+    "codestory-agent",
     "src",
-    "agent",
     "data",
     "claim_profiles.v2.json",
   ),
@@ -614,9 +613,8 @@ const guardedRequiredProductionDataFiles = [
   path.join(
     repoRoot,
     "crates",
-    "codestory-runtime",
+    "codestory-agent",
     "src",
-    "agent",
     "data",
     "claim_profiles.v2.json",
   ),
