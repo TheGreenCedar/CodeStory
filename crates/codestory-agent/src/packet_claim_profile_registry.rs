@@ -40,7 +40,7 @@ pub const PACKET_CLAIM_PROFILE_SCHEMA_VERSION: u32 = 2;
 ///
 /// The ratchet only ever falls: a new profile has to arrive contracted, and migrating a pending
 /// profile has to lower this number and the document's `pending_ratchet` in the same diff.
-pub const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize = 13;
+pub const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize = 0;
 
 /// Typed reasons a contracted profile is not runtime-valid.
 ///

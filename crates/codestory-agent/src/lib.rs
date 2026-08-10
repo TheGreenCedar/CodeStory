@@ -19,8 +19,11 @@ pub mod eval_probes;
 pub mod packet_citations;
 pub mod packet_claim_profile_registry;
 pub mod packet_claim_profiles;
+#[cfg(any(test, feature = "test-support"))]
+mod packet_claim_profiles_legacy_tests;
 pub mod packet_claims;
 pub mod packet_command;
+#[cfg(any(test, feature = "test-support"))]
 pub mod packet_command_profiles;
 pub mod packet_coverage;
 pub mod packet_degradation;

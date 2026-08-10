@@ -11,7 +11,7 @@ pub enum PacketEvidenceRole {
     SqlRelationshipConstraint,
     SqlSchemaFile,
     TestsAndRegressionCoverage,
-    SourceGroupConfiguration,
+    IndexInputConfiguration,
     IndexingWorkQueue,
     InterceptorManagement,
     RequestDispatch,
@@ -110,7 +110,7 @@ impl PacketEvidenceRole {
             Self::SqlRelationshipConstraint => "sql relationship constraint",
             Self::SqlSchemaFile => "sql schema file",
             Self::TestsAndRegressionCoverage => "tests and regression coverage",
-            Self::SourceGroupConfiguration => "source-group configuration",
+            Self::IndexInputConfiguration => "index input configuration",
             Self::IndexingWorkQueue => "indexing work queue",
             Self::InterceptorManagement => "interceptor management",
             Self::RequestDispatch => "request dispatch",
@@ -149,6 +149,8 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
     }
     let display = citation.display_name.to_ascii_lowercase();
     let normalized_display = normalize_identifier(&citation.display_name);
+    let display_tokens = crate::text::symbol_query_tokens(&citation.display_name);
+    let names = |token: &str| display_tokens.iter().any(|value| value == token);
     let path = citation
         .file_path
         .as_deref()
@@ -162,7 +164,8 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
 
     if path.ends_with(".sql") && normalized_display.starts_with("createtable") {
         Some(PacketEvidenceRole::SqlTableDefinition)
-    } else if path.ends_with(".sql") && display_is_sql_relationship_constraint(&normalized_display)
+    } else if path.ends_with(".sql")
+        && display_is_sql_relationship_constraint(&citation.display_name)
     {
         Some(PacketEvidenceRole::SqlRelationshipConstraint)
     } else if path.ends_with(".sql") {
@@ -173,19 +176,11 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
         || packet_display_name_is_test_like(&display)
     {
         Some(PacketEvidenceRole::TestsAndRegressionCoverage)
-    } else if normalized_display.contains("sourcegroup")
-        || path.contains("source_group")
-        || path.contains("sourcegroup")
-    {
-        Some(PacketEvidenceRole::SourceGroupConfiguration)
     } else if packet_citation_owns_indexer_source_extraction(citation, &path) {
         Some(PacketEvidenceRole::SymbolExtraction)
     } else if citation_owns_indexing_entrypoint(citation)
-        || normalized_display.contains("buildindex")
-        || (normalized_display.contains("task")
-            && normalized_display.contains("indexer")
-            && normalized_display.contains("queue"))
-        || normalized_display.contains("indexercommand")
+        || (names("task") && names("indexer") && names("queue"))
+        || (names("indexer") && names("command"))
         // The mirror of the `search` + `entrypoint` clause below. Until this existed an indexing
         // entrypoint could only be recognised by the directory it sat in, so `runtime/` handed the
         // role to everything filed there and to nothing that named itself.
@@ -211,9 +206,6 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
         || normalized_display.contains("event_loop")
         || (normalized_display.contains("event") && normalized_display.contains("poll"))
         || (normalized_display.contains("event") && normalized_display.contains("dispatch"))
-        // "process events" is the loop; "event processor" is the output stage below. The plural
-        // separates them, and naming the loop from the symbol rather than from its directory is
-        // what lets a coverage requirement stop trusting the directory.
         || (normalized_display.contains("events")
             && normalized_display.contains("process")
             && !normalized_display.contains("processor"))
@@ -273,13 +265,13 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
             || display_is_process_transport_entrypoint(&normalized_display))
     {
         Some(PacketEvidenceRole::CommandEntrypoint)
-    } else if (display.contains("event") && display.contains("processor"))
-        || display.contains("event_processor")
-        || display.contains("jsonl")
-        || path.contains("event_processor")
-        || path.contains("_events")
-        || path.contains("-events")
-        || path.contains("jsonl")
+    } else if names("event")
+        && display_tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "output" | "serialize" | "serializer" | "write" | "writer" | "emit" | "emitter"
+            )
+        })
     {
         Some(PacketEvidenceRole::EventOutputProcessing)
     } else if ((display.contains("thread") || display.contains("turn"))
@@ -294,9 +286,7 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
     {
         Some(PacketEvidenceRole::AppServerRequestProtocol)
     } else if behavioral_node
-        && (display.contains("run_exec")
-            || display.contains("run_main")
-            || display.contains("service")
+        && (display.contains("service")
             || display.contains("orchestrat")
             || display.contains("runtime")
             || path.contains("runtime"))
@@ -307,7 +297,7 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
         Some(PacketEvidenceRole::WorkspaceDiscoveryAndPlanning)
     } else if display.contains("snapshot") || display.contains("refresh") {
         Some(PacketEvidenceRole::SnapshotRefresh)
-    } else if packet_display_is_runtime_formatting_arg_store(&normalized_display) {
+    } else if packet_display_is_runtime_formatting_arg_store(&citation.display_name) {
         Some(PacketEvidenceRole::SourceEvidence)
     } else if behavioral_node
         && (display.contains("projection")
@@ -416,17 +406,26 @@ fn packet_path_is_route_like(path: &str) -> bool {
         || normalized_path.ends_with("/route.tsx")
 }
 
-fn packet_display_is_runtime_formatting_arg_store(normalized_display: &str) -> bool {
-    normalized_display.contains("formatargstore")
+fn packet_display_is_runtime_formatting_arg_store(display: &str) -> bool {
+    let tokens = crate::text::symbol_query_tokens(display);
+    tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "format" | "formatting"))
+        && tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "arg" | "args" | "argument" | "arguments"))
+        && tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "store" | "storage"))
 }
 
-fn display_is_sql_relationship_constraint(normalized_display: &str) -> bool {
-    normalized_display == "foreignkey"
-        || normalized_display == "references"
-        || normalized_display.contains("foreignkey")
-        || normalized_display.contains("references")
-        || (normalized_display.contains("constraint")
-            && (normalized_display.contains("foreign") || normalized_display.contains("refer")))
+fn display_is_sql_relationship_constraint(display: &str) -> bool {
+    let tokens = crate::text::symbol_query_tokens(display);
+    let has = |needle: &str| tokens.iter().any(|token| token == needle);
+    (has("foreign") && has("key"))
+        || has("reference")
+        || has("references")
+        || (has("constraint") && (has("foreign") || has("referential")))
 }
 
 fn packet_display_or_path_is_route_dispatch(normalized_display: &str, path: &str) -> bool {

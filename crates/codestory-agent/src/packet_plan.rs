@@ -1,16 +1,17 @@
+#[cfg(test)]
+use crate::eval_probes::push_eval_flow_hint_packet_queries;
 #[cfg(any(test, feature = "test-support"))]
 use crate::eval_probes::{
     eval_probes_enabled, push_eval_architecture_flow_probe_terms,
-    push_eval_flow_hint_packet_queries, push_prompt_named_file_probe_queries,
-};
-use crate::packet_command_profiles::{
-    packet_command_exact_probe_queries, packet_command_role_probe_queries,
+    push_prompt_named_file_probe_queries,
 };
 use crate::packet_flow_requirements::packet_flow_requirement_queries_for_terms;
 use crate::packet_obligations::build_packet_obligation_plan;
 use crate::packet_required_probes::{
     packet_concrete_file_probe_queries_from_required, packet_prompt_exact_symbol_probe_queries,
-    packet_sufficiency_required_probe_queries_from_terms,
+};
+#[cfg(test)]
+use crate::packet_required_probes::{
     push_command_loop_source_probe_queries_for_terms, push_indexing_flow_required_probe_queries,
     push_search_flow_probe_queries, push_sql_schema_required_probe_queries,
 };
@@ -18,10 +19,16 @@ use crate::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_query_stop_term,
 };
 use crate::packet_terms::{
-    packet_probe_terms, packet_terms_have, packet_terms_have_any,
-    packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
-    packet_terms_indicate_command_dispatch_flow, packet_terms_indicate_command_event_loop_flow,
-    packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_form_validation_flow,
+    packet_probe_terms, packet_terms_indicate_shell_install_dispatch_flow,
+    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_url_session_request_flow,
+    prompt_search_terms,
+};
+#[cfg(test)]
+use crate::packet_terms::{
+    packet_terms_have, packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
+    packet_terms_indicate_client_send_flow, packet_terms_indicate_command_dispatch_flow,
+    packet_terms_indicate_command_event_loop_flow, packet_terms_indicate_event_loop_command_flow,
+    packet_terms_indicate_form_validation_flow,
     packet_terms_indicate_html_css_template_structure_flow, packet_terms_indicate_indexing_flow,
     packet_terms_indicate_javascript_route_source_flow,
     packet_terms_indicate_log_record_handler_flow,
@@ -31,11 +38,8 @@ use crate::packet_terms::{
     packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_route_tree_dispatch_flow,
     packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
     packet_terms_indicate_server_request_dispatch_flow,
-    packet_terms_indicate_server_route_dispatch_flow,
-    packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
-    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_string_predicate_flow,
-    packet_terms_indicate_stylesheet_animation_flow,
-    packet_terms_indicate_url_session_request_flow, prompt_search_terms,
+    packet_terms_indicate_server_route_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
+    packet_terms_indicate_string_predicate_flow, packet_terms_indicate_stylesheet_animation_flow,
 };
 use crate::planning::{
     PACKET_EXACT_SYMBOL_QUERY_PURPOSE, dedupe_packet_plan_queries,
@@ -211,14 +215,6 @@ pub fn packet_symbol_probe_queries(
 
     push_unique_owned_terms(
         &mut queries,
-        &packet_command_role_probe_queries(question, task_class),
-    );
-    push_unique_owned_terms(
-        &mut queries,
-        &packet_command_exact_probe_queries(question, task_class),
-    );
-    push_unique_owned_terms(
-        &mut queries,
         &packet_prompt_exact_symbol_probe_queries(question, &terms, task_class),
     );
     #[cfg(any(test, feature = "test-support"))]
@@ -229,20 +225,10 @@ pub fn packet_symbol_probe_queries(
         &mut queries,
         &packet_flow_requirement_queries_for_terms(&terms, task_class),
     );
-    push_prompt_derived_exact_flow_anchor_queries(&terms, &mut queries);
-    push_unique_owned_terms(
-        &mut queries,
-        &packet_sufficiency_required_probe_queries_from_terms(&terms, task_class),
-    );
     let concrete_file_queries = packet_concrete_file_probe_queries_from_required(&queries);
     push_unique_owned_terms(&mut queries, &concrete_file_queries);
-    push_predicate_symbol_probe_queries(&terms, &mut queries);
-    push_flow_hint_packet_queries(&terms, &mut queries);
-    push_task_class_symbol_probe_queries(task_class, &terms, &mut queries);
     if !compact {
         push_adjacent_packet_term_queries(&terms, &mut queries, 8);
-    } else if matches!(task_class, PacketTaskClassDto::ArchitectureExplanation) {
-        push_adjacent_packet_term_queries(&terms, &mut queries, 12);
     }
     push_generic_symbol_probe_queries(&terms, &mut queries, compact);
 
@@ -250,6 +236,7 @@ pub fn packet_symbol_probe_queries(
     queries
 }
 
+#[cfg(test)]
 fn push_flow_hint_packet_queries(terms: &[String], queries: &mut Vec<String>) {
     push_prompt_derived_flow_hint_packet_queries(terms, queries);
     #[cfg(any(test, feature = "test-support"))]
@@ -269,6 +256,7 @@ fn push_flow_hint_packet_queries(terms: &[String], queries: &mut Vec<String>) {
     }
 }
 
+#[cfg(test)]
 fn push_index_derived_architecture_probes(
     _task_class: PacketTaskClassDto,
     terms: &[String],
@@ -281,6 +269,7 @@ fn push_index_derived_architecture_probes(
     }
 }
 
+#[cfg(test)]
 fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut Vec<String>) {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
@@ -525,6 +514,7 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
     }
 }
 
+#[cfg(test)]
 fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut Vec<String>) {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
@@ -813,6 +803,7 @@ fn push_generic_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>
     }
 }
 
+#[cfg(test)]
 fn push_javascript_route_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -832,6 +823,7 @@ fn push_javascript_route_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_server_request_dispatch_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -847,6 +839,7 @@ fn push_server_request_dispatch_source_probe_queries(queries: &mut Vec<String>) 
     );
 }
 
+#[cfg(test)]
 fn push_client_send_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -868,6 +861,7 @@ fn push_client_send_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_url_session_request_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -882,6 +876,7 @@ fn push_url_session_request_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_form_validation_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -897,6 +892,7 @@ fn push_form_validation_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_stylesheet_animation_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -915,6 +911,7 @@ fn push_stylesheet_animation_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_html_css_template_structure_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -932,6 +929,7 @@ fn push_html_css_template_structure_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_shell_install_dispatch_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -945,6 +943,7 @@ fn push_shell_install_dispatch_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_runtime_formatting_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -967,6 +966,7 @@ fn push_runtime_formatting_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_log_record_handler_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -981,6 +981,7 @@ fn push_log_record_handler_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_site_build_phase_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -997,6 +998,7 @@ fn push_site_build_phase_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_mapper_configuration_plan_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -1012,6 +1014,7 @@ fn push_mapper_configuration_plan_source_probe_queries(queries: &mut Vec<String>
     );
 }
 
+#[cfg(test)]
 fn push_predicate_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>) {
     if !packet_terms_indicate_predicate_probe_flow(terms) {
         return;
@@ -1049,6 +1052,7 @@ fn push_predicate_symbol_probe_queries(terms: &[String], queries: &mut Vec<Strin
     }
 }
 
+#[cfg(test)]
 fn packet_terms_indicate_predicate_probe_flow(terms: &[String]) -> bool {
     packet_terms_indicate_string_predicate_flow(terms)
         || (packet_terms_have_any(
@@ -1068,6 +1072,7 @@ fn packet_terms_indicate_predicate_probe_flow(terms: &[String]) -> bool {
             .any(|term| packet_predicate_probe_single_term(term)))
 }
 
+#[cfg(test)]
 fn packet_predicate_probe_single_term(term: &str) -> bool {
     matches!(
         normalize_identifier(term).as_str(),
@@ -1085,6 +1090,7 @@ fn packet_predicate_probe_single_term(term: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn packet_predicate_probe_term_pair(left: &str, right: &str) -> bool {
     matches!(
         (
@@ -1099,6 +1105,7 @@ fn packet_predicate_probe_term_pair(left: &str, right: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn packet_predicate_probe_scopes(terms: &[String], queries: &[String]) -> Vec<String> {
     let mut scopes: Vec<String> = Vec::new();
     for value in queries
@@ -1119,6 +1126,7 @@ fn packet_predicate_probe_scopes(terms: &[String], queries: &[String]) -> Vec<St
     scopes
 }
 
+#[cfg(test)]
 fn packet_predicate_probe_scope_term(term: &str) -> bool {
     let trimmed = term.trim();
     let normalized = normalize_identifier(trimmed);
@@ -1167,6 +1175,7 @@ fn packet_predicate_probe_scope_term(term: &str) -> bool {
         || normalized.contains("charsequence")
 }
 
+#[cfg(test)]
 fn push_string_region_matching_probe_queries(
     terms: &[String],
     queries: &mut Vec<String>,
@@ -1207,6 +1216,7 @@ fn push_string_region_matching_probe_queries(
     }
 }
 
+#[cfg(test)]
 fn packet_predicate_scope_source_file(scope: &str) -> Option<String> {
     let trimmed = scope.trim();
     if !packet_predicate_probe_scope_term(trimmed)
@@ -1223,6 +1233,7 @@ fn packet_predicate_scope_source_file(scope: &str) -> Option<String> {
         .then(|| format!("{trimmed}.java"))
 }
 
+#[cfg(test)]
 fn packet_predicate_method_source_probe_allowed(method_name: &str) -> bool {
     matches!(
         normalize_identifier(method_name).as_str(),
@@ -1230,6 +1241,7 @@ fn packet_predicate_method_source_probe_allowed(method_name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn push_predicate_identifier_variants(queries: &mut Vec<String>, terms: &[&str]) {
     push_predicate_method_name(queries, terms);
     let words = packet_identifier_words(terms);
@@ -1240,6 +1252,7 @@ fn push_predicate_identifier_variants(queries: &mut Vec<String>, terms: &[&str])
     push_unique_term(queries, &format!("is_{snake}"));
 }
 
+#[cfg(test)]
 fn push_predicate_method_name(queries: &mut Vec<String>, terms: &[&str]) {
     let words = packet_identifier_words(terms);
     if words.is_empty() {
@@ -1252,6 +1265,7 @@ fn push_predicate_method_name(queries: &mut Vec<String>, terms: &[&str]) {
     push_unique_term(queries, &format!("is{pascal}"));
 }
 
+#[cfg(test)]
 fn packet_identifier_words(terms: &[&str]) -> Vec<String> {
     terms
         .iter()
@@ -1264,6 +1278,7 @@ fn packet_identifier_words(terms: &[&str]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn packet_capitalize_identifier_word(word: &str) -> String {
     let mut value = String::new();
     let mut chars = word.chars();
@@ -1274,6 +1289,7 @@ fn packet_capitalize_identifier_word(word: &str) -> String {
     value
 }
 
+#[cfg(test)]
 fn push_task_class_symbol_probe_queries(
     task_class: PacketTaskClassDto,
     terms: &[String],
@@ -1530,6 +1546,7 @@ pub fn push_unique_term(terms: &mut Vec<String>, value: &str) {
     }
 }
 
+#[cfg(test)]
 fn push_unique_terms(terms: &mut Vec<String>, values: &[&str]) {
     for value in values {
         push_unique_term(terms, value);
@@ -1566,7 +1583,7 @@ fn task_class_seed_queries(
         PacketTaskClassDto::SymbolOwnership => &["definition references", "callers"],
         PacketTaskClassDto::DataFlow if sql_schema_flow => &[
             "table definitions",
-            "foreign key relationships",
+            "referential relationships",
             "schema dialect scripts",
         ],
         PacketTaskClassDto::DataFlow => &["pipeline flow", "storage handoff"],

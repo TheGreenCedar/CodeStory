@@ -316,15 +316,8 @@ pub fn packet_terms_indicate_route_tree_dispatch_flow(terms: &[String]) -> bool 
         && packet_terms_have_any(
             terms,
             &[
-                "engine",
-                "engines",
-                "group",
-                "groups",
-                "method",
-                "methods",
-                "tree",
-                "trees",
-                "routergroup",
+                "engine", "engines", "group", "groups", "method", "methods", "tree", "trees",
+                "router",
             ],
         )
 }
@@ -390,13 +383,8 @@ pub fn packet_terms_indicate_mapper_configuration_plan_flow(terms: &[String]) ->
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let mapper_intent = has_any(&["mapper", "mappers", "mapping", "map", "maps"]);
-    let configuration_intent = has_any(&[
-        "configuration",
-        "config",
-        "profile",
-        "profiles",
-        "mappingconfiguration",
-    ]);
+    let configuration_intent =
+        has_any(&["configuration", "config", "profile", "profiles", "mapping"]);
     let runtime_api_intent = has_any(&[
         "runtime",
         "api",
@@ -415,8 +403,6 @@ pub fn packet_terms_indicate_mapper_configuration_plan_flow(terms: &[String]) ->
         "execution",
         "expression",
         "lambda",
-        "typemap",
-        "typemaps",
         "type",
         "types",
     ]);
@@ -455,7 +441,6 @@ pub fn packet_terms_indicate_stylesheet_animation_flow(terms: &[String]) -> bool
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let css_signal = has("css")
-        || has("animatecss")
         || has_any(&[
             "stylesheet",
             "stylesheets",
@@ -466,7 +451,6 @@ pub fn packet_terms_indicate_stylesheet_animation_flow(terms: &[String]) -> bool
         ]);
     let animation_signal = has_any(&[
         "animate",
-        "animated",
         "animation",
         "animations",
         "keyframe",
@@ -741,22 +725,20 @@ pub fn packet_terms_indicate_string_predicate_flow(terms: &[String]) -> bool {
 }
 
 pub fn packet_terms_indicate_runtime_formatting_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(
-        terms,
-        &["format", "formats", "formatting", "vformat", "format_to"],
-    ) && packet_terms_have_any(
-        terms,
-        &[
-            "arg",
-            "args",
-            "argument",
-            "arguments",
-            "runtime",
-            "type",
-            "erased",
-            "output",
-        ],
-    )
+    packet_terms_have_any(terms, &["format", "formats", "formatting", "vformat"])
+        && packet_terms_have_any(
+            terms,
+            &[
+                "arg",
+                "args",
+                "argument",
+                "arguments",
+                "runtime",
+                "type",
+                "erased",
+                "output",
+            ],
+        )
 }
 
 #[cfg(test)]

@@ -533,7 +533,7 @@ fn assemble_packet_sufficiency_with_probe_context(
                     .any(|blocking| blocking == query)
         })
         .collect::<Vec<_>>();
-    let follow_up_argv = if terminally_sufficient {
+    let mut follow_up_argv = if terminally_sufficient {
         Vec::new()
     } else {
         packet_follow_up_argv(
@@ -546,14 +546,6 @@ fn assemble_packet_sufficiency_with_probe_context(
             packet_full_retrieval_available(answer),
         )
     };
-    let follow_up_commands = follow_up_argv
-        .iter()
-        .map(|argv| render_packet_command(argv))
-        .collect::<Vec<_>>();
-    let follow_up_invocations = follow_up_argv
-        .iter()
-        .map(|argv| packet_follow_up_invocation(argv))
-        .collect::<Vec<_>>();
     let coverage_report = packet_coverage_report(PacketCoverageReportInput {
         supported_claims: &supported_claims,
         proven_claims: &proven_claims,
@@ -564,11 +556,6 @@ fn assemble_packet_sufficiency_with_probe_context(
         budget,
         has_sufficiency_blocking_budget_omission,
     });
-    let mut open_next = if terminally_sufficient {
-        Vec::new()
-    } else {
-        follow_up_commands.clone()
-    };
     if !terminally_sufficient && !open_next_paths.is_empty() {
         let project = packet_display_project_arg(project_root);
         let candidate_commands = if packet_full_retrieval_available(answer) {
@@ -577,10 +564,25 @@ fn assemble_packet_sufficiency_with_probe_context(
             packet_follow_up_trail_argv(&project, &open_next_paths)
         };
         for command in candidate_commands {
-            push_unique_sufficiency_term(&mut open_next, &render_packet_command(&command));
+            let rendered = render_packet_command(&command);
+            if !follow_up_argv
+                .iter()
+                .any(|existing| render_packet_command(existing) == rendered)
+            {
+                follow_up_argv.push(command);
+            }
         }
-        open_next.truncate(12);
     }
+    follow_up_argv.truncate(12);
+    let follow_up_commands = follow_up_argv
+        .iter()
+        .map(|argv| render_packet_command(argv))
+        .collect::<Vec<_>>();
+    let follow_up_invocations = follow_up_argv
+        .iter()
+        .map(|argv| packet_follow_up_invocation(argv))
+        .collect::<Vec<_>>();
+    let open_next = follow_up_commands.clone();
     debug_assert!(
         !terminally_sufficient
             || (open_next_paths.is_empty()
@@ -1666,338 +1668,6 @@ pub fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str> {
             [codestory_contracts::api::PacketClaimObligationKindDto::ExactProbe] => None,
             _ => None,
         };
-    }
-    let normalized_claim = normalize_identifier(&claim.claim);
-    if !normalized_claim.is_empty() {
-        if normalized_claim.contains("serialize") && normalized_claim.contains("key") {
-            return Some("key serialization");
-        }
-        if normalized_claim.contains("cache")
-            && contains_any(
-                &normalized_claim,
-                &["helper", "state", "snapshot", "subscribe", "getset"],
-            )
-        {
-            return Some("cache state");
-        }
-        if contains_any(&normalized_claim, &["mutation", "mutate", "internalmutate"]) {
-            return Some("mutation flow");
-        }
-        if normalized_claim.contains("isblank")
-            || (normalized_claim.contains("blank") && normalized_claim.contains("whitespace"))
-        {
-            return Some("predicate blank behavior");
-        }
-        if normalized_claim.contains("isempty")
-            || (normalized_claim.contains("empty") && normalized_claim.contains("trim"))
-        {
-            return Some("predicate empty behavior");
-        }
-        if normalized_claim.contains("regionmatches")
-            || (normalized_claim.contains("region") && normalized_claim.contains("delegate"))
-            || normalized_claim.contains("casesensitive")
-            || normalized_claim.contains("ignorecase")
-        {
-            return Some("predicate region/case flow");
-        }
-        if contains_any(
-            &normalized_claim,
-            &[
-                "blank",
-                "empty",
-                "casesensitive",
-                "ignorecase",
-                "region",
-                "regionmatches",
-                "whitespace",
-                "trim",
-            ],
-        ) && contains_any(
-            &normalized_claim,
-            &[
-                "treats",
-                "tests",
-                "doesnot",
-                "deciding",
-                "return",
-                "compares",
-                "delegates",
-            ],
-        ) {
-            return Some("predicate behavior");
-        }
-        if normalized_claim.contains("csscustomproperties")
-            || (normalized_claim.contains("animationduration")
-                && normalized_claim.contains("delay")
-                && normalized_claim.contains("repeat"))
-        {
-            return Some("css variables");
-        }
-        if normalized_claim.contains("baseclass")
-            || normalized_claim.contains("animationfillmode")
-            || normalized_claim.contains("animatedisthebase")
-        {
-            return Some("css base class");
-        }
-        if normalized_claim.contains("keyframes") || normalized_claim.contains("animationname") {
-            return Some("css keyframes");
-        }
-        if normalized_claim.contains("imports")
-            && (normalized_claim.contains("animationfiles")
-                || normalized_claim.contains("variablebase"))
-        {
-            return Some("css imports");
-        }
-        if normalized_claim.contains("appshell") && normalized_claim.contains("divapp") {
-            return Some("html app shell");
-        }
-        if normalized_claim.contains("roottypography")
-            || normalized_claim.contains("colorscheme")
-            || normalized_claim.contains("bodylayout")
-        {
-            return Some("css template defaults");
-        }
-        if normalized_claim.contains("appconstrains")
-            || normalized_claim.contains("appcontainer")
-            || (normalized_claim.contains("mountedapplication")
-                && normalized_claim.contains("padding"))
-            || (normalized_claim.contains("mountedcontent") && normalized_claim.contains("padding"))
-        {
-            return Some("css app layout");
-        }
-        if (normalized_claim.contains("logo") && normalized_claim.contains("button")
-            || normalized_claim.contains("interactionselectors"))
-            && contains_any(&normalized_claim, &["hover", "focus", "transition"])
-        {
-            return Some("css interaction styles");
-        }
-        if normalized_claim.contains("preferscolorschemelight")
-            || normalized_claim.contains("mediaquery")
-        {
-            return Some("css light theme");
-        }
-        if contains_all(&normalized_claim, &["wsgi", "app"])
-            && normalized_claim.contains("entrypoint")
-        {
-            return Some("server request entrypoint");
-        }
-        if contains_all(&normalized_claim, &["full", "dispatch", "request"])
-            && contains_any(&normalized_claim, &["finalization", "finalize"])
-            && contains_any(&normalized_claim, &["preprocess", "exception", "wrap"])
-        {
-            return Some("server request dispatch wrapper");
-        }
-        if contains_all(
-            &normalized_claim,
-            &["dispatch", "request", "view", "function"],
-        ) && !normalized_claim.contains("full")
-        {
-            return Some("server view dispatch");
-        }
-        if (normalized_claim.contains("routedecorator")
-            && normalized_claim.contains("registersviewfunctions"))
-            || (normalized_claim.contains("routeregistrationdecorator")
-                && normalized_claim.contains("urlrules"))
-        {
-            return Some("server route registration");
-        }
-        if normalized_claim.contains("sqlschema")
-            && (normalized_claim.contains("definestables")
-                || normalized_claim.contains("tables")
-                || normalized_claim.contains("createtable"))
-        {
-            return Some("sql table definitions");
-        }
-        if normalized_claim.contains("rowsreference")
-            || normalized_claim.contains("foreignkey")
-            || (normalized_claim.contains("reference") && normalized_claim.contains("rows"))
-        {
-            return Some("sql relationships");
-        }
-        if normalized_claim.contains("sqldialect")
-            || normalized_claim.contains("schemascripts")
-            || normalized_claim.contains("dialectscripts")
-        {
-            return Some("sql dialect scripts");
-        }
-        if (normalized_claim.contains("typeerased")
-            && (normalized_claim.contains("formatargs")
-                || normalized_claim.contains("formatarguments")
-                || normalized_claim.contains("formattingarguments")
-                || normalized_claim.contains("arguments")))
-            || (normalized_claim.contains("runtimeformatting")
-                && normalized_claim.contains("centralruntimeargumentpath"))
-        {
-            return Some("runtime format arguments");
-        }
-        if (normalized_claim.contains("formatto")
-            || normalized_claim.contains("outputiterator")
-            || normalized_claim.contains("formattedoutputhelpers"))
-            && (normalized_claim.contains("outputiterator")
-                || normalized_claim.contains("formattedoutput")
-                || normalized_claim.contains("output"))
-        {
-            return Some("runtime format output");
-        }
-        if normalized_claim.contains("formaterror")
-            || normalized_claim.contains("formattingfailures")
-            || normalized_claim.contains("systemerrors")
-        {
-            return Some("runtime format errors");
-        }
-        if normalized_claim.contains("buffer")
-            && normalized_claim.contains("append")
-            && normalized_claim.contains("formattedoutput")
-        {
-            return Some("runtime format buffer");
-        }
-        if (normalized_claim.contains("native")
-            || normalized_claim.contains("constraint")
-            || normalized_claim.contains("constraints")
-            || normalized_claim.contains("formvalidationexamples"))
-            && contains_any(&normalized_claim, &["required", "pattern", "min", "max"])
-        {
-            return Some("form native constraints");
-        }
-        if normalized_claim.contains("custom")
-            && normalized_claim.contains("validation")
-            && contains_any(&normalized_claim, &["browser", "defaultui", "ui"])
-        {
-            return Some("form custom validation ui");
-        }
-        if normalized_claim.contains("submit")
-            && contains_any(
-                &normalized_claim,
-                &["prevent", "prevents", "submission", "invalid"],
-            )
-        {
-            return Some("form submit guard");
-        }
-        if normalized_claim.contains("validitystate")
-            || (normalized_claim.contains("validity")
-                && contains_any(
-                    &normalized_claim,
-                    &[
-                        "valuemissing",
-                        "typemismatch",
-                        "tooshort",
-                        "message",
-                        "messages",
-                    ],
-                ))
-        {
-            return Some("form validity messages");
-        }
-        if normalized_claim.contains("public")
-            && contains_any(
-                &normalized_claim,
-                &["api", "export", "entrypoint", "hook", "method"],
-            )
-        {
-            return Some("public api/export");
-        }
-        if (normalized_claim.contains("toplevelhttphelper")
-            || normalized_claim.contains("toplevelhttphelpers")
-            || normalized_claim.contains("delegate")
-                && normalized_claim.contains("client")
-                && normalized_claim.contains("helper"))
-            && normalized_claim.contains("client")
-        {
-            return Some("client public facade");
-        }
-        if normalized_claim.contains("conveniencemethod")
-            || normalized_claim.contains("conveniencemethods")
-        {
-            return Some("client convenience methods");
-        }
-        if normalized_claim.contains("finalize")
-            && contains_any(&normalized_claim, &["request", "body", "sending"])
-        {
-            return Some("client request finalization");
-        }
-        if normalized_claim.contains("transportimplementation")
-            || (normalized_claim.contains("send")
-                && contains_any(&normalized_claim, &["transport", "httpclient", "adapter"]))
-        {
-            return Some("client transport send");
-        }
-        if normalized_claim.contains("responsefromstream")
-            || normalized_claim.contains("responsematerialization")
-            || normalized_claim.contains("responsestream")
-        {
-            return Some("client response materialization");
-        }
-        if normalized_claim.contains("server")
-            && contains_any(&normalized_claim, &["bootstrap", "initializes", "main"])
-        {
-            return Some("command server bootstrap");
-        }
-        if normalized_claim.contains("eventloop")
-            || (normalized_claim.contains("event") && normalized_claim.contains("loop"))
-        {
-            return Some("command event loop");
-        }
-        if normalized_claim.contains("socketinput")
-            || normalized_claim.contains("networkcommandinput")
-            || (normalized_claim.contains("network")
-                && normalized_claim.contains("input")
-                && normalized_claim.contains("command"))
-        {
-            return Some("command network input");
-        }
-        if normalized_claim.contains("commandtable")
-            || normalized_claim.contains("commanddispatch")
-            || (normalized_claim.contains("command")
-                && contains_any(&normalized_claim, &["dispatch", "proc", "slowlog"]))
-        {
-            return Some("command dispatch");
-        }
-        if normalized_claim.contains("handlerstack")
-            || normalized_claim.contains("pushhandler")
-            || (normalized_claim.contains("handler")
-                && contains_any(&normalized_claim, &["registration", "registered"])
-                && contains_any(&normalized_claim, &["log", "logger", "record"]))
-        {
-            return Some("logger handler stack");
-        }
-        if normalized_claim.contains("addrecord")
-            || (normalized_claim.contains("log")
-                && normalized_claim.contains("record")
-                && contains_any(&normalized_claim, &["creates", "creation"]))
-            || (normalized_claim.contains("record")
-                && normalized_claim.contains("creates")
-                && normalized_claim.contains("handlers"))
-        {
-            return Some("log record creation");
-        }
-        if normalized_claim.contains("handlerinterface")
-            && contains_any(
-                &normalized_claim,
-                &["handlebatch", "handlingboundaries", "contract"],
-            )
-        {
-            return Some("handler interface contract");
-        }
-        if normalized_claim.contains("processing")
-            && normalized_claim.contains("handler")
-            && normalized_claim.contains("records")
-            && contains_any(&normalized_claim, &["processing", "writing", "write"])
-        {
-            return Some("handler processing");
-        }
-        if contains_any(
-            &normalized_claim,
-            &[
-                "delegates",
-                "delegate",
-                "handoff",
-                "wraps",
-                "invokes",
-                "callsinto",
-            ],
-        ) {
-            return Some("delegation/handoff");
-        }
     }
 
     claim
@@ -8541,10 +8211,12 @@ fn packet_follow_up_search_argv(project: &str, queries: &[String]) -> Vec<Vec<St
     commands
 }
 
+#[cfg(test)]
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+#[cfg(test)]
 fn contains_all(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().all(|needle| haystack.contains(needle))
 }

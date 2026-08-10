@@ -89,8 +89,12 @@ fn packet_cli_json_budget_measures_publication_metadata_and_newline() {
         operation_id: "public-packet-budget".to_string(),
         attempt: 1,
     };
-    enforce_packet_cli_json_output_budget(Path::new("/workspace/project"), &mut operation)
-        .expect("measure unrestricted CLI packet");
+    enforce_packet_cli_json_output_budget(
+        Path::new("/workspace/project"),
+        &mut operation,
+        Path::new("/managed/codestory-cli"),
+    )
+    .expect("measure unrestricted CLI packet");
 
     let compact_len = serde_json::to_vec(&operation.value)
         .expect("serialize compact packet")
@@ -110,8 +114,12 @@ fn packet_cli_json_budget_measures_publication_metadata_and_newline() {
     assert!(compact_before <= cap, "{compact_before} > {cap}");
     assert!(rendered_before > cap, "{rendered_before} <= {cap}");
 
-    enforce_packet_cli_json_output_budget(Path::new("/workspace/project"), &mut operation)
-        .expect("enforce CLI packet budget");
+    enforce_packet_cli_json_output_budget(
+        Path::new("/workspace/project"),
+        &mut operation,
+        Path::new("/managed/codestory-cli"),
+    )
+    .expect("enforce CLI packet budget");
 
     let rendered = render_public_operation_json_content(&operation, &operation.value)
         .expect("render budgeted public packet");

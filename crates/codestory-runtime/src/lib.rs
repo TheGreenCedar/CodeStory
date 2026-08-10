@@ -90,7 +90,8 @@ mod source_coverage;
 mod workspace_state;
 use affected::{AffectedOperationIdentityIndex, IndexFreshnessObservation};
 pub use agent::{
-    enforce_packet_output_budget_for_representation, packet_step_trace_json, plan_packet,
+    bind_packet_follow_up_program, enforce_packet_output_budget_for_representation,
+    packet_step_trace_json, plan_packet,
 };
 
 #[cfg(feature = "test-support")]

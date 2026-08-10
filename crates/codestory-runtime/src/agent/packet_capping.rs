@@ -12,8 +12,8 @@ use crate::agent::packet_scoring::{
 };
 use crate::{query_mentions_non_primary_source, retrieval_file_role_from_path};
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentCitationDto, NodeKind, PacketBudgetLimitsDto, RetrievalAnnotationDto,
-    SearchHitOrigin,
+    AgentAnswerDto, AgentCitationDto, NodeId, NodeKind, PacketBudgetLimitsDto,
+    RetrievalAnnotationDto, SearchHitOrigin,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -486,17 +486,13 @@ fn packet_keep_secondary_claim_definition(_claim_key: &str, citation: &AgentCita
 }
 
 fn packet_mandatory_secondary_path_citation(citation: &AgentCitationDto) -> bool {
-    let path = citation
+    citation
         .file_path
         .as_deref()
         .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    path.contains("event_processor")
-        || path.contains("_events")
-        || path.contains("-events")
-        || path.contains("/cli/")
-        || path.ends_with("/main.rs")
+        .is_some_and(|path| {
+            retrieval_file_role_from_path(&path) == crate::RetrievalFileRole::Source
+        })
 }
 
 fn rebuild_packet_cap_tracking(
@@ -525,13 +521,31 @@ fn packet_file_fits_limit(path: Option<&str>, files: &HashSet<String>, max_files
 
 const PACKET_FOCUS_NEIGHBORHOOD_CARRY_LIMIT: usize = 4;
 
+#[cfg(test)]
 pub(crate) fn cap_packet_citations(
     answer: &mut AgentAnswerDto,
     limits: &PacketBudgetLimitsDto,
     required_probe_queries: &[String],
 ) -> bool {
+    cap_packet_citations_with_obligation_carriers(answer, limits, required_probe_queries, &[])
+}
+
+pub(crate) fn cap_packet_citations_with_obligation_carriers(
+    answer: &mut AgentAnswerDto,
+    limits: &PacketBudgetLimitsDto,
+    required_probe_queries: &[String],
+    obligation_carrier_node_ids: &[NodeId],
+) -> bool {
     let mut protected_citation_keys =
         promote_required_probe_citations(answer, required_probe_queries);
+    let obligation_carrier_node_ids = obligation_carrier_node_ids.iter().collect::<HashSet<_>>();
+    protected_citation_keys.extend(
+        answer
+            .citations
+            .iter()
+            .filter(|citation| obligation_carrier_node_ids.contains(&citation.node_id))
+            .map(packet_citation_key),
+    );
     let focus_neighborhood_keys =
         promote_focus_neighborhood_citations(answer, &protected_citation_keys);
     protected_citation_keys.extend(focus_neighborhood_keys);
@@ -1206,7 +1220,7 @@ fn packet_command_focus_roots(citations: &[AgentCitationDto]) -> Vec<PacketComma
         };
         let normalized_path = path.replace('\\', "/");
         let weight =
-            if normalized_display.ends_with("runmain") || normalized_display.contains("runexec") {
+            if packet_evidence_role(citation) == Some(PacketEvidenceRole::CommandEntrypoint) {
                 3
             } else if display.contains("::Cli")
                 || display.contains("::cli")
@@ -1401,6 +1415,32 @@ mod tests {
                 .iter()
                 .all(|citation| citation.coverage_role.as_deref() == Some("explicit exact probe"))
         );
+    }
+
+    #[test]
+    fn lawful_material_obligation_carrier_is_spent_before_ranked_distractors() {
+        let distractor = citation("unrelated helper", "src/unrelated.rs", 500.0);
+        let lawful_carrier = citation("IndexService::run", "src/index_service.rs", 0.1);
+        let wrong_role_sibling = citation("IndexService", "src/index_service.rs", 400.0);
+        let protected_node_id = lawful_carrier.node_id.clone();
+        let mut answer = answer_fixture(vec![distractor, wrong_role_sibling, lawful_carrier]);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 1,
+            max_files: 1,
+            max_snippets: 1,
+            max_trail_edges: 1,
+            max_output_bytes: 1024,
+        };
+
+        assert!(cap_packet_citations_with_obligation_carriers(
+            &mut answer,
+            &limits,
+            &[],
+            std::slice::from_ref(&protected_node_id),
+        ));
+        assert_eq!(answer.citations.len(), 1);
+        assert_eq!(answer.citations[0].node_id, protected_node_id);
+        assert_eq!(answer.citations[0].display_name, "IndexService::run");
     }
 
     #[test]

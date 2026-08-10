@@ -3281,7 +3281,38 @@ fn handle_stdio_packet(
             include_evidence,
             latency_budget_ms,
         })
-        .map(|packet| serde_json::json!({"result": packet}))
+        .map(|mut packet| {
+            match std::env::current_exe() {
+                Ok(executable) => {
+                    codestory_runtime::enforce_packet_output_budget_for_representation(
+                        &runtime.project_root,
+                        &mut packet,
+                        |candidate| {
+                            let mut public_packet = candidate.clone();
+                            codestory_runtime::bind_packet_follow_up_program(
+                                &runtime.project_root,
+                                &mut public_packet,
+                                &executable,
+                            );
+                            serde_json::to_vec(&public_packet)
+                                .expect("packet response is serializable")
+                                .len()
+                        },
+                    );
+                    codestory_runtime::bind_packet_follow_up_program(
+                        &runtime.project_root,
+                        &mut packet,
+                        &executable,
+                    );
+                }
+                Err(error) => {
+                    return serde_json::json!({
+                        "error": format!("failed to resolve managed CodeStory executable: {error}")
+                    });
+                }
+            }
+            serde_json::json!({"result": packet})
+        })
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}));
     if response.get("result").is_some()
         && let (Some(cache_key), Some(publication)) = (cache_key, publication.as_ref())

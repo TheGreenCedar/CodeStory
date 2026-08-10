@@ -389,7 +389,6 @@ pub fn citation_owns_css_animation_structure(citation: &AgentCitationDto) -> boo
             &[
                 "keyframes",
                 "animation",
-                "animated",
                 "transition",
                 "duration",
                 "delay",

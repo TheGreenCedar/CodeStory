@@ -1,8 +1,7 @@
-use crate::agent::packet_capping::cap_packet_citations;
+use crate::agent::packet_capping::cap_packet_citations_with_obligation_carriers;
 use crate::agent::packet_claims::{
     packet_flow_claims_markdown, packet_supported_claims_with_telemetry,
 };
-use crate::agent::packet_command_profiles::packet_command_exact_probe_queries;
 use crate::agent::packet_obligations::{
     bind_claims_to_packet_obligations, finalize_packet_obligation_plan,
     packet_claims_with_obligation_receipts,
@@ -91,6 +90,7 @@ pub(crate) fn apply_packet_budget(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn apply_packet_budget_with_extra(
     project_root: &Path,
     question: &str,
@@ -100,16 +100,43 @@ pub(crate) fn apply_packet_budget_with_extra(
     answer: &mut AgentAnswerDto,
     extra_probes: &[String],
 ) -> PacketBudgetDto {
+    apply_packet_budget_with_extra_and_obligation_carriers(
+        project_root,
+        question,
+        task_class,
+        requested,
+        limits,
+        answer,
+        extra_probes,
+        &[],
+    )
+}
+
+pub(crate) fn apply_packet_budget_with_extra_and_obligation_carriers(
+    project_root: &Path,
+    question: &str,
+    task_class: PacketTaskClassDto,
+    requested: PacketBudgetModeDto,
+    limits: PacketBudgetLimitsDto,
+    answer: &mut AgentAnswerDto,
+    extra_probes: &[String],
+    obligation_carrier_node_ids: &[codestory_contracts::api::NodeId],
+) -> PacketBudgetDto {
     let mut truncated = false;
     let mut omitted_sections = Vec::new();
 
-    let mut protected_probe_queries = packet_command_exact_probe_queries(question, task_class);
+    let mut protected_probe_queries = Vec::new();
     for probe in
         packet_sufficiency_required_probe_queries_with_extra(question, task_class, extra_probes)
     {
         push_unique_term(&mut protected_probe_queries, &probe);
     }
-    if cap_packet_citations(answer, &limits, &protected_probe_queries) {
+    if cap_packet_citations_with_obligation_carriers(
+        answer,
+        &limits,
+        &protected_probe_queries,
+        obligation_carrier_node_ids,
+    ) {
         truncated = true;
         omitted_sections.push("citations".to_string());
     }
@@ -733,7 +760,7 @@ pub(crate) fn packet_budget_usage(answer: &AgentAnswerDto) -> PacketBudgetUsageD
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::agent::packet_obligations::build_packet_obligation_plan;
     use crate::agent::trace_export::{packet_step_trace_json, write_packet_step_trace_from_env};
@@ -1961,7 +1988,7 @@ mod tests {
         );
     }
 
-    fn test_packet(question: &str, max_output_bytes: u32) -> AgentPacketDto {
+    pub(in crate::agent) fn test_packet(question: &str, max_output_bytes: u32) -> AgentPacketDto {
         let answer = AgentAnswerDto {
             source_coverage: Vec::new(),
             answer_id: "packet-budget-test".to_string(),

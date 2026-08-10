@@ -42,6 +42,7 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
             })
             .map_err(map_api_error)
     })?;
+    let executable = std::env::current_exe()?;
 
     let step_trace = if cmd.step_trace_out.is_some() {
         let trace = codestory_runtime::packet_step_trace_json(&operation.value.answer);
@@ -50,7 +51,13 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
         None
     };
     if cmd.format == args::OutputFormat::Json {
-        enforce_packet_cli_json_output_budget(&runtime.project_root, &mut operation)?;
+        enforce_packet_cli_json_output_budget(&runtime.project_root, &mut operation, &executable)?;
+    } else {
+        codestory_runtime::bind_packet_follow_up_program(
+            &runtime.project_root,
+            &mut operation.value,
+            &executable,
+        );
     }
     if let (Some(path), Some(trace)) = (&cmd.step_trace_out, step_trace) {
         std::fs::write(path, trace)?;
@@ -64,6 +71,7 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
 pub(in crate::app) fn enforce_packet_cli_json_output_budget(
     project_root: &std::path::Path,
     operation: &mut codestory_runtime::PublicOperation<AgentPacketDto>,
+    executable: &std::path::Path,
 ) -> Result<()> {
     let envelope = codestory_runtime::PublicOperation {
         value: (),
@@ -77,10 +85,21 @@ pub(in crate::app) fn enforce_packet_cli_json_output_budget(
         project_root,
         &mut operation.value,
         |packet| {
-            render_public_operation_json_content(&envelope, packet)
+            let mut public_packet = packet.clone();
+            codestory_runtime::bind_packet_follow_up_program(
+                project_root,
+                &mut public_packet,
+                executable,
+            );
+            render_public_operation_json_content(&envelope, &public_packet)
                 .expect("packet public JSON rendering was validated before budget enforcement")
                 .len()
         },
+    );
+    codestory_runtime::bind_packet_follow_up_program(
+        project_root,
+        &mut operation.value,
+        executable,
     );
     Ok(())
 }

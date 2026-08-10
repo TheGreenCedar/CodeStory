@@ -2,6 +2,7 @@
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::eval_probes::eval_citation_rank_adjustment;
+#[cfg(test)]
 use crate::packet_terms::{
     packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
     packet_terms_indicate_form_validation_flow,
@@ -150,71 +151,10 @@ pub fn packet_citation_rank(
     {
         score += 4.0;
     }
-    if packet_terms_indicate_server_route_dispatch_flow(terms) {
-        score += packet_route_dispatch_rank_bonus(
-            &citation.display_name,
-            &normalized_display,
-            &path,
-            terms,
-        );
-    }
-    if packet_terms_indicate_server_request_dispatch_flow(terms) {
-        score += packet_server_request_dispatch_rank_bonus(
-            &citation.display_name,
-            &normalized_display,
-            &path,
-            terms,
-        );
-    }
-    if packet_terms_indicate_buffered_io_flow(terms) {
-        score += packet_buffered_io_rank_bonus(&normalized_display, &path);
-    }
-    if packet_terms_indicate_log_record_handler_flow(terms) {
-        score += packet_log_record_handler_rank_bonus(&normalized_display, &path);
-    }
-    if packet_terms_indicate_site_build_phase_flow(terms) {
-        score += packet_site_build_phase_rank_bonus(&normalized_display, &path);
-    }
-    if packet_terms_indicate_mapper_configuration_plan_flow(terms) {
-        score += packet_mapper_configuration_plan_rank_bonus(&normalized_display, &path);
-    }
-    if packet_terms_indicate_client_send_flow(terms) {
-        score += packet_client_send_rank_bonus(&normalized_display, &path, terms);
-    }
-    if packet_terms_indicate_url_session_request_flow(terms) {
-        score += packet_url_session_request_rank_bonus(&normalized_display, &path);
-    }
-    if packet_terms_indicate_form_validation_flow(terms) {
-        score += packet_form_validation_rank_bonus(&normalized_display, &path);
-    }
-    if packet_terms_indicate_stylesheet_animation_flow(terms) {
-        score += packet_stylesheet_animation_rank_bonus(&normalized_display, &path);
-    }
-    if packet_terms_indicate_html_css_template_structure_flow(terms) {
-        score += packet_html_css_template_structure_rank_bonus(&normalized_display, &path);
-    }
-    if packet_terms_indicate_sql_schema_flow(terms) {
-        score += packet_sql_schema_rank_bonus(&normalized_display, &path, terms);
-    }
-    if packet_terms_indicate_runtime_formatting_flow(terms) {
-        score += packet_runtime_formatting_rank_bonus(&normalized_display, &path);
-    }
-    if packet_terms_indicate_string_predicate_flow(terms) {
-        score += packet_string_predicate_rank_bonus(&normalized_display, &path);
-    }
-    if packet_terms_indicate_shell_install_dispatch_flow(terms) {
-        score += packet_shell_install_dispatch_rank_bonus(&normalized_display, &path);
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     {
         score = eval_citation_rank_adjustment(&normalized_display, &path, score);
     }
-    if let Some(breakdown) = citation.retrieval_score_breakdown.as_ref() {
-        score += breakdown.lexical * 2.0;
-        score += breakdown.graph;
-    }
-
     for term in terms {
         if term.len() < 3 {
             continue;
@@ -332,6 +272,7 @@ pub fn packet_display_name_is_test_like(display: &str) -> bool {
         || local_name.contains("_tests_")
 }
 
+#[cfg(test)]
 fn packet_route_dispatch_rank_bonus(
     display: &str,
     normalized_display: &str,
@@ -373,6 +314,7 @@ fn packet_route_dispatch_rank_bonus(
     bonus
 }
 
+#[cfg(test)]
 fn packet_server_request_dispatch_rank_bonus(
     display: &str,
     normalized_display: &str,
@@ -416,6 +358,7 @@ fn packet_server_request_dispatch_rank_bonus(
     bonus
 }
 
+#[cfg(test)]
 fn packet_request_dispatch_anchor_rank_bonus(
     display: &str,
     normalized_display: &str,
@@ -436,6 +379,7 @@ fn packet_request_dispatch_anchor_rank_bonus(
     bonus
 }
 
+#[cfg(test)]
 fn packet_request_dispatch_artifact_anchor(normalized_display: &str, path: &str) -> bool {
     normalized_display.starts_with("componentreport")
         || normalized_display.contains("schemareference")
@@ -445,6 +389,7 @@ fn packet_request_dispatch_artifact_anchor(normalized_display: &str, path: &str)
         || path.contains("schema-reference")
 }
 
+#[cfg(test)]
 fn packet_application_router_response_source_anchor(
     display: &str,
     normalized_display: &str,
@@ -464,6 +409,7 @@ fn packet_application_router_response_source_anchor(
         && packet_request_dispatch_method_tail(normalized_display)
 }
 
+#[cfg(test)]
 fn packet_display_owner_and_method(display: &str) -> Option<(String, String)> {
     let trimmed = display.trim();
     for separator in ['.', '#', ':'] {
@@ -478,6 +424,7 @@ fn packet_display_owner_and_method(display: &str) -> Option<(String, String)> {
     None
 }
 
+#[cfg(test)]
 fn packet_request_dispatch_receiver_owner(owner: &str) -> bool {
     matches!(
         owner,
@@ -485,6 +432,7 @@ fn packet_request_dispatch_receiver_owner(owner: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn packet_request_dispatch_owner_path_stem(path_stem: &str) -> bool {
     path_stem.contains("app")
         || path_stem.contains("application")
@@ -493,6 +441,7 @@ fn packet_request_dispatch_owner_path_stem(path_stem: &str) -> bool {
         || path_stem.contains("response")
 }
 
+#[cfg(test)]
 fn packet_request_dispatch_method_tail(method: &str) -> bool {
     matches!(
         method,
@@ -500,10 +449,12 @@ fn packet_request_dispatch_method_tail(method: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn normalized_display_contains_all_parts(value: &str, parts: &[&str]) -> bool {
     parts.iter().all(|part| value.contains(part))
 }
 
+#[cfg(test)]
 fn normalized_display_matches_prompt_owner(normalized_display: &str, terms: &[String]) -> bool {
     terms
         .iter()
@@ -512,6 +463,7 @@ fn normalized_display_matches_prompt_owner(normalized_display: &str, terms: &[St
         .any(|term| !term.is_empty() && normalized_display.starts_with(&term))
 }
 
+#[cfg(test)]
 fn packet_prompt_owner_term(term: &str) -> bool {
     !matches!(
         term,
@@ -535,6 +487,7 @@ fn packet_prompt_owner_term(term: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn packet_buffered_io_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -559,6 +512,7 @@ fn packet_buffered_io_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     bonus
 }
 
+#[cfg(test)]
 fn packet_log_record_handler_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let path_stem = packet_path_file_stem(path);
@@ -588,6 +542,7 @@ fn packet_log_record_handler_rank_bonus(normalized_display: &str, path: &str) ->
     bonus
 }
 
+#[cfg(test)]
 fn packet_site_build_phase_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -629,6 +584,7 @@ fn packet_site_build_phase_rank_bonus(normalized_display: &str, path: &str) -> f
     bonus
 }
 
+#[cfg(test)]
 fn packet_mapper_configuration_plan_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -667,6 +623,7 @@ fn packet_mapper_configuration_plan_rank_bonus(normalized_display: &str, path: &
     bonus
 }
 
+#[cfg(test)]
 fn packet_client_send_rank_bonus(normalized_display: &str, path: &str, terms: &[String]) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -707,6 +664,7 @@ fn packet_client_send_rank_bonus(normalized_display: &str, path: &str, terms: &[
     bonus
 }
 
+#[cfg(test)]
 fn packet_path_has_prompt_package_segment(path: &str, terms: &[String]) -> bool {
     let segments = path
         .split(['/', '\\'])
@@ -719,6 +677,7 @@ fn packet_path_has_prompt_package_segment(path: &str, terms: &[String]) -> bool 
     })
 }
 
+#[cfg(test)]
 fn packet_url_session_request_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -775,6 +734,7 @@ fn packet_url_session_request_rank_bonus(normalized_display: &str, path: &str) -
     bonus
 }
 
+#[cfg(test)]
 fn packet_path_file_stem(path: &str) -> String {
     let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path).trim();
     let stem = file_name
@@ -784,6 +744,7 @@ fn packet_path_file_stem(path: &str) -> String {
     normalize_identifier(stem)
 }
 
+#[cfg(test)]
 fn packet_form_validation_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -827,6 +788,7 @@ fn packet_form_validation_rank_bonus(normalized_display: &str, path: &str) -> f3
     bonus
 }
 
+#[cfg(test)]
 fn packet_stylesheet_animation_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -881,6 +843,7 @@ fn packet_stylesheet_animation_rank_bonus(normalized_display: &str, path: &str) 
     bonus
 }
 
+#[cfg(test)]
 fn packet_html_css_template_structure_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -936,6 +899,7 @@ fn packet_html_css_template_structure_rank_bonus(normalized_display: &str, path:
     bonus
 }
 
+#[cfg(test)]
 fn packet_sql_schema_rank_bonus(normalized_display: &str, path: &str, terms: &[String]) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -989,6 +953,7 @@ fn packet_sql_schema_rank_bonus(normalized_display: &str, path: &str, terms: &[S
     bonus
 }
 
+#[cfg(test)]
 fn packet_runtime_formatting_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -1037,6 +1002,7 @@ fn packet_runtime_formatting_rank_bonus(normalized_display: &str, path: &str) ->
     bonus
 }
 
+#[cfg(test)]
 fn packet_string_predicate_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -1077,6 +1043,7 @@ fn packet_string_predicate_rank_bonus(normalized_display: &str, path: &str) -> f
     bonus
 }
 
+#[cfg(test)]
 fn packet_shell_install_dispatch_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let file_name = path.rsplit('/').next().unwrap_or(path);

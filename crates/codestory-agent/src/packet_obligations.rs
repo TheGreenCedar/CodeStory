@@ -750,6 +750,7 @@ pub fn finalize_packet_obligation_plan(
 #[derive(Clone, Debug, Default)]
 pub struct PacketObligationEdgeProofSnapshot {
     entries: Vec<PacketObligationEdgeProofSnapshotEntry>,
+    protected_carrier_node_ids: Vec<NodeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -776,6 +777,25 @@ pub fn capture_packet_obligation_edge_proofs_before_budget(
         answer,
         PacketObligationEvidenceView::complete(answer.citations.len()),
     );
+    let mut protected_carrier_node_ids = Vec::new();
+    let mut protected_carrier_node_id_set = HashSet::new();
+    for obligation in &proof_plan.claim_obligations {
+        if !obligation.material || obligation.proof_status != PacketObligationProofStatusDto::Proven
+        {
+            continue;
+        }
+        let carrier_node_id = obligation.carrier_node_ids.first().cloned().or_else(|| {
+            obligation
+                .carrier_edge_proofs
+                .first()
+                .map(|proof| proof.carrier_node_id.clone())
+        });
+        if let Some(carrier_node_id) = carrier_node_id
+            && protected_carrier_node_id_set.insert(carrier_node_id.clone())
+        {
+            protected_carrier_node_ids.push(carrier_node_id);
+        }
+    }
     let mut entries = proof_plan
         .claim_obligations
         .iter()
@@ -791,7 +811,18 @@ pub fn capture_packet_obligation_edge_proofs_before_budget(
         })
         .collect::<Vec<_>>();
     sort_and_dedup_edge_proof_snapshot_entries(&mut entries);
-    PacketObligationEdgeProofSnapshot { entries }
+    PacketObligationEdgeProofSnapshot {
+        entries,
+        protected_carrier_node_ids,
+    }
+}
+
+/// Exact lawful carriers selected while the complete answer and graph are still available.
+/// Packet capping uses this ordered set before spending citation slots on general relevance.
+pub fn protected_packet_obligation_carrier_node_ids(
+    snapshot: &PacketObligationEdgeProofSnapshot,
+) -> &[NodeId] {
+    &snapshot.protected_carrier_node_ids
 }
 
 /// Bind pre-cap proof candidates to the carriers that survived the actual citation cap. Normal
@@ -4101,6 +4132,10 @@ mod tests {
         );
         assert_eq!(receipt[0].edge_id, EdgeId("requested-call".to_string()));
         assert_eq!(receipt[0].edge_kind, EdgeKind::CALL);
+        assert_eq!(
+            protected_packet_obligation_carrier_node_ids(&snapshot),
+            &[NodeId("BuildIndex::run".to_string())]
+        );
 
         // Compact citation selection may retain another copy of the same exact node without its
         // verbose edge-id list, while the global graph cap omits the proven trail edge.

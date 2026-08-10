@@ -564,7 +564,7 @@ const REQUEST_INTERCEPTOR_REQUIREMENT: FlowRequirement = FlowRequirement {
 
 const URL_SESSION_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
-        id: "session_request",
+        id: "client_request_entry",
         role: FlowRole::Entrypoint,
         query_seeds: &["session request creation", "request task resume"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
@@ -739,7 +739,7 @@ const SQL_SCHEMA_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "sql_relationships",
         role: FlowRole::Configuration,
-        query_seeds: &["foreign key relationships", "schema constraints"],
+        query_seeds: &["referential relationships", "schema constraints"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_sql_schema,
@@ -903,7 +903,7 @@ const MAPPER_PLAN_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Configuration,
         query_seeds: &[
             "mapper runtime api",
-            "mapper configuration",
+            "mapping configuration",
             "type map plan",
         ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
@@ -927,9 +927,9 @@ const RUNTIME_FORMATTING_FLOW: &[FlowRequirement] = &[
         evidence: EvidencePredicate::CitedCarrier(citation_owns_format_arguments),
     },
     FlowRequirement {
-        id: "format_errors",
+        id: "formatter_fallback",
         role: FlowRole::ErrorOrFallback,
-        query_seeds: &["format error", "error formatting"],
+        query_seeds: &["formatting failure", "formatter fallback"],
         coverage_mode: CoverageMode::AllowsSourceRange,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_formatter_fallback),
     },

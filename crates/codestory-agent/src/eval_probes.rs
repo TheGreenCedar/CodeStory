@@ -512,7 +512,7 @@ pub fn eval_indexing_storage_flow_template_claims(
 
     let mut claims = Vec::new();
     let source_group = citations.iter().find(|citation| {
-        packet_evidence_role(citation) == Some(PacketEvidenceRole::SourceGroupConfiguration)
+        packet_evidence_role(citation) == Some(PacketEvidenceRole::IndexInputConfiguration)
     });
     let indexing_work = citations.iter().find(|citation| {
         packet_evidence_role(citation) == Some(PacketEvidenceRole::IndexingWorkQueue)

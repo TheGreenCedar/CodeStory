@@ -263,6 +263,21 @@ function staticLiteralPattern(extension) {
   );
 }
 
+export function maskDeclarativeCoverageMetadata(filePath, source) {
+  if (path.basename(filePath) !== "route_coverage.rs") {
+    return source;
+  }
+  // The framework coverage matrix is user-facing capability metadata. Its
+  // `framework` field is not consulted by retrieval, ranking, or packet
+  // planning, so corpus-derived name bans must not force that report to omit a
+  // framework it actually describes. Only the standalone struct-literal field
+  // is masked; executable comparisons and every other string remain guarded.
+  return source.replace(
+    /^(\s*framework:\s*)"[^"\r\n]*"(,\s*)$/gm,
+    '$1""$2',
+  );
+}
+
 export function runRetrievalGeneralizationLint({
   repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.."),
   productionRepositoryRoot = repositoryRoot,
@@ -2438,7 +2453,7 @@ function rustBlockCommentEnd(text, start) {
 }
 
 function prepareProductionFile(filePath) {
-  const production = productionSource(filePath);
+  const production = maskDeclarativeCoverageMetadata(filePath, productionSource(filePath));
   return {
     filePath,
     // Stated rather than left undefined: it is what tells the literal scanner

@@ -8,12 +8,15 @@ use crate::agent::packet_batch::{
     packet_anchor_hit_is_relevant, packet_anchor_probe_limit_for_budget,
 };
 #[cfg(test)]
+use crate::agent::packet_budget::apply_packet_budget_with_extra;
+#[cfg(test)]
 use crate::agent::packet_budget::{
     apply_packet_budget, next_deeper_packet_argv, next_deeper_packet_command, packet_budget_usage,
     truncate_answer_markdown_to_byte_cap,
 };
 use crate::agent::packet_budget::{
-    apply_packet_budget_with_extra, enforce_packet_output_budget, packet_budget_limits,
+    apply_packet_budget_with_extra_and_obligation_carriers, enforce_packet_output_budget,
+    packet_budget_limits,
 };
 #[cfg(test)]
 use crate::agent::packet_capping::{
@@ -45,6 +48,7 @@ use crate::agent::packet_obligations::{
     capture_packet_obligation_edge_proofs_before_budget, finalize_packet_obligation_plan,
     install_retained_packet_obligation_edge_proofs,
     packet_claims_with_obligation_receipts_and_telemetry,
+    protected_packet_obligation_carrier_node_ids,
 };
 #[cfg(test)]
 use crate::agent::packet_plan::{
@@ -59,6 +63,7 @@ use crate::agent::packet_probe::{
 };
 #[cfg(test)]
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries;
+#[cfg(test)]
 use crate::agent::packet_required_probes::{
     PacketFileScopedSymbolProbe, packet_file_scoped_symbol_probe_parts,
     packet_probe_file_name_matches, packet_probe_query_is_cited,
@@ -69,6 +74,7 @@ use crate::agent::packet_scoring::packet_citation_key;
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path, sort_by_cached_rank_desc,
 };
+#[cfg(test)]
 use crate::agent::packet_source_patterns::packet_sql_identifier_after;
 use crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context;
 #[cfg(test)]
@@ -82,14 +88,18 @@ use crate::agent::packet_sufficiency::{
     packet_claim_family, packet_supported_claim_family_count, packet_targeted_follow_up_queries,
 };
 use crate::agent::packet_terms::{
-    packet_probe_terms, packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
+    packet_probe_terms, packet_terms_indicate_search_execution_flow, prompt_search_terms,
+};
+#[cfg(test)]
+use crate::agent::packet_terms::{
+    packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
     packet_terms_indicate_client_send_flow, packet_terms_indicate_event_loop_command_flow,
     packet_terms_indicate_form_validation_flow, packet_terms_indicate_hook_cache_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
-    packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
+    packet_terms_indicate_runtime_formatting_flow,
     packet_terms_indicate_server_route_dispatch_flow, packet_terms_indicate_sql_schema_flow,
     packet_terms_indicate_stylesheet_animation_flow,
-    packet_terms_indicate_url_session_request_flow, prompt_search_terms,
+    packet_terms_indicate_url_session_request_flow,
 };
 use crate::agent::path_identity::RuntimeWorkspacePathIdentity;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
@@ -125,8 +135,11 @@ use codestory_contracts::api::{
     RetrievalAnnotationKindDto, RetrievalShadowDto, SearchMatchQualityDto,
 };
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+#[cfg(test)]
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -482,18 +495,6 @@ pub(crate) fn agent_packet(
         &mut answer,
     )?;
     let phase_started = Instant::now();
-    maybe_append_sql_schema_file_citations(&project_root, &question, &mut answer);
-    maybe_append_generic_source_shape_citations(&project_root, &question, &mut answer);
-    let file_scoped_source_probes =
-        packet_file_scoped_source_probe_inputs_from_plan(&plan, &extra_probes);
-    maybe_append_required_file_scoped_source_citations(
-        &project_root,
-        &question,
-        plan.task_class,
-        &file_scoped_source_probes,
-        &extra_probes,
-        &mut answer,
-    );
     append_packet_non_trace_phase(&mut answer, "pre_rank_citations", phase_started);
     let phase_started = Instant::now();
     packet_latency.apply_to_trace(&mut answer);
@@ -558,7 +559,7 @@ pub(crate) fn agent_packet(
         &plan.obligations,
         &answer,
     );
-    let budget = apply_packet_budget_with_extra(
+    let budget = apply_packet_budget_with_extra_and_obligation_carriers(
         &project_root,
         &question,
         plan.task_class,
@@ -566,6 +567,7 @@ pub(crate) fn agent_packet(
         limits.clone(),
         &mut answer,
         &sufficiency_extra_probes,
+        protected_packet_obligation_carrier_node_ids(&obligation_edge_proofs),
     );
     append_packet_non_trace_phase(&mut answer, "budget", phase_started);
     let phase_started = Instant::now();
@@ -674,8 +676,7 @@ fn packet_plan_sufficiency_extra_probes(
     let mut probes = Vec::new();
     for query in &plan.queries {
         if !query.purpose.contains("explicit")
-            && (packet_plan_query_can_gate_sufficiency(&query.query)
-                || packet_file_scoped_symbol_probe_parts(&query.query).is_some())
+            && packet_plan_query_can_gate_sufficiency(&query.query)
         {
             push_packet_sufficiency_extra_probe(&mut probes, &query.query);
         }
@@ -684,44 +685,9 @@ fn packet_plan_sufficiency_extra_probes(
 }
 
 fn packet_plan_query_can_gate_sufficiency(query: &str) -> bool {
-    matches!(
-        normalize_identifier(query).as_str(),
-        "serialize"
-            | "cachehelper"
-            | "middleware"
-            | "appinitialization"
-            | "middlewareregistration"
-            | "routeregistration"
-            | "handlerprocessing"
-            | "handlerdispatch"
-            | "requesthandler"
-            | "responsesend"
-            | "routetreeaddroute"
-            | "routergrouphandleroute"
-            | "enginerequesthandler"
-            | "contextnexthandlerchain"
-            | "enginecreationrouterstate"
-            | "formvalidation"
-            | "constraintvalidation"
-            | "htmlconstraint"
-            | "pattern"
-            | "javascriptvalidation"
-            | "customvalidation"
-            | "customvalidationflow"
-            | "formvalidationbypass"
-            | "validitystate"
-            | "mappingconfiguration"
-            | "typemap"
-            | "mappingplan"
-            | "bufferedsource"
-            | "bufferedsink"
-            | "sourcebuffer"
-            | "sinkbuffer"
-            | "sourcereadbuffer"
-            | "sinkwritebuffer"
-            | "clientsend"
-            | "requestresponse"
-    )
+    packet_probe_terms(query)
+        .iter()
+        .any(|term| term.len() >= 4 && !crate::agent::packet_scoring::packet_query_stop_term(term))
 }
 
 fn push_packet_sufficiency_extra_probe(probes: &mut Vec<String>, probe: &str) {
@@ -1013,57 +979,280 @@ fn packet_evidence_ledger_row(citation: &AgentCitationDto) -> String {
     )
 }
 
-struct PacketSqlSchemaFileCandidate {
-    path: std::path::PathBuf,
-    display_name: String,
-    line: u32,
-    score: f32,
-    anchors: Vec<PacketSqlSchemaAnchorCandidate>,
-}
+#[cfg(test)]
+mod legacy_source_scans {
+    use super::*;
 
-struct PacketSqlSchemaAnchorCandidate {
-    display_name: String,
-    line: u32,
-    score: f32,
-}
-
-fn maybe_append_sql_schema_file_citations(
-    project_root: &Path,
-    question: &str,
-    answer: &mut AgentAnswerDto,
-) {
-    let terms = packet_probe_terms(question);
-    if !packet_terms_indicate_sql_schema_flow(&terms) {
-        return;
+    struct PacketSqlSchemaFileCandidate {
+        path: std::path::PathBuf,
+        display_name: String,
+        line: u32,
+        score: f32,
+        anchors: Vec<PacketSqlSchemaAnchorCandidate>,
     }
-    let mut candidates = Vec::new();
-    collect_sql_schema_file_candidates(project_root, project_root, &terms, &mut candidates);
-    candidates.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.display_name.cmp(&right.display_name))
-    });
 
-    let mut appended_files = 0;
-    let mut appended_anchors = 0;
-    const SYNTHETIC_SQL_SCORE_CAP: f32 = 20.0;
-    for candidate in candidates.into_iter().take(12) {
-        let path_string = candidate.path.to_string_lossy().to_string();
-        let file_already_present = answer.citations.iter().any(|existing| {
-            existing.file_path.as_deref().is_some_and(|existing_path| {
-                packet_display_path(existing_path) == packet_display_path(&path_string)
-            })
+    struct PacketSqlSchemaAnchorCandidate {
+        display_name: String,
+        line: u32,
+        score: f32,
+    }
+
+    pub(super) fn maybe_append_sql_schema_file_citations(
+        project_root: &Path,
+        question: &str,
+        answer: &mut AgentAnswerDto,
+    ) {
+        let terms = packet_probe_terms(question);
+        if !packet_terms_indicate_sql_schema_flow(&terms) {
+            return;
+        }
+        let mut candidates = Vec::new();
+        collect_sql_schema_file_candidates(project_root, project_root, &terms, &mut candidates);
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.display_name.cmp(&right.display_name))
         });
-        if !file_already_present {
-            let raw_score = candidate.score + 5.0;
-            let score = raw_score.min(SYNTHETIC_SQL_SCORE_CAP);
+
+        let mut appended_files = 0;
+        let mut appended_anchors = 0;
+        const SYNTHETIC_SQL_SCORE_CAP: f32 = 20.0;
+        for candidate in candidates.into_iter().take(12) {
+            let path_string = candidate.path.to_string_lossy().to_string();
+            let file_already_present = answer.citations.iter().any(|existing| {
+                existing.file_path.as_deref().is_some_and(|existing_path| {
+                    packet_display_path(existing_path) == packet_display_path(&path_string)
+                })
+            });
+            if !file_already_present {
+                let raw_score = candidate.score + 5.0;
+                let score = raw_score.min(SYNTHETIC_SQL_SCORE_CAP);
+                answer.citations.push(AgentCitationDto {
+                    node_id: NodeId(format!("packet::sql_schema::{}", candidate.display_name)),
+                    display_name: candidate.display_name.clone(),
+                    kind: NodeKind::FILE,
+                    file_path: Some(path_string.clone()),
+                    line: Some(candidate.line),
+                    score,
+                    origin: SearchHitOrigin::TextMatch,
+                    target: None,
+                    resolvable: false,
+                    subgraph_id: None,
+                    evidence_edge_ids: Vec::new(),
+                    retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
+                        lexical: score,
+                        semantic: 0.0,
+                        graph: 0.0,
+                        total: score,
+                        tier_cap: Some(SYNTHETIC_SQL_SCORE_CAP),
+                        boosts: Vec::new(),
+                        dampening: vec![format!(
+                            "synthetic SQL source scan capped from {raw_score:.3}"
+                        )],
+                        final_rank_reason: Some("synthetic SQL source scan".to_string()),
+                        provenance: vec!["packet_generic_sql_schema_file_probe".to_string()],
+                    }),
+                    evidence_tier: Some(
+                        codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan,
+                    ),
+                    evidence_producer: Some("packet_generic_sql_schema_file_probe".to_string()),
+                    resolution_status: Some(
+                        codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+                    ),
+                    loss_reason: None,
+                    coverage_role: Some("sql schema scripts".to_string()),
+                    eligible_for_sufficiency: Some(false),
+                });
+                appended_files += 1;
+            }
+
+            for anchor in candidate.anchors.into_iter().take(8) {
+                if appended_anchors >= 32 {
+                    break;
+                }
+                if answer.citations.iter().any(|existing| {
+                    existing.display_name == anchor.display_name
+                        && existing.file_path.as_deref().is_some_and(|existing_path| {
+                            packet_display_path(existing_path) == packet_display_path(&path_string)
+                        })
+                }) {
+                    continue;
+                }
+                let raw_score = candidate.score + anchor.score;
+                let score = raw_score.min(SYNTHETIC_SQL_SCORE_CAP);
+                answer.citations.push(AgentCitationDto {
+                    node_id: NodeId(format!(
+                        "packet::sql_schema::{}::{}::{}",
+                        candidate.display_name, anchor.display_name, anchor.line
+                    )),
+                    display_name: anchor.display_name,
+                    kind: NodeKind::ANNOTATION,
+                    file_path: Some(path_string.clone()),
+                    line: Some(anchor.line),
+                    score,
+                    origin: SearchHitOrigin::TextMatch,
+                    target: None,
+                    resolvable: false,
+                    subgraph_id: None,
+                    evidence_edge_ids: Vec::new(),
+                    retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
+                        lexical: score,
+                        semantic: 0.0,
+                        graph: 0.0,
+                        total: score,
+                        tier_cap: Some(SYNTHETIC_SQL_SCORE_CAP),
+                        boosts: Vec::new(),
+                        dampening: vec![format!(
+                            "synthetic SQL source scan capped from {raw_score:.3}"
+                        )],
+                        final_rank_reason: Some("synthetic SQL source scan".to_string()),
+                        provenance: vec!["packet_generic_sql_schema_anchor_probe".to_string()],
+                    }),
+                    evidence_tier: Some(
+                        codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan,
+                    ),
+                    evidence_producer: Some("packet_generic_sql_schema_anchor_probe".to_string()),
+                    resolution_status: Some(
+                        codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+                    ),
+                    loss_reason: None,
+                    coverage_role: Some("sql schema anchor".to_string()),
+                    eligible_for_sufficiency: Some(false),
+                });
+                appended_anchors += 1;
+            }
+        }
+
+        if appended_files > 0 || appended_anchors > 0 {
+            answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(format!(
+                "packet_generic_sql_schema_file_citations files={appended_files} anchors={appended_anchors}"
+            )));
+        }
+    }
+
+    struct PacketGenericSourceShapeCandidate {
+        path: std::path::PathBuf,
+        display_name: String,
+        kind: NodeKind,
+        line: u32,
+        score: f32,
+        coverage_role: String,
+        producer: String,
+        eligible_for_sufficiency: bool,
+    }
+
+    pub(super) fn maybe_append_generic_source_shape_citations(
+        project_root: &Path,
+        question: &str,
+        answer: &mut AgentAnswerDto,
+    ) {
+        let terms = packet_probe_terms(question);
+        let route_flow = packet_terms_indicate_server_route_dispatch_flow(&terms);
+        let mapper_flow = packet_terms_indicate_mapper_configuration_plan_flow(&terms);
+        let client_send_flow = packet_terms_indicate_client_send_flow(&terms);
+        let buffered_io_flow = packet_terms_indicate_buffered_io_flow(&terms);
+        let url_session_request_flow = packet_terms_indicate_url_session_request_flow(&terms);
+        let hook_cache_flow = packet_terms_indicate_hook_cache_flow(&terms);
+        let command_flow = packet_terms_indicate_event_loop_command_flow(&terms);
+        let form_validation_flow = packet_terms_indicate_form_validation_flow(&terms);
+        let formatting_flow = packet_terms_indicate_runtime_formatting_flow(&terms);
+        let css_animation_flow = packet_terms_indicate_stylesheet_animation_flow(&terms)
+            || (packet_terms_have_any(&terms, &["animation", "animations", "animate"])
+                && packet_terms_have_any(
+                    &terms,
+                    &["variable", "variables", "keyframe", "keyframes"],
+                ));
+        if !route_flow
+            && !mapper_flow
+            && !client_send_flow
+            && !buffered_io_flow
+            && !url_session_request_flow
+            && !hook_cache_flow
+            && !command_flow
+            && !form_validation_flow
+            && !formatting_flow
+            && !css_animation_flow
+        {
+            return;
+        }
+
+        let mut candidates = Vec::new();
+        collect_generic_source_shape_candidates(
+            project_root,
+            project_root,
+            route_flow,
+            mapper_flow,
+            client_send_flow,
+            buffered_io_flow,
+            url_session_request_flow,
+            hook_cache_flow,
+            command_flow,
+            form_validation_flow,
+            formatting_flow,
+            css_animation_flow,
+            &mut candidates,
+        );
+        if url_session_request_flow {
+            collect_cited_request_validation_shape_candidates(
+                project_root,
+                answer,
+                &mut candidates,
+            );
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.display_name.cmp(&right.display_name))
+        });
+
+        let mut appended = 0usize;
+        let mut skipped_existing = 0usize;
+        for candidate in candidates.into_iter().take(24) {
+            if appended >= 16 {
+                break;
+            }
+            let path_string = candidate.path.to_string_lossy().to_string();
+            let score = candidate.score.min(40.0);
+            if let Some(existing) = answer.citations.iter_mut().find(|existing| {
+                existing.display_name == candidate.display_name
+                    && existing.file_path.as_deref().is_some_and(|existing_path| {
+                        packet_display_path(existing_path) == packet_display_path(&path_string)
+                    })
+            }) {
+                skipped_existing = skipped_existing.saturating_add(1);
+                if existing.score < score {
+                    existing.score = score;
+                }
+                if existing.coverage_role.is_none() {
+                    existing.coverage_role = Some(candidate.coverage_role);
+                }
+                if let Some(breakdown) = existing.retrieval_score_breakdown.as_mut()
+                    && !breakdown
+                        .boosts
+                        .iter()
+                        .any(|boost| boost == "generic source-shape duplicate boost")
+                {
+                    breakdown
+                        .boosts
+                        .push("generic source-shape duplicate boost".to_string());
+                }
+                continue;
+            }
             answer.citations.push(AgentCitationDto {
-                node_id: NodeId(format!("packet::sql_schema::{}", candidate.display_name)),
-                display_name: candidate.display_name.clone(),
-                kind: NodeKind::FILE,
-                file_path: Some(path_string.clone()),
+                node_id: NodeId(format!(
+                    "packet::generic_source_shape::{}::{}::{}",
+                    candidate.producer, candidate.display_name, candidate.line
+                )),
+                display_name: candidate.display_name,
+                kind: candidate.kind,
+                file_path: Some(path_string),
                 line: Some(candidate.line),
                 score,
                 origin: SearchHitOrigin::TextMatch,
@@ -1076,2491 +1265,2310 @@ fn maybe_append_sql_schema_file_citations(
                     semantic: 0.0,
                     graph: 0.0,
                     total: score,
-                    tier_cap: Some(SYNTHETIC_SQL_SCORE_CAP),
+                    tier_cap: Some(40.0),
                     boosts: Vec::new(),
-                    dampening: vec![format!(
-                        "synthetic SQL source scan capped from {raw_score:.3}"
-                    )],
-                    final_rank_reason: Some("synthetic SQL source scan".to_string()),
-                    provenance: vec!["packet_generic_sql_schema_file_probe".to_string()],
+                    dampening: Vec::new(),
+                    final_rank_reason: Some("generic source-shape scan".to_string()),
+                    provenance: vec![candidate.producer.clone()],
                 }),
                 evidence_tier: Some(
                     codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan,
                 ),
-                evidence_producer: Some("packet_generic_sql_schema_file_probe".to_string()),
+                evidence_producer: Some(candidate.producer),
                 resolution_status: Some(
                     codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
                 ),
                 loss_reason: None,
-                coverage_role: Some("sql schema scripts".to_string()),
-                eligible_for_sufficiency: Some(false),
+                coverage_role: Some(candidate.coverage_role),
+                eligible_for_sufficiency: Some(candidate.eligible_for_sufficiency),
             });
-            appended_files += 1;
+            appended = appended.saturating_add(1);
         }
 
-        for anchor in candidate.anchors.into_iter().take(8) {
-            if appended_anchors >= 32 {
-                break;
-            }
-            if answer.citations.iter().any(|existing| {
-                existing.display_name == anchor.display_name
-                    && existing.file_path.as_deref().is_some_and(|existing_path| {
-                        packet_display_path(existing_path) == packet_display_path(&path_string)
-                    })
-            }) {
-                continue;
-            }
-            let raw_score = candidate.score + anchor.score;
-            let score = raw_score.min(SYNTHETIC_SQL_SCORE_CAP);
-            answer.citations.push(AgentCitationDto {
-                node_id: NodeId(format!(
-                    "packet::sql_schema::{}::{}::{}",
-                    candidate.display_name, anchor.display_name, anchor.line
-                )),
-                display_name: anchor.display_name,
-                kind: NodeKind::ANNOTATION,
-                file_path: Some(path_string.clone()),
-                line: Some(anchor.line),
-                score,
-                origin: SearchHitOrigin::TextMatch,
-                target: None,
-                resolvable: false,
-                subgraph_id: None,
-                evidence_edge_ids: Vec::new(),
-                retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
-                    lexical: score,
-                    semantic: 0.0,
-                    graph: 0.0,
-                    total: score,
-                    tier_cap: Some(SYNTHETIC_SQL_SCORE_CAP),
-                    boosts: Vec::new(),
-                    dampening: vec![format!(
-                        "synthetic SQL source scan capped from {raw_score:.3}"
-                    )],
-                    final_rank_reason: Some("synthetic SQL source scan".to_string()),
-                    provenance: vec!["packet_generic_sql_schema_anchor_probe".to_string()],
-                }),
-                evidence_tier: Some(
-                    codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan,
-                ),
-                evidence_producer: Some("packet_generic_sql_schema_anchor_probe".to_string()),
-                resolution_status: Some(
-                    codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
-                ),
-                loss_reason: None,
-                coverage_role: Some("sql schema anchor".to_string()),
-                eligible_for_sufficiency: Some(false),
-            });
-            appended_anchors += 1;
-        }
-    }
-
-    if appended_files > 0 || appended_anchors > 0 {
-        answer
-            .retrieval_trace
-            .annotations
-            .push(RetrievalAnnotationDto::observation(format!(
-                "packet_generic_sql_schema_file_citations files={appended_files} anchors={appended_anchors}"
-            )));
-    }
-}
-
-struct PacketGenericSourceShapeCandidate {
-    path: std::path::PathBuf,
-    display_name: String,
-    kind: NodeKind,
-    line: u32,
-    score: f32,
-    coverage_role: String,
-    producer: String,
-    eligible_for_sufficiency: bool,
-}
-
-fn maybe_append_generic_source_shape_citations(
-    project_root: &Path,
-    question: &str,
-    answer: &mut AgentAnswerDto,
-) {
-    let terms = packet_probe_terms(question);
-    let route_flow = packet_terms_indicate_server_route_dispatch_flow(&terms);
-    let mapper_flow = packet_terms_indicate_mapper_configuration_plan_flow(&terms);
-    let client_send_flow = packet_terms_indicate_client_send_flow(&terms);
-    let buffered_io_flow = packet_terms_indicate_buffered_io_flow(&terms);
-    let url_session_request_flow = packet_terms_indicate_url_session_request_flow(&terms);
-    let hook_cache_flow = packet_terms_indicate_hook_cache_flow(&terms);
-    let command_flow = packet_terms_indicate_event_loop_command_flow(&terms);
-    let form_validation_flow = packet_terms_indicate_form_validation_flow(&terms);
-    let formatting_flow = packet_terms_indicate_runtime_formatting_flow(&terms);
-    let css_animation_flow = packet_terms_indicate_stylesheet_animation_flow(&terms)
-        || (packet_terms_have_any(&terms, &["animation", "animations", "animate"])
-            && packet_terms_have_any(&terms, &["variable", "variables", "keyframe", "keyframes"]));
-    if !route_flow
-        && !mapper_flow
-        && !client_send_flow
-        && !buffered_io_flow
-        && !url_session_request_flow
-        && !hook_cache_flow
-        && !command_flow
-        && !form_validation_flow
-        && !formatting_flow
-        && !css_animation_flow
-    {
-        return;
-    }
-
-    let mut candidates = Vec::new();
-    collect_generic_source_shape_candidates(
-        project_root,
-        project_root,
-        route_flow,
-        mapper_flow,
-        client_send_flow,
-        buffered_io_flow,
-        url_session_request_flow,
-        hook_cache_flow,
-        command_flow,
-        form_validation_flow,
-        formatting_flow,
-        css_animation_flow,
-        &mut candidates,
-    );
-    if url_session_request_flow {
-        collect_cited_request_validation_shape_candidates(project_root, answer, &mut candidates);
-    }
-    candidates.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.display_name.cmp(&right.display_name))
-    });
-
-    let mut appended = 0usize;
-    let mut skipped_existing = 0usize;
-    for candidate in candidates.into_iter().take(24) {
-        if appended >= 16 {
-            break;
-        }
-        let path_string = candidate.path.to_string_lossy().to_string();
-        let score = candidate.score.min(40.0);
-        if let Some(existing) = answer.citations.iter_mut().find(|existing| {
-            existing.display_name == candidate.display_name
-                && existing.file_path.as_deref().is_some_and(|existing_path| {
-                    packet_display_path(existing_path) == packet_display_path(&path_string)
-                })
-        }) {
-            skipped_existing = skipped_existing.saturating_add(1);
-            if existing.score < score {
-                existing.score = score;
-            }
-            if existing.coverage_role.is_none() {
-                existing.coverage_role = Some(candidate.coverage_role);
-            }
-            if let Some(breakdown) = existing.retrieval_score_breakdown.as_mut()
-                && !breakdown
-                    .boosts
-                    .iter()
-                    .any(|boost| boost == "generic source-shape duplicate boost")
-            {
-                breakdown
-                    .boosts
-                    .push("generic source-shape duplicate boost".to_string());
-            }
-            continue;
-        }
-        answer.citations.push(AgentCitationDto {
-            node_id: NodeId(format!(
-                "packet::generic_source_shape::{}::{}::{}",
-                candidate.producer, candidate.display_name, candidate.line
-            )),
-            display_name: candidate.display_name,
-            kind: candidate.kind,
-            file_path: Some(path_string),
-            line: Some(candidate.line),
-            score,
-            origin: SearchHitOrigin::TextMatch,
-            target: None,
-            resolvable: false,
-            subgraph_id: None,
-            evidence_edge_ids: Vec::new(),
-            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
-                lexical: score,
-                semantic: 0.0,
-                graph: 0.0,
-                total: score,
-                tier_cap: Some(40.0),
-                boosts: Vec::new(),
-                dampening: Vec::new(),
-                final_rank_reason: Some("generic source-shape scan".to_string()),
-                provenance: vec![candidate.producer.clone()],
-            }),
-            evidence_tier: Some(
-                codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan,
-            ),
-            evidence_producer: Some(candidate.producer),
-            resolution_status: Some(
-                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
-            ),
-            loss_reason: None,
-            coverage_role: Some(candidate.coverage_role),
-            eligible_for_sufficiency: Some(candidate.eligible_for_sufficiency),
-        });
-        appended = appended.saturating_add(1);
-    }
-
-    if appended > 0 || skipped_existing > 0 {
-        // Counters, not evidence: `skipped_existing` here means "already cited", and the legacy
-        // prose heuristic read the word `skipped` as an evidence gap on every packet that
-        // appended generic source-shape citations.
-        answer
+        if appended > 0 || skipped_existing > 0 {
+            // Counters, not evidence: `skipped_existing` here means "already cited", and the legacy
+            // prose heuristic read the word `skipped` as an evidence gap on every packet that
+            // appended generic source-shape citations.
+            answer
             .retrieval_trace
             .annotations
             .push(RetrievalAnnotationDto::observation(format!(
                 "packet_generic_source_shape_citations appended={appended} skipped_existing={skipped_existing}"
             )));
+        }
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn collect_generic_source_shape_candidates(
-    project_root: &Path,
-    dir: &Path,
-    route_flow: bool,
-    mapper_flow: bool,
-    client_send_flow: bool,
-    buffered_io_flow: bool,
-    url_session_request_flow: bool,
-    hook_cache_flow: bool,
-    command_flow: bool,
-    form_validation_flow: bool,
-    formatting_flow: bool,
-    css_animation_flow: bool,
-    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
-) {
-    if candidates.len() >= 96 {
-        return;
-    }
-    let Ok(read_dir) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries = read_dir.flatten().collect::<Vec<_>>();
-    entries.sort_by(|left, right| {
-        let left_is_dir = left.path().is_dir();
-        let right_is_dir = right.path().is_dir();
-        left_is_dir
-            .cmp(&right_is_dir)
-            .then_with(|| left.file_name().cmp(&right.file_name()))
-    });
-    for entry in entries {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if path.is_dir() {
-            if !packet_source_probe_skip_dir(&name) {
-                collect_generic_source_shape_candidates(
-                    project_root,
-                    &path,
-                    route_flow,
-                    mapper_flow,
-                    client_send_flow,
-                    buffered_io_flow,
-                    url_session_request_flow,
-                    hook_cache_flow,
-                    command_flow,
-                    form_validation_flow,
-                    formatting_flow,
-                    css_animation_flow,
-                    candidates,
-                );
+    #[allow(clippy::too_many_arguments)]
+    fn collect_generic_source_shape_candidates(
+        project_root: &Path,
+        dir: &Path,
+        route_flow: bool,
+        mapper_flow: bool,
+        client_send_flow: bool,
+        buffered_io_flow: bool,
+        url_session_request_flow: bool,
+        hook_cache_flow: bool,
+        command_flow: bool,
+        form_validation_flow: bool,
+        formatting_flow: bool,
+        css_animation_flow: bool,
+        candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    ) {
+        if candidates.len() >= 96 {
+            return;
+        }
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries = read_dir.flatten().collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            let left_is_dir = left.path().is_dir();
+            let right_is_dir = right.path().is_dir();
+            left_is_dir
+                .cmp(&right_is_dir)
+                .then_with(|| left.file_name().cmp(&right.file_name()))
+        });
+        for entry in entries {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if !packet_source_probe_skip_dir(&name) {
+                    collect_generic_source_shape_candidates(
+                        project_root,
+                        &path,
+                        route_flow,
+                        mapper_flow,
+                        client_send_flow,
+                        buffered_io_flow,
+                        url_session_request_flow,
+                        hook_cache_flow,
+                        command_flow,
+                        form_validation_flow,
+                        formatting_flow,
+                        css_animation_flow,
+                        candidates,
+                    );
+                }
+                continue;
             }
-            continue;
-        }
-        if !packet_generic_source_shape_candidate_path(project_root, &path) {
-            continue;
-        }
-        let Ok(metadata) = path.metadata() else {
-            continue;
-        };
-        if metadata.len() > 1_500_000 {
-            continue;
-        }
-        let Ok(source) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if route_flow {
-            collect_route_receiver_assignment_candidates(&path, &source, candidates);
-        }
-        if mapper_flow {
-            collect_csharp_mapper_shape_candidates(&path, &source, candidates);
-        }
-        if client_send_flow {
-            collect_client_send_shape_candidates(&path, &source, candidates);
-        }
-        if buffered_io_flow {
-            collect_buffered_io_shape_candidates(&path, &source, candidates);
-        }
-        if url_session_request_flow {
-            collect_url_session_request_shape_candidates(&path, &source, candidates);
-        }
-        if hook_cache_flow {
-            collect_hook_cache_shape_candidates(&path, &source, candidates);
-        }
-        if command_flow {
-            collect_event_loop_command_shape_candidates(&path, &source, candidates);
-        }
-        if form_validation_flow {
-            collect_form_validation_shape_candidates(&path, &source, candidates);
-        }
-        if formatting_flow {
-            collect_runtime_formatting_shape_candidates(&path, &source, candidates);
-        }
-        if css_animation_flow {
-            collect_css_animation_variable_candidates(&path, &source, candidates);
-        }
-    }
-}
-
-fn packet_generic_source_shape_candidate_path(project_root: &Path, path: &Path) -> bool {
-    let relative = path
-        .strip_prefix(project_root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    if relative.contains("/test/")
-        || relative.contains("/tests/")
-        || relative.starts_with("test/")
-        || relative.starts_with("tests/")
-        || relative.contains("/example")
-        || relative.starts_with("example")
-        || relative.contains("/docs/")
-        || relative.starts_with("docs/")
-        || relative.contains("docssource/")
-        || relative.contains("/vendor/")
-        || relative.starts_with("vendor/")
-        || relative.contains("/third_party/")
-        || relative.starts_with("third_party/")
-        || relative.contains("/deps/")
-        || relative.starts_with("deps/")
-    {
-        return false;
-    }
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "js" | "mjs"
-                    | "cjs"
-                    | "ts"
-                    | "html"
-                    | "htm"
-                    | "css"
-                    | "c"
-                    | "h"
-                    | "hpp"
-                    | "hh"
-                    | "cc"
-                    | "cpp"
-                    | "cxx"
-                    | "cs"
-                    | "dart"
-                    | "go"
-                    | "java"
-                    | "kt"
-                    | "rs"
-                    | "swift"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn collect_route_receiver_assignment_candidates(
-    path: &Path,
-    source: &str,
-    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
-) {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-    if !matches!(extension.as_str(), "js" | "mjs" | "cjs" | "ts") {
-        return;
-    }
-    let source_lower = source.to_ascii_lowercase();
-    for (index, line) in source.lines().enumerate() {
-        let Some((receiver, method)) = packet_js_receiver_function_assignment(line) else {
-            continue;
-        };
-        let normalized_method = normalize_identifier(&method);
-        let route_method = matches!(
-            normalized_method.as_str(),
-            "init" | "handle" | "use" | "route" | "send" | "json" | "end" | "respond"
-        );
-        if !route_method {
-            continue;
-        }
-        let method_context = match normalized_method.as_str() {
-            "init" => source_lower.contains("configuration") || source_lower.contains("router"),
-            "handle" | "use" | "route" => source_lower.contains("router"),
-            "send" | "json" | "end" | "respond" => {
-                source_lower.contains("content-type")
-                    || source_lower.contains("content-length")
-                    || source_lower.contains(".end(")
-                    || source_lower.contains(".write(")
+            if !packet_generic_source_shape_candidate_path(project_root, &path) {
+                continue;
             }
-            _ => false,
-        };
-        if !method_context {
-            continue;
+            let Ok(metadata) = path.metadata() else {
+                continue;
+            };
+            if metadata.len() > 1_500_000 {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if route_flow {
+                collect_route_receiver_assignment_candidates(&path, &source, candidates);
+            }
+            if mapper_flow {
+                collect_csharp_mapper_shape_candidates(&path, &source, candidates);
+            }
+            if client_send_flow {
+                collect_client_send_shape_candidates(&path, &source, candidates);
+            }
+            if buffered_io_flow {
+                collect_buffered_io_shape_candidates(&path, &source, candidates);
+            }
+            if url_session_request_flow {
+                collect_url_session_request_shape_candidates(&path, &source, candidates);
+            }
+            if hook_cache_flow {
+                collect_hook_cache_shape_candidates(&path, &source, candidates);
+            }
+            if command_flow {
+                collect_event_loop_command_shape_candidates(&path, &source, candidates);
+            }
+            if form_validation_flow {
+                collect_form_validation_shape_candidates(&path, &source, candidates);
+            }
+            if formatting_flow {
+                collect_runtime_formatting_shape_candidates(&path, &source, candidates);
+            }
+            if css_animation_flow {
+                collect_css_animation_variable_candidates(&path, &source, candidates);
+            }
         }
-        let mut score = 90.0;
-        if matches!(
-            normalized_method.as_str(),
-            "handle" | "use" | "route" | "send"
-        ) {
-            score += 4.0;
-        }
-        if normalized_method == "init" {
-            score += 2.0;
-        }
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: format!("{receiver}.{method}"),
-            kind: NodeKind::METHOD,
-            line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
-            score,
-            coverage_role: "receiver method assignment".to_string(),
-            producer: "packet_generic_receiver_method_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-}
-
-fn packet_js_receiver_function_assignment(line: &str) -> Option<(String, String)> {
-    let compact = line.trim();
-    let (left, right) = compact.split_once('=')?;
-    let right = right.trim_start();
-    if !right.starts_with("function") {
-        return None;
-    }
-    let (receiver, method) = left.trim().rsplit_once('.')?;
-    let receiver = receiver
-        .rsplit(|ch: char| !packet_source_identifier_char(ch))
-        .next()
-        .unwrap_or(receiver)
-        .trim();
-    let method = method.trim();
-    if receiver.is_empty() || method.is_empty() {
-        return None;
-    }
-    if !receiver.chars().all(packet_source_identifier_char)
-        || !method.chars().all(packet_source_identifier_char)
-    {
-        return None;
-    }
-    Some((receiver.to_string(), method.to_string()))
-}
-
-fn collect_client_send_shape_candidates(
-    path: &Path,
-    source: &str,
-    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
-) {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-    if extension != "dart" {
-        return;
     }
 
-    let normalized_source = normalize_identifier(source);
-    let source_lower = source.to_ascii_lowercase();
-    if source_lower.contains("_withclient")
-        && source_lower.contains("client()")
-        && source_lower.contains("client.")
-        && packet_source_shape_has_any(source, &["get(", "post(", "put(", "patch(", "delete("])
-    {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: "Top-level HTTP helpers".to_string(),
-            kind: NodeKind::FUNCTION,
-            line: packet_first_line_containing(source, &["Future<Response>", " get("]).unwrap_or(1),
-            score: 116.0,
-            coverage_role: "client public facade".to_string(),
-            producer: "packet_generic_client_send_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-
-    if normalized_source.contains("interfaceclassclient")
-        && normalized_source.contains("futureresponse")
-        && normalized_source.contains("futurestreamedresponsesend")
-        && normalized_source.contains("request")
-    {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: "Client interface helpers".to_string(),
-            kind: NodeKind::METHOD,
-            line: packet_first_line_containing(source, &["Future<Response>", " get("]).unwrap_or(1),
-            score: 114.0,
-            coverage_role: "client interface helpers".to_string(),
-            producer: "packet_generic_client_send_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-
-    if normalized_source.contains("classrequestextends")
-        && normalized_source.contains("bytestreamfinalize")
-        && normalized_source.contains("frombytesbodybytes")
-    {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: "Request.finalize".to_string(),
-            kind: NodeKind::METHOD,
-            line: packet_first_line_containing(source, &["ByteStream", " finalize("]).unwrap_or(1),
-            score: 112.0,
-            coverage_role: "client request finalization".to_string(),
-            producer: "packet_generic_client_send_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-
-    if normalized_source.contains("classresponseextendsbaseresponse")
-        && normalized_source.contains("fromstreamstreamedresponseresponse")
-        && normalized_source.contains("responsestreamtobytes")
-    {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: "Response.fromStream".to_string(),
-            kind: NodeKind::METHOD,
-            line: packet_first_line_containing(source, &["fromStream", "StreamedResponse"])
-                .unwrap_or(1),
-            score: 112.0,
-            coverage_role: "client response materialization".to_string(),
-            producer: "packet_generic_client_send_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-
-    if source_lower.contains("dart:io")
-        && source_lower.contains("httpclient")
-        && source_lower.contains("future<streamedresponse>")
-        && source_lower.contains(" send(")
-        && source_lower.contains("request.finalize")
-        && normalized_source.contains("openurl")
-    {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: "Transport send".to_string(),
-            kind: NodeKind::METHOD,
-            line: packet_first_line_containing(source, &["Future<StreamedResponse>", " send("])
-                .unwrap_or(1),
-            score: 112.0,
-            coverage_role: "client transport send".to_string(),
-            producer: "packet_generic_client_send_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-}
-
-fn collect_hook_cache_shape_candidates(
-    path: &Path,
-    source: &str,
-    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
-) {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-    if !matches!(extension.as_str(), "js" | "mjs" | "cjs" | "ts") {
-        return;
-    }
-
-    let source_lower = source.to_ascii_lowercase();
-    let normalized_source = normalize_identifier(source);
-    let cache_helper_call = packet_source_shape_has_cache_helper_call(&normalized_source);
-    let hook_return_call = packet_source_shape_has_hook_return_call(&normalized_source);
-
-    if source_lower.contains("serialize(_key)")
-        && cache_helper_call
-        && normalized_source.contains("mutate")
-        && let Some((display_name, line)) = packet_first_exported_name_near(source, &["handler"])
-    {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name,
-            kind: NodeKind::FUNCTION,
-            line,
-            score: 118.0,
-            coverage_role: "hook_key_serialization".to_string(),
-            producer: "packet_generic_hook_cache_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-
-    if normalized_source.contains("stablehash")
-        && normalized_source.contains("returnkeyargs")
-        && let Some((display_name, line)) =
-            packet_first_exported_name_near(source, &["serialize", "key"])
-    {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name,
-            kind: NodeKind::FUNCTION,
-            line,
-            score: 116.0,
-            coverage_role: "hook_key_serialization".to_string(),
-            producer: "packet_generic_hook_cache_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-
-    if source_lower.contains("cache.get(key)")
-        && source_lower.contains("return [")
-        && (source_lower.contains("cache.set(key")
-            || source_lower.contains("state[5]")
-            || source_lower.contains("setter"))
-        && (source_lower.contains("state[6]")
-            || source_lower.contains("subscribe")
-            || source_lower.contains("subscriber"))
-        && (source_lower.contains("snapshot")
-            || source_lower.contains("initial_cache")
-            || source_lower.contains("initial cache"))
-        && let Some((display_name, line)) =
-            packet_first_exported_name_near(source, &["cache", "helper"])
-    {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name,
-            kind: NodeKind::FUNCTION,
-            line,
-            score: 116.0,
-            coverage_role: "hook_cache_helper".to_string(),
-            producer: "packet_generic_hook_cache_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-
-    if normalized_source.contains("exportasyncfunction")
-        && normalized_source.contains("serialize")
-        && cache_helper_call
-        && normalized_source.contains("mutatebykey")
-        && let Some((display_name, line)) =
-            packet_first_exported_name_near(source, &["mutate", "mutation", "mutat"])
-    {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name,
-            kind: NodeKind::FUNCTION,
-            line,
-            score: 115.0,
-            coverage_role: "hook_mutation_flow".to_string(),
-            producer: "packet_generic_hook_cache_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-
-    if normalized_source.contains("middleware")
-        && normalized_source.contains("hook")
-        && normalized_source.contains("configuse")
-        && hook_return_call
-        && let Some((display_name, line)) = packet_first_exported_name_near(source, &["middleware"])
-    {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name,
-            kind: NodeKind::FUNCTION,
-            line,
-            score: 110.0,
-            coverage_role: "hook_middleware_composition".to_string(),
-            producer: "packet_generic_hook_cache_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-}
-
-fn collect_event_loop_command_shape_candidates(
-    path: &Path,
-    source: &str,
-    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
-) {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-    if extension != "c" {
-        return;
-    }
-    let normalized_source = normalize_identifier(source);
-    let has_server = normalized_source.contains("server");
-    let has_command = normalized_source.contains("command");
-    let has_event_loop = normalized_source.contains("eventloop")
-        || normalized_source.contains("event_loop")
-        || (normalized_source.contains("event") && normalized_source.contains("loop"));
-    let has_client_input = normalized_source.contains("client")
-        && (normalized_source.contains("input")
-            || normalized_source.contains("buffer")
-            || normalized_source.contains("read"));
-    let functions = packet_c_function_names(source);
-
-    if has_server
-        && has_event_loop
-        && let Some((name, line)) =
-            packet_best_c_function_with_words(&functions, &["init", "server"], None)
-                .or_else(|| packet_c_function_exact(&functions, "main"))
-    {
-        push_command_shape_candidate(
-            path,
-            candidates,
-            name,
-            line,
-            "command_server_bootstrap",
-            124.0,
-        );
-    }
-    if has_event_loop
-        && let Some((name, line)) = packet_c_function_ending_with(&functions, "Main", "main")
-            .or_else(|| packet_best_c_function_with_words(&functions, &["event", "loop"], None))
-    {
-        push_command_shape_candidate(path, candidates, name, line, "command_event_loop", 128.0);
-    }
-    if has_command
-        && has_client_input
-        && let Some((name, line)) =
-            packet_best_c_function_with_words(&functions, &["read", "client"], Some("read"))
-                .or_else(|| {
-                    packet_best_c_function_with_words(&functions, &["client", "input"], None)
-                })
-    {
-        push_command_shape_candidate(path, candidates, name, line, "command_network_input", 130.0);
-    }
-    if has_command {
-        if let Some((name, line)) =
-            packet_best_c_function_with_words(&functions, &["process", "command"], None)
+    fn packet_generic_source_shape_candidate_path(project_root: &Path, path: &Path) -> bool {
+        let relative = path
+            .strip_prefix(project_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if relative.contains("/test/")
+            || relative.contains("/tests/")
+            || relative.starts_with("test/")
+            || relative.starts_with("tests/")
+            || relative.contains("/example")
+            || relative.starts_with("example")
+            || relative.contains("/docs/")
+            || relative.starts_with("docs/")
+            || relative.contains("docssource/")
+            || relative.contains("/vendor/")
+            || relative.starts_with("vendor/")
+            || relative.contains("/third_party/")
+            || relative.starts_with("third_party/")
+            || relative.contains("/deps/")
+            || relative.starts_with("deps/")
         {
-            push_command_shape_candidate(path, candidates, name, line, "command_dispatch", 126.0);
+            return false;
         }
-        if let Some((name, line)) = packet_c_function_exact(&functions, "call") {
-            push_command_shape_candidate(path, candidates, name, line, "command_dispatch", 125.0);
-        }
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "js" | "mjs"
+                        | "cjs"
+                        | "ts"
+                        | "html"
+                        | "htm"
+                        | "css"
+                        | "c"
+                        | "h"
+                        | "hpp"
+                        | "hh"
+                        | "cc"
+                        | "cpp"
+                        | "cxx"
+                        | "cs"
+                        | "dart"
+                        | "go"
+                        | "java"
+                        | "kt"
+                        | "rs"
+                        | "swift"
+                )
+            })
+            .unwrap_or(false)
     }
-}
 
-fn push_command_shape_candidate(
-    path: &Path,
-    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
-    display_name: String,
-    line: u32,
-    coverage_role: &str,
-    score: f32,
-) {
-    candidates.push(PacketGenericSourceShapeCandidate {
-        path: path.to_path_buf(),
-        line,
-        display_name,
-        kind: NodeKind::FUNCTION,
-        score,
-        coverage_role: coverage_role.to_string(),
-        producer: "packet_generic_command_source_probe".to_string(),
-        eligible_for_sufficiency: true,
-    });
-}
-
-fn packet_c_function_names(source: &str) -> Vec<(String, u32)> {
-    source
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let name = packet_c_function_name_from_line(line)?;
-            Some((name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)))
-        })
-        .collect()
-}
-
-fn packet_c_function_name_from_line(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.starts_with('#')
-        || trimmed.ends_with(';')
-        || trimmed.contains("typedef")
-        || !trimmed.contains('(')
-        || !trimmed.contains('{')
-    {
-        return None;
-    }
-    let before_paren = trimmed.split_once('(')?.0.trim_end();
-    let name = before_paren
-        .rsplit(|ch: char| !packet_source_identifier_char(ch))
-        .next()?
-        .trim();
-    if name.is_empty()
-        || matches!(
-            name,
-            "if" | "for" | "while" | "switch" | "return" | "sizeof"
-        )
-    {
-        return None;
-    }
-    Some(name.to_string())
-}
-
-fn packet_best_c_function_with_words(
-    functions: &[(String, u32)],
-    words: &[&str],
-    preferred_prefix: Option<&str>,
-) -> Option<(String, u32)> {
-    functions
-        .iter()
-        .filter(|(name, _)| {
-            let normalized = normalize_identifier(name);
-            words.iter().all(|word| normalized.contains(word))
-        })
-        .min_by_key(|(name, line)| {
-            let normalized = normalize_identifier(name);
-            let prefix_miss = preferred_prefix
-                .map(|prefix| !normalized.starts_with(prefix))
-                .unwrap_or(false);
-            (prefix_miss, name.len(), *line)
-        })
-        .cloned()
-}
-
-fn packet_c_function_exact(functions: &[(String, u32)], expected: &str) -> Option<(String, u32)> {
-    functions
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(expected))
-        .cloned()
-}
-
-fn packet_c_function_ending_with(
-    functions: &[(String, u32)],
-    suffix: &str,
-    excluded: &str,
-) -> Option<(String, u32)> {
-    functions
-        .iter()
-        .filter(|(name, _)| !name.eq_ignore_ascii_case(excluded) && name.ends_with(suffix))
-        .min_by_key(|(name, line)| (name.len(), *line))
-        .cloned()
-}
-
-fn collect_form_validation_shape_candidates(
-    path: &Path,
-    source: &str,
-    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
-) {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-    if !matches!(extension.as_str(), "html" | "htm") {
-        return;
-    }
-    let source_lower = source.to_ascii_lowercase();
-    if !source_lower.contains("<form") || !source_lower.contains("<input") {
-        return;
-    }
-    let has_native_constraints = source_lower.contains("required")
-        && source_lower.contains("pattern")
-        && source_lower.contains("min=")
-        && source_lower.contains("max=");
-    if has_native_constraints {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: "Native form constraints".to_string(),
-            kind: NodeKind::ANNOTATION,
-            line: packet_source_line_containing(source, "pattern").unwrap_or(1),
-            score: 132.0,
-            coverage_role: "form_native_constraints".to_string(),
-            producer: "packet_generic_form_validation_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-    if source_lower.contains("pattern=") {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: "pattern".to_string(),
-            kind: NodeKind::ANNOTATION,
-            line: packet_source_line_containing(source, "pattern").unwrap_or(1),
-            score: 130.0,
-            coverage_role: "form_pattern_constraint".to_string(),
-            producer: "packet_generic_form_validation_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-    if let Some((attribute, line)) = packet_first_form_validation_bypass_attribute(source) {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: attribute,
-            kind: NodeKind::ANNOTATION,
-            line,
-            score: 129.0,
-            coverage_role: "form_validation_bypass".to_string(),
-            producer: "packet_generic_form_validation_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-    if let Some(input_id) = packet_first_html_input_id(source) {
-        let score = if packet_first_form_validation_bypass_attribute(source).is_some()
-            || source_lower.contains("validity")
-        {
-            132.0
-        } else {
-            128.0
-        };
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: format!("input#{input_id}"),
-            kind: NodeKind::ANNOTATION,
-            line: packet_source_line_containing(source, &format!("id=\"{input_id}\""))
-                .or_else(|| packet_source_line_containing(source, &format!("id='{input_id}'")))
-                .unwrap_or(1),
-            score,
-            coverage_role: "form_custom_input".to_string(),
-            producer: "packet_generic_form_validation_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-    if let Some((function, line)) = packet_first_form_validation_error_function(source) {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: function,
-            kind: NodeKind::FUNCTION,
-            line,
-            score: 134.0,
-            coverage_role: "form_custom_error_rendering".to_string(),
-            producer: "packet_generic_form_validation_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-}
-
-fn collect_buffered_io_shape_candidates(
-    path: &Path,
-    source: &str,
-    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
-) {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-    if !matches!(extension.as_str(), "kt" | "java" | "swift" | "go" | "rs") {
-        return;
-    }
-    let buffered_type_names = packet_buffered_io_type_names(source);
-    for (display_name, role, score, line) in &buffered_type_names {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: display_name.clone(),
-            kind: NodeKind::CLASS,
-            line: *line,
-            score: *score,
-            coverage_role: (*role).to_string(),
-            producer: "packet_generic_buffered_io_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-    let source_lower = source.to_ascii_lowercase();
-    if source_lower.contains("buffer()") && !buffered_type_names.is_empty() {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: "buffer".to_string(),
-            kind: NodeKind::FUNCTION,
-            line: packet_source_line_containing(source, "buffer()").unwrap_or(1),
-            score: 134.0,
-            coverage_role: "buffered_wrapper_helper".to_string(),
-            producer: "packet_generic_buffered_io_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-}
-
-fn packet_buffered_io_type_names(source: &str) -> Vec<(String, &'static str, f32, u32)> {
-    let mut names = Vec::new();
-    for (index, line) in source.lines().enumerate() {
-        let Some(name) = packet_declared_type_name(line) else {
-            continue;
-        };
-        let normalized = name.to_ascii_lowercase();
-        if !normalized.contains("buffered") {
-            continue;
-        }
-        let Some((role, score)) = packet_buffered_io_role(&normalized) else {
-            continue;
-        };
-        names.push((
-            name,
-            role,
-            score,
-            index.saturating_add(1).try_into().unwrap_or(u32::MAX),
-        ));
-    }
-    names
-}
-
-fn packet_declared_type_name(line: &str) -> Option<String> {
-    let mut words = line
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .filter(|word| !word.is_empty());
-    while let Some(word) = words.next() {
-        if matches!(word, "class" | "struct" | "interface" | "object") {
-            return words.next().map(|name| name.to_string());
-        }
-    }
-    None
-}
-
-fn packet_buffered_io_role(normalized_name: &str) -> Option<(&'static str, f32)> {
-    if normalized_name.ends_with("source") {
-        return Some(("buffered_source_impl", 136.0));
-    }
-    if normalized_name.ends_with("sink") {
-        return Some(("buffered_sink_impl", 135.0));
-    }
-    None
-}
-
-fn collect_url_session_request_shape_candidates(
-    path: &Path,
-    source: &str,
-    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
-) {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-    if extension != "swift" {
-        return;
-    }
-    let source_lower = source.to_ascii_lowercase();
-    let type_name = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or("Request");
-    if source_lower.contains("func resume")
-        && (source_lower.contains("task.resume") || source_lower.contains("task?.resume"))
-    {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: format!("{type_name}.resume"),
-            kind: NodeKind::METHOD,
-            line: packet_source_line_containing(source, "func resume").unwrap_or(1),
-            score: 136.0,
-            coverage_role: "request_resume_dispatch".to_string(),
-            producer: "packet_generic_url_session_request_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-    if source_lower.contains("func validate")
-        && (source_lower.contains("validators") || source_lower.contains("validation"))
-    {
-        let score = if type_name.to_ascii_lowercase().contains("data") {
-            138.0
-        } else {
-            135.0
-        };
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: format!("{type_name}.validate"),
-            kind: NodeKind::METHOD,
-            line: packet_source_line_containing(source, "func validate").unwrap_or(1),
-            score,
-            coverage_role: "request_validation_pipeline".to_string(),
-            producer: "packet_generic_url_session_request_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-    if source_lower.contains("urlsession")
-        && source_lower.contains("func urlsession")
-        && (source_lower.contains("didreceive") || source_lower.contains("didcomplete"))
-    {
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
-            display_name: format!("{type_name}.urlSession"),
-            kind: NodeKind::METHOD,
-            line: packet_source_line_containing(source, "func urlSession").unwrap_or(1),
-            score: 137.0,
-            coverage_role: "session_callbacks".to_string(),
-            producer: "packet_generic_url_session_request_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-}
-
-fn collect_cited_request_validation_shape_candidates(
-    project_root: &Path,
-    answer: &AgentAnswerDto,
-    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
-) {
-    for citation in &answer.citations {
-        let Some(path) = citation.file_path.as_deref().map(Path::new) else {
-            continue;
-        };
-        let source_path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            project_root.join(path)
-        };
-        if path
+    fn collect_route_receiver_assignment_candidates(
+        path: &Path,
+        source: &str,
+        candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    ) {
+        let extension = path
             .extension()
             .and_then(|extension| extension.to_str())
-            .is_none_or(|extension| !extension.eq_ignore_ascii_case("swift"))
-        {
-            continue;
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(extension.as_str(), "js" | "mjs" | "cjs" | "ts") {
+            return;
         }
-        let Some(type_name) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        if normalize_identifier(type_name) != normalize_identifier(&citation.display_name) {
-            continue;
-        }
-        let Ok(source) = std::fs::read_to_string(&source_path) else {
-            continue;
-        };
-        if !packet_swift_request_validation_source(&source) {
-            continue;
-        }
-        candidates.push(PacketGenericSourceShapeCandidate {
-            path: source_path,
-            display_name: format!("{}.validate", citation.display_name),
-            kind: NodeKind::METHOD,
-            line: packet_source_line_containing(&source, "func validate").unwrap_or(1),
-            score: 140.0,
-            coverage_role: "request_validation_pipeline".to_string(),
-            producer: "packet_generic_url_session_request_source_probe".to_string(),
-            eligible_for_sufficiency: true,
-        });
-    }
-}
-
-fn packet_swift_request_validation_source(source: &str) -> bool {
-    let source_lower = source.to_ascii_lowercase();
-    source_lower.contains("func validate")
-        && source_lower.contains("request")
-        && (source_lower.contains("validators") || source_lower.contains("validation"))
-}
-
-fn packet_first_form_validation_bypass_attribute(source: &str) -> Option<(String, u32)> {
-    for (index, line) in source.lines().enumerate() {
-        let lower = line.to_ascii_lowercase();
-        if !lower.contains("<form") {
-            continue;
-        }
-        for attribute in line.split_ascii_whitespace() {
-            let attribute = attribute
-                .trim_matches(|ch: char| ch == '<' || ch == '>' || ch == '/')
-                .split('=')
-                .next()
-                .unwrap_or_default();
-            let normalized = attribute.to_ascii_lowercase();
-            if normalized.starts_with("no") && normalized.ends_with("validate") {
-                return Some((
-                    attribute.to_string(),
-                    index.saturating_add(1).try_into().unwrap_or(u32::MAX),
-                ));
-            }
-        }
-    }
-    None
-}
-
-fn packet_first_html_input_id(source: &str) -> Option<String> {
-    for line in source.lines() {
-        let lower = line.to_ascii_lowercase();
-        if !lower.contains("<input") || !lower.contains("id=") {
-            continue;
-        }
-        for quote in ['"', '\''] {
-            let marker = format!("id={quote}");
-            let Some(start) = lower.find(&marker) else {
+        let source_lower = source.to_ascii_lowercase();
+        for (index, line) in source.lines().enumerate() {
+            let Some((receiver, method)) = packet_js_receiver_function_assignment(line) else {
                 continue;
             };
-            let value_start = start + marker.len();
-            let value = &line[value_start..];
-            let Some(end) = value.find(quote) else {
+            let normalized_method = normalize_identifier(&method);
+            let route_method = matches!(
+                normalized_method.as_str(),
+                "init" | "handle" | "use" | "route" | "send" | "json" | "end" | "respond"
+            );
+            if !route_method {
                 continue;
-            };
-            let id = value[..end].trim();
-            if !id.is_empty() {
-                return Some(id.to_string());
             }
+            let method_context = match normalized_method.as_str() {
+                "init" => source_lower.contains("configuration") || source_lower.contains("router"),
+                "handle" | "use" | "route" => source_lower.contains("router"),
+                "send" | "json" | "end" | "respond" => {
+                    source_lower.contains("content-type")
+                        || source_lower.contains("content-length")
+                        || source_lower.contains(".end(")
+                        || source_lower.contains(".write(")
+                }
+                _ => false,
+            };
+            if !method_context {
+                continue;
+            }
+            let mut score = 90.0;
+            if matches!(
+                normalized_method.as_str(),
+                "handle" | "use" | "route" | "send"
+            ) {
+                score += 4.0;
+            }
+            if normalized_method == "init" {
+                score += 2.0;
+            }
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: format!("{receiver}.{method}"),
+                kind: NodeKind::METHOD,
+                line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+                score,
+                coverage_role: "receiver method assignment".to_string(),
+                producer: "packet_generic_receiver_method_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
         }
     }
-    None
-}
 
-fn packet_first_form_validation_error_function(source: &str) -> Option<(String, u32)> {
-    let source_lower = source.to_ascii_lowercase();
-    if !(source_lower.contains("validity.valuemissing")
-        || source_lower.contains("validity.typemismatch")
-        || source_lower.contains("validity.tooshort"))
-    {
-        return None;
-    }
-    source.lines().enumerate().find_map(|(index, line)| {
-        let trimmed = line.trim();
-        let name = trimmed.strip_prefix("function ")?.split_once('(')?.0.trim();
-        if name.is_empty() || !name.chars().all(packet_source_identifier_char) {
+    fn packet_js_receiver_function_assignment(line: &str) -> Option<(String, String)> {
+        let compact = line.trim();
+        let (left, right) = compact.split_once('=')?;
+        let right = right.trim_start();
+        if !right.starts_with("function") {
             return None;
         }
-        let normalized = normalize_identifier(name);
-        (normalized.contains("error") || normalized.contains("message")).then_some((
-            name.to_string(),
-            index.saturating_add(1).try_into().unwrap_or(u32::MAX),
-        ))
-    })
-}
-
-fn packet_source_line_containing(source: &str, needle: &str) -> Option<u32> {
-    source
-        .lines()
-        .position(|line| line.to_ascii_lowercase().contains(needle))
-        .map(|index| index.saturating_add(1).try_into().unwrap_or(u32::MAX))
-}
-
-fn packet_source_shape_has_cache_helper_call(normalized_source: &str) -> bool {
-    normalized_source.contains("cachehelper") && normalized_source.contains("create")
-}
-
-fn packet_source_shape_has_hook_return_call(normalized_source: &str) -> bool {
-    normalized_source.contains("returnuse") && normalized_source.contains("hook")
-}
-
-fn packet_source_shape_has_any(source: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| source.contains(needle))
-}
-
-fn packet_first_exported_name_near(
-    source: &str,
-    normalized_needles: &[&str],
-) -> Option<(String, u32)> {
-    source.lines().enumerate().find_map(|(index, line)| {
-        let name = packet_exported_name_from_line(line)?;
-        let normalized = normalize_identifier(&name);
-        normalized_needles
-            .iter()
-            .any(|needle| normalized.contains(needle))
-            .then(|| (name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)))
-    })
-}
-
-fn packet_exported_name_from_line(line: &str) -> Option<String> {
-    let trimmed = line.trim_start();
-    let remainder = trimmed
-        .strip_prefix("export async function ")
-        .or_else(|| trimmed.strip_prefix("export function "))
-        .or_else(|| trimmed.strip_prefix("export const "))?;
-    let name = remainder
-        .chars()
-        .take_while(|ch| packet_source_identifier_char(*ch))
-        .collect::<String>();
-    (!name.is_empty()).then_some(name)
-}
-
-fn packet_first_line_containing(source: &str, needles: &[&str]) -> Option<u32> {
-    source
-        .lines()
-        .enumerate()
-        .find(|(_, line)| needles.iter().all(|needle| line.contains(needle)))
-        .and_then(|(index, _)| index.saturating_add(1).try_into().ok())
-}
-
-fn collect_csharp_mapper_shape_candidates(
-    path: &Path,
-    source: &str,
-    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
-) {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-    if extension != "cs" {
-        return;
-    }
-    let normalized_source = normalize_identifier(source);
-    let source_lower = source.to_ascii_lowercase();
-    if !(normalized_source.contains("mapper")
-        || (normalized_source.contains("map") && normalized_source.contains("destination")))
-    {
-        return;
-    }
-    let normalized_path = path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    let internal_mapper_strategy_path = normalized_path.contains("/mappers/")
-        || normalized_path.contains("/mapperstrateg")
-        || normalized_path.contains("/mappingstrateg");
-
-    if packet_csharp_source_has_public_mapper_api(&normalized_source) {
-        let mut public_mapper_interfaces = Vec::new();
-        if !internal_mapper_strategy_path {
-            for (name, line) in packet_csharp_declared_type_names(source, "interface") {
-                let normalized_name = normalize_identifier(&name);
-                if packet_csharp_public_mapper_api_name(&normalized_name)
-                    && !normalized_name.contains("internal")
-                {
-                    public_mapper_interfaces.push((name, line));
-                }
-            }
+        let (receiver, method) = left.trim().rsplit_once('.')?;
+        let receiver = receiver
+            .rsplit(|ch: char| !packet_source_identifier_char(ch))
+            .next()
+            .unwrap_or(receiver)
+            .trim();
+        let method = method.trim();
+        if receiver.is_empty() || method.is_empty() {
+            return None;
         }
-        let runtime_mapper_method =
-            packet_csharp_runtime_mapper_method_candidate(source, &normalized_source);
-        let grouped_facade = packet_csharp_public_mapper_api_facade_group(
-            &public_mapper_interfaces,
-            runtime_mapper_method.as_ref(),
-        );
-        if let Some((display_name, line)) = grouped_facade {
+        if !receiver.chars().all(packet_source_identifier_char)
+            || !method.chars().all(packet_source_identifier_char)
+        {
+            return None;
+        }
+        Some((receiver.to_string(), method.to_string()))
+    }
+
+    fn collect_client_send_shape_candidates(
+        path: &Path,
+        source: &str,
+        candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    ) {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if extension != "dart" {
+            return;
+        }
+
+        let normalized_source = normalize_identifier(source);
+        let source_lower = source.to_ascii_lowercase();
+        if source_lower.contains("_withclient")
+            && source_lower.contains("client()")
+            && source_lower.contains("client.")
+            && packet_source_shape_has_any(source, &["get(", "post(", "put(", "patch(", "delete("])
+        {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: "Top-level HTTP helpers".to_string(),
+                kind: NodeKind::FUNCTION,
+                line: packet_first_line_containing(source, &["Future<Response>", " get("])
+                    .unwrap_or(1),
+                score: 116.0,
+                coverage_role: "client public facade".to_string(),
+                producer: "packet_generic_client_send_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+
+        if normalized_source.contains("interfaceclassclient")
+            && normalized_source.contains("futureresponse")
+            && normalized_source.contains("futurestreamedresponsesend")
+            && normalized_source.contains("request")
+        {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: "Client interface helpers".to_string(),
+                kind: NodeKind::METHOD,
+                line: packet_first_line_containing(source, &["Future<Response>", " get("])
+                    .unwrap_or(1),
+                score: 114.0,
+                coverage_role: "client interface helpers".to_string(),
+                producer: "packet_generic_client_send_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+
+        if normalized_source.contains("classrequestextends")
+            && normalized_source.contains("bytestreamfinalize")
+            && normalized_source.contains("frombytesbodybytes")
+        {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: "Request.finalize".to_string(),
+                kind: NodeKind::METHOD,
+                line: packet_first_line_containing(source, &["ByteStream", " finalize("])
+                    .unwrap_or(1),
+                score: 112.0,
+                coverage_role: "client request finalization".to_string(),
+                producer: "packet_generic_client_send_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+
+        if normalized_source.contains("classresponseextendsbaseresponse")
+            && normalized_source.contains("fromstreamstreamedresponseresponse")
+            && normalized_source.contains("responsestreamtobytes")
+        {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: "Response.fromStream".to_string(),
+                kind: NodeKind::METHOD,
+                line: packet_first_line_containing(source, &["fromStream", "StreamedResponse"])
+                    .unwrap_or(1),
+                score: 112.0,
+                coverage_role: "client response materialization".to_string(),
+                producer: "packet_generic_client_send_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+
+        if source_lower.contains("dart:io")
+            && source_lower.contains("httpclient")
+            && source_lower.contains("future<streamedresponse>")
+            && source_lower.contains(" send(")
+            && source_lower.contains("request.finalize")
+            && normalized_source.contains("openurl")
+        {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: "Transport send".to_string(),
+                kind: NodeKind::METHOD,
+                line: packet_first_line_containing(source, &["Future<StreamedResponse>", " send("])
+                    .unwrap_or(1),
+                score: 112.0,
+                coverage_role: "client transport send".to_string(),
+                producer: "packet_generic_client_send_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+    }
+
+    fn collect_hook_cache_shape_candidates(
+        path: &Path,
+        source: &str,
+        candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    ) {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(extension.as_str(), "js" | "mjs" | "cjs" | "ts") {
+            return;
+        }
+
+        let source_lower = source.to_ascii_lowercase();
+        let normalized_source = normalize_identifier(source);
+        let cache_helper_call = packet_source_shape_has_cache_helper_call(&normalized_source);
+        let hook_return_call = packet_source_shape_has_hook_return_call(&normalized_source);
+
+        if source_lower.contains("serialize(_key)")
+            && cache_helper_call
+            && normalized_source.contains("mutate")
+            && let Some((display_name, line)) =
+                packet_first_exported_name_near(source, &["handler"])
+        {
             candidates.push(PacketGenericSourceShapeCandidate {
                 path: path.to_path_buf(),
                 display_name,
-                kind: NodeKind::METHOD,
+                kind: NodeKind::FUNCTION,
                 line,
-                score: 112.0,
-                coverage_role: "mapper public api".to_string(),
-                producer: "packet_generic_csharp_mapper_source_probe".to_string(),
-                eligible_for_sufficiency: false,
+                score: 118.0,
+                coverage_role: "hook_key_serialization".to_string(),
+                producer: "packet_generic_hook_cache_source_probe".to_string(),
+                eligible_for_sufficiency: true,
             });
-        } else {
-            for (name, line) in public_mapper_interfaces {
-                candidates.push(PacketGenericSourceShapeCandidate {
-                    path: path.to_path_buf(),
-                    display_name: name,
-                    kind: NodeKind::INTERFACE,
-                    line,
-                    score: 108.0,
-                    coverage_role: "mapper public api".to_string(),
-                    producer: "packet_generic_csharp_mapper_source_probe".to_string(),
-                    eligible_for_sufficiency: false,
-                });
-            }
-            if let Some((owner, method, line)) = runtime_mapper_method.as_ref() {
-                candidates.push(PacketGenericSourceShapeCandidate {
-                    path: path.to_path_buf(),
-                    display_name: format!("{owner}.{method}"),
-                    kind: NodeKind::METHOD,
-                    line: *line,
-                    score: 109.0,
-                    coverage_role: "mapper public api".to_string(),
-                    producer: "packet_generic_csharp_mapper_source_probe".to_string(),
-                    eligible_for_sufficiency: false,
-                });
-            }
+        }
+
+        if normalized_source.contains("stablehash")
+            && normalized_source.contains("returnkeyargs")
+            && let Some((display_name, line)) =
+                packet_first_exported_name_near(source, &["serialize", "key"])
+        {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name,
+                kind: NodeKind::FUNCTION,
+                line,
+                score: 116.0,
+                coverage_role: "hook_key_serialization".to_string(),
+                producer: "packet_generic_hook_cache_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+
+        if source_lower.contains("cache.get(key)")
+            && source_lower.contains("return [")
+            && (source_lower.contains("cache.set(key")
+                || source_lower.contains("state[5]")
+                || source_lower.contains("setter"))
+            && (source_lower.contains("state[6]")
+                || source_lower.contains("subscribe")
+                || source_lower.contains("subscriber"))
+            && (source_lower.contains("snapshot")
+                || source_lower.contains("initial_cache")
+                || source_lower.contains("initial cache"))
+            && let Some((display_name, line)) =
+                packet_first_exported_name_near(source, &["cache", "helper"])
+        {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name,
+                kind: NodeKind::FUNCTION,
+                line,
+                score: 116.0,
+                coverage_role: "hook_cache_helper".to_string(),
+                producer: "packet_generic_hook_cache_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+
+        if normalized_source.contains("exportasyncfunction")
+            && normalized_source.contains("serialize")
+            && cache_helper_call
+            && normalized_source.contains("mutatebykey")
+            && let Some((display_name, line)) =
+                packet_first_exported_name_near(source, &["mutate", "mutation", "mutat"])
+        {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name,
+                kind: NodeKind::FUNCTION,
+                line,
+                score: 115.0,
+                coverage_role: "hook_mutation_flow".to_string(),
+                producer: "packet_generic_hook_cache_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+
+        if normalized_source.contains("middleware")
+            && normalized_source.contains("hook")
+            && normalized_source.contains("configuse")
+            && hook_return_call
+            && let Some((display_name, line)) =
+                packet_first_exported_name_near(source, &["middleware"])
+        {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name,
+                kind: NodeKind::FUNCTION,
+                line,
+                score: 110.0,
+                coverage_role: "hook_middleware_composition".to_string(),
+                producer: "packet_generic_hook_cache_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
         }
     }
 
-    if packet_csharp_source_has_mapping_configuration_owner(&normalized_source) {
-        for (name, line) in packet_csharp_declared_type_names(source, "class") {
-            let normalized_name = normalize_identifier(&name);
-            if normalized_name.contains("configuration")
-                && (normalized_name.contains("mapper") || normalized_name.contains("mapping"))
+    fn collect_event_loop_command_shape_candidates(
+        path: &Path,
+        source: &str,
+        candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    ) {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if extension != "c" {
+            return;
+        }
+        let normalized_source = normalize_identifier(source);
+        let has_server = normalized_source.contains("server");
+        let has_command = normalized_source.contains("command");
+        let has_event_loop = normalized_source.contains("eventloop")
+            || normalized_source.contains("event_loop")
+            || (normalized_source.contains("event") && normalized_source.contains("loop"));
+        let has_client_input = normalized_source.contains("client")
+            && (normalized_source.contains("input")
+                || normalized_source.contains("buffer")
+                || normalized_source.contains("read"));
+        let functions = packet_c_function_names(source);
+
+        if has_server
+            && has_event_loop
+            && let Some((name, line)) =
+                packet_best_c_function_with_words(&functions, &["init", "server"], None)
+                    .or_else(|| packet_c_function_exact(&functions, "main"))
+        {
+            push_command_shape_candidate(
+                path,
+                candidates,
+                name,
+                line,
+                "command_server_bootstrap",
+                124.0,
+            );
+        }
+        if has_event_loop
+            && let Some((name, line)) = packet_c_function_ending_with(&functions, "Main", "main")
+                .or_else(|| packet_best_c_function_with_words(&functions, &["event", "loop"], None))
+        {
+            push_command_shape_candidate(path, candidates, name, line, "command_event_loop", 128.0);
+        }
+        if has_command
+            && has_client_input
+            && let Some((name, line)) =
+                packet_best_c_function_with_words(&functions, &["read", "client"], Some("read"))
+                    .or_else(|| {
+                        packet_best_c_function_with_words(&functions, &["client", "input"], None)
+                    })
+        {
+            push_command_shape_candidate(
+                path,
+                candidates,
+                name,
+                line,
+                "command_network_input",
+                130.0,
+            );
+        }
+        if has_command {
+            if let Some((name, line)) =
+                packet_best_c_function_with_words(&functions, &["process", "command"], None)
             {
-                candidates.push(PacketGenericSourceShapeCandidate {
-                    path: path.to_path_buf(),
-                    display_name: name,
-                    kind: NodeKind::CLASS,
+                push_command_shape_candidate(
+                    path,
+                    candidates,
+                    name,
                     line,
-                    score: 99.0,
-                    coverage_role: "mapper configuration".to_string(),
-                    producer: "packet_generic_csharp_mapper_source_probe".to_string(),
-                    eligible_for_sufficiency: false,
-                });
+                    "command_dispatch",
+                    126.0,
+                );
+            }
+            if let Some((name, line)) = packet_c_function_exact(&functions, "call") {
+                push_command_shape_candidate(
+                    path,
+                    candidates,
+                    name,
+                    line,
+                    "command_dispatch",
+                    125.0,
+                );
             }
         }
     }
 
-    if packet_csharp_source_has_type_map_lambda_plan(&normalized_source) {
-        let type_owner = packet_csharp_declared_type_names(source, "class")
-            .into_iter()
-            .find(|(name, _)| {
+    fn push_command_shape_candidate(
+        path: &Path,
+        candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+        display_name: String,
+        line: u32,
+        coverage_role: &str,
+        score: f32,
+    ) {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            line,
+            display_name,
+            kind: NodeKind::FUNCTION,
+            score,
+            coverage_role: coverage_role.to_string(),
+            producer: "packet_generic_command_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    fn packet_c_function_names(source: &str) -> Vec<(String, u32)> {
+        source
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                let name = packet_c_function_name_from_line(line)?;
+                Some((name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)))
+            })
+            .collect()
+    }
+
+    fn packet_c_function_name_from_line(line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#')
+            || trimmed.ends_with(';')
+            || trimmed.contains("typedef")
+            || !trimmed.contains('(')
+            || !trimmed.contains('{')
+        {
+            return None;
+        }
+        let before_paren = trimmed.split_once('(')?.0.trim_end();
+        let name = before_paren
+            .rsplit(|ch: char| !packet_source_identifier_char(ch))
+            .next()?
+            .trim();
+        if name.is_empty()
+            || matches!(
+                name,
+                "if" | "for" | "while" | "switch" | "return" | "sizeof"
+            )
+        {
+            return None;
+        }
+        Some(name.to_string())
+    }
+
+    fn packet_best_c_function_with_words(
+        functions: &[(String, u32)],
+        words: &[&str],
+        preferred_prefix: Option<&str>,
+    ) -> Option<(String, u32)> {
+        functions
+            .iter()
+            .filter(|(name, _)| {
                 let normalized = normalize_identifier(name);
-                normalized.contains("map")
-                    && (normalized.contains("type")
-                        || normalized_source.contains("sourcetype")
-                        || normalized_source.contains("destinationtype"))
+                words.iter().all(|word| normalized.contains(word))
+            })
+            .min_by_key(|(name, line)| {
+                let normalized = normalize_identifier(name);
+                let prefix_miss = preferred_prefix
+                    .map(|prefix| !normalized.starts_with(prefix))
+                    .unwrap_or(false);
+                (prefix_miss, name.len(), *line)
+            })
+            .cloned()
+    }
+
+    fn packet_c_function_exact(
+        functions: &[(String, u32)],
+        expected: &str,
+    ) -> Option<(String, u32)> {
+        functions
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(expected))
+            .cloned()
+    }
+
+    fn packet_c_function_ending_with(
+        functions: &[(String, u32)],
+        suffix: &str,
+        excluded: &str,
+    ) -> Option<(String, u32)> {
+        functions
+            .iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case(excluded) && name.ends_with(suffix))
+            .min_by_key(|(name, line)| (name.len(), *line))
+            .cloned()
+    }
+
+    fn collect_form_validation_shape_candidates(
+        path: &Path,
+        source: &str,
+        candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    ) {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(extension.as_str(), "html" | "htm") {
+            return;
+        }
+        let source_lower = source.to_ascii_lowercase();
+        if !source_lower.contains("<form") || !source_lower.contains("<input") {
+            return;
+        }
+        let has_native_constraints = source_lower.contains("required")
+            && source_lower.contains("pattern")
+            && source_lower.contains("min=")
+            && source_lower.contains("max=");
+        if has_native_constraints {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: "Native form constraints".to_string(),
+                kind: NodeKind::ANNOTATION,
+                line: packet_source_line_containing(source, "pattern").unwrap_or(1),
+                score: 132.0,
+                coverage_role: "form_native_constraints".to_string(),
+                producer: "packet_generic_form_validation_source_probe".to_string(),
+                eligible_for_sufficiency: true,
             });
-        if let Some((owner, _)) = type_owner {
-            for (method, line) in packet_csharp_method_names(source) {
-                let normalized_method = normalize_identifier(&method);
-                if normalized_method.contains("lambda")
-                    && (normalized_method.contains("map") || source_lower.contains("mapexpression"))
-                {
+        }
+        if source_lower.contains("pattern=") {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: "pattern".to_string(),
+                kind: NodeKind::ANNOTATION,
+                line: packet_source_line_containing(source, "pattern").unwrap_or(1),
+                score: 130.0,
+                coverage_role: "form_pattern_constraint".to_string(),
+                producer: "packet_generic_form_validation_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+        if let Some((attribute, line)) = packet_first_form_validation_bypass_attribute(source) {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: attribute,
+                kind: NodeKind::ANNOTATION,
+                line,
+                score: 129.0,
+                coverage_role: "form_validation_bypass".to_string(),
+                producer: "packet_generic_form_validation_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+        if let Some(input_id) = packet_first_html_input_id(source) {
+            let score = if packet_first_form_validation_bypass_attribute(source).is_some()
+                || source_lower.contains("validity")
+            {
+                132.0
+            } else {
+                128.0
+            };
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: format!("input#{input_id}"),
+                kind: NodeKind::ANNOTATION,
+                line: packet_source_line_containing(source, &format!("id=\"{input_id}\""))
+                    .or_else(|| packet_source_line_containing(source, &format!("id='{input_id}'")))
+                    .unwrap_or(1),
+                score,
+                coverage_role: "form_custom_input".to_string(),
+                producer: "packet_generic_form_validation_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+        if let Some((function, line)) = packet_first_form_validation_error_function(source) {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: function,
+                kind: NodeKind::FUNCTION,
+                line,
+                score: 134.0,
+                coverage_role: "form_custom_error_rendering".to_string(),
+                producer: "packet_generic_form_validation_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+    }
+
+    fn collect_buffered_io_shape_candidates(
+        path: &Path,
+        source: &str,
+        candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    ) {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(extension.as_str(), "kt" | "java" | "swift" | "go" | "rs") {
+            return;
+        }
+        let buffered_type_names = packet_buffered_io_type_names(source);
+        for (display_name, role, score, line) in &buffered_type_names {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: display_name.clone(),
+                kind: NodeKind::CLASS,
+                line: *line,
+                score: *score,
+                coverage_role: (*role).to_string(),
+                producer: "packet_generic_buffered_io_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+        let source_lower = source.to_ascii_lowercase();
+        if source_lower.contains("buffer()") && !buffered_type_names.is_empty() {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: "buffer".to_string(),
+                kind: NodeKind::FUNCTION,
+                line: packet_source_line_containing(source, "buffer()").unwrap_or(1),
+                score: 134.0,
+                coverage_role: "buffered_wrapper_helper".to_string(),
+                producer: "packet_generic_buffered_io_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+    }
+
+    fn packet_buffered_io_type_names(source: &str) -> Vec<(String, &'static str, f32, u32)> {
+        let mut names = Vec::new();
+        for (index, line) in source.lines().enumerate() {
+            let Some(name) = packet_declared_type_name(line) else {
+                continue;
+            };
+            let normalized = name.to_ascii_lowercase();
+            if !normalized.contains("buffered") {
+                continue;
+            }
+            let Some((role, score)) = packet_buffered_io_role(&normalized) else {
+                continue;
+            };
+            names.push((
+                name,
+                role,
+                score,
+                index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            ));
+        }
+        names
+    }
+
+    fn packet_declared_type_name(line: &str) -> Option<String> {
+        let mut words = line
+            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .filter(|word| !word.is_empty());
+        while let Some(word) = words.next() {
+            if matches!(word, "class" | "struct" | "interface" | "object") {
+                return words.next().map(|name| name.to_string());
+            }
+        }
+        None
+    }
+
+    fn packet_buffered_io_role(normalized_name: &str) -> Option<(&'static str, f32)> {
+        if normalized_name.ends_with("source") {
+            return Some(("buffered_source_impl", 136.0));
+        }
+        if normalized_name.ends_with("sink") {
+            return Some(("buffered_sink_impl", 135.0));
+        }
+        None
+    }
+
+    fn collect_url_session_request_shape_candidates(
+        path: &Path,
+        source: &str,
+        candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    ) {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if extension != "swift" {
+            return;
+        }
+        let source_lower = source.to_ascii_lowercase();
+        let type_name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or("Request");
+        if source_lower.contains("func resume")
+            && (source_lower.contains("task.resume") || source_lower.contains("task?.resume"))
+        {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: format!("{type_name}.resume"),
+                kind: NodeKind::METHOD,
+                line: packet_source_line_containing(source, "func resume").unwrap_or(1),
+                score: 136.0,
+                coverage_role: "request_resume_dispatch".to_string(),
+                producer: "packet_generic_url_session_request_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+        if source_lower.contains("func validate")
+            && (source_lower.contains("validators") || source_lower.contains("validation"))
+        {
+            let score = if type_name.to_ascii_lowercase().contains("data") {
+                138.0
+            } else {
+                135.0
+            };
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: format!("{type_name}.validate"),
+                kind: NodeKind::METHOD,
+                line: packet_source_line_containing(source, "func validate").unwrap_or(1),
+                score,
+                coverage_role: "request_validation_pipeline".to_string(),
+                producer: "packet_generic_url_session_request_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+        if source_lower.contains("urlsession")
+            && source_lower.contains("func urlsession")
+            && (source_lower.contains("didreceive") || source_lower.contains("didcomplete"))
+        {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: format!("{type_name}.urlSession"),
+                kind: NodeKind::METHOD,
+                line: packet_source_line_containing(source, "func urlSession").unwrap_or(1),
+                score: 137.0,
+                coverage_role: "session_callbacks".to_string(),
+                producer: "packet_generic_url_session_request_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+    }
+
+    fn collect_cited_request_validation_shape_candidates(
+        project_root: &Path,
+        answer: &AgentAnswerDto,
+        candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    ) {
+        for citation in &answer.citations {
+            let Some(path) = citation.file_path.as_deref().map(Path::new) else {
+                continue;
+            };
+            let source_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                project_root.join(path)
+            };
+            if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_none_or(|extension| !extension.eq_ignore_ascii_case("swift"))
+            {
+                continue;
+            }
+            let Some(type_name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if normalize_identifier(type_name) != normalize_identifier(&citation.display_name) {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&source_path) else {
+                continue;
+            };
+            if !packet_swift_request_validation_source(&source) {
+                continue;
+            }
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: source_path,
+                display_name: format!("{}.validate", citation.display_name),
+                kind: NodeKind::METHOD,
+                line: packet_source_line_containing(&source, "func validate").unwrap_or(1),
+                score: 140.0,
+                coverage_role: "request_validation_pipeline".to_string(),
+                producer: "packet_generic_url_session_request_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+    }
+
+    fn packet_swift_request_validation_source(source: &str) -> bool {
+        let source_lower = source.to_ascii_lowercase();
+        source_lower.contains("func validate")
+            && source_lower.contains("request")
+            && (source_lower.contains("validators") || source_lower.contains("validation"))
+    }
+
+    fn packet_first_form_validation_bypass_attribute(source: &str) -> Option<(String, u32)> {
+        for (index, line) in source.lines().enumerate() {
+            let lower = line.to_ascii_lowercase();
+            if !lower.contains("<form") {
+                continue;
+            }
+            for attribute in line.split_ascii_whitespace() {
+                let attribute = attribute
+                    .trim_matches(|ch: char| ch == '<' || ch == '>' || ch == '/')
+                    .split('=')
+                    .next()
+                    .unwrap_or_default();
+                let normalized = attribute.to_ascii_lowercase();
+                if normalized.starts_with("no") && normalized.ends_with("validate") {
+                    return Some((
+                        attribute.to_string(),
+                        index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    fn packet_first_html_input_id(source: &str) -> Option<String> {
+        for line in source.lines() {
+            let lower = line.to_ascii_lowercase();
+            if !lower.contains("<input") || !lower.contains("id=") {
+                continue;
+            }
+            for quote in ['"', '\''] {
+                let marker = format!("id={quote}");
+                let Some(start) = lower.find(&marker) else {
+                    continue;
+                };
+                let value_start = start + marker.len();
+                let value = &line[value_start..];
+                let Some(end) = value.find(quote) else {
+                    continue;
+                };
+                let id = value[..end].trim();
+                if !id.is_empty() {
+                    return Some(id.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn packet_first_form_validation_error_function(source: &str) -> Option<(String, u32)> {
+        let source_lower = source.to_ascii_lowercase();
+        if !(source_lower.contains("validity.valuemissing")
+            || source_lower.contains("validity.typemismatch")
+            || source_lower.contains("validity.tooshort"))
+        {
+            return None;
+        }
+        source.lines().enumerate().find_map(|(index, line)| {
+            let trimmed = line.trim();
+            let name = trimmed.strip_prefix("function ")?.split_once('(')?.0.trim();
+            if name.is_empty() || !name.chars().all(packet_source_identifier_char) {
+                return None;
+            }
+            let normalized = normalize_identifier(name);
+            (normalized.contains("error") || normalized.contains("message")).then_some((
+                name.to_string(),
+                index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            ))
+        })
+    }
+
+    fn packet_source_line_containing(source: &str, needle: &str) -> Option<u32> {
+        source
+            .lines()
+            .position(|line| line.to_ascii_lowercase().contains(needle))
+            .map(|index| index.saturating_add(1).try_into().unwrap_or(u32::MAX))
+    }
+
+    fn packet_source_shape_has_cache_helper_call(normalized_source: &str) -> bool {
+        normalized_source.contains("cachehelper") && normalized_source.contains("create")
+    }
+
+    fn packet_source_shape_has_hook_return_call(normalized_source: &str) -> bool {
+        normalized_source.contains("returnuse") && normalized_source.contains("hook")
+    }
+
+    fn packet_source_shape_has_any(source: &str, needles: &[&str]) -> bool {
+        needles.iter().any(|needle| source.contains(needle))
+    }
+
+    fn packet_first_exported_name_near(
+        source: &str,
+        normalized_needles: &[&str],
+    ) -> Option<(String, u32)> {
+        source.lines().enumerate().find_map(|(index, line)| {
+            let name = packet_exported_name_from_line(line)?;
+            let normalized = normalize_identifier(&name);
+            normalized_needles
+                .iter()
+                .any(|needle| normalized.contains(needle))
+                .then(|| (name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)))
+        })
+    }
+
+    fn packet_exported_name_from_line(line: &str) -> Option<String> {
+        let trimmed = line.trim_start();
+        let remainder = trimmed
+            .strip_prefix("export async function ")
+            .or_else(|| trimmed.strip_prefix("export function "))
+            .or_else(|| trimmed.strip_prefix("export const "))?;
+        let name = remainder
+            .chars()
+            .take_while(|ch| packet_source_identifier_char(*ch))
+            .collect::<String>();
+        (!name.is_empty()).then_some(name)
+    }
+
+    fn packet_first_line_containing(source: &str, needles: &[&str]) -> Option<u32> {
+        source
+            .lines()
+            .enumerate()
+            .find(|(_, line)| needles.iter().all(|needle| line.contains(needle)))
+            .and_then(|(index, _)| index.saturating_add(1).try_into().ok())
+    }
+
+    fn collect_csharp_mapper_shape_candidates(
+        path: &Path,
+        source: &str,
+        candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    ) {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if extension != "cs" {
+            return;
+        }
+        let normalized_source = normalize_identifier(source);
+        let source_lower = source.to_ascii_lowercase();
+        if !(normalized_source.contains("mapper")
+            || (normalized_source.contains("map") && normalized_source.contains("destination")))
+        {
+            return;
+        }
+        let normalized_path = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        let internal_mapper_strategy_path = normalized_path.contains("/mappers/")
+            || normalized_path.contains("/mapperstrateg")
+            || normalized_path.contains("/mappingstrateg");
+
+        if packet_csharp_source_has_public_mapper_api(&normalized_source) {
+            let mut public_mapper_interfaces = Vec::new();
+            if !internal_mapper_strategy_path {
+                for (name, line) in packet_csharp_declared_type_names(source, "interface") {
+                    let normalized_name = normalize_identifier(&name);
+                    if packet_csharp_public_mapper_api_name(&normalized_name)
+                        && !normalized_name.contains("internal")
+                    {
+                        public_mapper_interfaces.push((name, line));
+                    }
+                }
+            }
+            let runtime_mapper_method =
+                packet_csharp_runtime_mapper_method_candidate(source, &normalized_source);
+            let grouped_facade = packet_csharp_public_mapper_api_facade_group(
+                &public_mapper_interfaces,
+                runtime_mapper_method.as_ref(),
+            );
+            if let Some((display_name, line)) = grouped_facade {
+                candidates.push(PacketGenericSourceShapeCandidate {
+                    path: path.to_path_buf(),
+                    display_name,
+                    kind: NodeKind::METHOD,
+                    line,
+                    score: 112.0,
+                    coverage_role: "mapper public api".to_string(),
+                    producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                    eligible_for_sufficiency: false,
+                });
+            } else {
+                for (name, line) in public_mapper_interfaces {
+                    candidates.push(PacketGenericSourceShapeCandidate {
+                        path: path.to_path_buf(),
+                        display_name: name,
+                        kind: NodeKind::INTERFACE,
+                        line,
+                        score: 108.0,
+                        coverage_role: "mapper public api".to_string(),
+                        producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                        eligible_for_sufficiency: false,
+                    });
+                }
+                if let Some((owner, method, line)) = runtime_mapper_method.as_ref() {
                     candidates.push(PacketGenericSourceShapeCandidate {
                         path: path.to_path_buf(),
                         display_name: format!("{owner}.{method}"),
                         kind: NodeKind::METHOD,
-                        line,
-                        score: 99.0,
-                        coverage_role: "mapping execution plan".to_string(),
+                        line: *line,
+                        score: 109.0,
+                        coverage_role: "mapper public api".to_string(),
                         producer: "packet_generic_csharp_mapper_source_probe".to_string(),
                         eligible_for_sufficiency: false,
                     });
                 }
             }
         }
-    }
-}
 
-fn packet_csharp_source_has_public_mapper_api(normalized_source: &str) -> bool {
-    normalized_source.contains("interface")
-        && normalized_source.contains("map")
-        && normalized_source.contains("source")
-        && normalized_source.contains("destination")
-        && (normalized_source.contains("mapper") || normalized_source.contains("mapping"))
-}
-
-fn packet_csharp_public_mapper_api_name(normalized_name: &str) -> bool {
-    normalized_name.contains("mapper")
-        && ![
-            "action",
-            "configuration",
-            "convention",
-            "destinationname",
-            "expression",
-            "member",
-            "operation",
-            "options",
-            "projection",
-            "source",
-        ]
-        .iter()
-        .any(|needle| normalized_name.contains(needle))
-}
-
-fn packet_csharp_runtime_mapper_method_candidate(
-    source: &str,
-    normalized_source: &str,
-) -> Option<(String, String, u32)> {
-    if !(normalized_source.contains("class")
-        && normalized_source.contains("mapper")
-        && normalized_source.contains("mapcore")
-        && normalized_source.contains("getexecutionplan"))
-    {
-        return None;
-    }
-    let owner = packet_csharp_declared_type_names(source, "class")
-        .into_iter()
-        .find_map(|(name, _)| {
-            packet_csharp_public_mapper_api_name(&normalize_identifier(&name)).then_some(name)
-        })?;
-    packet_csharp_method_names(source)
-        .into_iter()
-        .find(|(method, _)| normalize_identifier(method) == "map")
-        .map(|(method, line)| (owner, method, line))
-}
-
-fn packet_csharp_public_mapper_api_facade_group(
-    interfaces: &[(String, u32)],
-    runtime_method: Option<&(String, String, u32)>,
-) -> Option<(String, u32)> {
-    let mut names = Vec::new();
-    let mut line = u32::MAX;
-    for (name, name_line) in interfaces {
-        if !names.iter().any(|existing| existing == name) {
-            names.push(name.clone());
-            line = line.min(*name_line);
-        }
-    }
-    if let Some((owner, method, method_line)) = runtime_method {
-        let display_name = format!("{owner}.{method}");
-        if !names.iter().any(|existing| existing == &display_name) {
-            names.push(display_name);
-            line = line.min(*method_line);
-        }
-    }
-    if names.len() < 2 {
-        return None;
-    }
-    Some((format!("public mapper API: {}", names.join(", ")), line))
-}
-
-fn packet_csharp_source_has_mapping_configuration_owner(normalized_source: &str) -> bool {
-    normalized_source.contains("configuration")
-        && (normalized_source.contains("configuredmaps")
-            || normalized_source.contains("resolvedmaps")
-            || normalized_source.contains("typemaps")
-            || normalized_source.contains("executionplans"))
-        && (normalized_source.contains("buildexecutionplan")
-            || normalized_source.contains("createmapper")
-            || normalized_source.contains("compilemappings"))
-}
-
-fn packet_csharp_source_has_type_map_lambda_plan(normalized_source: &str) -> bool {
-    normalized_source.contains("lambda")
-        && normalized_source.contains("map")
-        && (normalized_source.contains("sourcetype") || normalized_source.contains("source"))
-        && (normalized_source.contains("destinationtype")
-            || normalized_source.contains("destination"))
-        && (normalized_source.contains("planbuilder")
-            || normalized_source.contains("mapexpression")
-            || normalized_source.contains("expression"))
-}
-
-fn packet_csharp_declared_type_names(source: &str, keyword: &str) -> Vec<(String, u32)> {
-    source
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            if packet_source_line_is_comment_like(line) {
-                return None;
+        if packet_csharp_source_has_mapping_configuration_owner(&normalized_source) {
+            for (name, line) in packet_csharp_declared_type_names(source, "class") {
+                let normalized_name = normalize_identifier(&name);
+                if normalized_name.contains("configuration")
+                    && (normalized_name.contains("mapper") || normalized_name.contains("mapping"))
+                {
+                    candidates.push(PacketGenericSourceShapeCandidate {
+                        path: path.to_path_buf(),
+                        display_name: name,
+                        kind: NodeKind::CLASS,
+                        line,
+                        score: 99.0,
+                        coverage_role: "mapper configuration".to_string(),
+                        producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                        eligible_for_sufficiency: false,
+                    });
+                }
             }
-            packet_text_after_keyword(line, keyword).and_then(|after| {
-                packet_identifier_tokens(after)
-                    .into_iter()
-                    .find(|token| !packet_csharp_modifier_token(token))
-                    .map(|token| {
-                        (
-                            token,
-                            index.saturating_add(1).try_into().unwrap_or(u32::MAX),
-                        )
-                    })
-            })
-        })
-        .collect()
-}
+        }
 
-fn packet_csharp_method_names(source: &str) -> Vec<(String, u32)> {
-    source
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            if packet_source_line_is_comment_like(line) || !line.contains('(') {
-                return None;
-            }
-            let before_paren = line.split_once('(')?.0;
-            let method_prefix = before_paren
-                .rfind('<')
-                .map(|generic_start| &before_paren[..generic_start])
-                .unwrap_or(before_paren);
-            let name = packet_identifier_tokens(method_prefix)
+        if packet_csharp_source_has_type_map_lambda_plan(&normalized_source) {
+            let type_owner = packet_csharp_declared_type_names(source, "class")
                 .into_iter()
-                .rev()
-                .find(|token| !packet_csharp_modifier_token(token))?;
-            Some((name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)))
-        })
-        .collect()
-}
-
-fn packet_csharp_modifier_token(token: &str) -> bool {
-    matches!(
-        normalize_identifier(token).as_str(),
-        "public"
-            | "private"
-            | "protected"
-            | "internal"
-            | "static"
-            | "sealed"
-            | "abstract"
-            | "partial"
-            | "readonly"
-            | "virtual"
-            | "override"
-            | "async"
-            | "new"
-            | "where"
-            | "return"
-    )
-}
-
-fn collect_runtime_formatting_shape_candidates(
-    path: &Path,
-    source: &str,
-    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
-) {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-    if !matches!(
-        extension.as_str(),
-        "h" | "hpp" | "hh" | "cc" | "cpp" | "cxx"
-    ) {
-        return;
+                .find(|(name, _)| {
+                    let normalized = normalize_identifier(name);
+                    normalized.contains("map")
+                        && (normalized.contains("type")
+                            || normalized_source.contains("sourcetype")
+                            || normalized_source.contains("destinationtype"))
+                });
+            if let Some((owner, _)) = type_owner {
+                for (method, line) in packet_csharp_method_names(source) {
+                    let normalized_method = normalize_identifier(&method);
+                    if normalized_method.contains("lambda")
+                        && (normalized_method.contains("map")
+                            || source_lower.contains("mapexpression"))
+                    {
+                        candidates.push(PacketGenericSourceShapeCandidate {
+                            path: path.to_path_buf(),
+                            display_name: format!("{owner}.{method}"),
+                            kind: NodeKind::METHOD,
+                            line,
+                            score: 99.0,
+                            coverage_role: "mapping execution plan".to_string(),
+                            producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                            eligible_for_sufficiency: false,
+                        });
+                    }
+                }
+            }
+        }
     }
-    for (index, line) in source.lines().enumerate() {
-        if packet_source_line_is_comment_like(line) {
-            continue;
+
+    fn packet_csharp_source_has_public_mapper_api(normalized_source: &str) -> bool {
+        normalized_source.contains("interface")
+            && normalized_source.contains("map")
+            && normalized_source.contains("source")
+            && normalized_source.contains("destination")
+            && (normalized_source.contains("mapper") || normalized_source.contains("mapping"))
+    }
+
+    fn packet_csharp_public_mapper_api_name(normalized_name: &str) -> bool {
+        normalized_name.contains("mapper")
+            && ![
+                "action",
+                "configuration",
+                "convention",
+                "destinationname",
+                "expression",
+                "member",
+                "operation",
+                "options",
+                "projection",
+                "source",
+            ]
+            .iter()
+            .any(|needle| normalized_name.contains(needle))
+    }
+
+    fn packet_csharp_runtime_mapper_method_candidate(
+        source: &str,
+        normalized_source: &str,
+    ) -> Option<(String, String, u32)> {
+        if !(normalized_source.contains("class")
+            && normalized_source.contains("mapper")
+            && normalized_source.contains("mapcore")
+            && normalized_source.contains("getexecutionplan"))
+        {
+            return None;
         }
-        let Some((name, kind)) = packet_cpp_declared_type_name(line) else {
-            continue;
-        };
-        let normalized = normalize_identifier(&name);
-        let argument_store_shape = normalized.contains("format")
-            && (normalized.contains("arg") || normalized.contains("argument"))
-            && normalized.contains("store");
-        let failure_type_shape = normalized.contains("format")
-            && (normalized.contains("error") || normalized.contains("failure"));
-        if !argument_store_shape && !failure_type_shape {
-            continue;
+        let owner = packet_csharp_declared_type_names(source, "class")
+            .into_iter()
+            .find_map(|(name, _)| {
+                packet_csharp_public_mapper_api_name(&normalize_identifier(&name)).then_some(name)
+            })?;
+        packet_csharp_method_names(source)
+            .into_iter()
+            .find(|(method, _)| normalize_identifier(method) == "map")
+            .map(|(method, line)| (owner, method, line))
+    }
+
+    fn packet_csharp_public_mapper_api_facade_group(
+        interfaces: &[(String, u32)],
+        runtime_method: Option<&(String, String, u32)>,
+    ) -> Option<(String, u32)> {
+        let mut names = Vec::new();
+        let mut line = u32::MAX;
+        for (name, name_line) in interfaces {
+            if !names.iter().any(|existing| existing == name) {
+                names.push(name.clone());
+                line = line.min(*name_line);
+            }
         }
-        let score = if argument_store_shape { 94.0 } else { 92.0 };
+        if let Some((owner, method, method_line)) = runtime_method {
+            let display_name = format!("{owner}.{method}");
+            if !names.iter().any(|existing| existing == &display_name) {
+                names.push(display_name);
+                line = line.min(*method_line);
+            }
+        }
+        if names.len() < 2 {
+            return None;
+        }
+        Some((format!("public mapper API: {}", names.join(", ")), line))
+    }
+
+    fn packet_csharp_source_has_mapping_configuration_owner(normalized_source: &str) -> bool {
+        normalized_source.contains("configuration")
+            && (normalized_source.contains("configuredmaps")
+                || normalized_source.contains("resolvedmaps")
+                || normalized_source.contains("typemaps")
+                || normalized_source.contains("executionplans"))
+            && (normalized_source.contains("buildexecutionplan")
+                || normalized_source.contains("createmapper")
+                || normalized_source.contains("compilemappings"))
+    }
+
+    fn packet_csharp_source_has_type_map_lambda_plan(normalized_source: &str) -> bool {
+        normalized_source.contains("lambda")
+            && normalized_source.contains("map")
+            && (normalized_source.contains("sourcetype") || normalized_source.contains("source"))
+            && (normalized_source.contains("destinationtype")
+                || normalized_source.contains("destination"))
+            && (normalized_source.contains("planbuilder")
+                || normalized_source.contains("mapexpression")
+                || normalized_source.contains("expression"))
+    }
+
+    fn packet_csharp_declared_type_names(source: &str, keyword: &str) -> Vec<(String, u32)> {
+        source
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                if packet_source_line_is_comment_like(line) {
+                    return None;
+                }
+                packet_text_after_keyword(line, keyword).and_then(|after| {
+                    packet_identifier_tokens(after)
+                        .into_iter()
+                        .find(|token| !packet_csharp_modifier_token(token))
+                        .map(|token| {
+                            (
+                                token,
+                                index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+                            )
+                        })
+                })
+            })
+            .collect()
+    }
+
+    fn packet_csharp_method_names(source: &str) -> Vec<(String, u32)> {
+        source
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                if packet_source_line_is_comment_like(line) || !line.contains('(') {
+                    return None;
+                }
+                let before_paren = line.split_once('(')?.0;
+                let method_prefix = before_paren
+                    .rfind('<')
+                    .map(|generic_start| &before_paren[..generic_start])
+                    .unwrap_or(before_paren);
+                let name = packet_identifier_tokens(method_prefix)
+                    .into_iter()
+                    .rev()
+                    .find(|token| !packet_csharp_modifier_token(token))?;
+                Some((name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)))
+            })
+            .collect()
+    }
+
+    fn packet_csharp_modifier_token(token: &str) -> bool {
+        matches!(
+            normalize_identifier(token).as_str(),
+            "public"
+                | "private"
+                | "protected"
+                | "internal"
+                | "static"
+                | "sealed"
+                | "abstract"
+                | "partial"
+                | "readonly"
+                | "virtual"
+                | "override"
+                | "async"
+                | "new"
+                | "where"
+                | "return"
+        )
+    }
+
+    fn collect_runtime_formatting_shape_candidates(
+        path: &Path,
+        source: &str,
+        candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    ) {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(
+            extension.as_str(),
+            "h" | "hpp" | "hh" | "cc" | "cpp" | "cxx"
+        ) {
+            return;
+        }
+        for (index, line) in source.lines().enumerate() {
+            if packet_source_line_is_comment_like(line) {
+                continue;
+            }
+            let Some((name, kind)) = packet_cpp_declared_type_name(line) else {
+                continue;
+            };
+            let normalized = normalize_identifier(&name);
+            let argument_store_shape = normalized.contains("format")
+                && (normalized.contains("arg") || normalized.contains("argument"))
+                && normalized.contains("store");
+            let failure_type_shape = normalized.contains("format")
+                && (normalized.contains("error") || normalized.contains("failure"));
+            if !argument_store_shape && !failure_type_shape {
+                continue;
+            }
+            let score = if argument_store_shape { 94.0 } else { 92.0 };
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name: name,
+                kind,
+                line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+                score,
+                coverage_role: if argument_store_shape {
+                    "runtime format argument store".to_string()
+                } else {
+                    "runtime formatting failure type".to_string()
+                },
+                producer: "packet_generic_runtime_formatting_source_probe".to_string(),
+                eligible_for_sufficiency: true,
+            });
+        }
+    }
+
+    fn packet_cpp_declared_type_name(line: &str) -> Option<(String, NodeKind)> {
+        for (keyword, kind) in [
+            ("class", NodeKind::CLASS),
+            ("struct", NodeKind::STRUCT),
+            ("using", NodeKind::TYPEDEF),
+        ] {
+            let Some(after) = packet_text_after_keyword(line, keyword) else {
+                continue;
+            };
+            for token in packet_identifier_tokens(after) {
+                let normalized = normalize_identifier(&token);
+                if normalized.is_empty()
+                    || matches!(
+                        normalized.as_str(),
+                        "typename" | "template" | "public" | "private" | "protected" | "default"
+                    )
+                    || token.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
+                {
+                    continue;
+                }
+                return Some((token, kind));
+            }
+        }
+        None
+    }
+
+    fn packet_text_after_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+        let lower = line.to_ascii_lowercase();
+        let index = lower.find(keyword)?;
+        let before = lower[..index].chars().last();
+        let after_index = index + keyword.len();
+        let after = lower[after_index..].chars().next();
+        if before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            || after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return None;
+        }
+        Some(&line[after_index..])
+    }
+
+    fn packet_identifier_tokens(input: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut token = String::new();
+        for ch in input.chars() {
+            if packet_source_identifier_char(ch) {
+                token.push(ch);
+            } else if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        }
+        if !token.is_empty() {
+            tokens.push(token);
+        }
+        tokens
+    }
+
+    fn collect_css_animation_variable_candidates(
+        path: &Path,
+        source: &str,
+        candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    ) {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if extension != "css" {
+            return;
+        }
+        let lower = source.to_ascii_lowercase();
+        if !lower.contains(":root") || !lower.contains("--") {
+            return;
+        }
+        let custom_properties = packet_css_custom_properties(source);
+        let animation_properties = custom_properties
+            .into_iter()
+            .filter(|property| {
+                let normalized = normalize_identifier(property);
+                normalized.contains("animation")
+                    || normalized.contains("animate")
+                    || normalized.contains("duration")
+                    || normalized.contains("delay")
+                    || normalized.contains("repeat")
+            })
+            .collect::<Vec<_>>();
+        if animation_properties.is_empty() {
+            return;
+        }
+        let display_name = animation_properties
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "css custom property".to_string());
         candidates.push(PacketGenericSourceShapeCandidate {
             path: path.to_path_buf(),
-            display_name: name,
-            kind,
-            line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
-            score,
-            coverage_role: if argument_store_shape {
-                "runtime format argument store".to_string()
-            } else {
-                "runtime formatting failure type".to_string()
-            },
-            producer: "packet_generic_runtime_formatting_source_probe".to_string(),
+            display_name,
+            kind: NodeKind::CONSTANT,
+            line: packet_first_css_custom_property_line(source).unwrap_or(1),
+            score: 96.0 + animation_properties.len().min(4) as f32,
+            coverage_role: "css animation variables".to_string(),
+            producer: "packet_generic_css_variable_source_probe".to_string(),
             eligible_for_sufficiency: true,
         });
     }
-}
 
-fn packet_cpp_declared_type_name(line: &str) -> Option<(String, NodeKind)> {
-    for (keyword, kind) in [
-        ("class", NodeKind::CLASS),
-        ("struct", NodeKind::STRUCT),
-        ("using", NodeKind::TYPEDEF),
-    ] {
-        let Some(after) = packet_text_after_keyword(line, keyword) else {
-            continue;
-        };
-        for token in packet_identifier_tokens(after) {
-            let normalized = normalize_identifier(&token);
-            if normalized.is_empty()
-                || matches!(
-                    normalized.as_str(),
-                    "typename" | "template" | "public" | "private" | "protected" | "default"
-                )
-                || token.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
-            {
+    fn packet_css_custom_properties(source: &str) -> Vec<String> {
+        let mut properties = Vec::new();
+        for line in source.lines() {
+            let trimmed = line.trim();
+            let Some(start) = trimmed.find("--") else {
                 continue;
-            }
-            return Some((token, kind));
-        }
-    }
-    None
-}
-
-fn packet_text_after_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
-    let lower = line.to_ascii_lowercase();
-    let index = lower.find(keyword)?;
-    let before = lower[..index].chars().last();
-    let after_index = index + keyword.len();
-    let after = lower[after_index..].chars().next();
-    if before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-        || after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-    {
-        return None;
-    }
-    Some(&line[after_index..])
-}
-
-fn packet_identifier_tokens(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut token = String::new();
-    for ch in input.chars() {
-        if packet_source_identifier_char(ch) {
-            token.push(ch);
-        } else if !token.is_empty() {
-            tokens.push(std::mem::take(&mut token));
-        }
-    }
-    if !token.is_empty() {
-        tokens.push(token);
-    }
-    tokens
-}
-
-fn collect_css_animation_variable_candidates(
-    path: &Path,
-    source: &str,
-    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
-) {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-    if extension != "css" {
-        return;
-    }
-    let lower = source.to_ascii_lowercase();
-    if !lower.contains(":root") || !lower.contains("--") {
-        return;
-    }
-    let custom_properties = packet_css_custom_properties(source);
-    let animation_properties = custom_properties
-        .into_iter()
-        .filter(|property| {
-            let normalized = normalize_identifier(property);
-            normalized.contains("animation")
-                || normalized.contains("animate")
-                || normalized.contains("duration")
-                || normalized.contains("delay")
-                || normalized.contains("repeat")
-        })
-        .collect::<Vec<_>>();
-    if animation_properties.is_empty() {
-        return;
-    }
-    let display_name = animation_properties
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "css custom property".to_string());
-    candidates.push(PacketGenericSourceShapeCandidate {
-        path: path.to_path_buf(),
-        display_name,
-        kind: NodeKind::CONSTANT,
-        line: packet_first_css_custom_property_line(source).unwrap_or(1),
-        score: 96.0 + animation_properties.len().min(4) as f32,
-        coverage_role: "css animation variables".to_string(),
-        producer: "packet_generic_css_variable_source_probe".to_string(),
-        eligible_for_sufficiency: true,
-    });
-}
-
-fn packet_css_custom_properties(source: &str) -> Vec<String> {
-    let mut properties = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim();
-        let Some(start) = trimmed.find("--") else {
-            continue;
-        };
-        let name = trimmed[start..]
-            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
-            .next()
-            .unwrap_or_default();
-        if name.len() > 2 && !properties.iter().any(|existing| existing == name) {
-            properties.push(name.to_string());
-        }
-    }
-    properties
-}
-
-fn packet_first_css_custom_property_line(source: &str) -> Option<u32> {
-    source
-        .lines()
-        .position(|line| line.contains("--"))
-        .map(|index| index.saturating_add(1).try_into().unwrap_or(u32::MAX))
-}
-
-fn packet_source_identifier_char(ch: char) -> bool {
-    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
-}
-
-fn collect_sql_schema_file_candidates(
-    project_root: &Path,
-    dir: &Path,
-    terms: &[String],
-    candidates: &mut Vec<PacketSqlSchemaFileCandidate>,
-) {
-    if candidates.len() >= 32 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if path.is_dir() {
-            let lower = name.to_ascii_lowercase();
-            if matches!(
-                lower.as_str(),
-                ".git" | "target" | "node_modules" | "vendor" | "dist" | "build"
-            ) {
-                continue;
-            }
-            collect_sql_schema_file_candidates(project_root, &path, terms, candidates);
-            continue;
-        }
-        if path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_none_or(|extension| !extension.eq_ignore_ascii_case("sql"))
-        {
-            continue;
-        }
-        let Ok(metadata) = path.metadata() else {
-            continue;
-        };
-        if metadata.len() > 1_500_000 {
-            continue;
-        }
-        let Ok(source) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let lower = source.to_ascii_lowercase();
-        if !lower.contains("create table") {
-            continue;
-        }
-        let relative = path
-            .strip_prefix(project_root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let anchors = packet_sql_schema_anchors(&source, terms);
-        let mut score = 45.0;
-        if lower.contains("foreign key") || lower.contains("references") {
-            score += 12.0;
-        }
-        score += anchors.len().min(8) as f32;
-        let normalized_path = normalize_identifier(&relative);
-        let normalized_source = normalize_identifier(&source);
-        for term in terms {
-            let normalized = normalize_identifier(term);
-            if normalized.len() >= 4
-                && (normalized_path.contains(&normalized)
-                    || normalized_source.contains(&normalized))
-            {
-                score += 1.5;
-            }
-        }
-        candidates.push(PacketSqlSchemaFileCandidate {
-            path,
-            display_name: relative,
-            line: packet_sql_first_schema_line(&source),
-            score,
-            anchors,
-        });
-    }
-}
-
-fn packet_sql_schema_anchors(
-    source: &str,
-    terms: &[String],
-) -> Vec<PacketSqlSchemaAnchorCandidate> {
-    let mut anchors = Vec::new();
-    for (index, line) in source.lines().enumerate() {
-        let line_number = index.saturating_add(1).try_into().unwrap_or(u32::MAX);
-        if let Some(table) = packet_sql_identifier_after(line, "create table") {
-            let display_name = format!("CREATE TABLE {table}");
-            if !anchors
-                .iter()
-                .any(|existing: &PacketSqlSchemaAnchorCandidate| {
-                    existing.display_name == display_name
-                })
-            {
-                anchors.push(PacketSqlSchemaAnchorCandidate {
-                    score: 30.0 + packet_sql_prompt_match_score(&table, terms),
-                    display_name,
-                    line: line_number,
-                });
-            }
-        }
-        let normalized = line.to_ascii_lowercase();
-        if normalized.contains("foreign key") && normalized.contains("references") {
-            let relation_score = if terms.iter().any(|term| {
-                matches!(
-                    term.as_str(),
-                    "relationship"
-                        | "relationships"
-                        | "relation"
-                        | "relations"
-                        | "foreign"
-                        | "constraint"
-                        | "constraints"
-                        | "reference"
-                        | "references"
-                )
-            }) {
-                8.0
-            } else {
-                0.0
             };
-            if !anchors
-                .iter()
-                .any(|existing: &PacketSqlSchemaAnchorCandidate| {
-                    existing.display_name == "FOREIGN KEY"
-                })
-            {
-                anchors.push(PacketSqlSchemaAnchorCandidate {
-                    display_name: "FOREIGN KEY".to_string(),
-                    line: line_number,
-                    score: 28.0 + relation_score,
-                });
+            let name = trimmed[start..]
+                .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+                .next()
+                .unwrap_or_default();
+            if name.len() > 2 && !properties.iter().any(|existing| existing == name) {
+                properties.push(name.to_string());
             }
         }
+        properties
     }
-    anchors.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.line.cmp(&right.line))
-            .then_with(|| left.display_name.cmp(&right.display_name))
-    });
-    anchors
-}
 
-fn packet_sql_prompt_match_score(value: &str, terms: &[String]) -> f32 {
-    let normalized_value = normalize_identifier(value);
-    if normalized_value.is_empty() {
-        return 0.0;
+    fn packet_first_css_custom_property_line(source: &str) -> Option<u32> {
+        source
+            .lines()
+            .position(|line| line.contains("--"))
+            .map(|index| index.saturating_add(1).try_into().unwrap_or(u32::MAX))
     }
-    let mut score = 0.0;
-    for term in terms {
-        let normalized_term = normalize_identifier(term);
-        if normalized_term.len() < 4 {
-            continue;
+
+    fn packet_source_identifier_char(ch: char) -> bool {
+        ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
+    }
+
+    fn collect_sql_schema_file_candidates(
+        project_root: &Path,
+        dir: &Path,
+        terms: &[String],
+        candidates: &mut Vec<PacketSqlSchemaFileCandidate>,
+    ) {
+        if candidates.len() >= 32 {
+            return;
         }
-        if normalized_value.contains(&normalized_term)
-            || normalized_term.contains(&normalized_value)
-        {
-            score += 5.0;
-            continue;
-        }
-        let singular = normalized_term
-            .strip_suffix("ies")
-            .map(|prefix| format!("{prefix}y"))
-            .or_else(|| normalized_term.strip_suffix("es").map(str::to_string))
-            .or_else(|| normalized_term.strip_suffix('s').map(str::to_string));
-        if let Some(singular) = singular
-            && singular.len() >= 4
-            && (normalized_value.contains(&singular) || singular.contains(&normalized_value))
-        {
-            score += 5.0;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                let lower = name.to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    ".git" | "target" | "node_modules" | "vendor" | "dist" | "build"
+                ) {
+                    continue;
+                }
+                collect_sql_schema_file_candidates(project_root, &path, terms, candidates);
+                continue;
+            }
+            if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_none_or(|extension| !extension.eq_ignore_ascii_case("sql"))
+            {
+                continue;
+            }
+            let Ok(metadata) = path.metadata() else {
+                continue;
+            };
+            if metadata.len() > 1_500_000 {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let lower = source.to_ascii_lowercase();
+            if !lower.contains("create table") {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(project_root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let anchors = packet_sql_schema_anchors(&source, terms);
+            let mut score = 45.0;
+            if lower.contains("foreign key") || lower.contains("references") {
+                score += 12.0;
+            }
+            score += anchors.len().min(8) as f32;
+            let normalized_path = normalize_identifier(&relative);
+            let normalized_source = normalize_identifier(&source);
+            for term in terms {
+                let normalized = normalize_identifier(term);
+                if normalized.len() >= 4
+                    && (normalized_path.contains(&normalized)
+                        || normalized_source.contains(&normalized))
+                {
+                    score += 1.5;
+                }
+            }
+            candidates.push(PacketSqlSchemaFileCandidate {
+                path,
+                display_name: relative,
+                line: packet_sql_first_schema_line(&source),
+                score,
+                anchors,
+            });
         }
     }
-    score
-}
 
-fn packet_sql_first_schema_line(source: &str) -> u32 {
-    source
-        .lines()
-        .position(|line| line.to_ascii_lowercase().contains("create table"))
-        .map(|index| index.saturating_add(1).try_into().unwrap_or(u32::MAX))
-        .unwrap_or(1)
-}
-
-fn maybe_append_required_file_scoped_source_citations(
-    project_root: &Path,
-    question: &str,
-    task_class: PacketTaskClassDto,
-    extra_probes: &[String],
-    explicit_probes: &[String],
-    answer: &mut AgentAnswerDto,
-) {
-    let required_queries =
-        packet_sufficiency_required_probe_queries_with_extra(question, task_class, extra_probes);
-    let mut appended = 0usize;
-    let mut file_scoped = 0usize;
-    let mut already_cited = 0usize;
-    let mut no_path = 0usize;
-    let mut too_large = 0usize;
-    let mut read_failed = 0usize;
-    let mut no_anchor = 0usize;
-    for query in required_queries {
-        if appended >= 16 {
-            break;
+    fn packet_sql_schema_anchors(
+        source: &str,
+        terms: &[String],
+    ) -> Vec<PacketSqlSchemaAnchorCandidate> {
+        let mut anchors = Vec::new();
+        for (index, line) in source.lines().enumerate() {
+            let line_number = index.saturating_add(1).try_into().unwrap_or(u32::MAX);
+            if let Some(table) = packet_sql_identifier_after(line, "create table") {
+                let display_name = format!("CREATE TABLE {table}");
+                if !anchors
+                    .iter()
+                    .any(|existing: &PacketSqlSchemaAnchorCandidate| {
+                        existing.display_name == display_name
+                    })
+                {
+                    anchors.push(PacketSqlSchemaAnchorCandidate {
+                        score: 30.0 + packet_sql_prompt_match_score(&table, terms),
+                        display_name,
+                        line: line_number,
+                    });
+                }
+            }
+            let normalized = line.to_ascii_lowercase();
+            if normalized.contains("foreign key") && normalized.contains("references") {
+                let relation_score = if terms.iter().any(|term| {
+                    matches!(
+                        term.as_str(),
+                        "relationship"
+                            | "relationships"
+                            | "relation"
+                            | "relations"
+                            | "foreign"
+                            | "constraint"
+                            | "constraints"
+                            | "reference"
+                            | "references"
+                    )
+                }) {
+                    8.0
+                } else {
+                    0.0
+                };
+                if !anchors
+                    .iter()
+                    .any(|existing: &PacketSqlSchemaAnchorCandidate| {
+                        existing.display_name == "FOREIGN KEY"
+                    })
+                {
+                    anchors.push(PacketSqlSchemaAnchorCandidate {
+                        display_name: "FOREIGN KEY".to_string(),
+                        line: line_number,
+                        score: 28.0 + relation_score,
+                    });
+                }
+            }
         }
-        let Some(parts) = packet_file_scoped_symbol_probe_parts(&query) else {
-            continue;
-        };
-        file_scoped = file_scoped.saturating_add(1);
-        if packet_probe_query_is_cited(&query, answer) {
-            already_cited = already_cited.saturating_add(1);
-            continue;
-        }
-        let Some(path) = packet_required_probe_source_path(project_root, &parts, &answer.citations)
-        else {
-            no_path = no_path.saturating_add(1);
-            continue;
-        };
-        let Ok(metadata) = path.metadata() else {
-            no_path = no_path.saturating_add(1);
-            continue;
-        };
-        if metadata.len() > 1_500_000 {
-            too_large = too_large.saturating_add(1);
-            continue;
-        }
-        let Ok(source) = std::fs::read_to_string(&path) else {
-            read_failed = read_failed.saturating_add(1);
-            continue;
-        };
-        let Some(anchor) = packet_required_probe_source_anchor(&parts, &source) else {
-            no_anchor = no_anchor.saturating_add(1);
-            continue;
-        };
-        let path_string = path.to_string_lossy().to_string();
-        if answer.citations.iter().any(|existing| {
-            existing.display_name == anchor.display_name
-                && existing.file_path.as_deref().is_some_and(|existing_path| {
-                    packet_display_path(existing_path) == packet_display_path(&path_string)
-                })
-        }) {
-            already_cited = already_cited.saturating_add(1);
-            continue;
-        }
-        let explicit = explicit_probes
-            .iter()
-            .any(|probe| probe.eq_ignore_ascii_case(&query));
-        answer.citations.push(AgentCitationDto {
-            node_id: NodeId(format!(
-                "packet::required_source_probe::{}::{}::{}",
-                parts.query_path, anchor.display_name, anchor.line
-            )),
-            display_name: anchor.display_name,
-            kind: anchor.kind,
-            file_path: Some(path_string),
-            line: Some(anchor.line),
-            score: 96.0,
-            origin: SearchHitOrigin::TextMatch,
-            target: None,
-            resolvable: false,
-            subgraph_id: None,
-            evidence_edge_ids: Vec::new(),
-            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
-                lexical: 96.0,
-                semantic: 0.0,
-                graph: 0.0,
-                total: 96.0,
-                tier_cap: Some(40.0),
-                boosts: Vec::new(),
-                dampening: Vec::new(),
-                final_rank_reason: Some("required source probe".to_string()),
-                provenance: vec!["packet_required_file_scoped_source_probe".to_string()],
-            }),
-            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::LexicalSource),
-            evidence_producer: Some("packet_required_file_scoped_source_probe".to_string()),
-            resolution_status: Some(
-                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
-            ),
-            loss_reason: None,
-            coverage_role: Some(if explicit {
-                "explicit source probe".to_string()
-            } else {
-                "required source probe".to_string()
-            }),
-            eligible_for_sufficiency: Some(!explicit),
+        anchors.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.line.cmp(&right.line))
+                .then_with(|| left.display_name.cmp(&right.display_name))
         });
-        appended += 1;
+        anchors
     }
 
-    if appended > 0 || file_scoped > 0 {
-        answer
+    fn packet_sql_prompt_match_score(value: &str, terms: &[String]) -> f32 {
+        let normalized_value = normalize_identifier(value);
+        if normalized_value.is_empty() {
+            return 0.0;
+        }
+        let mut score = 0.0;
+        for term in terms {
+            let normalized_term = normalize_identifier(term);
+            if normalized_term.len() < 4 {
+                continue;
+            }
+            if normalized_value.contains(&normalized_term)
+                || normalized_term.contains(&normalized_value)
+            {
+                score += 5.0;
+                continue;
+            }
+            let singular = normalized_term
+                .strip_suffix("ies")
+                .map(|prefix| format!("{prefix}y"))
+                .or_else(|| normalized_term.strip_suffix("es").map(str::to_string))
+                .or_else(|| normalized_term.strip_suffix('s').map(str::to_string));
+            if let Some(singular) = singular
+                && singular.len() >= 4
+                && (normalized_value.contains(&singular) || singular.contains(&normalized_value))
+            {
+                score += 5.0;
+            }
+        }
+        score
+    }
+
+    fn packet_sql_first_schema_line(source: &str) -> u32 {
+        source
+            .lines()
+            .position(|line| line.to_ascii_lowercase().contains("create table"))
+            .map(|index| index.saturating_add(1).try_into().unwrap_or(u32::MAX))
+            .unwrap_or(1)
+    }
+    pub(super) fn maybe_append_required_file_scoped_source_citations(
+        project_root: &Path,
+        question: &str,
+        task_class: PacketTaskClassDto,
+        extra_probes: &[String],
+        explicit_probes: &[String],
+        answer: &mut AgentAnswerDto,
+    ) {
+        let required_queries = packet_sufficiency_required_probe_queries_with_extra(
+            question,
+            task_class,
+            extra_probes,
+        );
+        let mut appended = 0usize;
+        let mut file_scoped = 0usize;
+        let mut already_cited = 0usize;
+        let mut no_path = 0usize;
+        let mut too_large = 0usize;
+        let mut read_failed = 0usize;
+        let mut no_anchor = 0usize;
+        for query in required_queries {
+            if appended >= 16 {
+                break;
+            }
+            let Some(parts) = packet_file_scoped_symbol_probe_parts(&query) else {
+                continue;
+            };
+            file_scoped = file_scoped.saturating_add(1);
+            if packet_probe_query_is_cited(&query, answer) {
+                already_cited = already_cited.saturating_add(1);
+                continue;
+            }
+            let Some(path) =
+                packet_required_probe_source_path(project_root, &parts, &answer.citations)
+            else {
+                no_path = no_path.saturating_add(1);
+                continue;
+            };
+            let Ok(metadata) = path.metadata() else {
+                no_path = no_path.saturating_add(1);
+                continue;
+            };
+            if metadata.len() > 1_500_000 {
+                too_large = too_large.saturating_add(1);
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                read_failed = read_failed.saturating_add(1);
+                continue;
+            };
+            let Some(anchor) = packet_required_probe_source_anchor(&parts, &source) else {
+                no_anchor = no_anchor.saturating_add(1);
+                continue;
+            };
+            let path_string = path.to_string_lossy().to_string();
+            if answer.citations.iter().any(|existing| {
+                existing.display_name == anchor.display_name
+                    && existing.file_path.as_deref().is_some_and(|existing_path| {
+                        packet_display_path(existing_path) == packet_display_path(&path_string)
+                    })
+            }) {
+                already_cited = already_cited.saturating_add(1);
+                continue;
+            }
+            let explicit = explicit_probes
+                .iter()
+                .any(|probe| probe.eq_ignore_ascii_case(&query));
+            answer.citations.push(AgentCitationDto {
+                node_id: NodeId(format!(
+                    "packet::required_source_probe::{}::{}::{}",
+                    parts.query_path, anchor.display_name, anchor.line
+                )),
+                display_name: anchor.display_name,
+                kind: anchor.kind,
+                file_path: Some(path_string),
+                line: Some(anchor.line),
+                score: 96.0,
+                origin: SearchHitOrigin::TextMatch,
+                target: None,
+                resolvable: false,
+                subgraph_id: None,
+                evidence_edge_ids: Vec::new(),
+                retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
+                    lexical: 96.0,
+                    semantic: 0.0,
+                    graph: 0.0,
+                    total: 96.0,
+                    tier_cap: Some(40.0),
+                    boosts: Vec::new(),
+                    dampening: Vec::new(),
+                    final_rank_reason: Some("required source probe".to_string()),
+                    provenance: vec!["packet_required_file_scoped_source_probe".to_string()],
+                }),
+                evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::LexicalSource),
+                evidence_producer: Some("packet_required_file_scoped_source_probe".to_string()),
+                resolution_status: Some(
+                    codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+                ),
+                loss_reason: None,
+                coverage_role: Some(if explicit {
+                    "explicit source probe".to_string()
+                } else {
+                    "required source probe".to_string()
+                }),
+                eligible_for_sufficiency: Some(!explicit),
+            });
+            appended += 1;
+        }
+
+        if appended > 0 || file_scoped > 0 {
+            answer
             .retrieval_trace
             .annotations
             .push(RetrievalAnnotationDto::observation(format!(
                 "packet_required_file_scoped_source_citations file_scoped={file_scoped} appended={appended} already_cited={already_cited} no_path={no_path} too_large={too_large} read_failed={read_failed} no_anchor={no_anchor}"
             )));
-    }
-}
-
-fn packet_file_scoped_source_probe_inputs_from_plan(
-    plan: &PacketPlanDto,
-    extra_probes: &[String],
-) -> Vec<String> {
-    let mut probes = Vec::new();
-    for probe in extra_probes {
-        probes.push(probe.clone());
-    }
-    for query in &plan.queries {
-        if packet_file_scoped_symbol_probe_parts(&query.query).is_some()
-            && !probes
-                .iter()
-                .any(|probe| probe.eq_ignore_ascii_case(&query.query))
-        {
-            probes.push(query.query.clone());
         }
     }
-    probes
-}
 
-struct PacketRequiredSourceAnchor {
-    display_name: String,
-    kind: NodeKind,
-    line: u32,
-}
-
-fn packet_required_probe_source_path(
-    project_root: &Path,
-    parts: &PacketFileScopedSymbolProbe,
-    citations: &[AgentCitationDto],
-) -> Option<std::path::PathBuf> {
-    let direct = project_root.join(&parts.query_path);
-    if direct.is_file() {
-        return Some(direct);
+    struct PacketRequiredSourceAnchor {
+        display_name: String,
+        kind: NodeKind,
+        line: u32,
     }
-    let normalized_query_path = parts.query_path.replace('\\', "/").to_ascii_lowercase();
-    for citation in citations {
-        let Some(path) = citation.file_path.as_deref() else {
-            continue;
-        };
-        let display_path = packet_display_path(path)
-            .replace('\\', "/")
-            .to_ascii_lowercase();
-        if display_path.ends_with(&normalized_query_path) {
-            return Some(std::path::PathBuf::from(path));
+
+    fn packet_required_probe_source_path(
+        project_root: &Path,
+        parts: &PacketFileScopedSymbolProbe,
+        citations: &[AgentCitationDto],
+    ) -> Option<std::path::PathBuf> {
+        let direct = project_root.join(&parts.query_path);
+        if direct.is_file() {
+            return Some(direct);
         }
-    }
-    for citation in citations {
-        let Some(path) = citation.file_path.as_deref() else {
-            continue;
-        };
-        let file_name = packet_display_path(path)
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if packet_probe_file_name_matches(&parts.file_name, &file_name) {
-            return Some(std::path::PathBuf::from(path));
-        }
-    }
-    if !parts.query_path.contains('/') {
-        return packet_find_unique_source_file_by_name(project_root, &parts.file_name);
-    }
-    None
-}
-
-fn packet_find_unique_source_file_by_name(
-    project_root: &Path,
-    file_name: &str,
-) -> Option<std::path::PathBuf> {
-    let mut queue = VecDeque::from([project_root.to_path_buf()]);
-    let mut found = None;
-    let mut visited_dirs = 0usize;
-
-    while let Some(dir) = queue.pop_front() {
-        visited_dirs = visited_dirs.saturating_add(1);
-        if visited_dirs > 20_000 {
-            return None;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
+        let normalized_query_path = parts.query_path.replace('\\', "/").to_ascii_lowercase();
+        for citation in citations {
+            let Some(path) = citation.file_path.as_deref() else {
                 continue;
             };
-            let entry_name = entry.file_name();
-            let entry_name = entry_name.to_string_lossy();
-            if file_type.is_dir() {
-                if !packet_source_probe_skip_dir(&entry_name) {
-                    queue.push_back(entry.path());
-                }
+            let display_path = packet_display_path(path)
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            if display_path.ends_with(&normalized_query_path) {
+                return Some(std::path::PathBuf::from(path));
+            }
+        }
+        for citation in citations {
+            let Some(path) = citation.file_path.as_deref() else {
                 continue;
+            };
+            let file_name = packet_display_path(path)
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if packet_probe_file_name_matches(&parts.file_name, &file_name) {
+                return Some(std::path::PathBuf::from(path));
             }
-            if packet_probe_file_name_matches(file_name, &entry_name) {
-                if found.is_some() {
-                    return None;
+        }
+        if !parts.query_path.contains('/') {
+            return packet_find_unique_source_file_by_name(project_root, &parts.file_name);
+        }
+        None
+    }
+
+    fn packet_find_unique_source_file_by_name(
+        project_root: &Path,
+        file_name: &str,
+    ) -> Option<std::path::PathBuf> {
+        let mut queue = VecDeque::from([project_root.to_path_buf()]);
+        let mut found = None;
+        let mut visited_dirs = 0usize;
+
+        while let Some(dir) = queue.pop_front() {
+            visited_dirs = visited_dirs.saturating_add(1);
+            if visited_dirs > 20_000 {
+                return None;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let entry_name = entry.file_name();
+                let entry_name = entry_name.to_string_lossy();
+                if file_type.is_dir() {
+                    if !packet_source_probe_skip_dir(&entry_name) {
+                        queue.push_back(entry.path());
+                    }
+                    continue;
                 }
-                found = Some(entry.path());
+                if packet_probe_file_name_matches(file_name, &entry_name) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(entry.path());
+                }
             }
         }
+
+        found
     }
 
-    found
-}
-
-fn packet_source_probe_skip_dir(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        ".git" | ".hg" | ".svn" | "node_modules" | "target" | "dist" | "build" | "coverage"
-    )
-}
-
-fn packet_required_probe_source_anchor(
-    parts: &PacketFileScopedSymbolProbe,
-    source: &str,
-) -> Option<PacketRequiredSourceAnchor> {
-    let display_name = packet_required_probe_source_display_name(parts);
-    for (index, line) in source.lines().enumerate() {
-        if packet_source_line_declares_file_scoped_probe(line, parts) {
-            let kind = packet_source_probe_anchor_kind(line, parts);
-            return Some(PacketRequiredSourceAnchor {
-                display_name,
-                kind,
-                line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
-            });
-        }
-    }
-    for (index, line) in source.lines().enumerate() {
-        if packet_source_line_matches_file_scoped_probe(line, parts) {
-            let kind = packet_source_probe_anchor_kind(line, parts);
-            return Some(PacketRequiredSourceAnchor {
-                display_name,
-                kind,
-                line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
-            });
-        }
-    }
-    None
-}
-
-fn packet_required_probe_source_display_name(parts: &PacketFileScopedSymbolProbe) -> String {
-    let display_name = parts.raw_symbols.join(" ");
-    if display_name.contains('.') || display_name.contains(':') || display_name.contains('#') {
-        return display_name;
-    }
-    let path = parts.query_path.replace('\\', "/");
-    let receiver = path.rsplit('/').next().and_then(|name| {
-        let (stem, extension) = name.rsplit_once('.')?;
-        match (stem.to_ascii_lowercase().as_str(), extension) {
-            ("application", "js") => Some("app"),
-            ("response", "js") => Some("res"),
-            ("request", "js") => Some("req"),
-            (_, "java") => Some(stem),
-            _ => None,
-        }
-    });
-    receiver
-        .map(|receiver| format!("{receiver}.{display_name}"))
-        .unwrap_or(display_name)
-}
-
-fn packet_source_line_declares_file_scoped_probe(
-    line: &str,
-    parts: &PacketFileScopedSymbolProbe,
-) -> bool {
-    if parts.raw_symbols.is_empty() {
-        return false;
-    }
-    let terminal = packet_required_probe_terminal_symbol(&parts.raw_symbols.join(" "));
-    let normalized_terminal = normalize_identifier(&terminal);
-    if normalized_terminal.is_empty() || !normalize_identifier(line).contains(&normalized_terminal)
-    {
-        return false;
-    }
-    packet_source_line_declares_named_symbol(line, &normalized_terminal)
-}
-
-fn packet_source_line_matches_file_scoped_probe(
-    line: &str,
-    parts: &PacketFileScopedSymbolProbe,
-) -> bool {
-    if parts.raw_symbols.is_empty() {
-        return false;
-    }
-    let raw_display = parts.raw_symbols.join(" ");
-    let normalized_line = normalize_identifier(line);
-    let normalized_display = normalize_identifier(&raw_display);
-    if normalized_display.is_empty() {
-        return false;
-    }
-    if parts.symbols.len() >= 3 && parts.symbols[0] == "create" && parts.symbols[1] == "table" {
-        return packet_sql_identifier_after(line, "create table")
-            .map(|table| normalize_identifier(&table))
-            .is_some_and(|table| {
-                parts
-                    .symbols
-                    .last()
-                    .is_some_and(|expected| table == *expected)
-            });
-    }
-    if parts.symbols.len() >= 2 && parts.symbols[0] == "foreign" && parts.symbols[1] == "key" {
-        let lower = line.to_ascii_lowercase();
-        return lower.contains("foreign key") && lower.contains("references");
-    }
-    if let Some(id) = raw_display.strip_prefix("input#") {
-        let lower = line.to_ascii_lowercase();
-        return lower.contains("<input") && packet_html_line_has_attribute_value(&lower, "id", id);
-    }
-    if !raw_display.contains(':')
-        && !raw_display.contains('.')
-        && !raw_display.contains('#')
-        && parts.symbols.len() == 1
-        && packet_html_boolean_attribute_line_matches(line, &parts.symbols[0])
-    {
-        return true;
-    }
-
-    if parts.symbols.len() > 1
-        && !packet_source_line_is_comment_like(line)
-        && parts
-            .symbols
-            .iter()
-            .all(|symbol| normalized_line.contains(symbol))
-    {
-        return true;
-    }
-
-    let terminal = packet_required_probe_terminal_symbol(&raw_display);
-    let normalized_terminal = normalize_identifier(&terminal);
-    if normalized_terminal.is_empty() || !normalized_line.contains(&normalized_terminal) {
-        return false;
-    }
-
-    if packet_shell_function_line_matches(line, &normalized_terminal) {
-        return true;
-    }
-
-    if parts.symbols.len() == 1
-        && normalized_line.contains(&parts.symbols[0])
-        && (packet_source_line_looks_like_code_call(line)
-            || packet_cpp_template_instantiation(line))
-    {
-        return true;
-    }
-
-    packet_source_line_declares_named_symbol(line, &normalized_terminal)
-        || normalized_line == normalized_display
-        || normalized_line.ends_with(&normalized_display)
-}
-
-fn packet_source_line_looks_like_code_call(line: &str) -> bool {
-    if packet_source_line_is_comment_like(line) {
-        return false;
-    }
-    let trimmed = line.trim_start();
-    trimmed.contains('(') && (trimmed.contains(';') || trimmed.contains('{'))
-}
-
-fn packet_source_line_is_comment_like(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*')
-}
-
-fn packet_cpp_template_instantiation(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("template ") && (lower.contains("api ") || lower.contains("extern "))
-}
-
-fn packet_shell_function_line_matches(line: &str, normalized_terminal: &str) -> bool {
-    if normalized_terminal.is_empty() {
-        return false;
-    }
-    let trimmed = line.trim_start().to_ascii_lowercase();
-    let compact = trimmed
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>();
-    compact.starts_with(&format!("{normalized_terminal}()"))
-}
-
-fn packet_html_line_has_attribute_value(line_lower: &str, attribute: &str, value: &str) -> bool {
-    let value_lower = value.to_ascii_lowercase();
-    [
-        format!("{attribute}=\"{value_lower}\""),
-        format!("{attribute}='{value_lower}'"),
-        format!("{attribute}={value_lower}"),
-    ]
-    .iter()
-    .any(|needle| line_lower.contains(needle))
-}
-
-fn packet_html_boolean_attribute_line_matches(line: &str, attribute: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    if !lower.contains(&attribute.to_ascii_lowercase()) {
-        return false;
-    }
-    let normalized_line = normalize_identifier(line);
-    normalized_line.contains(attribute) && (lower.contains('<') || lower.contains(attribute))
-}
-
-fn packet_required_probe_terminal_symbol(raw_symbol: &str) -> String {
-    raw_symbol
-        .rsplit([':', '.', '#'])
-        .find(|part| !part.is_empty())
-        .unwrap_or(raw_symbol)
-        .trim()
-        .to_string()
-}
-
-fn packet_source_line_declares_named_symbol(line: &str, normalized_terminal: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    let normalized_line = normalize_identifier(line);
-    let declaration_words = [
-        "class ",
-        "struct ",
-        "interface ",
-        "enum ",
-        "module ",
-        "trait ",
-        "def ",
-        "function ",
-        "func ",
-        "fn ",
-        "const ",
-        "let ",
-        "var ",
-        "public ",
-        "private ",
-        "protected ",
-        "internal ",
-        "static ",
-        "abstract ",
-        "template ",
-        "using ",
-        "typealias ",
-    ];
-    if !declaration_words.iter().any(|word| lower.contains(word)) {
-        return false;
-    }
-    if [
-        "class ",
-        "struct ",
-        "interface ",
-        "enum ",
-        "module ",
-        "trait ",
-    ]
-    .iter()
-    .any(|word| lower.contains(word))
-        && normalized_line.contains(normalized_terminal)
-    {
-        return true;
-    }
-    let declaration_needles = [
-        format!("class{normalized_terminal}"),
-        format!("struct{normalized_terminal}"),
-        format!("interface{normalized_terminal}"),
-        format!("enum{normalized_terminal}"),
-        format!("module{normalized_terminal}"),
-        format!("trait{normalized_terminal}"),
-        format!("def{normalized_terminal}"),
-        format!("function{normalized_terminal}"),
-        format!("func{normalized_terminal}"),
-        format!("fn{normalized_terminal}"),
-        format!("const{normalized_terminal}"),
-        format!("let{normalized_terminal}"),
-        format!("var{normalized_terminal}"),
-        format!("using{normalized_terminal}"),
-        format!("typealias{normalized_terminal}"),
-    ];
-    declaration_needles
-        .iter()
-        .any(|needle| normalized_line.contains(needle))
-        || normalized_line.ends_with(normalized_terminal)
-}
-
-fn packet_source_probe_anchor_kind(line: &str, parts: &PacketFileScopedSymbolProbe) -> NodeKind {
-    let lower = line.to_ascii_lowercase();
-    if parts.raw_symbols.join(" ").starts_with("input#")
-        || (parts.raw_symbols.len() == 1 && lower.contains('<'))
-        || (parts.symbols.len() >= 2 && parts.symbols[0] == "foreign" && parts.symbols[1] == "key")
-        || (parts.symbols.len() >= 3 && parts.symbols[0] == "create" && parts.symbols[1] == "table")
-    {
-        NodeKind::ANNOTATION
-    } else if lower.contains("class ") || lower.contains("struct ") {
-        NodeKind::CLASS
-    } else if lower.contains("interface ") || lower.contains("trait ") {
-        NodeKind::INTERFACE
-    } else if parts
-        .raw_symbols
-        .iter()
-        .any(|symbol| symbol.contains(':') || symbol.contains('.') || symbol.contains('#'))
-        || lower.contains("def ")
-        || lower.contains("function ")
-        || lower.contains("func ")
-        || lower.contains("fn ")
-        || packet_shell_function_line_matches(
-            line,
-            &packet_required_probe_terminal_symbol(&parts.raw_symbols.join(" ")),
+    fn packet_source_probe_skip_dir(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            ".git" | ".hg" | ".svn" | "node_modules" | "target" | "dist" | "build" | "coverage"
         )
-    {
-        NodeKind::METHOD
-    } else {
-        NodeKind::ANNOTATION
+    }
+
+    fn packet_required_probe_source_anchor(
+        parts: &PacketFileScopedSymbolProbe,
+        source: &str,
+    ) -> Option<PacketRequiredSourceAnchor> {
+        let display_name = packet_required_probe_source_display_name(parts);
+        for (index, line) in source.lines().enumerate() {
+            if packet_source_line_declares_file_scoped_probe(line, parts) {
+                let kind = packet_source_probe_anchor_kind(line, parts);
+                return Some(PacketRequiredSourceAnchor {
+                    display_name,
+                    kind,
+                    line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+                });
+            }
+        }
+        for (index, line) in source.lines().enumerate() {
+            if packet_source_line_matches_file_scoped_probe(line, parts) {
+                let kind = packet_source_probe_anchor_kind(line, parts);
+                return Some(PacketRequiredSourceAnchor {
+                    display_name,
+                    kind,
+                    line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+                });
+            }
+        }
+        None
+    }
+
+    fn packet_required_probe_source_display_name(parts: &PacketFileScopedSymbolProbe) -> String {
+        let display_name = parts.raw_symbols.join(" ");
+        if display_name.contains('.') || display_name.contains(':') || display_name.contains('#') {
+            return display_name;
+        }
+        let path = parts.query_path.replace('\\', "/");
+        let receiver = path.rsplit('/').next().and_then(|name| {
+            let (stem, extension) = name.rsplit_once('.')?;
+            match (stem.to_ascii_lowercase().as_str(), extension) {
+                ("application", "js") => Some("app"),
+                ("response", "js") => Some("res"),
+                ("request", "js") => Some("req"),
+                (_, "java") => Some(stem),
+                _ => None,
+            }
+        });
+        receiver
+            .map(|receiver| format!("{receiver}.{display_name}"))
+            .unwrap_or(display_name)
+    }
+
+    fn packet_source_line_declares_file_scoped_probe(
+        line: &str,
+        parts: &PacketFileScopedSymbolProbe,
+    ) -> bool {
+        if parts.raw_symbols.is_empty() {
+            return false;
+        }
+        let terminal = packet_required_probe_terminal_symbol(&parts.raw_symbols.join(" "));
+        let normalized_terminal = normalize_identifier(&terminal);
+        if normalized_terminal.is_empty()
+            || !normalize_identifier(line).contains(&normalized_terminal)
+        {
+            return false;
+        }
+        packet_source_line_declares_named_symbol(line, &normalized_terminal)
+    }
+
+    fn packet_source_line_matches_file_scoped_probe(
+        line: &str,
+        parts: &PacketFileScopedSymbolProbe,
+    ) -> bool {
+        if parts.raw_symbols.is_empty() {
+            return false;
+        }
+        let raw_display = parts.raw_symbols.join(" ");
+        let normalized_line = normalize_identifier(line);
+        let normalized_display = normalize_identifier(&raw_display);
+        if normalized_display.is_empty() {
+            return false;
+        }
+        if parts.symbols.len() >= 3 && parts.symbols[0] == "create" && parts.symbols[1] == "table" {
+            return packet_sql_identifier_after(line, "create table")
+                .map(|table| normalize_identifier(&table))
+                .is_some_and(|table| {
+                    parts
+                        .symbols
+                        .last()
+                        .is_some_and(|expected| table == *expected)
+                });
+        }
+        if parts.symbols.len() >= 2 && parts.symbols[0] == "foreign" && parts.symbols[1] == "key" {
+            let lower = line.to_ascii_lowercase();
+            return lower.contains("foreign key") && lower.contains("references");
+        }
+        if let Some(id) = raw_display.strip_prefix("input#") {
+            let lower = line.to_ascii_lowercase();
+            return lower.contains("<input")
+                && packet_html_line_has_attribute_value(&lower, "id", id);
+        }
+        if !raw_display.contains(':')
+            && !raw_display.contains('.')
+            && !raw_display.contains('#')
+            && parts.symbols.len() == 1
+            && packet_html_boolean_attribute_line_matches(line, &parts.symbols[0])
+        {
+            return true;
+        }
+
+        if parts.symbols.len() > 1
+            && !packet_source_line_is_comment_like(line)
+            && parts
+                .symbols
+                .iter()
+                .all(|symbol| normalized_line.contains(symbol))
+        {
+            return true;
+        }
+
+        let terminal = packet_required_probe_terminal_symbol(&raw_display);
+        let normalized_terminal = normalize_identifier(&terminal);
+        if normalized_terminal.is_empty() || !normalized_line.contains(&normalized_terminal) {
+            return false;
+        }
+
+        if packet_shell_function_line_matches(line, &normalized_terminal) {
+            return true;
+        }
+
+        if parts.symbols.len() == 1
+            && normalized_line.contains(&parts.symbols[0])
+            && (packet_source_line_looks_like_code_call(line)
+                || packet_cpp_template_instantiation(line))
+        {
+            return true;
+        }
+
+        packet_source_line_declares_named_symbol(line, &normalized_terminal)
+            || normalized_line == normalized_display
+            || normalized_line.ends_with(&normalized_display)
+    }
+
+    fn packet_source_line_looks_like_code_call(line: &str) -> bool {
+        if packet_source_line_is_comment_like(line) {
+            return false;
+        }
+        let trimmed = line.trim_start();
+        trimmed.contains('(') && (trimmed.contains(';') || trimmed.contains('{'))
+    }
+
+    fn packet_source_line_is_comment_like(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*')
+    }
+
+    fn packet_cpp_template_instantiation(line: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("template ") && (lower.contains("api ") || lower.contains("extern "))
+    }
+
+    fn packet_shell_function_line_matches(line: &str, normalized_terminal: &str) -> bool {
+        if normalized_terminal.is_empty() {
+            return false;
+        }
+        let trimmed = line.trim_start().to_ascii_lowercase();
+        let compact = trimmed
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        compact.starts_with(&format!("{normalized_terminal}()"))
+    }
+
+    fn packet_html_line_has_attribute_value(
+        line_lower: &str,
+        attribute: &str,
+        value: &str,
+    ) -> bool {
+        let value_lower = value.to_ascii_lowercase();
+        [
+            format!("{attribute}=\"{value_lower}\""),
+            format!("{attribute}='{value_lower}'"),
+            format!("{attribute}={value_lower}"),
+        ]
+        .iter()
+        .any(|needle| line_lower.contains(needle))
+    }
+
+    fn packet_html_boolean_attribute_line_matches(line: &str, attribute: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains(&attribute.to_ascii_lowercase()) {
+            return false;
+        }
+        let normalized_line = normalize_identifier(line);
+        normalized_line.contains(attribute) && (lower.contains('<') || lower.contains(attribute))
+    }
+
+    fn packet_required_probe_terminal_symbol(raw_symbol: &str) -> String {
+        raw_symbol
+            .rsplit([':', '.', '#'])
+            .find(|part| !part.is_empty())
+            .unwrap_or(raw_symbol)
+            .trim()
+            .to_string()
+    }
+
+    fn packet_source_line_declares_named_symbol(line: &str, normalized_terminal: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        let normalized_line = normalize_identifier(line);
+        let declaration_words = [
+            "class ",
+            "struct ",
+            "interface ",
+            "enum ",
+            "module ",
+            "trait ",
+            "def ",
+            "function ",
+            "func ",
+            "fn ",
+            "const ",
+            "let ",
+            "var ",
+            "public ",
+            "private ",
+            "protected ",
+            "internal ",
+            "static ",
+            "abstract ",
+            "template ",
+            "using ",
+            "typealias ",
+        ];
+        if !declaration_words.iter().any(|word| lower.contains(word)) {
+            return false;
+        }
+        if [
+            "class ",
+            "struct ",
+            "interface ",
+            "enum ",
+            "module ",
+            "trait ",
+        ]
+        .iter()
+        .any(|word| lower.contains(word))
+            && normalized_line.contains(normalized_terminal)
+        {
+            return true;
+        }
+        let declaration_needles = [
+            format!("class{normalized_terminal}"),
+            format!("struct{normalized_terminal}"),
+            format!("interface{normalized_terminal}"),
+            format!("enum{normalized_terminal}"),
+            format!("module{normalized_terminal}"),
+            format!("trait{normalized_terminal}"),
+            format!("def{normalized_terminal}"),
+            format!("function{normalized_terminal}"),
+            format!("func{normalized_terminal}"),
+            format!("fn{normalized_terminal}"),
+            format!("const{normalized_terminal}"),
+            format!("let{normalized_terminal}"),
+            format!("var{normalized_terminal}"),
+            format!("using{normalized_terminal}"),
+            format!("typealias{normalized_terminal}"),
+        ];
+        declaration_needles
+            .iter()
+            .any(|needle| normalized_line.contains(needle))
+            || normalized_line.ends_with(normalized_terminal)
+    }
+
+    fn packet_source_probe_anchor_kind(
+        line: &str,
+        parts: &PacketFileScopedSymbolProbe,
+    ) -> NodeKind {
+        let lower = line.to_ascii_lowercase();
+        if parts.raw_symbols.join(" ").starts_with("input#")
+            || (parts.raw_symbols.len() == 1 && lower.contains('<'))
+            || (parts.symbols.len() >= 2
+                && parts.symbols[0] == "foreign"
+                && parts.symbols[1] == "key")
+            || (parts.symbols.len() >= 3
+                && parts.symbols[0] == "create"
+                && parts.symbols[1] == "table")
+        {
+            NodeKind::ANNOTATION
+        } else if lower.contains("class ") || lower.contains("struct ") {
+            NodeKind::CLASS
+        } else if lower.contains("interface ") || lower.contains("trait ") {
+            NodeKind::INTERFACE
+        } else if parts
+            .raw_symbols
+            .iter()
+            .any(|symbol| symbol.contains(':') || symbol.contains('.') || symbol.contains('#'))
+            || lower.contains("def ")
+            || lower.contains("function ")
+            || lower.contains("func ")
+            || lower.contains("fn ")
+            || packet_shell_function_line_matches(
+                line,
+                &packet_required_probe_terminal_symbol(&parts.raw_symbols.join(" ")),
+            )
+        {
+            NodeKind::METHOD
+        } else {
+            NodeKind::ANNOTATION
+        }
     }
 }
+
+#[cfg(test)]
+use legacy_source_scans::*;
+
 #[cfg(test)]
 fn packet_claim_for_role(
     _key: &str,

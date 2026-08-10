@@ -149,6 +149,7 @@ pub fn packet_sql_create_table_names(source: &str) -> Vec<String> {
     names
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn packet_sql_foreign_key_claims(source: &str) -> Vec<String> {
     let mut links = Vec::new();
     let mut current_table: Option<String> = None;
@@ -221,6 +222,7 @@ pub fn packet_sql_foreign_key_claims(source: &str) -> Vec<String> {
     claims
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn packet_sql_identifier_between(line: &str, start: &str, end: &str) -> Option<String> {
     let lower = line.to_ascii_lowercase();
     let start_at = lower.find(start)? + start.len();

@@ -4,11 +4,10 @@ use crate::eval_probes::{
     eval_indexing_storage_flow_template_claims, eval_probes_enabled,
     eval_supporting_claim_flow_sentence,
 };
+#[cfg(test)]
 use crate::packet_citations::packet_citation_source_text;
-use crate::packet_claim_profiles::{
-    packet_source_derived_claim_for_role, packet_source_derived_claims_for_citation_counted,
-};
-use crate::packet_command_profiles::packet_append_command_flow_template_claims;
+#[cfg(test)]
+use crate::packet_claim_profiles::packet_source_derived_claims_for_citation_counted;
 use crate::packet_evidence::{
     citation_sufficiency_eligible, evidence_resolution_for_citation, evidence_tier_for_citation,
 };
@@ -21,6 +20,7 @@ use crate::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_claim_carry_rank,
     packet_display_path, packet_query_stop_term, sort_by_cached_rank_desc,
 };
+#[cfg(test)]
 use crate::packet_terms::{packet_probe_terms, packet_terms_indicate_sql_schema_flow};
 use crate::text::query_mentions_non_primary_source;
 use codestory_contracts::api::{
@@ -30,6 +30,7 @@ use codestory_contracts::api::{
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
+#[cfg(test)]
 const PACKET_SOURCE_DEFINITION_CLAIM_LIMIT: usize = 6;
 
 pub fn packet_flow_claims_markdown(claims: &[PacketClaimDto]) -> String {
@@ -156,20 +157,8 @@ pub fn append_flow_template_claims(
     let normalized_prompt = normalize_identifier(prompt);
 
     let phase = ClaimSourcePhase::start(claims);
-    packet_append_command_flow_template_claims(prompt, citations, claims, seen);
-    phase.finish(PacketClaimSource::CommandProfile, claims, telemetry);
-
-    let phase = ClaimSourcePhase::start(claims);
     packet_append_event_output_flow_template_claims(&normalized_prompt, citations, claims, seen);
     packet_append_indexing_pipeline_flow_template_claims(prompt, citations, claims, seen);
-    phase.finish(PacketClaimSource::FlowTemplate, claims, telemetry);
-
-    let phase = ClaimSourcePhase::start(claims);
-    packet_append_source_derived_flow_claims(prompt, citations, claims, seen, telemetry);
-    phase.finish(PacketClaimSource::SourceProfile, claims, telemetry);
-
-    let phase = ClaimSourcePhase::start(claims);
-    packet_append_sql_schema_file_claims(prompt, citations, claims, seen);
     phase.finish(PacketClaimSource::FlowTemplate, claims, telemetry);
 
     #[cfg(any(test, feature = "test-support"))]
@@ -218,7 +207,7 @@ fn packet_append_event_output_flow_template_claims(
 ) {
     if (normalized_prompt.contains("json") || normalized_prompt.contains("jsonl"))
         && (normalized_prompt.contains("event") || normalized_prompt.contains("output"))
-        && let Some(json_output_citation) = citations.iter().find(|citation| {
+        && let Some(event_output_citation) = citations.iter().find(|citation| {
             packet_evidence_role(citation) == Some(PacketEvidenceRole::EventOutputProcessing)
         })
     {
@@ -226,7 +215,7 @@ fn packet_append_event_output_flow_template_claims(
             claims,
             seen,
             "Event-output processing evidence describes how structured runtime events are serialized for JSON/JSONL output.",
-            Some(json_output_citation.clone()),
+            Some(event_output_citation.clone()),
         );
     }
 }
@@ -365,6 +354,7 @@ fn packet_symbol_extraction_witness_rank(citation: &AgentCitationDto) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn packet_append_source_derived_flow_claims(
     prompt: &str,
     citations: &[AgentCitationDto],
@@ -394,6 +384,7 @@ fn packet_append_source_derived_flow_claims(
     }
 }
 
+#[cfg(test)]
 fn packet_preferred_source_derived_claim_citation(
     claim: &str,
     source_citation: &AgentCitationDto,
@@ -408,6 +399,7 @@ fn packet_preferred_source_derived_claim_citation(
     source_citation.clone()
 }
 
+#[cfg(test)]
 fn packet_matching_sql_relationship_citation(
     source_citation: &AgentCitationDto,
     citations: &[AgentCitationDto],
@@ -441,6 +433,7 @@ fn packet_matching_sql_relationship_citation(
         .cloned()
 }
 
+#[cfg(test)]
 fn packet_claim_text_indicates_sql_relationship(claim: &str) -> bool {
     let normalized = normalize_identifier(claim);
     normalized.contains("rowsreference")
@@ -459,6 +452,7 @@ fn packet_claim_text_indicates_sql_relationship(claim: &str) -> bool {
                 || normalized.contains("referential")))
 }
 
+#[cfg(test)]
 fn packet_append_sql_schema_file_claims(
     prompt: &str,
     citations: &[AgentCitationDto],
@@ -528,6 +522,7 @@ fn packet_append_sql_schema_file_claims(
     );
 }
 
+#[cfg(test)]
 fn packet_sql_dialect_key(normalized_path: &str) -> Option<&'static str> {
     if normalized_path.contains("sqlite") {
         Some("sqlite")
@@ -546,6 +541,7 @@ fn packet_sql_dialect_key(normalized_path: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn packet_sql_schema_prompt_subject(prompt: &str) -> Option<String> {
     let stop_words = [
         "Explain",
@@ -611,6 +607,7 @@ fn packet_push_flow_template_claim_with_citations(
     });
 }
 
+#[cfg(test)]
 fn packet_push_unbound_reported_claim(
     claims: &mut Vec<PacketClaimDto>,
     seen: &mut HashSet<String>,
@@ -696,9 +693,6 @@ pub fn append_ranked_citation_claims(
             break;
         }
     }
-    if claims.len() < 18 {
-        packet_append_source_definition_claims(&ordered_citations, rank_terms, claims, seen_claims);
-    }
 }
 
 pub fn packet_claim_for_role(
@@ -709,9 +703,6 @@ pub fn packet_claim_for_role(
 ) -> String {
     if let Some(shaped) = packet_citation_shaped_claim(citation, prompt) {
         return shaped;
-    }
-    if let Some(source_derived) = packet_source_derived_claim_for_role(role, citation, prompt) {
-        return source_derived;
     }
     let symbol = citation.display_name.as_str();
     let path = citation
@@ -759,8 +750,8 @@ pub fn packet_claim_for_role(
         PacketEvidenceRole::WorkspaceDiscoveryAndPlanning => format!(
             "`{symbol}` handles workspace file selection, manifests, or execution-plan behavior."
         ),
-        PacketEvidenceRole::SourceGroupConfiguration => {
-            format!("`{symbol}` maps project settings into source-group-specific indexing inputs.")
+        PacketEvidenceRole::IndexInputConfiguration => {
+            format!("`{symbol}` maps project settings into indexing inputs.")
         }
         PacketEvidenceRole::IndexingWorkQueue => format!(
             "`{symbol}` turns build-index commands into parser handoff or source-file work items."
@@ -866,6 +857,7 @@ fn packet_citation_shaped_claim(citation: &AgentCitationDto, prompt: &str) -> Op
     }
 }
 
+#[cfg(test)]
 fn packet_append_source_definition_claims(
     citations: &[AgentCitationDto],
     rank_terms: &[String],
@@ -932,6 +924,7 @@ fn packet_append_source_definition_claims(
     }
 }
 
+#[cfg(test)]
 fn packet_push_claim(
     claims: &mut Vec<PacketClaimDto>,
     seen_claims: &mut HashSet<String>,
@@ -954,6 +947,7 @@ fn packet_push_claim(
     });
 }
 
+#[cfg(test)]
 fn packet_source_definition_name(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
     for prefix in [
@@ -990,6 +984,7 @@ fn packet_source_definition_name(line: &str) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 fn packet_take_definition_identifier(rest: &str) -> Option<String> {
     let mut identifier = String::new();
     for ch in rest.chars() {
@@ -1002,6 +997,7 @@ fn packet_take_definition_identifier(rest: &str) -> Option<String> {
     (identifier.len() >= 3).then_some(identifier)
 }
 
+#[cfg(test)]
 fn packet_definition_matches_rank_terms(
     definition: &str,
     normalized_definition: &str,
@@ -1025,6 +1021,7 @@ fn packet_definition_matches_rank_terms(
     overlap >= 2 || (definition_tokens.iter().any(|token| token == "exec") && overlap >= 1)
 }
 
+#[cfg(test)]
 fn packet_definition_rank_tokens(rank_terms: &[String]) -> HashSet<String> {
     rank_terms
         .iter()
@@ -1039,6 +1036,7 @@ fn packet_definition_rank_tokens(rank_terms: &[String]) -> HashSet<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn packet_identifier_tokens(identifier: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
