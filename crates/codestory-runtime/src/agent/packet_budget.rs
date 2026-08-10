@@ -19,6 +19,7 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, AgentResponseBlockDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, GraphArtifactDto, GraphResponse, PacketBudgetDto,
     PacketBudgetLimitsDto, PacketBudgetModeDto, PacketBudgetUsageDto, PacketTaskClassDto,
+    RetrievalShadowDto, RetrievalStageTimingDto,
 };
 use std::collections::HashSet;
 use std::path::Path;
@@ -28,6 +29,7 @@ pub(crate) use codestory_agent::packet_command::next_deeper_packet_argv;
 pub(crate) use codestory_agent::packet_command::next_deeper_packet_command;
 
 const MARKDOWN_TRUNCATION_FLOOR_BYTES: usize = 256;
+const ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION: &str = "answer.retrieval_trace.diagnostics";
 const AVOID_OPENING_OMISSION: &str = "avoid_opening";
 const COVERAGE_REPORT_INELIGIBLE_OMISSION: &str = "coverage_report.ineligible";
 const RETRIEVAL_TRACE_SUMMARY_OMISSION: &str = "retrieval_trace_summary";
@@ -151,7 +153,8 @@ pub fn enforce_packet_output_budget_for_representation(
 ) {
     let extra_probes = packet_explicit_request_probe_queries(&packet.plan);
     for _ in 0..8 {
-        let output_bytes = refresh_packet_output_bytes(packet, &representation_len);
+        let output_bytes =
+            refresh_packet_budget_usage_for_representation(packet, &representation_len);
         if output_bytes <= packet.budget.limits.max_output_bytes as usize {
             break;
         }
@@ -168,41 +171,66 @@ pub fn enforce_packet_output_budget_for_representation(
             .saturating_sub(over_by.saturating_add(1024))
             .max(1024);
 
+        let mut structurally_trimmed = false;
         let trimmed_verbose_sections = trim_packet_sufficiency_verbose_lists(packet);
         if !trimmed_verbose_sections.is_empty() {
             for section in trimmed_verbose_sections {
                 push_omitted_section(&mut packet.budget, section);
             }
-            continue;
-        }
-
-        if trim_packet_retrieval_trace_summary(packet) {
+            structurally_trimmed = true;
+        } else if trim_packet_retrieval_trace_summary(packet) {
             push_omitted_section(&mut packet.budget, RETRIEVAL_TRACE_SUMMARY_OMISSION);
-            continue;
+            structurally_trimmed = true;
+        } else if trim_packet_answer_retrieval_diagnostics(packet) {
+            push_omitted_section(&mut packet.budget, ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION);
+            structurally_trimmed = true;
+        } else if truncate_answer_markdown_to_byte_cap(&mut packet.answer, next_answer_cap) {
+            push_omitted_section(&mut packet.budget, "markdown_blocks");
+            structurally_trimmed = true;
         }
 
-        if truncate_answer_markdown_to_byte_cap(&mut packet.answer, next_answer_cap) {
-            push_omitted_section(&mut packet.budget, "markdown_blocks");
-            packet.budget.used = packet_budget_usage(&packet.answer);
-            rebuild_packet_budget_dependents(project_root, packet, &extra_probes);
+        if structurally_trimmed {
+            refresh_packet_after_budget_mutation(
+                project_root,
+                packet,
+                &extra_probes,
+                &representation_len,
+            );
             continue;
         }
         break;
     }
 
-    let output_bytes = refresh_packet_output_bytes(packet, &representation_len);
+    let output_bytes = refresh_packet_budget_usage_for_representation(packet, &representation_len);
     if output_bytes > packet.budget.limits.max_output_bytes as usize {
         packet.budget.truncated = true;
         push_omitted_section(&mut packet.budget, "output_bytes");
         push_omitted_section(&mut packet.budget, "packet_payload");
-        rebuild_packet_budget_dependents(project_root, packet, &extra_probes);
-        let _ = refresh_packet_output_bytes(packet, &representation_len);
     } else {
         remove_omitted_section(&mut packet.budget, "output_bytes");
         remove_omitted_section(&mut packet.budget, "packet_payload");
-        rebuild_packet_budget_dependents(project_root, packet, &extra_probes);
-        let _ = refresh_packet_output_bytes(packet, &representation_len);
     }
+    refresh_packet_after_budget_mutation(project_root, packet, &extra_probes, &representation_len);
+}
+
+fn refresh_packet_after_budget_mutation(
+    project_root: &Path,
+    packet: &mut AgentPacketDto,
+    extra_probes: &[String],
+    representation_len: &impl Fn(&AgentPacketDto) -> usize,
+) -> usize {
+    rebuild_packet_budget_dependents(project_root, packet, extra_probes);
+    refresh_packet_budget_usage_for_representation(packet, representation_len)
+}
+
+fn refresh_packet_budget_usage_for_representation(
+    packet: &mut AgentPacketDto,
+    representation_len: &impl Fn(&AgentPacketDto) -> usize,
+) -> usize {
+    let adapter_output_bytes = packet.budget.used.output_bytes;
+    packet.budget.used = packet_budget_usage(&packet.answer);
+    packet.budget.used.output_bytes = adapter_output_bytes;
+    refresh_packet_output_bytes(packet, representation_len)
 }
 
 fn trim_packet_sufficiency_verbose_lists(packet: &mut AgentPacketDto) -> Vec<&'static str> {
@@ -228,30 +256,76 @@ fn trim_packet_sufficiency_verbose_lists(packet: &mut AgentPacketDto) -> Vec<&'s
 
 fn trim_packet_retrieval_trace_summary(packet: &mut AgentPacketDto) -> bool {
     let trace = &mut packet.retrieval_trace_summary.retrieval_trace;
+    let shadow_trimmed = trace
+        .retrieval_shadow
+        .as_mut()
+        .is_some_and(trim_retrieval_shadow_verbose_diagnostics);
     let trimmed = !trace.request_id.is_empty()
-        || trace.total_latency_ms != 0
-        || trace.sla_target_ms.is_some()
-        || trace.sla_missed
         || trace.semantic_fallback_count != 0
         || !trace.semantic_fallbacks.is_empty()
         || !trace.annotations.is_empty()
         || !trace.steps.is_empty()
         || !trace.packet_sidecar_diagnostics.is_empty()
-        || trace.retrieval_shadow.is_some();
+        || shadow_trimmed;
 
     if trimmed {
         trace.request_id.clear();
-        trace.total_latency_ms = 0;
-        trace.sla_target_ms = None;
-        trace.sla_missed = false;
         trace.semantic_fallback_count = 0;
         trace.semantic_fallbacks.clear();
         trace.annotations.clear();
         trace.steps.clear();
         trace.packet_sidecar_diagnostics.clear();
-        trace.retrieval_shadow = None;
     }
 
+    trimmed
+}
+
+fn trim_packet_answer_retrieval_diagnostics(packet: &mut AgentPacketDto) -> bool {
+    let trace = &mut packet.answer.retrieval_trace;
+    let original_annotation_count = trace.annotations.len();
+    trace.annotations.retain(|annotation| annotation.is_gap());
+
+    let shadow_trimmed = trace
+        .retrieval_shadow
+        .as_mut()
+        .is_some_and(trim_retrieval_shadow_verbose_diagnostics);
+    let trimmed = original_annotation_count != trace.annotations.len()
+        || !trace.steps.is_empty()
+        || shadow_trimmed;
+    trace.steps.clear();
+    trimmed
+}
+
+fn trim_retrieval_shadow_verbose_diagnostics(shadow: &mut RetrievalShadowDto) -> bool {
+    let mut stage_details_trimmed = false;
+    for stage in &mut shadow.stage_timings {
+        stage_details_trimmed |= trim_retrieval_stage_verbose_diagnostics(stage);
+    }
+    let trimmed = stage_details_trimmed
+        || !shadow.candidates.is_empty()
+        || !shadow.would_rank.is_empty()
+        || !shadow.candidate_resolution_counts.is_empty();
+    shadow.candidates.clear();
+    shadow.would_rank.clear();
+    shadow.candidate_resolution_counts.clear();
+    trimmed
+}
+
+fn trim_retrieval_stage_verbose_diagnostics(stage: &mut RetrievalStageTimingDto) -> bool {
+    let trimmed = stage.deadline_ms.is_some()
+        || stage.admission_wait_ms.is_some()
+        || stage.queue_wait_ms.is_some()
+        || stage.execution_ms.is_some()
+        || stage.candidates_added != 0
+        || stage.marginal_gain != 0.0
+        || stage.sidecar_latency_ms.is_some();
+    stage.deadline_ms = None;
+    stage.admission_wait_ms = None;
+    stage.queue_wait_ms = None;
+    stage.execution_ms = None;
+    stage.candidates_added = 0;
+    stage.marginal_gain = 0.0;
+    stage.sidecar_latency_ms = None;
     trimmed
 }
 
@@ -922,7 +996,227 @@ mod tests {
     }
 
     #[test]
-    fn compact_budget_keeps_hard_payload_omission_when_summary_trace_trim_is_not_enough() {
+    fn compact_budget_trims_answer_trace_diagnostics_before_hard_payload_omission() {
+        let question = "Explain packet retrieval diagnostics under the wire cap.";
+        let mut packet = test_packet(question, 1);
+        install_duplicate_summary_trace_payload(&mut packet, 180);
+        packet.answer.retrieval_trace.annotations.push(
+            codestory_contracts::api::RetrievalAnnotationDto::gap(
+                "material retrieval gap must survive payload trimming",
+            ),
+        );
+        packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
+
+        let mut trimmed_probe = packet.clone();
+        assert!(trim_packet_retrieval_trace_summary(&mut trimmed_probe));
+        assert!(trim_packet_answer_retrieval_diagnostics(&mut trimmed_probe));
+        let trimmed_len = serialized_packet_len(&trimmed_probe);
+        let max_output_bytes = u32::try_from(trimmed_len + 4096).expect("test cap fits u32");
+        packet.budget.limits.max_output_bytes = max_output_bytes;
+        assert!(
+            serialized_packet_len(&packet) > max_output_bytes as usize,
+            "fixture must start over the packet output cap"
+        );
+
+        enforce_packet_output_budget(test_project_root(), &mut packet);
+
+        let serialized_len = serialized_packet_len(&packet);
+        assert!(
+            serialized_len <= max_output_bytes as usize,
+            "trimming answer trace diagnostics should bring the packet under cap: {serialized_len} > {max_output_bytes}"
+        );
+        assert_eq!(packet.budget.used.output_bytes as usize, serialized_len);
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION.to_string())
+        );
+        assert!(packet.answer.retrieval_trace.steps.is_empty());
+        assert_eq!(packet.answer.retrieval_trace.annotations.len(), 1);
+        assert!(packet.answer.retrieval_trace.annotations[0].is_gap());
+        assert_eq!(
+            packet
+                .retrieval_trace_summary
+                .retrieval_trace
+                .total_latency_ms,
+            123
+        );
+        assert_eq!(
+            packet.retrieval_trace_summary.retrieval_trace.sla_target_ms,
+            Some(1_000)
+        );
+        assert!(packet.retrieval_trace_summary.retrieval_trace.sla_missed);
+    }
+
+    #[test]
+    fn compact_budget_refreshes_usage_after_answer_trace_trimming() {
+        let question = "Explain packet usage accounting after diagnostic trimming.";
+        let mut packet = test_packet(question, 1);
+        packet.answer.retrieval_trace.steps = vec![AgentRetrievalStepDto {
+            kind: AgentRetrievalStepKindDto::SourceRead,
+            status: AgentRetrievalStepStatusDto::Ok,
+            duration_ms: 30,
+            input: Vec::new(),
+            output: Vec::new(),
+            message: Some("duplicated source-read diagnostic ".repeat(700)),
+        }];
+        install_verbose_semantic_stage_shadow(&mut packet);
+        packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
+        packet.budget.used = packet_budget_usage(&packet.answer);
+        assert_eq!(packet.budget.used.snippets, 1);
+        assert_eq!(packet.retrieval_trace_summary.source_read_steps, 1);
+
+        let represented_len = |packet: &AgentPacketDto| serialized_packet_len(packet) + 2_048;
+        let mut trimmed_probe = packet.clone();
+        assert!(trim_packet_retrieval_trace_summary(&mut trimmed_probe));
+        assert!(trim_packet_answer_retrieval_diagnostics(&mut trimmed_probe));
+        let max_output_bytes =
+            u32::try_from(represented_len(&trimmed_probe) + 4_096).expect("test cap fits u32");
+        packet.budget.limits.max_output_bytes = max_output_bytes;
+        assert!(
+            represented_len(&packet) > max_output_bytes as usize,
+            "fixture must start over the represented output cap"
+        );
+
+        enforce_packet_output_budget_for_representation(
+            test_project_root(),
+            &mut packet,
+            represented_len,
+        );
+
+        let retained_source_reads = packet
+            .answer
+            .retrieval_trace
+            .steps
+            .iter()
+            .filter(|step| {
+                step.kind == AgentRetrievalStepKindDto::SourceRead
+                    && step.status == AgentRetrievalStepStatusDto::Ok
+            })
+            .count() as u32;
+        assert_eq!(retained_source_reads, 0);
+        assert_eq!(
+            packet.retrieval_trace_summary.source_read_steps,
+            retained_source_reads
+        );
+        assert_eq!(packet.budget.used.snippets, retained_source_reads);
+
+        let answer_usage = packet_budget_usage(&packet.answer);
+        assert_eq!(packet.budget.used.anchors, answer_usage.anchors);
+        assert_eq!(packet.budget.used.files, answer_usage.files);
+        assert_eq!(packet.budget.used.snippets, answer_usage.snippets);
+        assert_eq!(packet.budget.used.trail_edges, answer_usage.trail_edges);
+        assert_eq!(
+            packet.budget.used.output_bytes as usize,
+            represented_len(&packet)
+        );
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION.to_string())
+        );
+
+        for trace in [
+            &packet.answer.retrieval_trace,
+            &packet.retrieval_trace_summary.retrieval_trace,
+        ] {
+            let semantic_stages = &trace
+                .retrieval_shadow
+                .as_ref()
+                .expect("retrieval shadow proof")
+                .stage_timings;
+            assert_eq!(semantic_stages.len(), 2);
+            assert_eq!(semantic_stages[0].completion_status, "completed");
+            assert_eq!(
+                semantic_stages[1].cancel_reason.as_deref(),
+                Some("stage_deadline")
+            );
+            assert!(semantic_stages[1].degraded);
+        }
+    }
+
+    #[test]
+    fn compact_budget_preserves_semantic_execution_proof_under_adapter_cap() {
+        let question = "Explain semantic retrieval proof under the public adapter cap.";
+        let mut packet = test_packet(question, 1);
+        install_duplicate_summary_trace_payload(&mut packet, 180);
+        install_verbose_semantic_stage_shadow(&mut packet);
+
+        let represented_len = |packet: &AgentPacketDto| serialized_packet_len(packet) + 2_048;
+        let mut trimmed_probe = packet.clone();
+        assert!(trim_packet_retrieval_trace_summary(&mut trimmed_probe));
+        assert!(trim_packet_answer_retrieval_diagnostics(&mut trimmed_probe));
+        let max_output_bytes =
+            u32::try_from(represented_len(&trimmed_probe) + 4_096).expect("test cap fits u32");
+        packet.budget.limits.max_output_bytes = max_output_bytes;
+        assert!(
+            represented_len(&packet) > max_output_bytes as usize,
+            "fixture must start over the represented output cap"
+        );
+
+        enforce_packet_output_budget_for_representation(
+            test_project_root(),
+            &mut packet,
+            represented_len,
+        );
+
+        assert!(represented_len(&packet) <= max_output_bytes as usize);
+        assert_eq!(
+            packet.budget.used.output_bytes as usize,
+            represented_len(&packet)
+        );
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&RETRIEVAL_TRACE_SUMMARY_OMISSION.to_string())
+        );
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION.to_string())
+        );
+
+        for trace in [
+            &packet.answer.retrieval_trace,
+            &packet.retrieval_trace_summary.retrieval_trace,
+        ] {
+            assert_eq!(trace.total_latency_ms, 123);
+            assert_eq!(trace.sla_target_ms, Some(1_000));
+            assert!(trace.sla_missed);
+            let semantic_stages = trace
+                .retrieval_shadow
+                .as_ref()
+                .expect("retrieval shadow proof")
+                .stage_timings
+                .iter()
+                .filter(|stage| stage.stage.contains("semantic"))
+                .collect::<Vec<_>>();
+            assert_eq!(semantic_stages.len(), 2);
+            assert!(
+                semantic_stages
+                    .iter()
+                    .any(|stage| stage.completion_status == "completed")
+            );
+            assert!(
+                semantic_stages
+                    .iter()
+                    .any(|stage| stage.cancel_reason.as_deref() == Some("stage_deadline"))
+            );
+            assert!(semantic_stages.iter().any(|stage| stage.degraded));
+            assert!(
+                semantic_stages
+                    .iter()
+                    .any(|stage| stage.stub_reason.as_deref() == Some("semantic_runtime_degraded"))
+            );
+        }
+    }
+
+    #[test]
+    fn compact_budget_keeps_hard_payload_omission_when_diagnostic_trimming_is_not_enough() {
         let question = "Explain still oversized packet diagnostics.";
         let mut packet = test_packet(question, 512);
         install_duplicate_summary_trace_payload(&mut packet, 24);
@@ -932,7 +1226,7 @@ mod tests {
         let serialized_len = serialized_packet_len(&packet);
         assert!(
             serialized_len > packet.budget.limits.max_output_bytes as usize,
-            "fixture should remain over cap after summary trace trimming"
+            "fixture should remain over an impossible cap after diagnostic trimming"
         );
         assert_eq!(packet.budget.used.output_bytes as usize, serialized_len);
         assert!(
@@ -954,9 +1248,9 @@ mod tests {
                 .contains(&"packet_payload".to_string())
         );
         assert!(packet.budget.truncated);
-        assert_eq!(packet.retrieval_trace_summary.search_steps, 1);
-        assert_eq!(packet.retrieval_trace_summary.trail_steps, 1);
-        assert_eq!(packet.retrieval_trace_summary.source_read_steps, 1);
+        assert_eq!(packet.retrieval_trace_summary.search_steps, 0);
+        assert_eq!(packet.retrieval_trace_summary.trail_steps, 0);
+        assert_eq!(packet.retrieval_trace_summary.source_read_steps, 0);
         assert!(
             packet
                 .retrieval_trace_summary
@@ -964,7 +1258,13 @@ mod tests {
                 .steps
                 .is_empty()
         );
-        assert_eq!(packet.answer.retrieval_trace.steps.len(), 3);
+        assert!(packet.answer.retrieval_trace.steps.is_empty());
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION.to_string())
+        );
     }
 
     #[test]
@@ -1339,6 +1639,60 @@ mod tests {
             search_steps: 1,
             trail_steps: 1,
         };
+    }
+
+    fn install_verbose_semantic_stage_shadow(packet: &mut AgentPacketDto) {
+        let shadow = serde_json::from_value::<RetrievalShadowDto>(serde_json::json!({
+            "retrieval_mode": "full",
+            "degraded_reason": "semantic_runtime_degraded",
+            "retrieval_total_ms": 88,
+            "total_budget_ms": 100,
+            "cancel_reason": "stage_deadline",
+            "cache_hit": false,
+            "stage_timings": [
+                {
+                    "stage": "stage1b_semantic",
+                    "deadline_ms": 50,
+                    "elapsed_ms": 40,
+                    "admission_wait_ms": 3,
+                    "queue_wait_ms": 2,
+                    "execution_ms": 35,
+                    "candidates_added": 4,
+                    "marginal_gain": 0.75,
+                    "cache_hit": false,
+                    "sidecar_latency_ms": 35,
+                    "degraded": false,
+                    "completion_status": "completed"
+                },
+                {
+                    "stage": "stage2_semantic_vector",
+                    "deadline_ms": 50,
+                    "elapsed_ms": 48,
+                    "admission_wait_ms": 4,
+                    "queue_wait_ms": 3,
+                    "execution_ms": 41,
+                    "candidates_added": 0,
+                    "marginal_gain": 0.0,
+                    "cancel_reason": "stage_deadline",
+                    "cache_hit": false,
+                    "sidecar_latency_ms": 41,
+                    "degraded": true,
+                    "stub_reason": "semantic_runtime_degraded",
+                    "completion_status": "cancelled_before_start"
+                }
+            ],
+            "would_rank": ["verbose semantic candidate detail ".repeat(180)],
+            "candidate_count": 4,
+            "resolved_hit_count": 2,
+            "unresolved_candidate_count": 2,
+            "diagnostic_only": false,
+            "candidate_resolution_counts": [
+                { "resolution": "semantic candidate detail", "count": 4 }
+            ]
+        }))
+        .expect("semantic retrieval shadow fixture");
+        packet.answer.retrieval_trace.retrieval_shadow = Some(shadow);
+        packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
     }
 
     fn test_project_root() -> &'static Path {

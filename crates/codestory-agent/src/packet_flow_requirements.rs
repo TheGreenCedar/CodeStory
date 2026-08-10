@@ -1037,6 +1037,7 @@ pub fn all_flow_requirements() -> Vec<FlowRequirement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packet_evidence_carriers::carrier_taxonomy_vocabulary;
     use crate::packet_terms::packet_probe_terms;
     use codestory_contracts::api::{NodeId, NodeKind, SearchHitOrigin};
     use std::collections::BTreeMap;
@@ -1525,7 +1526,7 @@ mod tests {
             ),
             (
                 ("shell_function_dispatch", "dispatch"),
-                witness("nvm_command", "nvm.sh", NodeKind::FUNCTION),
+                witness("nvm_command_dispatch", "nvm.sh", NodeKind::FUNCTION),
             ),
             (
                 ("shell_completion", "terminal_boundary"),
@@ -2130,17 +2131,6 @@ mod tests {
         "shell_completion | compgen",
         "shell_completion | complete",
         "shell_completion | completion",
-        "shell_function_dispatch | case",
-        "shell_function_dispatch | command",
-        "shell_function_dispatch | commands",
-        "shell_function_dispatch | dispatch",
-        "shell_function_dispatch | dispatcher",
-        "shell_function_dispatch | exec",
-        "shell_function_dispatch | execut",
-        "shell_function_dispatch | execute",
-        "shell_function_dispatch | execution",
-        "shell_function_dispatch | run",
-        "shell_function_dispatch | use",
         "shell_installer_bootstrap | bootstrap",
         "shell_installer_bootstrap | download",
         "shell_installer_bootstrap | install",
@@ -2152,8 +2142,8 @@ mod tests {
     /// Every word any predicate in this crate reads, so the sweep below covers the whole vocabulary
     /// the tables are written in rather than a sample of it. Held to the carriers' own source by
     /// `the_one_word_sweep_covers_every_word_the_carriers_match_on`, so it cannot fall behind them.
-    fn evidence_vocabulary() -> Vec<&'static str> {
-        vec![
+    fn evidence_vocabulary() -> Vec<String> {
+        let mut vocabulary = vec![
             "request",
             "requests",
             "route",
@@ -2526,6 +2516,13 @@ mod tests {
             "sitemap",
             "sitemaps",
         ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        vocabulary.extend(carrier_taxonomy_vocabulary());
+        vocabulary.sort();
+        vocabulary.dedup();
+        vocabulary
     }
 
     /// The sweep is only as wide as the vocabulary it sweeps, so the vocabulary is checked against
@@ -2555,7 +2552,7 @@ mod tests {
                     || !literal
                         .chars()
                         .all(|character| character.is_ascii_lowercase())
-                    || vocabulary.contains(&literal)
+                    || vocabulary.iter().any(|word| word.as_str() == literal)
                     || missing.iter().any(|word| word == literal)
                 {
                     continue;
@@ -2798,17 +2795,6 @@ mod tests {
         "shell_completion | compgen",
         "shell_completion | complete",
         "shell_completion | completion",
-        "shell_function_dispatch | case",
-        "shell_function_dispatch | command",
-        "shell_function_dispatch | commands",
-        "shell_function_dispatch | dispatch",
-        "shell_function_dispatch | dispatcher",
-        "shell_function_dispatch | exec",
-        "shell_function_dispatch | execut",
-        "shell_function_dispatch | execute",
-        "shell_function_dispatch | execution",
-        "shell_function_dispatch | run",
-        "shell_function_dispatch | use",
         "shell_installer_bootstrap | bootstrap",
         "shell_installer_bootstrap | download",
         "shell_installer_bootstrap | install",
@@ -2912,7 +2898,7 @@ mod tests {
         let mut names_swept = 0_usize;
         let mut closes_every_name: BTreeMap<String, usize> = BTreeMap::new();
         for word in evidence_vocabulary() {
-            for name in compound_shapes_for(word) {
+            for name in compound_shapes_for(&word) {
                 for surface in sweep_surfaces() {
                     names_swept += 1;
                     let mut closed_here: Vec<&str> = Vec::new();
@@ -3011,11 +2997,12 @@ mod tests {
                 // for, crossed with one file per surface class. It used to be `.rs` and `.ts` under
                 // a comment claiming `.ts` stood for every script surface; that claim is now a
                 // test rather than a comment, and it was false while `.vue` took the markup branch.
-                // `STRUCT` is treated identically to `CLASS` by every predicate in the crate, and
-                // the non-behavior kinds are crossed against the corpus above.
+                // These callable/owner shapes exercise the lexical predicates only. Narrower kind
+                // policies belong to explicit carrier contracts rather than an assumed global
+                // equivalence between every `NodeKind`.
                 for file in sweep_surface_files() {
                     for kind in [NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::CLASS] {
-                        let citation = witness(word, &format!("{directory}{file}"), kind);
+                        let citation = witness(&word, &format!("{directory}{file}"), kind);
                         for requirement in &requirements {
                             if !requirement.evidence.citation_proves(&citation) {
                                 continue;
@@ -3563,10 +3550,12 @@ mod tests {
     /// generic web nouns stood in for one specific one. Both are two-word-plus-verb shapes, and the
     /// one-vocabulary-word sweeps are structurally blind to them.
     ///
-    /// `NodeKind::METHOD` alone, and provably so: every requirement in these six flows is a
-    /// `CitedCarrier`, and every carrier's kind test is either `owns_behavior` — which accepts
-    /// `FUNCTION`, `METHOD`, `CLASS` and `STRUCT` alike — or `FUNCTION | METHOD`. No carrier can
-    /// accept a kind it rejects for a method, so widening the axis could only cost time.
+    /// `NodeKind::METHOD` is the callable representative for this lexical cross-product, not a
+    /// global kind-policy assertion. Carrier-specific extractor boundaries are covered beside the
+    /// carrier itself; for example, shell dispatch explicitly crosses callable `FUNCTION` /
+    /// `METHOD` anchors with non-callable `VARIABLE`, `FIELD` and `TYPEDEF` anchors. Keeping kind
+    /// policy out of this already-large sweep lets it answer one question: whether off-subject
+    /// words can satisfy a carrier's two lexical factors.
     #[test]
     fn no_carrier_flow_closes_on_evidence_that_never_names_it() {
         let vocabulary = evidence_vocabulary();
@@ -3587,8 +3576,8 @@ mod tests {
             for requirement in &requirements {
                 assert!(
                     matches!(requirement.evidence, EvidencePredicate::CitedCarrier(_)),
-                    "{} is not carrier-backed, so the METHOD-only kind axis below is no longer \
-                     sound for the {} flow",
+                    "{} is not carrier-backed, so the lexical carrier sweep no longer applies to \
+                     the {} flow",
                     requirement.id,
                     flow.flow
                 );
@@ -3596,7 +3585,12 @@ mod tests {
 
             let off_subject = vocabulary
                 .iter()
-                .filter(|word| !flow.subject_words.contains(*word))
+                .filter(|word| {
+                    !flow
+                        .subject_words
+                        .iter()
+                        .any(|subject| *subject == word.as_str())
+                })
                 .collect::<Vec<_>>();
             let mut closable: Vec<String> = Vec::new();
             for object in &off_subject {

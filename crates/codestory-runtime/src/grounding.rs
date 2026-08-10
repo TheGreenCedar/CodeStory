@@ -487,11 +487,14 @@ fn diversify_grounding_root_records(
     records.sort_by_cached_key(|record| {
         GroundingRootSortKey::new(record, root, file_roles, degrees, member_counts)
     });
-    // Spend the compact budget on distinct language/subsystem surfaces inside
-    // each architecture band. Sharing diversity state across bands preserves
-    // duplicate-name suppression without letting a novel tool language jump
-    // ahead of a production ownership boundary. Every budget truncates this
-    // one stable order.
+    // Spend the compact budget on one best root from every production
+    // subsystem before repeating any subsystem. Name diversity alone cannot do
+    // this: a new subsystem may expose the same conventional symbol name as an
+    // already represented one. Keep the strongest entrypoint first, then pin
+    // one representative per remaining subsystem. After breadth is secured,
+    // the shared diversification pass retains its existing stable name order
+    // over the leftovers. Tooling, secondary roles, and imports remain later
+    // tiers, and every budget truncates this one deterministic order.
     let surface_key = |record: &GroundingNodeRecord| {
         (
             grounding_root_subsystem_key(root, record, file_languages),
@@ -509,10 +512,49 @@ fn diversify_grounding_root_records(
             grounding_root_architecture_band(&record, role, relative.as_deref(), entry) as usize;
         bands[band].push(record);
     }
-    let mut diversified = Vec::new();
-    for band in bands {
+    let mut production_architecture = Vec::new();
+    for band in bands.iter_mut().take(3) {
+        production_architecture.append(band);
+    }
+
+    let highest_ranked_entrypoint = production_architecture.iter().position(|record| {
+        grounding_entry_evidence(
+            record,
+            file_roles,
+            degrees.get(&record.node.id).copied().unwrap_or_default(),
+        ) != EntryEvidence::None
+    });
+    let mut representatives = Vec::new();
+    let mut represented_subsystems = HashSet::new();
+    let mut representative_ids = HashSet::new();
+    if let Some(index) = highest_ranked_entrypoint {
+        let record = production_architecture.remove(index);
+        represented_subsystems.insert(grounding_root_subsystem_key(root, &record, file_languages));
+        representative_ids.insert(record.node.id);
+        representatives.push(record);
+    }
+
+    let mut leftovers = Vec::new();
+    for record in production_architecture {
+        let subsystem = grounding_root_subsystem_key(root, &record, file_languages);
+        if represented_subsystems.insert(subsystem) {
+            representative_ids.insert(record.node.id);
+            representatives.push(record);
+        } else {
+            leftovers.push(record);
+        }
+    }
+    representatives.extend(leftovers);
+
+    let mut diversified = diversify_root_order_within(
+        representatives,
+        |record| representative_ids.contains(&record.node.id),
+        surface_key,
+        &mut state,
+    );
+    for tier in bands.into_iter().skip(3) {
         diversified.extend(diversify_root_order_within(
-            band,
+            tier,
             |_| false,
             surface_key,
             &mut state,
@@ -1978,7 +2020,7 @@ mod tests {
     }
 
     #[test]
-    fn grounding_root_diversity_does_not_consume_duplicate_name_subsystems() {
+    fn grounding_root_breadth_keeps_subsystems_with_duplicate_root_names() {
         let root = Path::new("/repo");
         let record = |node_id, file_id, name: &str, path: &str| GroundingNodeRecord {
             node: Node {
@@ -2040,7 +2082,7 @@ mod tests {
                     "typescript:packages/a/src".to_string()
                 ),
                 (
-                    "uniqueb".to_string(),
+                    "sharedroot".to_string(),
                     "typescript:packages/b/src".to_string()
                 ),
                 (
@@ -2048,6 +2090,98 @@ mod tests {
                     "typescript:packages/c/src".to_string()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn production_architecture_breadth_does_not_require_a_novel_symbol_name() {
+        let root = Path::new("/repo");
+        let record = |node_id, file_id, name: String, path: &str, kind| GroundingNodeRecord {
+            node: Node {
+                id: CoreNodeId(node_id),
+                kind,
+                serialized_name: name.clone(),
+                file_node_id: Some(CoreNodeId(file_id)),
+                start_line: Some(node_id as u32),
+                ..Default::default()
+            },
+            display_name: name,
+            file_path: Some(root.join(path)),
+        };
+        let mut records = (0..8_i64)
+            .map(|index| {
+                record(
+                    100 + index,
+                    10,
+                    if index == 0 {
+                        "Common".to_string()
+                    } else {
+                        format!("A{index}")
+                    },
+                    "apps/alpha/src/main.ts",
+                    NodeKind::FUNCTION,
+                )
+            })
+            .collect::<Vec<_>>();
+        records.push(record(
+            200,
+            20,
+            "Common".to_string(),
+            "crates/beta/src/lib.rs",
+            NodeKind::STRUCT,
+        ));
+        let file_roles = [(10, FileRole::Entrypoint), (20, FileRole::Source)]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let file_languages = [(10, "typescript"), (20, "rust")]
+            .into_iter()
+            .map(|(id, language)| (id, language.to_string()))
+            .collect::<HashMap<_, _>>();
+        let degrees = (0..8_i64)
+            .map(|index| {
+                (
+                    CoreNodeId(100 + index),
+                    CallDegrees {
+                        production_in_calls: 0,
+                        out_calls: 3,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let ordered = diversify_grounding_root_records(
+            records,
+            root,
+            &file_roles,
+            &file_languages,
+            &degrees,
+            &HashMap::new(),
+        );
+        let first_two = ordered
+            .iter()
+            .take(2)
+            .map(|candidate| {
+                (
+                    candidate.display_name.as_str(),
+                    grounding_root_subsystem_key(root, candidate, &file_languages),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_two[0].0, "Common");
+        assert_eq!(first_two[1].0, "Common");
+        assert_ne!(first_two[0].1, first_two[1].1);
+        assert_eq!(ordered[0].node.id, CoreNodeId(100));
+        assert_eq!(ordered[1].node.id, CoreNodeId(200));
+        assert_eq!(
+            ordered
+                .iter()
+                .take(8)
+                .map(|candidate| { grounding_root_subsystem_key(root, candidate, &file_languages) })
+                .collect::<HashSet<_>>()
+                .len(),
+            2,
+            "strict grounding must represent both subsystems before repeating alpha"
         );
     }
 
@@ -2425,7 +2559,7 @@ mod tests {
     }
 
     #[test]
-    fn large_mixed_project_keeps_entrypoint_and_ui_host_boundaries_above_decoys() {
+    fn large_member_rich_mixed_project_diversifies_entrypoints_into_architecture_breadth() {
         let temp = tempdir().expect("temp dir");
         let project_root = temp.path().join("target/acceptance/project");
         let db_path = temp.path().join("cache/codestory.db");
@@ -2524,17 +2658,41 @@ mod tests {
                 (
                     401,
                     4_001,
+                    "apps/desktop/ui/src/lib/runtimeBridge.ts",
+                    "typescript",
+                    "UiLibraryBoundary",
+                    NodeKind::STRUCT,
+                ),
+                (
+                    501,
+                    5_001,
                     "packages/shared/src/lib.rs",
                     "rust",
                     "SharedLibrary",
                     NodeKind::STRUCT,
                 ),
                 (
-                    501,
-                    5_001,
+                    601,
+                    6_001,
                     "services/api/src/service.go",
                     "go",
                     "ApiBoundary",
+                    NodeKind::STRUCT,
+                ),
+                (
+                    701,
+                    7_001,
+                    "crates/state/src/lib.rs",
+                    "rust",
+                    "StateBoundary",
+                    NodeKind::STRUCT,
+                ),
+                (
+                    801,
+                    8_001,
+                    "crates/query/src/lib.rs",
+                    "rust",
+                    "QueryBoundary",
                     NodeKind::STRUCT,
                 ),
             ];
@@ -2558,7 +2716,110 @@ mod tests {
                     },
                 )
                 .expect("insert architecture root");
+
+                if kind == NodeKind::STRUCT {
+                    let members = (1..=4_i64)
+                        .map(|offset| Node {
+                            id: CoreNodeId(node_id + offset),
+                            kind: NodeKind::METHOD,
+                            serialized_name: format!("{name}Member{offset}"),
+                            file_node_id: Some(CoreNodeId(file_id)),
+                            start_line: Some(500 + offset as u32),
+                            ..Default::default()
+                        })
+                        .collect::<Vec<_>>();
+                    storage
+                        .insert_nodes_batch(&members)
+                        .expect("insert architecture members");
+                    storage
+                        .insert_edges_batch(
+                            &(1..=4_i64)
+                                .map(|offset| Edge {
+                                    id: EdgeId(60_000 + node_id + offset),
+                                    source: CoreNodeId(node_id),
+                                    target: CoreNodeId(node_id + offset),
+                                    kind: EdgeKind::MEMBER,
+                                    file_node_id: Some(CoreNodeId(file_id)),
+                                    line: Some(500 + offset as u32),
+                                    resolved_source: None,
+                                    resolved_target: None,
+                                    confidence: None,
+                                    certainty: None,
+                                    callsite_identity: None,
+                                    candidate_targets: Vec::new(),
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .expect("insert architecture membership");
+                }
             }
+
+            // Real applications often expose several host commands and
+            // bootstrap functions from the same entry files. They all carry
+            // valid topology, but they must not consume the whole strict map
+            // before distinct production ownership boundaries are shown.
+            let clustered_entry_roots = (0..6_i64)
+                .map(|index| {
+                    (
+                        50_000 + index,
+                        101,
+                        format!("BootstrapCommand{index}"),
+                        520 + index as u32,
+                        [CoreNodeId(2_001), CoreNodeId(4_001)],
+                    )
+                })
+                .chain((0..6_i64).map(|index| {
+                    (
+                        50_100 + index,
+                        301,
+                        format!("HostCommand{index}"),
+                        620 + index as u32,
+                        [CoreNodeId(2_001), CoreNodeId(5_001)],
+                    )
+                }))
+                .collect::<Vec<_>>();
+            storage
+                .insert_nodes_batch(
+                    &clustered_entry_roots
+                        .iter()
+                        .map(|(node_id, file_id, name, line, _)| Node {
+                            id: CoreNodeId(*node_id),
+                            kind: NodeKind::FUNCTION,
+                            serialized_name: name.clone(),
+                            file_node_id: Some(CoreNodeId(*file_id)),
+                            start_line: Some(*line),
+                            ..Default::default()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .expect("insert clustered entry roots");
+            storage
+                .insert_edges_batch(
+                    &clustered_entry_roots
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(index, (source, file_id, _, line, targets))| {
+                            targets
+                                .iter()
+                                .enumerate()
+                                .map(move |(target_index, target)| Edge {
+                                    id: EdgeId(90_000 + index as i64 * 2 + target_index as i64),
+                                    source: CoreNodeId(*source),
+                                    target: *target,
+                                    kind: EdgeKind::CALL,
+                                    file_node_id: Some(CoreNodeId(*file_id)),
+                                    line: Some(*line + target_index as u32),
+                                    resolved_source: None,
+                                    resolved_target: None,
+                                    confidence: None,
+                                    certainty: None,
+                                    callsite_identity: None,
+                                    candidate_targets: Vec::new(),
+                                })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .expect("insert clustered entry topology");
             storage
                 .insert_edges_batch(&[
                     Edge {
@@ -2627,9 +2888,11 @@ mod tests {
         assert_eq!(names.first().map(String::as_str), Some("LaunchWorkspace"));
         for boundary in [
             "ApplicationShell",
-            "HostRuntime",
+            "UiLibraryBoundary",
             "SharedLibrary",
             "ApiBoundary",
+            "StateBoundary",
+            "QueryBoundary",
         ] {
             assert!(
                 names.iter().any(|name| name == boundary),
@@ -2637,9 +2900,26 @@ mod tests {
             );
         }
         assert!(strict.orientation.evaluated_root_candidates > 224);
-        assert_eq!(strict.orientation.selected_entrypoint_roots, 1);
-        assert!(strict.orientation.candidate_subsystems >= 5);
-        assert!(strict.orientation.selected_subsystems >= 5);
+        assert!(strict.orientation.selected_entrypoint_roots >= 1);
+        assert!(strict.orientation.candidate_subsystems >= 8);
+        assert_eq!(strict.orientation.selected_subsystems, 8);
+        let selected_paths = strict
+            .root_symbols
+            .iter()
+            .filter_map(grounding_symbol_path)
+            .collect::<Vec<_>>();
+        assert!(
+            selected_paths
+                .iter()
+                .any(|path| path.starts_with("apps/desktop/src-tauri/")),
+            "strict grounding omitted the host boundary: {selected_paths:?}"
+        );
+        assert!(
+            selected_paths
+                .iter()
+                .any(|path| path.starts_with("apps/desktop/ui/src/lib/")),
+            "strict grounding omitted the UI library boundary: {selected_paths:?}"
+        );
 
         let root_refs = |snapshot: &GroundingSnapshotDto| {
             snapshot

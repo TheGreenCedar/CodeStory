@@ -16,6 +16,7 @@ import {
   benchmarkRunId,
   commandCategory,
   copyResultArtifact,
+  groupPacketRuntimeColdJobs,
   isTrustedPublishableRepoUrl,
   isPathInside,
   loadTaskForResult,
@@ -64,6 +65,41 @@ const RUNTIME_SERVICE_FILE = "crates/codestory-runtime/src/services.rs";
 const RUN_INDEX_SYMBOL = "IndexService::run_indexing_blocking";
 const RUNTIME_REFRESH_CLAIM =
   "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.";
+
+test("groups cold packet-runtime jobs by repo", () => {
+  const expressRouting = { repo: "express", id: "express-routing" };
+  const muxRouting = { repo: "mux", id: "mux-routing" };
+  const expressResponse = { repo: "express", id: "express-response" };
+
+  const groups = groupPacketRuntimeColdJobs(
+    [expressRouting, muxRouting, expressResponse],
+    3,
+  );
+
+  assert.deepEqual(
+    groups.map(({ repo, jobs }) => ({
+      repo,
+      jobs: jobs.map(({ task, repeat }) => `${task.id}:${repeat}`),
+    })),
+    [
+      {
+        repo: "express",
+        jobs: [
+          "express-routing:1",
+          "express-routing:2",
+          "express-routing:3",
+          "express-response:1",
+          "express-response:2",
+          "express-response:3",
+        ],
+      },
+      {
+        repo: "mux",
+        jobs: ["mux-routing:1", "mux-routing:2", "mux-routing:3"],
+      },
+    ],
+  );
+});
 
 test("parses packet-runtime benchmark run id", () => {
   const opts = parseBenchmarkArgs([

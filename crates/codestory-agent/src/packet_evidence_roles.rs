@@ -1,3 +1,4 @@
+use crate::packet_evidence_carriers::citation_owns_indexing_entrypoint;
 use crate::packet_scoring::{
     normalize_identifier, packet_display_name_is_test_like, packet_display_path,
 };
@@ -177,7 +178,8 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
         || path.contains("sourcegroup")
     {
         Some(PacketEvidenceRole::SourceGroupConfiguration)
-    } else if normalized_display.contains("buildindex")
+    } else if citation_owns_indexing_entrypoint(citation)
+        || normalized_display.contains("buildindex")
         || (normalized_display.contains("task")
             && normalized_display.contains("indexer")
             && normalized_display.contains("queue"))
@@ -615,6 +617,64 @@ mod tests {
             ),
             "configuration names must not claim process-launch behavior"
         );
+    }
+
+    #[test]
+    fn indexing_entrypoint_role_recognizes_generic_run_shapes() {
+        for (name, kind) in [
+            ("run_index", NodeKind::FUNCTION),
+            (
+                "IndexService::run_indexing_blocking_without_runtime_refresh",
+                NodeKind::METHOD,
+            ),
+            ("BuildIndex::run", NodeKind::METHOD),
+            ("index_file", NodeKind::FUNCTION),
+            ("build_index", NodeKind::FUNCTION),
+            ("create_index", NodeKind::FUNCTION),
+            ("write_index", NodeKind::FUNCTION),
+            ("persist_index", NodeKind::FUNCTION),
+            ("rebuild_index", NodeKind::FUNCTION),
+            ("reindex_files", NodeKind::FUNCTION),
+            ("re_index_files", NodeKind::FUNCTION),
+            ("IndexWriter::write", NodeKind::METHOD),
+            ("SearchIndex::build", NodeKind::METHOD),
+        ] {
+            let mut candidate = citation(name, "src/services.rs");
+            candidate.kind = kind;
+            assert_eq!(
+                packet_evidence_role(&candidate),
+                Some(PacketEvidenceRole::IndexingWorkQueue),
+                "{name}",
+            );
+        }
+        for name in [
+            "run_indexed_query",
+            "SearchIndex::execute_query",
+            "IndexReader::read",
+            "IndexReader::read_index",
+            "IndexLookup::run",
+            "execute_index_query",
+            "query_index",
+            "search_index",
+            "lookup_index",
+            "scan_index",
+            "fetch_index",
+            "get_index",
+            "list_index",
+            "inspect_index",
+            "index",
+            "cache_index",
+            "build_files",
+            "create_files",
+        ] {
+            let mut candidate = citation(name, "src/search.rs");
+            candidate.kind = NodeKind::METHOD;
+            assert_ne!(
+                packet_evidence_role(&candidate),
+                Some(PacketEvidenceRole::IndexingWorkQueue),
+                "{name} must remain a read-side role",
+            );
+        }
     }
 
     #[test]

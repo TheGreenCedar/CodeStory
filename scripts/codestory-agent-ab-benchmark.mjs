@@ -5283,6 +5283,15 @@ function groupTasksByRepo(tasks) {
   return byRepo;
 }
 
+function groupPacketRuntimeColdJobs(tasks, repeats) {
+  return [...groupTasksByRepo(tasks)].map(([repo, repoTasks]) => ({
+    repo,
+    jobs: repoTasks.flatMap((task) =>
+      Array.from({ length: repeats }, (_, index) => ({ task, repeat: index + 1 })),
+    ),
+  }));
+}
+
 function packetCompositionPayload(results) {
   return {
     generated_at: new Date().toISOString(),
@@ -5406,19 +5415,23 @@ async function runPacketRuntimeBenchmarkBody(opts, tasks) {
       : [opts.packetRuntimeMode];
   const results = [];
   if (modes.includes("cold-cli")) {
-    const coldJobs = [];
-    for (const task of tasks) {
-      for (let repeat = 1; repeat <= opts.repeats; repeat += 1) {
-        coldJobs.push({ task, repeat });
-      }
-    }
-    const coldResults = await parallelMap(coldJobs, opts.jobs, async ({ task, repeat }) => {
-      console.log(`packet-runtime cold-cli ${task.repo} ${task.id} repeat ${repeat}/${opts.repeats}`);
-      return await runColdPacketRuntime(opts, task, repeat, outDir);
-    });
-    for (const result of coldResults) {
-      if (result) {
-        results.push(result);
+    const coldResultGroups = await parallelMap(
+      groupPacketRuntimeColdJobs(tasks, opts.repeats),
+      opts.jobs,
+      async ({ jobs }) => {
+        const repoResults = [];
+        for (const { task, repeat } of jobs) {
+          console.log(`packet-runtime cold-cli ${task.repo} ${task.id} repeat ${repeat}/${opts.repeats}`);
+          repoResults.push(await runColdPacketRuntime(opts, task, repeat, outDir));
+        }
+        return repoResults;
+      },
+    );
+    for (const coldResults of coldResultGroups) {
+      for (const result of coldResults) {
+        if (result) {
+          results.push(result);
+        }
       }
     }
   }
@@ -7065,6 +7078,7 @@ export {
   packetLatencyTelemetry,
   packetRuntimeCacheObservations,
   packetEmbeddingExecutionProof,
+  groupPacketRuntimeColdJobs,
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
   cacheProvenanceBlockers,
