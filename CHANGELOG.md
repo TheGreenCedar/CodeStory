@@ -4,193 +4,33 @@
 
 ## 0.17.0
 
+CodeStory 0.17 focuses on more trustworthy answers and a faster, more predictable installed experience. Grounding is centered on project architecture, packet and search results separate proven evidence from gaps, and the embedding model stays resident for work across projects instead of being loaded for each command.
+
+### Added
+
+- The installed plugin now shares one accelerated embedding server across projects for the same OS account. It keeps model residency between commands, separates query and bulk work with bounded queues, returns useful retry state under pressure, and refuses CPU fallback rather than quietly changing the performance and quality contract.
+- Grounding now leads with real entry points, ownership boundaries, and distinct production subsystems. Compact results report typed confidence and uncertainty when the view is compressed or the index cannot support a stronger architectural claim.
+- Bookmarks now live outside the rebuildable index, follow symbols through ordinary moves and renames when identity is unambiguous, and survive reindexing, cache resets, interrupted migration, and temporary symbol disappearance.
+- Every MCP response identifies the response contract that produced it. Contract v2 validates tool arguments against the published tool list and reports the protocol revision CodeStory actually negotiated.
+
+### Improved
+
+- Packet and route answers now require evidence for each requested step, keep exact-file questions tied to those files, publish only claims they proved, and preserve useful gaps and follow-ups when the response has to be compacted.
+- Search leaves out semantically unrelated results instead of filling the page with weak matches, preserves separate symbols that share a name, and keeps differently cased queries independent.
+- Large repositories open and refresh faster without weakening content freshness. Unchanged source checks use bounded parallel work, repeated installed grounding reuses safe observations, and identical discovery roots are walked once.
+- Files admitted by the larger source-size limit now reach lexical, repository-text, and semantic search consistently, while unsupported binary images are reported by file type instead of as oversized source.
+
 ### Fixed
 
-- Large repositories keep real entrypoints and architecture boundaries in
-  bounded grounding results even when the checkout itself sits under a folder
-  named `target` or `build`; generated-looking parent directories no longer
-  reclassify every project file.
-- Route packets now follow registration through dispatch and any requested
-  response boundary, preserve typed capacity/backpressure failures instead of
-  suggesting a reindex, and enforce the CLI JSON byte limit against its actual
-  pretty output and publication metadata while stdio keeps compact accounting.
-- Raising the source-file size limit no longer leaves newly admitted files
-  missing from lexical, repository-text, or semantic search. Unsupported binary
-  images are now classified by file type instead of being reported as oversized
-  source.
-- A packet no longer reports a step of a flow as covered because a different
-  step was. Coverage was decided by the kind of position a step occupies —
-  entrypoint, dispatch, terminal boundary — so when a question asked about two
-  steps of the same kind, evidence for one closed both, and an answer that only
-  used the right words could close either. Each step now has to be backed by
-  evidence for that step. Asking about an HTTP client that runs interceptors
-  before dispatching a request, for instance, no longer counts as answered when
-  the interceptor owner was never found.
-- A packet only repeats back the claims it proved. Claims the same packet
-  reported as unproven — an unsupported sentence, evidence it had already ruled
-  diagnostic, or prose that points at a file without explaining it — were still
-  published as covered, and the files behind them were listed as not worth
-  opening. Both lists now come from proven claims; the coverage report still
-  names every dropped claim and why.
-- Naming an exact file in a question holds the answer to that file. Only
-  architecture questions did; every other kind could answer around a requested
-  path and still report itself complete. Each unproven path is now reported on
-  its own, with its own follow-up, for every kind of question.
-- Evidence for a step now has to come from the part of the codebase that step is
-  about. A step was matched by looking for a word anywhere inside a symbol's
-  name, so a symbol could close a step it had nothing to do with whenever its
-  letters happened to line up — a command-line parser error standing in for a
-  formatter's failure path, or a page-layout helper standing in for a form's
-  input constraints, because "adminPanel" contains "min". Words are now matched
-  whole, and a step also checks that the symbol belongs to the subsystem in
-  question, so unrelated results no longer make a packet look complete.
-- The file a result sits in no longer decides which step it proves. Half of the
-  steps were matched by asking what kind of result something was, and that
-  question is largely answered by the file's path — so everything under a folder
-  called `views`, `runtime`, `store` or `flags` proved whichever step named that
-  kind, whatever the result actually was. A chart renderer stood in for a web
-  server's entrypoint and a cache deletion stood in for an indexer storing
-  symbols. A result now has to say what it is by its own name. The path is used
-  only to take a step away, never to hand one out — with one stated exception,
-  below.
-- The exception is a file that *is* the evidence: a stylesheet, an HTML
-  document, and a `.sql` schema. Their anchors are selectors, attributes and
-  statements with no symbol name to read, so there the file still says what the
-  result is about. It is one exception and it covers those three file kinds —
-  `.html`, `.htm` and `.xhtml` for the document — and nothing else.
-- A single-file component is read as a script, not as a document. `.vue` and
-  `.svelte` files were treated as markup, but CodeStory only ever reads their
-  `<script>` block, so every result from one is an ordinary function with a name
-  of its own. While they counted as markup, the folder they sat in answered the
-  question the name should have: three unrelated helpers in one component under
-  a `forms/` directory reported a form's constraints, its custom validation and
-  its submit guard as all proved, and none of the three mentions a form.
-- Within an HTML document, only the step whose evidence really is markup takes
-  the file's word for it. A form's native constraints are attributes written in
-  the document; its custom validation and its submit guard are code. While all
-  three took the document's word, any three text matches in one HTML file under
-  a `forms/` directory reported the whole flow as proved.
-- A static-site build step has to name the site. The folder was allowed to say
-  it instead, so a build pipeline and a layout renderer filed under `lib/site/`
-  reported a site's build lifecycle and its output boundary as proved, while the
-  identical two symbols one directory over proved nothing. Two ordinary web
-  words were allowed to stand in for the site as well, so an asset collection
-  and a page template did the same thing from a `src/ui/` folder. Both are now
-  results that say "site" in their own name. The cost is stated: a helper class
-  named only `Renderer` or `Reader` no longer closes a step on its own, which
-  makes an unproven step easier to report than a proven one — the safe
-  direction.
-- A result also has to be about the step in more than one word. A name like
-  `FrameBuffer`, `sourceMapOptions`, `PaymentHandler.process` or `Layout.render`
-  reads as two signals until you notice both come from the same word, or from a
-  word every codebase uses for something else. Those four each closed a step of
-  a flow they have nothing to do with, and between them they closed five whole
-  flows — a graphics buffer and a segment tree proving a byte-IO pipeline, a
-  build config and a route planner proving an object mapper. The words that can
-  still decide a step on their own are recorded in the codebase and checked on
-  every build, so the list cannot grow unnoticed.
-- That check now covers the two places it could not see, which is where the
-  remaining false reports were. It reads every kind of file the coverage rules
-  branch on — scripts, single-file components, HTML, stylesheets, shell scripts
-  and schemas — rather than two source extensions with a comment claiming the
-  rest behave the same; that claim is now itself a test, and it was untrue for
-  `.vue`. And it builds names that carry a subject *and* an action, not one word
-  each, because that is the shape that was slipping through: `ChartPipeline`
-  proved nothing while `ChartPipeline.run` proved a static-site build, and only
-  the second is a counter-example. Every step of every flow is now checked
-  against every such name the vocabulary can spell without the flow's own
-  subject in it, and at least one step of each flow has to survive — so a
-  question can no longer be reported as fully answered by results that never
-  mention what it asked about.
-- When a question names more files than fit in the follow-up list, the missing
-  parts of the flow are no longer pushed out of it. Follow-ups for requested
-  files and for unproven steps now alternate, so both survive the limit.
-- Meaning-based search now says nothing rather than something unrelated. It
-  always returned a full page of results, so a question with no close match got
-  the least-distant files in the codebase, ranked as though they were relevant —
-  and those crowded out the exact matches. Results it cannot claim are related
-  are left out, and a result's reported meaning score is now the similarity that
-  was actually measured instead of a minimum every result was given.
-- Two functions with the same name in one file are both returned. One of them
-  used to absorb the other, keeping the higher score and the wrong line number,
-  so overloads and repeated local names went missing from results.
-- Searching for `Foo` and then `foo` no longer returns the first search's
-  results for the second. Answers are remembered per exact query, so the hits,
-  the echoed query, and the exact-match labels match what you typed.
-- Questions are routed by how they are written, not by their punctuation. A
-  capitalised first word or a closing full stop made an ordinary question look
-  like a symbol name and halved how much of the codebase was searched, and a
-  bare filename was only recognised for three languages. Every language
-  CodeStory supports is now recognised, and only a genuine mid-word capital or
-  qualifier marks a query as a symbol.
-- One failed request no longer takes the whole editor session down with it. A
-  request that crashed inside CodeStory ended the server, so every project the
-  session had open went with it and the next question got no answer at all. The
-  crash is now contained to the request that caused it: it comes back as a
-  stated failure, the project it was working on is thrown away and rebuilt
-  before anything reads from it again, and the other projects keep answering.
-- A client that sends requests faster than CodeStory can answer them is told so
-  instead of growing the queue without limit. Everything waiting — work still to
-  run and refusals not yet written out — is capped together at 32 requests and
-  8 MiB, and anything past that is refused with a message that names the limit
-  it hit. Those refusals go out straight away rather than queueing behind the
-  work already accepted, so a client that keeps pushing during a long request
-  hears back immediately and memory stops growing. A cancelled request also
-  leaves the queue right away instead of sitting there holding its place until
-  its turn came.
-- Requests carrying an enormous id are answered without it. CodeStory will not
-  hold on to an identifier longer than 512 bytes, so a refusal for one comes
-  back with an empty id and states the limit; ordinary ids are unaffected.
-- Asking CodeStory to shut down now ends it predictably and on a clock. It stops
-  taking new work, tells the request it is already running to stop, and gives
-  the whole wind-down three seconds: whatever finishes in time is answered
-  normally, and anything still going — including a request that will not stop,
-  or an editor that has stopped reading replies — is told the server is
-  stopping and left there. It then exits reporting a clean shutdown, instead of
-  waiting for input that will never arrive until the host force-kills it.
-- Bookmarks and bookmark categories are no longer destroyed by ordinary editing.
-  They used to live in the same database that indexing rebuilds and replaces, so
-  a refresh, a cleanup, or a reset could take them with it. They now live in
-  their own file beside the cache, and each one remembers the symbol it points
-  at rather than a row number — so it survives edits that move the code down the
-  file, a full re-index, a cache reset, and the symbol disappearing and coming
-  back. A bookmark now really does follow a function that is renamed in place or
-  moved to another file, as long as the evidence points at one symbol and only
-  one; anything less leaves it visible and yours, labelled with why it could not
-  be followed, until you relink or delete it. In particular, deleting a small
-  function never hands its bookmark to a similar-looking neighbour. Copying a
-  project to another machine or volume no longer silently adopts someone else's
-  bookmarks — export and import them explicitly. Opening this release's cache
-  with 0.16.3 now refuses the whole database instead of quietly writing
-  bookmarks the new release will not read.
-- A bookmark you just listed can still be edited or deleted by the id you were
-  given, even when that first edit is what moves bookmarks to their new home.
-- If moving bookmarks to their new home is interrupted — a full disk, a closed
-  laptop — the bookmarks you already had stay visible instead of appearing to
-  have vanished, and the move finishes the next time you make a change.
-- A host is no longer told CodeStory speaks a protocol revision it does not
-  implement. The MCP handshake used to repeat back whichever revision the host
-  asked for, which read as agreement. It now answers with a revision CodeStory
-  actually implements and reports what was asked for, what was agreed, and
-  everything supported.
-- Every CodeStory response now says which response contract produced it, and the
-  handshake says it first, so a tool that reads CodeStory output knows the
-  vocabulary before it reads a single result. The contract is version 2: tool
-  arguments are checked against the published tool list and refused instead of
-  being quietly repaired, so a tool written against version 1 can see requests it
-  believes are valid rejected. A response with no version stamp is the old
-  unversioned one.
-- Pointing `CODESTORY_CLI` at a build that does not match the installed plugin
-  now stops the session with a plain reason instead of mixing two contracts.
-  Nothing that build produces reaches the host, and CodeStory's own diagnostics
-  explain why. This was the one supported way to end up with a mismatched pair
-  and the only place it could be caught.
-- Evidence that arrives without saying whether it was resolvable, where it came
-  from, or whether its retrieval stage finished is now refused instead of being
-  read as resolvable, parser-backed and complete.
-- The same word spelled two ways across CodeStory's own output — `Full` and
-  `full`, `Public` and `public` — is now accepted either way when read back.
-  What CodeStory writes is unchanged.
+- Directory names such as `target`, `build`, `views`, `runtime`, or `store` no longer make unrelated symbols look like architecture or flow evidence. Flow coverage now uses the symbol and its actual role, including correct handling for HTML, stylesheets, SQL, shell, Vue, and Svelte sources.
+- A failed request is contained to that request and project instead of taking down every project in the editor session. Request admission is bounded by count and memory, overload refusals are immediate, cancellation frees capacity promptly, and shutdown has a three-second upper bound.
+- Route packets now follow registration through dispatch and any requested response boundary, preserve typed capacity failures, and enforce the public CLI JSON limit against the bytes actually emitted. Compact packets retain their per-step trace and obligation evidence instead of becoming misleading after trimming.
+- Exact file queries, filenames from every supported language, same-file overloads, and case-sensitive searches now resolve consistently. Questions are no longer misrouted because of capitalization or punctuation.
+
+### Compatibility
+
+- CodeStory refuses a `CODESTORY_CLI` binary whose version does not match the installed plugin instead of mixing incompatible contracts.
+- The 0.17 bookmark store is intentionally separate from the index. Opening a 0.17 cache with 0.16.3 is refused rather than allowing the older version to write data the newer version will not read; use bookmark export/import when moving a project between machines or volumes.
 
 ## 0.16.3
 
