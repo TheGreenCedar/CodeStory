@@ -114,6 +114,7 @@ impl ExactExecutable {
         let attested_sha256 = matches!(mode, ClientTransportMode::ObserveOnly)
             .then(|| store.and_then(|store| read_matching_attestation(store, &before)))
             .flatten();
+        let reused_attestation = attested_sha256.is_some();
         let sha256 = match attested_sha256 {
             Some(sha256) => sha256,
             None => digest(&file, &path)?,
@@ -125,12 +126,23 @@ impl ExactExecutable {
                 "embedding_executable_changed: current executable changed while it was being verified"
             );
         }
-        Ok(Self {
+        let executable = Self {
             path,
             sha256,
             file_identity: before,
             version: env!("CARGO_PKG_VERSION"),
-        })
+        };
+        if matches!(mode, ClientTransportMode::ObserveOnly)
+            && !reused_attestation
+            && let Some(store) = store
+        {
+            // A read-only command may establish reusable digest evidence after it has
+            // performed the same exact hash and before/after identity check as a fresh
+            // capture. This never authorizes spawning: the transport mode remains
+            // ObserveOnly, and spawn_exact_current_exe rejects it unconditionally.
+            let _ = publish_attestation(store, &executable);
+        }
+        Ok(executable)
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -4723,6 +4735,47 @@ mod tests {
             &mut missing_calls,
         )?;
         assert_eq!(missing_calls, 1, "missing evidence must fresh-hash");
+        Ok(())
+    }
+
+    #[test]
+    fn observe_capture_writes_through_a_fresh_exact_digest() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let executable_path = directory.path().join("codestory-cli");
+        std::fs::write(&executable_path, b"exact candidate bytes")?;
+        let store = TestAttestationStore::new("normal-authority");
+
+        let mut first_calls = 0;
+        let first = capture_test_file(
+            &executable_path,
+            ClientTransportMode::ObserveOnly,
+            Some(&store),
+            &mut first_calls,
+        )?;
+        assert_eq!(first_calls, 1, "the cache miss must fresh-hash once");
+        assert!(store.read()?.is_some(), "the exact digest must be cached");
+
+        let mut second_calls = 0;
+        let second = capture_test_file(
+            &executable_path,
+            ClientTransportMode::ObserveOnly,
+            Some(&store),
+            &mut second_calls,
+        )?;
+        assert_eq!(second_calls, 0, "the next process may reuse the digest");
+        assert_eq!(second.sha256(), first.sha256());
+
+        let mut spawn_calls = 0;
+        capture_test_file(
+            &executable_path,
+            ClientTransportMode::SpawnCapable,
+            Some(&store),
+            &mut spawn_calls,
+        )?;
+        assert_eq!(
+            spawn_calls, 1,
+            "observe-only evidence must not widen spawn-capable capture"
+        );
         Ok(())
     }
 

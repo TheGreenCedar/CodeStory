@@ -1519,12 +1519,6 @@ fn build_refresh_outcome_from_inventory(
 
     if let Some(decisions) = parallel_stored_file_decisions(&current_files, &stored_files) {
         for (path, decision) in current_files.iter().zip(decisions) {
-            if decision.content_hash_read {
-                // Worker threads deliberately never enter the operation-local
-                // memo. Account for their direct reads on the caller thread so
-                // existing telemetry still describes the work performed.
-                source_freshness::record_content_hash_read();
-            }
             if decision.needs_index {
                 files_to_index.push(path.clone());
             }
@@ -1570,6 +1564,14 @@ const PARALLEL_STORED_FILE_MAX_THREADS: usize = 8;
 struct StoredFileDecision {
     needs_index: bool,
     content_hash_read: bool,
+    memo_reused: bool,
+    memo_record: Option<StoredFileMemoRecord>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StoredFileMemoRecord {
+    modified_ms: i64,
+    len: u64,
 }
 
 fn freshness_hash_pool() -> Option<&'static rayon::ThreadPool> {
@@ -1595,20 +1597,58 @@ fn parallel_stored_file_decisions(
     paths: &[PathBuf],
     stored_files: &[Option<&StoredFileState>],
 ) -> Option<Vec<StoredFileDecision>> {
-    if source_freshness::source_freshness_scope_is_active()
-        || paths.len() < PARALLEL_STORED_FILE_MINIMUM
-        || paths.len() != stored_files.len()
-    {
+    if paths.len() < PARALLEL_STORED_FILE_MINIMUM || paths.len() != stored_files.len() {
         return None;
     }
     let pool = freshness_hash_pool()?;
-    Some(stored_file_decisions_in_pool(pool, paths, stored_files))
+    let batch = source_freshness::source_freshness_batch();
+    let decisions = stored_file_decisions_in_pool(pool, paths, stored_files, batch.as_ref());
+    account_parallel_stored_file_decisions(paths, stored_files, &decisions, batch.as_ref());
+    Some(decisions)
+}
+
+fn account_parallel_stored_file_decisions(
+    paths: &[PathBuf],
+    stored_files: &[Option<&StoredFileState>],
+    decisions: &[StoredFileDecision],
+    batch: Option<&source_freshness::SourceFreshnessBatch>,
+) {
+    for decision in decisions {
+        if decision.content_hash_read {
+            // Worker threads deliberately never enter the caller's thread-local
+            // scope. Account for completed reads here so telemetry remains
+            // deterministic and attached to the public operation.
+            source_freshness::record_content_hash_read();
+        }
+        if decision.memo_reused {
+            source_freshness::record_verdict_reuse();
+        }
+    }
+    if let Some(batch) = batch {
+        source_freshness::record_batch_verdicts(
+            batch,
+            paths.iter().zip(stored_files).zip(decisions).filter_map(
+                |((path, stored), decision)| {
+                    let record = decision.memo_record?;
+                    let expected_hash = stored.as_ref()?.content_hash.as_deref()?;
+                    Some((
+                        path.as_path(),
+                        record.modified_ms,
+                        record.len,
+                        expected_hash,
+                        decision.needs_index,
+                    ))
+                },
+            ),
+        );
+    }
 }
 
 fn stored_file_decisions_in_pool(
     pool: &rayon::ThreadPool,
     paths: &[PathBuf],
     stored_files: &[Option<&StoredFileState>],
+    batch: Option<&source_freshness::SourceFreshnessBatch>,
 ) -> Vec<StoredFileDecision> {
     pool.install(|| {
         paths
@@ -1616,10 +1656,12 @@ fn stored_file_decisions_in_pool(
             .zip(stored_files.par_iter())
             .map(|(path, stored)| {
                 stored
-                    .map(|file| stored_file_needs_index_direct(path, file))
+                    .map(|file| stored_file_needs_index_direct(path, file, batch))
                     .unwrap_or(StoredFileDecision {
                         needs_index: true,
                         content_hash_read: false,
+                        memo_reused: false,
+                        memo_record: None,
                     })
             })
             .collect()
@@ -1820,6 +1862,7 @@ fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
     let Some(expected_hash) = file.content_hash.as_deref() else {
         return false;
     };
+    let batch = source_freshness::source_freshness_batch();
     // The hash below is the verification, never a redundant double-check: an
     // mtime mismatch already short-circuited, so this is the only mechanism
     // that sees same-mtime drift. The memo caches that verdict for one armed
@@ -1840,13 +1883,19 @@ fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
     // Only a torn-read-clean observation whose metadata still agrees with the
     // metadata the key was built from may be memoized. Anything that raced a
     // writer is recomputed next time.
-    if identity.modified_ms == observed.modified_ms && identity.len == observed.len {
-        source_freshness::record_verdict(
-            path,
-            observed.modified_ms,
-            observed.len,
-            expected_hash,
-            verdict,
+    if identity.modified_ms == observed.modified_ms
+        && identity.len == observed.len
+        && let Some(batch) = batch.as_ref()
+    {
+        source_freshness::record_batch_verdicts(
+            batch,
+            [(
+                path,
+                observed.modified_ms,
+                observed.len,
+                expected_hash,
+                verdict,
+            )],
         );
     }
     verdict
@@ -1859,40 +1908,83 @@ fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
 /// lifetime. Every same-mtime file is read directly, with the same before/read/
 /// after torn-read guard, and the caller records the returned work counters in
 /// deterministic input order.
-fn stored_file_needs_index_direct(path: &Path, file: &StoredFileState) -> StoredFileDecision {
+fn stored_file_needs_index_direct(
+    path: &Path,
+    file: &StoredFileState,
+    batch: Option<&source_freshness::SourceFreshnessBatch>,
+) -> StoredFileDecision {
     if !file.indexed || file.retry_required {
         return StoredFileDecision {
             needs_index: true,
             content_hash_read: false,
+            memo_reused: false,
+            memo_record: None,
         };
     }
     let Ok(observed) = observed_file_metadata(path) else {
         return StoredFileDecision {
             needs_index: true,
             content_hash_read: false,
+            memo_reused: false,
+            memo_record: None,
         };
     };
     if observed.modified_ms != file.modification_time {
         return StoredFileDecision {
             needs_index: true,
             content_hash_read: false,
+            memo_reused: false,
+            memo_record: None,
         };
     }
     let Some(expected_hash) = file.content_hash.as_deref() else {
         return StoredFileDecision {
             needs_index: false,
             content_hash_read: false,
+            memo_reused: false,
+            memo_record: None,
         };
     };
+    if let Some(verdict) = batch.and_then(|batch| {
+        source_freshness::batch_memoized_verdict(
+            batch,
+            path,
+            observed.modified_ms,
+            observed.len,
+            expected_hash,
+        )
+    }) {
+        return StoredFileDecision {
+            needs_index: verdict,
+            content_hash_read: false,
+            memo_reused: true,
+            memo_record: None,
+        };
+    }
     let Ok(identity) = read_content_identity(path) else {
         return StoredFileDecision {
             needs_index: true,
             content_hash_read: true,
+            memo_reused: false,
+            memo_record: None,
         };
     };
+    if identity.modified_ms != observed.modified_ms || identity.len != observed.len {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: true,
+            memo_reused: false,
+            memo_record: None,
+        };
+    }
     StoredFileDecision {
         needs_index: identity.content_hash != expected_hash,
         content_hash_read: true,
+        memo_reused: false,
+        memo_record: Some(StoredFileMemoRecord {
+            modified_ms: observed.modified_ms,
+            len: observed.len,
+        }),
     }
 }
 
@@ -3330,7 +3422,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_stored_file_decisions_are_exact_ordered_and_memo_free() -> Result<()> {
+    fn parallel_stored_file_decisions_are_exact_ordered_and_memo_aware() -> Result<()> {
         let temp = tempdir()?;
         let root = temp.path().join("repo");
         fs::create_dir_all(&root)?;
@@ -3358,12 +3450,18 @@ mod tests {
 
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
         let _scope = SourceFreshnessScope::enter();
-        assert!(
-            parallel_stored_file_decisions(&files, &stored_files).is_none(),
-            "an active ready-lease scope must retain the sequential memo-aware path"
+        let batch = source_freshness::source_freshness_batch();
+        let decisions = stored_file_decisions_in_pool(&pool, &files, &stored_files, batch.as_ref());
+        account_parallel_stored_file_decisions(&files, &stored_files, &decisions, batch.as_ref());
+        let repeated_batch = source_freshness::source_freshness_batch();
+        let repeated =
+            stored_file_decisions_in_pool(&pool, &files, &stored_files, repeated_batch.as_ref());
+        account_parallel_stored_file_decisions(
+            &files,
+            &stored_files,
+            &repeated,
+            repeated_batch.as_ref(),
         );
-        let decisions = stored_file_decisions_in_pool(&pool, &files, &stored_files);
-        let repeated = stored_file_decisions_in_pool(&pool, &files, &stored_files);
         assert_eq!(
             decisions
                 .iter()
@@ -3384,19 +3482,24 @@ mod tests {
             "indexed parallel collection must preserve deterministic input order"
         );
         assert_eq!(
-            source_freshness_counts()
-                .expect("armed scope")
-                .content_hash_reads,
-            0,
-            "worker decisions must not read or write the caller's freshness memo or counters"
+            source_freshness_counts().expect("armed scope"),
+            SourceFreshnessCounts {
+                content_hash_reads: 17,
+                verdict_reuses: 17,
+                readiness_fingerprint_passes: 0,
+            },
+            "the first batch must hash each eligible file once and the second must reuse it"
         );
 
+        source_freshness::reverify_from_content();
         let torn_target = files[5].clone();
         arm_torn_read_mutation_for_test(
             torn_target,
             b"fn file_05() { let write_raced_the_reader = true; }\n".to_vec(),
         );
-        let torn = stored_file_decisions_in_pool(&pool, &files, &stored_files);
+        let torn_batch = source_freshness::source_freshness_batch();
+        let torn = stored_file_decisions_in_pool(&pool, &files, &stored_files, torn_batch.as_ref());
+        account_parallel_stored_file_decisions(&files, &stored_files, &torn, torn_batch.as_ref());
         assert!(torn[5].needs_index, "a torn content read must fail closed");
         Ok(())
     }

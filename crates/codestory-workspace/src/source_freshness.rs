@@ -63,8 +63,14 @@ struct VerdictKey {
 
 #[derive(Default)]
 struct MemoState {
-    verdicts: Mutex<HashMap<VerdictKey, bool>>,
+    verdicts: Mutex<VerdictState>,
     opaque_values: Mutex<HashMap<&'static str, Box<dyn Any + Send + Sync>>>,
+}
+
+#[derive(Default)]
+struct VerdictState {
+    epoch: u64,
+    values: HashMap<VerdictKey, bool>,
 }
 
 /// Reusable source/readiness observations owned by one runtime ready lease.
@@ -184,13 +190,81 @@ pub fn source_freshness_counts() -> Option<SourceFreshnessCounts> {
     })
 }
 
-/// Whether the current thread owns an operation-scoped freshness memo.
+/// A stable epoch of the active operation's shared memo.
 ///
-/// Batch planners use this only to retain the sequential memo-aware path for
-/// ready-lease operations. Worker threads must never use it as a proxy for the
-/// caller's scope because the scope is deliberately thread-local.
-pub(crate) fn source_freshness_scope_is_active() -> bool {
-    SCOPE.with(|scope| scope.borrow().depth > 0)
+/// Parallel freshness workers may read this memo, but their results are
+/// published only while the epoch remains current. A concurrent post-build
+/// reverification advances the epoch before clearing verdicts, so an older
+/// worker batch cannot repopulate the memo with stale observations.
+#[derive(Clone)]
+pub(crate) struct SourceFreshnessBatch {
+    memo: SourceFreshnessMemo,
+    epoch: u64,
+}
+
+pub(crate) fn source_freshness_batch() -> Option<SourceFreshnessBatch> {
+    let memo = active_memo()?;
+    let epoch = memo
+        .state
+        .verdicts
+        .lock()
+        .expect("source freshness memo poisoned")
+        .epoch;
+    Some(SourceFreshnessBatch { memo, epoch })
+}
+
+pub(crate) fn batch_memoized_verdict(
+    batch: &SourceFreshnessBatch,
+    path: &Path,
+    modified_ms: i64,
+    len: u64,
+    stored_content_hash: &str,
+) -> Option<bool> {
+    let key = VerdictKey {
+        path: path.to_path_buf(),
+        modified_ms,
+        len,
+        stored_content_hash: stored_content_hash.to_string(),
+    };
+    let state = batch
+        .memo
+        .state
+        .verdicts
+        .lock()
+        .expect("source freshness memo poisoned");
+    if state.epoch != batch.epoch {
+        return None;
+    }
+    state.values.get(&key).copied()
+}
+
+pub(crate) fn record_batch_verdicts<'a>(
+    batch: &SourceFreshnessBatch,
+    verdicts: impl IntoIterator<Item = (&'a Path, i64, u64, &'a str, bool)>,
+) {
+    let mut state = batch
+        .memo
+        .state
+        .verdicts
+        .lock()
+        .expect("source freshness memo poisoned");
+    if state.epoch != batch.epoch {
+        return;
+    }
+    for (path, modified_ms, len, stored_content_hash, verdict) in verdicts {
+        if state.values.len() >= SOURCE_FRESHNESS_MEMO_MAX_ENTRIES {
+            break;
+        }
+        state.values.insert(
+            VerdictKey {
+                path: path.to_path_buf(),
+                modified_ms,
+                len,
+                stored_content_hash: stored_content_hash.to_string(),
+            },
+            verdict,
+        );
+    }
 }
 
 /// Record one strict-readiness fingerprint pass.
@@ -223,11 +297,13 @@ pub fn record_readiness_fingerprint_pass() {
 /// Inert with no scope armed, like the rest of this module.
 pub fn reverify_from_content() {
     if let Some(memo) = active_memo() {
-        memo.state
+        let mut state = memo
+            .state
             .verdicts
             .lock()
-            .expect("source freshness memo poisoned")
-            .clear();
+            .expect("source freshness memo poisoned");
+        state.epoch = state.epoch.wrapping_add(1);
+        state.values.clear();
     }
 }
 
@@ -301,6 +377,7 @@ pub(crate) fn memoized_verdict(
             .verdicts
             .lock()
             .expect("source freshness memo poisoned")
+            .values
             .get(&key)
             .copied()
     });
@@ -324,7 +401,19 @@ pub(crate) fn record_content_hash_read() {
     });
 }
 
+/// Record one verdict served from the shared memo by a worker batch.
+pub(crate) fn record_verdict_reuse() {
+    SCOPE.with(|scope| {
+        let mut scope = scope.borrow_mut();
+        if scope.depth == 0 {
+            return;
+        }
+        scope.verdict_reuses = scope.verdict_reuses.saturating_add(1);
+    });
+}
+
 /// Record a verdict produced by a clean, metadata-agreeing hashing read.
+#[cfg(test)]
 pub(crate) fn record_verdict(
     path: &Path,
     modified_ms: i64,
@@ -335,13 +424,13 @@ pub(crate) fn record_verdict(
     let Some(memo) = active_memo() else {
         return;
     };
-    let mut verdicts = memo
+    let mut state = memo
         .state
         .verdicts
         .lock()
         .expect("source freshness memo poisoned");
-    if verdicts.len() < SOURCE_FRESHNESS_MEMO_MAX_ENTRIES {
-        verdicts.insert(
+    if state.values.len() < SOURCE_FRESHNESS_MEMO_MAX_ENTRIES {
+        state.values.insert(
             VerdictKey {
                 path: path.to_path_buf(),
                 modified_ms,
@@ -356,6 +445,26 @@ pub(crate) fn record_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reverification_epoch_rejects_late_worker_results() {
+        let path = Path::new("/tmp/source-freshness-batch-epoch");
+        let _scope = SourceFreshnessScope::enter();
+        let stale = source_freshness_batch().expect("armed scope has a batch epoch");
+
+        reverify_from_content();
+        record_batch_verdicts(&stale, [(path, 7, 11, "hash", false)]);
+        assert_eq!(
+            memoized_verdict(path, 7, 11, "hash"),
+            None,
+            "a batch captured before reverification must not repopulate the cleared memo"
+        );
+
+        let current = source_freshness_batch().expect("reverified scope has a new epoch");
+        record_batch_verdicts(&current, [(path, 7, 11, "hash", false)]);
+        assert_eq!(memoized_verdict(path, 7, 11, "hash"), Some(false));
+        assert_eq!(batch_memoized_verdict(&stale, path, 7, 11, "hash"), None);
+    }
 
     #[test]
     fn nothing_is_memoized_or_counted_without_an_armed_scope() {
