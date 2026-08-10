@@ -20,12 +20,12 @@ use crate::text::{
 use crate::trail::is_speculative_trail_edge;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
-    EdgeKind, NodeId, NodeKind, PACKET_OBLIGATION_PLAN_VERSION, PacketBudgetDto, PacketClaimDto,
-    PacketClaimObligationDto, PacketClaimObligationKindDto, PacketObligationCarrierEdgeProofDto,
-    PacketObligationPlanDto, PacketObligationProofStatusDto, PacketPlanQueryDto, PacketProbeDto,
-    PacketProbeRejectionCodeDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto,
-    PacketProofStatusDto, PacketQueryCompletionDto, PacketQueryObligationDto,
-    PacketQueryObligationKindDto, PacketTaskClassDto,
+    EdgeId, EdgeKind, NodeId, NodeKind, PACKET_OBLIGATION_PLAN_VERSION, PacketBudgetDto,
+    PacketClaimDto, PacketClaimObligationDto, PacketClaimObligationKindDto,
+    PacketObligationCarrierEdgeProofDto, PacketObligationPlanDto, PacketObligationProofStatusDto,
+    PacketPlanQueryDto, PacketProbeDto, PacketProbeRejectionCodeDto, PacketProbeResolutionDto,
+    PacketProbeResolutionStatusDto, PacketProofStatusDto, PacketQueryCompletionDto,
+    PacketQueryObligationDto, PacketQueryObligationKindDto, PacketTaskClassDto,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -751,6 +751,7 @@ pub fn finalize_packet_obligation_plan(
 pub struct PacketObligationEdgeProofSnapshot {
     entries: Vec<PacketObligationEdgeProofSnapshotEntry>,
     protected_carrier_node_ids: Vec<NodeId>,
+    protected_edge_ids: Vec<EdgeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -779,6 +780,8 @@ pub fn capture_packet_obligation_edge_proofs_before_budget(
     );
     let mut protected_carrier_node_ids = Vec::new();
     let mut protected_carrier_node_id_set = HashSet::new();
+    let mut protected_edge_ids = Vec::new();
+    let mut protected_edge_id_set = HashSet::new();
     for obligation in &proof_plan.claim_obligations {
         if !obligation.material || obligation.proof_status != PacketObligationProofStatusDto::Proven
         {
@@ -790,10 +793,18 @@ pub fn capture_packet_obligation_edge_proofs_before_budget(
                 .first()
                 .map(|proof| proof.carrier_node_id.clone())
         });
-        if let Some(carrier_node_id) = carrier_node_id
-            && protected_carrier_node_id_set.insert(carrier_node_id.clone())
-        {
-            protected_carrier_node_ids.push(carrier_node_id);
+        if let Some(carrier_node_id) = carrier_node_id {
+            if protected_carrier_node_id_set.insert(carrier_node_id.clone()) {
+                protected_carrier_node_ids.push(carrier_node_id.clone());
+            }
+            if let Some(proof) = obligation
+                .carrier_edge_proofs
+                .iter()
+                .find(|proof| proof.carrier_node_id == carrier_node_id)
+                && protected_edge_id_set.insert(proof.edge_id.clone())
+            {
+                protected_edge_ids.push(proof.edge_id.clone());
+            }
         }
     }
     let mut entries = proof_plan
@@ -814,6 +825,7 @@ pub fn capture_packet_obligation_edge_proofs_before_budget(
     PacketObligationEdgeProofSnapshot {
         entries,
         protected_carrier_node_ids,
+        protected_edge_ids,
     }
 }
 
@@ -823,6 +835,14 @@ pub fn protected_packet_obligation_carrier_node_ids(
     snapshot: &PacketObligationEdgeProofSnapshot,
 ) -> &[NodeId] {
     &snapshot.protected_carrier_node_ids
+}
+
+/// Exact typed edges paired with the ordered material carriers above. Graph capping spends these
+/// slots before unrelated trail context so the public packet keeps the proof it claims to carry.
+pub fn protected_packet_obligation_edge_ids(
+    snapshot: &PacketObligationEdgeProofSnapshot,
+) -> &[EdgeId] {
+    &snapshot.protected_edge_ids
 }
 
 /// Bind pre-cap proof candidates to the carriers that survived the actual citation cap. Normal
@@ -4135,6 +4155,10 @@ mod tests {
         assert_eq!(
             protected_packet_obligation_carrier_node_ids(&snapshot),
             &[NodeId("BuildIndex::run".to_string())]
+        );
+        assert_eq!(
+            protected_packet_obligation_edge_ids(&snapshot),
+            &[EdgeId("requested-call".to_string())]
         );
 
         // Compact citation selection may retain another copy of the same exact node without its

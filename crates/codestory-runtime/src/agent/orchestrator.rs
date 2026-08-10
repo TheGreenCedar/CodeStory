@@ -48,7 +48,7 @@ use crate::agent::packet_obligations::{
     capture_packet_obligation_edge_proofs_before_budget, finalize_packet_obligation_plan,
     install_retained_packet_obligation_edge_proofs,
     packet_claims_with_obligation_receipts_and_telemetry,
-    protected_packet_obligation_carrier_node_ids,
+    protected_packet_obligation_carrier_node_ids, protected_packet_obligation_edge_ids,
 };
 #[cfg(test)]
 use crate::agent::packet_plan::{
@@ -568,6 +568,7 @@ pub(crate) fn agent_packet(
         &mut answer,
         &sufficiency_extra_probes,
         protected_packet_obligation_carrier_node_ids(&obligation_edge_proofs),
+        protected_packet_obligation_edge_ids(&obligation_edge_proofs),
     );
     append_packet_non_trace_phase(&mut answer, "budget", phase_started);
     let phase_started = Instant::now();

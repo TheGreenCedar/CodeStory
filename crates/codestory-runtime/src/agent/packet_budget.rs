@@ -19,11 +19,11 @@ use crate::agent::trace_export::{
 };
 use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, AgentResponseBlockDto, AgentRetrievalStepKindDto,
-    AgentRetrievalStepStatusDto, GraphArtifactDto, GraphResponse, PacketBudgetDto,
+    AgentRetrievalStepStatusDto, EdgeId, GraphArtifactDto, GraphResponse, PacketBudgetDto,
     PacketBudgetLimitsDto, PacketBudgetModeDto, PacketBudgetUsageDto, PacketTaskClassDto,
     RetrievalShadowDto, RetrievalStageTimingDto,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 #[allow(unused_imports)]
@@ -109,6 +109,7 @@ pub(crate) fn apply_packet_budget_with_extra(
         answer,
         extra_probes,
         &[],
+        &[],
     )
 }
 
@@ -121,6 +122,7 @@ pub(crate) fn apply_packet_budget_with_extra_and_obligation_carriers(
     answer: &mut AgentAnswerDto,
     extra_probes: &[String],
     obligation_carrier_node_ids: &[codestory_contracts::api::NodeId],
+    obligation_edge_ids: &[EdgeId],
 ) -> PacketBudgetDto {
     let mut truncated = false;
     let mut omitted_sections = Vec::new();
@@ -140,7 +142,7 @@ pub(crate) fn apply_packet_budget_with_extra_and_obligation_carriers(
         truncated = true;
         omitted_sections.push("citations".to_string());
     }
-    if cap_graph_edges(answer, limits.max_trail_edges) {
+    if cap_graph_edges(answer, limits.max_trail_edges, obligation_edge_ids) {
         truncated = true;
         omitted_sections.push("trail_edges".to_string());
     }
@@ -560,24 +562,66 @@ fn remove_omitted_section(budget: &mut PacketBudgetDto, section: &str) -> bool {
     budget.omitted_sections.len() != original_len
 }
 
-fn cap_graph_edges(answer: &mut AgentAnswerDto, max_edges: u32) -> bool {
-    let mut remaining = max_edges as usize;
+fn cap_graph_edges(
+    answer: &mut AgentAnswerDto,
+    max_edges: u32,
+    protected_edge_ids: &[EdgeId],
+) -> bool {
+    let protected_order = protected_edge_ids
+        .iter()
+        .enumerate()
+        .map(|(index, edge_id)| (edge_id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let present_edge_ids = answer
+        .graphs
+        .iter()
+        .filter_map(|artifact| match artifact {
+            GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.iter()),
+            GraphArtifactDto::Mermaid { .. } => None,
+        })
+        .flatten()
+        .map(|edge| edge.id.clone())
+        .collect::<HashSet<_>>();
+    let selected_protected = protected_edge_ids
+        .iter()
+        .filter(|edge_id| present_edge_ids.contains(*edge_id))
+        .take(max_edges as usize)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut remaining = (max_edges as usize).saturating_sub(selected_protected.len());
     let mut truncated = false;
     for artifact in &mut answer.graphs {
         let GraphArtifactDto::Uml { graph, .. } = artifact else {
             continue;
         };
-        if graph.edges.len() > remaining {
-            let omitted = graph.edges.len() - remaining;
-            graph.edges.truncate(remaining);
+        let original_len = graph.edges.len();
+        graph.edges.sort_by(|left, right| {
+            let left_order = protected_order.get(&left.id).copied();
+            let right_order = protected_order.get(&right.id).copied();
+            match (left_order, right_order) {
+                (Some(left), Some(right)) => left.cmp(&right),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
+        let mut retained = Vec::with_capacity(graph.edges.len().min(max_edges as usize));
+        for edge in graph.edges.drain(..) {
+            if selected_protected.contains(&edge.id) {
+                retained.push(edge);
+            } else if remaining > 0 {
+                retained.push(edge);
+                remaining -= 1;
+            }
+        }
+        graph.edges = retained;
+        if graph.edges.len() < original_len {
+            let omitted = original_len - graph.edges.len();
             graph.truncated = true;
             graph.omitted_edge_count = graph
                 .omitted_edge_count
                 .saturating_add(omitted.try_into().unwrap_or(u32::MAX));
             truncated = true;
-            remaining = 0;
-        } else {
-            remaining = remaining.saturating_sub(graph.edges.len());
         }
         if prune_graph_to_retained_edges(graph) {
             truncated = true;
@@ -774,6 +818,85 @@ pub(super) mod tests {
         PacketRetrievalTraceSummaryDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto,
         PacketSufficiencyStatusDto, SearchHitOrigin,
     };
+
+    fn budget_graph_node(id: &str) -> GraphNodeDto {
+        GraphNodeDto {
+            id: NodeId(id.to_string()),
+            label: id.to_string(),
+            kind: NodeKind::FUNCTION,
+            depth: 1,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: Some(format!("src/{id}.rs")),
+            qualified_name: Some(id.to_string()),
+            member_access: None,
+        }
+    }
+
+    fn budget_graph_artifact(id: &str, edge_ids: &[&str]) -> GraphArtifactDto {
+        let center = format!("{id}-center");
+        let mut nodes = vec![budget_graph_node(&center)];
+        let edges = edge_ids
+            .iter()
+            .map(|edge_id| {
+                let target = format!("{id}-{edge_id}-target");
+                nodes.push(budget_graph_node(&target));
+                GraphEdgeDto {
+                    id: EdgeId((*edge_id).to_string()),
+                    source: NodeId(center.clone()),
+                    target: NodeId(target),
+                    kind: EdgeKind::CALL,
+                    confidence: Some(1.0),
+                    certainty: Some("certain".to_string()),
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                }
+            })
+            .collect();
+        GraphArtifactDto::Uml {
+            id: id.to_string(),
+            title: id.to_string(),
+            graph: GraphResponse {
+                center_id: NodeId(center),
+                nodes,
+                edges,
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        }
+    }
+
+    #[test]
+    fn graph_cap_reserves_material_proof_edges_before_unrelated_artifact_order() {
+        let mut packet = test_packet("Trace material proof edges.", 96 * 1024);
+        packet.answer.graphs = vec![
+            budget_graph_artifact("first", &["ordinary-a", "ordinary-b"]),
+            budget_graph_artifact("second", &["material-proof"]),
+        ];
+        let protected = EdgeId("material-proof".to_string());
+
+        assert!(cap_graph_edges(
+            &mut packet.answer,
+            2,
+            std::slice::from_ref(&protected),
+        ));
+        let retained = packet
+            .answer
+            .graphs
+            .iter()
+            .filter_map(|artifact| match artifact {
+                GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.iter()),
+                GraphArtifactDto::Mermaid { .. } => None,
+            })
+            .flatten()
+            .map(|edge| edge.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 2);
+        assert!(retained.contains(&protected));
+    }
 
     #[test]
     fn post_budget_rebuild_demotes_retained_false_safe_architecture_packet() {

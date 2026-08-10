@@ -15,33 +15,91 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, NodeId, NodeKind, PacketBudgetLimitsDto,
     RetrievalAnnotationDto, SearchHitOrigin,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
-pub(crate) fn cap_citations(answer: &mut AgentAnswerDto, limits: &PacketBudgetLimitsDto) -> bool {
-    cap_citations_with_protected(answer, limits, &HashSet::new())
+#[derive(Clone, Copy, Debug)]
+struct PacketUtilityHeapEntry {
+    candidate_index: usize,
+    original_index: usize,
+    utility: f32,
 }
 
-pub(crate) fn cap_citations_with_protected(
+impl PartialEq for PacketUtilityHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.candidate_index == other.candidate_index
+            && self.original_index == other.original_index
+            && self.utility.to_bits() == other.utility.to_bits()
+    }
+}
+
+impl Eq for PacketUtilityHeapEntry {}
+
+impl PartialOrd for PacketUtilityHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PacketUtilityHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.utility
+            .total_cmp(&other.utility)
+            .then_with(|| other.original_index.cmp(&self.original_index))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cap_citations(answer: &mut AgentAnswerDto, limits: &PacketBudgetLimitsDto) -> bool {
+    let protected = answer
+        .citations
+        .iter()
+        .filter(|citation| citation.coverage_role.as_deref() == Some("explicit exact probe"))
+        .map(packet_citation_key)
+        .collect::<HashSet<_>>();
+    cap_citations_with_priorities(answer, limits, &protected, &protected)
+}
+
+fn cap_citations_with_priorities(
     answer: &mut AgentAnswerDto,
     limits: &PacketBudgetLimitsDto,
     protected_citation_keys: &HashSet<String>,
+    obligation_value_keys: &HashSet<String>,
 ) -> bool {
     let original_len = answer.citations.len();
     let mut files = HashSet::new();
     let mut roles = HashSet::new();
     let mut claim_keys: HashSet<String> = HashSet::new();
     let mut secondary_claim_keys: HashSet<String> = HashSet::new();
-    let mut kept = Vec::new();
+    let mut kept: Vec<AgentCitationDto> = Vec::new();
     let mut deferred = Vec::new();
 
     let mut candidates = answer.citations.drain(..).collect::<Vec<_>>();
     prioritize_protected_citations(&mut candidates, protected_citation_keys);
+    order_citations_by_marginal_utility(
+        &mut candidates,
+        protected_citation_keys,
+        obligation_value_keys,
+    );
     for citation in candidates {
         let file = citation.file_path.as_deref().map(packet_display_path);
         let role = packet_evidence_role(&citation);
         let claim_key = role.map(|role| packet_claim_key_for_citation(role, &citation));
         let low_priority_role = packet_low_priority_cap_role(role);
         let protected = packet_citation_is_protected(&citation, protected_citation_keys);
+        let ordinary_file_limit_reached = !protected
+            && file.as_ref().is_some_and(|path| {
+                kept.iter()
+                    .filter(|existing| {
+                        existing
+                            .file_path
+                            .as_deref()
+                            .map(packet_display_path)
+                            .as_ref()
+                            == Some(path)
+                    })
+                    .count()
+                    >= 2
+            });
         if protected
             && kept.len() < limits.max_anchors as usize
             && packet_file_fits_limit(file.as_deref(), &files, limits.max_files)
@@ -114,6 +172,7 @@ pub(crate) fn cap_citations_with_protected(
             continue;
         }
         if kept.len() < limits.max_anchors as usize
+            && !ordinary_file_limit_reached
             && expands_primary_packet_coverage
             && packet_file_fits_limit(file.as_deref(), &files, limits.max_files)
         {
@@ -164,6 +223,21 @@ pub(crate) fn cap_citations_with_protected(
             continue;
         }
         let file = citation.file_path.as_deref().map(packet_display_path);
+        if file.as_ref().is_some_and(|path| {
+            kept.iter()
+                .filter(|existing| {
+                    existing
+                        .file_path
+                        .as_deref()
+                        .map(packet_display_path)
+                        .as_ref()
+                        == Some(path)
+                })
+                .count()
+                >= 2
+        }) {
+            continue;
+        }
         if !packet_file_fits_limit(file.as_deref(), &files, limits.max_files) {
             continue;
         }
@@ -182,23 +256,156 @@ pub(crate) fn packet_low_priority_cap_role(role: Option<PacketEvidenceRole>) -> 
     role.is_some_and(PacketEvidenceRole::is_low_priority_cap_role)
 }
 
+fn order_citations_by_marginal_utility(
+    citations: &mut Vec<AgentCitationDto>,
+    protected_citation_keys: &HashSet<String>,
+    obligation_value_keys: &HashSet<String>,
+) {
+    let mut protected = Vec::new();
+    let mut remaining = Vec::new();
+    for (index, citation) in std::mem::take(citations).into_iter().enumerate() {
+        if packet_citation_is_protected(&citation, protected_citation_keys) {
+            protected.push((index, citation));
+        } else {
+            remaining.push((index, Some(citation)));
+        }
+    }
+
+    let mut roles = HashSet::new();
+    let mut claim_keys = HashSet::new();
+    let mut subsystems = HashSet::new();
+    for (_, citation) in &protected {
+        record_packet_utility_coverage(citation, &mut roles, &mut claim_keys, &mut subsystems);
+    }
+
+    let mut heap = remaining
+        .iter()
+        .enumerate()
+        .map(
+            |(candidate_index, (original_index, citation))| PacketUtilityHeapEntry {
+                candidate_index,
+                original_index: *original_index,
+                utility: packet_marginal_utility(
+                    citation.as_ref().expect("candidate is present"),
+                    &roles,
+                    &claim_keys,
+                    &subsystems,
+                    obligation_value_keys,
+                ),
+            },
+        )
+        .collect::<BinaryHeap<_>>();
+    let mut ordered = protected;
+    while let Some(entry) = heap.pop() {
+        let Some(citation) = remaining[entry.candidate_index].1.as_ref() else {
+            continue;
+        };
+        let current_utility = packet_marginal_utility(
+            citation,
+            &roles,
+            &claim_keys,
+            &subsystems,
+            obligation_value_keys,
+        );
+        if current_utility.to_bits() != entry.utility.to_bits() {
+            heap.push(PacketUtilityHeapEntry {
+                utility: current_utility,
+                ..entry
+            });
+            continue;
+        }
+        let selected = (
+            remaining[entry.candidate_index].0,
+            remaining[entry.candidate_index]
+                .1
+                .take()
+                .expect("selected candidate is present"),
+        );
+        record_packet_utility_coverage(&selected.1, &mut roles, &mut claim_keys, &mut subsystems);
+        ordered.push(selected);
+    }
+    *citations = ordered.into_iter().map(|(_, citation)| citation).collect();
+}
+
+fn packet_marginal_utility(
+    citation: &AgentCitationDto,
+    roles: &HashSet<PacketEvidenceRole>,
+    claim_keys: &HashSet<String>,
+    subsystems: &HashSet<String>,
+    obligation_value_keys: &HashSet<String>,
+) -> f32 {
+    let role = packet_evidence_role(citation);
+    let claim_key = role.map(|role| packet_claim_key_for_citation(role, citation));
+    let new_coverage = role.is_some_and(|role| !roles.contains(&role))
+        || claim_key
+            .as_ref()
+            .is_some_and(|claim_key| !claim_keys.contains(claim_key));
+    let subsystem_novelty = packet_citation_subsystem(citation)
+        .is_some_and(|subsystem| !subsystems.contains(&subsystem));
+    let obligation_value = obligation_value_keys.contains(&packet_citation_key(citation));
+    0.65 * packet_citation_fused_score(citation)
+        + 0.15 * if new_coverage { 1.0 } else { 0.0 }
+        + 0.10 * if subsystem_novelty { 1.0 } else { 0.0 }
+        + 0.10 * if obligation_value { 1.0 } else { 0.0 }
+}
+
+fn packet_citation_fused_score(citation: &AgentCitationDto) -> f32 {
+    citation
+        .retrieval_score_breakdown
+        .as_ref()
+        .map(|breakdown| breakdown.total)
+        .filter(|score| score.is_finite())
+        .unwrap_or(citation.score)
+        .clamp(0.0, 1.0)
+}
+
+fn packet_citation_subsystem(citation: &AgentCitationDto) -> Option<String> {
+    let path = packet_display_path(citation.file_path.as_deref()?);
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect::<Vec<_>>();
+    let first = *segments.first()?;
+    let second = segments.get(1).copied();
+    if matches!(first, "apps" | "crates" | "lib" | "packages" | "src") {
+        second
+            .map(|second| format!("{first}/{second}"))
+            .or_else(|| Some(first.to_string()))
+    } else {
+        Some(first.to_string())
+    }
+}
+
+fn record_packet_utility_coverage(
+    citation: &AgentCitationDto,
+    roles: &mut HashSet<PacketEvidenceRole>,
+    claim_keys: &mut HashSet<String>,
+    subsystems: &mut HashSet<String>,
+) {
+    if let Some(role) = packet_evidence_role(citation) {
+        roles.insert(role);
+        claim_keys.insert(packet_claim_key_for_citation(role, citation));
+    }
+    if let Some(subsystem) = packet_citation_subsystem(citation) {
+        subsystems.insert(subsystem);
+    }
+}
+
 fn packet_citation_is_protected(
     citation: &AgentCitationDto,
     protected_citation_keys: &HashSet<String>,
 ) -> bool {
-    packet_citation_protection_rank(citation, protected_citation_keys) < 2
+    packet_citation_protection_rank(citation, protected_citation_keys) == 0
 }
 
 fn packet_citation_protection_rank(
     citation: &AgentCitationDto,
     protected_citation_keys: &HashSet<String>,
 ) -> u8 {
-    if citation.coverage_role.as_deref() == Some("explicit exact probe") {
+    if protected_citation_keys.contains(&packet_citation_key(citation)) {
         0
-    } else if protected_citation_keys.contains(&packet_citation_key(citation)) {
-        1
     } else {
-        2
+        1
     }
 }
 
@@ -536,25 +743,67 @@ pub(crate) fn cap_packet_citations_with_obligation_carriers(
     required_probe_queries: &[String],
     obligation_carrier_node_ids: &[NodeId],
 ) -> bool {
-    let mut protected_citation_keys =
-        promote_required_probe_citations(answer, required_probe_queries);
-    let obligation_carrier_node_ids = obligation_carrier_node_ids.iter().collect::<HashSet<_>>();
+    let required_probe_keys = promote_required_probe_citations(answer, required_probe_queries);
+    let focus_neighborhood_keys =
+        promote_focus_neighborhood_citations(answer, &required_probe_keys);
+    let obligation_carrier_keys =
+        promote_obligation_carrier_citations(answer, obligation_carrier_node_ids);
+    let mut protected_citation_keys = obligation_carrier_keys;
     protected_citation_keys.extend(
         answer
             .citations
             .iter()
-            .filter(|citation| obligation_carrier_node_ids.contains(&citation.node_id))
+            .filter(|citation| citation.coverage_role.as_deref() == Some("explicit exact probe"))
             .map(packet_citation_key),
     );
-    let focus_neighborhood_keys =
-        promote_focus_neighborhood_citations(answer, &protected_citation_keys);
-    protected_citation_keys.extend(focus_neighborhood_keys);
-    prioritize_protected_citations(&mut answer.citations, &protected_citation_keys);
-    if protected_citation_keys.is_empty() {
-        cap_citations(answer, limits)
-    } else {
-        cap_citations_with_protected(answer, limits, &protected_citation_keys)
+    let mut obligation_value_keys = required_probe_keys;
+    obligation_value_keys.extend(focus_neighborhood_keys);
+    obligation_value_keys.extend(protected_citation_keys.iter().cloned());
+    cap_citations_with_priorities(
+        answer,
+        limits,
+        &protected_citation_keys,
+        &obligation_value_keys,
+    )
+}
+
+fn promote_obligation_carrier_citations(
+    answer: &mut AgentAnswerDto,
+    obligation_carrier_node_ids: &[NodeId],
+) -> HashSet<String> {
+    if obligation_carrier_node_ids.is_empty() || answer.citations.is_empty() {
+        return HashSet::new();
     }
+    let mut retained_indices = Vec::new();
+    let mut retained_index_set = HashSet::new();
+    for node_id in obligation_carrier_node_ids {
+        if let Some((index, _)) = answer
+            .citations
+            .iter()
+            .enumerate()
+            .find(|(index, citation)| {
+                !retained_index_set.contains(index) && citation.node_id == *node_id
+            })
+            && retained_index_set.insert(index)
+        {
+            retained_indices.push(index);
+        }
+    }
+    let keys = retained_indices
+        .iter()
+        .map(|index| packet_citation_key(&answer.citations[*index]))
+        .collect::<HashSet<_>>();
+    let mut reordered = Vec::with_capacity(answer.citations.len());
+    for index in &retained_indices {
+        reordered.push(answer.citations[*index].clone());
+    }
+    for (index, citation) in answer.citations.drain(..).enumerate() {
+        if !retained_index_set.contains(&index) {
+            reordered.push(citation);
+        }
+    }
+    answer.citations = reordered;
+    keys
 }
 
 pub(crate) fn promote_required_probe_citations(
@@ -1290,7 +1539,7 @@ mod tests {
     use codestory_contracts::api::{
         AgentResponseBlockDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
         AgentRetrievalPresetDto, AgentRetrievalTraceDto, NodeId, PacketEvidenceResolutionDto,
-        PacketEvidenceTierDto,
+        PacketEvidenceTierDto, RetrievalScoreBreakdownDto,
     };
 
     fn citation(display_name: &str, file_path: &str, score: f32) -> AgentCitationDto {
@@ -1354,6 +1603,21 @@ mod tests {
                 retrieval_shadow: None,
             },
         }
+    }
+
+    fn with_fused_score(mut citation: AgentCitationDto, total: f32) -> AgentCitationDto {
+        citation.retrieval_score_breakdown = Some(RetrievalScoreBreakdownDto {
+            lexical: total,
+            semantic: 0.0,
+            graph: 0.0,
+            total,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: Some("weighted_rrf_v2".to_string()),
+            provenance: vec!["lexical".to_string()],
+        });
+        citation
     }
 
     #[test]
@@ -1441,6 +1705,44 @@ mod tests {
         assert_eq!(answer.citations.len(), 1);
         assert_eq!(answer.citations[0].node_id, protected_node_id);
         assert_eq!(answer.citations[0].display_name, "IndexService::run");
+    }
+
+    #[test]
+    fn marginal_utility_limits_ordinary_file_duplicates_without_dropping_novel_subsystems() {
+        let same_a = with_fused_score(citation("alpha", "crates/a/src/lib.rs", 0.9), 0.9);
+        let same_b = with_fused_score(citation("beta", "crates/a/src/lib.rs", 0.8), 0.8);
+        let same_c = with_fused_score(citation("gamma", "crates/a/src/lib.rs", 0.7), 0.7);
+        let novel = with_fused_score(citation("delta", "crates/b/src/lib.rs", 0.4), 0.4);
+        let mut answer = answer_fixture(vec![same_a, same_b, same_c, novel]);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 3,
+            max_files: 3,
+            max_snippets: 3,
+            max_trail_edges: 3,
+            max_output_bytes: 1024,
+        };
+
+        assert!(cap_citations_with_priorities(
+            &mut answer,
+            &limits,
+            &HashSet::new(),
+            &HashSet::new(),
+        ));
+        assert_eq!(answer.citations.len(), 3);
+        assert_eq!(
+            answer
+                .citations
+                .iter()
+                .filter(|citation| citation.file_path.as_deref() == Some("crates/a/src/lib.rs"))
+                .count(),
+            2
+        );
+        assert!(
+            answer
+                .citations
+                .iter()
+                .any(|citation| citation.display_name == "delta")
+        );
     }
 
     #[test]
@@ -1720,18 +2022,15 @@ mod tests {
             answer.citations.len() <= limits.max_anchors as usize,
             "citation cap should stay within max_anchors"
         );
-        let leading_paths = answer
+        let required_paths = answer
             .citations
             .iter()
-            .take(UNIQUE_REQUIRED_PROBE_COUNT)
             .filter_map(|citation| citation.file_path.clone())
+            .filter(|path| path.contains("synthetic_probe_"))
             .collect::<Vec<_>>();
-        let expected_leading_paths = (0..UNIQUE_REQUIRED_PROBE_COUNT)
-            .map(|index| format!("src/flow/synthetic_probe_{index}.rs"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            leading_paths, expected_leading_paths,
-            "unique required probes should keep their protected citation order"
+        assert!(
+            required_paths.len() >= UNIQUE_REQUIRED_PROBE_COUNT - 1,
+            "required probes should receive obligation value without becoming an unconditional hard reservation: {required_paths:?}"
         );
         let multi_match_paths = answer
             .citations
@@ -1739,10 +2038,9 @@ mod tests {
             .filter_map(|citation| citation.file_path.as_deref())
             .filter(|path| path.contains("source_buffer_"))
             .collect::<Vec<_>>();
-        assert_eq!(
-            multi_match_paths.len(),
-            2,
-            "duplicated multi-match source probes should protect exactly two distinct source-buffer citations"
+        assert!(
+            (1..=2).contains(&multi_match_paths.len()),
+            "multi-match source probes receive utility but cannot hard-reserve the packet: {multi_match_paths:?}"
         );
         let kept_files = answer
             .citations
