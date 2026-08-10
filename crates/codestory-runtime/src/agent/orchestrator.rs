@@ -74,8 +74,6 @@ use crate::agent::packet_scoring::packet_citation_key;
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path, sort_by_cached_rank_desc,
 };
-#[cfg(test)]
-use crate::agent::packet_source_patterns::packet_sql_identifier_after;
 use crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context;
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
@@ -983,6 +981,63 @@ fn packet_evidence_ledger_row(citation: &AgentCitationDto) -> String {
 #[cfg(test)]
 mod legacy_source_scans {
     use super::*;
+
+    fn packet_sql_identifier_after(line: &str, needle: &str) -> Option<String> {
+        let lower = line.to_ascii_lowercase();
+        let at = lower.find(needle)? + needle.len();
+        if needle == "create table"
+            && lower[at..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        {
+            return None;
+        }
+        let mut rest = line[at..].trim_start();
+        for prefix in ["if not exists", "only"] {
+            if rest.to_ascii_lowercase().starts_with(prefix) {
+                rest = rest[prefix.len()..].trim_start();
+            }
+        }
+        packet_first_sql_identifier(rest)
+    }
+
+    fn packet_first_sql_identifier(input: &str) -> Option<String> {
+        let mut token = String::new();
+        let mut in_identifier = false;
+        let mut quote: Option<char> = None;
+        for ch in input.chars() {
+            if !in_identifier {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '"' | '\'' | '`' | '[') {
+                    in_identifier = true;
+                    quote = match ch {
+                        '"' | '\'' | '`' => Some(ch),
+                        '[' => Some(']'),
+                        _ => None,
+                    };
+                    if quote.is_none() {
+                        token.push(ch);
+                    }
+                }
+                continue;
+            }
+            if quote.is_some_and(|end| ch == end) {
+                break;
+            }
+            if quote.is_none() && !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '$')) {
+                break;
+            }
+            token.push(ch);
+        }
+        let token = token
+            .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '[' | ']' | '(' | ')'))
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '[' | ']'))
+            .trim();
+        (!token.is_empty()).then(|| token.to_string())
+    }
 
     struct PacketSqlSchemaFileCandidate {
         path: std::path::PathBuf,

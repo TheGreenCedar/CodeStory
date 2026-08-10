@@ -540,14 +540,13 @@ fn indexer_crate_stays_decoupled_from_runtime_and_cli() {
 /// `agent_module_allowlist_stays_in_sync_with_the_agent_source_tree` enforces
 /// that, so adding a module to the crate without extending this list fails
 /// loudly instead of silently escaping every contract built on it.
-const AGENT_PLANNING_MODULES: [&str; 30] = [
+const AGENT_PLANNING_MODULES: [&str; 28] = [
     "citation.rs",
     "packet_citations.rs",
     "packet_claim_profile_registry.rs",
     "packet_claim_profiles.rs",
     "packet_claims.rs",
     "packet_command.rs",
-    "packet_command_profiles.rs",
     "packet_coverage.rs",
     "packet_degradation.rs",
     "packet_evidence.rs",
@@ -562,7 +561,6 @@ const AGENT_PLANNING_MODULES: [&str; 30] = [
     "packet_profile_telemetry.rs",
     "packet_required_probes.rs",
     "packet_scoring.rs",
-    "packet_source_patterns.rs",
     "packet_sufficiency.rs",
     "packet_terms.rs",
     "pinned_reader.rs",
