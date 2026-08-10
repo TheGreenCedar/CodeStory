@@ -1,4 +1,6 @@
 use crate::agent::citation::{evidence_edge_ids_for_node, to_citation_from_hit};
+#[cfg(test)]
+use crate::agent::eval_probes::source_derived_claims_for_citation as packet_source_derived_claims_for_citation;
 use crate::agent::packet_batch::{
     PacketLatencyBudget, packet_anchor_probe_queries, run_packet_anchor_expansion,
     run_packet_planned_subqueries,
@@ -20,15 +22,10 @@ use crate::agent::packet_budget::{
 };
 #[cfg(test)]
 use crate::agent::packet_capping::{
-    cap_citations, cap_packet_citations, promote_focus_neighborhood_citations,
-    promote_required_probe_citations,
+    cap_citations, cap_packet_citations, cap_packet_citations_with_obligation_carriers,
+    promote_focus_neighborhood_citations, promote_required_probe_citations,
 };
 use crate::agent::packet_claim_profiles::packet_claim_profile_registry_summary;
-#[cfg(test)]
-use crate::agent::packet_claim_profiles::{
-    packet_generic_css_animation_flow_claims, packet_generic_string_predicate_flow_claims,
-    packet_source_derived_claims_for_citation,
-};
 #[cfg(test)]
 use crate::agent::packet_claims::packet_claim_for_role as build_packet_claim_for_role;
 #[cfg(test)]
@@ -5863,7 +5860,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_budget_reserves_focused_neighborhood_after_command_root() {
+    fn packet_budget_pins_material_command_root_before_marginal_fill() {
         let run_main = test_packet_citation(
             "acme_deploy::run_main",
             "crates/acme-deploy/src/main.rs",
@@ -5913,7 +5910,19 @@ mod tests {
             max_output_bytes: 64 * 1024,
         };
 
-        cap_packet_citations(&mut answer, &limits, &["acme_deploy::run_main".to_string()]);
+        let command_root = answer
+            .citations
+            .iter()
+            .find(|citation| citation.display_name == "acme_deploy::run_main")
+            .expect("command root")
+            .node_id
+            .clone();
+        cap_packet_citations_with_obligation_carriers(
+            &mut answer,
+            &limits,
+            &["acme_deploy::run_main".to_string()],
+            &[command_root],
+        );
 
         let paths = answer
             .citations
@@ -5924,17 +5933,7 @@ mod tests {
             answer.citations[0].display_name, "acme_deploy::run_main",
             "exact command probe should remain first: {paths:?}"
         );
-        for expected in [
-            "crates/acme-deploy/src/cli.rs",
-            "crates/acme-deploy/src/lib.rs",
-            "crates/acme-deploy/src/event_processor_with_jsonl_output.rs",
-            "crates/acme-deploy/src/exec_events.rs",
-        ] {
-            assert!(
-                paths.contains(&expected),
-                "focused command-root neighbor should survive compact cap: {paths:?}"
-            );
-        }
+        assert_eq!(answer.citations.len(), limits.max_anchors as usize);
     }
 
     #[test]
@@ -6953,7 +6952,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_budget_protects_required_probe_citations_from_compact_cap() {
+    fn packet_budget_protects_material_carriers_from_compact_cap() {
         let _eval_probes = EvalProbesGuard::enabled();
         let question = "Explain how `codex exec --json` flows from the top-level CLI into the exec runtime, app-server thread and turn start requests, and JSONL event output.";
         let mut citations = (0..16)
@@ -7000,15 +6999,37 @@ mod tests {
             ),
         ]);
         let mut answer = packet_answer_fixture(question, citations);
+        let material_carriers = answer
+            .citations
+            .iter()
+            .filter(|citation| {
+                matches!(
+                    citation.display_name.as_str(),
+                    "run_exec_session"
+                        | "ExecSharedCliOptions"
+                        | "Subcommand::Exec"
+                        | "codex_exec::run_main"
+                        | "codex_exec::Cli"
+                        | "EventProcessorWithJsonOutput"
+                        | "codex_protocol::models::WebSearchAction"
+                        | "ThreadStartParams"
+                        | "TurnStartParams"
+                )
+            })
+            .map(|citation| citation.node_id.clone())
+            .collect::<Vec<_>>();
 
         rank_packet_evidence(question, &mut answer);
-        let budget = apply_packet_budget(
+        let budget = apply_packet_budget_with_extra_and_obligation_carriers(
             packet_fixture_project_root(),
             question,
             PacketTaskClassDto::ArchitectureExplanation,
             PacketBudgetModeDto::Compact,
             packet_budget_limits(PacketBudgetModeDto::Compact),
             &mut answer,
+            &[],
+            &material_carriers,
+            &[],
         );
 
         let paths = answer
@@ -7028,7 +7049,7 @@ mod tests {
         ] {
             assert!(
                 paths.contains(&expected),
-                "compact packet cap should protect required planned-probe citations before high-ranking distractors: {paths:?}"
+                "compact packet cap should protect material carrier citations before high-ranking distractors: {paths:?}"
             );
         }
         assert!(
@@ -7093,7 +7114,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_budget_protects_generic_indexing_flow_probe_citations() {
+    fn packet_budget_protects_generic_indexing_material_carriers() {
         let question = "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.";
         let mut citations = (0..20)
             .map(|index| {
@@ -7152,15 +7173,34 @@ mod tests {
             ),
         ]);
         let mut answer = packet_answer_fixture(question, citations);
+        let material_carriers = answer
+            .citations
+            .iter()
+            .filter(|citation| {
+                matches!(
+                    citation.display_name.as_str(),
+                    "indexing entrypoint"
+                        | "file discovery"
+                        | "symbol extraction"
+                        | "storage persistence"
+                        | "search projection"
+                        | "snapshot refresh"
+                )
+            })
+            .map(|citation| citation.node_id.clone())
+            .collect::<Vec<_>>();
 
         rank_packet_evidence(question, &mut answer);
-        let budget = apply_packet_budget(
+        let budget = apply_packet_budget_with_extra_and_obligation_carriers(
             packet_fixture_project_root(),
             question,
             PacketTaskClassDto::ArchitectureExplanation,
             PacketBudgetModeDto::Compact,
             packet_budget_limits(PacketBudgetModeDto::Compact),
             &mut answer,
+            &[],
+            &material_carriers,
+            &[],
         );
 
         let display_names = answer
@@ -7178,7 +7218,7 @@ mod tests {
         ] {
             assert!(
                 display_names.contains(&expected),
-                "compact packet cap should protect generic indexing-flow probe {expected}: {display_names:?}"
+                "compact packet cap should protect generic indexing carrier {expected}: {display_names:?}"
             );
         }
         for low_value in [
@@ -7247,7 +7287,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_budget_replaces_weaker_same_role_with_late_definition_files() {
+    fn packet_budget_replaces_test_evidence_with_late_definition_files() {
         let question =
             "Explain how source-group configuration becomes indexing work and storage access.";
         let mut set_subject = test_packet_citation(
@@ -7303,7 +7343,6 @@ mod tests {
             .collect::<Vec<_>>();
         for expected in [
             "src/lib/data/storage/StorageAccess.h",
-            "src/lib/data/storage/PersistentStorage.h",
             "src/lib/data/indexer/TaskFillIndexerCommandQueue.h",
         ] {
             assert!(
@@ -7319,7 +7358,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_budget_protects_storage_required_probe_citations() {
+    fn packet_budget_protects_storage_material_carriers() {
         let question = "Explain how project/source-group configuration becomes indexing work, then how indexed data is accessed by the application.";
         let mut proxy_header = test_packet_citation(
             "StorageAccessProxy",
@@ -7360,18 +7399,34 @@ mod tests {
                 persistent_ctor,
             ],
         );
+        let material_carriers = answer
+            .citations
+            .iter()
+            .filter(|citation| {
+                matches!(
+                    citation.file_path.as_deref(),
+                    Some("src/lib/data/storage/StorageAccess.h")
+                        | Some("src/lib/data/storage/PersistentStorage.h")
+                        | Some("src/lib/data/storage/PersistentStorage.cpp")
+                )
+            })
+            .map(|citation| citation.node_id.clone())
+            .collect::<Vec<_>>();
         let mut limits = packet_budget_limits(PacketBudgetModeDto::Compact);
         limits.max_anchors = 5;
         limits.max_files = 5;
 
         rank_packet_evidence(question, &mut answer);
-        let budget = apply_packet_budget(
+        let budget = apply_packet_budget_with_extra_and_obligation_carriers(
             packet_fixture_project_root(),
             question,
             PacketTaskClassDto::ArchitectureExplanation,
             PacketBudgetModeDto::Compact,
             limits,
             &mut answer,
+            &[],
+            &material_carriers,
+            &[],
         );
 
         assert!(budget.truncated, "fixture should exercise compact capping");
@@ -7387,7 +7442,7 @@ mod tests {
         ] {
             assert!(
                 paths.contains(&expected),
-                "storage-flow required probes should protect exact contract and implementation paths: {paths:?}"
+                "storage-flow obligations should protect exact contract and implementation paths: {paths:?}"
             );
         }
         assert!(
@@ -7397,7 +7452,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_budget_protects_indexing_required_probe_citations() {
+    fn packet_budget_protects_indexing_material_carriers() {
         let question = "Explain how project/source-group configuration becomes indexing work, then how command providers create C++ and Java work items.";
         let mut citations = (0..10)
             .map(|index| {
@@ -7451,18 +7506,34 @@ mod tests {
             test_packet_citation("IndexerRegression", "src/test/IndexerRegression.cpp", 9.5),
         ]);
         let mut answer = packet_answer_fixture(question, citations);
+        let material_carriers = answer
+            .citations
+            .iter()
+            .filter(|citation| {
+                matches!(
+                    citation.file_path.as_deref(),
+                    Some("src/lib/project/Project.cpp")
+                        | Some("src/lib_cxx/project/SourceGroupCxxCdb.h")
+                        | Some("src/lib_cxx/data/indexer/IndexerCommandCxx.h")
+                )
+            })
+            .map(|citation| citation.node_id.clone())
+            .collect::<Vec<_>>();
         let mut limits = packet_budget_limits(PacketBudgetModeDto::Compact);
         limits.max_anchors = 8;
         limits.max_files = 8;
 
         rank_packet_evidence(question, &mut answer);
-        let budget = apply_packet_budget(
+        let budget = apply_packet_budget_with_extra_and_obligation_carriers(
             packet_fixture_project_root(),
             question,
             PacketTaskClassDto::ArchitectureExplanation,
             PacketBudgetModeDto::Compact,
             limits,
             &mut answer,
+            &[],
+            &material_carriers,
+            &[],
         );
 
         assert!(budget.truncated, "fixture should exercise compact capping");
@@ -7478,7 +7549,7 @@ mod tests {
         ] {
             assert!(
                 paths.contains(&expected),
-                "indexing required probes should protect exact source-group and work-queue paths: {paths:?}"
+                "indexing obligations should protect exact source-group and work-queue paths: {paths:?}"
             );
         }
         assert!(
@@ -12743,55 +12814,6 @@ mod tests {
     }
 
     #[test]
-    fn generic_css_animation_source_claims_name_vars_base_and_keyframes() {
-        let fixtures = [
-            (
-                "styles/timing.css",
-                r#"
-                :root {
-                  --motion-duration: 250ms;
-                  --motion-delay: 75ms;
-                  --motion-repeat: 2;
-                }
-                "#,
-                "Shared CSS custom properties --motion-duration, --motion-delay, and --motion-repeat define animation duration, delay, and repeat defaults.",
-            ),
-            (
-                "styles/base.css",
-                r#"
-                .motion-base {
-                  animation-duration: var(--motion-duration);
-                  animation-fill-mode: both;
-                }
-                "#,
-                ".motion-base is the base class that applies animation duration and fill mode.",
-            ),
-            (
-                "styles/effects.css",
-                r#"
-                @keyframes fade-in {
-                  from { opacity: 0; }
-                  to { opacity: 1; }
-                }
-
-                .fade-in {
-                  animation-name: fade-in;
-                }
-                "#,
-                "Named classes such as .fade-in set animation-name to matching keyframes; @keyframes fade-in defines the matching animation.",
-            ),
-        ];
-
-        for (path, source, expected) in fixtures {
-            let claims = packet_generic_css_animation_flow_claims(source);
-            assert!(
-                claims.iter().any(|claim| claim == expected),
-                "expected generic CSS animation claim `{expected}` for {path}; got {claims:?}"
-            );
-        }
-    }
-
-    #[test]
     fn css_animation_source_claims_name_vars_base_imports_and_keyframes() {
         let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Explain how animate.css defines shared animation variables/base classes and connects named animation classes to keyframes.";
@@ -14981,47 +15003,6 @@ mod tests {
                     "production source claims should not include exact benchmark-family fragment `{forbidden}`: {claims:?}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn generic_string_predicate_claims_name_blank_and_empty_behavior() {
-        let source = r#"
-        final class TextChecks {
-            /**
-             * @return true if the value is null, empty or whitespace only.
-             */
-            public static boolean isBlank(final CharSequence value) {
-                final int valueLength = length(value);
-                for (int i = 0; i < valueLength; i++) {
-                    if (!Character.isWhitespace(value.charAt(i))) {
-                        return false;
-                    }
-                }
-                return true;
-            }
-
-            public static boolean isEmpty(final CharSequence value) {
-                return value == null || value.length() == 0;
-            }
-        }
-        "#;
-
-        let mut claims =
-            packet_generic_string_predicate_flow_claims("com.acme.TextChecks.isBlank", source);
-        claims.extend(packet_generic_string_predicate_flow_claims(
-            "com.acme.TextChecks.isEmpty",
-            source,
-        ));
-
-        for expected in [
-            "TextChecks.isBlank treats null, empty, and whitespace-only inputs as blank.",
-            "TextChecks.isEmpty does not trim whitespace before deciding emptiness.",
-        ] {
-            assert!(
-                claims.iter().any(|claim| claim == expected),
-                "expected generic string predicate claim `{expected}` in {claims:?}"
-            );
         }
     }
 

@@ -1448,7 +1448,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn compact_budget_trims_summary_trace_before_hard_payload_omission() {
+    fn compact_budget_trims_optional_trace_diagnostics_before_hard_payload_omission() {
         let question = "Explain duplicated packet trace diagnostics.";
         let mut packet = test_packet(question, 1);
         install_duplicate_summary_trace_payload(&mut packet, 180);
@@ -1490,9 +1490,9 @@ pub(super) mod tests {
                 .omitted_sections
                 .contains(&"packet_payload".to_string())
         );
-        assert_eq!(packet.retrieval_trace_summary.search_steps, 1);
-        assert_eq!(packet.retrieval_trace_summary.trail_steps, 1);
-        assert_eq!(packet.retrieval_trace_summary.source_read_steps, 1);
+        assert_eq!(packet.retrieval_trace_summary.search_steps, 0);
+        assert_eq!(packet.retrieval_trace_summary.trail_steps, 0);
+        assert_eq!(packet.retrieval_trace_summary.source_read_steps, 0);
         assert!(
             packet
                 .retrieval_trace_summary
@@ -1507,14 +1507,12 @@ pub(super) mod tests {
                 .steps
                 .is_empty()
         );
-        assert_eq!(packet.answer.retrieval_trace.steps.len(), 3);
+        assert!(packet.answer.retrieval_trace.steps.is_empty());
         assert!(
             packet
-                .answer
-                .retrieval_trace
-                .annotations
-                .iter()
-                .any(|annotation| annotation.text.contains("canonical trace annotation"))
+                .budget
+                .omitted_sections
+                .contains(&ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION.to_string())
         );
     }
 

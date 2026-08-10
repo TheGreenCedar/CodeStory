@@ -18,8 +18,6 @@ pub const CALIBRATION_FIXTURE_PATH: &str =
     "crates/codestory-indexer/tests/fixtures/call_resolution_comprehensive/rust_workflow.rs";
 pub const CALIBRATION_EDGE_CONTRACT_PATH: &str =
     "crates/codestory-indexer/tests/call_resolution_common_methods.rs";
-pub const CALIBRATION_HOLDOUT_MANIFEST_PATH: &str =
-    "benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json";
 pub const CALIBRATION_FIXTURE_TRANSFORMATION: &str = "rust-public-owner-anchors-v1";
 pub const QUERY_VECTOR_CAPTURE_DIR_ENV: &str = "CODESTORY_SEMANTIC_CALIBRATION_QUERY_VECTOR_DIR";
 const MRR_SCALE: u64 = 2_520;
@@ -314,6 +312,7 @@ pub fn validate_vector_artifacts(manifest_path: &Path, database_path: &Path) -> 
 pub fn load_attested_corpus(
     directory: &Path,
     repository_root: &Path,
+    disjointness_manifest_path: &str,
 ) -> Result<SemanticCalibrationCorpus> {
     let corpus_path = directory.join("capture.json");
     let corpus: SemanticCalibrationCorpus =
@@ -330,7 +329,7 @@ pub fn load_attested_corpus(
             )
         })?;
     validate_corpus_shape(&corpus)?;
-    validate_attested_repository_inputs(&corpus, repository_root)?;
+    validate_attested_repository_inputs(&corpus, repository_root, disjointness_manifest_path)?;
     let manifest_path =
         checked_artifact_path(directory, &corpus.capture.vector_generation_manifest_file)?;
     let database_path = checked_artifact_path(directory, &corpus.capture.vector_database_file)?;
@@ -384,10 +383,11 @@ pub fn load_attested_corpus(
 pub fn validate_attested_repository_inputs(
     corpus: &SemanticCalibrationCorpus,
     repository_root: &Path,
+    disjointness_manifest_path: &str,
 ) -> Result<()> {
     if corpus.fixture.source_path != CALIBRATION_FIXTURE_PATH
         || corpus.fixture.edge_contract_path != CALIBRATION_EDGE_CONTRACT_PATH
-        || corpus.fixture.disjointness_manifest_path != CALIBRATION_HOLDOUT_MANIFEST_PATH
+        || corpus.fixture.disjointness_manifest_path != disjointness_manifest_path
         || corpus.fixture.transformation_id != CALIBRATION_FIXTURE_TRANSFORMATION
     {
         bail!("semantic calibration corpus changed its source-owned input contract");
@@ -396,7 +396,7 @@ pub fn validate_attested_repository_inputs(
 
     let fixture_path = repository_root.join(CALIBRATION_FIXTURE_PATH);
     let edge_contract_path = repository_root.join(CALIBRATION_EDGE_CONTRACT_PATH);
-    let disjointness_manifest_path = repository_root.join(CALIBRATION_HOLDOUT_MANIFEST_PATH);
+    let disjointness_manifest_path = repository_root.join(disjointness_manifest_path);
     if sha256_file(&fixture_path)? != corpus.fixture.source_sha256 {
         bail!("semantic calibration source fixture digest mismatch");
     }

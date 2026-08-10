@@ -2,21 +2,27 @@
 
 use codestory_retrieval::semantic_calibration_support::{
     CALIBRATION_CORPUS_SCHEMA_VERSION, CALIBRATION_EDGE_CONTRACT_PATH, CALIBRATION_FEATURE,
-    CALIBRATION_FIXTURE_PATH, CALIBRATION_FIXTURE_TRANSFORMATION,
-    CALIBRATION_HOLDOUT_MANIFEST_PATH, CalibrationCandidate, CalibrationCaptureIdentity,
-    CalibrationExpectedCall, CalibrationFixtureIdentity, CalibrationMetrics, CalibrationPolicy,
-    CalibrationQuery, CalibrationSelection, CalibrationSelectionContract,
-    SemanticCalibrationCorpus, development_queries, hex_bytes, load_attested_corpus,
-    materialize_public_owner_fixture, query_vector_bytes, select_policy, sha256_bytes,
-    validate_attested_repository_inputs, validate_holdout_disjointness,
+    CALIBRATION_FIXTURE_PATH, CALIBRATION_FIXTURE_TRANSFORMATION, CalibrationCandidate,
+    CalibrationCaptureIdentity, CalibrationExpectedCall, CalibrationFixtureIdentity,
+    CalibrationMetrics, CalibrationPolicy, CalibrationQuery, CalibrationSelection,
+    CalibrationSelectionContract, SemanticCalibrationCorpus, development_queries, hex_bytes,
+    load_attested_corpus, materialize_public_owner_fixture, query_vector_bytes, select_policy,
+    sha256_bytes, validate_attested_repository_inputs, validate_holdout_disjointness,
 };
 use std::path::{Path, PathBuf};
+
+const CALIBRATION_HOLDOUT_MANIFEST_PATH: &str =
+    "benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json";
 
 #[test]
 fn semantic_calibration_missing_attested_corpus_fails_closed() {
     let empty = tempfile::tempdir().expect("empty calibration directory");
-    let error = load_attested_corpus(empty.path(), &repository_root())
-        .expect_err("missing corpus must block selection");
+    let error = load_attested_corpus(
+        empty.path(),
+        &repository_root(),
+        CALIBRATION_HOLDOUT_MANIFEST_PATH,
+    )
+    .expect_err("missing corpus must block selection");
     assert!(
         error
             .to_string()
@@ -98,7 +104,7 @@ fn semantic_calibration_generator_inputs_are_source_backed_and_holdout_disjoint(
     let holdout =
         std::fs::read(root.join(CALIBRATION_HOLDOUT_MANIFEST_PATH)).expect("read holdout manifest");
     corpus.fixture.disjointness_manifest_sha256 = sha256_bytes(&holdout);
-    validate_attested_repository_inputs(&corpus, &root)
+    validate_attested_repository_inputs(&corpus, &root, CALIBRATION_HOLDOUT_MANIFEST_PATH)
         .expect("attested inputs remain source-backed and disjoint");
     validate_holdout_disjointness(&corpus, &holdout)
         .expect("development task ids, source commit, and query hashes are disjoint");
@@ -139,6 +145,7 @@ fn checked_in_semantic_calibration_replays_the_product_policy() {
         &repository_root()
             .join("crates/codestory-retrieval/testdata/semantic-abstention-calibration-v1"),
         &repository_root(),
+        CALIBRATION_HOLDOUT_MANIFEST_PATH,
     )
     .expect("checked-in semantic calibration evidence");
     assert_eq!(

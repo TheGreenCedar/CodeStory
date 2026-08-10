@@ -1,13 +1,13 @@
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::semantic_calibration_support::{
     CALIBRATION_CORPUS_SCHEMA_VERSION, CALIBRATION_EDGE_CONTRACT_PATH, CALIBRATION_FEATURE,
-    CALIBRATION_FIXTURE_PATH, CALIBRATION_FIXTURE_TRANSFORMATION,
-    CALIBRATION_HOLDOUT_MANIFEST_PATH, CalibrationCandidate, CalibrationCaptureIdentity,
-    CalibrationExpectedCall, CalibrationFixtureIdentity, CalibrationMetrics, CalibrationPolicy,
-    CalibrationQuery, CalibrationSelection, CalibrationSelectionContract,
-    QUERY_VECTOR_CAPTURE_DIR_ENV, SemanticCalibrationCorpus, development_queries, hex_bytes,
-    load_attested_corpus, materialize_public_owner_fixture, raw_semantic_scan, select_policy,
-    sha256_bytes, sha256_file, validate_attested_repository_inputs, validate_vector_artifacts,
+    CALIBRATION_FIXTURE_PATH, CALIBRATION_FIXTURE_TRANSFORMATION, CalibrationCandidate,
+    CalibrationCaptureIdentity, CalibrationExpectedCall, CalibrationFixtureIdentity,
+    CalibrationMetrics, CalibrationPolicy, CalibrationQuery, CalibrationSelection,
+    CalibrationSelectionContract, QUERY_VECTOR_CAPTURE_DIR_ENV, SemanticCalibrationCorpus,
+    development_queries, hex_bytes, load_attested_corpus, materialize_public_owner_fixture,
+    raw_semantic_scan, select_policy, sha256_bytes, sha256_file,
+    validate_attested_repository_inputs, validate_vector_artifacts,
 };
 use codestory_retrieval::{
     SidecarProcessDefaults, SidecarProfile, SidecarRuntimeConfig, SidecarRuntimeDefaults,
@@ -20,6 +20,8 @@ use std::process::Command;
 const VECTOR_MANIFEST_FILE: &str = "vector-generation-manifest.json";
 const VECTOR_DATABASE_FILE: &str = "vectors.sqlite3";
 const CORPUS_FILE: &str = "capture.json";
+const CALIBRATION_HOLDOUT_MANIFEST_PATH: &str =
+    "benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json";
 
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
@@ -240,7 +242,11 @@ fn main() -> Result<()> {
             metrics: CalibrationMetrics::default(),
         },
     };
-    validate_attested_repository_inputs(&corpus, &repository_root)?;
+    validate_attested_repository_inputs(
+        &corpus,
+        &repository_root,
+        CALIBRATION_HOLDOUT_MANIFEST_PATH,
+    )?;
     corpus.selection = select_policy(&corpus)?;
 
     std::fs::create_dir(&output_dir).with_context(|| format!("create {}", output_dir.display()))?;
@@ -249,7 +255,11 @@ fn main() -> Result<()> {
     let mut corpus_bytes = serde_json::to_vec_pretty(&corpus)?;
     corpus_bytes.push(b'\n');
     std::fs::write(output_dir.join(CORPUS_FILE), corpus_bytes)?;
-    let replayed = load_attested_corpus(&output_dir, &repository_root)?;
+    let replayed = load_attested_corpus(
+        &output_dir,
+        &repository_root,
+        CALIBRATION_HOLDOUT_MANIFEST_PATH,
+    )?;
     if replayed != corpus {
         bail!("written semantic calibration corpus changed during replay");
     }
