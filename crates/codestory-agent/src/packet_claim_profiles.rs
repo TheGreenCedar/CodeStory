@@ -30,12 +30,6 @@ pub fn packet_claim_profile_registry_summary() -> PacketClaimProfileRegistrySumm
     }
 }
 
-#[cfg(feature = "test-support")]
-pub use crate::packet_claim_profiles_legacy_tests::{
-    packet_generic_css_animation_flow_claims, packet_generic_string_predicate_flow_claims,
-    packet_source_derived_claims_for_citation, packet_source_derived_claims_for_citation_counted,
-};
-
 #[cfg(test)]
 mod tests {
     use super::*;

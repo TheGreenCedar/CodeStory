@@ -835,7 +835,7 @@ fn belongs_to_string_predicates(citation: &AgentCitationDto) -> bool {
 }
 
 /// A string helper's blank-or-whitespace predicate. The string subject is deliberately read from
-/// the symbol, not its package path, so an unrelated `Record.isBlank` filed beside StringUtils
+/// the symbol, not its package path, so an unrelated record predicate filed beside text helpers
 /// cannot close the requirement.
 pub fn citation_owns_string_blank_predicate(citation: &AgentCitationDto) -> bool {
     belongs_to_string_predicates(citation) && names_token(citation, &["blank", "whitespace"])
