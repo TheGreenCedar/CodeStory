@@ -977,10 +977,9 @@ fn taxonomy_token_matches(token: &str, family: &str) -> bool {
     }
     let token_bytes = token.as_bytes();
     let family_bytes = family.as_bytes();
-    (token_bytes.ends_with(&[b'e', b's'])
-        && token_bytes.get(..token_bytes.len() - 2) == Some(family_bytes))
-        || (token_bytes.ends_with(&[b'i', b'e', b's'])
-            && family_bytes.ends_with(&[b'y'])
+    (token_bytes.ends_with(b"es") && token_bytes.get(..token_bytes.len() - 2) == Some(family_bytes))
+        || (token_bytes.ends_with(b"ies")
+            && family_bytes.ends_with(b"y")
             && token_bytes.get(..token_bytes.len() - 3)
                 == family_bytes.get(..family_bytes.len() - 1))
 }
@@ -1000,7 +999,7 @@ fn indexing_action_direction(terminal_tokens: &[String]) -> IndexingActionDirect
     if INDEXING_MUTATION_ACTIONS
         .iter()
         .any(|candidate| taxonomy_token_matches(action, candidate))
-        || (action.as_bytes() == [b'r', b'e']
+        || (action.as_bytes() == *b"re"
             && terminal_tokens.get(1).is_some_and(|token| token == "index"))
     {
         IndexingActionDirection::Mutation
@@ -1024,7 +1023,7 @@ fn is_intrinsic_indexing_action(terminal_tokens: &[String]) -> bool {
         taxonomy_token_matches(action, "index") || taxonomy_token_matches(action, "reindex")
     }) || (terminal_tokens
         .first()
-        .is_some_and(|action| action.as_bytes() == [b'r', b'e'])
+        .is_some_and(|action| action.as_bytes() == *b"re")
         && terminal_tokens.get(1).is_some_and(|token| token == "index"))
 }
 
@@ -1040,7 +1039,7 @@ pub fn citation_owns_indexing_entrypoint(citation: &AgentCitationDto) -> bool {
     let terminal_tokens = identifier_tokens(terminal_segment_raw(&citation.display_name));
     let action_width = if terminal_tokens
         .first()
-        .is_some_and(|token| token.as_bytes() == [b'r', b'e'])
+        .is_some_and(|token| token.as_bytes() == *b"re")
         && terminal_tokens.get(1).is_some_and(|token| token == "index")
     {
         2

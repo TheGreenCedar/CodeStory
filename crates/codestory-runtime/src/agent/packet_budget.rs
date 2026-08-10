@@ -14,7 +14,10 @@ use crate::agent::packet_sufficiency::{
     PACKET_MARKDOWN_TRUNCATION_SUFFIX, build_packet_sufficiency_with_obligation_context,
 };
 use crate::agent::path_identity::RuntimeWorkspacePathIdentity;
-use crate::agent::trace_export::packet_retrieval_trace_summary;
+use crate::agent::trace_export::{
+    PACKET_STEP_TRACE_ANNOTATION_PREFIX, packet_retrieval_trace_summary,
+    retain_packet_step_trace_for_export,
+};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, AgentResponseBlockDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, GraphArtifactDto, GraphResponse, PacketBudgetDto,
@@ -32,7 +35,6 @@ const MARKDOWN_TRUNCATION_FLOOR_BYTES: usize = 256;
 const ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION: &str = "answer.retrieval_trace.diagnostics";
 const AVOID_OPENING_OMISSION: &str = "avoid_opening";
 const COVERAGE_REPORT_INELIGIBLE_OMISSION: &str = "coverage_report.ineligible";
-const PACKET_STEP_TRACE_ANNOTATION_PREFIX: &str = "packet_step_trace ";
 const RETRIEVAL_TRACE_SUMMARY_OMISSION: &str = "retrieval_trace_summary";
 
 pub(crate) fn packet_budget_limits(mode: PacketBudgetModeDto) -> PacketBudgetLimitsDto {
@@ -298,9 +300,9 @@ fn trim_packet_answer_retrieval_diagnostics(packet: &mut AgentPacketDto) -> bool
         .retrieval_shadow
         .as_mut()
         .is_some_and(trim_retrieval_shadow_verbose_diagnostics);
-    let trimmed = original_annotation_count != trace.annotations.len()
-        || !trace.steps.is_empty()
-        || shadow_trimmed;
+    let steps_trimmed = retain_packet_step_trace_for_export(trace);
+    let trimmed =
+        original_annotation_count != trace.annotations.len() || steps_trimmed || shadow_trimmed;
     trace.steps.clear();
     trimmed
 }
@@ -676,6 +678,7 @@ pub(crate) fn packet_budget_usage(answer: &AgentAnswerDto) -> PacketBudgetUsageD
 mod tests {
     use super::*;
     use crate::agent::packet_obligations::build_packet_obligation_plan;
+    use crate::agent::trace_export::{packet_step_trace_json, write_packet_step_trace_from_env};
     use codestory_contracts::api::{
         AgentCitationDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
         AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalTraceDto, EdgeId, EdgeKind,
@@ -1086,6 +1089,137 @@ mod tests {
             Some(1_000)
         );
         assert!(packet.retrieval_trace_summary.retrieval_trace.sla_missed);
+    }
+
+    #[test]
+    fn compact_budget_retains_step_rows_for_json_and_file_export() {
+        let question = "Explain packet step trace export under the wire cap.";
+        let mut packet = test_packet(question, 1);
+        install_duplicate_summary_trace_payload(&mut packet, 180);
+        packet.answer.retrieval_trace.annotations.push(
+            codestory_contracts::api::RetrievalAnnotationDto::observation(
+                "packet_step_trace search_total_ms=10 step_count=3",
+            ),
+        );
+        packet.answer.retrieval_trace.annotations.push(
+            codestory_contracts::api::RetrievalAnnotationDto::gap(
+                "packet_step_trace typed gap must survive compaction",
+            ),
+        );
+        packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
+
+        let mut trimmed_probe = packet.clone();
+        assert!(trim_packet_retrieval_trace_summary(&mut trimmed_probe));
+        assert!(trim_packet_answer_retrieval_diagnostics(&mut trimmed_probe));
+        let max_output_bytes = u32::try_from(serialized_packet_len(&trimmed_probe) + 4_096)
+            .expect("test cap fits u32");
+        packet.budget.limits.max_output_bytes = max_output_bytes;
+        assert!(
+            serialized_packet_len(&packet) > max_output_bytes as usize,
+            "fixture must start over the packet output cap"
+        );
+
+        enforce_packet_output_budget(test_project_root(), &mut packet);
+
+        assert!(packet.answer.retrieval_trace.steps.is_empty());
+        assert!(serialized_packet_len(&packet) <= max_output_bytes as usize);
+        let json = packet_step_trace_json(&packet.answer);
+        assert_eq!(json["step_count"], 3);
+        assert_eq!(json["retained_step_trace"]["source_step_count"], 3);
+        assert_eq!(json["retained_step_trace"]["rows_truncated"], false);
+        assert_eq!(json["steps"][0]["kind"], "Search");
+        assert_eq!(json["steps"][0]["duration_ms"], 10);
+        assert_eq!(json["steps"][1]["kind"], "Trail");
+        assert_eq!(json["steps"][2]["kind"], "SourceRead");
+        assert!(
+            packet
+                .answer
+                .retrieval_trace
+                .annotations
+                .iter()
+                .any(|annotation| annotation.is_gap()
+                    && annotation.text.starts_with("packet_step_trace typed gap"))
+        );
+
+        packet
+            .answer
+            .retrieval_trace
+            .steps
+            .push(AgentRetrievalStepDto {
+                kind: AgentRetrievalStepKindDto::AnswerSynthesis,
+                status: AgentRetrievalStepStatusDto::Ok,
+                duration_ms: 7,
+                input: Vec::new(),
+                output: Vec::new(),
+                message: Some("post-budget phase ".repeat(1_000)),
+            });
+        packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
+        assert!(serialized_packet_len(&packet) > max_output_bytes as usize);
+
+        enforce_packet_output_budget(test_project_root(), &mut packet);
+
+        assert!(packet.answer.retrieval_trace.steps.is_empty());
+        assert!(serialized_packet_len(&packet) <= max_output_bytes as usize);
+        let json = packet_step_trace_json(&packet.answer);
+        assert_eq!(json["step_count"], 4);
+        assert_eq!(json["retained_step_trace"]["source_step_count"], 4);
+        assert_eq!(json["steps"][3]["step_index"], 3);
+        assert_eq!(json["steps"][3]["kind"], "AnswerSynthesis");
+        assert_eq!(json["steps"][3]["duration_ms"], 7);
+
+        let _lock = crate::process_env_test_lock();
+        let trace_path = std::env::temp_dir().join(format!(
+            "codestory-over-cap-packet-step-trace-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&trace_path);
+        // SAFETY: this test holds the process env lock and restores the variable below.
+        unsafe {
+            std::env::set_var("CODESTORY_PACKET_STEP_TRACE_OUT", &trace_path);
+        }
+        let diagnostic = write_packet_step_trace_from_env(&packet.answer);
+        // SAFETY: this test holds the process env lock.
+        unsafe {
+            std::env::remove_var("CODESTORY_PACKET_STEP_TRACE_OUT");
+        }
+        assert_eq!(diagnostic, None);
+        let exported: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&trace_path).expect("read exported packet step trace"),
+        )
+        .expect("parse exported packet step trace");
+        let _ = std::fs::remove_file(&trace_path);
+        assert_eq!(exported["step_count"], 4);
+        assert_eq!(exported["steps"][0]["kind"], "Search");
+        assert_eq!(exported["steps"][2]["duration_ms"], 30);
+        assert_eq!(exported["steps"][3]["kind"], "AnswerSynthesis");
+    }
+
+    #[test]
+    fn compact_step_trace_proof_reports_bounded_row_loss() {
+        let mut packet = test_packet("Explain bounded packet step trace retention.", u32::MAX);
+        packet.answer.retrieval_trace.steps = (0..70)
+            .map(|_| AgentRetrievalStepDto {
+                kind: AgentRetrievalStepKindDto::Search,
+                status: AgentRetrievalStepStatusDto::Ok,
+                duration_ms: 1,
+                input: Vec::new(),
+                output: Vec::new(),
+                message: None,
+            })
+            .collect();
+        packet.answer.retrieval_trace.annotations.push(
+            codestory_contracts::api::RetrievalAnnotationDto::observation(
+                "packet_step_trace search_total_ms=70 step_count=70",
+            ),
+        );
+
+        assert!(trim_packet_answer_retrieval_diagnostics(&mut packet));
+
+        let json = packet_step_trace_json(&packet.answer);
+        assert_eq!(json["step_count"], 64);
+        assert_eq!(json["retained_step_trace"]["source_step_count"], 70);
+        assert_eq!(json["retained_step_trace"]["retained_step_count"], 64);
+        assert_eq!(json["retained_step_trace"]["rows_truncated"], true);
     }
 
     #[test]

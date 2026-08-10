@@ -178,6 +178,8 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
         || path.contains("sourcegroup")
     {
         Some(PacketEvidenceRole::SourceGroupConfiguration)
+    } else if packet_citation_owns_indexer_source_extraction(citation, &path) {
+        Some(PacketEvidenceRole::SymbolExtraction)
     } else if citation_owns_indexing_entrypoint(citation)
         || normalized_display.contains("buildindex")
         || (normalized_display.contains("task")
@@ -338,6 +340,56 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
     } else {
         None
     }
+}
+
+/// A per-source indexing action implemented by the indexer is extraction work, even though the
+/// same callable shape is also a valid indexing entrypoint in a service or work queue. Repository,
+/// project, and workspace actions stay entrypoints; only concrete source units take this narrower
+/// role.
+fn packet_citation_owns_indexer_source_extraction(citation: &AgentCitationDto, path: &str) -> bool {
+    if !matches!(
+        citation.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    ) || !path
+        .split('/')
+        .any(|segment| matches!(segment, "indexer" | "codestory-indexer"))
+    {
+        return false;
+    }
+
+    let terminal = citation
+        .display_name
+        .rsplit([':', '.', '/', '\\'])
+        .next()
+        .unwrap_or(&citation.display_name);
+    let tokens = crate::text::symbol_query_tokens(terminal);
+    let action_width = match tokens.as_slice() {
+        [action, ..] if matches!(action.as_str(), "index" | "reindex") => 1,
+        [prefix, action, ..] if prefix == "re" && action == "index" => 2,
+        _ => return false,
+    };
+    let object_tokens = &tokens[action_width..];
+    if object_tokens.iter().any(|object| {
+        matches!(
+            object.as_str(),
+            "project" | "projects" | "repository" | "repositories" | "workspace" | "workspaces"
+        )
+    }) {
+        return false;
+    }
+    object_tokens.iter().any(|object| {
+        matches!(
+            object.as_str(),
+            "file"
+                | "files"
+                | "document"
+                | "documents"
+                | "source"
+                | "sources"
+                | "record"
+                | "records"
+        )
+    })
 }
 
 pub fn packet_claim_key_for_citation(
@@ -673,6 +725,51 @@ mod tests {
                 packet_evidence_role(&candidate),
                 Some(PacketEvidenceRole::IndexingWorkQueue),
                 "{name} must remain a read-side role",
+            );
+        }
+    }
+
+    #[test]
+    fn indexing_entrypoint_role_preserves_indexer_owned_source_extraction() {
+        for name in [
+            "index_file",
+            "indexFile",
+            "reindex_files",
+            "re_index_sources",
+            "index_structural_file",
+            "index_structural_source",
+            "index_template_file",
+            "index_text_only_file",
+            "index_openapi_schema_file",
+        ] {
+            assert_eq!(
+                packet_evidence_role(&citation(
+                    name,
+                    "crates/codestory-indexer/src/extraction.rs",
+                )),
+                Some(PacketEvidenceRole::SymbolExtraction),
+                "{name} is per-source extraction when the indexer owns it",
+            );
+        }
+
+        assert_eq!(
+            packet_evidence_role(&citation(
+                "index_file",
+                "crates/codestory-runtime/src/services.rs"
+            )),
+            Some(PacketEvidenceRole::IndexingWorkQueue),
+            "the same callable shape remains an entrypoint when a runtime service owns it",
+        );
+        for name in [
+            "index_project",
+            "index_repository",
+            "index_workspace",
+            "WorkspaceIndexer::run",
+        ] {
+            assert_eq!(
+                packet_evidence_role(&citation(name, "crates/codestory-indexer/src/lib.rs")),
+                Some(PacketEvidenceRole::IndexingWorkQueue),
+                "{name} describes project/work-queue scope, not per-source extraction",
             );
         }
     }
