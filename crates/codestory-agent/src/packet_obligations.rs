@@ -921,10 +921,12 @@ fn finalize_packet_claim_obligations(
         if obligation.proof_status == PacketObligationProofStatusDto::Contradicted {
             continue;
         }
-        let previous_edge_proofs = (obligation.proof_status
-            == PacketObligationProofStatusDto::Proven)
-            .then(|| obligation.carrier_edge_proofs.clone())
-            .unwrap_or_default();
+        let previous_edge_proofs =
+            if obligation.proof_status == PacketObligationProofStatusDto::Proven {
+                obligation.carrier_edge_proofs.clone()
+            } else {
+                Vec::new()
+            };
         if obligation.probe_binding.is_some() {
             finalize_exact_probe_obligation(obligation, answer, evidence_view);
             continue;
