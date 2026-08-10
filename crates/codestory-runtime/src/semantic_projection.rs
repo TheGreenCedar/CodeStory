@@ -72,6 +72,7 @@ pub(super) struct SemanticProjectionStats {
     pub(super) dense_entrypoint: u32,
     pub(super) dense_documented_nontrivial: u32,
     pub(super) dense_central_graph_node: u32,
+    pub(super) dense_flow_neighbor: u32,
     pub(super) dense_component_report: u32,
     pub(super) dense_unstructured_doc: u32,
 }
@@ -360,11 +361,16 @@ pub(super) fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {
     )
 }
 
-/// Version 7 binds source-backed semantic documents to the active source-file
+/// Version 8 assigns independent identity, source, and graph budgets. A
+/// version-7 document cannot prove that graph evidence survived a long source
+/// excerpt, so retained cores must repair it from source instead of restamping
+/// it through `StoredCore` republish.
+///
+/// Version 7 bound source-backed semantic documents to the active source-file
 /// admission cap. A version-6 document cannot prove an over-default file body
 /// was available when it was built, so retained cores must repair it from
 /// source instead of restamping it through `StoredCore` republish.
-pub(super) const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 7;
+pub(super) const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 8;
 pub(super) const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
 #[cfg(test)]
 pub(super) const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
@@ -392,6 +398,10 @@ pub(super) const LEGACY_OVERSIZED_SOURCE_POLICY_VERSION: &str = "oversized-sourc
 pub(super) const SYMBOL_SEARCH_DOC_PROVENANCE: &str = "extracted";
 pub(super) const DENSE_CENTRAL_RELATIONSHIP_THRESHOLD: usize = 12;
 pub(super) const DENSE_CENTRAL_SCORE_THRESHOLD: usize = 24;
+pub(super) const FLOW_NEIGHBORS_PER_SEED: usize = 8;
+pub(super) const DOC_IDENTITY_BUDGET: usize = 32;
+pub(super) const DOC_SOURCE_BUDGET: usize = 48;
+pub(super) const DOC_GRAPH_BUDGET: usize = 48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DenseAnchorReason {
@@ -399,6 +409,7 @@ pub(super) enum DenseAnchorReason {
     Entrypoint,
     DocumentedNontrivial,
     CentralGraphNode,
+    FlowNeighbor,
     ComponentReport,
     UnstructuredDoc,
 }
@@ -438,6 +449,7 @@ impl DenseAnchorReason {
             Self::Entrypoint => "entrypoint",
             Self::DocumentedNontrivial => "documented_nontrivial",
             Self::CentralGraphNode => "central_graph_node",
+            Self::FlowNeighbor => "flow_neighbor",
             Self::ComponentReport => "component_report",
             Self::UnstructuredDoc => "unstructured_doc",
         }
@@ -1556,6 +1568,45 @@ pub(super) fn semantic_doc_budget_cost(token: &str) -> usize {
     token.chars().count().div_ceil(3).max(1)
 }
 
+/// Split the configured document budget into independent identity, source, and
+/// graph fragments. The default remains the intentionally fixed 32/48/48
+/// shape; lower configured limits retain all three fragments proportionally.
+pub(super) fn semantic_doc_field_budgets(max_tokens: usize) -> [usize; 3] {
+    let default_total = DOC_IDENTITY_BUDGET
+        .saturating_add(DOC_SOURCE_BUDGET)
+        .saturating_add(DOC_GRAPH_BUDGET);
+    if max_tokens > default_total {
+        let overflow = max_tokens - default_total;
+        let shared = overflow / 3;
+        let remainder = overflow % 3;
+        return [
+            DOC_IDENTITY_BUDGET
+                .saturating_add(shared)
+                .saturating_add(usize::from(remainder > 0)),
+            DOC_SOURCE_BUDGET
+                .saturating_add(shared)
+                .saturating_add(usize::from(remainder > 1)),
+            DOC_GRAPH_BUDGET.saturating_add(shared),
+        ];
+    }
+    let total = max_tokens;
+    let weights = [DOC_IDENTITY_BUDGET, DOC_SOURCE_BUDGET, DOC_GRAPH_BUDGET];
+    let weight_total = weights.iter().sum::<usize>();
+    let mut budgets = [0; 3];
+    let mut remainders = [(0usize, 0usize); 3];
+    let mut assigned = 0usize;
+    for (index, weight) in weights.into_iter().enumerate() {
+        budgets[index] = total.saturating_mul(weight) / weight_total;
+        assigned = assigned.saturating_add(budgets[index]);
+        remainders[index] = (total.saturating_mul(weight) % weight_total, index);
+    }
+    remainders.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    for (_, index) in remainders.into_iter().take(total.saturating_sub(assigned)) {
+        budgets[index] = budgets[index].saturating_add(1);
+    }
+    budgets
+}
+
 #[cfg(test)]
 pub(super) fn semantic_doc_text_budget_cost(doc_text: &str) -> usize {
     doc_text
@@ -1564,6 +1615,7 @@ pub(super) fn semantic_doc_text_budget_cost(doc_text: &str) -> usize {
         .sum()
 }
 
+#[cfg(test)]
 pub(super) fn truncate_semantic_doc_text_to_token_budget(
     doc_text: &str,
     max_tokens: usize,
@@ -1597,6 +1649,62 @@ pub(super) fn truncate_semantic_doc_text_to_token_budget(
         out.push('\n');
     }
     out
+}
+
+fn compact_semantic_doc_fragment(lines: impl IntoIterator<Item = String>, budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    let mut remaining = budget;
+    let mut out = String::new();
+    for line in lines {
+        let mut selected = Vec::new();
+        for token in line.split_whitespace() {
+            let cost = semantic_doc_budget_cost(token);
+            if cost > remaining {
+                if remaining > 0 {
+                    let max_chars = remaining.saturating_mul(3);
+                    let prefix = token.chars().take(max_chars).collect::<String>();
+                    if !prefix.is_empty() {
+                        selected.push(prefix);
+                        remaining = 0;
+                    }
+                }
+                break;
+            }
+            selected.push(token.to_string());
+            remaining -= cost;
+        }
+        if selected.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&selected.join(" "));
+        if remaining == 0 {
+            break;
+        }
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+fn compact_semantic_doc_sections(
+    identity: Vec<String>,
+    source: Vec<String>,
+    graph: Vec<String>,
+    max_tokens: usize,
+) -> String {
+    let [identity_budget, source_budget, graph_budget] = semantic_doc_field_budgets(max_tokens);
+    format!(
+        "{}{}{}",
+        compact_semantic_doc_fragment(identity, identity_budget),
+        compact_semantic_doc_fragment(source, source_budget),
+        compact_semantic_doc_fragment(graph, graph_budget),
+    )
 }
 
 pub(super) fn comment_block_before(lines: &[&str], start_idx: usize, limit: usize) -> Vec<String> {
@@ -1697,66 +1805,72 @@ pub(super) fn build_llm_symbol_doc_text_with_policy(
     alias_mode: SemanticDocAliasMode,
     max_tokens: usize,
 ) -> String {
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
+    let mut identity = Vec::new();
+    let mut source = Vec::new();
+    let mut graph = Vec::new();
+    let mut push_identity = |line: String| identity.push(line);
+    let mut push_source = |line: String| source.push(line);
+    let mut push_graph = |line: String| graph.push(line);
+    push_identity(format!(
         "{LLM_SYMBOL_DOC_VERSION_PREFIX} {LLM_SYMBOL_DOC_SCHEMA_VERSION}"
-    );
-    let _ = writeln!(out, "symbol: {display_name}");
-    let _ = writeln!(out, "kind: {:?}", node.kind);
-    if let Some(line) = node.start_line {
-        let _ = writeln!(out, "line: {line}");
-    }
-    if let Some(qualified_name) = node.qualified_name.as_deref() {
-        let _ = writeln!(out, "qualified_name: {qualified_name}");
-    }
+    ));
+    push_identity(format!("symbol: {display_name}"));
     let (signature, comments, body) = symbol_excerpt(node, file_path, file_text_cache);
     if !comments.is_empty() {
-        let _ = writeln!(out, "comments: {}", comments.join(" "));
+        push_source(format!("comments: {}", comments.join(" ")));
     }
     if alias_mode != SemanticDocAliasMode::NoAlias {
         if let Some(language) = semantic_doc_language_from_path(file_path) {
-            let _ = writeln!(out, "language: {language}");
+            push_identity(format!("language: {language}"));
         }
 
         let aliases = semantic_symbol_aliases(display_name, node.qualified_name.as_deref());
-        if alias_mode == SemanticDocAliasMode::CurrentAlias && !aliases.name_aliases.is_empty() {
-            let _ = writeln!(out, "name_aliases: {}", aliases.name_aliases.join(", "));
-        }
         if let Some(terminal_alias) = aliases.terminal_alias {
-            let _ = writeln!(out, "terminal_alias: {terminal_alias}");
+            push_identity(format!("terminal_alias: {terminal_alias}"));
         }
         if !aliases.owner_aliases.is_empty() {
-            let _ = writeln!(out, "owner_aliases: {}", aliases.owner_aliases.join(", "));
+            push_identity(format!(
+                "owner_aliases: {}",
+                aliases.owner_aliases.join(", ")
+            ));
         }
+        push_identity(format!(
+            "symbol_role: {}",
+            semantic_symbol_role_aliases(node.kind)
+        ));
         if alias_mode == SemanticDocAliasMode::CurrentAlias {
             let path_aliases = semantic_path_aliases(file_path, 8);
             if !path_aliases.is_empty() {
-                let _ = writeln!(out, "path_aliases: {}", path_aliases.join(", "));
+                push_identity(format!("path_aliases: {}", path_aliases.join(", ")));
+            }
+            if !aliases.name_aliases.is_empty() {
+                push_identity(format!("name_aliases: {}", aliases.name_aliases.join(", ")));
             }
         }
-        let _ = writeln!(
-            out,
-            "symbol_role: {}",
-            semantic_symbol_role_aliases(node.kind)
-        );
+    }
+    push_identity(format!("kind: {:?}", node.kind));
+    if let Some(line) = node.start_line {
+        push_identity(format!("line: {line}"));
+    }
+    if let Some(qualified_name) = node.qualified_name.as_deref() {
+        push_identity(format!("qualified_name: {qualified_name}"));
     }
     if !signature.is_empty() {
-        let _ = writeln!(out, "signature: {}", signature.join(" "));
+        push_source(format!("signature: {}", signature.join(" ")));
     }
     if !body.is_empty() {
-        let _ = writeln!(out, "body_summary: {}", body.join(" "));
+        push_source(format!("body_summary: {}", body.join(" ")));
     }
     if let Some(path) = file_path {
-        let _ = writeln!(out, "file: {path}");
+        push_graph(format!("file: {path}"));
         let path_lower = path.to_ascii_lowercase();
         if path_lower.contains("/tests/") || path_lower.contains("\\tests\\") {
-            let _ = writeln!(out, "file_role: test");
+            push_graph("file_role: test".to_string());
         } else if path_lower.contains("/docs/")
             || path_lower.contains("\\docs\\")
             || path_lower.ends_with(".md")
         {
-            let _ = writeln!(out, "file_role: docs");
+            push_graph("file_role: docs".to_string());
         }
     }
 
@@ -1766,7 +1880,7 @@ pub(super) fn build_llm_symbol_doc_text_with_policy(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     if !children.is_empty() {
-        let _ = writeln!(out, "members: {}", children.join(", "));
+        push_graph(format!("members: {}", children.join(", ")));
     }
 
     let related = graph_context
@@ -1775,7 +1889,7 @@ pub(super) fn build_llm_symbol_doc_text_with_policy(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     if !related.is_empty() {
-        let _ = writeln!(out, "related_symbols: {}", related.join(", "));
+        push_graph(format!("related_symbols: {}", related.join(", ")));
     }
 
     let edge_digest = graph_context
@@ -1784,16 +1898,16 @@ pub(super) fn build_llm_symbol_doc_text_with_policy(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     if !edge_digest.is_empty() {
-        out.push_str("edge_digest:");
+        let mut line = "edge_digest:".to_string();
         for digest in edge_digest {
-            let _ = write!(out, " {digest};");
+            let _ = write!(line, " {digest};");
         }
-        out.push('\n');
+        push_graph(line);
     }
-
-    out = truncate_semantic_doc_text_to_token_budget(&out, max_tokens);
-
-    out
+    drop(push_identity);
+    drop(push_source);
+    drop(push_graph);
+    compact_semantic_doc_sections(identity, source, graph, max_tokens)
 }
 
 #[derive(Debug, Clone)]
@@ -1860,6 +1974,9 @@ pub(super) fn observe_dense_anchor_reason(
         }
         DenseAnchorReason::CentralGraphNode => {
             stats.dense_central_graph_node = stats.dense_central_graph_node.saturating_add(1);
+        }
+        DenseAnchorReason::FlowNeighbor => {
+            stats.dense_flow_neighbor = stats.dense_flow_neighbor.saturating_add(1);
         }
         DenseAnchorReason::ComponentReport => {
             stats.dense_component_report = stats.dense_component_report.saturating_add(1);
@@ -2126,7 +2243,7 @@ pub(super) fn semantic_doc_is_documented_nontrivial(doc_text: &str) -> bool {
         .is_some_and(|body| body.split_whitespace().count() >= 8)
 }
 
-pub(super) fn dense_anchor_reason_for_node(
+fn base_dense_anchor_reason_for_node(
     graph_context: &SemanticDocGraphContext,
     node: &GraphNode,
     display_name: &str,
@@ -2165,6 +2282,247 @@ pub(super) fn dense_anchor_reason_for_node(
         return Some(DenseAnchorReason::DocumentedNontrivial);
     }
     None
+}
+
+#[cfg(test)]
+pub(super) fn dense_anchor_reason_for_node(
+    graph_context: &SemanticDocGraphContext,
+    node: &GraphNode,
+    display_name: &str,
+    file_path: Option<&str>,
+    doc_text: &str,
+    access: Option<AccessKind>,
+) -> Option<DenseAnchorReason> {
+    base_dense_anchor_reason_for_node(
+        graph_context,
+        node,
+        display_name,
+        file_path,
+        doc_text,
+        access,
+    )
+}
+
+pub(super) fn dense_anchor_reason_for_node_with_flow_neighbors(
+    graph_context: &SemanticDocGraphContext,
+    node: &GraphNode,
+    display_name: &str,
+    file_path: Option<&str>,
+    doc_text: &str,
+    access: Option<AccessKind>,
+    flow_neighbor_ids: &HashSet<GraphNodeId>,
+) -> Option<DenseAnchorReason> {
+    base_dense_anchor_reason_for_node(
+        graph_context,
+        node,
+        display_name,
+        file_path,
+        doc_text,
+        access,
+    )
+    .or_else(|| {
+        flow_neighbor_ids
+            .contains(&node.id)
+            .then_some(DenseAnchorReason::FlowNeighbor)
+    })
+}
+
+fn dense_anchor_reason_is_flow_seed(reason: Option<DenseAnchorReason>) -> bool {
+    matches!(
+        reason,
+        Some(
+            DenseAnchorReason::Entrypoint
+                | DenseAnchorReason::PublicApi
+                | DenseAnchorReason::DocumentedNontrivial
+                | DenseAnchorReason::CentralGraphNode
+        )
+    )
+}
+
+pub(super) fn route_endpoint_is_parser_backed(node: &GraphNode) -> bool {
+    let Some(canonical_id) = node.canonical_id.as_deref() else {
+        return false;
+    };
+    let Some(metadata) = canonical_id.strip_prefix("route_endpoint:") else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(metadata)
+        .ok()
+        .is_some_and(|value| {
+            value.get("claim_tier").and_then(serde_json::Value::as_str) == Some("parser_backed")
+                && value
+                    .get("extraction_provenance")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("tree_sitter_query")
+        })
+}
+
+pub(super) fn flow_neighbor_node_is_primary_source(
+    node: &GraphNode,
+    file_paths: &HashMap<GraphNodeId, String>,
+) -> bool {
+    node.file_node_id
+        .and_then(|file_id| file_paths.get(&file_id))
+        .map(|path| retrieval_file_role_from_path(path) == RetrievalFileRole::Source)
+        .unwrap_or(false)
+}
+
+pub(super) fn flow_neighbor_order(
+    left: &GraphNode,
+    right: &GraphNode,
+    file_paths: &HashMap<GraphNodeId, String>,
+) -> std::cmp::Ordering {
+    left.canonical_id
+        .cmp(&right.canonical_id)
+        .then(left.qualified_name.cmp(&right.qualified_name))
+        .then(left.serialized_name.cmp(&right.serialized_name))
+        .then(
+            left.file_node_id
+                .and_then(|file_id| file_paths.get(&file_id))
+                .cmp(
+                    &right
+                        .file_node_id
+                        .and_then(|file_id| file_paths.get(&file_id)),
+                ),
+        )
+        .then(left.start_line.cmp(&right.start_line))
+        .then(left.end_line.cmp(&right.end_line))
+        .then(left.id.cmp(&right.id))
+}
+
+pub(super) fn flow_neighbor_edge_is_eligible(
+    seed: &GraphNode,
+    edge: &GraphEdge,
+    candidate: &GraphNode,
+    file_paths: &HashMap<GraphNodeId, String>,
+) -> bool {
+    if edge.kind != codestory_contracts::graph::EdgeKind::CALL
+        || !matches!(
+            edge.certainty,
+            Some(
+                codestory_contracts::graph::ResolutionCertainty::Certain
+                    | codestory_contracts::graph::ResolutionCertainty::Probable
+            )
+        )
+        || candidate.id == seed.id
+        || !matches!(
+            candidate.kind,
+            codestory_contracts::graph::NodeKind::FUNCTION
+                | codestory_contracts::graph::NodeKind::METHOD
+        )
+        || !flow_neighbor_node_is_primary_source(candidate, file_paths)
+    {
+        return false;
+    }
+    let (source, target) = edge.effective_endpoints();
+    if seed.id != source && seed.id != target {
+        return false;
+    }
+    let other_id = if seed.id == source { target } else { source };
+    if candidate.id != other_id {
+        return false;
+    }
+    let route_seed = seed
+        .canonical_id
+        .as_deref()
+        .is_some_and(|value| value.starts_with("route_endpoint:"));
+    if route_seed {
+        source == seed.id
+            && route_endpoint_is_parser_backed(seed)
+            && edge.source == seed.id
+            && edge.target == candidate.id
+    } else {
+        edge.resolved_target.is_some()
+    }
+}
+
+pub(super) fn retain_bounded_flow_neighbor_candidate(
+    candidates: &mut Vec<GraphNode>,
+    candidate: GraphNode,
+    file_paths: &HashMap<GraphNodeId, String>,
+) {
+    candidates.push(candidate);
+    candidates.sort_by(|left, right| flow_neighbor_order(left, right, file_paths));
+    candidates.dedup_by_key(|candidate| candidate.id);
+    candidates.truncate(FLOW_NEIGHBORS_PER_SEED);
+}
+
+fn collect_flow_neighbor_ids(
+    storage: &Storage,
+    seeds: &HashMap<GraphNodeId, GraphNode>,
+    file_paths: &HashMap<GraphNodeId, String>,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<HashSet<GraphNodeId>, ApiError> {
+    let mut seed_ids = seeds.keys().copied().collect::<Vec<_>>();
+    seed_ids.sort_unstable_by_key(|node_id| node_id.0);
+    let mut selected = HashSet::new();
+    for seed_batch in seed_ids.chunks(BUILD_EDGE_SEED_BATCH_SIZE) {
+        let seed_set = seed_batch.iter().copied().collect::<HashSet<_>>();
+        let mut selected_by_seed = seed_batch
+            .iter()
+            .copied()
+            .map(|node_id| (node_id, Vec::<GraphNode>::new()))
+            .collect::<HashMap<_, _>>();
+        let mut after_edge_id = None;
+        loop {
+            if is_indexing_cancelled(cancel_token) {
+                return Err(indexing_cancelled_error());
+            }
+            let edges = storage
+                .get_edges_for_node_ids_batch_after_for_build(
+                    seed_batch,
+                    after_edge_id,
+                    SEMANTIC_EDGE_STREAM_BATCH_SIZE,
+                )
+                .map_err(|error| {
+                    ApiError::internal(format!("Failed to stream flow-neighbor edges: {error}"))
+                })?;
+            if edges.is_empty() {
+                break;
+            }
+            after_edge_id = edges.last().map(|edge| edge.id);
+            let mut endpoint_ids = HashSet::new();
+            for edge in &edges {
+                let (source, target) = edge.effective_endpoints();
+                if seed_set.contains(&source) || seed_set.contains(&target) {
+                    endpoint_ids.insert(source);
+                    endpoint_ids.insert(target);
+                }
+            }
+            let mut endpoint_ids = endpoint_ids.into_iter().collect::<Vec<_>>();
+            endpoint_ids.sort_unstable_by_key(|node_id| node_id.0);
+            let endpoints = storage
+                .get_nodes_by_ids_no_cache_for_build(&endpoint_ids)
+                .map_err(|error| {
+                    ApiError::internal(format!("Failed to load flow-neighbor endpoints: {error}"))
+                })?
+                .nodes;
+            for edge in &edges {
+                let (source, target) = edge.effective_endpoints();
+                for (seed_id, other_id) in [(source, target), (target, source)] {
+                    let Some(seed) = seeds.get(&seed_id) else {
+                        continue;
+                    };
+                    let Some(candidate) = endpoints.get(&other_id) else {
+                        continue;
+                    };
+                    if !flow_neighbor_edge_is_eligible(seed, edge, candidate, file_paths) {
+                        continue;
+                    }
+                    let candidates = selected_by_seed.entry(seed_id).or_default();
+                    retain_bounded_flow_neighbor_candidate(
+                        candidates,
+                        candidate.clone(),
+                        file_paths,
+                    );
+                }
+            }
+        }
+        for candidates in selected_by_seed.into_values() {
+            selected.extend(candidates.into_iter().map(|candidate| candidate.id));
+        }
+    }
+    Ok(selected)
 }
 
 pub(super) fn is_retrieval_artifact_node(node: &GraphNode) -> bool {
@@ -2276,30 +2634,26 @@ impl ComponentReportAccumulator {
                 let files = summary.files.into_iter().collect::<Vec<_>>();
                 let representative_file_path = files.first().cloned();
 
-                let mut doc_text = String::new();
-                let _ = writeln!(
-                    doc_text,
-                    "{LLM_SYMBOL_DOC_VERSION_PREFIX} {LLM_SYMBOL_DOC_SCHEMA_VERSION}"
-                );
-                let _ = writeln!(doc_text, "component_report: {component_key}");
-                let _ = writeln!(
-                    doc_text,
-                    "source_provenance: {SYMBOL_SEARCH_DOC_PROVENANCE}"
-                );
-                let _ = writeln!(doc_text, "policy_version: {SEMANTIC_POLICY_VERSION}");
+                let identity = vec![
+                    format!("{LLM_SYMBOL_DOC_VERSION_PREFIX} {LLM_SYMBOL_DOC_SCHEMA_VERSION}"),
+                    format!("component_report: {component_key}"),
+                    format!("source_provenance: {SYMBOL_SEARCH_DOC_PROVENANCE}"),
+                    format!("policy_version: {SEMANTIC_POLICY_VERSION}"),
+                ];
+                let mut source = Vec::new();
                 if let Some(path) = representative_file_path.as_deref() {
-                    let _ = writeln!(doc_text, "representative_file: {path}");
+                    source.push(format!("representative_file: {path}"));
                 }
-                let _ = writeln!(doc_text, "symbol_count: {}", summary.symbol_count);
-                let _ = writeln!(doc_text, "file_count: {}", files.len());
+                source.push(format!("symbol_count: {}", summary.symbol_count));
+                source.push(format!("file_count: {}", files.len()));
                 if !files.is_empty() {
-                    let _ = writeln!(doc_text, "files: {}", files.join("; "));
+                    source.push(format!("files: {}", files.join("; ")));
                 }
-                let _ = writeln!(doc_text, "god_nodes:");
+                let mut graph = vec!["god_nodes:".to_string()];
                 for line in god_nodes {
-                    let _ = writeln!(doc_text, "{line}");
+                    graph.push(line);
                 }
-                doc_text = truncate_semantic_doc_text_to_token_budget(&doc_text, max_tokens);
+                let doc_text = compact_semantic_doc_sections(identity, source, graph, max_tokens);
                 let doc_hash = llm_symbol_doc_hash_with_alias(&doc_text, alias_mode);
                 let node_id = virtual_component_report_node_id(&component_key);
                 let display_name = format!("component_report:{component_key}");
@@ -2427,6 +2781,7 @@ struct SemanticNodeBuildContext<'a> {
     updated_at_epoch_ms: i64,
     semantic_alias_mode: SemanticDocAliasMode,
     semantic_max_tokens: usize,
+    flow_neighbor_ids: &'a HashSet<GraphNodeId>,
 }
 
 struct SemanticProjectionProgress<'a> {
@@ -2496,13 +2851,14 @@ fn build_semantic_symbol_docs(
             };
             let doc_hash =
                 llm_symbol_doc_hash_with_alias(&doc_text, context.semantic_alias_mode);
-            let dense_reason = dense_anchor_reason_for_node(
+            let dense_reason = dense_anchor_reason_for_node_with_flow_neighbors(
                 context.graph_context,
                 node,
                 &display_name,
                 file_path.as_deref(),
                 &doc_text,
                 context.component_access.get(&node.id).copied(),
+                context.flow_neighbor_ids,
             );
             let symbol_doc = SymbolSearchDoc {
                 node_id: node.id,
@@ -2634,6 +2990,7 @@ pub(super) fn process_semantic_symbol_nodes(
     updated_at_epoch_ms: i64,
     semantic_alias_mode: SemanticDocAliasMode,
     semantic_max_tokens: usize,
+    flow_neighbor_ids: &HashSet<GraphNodeId>,
     stream_sort_window_size: usize,
     anchor_batch_size: usize,
     source_identity: &str,
@@ -2653,6 +3010,7 @@ pub(super) fn process_semantic_symbol_nodes(
         updated_at_epoch_ms,
         semantic_alias_mode,
         semantic_max_tokens,
+        flow_neighbor_ids,
     };
     let mut progress = SemanticProjectionProgress {
         stats,
@@ -3022,6 +3380,7 @@ struct SemanticPublicationContext<'a> {
     cancel_token: Option<&'a CancellationToken>,
     policy: SemanticRuntimePolicy,
     existing_docs: &'a HashMap<GraphNodeId, DenseAnchorInputReuseMetadata>,
+    flow_neighbor_ids: &'a HashSet<GraphNodeId>,
 }
 
 #[derive(Default)]
@@ -3080,6 +3439,7 @@ fn publish_incremental_semantic_docs(
         publication.policy.updated_at_epoch_ms,
         publication.policy.alias_mode,
         publication.policy.max_tokens,
+        publication.flow_neighbor_ids,
         publication.policy.stream_sort_window_size,
         publication.policy.anchor_batch_size,
         publication.source_identity,
@@ -3212,6 +3572,57 @@ pub(super) fn sync_llm_symbol_projection_for_runtime(
     let (file_paths, file_read_paths) = semantic_file_table_path_maps(files);
     let (effective_file_scope, expand_for_contract_repair) =
         effective_incremental_file_scope(storage, refresh_scope.file_ids, &existing_docs)?;
+    // Flow neighbors are selected globally. A changed seed may add or remove a
+    // dense anchor in an otherwise untouched file, so widen the incremental
+    // file scope before the normal writer/pruner decide what to retain.
+    let (selection_prepared, _) = prepare_full_semantic_stream(
+        storage,
+        policy,
+        SemanticProjectionDocumentSource::SourceFiles { max_file_bytes },
+    )?;
+    let selection_plan = build_full_dense_selection_plan(
+        storage,
+        &selection_prepared,
+        policy,
+        SemanticProjectionDocumentSource::SourceFiles { max_file_bytes },
+        cancel_token,
+    )?;
+    let nodes_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
+    let mut expanded_file_scope = effective_file_scope.cloned();
+    if let Some(scope) = expanded_file_scope.as_mut() {
+        for node_id in selection_plan.base_reasons.keys() {
+            let desired = selection_plan
+                .reason_for_node(*node_id)
+                .map(DenseAnchorReason::as_str);
+            let existing = existing_docs
+                .get(node_id)
+                .map(|document| document.selection_reason.as_str());
+            if desired != existing
+                && let Some(file_id) = nodes_by_id.get(node_id).and_then(|node| node.file_node_id)
+            {
+                scope.insert(file_id);
+            }
+        }
+        // A removed graph node cannot be in the current plan; retain its last
+        // file scope when it was a flow anchor so the normal prune removes it.
+        for existing in existing_docs
+            .values()
+            .filter(|doc| doc.selection_reason == DenseAnchorReason::FlowNeighbor.as_str())
+        {
+            if !selection_plan.base_reasons.contains_key(&existing.node_id)
+                && let Some(file_id) = nodes_by_id
+                    .get(&existing.node_id)
+                    .and_then(|node| node.file_node_id)
+            {
+                scope.insert(file_id);
+            }
+        }
+    }
+    drop(selection_prepared);
+    let effective_file_scope = expanded_file_scope.as_ref();
     let component_scope = effective_component_report_scope(
         refresh_scope.component_reports,
         expand_for_contract_repair,
@@ -3243,6 +3654,7 @@ pub(super) fn sync_llm_symbol_projection_for_runtime(
         cancel_token,
         policy,
         existing_docs: &existing_docs,
+        flow_neighbor_ids: &selection_plan.flow_neighbor_ids,
     };
     let mut output = SemanticProjectionOutput {
         component_report_node_ids: inputs.component_report_node_ids.clone(),
@@ -3291,6 +3703,139 @@ struct PreparedFullSemanticStream {
     file_read_paths: HashMap<GraphNodeId, String>,
     file_text_cache: HashMap<String, Option<String>>,
     file_cache_build_ns: u128,
+}
+
+#[derive(Default)]
+struct DenseSelectionPlan {
+    flow_neighbor_ids: HashSet<GraphNodeId>,
+    base_reasons: HashMap<GraphNodeId, Option<DenseAnchorReason>>,
+}
+
+impl DenseSelectionPlan {
+    fn reason_for_node(&self, node_id: GraphNodeId) -> Option<DenseAnchorReason> {
+        self.base_reasons
+            .get(&node_id)
+            .copied()
+            .flatten()
+            .or_else(|| {
+                self.flow_neighbor_ids
+                    .contains(&node_id)
+                    .then_some(DenseAnchorReason::FlowNeighbor)
+            })
+    }
+}
+
+fn build_full_dense_selection_plan(
+    storage: &Storage,
+    prepared: &PreparedFullSemanticStream,
+    policy: SemanticRuntimePolicy,
+    document_source: SemanticProjectionDocumentSource,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<DenseSelectionPlan, ApiError> {
+    let mut seeds = HashMap::new();
+    let mut base_reasons = HashMap::new();
+    let mut after_node_id = None;
+    loop {
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        let mut nodes = storage
+            .get_nodes_by_kinds_batch_after_for_build(
+                prepared.semantic_kinds,
+                after_node_id,
+                SEMANTIC_NODE_STREAM_BATCH_SIZE,
+            )
+            .map_err(|error| {
+                ApiError::internal(format!("Failed to stream flow-neighbor seeds: {error}"))
+            })?;
+        if nodes.is_empty() {
+            break;
+        }
+        after_node_id = nodes.last().map(|node| node.id);
+        nodes.retain(|node| !is_retrieval_artifact_node(node));
+        if nodes.is_empty() {
+            continue;
+        }
+        let node_ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+        let stored_docs = if document_source == SemanticProjectionDocumentSource::StoredCore {
+            let docs = storage
+                .get_symbol_search_docs_for_node_ids(&node_ids)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to load pinned flow-neighbor documents: {error}"
+                    ))
+                })?;
+            if docs.len() != node_ids.len() {
+                return Err(ApiError::new(
+                    "semantic_projection_migration_required",
+                    "Pinned core is missing documents required for flow-neighbor selection",
+                ));
+            }
+            Some(
+                docs.into_iter()
+                    .map(|doc| (doc.node_id, doc))
+                    .collect::<HashMap<_, _>>(),
+            )
+        } else {
+            None
+        };
+        let access = storage
+            .get_component_access_map_for_nodes(&node_ids)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to load flow-neighbor access metadata: {error}"
+                ))
+            })?;
+        let (graph, _) = SemanticDocGraphContext::build_for_full_page(
+            storage,
+            &nodes,
+            policy.scope,
+            &prepared.file_paths,
+            &prepared.file_read_paths,
+            cancel_token,
+        )?;
+        for node in &nodes {
+            let display_name = node_display_name(node);
+            let file_path = graph.file_path_for_node(node);
+            let doc_text = stored_docs
+                .as_ref()
+                .and_then(|docs| docs.get(&node.id).map(|doc| doc.doc_text.clone()))
+                .unwrap_or_else(|| {
+                    build_llm_symbol_doc_text_with_policy(
+                        &graph,
+                        node,
+                        &display_name,
+                        file_path,
+                        &prepared.file_text_cache,
+                        policy.alias_mode,
+                        policy.max_tokens,
+                    )
+                });
+            let reason = base_dense_anchor_reason_for_node(
+                &graph,
+                node,
+                &display_name,
+                file_path,
+                &doc_text,
+                access.get(&node.id).copied(),
+            );
+            base_reasons.insert(node.id, reason);
+            if dense_anchor_reason_is_flow_seed(reason)
+                && flow_neighbor_node_is_primary_source(node, &prepared.file_paths)
+            {
+                seeds.insert(node.id, node.clone());
+            }
+        }
+    }
+    Ok(DenseSelectionPlan {
+        flow_neighbor_ids: collect_flow_neighbor_ids(
+            storage,
+            &seeds,
+            &prepared.file_paths,
+            cancel_token,
+        )?,
+        base_reasons,
+    })
 }
 
 fn prepare_full_semantic_stream(
@@ -3493,6 +4038,7 @@ fn process_full_semantic_page(
         context.publication.policy.updated_at_epoch_ms,
         context.publication.policy.alias_mode,
         context.publication.policy.max_tokens,
+        context.publication.flow_neighbor_ids,
         context.publication.policy.stream_sort_window_size,
         context.publication.policy.anchor_batch_size,
         context.publication.source_identity,
@@ -3614,11 +4160,14 @@ pub(super) fn sync_full_llm_symbol_projection_streaming_for_runtime(
         .map(|doc| (doc.node_id, doc))
         .collect::<HashMap<_, _>>();
     let (prepared, mut stats) = prepare_full_semantic_stream(storage, policy, document_source)?;
+    let selection_plan =
+        build_full_dense_selection_plan(storage, &prepared, policy, document_source, cancel_token)?;
     let publication = SemanticPublicationContext {
         source_identity,
         cancel_token,
         policy,
         existing_docs: &existing_docs,
+        flow_neighbor_ids: &selection_plan.flow_neighbor_ids,
     };
     let context = FullSemanticStreamContext {
         prepared: &prepared,

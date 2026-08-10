@@ -13329,3 +13329,321 @@ class Bus {
     );
     Ok(())
 }
+
+#[test]
+fn test_projection_regression_rust_untyped_cross_file_method_stays_unresolved() -> anyhow::Result<()>
+{
+    let worker = r#"
+pub struct Worker;
+impl Worker {
+    pub fn execute(&mut self) {}
+}
+"#;
+    let factory = r#"
+pub struct Factory;
+impl Factory {
+    pub fn make(&self) -> Result<Worker, ()> { unimplemented!() }
+}
+"#;
+    let caller = r#"
+fn run(factory: &Factory) -> Result<(), ()> {
+    let mut worker = factory.make()?;
+    worker.execute();
+    Ok(())
+}
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("worker.rs", worker),
+        ("factory.rs", factory),
+        ("caller.rs", caller),
+    ])?;
+    assert_no_resolved_call_to_method_owner(
+        "rust cross-file return type remains fail-closed",
+        &nodes,
+        &edges,
+        "run",
+        "Worker",
+        "execute",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_rust_local_generic_bound_requires_one_trait_method()
+-> anyhow::Result<()> {
+    let source = r#"
+trait Handler {
+    fn handle(&self);
+}
+
+trait Auditor {
+    fn handle(&self);
+}
+
+fn dispatch<T: Handler>(target: &T) {
+    target.handle();
+}
+
+fn ambiguous<T: Handler + Auditor>(target: &T) {
+    target.handle();
+}
+"#;
+
+    let (nodes, edges) = index_single_file("workflow.rs", source)?;
+    assert_resolved_call_to_method_owner(
+        "rust unique local generic trait bound",
+        &nodes,
+        &edges,
+        "dispatch",
+        "Handler",
+        "handle",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "rust ambiguous local generic trait bound",
+        &nodes,
+        &edges,
+        "ambiguous",
+        "Handler",
+        "handle",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "rust ambiguous local generic trait bound",
+        &nodes,
+        &edges,
+        "ambiguous",
+        "Auditor",
+        "handle",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_rust_local_unit_struct_constructor_keeps_owner() -> anyhow::Result<()>
+{
+    let source = r#"
+struct Runner;
+impl Runner {
+    fn execute(&self) {}
+}
+
+struct OtherRunner;
+impl OtherRunner {
+    fn execute(&self) {}
+}
+
+fn entrypoint() {
+    let runner = Runner;
+    runner.execute();
+}
+"#;
+
+    let (nodes, edges) = index_single_file("runner.rs", source)?;
+    assert_resolved_call_to_method_owner(
+        "rust local unit struct constructor",
+        &nodes,
+        &edges,
+        "entrypoint",
+        "Runner",
+        "execute",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "rust local unit struct constructor",
+        &nodes,
+        &edges,
+        "entrypoint",
+        "OtherRunner",
+        "execute",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_go_cross_file_typed_receivers_resolve_without_guessing()
+-> anyhow::Result<()> {
+    let types = r#"
+package router
+
+type node struct{}
+func (*node) addRoute() {}
+
+type Context struct{}
+func (*Context) Next() {}
+
+type other struct{}
+func (*other) addRoute() {}
+"#;
+    let callers = r#"
+package router
+
+func dispatch(c *Context) {
+    c.Next()
+}
+
+func build() {
+    var root *node
+    root = new(node)
+    root.addRoute()
+}
+
+func shadowed(new func(node) *other) {
+    root := new(node)
+    root.addRoute()
+}
+"#;
+
+    let (nodes, edges) = index_files(&[("types.go", types), ("callers.go", callers)])?;
+    assert_resolved_call_to_method_owner(
+        "go cross-file typed parameter",
+        &nodes,
+        &edges,
+        "dispatch",
+        "Context",
+        "Next",
+    );
+    assert_resolved_call_to_method_owner(
+        "go builtin new binding",
+        &nodes,
+        &edges,
+        "build",
+        "node",
+        "addRoute",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "go shadowed new remains fail-closed",
+        &nodes,
+        &edges,
+        "shadowed",
+        "node",
+        "addRoute",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_go_file_scope_new_shadow_stays_unresolved() -> anyhow::Result<()> {
+    let source = r#"
+package router
+
+type node struct{}
+func (*node) addRoute() {}
+
+type other struct{}
+func (*other) addRoute() {}
+
+var new = func(node) *other { return &other{} }
+
+func build() {
+    root := new(node)
+    root.addRoute()
+}
+"#;
+
+    let (nodes, edges) = index_files(&[("router.go", source)])?;
+    assert_no_resolved_call_to_method_owner(
+        "go file-scope new shadow remains fail-closed",
+        &nodes,
+        &edges,
+        "build",
+        "node",
+        "addRoute",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_dart_arrow_and_initializer_calls_are_typed() -> anyhow::Result<()> {
+    let request = r#"
+class BaseRequest {
+  void finalize() {}
+}
+"#;
+    let client = r#"
+class BaseClient {
+  Object get(Object url) => _sendUnstreamed(url);
+  Object _sendUnstreamed(Object url) => url;
+}
+"#;
+    let io_client = r#"
+import 'base_request.dart';
+
+class IOClient {
+  void send(BaseRequest request) {
+    var stream = request.finalize();
+  }
+
+  void untyped(dynamic request) {
+    var stream = request.finalize();
+  }
+}
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("lib/base_request.dart", request),
+        ("lib/base_client.dart", client),
+        ("lib/io_client.dart", io_client),
+    ])?;
+    assert_resolved_call_to_method_owner(
+        "dart arrow body direct call",
+        &nodes,
+        &edges,
+        "BaseClient.get",
+        "BaseClient",
+        "_sendUnstreamed",
+    );
+    assert_resolved_call_to_method_owner(
+        "dart typed initializer receiver",
+        &nodes,
+        &edges,
+        "IOClient.send",
+        "BaseRequest",
+        "finalize",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "dart untyped initializer remains fail-closed",
+        &nodes,
+        &edges,
+        "IOClient.untyped",
+        "BaseRequest",
+        "finalize",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_dart_duplicate_local_owner_stays_unresolved() -> anyhow::Result<()> {
+    let first_request = r#"
+class Request {
+  void finish() {}
+}
+"#;
+    let second_request = r#"
+class Request {
+  void finish() {}
+}
+"#;
+    let caller = r#"
+import 'first_request.dart';
+
+class Client {
+  void send(Request request) {
+    request.finish();
+  }
+}
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("lib/first_request.dart", first_request),
+        ("lib/second_request.dart", second_request),
+        ("lib/client.dart", caller),
+    ])?;
+    assert_no_resolved_call_to_method_owner(
+        "dart duplicate same-directory owner remains fail-closed",
+        &nodes,
+        &edges,
+        "Client.send",
+        "Request",
+        "finish",
+    );
+    Ok(())
+}

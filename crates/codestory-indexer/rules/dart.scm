@@ -195,7 +195,7 @@
   attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
 }
 
-(expression_statement
+(_
   (identifier)
   .
   (selector

@@ -21,6 +21,22 @@ struct LocatedQualifiedName {
     len: usize,
 }
 
+struct TableDefinition {
+    schema: String,
+    name: String,
+    node_id: NodeId,
+    header_offset: usize,
+}
+
+struct PendingForeignKey {
+    owner_table_id: NodeId,
+    owner_key: String,
+    referenced_key: String,
+    line_number: u32,
+    start: usize,
+    len: usize,
+}
+
 /// Blank out SQL comments while preserving every byte offset.
 ///
 /// The collector is line-oriented and records exact byte spans, so comments are
@@ -35,6 +51,7 @@ fn mask_sql_comments(source: &str) -> String {
     enum Scan {
         Code,
         Quoted(u8),
+        BracketQuoted,
         BlockComment,
     }
 
@@ -66,11 +83,25 @@ fn mask_sql_comments(source: &str) -> String {
                     state = Scan::Quoted(byte);
                     index += 1;
                 }
+                (b'[', _) => {
+                    state = Scan::BracketQuoted;
+                    index += 1;
+                }
                 _ => index += 1,
             },
             Scan::Quoted(quote) => {
                 if byte == quote {
                     state = Scan::Code;
+                }
+                index += 1;
+            }
+            Scan::BracketQuoted => {
+                if byte == b']' {
+                    if next == Some(b']') {
+                        index += 1;
+                    } else {
+                        state = Scan::Code;
+                    }
                 }
                 index += 1;
             }
@@ -100,17 +131,18 @@ pub(crate) fn collect_sql_entities(
 ) {
     let masked = mask_sql_comments(source);
     let source = masked.as_str();
+    let lines = source.lines().collect::<Vec<_>>();
+    let line_offsets = source_line_offsets(source);
     let default_schema = infer_default_schema(source);
     let schema_nodes = collect_schemas(source, file_id, storage, &default_schema);
-    let mut tables: HashMap<String, NodeId> = HashMap::new();
-    let mut views: HashMap<String, NodeId> = HashMap::new();
+    let mut tables: HashMap<String, Vec<NodeId>> = HashMap::new();
+    let mut table_definitions = Vec::new();
 
-    for (line_idx, line_text) in source.lines().enumerate() {
+    // Collect table headers first so a foreign key can resolve a table declared
+    // later in the same schema file. Structural relationships remain local to a
+    // file; we never guess across files or from an unresolved name.
+    for (line_idx, line_text) in lines.iter().enumerate() {
         let line_number = line_idx as u32 + 1;
-        let upper = line_text.trim().to_ascii_uppercase();
-        if upper.starts_with("CREATE SCHEMA ") || upper.starts_with("CREATE DATABASE ") {
-            continue;
-        }
         if let Some(object) = parse_qualified_name_after_keyword(line_text, "CREATE TABLE") {
             let LocatedQualifiedName {
                 schema,
@@ -132,17 +164,77 @@ pub(crate) fn collect_sql_entities(
                 StructuralSourceSpan::token(line_number, start, len),
             );
             push_member_edge(storage, file_id, schema_id, node_id, line_number);
-            tables.insert(format!("{schema}.{name}"), node_id);
-            collect_inline_columns(
-                line_text,
-                file_id,
-                storage,
-                &schema,
-                &name,
+            let table_key = format!("{schema}.{name}");
+            tables.entry(table_key).or_default().push(node_id);
+            table_definitions.push(TableDefinition {
+                schema,
+                name,
                 node_id,
-                line_number,
+                header_offset: line_offsets[line_idx]
+                    .saturating_add(start)
+                    .saturating_add(len),
+            });
+        }
+    }
+
+    let mut pending_foreign_keys = Vec::new();
+    for table in &table_definitions {
+        collect_table_body(
+            source,
+            &line_offsets,
+            table,
+            file_id,
+            storage,
+            &mut pending_foreign_keys,
+        );
+    }
+    collect_alter_table_foreign_keys(&lines, &tables, &mut pending_foreign_keys);
+
+    for foreign_key in pending_foreign_keys {
+        let canonical = format!(
+            "sql:foreign_key:{}:{}",
+            foreign_key.owner_key, foreign_key.referenced_key
+        );
+        let foreign_key_id = push_structural_node(
+            storage,
+            file_id,
+            NodeKind::ANNOTATION,
+            "FOREIGN KEY",
+            &canonical,
+            StructuralSourceSpan::token(
+                foreign_key.line_number,
+                foreign_key.start,
+                foreign_key.len,
+            ),
+        );
+        push_member_edge(
+            storage,
+            file_id,
+            foreign_key.owner_table_id,
+            foreign_key_id,
+            foreign_key.line_number,
+        );
+        if let Some(referenced_table_id) = unique_table_id(&tables, &foreign_key.referenced_key) {
+            push_annotation_usage_edge(
+                storage,
+                file_id,
+                foreign_key_id,
+                referenced_table_id,
+                foreign_key.line_number,
             );
-        } else if let Some(object) = parse_qualified_name_after_keyword(line_text, "CREATE VIEW") {
+        }
+    }
+
+    for (line_idx, line_text) in lines.iter().enumerate() {
+        let line_number = line_idx as u32 + 1;
+        let upper = line_text.trim().to_ascii_uppercase();
+        if upper.starts_with("CREATE SCHEMA ")
+            || upper.starts_with("CREATE DATABASE ")
+            || parse_qualified_name_after_keyword(line_text, "CREATE TABLE").is_some()
+        {
+            continue;
+        }
+        if let Some(object) = parse_qualified_name_after_keyword(line_text, "CREATE VIEW") {
             let LocatedQualifiedName {
                 schema,
                 name,
@@ -163,14 +255,13 @@ pub(crate) fn collect_sql_entities(
                 StructuralSourceSpan::token(line_number, start, len),
             );
             push_member_edge(storage, file_id, schema_id, node_id, line_number);
-            views.insert(format!("{schema}.{name}"), node_id);
             if let Some(base) = parse_view_base_table(line_text)
-                && let Some(base_id) = tables.get(&base).copied()
+                && let Some(base_id) = unique_table_id(&tables, &base)
             {
                 push_type_usage_edge(storage, file_id, node_id, base_id, line_number);
             }
         } else if let Some((schema, table, index_name)) = parse_create_index(line_text) {
-            if let Some(table_id) = tables.get(&format!("{schema}.{table}")).copied() {
+            if let Some(table_id) = unique_table_id(&tables, &format!("{schema}.{table}")) {
                 let canonical = format!("sql:index:{schema}.{table}.{}", index_name.value);
                 let node_id = push_structural_node(
                     storage,
@@ -207,14 +298,14 @@ pub(crate) fn collect_sql_entities(
             );
             push_member_edge(storage, file_id, schema_id, node_id, line_number);
             for table_key in referenced_tables(line_text, &schema) {
-                if let Some(table_id) = tables.get(&table_key).copied() {
+                if let Some(table_id) = unique_table_id(&tables, &table_key) {
                     push_usage_edge(storage, file_id, node_id, table_id, line_number);
                 }
             }
         }
     }
 
-    let _ = (path, views);
+    let _ = path;
 }
 
 fn infer_default_schema(source: &str) -> String {
@@ -355,9 +446,10 @@ fn located_sql_identifier(line: &str, from: usize) -> Option<LocatedSqlIdentifie
     let start = skip_ascii_whitespace(line, from);
     let rest = line.get(start..)?;
     let first = rest.chars().next()?;
-    if matches!(first, '"' | '\'' | '`') {
+    if matches!(first, '"' | '\'' | '`' | '[') {
         let inner_start = start + first.len_utf8();
-        let end = line[inner_start..].find(first)? + inner_start;
+        let close = if first == '[' { ']' } else { first };
+        let end = line[inner_start..].find(close)? + inner_start;
         return (end > inner_start).then(|| LocatedSqlIdentifier {
             value: line[inner_start..end].to_string(),
             start: inner_start,
@@ -385,50 +477,284 @@ fn skip_ascii_whitespace(line: &str, mut index: usize) -> usize {
     index
 }
 
-fn collect_inline_columns(
-    line: &str,
+fn source_line_offsets(source: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    offsets.extend(
+        source
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+    );
+    offsets
+}
+
+fn source_location_for_offset(line_offsets: &[usize], offset: usize) -> (u32, usize) {
+    let line_index = line_offsets.partition_point(|line_start| *line_start <= offset) - 1;
+    (
+        line_index as u32 + 1,
+        offset.saturating_sub(line_offsets[line_index]),
+    )
+}
+
+fn unique_table_id(tables: &HashMap<String, Vec<NodeId>>, key: &str) -> Option<NodeId> {
+    let table_ids = tables.get(key)?;
+    (table_ids.len() == 1).then_some(table_ids[0])
+}
+
+fn collect_table_body(
+    source: &str,
+    line_offsets: &[usize],
+    table: &TableDefinition,
     file_id: NodeId,
     storage: &mut IntermediateStorage,
-    schema: &str,
-    table: &str,
-    table_id: NodeId,
-    line_no: u32,
+    pending_foreign_keys: &mut Vec<PendingForeignKey>,
 ) {
-    if !line.contains('(') {
-        return;
-    }
-    let Some(start) = line.find('(') else {
+    let Some((body_start, body_end)) = table_body_range(source, table.header_offset) else {
         return;
     };
-    let Some(end) = line.rfind(')') else {
-        return;
-    };
-    let body_start = start + 1;
-    let body = &line[body_start..end];
-    let mut part_start = 0usize;
-    for raw_part in body.split(',') {
-        let absolute_part_start = body_start + part_start;
-        let Some(identifier) = located_sql_identifier(line, absolute_part_start) else {
-            part_start = part_start.saturating_add(raw_part.len()).saturating_add(1);
+    let owner_key = format!("{}.{}", table.schema, table.name);
+    for (segment_start, segment_end) in table_body_segments(source, body_start, body_end) {
+        let segment = &source[segment_start..segment_end];
+        if let Some(foreign_key) = parse_foreign_key(segment, &table.schema) {
+            let foreign_offset = segment_start.saturating_add(foreign_key.start);
+            let (line_number, start) = source_location_for_offset(line_offsets, foreign_offset);
+            pending_foreign_keys.push(PendingForeignKey {
+                owner_table_id: table.node_id,
+                owner_key: owner_key.clone(),
+                referenced_key: foreign_key.referenced_key,
+                line_number,
+                start,
+                len: foreign_key.len,
+            });
+            continue;
+        }
+        let Some(identifier) = located_sql_identifier(segment, 0) else {
             continue;
         };
-        if identifier.value.eq_ignore_ascii_case("CONSTRAINT") {
-            part_start = part_start.saturating_add(raw_part.len()).saturating_add(1);
+        if sql_table_body_keyword(&identifier.value) {
             continue;
         }
         let col = identifier.value;
-        let canonical = format!("sql:column:{schema}.{table}.{col}");
+        let column_offset = segment_start.saturating_add(identifier.start);
+        let (line_number, start) = source_location_for_offset(line_offsets, column_offset);
+        let canonical = format!("sql:column:{}.{}.{col}", table.schema, table.name);
         let node_id = push_structural_node(
             storage,
             file_id,
             NodeKind::FIELD,
             &col,
             &canonical,
-            StructuralSourceSpan::token(line_no, identifier.start, identifier.len),
+            StructuralSourceSpan::token(line_number, start, identifier.len),
         );
-        push_member_edge(storage, file_id, table_id, node_id, line_no);
-        part_start = part_start.saturating_add(raw_part.len()).saturating_add(1);
+        push_member_edge(storage, file_id, table.node_id, node_id, line_number);
     }
+}
+
+fn table_body_range(source: &str, header_offset: usize) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut state = SqlScanState::Code;
+    let mut opened = false;
+    let mut depth = 0usize;
+    let mut body_start = None;
+    let mut index = header_offset;
+    while index < bytes.len() {
+        match state {
+            SqlScanState::Code => match bytes[index] {
+                b'\'' => state = SqlScanState::Quoted(b'\''),
+                b'"' => state = SqlScanState::Quoted(b'"'),
+                b'`' => state = SqlScanState::Quoted(b'`'),
+                b'[' => state = SqlScanState::BracketQuoted,
+                b'(' => {
+                    if !opened {
+                        body_start = Some(index + 1);
+                    }
+                    opened = true;
+                    depth = depth.saturating_add(1);
+                }
+                b')' if opened => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return body_start.map(|body_start| (body_start, index));
+                    }
+                }
+                b';' if !opened => return None,
+                _ => {}
+            },
+            SqlScanState::Quoted(quote) => {
+                if bytes[index] == quote {
+                    if bytes.get(index + 1) == Some(&quote) {
+                        index += 1;
+                    } else {
+                        state = SqlScanState::Code;
+                    }
+                }
+            }
+            SqlScanState::BracketQuoted => {
+                if bytes[index] == b']' {
+                    if bytes.get(index + 1) == Some(&b']') {
+                        index += 1;
+                    } else {
+                        state = SqlScanState::Code;
+                    }
+                }
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn table_body_segments(source: &str, body_start: usize, body_end: usize) -> Vec<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut state = SqlScanState::Code;
+    let mut depth = 0usize;
+    let mut segment_start = body_start;
+    let mut segments = Vec::new();
+    let mut index = body_start;
+    while index < body_end {
+        match state {
+            SqlScanState::Code => match bytes[index] {
+                b'\'' => state = SqlScanState::Quoted(b'\''),
+                b'"' => state = SqlScanState::Quoted(b'"'),
+                b'`' => state = SqlScanState::Quoted(b'`'),
+                b'[' => state = SqlScanState::BracketQuoted,
+                b'(' => depth = depth.saturating_add(1),
+                b')' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    segments.push((segment_start, index));
+                    segment_start = index + 1;
+                }
+                _ => {}
+            },
+            SqlScanState::Quoted(quote) => {
+                if bytes[index] == quote {
+                    if bytes.get(index + 1) == Some(&quote) {
+                        index += 1;
+                    } else {
+                        state = SqlScanState::Code;
+                    }
+                }
+            }
+            SqlScanState::BracketQuoted => {
+                if bytes[index] == b']' {
+                    if bytes.get(index + 1) == Some(&b']') {
+                        index += 1;
+                    } else {
+                        state = SqlScanState::Code;
+                    }
+                }
+            }
+        }
+        index += 1;
+    }
+    segments.push((segment_start, body_end));
+    segments
+}
+
+#[derive(Clone, Copy)]
+enum SqlScanState {
+    Code,
+    Quoted(u8),
+    BracketQuoted,
+}
+
+fn sql_table_body_keyword(identifier: &str) -> bool {
+    matches!(
+        identifier.to_ascii_uppercase().as_str(),
+        "CONSTRAINT" | "FOREIGN" | "PRIMARY" | "UNIQUE" | "CHECK" | "KEY" | "INDEX"
+    )
+}
+
+struct ParsedForeignKey {
+    referenced_key: String,
+    start: usize,
+    len: usize,
+}
+
+fn parse_foreign_key(line: &str, default_schema: &str) -> Option<ParsedForeignKey> {
+    let mut cursor = skip_ascii_whitespace(line, 0);
+    if starts_sql_keyword(line, cursor, "CONSTRAINT") {
+        cursor = skip_ascii_whitespace(line, cursor + "CONSTRAINT".len());
+        let constraint = located_sql_identifier(line, cursor)?;
+        cursor = skip_ascii_whitespace(line, constraint.start + constraint.len);
+        while matches!(
+            line.as_bytes().get(cursor),
+            Some(b']' | b'"' | b'\'' | b'`')
+        ) {
+            cursor = skip_ascii_whitespace(line, cursor.saturating_add(1));
+        }
+    }
+    if !starts_sql_keyword(line, cursor, "FOREIGN") {
+        return None;
+    }
+    let foreign_start = cursor;
+    cursor = skip_ascii_whitespace(line, cursor + "FOREIGN".len());
+    if !starts_sql_keyword(line, cursor, "KEY") {
+        return None;
+    }
+    cursor = skip_ascii_whitespace(line, cursor + "KEY".len());
+    if line.as_bytes().get(cursor) != Some(&b'(') {
+        return None;
+    }
+    let local_end = line[cursor + 1..].find(')')? + cursor + 1;
+    cursor = skip_ascii_whitespace(line, local_end + 1);
+    if !starts_sql_keyword(line, cursor, "REFERENCES") {
+        return None;
+    }
+    cursor = skip_ascii_whitespace(line, cursor + "REFERENCES".len());
+    let referenced = located_sql_identifier(line, cursor)?;
+    let (schema, name) = split_qualified_ident(&referenced.value)?;
+    let schema = if schema == "public" && !referenced.value.contains('.') {
+        default_schema.to_string()
+    } else {
+        schema
+    };
+    Some(ParsedForeignKey {
+        referenced_key: format!("{schema}.{name}"),
+        start: foreign_start,
+        len: "FOREIGN KEY".len(),
+    })
+}
+
+fn collect_alter_table_foreign_keys(
+    lines: &[&str],
+    tables: &HashMap<String, Vec<NodeId>>,
+    pending_foreign_keys: &mut Vec<PendingForeignKey>,
+) {
+    let mut alter_table: Option<(NodeId, String, String)> = None;
+    for (line_index, line) in lines.iter().enumerate() {
+        if let Some(object) = parse_qualified_name_after_keyword(line, "ALTER TABLE") {
+            let owner_key = format!("{}.{}", object.schema, object.name);
+            alter_table = unique_table_id(tables, &owner_key)
+                .map(|node_id| (node_id, owner_key, object.schema));
+        }
+        if let Some((owner_table_id, owner_key, schema)) = alter_table.as_ref()
+            && let Some(foreign_key) = parse_foreign_key(line, schema)
+        {
+            pending_foreign_keys.push(PendingForeignKey {
+                owner_table_id: *owner_table_id,
+                owner_key: owner_key.clone(),
+                referenced_key: foreign_key.referenced_key,
+                line_number: line_index as u32 + 1,
+                start: foreign_key.start,
+                len: foreign_key.len,
+            });
+        }
+        if alter_table.is_some() && line.contains(';') {
+            alter_table = None;
+        }
+    }
+}
+
+fn starts_sql_keyword(line: &str, start: usize, keyword: &str) -> bool {
+    line.get(start..).is_some_and(|tail| {
+        tail.get(..keyword.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
+            && tail
+                .as_bytes()
+                .get(keyword.len())
+                .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'(')
+    })
 }
 
 fn parse_create_index(line: &str) -> Option<(String, String, LocatedSqlIdentifier)> {
@@ -512,6 +838,201 @@ CREATE INDEX users_email_idx ON app.users (email);
                 .edges
                 .iter()
                 .any(|e| e.kind == EdgeKind::ANNOTATION_USAGE)
+        );
+    }
+
+    #[test]
+    fn inline_table_columns_are_collected_as_distinct_members() {
+        let storage = collect("CREATE TABLE app.entries (id INTEGER, label TEXT, owner_id INT);\n");
+        let fields = storage
+            .nodes
+            .iter()
+            .filter_map(|node| node.canonical_id.as_deref())
+            .filter(|canonical| canonical.starts_with("sql:column:app.entries."))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fields,
+            vec![
+                "sql:column:app.entries.id",
+                "sql:column:app.entries.label",
+                "sql:column:app.entries.owner_id",
+            ]
+        );
+    }
+
+    #[test]
+    fn table_body_segments_keep_quoted_and_nested_commas_inside_one_field() {
+        let storage = collect(
+            "CREATE TABLE app.entries (\n\
+             id INTEGER,\n\
+             label TEXT DEFAULT 'north, south (archived)',\n\
+             total NUMERIC(10, 2),\n\
+             CHECK (length(label) > 0)\n\
+             );\n",
+        );
+        let fields = storage
+            .nodes
+            .iter()
+            .filter_map(|node| node.canonical_id.as_deref())
+            .filter(|canonical| canonical.starts_with("sql:column:app.entries."))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fields,
+            vec![
+                "sql:column:app.entries.id",
+                "sql:column:app.entries.label",
+                "sql:column:app.entries.total",
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_target_tables_leave_foreign_keys_unlinked() {
+        let storage = collect(
+            "CREATE TABLE app.target (id INTEGER);\n\
+             CREATE TABLE app.target (id INTEGER);\n\
+             CREATE TABLE app.source (target_id INTEGER, \
+             FOREIGN KEY (target_id) REFERENCES app.target (id));\n",
+        );
+        let foreign_key = storage
+            .nodes
+            .iter()
+            .find(|node| {
+                node.canonical_id.as_deref() == Some("sql:foreign_key:app.source:app.target")
+            })
+            .expect("foreign-key evidence remains visible");
+        assert!(
+            !storage.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::ANNOTATION_USAGE && edge.source == foreign_key.id
+            }),
+            "an ambiguous target must not receive an arbitrary relationship edge"
+        );
+    }
+
+    #[test]
+    fn bracket_quoted_multiline_tables_and_foreign_keys_keep_exact_structural_spans() {
+        let source = r#"
+CREATE TABLE [ledger_entry]
+(
+    [entry_id] INTEGER PRIMARY KEY,
+    [account_id] INTEGER NOT NULL,
+    FOREIGN KEY ([account_id]) REFERENCES [account] ([account_id])
+);
+CREATE TABLE [account]
+(
+    [account_id] INTEGER PRIMARY KEY
+);
+"#;
+        let storage = collect(source);
+        let entry = storage
+            .nodes
+            .iter()
+            .find(|node| node.canonical_id.as_deref() == Some("sql:table:public.ledger_entry"))
+            .expect("bracket-quoted table");
+        let account = storage
+            .nodes
+            .iter()
+            .find(|node| node.canonical_id.as_deref() == Some("sql:table:public.account"))
+            .expect("forward table");
+        let field = storage
+            .nodes
+            .iter()
+            .find(|node| {
+                node.canonical_id.as_deref() == Some("sql:column:public.ledger_entry.account_id")
+            })
+            .expect("multiline field");
+        let foreign_key = storage
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == NodeKind::ANNOTATION
+                    && node.canonical_id.as_deref()
+                        == Some("sql:foreign_key:public.ledger_entry:public.account")
+            })
+            .expect("foreign-key annotation");
+
+        let field_line = source.lines().nth(4).expect("field line");
+        let field_start = field.start_col.expect("field start") as usize - 1;
+        let field_end = field.end_col.expect("field end") as usize;
+        assert_eq!(
+            &field_line.as_bytes()[field_start..field_end],
+            b"account_id"
+        );
+
+        let foreign_key_line = source.lines().nth(5).expect("foreign-key line");
+        let foreign_key_start = foreign_key.start_col.expect("foreign-key start") as usize - 1;
+        let foreign_key_end = foreign_key.end_col.expect("foreign-key end") as usize;
+        assert_eq!(
+            &foreign_key_line.as_bytes()[foreign_key_start..foreign_key_end],
+            b"FOREIGN KEY"
+        );
+        assert!(storage.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER
+                && edge.source == entry.id
+                && edge.target == foreign_key.id
+        }));
+        assert!(storage.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::ANNOTATION_USAGE
+                && edge.source == foreign_key.id
+                && edge.target == account.id
+        }));
+    }
+
+    #[test]
+    fn alter_table_foreign_key_connects_existing_tables() {
+        let source = r#"
+CREATE TABLE parent_item (id INTEGER PRIMARY KEY);
+CREATE TABLE child_item (parent_id INTEGER NOT NULL);
+ALTER TABLE child_item ADD CONSTRAINT child_parent_fk
+    FOREIGN KEY (parent_id) REFERENCES parent_item (id);
+"#;
+        let storage = collect(source);
+        let child = storage
+            .nodes
+            .iter()
+            .find(|node| node.canonical_id.as_deref() == Some("sql:table:public.child_item"))
+            .expect("child table");
+        let parent = storage
+            .nodes
+            .iter()
+            .find(|node| node.canonical_id.as_deref() == Some("sql:table:public.parent_item"))
+            .expect("parent table");
+        let foreign_key = storage
+            .nodes
+            .iter()
+            .find(|node| {
+                node.canonical_id.as_deref()
+                    == Some("sql:foreign_key:public.child_item:public.parent_item")
+            })
+            .expect("alter-table foreign key");
+        assert!(storage.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::MEMBER
+                && edge.source == child.id
+                && edge.target == foreign_key.id
+        }));
+        assert!(storage.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::ANNOTATION_USAGE
+                && edge.source == foreign_key.id
+                && edge.target == parent.id
+        }));
+    }
+
+    #[test]
+    fn commented_foreign_keys_do_not_mint_relationships() {
+        let storage = collect(
+            "CREATE TABLE source_item (\n\
+             -- FOREIGN KEY (target_id) REFERENCES target_item (id)\n\
+             target_id INTEGER\n\
+             );\n\
+             CREATE TABLE target_item (id INTEGER);\n",
+        );
+        assert!(
+            !storage.nodes.iter().any(|node| {
+                node.canonical_id
+                    .as_deref()
+                    .is_some_and(|canonical| canonical.starts_with("sql:foreign_key:"))
+            }),
+            "commented relationship must not be collected"
         );
     }
 

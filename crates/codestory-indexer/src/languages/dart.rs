@@ -492,6 +492,9 @@ pub(crate) fn direct_call_specs(tree: &Tree, source: &str) -> Vec<ManualPreciseC
             let Some(target_name) = dart_direct_call(node, source) else {
                 return;
             };
+            if !receiver_call_belongs_to_callable(node, body) {
+                return;
+            }
             edges.push(ManualPreciseCallSpec {
                 source_name: source_name.clone(),
                 source_span,
@@ -645,27 +648,26 @@ fn dart_import_alias_name(statement: &str) -> Option<String> {
 }
 
 fn member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
-    if !matches!(node.kind(), "expression_statement" | "return_statement") {
-        return None;
+    let mut cursor = node.walk();
+    let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+    for window in children.windows(3) {
+        if window[0].kind() != "identifier"
+            || window[1].kind() != "selector"
+            || window[2].kind() != "selector"
+            || first_descendant_with_kind(window[2], "argument_part").is_none()
+        {
+            continue;
+        }
+        let selector = first_descendant_with_kind(window[1], "unconditional_assignable_selector")?;
+        let method = first_descendant_with_kind(selector, "identifier")
+            .and_then(|identifier| trimmed_node_text(identifier, source))?;
+        let receiver = trimmed_node_text(window[0], source)?;
+        return Some((
+            normalized_dart_receiver_surface(&receiver)?,
+            normalize_parameter_name(&method)?,
+        ));
     }
-    let text = trimmed_node_text(node, source)?;
-    let callable = text
-        .split('(')
-        .next()
-        .unwrap_or(text.as_str())
-        .trim()
-        .trim_end_matches(';')
-        .trim();
-    let separator = callable.rfind('.')?;
-    let receiver = callable[..separator].trim().trim_end_matches('?').trim();
-    let method = callable[separator + 1..]
-        .trim()
-        .trim_start_matches('?')
-        .trim();
-    Some((
-        normalized_dart_receiver_surface(receiver)?,
-        normalize_parameter_name(method)?,
-    ))
+    None
 }
 
 fn normalized_dart_receiver_surface(raw: &str) -> Option<String> {
@@ -689,27 +691,15 @@ fn normalized_dart_receiver_surface(raw: &str) -> Option<String> {
 }
 
 fn dart_direct_call(node: TsNode<'_>, source: &str) -> Option<String> {
-    if !matches!(node.kind(), "expression_statement" | "return_statement") {
+    if node.kind() != "method_invocation" {
         return None;
     }
-    let text = trimmed_node_text(node, source)?;
-    let callable = text
-        .split('(')
-        .next()
-        .unwrap_or(text.as_str())
-        .trim()
-        .trim_end_matches(';')
-        .trim();
-    if callable.contains('.') {
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "identifier" {
         return None;
     }
-    let callable = callable
-        .strip_prefix("return")
-        .map(str::trim)
-        .unwrap_or(callable);
-    callable
-        .split_whitespace()
-        .last()
+    trimmed_node_text(function, source)
+        .as_deref()
         .and_then(normalize_parameter_name)
 }
 

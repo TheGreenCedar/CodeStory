@@ -42,6 +42,17 @@ pub(super) fn compute_call_resolution(
         });
     }
 
+    if is_rust_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+        && !target_name.contains("::")
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
     if is_js_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
@@ -240,6 +251,29 @@ pub(super) fn compute_call_resolution(
                 ResolutionStrategy::CallSameModule,
             ));
         }
+    }
+
+    if selected.is_none()
+        && receiver_module.is_none()
+        && matches!(
+            semantic_language_bucket(caller_file_path.as_deref()),
+            Some("go" | "dart")
+        )
+        && let Some(owner_name) = receiver_owner
+        && let Some(candidate) = candidate_index.find_same_directory_owner_member_readonly(
+            caller_file_path.as_deref(),
+            owner_name,
+            target_name,
+        )
+    {
+        if pass.flags.store_candidates {
+            candidate_ids.push(candidate);
+        }
+        selected = Some((
+            candidate,
+            pass.policy.call_same_module,
+            ResolutionStrategy::CallSameModule,
+        ));
     }
 
     if selected.is_none() && receiver_owner.is_some() && receiver_module.is_none() {

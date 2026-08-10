@@ -3,7 +3,7 @@ use codestory_contracts::graph::NodeKind;
 use codestory_store::{RetrievalIndexManifest, Store};
 
 pub const SIDECAR_SCHEMA_VERSION: i32 = 6;
-pub const SEMANTIC_POLICY_VERSION: &str = "graph_first_v2";
+pub const SEMANTIC_POLICY_VERSION: &str = "graph_first_v3";
 pub const SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED: &str =
     "sidecar_semantic_doc_embedding_contract_changed";
 
@@ -311,7 +311,7 @@ mod tests {
         assert!(!manifest_has_current_sidecar_contract(project_id, &legacy));
 
         let mut legacy_policy = manifest(project_id, hash);
-        legacy_policy.semantic_policy_version = Some("graph_first_v1".into());
+        legacy_policy.semantic_policy_version = Some("graph_first_v2".into());
         assert!(!manifest_has_current_sidecar_contract(
             project_id,
             &legacy_policy
@@ -319,20 +319,20 @@ mod tests {
     }
 
     #[test]
-    fn manifest_staleness_rejects_previous_dense_anchor_policy() {
+    fn manifest_staleness_rejects_graph_first_v2_dense_anchor_policy() {
         let project = TempDir::new().expect("project");
         let storage_path = project.path().join("codestory.db");
         let storage = Store::open(&storage_path).expect("open store");
         let mut manifest = manifest("proj", "deadbeefcafebabe1234");
         manifest.embedding_backend = Some(crate::embeddings::embedding_runtime_id());
         manifest.embedding_dim = Some(crate::embeddings::semantic_vector_dim() as i32);
-        manifest.semantic_policy_version = Some("graph_first_v1".into());
+        manifest.semantic_policy_version = Some("graph_first_v2".into());
 
         let reason = manifest_staleness_reason(&storage, &manifest)
             .expect("previous dense-anchor policy should stale");
 
         assert!(reason.contains("sidecar_semantic_policy_changed"));
-        assert!(reason.contains("manifest=graph_first_v1"));
+        assert!(reason.contains("manifest=graph_first_v2"));
         assert!(reason.contains(SEMANTIC_POLICY_VERSION));
     }
 
@@ -375,7 +375,7 @@ mod tests {
         storage
             .upsert_dense_anchor_inputs_batch(&[
                 dense_anchor(1, NodeKind::FUNCTION, SEMANTIC_POLICY_VERSION),
-                dense_anchor(2, NodeKind::FUNCTION, "graph_first_v0"),
+                dense_anchor(2, NodeKind::FUNCTION, "graph_first_v2"),
             ])
             .expect("dense anchors");
         let mut manifest = manifest("proj", "deadbeefcafebabe1234");

@@ -401,6 +401,9 @@ fn go_direct_composite_literal_owner(
     source: &str,
     import_bindings: &HashMap<String, String>,
 ) -> OptionalReceiverOwnerBinding {
+    if let Some(owner) = go_builtin_new_owner(node, source, import_bindings) {
+        return Some(owner);
+    }
     if node.kind() == "composite_literal" {
         return node
             .child_by_field_name("type")
@@ -413,6 +416,128 @@ fn go_direct_composite_literal_owner(
     trimmed_node_text(node, source)
         .as_deref()
         .and_then(|surface| go_direct_composite_literal_owner_surface(surface, import_bindings))
+}
+
+fn go_builtin_new_owner(
+    node: TsNode<'_>,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+) -> OptionalReceiverOwnerBinding {
+    if node.kind() != "call_expression"
+        || import_bindings.contains_key("new")
+        || go_builtin_name_is_shadowed(node, "new", source)
+    {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "identifier"
+        || trimmed_node_text(function, source).as_deref() != Some("new")
+    {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let argument_nodes = arguments.named_children(&mut cursor).collect::<Vec<_>>();
+    if argument_nodes.len() != 1 {
+        return None;
+    }
+    let raw_type = trimmed_node_text(argument_nodes[0], source)?;
+    go_composite_literal_owner_binding_from_type(&raw_type, import_bindings)
+}
+
+fn go_builtin_name_is_shadowed(call: TsNode<'_>, name: &str, source: &str) -> bool {
+    if go_file_scope_name_is_shadowed(call, name, source) {
+        return true;
+    }
+    let Some(callable) = enclosing_node_with_kind(
+        call,
+        &["function_declaration", "method_declaration", "func_literal"],
+    ) else {
+        return false;
+    };
+    let mut shadowed = false;
+    walk_tree_nodes(callable, &mut |node| {
+        if shadowed || node.start_byte() >= call.start_byte() {
+            return;
+        }
+        match node.kind() {
+            "parameter_declaration" | "variadic_parameter_declaration" => {
+                let type_start = node
+                    .child_by_field_name("type")
+                    .map(|type_node| type_node.start_byte())
+                    .unwrap_or(usize::MAX);
+                let mut cursor = node.walk();
+                shadowed = node.named_children(&mut cursor).any(|child| {
+                    child.start_byte() < type_start
+                        && normalized_receiver_variable(child, source).as_deref() == Some(name)
+                });
+            }
+            "short_var_declaration" | "assignment_statement" => {
+                if !go_local_binding_visible_at_call(node, call) {
+                    return;
+                }
+                shadowed = node
+                    .child_by_field_name("left")
+                    .map(go_expression_list_items)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .any(|left| {
+                        normalized_receiver_variable(left, source).as_deref() == Some(name)
+                    });
+            }
+            "var_spec" => {
+                if !go_local_binding_visible_at_call(node, call) {
+                    return;
+                }
+                let mut cursor = node.walk();
+                shadowed = node.named_children(&mut cursor).any(|child| {
+                    matches!(child.kind(), "identifier" | "field_identifier")
+                        && normalized_receiver_variable(child, source).as_deref() == Some(name)
+                });
+            }
+            _ => {}
+        }
+    });
+    shadowed
+}
+
+fn go_file_scope_name_is_shadowed(call: TsNode<'_>, name: &str, source: &str) -> bool {
+    let mut root = call;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .any(|declaration| match declaration.kind() {
+            "function_declaration" => {
+                declaration
+                    .child_by_field_name("name")
+                    .and_then(|node| trimmed_node_text(node, source))
+                    .as_deref()
+                    == Some(name)
+            }
+            "type_declaration" | "var_declaration" | "const_declaration" => {
+                let mut found = false;
+                walk_tree_nodes(declaration, &mut |node| {
+                    if found || !matches!(node.kind(), "type_spec" | "var_spec" | "const_spec") {
+                        return;
+                    }
+                    let boundary = node
+                        .child_by_field_name("type")
+                        .or_else(|| node.child_by_field_name("value"))
+                        .map(|child| child.start_byte())
+                        .unwrap_or(usize::MAX);
+                    let mut cursor = node.walk();
+                    found = node.named_children(&mut cursor).any(|child| {
+                        child.start_byte() < boundary
+                            && matches!(child.kind(), "identifier" | "field_identifier")
+                            && normalized_receiver_variable(child, source).as_deref() == Some(name)
+                    });
+                });
+                found
+            }
+            _ => false,
+        })
 }
 
 fn go_direct_composite_literal_owner_surface(

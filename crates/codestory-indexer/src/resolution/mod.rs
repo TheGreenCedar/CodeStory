@@ -1325,6 +1325,18 @@ fn is_cpp_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option
     })
 }
 
+fn is_rust_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::languages::rust::MEMBER_CALLSITE_MARKER)
+    })
+}
+
 fn is_js_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
     if edge_kind != EdgeKind::CALL {
         return false;
@@ -2017,6 +2029,34 @@ impl CandidateIndex {
         }
     }
 
+    fn find_same_directory_owner_member_readonly(
+        &self,
+        caller_file_path: Option<&str>,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let caller_file_path = normalize_resolution_path(caller_file_path?)?;
+        let caller_directory = resolution_path_directory(&caller_file_path);
+        let mut matches = self
+            .owner_member_candidate_offsets(owner_name, method_name)
+            .into_iter()
+            .filter_map(|offset| self.nodes.get(offset))
+            .filter(|node| owner_member_candidate_matches(node, owner_name, method_name))
+            .filter(|node| {
+                node.normalized_file_path
+                    .as_deref()
+                    .is_some_and(|path| resolution_path_directory(path) == caller_directory)
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        match matches.as_slice() {
+            [candidate] => Some(*candidate),
+            _ => None,
+        }
+    }
+
     fn find_python_imported_owner_member_readonly(
         &self,
         caller_file_path: Option<&str>,
@@ -2650,6 +2690,12 @@ fn normalize_resolution_path(path: &str) -> Option<String> {
     out.push_str(&parts.join("/"));
     let out = out.trim_end_matches('/').to_ascii_lowercase();
     (!out.is_empty()).then_some(out)
+}
+
+fn resolution_path_directory(path: &str) -> &str {
+    path.rsplit_once('/')
+        .map(|(directory, _)| directory)
+        .unwrap_or_default()
 }
 
 fn relative_import_path_candidates(caller_file_path: &str, module_name: &str) -> Vec<String> {

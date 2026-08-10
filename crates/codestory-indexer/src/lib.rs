@@ -5278,11 +5278,14 @@ struct RustReceiverCallHint {
 type RustStructFieldTypes = HashMap<(String, String), String>;
 type RustMethodReturnTypes = HashMap<(String, String), String>;
 type RustTypeAliases = HashMap<String, String>;
+type RustTraitMethods = HashMap<String, HashSet<String>>;
 
 fn collect_rust_receiver_call_hints(tree: &Tree, source: &str) -> Vec<RustReceiverCallHint> {
     let aliases = collect_rust_type_aliases(tree, source);
     let field_types = collect_rust_struct_field_types(tree, source, &aliases);
     let method_return_types = collect_rust_method_return_types(tree, source, &aliases);
+    let local_trait_methods = collect_rust_trait_methods(tree, source, &aliases);
+    let local_unit_structs = collect_rust_unit_structs(tree, source, &aliases);
     let mut hints = Vec::new();
     let mut scopes: HashMap<usize, RustValueScope<'_>> = HashMap::new();
 
@@ -5324,12 +5327,13 @@ fn collect_rust_receiver_call_hints(tree: &Tree, source: &str) -> Vec<RustReceiv
                     &aliases,
                     &field_types,
                     &method_return_types,
+                    &local_unit_structs,
                 );
                 &scope.value_types
             }
             None => &empty_value_types,
         };
-        let Some(owner_name) = infer_rust_receiver_owner(
+        let Some(mut owner_name) = infer_rust_receiver_owner(
             receiver_node,
             source,
             impl_owner.as_deref(),
@@ -5342,7 +5346,17 @@ fn collect_rust_receiver_call_hints(tree: &Tree, source: &str) -> Vec<RustReceiv
             return;
         };
         if rust_enclosing_generic_type_params(node, source).contains(&owner_name) {
-            return;
+            let Some(bound_owner) = rust_local_generic_bound_owner_for_method(
+                node,
+                &owner_name,
+                &method_name,
+                source,
+                &aliases,
+                &local_trait_methods,
+            ) else {
+                return;
+            };
+            owner_name = bound_owner;
         }
         let position = method_node.start_position();
         hints.push(RustReceiverCallHint {
@@ -5354,6 +5368,177 @@ fn collect_rust_receiver_call_hints(tree: &Tree, source: &str) -> Vec<RustReceiv
     });
 
     hints
+}
+
+fn collect_rust_unit_structs(
+    tree: &Tree,
+    source: &str,
+    aliases: &RustTypeAliases,
+) -> HashSet<String> {
+    let mut owners = HashSet::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "struct_item" || node.child_by_field_name("body").is_some() {
+            return;
+        }
+        if let Some(owner) = node
+            .child_by_field_name("name")
+            .and_then(|name| node_source_text(name, source))
+            .and_then(|name| normalize_rust_type_owner_name(&name, aliases))
+        {
+            owners.insert(owner);
+        }
+    });
+    owners
+}
+
+fn collect_rust_trait_methods(
+    tree: &Tree,
+    source: &str,
+    aliases: &RustTypeAliases,
+) -> RustTraitMethods {
+    let mut traits = RustTraitMethods::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "trait_item" {
+            return;
+        }
+        let Some(owner) = node
+            .child_by_field_name("name")
+            .and_then(|name| node_source_text(name, source))
+            .and_then(|name| normalize_rust_type_owner_name(&name, aliases))
+        else {
+            return;
+        };
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        let mut methods = HashSet::new();
+        let mut cursor = body.walk();
+        for item in body.named_children(&mut cursor) {
+            if !matches!(item.kind(), "function_signature_item" | "function_item") {
+                continue;
+            }
+            if let Some(method) = item
+                .child_by_field_name("name")
+                .and_then(|name| node_source_text(name, source))
+                .map(|name| name.trim().to_string())
+                .filter(|name| is_rust_identifier_like(name))
+            {
+                methods.insert(method);
+            }
+        }
+        traits.insert(owner, methods);
+    });
+    traits
+}
+
+fn rust_local_generic_bound_owner_for_method(
+    node: TsNode<'_>,
+    generic_name: &str,
+    method_name: &str,
+    source: &str,
+    aliases: &RustTypeAliases,
+    local_trait_methods: &RustTraitMethods,
+) -> Option<String> {
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        if matches!(
+            current.kind(),
+            "function_item" | "impl_item" | "struct_item" | "enum_item" | "trait_item"
+        ) {
+            let (declares_generic, owners) =
+                rust_generic_bound_owners(current, generic_name, source, aliases);
+            if declares_generic || !owners.is_empty() {
+                let mut candidates = owners
+                    .into_iter()
+                    .filter(|owner| {
+                        local_trait_methods
+                            .get(owner)
+                            .is_some_and(|methods| methods.contains(method_name))
+                    })
+                    .collect::<Vec<_>>();
+                candidates.sort();
+                candidates.dedup();
+                return match candidates.as_slice() {
+                    [owner] => Some(owner.clone()),
+                    _ => None,
+                };
+            }
+        }
+        cursor = current.parent();
+    }
+    None
+}
+
+fn rust_generic_bound_owners(
+    boundary: TsNode<'_>,
+    generic_name: &str,
+    source: &str,
+    aliases: &RustTypeAliases,
+) -> (bool, HashSet<String>) {
+    let mut declares_generic = false;
+    let mut owners = HashSet::new();
+    if let Some(parameters) = boundary.child_by_field_name("type_parameters") {
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            if parameter.kind() != "type_parameter"
+                || parameter
+                    .child_by_field_name("name")
+                    .and_then(|name| node_source_text(name, source))
+                    .as_deref()
+                    .map(str::trim)
+                    != Some(generic_name)
+            {
+                continue;
+            }
+            declares_generic = true;
+            if let Some(bounds) = parameter.child_by_field_name("bounds") {
+                collect_rust_bound_owners(bounds, source, aliases, &mut owners);
+            }
+        }
+    }
+
+    let mut boundary_cursor = boundary.walk();
+    for child in boundary.named_children(&mut boundary_cursor) {
+        if child.kind() != "where_clause" {
+            continue;
+        }
+        let mut where_cursor = child.walk();
+        for predicate in child.named_children(&mut where_cursor) {
+            if predicate.kind() != "where_predicate"
+                || predicate
+                    .child_by_field_name("left")
+                    .and_then(|left| node_source_text(left, source))
+                    .as_deref()
+                    .map(str::trim)
+                    != Some(generic_name)
+            {
+                continue;
+            }
+            if let Some(bounds) = predicate.child_by_field_name("bounds") {
+                collect_rust_bound_owners(bounds, source, aliases, &mut owners);
+            }
+        }
+    }
+    (declares_generic, owners)
+}
+
+fn collect_rust_bound_owners(
+    bounds: TsNode<'_>,
+    source: &str,
+    aliases: &RustTypeAliases,
+    owners: &mut HashSet<String>,
+) {
+    let mut cursor = bounds.walk();
+    for bound in bounds.named_children(&mut cursor) {
+        if bound.kind() == "lifetime" {
+            continue;
+        }
+        if let Some(owner) = node_source_text(bound, source)
+            .and_then(|surface| normalize_rust_type_owner_name(&surface, aliases))
+        {
+            owners.insert(owner);
+        }
+    }
 }
 
 fn apply_rust_receiver_call_hints(
@@ -5610,6 +5795,7 @@ impl<'tree> RustValueScope<'tree> {
         aliases: &RustTypeAliases,
         field_types: &RustStructFieldTypes,
         method_return_types: &RustMethodReturnTypes,
+        local_unit_structs: &HashSet<String>,
     ) {
         while let Some(binding) = self.bindings.get(self.cursor) {
             if binding.start_byte() > call_start_byte {
@@ -5641,6 +5827,14 @@ impl<'tree> RustValueScope<'tree> {
                             &self.value_types,
                             aliases,
                         )
+                        .or_else(|| {
+                            rust_direct_local_unit_struct_owner(
+                                value,
+                                source,
+                                aliases,
+                                local_unit_structs,
+                            )
+                        })
                     })
                 });
             let Some(type_name) = type_name else {
@@ -5649,6 +5843,20 @@ impl<'tree> RustValueScope<'tree> {
             self.value_types.insert(value_name, type_name);
         }
     }
+}
+
+fn rust_direct_local_unit_struct_owner(
+    value: TsNode<'_>,
+    source: &str,
+    aliases: &RustTypeAliases,
+    local_unit_structs: &HashSet<String>,
+) -> Option<String> {
+    if !matches!(value.kind(), "identifier" | "scoped_identifier") {
+        return None;
+    }
+    let owner = node_source_text(value, source)
+        .and_then(|surface| normalize_rust_type_owner_name(&surface, aliases))?;
+    local_unit_structs.contains(&owner).then_some(owner)
 }
 
 fn rust_enclosing_function_item(call_node: TsNode<'_>) -> Option<TsNode<'_>> {
@@ -7405,7 +7613,7 @@ fn append_manual_receiver_call_edges(
                         method_col: spec.method_col,
                         method_name: &spec.method_name,
                         owner_name: &spec.owner_name,
-                        owner_module,
+                        owner_module: Some(owner_module),
                     },
                     callsite_ordinals,
                 );
@@ -7421,10 +7629,13 @@ fn append_manual_receiver_call_edges(
             file_id,
             spec.allow_global_fallback,
         ) else {
-            if language_name == "python"
-                && !languages::python::is_implicit_receiver(&spec.receiver_name)
-            {
-                annotate_receiver_call_placeholder_owner(
+            let should_annotate = match language_name {
+                "python" => !languages::python::is_implicit_receiver(&spec.receiver_name),
+                "go" | "dart" => true,
+                _ => false,
+            };
+            if should_annotate {
+                let annotated_index = annotate_receiver_call_placeholder_owner(
                     unique_nodes,
                     result_edges,
                     edge_keys,
@@ -7436,8 +7647,32 @@ fn append_manual_receiver_call_edges(
                         owner_name: &spec.owner_name,
                         owner_module: spec.owner_module.as_deref(),
                     },
-                    Some(languages::python::MEMBER_CALLSITE_MARKER),
+                    receiver_annotation_required_callsite_marker(language_name),
                 );
+                if language_name == "dart" {
+                    if let Some(index) = annotated_index {
+                        if let Some(edge) = result_edges.get(index) {
+                            edge_keys.remove(&edge_dedup_key(edge, flags));
+                        }
+                        result_edges.remove(index);
+                    }
+                    append_manual_receiver_call_placeholder_edge(
+                        unique_nodes,
+                        result_edges,
+                        edge_keys,
+                        flags,
+                        ManualReceiverCallPlaceholder {
+                            source_id,
+                            file_id,
+                            line: spec.line,
+                            method_col: spec.method_col,
+                            method_name: &spec.method_name,
+                            owner_name: &spec.owner_name,
+                            owner_module: None,
+                        },
+                        callsite_ordinals,
+                    );
+                }
             }
             continue;
         };
@@ -7610,7 +7845,7 @@ struct ManualReceiverCallPlaceholder<'a> {
     method_col: Option<u32>,
     method_name: &'a str,
     owner_name: &'a str,
-    owner_module: &'a str,
+    owner_module: Option<&'a str>,
 }
 
 fn append_manual_receiver_call_placeholder_edge(
@@ -7622,9 +7857,10 @@ fn append_manual_receiver_call_placeholder_edge(
     callsite_ordinals: &mut HashMap<(NodeId, Option<u32>), u32>,
 ) {
     if placeholder.owner_name.contains('|')
-        || placeholder.owner_module.contains('|')
         || placeholder.owner_name.trim().is_empty()
-        || placeholder.owner_module.trim().is_empty()
+        || placeholder
+            .owner_module
+            .is_some_and(|module| module.contains('|') || module.trim().is_empty())
     {
         return;
     }
@@ -7658,13 +7894,12 @@ fn append_manual_receiver_call_placeholder_edge(
         &mut edge,
         &format!("{RECEIVER_OWNER_CALLSITE_PREFIX}{}", placeholder.owner_name),
     );
-    append_callsite_part(
-        &mut edge,
-        &format!(
-            "{RECEIVER_MODULE_CALLSITE_PREFIX}{}",
-            placeholder.owner_module
-        ),
-    );
+    if let Some(owner_module) = placeholder.owner_module {
+        append_callsite_part(
+            &mut edge,
+            &format!("{RECEIVER_MODULE_CALLSITE_PREFIX}{owner_module}"),
+        );
+    }
     if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
         return;
     }

@@ -79,8 +79,10 @@ use crate::search_terms::search_plan_terms;
 use crate::semantic_projection::{
     LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION, SEMANTIC_POLICY_VERSION,
     SemanticProjectionSourcePolicyCompatibility, SemanticProjectionStats,
-    semantic_component_key_for_path, semantic_graph_dependent_file_ids_by_seed,
-    semantic_projection_source_policy_compatibility,
+    build_component_report_docs_with_policy, dense_anchor_reason_for_node_with_flow_neighbors,
+    flow_neighbor_edge_is_eligible, retain_bounded_flow_neighbor_candidate,
+    route_endpoint_is_parser_backed, semantic_component_key_for_path, semantic_doc_field_budgets,
+    semantic_graph_dependent_file_ids_by_seed, semantic_projection_source_policy_compatibility,
 };
 use crate::semantic_republish::semantic_projection_republish_for_runtime;
 use crate::snippets::bounded_direct_markdown_snippet;
@@ -724,6 +726,152 @@ fn dense_policy_skips_private_trivial_helpers() {
 }
 
 #[test]
+fn semantic_projection_v3_reserves_independent_identity_source_and_graph_budgets() {
+    assert_eq!(semantic_doc_field_budgets(128), [32, 48, 48]);
+    assert_eq!(semantic_doc_field_budgets(16), [4, 6, 6]);
+    assert_eq!(semantic_doc_field_budgets(0), [0, 0, 0]);
+    assert_eq!(semantic_doc_field_budgets(127).iter().sum::<usize>(), 127);
+    assert_eq!(semantic_doc_field_budgets(256), [75, 91, 90]);
+}
+
+#[test]
+fn semantic_projection_v3_flow_neighbor_only_fills_a_missing_base_reason() {
+    let helper = semantic_policy_node(101, NodeKind::FUNCTION, "helper", 1);
+    let public = semantic_policy_node(102, NodeKind::STRUCT, "PublicType", 1);
+    let context = semantic_policy_context("src/lib.rs", &helper);
+    let flow_neighbors = std::collections::HashSet::from([helper.id, public.id]);
+
+    assert_eq!(
+        dense_anchor_reason_for_node_with_flow_neighbors(
+            &context,
+            &helper,
+            "helper",
+            Some("src/internal/helper.rs"),
+            "semantic_doc_version: 8\nsymbol: helper\n",
+            Some(AccessKind::Private),
+            &flow_neighbors,
+        ),
+        Some(DenseAnchorReason::FlowNeighbor)
+    );
+    assert_eq!(
+        dense_anchor_reason_for_node_with_flow_neighbors(
+            &context,
+            &public,
+            "PublicType",
+            Some("src/lib.rs"),
+            "semantic_doc_version: 8\nsymbol: PublicType\n",
+            Some(AccessKind::Public),
+            &flow_neighbors,
+        ),
+        Some(DenseAnchorReason::PublicApi)
+    );
+}
+
+#[test]
+fn semantic_projection_v3_flow_neighbor_admission_is_typed_primary_and_deterministic() {
+    let seed = semantic_policy_node(201, NodeKind::FUNCTION, "seed", 1);
+    let mut candidates = (0..9)
+        .map(|index| {
+            semantic_policy_node(
+                300 + index,
+                NodeKind::FUNCTION,
+                &format!("helper_{index}"),
+                10 + index,
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.reverse();
+    let mut file_paths = HashMap::from([(CoreNodeId(1), "src/seed.rs".to_string())]);
+    for candidate in &candidates {
+        file_paths.insert(
+            candidate.file_node_id.expect("candidate file"),
+            format!("src/{}.rs", candidate.serialized_name),
+        );
+    }
+    let edge = Edge {
+        id: EdgeId(1),
+        source: seed.id,
+        target: candidates[0].id,
+        kind: EdgeKind::CALL,
+        resolved_target: Some(candidates[0].id),
+        certainty: Some(ResolutionCertainty::Certain),
+        ..Default::default()
+    };
+    assert!(flow_neighbor_edge_is_eligible(
+        &seed,
+        &edge,
+        &candidates[0],
+        &file_paths
+    ));
+    let unresolved = Edge {
+        resolved_target: None,
+        ..edge.clone()
+    };
+    assert!(!flow_neighbor_edge_is_eligible(
+        &seed,
+        &unresolved,
+        &candidates[0],
+        &file_paths
+    ));
+    let test_paths = HashMap::from([(
+        candidates[0].file_node_id.expect("file"),
+        "tests/helper.rs".to_string(),
+    )]);
+    assert!(!flow_neighbor_edge_is_eligible(
+        &seed,
+        &edge,
+        &candidates[0],
+        &test_paths
+    ));
+
+    let mut bounded = Vec::new();
+    for candidate in candidates.iter().cloned() {
+        retain_bounded_flow_neighbor_candidate(&mut bounded, candidate, &file_paths);
+    }
+    retain_bounded_flow_neighbor_candidate(&mut bounded, candidates[0].clone(), &file_paths);
+    let selected = bounded
+        .iter()
+        .map(|candidate| candidate.id)
+        .collect::<Vec<_>>();
+    assert_eq!(selected, (300..308).map(CoreNodeId).collect::<Vec<_>>());
+
+    let mut parser_route = semantic_policy_node(210, NodeKind::FUNCTION, "GET /health", 1);
+    parser_route.canonical_id = Some(
+        r#"route_endpoint:{"claim_tier":"parser_backed","extraction_provenance":"tree_sitter_query"}"#.to_string(),
+    );
+    let route_edge = Edge {
+        source: parser_route.id,
+        target: candidates[0].id,
+        kind: EdgeKind::CALL,
+        certainty: Some(ResolutionCertainty::Probable),
+        ..Default::default()
+    };
+    assert!(route_endpoint_is_parser_backed(&parser_route));
+    assert!(flow_neighbor_edge_is_eligible(
+        &parser_route,
+        &route_edge,
+        &candidates[0],
+        &file_paths
+    ));
+    parser_route.canonical_id = Some(
+        r#"route_endpoint:{"claim_tier":"parser_backed","extraction_provenance":"structural"}"#
+            .to_string(),
+    );
+    assert!(!route_endpoint_is_parser_backed(&parser_route));
+    assert!(!flow_neighbor_edge_is_eligible(
+        &parser_route,
+        &route_edge,
+        &candidates[0],
+        &file_paths
+    ));
+    parser_route.canonical_id = Some(
+        r#"route_endpoint:{"claim_tier":"parser_backed","extraction_provenance":"lexical"}"#
+            .to_string(),
+    );
+    assert!(!route_endpoint_is_parser_backed(&parser_route));
+}
+
+#[test]
 fn dense_policy_does_not_treat_every_handler_name_as_entrypoint() {
     let node = semantic_policy_node(14, NodeKind::FUNCTION, "handler", 1);
     let context = semantic_policy_context("src/internal/request.rs", &node);
@@ -1066,6 +1214,35 @@ fn component_reports_are_extracted_dense_anchors_with_virtual_ids() {
     assert_eq!(pending.doc_text, report.symbol_doc.doc_text);
     assert!(pending.end_line.is_none());
     assert!(!report.reusable);
+}
+
+#[test]
+fn semantic_projection_v3_component_reports_keep_graph_evidence_after_source_compaction() {
+    let node = semantic_policy_node(121, NodeKind::FUNCTION, "central_service", 1);
+    let long_path = format!("src/{}", "very_long_component_path_".repeat(40));
+    let mut context = semantic_policy_context(&long_path, &node);
+    context.centrality.insert(
+        node.id,
+        DenseAnchorCentrality {
+            child_count: 0,
+            related_count: DENSE_CENTRAL_RELATIONSHIP_THRESHOLD,
+            edge_count: DENSE_CENTRAL_SCORE_THRESHOLD,
+        },
+    );
+    let reports = build_component_report_docs_with_policy(
+        &context,
+        &[&node],
+        &std::collections::HashMap::new(),
+        123,
+        SemanticDocAliasMode::NoAlias,
+        128,
+    );
+    let doc = &reports[0].symbol_doc.doc_text;
+    assert!(doc.contains("semantic_doc_version: 8"));
+    assert!(
+        doc.contains("god_nodes:"),
+        "v8 report lost graph fragment: {doc}"
+    );
 }
 
 #[test]
@@ -1506,8 +1683,12 @@ fn semantic_doc_text_token_budget_respects_configured_limit() {
         "budgeted semantic doc should preserve the leading version field:\n{doc}"
     );
     assert!(
-        doc.contains("symbol: AppController::openProjectWithStoragePath"),
-        "budgeted semantic doc should preserve the symbol identity:\n{doc}"
+        doc.contains("symbol: App"),
+        "budgeted semantic doc should preserve a bounded symbol identity prefix:\n{doc}"
+    );
+    assert!(
+        doc.contains("file: crates/codestory-runtime/src/lib.rs"),
+        "the independent graph budget should preserve source identity:\n{doc}"
     );
 }
 
