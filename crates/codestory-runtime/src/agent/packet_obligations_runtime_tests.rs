@@ -204,7 +204,7 @@ fn cancelled_diagnostic_query_does_not_block_a_complete_material_ledger() {
         build_packet_obligation_plan(question, PacketTaskClassDto::ArchitectureExplanation, &[]);
     let mut answer = answer(vec![
         lexical_citation("nvm_download", "install.sh", NodeKind::FUNCTION),
-        lexical_citation("nvm_use", "nvm.sh", NodeKind::FUNCTION),
+        lexical_citation("nvm_command_dispatch", "nvm.sh", NodeKind::FUNCTION),
         citation("Helper::noop", "src/helper.rs", NodeKind::METHOD),
     ]);
     answer.prompt = question.to_string();
@@ -283,7 +283,7 @@ fn a_required_query_whose_semantic_stage_timed_out_demotes_through_its_obligatio
         build_packet_obligation_plan(question, PacketTaskClassDto::ArchitectureExplanation, &[]);
     let mut answer = answer(vec![
         lexical_citation("nvm_download", "install.sh", NodeKind::FUNCTION),
-        lexical_citation("nvm_use", "nvm.sh", NodeKind::FUNCTION),
+        lexical_citation("nvm_command_dispatch", "nvm.sh", NodeKind::FUNCTION),
         citation("Helper::noop", "src/helper.rs", NodeKind::METHOD),
     ]);
     answer.prompt = question.to_string();
