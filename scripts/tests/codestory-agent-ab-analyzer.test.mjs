@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  agentRunnerEnv,
   analyzeTranscript,
   agentPublishableBlockers,
   assertSafeWindowsCmdArgs,
@@ -43,6 +44,7 @@ import {
   repoProvenanceBlockers,
   resolveRunArtifactPath,
   resolveCodeStoryCli,
+  runnerCommand,
   retrievalIndexCommandArgs,
   retrievalStatusCommandArgs,
   scoreQuality,
@@ -65,6 +67,25 @@ const RUNTIME_SERVICE_FILE = "crates/codestory-runtime/src/services.rs";
 const RUN_INDEX_SYMBOL = "IndexService::run_indexing_blocking";
 const RUNTIME_REFRESH_CLAIM =
   "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.";
+
+test("keeps CLI overrides out of both isolated agent arms", () => {
+  const opts = {
+    runner: "codex",
+    sandbox: "read-only",
+    model: "gpt-5.6-sol",
+  };
+  const baseline = runnerCommand(opts, "/tmp/repo", "prompt");
+  const measured = runnerCommand(opts, "/tmp/repo", "prompt");
+  assert.deepEqual(baseline.args, measured.args);
+
+  const env = agentRunnerEnv({
+    CODESTORY_CLI: "/tmp/codestory-cli",
+    CODESTORY_EMBED_ALLOW_CPU: "0",
+  }, "/tmp/isolated-codex-home");
+  assert.equal(env.CODESTORY_CLI, undefined);
+  assert.equal(env.CODESTORY_RETRIEVAL, "1");
+  assert.equal(env.CODEX_HOME, "/tmp/isolated-codex-home");
+});
 
 test("groups cold packet-runtime jobs by repo", () => {
   const expressRouting = { repo: "express", id: "express-routing" };
@@ -1152,6 +1173,40 @@ test("counts modern Codex JSONL tool categories including web search", () => {
     },
   ]);
   assert.match(blockers[0].reasons.join("\n"), /external web\/search tool calls=1 > 0/);
+});
+
+test("counts only started CodeStory MCP calls and records completed managed runtime identity", () => {
+  const runtime = {
+    plugin_version: "0.17.0",
+    plugin_cli_version: "0.17.0",
+    cli_version: "0.17.0",
+    cli_source: "managed",
+    pinned_pair_matches: true,
+    known_override_skew_channel: false,
+  };
+  const events = [
+    {
+      type: "item.started",
+      item: { id: "codestory", type: "mcp_tool_call", server: "codestory", tool: "packet" },
+    },
+    {
+      type: "item.completed",
+      item: {
+        id: "codestory",
+        type: "mcp_tool_call",
+        server: "codestory",
+        tool: "packet",
+        result: { _meta: { codestory_publication: { contract_runtime: runtime } } },
+      },
+    },
+    {
+      type: "item.started",
+      item: { id: "other", type: "mcp_tool_call", server: "other", tool: "packet" },
+    },
+  ];
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.codestory_mcp_tool_calls_observed, 1);
+  assert.deepEqual(analysis.codestory_mcp_runtime_identities, [runtime]);
 });
 
 test("summarizes A/B cost accounting totals and ratios", () => {
@@ -2289,6 +2344,66 @@ test("publishable gate rejects CodeStory use in the without arm", () => {
 
   assert.equal(blockers.length, 1);
   assert.match(blockers[0].reasons.join("\n"), /without_codestory arm used CodeStory/);
+});
+
+test("publishable gate rejects CodeStory MCP use in the without arm", () => {
+  const blockers = agentPublishableBlockers([
+    {
+      repo: "codestory",
+      task_id: "codestory-indexing-flow",
+      arm: "without_codestory",
+      repeat: 1,
+      status: "pass",
+      wall_ms: 10,
+      usage: { total_tokens: 100 },
+      tool_calls_observed: 2,
+      packet_first_required: false,
+      packet_first_pass: true,
+      quality: { pass: true },
+      transcript_analysis: {
+        command_count: 1,
+        command_categories: { shell_search: 1 },
+        codestory_mcp_tool_calls_observed: 1,
+        external_context_tool_calls: 0,
+      },
+    },
+  ]);
+
+  assert.equal(blockers.length, 1);
+  assert.match(blockers[0].reasons.join("\n"), /without_codestory arm used CodeStory/);
+});
+
+test("publishable gate rejects measured CodeStory MCP calls without managed runtime identity", () => {
+  const blockers = agentPublishableBlockers([
+    {
+      repo: "codestory",
+      task_id: "codestory-indexing-flow",
+      arm: "with_codestory",
+      repeat: 1,
+      status: "pass",
+      wall_ms: 10,
+      usage: { total_tokens: 100 },
+      tool_calls_observed: 1,
+      packet_first_required: false,
+      packet_first_pass: true,
+      quality: { pass: true },
+      codestory_harness_prelude: {
+        packet_contract_runtime: { cli_version: "0.17.0" },
+      },
+      transcript_analysis: {
+        command_count: 1,
+        command_categories: { shell_search: 1 },
+        codestory_mcp_tool_calls_observed: 1,
+        codestory_mcp_runtime_identities: [],
+        external_context_tool_calls: 0,
+      },
+    },
+  ]);
+
+  assert.match(
+    blockers.flatMap((blocker) => blocker.reasons).join("\n"),
+    /with_codestory arm used CodeStory MCP without managed runtime identity/,
+  );
 });
 
 test("publishable gate requires local repo inspection in the without arm", () => {
