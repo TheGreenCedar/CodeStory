@@ -957,7 +957,7 @@ fn packet_search_live_eval_honors_explicit_project_path() {
 }
 
 #[test]
-#[ignore = "live production packet/search eval; requires retrieval_mode=full sidecars for this checkout"]
+#[ignore = "live production packet/search eval; requires CODESTORY_CLI to name a production binary with an embedded model"]
 fn packet_search_eval_live_runs_production_cli_path() {
     let fixtures = load_fixture_set();
     let baseline = load_baseline();
@@ -1410,18 +1410,79 @@ fn assert_live_eval_device_truth(status: &Value) {
     assert_json_path_str(
         status,
         &["embedding_device_observation_source"],
-        "native_log",
+        "per_user_server",
     );
     assert_json_path_bool(status, &["embedding_cpu_allowed"], false);
     assert_json_path_bool(status, &["embedding_accelerator_requested"], true);
-    assert_json_path_str(
-        status,
-        &["embedding_accelerator_request_provider"],
-        "vulkan",
+    let detected_provider = json_path(status, &["embedding_detected_provider"])
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .expect("live eval status must report a detected accelerator provider");
+    let detected_gpu = json_path(status, &["embedding_detected_gpu"])
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .expect("live eval status must report a detected accelerator device");
+    assert_eq!(
+        json_path(status, &["embedding_accelerator_request_provider"]).and_then(Value::as_str),
+        Some(detected_provider),
+        "the requested and observed accelerator providers must agree: {status:#}"
     );
-    assert_json_path_str(status, &["embedding_accelerator_request_device"], "Vulkan0");
-    assert_json_path_str(status, &["embedding_detected_provider"], "amd");
+    assert_eq!(
+        json_path(status, &["embedding_accelerator_request_device"]).and_then(Value::as_str),
+        Some(detected_gpu),
+        "the requested and observed accelerator devices must agree: {status:#}"
+    );
+    assert!(
+        !matches!(
+            detected_provider.to_ascii_lowercase().as_str(),
+            "cpu" | "test-accelerator"
+        ),
+        "the live production eval cannot use a CPU or test accelerator: {status:#}"
+    );
     assert_json_path_non_empty(status, &["embedding_detected_gpu"]);
+}
+
+#[test]
+fn packet_search_live_eval_accepts_a_real_accelerator_identity() {
+    assert_live_eval_device_truth(&serde_json::json!({
+        "ownership": {
+            "profile": "agent",
+            "namespace": "codestory-agent-packet-search-eval",
+            "state_file": "/tmp/codestory-agent-packet-search-eval.json",
+            "cleanup_command": "codestory-cli retrieval cleanup --profile agent --run-id packet-search-eval"
+        },
+        "embedding_device_policy": "accelerator_required",
+        "embedding_device_state": "accelerated",
+        "embedding_device_observation_source": "per_user_server",
+        "embedding_cpu_allowed": false,
+        "embedding_accelerator_requested": true,
+        "embedding_accelerator_request_provider": "Metal",
+        "embedding_accelerator_request_device": "Apple GPU",
+        "embedding_detected_provider": "Metal",
+        "embedding_detected_gpu": "Apple GPU"
+    }));
+}
+
+#[test]
+#[should_panic(expected = "per_user_server")]
+fn packet_search_live_eval_rejects_test_support_accelerator_identity() {
+    assert_live_eval_device_truth(&serde_json::json!({
+        "ownership": {
+            "profile": "agent",
+            "namespace": "codestory-agent-packet-search-eval",
+            "state_file": "/tmp/codestory-agent-packet-search-eval.json",
+            "cleanup_command": "codestory-cli retrieval cleanup --profile agent --run-id packet-search-eval"
+        },
+        "embedding_device_policy": "accelerator_required",
+        "embedding_device_state": "accelerated",
+        "embedding_device_observation_source": "test_support",
+        "embedding_cpu_allowed": false,
+        "embedding_accelerator_requested": true,
+        "embedding_accelerator_request_provider": "test-accelerator",
+        "embedding_accelerator_request_device": "test-accelerator",
+        "embedding_detected_provider": "test-accelerator",
+        "embedding_detected_gpu": "test-accelerator"
+    }));
 }
 
 fn assert_json_path_str(status: &Value, path: &[&str], expected: &str) {
