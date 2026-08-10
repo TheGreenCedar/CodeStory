@@ -384,7 +384,11 @@
         ],
         "setup": [
           "No dependency setup is required for read-only benchmark inspection."
-        ]
+        ],
+        "codestory_project_manifest": {
+          "path": "swr-typescript-codestory-project.json",
+          "sha256": "bc529bd89514030258c4b09a405416aac082e57f52b2b598be2899b39aaf3106"
+        }
       },
       "prompt": "Explain how SWR exposes useSWR, serializes keys, connects cache helpers, and routes mutate behavior through the internal mutation helper. Cite the source files and name the supporting symbols.",
       "expected_files": [
@@ -765,7 +769,11 @@
         ],
         "setup": [
           "No dependency setup is required for read-only benchmark inspection."
-        ]
+        ],
+        "codestory_project_manifest": {
+          "path": "jekyll-ruby-codestory-project.json",
+          "sha256": "698a0e9472c79ddb03f19845c3c407230da5f56e99b91a5fc586dde775bbf4dc"
+        }
       },
       "prompt": "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases. Cite the source files and name the supporting symbols.",
       "expected_files": [
@@ -1151,7 +1159,11 @@
         ],
         "setup": [
           "No dependency setup is required for read-only benchmark inspection."
-        ]
+        ],
+        "codestory_project_manifest": {
+          "path": "alamofire-swift-codestory-project.json",
+          "sha256": "0e004e623377806d669717b72beb912f8902f9923b25e65b7a88410a78b24572"
+        }
       },
       "prompt": "Trace how Alamofire's Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks. Cite the source files and name the supporting symbols.",
       "expected_files": [
@@ -1346,7 +1358,11 @@
         ],
         "setup": [
           "No dependency setup is required for read-only benchmark inspection."
-        ]
+        ],
+        "codestory_project_manifest": {
+          "path": "nvm-bash-codestory-project.json",
+          "sha256": "e21f7df1cf5910db074626655a543b04dd88a0f75250960dd2f9dae723e9cae6"
+        }
       },
       "prompt": "Trace how nvm's install script bootstraps the shell function and how nvm.sh dispatches install, download, and use commands. Cite the source files and name the supporting symbols.",
       "expected_files": [
@@ -1628,7 +1644,11 @@
         ],
         "setup": [
           "No dependency setup is required for read-only benchmark inspection."
-        ]
+        ],
+        "codestory_project_manifest": {
+          "path": "chinook-sql-codestory-project.json",
+          "sha256": "c646ae0855941eb244de9f2f2ce1cff9d30abe9e7fea54c0833d8317578ba5d3"
+        }
       },
       "prompt": "Explain the core Chinook schema relationships between artists, albums, tracks, invoices, and invoice lines across the SQL seed scripts. Cite the source files and name the supporting tables or constraints.",
       "expected_files": [
