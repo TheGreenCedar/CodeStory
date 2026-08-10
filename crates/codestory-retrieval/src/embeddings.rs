@@ -10,8 +10,14 @@ use crate::embedding_server_compat::{
     ProductEmbeddingServerLease, acquire_product_embedding_server_lease,
     product_embedding_identity, product_embedding_identity_if_initialized,
 };
+#[cfg(feature = "semantic-calibration-support")]
+use anyhow::Context;
 use anyhow::{Result, bail};
+#[cfg(feature = "semantic-calibration-support")]
+use sha2::{Digest, Sha256};
 use std::path::Path;
+#[cfg(feature = "semantic-calibration-support")]
+use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::{
     Arc,
@@ -143,12 +149,15 @@ impl ProductEmbeddingClient {
             bail!("cannot embed an empty query");
         }
         let prepared = format!("{CODERANK_QUERY_PREFIX_DEFAULT}{text}");
-        embed_prepared_query_via_server_with_control(
+        let vector = embed_prepared_query_via_server_with_control(
             &self.runtime,
             prepared,
             maximum_timeout,
             cancelled,
-        )
+        )?;
+        #[cfg(feature = "semantic-calibration-support")]
+        capture_semantic_calibration_query_vector(text, &vector)?;
+        Ok(vector)
     }
 
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -187,6 +196,37 @@ impl ProductEmbeddingClient {
         }
         embed_prepared_via_server_with_control(&self.runtime, texts, maximum_timeout, cancelled)
     }
+}
+
+#[cfg(feature = "semantic-calibration-support")]
+fn capture_semantic_calibration_query_vector(text: &str, vector: &[f32]) -> Result<()> {
+    let Some(directory) =
+        std::env::var_os(crate::semantic_calibration_support::QUERY_VECTOR_CAPTURE_DIR_ENV)
+    else {
+        return Ok(());
+    };
+    let directory = PathBuf::from(directory);
+    if !directory.is_dir() {
+        bail!(
+            "semantic calibration query-vector directory is unavailable: {}",
+            directory.display()
+        );
+    }
+    let query_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let bytes = vector
+        .iter()
+        .flat_map(|value| value.to_bits().to_le_bytes())
+        .collect::<Vec<_>>();
+    let path = directory.join(format!("{query_sha256}.f32le"));
+    std::fs::write(&path, &bytes)
+        .with_context(|| format!("write semantic calibration query vector {}", path.display()))?;
+    if std::fs::read(&path)
+        .with_context(|| format!("read semantic calibration query vector {}", path.display()))?
+        != bytes
+    {
+        bail!("semantic calibration query vector changed during capture");
+    }
+    Ok(())
 }
 
 pub fn embedding_runtime_id() -> String {

@@ -1007,7 +1007,7 @@ fn write_database(
     Ok(actual_anchors)
 }
 
-fn validate_database(
+pub(crate) fn validate_database(
     path: &Path,
     generation: &str,
     input_hash: &str,
@@ -1378,6 +1378,18 @@ pub(crate) fn search_database(
     limit: usize,
     cancelled: impl Fn() -> bool,
 ) -> Result<Vec<CandidateHit>> {
+    search_database_with_abstention(path, generation, input_hash, query, limit, cancelled, true)
+}
+
+fn search_database_with_abstention(
+    path: &Path,
+    generation: &str,
+    input_hash: &str,
+    query: &[f32],
+    limit: usize,
+    cancelled: impl Fn() -> bool,
+    apply_abstention: bool,
+) -> Result<Vec<CandidateHit>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -1438,7 +1450,9 @@ pub(crate) fn search_database(
         }
     }
     scored.sort_unstable_by(compare_scored_hits);
-    retain_dense_evidence(&mut scored);
+    if apply_abstention {
+        retain_dense_evidence(&mut scored);
+    }
     Ok(scored
         .into_iter()
         .map(
@@ -1484,6 +1498,17 @@ fn retain_dense_evidence(scored: &mut Vec<ScoredHit>) {
     scored.retain(|hit| hit.0 > 0.0 && hit.0 >= floor);
 }
 
+#[cfg(feature = "semantic-calibration-support")]
+pub(crate) fn search_database_for_semantic_calibration(
+    path: &Path,
+    generation: &str,
+    input_hash: &str,
+    query: &[f32],
+    limit: usize,
+) -> Result<Vec<CandidateHit>> {
+    search_database_with_abstention(path, generation, input_hash, query, limit, || false, false)
+}
+
 fn compare_scored_hits(left: &ScoredHit, right: &ScoredHit) -> Ordering {
     right
         .0
@@ -1491,7 +1516,7 @@ fn compare_scored_hits(left: &ScoredHit, right: &ScoredHit) -> Ordering {
         .then_with(|| left.1.cmp(&right.1))
 }
 
-fn open_read_only(path: &Path) -> Result<Connection> {
+pub(crate) fn open_read_only(path: &Path) -> Result<Connection> {
     Connection::open_with_flags(
         sqlite_open_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,

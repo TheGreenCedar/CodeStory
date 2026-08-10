@@ -37,6 +37,8 @@ mod retention;
 mod rollback;
 mod scip_client;
 mod scip_index;
+#[cfg(feature = "semantic-calibration-support")]
+pub mod semantic_calibration_support;
 mod sidecar;
 mod sidecar_search;
 
