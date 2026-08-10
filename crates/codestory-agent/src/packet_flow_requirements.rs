@@ -14,7 +14,9 @@ use crate::packet_evidence_carriers::{
     citation_owns_mapper_configuration, citation_owns_mapper_execution,
     citation_owns_shell_completion, citation_owns_shell_function_dispatch,
     citation_owns_shell_installer_bootstrap, citation_owns_site_lifecycle,
-    citation_owns_site_terminal, flow_belongs_to_client_request, flow_belongs_to_command_dispatch,
+    citation_owns_site_terminal, citation_owns_string_blank_predicate,
+    citation_owns_string_empty_predicate, citation_owns_string_region_handoff,
+    flow_belongs_to_client_request, flow_belongs_to_command_dispatch,
     flow_belongs_to_command_server, flow_belongs_to_event_loop, flow_belongs_to_indexing,
     flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
     flow_belongs_to_server_request, flow_belongs_to_sql_schema, flow_belongs_to_url_session,
@@ -36,7 +38,8 @@ use crate::packet_terms::{
     packet_terms_indicate_server_request_dispatch_flow,
     packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
-    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
+    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_string_predicate_flow,
+    packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
 use codestory_contracts::api::{AgentCitationDto, NodeKind, PacketTaskClassDto};
@@ -304,6 +307,9 @@ pub fn packet_flow_requirements_for_terms(
     }
     if packet_terms_indicate_runtime_formatting_flow(terms) {
         requirements.extend_from_slice(RUNTIME_FORMATTING_FLOW);
+    }
+    if packet_terms_indicate_string_predicate_flow(terms) {
+        push_string_predicate_requirements_for_terms(terms, &mut requirements);
     }
     if packet_terms_indicate_search_execution_flow(terms) {
         requirements.extend_from_slice(SEARCH_EXECUTION_FLOW);
@@ -935,6 +941,60 @@ const RUNTIME_FORMATTING_FLOW: &[FlowRequirement] = &[
     },
 ];
 
+const STRING_PREDICATE_FLOW: &[FlowRequirement] = &[
+    FlowRequirement {
+        id: "string_blank_predicate",
+        role: FlowRole::TransformOrValidate,
+        query_seeds: &["string blank predicate", "whitespace predicate"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_string_blank_predicate),
+    },
+    FlowRequirement {
+        id: "string_empty_predicate",
+        role: FlowRole::TransformOrValidate,
+        query_seeds: &["string empty predicate"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_string_empty_predicate),
+    },
+    FlowRequirement {
+        id: "string_region_handoff",
+        role: FlowRole::Dispatch,
+        query_seeds: &["string region match", "case-sensitive string comparison"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_string_region_handoff),
+    },
+];
+
+fn push_string_predicate_requirements_for_terms(
+    terms: &[String],
+    requirements: &mut Vec<FlowRequirement>,
+) {
+    let generic = packet_terms_have_any(terms, &["predicate", "predicates"]);
+    if generic || packet_terms_have_any(terms, &["blank", "whitespace", "trim", "trims"]) {
+        requirements.push(STRING_PREDICATE_FLOW[0]);
+    }
+    if generic || packet_terms_have_any(terms, &["empty"]) {
+        requirements.push(STRING_PREDICATE_FLOW[1]);
+    }
+    if generic
+        || packet_terms_have_any(
+            terms,
+            &[
+                "case",
+                "cases",
+                "sensitive",
+                "region",
+                "regions",
+                "match",
+                "matches",
+                "matching",
+            ],
+        )
+    {
+        requirements.push(STRING_PREDICATE_FLOW[2]);
+    }
+}
+
 const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "search_entrypoint",
@@ -1022,6 +1082,7 @@ pub fn all_flow_requirement_groups() -> Vec<(&'static str, Vec<FlowRequirement>)
         ("site_build", SITE_BUILD_FLOW.to_vec()),
         ("mapper_plan", MAPPER_PLAN_FLOW.to_vec()),
         ("runtime_formatting", RUNTIME_FORMATTING_FLOW.to_vec()),
+        ("string_predicates", STRING_PREDICATE_FLOW.to_vec()),
         ("search_execution", SEARCH_EXECUTION_FLOW.to_vec()),
     ]
 }
@@ -1257,7 +1318,7 @@ mod tests {
         "form_native_constraints | transform_or_validate | AllowsLexicalSource",
         "form_submit_guard | terminal_boundary | AllowsLexicalSource",
         "format_arguments | transform_or_validate | RequiresResolvedSourceOrGraph",
-        "format_errors | error_or_fallback | AllowsSourceRange",
+        "formatter_fallback | error_or_fallback | AllowsSourceRange",
         "handler_processing | dispatch | RequiresResolvedSourceOrGraph",
         "hook_cache_helper | state_or_storage | AllowsSourceRange",
         "hook_key_serialization | transform_or_validate | AllowsSourceRange",
@@ -1277,7 +1338,7 @@ mod tests {
         "search_dispatch | dispatch | RequiresResolvedSourceOrGraph",
         "search_entrypoint | entrypoint | RequiresResolvedSourceOrGraph",
         "session_callbacks | dispatch | AllowsSourceRange",
-        "session_request | entrypoint | RequiresResolvedSourceOrGraph",
+        "client_request_entry | entrypoint | RequiresResolvedSourceOrGraph",
         "shell_completion | terminal_boundary | DiagnosticOnly",
         "shell_function_dispatch | dispatch | AllowsLexicalSource",
         "shell_installer_bootstrap | entrypoint | AllowsLexicalSource",
@@ -1285,6 +1346,9 @@ mod tests {
         "site_terminal | terminal_boundary | AllowsSourceRange",
         "sql_relationships | configuration | AllowsLexicalSource",
         "sql_tables | state_or_storage | AllowsLexicalSource",
+        "string_blank_predicate | transform_or_validate | RequiresResolvedSourceOrGraph",
+        "string_empty_predicate | transform_or_validate | RequiresResolvedSourceOrGraph",
+        "string_region_handoff | dispatch | RequiresResolvedSourceOrGraph",
     ];
 
     fn requirement_inventory_entry(requirement: &FlowRequirement) -> String {
@@ -1381,7 +1445,7 @@ mod tests {
                 ),
             ),
             (
-                ("session_request", "entrypoint"),
+                ("client_request_entry", "entrypoint"),
                 witness(
                     "createClientInstance",
                     "Source/Session.swift",
@@ -1591,7 +1655,7 @@ mod tests {
                 witness("basic_format_args", "include/fmt/base.h", NodeKind::CLASS),
             ),
             (
-                ("format_errors", "error_or_fallback"),
+                ("formatter_fallback", "error_or_fallback"),
                 witness(
                     "throw_format_error",
                     "include/fmt/format.h",
@@ -1605,6 +1669,26 @@ mod tests {
             (
                 ("search_dispatch", "dispatch"),
                 witness("SearchWorker", "crates/core/search.rs", NodeKind::STRUCT),
+            ),
+            (
+                ("string_blank_predicate", "transform_or_validate"),
+                witness(
+                    "StringUtils.isBlank",
+                    "src/text/StringUtils.java",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("string_empty_predicate", "transform_or_validate"),
+                witness("Strings.isEmpty", "src/text/Strings.java", NodeKind::METHOD),
+            ),
+            (
+                ("string_region_handoff", "dispatch"),
+                witness(
+                    "CharSequenceUtils.regionMatches",
+                    "src/text/CharSequenceUtils.java",
+                    NodeKind::METHOD,
+                ),
             ),
         ]
     }
@@ -2093,7 +2177,6 @@ mod tests {
         "css_animation_entrypoint | forward",
         "css_animation_entrypoint | import",
         "css_animation_entrypoint | use",
-        "css_animation_structure | animated",
         "css_animation_structure | animation",
         "css_animation_structure | delay",
         "css_animation_structure | duration",
@@ -2352,12 +2435,29 @@ mod tests {
             "forward",
             "keyframes",
             "animation",
-            "animated",
             "transition",
             "duration",
             "delay",
             "iteration",
             "fillmode",
+            "string",
+            "strings",
+            "text",
+            "char",
+            "sequence",
+            "sequences",
+            "charsequence",
+            "charsequences",
+            "blank",
+            "whitespace",
+            "empty",
+            "region",
+            "regions",
+            "matches",
+            "matching",
+            "compare",
+            "equal",
+            "equals",
             "forms",
             "fieldset",
             "validation",
@@ -2749,7 +2849,6 @@ mod tests {
         "css_animation_entrypoint | forward",
         "css_animation_entrypoint | import",
         "css_animation_entrypoint | use",
-        "css_animation_structure | animated",
         "css_animation_structure | animation",
         "css_animation_structure | delay",
         "css_animation_structure | duration",

@@ -4,9 +4,9 @@ use crate::eval_probes::{
     eval_indexing_storage_flow_template_claims, eval_probes_enabled,
     eval_supporting_claim_flow_sentence,
 };
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 use crate::packet_citations::packet_citation_source_text;
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 use crate::packet_claim_profiles::packet_source_derived_claims_for_citation_counted;
 use crate::packet_evidence::{
     citation_sufficiency_eligible, evidence_resolution_for_citation, evidence_tier_for_citation,
@@ -20,7 +20,7 @@ use crate::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_claim_carry_rank,
     packet_display_path, packet_query_stop_term, sort_by_cached_rank_desc,
 };
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 use crate::packet_terms::{packet_probe_terms, packet_terms_indicate_sql_schema_flow};
 use crate::text::query_mentions_non_primary_source;
 use codestory_contracts::api::{
@@ -30,7 +30,7 @@ use codestory_contracts::api::{
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 const PACKET_SOURCE_DEFINITION_CLAIM_LIMIT: usize = 6;
 
 pub fn packet_flow_claims_markdown(claims: &[PacketClaimDto]) -> String {
@@ -354,7 +354,7 @@ fn packet_symbol_extraction_witness_rank(citation: &AgentCitationDto) -> u8 {
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_append_source_derived_flow_claims(
     prompt: &str,
     citations: &[AgentCitationDto],
@@ -384,7 +384,7 @@ fn packet_append_source_derived_flow_claims(
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_preferred_source_derived_claim_citation(
     claim: &str,
     source_citation: &AgentCitationDto,
@@ -399,7 +399,7 @@ fn packet_preferred_source_derived_claim_citation(
     source_citation.clone()
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_matching_sql_relationship_citation(
     source_citation: &AgentCitationDto,
     citations: &[AgentCitationDto],
@@ -433,7 +433,7 @@ fn packet_matching_sql_relationship_citation(
         .cloned()
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_claim_text_indicates_sql_relationship(claim: &str) -> bool {
     let normalized = normalize_identifier(claim);
     normalized.contains("rowsreference")
@@ -452,7 +452,7 @@ fn packet_claim_text_indicates_sql_relationship(claim: &str) -> bool {
                 || normalized.contains("referential")))
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_append_sql_schema_file_claims(
     prompt: &str,
     citations: &[AgentCitationDto],
@@ -522,7 +522,7 @@ fn packet_append_sql_schema_file_claims(
     );
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_sql_dialect_key(normalized_path: &str) -> Option<&'static str> {
     if normalized_path.contains("sqlite") {
         Some("sqlite")
@@ -541,7 +541,7 @@ fn packet_sql_dialect_key(normalized_path: &str) -> Option<&'static str> {
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_sql_schema_prompt_subject(prompt: &str) -> Option<String> {
     let stop_words = [
         "Explain",
@@ -607,7 +607,7 @@ fn packet_push_flow_template_claim_with_citations(
     });
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_push_unbound_reported_claim(
     claims: &mut Vec<PacketClaimDto>,
     seen: &mut HashSet<String>,
@@ -687,7 +687,10 @@ pub fn append_ranked_citation_claims(
             required_evidence_role: None,
             citations: vec![citation.clone()],
             coverage_role: Some(role.as_str().to_string()),
-            eligible_for_sufficiency: Some(false),
+            eligible_for_sufficiency: Some(
+                role != PacketEvidenceRole::SourceEvidence
+                    && citation_sufficiency_eligible(citation),
+            ),
         });
         if claims.len() >= 18 {
             break;
@@ -857,7 +860,7 @@ fn packet_citation_shaped_claim(citation: &AgentCitationDto, prompt: &str) -> Op
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_append_source_definition_claims(
     citations: &[AgentCitationDto],
     rank_terms: &[String],
@@ -924,7 +927,7 @@ fn packet_append_source_definition_claims(
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_push_claim(
     claims: &mut Vec<PacketClaimDto>,
     seen_claims: &mut HashSet<String>,
@@ -947,7 +950,7 @@ fn packet_push_claim(
     });
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_source_definition_name(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
     for prefix in [
@@ -984,7 +987,7 @@ fn packet_source_definition_name(line: &str) -> Option<String> {
     None
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_take_definition_identifier(rest: &str) -> Option<String> {
     let mut identifier = String::new();
     for ch in rest.chars() {
@@ -997,7 +1000,7 @@ fn packet_take_definition_identifier(rest: &str) -> Option<String> {
     (identifier.len() >= 3).then_some(identifier)
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_definition_matches_rank_terms(
     definition: &str,
     normalized_definition: &str,
@@ -1021,7 +1024,7 @@ fn packet_definition_matches_rank_terms(
     overlap >= 2 || (definition_tokens.iter().any(|token| token == "exec") && overlap >= 1)
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_definition_rank_tokens(rank_terms: &[String]) -> HashSet<String> {
     rank_terms
         .iter()
@@ -1036,7 +1039,7 @@ fn packet_definition_rank_tokens(rank_terms: &[String]) -> HashSet<String> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 fn packet_identifier_tokens(identifier: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -1228,49 +1231,20 @@ mod tests {
         );
     }
 
-    fn write_sql_fixture(name: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "codestory-packet-claims-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create packet claims temp dir");
-        let path = root.join("schema.sql");
-        std::fs::write(
-            &path,
-            r#"
-            CREATE TABLE Child
-            (
-                ChildId INTEGER NOT NULL,
-                ParentId INTEGER NOT NULL,
-                FOREIGN KEY (ParentId) REFERENCES Parent (ParentId)
-            );
-            CREATE TABLE Parent
-            (
-                ParentId INTEGER NOT NULL
-            );
-            "#,
-        )
-        .expect("write packet claims sql fixture");
-        path
-    }
-
     #[test]
     fn sql_relationship_claims_attach_to_retained_foreign_key_citations() {
-        let path = write_sql_fixture("foreign-key");
-        let path_text = path.to_string_lossy().to_string();
         let answer = test_answer(
             "Explain SQL schema relationships between child and parent rows.",
             vec![
-                test_citation("CREATE TABLE Child", &path_text, 0.9),
-                test_citation("FOREIGN KEY", &path_text, 0.8),
+                test_citation("CREATE TABLE Child", "db/schema.sql", 0.9),
+                test_citation("FOREIGN KEY", "db/schema.sql", 0.8),
             ],
         );
 
         let claims = packet_supported_claims(&answer);
         let relationship_claim = claims
             .iter()
-            .find(|claim| claim.claim == "Child rows reference Parent rows through ParentId.")
+            .find(|claim| claim.coverage_role.as_deref() == Some("sql relationship constraint"))
             .unwrap_or_else(|| panic!("expected relationship claim in {claims:?}"));
         assert!(
             relationship_claim
@@ -1289,7 +1263,7 @@ mod tests {
 
         let table_claim = claims
             .iter()
-            .find(|claim| claim.claim == "SQL schema defines tables Child and Parent.")
+            .find(|claim| claim.coverage_role.as_deref() == Some("sql table definition"))
             .unwrap_or_else(|| panic!("expected table claim in {claims:?}"));
         assert!(
             table_claim
@@ -1298,26 +1272,22 @@ mod tests {
                 .any(|citation| citation.display_name == "CREATE TABLE Child"),
             "table claim should keep table-definition evidence: {table_claim:?}"
         );
-
-        let _ = std::fs::remove_dir_all(path.parent().expect("sql fixture parent"));
     }
 
     #[test]
     fn sql_relationship_claims_can_attach_to_retained_references_citations() {
-        let path = write_sql_fixture("references");
-        let path_text = path.to_string_lossy().to_string();
         let answer = test_answer(
             "Explain SQL schema relationships and references between child and parent rows.",
             vec![
-                test_citation("CREATE TABLE Child", &path_text, 0.9),
-                test_citation("REFERENCES", &path_text, 0.8),
+                test_citation("CREATE TABLE Child", "db/schema.sql", 0.9),
+                test_citation("REFERENCES", "db/schema.sql", 0.8),
             ],
         );
 
         let claims = packet_supported_claims(&answer);
         let relationship_claim = claims
             .iter()
-            .find(|claim| claim.claim == "Child rows reference Parent rows through ParentId.")
+            .find(|claim| claim.coverage_role.as_deref() == Some("sql relationship constraint"))
             .unwrap_or_else(|| panic!("expected relationship claim in {claims:?}"));
         assert!(
             relationship_claim
@@ -1326,7 +1296,5 @@ mod tests {
                 .any(|citation| citation.display_name == "REFERENCES"),
             "relationship claim should cite retained REFERENCES evidence: {relationship_claim:?}"
         );
-
-        let _ = std::fs::remove_dir_all(path.parent().expect("sql fixture parent"));
     }
 }

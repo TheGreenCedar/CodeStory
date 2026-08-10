@@ -250,8 +250,17 @@ fn assemble_packet_sufficiency_with_probe_context(
         .any(|step| step.status == AgentRetrievalStepStatusDto::Error);
     let min_citations = packet_sufficiency_min_citations(task_class);
     let min_claims = packet_sufficiency_min_claims_with_obligations(task_class, obligations);
-    let min_claim_families =
-        packet_sufficiency_min_claim_families_with_obligations(task_class, obligations);
+    let has_compositional_flow_requirements =
+        !packet_flow_requirements_for_terms(&packet_probe_terms(question), task_class).is_empty();
+    // A recognized flow already requires every distinct structural predicate below. Reapplying
+    // the older prose-family floor would make claim wording a second, lossy proof system and can
+    // reject three independently proven flow steps merely because their citations share one
+    // broad evidence role.
+    let min_claim_families = if has_compositional_flow_requirements {
+        1
+    } else {
+        packet_sufficiency_min_claim_families_with_obligations(task_class, obligations)
+    };
     let route_stages = packet_route_proof_stages(question, selected_probes);
     let sufficiency_claims = supported_claims
         .iter()
@@ -302,9 +311,10 @@ fn assemble_packet_sufficiency_with_probe_context(
         selected_probes,
         obligations,
     );
-    let mut missing_required_flow_requirements =
-        packet_missing_required_flow_requirements(question, task_class, &sufficiency_claims);
+    let (mut covered_required_flow_requirements, mut missing_required_flow_requirements) =
+        packet_required_flow_requirement_coverage(question, task_class, &sufficiency_claims);
     if task_class == PacketTaskClassDto::RouteTracing && route_proof.complete {
+        covered_required_flow_requirements.extend(missing_required_flow_requirements.drain(..));
         missing_required_flow_requirements.clear();
     }
     let obligations_proven = obligations
@@ -417,6 +427,14 @@ fn assemble_packet_sufficiency_with_probe_context(
     }
     for query in &blocking_route_probe_queries {
         push_unique_sufficiency_term(&mut blocking_follow_up_probe_query_seeds, query);
+    }
+    // A missing compositional requirement is actionable even when the retrieval adapter did not
+    // return a matching selected-probe receipt. Use the requirement's own stable query vocabulary
+    // instead of falling back to a generic packet-budget message or silently dropping the step.
+    for requirement in &missing_required_flow_requirements {
+        if let Some(query) = requirement.query_seeds.first() {
+            push_unique_sufficiency_term(&mut blocking_follow_up_probe_query_seeds, query);
+        }
     }
     // The legacy no-ledger path may still report uncovered planner probes whose flow requirement
     // is already covered. Those are hints, not repair work. Production ledgers put every
@@ -549,6 +567,7 @@ fn assemble_packet_sufficiency_with_probe_context(
     let coverage_report = packet_coverage_report(PacketCoverageReportInput {
         supported_claims: &supported_claims,
         proven_claims: &proven_claims,
+        covered_required_flow_requirements: &covered_required_flow_requirements,
         missing_required_flow_requirements: &missing_required_flow_requirements,
         route_proof: &route_proof,
         missing_exact_path_claims: &missing_exact_path_claims,
@@ -1847,6 +1866,7 @@ fn packet_role_label_is_generic_source_evidence(role: &str) -> bool {
 struct PacketCoverageReportInput<'a> {
     supported_claims: &'a [PacketClaimDto],
     proven_claims: &'a [PacketClaimDto],
+    covered_required_flow_requirements: &'a [FlowRequirement],
     missing_required_flow_requirements: &'a [FlowRequirement],
     route_proof: &'a RouteProofAssessment,
     missing_exact_path_claims: &'a [String],
@@ -1859,6 +1879,7 @@ fn packet_coverage_report(input: PacketCoverageReportInput<'_>) -> PacketCoverag
     let PacketCoverageReportInput {
         supported_claims,
         proven_claims,
+        covered_required_flow_requirements,
         missing_required_flow_requirements,
         route_proof,
         missing_exact_path_claims,
@@ -1866,12 +1887,15 @@ fn packet_coverage_report(input: PacketCoverageReportInput<'_>) -> PacketCoverag
         budget,
         has_sufficiency_blocking_budget_omission,
     } = input;
-    let covered = proven_claims
+    let mut covered = proven_claims
         .iter()
         .filter_map(packet_claim_coverage_label)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    for requirement in covered_required_flow_requirements {
+        push_unique_sufficiency_term(&mut covered, requirement.id);
+    }
     let ineligible = supported_claims
         .iter()
         .filter_map(|claim| {
@@ -2100,18 +2124,33 @@ fn packet_missing_required_flow_requirements(
     task_class: PacketTaskClassDto,
     supported_claims: &[PacketClaimDto],
 ) -> Vec<FlowRequirement> {
+    packet_required_flow_requirement_coverage(question, task_class, supported_claims).1
+}
+
+fn packet_required_flow_requirement_coverage(
+    question: &str,
+    task_class: PacketTaskClassDto,
+    supported_claims: &[PacketClaimDto],
+) -> (Vec<FlowRequirement>, Vec<FlowRequirement>) {
     let flow_context = PacketFlowContext::new(question, task_class);
-    flow_context
+    let mut covered = Vec::new();
+    let mut missing = Vec::new();
+    for requirement in flow_context
         .requirements
         .iter()
         .copied()
         .filter(flow_requirement_blocks_sufficiency)
-        .filter(|requirement| {
-            !supported_claims
-                .iter()
-                .any(|claim| flow_context.claim_satisfies_requirement(claim, requirement))
-        })
-        .collect()
+    {
+        if supported_claims
+            .iter()
+            .any(|claim| flow_context.claim_satisfies_requirement(claim, &requirement))
+        {
+            covered.push(requirement);
+        } else {
+            missing.push(requirement);
+        }
+    }
+    (covered, missing)
 }
 
 #[cfg(test)]
@@ -4419,7 +4458,7 @@ mod tests {
             "eligible logger/record/handler claims should not leave citation-budget or family gaps: {sufficiency:?}"
         );
         let report = sufficiency.coverage_report.as_ref().unwrap();
-        for expected in ["log record creation", "handler processing"] {
+        for expected in ["logger_event", "handler_processing"] {
             assert!(
                 report.covered.contains(&expected.to_string()),
                 "log-record DataFlow should report concrete covered family `{expected}`: {report:?}"
@@ -4871,7 +4910,7 @@ mod tests {
                     anchor_at("FormationError", "src/geometry/FormationError.svelte"),
                     anchor_at("FormativelyFallback", "src/geometry/Fallback.vue"),
                 ],
-                expected_missing: &["format_arguments", "format_errors"],
+                expected_missing: &["format_arguments", "formatter_fallback"],
             },
         ];
 
@@ -4897,13 +4936,6 @@ mod tests {
                     evidence_claim(text, citation)
                 })
                 .collect::<Vec<_>>();
-            assert!(
-                packet_supported_claim_family_count(&claims) >= 2,
-                "{} must satisfy the DataFlow family floor so a Partial verdict cannot come from \
-                 an unrelated family-count gate",
-                case.label
-            );
-
             let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
                 project_root: Path::new("C:/workspace/project"),
                 question: case.question,
@@ -4936,25 +4968,41 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_handler_registration_does_not_get_logger_handler_family() {
-        let unrelated = claim("Request handler registration wires middleware callbacks.");
-        assert_ne!(
-            packet_claim_family(&unrelated),
-            Some("logger handler stack"),
-            "unrelated handler registration should not be labeled as log handler stack"
+    fn unrelated_handler_registration_does_not_cover_logger_processing() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let unrelated = evidence_claim(
+            "Request handler registration wires middleware callbacks.",
+            anchor_at("RequestHandler.register", "src/http/router.rs"),
         );
-        assert_eq!(
-            packet_supported_claim_family_count(&[unrelated]),
-            0,
-            "unrelated handler registration should not add log-record sufficiency-family coverage"
+        let (_, missing) = packet_required_flow_requirement_coverage(
+            question,
+            PacketTaskClassDto::DataFlow,
+            &[unrelated],
+        );
+        assert!(
+            missing
+                .iter()
+                .any(|requirement| requirement.id == "handler_processing"),
+            "an HTTP handler must not cover logger processing: {missing:?}"
         );
 
-        let exact_stack =
-            claim("The logger owns a handler stack populated by handler registration.");
-        assert_eq!(
-            packet_claim_family(&exact_stack),
-            Some("logger handler stack"),
-            "log/logger handler-stack wording should still carry the family"
+        let logger = evidence_claim(
+            "The processing handler writes the log record.",
+            anchor_at(
+                "LogProcessingHandler.write",
+                "src/logging/ProcessingHandler.php",
+            ),
+        );
+        let (covered, _) = packet_required_flow_requirement_coverage(
+            question,
+            PacketTaskClassDto::DataFlow,
+            &[logger],
+        );
+        assert!(
+            covered
+                .iter()
+                .any(|requirement| requirement.id == "handler_processing"),
+            "a typed logger processing carrier must cover its own requirement: {covered:?}"
         );
     }
 
@@ -5023,7 +5071,7 @@ mod tests {
             "handler stack/registration should not close processing without process/write evidence: {report:?}"
         );
         assert!(
-            report.covered.contains(&"logger handler stack".to_string()),
+            report.covered.contains(&"logger_event".to_string()),
             "handler stack evidence should remain covered context even when processing is missing: {report:?}"
         );
     }
@@ -5076,7 +5124,7 @@ mod tests {
             "handler stack plus processing should not close logger event without record-creation evidence: {report:?}"
         );
         assert!(
-            report.covered.contains(&"handler processing".to_string()),
+            report.covered.contains(&"handler_processing".to_string()),
             "processing evidence should still cover handler processing: {report:?}"
         );
     }
@@ -5506,7 +5554,7 @@ mod tests {
         let answer = answer_fixture(question);
         let budget = budget_fixture();
         // Three proof-bearing claims over real formatting anchors. `format_arguments` and
-        // `format_errors` are separate requirements, so argument, output, and buffer evidence must
+        // `formatter_fallback` are separate requirements, so argument, output, and buffer evidence must
         // leave the error/fallback requirement open — the case wording used to close.
         let claims = vec![
             evidence_claim(
@@ -5536,19 +5584,19 @@ mod tests {
 
         assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
         let report = sufficiency.coverage_report.as_ref().unwrap();
-        assert!(report.missing.iter().any(|gap| gap == "format_errors"));
+        assert!(report.missing.iter().any(|gap| gap == "formatter_fallback"));
         assert!(!report.missing.iter().any(|gap| gap == "format error"));
         assert!(
             sufficiency
                 .gaps
                 .iter()
-                .any(|gap| gap.contains("format error"))
+                .any(|gap| gap.contains("formatter_fallback"))
         );
         assert!(
             sufficiency
                 .follow_up_commands
                 .iter()
-                .any(|command| command.contains("--query 'format error'"))
+                .any(|command| command.contains("--query 'formatting failure'"))
         );
     }
 
@@ -6122,7 +6170,7 @@ mod tests {
 
         assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
         let report = sufficiency.coverage_report.as_ref().unwrap();
-        assert!(report.missing.iter().any(|gap| gap == "format_errors"));
+        assert!(report.missing.iter().any(|gap| gap == "formatter_fallback"));
         assert!(
             report
                 .budget_omitted
@@ -6347,7 +6395,7 @@ mod tests {
             report.missing.is_empty(),
             "generic source-shape role coverage should satisfy request dispatch without product-specific strings: {report:?}"
         );
-        for expected in ["entrypoint", "server view dispatch"] {
+        for expected in ["entrypoint", "request dispatch"] {
             assert!(
                 report.covered.iter().any(|entry| entry == expected),
                 "expected generic coverage report to include {expected}: {report:?}"
@@ -7146,9 +7194,17 @@ mod tests {
             missing.is_empty(),
             "log-record handler prompts should use record creation and handler processing roles: {missing:?}"
         );
-        assert!(
-            packet_supported_claim_family_count(&claims) >= 3,
-            "log-record handler claims should cover distinct sufficiency families"
+        let (covered, _) = packet_required_flow_requirement_coverage(
+            "Explain how a logger turns a log call into a record object and passes it through handlers.",
+            PacketTaskClassDto::DataFlow,
+            &claims,
+        );
+        assert_eq!(
+            covered
+                .iter()
+                .map(|requirement| requirement.id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["handler_processing", "logger_event"]),
         );
     }
 
@@ -7178,9 +7234,17 @@ mod tests {
             missing.is_empty(),
             "runtime formatting prompts should use argument, output, and error roles: {missing:?}"
         );
-        assert!(
-            packet_supported_claim_family_count(&claims) >= 3,
-            "runtime formatting claims should cover distinct sufficiency families"
+        let (covered, _) = packet_required_flow_requirement_coverage(
+            "Explain how formatting arguments become type-erased format args and reach vformat or format_to output paths.",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &claims,
+        );
+        assert_eq!(
+            covered
+                .iter()
+                .map(|requirement| requirement.id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["format_arguments", "formatter_fallback"]),
         );
     }
 
@@ -7217,9 +7281,21 @@ mod tests {
             missing.is_empty(),
             "form validation prompts should use constraint, submit, and validity-state roles: {missing:?}"
         );
-        assert!(
-            packet_supported_claim_family_count(&claims) >= 3,
-            "form validation claims should cover distinct sufficiency families"
+        let (covered, _) = packet_required_flow_requirement_coverage(
+            "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &claims,
+        );
+        assert_eq!(
+            covered
+                .iter()
+                .map(|requirement| requirement.id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "form_custom_validation",
+                "form_native_constraints",
+                "form_submit_guard",
+            ]),
         );
     }
 
@@ -7258,9 +7334,21 @@ mod tests {
             missing.is_empty(),
             "string predicate prompts should use public helper, behavior, and region handoff roles: {missing:?}"
         );
-        assert!(
-            packet_supported_claim_family_count(&claims) >= 3,
-            "string predicate claims should cover distinct sufficiency families"
+        let (covered, _) = packet_required_flow_requirement_coverage(
+            "Explain how string helpers implement blank, empty, and case-sensitive string checks across StringUtils, Strings, and CharSequenceUtils.",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &claims,
+        );
+        assert_eq!(
+            covered
+                .iter()
+                .map(|requirement| requirement.id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "string_blank_predicate",
+                "string_empty_predicate",
+                "string_region_handoff",
+            ]),
         );
     }
 
@@ -7846,7 +7934,7 @@ mod tests {
             sufficiency
                 .follow_up_commands
                 .iter()
-                .any(|command| command.contains("--query 'format error'")),
+                .any(|command| command.contains("--query 'formatting failure'")),
             "the missing flow probe must survive the command cap even when unproven exact paths \
              could fill it: {:?}",
             sufficiency.follow_up_commands
@@ -7878,7 +7966,7 @@ mod tests {
         let answer = answer_fixture(question);
         let budget = budget_fixture();
         // `CliParseError` is a command-line parser error in a different subsystem. Its name contains
-        // "error", which is all the `format_errors` carrier used to ask for.
+        // "error", which is all the old formatter-fallback carrier used to ask for.
         let claims = vec![
             evidence_claim(
                 "Runtime formatting uses type-erased arguments before dispatching formatted output helpers.",
@@ -7913,7 +8001,7 @@ mod tests {
         );
         let report = sufficiency.coverage_report.as_ref().unwrap();
         assert!(
-            report.missing.iter().any(|gap| gap == "format_errors"),
+            report.missing.iter().any(|gap| gap == "formatter_fallback"),
             "the formatting error requirement must still be named as missing: {report:?}"
         );
     }

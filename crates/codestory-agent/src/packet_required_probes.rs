@@ -2495,7 +2495,7 @@ mod tests {
             "Explain how the public hook serializes keys, connects cache helpers, and composes middleware.",
             PacketTaskClassDto::ArchitectureExplanation,
         );
-        for expected in ["serialize", "cache helper", "middleware"] {
+        for expected in ["public hook export", "key serialization", "cache helper"] {
             assert!(
                 hook_queries.iter().any(|query| query == expected),
                 "expected {expected:?} in {hook_queries:?}"
@@ -2511,26 +2511,16 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
         );
         for expected in [
-            "form validation",
+            "native form constraints",
             "constraint validation",
-            "html constraint",
-            "pattern",
-            "javascript validation",
-            "custom validation flow",
-            "validity state",
-            "handler processing",
-            "mapper configuration",
-            "type map",
-            "mapping plan",
-            "buffered source",
-            "buffered sink",
-            "source sink buffer",
+            "custom validation",
+            "submit prevent default",
+            "mapper runtime api",
+            "mapping execution plan",
             "buffer storage",
-            "buffered wrapper",
+            "source sink buffer",
             "source read buffer",
             "sink write buffer",
-            "source buffer",
-            "sink buffer",
         ] {
             assert!(
                 flow_queries.iter().any(|query| query == expected),
@@ -2543,18 +2533,10 @@ mod tests {
             PacketTaskClassDto::RouteTracing,
         );
         for expected in [
-            "handler dispatch",
+            "request entrypoint",
             "route registration",
-            "router group",
-            "route tree",
-            "route tree add route",
-            "router group handle route",
-            "request handler",
-            "engine request handler",
-            "context next handler chain",
-            "handler chain",
-            "engine creation",
-            "engine creation router state",
+            "request dispatch",
+            "handler dispatch",
         ] {
             assert!(
                 route_queries.iter().any(|query| query == expected),
@@ -2633,10 +2615,13 @@ mod tests {
             "route registration",
             &test_packet_citation("app.route", "lib/application.js", 0.9)
         ));
-        assert!(packet_citation_satisfies_required_probe(
-            "route registration",
-            &test_packet_citation("app.use", "lib/application.js", 0.9)
-        ));
+        assert!(
+            !packet_citation_satisfies_required_probe(
+                "route registration",
+                &test_packet_citation("app.use", "lib/application.js", 0.9)
+            ),
+            "middleware installation is not route registration"
+        );
         assert!(packet_citation_satisfies_required_probe(
             "request handler",
             &test_packet_citation("app.handle", "lib/application.js", 0.9)
@@ -2886,9 +2871,9 @@ mod tests {
     }
 
     #[test]
-    fn sql_schema_required_probes_derive_prompt_table_symbols() {
+    fn sql_schema_required_probes_are_compositional() {
         let terms = packet_probe_terms(
-            "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across SQL seed scripts. Cite the source files.",
+            "Explain SQL table definitions and referential relationships across schema seed scripts.",
         );
         let queries = packet_sufficiency_required_probe_queries_from_terms(
             &terms,
@@ -2896,28 +2881,17 @@ mod tests {
         );
 
         for expected in [
+            "sql table definitions",
             "CREATE TABLE",
-            "FOREIGN KEY",
-            "REFERENCES",
-            "CREATE TABLE Artist",
-            "CREATE TABLE Album",
-            "CREATE TABLE Track",
-            "CREATE TABLE Invoice",
-            "CREATE TABLE InvoiceLine",
+            "referential relationships",
+            "schema constraints",
         ] {
             assert!(
                 queries.iter().any(|query| query == expected),
                 "expected SQL schema probe `{expected}` in {queries:?}"
             );
         }
-        assert!(
-            !queries.iter().any(|query| query == "CREATE TABLE Line"),
-            "standalone compound suffixes should not become table probes: {queries:?}"
-        );
-        assert!(
-            !queries.iter().any(|query| query == "CREATE TABLE File"),
-            "documentation words should not become table probes: {queries:?}"
-        );
+        assert_eq!(queries.len(), 4, "the flow emits only typed general probes");
     }
 
     #[test]

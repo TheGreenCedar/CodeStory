@@ -317,7 +317,6 @@ pub fn packet_terms_indicate_route_tree_dispatch_flow(terms: &[String]) -> bool 
             terms,
             &[
                 "engine", "engines", "group", "groups", "method", "methods", "tree", "trees",
-                "router",
             ],
         )
 }
@@ -720,6 +719,14 @@ pub fn packet_terms_indicate_string_predicate_flow(terms: &[String]) -> bool {
             "trims",
             "predicate",
             "predicates",
+            "case",
+            "cases",
+            "sensitive",
+            "region",
+            "regions",
+            "match",
+            "matches",
+            "matching",
         ],
     )
 }

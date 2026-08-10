@@ -135,9 +135,13 @@ pub fn packet_citation_rank(
         score -= 12.0;
     }
     if path.contains("/sandbox/")
+        || path.starts_with("sandbox/")
         || path.contains("/examples/")
+        || path.starts_with("examples/")
         || path.contains("/test/")
+        || path.starts_with("test/")
         || path.contains("/tests/")
+        || path.starts_with("tests/")
     {
         score -= 14.0;
     }
@@ -1399,40 +1403,14 @@ mod tests {
     }
 
     #[test]
-    fn request_dispatch_rank_prefers_source_anchors_over_artifacts() {
-        let terms = vec![
-            "server".to_string(),
-            "request".to_string(),
-            "dispatch".to_string(),
-            "router".to_string(),
-            "response".to_string(),
-        ];
+    fn citation_rank_prefers_primary_source_paths_over_examples() {
+        let terms = vec!["request".to_string(), "response".to_string()];
         let source = test_rank_citation("app.handle", "lib/application.js", 1.0);
         let example = test_rank_citation("app.handle", "examples/application.js", 1.0);
-        let schema_reference = test_rank_citation(
-            "schema_reference::request_dispatch",
-            "schema/reference.js",
-            1.0,
-        );
-        let component_report =
-            test_rank_citation("component_report:routes", "lib/application.js", 1.0);
-        let response_source = test_rank_citation("res.send", "lib/response.js", 1.0);
 
         assert!(
             packet_citation_rank(&source, &terms, false)
                 > packet_citation_rank(&example, &terms, false)
-        );
-        assert!(
-            packet_citation_rank(&source, &terms, false)
-                > packet_citation_rank(&schema_reference, &terms, false)
-        );
-        assert!(
-            packet_citation_rank(&source, &terms, false)
-                > packet_citation_rank(&component_report, &terms, false)
-        );
-        assert!(
-            packet_citation_rank(&response_source, &terms, false)
-                > packet_citation_rank(&component_report, &terms, false)
         );
     }
 

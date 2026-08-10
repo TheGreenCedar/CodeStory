@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 #![allow(dead_code)]
 
 #[cfg(any(test, feature = "test-support"))]

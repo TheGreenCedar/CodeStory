@@ -824,6 +824,39 @@ pub fn citation_owns_mapper_execution(citation: &AgentCitationDto) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// String predicates
+// ---------------------------------------------------------------------------
+
+fn belongs_to_string_predicates(citation: &AgentCitationDto) -> bool {
+    matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        && (names_token(citation, &["string", "strings", "text"])
+            || (names_token(citation, &["char"])
+                && names_token(citation, &["sequence", "sequences"])))
+}
+
+/// A string helper's blank-or-whitespace predicate. The string subject is deliberately read from
+/// the symbol, not its package path, so an unrelated `Record.isBlank` filed beside StringUtils
+/// cannot close the requirement.
+pub fn citation_owns_string_blank_predicate(citation: &AgentCitationDto) -> bool {
+    belongs_to_string_predicates(citation) && names_token(citation, &["blank", "whitespace"])
+}
+
+/// The empty-string predicate remains distinct from blank/trim behavior.
+pub fn citation_owns_string_empty_predicate(citation: &AgentCitationDto) -> bool {
+    belongs_to_string_predicates(citation) && names_token(citation, &["empty"])
+}
+
+/// The helper that hands a case-sensitive comparison to a region matcher.
+pub fn citation_owns_string_region_handoff(citation: &AgentCitationDto) -> bool {
+    belongs_to_string_predicates(citation)
+        && names_token(citation, &["region"])
+        && names_token(
+            citation,
+            &["match", "matches", "matching", "compare", "equal", "equals"],
+        )
+}
+
+// ---------------------------------------------------------------------------
 // Runtime formatting
 // ---------------------------------------------------------------------------
 
@@ -1555,6 +1588,51 @@ mod tests {
                 expected,
                 "exact carrier {name}",
             );
+        }
+    }
+
+    #[test]
+    fn string_predicate_carriers_require_both_string_subject_and_distinct_behavior() {
+        for name in ["StringUtils.isBlank", "TextPredicates::whitespaceOnly"] {
+            assert!(
+                citation_owns_string_blank_predicate(&citation(
+                    name,
+                    "src/text/predicates.rs",
+                    NodeKind::METHOD,
+                )),
+                "{name} is a string blank predicate",
+            );
+        }
+        for name in ["Strings.isEmpty", "CharSequencePredicates::empty"] {
+            assert!(
+                citation_owns_string_empty_predicate(&citation(
+                    name,
+                    "src/text/predicates.rs",
+                    NodeKind::METHOD,
+                )),
+                "{name} is a string empty predicate",
+            );
+        }
+        for name in ["Strings.regionMatches", "CharSequenceUtils::compareRegion"] {
+            assert!(
+                citation_owns_string_region_handoff(&citation(
+                    name,
+                    "src/text/compare.rs",
+                    NodeKind::METHOD,
+                )),
+                "{name} is a string region handoff",
+            );
+        }
+
+        for name in [
+            "DatabaseRecord.isBlank",
+            "Queue.isEmpty",
+            "MemoryRegion.compare",
+        ] {
+            let unrelated = citation(name, "src/storage/state.rs", NodeKind::METHOD);
+            assert!(!citation_owns_string_blank_predicate(&unrelated));
+            assert!(!citation_owns_string_empty_predicate(&unrelated));
+            assert!(!citation_owns_string_region_handoff(&unrelated));
         }
     }
 

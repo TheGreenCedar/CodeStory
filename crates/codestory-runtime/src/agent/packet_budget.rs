@@ -36,6 +36,9 @@ const AVOID_OPENING_OMISSION: &str = "avoid_opening";
 const COVERAGE_REPORT_INELIGIBLE_OMISSION: &str = "coverage_report.ineligible";
 const RETRIEVAL_TRACE_SUMMARY_OMISSION: &str = "retrieval_trace_summary";
 const RETAINED_STEP_TRACE_DETAIL_OMISSION: &str = "answer.retrieval_trace.step_details";
+const PACKET_PROOF_RESERVE_PERCENT: usize = 70;
+const PACKET_GRAPH_MAX_PERCENT: usize = 20;
+const PACKET_DIAGNOSTICS_MAX_PERCENT: usize = 10;
 
 pub(crate) fn packet_budget_limits(mode: PacketBudgetModeDto) -> PacketBudgetLimitsDto {
     match mode {
@@ -185,11 +188,13 @@ pub fn enforce_packet_output_budget_for_representation(
     representation_len: impl Fn(&AgentPacketDto) -> usize,
 ) {
     let extra_probes = packet_explicit_request_probe_queries(&packet.plan);
-    let mut needs_dependent_rebuild = packet
-        .budget
-        .omitted_sections
-        .iter()
-        .any(|section| section == "output_bytes" || section == "packet_payload");
+    let section_budget_changed = enforce_packet_section_budgets(packet, &representation_len);
+    let mut needs_dependent_rebuild = section_budget_changed
+        || packet
+            .budget
+            .omitted_sections
+            .iter()
+            .any(|section| section == "output_bytes" || section == "packet_payload");
     let mut dependent_shape_rebuilt = false;
     loop {
         let output_bytes = if needs_dependent_rebuild {
@@ -273,6 +278,9 @@ pub fn enforce_packet_output_budget_for_representation(
         } else if trim_packet_answer_retrieval_diagnostics(packet) {
             push_omitted_section(&mut packet.budget, ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION);
             structurally_trimmed = true;
+        } else if trim_one_optional_graph_unit(packet) {
+            push_omitted_section(&mut packet.budget, "trail_edges");
+            structurally_trimmed = true;
         } else if truncate_answer_markdown_to_byte_cap(&mut packet.answer, next_answer_cap) {
             push_omitted_section(&mut packet.budget, "markdown_blocks");
             structurally_trimmed = true;
@@ -299,6 +307,190 @@ pub fn enforce_packet_output_budget_for_representation(
         }
         return;
     }
+}
+
+/// Keep optional packet sections inside their shares of the exact adapter envelope before the
+/// hard-cap fixpoint starts. Material carrier edges are proof, not optional graph detail, so they
+/// are excluded from the graph share and survive every section-budget trim.
+fn enforce_packet_section_budgets(
+    packet: &mut AgentPacketDto,
+    representation_len: &impl Fn(&AgentPacketDto) -> usize,
+) -> bool {
+    debug_assert_eq!(
+        PACKET_PROOF_RESERVE_PERCENT + PACKET_GRAPH_MAX_PERCENT + PACKET_DIAGNOSTICS_MAX_PERCENT,
+        100
+    );
+    let envelope_bytes = packet_fixed_envelope_bytes(packet, representation_len);
+    let remaining_bytes =
+        (packet.budget.limits.max_output_bytes as usize).saturating_sub(envelope_bytes);
+    let graph_cap = remaining_bytes.saturating_mul(PACKET_GRAPH_MAX_PERCENT) / 100;
+    let diagnostics_cap = remaining_bytes.saturating_mul(PACKET_DIAGNOSTICS_MAX_PERCENT) / 100;
+    let mut changed = false;
+
+    while packet_optional_diagnostics_bytes(packet, representation_len) > diagnostics_cap {
+        let trimmed_sections = trim_packet_sufficiency_verbose_lists(packet);
+        if !trimmed_sections.is_empty() {
+            for section in trimmed_sections {
+                push_omitted_section(&mut packet.budget, section);
+            }
+        } else if trim_packet_retrieval_trace_summary(packet) {
+            push_omitted_section(&mut packet.budget, RETRIEVAL_TRACE_SUMMARY_OMISSION);
+        } else if trim_packet_answer_retrieval_diagnostics(packet) {
+            push_omitted_section(&mut packet.budget, ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION);
+        } else {
+            break;
+        }
+        packet.budget.truncated = true;
+        changed = true;
+    }
+
+    while packet_optional_graph_bytes(packet, representation_len) > graph_cap {
+        if !trim_one_optional_graph_unit(packet) {
+            break;
+        }
+        packet.budget.truncated = true;
+        push_omitted_section(&mut packet.budget, "trail_edges");
+        changed = true;
+    }
+
+    changed
+}
+
+fn packet_fixed_envelope_bytes(
+    packet: &AgentPacketDto,
+    representation_len: &impl Fn(&AgentPacketDto) -> usize,
+) -> usize {
+    let mut envelope = packet.clone();
+    envelope.answer.summary.clear();
+    envelope.answer.source_coverage.clear();
+    envelope.answer.sections.clear();
+    envelope.answer.citations.clear();
+    envelope.answer.subgraph_ids.clear();
+    envelope.answer.graphs.clear();
+    strip_optional_packet_diagnostics(&mut envelope);
+    representation_len(&envelope)
+}
+
+fn packet_optional_diagnostics_bytes(
+    packet: &AgentPacketDto,
+    representation_len: &impl Fn(&AgentPacketDto) -> usize,
+) -> usize {
+    let full = representation_len(packet);
+    let mut without_optional = packet.clone();
+    strip_optional_packet_diagnostics(&mut without_optional);
+    full.saturating_sub(representation_len(&without_optional))
+}
+
+fn strip_optional_packet_diagnostics(packet: &mut AgentPacketDto) {
+    let _ = trim_packet_sufficiency_verbose_lists(packet);
+    let _ = trim_packet_retrieval_trace_summary(packet);
+    let _ = trim_packet_answer_retrieval_diagnostics(packet);
+}
+
+fn packet_obligation_edge_ids(packet: &AgentPacketDto) -> Vec<EdgeId> {
+    let mut seen = HashSet::new();
+    packet
+        .plan
+        .obligations
+        .claim_obligations
+        .iter()
+        .flat_map(|obligation| obligation.carrier_edge_proofs.iter())
+        .filter_map(|proof| {
+            if seen.insert(proof.edge_id.clone()) {
+                Some(proof.edge_id.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn packet_optional_graph_bytes(
+    packet: &AgentPacketDto,
+    representation_len: &impl Fn(&AgentPacketDto) -> usize,
+) -> usize {
+    let full = representation_len(packet);
+    let protected = packet_obligation_edge_ids(packet);
+    let protected = protected.into_iter().collect::<HashSet<_>>();
+    let mut proof_only = packet.clone();
+    retain_required_graph_proof_only(&mut proof_only.answer, &protected);
+    full.saturating_sub(representation_len(&proof_only))
+}
+
+fn retain_required_graph_proof_only(answer: &mut AgentAnswerDto, protected: &HashSet<EdgeId>) {
+    answer.graphs.retain_mut(|artifact| {
+        let GraphArtifactDto::Uml { graph, .. } = artifact else {
+            return false;
+        };
+        graph.edges.retain(|edge| protected.contains(&edge.id));
+        if graph.edges.is_empty() {
+            return false;
+        }
+        let _ = prune_graph_to_retained_edges(graph);
+        true
+    });
+}
+
+fn trim_one_optional_graph_unit(packet: &mut AgentPacketDto) -> bool {
+    let protected = packet_obligation_edge_ids(packet);
+    let protected_set = protected.iter().cloned().collect::<HashSet<_>>();
+
+    if let Some(index) = packet
+        .answer
+        .graphs
+        .iter()
+        .rposition(|artifact| matches!(artifact, GraphArtifactDto::Mermaid { .. }))
+    {
+        packet.answer.graphs.remove(index);
+        return true;
+    }
+    if let Some(index) = packet
+        .answer
+        .graphs
+        .iter()
+        .rposition(|artifact| match artifact {
+            GraphArtifactDto::Uml { graph, .. } => {
+                !graph
+                    .edges
+                    .iter()
+                    .any(|edge| protected_set.contains(&edge.id))
+                    && graph.edges.is_empty()
+            }
+            GraphArtifactDto::Mermaid { .. } => false,
+        })
+    {
+        packet.answer.graphs.remove(index);
+        return true;
+    }
+
+    let total_edges = packet
+        .answer
+        .graphs
+        .iter()
+        .filter_map(|artifact| match artifact {
+            GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.len()),
+            GraphArtifactDto::Mermaid { .. } => None,
+        })
+        .sum::<usize>();
+    let protected_present = packet
+        .answer
+        .graphs
+        .iter()
+        .filter_map(|artifact| match artifact {
+            GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.iter()),
+            GraphArtifactDto::Mermaid { .. } => None,
+        })
+        .flatten()
+        .filter(|edge| protected_set.contains(&edge.id))
+        .count();
+    if total_edges <= protected_present {
+        return false;
+    }
+    cap_graph_edges(
+        &mut packet.answer,
+        total_edges.saturating_sub(1).try_into().unwrap_or(u32::MAX),
+        &protected,
+    )
 }
 
 fn refresh_packet_after_budget_mutation(
@@ -811,12 +1003,13 @@ pub(super) mod tests {
     use codestory_contracts::api::{
         AgentCitationDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
         AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalTraceDto, EdgeId, EdgeKind,
-        GraphEdgeDto, GraphNodeDto, NodeId, NodeKind, PacketClaimDto, PacketCoverageReportDto,
-        PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketPlanDto, PacketPlanQueryDto,
-        PacketProbeDto, PacketProbeRejectionCodeDto, PacketProbeRejectionDto,
-        PacketProbeResolutionDto, PacketProbeResolutionStatusDto, PacketQueryCompletionDto,
-        PacketRetrievalTraceSummaryDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto,
-        PacketSufficiencyStatusDto, SearchHitOrigin,
+        GraphEdgeDto, GraphNodeDto, NodeId, NodeKind, PacketClaimDto, PacketClaimObligationDto,
+        PacketClaimObligationKindDto, PacketCoverageReportDto, PacketEvidenceResolutionDto,
+        PacketEvidenceTierDto, PacketObligationCarrierEdgeProofDto, PacketObligationProofStatusDto,
+        PacketPlanDto, PacketPlanQueryDto, PacketProbeDto, PacketProbeRejectionCodeDto,
+        PacketProbeRejectionDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto,
+        PacketQueryCompletionDto, PacketRetrievalTraceSummaryDto, PacketSidecarQueryDiagnosticDto,
+        PacketSufficiencyDto, PacketSufficiencyStatusDto, SearchHitOrigin,
     };
 
     fn budget_graph_node(id: &str) -> GraphNodeDto {
@@ -896,6 +1089,113 @@ pub(super) mod tests {
             .collect::<Vec<_>>();
         assert_eq!(retained.len(), 2);
         assert!(retained.contains(&protected));
+    }
+
+    #[test]
+    fn section_budgets_reserve_proof_before_optional_graph_and_diagnostics() {
+        let mut packet = test_packet("Trace a material dispatch proof.", 96 * 1024);
+        let required_edge = EdgeId("required-call".to_string());
+        packet.answer.graphs = vec![budget_graph_artifact(
+            "dispatch",
+            &[
+                "ordinary-00",
+                "ordinary-01",
+                "ordinary-02",
+                "ordinary-03",
+                "ordinary-04",
+                "ordinary-05",
+                "ordinary-06",
+                "ordinary-07",
+                "ordinary-08",
+                "ordinary-09",
+                "ordinary-10",
+                "ordinary-11",
+                "ordinary-12",
+                "ordinary-13",
+                "ordinary-14",
+                "ordinary-15",
+                "ordinary-16",
+                "ordinary-17",
+                "ordinary-18",
+                "required-call",
+            ],
+        )];
+        packet.plan.obligations.claim_obligations = vec![PacketClaimObligationDto {
+            id: "material-dispatch".to_string(),
+            kind: PacketClaimObligationKindDto::Dispatch,
+            binding_terms: vec!["dispatch".to_string()],
+            probe_binding: None,
+            material: true,
+            allowed_node_kinds: vec![NodeKind::FUNCTION],
+            required_edge_kind: Some(EdgeKind::CALL),
+            requires_complete_discovery: false,
+            proof_status: PacketObligationProofStatusDto::Proven,
+            reason: None,
+            carrier_node_ids: vec![NodeId("dispatch-center".to_string())],
+            carrier_paths: vec!["src/dispatch-center.rs".to_string()],
+            carrier_edge_proofs: vec![PacketObligationCarrierEdgeProofDto {
+                carrier_node_id: NodeId("dispatch-center".to_string()),
+                edge_id: required_edge.clone(),
+                edge_kind: EdgeKind::CALL,
+            }],
+            open_next_candidates: Vec::new(),
+        }];
+        for index in 0..24 {
+            packet.answer.retrieval_trace.annotations.push(
+                codestory_contracts::api::RetrievalAnnotationDto::observation(format!(
+                    "optional diagnostic {index}: {}",
+                    "detail ".repeat(80)
+                )),
+            );
+        }
+        packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
+
+        let envelope_bytes = packet_fixed_envelope_bytes(&packet, &serialized_packet_len);
+        let remaining_bytes = 16 * 1024;
+        packet.budget.limits.max_output_bytes = (envelope_bytes + remaining_bytes)
+            .try_into()
+            .expect("test cap");
+        let graph_cap = remaining_bytes * PACKET_GRAPH_MAX_PERCENT / 100;
+        let diagnostics_cap = remaining_bytes * PACKET_DIAGNOSTICS_MAX_PERCENT / 100;
+        assert!(packet_optional_graph_bytes(&packet, &serialized_packet_len) > graph_cap);
+        assert!(
+            packet_optional_diagnostics_bytes(&packet, &serialized_packet_len) > diagnostics_cap
+        );
+
+        assert!(enforce_packet_section_budgets(
+            &mut packet,
+            &serialized_packet_len,
+        ));
+
+        assert!(packet_optional_graph_bytes(&packet, &serialized_packet_len) <= graph_cap);
+        assert!(
+            packet_optional_diagnostics_bytes(&packet, &serialized_packet_len) <= diagnostics_cap
+        );
+        assert_eq!(
+            packet.answer.citations.len(),
+            2,
+            "proof citations must survive"
+        );
+        assert!(packet.answer.graphs.iter().any(|artifact| match artifact {
+            GraphArtifactDto::Uml { graph, .. } => {
+                graph.edges.iter().any(|edge| edge.id == required_edge)
+            }
+            GraphArtifactDto::Mermaid { .. } => false,
+        }));
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .iter()
+                .any(|section| section == "trail_edges")
+        );
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .iter()
+                .any(|section| section == ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION)
+        );
     }
 
     #[test]
