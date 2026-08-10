@@ -31,6 +31,20 @@ from .subprocess_control import json_command, run
 
 SERVER_PRODUCER_LABEL = "the per-user embedding qualification server"
 _WORKER_LABEL = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+_COMMAND_UNLINK_TIMEOUT_SECS = 2.0
+
+
+def _unlink_control_command(path: Path) -> None:
+    """Remove a consumed command after a bounded Windows sharing retry."""
+    deadline = time.monotonic() + _COMMAND_UNLINK_TIMEOUT_SECS
+    while True:
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
 
 
 def control_timeout_secs(timeout: int) -> int:
@@ -220,7 +234,7 @@ def send_server_qualification_control(
         )
         return event
     finally:
-        command_path.unlink(missing_ok=True)
+        _unlink_control_command(command_path)
 
 
 def server_observation_from_control_event(event: dict, phase: str) -> dict:
