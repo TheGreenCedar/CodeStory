@@ -1310,17 +1310,16 @@ pub fn flow_belongs_to_sql_schema(citation: &AgentCitationDto) -> bool {
 #[cfg(test)]
 fn taxonomy_plural(term: &str) -> String {
     let bytes = term.as_bytes();
-    if bytes.ends_with(&[b'y'])
+    let last = bytes.last().copied();
+    let penultimate = bytes.get(bytes.len().saturating_sub(2)).copied();
+    if last == Some(b'y')
         && bytes
             .get(bytes.len().saturating_sub(2))
             .is_some_and(|previous| !matches!(previous, b'a' | b'e' | b'i' | b'o' | b'u'))
     {
         format!("{}ies", &term[..term.len() - 1])
-    } else if bytes.ends_with(&[b's'])
-        || bytes.ends_with(&[b'x'])
-        || bytes.ends_with(&[b'z'])
-        || bytes.ends_with(&[b'c', b'h'])
-        || bytes.ends_with(&[b's', b'h'])
+    } else if matches!(last, Some(b's' | b'x' | b'z'))
+        || matches!((penultimate, last), (Some(b'c' | b's'), Some(b'h')))
     {
         format!("{term}es")
     } else {

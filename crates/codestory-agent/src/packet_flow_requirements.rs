@@ -3585,12 +3585,7 @@ mod tests {
 
             let off_subject = vocabulary
                 .iter()
-                .filter(|word| {
-                    !flow
-                        .subject_words
-                        .iter()
-                        .any(|subject| *subject == word.as_str())
-                })
+                .filter(|word| !flow.subject_words.contains(&word.as_str()))
                 .collect::<Vec<_>>();
             let mut closable: Vec<String> = Vec::new();
             for object in &off_subject {
