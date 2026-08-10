@@ -32,6 +32,7 @@ const MARKDOWN_TRUNCATION_FLOOR_BYTES: usize = 256;
 const ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION: &str = "answer.retrieval_trace.diagnostics";
 const AVOID_OPENING_OMISSION: &str = "avoid_opening";
 const COVERAGE_REPORT_INELIGIBLE_OMISSION: &str = "coverage_report.ineligible";
+const PACKET_STEP_TRACE_ANNOTATION_PREFIX: &str = "packet_step_trace ";
 const RETRIEVAL_TRACE_SUMMARY_OMISSION: &str = "retrieval_trace_summary";
 
 pub(crate) fn packet_budget_limits(mode: PacketBudgetModeDto) -> PacketBudgetLimitsDto {
@@ -283,7 +284,15 @@ fn trim_packet_retrieval_trace_summary(packet: &mut AgentPacketDto) -> bool {
 fn trim_packet_answer_retrieval_diagnostics(packet: &mut AgentPacketDto) -> bool {
     let trace = &mut packet.answer.retrieval_trace;
     let original_annotation_count = trace.annotations.len();
-    trace.annotations.retain(|annotation| annotation.is_gap());
+    // Gaps affect sufficiency, and the scalar packet-step record is the retained provenance for
+    // the full trace before its verbose steps are removed. Other observations are duplicate
+    // diagnostics and can be discarded under the public payload cap.
+    trace.annotations.retain(|annotation| {
+        annotation.is_gap()
+            || annotation
+                .text
+                .starts_with(PACKET_STEP_TRACE_ANNOTATION_PREFIX)
+    });
 
     let shadow_trimmed = trace
         .retrieval_shadow
@@ -1005,6 +1014,11 @@ mod tests {
                 "material retrieval gap must survive payload trimming",
             ),
         );
+        packet.answer.retrieval_trace.annotations.push(
+            codestory_contracts::api::RetrievalAnnotationDto::observation(
+                "packet_step_trace search_total_ms=10 step_count=3",
+            ),
+        );
         packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
 
         let mut trimmed_probe = packet.clone();
@@ -1033,8 +1047,33 @@ mod tests {
                 .contains(&ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION.to_string())
         );
         assert!(packet.answer.retrieval_trace.steps.is_empty());
-        assert_eq!(packet.answer.retrieval_trace.annotations.len(), 1);
-        assert!(packet.answer.retrieval_trace.annotations[0].is_gap());
+        assert_eq!(packet.answer.retrieval_trace.annotations.len(), 2);
+        assert!(
+            packet
+                .answer
+                .retrieval_trace
+                .annotations
+                .iter()
+                .any(|annotation| annotation.is_gap())
+        );
+        assert!(
+            packet
+                .answer
+                .retrieval_trace
+                .annotations
+                .iter()
+                .any(|annotation| annotation
+                    .text
+                    .starts_with(PACKET_STEP_TRACE_ANNOTATION_PREFIX))
+        );
+        assert!(
+            !packet
+                .answer
+                .retrieval_trace
+                .annotations
+                .iter()
+                .any(|annotation| annotation.text.contains("canonical trace annotation"))
+        );
         assert_eq!(
             packet
                 .retrieval_trace_summary
