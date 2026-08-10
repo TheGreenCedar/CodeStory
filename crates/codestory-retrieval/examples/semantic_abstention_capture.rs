@@ -71,6 +71,7 @@ fn main() -> Result<()> {
         .arg(&project)
         .arg("--cache-dir")
         .arg(&cache)
+        .env("CODESTORY_CACHE_ROOT", &cache)
         .args([
             "--profile",
             "local",
@@ -127,6 +128,7 @@ fn main() -> Result<()> {
             .arg(&project)
             .arg("--cache-dir")
             .arg(&cache)
+            .env("CODESTORY_CACHE_ROOT", &cache)
             .args(["--format", "json", spec.query])
             .env(QUERY_VECTOR_CAPTURE_DIR_ENV, &query_vector_dir)
             .output()
