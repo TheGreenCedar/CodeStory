@@ -474,39 +474,30 @@ fn search_lexical_index_with_cancel_inner(
     let total_weight = token_weights.iter().sum::<f32>();
     let required_weight = required_lexical_match_weight(tokens.len(), total_weight);
 
-    let mut statement = connection.prepare(
-        "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
-                d.source, d.node_id, d.symbol_name, d.start_line
-         FROM lexical_fts
-         JOIN lexical_documents d ON d.id = lexical_fts.rowid
-         WHERE lexical_fts MATCH ?1
-         ORDER BY bm25(lexical_fts, 8.0, 1.0)
-         LIMIT ?2",
+    let mut candidates = query_fts_candidates(
+        &connection,
+        &fts_query,
+        candidate_limit,
+        LexicalCandidateOrder::Path,
     )?;
-    let rows = statement.query_map(params![fts_query, candidate_limit as i64], |row| {
-        let document = LexicalDocument {
-            path: row.get(0)?,
-            content: row.get(1)?,
-            source: LexicalDocumentSource::parse(&row.get::<_, String>(4)?).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    4,
-                    rusqlite::types::Type::Text,
-                    error.into(),
-                )
-            })?,
-            node_id: row.get(5)?,
-            symbol_name: row.get(6)?,
-            start_line: row.get(7)?,
-        };
-        Ok((document, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
-    })?;
+    candidates.extend(query_fts_candidates(
+        &connection,
+        &fts_query,
+        candidate_limit,
+        LexicalCandidateOrder::Content,
+    )?);
 
     let mut hits = Vec::new();
-    for (index, row) in rows.enumerate() {
+    let mut seen = HashSet::new();
+    for (index, (document, normalized_path, normalized_content)) in
+        candidates.into_iter().enumerate()
+    {
         if index % 64 == 0 && cancelled() {
             bail!("lexical search cancelled");
         }
-        let (document, normalized_path, normalized_content) = row?;
+        if !seen.insert(lexical_candidate_identity(&document)) {
+            continue;
+        }
         let token_match = lexical_token_match(
             &tokens,
             &token_weights,
@@ -514,7 +505,7 @@ fn search_lexical_index_with_cancel_inner(
             &normalized_content,
         );
         if token_match.matched_weight >= required_weight
-            && broad_query_path_gate(tokens.len(), &token_match)
+            && lexical_match_is_eligible(tokens.len(), &document.path, &token_match)
         {
             let (target, matched_line, source_excerpt) =
                 if document.source == LexicalDocumentSource::LexicalSource {
@@ -548,9 +539,94 @@ fn search_lexical_index_with_cancel_inner(
             .partial_cmp(&left.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| lexical_source_rank(left.source).cmp(&lexical_source_rank(right.source)))
+            .then_with(|| left.node_id.cmp(&right.node_id))
+            .then_with(|| left.symbol_name.cmp(&right.symbol_name))
+            .then_with(|| left.start_line.cmp(&right.start_line))
     });
     hits.truncate(limit);
     Ok(hits)
+}
+
+fn lexical_source_rank(source: LexicalDocumentSource) -> u8 {
+    match source {
+        LexicalDocumentSource::LexicalSource => 0,
+        LexicalDocumentSource::SymbolDoc => 1,
+        LexicalDocumentSource::ComponentReport => 2,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LexicalCandidateOrder {
+    Path,
+    Content,
+}
+
+type LexicalCandidate = (LexicalDocument, String, String);
+
+fn query_fts_candidates(
+    connection: &Connection,
+    fts_query: &str,
+    candidate_limit: usize,
+    order: LexicalCandidateOrder,
+) -> Result<Vec<LexicalCandidate>> {
+    let sql = match order {
+        LexicalCandidateOrder::Path => {
+            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1
+             ORDER BY bm25(lexical_fts, 8.0, 1.0), d.path, d.id
+             LIMIT ?2"
+        }
+        LexicalCandidateOrder::Content => {
+            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1
+             ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
+             LIMIT ?2"
+        }
+    };
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map(params![fts_query, candidate_limit as i64], |row| {
+        let document = LexicalDocument {
+            path: row.get(0)?,
+            content: row.get(1)?,
+            source: LexicalDocumentSource::parse(&row.get::<_, String>(4)?).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })?,
+            node_id: row.get(5)?,
+            symbol_name: row.get(6)?,
+            start_line: row.get(7)?,
+        };
+        Ok((document, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn lexical_candidate_identity(
+    document: &LexicalDocument,
+) -> (String, u8, Option<String>, Option<String>, Option<u32>) {
+    let source = match document.source {
+        LexicalDocumentSource::LexicalSource => 0,
+        LexicalDocumentSource::SymbolDoc => 1,
+        LexicalDocumentSource::ComponentReport => 2,
+    };
+    (
+        document.path.clone(),
+        source,
+        document.node_id.clone(),
+        document.symbol_name.clone(),
+        document.start_line,
+    )
 }
 
 pub fn shard_dir_for(lexical_data_dir: &Path, project_id: &str) -> PathBuf {
@@ -1433,10 +1509,11 @@ fn lexical_token_weight(document_frequency: usize, document_count: usize) -> f32
 }
 
 fn required_lexical_match_weight(token_count: usize, total_weight: f32) -> f32 {
-    if token_count <= 3 {
-        total_weight
-    } else {
-        (total_weight * 0.28).max(2.5)
+    match token_count {
+        0 => 0.0,
+        1 => total_weight,
+        2 | 3 => total_weight * 0.60,
+        _ => (total_weight * 0.35).max(2.5),
     }
 }
 
@@ -1446,7 +1523,6 @@ struct LexicalTokenMatch {
     path_weight: f32,
     content_weight: f32,
     total_weight: f32,
-    meaningful_path_weight: f32,
 }
 
 fn lexical_token_match(
@@ -1460,7 +1536,6 @@ fn lexical_token_match(
         path_weight: 0.0,
         content_weight: 0.0,
         total_weight: 0.0,
-        meaningful_path_weight: 0.0,
     };
     for (token, weight) in tokens.iter().zip(token_weights.iter().copied()) {
         result.total_weight += weight;
@@ -1471,19 +1546,12 @@ fn lexical_token_match(
         }
         if path_factor > 0.0 {
             result.path_weight += weight * path_factor;
-            if path_factor >= 1.0 && weight >= 1.5 {
-                result.meaningful_path_weight += weight;
-            }
         }
         if content_match {
             result.content_weight += weight;
         }
     }
     result
-}
-
-fn broad_query_path_gate(token_count: usize, token_match: &LexicalTokenMatch) -> bool {
-    token_count < 8 || token_match.meaningful_path_weight > 0.0
 }
 
 fn path_match_factor(normalized_path: &str, token: &str) -> f32 {
@@ -1496,6 +1564,25 @@ fn path_match_factor(normalized_path: &str, token: &str) -> f32 {
     }
 }
 
+fn lexical_match_is_eligible(
+    token_count: usize,
+    path: &str,
+    token_match: &LexicalTokenMatch,
+) -> bool {
+    if token_count < 8 || token_match.path_weight > 0.0 {
+        return true;
+    }
+    let coverage = if token_match.total_weight <= 0.0 {
+        0.0
+    } else {
+        token_match.matched_weight / token_match.total_weight
+    };
+    matches!(
+        lexical_file_role(path),
+        FileRole::Entrypoint | FileRole::Source
+    ) && coverage >= 0.45
+}
+
 fn score_lexical_match(
     path: &str,
     source: LexicalDocumentSource,
@@ -1506,28 +1593,54 @@ fn score_lexical_match(
     } else {
         token_match.matched_weight / token_match.total_weight
     };
-    let mut score = 0.20_f32
-        + coverage * 0.25
-        + token_match.path_weight * 0.09
-        + token_match.content_weight * 0.035;
-    let path_lower = path.replace('\\', "/").to_ascii_lowercase();
-    if path_lower.contains("/src/") || path_lower.starts_with("src/") {
-        score += 0.04;
-    }
-    if source == LexicalDocumentSource::ComponentReport {
-        score += 0.08;
+    let path_coverage = if token_match.total_weight <= 0.0 {
+        0.0
     } else {
-        score *= match FileRole::classify_path(Path::new(path)) {
-            FileRole::Entrypoint => 1.08,
-            FileRole::Source => 1.0,
-            FileRole::Test => 0.68,
-            FileRole::Docs => 0.72,
-            FileRole::Benchmark => 0.64,
-            FileRole::Generated => 0.55,
-            FileRole::Vendor => 0.45,
-        };
+        token_match.path_weight / token_match.total_weight
+    };
+    let content_coverage = if token_match.total_weight <= 0.0 {
+        0.0
+    } else {
+        token_match.content_weight / token_match.total_weight
+    };
+    let role_prior = match lexical_file_role(path) {
+        FileRole::Entrypoint => 1.0,
+        FileRole::Source => 0.9,
+        FileRole::Test => 0.55,
+        FileRole::Docs => 0.50,
+        FileRole::Benchmark => 0.45,
+        FileRole::Generated => 0.35,
+        FileRole::Vendor => 0.25,
+    };
+    let source_quality = match source {
+        LexicalDocumentSource::SymbolDoc => 1.0,
+        LexicalDocumentSource::LexicalSource => 0.9,
+        LexicalDocumentSource::ComponentReport => 0.8,
+    };
+    (0.55 * coverage
+        + 0.20 * content_coverage.clamp(0.0, 1.0)
+        + 0.15 * path_coverage.clamp(0.0, 1.0)
+        + 0.05 * role_prior
+        + 0.05 * source_quality)
+        .clamp(0.0, 1.0)
+}
+
+fn lexical_file_role(path: &str) -> FileRole {
+    let path = Path::new(path);
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "md" | "mdx" | "rst"
+            )
+        })
+    {
+        FileRole::Docs
+    } else {
+        FileRole::classify_path(path)
     }
-    score.min(0.99)
 }
 
 #[cfg(test)]
@@ -1666,6 +1779,33 @@ mod tests {
                 .is_empty()
         );
         assert!(search_lexical_index(&shard_a, "wrong-input", "handler", 8).is_err());
+    }
+
+    #[test]
+    fn lexical_union_retains_content_candidates_beyond_the_path_rank_window() {
+        let project = TempDir::new().expect("project");
+        let path_matches = project.path().join("needle");
+        std::fs::create_dir_all(&path_matches).expect("path matches");
+        for index in 0..300 {
+            std::fs::write(
+                path_matches.join(format!("path_match_{index:03}.rs")),
+                "fn unrelated() {}",
+            )
+            .expect("path candidate");
+        }
+        let content_match = project.path().join("src/content_match.rs");
+        std::fs::create_dir_all(content_match.parent().expect("parent")).expect("src");
+        std::fs::write(&content_match, "fn content_match() { /* needle */ }")
+            .expect("content candidate");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "union", "input");
+
+        let hits = search_lexical_index(&shard, "input", "needle", 1).expect("search");
+
+        assert_eq!(
+            hits.first().map(|hit| hit.path.as_str()),
+            Some("src/content_match.rs")
+        );
     }
 
     #[test]

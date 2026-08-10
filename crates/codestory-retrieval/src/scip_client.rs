@@ -5,13 +5,13 @@ use crate::scip_index::{
     load_scip_symbols, parse_scip_index_marker, reference_defect,
 };
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// Anchors expanded per stage-2 call, and the score a validated adjacency hit
-/// enters fusion with.
-const SCIP_ADJACENCY_ANCHOR_LIMIT: usize = 4;
-const SCIP_ADJACENCY_SCORE: f32 = 0.65;
+/// Bound graph work while retaining independently ranked anchors from more
+/// than one file and retrieval lane.
+const SCIP_ADJACENCY_ANCHOR_LIMIT: usize = 8;
+const SCIP_ADJACENCY_ANCHORS_PER_FILE: usize = 2;
 
 /// Artifact status meaning "the graph lane is ready to serve".
 const SCIP_READY_STATUS: &str = "ready";
@@ -190,29 +190,31 @@ impl ScipClient {
             return Ok(Vec::new());
         };
 
-        let mut anchor_hops: Vec<(&str, u32)> = Vec::new();
-        for anchor in anchors.iter().take(SCIP_ADJACENCY_ANCHOR_LIMIT) {
+        let selected_anchors = selected_adjacency_anchors(anchors);
+        let mut anchor_hops: Vec<(&str, u32, f32)> = Vec::new();
+        for anchor in selected_anchors {
             let Some(node_id) = anchor.node_id.as_deref() else {
                 continue;
             };
-            if anchor_hops.iter().any(|(seen, _)| *seen == node_id) {
+            if anchor_hops.iter().any(|(seen, _, _)| *seen == node_id) {
                 continue;
             }
-            anchor_hops.push((node_id, anchor.scip_hop_distance.unwrap_or(0)));
+            anchor_hops.push((
+                node_id,
+                anchor.scip_hop_distance.unwrap_or(0),
+                adjacency_anchor_relevance(anchor),
+            ));
         }
         if anchor_hops.is_empty() {
             return Ok(Vec::new());
         }
 
         let lookup = ScipSymbolLookup::new(&index.symbols);
-        let mut emitted: HashSet<&str> = anchor_hops.iter().map(|(node_id, _)| *node_id).collect();
-        let mut hits = Vec::new();
+        let emitted: HashSet<&str> = anchor_hops.iter().map(|(node_id, _, _)| *node_id).collect();
+        let mut hits_by_node = HashMap::<String, super::CandidateHit>::new();
         for (position, proof) in index.proofs.iter().enumerate() {
             if position % 64 == 0 && cancelled() {
                 anyhow::bail!("SCIP reference adjacency cancelled");
-            }
-            if hits.len() >= limit {
-                break;
             }
             if !proof.is_reference() {
                 continue;
@@ -222,16 +224,18 @@ impl ScipClient {
             else {
                 continue;
             };
-            let Some((neighbor_node_id, anchor_hop)) =
-                anchor_hops.iter().find_map(|(anchor_node_id, hop)| {
-                    if *anchor_node_id == node_id {
-                        Some((target_node_id, *hop))
-                    } else if *anchor_node_id == target_node_id {
-                        Some((node_id, *hop))
-                    } else {
-                        None
-                    }
-                })
+            let Some((neighbor_node_id, anchor_hop, anchor_relevance, direction_weight)) =
+                anchor_hops
+                    .iter()
+                    .find_map(|(anchor_node_id, hop, relevance)| {
+                        if *anchor_node_id == node_id {
+                            Some((target_node_id, *hop, *relevance, 1.0))
+                        } else if *anchor_node_id == target_node_id {
+                            Some((node_id, *hop, *relevance, 0.9))
+                        } else {
+                            None
+                        }
+                    })
             else {
                 continue;
             };
@@ -244,20 +248,93 @@ impl ScipClient {
             let Some(neighbor) = lookup.symbol_for_node(neighbor_node_id) else {
                 continue;
             };
-            hits.push(symbol_to_hit(
-                neighbor,
-                SCIP_ADJACENCY_SCORE,
-                anchor_hop.saturating_add(1),
-                provenance,
-            ));
-            emitted.insert(neighbor_node_id);
+            let hop = anchor_hop.saturating_add(1);
+            let score = (anchor_relevance * direction_weight / hop.max(1) as f32).clamp(0.0, 1.0);
+            let hit = symbol_to_hit(neighbor, score, hop, provenance);
+            match hits_by_node.entry(neighbor_node_id.to_string()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if hit.score > entry.get().score
+                        || (hit.score == entry.get().score
+                            && hit.scip_hop_distance < entry.get().scip_hop_distance)
+                    {
+                        entry.insert(hit);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(hit);
+                }
+            }
         }
         if cancelled() {
             anyhow::bail!("SCIP reference adjacency cancelled");
         }
+        let mut hits = hits_by_node.into_values().collect::<Vec<_>>();
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.file_path.cmp(&right.file_path))
+                .then_with(|| left.symbol_name.cmp(&right.symbol_name))
+                .then_with(|| left.start_line.cmp(&right.start_line))
+        });
         hits.truncate(limit);
         Ok(hits)
     }
+}
+
+fn selected_adjacency_anchors(anchors: &[super::CandidateHit]) -> Vec<&super::CandidateHit> {
+    let mut selected = anchors
+        .iter()
+        .filter(|anchor| anchor.node_id.is_some())
+        .collect::<Vec<_>>();
+    selected.sort_by(|left, right| {
+        let left_exact = left.provenance.iter().any(|label| label == "exact");
+        let right_exact = right.provenance.iter().any(|label| label == "exact");
+        right_exact
+            .cmp(&left_exact)
+            .then_with(|| best_lane_rank(left).cmp(&best_lane_rank(right)))
+            .then_with(|| {
+                adjacency_anchor_relevance(right)
+                    .partial_cmp(&adjacency_anchor_relevance(left))
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| left.file_path.cmp(&right.file_path))
+            .then_with(|| left.symbol_name.cmp(&right.symbol_name))
+            .then_with(|| left.start_line.cmp(&right.start_line))
+    });
+    let mut per_file = HashMap::<&str, usize>::new();
+    selected.retain(|anchor| {
+        let count = per_file.entry(anchor.file_path.as_str()).or_default();
+        if *count >= SCIP_ADJACENCY_ANCHORS_PER_FILE {
+            return false;
+        }
+        *count += 1;
+        true
+    });
+    selected.truncate(SCIP_ADJACENCY_ANCHOR_LIMIT);
+    selected
+}
+
+fn best_lane_rank(candidate: &super::CandidateHit) -> u32 {
+    [
+        candidate.lane_scores.lexical.as_ref(),
+        candidate.lane_scores.semantic.as_ref(),
+        candidate.lane_scores.graph.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|evidence| (evidence.rank > 0).then_some(evidence.rank))
+    .min()
+    .unwrap_or(u32::MAX)
+}
+
+fn adjacency_anchor_relevance(candidate: &super::CandidateHit) -> f32 {
+    let rank = best_lane_rank(candidate);
+    if rank != u32::MAX {
+        return ((20.0 + 1.0) / (20.0 + rank as f32)).clamp(0.0, 1.0);
+    }
+    candidate.score.clamp(0.0, 1.0)
 }
 
 fn symbol_to_hit(
@@ -267,7 +344,7 @@ fn symbol_to_hit(
     provenance: &str,
 ) -> super::CandidateHit {
     use super::candidate::{CandidateHit, CandidateSource};
-    CandidateHit {
+    let mut hit = CandidateHit {
         node_id: if provenance == SCIP_GRAPH_PROJECTION_PROVENANCE {
             symbol.node_id.clone()
         } else {
@@ -279,12 +356,20 @@ fn symbol_to_hit(
         target: None,
         source_excerpt: None,
         score,
+        lane_scores: Default::default(),
         source: CandidateSource::Scip,
         provenance: vec![provenance.into()],
         file_role: None,
         scip_hop_distance: Some(hop),
         rank_features: None,
-    }
+    };
+    hit.record_lane(
+        CandidateSource::Scip.lane(),
+        score,
+        0,
+        if hop == 0 { "exact" } else { "graph_neighbor" },
+    );
+    hit
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1103,6 +1188,40 @@ mod tests {
         );
         assert_eq!(hits[0].node_id.as_deref(), Some("4"));
         assert_eq!(hits[0].scip_hop_distance, Some(1));
+    }
+
+    #[test]
+    fn stage_two_order_is_independent_of_serialized_proof_order() {
+        let root = TempDir::new().expect("root");
+        let layout = adjacency_layout(&root);
+        let symbols = adjacency_symbols();
+        let first = graph_reference_proof(&symbols[0], &symbols[1]);
+        let second = graph_reference_proof(&symbols[0], &symbols[2]);
+        write_adjacency_artifact(
+            &layout,
+            "generation-a",
+            "generation-a",
+            vec![first.clone(), second.clone()],
+        );
+        write_adjacency_artifact(&layout, "generation-b", "generation-b", vec![second, first]);
+
+        let first_order =
+            ScipClient::expand_reference_adjacency(&layout, "generation-a", &[client_anchor()], 1)
+                .expect("first order");
+        let reverse_order =
+            ScipClient::expand_reference_adjacency(&layout, "generation-b", &[client_anchor()], 1)
+                .expect("reverse order");
+
+        assert_eq!(
+            first_order
+                .iter()
+                .map(|hit| (&hit.file_path, &hit.symbol_name, hit.score))
+                .collect::<Vec<_>>(),
+            reverse_order
+                .iter()
+                .map(|hit| (&hit.file_path, &hit.symbol_name, hit.score))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

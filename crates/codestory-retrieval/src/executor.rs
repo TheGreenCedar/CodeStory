@@ -1,7 +1,7 @@
 use crate::cache::RetrievalCache;
 #[cfg(test)]
 use crate::cache::RetrievalCacheKey;
-use crate::candidate::{CandidateHit, fused_candidate_identity_matches};
+use crate::candidate::{CandidateHit, CandidateLane, fused_candidate_identity_matches};
 use crate::health::{
     probe_sidecar_health, probe_sidecar_health_for_runtime,
     probe_sidecar_health_with_embedding_device,
@@ -437,20 +437,6 @@ impl<'a> QueryExecutor<'a> {
                 return Ok(Some(cancel_reason.unwrap_or_else(|| "deadline".into())));
             }
 
-            if should_skip_after_exact_symbol_anchor(stage, features, candidates) {
-                let mut trace = stage_trace(
-                    stage,
-                    0,
-                    0,
-                    0.0,
-                    Some("exact_symbol_anchor".into()),
-                    false,
-                    None,
-                );
-                trace.completion_status = StageCompletionStatus::Skipped;
-                stage_traces.push(trace);
-                continue;
-            }
             if should_skip_zero_dense_stage(stage, self.manifest.as_ref()) {
                 let mut trace = stage_trace(
                     stage,
@@ -545,7 +531,14 @@ impl<'a> QueryExecutor<'a> {
             if let Some(threshold) = options.stop_marginal_gain_threshold {
                 if marginal_gain < threshold && !candidates.is_empty() {
                     low_gain_streak += 1;
-                    if low_gain_streak >= options.stop_after_low_gain_streak {
+                    let remaining_stages = &stages[index + 1..];
+                    let only_diagnostic_stages_remain = !remaining_stages.is_empty()
+                        && remaining_stages
+                            .iter()
+                            .all(|stage| stage.kind == RetrievalStageKind::Stage3RepoTextFallback);
+                    if low_gain_streak >= options.stop_after_low_gain_streak
+                        && only_diagnostic_stages_remain
+                    {
                         return Ok(Some(
                             cancel_reason.unwrap_or_else(|| "marginal_gain".into()),
                         ));
@@ -834,28 +827,6 @@ fn stage_trace(
     }
 }
 
-fn should_skip_after_exact_symbol_anchor(
-    stage: &PlannedStage,
-    features: &QueryFeatures,
-    candidates: &[CandidateHit],
-) -> bool {
-    if !matches!(
-        features.shape,
-        crate::query_features::QueryShape::SymbolLike
-    ) {
-        return false;
-    }
-    if !matches!(
-        stage.kind,
-        RetrievalStageKind::Stage1bSemantic | RetrievalStageKind::Stage2ScipExpand
-    ) {
-        return false;
-    }
-    candidates
-        .iter()
-        .any(|candidate| candidate_is_exact_symbol_anchor(&features.raw_query, candidate))
-}
-
 fn should_skip_zero_dense_stage(
     stage: &PlannedStage,
     manifest: Option<&RetrievalIndexManifest>,
@@ -875,46 +846,27 @@ fn should_skip_zero_dense_stage(
 
 fn annotate_stage_provenance(stage: &PlannedStage, hits: &mut [CandidateHit]) {
     if let Some(label) = stage.kind.provenance_label() {
-        for hit in hits {
+        let lane = match stage.kind {
+            RetrievalStageKind::Stage0ScipAnchor | RetrievalStageKind::Stage2ScipExpand => {
+                CandidateLane::Graph
+            }
+            RetrievalStageKind::Stage1Lexical => CandidateLane::Lexical,
+            RetrievalStageKind::Stage1bSemantic => CandidateLane::Semantic,
+            RetrievalStageKind::Stage3RepoTextFallback => return,
+        };
+        for (index, hit) in hits.iter_mut().enumerate() {
+            let raw_score = hit.score;
             hit.add_provenance(label);
+            hit.record_lane(lane, raw_score, (index + 1) as u32, label);
         }
     }
 }
 
-fn candidate_is_exact_symbol_anchor(query: &str, candidate: &CandidateHit) -> bool {
-    if matches!(
-        candidate.source,
-        crate::candidate::CandidateSource::Semantic | crate::candidate::CandidateSource::Legacy
-    ) {
-        return false;
-    }
-    let Some(symbol) = candidate.symbol_name.as_deref() else {
-        return false;
-    };
-    let query_lower = query.trim().to_ascii_lowercase();
-    if query_lower.is_empty() {
-        return false;
-    }
-    let symbol_lower = symbol.trim().to_ascii_lowercase();
-    if symbol_lower == query_lower {
-        return true;
-    }
-    let symbol_tail = symbol_lower
-        .rsplit("::")
-        .next()
-        .unwrap_or(&symbol_lower)
-        .rsplit('.')
-        .next()
-        .unwrap_or(&symbol_lower);
-    query
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|token| token.len() >= 2)
-        .map(|token| token.to_ascii_lowercase())
-        .any(|token| token == symbol_tail)
-}
-
 fn candidate_mass(candidates: &[CandidateHit]) -> f32 {
-    candidates.iter().map(|hit| hit.score.max(0.01)).sum()
+    candidates
+        .iter()
+        .map(|hit| hit.lane_scores.evidence_count().max(1) as f32)
+        .sum()
 }
 
 fn stage_stub_metadata(hits: &[CandidateHit]) -> (Option<String>, bool) {
@@ -934,7 +886,7 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
             .iter_mut()
             .find(|existing| fused_candidate_identity_matches(existing, &hit));
         if let Some(existing) = duplicate {
-            existing.score = existing.score.max(hit.score);
+            existing.merge_lane_scores(&hit.lane_scores);
             if existing.node_id.is_none() {
                 existing.node_id = hit.node_id.clone();
             }
@@ -950,9 +902,10 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
             if existing.file_role.is_none() {
                 existing.file_role = hit.file_role;
             }
-            if existing.scip_hop_distance.is_none() {
-                existing.scip_hop_distance = hit.scip_hop_distance;
-            }
+            existing.scip_hop_distance = match (existing.scip_hop_distance, hit.scip_hop_distance) {
+                (Some(existing), Some(incoming)) => Some(existing.min(incoming)),
+                (existing, incoming) => existing.or(incoming),
+            };
             for label in hit.provenance {
                 existing.add_provenance(label);
             }
@@ -1155,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn executor_caches_successful_marginal_gain_stop() {
+    fn executor_caches_completed_low_gain_sequence() {
         let query = "explain startup request flow";
         let mock = Arc::new(MockSidecarSearch {
             lexical: Mutex::new(HashMap::from([(
@@ -1181,7 +1134,7 @@ mod tests {
             mode_override: Some(RetrievalDegradedMode::Full),
         };
         let first = executor.execute(query, Some(1_000)).expect("first query");
-        assert_eq!(first.trace.cancel_reason.as_deref(), Some("marginal_gain"));
+        assert_eq!(first.trace.cancel_reason, None);
         assert!(!first.trace.cache_hit);
 
         let cached = executor.execute(query, Some(1_000)).expect("cached query");
@@ -1190,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn executor_skips_semantic_and_expand_after_exact_symbol_anchor() {
+    fn executor_keeps_complementary_lanes_after_exact_symbol_anchor() {
         let mock = MockSidecarSearch {
             scip_anchor: Mutex::new(HashMap::from([(
                 "EventProcessor".into(),
@@ -1238,28 +1191,65 @@ mod tests {
             result
                 .hits
                 .iter()
-                .all(|hit| hit.file_path != "docs/event-output.md")
+                .any(|hit| hit.file_path == "docs/event-output.md")
         );
-        let skipped: Vec<_> = result
-            .trace
-            .stages
-            .iter()
-            .filter(|stage| stage.cancel_reason.as_deref() == Some("exact_symbol_anchor"))
-            .map(|stage| stage.stage)
-            .collect();
-        assert!(skipped.contains(&RetrievalStageKind::Stage1bSemantic));
-        assert!(skipped.contains(&RetrievalStageKind::Stage2ScipExpand));
-        let skipped_final = result
-            .trace
-            .stages
-            .iter()
-            .find(|stage| stage.stage == RetrievalStageKind::Stage1bSemantic)
-            .expect("skipped final stage");
-        assert_eq!(skipped_final.budget_ms, 120);
-        assert_eq!(
-            skipped_final.completion_status,
-            StageCompletionStatus::Skipped
+        for kind in [
+            RetrievalStageKind::Stage1bSemantic,
+            RetrievalStageKind::Stage2ScipExpand,
+        ] {
+            let stage = result
+                .trace
+                .stages
+                .iter()
+                .find(|stage| stage.stage == kind)
+                .expect("complementary stage");
+            assert_eq!(stage.completion_status, StageCompletionStatus::Completed);
+        }
+    }
+
+    #[test]
+    fn low_gain_stages_cannot_skip_graph_expansion_of_an_exact_anchor() {
+        let query = "explain how EventProcessor handles output";
+        let mock = MockSidecarSearch {
+            scip_anchor: Mutex::new(HashMap::from([(
+                query.into(),
+                vec![CandidateHit::with_source(
+                    "src/event_processor.rs",
+                    Some("EventProcessor".into()),
+                    0.95,
+                    CandidateSource::Scip,
+                )],
+            )])),
+            scip_expand: Mutex::new(vec![CandidateHit::with_source(
+                "src/event_sink.rs",
+                Some("EventSink".into()),
+                0.80,
+                CandidateSource::Scip,
+            )]),
+            ..Default::default()
+        };
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(mock),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+
+        let result = executor.execute(query, Some(800)).expect("query");
+
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.file_path == "src/event_sink.rs")
         );
+        assert!(result.trace.stages.iter().any(|stage| {
+            stage.stage == RetrievalStageKind::Stage2ScipExpand
+                && stage.completion_status == StageCompletionStatus::Completed
+        }));
     }
 
     #[test]
@@ -2168,12 +2158,11 @@ mod tests {
         assert!(hit.provenance.iter().any(|label| label == "graph_neighbor"));
         assert!(hit.provenance.iter().any(|label| label == "dense_anchor"));
         let rank_features = hit.rank_features.as_ref().expect("rank features");
-        assert!(rank_features.lexical >= 0.85);
-        assert!(rank_features.semantic >= 0.85);
+        assert_eq!(rank_features.lexical, 0.70);
+        assert_eq!(rank_features.semantic, 0.85);
         assert_eq!(
-            rank_features.scip_distance, 0.5,
-            "a stage-2 candidate carries real reference adjacency, so the published graph \
-             feature is the hop-1 value rather than the non-graph floor: {hit:?}"
+            rank_features.scip_distance, 0.75,
+            "a stage-2 candidate must retain its own graph-lane score: {hit:?}"
         );
     }
 

@@ -96,12 +96,7 @@ pub fn plan_query(features: &QueryFeatures, mode: RetrievalDegradedMode) -> Retr
     let mut stages = Vec::new();
     let top_k = top_k_for_shape(features.shape);
 
-    if mode.runs_scip_stages()
-        && matches!(
-            features.shape,
-            QueryShape::SymbolLike | QueryShape::PathLike
-        )
-    {
+    if mode.runs_scip_stages() && (features.intent.symbol || features.intent.path) {
         stages.push(PlannedStage {
             kind: RetrievalStageKind::Stage0ScipAnchor,
             budget_ms: stage0_budget_ms(features.shape),
@@ -117,7 +112,7 @@ pub fn plan_query(features: &QueryFeatures, mode: RetrievalDegradedMode) -> Retr
         });
     }
 
-    let semantic_stage = if mode.runs_semantic_stage() && features.shape != QueryShape::PathLike {
+    let semantic_stage = if mode.runs_semantic_stage() && !features.intent.standalone_path {
         let semantic_top_k = match features.shape {
             QueryShape::NaturalLanguage | QueryShape::Mixed => top_k.saturating_mul(2).min(40),
             _ => top_k,
@@ -145,10 +140,7 @@ pub fn plan_query(features: &QueryFeatures, mode: RetrievalDegradedMode) -> Retr
         None
     };
 
-    if matches!(
-        features.shape,
-        QueryShape::NaturalLanguage | QueryShape::Mixed
-    ) {
+    if features.intent.natural_language {
         stages.extend(semantic_stage);
         stages.extend(scip_expand_stage);
     } else {
@@ -182,7 +174,7 @@ fn top_k_for_shape(shape: QueryShape) -> usize {
 fn stage0_budget_ms(shape: QueryShape) -> u64 {
     match shape {
         QueryShape::SymbolLike | QueryShape::PathLike => 40,
-        _ => 30,
+        QueryShape::NaturalLanguage | QueryShape::Mixed => 120,
     }
 }
 
@@ -336,7 +328,7 @@ mod tests {
         let features = classify_query("Explain how FooBar flows through request handling");
         let plan = plan_query(&features, RetrievalDegradedMode::Full);
         let kinds: Vec<_> = plan.stages.iter().map(|s| s.kind).collect();
-        assert!(!kinds.contains(&RetrievalStageKind::Stage0ScipAnchor));
+        assert!(kinds.contains(&RetrievalStageKind::Stage0ScipAnchor));
         assert!(kinds.contains(&RetrievalStageKind::Stage1Lexical));
         assert!(kinds.contains(&RetrievalStageKind::Stage2ScipExpand));
         assert!(kinds.contains(&RetrievalStageKind::Stage1bSemantic));
@@ -347,6 +339,17 @@ mod tests {
                 < kinds
                     .iter()
                     .position(|kind| *kind == RetrievalStageKind::Stage2ScipExpand)
+        );
+    }
+
+    #[test]
+    fn slash_separated_concepts_keep_semantic_recall() {
+        let features = classify_query("how does input/output validation work");
+        let plan = plan_query(&features, RetrievalDegradedMode::Full);
+        assert!(
+            plan.stages
+                .iter()
+                .any(|stage| stage.kind == RetrievalStageKind::Stage1bSemantic)
         );
     }
 }

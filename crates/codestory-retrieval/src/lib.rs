@@ -244,7 +244,10 @@ pub use cache_clean::{
     CacheCleanRefusal, CacheCleanRemoval, CacheCleanReport, CacheCleanRetained, apply_cache_clean,
     plan_cache_clean,
 };
-pub use candidate::{CandidateHit, CandidateSource, RankFeatures};
+pub use candidate::{
+    CandidateHit, CandidateLane, CandidateLaneEvidence, CandidateLaneScores, CandidateSource,
+    RankFeatures,
+};
 pub use candidate::{is_phantom_sidecar_hit, phantom_sidecar_candidates_only};
 pub use capabilities::SidecarCapabilities;
 pub use codestory_llama_sys::{
@@ -348,7 +351,7 @@ pub use query::{
     execute_strict_retrieval_query_batch_with_cache_for_runtime, is_retrieval_publication_changed,
     retrieval_publication_identity_from_storage,
 };
-pub use query_features::{QueryFeatures, QueryShape, classify_query};
+pub use query_features::{QueryFeatures, QueryIntent, QueryShape, classify_query};
 pub use ranker::rank_candidates;
 pub use retention::{
     GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport, GenerationRetentionLock,

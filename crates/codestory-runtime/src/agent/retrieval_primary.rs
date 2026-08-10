@@ -882,13 +882,8 @@ fn sidecar_primary_search_outcome_from_resolution(
 
     let scored_hits = hits
         .iter()
-        .map(|hit| HybridSearchScoredHit {
-            hit: hit.clone(),
-            lexical_score: hit.score,
-            semantic_score: 0.0,
-            graph_score: 0.0,
-            total_score: hit.score,
-        })
+        .cloned()
+        .map(HybridSearchScoredHit::from_search_hit)
         .collect();
 
     SidecarPrimarySearchOutcome::Served {
@@ -2060,11 +2055,37 @@ fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBrea
         .rank_features
         .as_ref()
         .map(|features| (features.lexical, features.semantic, features.scip_distance))
-        .unwrap_or_else(|| match candidate.source {
-            CandidateSource::Lexical => (candidate.score, 0.0, 0.0),
-            CandidateSource::Semantic => (0.0, candidate.score, 0.0),
-            CandidateSource::Scip => (0.0, 0.0, candidate.score),
-            CandidateSource::Legacy => (candidate.score, 0.0, 0.0),
+        .unwrap_or_else(|| {
+            let lexical = candidate
+                .lane_scores
+                .lexical
+                .as_ref()
+                .map(|evidence| evidence.raw_score);
+            let semantic = candidate
+                .lane_scores
+                .semantic
+                .as_ref()
+                .map(|evidence| evidence.raw_score);
+            let graph = candidate
+                .lane_scores
+                .graph
+                .as_ref()
+                .map(|evidence| evidence.raw_score);
+            if lexical.is_some() || semantic.is_some() || graph.is_some() {
+                (
+                    lexical.unwrap_or(0.0),
+                    semantic.unwrap_or(0.0),
+                    graph.unwrap_or(0.0),
+                )
+            } else {
+                match candidate.source {
+                    CandidateSource::Lexical | CandidateSource::Legacy => {
+                        (candidate.score, 0.0, 0.0)
+                    }
+                    CandidateSource::Semantic => (0.0, candidate.score, 0.0),
+                    CandidateSource::Scip => (0.0, 0.0, candidate.score),
+                }
+            }
         });
     RetrievalScoreBreakdownDto {
         lexical,
@@ -3280,6 +3301,24 @@ mod tests {
         assert_eq!(breakdown.graph, 0.0);
         assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::DenseSemantic));
         assert_eq!(hit.eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn scored_hit_adapter_never_reports_total_as_lexical() {
+        let candidate = CandidateHit::with_source(
+            "src/search.rs",
+            Some("SearchService".into()),
+            0.86,
+            CandidateSource::Semantic,
+        );
+        let ranked = rank_candidates(&classify_query("explain search service"), vec![candidate]);
+        let hit = search_hit_for_candidate(ranked.first().expect("candidate"));
+
+        let scored = HybridSearchScoredHit::from_search_hit(hit);
+
+        assert_eq!(scored.lexical_score, 0.0);
+        assert_eq!(scored.semantic_score, 0.86);
+        assert!(scored.total_score > 0.0);
     }
 
     #[test]

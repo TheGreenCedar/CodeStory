@@ -10,10 +10,26 @@ pub enum QueryShape {
     Mixed,
 }
 
+/// Independent query intents used to plan complementary retrieval lanes.
+///
+/// A prompt can name a symbol and a path while also asking for a relationship;
+/// these labels are deliberately not mutually exclusive.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryIntent {
+    pub symbol: bool,
+    pub path: bool,
+    pub natural_language: bool,
+    pub relationship: bool,
+    pub standalone_symbol: bool,
+    pub standalone_path: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryFeatures {
     pub raw_query: String,
     pub shape: QueryShape,
+    #[serde(default)]
+    pub intent: QueryIntent,
     pub token_count: usize,
     pub has_path_separators: bool,
     pub has_camel_case_token: bool,
@@ -27,24 +43,33 @@ pub fn classify_query(query: &str) -> QueryFeatures {
     let token_count = tokens.len().max(1);
 
     let has_path_separators = trimmed.contains('/') || trimmed.contains('\\');
-    let has_camel_case_token = tokens.iter().any(|token| has_internal_camel_hump(token));
+    let standalone_token = token_count == 1;
+    let has_camel_case_token = tokens.iter().any(|token| {
+        !looks_like_path_token(token, standalone_token) && has_internal_camel_hump(token)
+    });
     let has_snake_case_token = tokens.iter().any(|token| {
-        token.contains('_')
+        !looks_like_path_token(token, standalone_token)
+            && token.contains('_')
             && token
                 .chars()
                 .filter(|c| c.is_ascii_alphabetic())
                 .all(|c| c.is_ascii_lowercase() || c == '_')
     });
-    let looks_like_qualified_symbol = tokens.iter().any(|token| is_qualified_symbol(token));
+    let looks_like_qualified_symbol = tokens
+        .iter()
+        .any(|token| !looks_like_path_token(token, standalone_token) && is_qualified_symbol(token));
 
-    let path_like =
-        has_path_separators || (token_count == 1 && has_supported_file_extension(trimmed));
+    let path_like = tokens
+        .iter()
+        .any(|token| looks_like_path_token(token, token_count == 1))
+        || (token_count == 1 && has_supported_file_extension(trimmed));
     let symbol_like = looks_like_qualified_symbol
         || has_camel_case_token
         || has_snake_case_token
         || (token_count == 1 && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_'));
 
-    let nl_like = token_count >= 3
+    let nl_like = (token_count == 1 && !path_like && !symbol_like)
+        || token_count >= 3
         || trimmed.split_whitespace().any(|word| {
             matches!(
                 word.to_ascii_lowercase().as_str(),
@@ -52,12 +77,41 @@ pub fn classify_query(query: &str) -> QueryFeatures {
             )
         });
 
-    let shape = if path_like {
-        if symbol_like && nl_like {
-            QueryShape::Mixed
-        } else {
-            QueryShape::PathLike
-        }
+    let relationship = tokens.iter().any(|word| {
+        matches!(
+            normalized_word(word).as_str(),
+            "call"
+                | "calls"
+                | "called"
+                | "caller"
+                | "callers"
+                | "depend"
+                | "depends"
+                | "dependency"
+                | "dependencies"
+                | "flow"
+                | "flows"
+                | "through"
+                | "use"
+                | "uses"
+                | "used"
+                | "owner"
+                | "owns"
+        )
+    });
+    let intent = QueryIntent {
+        symbol: symbol_like,
+        path: path_like,
+        natural_language: nl_like,
+        relationship,
+        standalone_symbol: symbol_like && !path_like && !nl_like && token_count == 1,
+        standalone_path: path_like && !nl_like && token_count == 1,
+    };
+
+    let shape = if nl_like && (path_like || symbol_like) {
+        QueryShape::Mixed
+    } else if path_like {
+        QueryShape::PathLike
     } else if symbol_like && !nl_like {
         QueryShape::SymbolLike
     } else if nl_like && !symbol_like {
@@ -73,12 +127,53 @@ pub fn classify_query(query: &str) -> QueryFeatures {
     QueryFeatures {
         raw_query: trimmed.to_string(),
         shape,
+        intent,
         token_count,
         has_path_separators,
         has_camel_case_token,
         has_snake_case_token,
         looks_like_qualified_symbol,
     }
+}
+
+fn normalized_word(word: &str) -> String {
+    word.trim_matches(|character: char| !character.is_alphanumeric() && character != '_')
+        .to_ascii_lowercase()
+}
+
+fn looks_like_path_token(token: &str, standalone: bool) -> bool {
+    let token = token.trim_matches(|character: char| {
+        matches!(
+            character,
+            '`' | '\'' | '"' | ',' | ';' | ':' | '(' | ')' | '[' | ']'
+        )
+    });
+    if !token.contains('/') && !token.contains('\\') {
+        return false;
+    }
+    if token.starts_with('/')
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.get(1..3).is_some_and(|prefix| prefix == ":\\")
+    {
+        return true;
+    }
+    let normalized = token.replace('\\', "/");
+    let final_component = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if has_supported_file_extension(final_component) {
+        return true;
+    }
+    let conventional_root = matches!(
+        normalized.split('/').next().unwrap_or_default(),
+        "app" | "apps" | "bin" | "crates" | "docs" | "lib" | "packages" | "src" | "test" | "tests"
+    );
+    conventional_root
+        || (standalone
+            && normalized
+                .split('/')
+                .filter(|component| !component.is_empty())
+                .count()
+                >= 3)
 }
 
 /// A camel hump is an interior lowercase-to-uppercase transition.
@@ -151,6 +246,31 @@ mod tests {
     fn classifies_path_like_queries() {
         let features = classify_query("src/agent/orchestrator.rs");
         assert_eq!(features.shape, QueryShape::PathLike);
+    }
+
+    #[test]
+    fn slash_separated_concepts_do_not_suppress_natural_language_intent() {
+        for query in [
+            "input/output",
+            "how does input/output validation work",
+            "explain producer/consumer ownership",
+        ] {
+            let features = classify_query(query);
+            assert!(!features.intent.path, "{query} is not a path lookup");
+            assert!(features.intent.natural_language);
+            assert_ne!(features.shape, QueryShape::PathLike);
+        }
+    }
+
+    #[test]
+    fn path_mentions_and_symbol_mentions_are_retained_as_multiple_intents() {
+        let features = classify_query("explain how SearchWorker in src/worker.rs drains calls");
+        assert_eq!(features.shape, QueryShape::Mixed);
+        assert!(features.intent.symbol);
+        assert!(features.intent.path);
+        assert!(features.intent.natural_language);
+        assert!(features.intent.relationship);
+        assert!(!features.intent.standalone_path);
     }
 
     #[test]

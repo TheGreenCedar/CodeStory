@@ -35,6 +35,19 @@ pub(crate) struct HybridSearchScoredHit {
     pub total_score: f32,
 }
 
+impl HybridSearchScoredHit {
+    pub(crate) fn from_search_hit(hit: SearchHit) -> Self {
+        let breakdown = hit.score_breakdown.as_ref();
+        Self {
+            lexical_score: breakdown.map(|scores| scores.lexical).unwrap_or(0.0),
+            semantic_score: breakdown.map(|scores| scores.semantic).unwrap_or(0.0),
+            graph_score: breakdown.map(|scores| scores.graph).unwrap_or(0.0),
+            total_score: breakdown.map(|scores| scores.total).unwrap_or(hit.score),
+            hit,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(super) fn exact_symbol_merged_lexical_hybrid_hits(
     engine: &SearchEngine,
@@ -499,25 +512,7 @@ impl AppController {
             self.search_hybrid_results(req, focus_node_id, max_results, request_weights)?;
         Ok(hits
             .into_iter()
-            .map(|hit| HybridSearchScoredHit {
-                lexical_score: hit.score,
-                semantic_score: hit
-                    .score_breakdown
-                    .as_ref()
-                    .map(|scores| scores.semantic)
-                    .unwrap_or(0.0),
-                graph_score: hit
-                    .score_breakdown
-                    .as_ref()
-                    .map(|scores| scores.graph)
-                    .unwrap_or(0.0),
-                total_score: hit
-                    .score_breakdown
-                    .as_ref()
-                    .map(|scores| scores.total)
-                    .unwrap_or(hit.score),
-                hit,
-            })
+            .map(HybridSearchScoredHit::from_search_hit)
             .collect())
     }
 
