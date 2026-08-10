@@ -120,6 +120,7 @@ fn finalized_obligation(
             .and_then(|citation| citation.file_path.clone())
             .into_iter()
             .collect(),
+        carrier_edge_proofs: Vec::new(),
         open_next_candidates: Vec::new(),
     }
 }
@@ -654,6 +655,7 @@ fn sufficient_profile_closes_incidental_nonmaterial_guard_path() {
         reason: None,
         carrier_node_ids: Vec::new(),
         carrier_paths: Vec::new(),
+        carrier_edge_proofs: Vec::new(),
         open_next_candidates: Vec::new(),
     });
     finalize_packet_obligation_plan(

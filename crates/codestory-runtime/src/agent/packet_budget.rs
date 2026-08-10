@@ -15,8 +15,8 @@ use crate::agent::packet_sufficiency::{
 };
 use crate::agent::path_identity::RuntimeWorkspacePathIdentity;
 use crate::agent::trace_export::{
-    PACKET_STEP_TRACE_ANNOTATION_PREFIX, packet_retrieval_trace_summary,
-    retain_packet_step_trace_for_export,
+    PACKET_STEP_TRACE_ANNOTATION_PREFIX, compact_retained_packet_step_trace_for_budget,
+    packet_retrieval_trace_summary, retain_packet_step_trace_for_export,
 };
 use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, AgentResponseBlockDto, AgentRetrievalStepKindDto,
@@ -36,6 +36,7 @@ const ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION: &str = "answer.retrieval_trace.diag
 const AVOID_OPENING_OMISSION: &str = "avoid_opening";
 const COVERAGE_REPORT_INELIGIBLE_OMISSION: &str = "coverage_report.ineligible";
 const RETRIEVAL_TRACE_SUMMARY_OMISSION: &str = "retrieval_trace_summary";
+const RETAINED_STEP_TRACE_DETAIL_OMISSION: &str = "answer.retrieval_trace.step_details";
 
 pub(crate) fn packet_budget_limits(mode: PacketBudgetModeDto) -> PacketBudgetLimitsDto {
     match mode {
@@ -155,13 +156,69 @@ pub fn enforce_packet_output_budget_for_representation(
     representation_len: impl Fn(&AgentPacketDto) -> usize,
 ) {
     let extra_probes = packet_explicit_request_probe_queries(&packet.plan);
-    for _ in 0..8 {
-        let output_bytes =
-            refresh_packet_budget_usage_for_representation(packet, &representation_len);
+    let mut needs_dependent_rebuild = packet
+        .budget
+        .omitted_sections
+        .iter()
+        .any(|section| section == "output_bytes" || section == "packet_payload");
+    let mut dependent_shape_rebuilt = false;
+    loop {
+        let output_bytes = if needs_dependent_rebuild {
+            dependent_shape_rebuilt = true;
+            refresh_packet_after_budget_mutation(
+                project_root,
+                packet,
+                &extra_probes,
+                &representation_len,
+            )
+        } else {
+            refresh_packet_budget_usage_for_representation(packet, &representation_len)
+        };
         if output_bytes <= packet.budget.limits.max_output_bytes as usize {
-            break;
+            let hard_omission_present = packet
+                .budget
+                .omitted_sections
+                .iter()
+                .any(|section| section == "output_bytes" || section == "packet_payload");
+            if !hard_omission_present {
+                if !dependent_shape_rebuilt {
+                    needs_dependent_rebuild = true;
+                    continue;
+                }
+                return;
+            }
+
+            // The omission receipt participates in sufficiency and obligation rendering. Probe
+            // the fully rebuilt marker-free shape before committing its removal: it can be larger
+            // than the marker-present shape. If that shape does not fit, the measured marker shape
+            // is the truthful irreducible result.
+            let marker_shape = packet.clone();
+            remove_omitted_section(&mut packet.budget, "output_bytes");
+            remove_omitted_section(&mut packet.budget, "packet_payload");
+            let marker_free_output_bytes = refresh_packet_after_budget_mutation(
+                project_root,
+                packet,
+                &extra_probes,
+                &representation_len,
+            );
+            if marker_free_output_bytes <= packet.budget.limits.max_output_bytes as usize {
+                return;
+            }
+            *packet = marker_shape;
+            return;
         }
 
+        let hard_budget_state_changed = !packet.budget.truncated
+            || !packet
+                .budget
+                .omitted_sections
+                .iter()
+                .any(|section| section == "output_bytes")
+            || !packet
+                .budget
+                .omitted_sections
+                .iter()
+                .any(|section| section == "packet_payload");
         packet.budget.truncated = true;
         push_omitted_section(&mut packet.budget, "output_bytes");
         push_omitted_section(&mut packet.budget, "packet_payload");
@@ -190,30 +247,29 @@ pub fn enforce_packet_output_budget_for_representation(
         } else if truncate_answer_markdown_to_byte_cap(&mut packet.answer, next_answer_cap) {
             push_omitted_section(&mut packet.budget, "markdown_blocks");
             structurally_trimmed = true;
+        } else if compact_retained_packet_step_trace_for_budget(
+            &mut packet.answer.retrieval_trace,
+            // The omission receipt and dependent rebuild also consume output bytes. The loop
+            // remeasures the exact adapter shape, so this is only bounded headroom rather than an
+            // estimate used as the final acceptance decision.
+            over_by.saturating_add(256),
+        ) {
+            push_omitted_section(&mut packet.budget, RETAINED_STEP_TRACE_DETAIL_OMISSION);
+            structurally_trimmed = true;
         }
 
         if structurally_trimmed {
-            refresh_packet_after_budget_mutation(
-                project_root,
-                packet,
-                &extra_probes,
-                &representation_len,
-            );
+            needs_dependent_rebuild = true;
             continue;
         }
-        break;
+        if hard_budget_state_changed {
+            // No structural trim was available in the pre-marker dependent shape. Rebuild the
+            // newly installed hard receipt before deciding whether that measured shape fits.
+            needs_dependent_rebuild = true;
+            continue;
+        }
+        return;
     }
-
-    let output_bytes = refresh_packet_budget_usage_for_representation(packet, &representation_len);
-    if output_bytes > packet.budget.limits.max_output_bytes as usize {
-        packet.budget.truncated = true;
-        push_omitted_section(&mut packet.budget, "output_bytes");
-        push_omitted_section(&mut packet.budget, "packet_payload");
-    } else {
-        remove_omitted_section(&mut packet.budget, "output_bytes");
-        remove_omitted_section(&mut packet.budget, "packet_payload");
-    }
-    refresh_packet_after_budget_mutation(project_root, packet, &extra_probes, &representation_len);
 }
 
 fn refresh_packet_after_budget_mutation(
@@ -469,10 +525,12 @@ fn push_omitted_section(budget: &mut PacketBudgetDto, section: &str) {
     }
 }
 
-fn remove_omitted_section(budget: &mut PacketBudgetDto, section: &str) {
+fn remove_omitted_section(budget: &mut PacketBudgetDto, section: &str) -> bool {
+    let original_len = budget.omitted_sections.len();
     budget
         .omitted_sections
         .retain(|existing| existing != section);
+    budget.omitted_sections.len() != original_len
 }
 
 fn cap_graph_edges(answer: &mut AgentAnswerDto, max_edges: u32) -> bool {
@@ -907,6 +965,9 @@ mod tests {
                 markdown: initial_markdown.clone(),
             }],
         });
+        for obligation in &mut packet.plan.obligations.claim_obligations {
+            obligation.carrier_edge_proofs.clear();
+        }
         packet.answer.graphs.clear();
         packet.budget.truncated = true;
         packet.budget.omitted_sections = vec!["trail_edges".to_string()];
@@ -1503,6 +1564,300 @@ mod tests {
                 .expect("coverage report")
                 .ineligible
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn output_budget_converges_across_all_available_structural_trims() {
+        let max_output_bytes = 64 * 1024;
+        let mut packet = test_packet(
+            "Explain packet output convergence after many independent markdown blocks.",
+            max_output_bytes,
+        );
+        packet.answer.sections.push(AgentResponseSectionDto {
+            id: "many-diagnostics".to_string(),
+            title: "Many diagnostics".to_string(),
+            blocks: (0..96)
+                .map(|index| AgentResponseBlockDto::Markdown {
+                    markdown: format!("diagnostic block {index} {}", "padding ".repeat(256)),
+                })
+                .collect(),
+        });
+        assert!(
+            serialized_packet_len(&packet) > max_output_bytes as usize,
+            "fixture must start over the output cap"
+        );
+
+        enforce_packet_output_budget(test_project_root(), &mut packet);
+
+        let serialized_len = serialized_packet_len(&packet);
+        assert!(
+            serialized_len <= max_output_bytes as usize,
+            "every available structural trim must participate in convergence: {serialized_len} > {max_output_bytes}"
+        );
+        assert_eq!(packet.budget.used.output_bytes as usize, serialized_len);
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&"markdown_blocks".to_string())
+        );
+        assert!(
+            !packet
+                .budget
+                .omitted_sections
+                .contains(&"output_bytes".to_string())
+        );
+        assert!(
+            !packet
+                .budget
+                .omitted_sections
+                .contains(&"packet_payload".to_string())
+        );
+    }
+
+    #[test]
+    fn adapter_budget_compacts_retained_step_proof_after_other_trims_are_exhausted() {
+        const PUBLIC_CAP: usize = 98_304;
+        const RETAINED_F22_SHAPE: usize = 98_467;
+        let mut packet = test_packet(
+            "Explain the retained packet trace after all ordinary compact trims are exhausted.",
+            PUBLIC_CAP as u32,
+        );
+        packet.answer.retrieval_trace.steps = (0..26)
+            .map(|index| AgentRetrievalStepDto {
+                kind: if index % 3 == 0 {
+                    AgentRetrievalStepKindDto::Search
+                } else {
+                    AgentRetrievalStepKindDto::SourceRead
+                },
+                status: AgentRetrievalStepStatusDto::Ok,
+                duration_ms: 5 + index,
+                input: vec![codestory_contracts::api::AgentRetrievalSummaryFieldDto {
+                    key: "query".to_string(),
+                    value: format!("packet-query-{index}-{}", "q".repeat(128)),
+                }],
+                output: vec![
+                    codestory_contracts::api::AgentRetrievalSummaryFieldDto {
+                        key: "hits".to_string(),
+                        value: "8".to_string(),
+                    },
+                    codestory_contracts::api::AgentRetrievalSummaryFieldDto {
+                        key: "mode".to_string(),
+                        value: "packet_fused_batch".to_string(),
+                    },
+                    codestory_contracts::api::AgentRetrievalSummaryFieldDto {
+                        key: "sidecar_query_ms".to_string(),
+                        value: "7".to_string(),
+                    },
+                    codestory_contracts::api::AgentRetrievalSummaryFieldDto {
+                        key: "candidate_resolution_ms".to_string(),
+                        value: "11".to_string(),
+                    },
+                ],
+                message: Some(format!("packet-step-{index}-{}", "diagnostic".repeat(14))),
+            })
+            .collect();
+        packet.answer.retrieval_trace.annotations.push(
+            codestory_contracts::api::RetrievalAnnotationDto::gap(
+                "typed retrieval gap must survive retained proof compaction",
+            ),
+        );
+        install_verbose_semantic_stage_shadow(&mut packet);
+        packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
+
+        let mut exhausted = packet.clone();
+        push_omitted_section(&mut exhausted.budget, "output_bytes");
+        push_omitted_section(&mut exhausted.budget, "packet_payload");
+        let extra_probes = packet_explicit_request_probe_queries(&exhausted.plan);
+        loop {
+            let trimmed_verbose_sections = trim_packet_sufficiency_verbose_lists(&mut exhausted);
+            let structurally_trimmed = if !trimmed_verbose_sections.is_empty() {
+                for section in trimmed_verbose_sections {
+                    push_omitted_section(&mut exhausted.budget, section);
+                }
+                true
+            } else if trim_packet_retrieval_trace_summary(&mut exhausted) {
+                push_omitted_section(&mut exhausted.budget, RETRIEVAL_TRACE_SUMMARY_OMISSION);
+                true
+            } else if trim_packet_answer_retrieval_diagnostics(&mut exhausted) {
+                push_omitted_section(&mut exhausted.budget, ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION);
+                true
+            } else {
+                false
+            };
+            if !structurally_trimmed {
+                break;
+            }
+            refresh_packet_after_budget_mutation(
+                test_project_root(),
+                &mut exhausted,
+                &extra_probes,
+                &serialized_packet_len,
+            );
+        }
+        assert!(
+            exhausted
+                .answer
+                .sections
+                .iter()
+                .all(|section| section.blocks.iter().all(|block| match block {
+                    AgentResponseBlockDto::Markdown { markdown } =>
+                        markdown.len() < MARKDOWN_TRUNCATION_FLOOR_BYTES,
+                    AgentResponseBlockDto::Mermaid { .. } => true,
+                }))
+        );
+        assert!(!truncate_answer_markdown_to_byte_cap(
+            &mut exhausted.answer,
+            1
+        ));
+        let exhausted_len = serialized_packet_len(&exhausted);
+        assert!(
+            exhausted_len < RETAINED_F22_SHAPE,
+            "adapter envelope must be positive"
+        );
+        let adapter_envelope = RETAINED_F22_SHAPE - exhausted_len;
+        let represented_len = |packet: &AgentPacketDto| {
+            serialized_packet_len(packet).saturating_add(adapter_envelope)
+        };
+        assert_eq!(represented_len(&exhausted), RETAINED_F22_SHAPE);
+
+        enforce_packet_output_budget_for_representation(
+            test_project_root(),
+            &mut packet,
+            represented_len,
+        );
+
+        let final_len = represented_len(&packet);
+        assert!(
+            final_len <= PUBLIC_CAP,
+            "fully rebuilt adapter packet must satisfy its cap: {final_len} > {PUBLIC_CAP}"
+        );
+        assert_eq!(packet.budget.used.output_bytes as usize, final_len);
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&RETAINED_STEP_TRACE_DETAIL_OMISSION.to_string())
+        );
+        assert!(
+            !packet
+                .budget
+                .omitted_sections
+                .iter()
+                .any(|section| section == "output_bytes" || section == "packet_payload")
+        );
+        assert!(
+            packet
+                .answer
+                .retrieval_trace
+                .annotations
+                .iter()
+                .any(|annotation| annotation.is_gap()
+                    && annotation.text.contains("typed retrieval gap"))
+        );
+
+        let exported = packet_step_trace_json(&packet.answer);
+        let retained_count = exported["retained_step_trace"]["retained_step_count"]
+            .as_u64()
+            .expect("retained count") as usize;
+        let source_count = exported["retained_step_trace"]["source_step_count"]
+            .as_u64()
+            .expect("source count") as usize;
+        assert_eq!(source_count, 26);
+        assert!(retained_count > 0 && retained_count <= source_count);
+        assert_eq!(exported["steps"][0]["step_index"], 0);
+        assert!(exported["steps"][0]["kind"].is_string());
+        assert_eq!(exported["retained_step_trace"]["fields_truncated"], true);
+        assert_eq!(
+            exported["retained_step_trace"]["rows_truncated"],
+            retained_count < source_count
+        );
+
+        for trace in [
+            &packet.answer.retrieval_trace,
+            &packet.retrieval_trace_summary.retrieval_trace,
+        ] {
+            let stages = &trace
+                .retrieval_shadow
+                .as_ref()
+                .expect("semantic stage proof")
+                .stage_timings;
+            assert_eq!(stages.len(), 2);
+            assert_eq!(stages[0].completion_status, "completed");
+            assert_eq!(stages[1].completion_status, "cancelled_before_start");
+            assert_eq!(stages[1].cancel_reason.as_deref(), Some("stage_deadline"));
+            assert!(stages[1].degraded);
+        }
+    }
+
+    #[test]
+    fn adapter_budget_keeps_hard_receipt_when_marker_free_shape_exceeds_cap() {
+        let max_output_bytes = 32 * 1024;
+        let mut packet = test_packet(
+            "Explain a representation whose marker-free dependent shape is larger.",
+            max_output_bytes,
+        );
+        let original_sections =
+            serde_json::to_value(&packet.answer.sections).expect("serialize original sections");
+        let original_citations =
+            serde_json::to_value(&packet.answer.citations).expect("serialize original citations");
+        let represented_len = |packet: &AgentPacketDto| {
+            let marker_free_penalty = if packet
+                .budget
+                .omitted_sections
+                .iter()
+                .any(|section| section == "packet_payload")
+            {
+                0
+            } else {
+                64 * 1024
+            };
+            serialized_packet_len(packet).saturating_add(marker_free_penalty)
+        };
+        assert!(represented_len(&packet) > max_output_bytes as usize);
+
+        enforce_packet_output_budget_for_representation(
+            test_project_root(),
+            &mut packet,
+            represented_len,
+        );
+
+        let marker_shape_len = represented_len(&packet);
+        assert!(marker_shape_len <= max_output_bytes as usize);
+        assert_eq!(packet.budget.used.output_bytes as usize, marker_shape_len);
+        assert!(packet.budget.truncated);
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&"output_bytes".to_string())
+        );
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&"packet_payload".to_string())
+        );
+        assert_eq!(
+            serde_json::to_value(&packet.answer.sections).expect("serialize retained sections"),
+            original_sections
+        );
+        assert_eq!(
+            serde_json::to_value(&packet.answer.citations).expect("serialize retained citations"),
+            original_citations
+        );
+
+        let converged = serde_json::to_vec(&packet).expect("serialize converged marker shape");
+        enforce_packet_output_budget_for_representation(
+            test_project_root(),
+            &mut packet,
+            represented_len,
+        );
+        assert_eq!(
+            serde_json::to_vec(&packet).expect("serialize repeated marker shape"),
+            converged,
+            "a second enforcement must retain the same measured marker-present fixpoint"
         );
     }
 

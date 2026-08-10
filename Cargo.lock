@@ -736,6 +736,7 @@ dependencies = [
  "ignore",
  "libc",
  "notify",
+ "rayon",
  "remove_dir_all",
  "serde",
  "serde_json",

@@ -42,7 +42,9 @@ use crate::agent::packet_evidence_roles::{
 use crate::agent::packet_obligations::build_packet_obligation_plan;
 use crate::agent::packet_obligations::{
     append_packet_probe_obligations, bind_claims_to_packet_obligations,
-    finalize_packet_obligation_plan, packet_claims_with_obligation_receipts_and_telemetry,
+    capture_packet_obligation_edge_proofs_before_budget, finalize_packet_obligation_plan,
+    install_retained_packet_obligation_edge_proofs,
+    packet_claims_with_obligation_receipts_and_telemetry,
 };
 #[cfg(test)]
 use crate::agent::packet_plan::{
@@ -550,6 +552,12 @@ pub(crate) fn agent_packet(
     answer.source_coverage =
         crate::source_coverage::observe_source_coverage(controller, &covered_paths);
     let phase_started = Instant::now();
+    let obligation_edge_proofs = capture_packet_obligation_edge_proofs_before_budget(
+        &question,
+        plan.task_class,
+        &plan.obligations,
+        &answer,
+    );
     let budget = apply_packet_budget_with_extra(
         &project_root,
         &question,
@@ -561,6 +569,13 @@ pub(crate) fn agent_packet(
     );
     append_packet_non_trace_phase(&mut answer, "budget", phase_started);
     let phase_started = Instant::now();
+    install_retained_packet_obligation_edge_proofs(
+        &mut plan.obligations,
+        &answer,
+        &budget,
+        &obligation_edge_proofs,
+        limits.max_anchors as usize,
+    );
     finalize_packet_obligation_plan(
         &question,
         plan.task_class,
@@ -8847,6 +8862,7 @@ mod tests {
                 reason: Some("required_evidence_edge_missing".to_string()),
                 carrier_node_ids: vec![NodeId("RuntimeCoordinator".to_string())],
                 carrier_paths: vec!["crates/core/src/runtime.rs".to_string()],
+                carrier_edge_proofs: Vec::new(),
                 open_next_candidates: vec!["crates/core/src/runtime.rs".to_string()],
             }],
             query_obligations: Vec::new(),

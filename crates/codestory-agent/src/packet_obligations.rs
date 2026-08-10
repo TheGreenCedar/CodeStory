@@ -20,9 +20,9 @@ use crate::text::{
 use crate::trail::is_speculative_trail_edge;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
-    EdgeKind, NodeKind, PACKET_OBLIGATION_PLAN_VERSION, PacketBudgetDto, PacketClaimDto,
-    PacketClaimObligationDto, PacketClaimObligationKindDto, PacketObligationPlanDto,
-    PacketObligationProofStatusDto, PacketPlanQueryDto, PacketProbeDto,
+    EdgeKind, NodeId, NodeKind, PACKET_OBLIGATION_PLAN_VERSION, PacketBudgetDto, PacketClaimDto,
+    PacketClaimObligationDto, PacketClaimObligationKindDto, PacketObligationCarrierEdgeProofDto,
+    PacketObligationPlanDto, PacketObligationProofStatusDto, PacketPlanQueryDto, PacketProbeDto,
     PacketProbeRejectionCodeDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto,
     PacketProofStatusDto, PacketQueryCompletionDto, PacketQueryObligationDto,
     PacketQueryObligationKindDto, PacketTaskClassDto,
@@ -352,6 +352,7 @@ fn packet_probe_obligation(resolution: &PacketProbeResolutionDto) -> PacketClaim
         reason,
         carrier_node_ids: Vec::new(),
         carrier_paths: Vec::new(),
+        carrier_edge_proofs: Vec::new(),
         open_next_candidates: packet_probe_open_next_candidates(resolution),
     }
 }
@@ -421,6 +422,7 @@ fn claim_obligation(
         reason: None,
         carrier_node_ids: Vec::new(),
         carrier_paths: Vec::new(),
+        carrier_edge_proofs: Vec::new(),
         open_next_candidates,
     }
 }
@@ -447,6 +449,7 @@ fn default_profile_requested_claim_obligations(
             reason: None,
             carrier_node_ids: Vec::new(),
             carrier_paths: Vec::new(),
+            carrier_edge_proofs: Vec::new(),
             open_next_candidates: vec![binding_term.clone()],
         })
         .collect()
@@ -493,6 +496,7 @@ fn default_profile_guards(
             reason: None,
             carrier_node_ids: Vec::new(),
             carrier_paths: Vec::new(),
+            carrier_edge_proofs: Vec::new(),
             open_next_candidates: Vec::new(),
         })
         .collect()
@@ -595,6 +599,7 @@ fn requested_claim_overflow_obligation(
         )),
         carrier_node_ids: Vec::new(),
         carrier_paths: Vec::new(),
+        carrier_edge_proofs: Vec::new(),
         open_next_candidates: Vec::new(),
     }
 }
@@ -732,6 +737,174 @@ pub fn finalize_packet_obligation_plan(
     answer: &AgentAnswerDto,
     budget: &PacketBudgetDto,
 ) {
+    finalize_packet_claim_obligations(
+        question,
+        task_class,
+        plan,
+        answer,
+        PacketObligationEvidenceView::from_budget(budget),
+    );
+    finalize_query_obligations(plan, answer, budget);
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PacketObligationEdgeProofSnapshot {
+    entries: Vec<PacketObligationEdgeProofSnapshotEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct PacketObligationEdgeProofSnapshotEntry {
+    obligation_id: String,
+    obligation_kind: PacketClaimObligationKindDto,
+    proof: PacketObligationCarrierEdgeProofDto,
+}
+
+/// Capture exact carrier-edge candidates while the full graph is still present. The snapshot is
+/// local to packet construction; only candidates whose carrier survives the real citation cap can
+/// become serialized obligation receipts.
+pub fn capture_packet_obligation_edge_proofs_before_budget(
+    question: &str,
+    task_class: PacketTaskClassDto,
+    plan: &PacketObligationPlanDto,
+    answer: &AgentAnswerDto,
+) -> PacketObligationEdgeProofSnapshot {
+    let mut proof_plan = plan.clone();
+    finalize_packet_claim_obligations(
+        question,
+        task_class,
+        &mut proof_plan,
+        answer,
+        PacketObligationEvidenceView::complete(answer.citations.len()),
+    );
+    let mut entries = proof_plan
+        .claim_obligations
+        .iter()
+        .filter(|obligation| obligation.proof_status == PacketObligationProofStatusDto::Proven)
+        .flat_map(|obligation| {
+            obligation.carrier_edge_proofs.iter().cloned().map(|proof| {
+                PacketObligationEdgeProofSnapshotEntry {
+                    obligation_id: obligation.id.clone(),
+                    obligation_kind: obligation.kind,
+                    proof,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    sort_and_dedup_edge_proof_snapshot_entries(&mut entries);
+    PacketObligationEdgeProofSnapshot { entries }
+}
+
+/// Bind pre-cap proof candidates to the carriers that survived the actual citation cap. Normal
+/// finalization still rechecks role, eligibility, node kind, and the explicit trail-edge omission.
+pub fn install_retained_packet_obligation_edge_proofs(
+    plan: &mut PacketObligationPlanDto,
+    answer: &AgentAnswerDto,
+    budget: &PacketBudgetDto,
+    snapshot: &PacketObligationEdgeProofSnapshot,
+    max_carriers: usize,
+) {
+    if !packet_budget_omitted_obligation_evidence(budget, "trail_edges") {
+        return;
+    }
+    let retained_order = answer.citations.iter().enumerate().fold(
+        HashMap::<NodeId, usize>::new(),
+        |mut order, (index, citation)| {
+            order.entry(citation.node_id.clone()).or_insert(index);
+            order
+        },
+    );
+    for obligation in &mut plan.claim_obligations {
+        if obligation.proof_status == PacketObligationProofStatusDto::Contradicted
+            || obligation.requires_complete_discovery
+        {
+            continue;
+        }
+        let Some(required_edge_kind) = obligation.required_edge_kind else {
+            continue;
+        };
+        let mut proofs = snapshot
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.obligation_id == obligation.id
+                    && entry.obligation_kind == obligation.kind
+                    && entry.proof.edge_kind == required_edge_kind
+                    && retained_order.contains_key(&entry.proof.carrier_node_id)
+            })
+            .map(|entry| entry.proof.clone())
+            .collect::<Vec<_>>();
+        proofs.sort_by(|left, right| {
+            retained_order[&left.carrier_node_id]
+                .cmp(&retained_order[&right.carrier_node_id])
+                .then_with(|| left.carrier_node_id.0.cmp(&right.carrier_node_id.0))
+                .then_with(|| left.edge_id.0.cmp(&right.edge_id.0))
+        });
+        proofs.dedup_by(|left, right| {
+            left.carrier_node_id == right.carrier_node_id
+                && left.edge_id == right.edge_id
+                && left.edge_kind == right.edge_kind
+        });
+        proofs.truncate(max_carriers.max(1));
+        if !proofs.is_empty() {
+            obligation.proof_status = PacketObligationProofStatusDto::Proven;
+            obligation.carrier_edge_proofs = proofs;
+        }
+    }
+}
+
+fn sort_and_dedup_edge_proof_snapshot_entries(
+    entries: &mut Vec<PacketObligationEdgeProofSnapshotEntry>,
+) {
+    entries.sort_by(|left, right| {
+        left.obligation_id
+            .cmp(&right.obligation_id)
+            .then_with(|| {
+                left.proof
+                    .carrier_node_id
+                    .0
+                    .cmp(&right.proof.carrier_node_id.0)
+            })
+            .then_with(|| left.proof.edge_id.0.cmp(&right.proof.edge_id.0))
+    });
+    entries.dedup_by(|left, right| {
+        left.obligation_id == right.obligation_id
+            && left.obligation_kind == right.obligation_kind
+            && left.proof == right.proof
+    });
+}
+
+#[derive(Clone, Copy)]
+struct PacketObligationEvidenceView {
+    max_carriers: usize,
+    citations_omitted: bool,
+    trail_edges_omitted: bool,
+}
+
+impl PacketObligationEvidenceView {
+    fn complete(max_carriers: usize) -> Self {
+        Self {
+            max_carriers: max_carriers.max(1),
+            citations_omitted: false,
+            trail_edges_omitted: false,
+        }
+    }
+
+    fn from_budget(budget: &PacketBudgetDto) -> Self {
+        Self {
+            max_carriers: (budget.limits.max_anchors as usize).max(1),
+            citations_omitted: packet_budget_omitted_obligation_evidence(budget, "citations"),
+            trail_edges_omitted: packet_budget_omitted_obligation_evidence(budget, "trail_edges"),
+        }
+    }
+}
+
+fn finalize_packet_claim_obligations(
+    question: &str,
+    task_class: PacketTaskClassDto,
+    plan: &mut PacketObligationPlanDto,
+    answer: &AgentAnswerDto,
+    evidence_view: PacketObligationEvidenceView,
+) {
     let requirements =
         packet_flow_requirements_for_terms(&packet_probe_terms(question), task_class)
             .into_iter()
@@ -748,12 +921,17 @@ pub fn finalize_packet_obligation_plan(
         if obligation.proof_status == PacketObligationProofStatusDto::Contradicted {
             continue;
         }
+        let previous_edge_proofs = (obligation.proof_status
+            == PacketObligationProofStatusDto::Proven)
+            .then(|| obligation.carrier_edge_proofs.clone())
+            .unwrap_or_default();
         if obligation.probe_binding.is_some() {
-            finalize_exact_probe_obligation(obligation, answer, budget);
+            finalize_exact_probe_obligation(obligation, answer, evidence_view);
             continue;
         }
         obligation.carrier_node_ids.clear();
         obligation.carrier_paths.clear();
+        obligation.carrier_edge_proofs.clear();
         if obligation.id == REQUESTED_CLAIM_OVERFLOW_ID {
             obligation.proof_status = PacketObligationProofStatusDto::Unsupported;
             obligation
@@ -773,22 +951,29 @@ pub fn finalize_packet_obligation_plan(
                 &exact_binding_terms,
                 &requested_paths,
                 answer,
-                budget,
+                evidence_view,
+                &previous_edge_proofs,
             );
             continue;
         };
-        finalize_claim_obligation(obligation, requirement, answer, budget);
+        finalize_claim_obligation(
+            obligation,
+            requirement,
+            answer,
+            evidence_view,
+            &previous_edge_proofs,
+        );
     }
-    finalize_query_obligations(plan, answer, budget);
 }
 
 fn finalize_exact_probe_obligation(
     obligation: &mut PacketClaimObligationDto,
     answer: &AgentAnswerDto,
-    budget: &PacketBudgetDto,
+    evidence_view: PacketObligationEvidenceView,
 ) {
     obligation.carrier_node_ids.clear();
     obligation.carrier_paths.clear();
+    obligation.carrier_edge_proofs.clear();
     let Some(binding) = obligation.probe_binding.clone() else {
         return;
     };
@@ -857,14 +1042,13 @@ fn finalize_exact_probe_obligation(
         })
         .collect::<Vec<_>>();
     if matching_citations.is_empty() {
-        obligation.proof_status = if packet_budget_omitted_obligation_evidence(budget, "citations")
-        {
+        obligation.proof_status = if evidence_view.citations_omitted {
             PacketObligationProofStatusDto::Reported
         } else {
             PacketObligationProofStatusDto::Unsupported
         };
         obligation.reason = Some(
-            if packet_budget_omitted_obligation_evidence(budget, "citations") {
+            if evidence_view.citations_omitted {
                 "packet_budget_truncated"
             } else {
                 "exact_probe_carrier_missing"
@@ -873,11 +1057,7 @@ fn finalize_exact_probe_obligation(
         );
         return;
     }
-    record_obligation_carriers(
-        obligation,
-        matching_citations,
-        budget.limits.max_anchors as usize,
-    );
+    record_obligation_carriers(obligation, matching_citations, evidence_view.max_carriers);
     obligation.proof_status = PacketObligationProofStatusDto::Proven;
     obligation.reason = None;
 }
@@ -949,7 +1129,8 @@ fn finalize_claim_obligation(
     obligation: &mut PacketClaimObligationDto,
     requirement: &FlowRequirement,
     answer: &AgentAnswerDto,
-    budget: &PacketBudgetDto,
+    evidence_view: PacketObligationEvidenceView,
+    previous_edge_proofs: &[PacketObligationCarrierEdgeProofDto],
 ) {
     let matching_citations = answer
         .citations
@@ -967,7 +1148,7 @@ fn finalize_claim_obligation(
     record_obligation_carriers(
         obligation,
         reported_citations.iter().copied(),
-        budget.limits.max_anchors as usize,
+        evidence_view.max_carriers,
     );
 
     if obligation.requires_complete_discovery {
@@ -976,7 +1157,7 @@ fn finalize_claim_obligation(
         return;
     }
     if matching_citations.is_empty() && reported_citations.is_empty() {
-        if packet_budget_omitted_obligation_evidence(budget, "citations") {
+        if evidence_view.citations_omitted {
             obligation.proof_status = PacketObligationProofStatusDto::Reported;
             obligation.reason = Some("packet_budget_truncated".to_string());
         } else {
@@ -1021,14 +1202,41 @@ fn finalize_claim_obligation(
             obligation
                 .required_edge_kind
                 .is_none_or(|required_edge_kind| {
-                    citation_satisfies_edge_requirement(citation, required_edge_kind, answer)
+                    citation_edge_proof(citation, required_edge_kind, answer).is_some()
                 })
         })
         .collect::<Vec<_>>();
     if proven_citations.is_empty() {
+        if let Some(required_edge_kind) = obligation.required_edge_kind {
+            let preserved_citations = retained_citations_with_prior_edge_proof(
+                &allowed_citations,
+                previous_edge_proofs,
+                required_edge_kind,
+                answer,
+                evidence_view,
+            );
+            if !preserved_citations.is_empty() {
+                record_obligation_carriers(
+                    obligation,
+                    preserved_citations.iter().copied(),
+                    evidence_view.max_carriers,
+                );
+                obligation.carrier_edge_proofs = retained_prior_edge_proofs(
+                    &preserved_citations,
+                    previous_edge_proofs,
+                    required_edge_kind,
+                    answer,
+                    evidence_view,
+                    evidence_view.max_carriers,
+                );
+                obligation.proof_status = PacketObligationProofStatusDto::Proven;
+                obligation.reason = None;
+                return;
+            }
+        }
         obligation.proof_status = PacketObligationProofStatusDto::Reported;
         obligation.reason = Some(
-            if packet_budget_omitted_obligation_evidence(budget, "trail_edges") {
+            if evidence_view.trail_edges_omitted {
                 "packet_budget_truncated"
             } else {
                 "required_evidence_edge_missing"
@@ -1040,8 +1248,17 @@ fn finalize_claim_obligation(
     record_obligation_carriers(
         obligation,
         proven_citations.iter().copied(),
-        budget.limits.max_anchors as usize,
+        evidence_view.max_carriers,
     );
+    if let Some(required_edge_kind) = obligation.required_edge_kind {
+        record_obligation_edge_proofs(
+            obligation,
+            &proven_citations,
+            required_edge_kind,
+            answer,
+            evidence_view.max_carriers,
+        );
+    }
     obligation.proof_status = PacketObligationProofStatusDto::Proven;
     obligation.reason = None;
 }
@@ -1052,7 +1269,8 @@ fn finalize_default_profile_obligation(
     exact_binding_terms: &[String],
     requested_paths: &[String],
     answer: &AgentAnswerDto,
-    budget: &PacketBudgetDto,
+    evidence_view: PacketObligationEvidenceView,
+    previous_edge_proofs: &[PacketObligationCarrierEdgeProofDto],
 ) {
     let reported_citations = answer
         .citations
@@ -1069,13 +1287,13 @@ fn finalize_default_profile_obligation(
     record_obligation_carriers(
         obligation,
         reported_citations.iter().copied(),
-        budget.limits.max_anchors as usize,
+        evidence_view.max_carriers,
     );
     if obligation.requires_complete_discovery {
         obligation.proof_status = PacketObligationProofStatusDto::Reported;
         obligation.reason = Some("complete_discovery_and_collector_coverage_unproven".to_string());
     } else if reported_citations.is_empty() {
-        if packet_budget_omitted_obligation_evidence(budget, "citations") {
+        if evidence_view.citations_omitted {
             obligation.proof_status = PacketObligationProofStatusDto::Reported;
             obligation.reason = Some("packet_budget_truncated".to_string());
         } else {
@@ -1092,18 +1310,49 @@ fn finalize_default_profile_obligation(
                     && obligation
                         .required_edge_kind
                         .is_none_or(|required_edge_kind| {
-                            citation_satisfies_edge_requirement(
-                                citation,
-                                required_edge_kind,
-                                answer,
-                            )
+                            citation_edge_proof(citation, required_edge_kind, answer).is_some()
                         })
             })
             .collect::<Vec<_>>();
         if proven_citations.is_empty() {
+            if let Some(required_edge_kind) = obligation.required_edge_kind {
+                let allowed_citations = reported_citations
+                    .iter()
+                    .copied()
+                    .filter(|citation| {
+                        citation_sufficiency_eligible(citation)
+                            && obligation.allowed_node_kinds.contains(&citation.kind)
+                    })
+                    .collect::<Vec<_>>();
+                let preserved_citations = retained_citations_with_prior_edge_proof(
+                    &allowed_citations,
+                    previous_edge_proofs,
+                    required_edge_kind,
+                    answer,
+                    evidence_view,
+                );
+                if !preserved_citations.is_empty() {
+                    record_obligation_carriers(
+                        obligation,
+                        preserved_citations.iter().copied(),
+                        evidence_view.max_carriers,
+                    );
+                    obligation.carrier_edge_proofs = retained_prior_edge_proofs(
+                        &preserved_citations,
+                        previous_edge_proofs,
+                        required_edge_kind,
+                        answer,
+                        evidence_view,
+                        evidence_view.max_carriers,
+                    );
+                    obligation.proof_status = PacketObligationProofStatusDto::Proven;
+                    obligation.reason = None;
+                    return;
+                }
+            }
             obligation.proof_status = PacketObligationProofStatusDto::Reported;
             obligation.reason = Some(
-                if packet_budget_omitted_obligation_evidence(budget, "trail_edges") {
+                if evidence_view.trail_edges_omitted {
                     "packet_budget_truncated"
                 } else {
                     "selected_claim_profile_requires_typed_flow"
@@ -1114,8 +1363,17 @@ fn finalize_default_profile_obligation(
             record_obligation_carriers(
                 obligation,
                 proven_citations.iter().copied(),
-                budget.limits.max_anchors as usize,
+                evidence_view.max_carriers,
             );
+            if let Some(required_edge_kind) = obligation.required_edge_kind {
+                record_obligation_edge_proofs(
+                    obligation,
+                    &proven_citations,
+                    required_edge_kind,
+                    answer,
+                    evidence_view.max_carriers,
+                );
+            }
             obligation.proof_status = PacketObligationProofStatusDto::Proven;
             obligation.reason = None;
         }
@@ -1273,22 +1531,161 @@ fn citation_plausibly_reports_obligation(
     }
 }
 
-fn citation_satisfies_edge_requirement(
+fn citation_edge_proof(
     citation: &AgentCitationDto,
     required_edge_kind: EdgeKind,
     answer: &AgentAnswerDto,
-) -> bool {
+) -> Option<PacketObligationCarrierEdgeProofDto> {
     let graphs = packet_execution_graphs(answer);
     let cited_edge_ids = citation.evidence_edge_ids.iter().collect::<HashSet<_>>();
-    !cited_edge_ids.is_empty()
-        && graphs.iter().any(|graph| {
-            graph.edges.iter().any(|edge| {
-                edge.kind == required_edge_kind
-                    && cited_edge_ids.contains(&edge.id)
-                    && (edge.source == citation.node_id || edge.target == citation.node_id)
-                    && !is_speculative_trail_edge(edge)
+    graphs
+        .iter()
+        .flat_map(|graph| graph.edges.iter())
+        .filter(|edge| {
+            edge.kind == required_edge_kind
+                && cited_edge_ids.contains(&edge.id)
+                && (edge.source == citation.node_id || edge.target == citation.node_id)
+                && !is_speculative_trail_edge(edge)
+        })
+        .min_by(|left, right| left.id.0.cmp(&right.id.0))
+        .map(|edge| PacketObligationCarrierEdgeProofDto {
+            carrier_node_id: citation.node_id.clone(),
+            edge_id: edge.id.clone(),
+            edge_kind: edge.kind,
+        })
+}
+
+fn record_obligation_edge_proofs(
+    obligation: &mut PacketClaimObligationDto,
+    citations: &[&AgentCitationDto],
+    required_edge_kind: EdgeKind,
+    answer: &AgentAnswerDto,
+    max_proofs: usize,
+) {
+    let retained_carrier_node_ids = obligation
+        .carrier_node_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut proofs = citations
+        .iter()
+        .filter_map(|citation| citation_edge_proof(citation, required_edge_kind, answer))
+        .filter(|proof| retained_carrier_node_ids.contains(&proof.carrier_node_id))
+        .collect::<Vec<_>>();
+    proofs.sort_by(|left, right| {
+        left.carrier_node_id
+            .0
+            .cmp(&right.carrier_node_id.0)
+            .then_with(|| left.edge_id.0.cmp(&right.edge_id.0))
+    });
+    proofs.dedup_by(|left, right| {
+        left.carrier_node_id == right.carrier_node_id
+            && left.edge_id == right.edge_id
+            && left.edge_kind == right.edge_kind
+    });
+    proofs.truncate(max_proofs.max(1));
+    obligation.carrier_edge_proofs = proofs;
+}
+
+fn retained_citations_with_prior_edge_proof<'a>(
+    allowed_citations: &[&'a AgentCitationDto],
+    previous_edge_proofs: &[PacketObligationCarrierEdgeProofDto],
+    required_edge_kind: EdgeKind,
+    answer: &AgentAnswerDto,
+    evidence_view: PacketObligationEvidenceView,
+) -> Vec<&'a AgentCitationDto> {
+    if !evidence_view.trail_edges_omitted {
+        return Vec::new();
+    }
+    allowed_citations
+        .iter()
+        .copied()
+        .filter(|citation| {
+            previous_edge_proofs.iter().any(|proof| {
+                prior_edge_proof_is_accounted_for(
+                    proof,
+                    citation,
+                    required_edge_kind,
+                    answer,
+                    evidence_view,
+                )
             })
         })
+        .take(evidence_view.max_carriers)
+        .collect()
+}
+
+fn retained_prior_edge_proofs(
+    retained_citations: &[&AgentCitationDto],
+    previous_edge_proofs: &[PacketObligationCarrierEdgeProofDto],
+    required_edge_kind: EdgeKind,
+    answer: &AgentAnswerDto,
+    evidence_view: PacketObligationEvidenceView,
+    max_proofs: usize,
+) -> Vec<PacketObligationCarrierEdgeProofDto> {
+    let retained_node_ids = retained_citations
+        .iter()
+        .map(|citation| &citation.node_id)
+        .collect::<HashSet<_>>();
+    let mut proofs = previous_edge_proofs
+        .iter()
+        .filter(|proof| retained_node_ids.contains(&proof.carrier_node_id))
+        .filter(|proof| {
+            retained_citations.iter().any(|citation| {
+                prior_edge_proof_is_accounted_for(
+                    proof,
+                    citation,
+                    required_edge_kind,
+                    answer,
+                    evidence_view,
+                )
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    proofs.sort_by(|left, right| {
+        left.carrier_node_id
+            .0
+            .cmp(&right.carrier_node_id.0)
+            .then_with(|| left.edge_id.0.cmp(&right.edge_id.0))
+    });
+    proofs.dedup_by(|left, right| {
+        left.carrier_node_id == right.carrier_node_id
+            && left.edge_id == right.edge_id
+            && left.edge_kind == right.edge_kind
+    });
+    proofs.truncate(max_proofs.max(1));
+    proofs
+}
+
+fn prior_edge_proof_is_accounted_for(
+    proof: &PacketObligationCarrierEdgeProofDto,
+    citation: &AgentCitationDto,
+    required_edge_kind: EdgeKind,
+    answer: &AgentAnswerDto,
+    evidence_view: PacketObligationEvidenceView,
+) -> bool {
+    if proof.carrier_node_id != citation.node_id || proof.edge_kind != required_edge_kind {
+        return false;
+    }
+    let retained_edges = answer
+        .graphs
+        .iter()
+        .filter_map(|artifact| match artifact {
+            codestory_contracts::api::GraphArtifactDto::Uml { graph, .. } => Some(graph),
+            codestory_contracts::api::GraphArtifactDto::Mermaid { .. } => None,
+        })
+        .flat_map(|graph| graph.edges.iter())
+        .filter(|edge| edge.id == proof.edge_id)
+        .collect::<Vec<_>>();
+    if retained_edges.is_empty() {
+        return evidence_view.trail_edges_omitted;
+    }
+    retained_edges.iter().all(|edge| {
+        edge.kind == proof.edge_kind
+            && (edge.source == proof.carrier_node_id || edge.target == proof.carrier_node_id)
+            && !is_speculative_trail_edge(edge)
+    })
 }
 
 fn finalize_query_obligations(
@@ -3674,6 +4071,387 @@ mod tests {
             PacketObligationProofStatusDto::Proven
         );
         assert_eq!(plan.claim_obligations[0].reason, None);
+    }
+
+    #[test]
+    fn pre_budget_edge_receipt_preserves_only_its_retained_call_carrier() {
+        let mut answer = answer_with_call_edge(
+            INDEXING_QUESTION,
+            "BuildIndex::run",
+            "crates/example/src/indexer.rs",
+        );
+        let mut plan = indexing_entrypoint_plan();
+        let snapshot = capture_packet_obligation_edge_proofs_before_budget(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &plan,
+            &answer,
+        );
+        let receipt = snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.proof.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(receipt.len(), 1);
+        assert_eq!(
+            receipt[0].carrier_node_id,
+            NodeId("BuildIndex::run".to_string())
+        );
+        assert_eq!(receipt[0].edge_id, EdgeId("requested-call".to_string()));
+        assert_eq!(receipt[0].edge_kind, EdgeKind::CALL);
+
+        // Compact citation selection may retain another copy of the same exact node without its
+        // verbose edge-id list, while the global graph cap omits the proven trail edge.
+        answer.citations[0].evidence_edge_ids.clear();
+        let GraphArtifactDto::Uml { graph, .. } = &mut answer.graphs[0] else {
+            panic!("fixture must carry a UML graph");
+        };
+        graph.edges.clear();
+        graph.truncated = true;
+        graph.omitted_edge_count = 1;
+        let mut truncated_budget = budget();
+        truncated_budget.truncated = true;
+        truncated_budget.omitted_sections = vec!["trail_edges".to_string()];
+
+        install_retained_packet_obligation_edge_proofs(
+            &mut plan,
+            &answer,
+            &truncated_budget,
+            &snapshot,
+            16,
+        );
+        finalize_packet_obligation_plan(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer,
+            &truncated_budget,
+        );
+        assert_eq!(
+            plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Proven
+        );
+        assert_eq!(plan.claim_obligations[0].carrier_edge_proofs, receipt);
+
+        // Output-budget enforcement rebuilds obligation dependents repeatedly. The receipt must
+        // stay bounded and idempotent rather than growing or degrading on each rebuild.
+        finalize_packet_obligation_plan(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer,
+            &truncated_budget,
+        );
+        assert_eq!(plan.claim_obligations[0].carrier_edge_proofs, receipt);
+    }
+
+    #[test]
+    fn post_cap_receipts_follow_the_actual_bounded_unique_carrier_set() {
+        let mut answer = answer_with_call_edge(
+            INDEXING_QUESTION,
+            "ZIndex::run",
+            "crates/example/src/z_index.rs",
+        );
+        let z_carrier = answer.citations[0].clone();
+        let mut a_carrier = citation(
+            "AIndex::run",
+            "crates/example/src/a_index.rs",
+            NodeKind::METHOD,
+        );
+        a_carrier.evidence_edge_ids = vec![EdgeId("a-call".to_string())];
+        answer.citations = vec![z_carrier.clone(), z_carrier.clone(), a_carrier.clone()];
+        let GraphArtifactDto::Uml { graph, .. } = &mut answer.graphs[0] else {
+            panic!("fixture must carry a UML graph");
+        };
+        graph.edges.push(GraphEdgeDto {
+            id: EdgeId("a-call".to_string()),
+            source: a_carrier.node_id.clone(),
+            target: NodeId("Worker::run".to_string()),
+            kind: EdgeKind::CALL,
+            confidence: Some(1.0),
+            certainty: Some("certain".to_string()),
+            callsite_identity: Some("test:2".to_string()),
+            candidate_targets: Vec::new(),
+        });
+        let mut plan = indexing_entrypoint_plan();
+        let snapshot = capture_packet_obligation_edge_proofs_before_budget(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &plan,
+            &answer,
+        );
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| { entry.proof.carrier_node_id == NodeId("ZIndex::run".to_string()) })
+        );
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| { entry.proof.carrier_node_id == NodeId("AIndex::run".to_string()) })
+        );
+
+        // Model the actual post-citation-cap selection: duplicates of Z are dropped and A is the
+        // only retained lawful carrier. The graph cap then omits A's exact pre-cap CALL edge.
+        answer.citations = vec![a_carrier];
+        let GraphArtifactDto::Uml { graph, .. } = &mut answer.graphs[0] else {
+            panic!("fixture must carry a UML graph");
+        };
+        graph.edges.clear();
+        graph.truncated = true;
+        graph.omitted_edge_count = 2;
+        let mut truncated_budget = budget();
+        truncated_budget.truncated = true;
+        truncated_budget.omitted_sections = vec!["trail_edges".to_string()];
+        install_retained_packet_obligation_edge_proofs(
+            &mut plan,
+            &answer,
+            &truncated_budget,
+            &snapshot,
+            2,
+        );
+        finalize_packet_obligation_plan(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer,
+            &truncated_budget,
+        );
+        assert_eq!(
+            plan.claim_obligations[0].carrier_node_ids,
+            vec![NodeId("AIndex::run".to_string())]
+        );
+        assert_eq!(plan.claim_obligations[0].carrier_edge_proofs.len(), 1);
+        assert_eq!(
+            plan.claim_obligations[0].carrier_edge_proofs[0].carrier_node_id,
+            NodeId("AIndex::run".to_string())
+        );
+    }
+
+    #[test]
+    fn omitted_unrelated_edges_do_not_mint_an_entrypoint_proof() {
+        let entrypoint = citation(
+            "BuildIndex::run",
+            "crates/example/src/indexer.rs",
+            NodeKind::METHOD,
+        );
+        let mut unrelated = citation(
+            "Unrelated::start",
+            "crates/example/src/unrelated.rs",
+            NodeKind::METHOD,
+        );
+        unrelated.evidence_edge_ids = vec![EdgeId("unrelated-call".to_string())];
+        let target = citation(
+            "Unrelated::finish",
+            "crates/example/src/unrelated.rs",
+            NodeKind::METHOD,
+        );
+        let mut answer = answer(vec![entrypoint, unrelated.clone(), target.clone()]);
+        answer.graphs.push(GraphArtifactDto::Uml {
+            id: "unrelated-flow".to_string(),
+            title: "Unrelated flow".to_string(),
+            graph: GraphResponse {
+                center_id: unrelated.node_id.clone(),
+                nodes: Vec::new(),
+                edges: vec![GraphEdgeDto {
+                    id: EdgeId("unrelated-call".to_string()),
+                    source: unrelated.node_id,
+                    target: target.node_id,
+                    kind: EdgeKind::CALL,
+                    confidence: Some(1.0),
+                    certainty: Some("certain".to_string()),
+                    callsite_identity: Some("test:1".to_string()),
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        });
+        let mut plan = indexing_entrypoint_plan();
+        let snapshot = capture_packet_obligation_edge_proofs_before_budget(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &plan,
+            &answer,
+        );
+        assert!(snapshot.entries.is_empty());
+
+        let GraphArtifactDto::Uml { graph, .. } = &mut answer.graphs[0] else {
+            panic!("fixture must carry a UML graph");
+        };
+        graph.edges.clear();
+        graph.truncated = true;
+        graph.omitted_edge_count = 1;
+        let mut truncated_budget = budget();
+        truncated_budget.truncated = true;
+        truncated_budget.omitted_sections = vec!["trail_edges".to_string()];
+        install_retained_packet_obligation_edge_proofs(
+            &mut plan,
+            &answer,
+            &truncated_budget,
+            &snapshot,
+            16,
+        );
+        finalize_packet_obligation_plan(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer,
+            &truncated_budget,
+        );
+
+        assert_eq!(
+            plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Reported
+        );
+        assert!(plan.claim_obligations[0].carrier_edge_proofs.is_empty());
+    }
+
+    #[test]
+    fn prior_edge_receipt_rejects_missing_wrong_kind_or_changed_carrier() {
+        let answer = answer_with_call_edge(
+            INDEXING_QUESTION,
+            "BuildIndex::run",
+            "crates/example/src/indexer.rs",
+        );
+        let base_plan = indexing_entrypoint_plan();
+        let snapshot = capture_packet_obligation_edge_proofs_before_budget(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &base_plan,
+            &answer,
+        );
+        assert_eq!(snapshot.entries.len(), 1);
+
+        let mut truncated_budget = budget();
+        truncated_budget.truncated = true;
+        truncated_budget.omitted_sections =
+            vec!["citations".to_string(), "trail_edges".to_string()];
+
+        let mut missing_carrier_answer = answer.clone();
+        missing_carrier_answer.citations.clear();
+        let GraphArtifactDto::Uml { graph, .. } = &mut missing_carrier_answer.graphs[0] else {
+            panic!("fixture must carry a UML graph");
+        };
+        graph.edges.clear();
+        let mut missing_carrier_plan = base_plan.clone();
+        install_retained_packet_obligation_edge_proofs(
+            &mut missing_carrier_plan,
+            &missing_carrier_answer,
+            &truncated_budget,
+            &snapshot,
+            16,
+        );
+        finalize_packet_obligation_plan(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut missing_carrier_plan,
+            &missing_carrier_answer,
+            &truncated_budget,
+        );
+        assert_eq!(
+            missing_carrier_plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Reported
+        );
+        assert!(
+            missing_carrier_plan.claim_obligations[0]
+                .carrier_edge_proofs
+                .is_empty()
+        );
+
+        let mut wrong_kind_answer = answer.clone();
+        wrong_kind_answer.citations[0].kind = NodeKind::STRUCT;
+        let GraphArtifactDto::Uml { graph, .. } = &mut wrong_kind_answer.graphs[0] else {
+            panic!("fixture must carry a UML graph");
+        };
+        graph.edges.clear();
+        let mut wrong_kind_plan = base_plan.clone();
+        install_retained_packet_obligation_edge_proofs(
+            &mut wrong_kind_plan,
+            &wrong_kind_answer,
+            &truncated_budget,
+            &snapshot,
+            16,
+        );
+        finalize_packet_obligation_plan(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut wrong_kind_plan,
+            &wrong_kind_answer,
+            &truncated_budget,
+        );
+        assert_eq!(
+            wrong_kind_plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Reported
+        );
+        assert!(
+            wrong_kind_plan.claim_obligations[0]
+                .carrier_edge_proofs
+                .is_empty()
+        );
+
+        let mut changed_edge_answer = answer.clone();
+        let GraphArtifactDto::Uml { graph, .. } = &mut changed_edge_answer.graphs[0] else {
+            panic!("fixture must carry a UML graph");
+        };
+        graph.edges[0].kind = EdgeKind::INHERITANCE;
+        let mut changed_edge_plan = base_plan.clone();
+        install_retained_packet_obligation_edge_proofs(
+            &mut changed_edge_plan,
+            &changed_edge_answer,
+            &truncated_budget,
+            &snapshot,
+            16,
+        );
+        finalize_packet_obligation_plan(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut changed_edge_plan,
+            &changed_edge_answer,
+            &truncated_budget,
+        );
+        assert_eq!(
+            changed_edge_plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Reported
+        );
+        assert!(
+            changed_edge_plan.claim_obligations[0]
+                .carrier_edge_proofs
+                .is_empty()
+        );
+
+        let mut speculative_edge_answer = answer;
+        let GraphArtifactDto::Uml { graph, .. } = &mut speculative_edge_answer.graphs[0] else {
+            panic!("fixture must carry a UML graph");
+        };
+        graph.edges[0].certainty = Some("speculative".to_string());
+        let mut speculative_edge_plan = base_plan;
+        install_retained_packet_obligation_edge_proofs(
+            &mut speculative_edge_plan,
+            &speculative_edge_answer,
+            &truncated_budget,
+            &snapshot,
+            16,
+        );
+        finalize_packet_obligation_plan(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut speculative_edge_plan,
+            &speculative_edge_answer,
+            &truncated_budget,
+        );
+        assert_eq!(
+            speculative_edge_plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Reported
+        );
+        assert!(
+            speculative_edge_plan.claim_obligations[0]
+                .carrier_edge_proofs
+                .is_empty()
+        );
     }
 
     #[test]

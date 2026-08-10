@@ -2969,6 +2969,7 @@ mod tests {
                 reason: None,
                 carrier_node_ids: vec![NodeId("RequestedEndpoint".to_string())],
                 carrier_paths: vec!["src/RequestedEndpoint.rs".to_string()],
+                carrier_edge_proofs: Vec::new(),
                 open_next_candidates: Vec::new(),
             }],
             query_obligations: Vec::new(),

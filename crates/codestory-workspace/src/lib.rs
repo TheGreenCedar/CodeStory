@@ -17,6 +17,7 @@ pub use codestory_contracts::workspace::{
     RefreshMode, RefreshPlan, SourceIndexPolicy, StoredFileRecord, StoredFileState,
     WorkspaceInventory,
 };
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
@@ -24,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 pub mod atomic_file;
@@ -1503,20 +1505,38 @@ fn build_refresh_outcome_from_inventory(
     let mut files_to_remove = Vec::new();
     let mut existing_file_ids = HashMap::new();
     let mut current_file_keys = HashSet::with_capacity(current_files.len());
+    let mut stored_files = Vec::with_capacity(current_files.len());
 
-    for path in current_files {
-        let normalized_key = normalized_compare_key(&workspace_root, &path);
+    for path in &current_files {
+        let normalized_key = normalized_compare_key(&workspace_root, path);
         current_file_keys.insert(normalized_key.clone());
-        let needs_index = match normalized_stored_map.get(&normalized_key) {
-            Some(file) => {
-                existing_file_ids.insert(path.clone(), file.id);
-                stored_file_needs_index(&path, file)
-            }
-            None => true,
-        };
+        let stored = normalized_stored_map.get(&normalized_key);
+        if let Some(file) = stored {
+            existing_file_ids.insert(path.clone(), file.id);
+        }
+        stored_files.push(stored);
+    }
 
-        if needs_index {
-            files_to_index.push(path);
+    if let Some(decisions) = parallel_stored_file_decisions(&current_files, &stored_files) {
+        for (path, decision) in current_files.iter().zip(decisions) {
+            if decision.content_hash_read {
+                // Worker threads deliberately never enter the operation-local
+                // memo. Account for their direct reads on the caller thread so
+                // existing telemetry still describes the work performed.
+                source_freshness::record_content_hash_read();
+            }
+            if decision.needs_index {
+                files_to_index.push(path.clone());
+            }
+        }
+    } else {
+        for (path, stored) in current_files.iter().zip(stored_files) {
+            let needs_index = stored
+                .map(|file| stored_file_needs_index(path, file))
+                .unwrap_or(true);
+            if needs_index {
+                files_to_index.push(path.clone());
+            }
         }
     }
 
@@ -1540,6 +1560,69 @@ fn build_refresh_outcome_from_inventory(
         inventory_outcome,
         inventory_issues,
         inventory_warnings,
+    })
+}
+
+const PARALLEL_STORED_FILE_MINIMUM: usize = 16;
+const PARALLEL_STORED_FILE_MAX_THREADS: usize = 8;
+
+#[derive(Debug, Clone, Copy)]
+struct StoredFileDecision {
+    needs_index: bool,
+    content_hash_read: bool,
+}
+
+fn freshness_hash_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .min(PARALLEL_STORED_FILE_MAX_THREADS);
+        (threads > 1)
+            .then(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .ok()
+            })
+            .flatten()
+    })
+    .as_ref()
+}
+
+fn parallel_stored_file_decisions(
+    paths: &[PathBuf],
+    stored_files: &[Option<&StoredFileState>],
+) -> Option<Vec<StoredFileDecision>> {
+    if source_freshness::source_freshness_scope_is_active()
+        || paths.len() < PARALLEL_STORED_FILE_MINIMUM
+        || paths.len() != stored_files.len()
+    {
+        return None;
+    }
+    let pool = freshness_hash_pool()?;
+    Some(stored_file_decisions_in_pool(pool, paths, stored_files))
+}
+
+fn stored_file_decisions_in_pool(
+    pool: &rayon::ThreadPool,
+    paths: &[PathBuf],
+    stored_files: &[Option<&StoredFileState>],
+) -> Vec<StoredFileDecision> {
+    pool.install(|| {
+        paths
+            .par_iter()
+            .zip(stored_files.par_iter())
+            .map(|(path, stored)| {
+                stored
+                    .map(|file| stored_file_needs_index_direct(path, file))
+                    .unwrap_or(StoredFileDecision {
+                        needs_index: true,
+                        content_hash_read: false,
+                    })
+            })
+            .collect()
     })
 }
 
@@ -1769,6 +1852,50 @@ fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
     verdict
 }
 
+/// The parallel planner's exact predicate.
+///
+/// Unlike [`stored_file_needs_index`], this never consults or publishes the
+/// operation-scoped memo: worker-thread TLS must not create a second cache
+/// lifetime. Every same-mtime file is read directly, with the same before/read/
+/// after torn-read guard, and the caller records the returned work counters in
+/// deterministic input order.
+fn stored_file_needs_index_direct(path: &Path, file: &StoredFileState) -> StoredFileDecision {
+    if !file.indexed || file.retry_required {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: false,
+        };
+    }
+    let Ok(observed) = observed_file_metadata(path) else {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: false,
+        };
+    };
+    if observed.modified_ms != file.modification_time {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: false,
+        };
+    }
+    let Some(expected_hash) = file.content_hash.as_deref() else {
+        return StoredFileDecision {
+            needs_index: false,
+            content_hash_read: false,
+        };
+    };
+    let Ok(identity) = read_content_identity(path) else {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: true,
+        };
+    };
+    StoredFileDecision {
+        needs_index: identity.content_hash != expected_hash,
+        content_hash_read: true,
+    }
+}
+
 #[cfg(test)]
 fn current_content_hash(path: &Path) -> Result<String> {
     current_content_identity(path).map(|(content_hash, _)| content_hash)
@@ -1812,26 +1939,26 @@ fn read_content_identity(path: &Path) -> Result<ContentIdentity> {
 }
 
 #[cfg(test)]
-thread_local! {
-    static TORN_READ_MUTATION: std::cell::RefCell<Option<(PathBuf, Vec<u8>)>> =
-        const { std::cell::RefCell::new(None) };
+fn torn_read_mutations_for_test() -> &'static std::sync::Mutex<HashMap<PathBuf, Vec<u8>>> {
+    static MUTATIONS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Vec<u8>>>> = OnceLock::new();
+    MUTATIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 #[cfg(test)]
 fn arm_torn_read_mutation_for_test(path: PathBuf, contents: Vec<u8>) {
-    TORN_READ_MUTATION.with(|mutation| mutation.replace(Some((path, contents))));
+    torn_read_mutations_for_test()
+        .lock()
+        .expect("torn-read mutation hook poisoned")
+        .insert(path, contents);
 }
 
 #[cfg(test)]
 fn run_torn_read_mutation_for_test(path: &Path) -> Result<()> {
-    TORN_READ_MUTATION.with(|mutation| {
-        let Some((target, contents)) = mutation.borrow_mut().take() else {
-            return Ok(());
-        };
-        if target != path {
-            mutation.replace(Some((target, contents)));
-            return Ok(());
-        }
+    let contents = torn_read_mutations_for_test()
+        .lock()
+        .expect("torn-read mutation hook poisoned")
+        .remove(path);
+    contents.map_or(Ok(()), |contents| {
         fs::write(path, contents).map_err(Into::into)
     })
 }
@@ -3186,6 +3313,123 @@ mod tests {
             policy_exclusions: Vec::new(),
             inventory: WorkspaceInventory::default(),
         })
+    }
+
+    fn parallel_refresh_fixture(
+        root: &Path,
+        count: usize,
+    ) -> Result<(Vec<PathBuf>, RefreshInputs)> {
+        let mut files = Vec::with_capacity(count);
+        for index in 0..count {
+            let path = root.join(format!("file_{index:02}.rs"));
+            fs::write(&path, format!("fn file_{index:02}() {{}}\n"))?;
+            files.push(path);
+        }
+        let inputs = indexed_inputs_for(&files)?;
+        Ok((files, inputs))
+    }
+
+    #[test]
+    fn parallel_stored_file_decisions_are_exact_ordered_and_memo_free() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let (mut files, mut inputs) = parallel_refresh_fixture(&root, 20)?;
+
+        let same_mtime = fs::metadata(&files[3])?.modified()?;
+        let mut same_length_drift = fs::read(&files[3])?;
+        same_length_drift[3] ^= 1;
+        fs::write(&files[3], same_length_drift)?;
+        fs::File::open(&files[3])?.set_modified(same_mtime)?;
+
+        let changed_mtime = fs::metadata(&files[7])?
+            .modified()?
+            .checked_add(std::time::Duration::from_secs(2))
+            .expect("fixture timestamp can advance");
+        fs::File::open(&files[7])?.set_modified(changed_mtime)?;
+        fs::remove_file(&files[11])?;
+        inputs.stored_files[15].retry_required = true;
+
+        let new_file = root.join("new_file.rs");
+        fs::write(&new_file, "fn newly_discovered() {}\n")?;
+        files.push(new_file);
+        let mut stored_files = inputs.stored_files.iter().map(Some).collect::<Vec<_>>();
+        stored_files.push(None);
+
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+        let _scope = SourceFreshnessScope::enter();
+        assert!(
+            parallel_stored_file_decisions(&files, &stored_files).is_none(),
+            "an active ready-lease scope must retain the sequential memo-aware path"
+        );
+        let decisions = stored_file_decisions_in_pool(&pool, &files, &stored_files);
+        let repeated = stored_file_decisions_in_pool(&pool, &files, &stored_files);
+        assert_eq!(
+            decisions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, decision)| decision.needs_index.then_some(index))
+                .collect::<Vec<_>>(),
+            vec![3, 7, 11, 15, 20]
+        );
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|decision| decision.needs_index)
+                .collect::<Vec<_>>(),
+            repeated
+                .iter()
+                .map(|decision| decision.needs_index)
+                .collect::<Vec<_>>(),
+            "indexed parallel collection must preserve deterministic input order"
+        );
+        assert_eq!(
+            source_freshness_counts()
+                .expect("armed scope")
+                .content_hash_reads,
+            0,
+            "worker decisions must not read or write the caller's freshness memo or counters"
+        );
+
+        let torn_target = files[5].clone();
+        arm_torn_read_mutation_for_test(
+            torn_target,
+            b"fn file_05() { let write_raced_the_reader = true; }\n".to_vec(),
+        );
+        let torn = stored_file_decisions_in_pool(&pool, &files, &stored_files);
+        assert!(torn[5].needs_index, "a torn content read must fail closed");
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_refresh_plan_preserves_stale_and_removal_order() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let (files, inputs) = parallel_refresh_fixture(&root, 20)?;
+        let same_mtime = fs::metadata(&files[3])?.modified()?;
+        let mut same_length_drift = fs::read(&files[3])?;
+        same_length_drift[3] ^= 1;
+        fs::write(&files[3], same_length_drift)?;
+        fs::File::open(&files[3])?.set_modified(same_mtime)?;
+        let changed_mtime = fs::metadata(&files[7])?
+            .modified()?
+            .checked_add(std::time::Duration::from_secs(2))
+            .expect("fixture timestamp can advance");
+        fs::File::open(&files[7])?.set_modified(changed_mtime)?;
+        fs::remove_file(&files[11])?;
+        let new_file = root.join("file_21.rs");
+        fs::write(&new_file, "fn file_21() {}\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let plan = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert_eq!(
+            plan.files_to_index,
+            vec![files[3].clone(), files[7].clone(), new_file],
+            "parallel decisions must be assembled in discovery order"
+        );
+        assert_eq!(plan.files_to_remove, vec![12]);
+        Ok(())
     }
 
     /// One public operation derives source freshness several times (before and

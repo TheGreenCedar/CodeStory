@@ -2863,6 +2863,13 @@ pub enum PacketObligationProofStatusDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketObligationCarrierEdgeProofDto {
+    pub carrier_node_id: NodeId,
+    pub edge_id: EdgeId,
+    pub edge_kind: EdgeKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct PacketClaimObligationDto {
     pub id: String,
     pub kind: PacketClaimObligationKindDto,
@@ -2887,6 +2894,11 @@ pub struct PacketClaimObligationDto {
     pub carrier_node_ids: Vec<NodeId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carrier_paths: Vec<String>,
+    /// Exact typed edge receipts verified for the carrier before packet presentation caps run.
+    /// A later compact representation may omit the corresponding global trail edge, but it may
+    /// preserve this obligation only while the same lawful carrier remains in the packet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carrier_edge_proofs: Vec<PacketObligationCarrierEdgeProofDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_next_candidates: Vec<String>,
 }

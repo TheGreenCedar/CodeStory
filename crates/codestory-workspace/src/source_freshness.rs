@@ -184,6 +184,15 @@ pub fn source_freshness_counts() -> Option<SourceFreshnessCounts> {
     })
 }
 
+/// Whether the current thread owns an operation-scoped freshness memo.
+///
+/// Batch planners use this only to retain the sequential memo-aware path for
+/// ready-lease operations. Worker threads must never use it as a proxy for the
+/// caller's scope because the scope is deliberately thread-local.
+pub(crate) fn source_freshness_scope_is_active() -> bool {
+    SCOPE.with(|scope| scope.borrow().depth > 0)
+}
+
 /// Record one strict-readiness fingerprint pass.
 ///
 /// Called by the retrieval crate's readiness fingerprint so the cost ARCH-002

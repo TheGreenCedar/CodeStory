@@ -39,9 +39,9 @@ struct RetainedPacketStepTraceProof {
     source_step_count: usize,
     #[serde(rename = "r")]
     rows: Vec<RetainedPacketStepTraceRow>,
-    #[serde(rename = "rt", default, skip_serializing_if = "is_false")]
+    #[serde(rename = "rt", default)]
     rows_truncated: bool,
-    #[serde(rename = "ft", default, skip_serializing_if = "is_false")]
+    #[serde(rename = "ft", default)]
     fields_truncated: bool,
 }
 
@@ -203,14 +203,9 @@ pub(crate) fn retain_packet_step_trace_for_export(trace: &mut AgentRetrievalTrac
     proof.rows_truncated |= live_step_count > available_rows;
     fit_retained_step_trace_proof(&mut proof);
 
-    let payload = serde_json::to_string(&proof)
-        .expect("bounded retained packet step trace proof must serialize");
-    let annotation = format!(
-        "{PACKET_STEP_TRACE_ANNOTATION_PREFIX}search_total_ms={} step_count={}{}{}",
+    let annotation = retained_step_trace_annotation(
         prior_search_total_ms.saturating_add(live_search_total_ms),
-        proof.source_step_count,
-        RETAINED_STEP_TRACE_MARKER,
-        payload
+        &proof,
     );
     trace.annotations.retain(|annotation| {
         annotation.kind != RetrievalAnnotationKindDto::Observation
@@ -222,6 +217,93 @@ pub(crate) fn retain_packet_step_trace_for_export(trace: &mut AgentRetrievalTrac
         .annotations
         .push(RetrievalAnnotationDto::observation(annotation));
     true
+}
+
+/// Shrink an already-retained step proof to satisfy a public packet budget.
+///
+/// Optional diagnostic fields are discarded before any core row. If rows must be removed, the
+/// source count and explicit truncation receipts remain, and rows are removed from the end so the
+/// retained prefix keeps stable step indexes. The caller remeasures the complete adapter shape and
+/// may call again with the remaining deficit.
+pub(crate) fn compact_retained_packet_step_trace_for_budget(
+    trace: &mut AgentRetrievalTraceDto,
+    required_savings: usize,
+) -> bool {
+    let Some((annotation_index, retained)) =
+        trace
+            .annotations
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, annotation)| {
+                parse_retained_step_trace_annotation(annotation).map(|retained| (index, retained))
+            })
+    else {
+        return false;
+    };
+
+    let original_len = trace.annotations[annotation_index].text.len();
+    let target_len = original_len.saturating_sub(required_savings.max(1));
+    let search_total_ms = retained.search_total_ms;
+    let mut proof = retained.proof;
+    let mut changed = false;
+
+    macro_rules! trim_optional_field {
+        ($field:ident) => {
+            for row in &mut proof.rows {
+                if row.$field.take().is_some() {
+                    changed = true;
+                }
+            }
+            if changed {
+                proof.fields_truncated = true;
+            }
+            if changed
+                && retained_step_trace_annotation(search_total_ms, &proof).len() <= target_len
+            {
+                trace.annotations[annotation_index].text =
+                    retained_step_trace_annotation(search_total_ms, &proof);
+                return true;
+            }
+        };
+    }
+
+    trim_optional_field!(message);
+    trim_optional_field!(query);
+    trim_optional_field!(mode);
+    trim_optional_field!(hits);
+    trim_optional_field!(sidecar_query_ms);
+    trim_optional_field!(candidate_resolution_ms);
+    trim_optional_field!(sidecar_total_ms);
+    trim_optional_field!(batch_query_wall_ms);
+
+    while !proof.rows.is_empty()
+        && retained_step_trace_annotation(search_total_ms, &proof).len() > target_len
+    {
+        proof.rows.pop();
+        proof.rows_truncated = true;
+        changed = true;
+    }
+
+    if !changed {
+        return false;
+    }
+    proof.rows_truncated = proof.rows.len() < proof.source_step_count;
+    trace.annotations[annotation_index].text =
+        retained_step_trace_annotation(search_total_ms, &proof);
+    true
+}
+
+fn retained_step_trace_annotation(
+    search_total_ms: u32,
+    proof: &RetainedPacketStepTraceProof,
+) -> String {
+    let payload = serde_json::to_string(proof)
+        .expect("bounded retained packet step trace proof must serialize");
+    format!(
+        "{PACKET_STEP_TRACE_ANNOTATION_PREFIX}search_total_ms={search_total_ms} step_count={}{}{}",
+        proof.source_step_count, RETAINED_STEP_TRACE_MARKER, payload
+    )
 }
 
 fn fit_retained_step_trace_proof(proof: &mut RetainedPacketStepTraceProof) {
@@ -414,10 +496,6 @@ fn packet_step_trace_data(answer: &AgentAnswerDto) -> PacketStepTraceData {
             }),
     );
     PacketStepTraceData { rows, retention }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 fn packet_step_row(index: usize, step: &AgentRetrievalStepDto) -> PacketStepTraceRow {
@@ -942,6 +1020,89 @@ mod tests {
             assert_eq!(json["step_count"], 0, "field={field}");
             assert_eq!(json["retained_step_trace"], Value::Null, "field={field}");
         }
+    }
+
+    #[test]
+    fn budget_compaction_keeps_core_rows_and_truthful_retention_receipts() {
+        let steps = (0..12)
+            .map(|index| AgentRetrievalStepDto {
+                kind: AgentRetrievalStepKindDto::Search,
+                status: AgentRetrievalStepStatusDto::Ok,
+                duration_ms: 10 + index,
+                input: vec![codestory_contracts::api::AgentRetrievalSummaryFieldDto {
+                    key: "query".to_string(),
+                    value: format!("query-{index}-{}", "q".repeat(140)),
+                }],
+                output: vec![
+                    codestory_contracts::api::AgentRetrievalSummaryFieldDto {
+                        key: "mode".to_string(),
+                        value: "packet_fused_batch".to_string(),
+                    },
+                    codestory_contracts::api::AgentRetrievalSummaryFieldDto {
+                        key: "hits".to_string(),
+                        value: "7".to_string(),
+                    },
+                    codestory_contracts::api::AgentRetrievalSummaryFieldDto {
+                        key: "sidecar_query_ms".to_string(),
+                        value: "8".to_string(),
+                    },
+                    codestory_contracts::api::AgentRetrievalSummaryFieldDto {
+                        key: "candidate_resolution_ms".to_string(),
+                        value: "9".to_string(),
+                    },
+                ],
+                message: Some(format!("step-{index}-{}", "diagnostic".repeat(14))),
+            })
+            .collect();
+        let mut answer = sample_answer(steps);
+        assert!(retain_packet_step_trace_for_export(
+            &mut answer.retrieval_trace
+        ));
+        answer.retrieval_trace.steps.clear();
+
+        let retained = retained_step_trace_proof(&answer.retrieval_trace.annotations)
+            .expect("retained proof fixture");
+        let original_len =
+            retained_step_trace_annotation(retained.search_total_ms, &retained.proof).len();
+        let mut expected = retained.proof.clone();
+        for row in &mut expected.rows {
+            row.query = None;
+            row.hits = None;
+            row.mode = None;
+            row.sidecar_query_ms = None;
+            row.candidate_resolution_ms = None;
+            row.sidecar_total_ms = None;
+            row.batch_query_wall_ms = None;
+            row.message = None;
+        }
+        expected.fields_truncated = true;
+        expected.rows.truncate(3);
+        expected.rows_truncated = true;
+        let target_len = retained_step_trace_annotation(retained.search_total_ms, &expected).len();
+
+        assert!(compact_retained_packet_step_trace_for_budget(
+            &mut answer.retrieval_trace,
+            original_len.saturating_sub(target_len),
+        ));
+
+        let compacted = retained_step_trace_proof(&answer.retrieval_trace.annotations)
+            .expect("compacted proof remains parseable");
+        assert_eq!(compacted.proof.source_step_count, 12);
+        assert_eq!(compacted.proof.rows.len(), 3);
+        assert!(compacted.proof.fields_truncated);
+        assert!(compacted.proof.rows_truncated);
+        assert!(compacted.proof.rows.iter().all(|row| row.query.is_none()
+            && row.mode.is_none()
+            && row.message.is_none()
+            && row.sidecar_query_ms.is_none()
+            && row.candidate_resolution_ms.is_none()));
+        let exported = packet_step_trace_json(&answer);
+        assert_eq!(exported["step_count"], 3);
+        assert_eq!(exported["steps"][0]["kind"], "Search");
+        assert_eq!(exported["retained_step_trace"]["source_step_count"], 12);
+        assert_eq!(exported["retained_step_trace"]["retained_step_count"], 3);
+        assert_eq!(exported["retained_step_trace"]["fields_truncated"], true);
+        assert_eq!(exported["retained_step_trace"]["rows_truncated"], true);
     }
 
     #[test]
