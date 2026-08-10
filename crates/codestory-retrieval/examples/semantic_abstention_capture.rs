@@ -51,6 +51,7 @@ fn main() -> Result<()> {
         .and_then(Path::parent)
         .context("resolve repository root")?
         .to_path_buf();
+    validate_clean_source_commit(&repository_root, &source_commit)?;
     let fixture_path = repository_root.join(CALIBRATION_FIXTURE_PATH);
     let edge_contract_path = repository_root.join(CALIBRATION_EDGE_CONTRACT_PATH);
     let disjointness_manifest_path = repository_root.join(CALIBRATION_HOLDOUT_MANIFEST_PATH);
@@ -267,4 +268,24 @@ fn string_field<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .get(field)
         .and_then(Value::as_str)
         .with_context(|| format!("retrieval manifest omitted {field}"))
+}
+
+fn validate_clean_source_commit(repository_root: &Path, expected: &str) -> Result<()> {
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repository_root)
+        .output()
+        .context("resolve semantic calibration source commit")?;
+    if !head.status.success() || String::from_utf8_lossy(&head.stdout).trim() != expected {
+        bail!("semantic calibration source commit does not match the checked-out HEAD");
+    }
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(repository_root)
+        .output()
+        .context("inspect semantic calibration source worktree")?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        bail!("semantic calibration source worktree must be clean");
+    }
+    Ok(())
 }

@@ -133,6 +133,35 @@ fn semantic_calibration_generator_inputs_are_source_backed_and_holdout_disjoint(
     );
 }
 
+#[test]
+fn checked_in_semantic_calibration_replays_the_product_policy() {
+    let corpus = load_attested_corpus(
+        &repository_root()
+            .join("crates/codestory-retrieval/testdata/semantic-abstention-calibration-v1"),
+        &repository_root(),
+    )
+    .expect("checked-in semantic calibration evidence");
+    assert_eq!(
+        corpus.selection.policy,
+        CalibrationPolicy {
+            absolute_floor_hundredths: 30,
+            additive_margin_hundredths: 10,
+        }
+    );
+    assert_eq!(corpus.selection.metrics.relevant_at_10, 9);
+    assert_eq!(corpus.selection.metrics.relevant_total, 9);
+    assert_eq!(corpus.selection.metrics.noisy_query_false_positives, 0);
+    assert!(
+        corpus.selection.metrics.retained_candidates
+            <= corpus
+                .selection
+                .baseline
+                .retained_candidates
+                .saturating_mul(5)
+                / 4
+    );
+}
+
 fn selector_contract_fixture() -> SemanticCalibrationCorpus {
     let vector_bytes = query_vector_bytes(&[1.0]);
     let answer_query = "selector contract answer";

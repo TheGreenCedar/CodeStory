@@ -30,14 +30,10 @@ const VECTOR_GENERATION_MANIFEST_FILE: &str = "vector-generation-manifest.json";
 const VECTOR_GENERATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const VECTOR_DIGEST_DOMAIN: &[u8] = b"codestory-vector-digest-v1\0";
 const VECTOR_NORM_TOLERANCE: f64 = 1.0e-3;
-/// Share of the lane's own best similarity a neighbour must reach to be
-/// reported as dense evidence.
-///
-/// The rule is stated against this query's own best hit rather than an
-/// absolute cosine, so it carries no corpus, repository, or model-scale
-/// assumption: a neighbour less than half as similar as the best vector the
-/// lane found is one the lane's own evidence argues against.
-const DENSE_ABSTENTION_RELATIVE_MARGIN: f32 = 0.5;
+/// Minimum cosine supported by the source-backed development calibration.
+const DENSE_ABSTENTION_ABSOLUTE_FLOOR: f32 = 0.30;
+/// Maximum distance from the lane's best cosine supported by that calibration.
+const DENSE_ABSTENTION_ADDITIVE_MARGIN: f32 = 0.10;
 type ScoredHit = (
     f32,
     String,
@@ -1490,12 +1486,11 @@ fn retain_dense_evidence(scored: &mut Vec<ScoredHit>) {
     let Some(best) = scored.first().map(|hit| hit.0) else {
         return;
     };
-    if best <= 0.0 {
-        scored.clear();
-        return;
-    }
-    let floor = best * DENSE_ABSTENTION_RELATIVE_MARGIN;
-    scored.retain(|hit| hit.0 > 0.0 && hit.0 >= floor);
+    scored.retain(|hit| {
+        hit.0.is_finite()
+            && hit.0 >= DENSE_ABSTENTION_ABSOLUTE_FLOOR
+            && hit.0 >= best - DENSE_ABSTENTION_ADDITIVE_MARGIN
+    });
 }
 
 #[cfg(feature = "semantic-calibration-support")]
@@ -1923,7 +1918,7 @@ mod tests {
             hits.iter()
                 .map(|hit| hit.node_id.as_deref().unwrap_or_default())
                 .collect::<Vec<_>>(),
-            vec!["related", "near"],
+            vec!["related"],
             "the window must not be padded with vectors the lane cannot claim"
         );
 
@@ -1940,6 +1935,37 @@ mod tests {
             abstained.is_empty(),
             "no positively related vector must yield no dense evidence: {abstained:?}"
         );
+    }
+
+    #[test]
+    fn dense_abstention_requires_absolute_and_additive_evidence() {
+        let hit = |score: f32, id: &str| {
+            (
+                score,
+                id.to_string(),
+                id.to_string(),
+                Some(format!("{id}.rs")),
+                None,
+                None,
+            )
+        };
+        let mut scored = vec![
+            hit(0.42, "best"),
+            hit(0.35, "near"),
+            hit(0.29, "below-floor"),
+        ];
+        retain_dense_evidence(&mut scored);
+        assert_eq!(
+            scored
+                .iter()
+                .map(|candidate| candidate.1.as_str())
+                .collect::<Vec<_>>(),
+            vec!["best", "near"]
+        );
+
+        let mut unsupported = vec![hit(0.29, "best"), hit(0.28, "near")];
+        retain_dense_evidence(&mut unsupported);
+        assert!(unsupported.is_empty());
     }
 
     #[test]

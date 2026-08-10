@@ -37,3 +37,7 @@ tempfile = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dev-dependencies]
+
+[[example]]
+name = "semantic_abstention_capture"
+required-features = ["semantic-calibration-support"]
