@@ -4,7 +4,7 @@
 
 ## 0.17.0
 
-CodeStory 0.17 focuses on more trustworthy answers and a faster, more predictable installed experience. Grounding is centered on project architecture, packet and search results separate proven evidence from gaps, and the embedding model stays resident for work across projects instead of being loaded for each command.
+CodeStory 0.17 focuses on more trustworthy answers and a more predictable installed experience. Grounding is centered on project architecture, packet and search results separate proven evidence from gaps, and the embedding model stays resident for work across projects instead of being loaded for each command.
 
 ### Added
 
@@ -15,14 +15,15 @@ CodeStory 0.17 focuses on more trustworthy answers and a faster, more predictabl
 
 ### Improved
 
-- Packet and route answers now require evidence for each requested step, keep exact-file questions tied to those files, publish only claims they proved, and preserve useful gaps and follow-ups when the response has to be compacted.
-- Search leaves out semantically unrelated results instead of filling the page with weak matches, preserves separate symbols that share a name, and keeps differently cased queries independent.
-- Large repositories open and refresh faster without weakening content freshness. Unchanged source checks use bounded parallel work, repeated installed grounding reuses safe observations, and identical discovery roots are walked once.
+- Packet and route answers now reserve proof for every required step before adding background context, keep exact-file questions tied to those files, stay within the public response limit, and name the precise missing obligation when the available evidence cannot support a complete answer.
+- Search keeps lexical, semantic, and graph evidence independent instead of turning one lane's total into another lane's score. It combines those ranks deterministically, keeps exact definitions prominent without suppressing unresolved flow questions, and leaves out semantically unrelated results instead of filling the page with weak matches.
+- Natural-language questions can carry symbols, paths, concepts, relations, and ordered flow stages at the same time. A slash inside a concept no longer turns the whole question into a file lookup, and graph expansion now follows typed direction and fanout rather than artifact order.
+- Large repositories check unchanged source with bounded parallel work without weakening content freshness, and source groups that share the same discovery root are walked once.
 - Files admitted by the larger source-size limit now reach lexical, repository-text, and semantic search consistently, while unsupported binary images are reported by file type instead of as oversized source.
 
 ### Fixed
 
-- Directory names such as `target`, `build`, `views`, `runtime`, or `store` no longer make unrelated symbols look like architecture or flow evidence. Flow coverage now uses the symbol and its actual role, including correct handling for HTML, stylesheets, SQL, shell, Vue, and Svelte sources.
+- Directory names such as `target`, `build`, `views`, `runtime`, or `store` no longer make unrelated symbols look like architecture or flow evidence. Flow coverage now uses the symbol, its source role, and typed relationships; SQL table and foreign-key structure, Go and Dart receiver calls, and parser-backed routes can support answers without inventing ambiguous edges.
 - A failed request is contained to that request and project instead of taking down every project in the editor session. Request admission is bounded by count and memory, overload refusals are immediate, cancellation frees capacity promptly, and shutdown has a three-second upper bound.
 - Route packets now follow registration through dispatch and any requested response boundary, preserve typed capacity failures, and enforce the public CLI JSON limit against the bytes actually emitted. Compact packets retain their per-step trace and obligation evidence instead of becoming misleading after trimming.
 - Exact file queries, filenames from every supported language, same-file overloads, and case-sensitive searches now resolve consistently. Questions are no longer misrouted because of capitalization or punctuation.
