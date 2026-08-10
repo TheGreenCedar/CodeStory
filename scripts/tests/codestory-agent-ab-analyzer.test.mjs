@@ -74,13 +74,23 @@ test("keeps CLI overrides out of both isolated agent arms", () => {
     sandbox: "read-only",
     model: "gpt-5.6-sol",
   };
-  const baseline = runnerCommand(opts, "/tmp/repo", "prompt");
-  const measured = runnerCommand(opts, "/tmp/repo", "prompt");
-  assert.deepEqual(baseline.args, measured.args);
+  const baseline = runnerCommand(opts, "/tmp/repo", "prompt", "without_codestory");
+  const measured = runnerCommand(opts, "/tmp/repo", "prompt", "with_codestory");
+  assert.ok(baseline.args.includes("--ignore-user-config"));
+  assert.ok(!measured.args.includes("--ignore-user-config"));
   assert.deepEqual(
-    measured.args.slice(measured.args.indexOf("--config"), measured.args.indexOf("--config") + 2),
-    ["--config", 'approval_policy="never"'],
+    baseline.args.filter((arg) => arg !== "--ignore-user-config"),
+    measured.args,
   );
+  for (const setting of [
+    'approval_policy="never"',
+    'model_reasoning_effort="xhigh"',
+    'service_tier="default"',
+    'personality="pragmatic"',
+    'model_verbosity="low"',
+  ]) {
+    assert.ok(measured.args.includes(setting), `missing pinned runner setting ${setting}`);
+  }
 
   const env = agentRunnerEnv(
     {
@@ -88,9 +98,8 @@ test("keeps CLI overrides out of both isolated agent arms", () => {
       CODESTORY_EMBED_ALLOW_CPU: "0",
     },
     "/tmp/isolated-codex-home",
-    "/tmp/exact-codestory-cli",
   );
-  assert.equal(env.CODESTORY_CLI, "/tmp/exact-codestory-cli");
+  assert.equal(env.CODESTORY_CLI, undefined);
   assert.equal(env.CODESTORY_RETRIEVAL, "1");
   assert.equal(env.CODEX_HOME, "/tmp/isolated-codex-home");
 });
@@ -1206,6 +1215,67 @@ test("counts only started CodeStory MCP calls", () => {
   ];
   const analysis = analyzeTranscript(events);
   assert.equal(analysis.codestory_mcp_tool_calls_observed, 1);
+  assert.equal(analysis.codestory_mcp_completed_calls_observed, 0);
+  assert.deepEqual(analysis.codestory_mcp_runtime_identities, []);
+});
+
+test("extracts managed runtime identity from completed CodeStory MCP results", () => {
+  const identity = {
+    plugin_version: "0.17.0",
+    plugin_cli_version: "0.17.0",
+    cli_version: "0.17.0",
+    cli_source: "managed",
+    pinned_pair_matches: true,
+    known_override_skew_channel: false,
+  };
+  const analysis = analyzeTranscript([
+    {
+      type: "item.started",
+      item: { id: "codestory", type: "mcp_tool_call", server: "codestory", tool: "packet" },
+    },
+    {
+      type: "item.completed",
+      item: {
+        id: "codestory",
+        type: "mcp_tool_call",
+        server: "codestory",
+        tool: "packet",
+        result: { _meta: { codestory_publication: { contract_runtime: identity } } },
+      },
+    },
+  ]);
+  assert.equal(analysis.codestory_mcp_tool_calls_observed, 1);
+  assert.equal(analysis.codestory_mcp_completed_calls_observed, 1);
+  assert.deepEqual(analysis.codestory_mcp_runtime_identities, [identity]);
+});
+
+test("publishable measured rows fail closed without managed runtime identity", () => {
+  const blockers = agentPublishableBlockers(
+    [
+      {
+        arm: "with_codestory",
+        status: "pass",
+        wall_ms: 1,
+        usage: { total_tokens: 1 },
+        tool_calls_observed: 1,
+        packet_first_required: false,
+        packet_first_pass: true,
+        transcript_analysis: {
+          command_count: 1,
+          command_categories: {},
+          codestory_mcp_tool_calls_observed: 1,
+          codestory_mcp_completed_calls_observed: 1,
+          codestory_mcp_runtime_identities: [],
+          external_context_tool_calls: 0,
+        },
+      },
+    ],
+    { publishable: true },
+  );
+  assert.match(
+    blockers.flatMap((blocker) => blocker.reasons).join("\n"),
+    /no managed CodeStory runtime identity/,
+  );
 });
 
 test("summarizes A/B cost accounting totals and ratios", () => {
@@ -2161,6 +2231,23 @@ test("warm process provenance still requires live engine identity and semantic r
 });
 
 function publishableWithCodeStoryResult(overrides = {}) {
+  const transcriptAnalysis = {
+    command_count: 1,
+    ordinary_source_reads_after_first_packet: 0,
+    codestory_mcp_tool_calls_observed: 1,
+    codestory_mcp_completed_calls_observed: 1,
+    codestory_mcp_runtime_identities: [
+      {
+        plugin_version: "0.17.0",
+        plugin_cli_version: "0.17.0",
+        cli_version: "0.17.0",
+        cli_source: "managed",
+        pinned_pair_matches: true,
+        known_override_skew_channel: false,
+      },
+    ],
+    ...(overrides.transcript_analysis ?? {}),
+  };
   return {
     repo: "codestory",
     task_id: "codestory-indexing-flow",
@@ -2173,13 +2260,10 @@ function publishableWithCodeStoryResult(overrides = {}) {
     packet_first_required: true,
     packet_first_pass: true,
     quality: { pass: true },
-    transcript_analysis: {
-      command_count: 1,
-      ordinary_source_reads_after_first_packet: 0,
-    },
     repo_provenance: pinnedRepoProvenance(),
     codestory_cache_provenance: localCacheProvenance(),
     ...overrides,
+    transcript_analysis: transcriptAnalysis,
   };
 }
 
@@ -2648,6 +2732,7 @@ test("publishable gate requires resource accounting fields", () => {
         usage: { total_tokens: null },
         tool_calls_observed: null,
         transcript_analysis: {
+          command_count: null,
           ordinary_source_reads_after_first_packet: 0,
         },
       }),

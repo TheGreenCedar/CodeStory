@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -42,6 +42,14 @@ const MANIFEST_TASK_ID_PATTERN = /^[a-z0-9][a-z0-9.-]*$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const MAX_PACKET_MANIFEST_EXTRA_PROBES = 12;
 const MAX_REUSED_ARTIFACT_BYTES = 64 * 1024 * 1024;
+const DEFAULT_BENCHMARK_MODEL = "gpt-5.6-sol";
+const REQUIRED_MANAGED_CODESTORY_VERSION = "0.17.0";
+const PINNED_CODEX_RUNNER_CONFIG = [
+  'model_reasoning_effort="xhigh"',
+  'service_tier="default"',
+  'personality="pragmatic"',
+  'model_verbosity="low"',
+];
 const REUSABLE_BASELINE_ARTIFACT_NAME_PATTERN =
   /(?:\.stdout\.jsonl|\.stderr\.txt|\.baseline-context\.json|\.baseline-context\.stderr\.txt)$/;
 const PACKET_TASK_CLASSES = new Set([
@@ -130,7 +138,7 @@ const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
-    "Use CodeStory grounding first. CODESTORY_CLI is set to the exact executable for this run. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` commands for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Copy exact source identifiers, table names, declarations, and claim phrases from packet citations and sufficiency.covered_claims; do not compress exact anchors into comma shorthand that drops their repeated prefix, such as rewriting `CREATE TABLE A` and `CREATE TABLE B` as `CREATE TABLE A and B`. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening_paths, and any post-packet local source reads. Full retrieval is mandatory; if CodeStory is unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
+    "Use the installed managed CodeStory plugin first. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` calls for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Copy exact source identifiers, table names, declarations, and claim phrases from packet citations and sufficiency.covered_claims; do not compress exact anchors into comma shorthand that drops their repeated prefix, such as rewriting `CREATE TABLE A` and `CREATE TABLE B` as `CREATE TABLE A and B`. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening_paths, and any post-packet local source reads. Full retrieval is mandatory; if CodeStory is unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
 };
 
 function usage() {
@@ -166,7 +174,7 @@ Options:
                   Include local sibling repos in the default non-quick run.
   --repeats       Repeats per repo/arm. Default: 3, or 1 with --quick.
   --runner        Runner command family. Default: codex.
-  --model         Optional model passed to codex exec.
+  --model         Model passed to codex exec. Default: ${DEFAULT_BENCHMARK_MODEL}.
   --sandbox       Codex sandbox mode. Default: workspace-write.
   --out-dir       Output directory. Default: target/agent-benchmark/<timestamp>.
   --timeout-ms    Timeout per runner invocation. Default: 600000.
@@ -262,7 +270,7 @@ function parseArgs(argv) {
     includeLocalRepos: false,
     repeats: null,
     runner: "codex",
-    model: null,
+    model: DEFAULT_BENCHMARK_MODEL,
     sandbox: "workspace-write",
     outDir: null,
     timeoutMs: 600000,
@@ -419,7 +427,7 @@ function selectedBenchmarkChildEnv(opts = {}) {
   return { ...(opts.packetRuntimeChildEnv ?? benchmarkChildEnv(process.env)) };
 }
 
-function runnerCommand(opts, repoPath, prompt) {
+function runnerCommand(opts, repoPath, prompt, arm = null) {
   if (opts.runner !== "codex") {
     return {
       command: opts.runner,
@@ -432,8 +440,10 @@ function runnerCommand(opts, repoPath, prompt) {
   const command = process.platform === "win32" ? "cmd.exe" : "codex";
   const codexArgs = [
     "exec",
+    ...(arm === "without_codestory" ? ["--ignore-user-config"] : []),
     "--config",
     'approval_policy="never"',
+    ...PINNED_CODEX_RUNNER_CONFIG.flatMap((value) => ["--config", value]),
     "--json",
     "--ephemeral",
     "--sandbox",
@@ -441,9 +451,7 @@ function runnerCommand(opts, repoPath, prompt) {
     "--cd",
     repoPath,
   ];
-  if (opts.model) {
-    codexArgs.push("--model", opts.model);
-  }
+  codexArgs.push("--model", opts.model ?? DEFAULT_BENCHMARK_MODEL);
   codexArgs.push("-");
   if (process.platform === "win32") {
     assertSafeWindowsCmdArgs(codexArgs);
@@ -452,19 +460,16 @@ function runnerCommand(opts, repoPath, prompt) {
   return { command, args, stdin: prompt, killProcessTree: process.platform === "win32" };
 }
 
-function agentRunnerEnv(baseEnv = process.env, codexHome = null, codestoryCli = null) {
+function agentRunnerEnv(baseEnv = process.env, codexHome = null) {
   const env = benchmarkChildEnv(baseEnv);
   delete env.CODESTORY_CLI;
   if (codexHome) {
     env.CODEX_HOME = codexHome;
   }
-  if (codestoryCli) {
-    env.CODESTORY_CLI = codestoryCli;
-  }
   return env;
 }
 
-async function prepareAgentCodexIsolation(outDir) {
+async function prepareAgentCodexIsolation(outDir, opts = {}) {
   const sourceCodexHome = path.resolve(
     process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex"),
   );
@@ -473,21 +478,15 @@ async function prepareAgentCodexIsolation(outDir) {
     throw new Error(`Codex benchmark isolation requires auth.json under ${sourceCodexHome}`);
   }
 
-  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-agent-ab-codex-home-"));
-  const withCodeStory = path.join(root, "with-codestory");
-  const withoutCodeStory = path.join(root, "without-codestory");
-  await mkdir(withCodeStory, { recursive: true });
-  await mkdir(withoutCodeStory, { recursive: true });
-  await symlink(authPath, path.join(withCodeStory, "auth.json"));
-  await symlink(authPath, path.join(withoutCodeStory, "auth.json"));
-
   const receipt = {
-    contract: "codestory.agent-benchmark-codex-isolation/v1",
-    codestory_surface: "direct_cli",
-    with_codestory_plugins: 0,
-    without_codestory_plugins: 0,
+    contract: "codestory.agent-benchmark-codex-isolation/v2",
+    codestory_surface: "managed_plugin",
+    with_codestory_config: "normal_user_config",
+    without_codestory_config: "ignore_user_config",
     shared_auth: true,
-    output_settings_source: "codex_defaults_and_explicit_runner_args",
+    output_settings_source: "explicit_runner_args",
+    model: opts.model ?? DEFAULT_BENCHMARK_MODEL,
+    runner_config: PINNED_CODEX_RUNNER_CONFIG,
   };
   await writeFile(
     path.join(outDir, "codex-agent-isolation.json"),
@@ -495,11 +494,8 @@ async function prepareAgentCodexIsolation(outDir) {
     "utf8",
   );
   return {
-    root,
-    homes: {
-      with_codestory: withCodeStory,
-      without_codestory: withoutCodeStory,
-    },
+    root: null,
+    homes: null,
     receipt,
   };
 }
@@ -1960,6 +1956,10 @@ function analyzeTranscript(events, projectRoot = null) {
   const commands = extractCommandExecutions(events);
   const toolCategories = toolCallCategories(events);
   const codestoryMcpToolCalls = events.filter(isCodeStoryMcpToolCallStartEvent);
+  const codestoryMcpCompletedCalls = events.filter(isSuccessfulCodeStoryMcpToolCallEvent);
+  const codestoryMcpRuntimeIdentities = codestoryMcpCompletedCalls
+    .map(codeStoryMcpRuntimeIdentity)
+    .filter(Boolean);
   const commandCategories = {};
   const outputCharsByCategory = {};
   const directFileReads = [];
@@ -2001,6 +2001,8 @@ function analyzeTranscript(events, projectRoot = null) {
   return {
     tool_categories: toolCategories,
     codestory_mcp_tool_calls_observed: codestoryMcpToolCalls.length,
+    codestory_mcp_completed_calls_observed: codestoryMcpCompletedCalls.length,
+    codestory_mcp_runtime_identities: codestoryMcpRuntimeIdentities,
     external_context_tool_calls: toolCategories.web_search ?? 0,
     command_categories: commandCategories,
     command_count: commands.length,
@@ -2051,6 +2053,84 @@ function isCodeStoryMcpToolCallEvent(event) {
 
 function isCodeStoryMcpToolCallStartEvent(event) {
   return isToolCallStartEvent(event) && isCodeStoryMcpToolCallEvent(event);
+}
+
+function isSuccessfulCodeStoryMcpToolCallEvent(event) {
+  if (!isCodeStoryMcpToolCallEvent(event)) {
+    return false;
+  }
+  const eventType = String(event.type ?? event.event ?? "").toLowerCase();
+  if (!(eventType === "item.completed" || eventType.endsWith(".completed"))) {
+    return false;
+  }
+  const item = itemOf(event);
+  const result = item.result ?? event.result ?? null;
+  return (
+    result != null &&
+    item.error == null &&
+    event.error == null &&
+    String(item.status ?? "completed").toLowerCase() !== "failed" &&
+    !(result && typeof result === "object" && result.isError === true)
+  );
+}
+
+function codeStoryMcpRuntimeIdentity(event) {
+  const item = itemOf(event);
+  const runtime = findCodeStoryRuntimeIdentity(item.result ?? event.result ?? null);
+  if (!runtime) {
+    return null;
+  }
+  return {
+    plugin_version: runtime.plugin_version ?? null,
+    plugin_cli_version: runtime.plugin_cli_version ?? null,
+    cli_version: runtime.cli_version ?? null,
+    cli_source: runtime.cli_source ?? null,
+    pinned_pair_matches: runtime.pinned_pair_matches ?? null,
+    known_override_skew_channel: runtime.known_override_skew_channel ?? null,
+  };
+}
+
+function findCodeStoryRuntimeIdentity(value, depth = 0) {
+  if (depth > 6 || value == null) {
+    return null;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!(trimmed.startsWith("{") || trimmed.startsWith("["))) {
+      return null;
+    }
+    try {
+      return findCodeStoryRuntimeIdentity(JSON.parse(trimmed), depth + 1);
+    } catch {
+      return null;
+    }
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const identity = findCodeStoryRuntimeIdentity(entry, depth + 1);
+      if (identity) {
+        return identity;
+      }
+    }
+    return null;
+  }
+  if (typeof value !== "object") {
+    return null;
+  }
+  const direct = value?._meta?.codestory_publication?.contract_runtime;
+  if (direct && typeof direct === "object") {
+    return direct;
+  }
+  for (const key of ["structuredContent", "structured_content", "content", "data", "output", "text"]) {
+    if (!(key in value)) {
+      continue;
+    }
+    const identity = findCodeStoryRuntimeIdentity(value[key], depth + 1);
+    if (identity) {
+      return identity;
+    }
+  }
+  return null;
 }
 
 function toolCallCategory(event) {
@@ -3150,11 +3230,7 @@ async function runOne(opts, run, outDir) {
       ? path.resolve(resolvedCodeStoryCli)
       : resolvedCodeStoryCli
     : null;
-  const env = agentRunnerEnv(
-    process.env,
-    opts.agentCodexHomes?.[run.arm] ?? null,
-    codestoryPreludeCli,
-  );
+  const env = agentRunnerEnv(process.env, opts.agentCodexHomes?.[run.arm] ?? null);
   const baselinePrelude =
     run.arm === "without_codestory"
       ? await runBaselinePrelude(opts, run, repoConfig, outDir, runId)
@@ -3175,7 +3251,12 @@ async function runOne(opts, run, outDir) {
     baselinePrelude,
     codestoryPrelude,
   });
-  const { command, args, stdin, killProcessTree } = runnerCommand(opts, repoConfig.path, prompt);
+  const { command, args, stdin, killProcessTree } = runnerCommand(
+    opts,
+    repoConfig.path,
+    prompt,
+    run.arm,
+  );
   const started = performance.now();
   const preludeFailure = [baselinePrelude, codestoryPrelude].find(
     (prelude) => prelude && !preludeAllowsAgentRun(prelude.public, opts),
@@ -3251,7 +3332,7 @@ async function runOne(opts, run, outDir) {
     command,
     args,
     stdin: stdin == null ? null : "<prompt>",
-    codestory_cli_env: run.arm === "with_codestory" ? codestoryPreludeCli : null,
+    codestory_cli_env: null,
     codestory_prelude_cli: run.arm === "with_codestory" ? codestoryPreludeCli : null,
     repo_path: repoConfig.path,
     repo_provenance: provenance,
@@ -6083,6 +6164,42 @@ function usefulAnchorHitsPer10kContextChars(row) {
   return hits / Math.max(1, contextChars / 10_000);
 }
 
+function managedCodeStoryRuntimeIdentityBlockers(analysis) {
+  const reasons = [];
+  const started = analysis?.codestory_mcp_tool_calls_observed ?? 0;
+  const completed = analysis?.codestory_mcp_completed_calls_observed ?? 0;
+  const identities = analysis?.codestory_mcp_runtime_identities ?? [];
+  if (started <= 0) {
+    reasons.push("with_codestory arm did not call the managed CodeStory MCP");
+  }
+  if (identities.length <= 0) {
+    reasons.push("with_codestory arm has no managed CodeStory runtime identity");
+  }
+  if (identities.length < completed) {
+    reasons.push(
+      `with_codestory arm proved ${identities.length}/${completed} completed CodeStory MCP runtime identities`,
+    );
+  }
+  for (const identity of identities) {
+    const versionMatches = [
+      identity.plugin_version,
+      identity.plugin_cli_version,
+      identity.cli_version,
+    ].every((version) => version === REQUIRED_MANAGED_CODESTORY_VERSION);
+    if (
+      !versionMatches ||
+      identity.pinned_pair_matches !== true ||
+      identity.cli_source !== "managed" ||
+      identity.known_override_skew_channel !== false
+    ) {
+      reasons.push(
+        `with_codestory arm runtime identity is not managed ${REQUIRED_MANAGED_CODESTORY_VERSION}: ${JSON.stringify(identity)}`,
+      );
+    }
+  }
+  return reasons;
+}
+
 function agentPublishableBlockers(results, opts = {}) {
   const maxSourceReadsAfterPacket = opts.maxSourceReadsAfterPacket;
   const enforceRepoProvenance = Boolean(opts.publishable || opts.enforceRepoProvenance);
@@ -6112,6 +6229,11 @@ function agentPublishableBlockers(results, opts = {}) {
           (result.transcript_analysis?.codestory_mcp_tool_calls_observed ?? 0) > 0)
       ) {
         environmentReasons.push("without_codestory arm used CodeStory");
+      }
+      if (opts.publishable && result.arm === "with_codestory") {
+        environmentReasons.push(
+          ...managedCodeStoryRuntimeIdentityBlockers(result.transcript_analysis),
+        );
       }
       if (
         result.arm === "without_codestory" &&
@@ -7062,7 +7184,7 @@ async function main() {
   }
 
   const agentCodexIsolation =
-    opts.runner === "codex" ? await prepareAgentCodexIsolation(outDir) : null;
+    opts.runner === "codex" ? await prepareAgentCodexIsolation(outDir, opts) : null;
   opts.agentCodexHomes = agentCodexIsolation?.homes ?? null;
   let results;
   try {
