@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 const FIXTURE_FILE: &str = "production_packet_search_fixtures.json";
 const BASELINE_FILE: &str = "production_packet_search_baseline.json";
 const LIVE_EVAL_RUN_ID: &str = "packet-search-eval";
+const LIVE_EVAL_PROJECT_ENV: &str = "CODESTORY_PACKET_SEARCH_EVAL_PROJECT";
 const LIVE_EVAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 const LIVE_EVAL_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -130,6 +131,13 @@ fn fixture_dir() -> PathBuf {
 }
 
 fn repo_root() -> PathBuf {
+    repo_root_from(std::env::var_os(LIVE_EVAL_PROJECT_ENV))
+}
+
+fn repo_root_from(explicit: Option<OsString>) -> PathBuf {
+    if let Some(project) = explicit.filter(|path| !path.is_empty()) {
+        return PathBuf::from(project);
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -936,6 +944,16 @@ fn packet_search_live_eval_honors_explicit_cli_path() {
         live_eval_cli_path_from(None),
         test_support::cli_binary_path()
     );
+}
+
+#[test]
+fn packet_search_live_eval_honors_explicit_project_path() {
+    let explicit = PathBuf::from("C:/projects/codestory-eval");
+    assert_eq!(
+        repo_root_from(Some(explicit.clone().into_os_string())),
+        explicit
+    );
+    assert_eq!(repo_root_from(None), repo_root());
 }
 
 #[test]
