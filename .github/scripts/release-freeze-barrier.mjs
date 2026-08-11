@@ -59,6 +59,7 @@ const CANCEL_POLL_MS = Number.parseInt(
   process.env.CODESTORY_FREEZE_CANCEL_POLL_MS ?? "1000",
   10,
 );
+const COMMAND_OUTPUT_MAX_BYTES = 64 * 1024 * 1024;
 
 function fail(message) {
   throw new Error(message);
@@ -76,6 +77,7 @@ function run(command, args, options = {}) {
   return execFileSync(command, args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: COMMAND_OUTPUT_MAX_BYTES,
     ...options,
   }).trim();
 }
