@@ -90,6 +90,7 @@ fn dart_language() -> tree_sitter::Language {
 pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
     let import_alias_bindings = collect_dart_import_alias_bindings(source);
+    let local_type_names = collect_dart_local_type_names(tree, source);
     walk_tree_nodes(tree.root_node(), &mut |body| {
         if body.kind() != "function_body" {
             return;
@@ -116,6 +117,7 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             DartReceiverContext {
                 parameter_receiver_types: &receiver_types,
                 import_alias_bindings: &import_alias_bindings,
+                local_type_names: &local_type_names,
             },
             &mut local_receiver_callsites,
             &mut edges,
@@ -153,6 +155,7 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
 struct DartReceiverContext<'a> {
     parameter_receiver_types: &'a HashMap<String, String>,
     import_alias_bindings: &'a HashMap<String, String>,
+    local_type_names: &'a HashSet<String>,
 }
 
 fn collect_dart_precise_receiver_call_specs(
@@ -389,7 +392,10 @@ fn dart_receiver_owner_from_type(
         let module_name = context.import_alias_bindings.get(&qualifier)?;
         return Some((owner_name, Some(module_name.clone())));
     }
-    Some((owner_name, None))
+    context
+        .local_type_names
+        .contains(&owner_name)
+        .then_some((owner_name, None))
 }
 
 fn dart_initialized_constructor_owner(
@@ -455,7 +461,26 @@ fn dart_constructor_owner_from_type_surface(
     if type_surface.contains('.') {
         return None;
     }
-    Some((owner_name, None))
+    context
+        .local_type_names
+        .contains(&owner_name)
+        .then_some((owner_name, None))
+}
+
+fn collect_dart_local_type_names(tree: &Tree, source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if !matches!(
+            node.kind(),
+            "class_definition" | "mixin_declaration" | "enum_declaration" | "extension_declaration"
+        ) {
+            return;
+        }
+        if let Some(name) = declaration_name(node, source) {
+            names.insert(name);
+        }
+    });
+    names
 }
 
 fn dart_local_binding_visible_at_call(binding: TsNode<'_>, call_node: TsNode<'_>) -> bool {
@@ -650,20 +675,21 @@ fn dart_import_alias_name(statement: &str) -> Option<String> {
 fn member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
     let mut cursor = node.walk();
     let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-    for window in children.windows(3) {
-        if window[0].kind() != "identifier"
+    for window in children.windows(2) {
+        if window[0].kind() != "selector"
             || window[1].kind() != "selector"
-            || window[2].kind() != "selector"
-            || first_descendant_with_kind(window[2], "argument_part").is_none()
+            || first_descendant_with_kind(window[1], "argument_part").is_none()
         {
             continue;
         }
-        let selector = first_descendant_with_kind(window[1], "unconditional_assignable_selector")?;
+        let selector = first_descendant_with_kind(window[0], "unconditional_assignable_selector")?;
         let method = first_descendant_with_kind(selector, "identifier")
             .and_then(|identifier| trimmed_node_text(identifier, source))?;
-        let receiver = trimmed_node_text(window[0], source)?;
+        let receiver = source
+            .get(node.start_byte()..window[0].start_byte())?
+            .trim();
         return Some((
-            normalized_dart_receiver_surface(&receiver)?,
+            normalized_dart_receiver_surface(receiver)?,
             normalize_parameter_name(&method)?,
         ));
     }
