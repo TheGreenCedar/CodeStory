@@ -10545,6 +10545,18 @@ void run(Notifier notifier) {
   notifier.notifyEvent('ready');
 }
 "#;
+    let commented_import_source = r#"
+/*
+import './mail/notifier.dart';
+*/
+const importExample = """
+import './mail/notifier.dart';
+""";
+
+void run(Notifier notifier) {
+  notifier.notifyEvent('ready');
+}
+"#;
 
     let (nodes, edges) = index_files(&[
         ("lib/mail/notifier.dart", notifier_source),
@@ -10604,6 +10616,20 @@ void run(Notifier notifier) {
         "dart unimported receiver type stays unresolved",
         &no_import_nodes,
         &no_import_edges,
+        "run",
+        "Notifier",
+        "notifyEvent",
+        "lib/mail/notifier.dart",
+    );
+
+    let (commented_import_nodes, commented_import_edges) = index_files(&[
+        ("lib/mail/notifier.dart", notifier_source),
+        ("lib/workflow.dart", commented_import_source),
+    ])?;
+    assert_no_resolved_call_to_method_owner_in_file(
+        "dart comment and string text cannot prove an import",
+        &commented_import_nodes,
+        &commented_import_edges,
         "run",
         "Notifier",
         "notifyEvent",
@@ -13672,6 +13698,29 @@ class IOClient {
         "IOClient.untyped",
         "BaseRequest",
         "finalize",
+    );
+
+    let worker = r#"
+class Worker {
+  void run() {}
+}
+"#;
+    let unimported_entry = r#"
+void call(Worker worker) {
+  worker.run();
+}
+"#;
+    let (unimported_nodes, unimported_edges) = index_files(&[
+        ("lib/worker.dart", worker),
+        ("lib/entry.dart", unimported_entry),
+    ])?;
+    assert_no_resolved_call_to_method_owner(
+        "dart unimported typed parameter remains fail-closed",
+        &unimported_nodes,
+        &unimported_edges,
+        "call",
+        "Worker",
+        "run",
     );
     Ok(())
 }

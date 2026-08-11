@@ -1486,6 +1486,23 @@ fn receiver_module_from_callsite(callsite_identity: Option<&str>) -> Option<&str
         })
 }
 
+fn dart_unprefixed_import_modules(module_marker: &str) -> Option<Vec<&str>> {
+    let mut encoded =
+        module_marker.strip_prefix(crate::languages::dart::UNPREFIXED_IMPORT_SET_PREFIX)?;
+    let mut modules = Vec::new();
+    while !encoded.is_empty() {
+        let (length, remainder) = encoded.split_once(':')?;
+        let length = length.parse::<usize>().ok()?;
+        if length == 0 || remainder.len() < length || !remainder.is_char_boundary(length) {
+            return None;
+        }
+        let (module, rest) = remainder.split_at(length);
+        modules.push(module);
+        encoded = rest;
+    }
+    (!modules.is_empty()).then_some(modules)
+}
+
 pub(super) fn semantic_candidate_kinds(edge_kind: EdgeKind) -> &'static [i32] {
     match edge_kind {
         EdgeKind::CALL => &[NodeKind::FUNCTION as i32, NodeKind::METHOD as i32],
@@ -2047,6 +2064,26 @@ impl CandidateIndex {
                     .as_deref()
                     .is_some_and(|path| resolution_path_directory(path) == caller_directory)
             })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        match matches.as_slice() {
+            [candidate] => Some(*candidate),
+            _ => None,
+        }
+    }
+
+    fn find_global_unique_owner_member_readonly(
+        &self,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let mut matches = self
+            .owner_member_candidate_offsets(owner_name, method_name)
+            .into_iter()
+            .filter_map(|offset| self.nodes.get(offset))
+            .filter(|node| owner_member_candidate_matches(node, owner_name, method_name))
             .map(|node| node.id)
             .collect::<Vec<_>>();
         matches.sort_unstable();

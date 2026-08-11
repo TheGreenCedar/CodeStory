@@ -49,6 +49,7 @@ use crate::{
 
 /// Callsite marker written onto edges produced from Dart member-call syntax.
 pub(crate) const MEMBER_CALLSITE_MARKER: &str = "syntax:dart-member-call";
+pub(crate) const UNPREFIXED_IMPORT_SET_PREFIX: &str = "dart-unprefixed-imports:";
 
 const GRAPH_QUERY: &str = include_str!("../../rules/dart.scm");
 
@@ -89,7 +90,9 @@ fn dart_language() -> tree_sitter::Language {
 /// Was `lib.rs::collect_dart_receiver_call_edges`.
 pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
-    let import_alias_bindings = collect_dart_import_alias_bindings(source);
+    let root = tree.root_node();
+    let import_alias_bindings = collect_dart_import_alias_bindings(root, source);
+    let unprefixed_import_set = encode_dart_unprefixed_import_modules(root, source);
     let local_type_names = collect_dart_local_type_names(tree, source);
     walk_tree_nodes(tree.root_node(), &mut |body| {
         if body.kind() != "function_body" {
@@ -105,7 +108,17 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             name: &source_name,
             span: ts_node_graph_span(signature),
         };
-        let receiver_types = collect_prefix_parameter_types(signature, source);
+        let mut receiver_types = collect_prefix_parameter_types(signature, source);
+        let receiver_modules = collect_dart_parameter_type_modules(
+            signature,
+            source,
+            &import_alias_bindings,
+            &local_type_names,
+            unprefixed_import_set.as_deref(),
+        );
+        receiver_types.retain(|receiver_name, owner_name| {
+            local_type_names.contains(owner_name) || receiver_modules.contains_key(receiver_name)
+        });
         let mut local_receiver_callsites = HashSet::new();
         collect_dart_precise_receiver_call_specs(
             body,
@@ -123,8 +136,6 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             &mut edges,
         );
         if !receiver_types.is_empty() {
-            let receiver_modules =
-                collect_dart_parameter_type_modules(signature, source, &import_alias_bindings);
             let start = edges.len();
             collect_receiver_call_specs_in_callable(
                 body,
@@ -539,6 +550,8 @@ fn collect_dart_parameter_type_modules(
     callable: TsNode<'_>,
     source: &str,
     import_alias_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+    unprefixed_import_set: Option<&str>,
 ) -> HashMap<String, String> {
     let mut receiver_modules = HashMap::new();
     let Some(parameters) = signature_parameter_surface(callable, source) else {
@@ -563,15 +576,54 @@ fn collect_dart_parameter_type_modules(
             continue;
         };
         let raw_type = tokens[..tokens.len() - 1].join(" ");
-        let Some(qualifier) = dart_type_import_qualifier(&raw_type) else {
+        if let Some(qualifier) = dart_type_import_qualifier(&raw_type) {
+            let Some(module_name) = import_alias_bindings.get(&qualifier) else {
+                continue;
+            };
+            receiver_modules.insert(receiver_name, module_name.clone());
+            continue;
+        }
+        let Some(owner_name) = normalize_type_surface(&raw_type) else {
             continue;
         };
-        let Some(module_name) = import_alias_bindings.get(&qualifier) else {
+        if local_type_names.contains(&owner_name) {
             continue;
-        };
-        receiver_modules.insert(receiver_name, module_name.clone());
+        }
+        if let Some(import_set) = unprefixed_import_set {
+            receiver_modules.insert(receiver_name, import_set.to_string());
+        }
     }
     receiver_modules
+}
+
+fn encode_dart_unprefixed_import_modules(root: TsNode<'_>, source: &str) -> Option<String> {
+    let mut modules = dart_import_statements(root, source)
+        .into_iter()
+        .filter(|statement| dart_import_alias_name(statement).is_none())
+        .filter_map(|statement| dart_import_module_name(&statement))
+        .filter_map(|module| {
+            if module.starts_with("./") || module.starts_with("../") {
+                Some(module)
+            } else if module.starts_with('/') || module.contains(':') {
+                None
+            } else {
+                Some(format!("./{module}"))
+            }
+        })
+        .filter(|module| !module.contains('|'))
+        .collect::<Vec<_>>();
+    modules.sort();
+    modules.dedup();
+    if modules.is_empty() {
+        return None;
+    }
+    let mut encoded = UNPREFIXED_IMPORT_SET_PREFIX.to_string();
+    for module in modules {
+        encoded.push_str(&module.len().to_string());
+        encoded.push(':');
+        encoded.push_str(&module);
+    }
+    Some(encoded)
 }
 
 fn dart_type_import_qualifier(raw_type: &str) -> Option<String> {
@@ -588,10 +640,10 @@ fn dart_type_import_qualifier(raw_type: &str) -> Option<String> {
     normalize_parameter_name(qualifier)
 }
 
-fn collect_dart_import_alias_bindings(source: &str) -> HashMap<String, String> {
+fn collect_dart_import_alias_bindings(root: TsNode<'_>, source: &str) -> HashMap<String, String> {
     let mut bindings = HashMap::new();
     let mut duplicates = HashSet::new();
-    for statement in dart_import_statements(source) {
+    for statement in dart_import_statements(root, source) {
         let Some(module_name) = dart_import_module_name(&statement) else {
             continue;
         };
@@ -611,38 +663,15 @@ fn collect_dart_import_alias_bindings(source: &str) -> HashMap<String, String> {
     bindings
 }
 
-fn dart_import_statements(source: &str) -> Vec<String> {
+fn dart_import_statements(root: TsNode<'_>, source: &str) -> Vec<String> {
     let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut collecting = false;
-
-    for raw_line in source.lines() {
-        let line = raw_line.split("//").next().unwrap_or(raw_line).trim();
-        if line.is_empty() {
-            continue;
+    walk_tree_nodes(root, &mut |node| {
+        if node.kind() == "import_specification"
+            && let Some(statement) = trimmed_node_text(node, source)
+        {
+            statements.push(statement);
         }
-        if !collecting {
-            if !line.starts_with("import ") {
-                continue;
-            }
-            current.clear();
-            current.push_str(line);
-            if line.contains(';') {
-                statements.push(current.clone());
-            } else {
-                collecting = true;
-            }
-            continue;
-        }
-
-        current.push(' ');
-        current.push_str(line);
-        if line.contains(';') {
-            statements.push(current.clone());
-            current.clear();
-            collecting = false;
-        }
-    }
+    });
 
     statements
 }

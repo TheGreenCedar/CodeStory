@@ -18,6 +18,7 @@ pub(super) fn compute_call_resolution(
     ) = row;
     let receiver_owner = receiver_owner_from_callsite(callsite_identity.as_deref());
     let receiver_module = receiver_module_from_callsite(callsite_identity.as_deref());
+    let dart_import_modules = receiver_module.and_then(dart_unprefixed_import_modules);
     let mut selected: Option<(i64, f32, ResolutionStrategy)> = None;
     let mut semantic_fallback = UnambiguousBestCandidate::default();
     let mut candidate_ids = OrderedCandidateIds::with_capacity(8);
@@ -175,7 +176,53 @@ pub(super) fn compute_call_resolution(
         }
     }
 
-    if let (Some(owner_name), Some(module_name)) = (receiver_owner, receiver_module) {
+    if let (Some(owner_name), Some(module_names)) = (receiver_owner, dart_import_modules.as_deref())
+    {
+        let mut imported_candidates = module_names
+            .iter()
+            .filter_map(|module_name| {
+                candidate_index.find_imported_owner_member_readonly(
+                    caller_file_path.as_deref(),
+                    module_name,
+                    owner_name,
+                    target_name,
+                )
+            })
+            .collect::<Vec<_>>();
+        imported_candidates.sort_unstable();
+        imported_candidates.dedup();
+        if pass.flags.store_candidates {
+            for candidate in &imported_candidates {
+                candidate_ids.push(*candidate);
+            }
+        }
+        if imported_candidates.len() != 1 {
+            let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+            return Ok(ComputedResolution {
+                update,
+                strategy: None,
+            });
+        }
+        let candidate = imported_candidates[0];
+        if candidate_index.find_global_unique_owner_member_readonly(owner_name, target_name)
+            != Some(candidate)
+        {
+            let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+            return Ok(ComputedResolution {
+                update,
+                strategy: None,
+            });
+        }
+        selected = Some((
+            candidate,
+            pass.policy.call_same_file,
+            ResolutionStrategy::CallGlobalUnique,
+        ));
+    }
+
+    if dart_import_modules.is_none()
+        && let (Some(owner_name), Some(module_name)) = (receiver_owner, receiver_module)
+    {
         let selected_imported_owner = candidate_index.find_imported_owner_member_readonly(
             caller_file_path.as_deref(),
             module_name,
