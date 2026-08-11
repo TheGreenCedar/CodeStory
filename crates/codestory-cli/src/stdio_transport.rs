@@ -1829,11 +1829,12 @@ fn handle_stdio_message(
                 operation_id.as_deref(),
                 attempt,
             );
-            return Some(stdio_jsonrpc_tool_call_from_legacy(
+            return Some(stdio_jsonrpc_tool_call_from_legacy_with_packet_budget(
                 id,
                 response,
                 publication_meta,
                 name,
+                &runtime.project_root,
             ));
         }
         _ => {
@@ -1924,7 +1925,69 @@ fn stdio_jsonrpc_tool_call_from_legacy(
     publication_meta: serde_json::Value,
     tool_name: &str,
 ) -> serde_json::Value {
+    stdio_jsonrpc_tool_call_from_legacy_inner(id, response, publication_meta, tool_name, None)
+}
+
+fn stdio_jsonrpc_tool_call_from_legacy_with_packet_budget(
+    id: serde_json::Value,
+    response: serde_json::Value,
+    publication_meta: serde_json::Value,
+    tool_name: &str,
+    project_root: &Path,
+) -> serde_json::Value {
+    stdio_jsonrpc_tool_call_from_legacy_inner(
+        id,
+        response,
+        publication_meta,
+        tool_name,
+        Some(project_root),
+    )
+}
+
+fn stdio_jsonrpc_tool_call_from_legacy_inner(
+    id: serde_json::Value,
+    response: serde_json::Value,
+    publication_meta: serde_json::Value,
+    tool_name: &str,
+    packet_project_root: Option<&Path>,
+) -> serde_json::Value {
     if let Some(result) = response.get("result") {
+        if tool_name == "packet"
+            && let Some(project_root) = packet_project_root
+            && let Ok(mut packet) =
+                serde_json::from_value::<codestory_contracts::api::AgentPacketDto>(result.clone())
+        {
+            let phase_probe = stdio_tool_call_success(tool_name, result.clone());
+            let packet_phases = phase_probe
+                .pointer("/_meta/codestory_stdio_phases")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            let measure_tool_result = |candidate: &codestory_contracts::api::AgentPacketDto| {
+                stdio_packet_tool_call_success(
+                    serde_json::to_value(candidate).expect("packet response is serializable"),
+                    &packet_phases,
+                    &publication_meta,
+                )
+            };
+            if let Err(error) = codestory_runtime::enforce_packet_output_budget_for_representation(
+                project_root,
+                &mut packet,
+                |candidate| {
+                    serde_json::to_vec(&measure_tool_result(candidate))
+                        .expect("packet tool result is serializable")
+                        .len()
+                },
+            ) {
+                return stdio_jsonrpc_success(
+                    id,
+                    stdio_tool_call_error(&serde_json::json!({
+                        "code": error.code,
+                        "message": error.message,
+                    })),
+                );
+            }
+            return stdio_jsonrpc_success(id, measure_tool_result(&packet));
+        }
         let mut success = stdio_tool_call_success(tool_name, result.clone());
         let success_object = success
             .as_object_mut()
@@ -1944,6 +2007,26 @@ fn stdio_jsonrpc_tool_call_from_legacy(
         return stdio_jsonrpc_success(id, stdio_tool_call_error(error));
     }
     stdio_jsonrpc_success(id, stdio_tool_call_success(tool_name, response))
+}
+
+fn stdio_packet_tool_call_success(
+    structured_content: serde_json::Value,
+    packet_phases: &serde_json::Value,
+    publication_meta: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "content": [
+            {
+                "type": "text",
+                "text": stdio_packet_text(&structured_content)
+            }
+        ],
+        "structuredContent": structured_content,
+        "_meta": {
+            "codestory_stdio_phases": packet_phases,
+            "codestory_publication": publication_meta,
+        }
+    })
 }
 
 fn stdio_tool_reads_publication(name: &str) -> bool {
@@ -3284,21 +3367,30 @@ fn handle_stdio_packet(
         .map(|mut packet| {
             match std::env::current_exe() {
                 Ok(executable) => {
-                    codestory_runtime::enforce_packet_output_budget_for_representation(
-                        &runtime.project_root,
-                        &mut packet,
-                        |candidate| {
-                            let mut public_packet = candidate.clone();
-                            codestory_runtime::bind_packet_follow_up_program(
-                                &runtime.project_root,
-                                &mut public_packet,
-                                &executable,
-                            );
-                            serde_json::to_vec(&public_packet)
-                                .expect("packet response is serializable")
-                                .len()
-                        },
-                    );
+                    if let Err(error) =
+                        codestory_runtime::enforce_packet_output_budget_for_representation(
+                            &runtime.project_root,
+                            &mut packet,
+                            |candidate| {
+                                let mut public_packet = candidate.clone();
+                                codestory_runtime::bind_packet_follow_up_program(
+                                    &runtime.project_root,
+                                    &mut public_packet,
+                                    &executable,
+                                );
+                                serde_json::to_vec(&public_packet)
+                                    .expect("packet response is serializable")
+                                    .len()
+                            },
+                        )
+                    {
+                        return serde_json::json!({
+                            "error": {
+                                "code": error.code,
+                                "message": error.message,
+                            }
+                        });
+                    }
                     codestory_runtime::bind_packet_follow_up_program(
                         &runtime.project_root,
                         &mut packet,
@@ -8245,6 +8337,43 @@ version = "0.11.20"
                 )
             })
         }));
+    }
+
+    #[test]
+    fn stdio_packet_budget_representation_is_the_complete_owned_tool_result() {
+        let structured_content = json!({
+            "packet_id": "packet-1",
+            "sufficiency": { "status": "partial" }
+        });
+        let phases = json!(["packet_stdio_phase label=test duration_ms=1"]);
+        let publication = json!({"generation": "generation-1"});
+        let tool_result =
+            stdio_packet_tool_call_success(structured_content.clone(), &phases, &publication);
+
+        assert_eq!(
+            tool_result.get("structuredContent"),
+            Some(&structured_content)
+        );
+        assert_eq!(
+            tool_result.pointer("/_meta/codestory_stdio_phases"),
+            Some(&phases)
+        );
+        assert_eq!(
+            tool_result.pointer("/_meta/codestory_publication"),
+            Some(&publication)
+        );
+        assert_eq!(
+            tool_result.pointer("/content/0/text"),
+            Some(&json!(stdio_packet_text(&structured_content)))
+        );
+
+        let owned_bytes = serde_json::to_vec(&tool_result)
+            .expect("serialize CodeStory-owned tool result")
+            .len();
+        let jsonrpc_bytes = serde_json::to_vec(&stdio_jsonrpc_success(json!(7), tool_result))
+            .expect("serialize caller-owned JSON-RPC frame")
+            .len();
+        assert!(jsonrpc_bytes > owned_bytes);
     }
 
     #[test]

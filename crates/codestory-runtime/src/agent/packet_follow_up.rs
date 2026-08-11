@@ -1,6 +1,5 @@
 use codestory_agent::packet_command::{next_deeper_packet_argv, render_packet_command};
 use codestory_contracts::api::{AgentPacketDto, PacketFollowUpInvocationDto};
-use std::collections::HashMap;
 use std::path::Path;
 
 const LOGICAL_CODESTORY_PROGRAM: &str = "codestory-cli";
@@ -14,26 +13,37 @@ pub fn bind_packet_follow_up_program(
     executable: &Path,
 ) {
     let executable = executable.to_string_lossy().into_owned();
-    let mut rendered_replacements = HashMap::new();
     for invocation in &mut packet.sufficiency.follow_up_invocations {
-        let previous = render_follow_up_invocation(invocation);
         if invocation.program == LOGICAL_CODESTORY_PROGRAM {
             invocation.program.clone_from(&executable);
         }
-        rendered_replacements.insert(previous, render_follow_up_invocation(invocation));
     }
 
-    packet.sufficiency.follow_up_commands = packet
-        .sufficiency
-        .follow_up_invocations
+    packet.sufficiency.follow_up_commands = if packet
+        .budget
+        .omitted_sections
         .iter()
-        .map(render_follow_up_invocation)
-        .collect();
-    for open_next in &mut packet.sufficiency.open_next {
-        if let Some(replacement) = rendered_replacements.get(open_next) {
-            open_next.clone_from(replacement);
-        }
-    }
+        .any(|section| section == "follow_up_commands")
+    {
+        Vec::new()
+    } else {
+        packet
+            .sufficiency
+            .follow_up_invocations
+            .iter()
+            .map(render_follow_up_invocation)
+            .collect()
+    };
+    packet.sufficiency.open_next = if packet
+        .budget
+        .omitted_sections
+        .iter()
+        .any(|section| section == "open_next")
+    {
+        Vec::new()
+    } else {
+        packet.sufficiency.follow_up_commands.clone()
+    };
 
     packet.budget.next_deeper_command =
         next_deeper_packet_argv(project_root, &packet.question, packet.budget.requested).map(
@@ -106,5 +116,18 @@ mod tests {
                 .is_some_and(|command| command
                     .starts_with("'/opt/CodeStory Managed/bin/codestory-cli' packet"))
         );
+
+        packet
+            .budget
+            .omitted_sections
+            .extend(["open_next".to_string(), "follow_up_commands".to_string()]);
+        bind_packet_follow_up_program(
+            Path::new("/tmp/project with space"),
+            &mut packet,
+            Path::new("/opt/CodeStory Managed/bin/codestory-cli"),
+        );
+        assert!(packet.sufficiency.open_next.is_empty());
+        assert!(packet.sufficiency.follow_up_commands.is_empty());
+        assert_eq!(packet.sufficiency.follow_up_invocations.len(), 1);
     }
 }

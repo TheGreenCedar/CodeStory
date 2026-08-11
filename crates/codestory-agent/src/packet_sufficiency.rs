@@ -23,6 +23,7 @@ use crate::packet_obligations::{
     PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE, bind_claims_to_packet_obligations,
     material_packet_obligations_are_proven, packet_claims_with_obligation_receipts,
     packet_obligation_open_next_candidates, packet_proven_obligation_carrier_paths,
+    packet_unmet_material_follow_up_queries,
 };
 use crate::packet_plan::packet_symbol_probe_queries;
 use crate::packet_required_probes::packet_missing_sufficiency_probe_queries_with_extra;
@@ -572,6 +573,15 @@ fn assemble_packet_sufficiency_with_probe_context(
         .collect::<Vec<_>>();
     let mut follow_up_argv = if terminally_sufficient {
         Vec::new()
+    } else if let Some(obligations) = obligations {
+        packet_obligation_follow_up_argv(
+            project_root,
+            question,
+            budget,
+            obligations,
+            &missing_exact_path_claims,
+            packet_full_retrieval_available(answer),
+        )
     } else {
         packet_follow_up_argv(
             project_root,
@@ -594,7 +604,7 @@ fn assemble_packet_sufficiency_with_probe_context(
         budget,
         has_sufficiency_blocking_budget_omission,
     });
-    if !terminally_sufficient && !open_next_paths.is_empty() {
+    if obligations.is_none() && !terminally_sufficient && !open_next_paths.is_empty() {
         let project = packet_display_project_arg(project_root);
         let candidate_commands = if packet_full_retrieval_available(answer) {
             packet_follow_up_search_argv(&project, &open_next_paths)
@@ -8262,6 +8272,22 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn obligation_follow_up_paths_are_project_relative_without_rewriting_symbols() {
+        let project_root = Path::new("/var/tmp/requests");
+        assert_eq!(
+            packet_project_relative_follow_up_query(
+                project_root,
+                "/var/tmp/requests/requests/sessions.py",
+            ),
+            "requests/sessions.py"
+        );
+        assert_eq!(
+            packet_project_relative_follow_up_query(project_root, "Session.send"),
+            "Session.send"
+        );
+    }
 }
 
 fn packet_has_sufficiency_blocking_budget_omission(
@@ -8311,6 +8337,58 @@ fn packet_missing_probe_requires_compact_proof(query: &str) -> bool {
 
 pub fn packet_budget_exceeded_hard_output_cap(budget: &PacketBudgetDto) -> bool {
     budget.used.output_bytes > budget.limits.max_output_bytes
+}
+
+const PACKET_FOLLOW_UP_COMMAND_LIMIT: usize = 12;
+
+fn packet_obligation_follow_up_argv(
+    project_root: &Path,
+    question: &str,
+    budget: &PacketBudgetDto,
+    obligations: &PacketObligationPlanDto,
+    missing_exact_path_claims: &[String],
+    full_retrieval_available: bool,
+) -> Vec<Vec<String>> {
+    let project = packet_display_project_arg(project_root);
+    let mut queries = Vec::new();
+    for query in packet_unmet_material_follow_up_queries(obligations) {
+        let query = packet_project_relative_follow_up_query(project_root, &query);
+        push_unique_sufficiency_term(&mut queries, &query);
+    }
+    for query in missing_exact_path_claims {
+        let query = packet_project_relative_follow_up_query(project_root, query);
+        push_unique_sufficiency_term(&mut queries, &query);
+    }
+    let deeper = next_deeper_packet_argv(project_root, question, budget.requested);
+    let reserved_for_deeper = usize::from(deeper.is_some());
+    let targeted_limit = PACKET_FOLLOW_UP_COMMAND_LIMIT.saturating_sub(reserved_for_deeper);
+    let mut commands = if full_retrieval_available {
+        packet_follow_up_search_argv(&project, &queries)
+    } else {
+        let mut commands = vec![packet_retrieval_activation_argv(&project)];
+        commands.extend(packet_follow_up_trail_argv(&project, &queries));
+        commands
+    };
+    commands.truncate(targeted_limit);
+    if let Some(deeper) = deeper {
+        push_unique_argv(&mut commands, deeper);
+    }
+    commands
+}
+
+fn packet_project_relative_follow_up_query(project_root: &Path, query: &str) -> String {
+    let normalized_query = query.trim_start_matches("\\\\?\\").replace('\\', "/");
+    let normalized_root = project_root
+        .to_string_lossy()
+        .trim_start_matches("\\\\?\\")
+        .replace('\\', "/");
+    if let Ok(relative) = Path::new(&normalized_query).strip_prefix(Path::new(&normalized_root)) {
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if !relative.is_empty() {
+            return relative;
+        }
+    }
+    packet_display_path(&normalized_query)
 }
 
 /// Build the follow-up contract as typed argv.

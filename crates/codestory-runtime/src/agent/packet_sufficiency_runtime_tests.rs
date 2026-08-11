@@ -244,7 +244,11 @@ fn route_proof_observes_actual_citation_and_edge_caps_across_packet_budgets() {
                 unreachable!("route fixture must retain UML")
             };
             assert_eq!(graph.edges.len(), limits.max_trail_edges as usize);
-            assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+            assert_eq!(
+                sufficiency.status,
+                PacketSufficiencyStatusDto::Sufficient,
+                "deterministic graph capping must retain the requested route ahead of unrelated edges: {sufficiency:?}"
+            );
         } else {
             assert!(!budget.truncated, "{requested:?} should retain the route");
             assert_eq!(

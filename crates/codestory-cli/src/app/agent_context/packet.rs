@@ -95,7 +95,8 @@ pub(in crate::app) fn enforce_packet_cli_json_output_budget(
                 .expect("packet public JSON rendering was validated before budget enforcement")
                 .len()
         },
-    );
+    )
+    .map_err(map_api_error)?;
     codestory_runtime::bind_packet_follow_up_program(
         project_root,
         &mut operation.value,
