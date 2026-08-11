@@ -776,7 +776,7 @@ fn selection_key(
 }
 
 fn decode_hex(hex: &str) -> Result<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         bail!("hex input must have an even length");
     }
     (0..hex.len())
