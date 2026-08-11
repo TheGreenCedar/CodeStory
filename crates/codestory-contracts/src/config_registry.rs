@@ -97,6 +97,8 @@ pub const RETRIEVAL_ENV: &str = "CODESTORY_RETRIEVAL";
 pub const RETRIEVAL_PROFILE_ENV: &str = "CODESTORY_RETRIEVAL_PROFILE";
 pub const RETRIEVAL_RUN_ID_ENV: &str = "CODESTORY_RETRIEVAL_RUN_ID";
 pub const RETRIEVAL_SHADOW_ENV: &str = "CODESTORY_RETRIEVAL_SHADOW";
+pub const SEMANTIC_CALIBRATION_QUERY_VECTOR_DIR_ENV: &str =
+    "CODESTORY_SEMANTIC_CALIBRATION_QUERY_VECTOR_DIR";
 pub const SEMANTIC_DOC_ALIAS_MODE_ENV: &str = "CODESTORY_SEMANTIC_DOC_ALIAS_MODE";
 pub const SEMANTIC_DOC_MAX_TOKENS_ENV: &str = "CODESTORY_SEMANTIC_DOC_MAX_TOKENS";
 pub const SEMANTIC_DOC_SCOPE_ENV: &str = "CODESTORY_SEMANTIC_DOC_SCOPE";
@@ -229,6 +231,8 @@ const RETRIEVAL_CONFIG: &str = "crates/codestory-retrieval/src/config.rs";
 const RETRIEVAL_INDEX: &str = "crates/codestory-retrieval/src/index.rs";
 const RETRIEVAL_QUALIFICATION: &str =
     "crates/codestory-retrieval/src/per_user_embedding/qualification_control.rs";
+const RETRIEVAL_SEMANTIC_CALIBRATION: &str =
+    "crates/codestory-retrieval/src/semantic_calibration_support.rs";
 const RUNTIME_FRESHNESS: &str = "crates/codestory-runtime/src/index_freshness.rs";
 const RUNTIME_GRAPH_DTO: &str = "crates/codestory-runtime/src/graph_dto.rs";
 const RUNTIME_ORCHESTRATOR: &str = "crates/codestory-runtime/src/agent/orchestrator.rs";
@@ -691,6 +695,13 @@ pub const ENV_SETTINGS: &[EnvSetting] = &[
         SettingKind::Boolean,
         SettingAudience::Diagnostic,
         "Runs published retrieval beside the incumbent path for comparison.",
+    ),
+    setting(
+        SEMANTIC_CALIBRATION_QUERY_VECTOR_DIR_ENV,
+        RETRIEVAL_SEMANTIC_CALIBRATION,
+        SettingKind::Path,
+        SettingAudience::Diagnostic,
+        "Directory where the development calibration harness captures query vectors.",
     ),
     setting(
         SEMANTIC_DOC_ALIAS_MODE_ENV,

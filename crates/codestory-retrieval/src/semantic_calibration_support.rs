@@ -5,6 +5,7 @@ use crate::embedded_vector::{
     search_database_for_semantic_calibration, validate_database,
 };
 use anyhow::{Context, Result, bail};
+pub use codestory_contracts::config_registry::SEMANTIC_CALIBRATION_QUERY_VECTOR_DIR_ENV as QUERY_VECTOR_CAPTURE_DIR_ENV;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -19,7 +20,6 @@ pub const CALIBRATION_FIXTURE_PATH: &str =
 pub const CALIBRATION_EDGE_CONTRACT_PATH: &str =
     "crates/codestory-indexer/tests/call_resolution_common_methods.rs";
 pub const CALIBRATION_FIXTURE_TRANSFORMATION: &str = "rust-public-owner-anchors-v1";
-pub const QUERY_VECTOR_CAPTURE_DIR_ENV: &str = "CODESTORY_SEMANTIC_CALIBRATION_QUERY_VECTOR_DIR";
 const MRR_SCALE: u64 = 2_520;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
