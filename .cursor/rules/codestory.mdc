@@ -17,4 +17,4 @@ Before making source claims, planning edits, choosing tests, or reviewing change
 
 Cursor setup, MCP wiring, and host-specific notes: [docs/users/cursor.md](../../docs/users/cursor.md).
 
-The **codestory-grounding** skill is loaded by the plugin and owns the detailed tool and evidence contract.
+This repository-managed setup provides the rule and MCP adapter only. Install the Cursor plugin to load the **codestory-grounding** skill and session hook.

@@ -6955,13 +6955,15 @@ test("portable plugin core and thin host adapters preserve their own contracts",
   assert.equal(fs.existsSync(join(pluginRoot, ".cursor", "rules", "codestory.mdc")), false);
 });
 
-test("Cursor rules share one grounding contract with host-correct documentation links", async () => {
+test("Cursor rules share one grounding core and describe their host surfaces truthfully", async () => {
   const pluginRule = await readFile(join(pluginRoot, "rules", "codestory.mdc"), "utf8");
   const dogfoodRule = await readFile(join(repoRoot, ".cursor", "rules", "codestory.mdc"), "utf8");
-  const normalize = (text) => text.replace(
-    /Cursor setup, MCP wiring, and host-specific notes: \[[^\n\]]+\]\([^\n)]+\)\./u,
-    "Cursor setup, MCP wiring, and host-specific notes: CURSOR_GUIDE.",
-  );
+  const normalize = (text) => text
+    .replace(
+      /Cursor setup, MCP wiring, and host-specific notes: \[[^\n\]]+\]\([^\n)]+\)\./u,
+      "Cursor setup, MCP wiring, and host-specific notes: CURSOR_GUIDE.",
+    )
+    .replace(/(?:The \*\*codestory-grounding\*\*|This repository-managed setup)[^\n]+/u, "HOST SURFACE NOTE");
   assert.equal(normalize(pluginRule), normalize(dogfoodRule));
   assert.match(
     pluginRule,
@@ -6970,6 +6972,8 @@ test("Cursor rules share one grounding contract with host-correct documentation 
   assert.doesNotMatch(pluginRule, /\]\(\.\.\//u);
   assert.match(dogfoodRule, /\]\(\.\.\/\.\.\/docs\/users\/cursor\.md\)/u);
   assert.match(pluginRule, /codestory-grounding.*loaded by the plugin/u);
+  assert.match(dogfoodRule, /provides the rule and MCP adapter only/u);
+  assert.doesNotMatch(dogfoodRule, /skill is loaded by the plugin/u);
   assert.doesNotMatch(pluginRule, /plugins\/codestory\/skills/u);
 });
 

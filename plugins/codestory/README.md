@@ -95,9 +95,15 @@ launcher fetches the matching managed runtime if it is not already installed.
 The MCP toggle is a Cursor platform setting, so installing the plugin cannot
 enable it on your behalf.
 
-Teams can import this repository through
-[`.cursor-plugin/marketplace.json`](../../.cursor-plugin/marketplace.json) in
-the Cursor Dashboard instead of copying individual files.
+For Teams or Enterprise distribution, an administrator uses **Dashboard →
+Plugins → Team Marketplaces → Add Marketplace → Import from Repo** and selects
+this repository. Cursor's access settings must grant the workspace access to
+the repository, including the required organization or repository permission
+for a private repository. The import reads
+[`.cursor-plugin/marketplace.json`](../../.cursor-plugin/marketplace.json).
+Enable **Auto Refresh** or use **Refresh** from the Team Marketplaces dashboard
+after an update. That refresh updates the team catalog; each user still refreshes
+the installed plugin from Customize and reloads Cursor.
 
 ## CodeStoryDev / Cursor refresh
 

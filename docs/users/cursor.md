@@ -20,8 +20,8 @@ Where is request validation implemented, who calls it, and which tests cover it?
 
 On the first call, the launcher fetches the matching CodeStory runtime if it is
 not already installed, then prepares the repository. Cursor should retry the
-same tool after its reported delay. A
-healthy answer cites real files and symbols; if MCP is unavailable, the agent
+same tool after its reported delay. A healthy answer cites real files and
+symbols; if MCP is unavailable, the agent
 uses ordinary source inspection and says that CodeStory evidence was not
 available.
 
@@ -33,33 +33,45 @@ the launcher then selects the matching managed runtime.
 
 ## Team distribution
 
-Teams can use **Import from Repo** on the Cursor Dashboard and select this
-repository. The repository marketplace manifest at
+For a Teams or Enterprise workspace, an administrator opens **Dashboard →
+Plugins → Team Marketplaces → Add Marketplace → Import from Repo**, then selects
+this repository. Cursor's repository access settings must grant the workspace
+access to the repository; private repositories also need the corresponding
+organization or repository permission. The marketplace manifest at
 [`.cursor-plugin/marketplace.json`](../../.cursor-plugin/marketplace.json)
-points Cursor at the publish-ready package under `plugins/codestory`.
-Publication in the public Cursor Marketplace is a separate maintainer step.
+points Cursor at the package under `plugins/codestory`.
+
+Enable **Auto Refresh** for automatic marketplace updates, or use **Refresh**
+from the Team Marketplaces dashboard after a repository update. This refreshes
+the team marketplace catalog. Individual users still refresh the installed
+plugin from Customize and reload Cursor. Publication in the public Cursor
+Marketplace is a separate maintainer step.
 
 ## Advanced: repository-managed setup
 
-Teams that do not use Cursor's plugin marketplace must vendor the complete
-`plugins/codestory` package before committing a rule and MCP configuration; the
-configuration alone does not contain the launcher or grounding skill. This
-repository's [rule](../../.cursor/rules/codestory.mdc) and
+This is a rule-and-MCP-only mode; it does not install the plugin's grounding
+skill or session hook. Teams using it must vendor the complete
+`plugins/codestory` package before committing the rule and MCP configuration,
+because the configuration alone does not contain the launcher. This repository's
+[rule](../../.cursor/rules/codestory.mdc) and
 [MCP configuration](../../.cursor/mcp.json) work because that complete package
 is present at `plugins/codestory`. Keep the MCP command rooted at
 `${workspaceFolder}` and do not add a repository-local plugin-data directory.
 
-For local CodeStory development, run:
+Cursor's MCP install deeplinks can add an MCP server for users who intentionally
+choose manual setup, but they do not install the rule, skill, or session hook
+and are not the primary CodeStory install path.
+
+## Local plugin development
+
+From a clean committed CodeStory checkout, run:
 
 ```sh
 node scripts/install-codestory-cursor-plugin.mjs \
   --cli "$(pwd)/target/release/codestory-cli"
 ```
 
-Without `--cli`, the plugin uses the version-matched managed runtime. Cursor's
-MCP install deeplinks can add an MCP server for users who intentionally choose
-manual setup, but they do not install the rule, skill, or session hook and are
-not the primary CodeStory install path.
+Without `--cli`, the plugin uses the version-matched managed runtime.
 
 ## Troubleshooting
 
