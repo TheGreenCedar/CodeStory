@@ -285,6 +285,7 @@ function inferredCodexPluginDataDir(root = pluginRoot) {
 function inferredCursorPluginDataDir(
   root = pluginRoot,
   home = process.env.HOME || process.env.USERPROFILE || os.homedir(),
+  options = {},
 ) {
   const parts = path.resolve(root).split(/[\\/]+/u);
   for (let index = 0; index <= parts.length - 5; index += 1) {
@@ -304,8 +305,18 @@ function inferredCursorPluginDataDir(
     if (usablePluginDataDir(dataDir)) return dataDir;
   }
 
+  if (!confirmedCursorIdentity(options.env || process.env)) return null;
   const fallback = path.join(home, '.cursor', 'plugins', 'data', 'codestory');
   return usablePluginDataDir(fallback) ? fallback : null;
+}
+
+const cursorDogfoodMarker = 'CODESTORY_CURSOR_DOGFOOD';
+
+function confirmedCursorIdentity(env = process.env) {
+  return Boolean(
+    env.CURSOR_PLUGIN_ROOT
+    || env[cursorDogfoodMarker] === '1'
+  );
 }
 
 function usablePluginDataDir(dataDir) {
@@ -332,10 +343,15 @@ const cursorLocalOverrideFileName = 'local-overrides.json';
 const cursorLocalOverrideMaxBytes = 64 * 1024;
 
 function readCursorLocalOverrides(root = pluginRoot, options = {}) {
-  const cursorHost = options.cursorHost
-    ?? Boolean(process.env.CURSOR_VERSION || process.env.CURSOR_PROJECT_DIR);
-  if (!cursorHost) return null;
-  const dataDir = inferredCursorPluginDataDir(root, options.home);
+  const env = options.env || process.env;
+  const explicitPluginData = Object.hasOwn(options, 'pluginData')
+    ? options.pluginData
+    : env.PLUGIN_DATA;
+  const dataDir = typeof explicitPluginData === 'string' && path.isAbsolute(explicitPluginData)
+    ? explicitPluginData
+    : env[cursorDogfoodMarker] === '1'
+      ? inferredCursorPluginDataDir(root, options.home, { env })
+      : null;
   if (!dataDir) return null;
   const overridePath = path.join(dataDir, cursorLocalOverrideFileName);
   try {
@@ -2258,7 +2274,7 @@ function publicationStampText(value) {
 // Mirrors `codestory_cli::runtime::codestory_publication_meta` for the one frame
 // the packaged path never delegates. The launcher answers `initialize` itself
 // and suppresses the runtime's own answer, so this is the only stamp a host
-// behind `plugins/codestory/mcp.json` can read at handshake; without it the
+// behind either package MCP config can read at handshake; without it the
 // packaged handshake is indistinguishable from a legacy v0 producer no matter
 // which contract the pinned runtime implements. The launcher authors the frame,
 // so the stamp describes the launcher's own knowledge: no publication identity
@@ -4695,9 +4711,11 @@ if (require.main === module) {
       fetchReleaseManifestEntry,
       inferredCodexPluginDataDir,
       inferredCursorPluginDataDir,
+      confirmedCursorIdentity,
       pluginDataDir,
       readCursorLocalOverrides,
       cursorLocalOverrideFileName,
+      cursorDogfoodMarker,
       bindArchiveToReleaseManifest,
       publishDownloadedFile,
       managedCliDownloadCacheDir,

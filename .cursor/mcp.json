@@ -3,7 +3,9 @@
     "codestory": {
       "command": "node",
       "args": ["${workspaceFolder}/plugins/codestory/scripts/codestory-mcp.cjs"],
-      "env": {},
+      "env": {
+        "CODESTORY_CURSOR_DOGFOOD": "1"
+      },
       "tool_timeout_sec": 300
     }
   }

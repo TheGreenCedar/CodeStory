@@ -1,11 +1,12 @@
 {
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
   "mcpServers": {
     "codestory": {
+      "type": "stdio",
       "command": "node",
       "args": ["./scripts/codestory-mcp.cjs"],
       "cwd": "${PLUGIN_ROOT}",
-      "env": {},
-      "tool_timeout_sec": 300
+      "env": {}
     }
   }
 }

@@ -4,7 +4,8 @@ const path = require('path');
 const { createHash } = require('crypto');
 
 const pluginRoot = path.dirname(__dirname);
-const isCursor = Boolean(process.env.CURSOR_VERSION || process.env.CURSOR_PROJECT_DIR);
+const cursorDogfoodMarker = 'CODESTORY_CURSOR_DOGFOOD';
+const isCursor = confirmedCursorIdentity();
 const isCopilot = !isCursor && Boolean(process.env.COPILOT_PLUGIN_DATA);
 const isCodex = !isCursor && !isCopilot && Boolean(process.env.PLUGIN_DATA);
 
@@ -46,6 +47,7 @@ function inferredCodexPluginDataDir(root = pluginRoot) {
 function inferredCursorPluginDataDir(
   root = pluginRoot,
   home = process.env.HOME || process.env.USERPROFILE || os.homedir(),
+  options = {},
 ) {
   const parts = path.resolve(root).split(/[\\/]+/u);
   for (let index = 0; index <= parts.length - 5; index += 1) {
@@ -64,8 +66,16 @@ function inferredCursorPluginDataDir(
     const dataDir = path.join(cursorRoot, 'plugins', 'data', 'codestory');
     if (usablePluginDataDir(dataDir)) return dataDir;
   }
+  if (!confirmedCursorIdentity(options.env || process.env)) return null;
   const fallback = path.join(home, '.cursor', 'plugins', 'data', 'codestory');
   return usablePluginDataDir(fallback) ? fallback : null;
+}
+
+function confirmedCursorIdentity(env = process.env) {
+  return Boolean(
+    env.CURSOR_PLUGIN_ROOT
+    || env[cursorDogfoodMarker] === '1'
+  );
 }
 
 function pluginDataDir() {
@@ -213,6 +223,8 @@ function writeHookOutput(event, context) {
 }
 
 module.exports = {
+  confirmedCursorIdentity,
+  cursorDogfoodMarker,
   dirtyMarkerPathForProject,
   inferredCodexPluginDataDir,
   inferredCursorPluginDataDir,

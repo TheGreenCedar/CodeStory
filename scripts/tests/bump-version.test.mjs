@@ -60,6 +60,7 @@ function fixtureRoot(version) {
       .join("\n")}`,
   );
   for (const manifest of [
+    "plugins/codestory/plugin.json",
     "plugins/codestory/.codex-plugin/plugin.json",
     "plugins/codestory/.cursor-plugin/plugin.json",
     "plugins/codestory/.claude-plugin/plugin.json",
@@ -137,6 +138,7 @@ function readVersions(root) {
   return {
     cli: crateVersion("codestory-cli"),
     bench: crateVersion("codestory-bench"),
+    portablePlugin: jsonVersion("plugins/codestory/plugin.json", ["version"]),
     codexPlugin: jsonVersion("plugins/codestory/.codex-plugin/plugin.json", ["version"]),
     cursorPlugin: jsonVersion("plugins/codestory/.cursor-plugin/plugin.json", ["version"]),
     claudePlugin: jsonVersion("plugins/codestory/.claude-plugin/plugin.json", ["version"]),
@@ -200,6 +202,7 @@ test("--check reports every surface that has not been bumped", () => {
     const message = `${failure.stdout}${failure.stderr}`;
     for (const surface of [
       "crates/codestory-cli/Cargo.toml",
+      "plugins/codestory/plugin.json",
       "plugins/codestory/.codex-plugin/plugin.json",
       "crates/codestory-llama-sys/model-contract.json",
       "plugins/codestory/cli-version.json",
@@ -285,6 +288,7 @@ test("the plugin lane pins published CLI digests without moving native versions"
     assert.equal(after.bench, "0.16.1");
     assert.equal(after.producer, "0.16.1");
     assert.equal(after.cargoLock, before.cargoLock);
+    assert.equal(after.portablePlugin, "0.16.2");
     assert.equal(after.codexPlugin, "0.16.2");
     assert.equal(after.cursorPlugin, "0.16.2");
     assert.equal(after.claudePlugin, "0.16.2");

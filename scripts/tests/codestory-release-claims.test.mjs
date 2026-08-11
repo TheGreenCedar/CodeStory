@@ -1966,6 +1966,7 @@ function versionSurfaceRepository(ref) {
     UNSTAMPED_NATIVE_CONTROL,
     "crates/codestory-llama-sys/model-contract.json",
     "plugins/codestory/cli-version.json",
+    "plugins/codestory/plugin.json",
     "plugins/codestory/.codex-plugin/plugin.json",
     "plugins/codestory/.cursor-plugin/plugin.json",
     "plugins/codestory/.claude-plugin/plugin.json",

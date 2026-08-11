@@ -7,11 +7,15 @@ explicitly.
 
 ## Host surfaces
 
+The portable [Agent Plugins v1](https://agent-plugins.org/specification) core is
+`plugin.json`, `skills/`, and `mcp.json`. Host manifests add only the rules,
+hooks, and compatibility wiring their clients require.
+
 | Host | Plugin surface | User guide |
 | --- | --- | --- |
-| Codex | `.codex-plugin/plugin.json`, `mcp.json`, hooks, skill | [Codex](../../docs/users/codex.md) |
-| Cursor | `.cursor-plugin/plugin.json`, `rules/`, `mcp.json`, `hooks/cursor-hooks.json`, skill | [Cursor](../../docs/users/cursor.md) |
-| Claude Code | `.claude-plugin/plugin.json`, session hooks | [Claude Code](../../docs/users/claude-code.md) |
+| Codex | `.codex-plugin/plugin.json`, legacy `.mcp.json`, hooks, skill | [Codex](../../docs/users/codex.md) |
+| Cursor | Portable core plus `.cursor-plugin/plugin.json`, `rules/`, and `hooks/cursor-hooks.json` | [Cursor](../../docs/users/cursor.md) |
+| Claude Code | `.claude-plugin/plugin.json`, legacy `.mcp.json`, session hooks | [Claude Code](../../docs/users/claude-code.md) |
 | Copilot CLI | `.github/plugin/plugin.json`, session hooks | [Copilot](../../docs/users/copilot.md#copilot-cli) |
 | Copilot editor | Repository instructions | [Copilot editor](../../docs/users/copilot.md#copilot-editor) |
 
@@ -21,6 +25,7 @@ privacy, and readiness behavior.
 ## Package anatomy
 
 - `scripts/codestory-mcp.cjs` is the stdio adapter and managed CLI launcher.
+- `plugin.json`, `skills/`, and `mcp.json` are the portable plugin core.
 - `hooks/` records bounded lifecycle state for hosts that support hooks.
 - `rules/codestory.mdc` is Cursor's always-on grounding rule.
 - `skills/codestory-grounding/` defines the canonical direct-tool and evidence
@@ -37,10 +42,10 @@ inspection.
 
 The adapter starts one projectless, multi-repository MCP runtime. It prefers the
 exact checksummed CLI version declared by the plugin. If that CLI is missing,
-one installer publishes it while other requests wait or receive a bounded
-preparing response. `CODESTORY_CLI` is an explicit local-development override;
-ambient `PATH` binaries are diagnostic only and are not launched by an installed
-plugin.
+the launcher fetches and publishes it while other requests wait or receive a
+bounded preparing response. `CODESTORY_CLI` is an explicit local-development
+override; ambient `PATH` binaries are diagnostic only and are not launched by
+an installed plugin.
 
 The managed installer verifies the release checksum manifest, archive,
 executable, plugin version, `--version`, and MCP initialization before
@@ -85,8 +90,10 @@ installed plugin, and a fresh host session loads that replacement. See the
 
 Open **Customize → Plugins**, install **codestory**, enable its MCP server once,
 and reload the Cursor window. The package supplies the rule, grounding skill,
-session-start context, and managed CLI launcher. The MCP toggle is a Cursor
-platform setting, so installing the plugin cannot enable it on your behalf.
+session-start context, and managed CLI launcher. On the first MCP call, the
+launcher fetches the matching managed runtime if it is not already installed.
+The MCP toggle is a Cursor platform setting, so installing the plugin cannot
+enable it on your behalf.
 
 Teams can import this repository through
 [`.cursor-plugin/marketplace.json`](../../.cursor-plugin/marketplace.json) in

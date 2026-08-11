@@ -28,9 +28,22 @@ plugins.
 ### Connect MCP
 
 Configure an MCP server that runs
-`plugins/codestory/scripts/codestory-mcp.cjs`. Use the same server block as the
-[Cursor guide](cursor.md#advanced-repository-managed-setup), with a persistent
-`CODESTORY_PLUGIN_DATA` directory.
+`plugins/codestory/scripts/codestory-mcp.cjs`, with a persistent per-user data
+directory outside the repository:
+
+```json
+{
+  "mcpServers": {
+    "codestory": {
+      "command": "node",
+      "args": ["/absolute/path/to/plugins/codestory/scripts/codestory-mcp.cjs"],
+      "env": {
+        "CODESTORY_PLUGIN_DATA": "/absolute/path/to/codestory-plugin-data"
+      }
+    }
+  }
+}
+```
 
 The session hook is useful without MCP because it preserves the grounding
 contract, but it cannot query the CodeStory index. Without MCP, the agent should
@@ -68,8 +81,8 @@ available. They do not install the CLI, start MCP, or create an index.
 
 1. Copy `.github/copilot-instructions.md` from this repository into the target
    repository.
-2. If the editor supports MCP, configure the shipped CodeStory adapter as in
-   the [Cursor guide](cursor.md#advanced-repository-managed-setup).
+2. If the editor supports MCP, configure the host-neutral CodeStory server
+   block above.
 3. Open the repository root and start a fresh chat.
 
 ### Verify the install

@@ -122,6 +122,21 @@ function pluginVersion(pluginSource) {
   return manifest.version;
 }
 
+function pinnedCliVersion(pluginSource) {
+  const pinPath = path.join(pluginSource, "cli-version.json");
+  const metadata = fs.lstatSync(pinPath);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) fail("cli_version_pin_not_direct_file");
+  const pin = JSON.parse(fs.readFileSync(pinPath, "utf8"));
+  if (
+    pin?.schema_version !== 1
+    || !/^\d+\.\d+\.\d+$/u.test(pin?.cli_version || "")
+    || pin.release_tag !== `v${pin.cli_version}`
+  ) {
+    fail("cli_version_pin_identity");
+  }
+  return pin.cli_version;
+}
+
 function verifyCli(cli, expectedVersion) {
   if (!path.isAbsolute(cli)) fail("codestory_cli_must_be_absolute");
   const resolved = path.resolve(cli);
@@ -197,12 +212,14 @@ export function installCursorPlugin(options = {}) {
   );
   const sourceCommit = verifyCommittedPluginSource(repoRoot, pluginSource);
   const version = pluginVersion(pluginSource);
-  const cli = options.cli ? verifyCli(options.cli, version) : null;
+  const cliVersion = pinnedCliVersion(pluginSource);
+  const cli = options.cli ? verifyCli(options.cli, cliVersion) : null;
   const linked = ensurePluginLink(pluginSource, installRoot);
   const overridePath = writeCursorOverride(pluginData, cli);
   return {
     plugin: "codestory",
     version,
+    cli_version: cliVersion,
     source_commit: sourceCommit,
     install_root: installRoot,
     plugin_data: pluginData,

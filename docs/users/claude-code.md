@@ -49,9 +49,9 @@ If the plugin does not register MCP for you, point a server at the adapter:
 }
 ```
 
-Use a persistent per-user plugin-data directory outside the repository.
-Cursor's repository-managed alternative is explained in the
-[Cursor guide](cursor.md#advanced-repository-managed-setup).
+Use a persistent per-user plugin-data directory outside the repository. This
+server block is host-neutral; the Claude plugin's `.mcp.json` keeps the legacy
+auto-discovery shape for Claude and Codex clients that still require it.
 
 ## Verify the install
 

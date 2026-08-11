@@ -1,7 +1,7 @@
 # Cursor
 
 CodeStory ships as a Cursor plugin. It installs the grounding rule, skill,
-session-start context, MCP launcher, and matching managed runtime together.
+session-start context, and managed runtime launcher together.
 
 ## Install
 
@@ -18,8 +18,9 @@ Ask:
 Where is request validation implemented, who calls it, and which tests cover it?
 ```
 
-The first call may install the matching CodeStory runtime and prepare the
-repository. Cursor should retry the same tool after its reported delay. A
+On the first call, the launcher fetches the matching CodeStory runtime if it is
+not already installed, then prepares the repository. Cursor should retry the
+same tool after its reported delay. A
 healthy answer cites real files and symbols; if MCP is unavailable, the agent
 uses ordinary source inspection and says that CodeStory evidence was not
 available.
@@ -40,11 +41,13 @@ Publication in the public Cursor Marketplace is a separate maintainer step.
 
 ## Advanced: repository-managed setup
 
-Teams that do not use Cursor's plugin marketplace can commit a rule and MCP
-configuration directly. This repository's [rule](../../.cursor/rules/codestory.mdc)
-and [MCP configuration](../../.cursor/mcp.json) are working examples. Keep the
-MCP command rooted at `${workspaceFolder}` and do not add a repository-local
-plugin-data directory; the adapter infers Cursor's private per-user data path.
+Teams that do not use Cursor's plugin marketplace must vendor the complete
+`plugins/codestory` package before committing a rule and MCP configuration; the
+configuration alone does not contain the launcher or grounding skill. This
+repository's [rule](../../.cursor/rules/codestory.mdc) and
+[MCP configuration](../../.cursor/mcp.json) work because that complete package
+is present at `plugins/codestory`. Keep the MCP command rooted at
+`${workspaceFolder}` and do not add a repository-local plugin-data directory.
 
 For local CodeStory development, run:
 

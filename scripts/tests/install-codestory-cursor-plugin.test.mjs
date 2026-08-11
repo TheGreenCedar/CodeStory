@@ -27,18 +27,21 @@ const sourcePlugin = path.join(repoRoot, "plugins", "codestory");
 const version = JSON.parse(
   await readFile(path.join(sourcePlugin, ".cursor-plugin", "plugin.json"), "utf8"),
 ).version;
+const cliVersion = JSON.parse(
+  await readFile(path.join(sourcePlugin, "cli-version.json"), "utf8"),
+).cli_version;
 
 function git(root, ...args) {
   return execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
 }
 
-async function writeFakeCli(cliPath, cliVersion = version) {
+async function writeFakeCli(cliPath, reportedVersion = cliVersion) {
   await mkdir(path.dirname(cliPath), { recursive: true });
-  await writeFile(cliPath, `#!/bin/sh\necho "codestory-cli ${cliVersion}"\n`, "utf8");
+  await writeFile(cliPath, `#!/bin/sh\necho "codestory-cli ${reportedVersion}"\n`, "utf8");
   await chmod(cliPath, 0o755);
 }
 
-async function fixture() {
+async function fixture(options = {}) {
   const root = await mkdtemp(path.join(await realpath(os.tmpdir()), "codestory-cursor-install-"));
   const checkout = path.join(root, "repo");
   const pluginSource = path.join(checkout, "plugins", "codestory");
@@ -48,6 +51,20 @@ async function fixture() {
   const cli = path.join(root, process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli");
   await mkdir(path.dirname(pluginSource), { recursive: true });
   await cp(sourcePlugin, pluginSource, { recursive: true });
+  if (options.pluginVersion) {
+    for (const relative of [
+      "plugin.json",
+      ".codex-plugin/plugin.json",
+      ".cursor-plugin/plugin.json",
+      ".claude-plugin/plugin.json",
+      ".github/plugin/plugin.json",
+    ]) {
+      const manifestPath = path.join(pluginSource, relative);
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+      manifest.version = options.pluginVersion;
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    }
+  }
   git(checkout, "init", "-q");
   git(checkout, "config", "user.email", "fixture@example.invalid");
   git(checkout, "config", "user.name", "Fixture");
@@ -86,6 +103,7 @@ test("Cursor installer links the committed plugin and writes only the local CLI 
     const first = install(value, { cli: value.cli });
     assert.equal(first.plugin, "codestory");
     assert.equal(first.version, version);
+    assert.equal(first.cli_version, cliVersion);
     assert.equal(first.linked, true);
     assert.equal(first.cli_override, "configured");
     assert.equal(await realpath(value.installRoot), await realpath(value.pluginSource));
@@ -104,6 +122,28 @@ test("Cursor installer links the committed plugin and writes only the local CLI 
     assert.equal(await realpath(value.installRoot), await realpath(value.pluginSource));
   } finally {
     delete process.env.CURSOR_INSTALL_TEST_SECRET;
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("Cursor installer validates a local CLI against the pin when plugin version differs", {
+  skip: process.platform === "win32" ? "fixture uses a POSIX executable" : false,
+}, async () => {
+  const [major, minor, patch] = version.split(".").map(Number);
+  const pluginVersion = `${major}.${minor}.${patch + 1}`;
+  const value = await fixture({ pluginVersion });
+  try {
+    await writeFakeCli(value.cli, cliVersion);
+    const result = install(value, { cli: value.cli });
+    assert.equal(result.version, pluginVersion);
+    assert.equal(result.cli_version, cliVersion);
+
+    await writeFakeCli(value.cli, pluginVersion);
+    assert.throws(
+      () => install(value, { cli: value.cli }),
+      new RegExp(`codestory_cli_version:expected=${cliVersion}:actual=${pluginVersion}`, "u"),
+    );
+  } finally {
     await rm(value.root, { recursive: true, force: true });
   }
 });

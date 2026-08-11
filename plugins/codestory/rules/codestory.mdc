@@ -15,6 +15,6 @@ Before making source claims, planning edits, choosing tests, or reviewing change
 3. Use `status` or `codestory://status` only to diagnose a failed or unexpectedly slow call.
 4. If MCP is missing, inspect source normally and report that CodeStory was unavailable for the task.
 
-Cursor setup, MCP wiring, and host-specific notes: [docs/users/cursor.md](../../../docs/users/cursor.md).
+Cursor setup, MCP wiring, and host-specific notes: [Cursor guide](https://github.com/TheGreenCedar/CodeStory/blob/main/docs/users/cursor.md).
 
 The **codestory-grounding** skill is loaded by the plugin and owns the detailed tool and evidence contract.

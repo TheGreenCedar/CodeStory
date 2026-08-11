@@ -262,6 +262,7 @@ adapter to compensate for incorrect upstream state.
   persisted vectors, so bumping it discards every user's dense sidecars. Move it
   only when the embeddings themselves change -- model, llama.cpp commit,
   pooling, normalization, dimension, prefixes, or vector schema.)
+  - `plugins/codestory/plugin.json`
   - `plugins/codestory/.codex-plugin/plugin.json`
   - `plugins/codestory/.cursor-plugin/plugin.json`
   - `plugins/codestory/.claude-plugin/plugin.json`

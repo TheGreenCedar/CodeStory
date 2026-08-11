@@ -12,7 +12,7 @@
   "keywords": ["codestory", "codex", "grounding", "mcp", "local"],
   "skills": "./skills/",
   "hooks": "./hooks/claude-codex-hooks.json",
-  "mcpServers": "./mcp.json",
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "CodeStory",
     "shortDescription": "Use local CodeStory grounding from Codex",
