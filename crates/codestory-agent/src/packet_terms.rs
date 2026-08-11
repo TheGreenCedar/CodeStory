@@ -567,16 +567,23 @@ pub fn packet_terms_indicate_client_send_flow(terms: &[String]) -> bool {
     {
         return false;
     }
-    let explicit_client_or_http_intent =
-        packet_terms_have_any(terms, &["client", "clients", "http", "httpclient"]);
-    let request_intent = packet_terms_have_any(terms, &["request", "requests"]);
+    let explicit_client_owner = packet_terms_have_any(
+        terms,
+        &["client", "clients", "httpclient", "session", "sessions"],
+    );
+    if (packet_terms_indicate_server_route_dispatch_flow(terms)
+        || packet_terms_indicate_server_request_dispatch_flow(terms))
+        && !explicit_client_owner
+    {
+        return false;
+    }
+    let explicit_client_or_http_intent = explicit_client_owner || packet_terms_have(terms, "http");
     let send_or_transport_intent =
         packet_terms_have_any(terms, &["send", "transport", "transports"]);
     let convenience_or_helper_intent =
         packet_terms_have_any(terms, &["convenience", "helper", "helpers"]);
 
-    (explicit_client_or_http_intent && (send_or_transport_intent || convenience_or_helper_intent))
-        || (request_intent && send_or_transport_intent)
+    explicit_client_or_http_intent && (send_or_transport_intent || convenience_or_helper_intent)
 }
 
 pub fn packet_terms_indicate_full_outbound_request_flow(terms: &[String]) -> bool {
@@ -825,6 +832,11 @@ mod tests {
             "Trace how Express creates an application, registers middleware routes, and handles an incoming request through the router and response helpers.",
         );
         assert!(!packet_terms_indicate_client_send_flow(&route_terms));
+
+        let response_terms = packet_probe_terms(
+            "Trace how an HTTP server dispatches an incoming request to a handler and sends the response.",
+        );
+        assert!(!packet_terms_indicate_client_send_flow(&response_terms));
     }
 
     #[test]

@@ -349,7 +349,7 @@ function reusedRunMetadata(groupId, { runId = 777, headSha = "b".repeat(40), con
       });
     }
   }
-  return { runId: String(runId), headSha, bindingValue: "t".repeat(40), artifacts, jobsByAttempt: jobs };
+  return { runId: String(runId), headSha, bindingValue: "d".repeat(40), artifacts, jobsByAttempt: jobs };
 }
 
 test("a reuse-bound group accepts binding-verified evidence from a prior run", () => {

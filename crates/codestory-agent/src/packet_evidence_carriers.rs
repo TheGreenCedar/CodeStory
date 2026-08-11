@@ -403,9 +403,24 @@ pub fn client_request_entrypoint_call_target(display_name: &str) -> bool {
         || (has_token(&tokens, &["send"]) && has_token(&tokens, &["client", "session", "requests"]))
 }
 
-/// Typed CALL targets that cross from the client/session dispatcher into its send boundary.
-pub fn client_request_dispatch_call_target(display_name: &str) -> bool {
-    display_name_has_token(display_name, &["send"])
+/// Typed CALL sources that precede the client/session dispatch stage.
+pub fn client_request_dispatch_predecessor_call_source(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    tokens.windows(2).last().is_some_and(|tail| {
+        tail[1] == "request" && matches!(tail[0].as_str(), "client" | "session" | "requests")
+    })
+}
+
+/// Typed CALL targets that advance client/session dispatch into adapter selection.
+pub fn client_request_dispatch_successor_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    tokens.windows(2).last().is_some_and(|tail| {
+        matches!(tail[0].as_str(), "get" | "select" | "choose" | "resolve")
+            && matches!(
+                tail[1].as_str(),
+                "adapter" | "adapters" | "transport" | "transports"
+            )
+    })
 }
 
 /// Typed CALL targets that implement route or middleware registration.
@@ -2178,7 +2193,24 @@ mod tests {
             "Session.prepare_request"
         ));
         assert!(!client_request_entrypoint_call_target("CacheBuilder.build"));
-        assert!(client_request_dispatch_call_target("BaseAdapter.send"));
+        assert!(client_request_dispatch_predecessor_call_source(
+            "Session.request"
+        ));
+        assert!(!client_request_dispatch_predecessor_call_source(
+            "Logger.record"
+        ));
+        assert!(!client_request_dispatch_predecessor_call_source(
+            "ClientRequestMetrics.record"
+        ));
+        assert!(client_request_dispatch_successor_call_target(
+            "Session.get_adapter"
+        ));
+        assert!(!client_request_dispatch_successor_call_target(
+            "Logger.record"
+        ));
+        assert!(!client_request_dispatch_successor_call_target(
+            "AdapterResolveMetrics.record"
+        ));
         assert!(server_request_entrypoint_call_target("Router.route"));
         assert!(server_request_dispatch_call_target("finalhandler"));
         assert!(server_response_terminal_call_target("ServerResponse.end"));

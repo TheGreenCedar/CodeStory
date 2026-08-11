@@ -1,11 +1,13 @@
 import test from "node:test";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 
 import {
   aggregateShardRuns,
@@ -15,11 +17,18 @@ import {
   assertSafeWindowsCmdArgs,
   baselineSearchPreludeStatus,
   benchmarkAgentScopeArgs,
+  benchmarkContractEnvironmentSha256,
+  benchmarkContractForRun,
   benchmarkRunId,
+  benchmarkShardAttestation,
   cachePreparationCanaryBlockers,
   commandCategory,
+  codestoryDoctorSnapshot,
+  codestoryRetrievalStatusSnapshot,
   copyResultArtifact,
+  createDurableJsonlAppender,
   groupPacketRuntimeColdJobs,
+  gitCheckedOutput,
   isTrustedPublishableRepoUrl,
   isPathInside,
   loadTaskForResult,
@@ -37,6 +46,7 @@ import {
   packetForAgentPrompt,
   packetManifestExtraProbes,
   packetManifestQualitySummary,
+  packetObligationAccounting,
   packetPreludeContractBlockers,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
@@ -44,6 +54,8 @@ import {
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
   publicCoreCorpusAudit,
+  planAgentRuns,
+  repoProvenance,
   repoProvenanceBlockers,
   resolveRunArtifactPath,
   resolveCodeStoryCli,
@@ -52,7 +64,11 @@ import {
   retrievalStatusCommandArgs,
   scoreQuality,
   summarizeCostAccounting,
+  summarizePacketObligationAccounting,
   summarizePacketRuntimeRuns,
+  runAgentBenchmarkPipeline,
+  runPlannedAgentRuns,
+  runProcess,
   buildQualityDebugPayload,
   qualityFailureReasons,
   taskSnapshotForResult,
@@ -227,40 +243,271 @@ function exactPacketStdout(packet) {
   }
 }
 
+function managedRuntimeIdentity(overrides = {}) {
+  return {
+    plugin_version: "0.17.0",
+    plugin_cli_version: "0.17.0",
+    cli_version: "0.17.0",
+    cli_source: "managed",
+    pinned_pair_matches: true,
+    known_override_skew_channel: false,
+    ...overrides,
+  };
+}
+
 test("packet canary rejects exact byte and graph-limit escapes before the agent", () => {
   const packet = {
+    _meta: {
+      codestory_publication: { contract_runtime: managedRuntimeIdentity() },
+    },
+    plan: { obligations: { claim_obligations: [] } },
     answer: {
-      citations: [{ node_id: "carrier" }],
-      graphs: [
-        { graph: { edges: [{ id: "protected" }] } },
-        { graph: { edges: [{ id: "protected" }] } },
-      ],
+      citations: [{ node_id: "carrier", file_path: "src/lib.rs" }],
+      graphs: Array.from(
+        { length: 21 },
+        () => ({ graph: { edges: [{ id: "protected" }] } }),
+      ),
+      retrieval_trace: {
+        steps: [{ kind: "source_read", status: "ok" }],
+        retrieval_shadow: { retrieval_mode: "full" },
+      },
     },
     sufficiency: {
       status: "sufficient",
       follow_up_invocations: [],
+      follow_up_commands: [],
       coverage_report: { claim_obligations: [] },
     },
     budget: {
       limits: {
-        max_anchors: 1,
+        max_anchors: 13,
         max_files: 1,
         max_output_bytes: 98_304,
-        max_snippets: 0,
-        max_trail_edges: 1,
+        max_snippets: 1,
+        max_trail_edges: 20,
       },
-      used: { anchors: 1, files: 1, output_bytes: 0, snippets: 0, trail_edges: 2 },
+      used: { anchors: 1, files: 1, output_bytes: 0, snippets: 1, trail_edges: 21 },
     },
   };
   const stdout = exactPacketStdout(packet);
-  const blockers = packetPreludeContractBlockers(packet, stdout, { requireSufficient: true });
-  assert.ok(blockers.some((blocker) => blocker.includes("trail_edges=2 exceeds 1")));
+  const blockers = packetPreludeContractBlockers(packet, stdout, {
+    requireSufficient: true,
+    requireManagedRuntime: true,
+  });
+  assert.ok(blockers.some((blocker) => blocker.includes("trail_edges=21 exceeds 20")));
   assert.equal(blockers.some((blocker) => blocker.includes("stdout bytes")), false);
 
   packet.answer.graphs.pop();
-  packet.budget.used.trail_edges = 1;
+  packet.budget.used.trail_edges = 20;
   const validStdout = exactPacketStdout(packet);
-  assert.deepEqual(packetPreludeContractBlockers(packet, validStdout, { requireSufficient: true }), []);
+  assert.deepEqual(packetPreludeContractBlockers(packet, validStdout, {
+    requireSufficient: true,
+    requireManagedRuntime: true,
+  }), []);
+
+  for (const [field, lowered, publicCap] of [
+    ["max_anchors", 12, 13],
+    ["max_trail_edges", 19, 20],
+    ["max_output_bytes", 90_000, 98_304],
+  ]) {
+    const original = packet.budget.limits[field];
+    packet.budget.limits[field] = lowered;
+    const loweredLimitStdout = exactPacketStdout(packet);
+    assert.ok(
+      packetPreludeContractBlockers(packet, loweredLimitStdout, {
+        requireSufficient: true,
+        requireManagedRuntime: true,
+      }).some((blocker) =>
+        blocker.includes(
+          `budget.limits.${field}=${lowered} does not equal public cap=${publicCap}`,
+        )
+      ),
+    );
+    packet.budget.limits[field] = original;
+  }
+
+  packet.budget.used.files = 0;
+  packet.budget.used.snippets = 0;
+  const invalidStructuralCounts = exactPacketStdout(packet);
+  const countBlockers = packetPreludeContractBlockers(packet, invalidStructuralCounts, {
+    requireSufficient: true,
+    requireManagedRuntime: true,
+  });
+  assert.ok(countBlockers.some((blocker) => blocker.includes("unique citation files=1")));
+  assert.ok(countBlockers.some((blocker) => blocker.includes("successful source reads=1")));
+  packet.budget.used.files = 1;
+  packet.budget.used.snippets = 1;
+
+  packet.sufficiency.follow_up_commands = ["codestory packet --deeper"];
+  const mismatchedFollowUps = exactPacketStdout(packet);
+  assert.match(
+    packetPreludeContractBlockers(packet, mismatchedFollowUps, {
+      requireSufficient: true,
+      requireManagedRuntime: true,
+    }).join("\n"),
+    /follow-up surfaces disagree.*packet follow-ups=1/s,
+  );
+  packet.sufficiency.follow_up_commands = [];
+
+  packet.answer.retrieval_trace.retrieval_shadow = {
+    retrieval_mode: "degraded",
+    degraded_reason: "semantic unavailable",
+  };
+  const degradedRetrieval = exactPacketStdout(packet);
+  assert.match(
+    packetPreludeContractBlockers(packet, degradedRetrieval, {
+      requireSufficient: true,
+      requireManagedRuntime: true,
+    }).join("\n"),
+    /retrieval shadow mode=degraded.*degraded_reason=semantic unavailable/s,
+  );
+  packet.answer.retrieval_trace.retrieval_shadow = { retrieval_mode: "full" };
+
+  packet.budget.limits.max_output_bytes = 200_000;
+  packet.hostile_padding = "x".repeat(100_000);
+  const raisedLimitStdout = exactPacketStdout(packet);
+  assert.ok(packet.budget.used.output_bytes > 98_304);
+  assert.match(
+    packetPreludeContractBlockers(packet, raisedLimitStdout, {
+      requireSufficient: true,
+      requireManagedRuntime: true,
+    }).join("\n"),
+    /max_output_bytes=200000 does not equal public cap=98304.*used\.output_bytes=.*exceeds public cap=98304/s,
+  );
+  delete packet.hostile_padding;
+  packet.budget.limits.max_output_bytes = 98_304;
+
+  for (const identity of [
+    managedRuntimeIdentity({ plugin_version: "0.16.3" }),
+    managedRuntimeIdentity({ cli_source: "override", known_override_skew_channel: true }),
+  ]) {
+    packet._meta.codestory_publication.contract_runtime = identity;
+    const staleStdout = exactPacketStdout(packet);
+    assert.match(
+      packetPreludeContractBlockers(packet, staleStdout, {
+        requireSufficient: true,
+        requireManagedRuntime: true,
+      }).join("\n"),
+      /runtime identity is not managed 0\.17\.0/,
+    );
+  }
+  packet._meta.codestory_publication.contract_runtime = managedRuntimeIdentity();
+
+  packet.plan.obligations.claim_obligations.push({ material: null, proof_status: "proven" });
+  const invalidObligationsStdout = exactPacketStdout(packet);
+  assert.match(
+    packetPreludeContractBlockers(packet, invalidObligationsStdout, {
+      requireSufficient: true,
+      requireManagedRuntime: true,
+    })
+      .join("\n"),
+    /total=1 does not reconcile with material=0 \+ nonmaterial=0/,
+  );
+});
+
+test("packet obligation accounting preserves the historical material split", () => {
+  const materialGroups = [
+    [33, { proof_status: "proven" }],
+    [105, { proof_status: "reported", reason: "packet_budget_truncated" }],
+    [33, { proof_status: "reported", reason: "carrier_not_sufficiency_eligible" }],
+    [18, { proof_status: "reported", reason: "carrier_does_not_satisfy_role_contract" }],
+    [6, { proof_status: "reported", reason: "required_evidence_edge_missing" }],
+    [3, { proof_status: "unsupported", reason: "requested_claim_binding_limit_exceeded:7" }],
+  ];
+  const packet = {
+    plan: {
+      obligations: {
+        claim_obligations: [
+          ...materialGroups.flatMap(([count, obligation]) =>
+            Array.from({ length: count }, () => ({ material: true, ...obligation }))
+          ),
+          ...Array.from({ length: 18 }, () => ({
+            material: false,
+            proof_status: "planned",
+          })),
+        ],
+      },
+    },
+  };
+
+  assert.deepEqual(packetObligationAccounting(packet), {
+    total: 216,
+    material: 198,
+    nonmaterial: 18,
+    material_status_buckets: {
+      carrier_does_not_satisfy_role_contract: 18,
+      carrier_not_sufficiency_eligible: 33,
+      packet_budget_truncated: 105,
+      proven: 33,
+      requested_claim_binding_limit_exceeded: 3,
+      required_evidence_edge_missing: 6,
+    },
+  });
+
+  assert.deepEqual(packetObligationAccounting({
+    plan: {
+      obligations: {
+        claim_obligations: [
+          { material: true, proof_status: "reported" },
+          { material: true, proof_status: "unsupported", reason: "new reason!" },
+        ],
+      },
+    },
+  }).material_status_buckets, {
+    missing_reason: 1,
+    "unclassified_reason:new_reason": 1,
+  });
+});
+
+test("packet obligation accounting rejects unreconciled summaries", () => {
+  const row = (accounting) => ({
+    repo: "fixture",
+    task_id: "generic-flow",
+    mode: "cold_cli_packet",
+    repeat: 1,
+    status: "pass",
+    sufficiency: {
+      status: "partial",
+      obligation_accounting: accounting,
+    },
+  });
+  assert.throws(
+    () => summarizePacketObligationAccounting([
+      row({
+        total: 215,
+        material: 198,
+        nonmaterial: 18,
+        material_status_buckets: { proven: 198 },
+      }),
+    ], "benchmark summary"),
+    /total=215 does not reconcile with material=198 \+ nonmaterial=18/,
+  );
+  assert.throws(
+    () => summarizePacketObligationAccounting([
+      row({
+        total: 216,
+        material: 198,
+        nonmaterial: 18,
+        material_status_buckets: { proven: 197 },
+      }),
+    ], "benchmark summary"),
+    /material=198 does not reconcile with material status buckets=197/,
+  );
+  assert.equal(
+    summarizePacketObligationAccounting([
+      { repo: "fixture", task_id: "baseline", arm: "without_codestory", repeat: 1 },
+    ], "benchmark summary"),
+    null,
+  );
+  for (const missing of [
+    { repo: "fixture", task_id: "measured", arm: "with_codestory", repeat: 1 },
+    { repo: "fixture", task_id: "runtime", mode: "cold_cli_packet", repeat: 1 },
+  ]) {
+    assert.throws(
+      () => summarizePacketObligationAccounting([missing], "benchmark summary"),
+      /packet obligation accounting is missing/,
+    );
+  }
 });
 
 test("canary preparation requires full accelerated execution with CPU disabled", () => {
@@ -284,7 +531,587 @@ test("canary preparation requires full accelerated execution with CPU disabled",
   );
 });
 
-test("shard aggregation rejects missing, duplicate, and mismatched rows", async () => {
+function pipelinePreparation(repo) {
+  return {
+    repo,
+    retrieval_index_status: "pass",
+    retrieval_status: {
+      retrieval_mode: "full",
+      embedding_policy: "accelerated",
+      embedding_accelerator_execution_verified: true,
+      embedding_backend: "Metal",
+      embedding_engine_instance_id: `engine-${repo}`,
+    },
+  };
+}
+
+const CLEAN_SHARD_ATTESTATION = {
+  sourceCommit: "source",
+  sourceTree: "tree",
+  trackedDirty: false,
+  cliSha256: "cli",
+};
+
+function pipelineResult(run, status = "pass") {
+  return {
+    benchmark_run_id: `${run.task.id}-${run.arm}-${run.repeat}`,
+    repo: run.repo,
+    task_id: run.task.id,
+    arm: run.arm,
+    repeat: run.repeat,
+    canary: run.canary === true,
+    preparation_overlap: run.preparation_overlap === true,
+    comparative_wall_time_eligible: run.comparative_wall_time_eligible !== false,
+    status,
+  };
+}
+
+function pipelineFixture(overrides = {}) {
+  const tasks = (overrides.repos ?? ["canary", "second"]).map((repo) => ({
+    id: `${repo}-task`,
+    repo,
+    prompt: `trace ${repo}`,
+  }));
+  const opts = {
+    arms: ["with_codestory", "without_codestory"],
+    repeats: overrides.repeats ?? 1,
+    jobs: overrides.jobs ?? 4,
+    prepareCodestoryJobs: 2,
+    publishable: false,
+    collectAllFailures: false,
+    canaryTaskId: overrides.canaryTaskId ?? tasks[0].id,
+    manifestCanaryTaskId: overrides.canaryTaskId ?? tasks[0].id,
+  };
+  return { tasks, opts, plannedRuns: planAgentRuns(opts, tasks) };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}
+
+test("benchmark pipeline fences a failed canary and counts a passing canary once", async () => {
+  const fixture = pipelineFixture({ repeats: 2 });
+  const materialized = [];
+  const prepared = [];
+  const launched = [];
+  const failed = await runAgentBenchmarkPipeline({
+    ...fixture,
+    materializeGroup: async (group) => materialized.push(group.repo),
+    prepareGroup: async (group) => {
+      prepared.push(group.repo);
+      return [pipelinePreparation(group.repo)];
+    },
+    executeRun: async (_opts, run) => {
+      launched.push(`${run.repo}/${run.arm}/${run.repeat}`);
+      return pipelineResult(run, run.canary ? "fail" : "pass");
+    },
+  });
+  assert.deepEqual(materialized, ["canary"]);
+  assert.deepEqual(prepared, ["canary"]);
+  assert.deepEqual(launched, ["canary/with_codestory/1"]);
+  assert.equal(failed.firstFailure.task_id, "canary-task");
+
+  const passingLaunches = [];
+  const passing = await runAgentBenchmarkPipeline({
+    ...pipelineFixture({ repeats: 2 }),
+    materializeGroup: async () => {},
+    prepareGroup: async (group) => [pipelinePreparation(group.repo)],
+    executeRun: async (_opts, run) => {
+      passingLaunches.push(`${run.repo}/${run.arm}/${run.repeat}`);
+      return pipelineResult(run);
+    },
+  });
+  assert.equal(passing.firstFailure, null);
+  assert.equal(passing.results.length, passingLaunches.length);
+  assert.equal(passing.results.length, 8);
+  assert.equal(
+    passing.results.filter((row) =>
+      row.task_id === "canary-task" &&
+      row.arm === "with_codestory" &&
+      row.repeat === 1
+    ).length,
+    1,
+  );
+  assert.equal(new Set(passingLaunches).size, passingLaunches.length);
+
+  const nonOwner = pipelineFixture({ repos: ["second"], canaryTaskId: "canary-task" });
+  const nonOwnerResult = await runAgentBenchmarkPipeline({
+    ...nonOwner,
+    materializeGroup: async () => {},
+    prepareGroup: async (group) => [pipelinePreparation(group.repo)],
+    executeRun: async (_opts, run) => pipelineResult(run),
+  });
+  assert.equal(nonOwnerResult.results.some((row) => row.canary), false);
+});
+
+test("benchmark pipeline retains product rows after an overlap baseline failure", async () => {
+  const fixture = pipelineFixture({
+    repos: ["canary", "alpha", "beta", "gamma", "delta", "epsilon"],
+  });
+  const baselineStarted = [];
+  const comparativeFailures = [];
+  const twoBaselinesStarted = deferred();
+  const releaseRemainingPreparation = deferred();
+  let abortedBaselineSiblings = 0;
+  const outcome = await runAgentBenchmarkPipeline({
+    ...fixture,
+    materializeGroup: async () => {},
+    prepareGroup: async (group) => {
+      if (!["canary", "alpha"].includes(group.repo)) {
+        await releaseRemainingPreparation.promise;
+      }
+      return [pipelinePreparation(group.repo)];
+    },
+    recordComparativeFailure: async (failure) => comparativeFailures.push(failure),
+    executeRun: async (runOpts, run) => {
+      if (run.arm === "with_codestory") return pipelineResult(run);
+      baselineStarted.push(run.repo);
+      if (baselineStarted.length === 2) {
+        twoBaselinesStarted.resolve();
+        releaseRemainingPreparation.resolve();
+      }
+      if (run.repo === "canary") {
+        await twoBaselinesStarted.promise;
+        return pipelineResult(run, "fail");
+      }
+      await new Promise((resolve) => {
+        if (runOpts.signal.aborted) return resolve();
+        runOpts.signal.addEventListener("abort", resolve, { once: true });
+      });
+      abortedBaselineSiblings += 1;
+      return pipelineResult(run, "cancelled");
+    },
+  });
+  assert.equal(outcome.firstFailure, null);
+  assert.equal(outcome.comparativeFailure.kind, "comparative_baseline_failure");
+  assert.equal(outcome.comparativePublishable, false);
+  assert.equal(comparativeFailures.length, 1);
+  assert.ok(abortedBaselineSiblings >= 1);
+  assert.ok(baselineStarted.length >= 2);
+  assert.ok(baselineStarted.length < fixture.tasks.length);
+  assert.equal(outcome.cachePreparation.length, fixture.tasks.length);
+  assert.equal(
+    outcome.results.filter((row) => row.arm === "with_codestory" && row.status === "pass").length,
+    fixture.tasks.length,
+  );
+  assert.equal(
+    outcome.results.some((row) => row.arm === "without_codestory" && row.status === "pass"),
+    false,
+  );
+});
+
+test("benchmark pipeline prepares two repos while baselines overlap and waits before CodeStory", async () => {
+  const fixture = pipelineFixture({ repos: ["canary", "alpha", "beta", "gamma"] });
+  const barriers = new Map();
+  const started = [];
+  const startedTwo = deferred();
+  const startedThree = deferred();
+  let active = 0;
+  let maxActive = 0;
+  let completed = 0;
+  let codeStoryStartedBeforeDrain = false;
+  const pipelinePromise = runAgentBenchmarkPipeline({
+    ...fixture,
+    materializeGroup: async () => {},
+    prepareGroup: async (group) => {
+      if (group.repo === "canary") {
+        return [pipelinePreparation(group.repo)];
+      }
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      started.push(group.repo);
+      const barrier = deferred();
+      barriers.set(group.repo, barrier);
+      if (started.length === 2) startedTwo.resolve();
+      if (started.length === 3) startedThree.resolve();
+      await barrier.promise;
+      active -= 1;
+      completed += 1;
+      return [pipelinePreparation(group.repo)];
+    },
+    executeRun: async (_opts, run) => {
+      if (run.arm === "with_codestory" && !run.canary && completed < 3) {
+        codeStoryStartedBeforeDrain = true;
+      }
+      return pipelineResult(run);
+    },
+  });
+
+  await startedTwo.promise;
+  assert.equal(started.length, 2);
+  assert.equal(maxActive, 2);
+  assert.equal(codeStoryStartedBeforeDrain, false);
+  barriers.get(started[0]).resolve();
+  await startedThree.promise;
+  assert.equal(started.length, 3);
+  assert.equal(maxActive, 2);
+  for (const barrier of barriers.values()) barrier.resolve();
+  const outcome = await pipelinePromise;
+
+  assert.equal(completed, 3);
+  assert.equal(codeStoryStartedBeforeDrain, false);
+  const overlapBaselines = outcome.results.filter((row) =>
+    row.arm === "without_codestory" && row.preparation_overlap
+  );
+  assert.ok(overlapBaselines.length > 0);
+  assert.ok(overlapBaselines.every((row) => row.comparative_wall_time_eligible === false));
+});
+
+test("agent fail-fast aborts active siblings and stops queued repo groups", async () => {
+  const fixture = pipelineFixture({ repos: ["first", "second", "third"], jobs: 2 });
+  const runs = fixture.plannedRuns.filter((run) => run.arm === "with_codestory");
+  const bothStarted = deferred();
+  const launched = [];
+  const recorded = [];
+  let siblingAborted = false;
+  const controller = new AbortController();
+  const outcome = await runPlannedAgentRuns(
+    fixture.opts,
+    runs,
+    new Map(),
+    null,
+    {
+      signal: controller.signal,
+      abortController: controller,
+      failFast: true,
+      onResult: async (row) => recorded.push(row),
+      runOne: async (runOpts, run) => {
+        launched.push(run.repo);
+        if (launched.length === 2) bothStarted.resolve();
+        await bothStarted.promise;
+        if (run.repo === "first") return pipelineResult(run, "fail");
+        await new Promise((resolve) => {
+          if (runOpts.signal.aborted) return resolve();
+          runOpts.signal.addEventListener("abort", resolve, { once: true });
+        });
+        siblingAborted = true;
+        return pipelineResult(run, "cancelled");
+      },
+    },
+  );
+  assert.deepEqual(new Set(launched), new Set(["first", "second"]));
+  assert.equal(siblingAborted, true);
+  assert.equal(controller.signal.aborted, true);
+  assert.equal(outcome.results.length, 2);
+  assert.equal(recorded.length, 2);
+});
+
+test("agent scheduler durably retains sibling rows after an active run exception", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-run-exception-"));
+  const runsLedger = await createDurableJsonlAppender(path.join(root, "runs.jsonl"));
+  const firstFailurePath = path.join(root, "first-failure.json");
+  const fixture = pipelineFixture({ repos: ["first", "second", "third"], jobs: 2 });
+  const runs = fixture.plannedRuns.filter((run) => run.arm === "with_codestory");
+  const controller = new AbortController();
+  const bothStarted = deferred();
+  const launched = [];
+  let outcome;
+  try {
+    outcome = await runPlannedAgentRuns(
+      fixture.opts,
+      runs,
+      new Map(),
+      root,
+      {
+        signal: controller.signal,
+        abortController: controller,
+        failFast: true,
+        onResult: (row) => runsLedger.append(row),
+        onFirstFailure: (failure) => writeFile(
+          firstFailurePath,
+          `${JSON.stringify(failure)}\n`,
+        ),
+        runOne: async (runOpts, run) => {
+          launched.push(run.repo);
+          if (launched.length === 2) bothStarted.resolve();
+          await bothStarted.promise;
+          if (run.repo === "first") {
+            throw new Error("fixture provenance write failed");
+          }
+          await new Promise((resolve) => {
+            if (runOpts.signal.aborted) return resolve();
+            runOpts.signal.addEventListener("abort", resolve, { once: true });
+          });
+          return pipelineResult(run, "cancelled");
+        },
+      },
+    );
+  } finally {
+    await runsLedger.close();
+  }
+
+  const firstFailure = JSON.parse(await readFile(firstFailurePath, "utf8"));
+  const rows = (await readFile(path.join(root, "runs.jsonl"), "utf8"))
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map(JSON.parse);
+  assert.deepEqual(new Set(launched), new Set(["first", "second"]));
+  assert.equal(controller.signal.aborted, true);
+  assert.equal(firstFailure.kind, "run_exception");
+  assert.equal(firstFailure.repo, "first");
+  assert.equal(firstFailure.task_id, "first-task");
+  assert.equal(firstFailure.arm, "with_codestory");
+  assert.equal(firstFailure.repeat, 1);
+  assert.deepEqual(firstFailure.blockers, [{
+    category: "harness-contract",
+    reasons: ["agent run raised an exception: fixture provenance write failed"],
+  }]);
+  assert.deepEqual(rows.map((row) => row.repo), ["second"]);
+  assert.deepEqual(outcome.results.map((row) => row.repo), ["second"]);
+  assert.equal(outcome.firstFailure.kind, "run_exception");
+  await rm(root, { recursive: true, force: true });
+});
+
+test("task-owned process abort escalates and timeout keeps precedence", async () => {
+  const ignoringChild = (signals) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = { end() {} };
+    child.kill = (signal) => {
+      signals.push(signal);
+      if (signal === "SIGKILL") {
+        queueMicrotask(() => child.emit("close", null, signal));
+      }
+      return true;
+    };
+    return child;
+  };
+
+  const abortSignals = [];
+  const abortController = new AbortController();
+  const aborted = runProcess("fixture", [], {
+    signal: abortController.signal,
+    timeoutMs: 1,
+    forceKillAfterMs: 5,
+    spawnProcess: () => ignoringChild(abortSignals),
+  });
+  abortController.abort();
+  const abortResult = await aborted;
+  assert.equal(abortResult.status, "aborted");
+  assert.deepEqual(abortSignals, ["SIGTERM", "SIGKILL"]);
+
+  const timeoutSignals = [];
+  const timeoutController = new AbortController();
+  const timedOut = runProcess("fixture", [], {
+    signal: timeoutController.signal,
+    timeoutMs: 1,
+    forceKillAfterMs: 5,
+    spawnProcess: () => ignoringChild(timeoutSignals),
+  });
+  setTimeout(() => timeoutController.abort(), 2);
+  const timeoutResult = await timedOut;
+  assert.equal(timeoutResult.status, "timeout");
+  assert.equal(timeoutResult.aborted, false);
+  assert.deepEqual(timeoutSignals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("snapshot child abort reaches doctor and retrieval-status probes", async () => {
+  for (const snapshot of [codestoryDoctorSnapshot, codestoryRetrievalStatusSnapshot]) {
+    const signals = [];
+    const controller = new AbortController();
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = { end() {} };
+    child.kill = (signal) => {
+      signals.push(signal);
+      if (signal === "SIGKILL") {
+        queueMicrotask(() => child.emit("close", null, signal));
+      }
+      return true;
+    };
+    const resultPromise = snapshot(
+      "fixture-codestory-cli",
+      "/fixture/project",
+      60_000,
+      {},
+      controller.signal,
+      { forceKillAfterMs: 5, spawnProcess: () => child },
+    );
+    controller.abort();
+    const result = await resultPromise;
+    assert.equal(result.status, "aborted");
+    assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  }
+});
+
+test("benchmark pipeline aborts active materialization and provenance git children", async () => {
+  const base = pipelineFixture({ repos: ["canary", "failing", "sibling"] });
+  const opts = { ...base.opts, arms: ["with_codestory"] };
+  const fixture = { ...base, opts, plannedRuns: planAgentRuns(opts, base.tasks) };
+  const materializationChildStarted = deferred();
+  const materializationSignals = [];
+  const ignoringChild = (signals, onStart = () => {}) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = { end() {} };
+    child.kill = (signal) => {
+      signals.push(signal);
+      if (signal === "SIGKILL") {
+        queueMicrotask(() => child.emit("close", null, signal));
+      }
+      return true;
+    };
+    onStart();
+    return child;
+  };
+
+  const outcome = await runAgentBenchmarkPipeline({
+    ...fixture,
+    materializeGroup: async (group, signal) => {
+      if (group.repo === "canary") return;
+      if (group.repo === "failing") {
+        await materializationChildStarted.promise;
+        throw new Error("fixture materialization failed");
+      }
+      await gitCheckedOutput(["status"], "/fixture", {
+        timeoutMs: 60_000,
+        signal,
+        forceKillAfterMs: 5,
+        spawnProcess: () => ignoringChild(
+          materializationSignals,
+          () => materializationChildStarted.resolve(),
+        ),
+      });
+    },
+    prepareGroup: async (group) => [pipelinePreparation(group.repo)],
+    executeRun: async (_runOpts, run) => pipelineResult(run),
+  });
+  assert.equal(outcome.firstFailure.kind, "materialization_failed");
+  assert.equal(outcome.aborted, true);
+  assert.deepEqual(materializationSignals, ["SIGTERM", "SIGKILL"]);
+  assert.equal(outcome.results.length, 1);
+  assert.equal(outcome.results[0].canary, true);
+
+  const provenanceSignals = [];
+  const provenanceController = new AbortController();
+  const provenanceRemoteStarted = deferred();
+  const provenanceCommands = [];
+  const completedChild = (stdout) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = { end() {} };
+    child.kill = () => true;
+    queueMicrotask(() => {
+      if (stdout) child.stdout.write(stdout);
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("close", 0, null);
+    });
+    return child;
+  };
+  const provenance = repoProvenance(
+    {
+      path: "/fixture/project",
+      checkout_path: "/fixture/project",
+      url: "https://example.test/project.git",
+      ref: "fixture",
+    },
+    provenanceController.signal,
+    {
+      forceKillAfterMs: 5,
+      spawnProcess: (_command, args) => {
+        provenanceCommands.push(args);
+        if (provenanceCommands.length === 1) return completedChild("");
+        if (provenanceCommands.length === 2) return completedChild(`${"a".repeat(40)}\n`);
+        return ignoringChild(provenanceSignals, () => provenanceRemoteStarted.resolve());
+      },
+    },
+  );
+  await provenanceRemoteStarted.promise;
+  provenanceController.abort();
+  const provenanceResult = await provenance;
+  assert.equal(provenanceResult.git_head, "a".repeat(40));
+  assert.equal(provenanceResult.git_origin, null);
+  assert.deepEqual(provenanceCommands, [
+    ["-C", "/fixture/project", "status", "--short"],
+    ["-C", "/fixture/project", "rev-parse", "HEAD"],
+    ["-C", "/fixture/project", "remote", "get-url", "origin"],
+  ]);
+  assert.deepEqual(provenanceSignals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("benchmark pipeline durably retains preparation and first failure state", async () => {
+  for (const stage of ["materialization", "preparation", "agent_isolation"]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), `codestory-pipeline-${stage}-`));
+    const runsLedger = await createDurableJsonlAppender(path.join(root, "runs.jsonl"));
+    const preparationLedger = await createDurableJsonlAppender(path.join(root, "preparations.jsonl"));
+    const firstFailurePath = path.join(root, "first-failure.json");
+    const fixture = pipelineFixture();
+    const launched = [];
+    try {
+      await runAgentBenchmarkPipeline({
+        ...fixture,
+        materializeGroup: async (group) => {
+          if (group.repo === "second" && stage === "materialization") {
+            throw new Error("fixture materialization failed");
+          }
+        },
+        prepareGroup: async (group) => {
+          if (group.repo === "second" && stage === "preparation") {
+            const error = new Error("fixture preparation failed");
+            error.preparation = { repo: group.repo, error: error.message };
+            throw error;
+          }
+          return [pipelinePreparation(group.repo)];
+        },
+        prepareIsolation: async () => {
+          if (stage === "agent_isolation") {
+            throw new Error("fixture agent isolation failed");
+          }
+          return null;
+        },
+        executeRun: async (_opts, run) => {
+          launched.push(run.repo);
+          return pipelineResult(run);
+        },
+        recordResult: (row) => runsLedger.append(row),
+        recordPreparation: (row) => preparationLedger.append({ kind: "preparation", ...row }),
+        recordPreparationState: (row) => preparationLedger.append(row),
+        recordFirstFailure: (failure) => writeFile(
+          firstFailurePath,
+          `${JSON.stringify(failure)}\n`,
+        ),
+      });
+    } finally {
+      await runsLedger.close();
+      await preparationLedger.close();
+    }
+    const parseLedger = (contents) => contents.split(/\r?\n/).filter(Boolean).map(JSON.parse);
+    const runRows = parseLedger(await readFile(path.join(root, "runs.jsonl"), "utf8"));
+    const preparationRows = parseLedger(
+      await readFile(path.join(root, "preparations.jsonl"), "utf8"),
+    );
+    const firstFailure = JSON.parse(await readFile(firstFailurePath, "utf8"));
+    assert.equal(preparationRows.some((row) => row.repo === "canary"), true);
+    if (stage === "preparation") {
+      assert.equal(preparationRows.some((row) => row.repo === "second" && row.error), true);
+    }
+    if (stage === "agent_isolation") {
+      assert.equal(runRows.length, 0);
+      assert.equal(firstFailure.kind, "agent_isolation_failed");
+      assert.equal(firstFailure.repo, "canary");
+      assert.deepEqual(launched, []);
+    } else {
+      assert.equal(runRows.some((row) => row.canary), true);
+      assert.equal(firstFailure.kind, `${stage}_failed`);
+      assert.equal(firstFailure.repo, "second");
+      assert.equal(launched.every((repo) => repo === "canary"), true);
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("shard aggregation binds canary, contract, accounting, and host-class latency", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "codestory-shards-"));
   try {
     const taskIds = [null, null];
@@ -292,72 +1119,275 @@ test("shard aggregation rejects missing, duplicate, and mismatched rows", async 
       const id = `task-${index}`;
       taskIds[taskShardIndex(id, 2)] ??= id;
     }
-    const tasks = taskIds.map((id, index) => ({ id, repo: `repo-${index}` }));
-    const attestation = {
-      contract: "codestory.agent-benchmark-shard/v1",
-      source_commit: "source",
-      source_tree: "tree",
-      cli_sha256: "cli",
-      package_sha256: "package",
-      manifest_sha256: "manifest",
-      flags_sha256: "flags",
-      model_sha256: "model",
-      host_class: { platform: "darwin", arch: "arm64", accelerator_backend: "Metal" },
-    };
-    const shardDirs = await Promise.all(
-      [0, 1].map(async (index) => {
-        const directory = path.join(root, `shard-${index}`);
-        await mkdir(directory);
-        await writeFile(
-          path.join(directory, "summary.json"),
-          `${JSON.stringify({ shard: { count: 2, index, attestation } })}\n`,
-        );
-        const task = tasks.find((candidate) => taskShardIndex(candidate.id, 2) === index);
-        await writeFile(
-          path.join(directory, "runs.jsonl"),
-          `${JSON.stringify({ repo: task.repo, task_id: task.id, arm: "with_codestory", repeat: 1, status: "pass" })}\n`,
-        );
-        return directory;
-      }),
-    );
+    const tasks = taskIds.map((id, index) => ({
+      id,
+      name: id,
+      repo: `repo-${index}`,
+      task_class: "route_tracing",
+      prompt: `trace ${id}`,
+      quality_thresholds: {},
+    }));
+    const canaryTask = tasks[0];
     const opts = {
-      aggregateShards: shardDirs,
+      aggregateShards: null,
       outDir: path.join(root, "aggregate"),
       arms: ["with_codestory"],
       repeats: 1,
+      jobs: 4,
+      timeoutMs: 600_000,
+      prepareCodestoryCache: true,
+      prepareCodestoryJobs: 2,
+      prepareCodestoryTimeoutMs: 1_800_000,
+      packetRuntime: false,
+      packetRuntimeMode: "both",
+      materializeRepos: true,
+      collectAllFailures: false,
+      shardCount: 2,
+      runner: "codex",
+      model: "gpt-5.6-sol",
+      sandbox: "read-only",
+      taskSuite: null,
+      maxSourceReadsAfterPacket: 0,
+      diagnosticExtraProbesFromManifest: false,
+      packetGateImprovedFrom: null,
+      codestoryCli: process.execPath,
+      candidatePackageSha256: "package",
+      canaryTaskId: canaryTask.id,
+      manifestCanaryTaskId: canaryTask.id,
+      publishable: false,
     };
-    await aggregateShardRuns(opts, tasks);
+    const planned = planAgentRuns(opts, tasks);
+    const emptyAccounting = {
+      total: 0,
+      material: 0,
+      nonmaterial: 0,
+      material_status_buckets: {},
+    };
+    const rows = planned.map((run) => ({
+      repo: run.repo,
+      task_id: run.task.id,
+      arm: run.arm,
+      repeat: run.repeat,
+      canary: run.task.id === canaryTask.id,
+      status: "pass",
+      wall_ms: 10,
+      benchmark_contract: benchmarkContractForRun(opts, run),
+      codestory_harness_prelude: {
+        packet_sufficiency: { obligation_accounting: emptyAccounting },
+      },
+    }));
+    const preparation = [{
+      retrieval_status: {
+        embedding_backend: "Metal",
+        embedding_policy: "accelerated",
+        embedding_model_sha256: "model",
+      },
+    }];
 
-    await writeFile(path.join(shardDirs[1], "runs.jsonl"), "", "utf8");
-    await assert.rejects(
-      () => aggregateShardRuns({ ...opts, outDir: path.join(root, "missing") }, tasks),
-      /aggregation is incomplete/,
-    );
+    const writeShards = async (rowValues = rows, summaryMutator = (summary) => summary) => {
+      const directories = [];
+      for (const index of [0, 1]) {
+        const directory = path.join(root, `shard-${index}`);
+        await mkdir(directory, { recursive: true });
+        const shardRows = rowValues.filter((row) => taskShardIndex(row.task_id, 2) === index);
+        const attestation = await benchmarkShardAttestation(
+          opts,
+          tasks,
+          preparation,
+          shardRows,
+          CLEAN_SHARD_ATTESTATION,
+        );
+        const summary = summaryMutator({
+          publishable: false,
+          expected_rows: shardRows.length,
+          completed_rows: shardRows.length,
+          first_failure: null,
+          canary_task_id: canaryTask.id,
+          effective_canary_task_id:
+            shardRows.some((row) => row.canary === true) ? canaryTask.id : null,
+          packet_obligation_accounting: emptyAccounting,
+          shard: { count: 2, index, attestation },
+        }, index);
+        await writeFile(path.join(directory, "summary.json"), `${JSON.stringify(summary)}\n`);
+        await writeFile(
+          path.join(directory, "runs.jsonl"),
+          shardRows.map((row) => JSON.stringify(row)).join("\n") + (shardRows.length ? "\n" : ""),
+        );
+        directories.push(directory);
+      }
+      return directories;
+    };
 
-    const task0 = tasks.find((candidate) => taskShardIndex(candidate.id, 2) === 0);
-    const duplicate = `${JSON.stringify({ repo: task0.repo, task_id: task0.id, arm: "with_codestory", repeat: 1, status: "pass" })}\n`;
-    await writeFile(path.join(shardDirs[0], "runs.jsonl"), `${duplicate}${duplicate}`, "utf8");
-    const task1 = tasks.find((candidate) => taskShardIndex(candidate.id, 2) === 1);
-    await writeFile(
-      path.join(shardDirs[1], "runs.jsonl"),
-      `${JSON.stringify({ repo: task1.repo, task_id: task1.id, arm: "with_codestory", repeat: 1, status: "pass" })}\n`,
-      "utf8",
+    let shardDirs = await writeShards();
+    await aggregateShardRuns({ ...opts, aggregateShards: shardDirs }, tasks);
+    let aggregate = JSON.parse(await readFile(path.join(opts.outDir, "summary.json"), "utf8"));
+    assert.equal(aggregate.latency_pooling_eligible, true);
+    assert.equal(aggregate.pooled_latency_summary.length, 2);
+    const shardOneRows = rows.filter((row) => taskShardIndex(row.task_id, 2) === 1);
+    const shardOneSummaryPath = path.join(shardDirs[1], "summary.json");
+    const shardOneSummary = JSON.parse(await readFile(shardOneSummaryPath, "utf8"));
+    shardOneSummary.shard.attestation = await benchmarkShardAttestation(
+      { ...opts, jobs: 8 },
+      tasks,
+      preparation,
+      shardOneRows,
+      CLEAN_SHARD_ATTESTATION,
     );
+    await writeFile(shardOneSummaryPath, `${JSON.stringify(shardOneSummary)}\n`);
     await assert.rejects(
-      () => aggregateShardRuns({ ...opts, outDir: path.join(root, "duplicate") }, tasks),
-      /Duplicate benchmark row/,
-    );
-
-    const mismatched = { ...attestation, package_sha256: "different" };
-    await writeFile(
-      path.join(shardDirs[1], "summary.json"),
-      `${JSON.stringify({ shard: { count: 2, index: 1, attestation: mismatched } })}\n`,
-      "utf8",
-    );
-    await assert.rejects(
-      () => aggregateShardRuns({ ...opts, outDir: path.join(root, "mismatch") }, tasks),
+      () => aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: path.join(root, "different-jobs") }, tasks),
       /attestation does not match/,
     );
+    await assert.rejects(
+      () => benchmarkShardAttestation(opts, tasks, preparation, rows, {
+        ...CLEAN_SHARD_ATTESTATION,
+        trackedDirty: true,
+      }),
+      /clean tracked source checkout/,
+    );
+    shardDirs = await writeShards(rows, (summary, index) => index === 1
+      ? {
+          ...summary,
+          shard: {
+            ...summary.shard,
+            attestation: { ...summary.shard.attestation, tracked_dirty: true },
+          },
+        }
+      : summary);
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: path.join(root, "dirty") }, tasks),
+      /clean tracked source checkout/,
+    );
+
+    const noCanaryRows = rows.map((row) => ({ ...row, canary: false }));
+    shardDirs = await writeShards(noCanaryRows);
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: path.join(root, "no-canary") }, tasks),
+      /must appear exactly once/,
+    );
+
+    shardDirs = await writeShards(rows);
+    const wrongContractRow = {
+      ...rows[0],
+      benchmark_contract: {
+        ...rows[0].benchmark_contract,
+        task_manifest_hash: "different-task-contract",
+      },
+    };
+    const wrongContractShard = taskShardIndex(wrongContractRow.task_id, 2);
+    await writeFile(
+      path.join(shardDirs[wrongContractShard], "runs.jsonl"),
+      `${JSON.stringify(wrongContractRow)}\n`,
+    );
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: path.join(root, "contract") }, tasks),
+      /compatibility fingerprint does not match its contents/,
+    );
+
+    const invalidAccounting = {
+      total: 216,
+      material: 198,
+      nonmaterial: 18,
+      material_status_buckets: { proven: 197 },
+    };
+    const invalidRows = rows.map((row, index) => index === 0
+      ? {
+          ...row,
+          codestory_harness_prelude: {
+            packet_sufficiency: { obligation_accounting: invalidAccounting },
+          },
+        }
+      : row);
+    shardDirs = await writeShards(invalidRows);
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: path.join(root, "obligations") }, tasks),
+      /material=198 does not reconcile with material status buckets=197/,
+    );
+
+    shardDirs = await writeShards(rows, (summary, index) => index === 1
+      ? {
+          ...summary,
+          shard: {
+            ...summary.shard,
+            attestation: {
+              ...summary.shard.attestation,
+              cli_sha256: "different-same-host-cli",
+            },
+          },
+        }
+      : summary);
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: path.join(root, "same-host-binary") }, tasks),
+      /platform artifacts do not match its host class/,
+    );
+
+    shardDirs = await writeShards(rows, (summary, index) => ({
+      ...summary,
+      shard: {
+        ...summary.shard,
+        attestation: {
+          ...summary.shard.attestation,
+          host_class: {
+            platform: "darwin",
+            arch: "arm64",
+            cpu_model: index === 0 ? "Apple M1 Pro" : "Apple M5 Pro",
+            logical_cpu_count: 10,
+            total_memory_bytes: 34_359_738_368,
+            accelerator_backend: "Metal",
+            accelerator_adapter: "MTL0",
+            embedding_policy: "accelerated",
+            model_sha256: "model",
+          },
+        },
+      },
+    }));
+    const cpuClassOut = path.join(root, "different-cpu-class");
+    await aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: cpuClassOut }, tasks);
+    const cpuClassAggregate = JSON.parse(
+      await readFile(path.join(cpuClassOut, "summary.json"), "utf8"),
+    );
+    assert.equal(cpuClassAggregate.latency_pooling_eligible, false);
+    assert.equal(cpuClassAggregate.pooled_latency_summary, null);
+    assert.equal(cpuClassAggregate.latency_summaries_by_host_class.length, 2);
+
+    const mixedRows = rows.map((row) => {
+      if (taskShardIndex(row.task_id, 2) !== 1) return row;
+      const run = planned.find((candidate) => candidate.task.id === row.task_id);
+      return {
+        ...row,
+        benchmark_contract: benchmarkContractForRun(
+          { ...opts, codestoryCli: "C:\\managed\\codestory-cli.exe" },
+          run,
+        ),
+      };
+    });
+    shardDirs = await writeShards(mixedRows, (summary, index) => index === 1
+      ? {
+          ...summary,
+          shard: {
+            ...summary.shard,
+            attestation: {
+              ...summary.shard.attestation,
+              cli_sha256: "other-platform-cli",
+              package_sha256: "other-platform-package",
+              host_class: {
+                ...summary.shard.attestation.host_class,
+                platform: "linux",
+                arch: "x64",
+                accelerator_backend: "Vulkan",
+              },
+            },
+          },
+        }
+      : summary);
+    const mixedOut = path.join(root, "mixed-hosts");
+    await aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: mixedOut }, tasks);
+    aggregate = JSON.parse(await readFile(path.join(mixedOut, "summary.json"), "utf8"));
+    assert.equal(aggregate.latency_pooling_eligible, false);
+    assert.equal(aggregate.pooled_latency_summary, null);
+    assert.equal(aggregate.latency_summaries_by_host_class.length, 2);
+    assert.ok(aggregate.latency_summaries_by_host_class.every((entry) => entry.cost_accounting));
+    assert.ok(aggregate.summary.every((entry) => entry.median_wall_ms === null));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -2416,6 +3446,15 @@ test("warm process provenance still requires live engine identity and semantic r
   assert.match(blockers.join("\n"), /CodeStory semantic docs are not ready/);
 });
 
+function emptyPacketObligationAccounting() {
+  return {
+    total: 0,
+    material: 0,
+    nonmaterial: 0,
+    material_status_buckets: {},
+  };
+}
+
 function publishableWithCodeStoryResult(overrides = {}) {
   const transcriptAnalysis = {
     command_count: 1,
@@ -2434,6 +3473,23 @@ function publishableWithCodeStoryResult(overrides = {}) {
     ],
     ...(overrides.transcript_analysis ?? {}),
   };
+  const defaultPrelude = {
+    status: "pass",
+    packet_sufficiency_status: "sufficient",
+    packet_sufficiency: {
+      status: "sufficient",
+      obligation_accounting: emptyPacketObligationAccounting(),
+    },
+  };
+  const preludeOverride = overrides.codestory_harness_prelude;
+  const codestoryPrelude = {
+    ...defaultPrelude,
+    ...(preludeOverride ?? {}),
+    packet_sufficiency: {
+      ...defaultPrelude.packet_sufficiency,
+      ...(preludeOverride?.packet_sufficiency ?? {}),
+    },
+  };
   return {
     repo: "codestory",
     task_id: "codestory-indexing-flow",
@@ -2450,10 +3506,131 @@ function publishableWithCodeStoryResult(overrides = {}) {
     codestory_cache_provenance: localCacheProvenance(),
     ...overrides,
     transcript_analysis: transcriptAnalysis,
+    codestory_harness_prelude: codestoryPrelude,
   };
 }
 
+test("publishable shard aggregation rejects incomplete, failed, and low-quality shards", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-publishable-shard-"));
+  try {
+    const task = {
+      id: "codestory-indexing-flow",
+      name: "CodeStory indexing flow",
+      repo: "codestory",
+      task_class: "route_tracing",
+      prompt: "Trace indexing",
+      quality_thresholds: {},
+    };
+    const directory = path.join(root, "shard-0");
+    await mkdir(directory);
+    const opts = {
+      aggregateShards: [directory],
+      outDir: path.join(root, "aggregate"),
+      arms: ["with_codestory"],
+      repeats: 3,
+      jobs: 4,
+      timeoutMs: 600_000,
+      prepareCodestoryCache: true,
+      prepareCodestoryJobs: 2,
+      prepareCodestoryTimeoutMs: 1_800_000,
+      packetRuntime: false,
+      packetRuntimeMode: "both",
+      materializeRepos: true,
+      collectAllFailures: false,
+      shardCount: 1,
+      runner: "codex",
+      model: "gpt-5.6-sol",
+      sandbox: "read-only",
+      taskSuite: null,
+      maxSourceReadsAfterPacket: 0,
+      diagnosticExtraProbesFromManifest: false,
+      packetGateImprovedFrom: null,
+      codestoryCli: process.execPath,
+      candidatePackageSha256: "package",
+      canaryTaskId: task.id,
+      manifestCanaryTaskId: task.id,
+      publishable: true,
+    };
+    const planned = planAgentRuns(opts, [task]);
+    const validRows = planned.map((run) => publishableWithCodeStoryResult({
+      repo: task.repo,
+      task_id: task.id,
+      repeat: run.repeat,
+      canary: run.repeat === 1,
+      benchmark_contract: benchmarkContractForRun(opts, run),
+    }));
+    const preparation = [{
+      retrieval_status: {
+        embedding_backend: "Metal",
+        embedding_policy: "accelerated",
+        embedding_model_sha256: "model",
+      },
+    }];
+    const writeFixture = async (rows, summaryOverrides = {}) => {
+      const attestation = await benchmarkShardAttestation(
+        opts,
+        [task],
+        preparation,
+        rows,
+        CLEAN_SHARD_ATTESTATION,
+      );
+      await writeFile(
+        path.join(directory, "runs.jsonl"),
+        `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
+      );
+      await writeFile(
+        path.join(directory, "summary.json"),
+        `${JSON.stringify({
+          publishable: true,
+          comparative_publishable: true,
+          comparative_failure: null,
+          expected_rows: 3,
+          completed_rows: rows.length,
+          first_failure: null,
+          canary_task_id: task.id,
+          effective_canary_task_id: task.id,
+          packet_obligation_accounting: emptyPacketObligationAccounting(),
+          shard: { count: 1, index: 0, attestation },
+          ...summaryOverrides,
+        })}\n`,
+      );
+    };
+
+    await writeFixture(validRows);
+    await aggregateShardRuns(opts, [task]);
+
+    await writeFixture(validRows, { publishable: false });
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, outDir: path.join(root, "not-publishable") }, [task]),
+      /summary is not publishable and complete/,
+    );
+
+    await writeFixture(validRows.map((row, index) => index === 1
+      ? { ...row, status: "fail" }
+      : row));
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, outDir: path.join(root, "failed") }, [task]),
+      /Publishable shard rows failed/,
+    );
+
+    await writeFixture(validRows.map((row, index) => index === 1
+      ? { ...row, quality: { pass: false } }
+      : row));
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, outDir: path.join(root, "low-quality") }, [task]),
+      /Publishable shard rows failed/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function publishablePacketRuntimeResult(overrides = {}) {
+  const defaultSufficiency = {
+    status: "sufficient",
+    sufficient_quality_mismatch: false,
+    obligation_accounting: emptyPacketObligationAccounting(),
+  };
   return {
     repo: "codestory",
     task_id: "codestory-indexing-flow",
@@ -2461,10 +3638,7 @@ function publishablePacketRuntimeResult(overrides = {}) {
     repeat: 1,
     status: "pass",
     quality: { pass: true },
-    sufficiency: {
-      status: "sufficient",
-      sufficient_quality_mismatch: false,
-    },
+    sufficiency: defaultSufficiency,
     packet_latency: {
       sla_missed: false,
       retrieval_shadow: {
@@ -2474,8 +3648,61 @@ function publishablePacketRuntimeResult(overrides = {}) {
     repo_provenance: pinnedRepoProvenance(),
     codestory_cache_provenance: localCacheProvenance(),
     ...overrides,
+    sufficiency: overrides.sufficiency === null
+      ? null
+      : { ...defaultSufficiency, ...(overrides.sufficiency ?? {}) },
   };
 }
+
+test("publishable packet obligation accounting rejects mismatched rows", () => {
+  assert.deepEqual(
+    agentPublishableBlockers(
+      [publishableWithCodeStoryResult()],
+      { publishable: true, maxSourceReadsAfterPacket: 0 },
+    ),
+    [],
+  );
+  assert.deepEqual(
+    packetRuntimePublishableBlockers(
+      [publishablePacketRuntimeResult()],
+      { publishable: true },
+    ),
+    [],
+  );
+  const mismatched = {
+    total: 3,
+    material: 2,
+    nonmaterial: 1,
+    material_status_buckets: { proven: 1 },
+  };
+  const agentBlockers = agentPublishableBlockers(
+    [
+      publishableWithCodeStoryResult({
+        codestory_harness_prelude: {
+          packet_sufficiency: { obligation_accounting: mismatched },
+        },
+      }),
+    ],
+    { publishable: true, maxSourceReadsAfterPacket: 0 },
+  );
+  assert.match(
+    agentBlockers.flatMap((blocker) => blocker.reasons).join("\n"),
+    /material=2 does not reconcile with material status buckets=1/,
+  );
+
+  const runtimeBlockers = packetRuntimePublishableBlockers(
+    [
+      publishablePacketRuntimeResult({
+        sufficiency: { obligation_accounting: mismatched },
+      }),
+    ],
+    { publishable: true },
+  );
+  assert.match(
+    runtimeBlockers.flatMap((blocker) => blocker.reasons).join("\n"),
+    /material=2 does not reconcile with material status buckets=1/,
+  );
+});
 
 test("publishable gate blocks avoidable source reads after packet", () => {
   const blockers = agentPublishableBlockers(

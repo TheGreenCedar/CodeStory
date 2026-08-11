@@ -3513,6 +3513,109 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       workflows.get("source-proof.yml").on.workflow_dispatch
         .inputs.acceptance_phase.options.push("pre_calibration_source_proof");
     }, /separate acceptance from broad proof/u],
+    ["frozen acceptance stops requiring a frozen record", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Resolve frozen calibration acceptance identity",
+      );
+      step.run = step.run.replace('--github-output "$GITHUB_OUTPUT"', "");
+    }, /resolve a frozen direct constant-only child/u],
+    ["frozen acceptance trusts the recorded source as its checkout", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Resolve frozen calibration acceptance identity",
+      );
+      step.env.HEAD_SHA = "${{ steps.frozen-calibration.outputs.source_commit }}";
+    }, /must bind HEAD_SHA/u],
+    ["frozen acceptance permits a later Rust or docs commit", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Resolve frozen calibration acceptance identity",
+      );
+      step.run += " \\\n  --allow-promotion-commit\n";
+    }, /canonical acceptance job manifest/u],
+    ["frozen acceptance authenticates the latest run attempt", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Authenticate frozen calibration producer",
+      );
+      step.run = step.run.replace(
+        "/attempts/$PRODUCER_RUN_ATTEMPT",
+        "",
+      );
+    }, /recorded calibration run, attempt, and artifact/u],
+    ["frozen acceptance trusts a different calibration workflow", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Authenticate frozen calibration producer",
+      );
+      step.run = step.run.replace(
+        ".github/workflows/packaged-platform-pr.yml",
+        ".github/workflows/source-proof.yml",
+      );
+    }, /recorded calibration run, attempt, and artifact/u],
+    ["frozen acceptance admits an artifact from another run", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Authenticate frozen calibration producer",
+      );
+      step.run = step.run.replace(".workflow_run.id == $run_id", "true");
+    }, /recorded calibration run, attempt, and artifact/u],
+    ["frozen acceptance admits an artifact from another attempt", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Authenticate frozen calibration producer",
+      );
+      step.run = step.run.replace(".created_at >= $attempt_started", "true");
+    }, /recorded calibration run, attempt, and artifact/u],
+    ["frozen acceptance downloads by mutable artifact name", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Download frozen calibration bundle",
+      );
+      step.run = step.run.replace(
+        "actions/artifacts/$ARTIFACT_ID/zip",
+        "actions/runs/$PRODUCER_RUN_ID/artifacts",
+      );
+    }, /exact authenticated calibration artifact container/u],
+    ["frozen acceptance skips the artifact container digest", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Download frozen calibration bundle",
+      );
+      step.run = step.run.replace(
+        'test "$actual_digest" = "$CONTAINER_DIGEST"',
+        "true",
+      );
+    }, /exact authenticated calibration artifact container/u],
+    ["frozen acceptance compares the checked-in constant to itself", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Verify frozen calibration acceptance",
+      );
+      step.run = step.run.replace(
+        "$RUNNER_TEMP/frozen-calibration-bundle/per-user-embedding-server-constant-set.json",
+        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+      );
+    }, /recompute the downloaded calibration and compare the checked-in freeze/u],
+    ["frozen acceptance verifies the wrong downloaded bundle", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Verify frozen calibration acceptance",
+      );
+      step.run = step.run.replace(
+        "$RUNNER_TEMP/frozen-calibration-bundle/calibration-bundle.json",
+        "$RUNNER_TEMP/frozen-calibration-bundle/assembly.json",
+      );
+    }, /recompute the downloaded calibration and compare the checked-in freeze/u],
+    ["frozen acceptance mints the receipt before recomputation", workflows => {
+      const job = workflows.get("source-proof.yml").jobs.resolve;
+      const verification = job.steps.splice(
+        job.steps.findIndex(({ name }) => name === "Verify frozen calibration acceptance"),
+        1,
+      )[0];
+      job.steps.push(verification);
+    }, /only after frozen calibration acceptance/u],
     ["acceptance adds an Ubuntu workspace test job", workflows => {
       workflows.get("source-proof.yml").jobs["acceptance-ubuntu-workspace"] = {
         if: "inputs.acceptance_only",
@@ -3849,13 +3952,26 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       );
       step.run = step.run.replaceAll(".expired == false", "true");
     }, /Reuse a completed gate.*expired/u],
+    ["release accepts an expired freeze receipt", workflows => {
+      const step = draftStep(
+        workflows.get("release.yml").jobs.preflight,
+        "Resolve reusable prior evidence",
+      );
+      step.run = step.run.replace(
+        "select(.name == $receipt and .expired == false)",
+        "select(.name == $receipt)",
+      );
+    }, /Resolve reusable prior evidence.*select\(\.name == \$receipt and \.expired == false\)/u],
     ["release accepts an expired source cell", workflows => {
       const step = draftStep(
         workflows.get("release.yml").jobs.preflight,
         "Resolve reusable prior evidence",
       );
-      step.run = step.run.replace(".expired == false", "true");
-    }, /Resolve reusable prior evidence.*expired/u],
+      step.run = step.run.replace(
+        "select(.name == $source and .expired == false)",
+        "select(.name == $source)",
+      );
+    }, /Resolve reusable prior evidence.*select\(\.name == \$source and \.expired == false\)/u],
     ["qualification trusts a bare success status", workflows => {
       const step = draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,

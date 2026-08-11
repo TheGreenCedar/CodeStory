@@ -1298,10 +1298,12 @@ fn semantic_projection_v3_component_reports_keep_graph_evidence_after_source_com
         128,
     );
     let doc = &reports[0].symbol_doc.doc_text;
-    assert!(doc.contains("semantic_doc_version: 9"));
+    assert!(doc.contains(&format!(
+        "semantic_doc_version: {LLM_SYMBOL_DOC_SCHEMA_VERSION}"
+    )));
     assert!(
         doc.contains("god_nodes:"),
-        "v9 report lost graph fragment: {doc}"
+        "current semantic report lost graph fragment: {doc}"
     );
 }
 

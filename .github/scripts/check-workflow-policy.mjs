@@ -8806,11 +8806,164 @@ export function releaseFreezeBarrierWorkflowViolations(
       && object(acceptedCheckout.with)["fetch-depth"] === 0,
     "[freeze_barrier] Actions receipt generation must have complete history for support PR ancestry",
   );
+  const frozenAcceptanceCondition
+    = "${{ inputs.acceptance_only && inputs.acceptance_phase == 'frozen_candidate' }}";
+  const frozenIdentity = namedStep(
+    sourceResolve,
+    "Resolve frozen calibration acceptance identity",
+  );
+  const frozenIdentityRun = executableRunText(String(frozenIdentity?.run ?? ""));
+  add(
+    violations,
+    frozenIdentity?.id === "frozen-calibration"
+      && frozenIdentity?.if === frozenAcceptanceCondition
+      && frozenIdentity?.shell === "bash"
+      && frozenIdentity?.["continue-on-error"] === undefined
+      && [
+        "python .github/scripts/check-calibration-release-lineage.py",
+        '--repo "$GITHUB_WORKSPACE"',
+        '--expected-sha "$HEAD_SHA"',
+        '--github-output "$GITHUB_OUTPUT"',
+      ].every(fragment => frozenIdentityRun.includes(fragment)),
+    "[freeze_barrier] frozen acceptance must resolve a frozen direct constant-only child before receipt generation",
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Resolve frozen calibration acceptance identity",
+    { HEAD_SHA: "${{ steps.resolve.outputs.ref }}" },
+  );
+
+  const frozenProducer = namedStep(
+    sourceResolve,
+    "Authenticate frozen calibration producer",
+  );
+  const frozenProducerRun = executableRunText(String(frozenProducer?.run ?? ""));
+  add(
+    violations,
+    frozenProducer?.id === "frozen-calibration-producer"
+      && frozenProducer?.if === frozenAcceptanceCondition
+      && frozenProducer?.shell === "bash"
+      && frozenProducer?.["continue-on-error"] === undefined
+      && [
+        "actions/runs/$PRODUCER_RUN_ID/attempts/$PRODUCER_RUN_ATTEMPT",
+        '.path == ".github/workflows/packaged-platform-pr.yml"',
+        '.event == "workflow_dispatch"',
+        '.status == "completed"',
+        '.conclusion == "success"',
+        ".head_sha == $source",
+        ".head_repository.full_name == $repo",
+        "actions/runs/$PRODUCER_RUN_ID/artifacts?per_page=100",
+        ".name == $artifact",
+        ".expired == false",
+        ".created_at >= $attempt_started",
+        ".created_at <= $attempt_finished",
+        ".workflow_run.id == $run_id",
+        ".workflow_run.head_sha == $source",
+        "test \"$(jq 'length' <<<\"$matches\")\" = 1",
+        "^sha256:[0-9a-f]{64}$",
+      ].every(fragment => frozenProducerRun.includes(fragment)),
+    "[freeze_barrier] frozen acceptance must authenticate the recorded calibration run, attempt, and artifact",
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Authenticate frozen calibration producer",
+    {
+      ARTIFACT_NAME: "${{ steps.frozen-calibration.outputs.artifact_name }}",
+      GH_TOKEN: "${{ github.token }}",
+      PRODUCER_RUN_ATTEMPT:
+        "${{ steps.frozen-calibration.outputs.producer_run_attempt }}",
+      PRODUCER_RUN_ID: "${{ steps.frozen-calibration.outputs.producer_run_id }}",
+      SOURCE_SHA: "${{ steps.frozen-calibration.outputs.source_commit }}",
+    },
+  );
+
+  const frozenDownload = namedStep(
+    sourceResolve,
+    "Download frozen calibration bundle",
+  );
+  const frozenDownloadRun = executableRunText(String(frozenDownload?.run ?? ""));
+  add(
+    violations,
+    frozenDownload?.if === frozenAcceptanceCondition
+      && frozenDownload?.shell === "bash"
+      && frozenDownload?.["continue-on-error"] === undefined
+      && [
+        "actions/artifacts/$ARTIFACT_ID/zip",
+        'actual_digest="sha256:$(sha256sum "$archive"',
+        'test "$actual_digest" = "$CONTAINER_DIGEST"',
+        'unzip -q "$archive" -d "$destination"',
+        'test -f "$destination/calibration-bundle.json"',
+        'test -f "$destination/per-user-embedding-server-constant-set.json"',
+      ].every(fragment => frozenDownloadRun.includes(fragment)),
+    "[freeze_barrier] frozen acceptance must download the exact authenticated calibration artifact container",
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Download frozen calibration bundle",
+    {
+      ARTIFACT_ID: "${{ steps.frozen-calibration-producer.outputs.artifact_id }}",
+      CONTAINER_DIGEST:
+        "${{ steps.frozen-calibration-producer.outputs.container_digest }}",
+      GH_TOKEN: "${{ github.token }}",
+    },
+  );
+
+  const frozenVerification = namedStep(
+    sourceResolve,
+    "Verify frozen calibration acceptance",
+  );
+  const frozenVerificationRun = executableRunText(
+    String(frozenVerification?.run ?? ""),
+  );
+  add(
+    violations,
+    frozenVerification?.if === frozenAcceptanceCondition
+      && frozenVerification?.shell === "bash"
+      && frozenVerification?.["continue-on-error"] === undefined
+      && [
+        "python .github/scripts/check-calibration-release-lineage.py",
+        '--repo "$GITHUB_WORKSPACE"',
+        '--expected-sha "$HEAD_SHA"',
+        '--calibration-bundle "$RUNNER_TEMP/frozen-calibration-bundle/calibration-bundle.json"',
+        '--artifact-constant-set "$RUNNER_TEMP/frozen-calibration-bundle/per-user-embedding-server-constant-set.json"',
+        '--expected-producer-run-id "$PRODUCER_RUN_ID"',
+        '--expected-producer-run-attempt "$PRODUCER_RUN_ATTEMPT"',
+        '--expected-producer-artifact "$ARTIFACT_NAME"',
+      ].every(fragment => frozenVerificationRun.includes(fragment)),
+    "[freeze_barrier] frozen acceptance must recompute the downloaded calibration and compare the checked-in freeze",
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Verify frozen calibration acceptance",
+    {
+      ARTIFACT_NAME: "${{ steps.frozen-calibration.outputs.artifact_name }}",
+      HEAD_SHA: "${{ steps.resolve.outputs.ref }}",
+      PRODUCER_RUN_ATTEMPT:
+        "${{ steps.frozen-calibration.outputs.producer_run_attempt }}",
+      PRODUCER_RUN_ID: "${{ steps.frozen-calibration.outputs.producer_run_id }}",
+    },
+  );
   const recordReceipt = namedStep(sourceResolve, "Record executable release freeze");
   add(
     violations,
-    recordReceipt?.if === "${{ inputs.acceptance_only }}",
-    "[freeze_barrier] Actions may generate a release freeze receipt only in acceptance mode",
+    recordReceipt?.if === "${{ inputs.acceptance_only }}"
+      && stepIndex(sourceResolve, "Resolve frozen calibration acceptance identity")
+        < stepIndex(sourceResolve, "Authenticate frozen calibration producer")
+      && stepIndex(sourceResolve, "Authenticate frozen calibration producer")
+        < stepIndex(sourceResolve, "Download frozen calibration bundle")
+      && stepIndex(sourceResolve, "Download frozen calibration bundle")
+        < stepIndex(sourceResolve, "Verify frozen calibration acceptance")
+      && stepIndex(sourceResolve, "Verify frozen calibration acceptance")
+        < stepIndex(sourceResolve, "Record executable release freeze"),
+    "[freeze_barrier] Actions may generate a release freeze receipt only after frozen calibration acceptance",
   );
   // The receipt-recording step fragments are rule instances and live in
   // release-claims.json under workflow_policy.step_fragments;

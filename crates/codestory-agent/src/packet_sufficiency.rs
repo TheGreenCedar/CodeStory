@@ -6048,8 +6048,12 @@ mod tests {
                 anchor_at("dispatchRequest", "lib/dispatch.dart"),
             ),
             evidence_claim(
-                "The transport send implementation sends through an HTTP client adapter.",
-                anchor_at("selectAdapter", "lib/adapters/select.dart"),
+                "The client selects the adapter used for the request.",
+                anchor_at("Client.selectAdapter", "lib/adapters/select.dart"),
+            ),
+            evidence_claim(
+                "The declared transport boundary sends the prepared request.",
+                anchor_at("BaseAdapter.send", "lib/adapters/base.dart"),
             ),
         ]
     }

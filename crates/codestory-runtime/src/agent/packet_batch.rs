@@ -25,11 +25,11 @@ pub(crate) use codestory_agent::packet_scoring::packet_file_stem_matches_query;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError,
     PacketBudgetLimitsDto, PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto,
-    PacketSidecarQueryDiagnosticDto, PacketTaskClassDto, RetrievalAnnotationDto, SearchHit,
+    PacketSidecarQueryDiagnosticDto, PacketTaskClassDto, RetrievalAnnotationDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{
-    AgentRetrievalStepDto, NodeKind, SearchHitOrigin, SearchMatchQualityDto,
+    AgentRetrievalStepDto, NodeKind, SearchHit, SearchHitOrigin, SearchMatchQualityDto,
 };
 use std::collections::HashSet;
 use std::sync::atomic::Ordering as AtomicOrdering;

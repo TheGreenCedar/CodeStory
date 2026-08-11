@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
@@ -25,7 +26,23 @@ from .calibration_lineage import (
     CONSTANT_SET_FREEZE_PATH,
     verify_calibration_source_lineage,
 )
-from .foundation import REPOSITORY_ROOT, ProofFailure, require
+from .calibration_self_test import build_calibration_self_test_bundle
+from .contract_primitives import sha256, write_json
+from .frozen_acceptance import (
+    require_artifact_constant_set_digest,
+    require_artifact_constant_set_matches,
+    require_frozen_acceptance_coordinates,
+    resolve_frozen_acceptance_identity,
+)
+from .foundation import (
+    MEASUREMENT_PROTOCOL,
+    REPOSITORY_ROOT,
+    SERVER_CONSTANT_SET,
+    SERVER_PROTOCOL,
+    ProofFailure,
+    require,
+)
+from .measurement_protocol import load_server_measurement_contract
 
 CARGO_MANIFEST_PATH = "crates/codestory-cli/Cargo.toml"
 _GIT_ENVIRONMENT = {
@@ -40,6 +57,7 @@ _GIT_ENVIRONMENT = {
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_SYSTEM": os.devnull,
 }
+_LINEAGE_CLI = REPOSITORY_ROOT / ".github/scripts/check-calibration-release-lineage.py"
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -86,6 +104,61 @@ def _commit(root: Path, message: str, *, allow_empty: bool = False) -> dict:
     }
 
 
+def _run_acceptance_cli(
+    root: Path,
+    expected_sha: str,
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(_LINEAGE_CLI),
+            "--repo",
+            str(root),
+            "--expected-sha",
+            expected_sha,
+            *arguments,
+        ],
+        cwd=REPOSITORY_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+
+def _require_acceptance_cli_pass(
+    label: str,
+    completed: subprocess.CompletedProcess[str],
+) -> dict:
+    require(
+        completed.returncode == 0,
+        f"{label} failed: "
+        + (completed.stderr.strip() or completed.stdout.strip() or "no output"),
+    )
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ProofFailure(f"{label} returned invalid JSON: {exc}") from exc
+    require(
+        isinstance(result, dict) and result.get("status") == "passed",
+        f"{label} did not return a passing result: {result}",
+    )
+    return result
+
+
+def _require_acceptance_cli_rejection(
+    label: str,
+    fragment: str,
+    completed: subprocess.CompletedProcess[str],
+) -> None:
+    require(completed.returncode != 0, f"{label} was accepted by the lineage CLI")
+    require(
+        fragment in completed.stderr,
+        f"{label} rejection omitted {fragment!r}: "
+        + (completed.stderr.strip() or completed.stdout.strip() or "no output"),
+    )
+
+
 def _reject(
     label: str,
     fragments: Iterable[str],
@@ -106,6 +179,18 @@ def _reject(
         raise ProofFailure(
             f"{label} was accepted by the calibration source-lineage guard"
         )
+
+
+def _reject_call(label: str, fragment: str, call) -> None:
+    try:
+        call()
+    except ProofFailure as failure:
+        require(
+            fragment in str(failure),
+            f"{label} rejection message omitted {fragment!r}: {failure}",
+        )
+    else:
+        raise ProofFailure(f"{label} was accepted by frozen calibration acceptance")
 
 
 def _build_calibration_history(root: Path) -> dict:
@@ -240,6 +325,268 @@ def _rejects_calibrate_then_bump(root: Path, calibration: dict) -> None:
             bumped_after_calibration["commit"],
         ),
         "the calibrate-then-bump fixture did not also land the freeze file",
+    )
+
+
+def _rejects_arbitrary_source_and_docs_drift(root: Path, calibration: dict) -> None:
+    for branch, relative, contents in (
+        ("rust-drift", "crates/example/src/lib.rs", "pub fn drift() {}\n"),
+        ("docs-drift", "docs/release.md", "changed after calibration\n"),
+    ):
+        _git(root, "checkout", "-q", "-B", branch, calibration["commit"])
+        _write(root, relative, contents)
+        _commit(root, f"add {branch}")
+        _write(root, CONSTANT_SET_FREEZE_PATH, _constant_set("frozen"))
+        frozen = _commit(root, f"freeze after {branch}")
+        _reject(
+            f"arbitrary {branch}",
+            [
+                "post-calibration source drift exceeded the one allowed "
+                "constant-set freeze file",
+                relative,
+            ],
+            calibration,
+            frozen,
+            root,
+        )
+
+
+def _frozen_acceptance_identity_tests() -> None:
+    source_commit = "d" * 40
+    freeze_record = {
+        "selection_source_commit": source_commit,
+        "selection_source_tree": "e" * 40,
+        "measurement_protocol_sha256": "1" * 64,
+        "protocol_sha256": "2" * 64,
+        "input_constant_set_sha256": "3" * 64,
+        "calibration_bundle_sha256": "4" * 64,
+        "calibration_freeze_digest": "5" * 64,
+        "run_artifact_sha256s": ["6" * 64, "7" * 64, "8" * 64],
+        "selection_rule": (
+            "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2"
+        ),
+        "selected_at": "github-actions-run:123456789:2",
+    }
+    constant_set = {
+        "schema_version": 1,
+        "status": "frozen",
+        "calibration_required_values": {"connect_timeout_ms": 1},
+        "qualification_thresholds": {},
+        "freeze_record": freeze_record,
+    }
+    contract = {
+        "measurement_protocol": {"calibration_matrix": {"macos-metal": {}}},
+        "constant_set": constant_set,
+    }
+    identity = resolve_frozen_acceptance_identity(contract)
+    require(
+        identity
+        == {
+            "source_commit": source_commit,
+            "producer_run_id": "123456789",
+            "producer_run_attempt": "2",
+            "artifact_name": f"embedding-calibration-bundle-{source_commit}",
+        },
+        "frozen acceptance did not resolve exact producer coordinates",
+    )
+    require_frozen_acceptance_coordinates(
+        identity,
+        producer_run_id="123456789",
+        producer_run_attempt="2",
+        producer_artifact=f"embedding-calibration-bundle-{source_commit}",
+    )
+    for label, values in (
+        ("wrong producer run", ("123456788", "2", identity["artifact_name"])),
+        ("wrong producer attempt", ("123456789", "1", identity["artifact_name"])),
+        ("wrong producer artifact", ("123456789", "2", "wrong-artifact")),
+    ):
+        _reject_call(
+            label,
+            "download coordinates differ",
+            lambda values=values: require_frozen_acceptance_coordinates(
+                identity,
+                producer_run_id=values[0],
+                producer_run_attempt=values[1],
+                producer_artifact=values[2],
+            ),
+        )
+    unfrozen = json.loads(json.dumps(contract))
+    unfrozen["constant_set"]["status"] = "unfrozen"
+    unfrozen["constant_set"]["freeze_record"] = None
+    _reject_call(
+        "an unfrozen constant set",
+        "constants are not frozen",
+        lambda: resolve_frozen_acceptance_identity(unfrozen),
+    )
+    absent_record = json.loads(json.dumps(contract))
+    absent_record["constant_set"]["freeze_record"] = None
+    _reject_call(
+        "an absent freeze record",
+        "omit their freeze record",
+        lambda: resolve_frozen_acceptance_identity(absent_record),
+    )
+    wrong_selected_at = json.loads(json.dumps(contract))
+    wrong_selected_at["constant_set"]["freeze_record"]["selected_at"] = "self-test"
+    _reject_call(
+        "an unbound selected_at value",
+        "must name one exact GitHub Actions run and attempt",
+        lambda: resolve_frozen_acceptance_identity(wrong_selected_at),
+    )
+    require_artifact_constant_set_matches(
+        constant_set,
+        json.loads(json.dumps(constant_set)),
+    )
+    changed_constant = json.loads(json.dumps(constant_set))
+    changed_constant["calibration_required_values"]["connect_timeout_ms"] = 2
+    _reject_call(
+        "a changed selected constant",
+        "artifact constant set differs",
+        lambda: require_artifact_constant_set_matches(constant_set, changed_constant),
+    )
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        checked_in = root / "checked-in.json"
+        artifact = root / "artifact.json"
+        checked_in.write_text(
+            json.dumps(constant_set, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        artifact.write_text(
+            json.dumps(constant_set, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        require(
+            json.loads(checked_in.read_text(encoding="utf-8"))
+            == json.loads(artifact.read_text(encoding="utf-8")),
+            "the reserialized constant-set fixture changed its JSON value",
+        )
+        require_artifact_constant_set_digest(sha256(checked_in), checked_in)
+        _reject_call(
+            "a byte-different reserialization of the selected constant set",
+            "constant-set bytes differ",
+            lambda: require_artifact_constant_set_digest(
+                sha256(checked_in), artifact
+            ),
+        )
+
+
+def _frozen_acceptance_cli_tests(parent: Path) -> None:
+    root = parent / "frozen-acceptance-cli"
+    artifacts = parent / "frozen-acceptance-artifacts"
+    root.mkdir()
+    artifacts.mkdir()
+    _git(root, "-c", "init.defaultBranch=main", "init", "-q")
+    _write(root, "README.md", "frozen acceptance CLI fixture\n")
+    for source in (MEASUREMENT_PROTOCOL, SERVER_PROTOCOL, SERVER_CONSTANT_SET):
+        destination = root / source.relative_to(REPOSITORY_ROOT)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
+    calibration = _commit(root, "calibration source")
+    measurement_contract = load_server_measurement_contract(
+        root / MEASUREMENT_PROTOCOL.relative_to(REPOSITORY_ROOT)
+    )
+    bundle_path, frozen_contract, _ = build_calibration_self_test_bundle(
+        artifacts,
+        measurement_contract,
+        source=calibration,
+    )
+    artifact_name = f"embedding-calibration-bundle-{calibration['commit']}"
+    frozen_constant_set = frozen_contract["constant_set"]
+    frozen_constant_set["freeze_record"]["selected_at"] = (
+        "github-actions-run:123:1"
+    )
+    artifact_constant_set = artifacts / SERVER_CONSTANT_SET.name
+    write_json(artifact_constant_set, frozen_constant_set)
+    checked_in_constant_set = root / SERVER_CONSTANT_SET.relative_to(REPOSITORY_ROOT)
+    checked_in_constant_set.write_bytes(artifact_constant_set.read_bytes())
+    frozen = _commit(root, "generated constant freeze")
+
+    github_output = artifacts / "identity-output.txt"
+    identity = _require_acceptance_cli_pass(
+        "frozen acceptance identity CLI",
+        _run_acceptance_cli(
+            root,
+            frozen["commit"],
+            "--github-output",
+            str(github_output),
+        ),
+    )
+    output_values = dict(
+        line.split("=", 1)
+        for line in github_output.read_text(encoding="utf-8").splitlines()
+    )
+    require(
+        identity["identity"]
+        == output_values
+        == {
+            "source_commit": calibration["commit"],
+            "producer_run_id": "123",
+            "producer_run_attempt": "1",
+            "artifact_name": artifact_name,
+        },
+        "frozen acceptance identity CLI emitted different producer coordinates",
+    )
+
+    complete_arguments = (
+        "--calibration-bundle",
+        str(bundle_path),
+        "--artifact-constant-set",
+        str(artifact_constant_set),
+        "--expected-producer-run-id",
+        "123",
+        "--expected-producer-run-attempt",
+        "1",
+        "--expected-producer-artifact",
+        artifact_name,
+    )
+    verified = _require_acceptance_cli_pass(
+        "complete frozen acceptance CLI",
+        _run_acceptance_cli(root, frozen["commit"], *complete_arguments),
+    )
+    require(
+        verified["lineage"]["selection_commit"] == calibration["commit"]
+        and verified["calibration"]["source"]["commit"]
+        == calibration["commit"]
+        and verified["calibration"]["artifact"]["sha256"] == sha256(bundle_path),
+        "complete frozen acceptance CLI did not retain recomputed source and "
+        "bundle identity",
+    )
+
+    later = _commit(root, "later commit revokes acceptance", allow_empty=True)
+    rejected_output = artifacts / "rejected-identity-output.txt"
+    _require_acceptance_cli_rejection(
+        "later source through --github-output",
+        "direct single-parent child",
+        _run_acceptance_cli(
+            root,
+            later["commit"],
+            "--github-output",
+            str(rejected_output),
+        ),
+    )
+    require(
+        not rejected_output.exists(),
+        "rejected --github-output lineage wrote trusted producer coordinates",
+    )
+    _git(root, "reset", "-q", "--hard", frozen["commit"])
+
+    reserialized = artifacts / "reserialized-constant-set.json"
+    reserialized.write_text(
+        json.dumps(frozen_constant_set, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    require(
+        json.loads(reserialized.read_text(encoding="utf-8"))
+        == json.loads(artifact_constant_set.read_text(encoding="utf-8"))
+        and sha256(reserialized) != sha256(artifact_constant_set),
+        "the CLI hostile fixture is not same-JSON with different bytes",
+    )
+    hostile_arguments = list(complete_arguments)
+    hostile_arguments[3] = str(reserialized)
+    _require_acceptance_cli_rejection(
+        "reserialized artifact through complete acceptance flags",
+        "constant-set bytes differ",
+        _run_acceptance_cli(root, frozen["commit"], *hostile_arguments),
     )
 
 
@@ -421,12 +768,16 @@ def _version_only_invocation_enforces_the_lineage() -> None:
 
 def run_calibration_lineage_self_tests() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw) / "calibration-lineage"
+        parent = Path(raw)
+        root = parent / "calibration-lineage"
         root.mkdir(parents=True)
         calibration = _build_calibration_history(root)
         frozen = _accepts_the_single_freeze_commit(root, calibration)
         _rejects_commit_after_freeze(root, calibration, frozen)
         _rejects_identity_and_checkout_drift(root, calibration, frozen)
         _rejects_calibrate_then_bump(root, calibration)
+        _rejects_arbitrary_source_and_docs_drift(root, calibration)
         _rejects_missing_freeze_and_unrelated_history(root, frozen)
+        _frozen_acceptance_cli_tests(parent)
+    _frozen_acceptance_identity_tests()
     _version_only_invocation_enforces_the_lineage()

@@ -2894,9 +2894,9 @@ pub struct PacketClaimObligationDto {
     pub carrier_node_ids: Vec<NodeId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carrier_paths: Vec<String>,
-    /// Exact typed edge receipts verified for the carrier before packet presentation caps run.
-    /// A later compact representation may omit the corresponding global trail edge, but it may
-    /// preserve this obligation only while the same lawful carrier remains in the packet.
+    /// Exact typed edge receipts that remain serialized with the carrier in the final packet.
+    /// Trimming the corresponding trail edge removes its receipt and demotes only that obligation;
+    /// a global omission marker never substitutes for the missing typed edge.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carrier_edge_proofs: Vec<PacketObligationCarrierEdgeProofDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

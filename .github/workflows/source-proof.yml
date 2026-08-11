@@ -177,6 +177,124 @@ jobs:
           )"
           echo "cancelled=$(jq -c '.cancelled' <<<"$result")" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve frozen calibration acceptance identity
+        id: frozen-calibration
+        if: ${{ inputs.acceptance_only && inputs.acceptance_phase == 'frozen_candidate' }}
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          python .github/scripts/check-calibration-release-lineage.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "$HEAD_SHA" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Authenticate frozen calibration producer
+        id: frozen-calibration-producer
+        if: ${{ inputs.acceptance_only && inputs.acceptance_phase == 'frozen_candidate' }}
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ steps.frozen-calibration.outputs.artifact_name }}
+          GH_TOKEN: ${{ github.token }}
+          PRODUCER_RUN_ATTEMPT: ${{ steps.frozen-calibration.outputs.producer_run_attempt }}
+          PRODUCER_RUN_ID: ${{ steps.frozen-calibration.outputs.producer_run_id }}
+          SOURCE_SHA: ${{ steps.frozen-calibration.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          producer_run="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$PRODUCER_RUN_ID/attempts/$PRODUCER_RUN_ATTEMPT"
+          )"
+          jq -e \
+            --arg attempt "$PRODUCER_RUN_ATTEMPT" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg run_id "$PRODUCER_RUN_ID" \
+            --arg source "$SOURCE_SHA" \
+            '.id == ($run_id | tonumber)
+             and .run_attempt == ($attempt | tonumber)
+             and .path == ".github/workflows/packaged-platform-pr.yml"
+             and .event == "workflow_dispatch"
+             and .status == "completed"
+             and .conclusion == "success"
+            and .head_sha == $source
+             and .head_repository.full_name == $repo' \
+            <<<"$producer_run" >/dev/null
+          attempt_started="$(jq -r '.run_started_at' <<<"$producer_run")"
+          attempt_finished="$(jq -r '.updated_at' <<<"$producer_run")"
+          artifacts="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$PRODUCER_RUN_ID/artifacts?per_page=100"
+          )"
+          matches="$(
+            jq -c \
+              --arg artifact "$ARTIFACT_NAME" \
+              --arg attempt_finished "$attempt_finished" \
+              --arg attempt_started "$attempt_started" \
+              --arg source "$SOURCE_SHA" \
+              --argjson run_id "$PRODUCER_RUN_ID" \
+              '[.artifacts[]
+                | select(
+                    .name == $artifact
+                    and .expired == false
+                    and .created_at >= $attempt_started
+                    and .created_at <= $attempt_finished
+                    and .workflow_run.id == $run_id
+                    and .workflow_run.head_sha == $source
+                  )]' \
+              <<<"$artifacts"
+          )"
+          test "$(jq 'length' <<<"$matches")" = 1 || {
+            echo "::error::Expected one unexpired $ARTIFACT_NAME artifact from calibration run $PRODUCER_RUN_ID."
+            exit 1
+          }
+          artifact_id="$(jq -r '.[0].id' <<<"$matches")"
+          container_digest="$(jq -r '.[0].digest // empty' <<<"$matches")"
+          printf '%s' "$artifact_id" | grep -Eq '^[1-9][0-9]*$'
+          printf '%s' "$container_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
+          echo "container_digest=$container_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Download frozen calibration bundle
+        if: ${{ inputs.acceptance_only && inputs.acceptance_phase == 'frozen_candidate' }}
+        shell: bash
+        env:
+          ARTIFACT_ID: ${{ steps.frozen-calibration-producer.outputs.artifact_id }}
+          CONTAINER_DIGEST: ${{ steps.frozen-calibration-producer.outputs.container_digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          destination="$RUNNER_TEMP/frozen-calibration-bundle"
+          archive="$RUNNER_TEMP/frozen-calibration-bundle.zip"
+          mkdir "$destination"
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
+            > "$archive"
+          actual_digest="sha256:$(sha256sum "$archive" | awk '{print $1}')"
+          test "$actual_digest" = "$CONTAINER_DIGEST"
+          unzip -q "$archive" -d "$destination"
+          test -f "$destination/calibration-bundle.json"
+          test -f "$destination/per-user-embedding-server-constant-set.json"
+
+      - name: Verify frozen calibration acceptance
+        if: ${{ inputs.acceptance_only && inputs.acceptance_phase == 'frozen_candidate' }}
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ steps.frozen-calibration.outputs.artifact_name }}
+          HEAD_SHA: ${{ steps.resolve.outputs.ref }}
+          PRODUCER_RUN_ATTEMPT: ${{ steps.frozen-calibration.outputs.producer_run_attempt }}
+          PRODUCER_RUN_ID: ${{ steps.frozen-calibration.outputs.producer_run_id }}
+        run: |
+          set -euo pipefail
+          python .github/scripts/check-calibration-release-lineage.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "$HEAD_SHA" \
+            --calibration-bundle "$RUNNER_TEMP/frozen-calibration-bundle/calibration-bundle.json" \
+            --artifact-constant-set "$RUNNER_TEMP/frozen-calibration-bundle/per-user-embedding-server-constant-set.json" \
+            --expected-producer-run-id "$PRODUCER_RUN_ID" \
+            --expected-producer-run-attempt "$PRODUCER_RUN_ATTEMPT" \
+            --expected-producer-artifact "$ARTIFACT_NAME"
+
       - name: Record executable release freeze
         id: receipt
         if: ${{ inputs.acceptance_only }}

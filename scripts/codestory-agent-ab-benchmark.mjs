@@ -41,6 +41,9 @@ const MANIFEST_REPO_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
 const MANIFEST_TASK_ID_PATTERN = /^[a-z0-9][a-z0-9.-]*$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const MAX_PACKET_MANIFEST_EXTRA_PROBES = 12;
+const PUBLIC_PACKET_MAX_ANCHORS = 13;
+const PUBLIC_PACKET_MAX_TRAIL_EDGES = 20;
+const PUBLIC_PACKET_MAX_OUTPUT_BYTES = 98_304;
 const MAX_REUSED_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_BENCHMARK_MODEL = "gpt-5.6-sol";
 const REQUIRED_MANAGED_CODESTORY_VERSION = "0.17.0";
@@ -1181,8 +1184,20 @@ function validatePublishableShape(opts, tasks) {
 }
 
 async function runProcess(command, args, options = {}) {
+  if (options.signal?.aborted) {
+    return {
+      status: "aborted",
+      exitCode: null,
+      signal: null,
+      stdout: "",
+      stderr: `${options.abortMessage ?? "Process aborted by benchmark fail-fast."}\n`,
+      error: null,
+      timedOut: false,
+      aborted: true,
+    };
+  }
   return await new Promise((resolve) => {
-    const child = spawn(command, args, {
+    const child = (options.spawnProcess ?? spawn)(command, args, {
       cwd: options.cwd,
       env: options.env ?? process.env,
       shell: false,
@@ -1192,20 +1207,41 @@ async function runProcess(command, args, options = {}) {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let aborted = false;
     let settled = false;
     let forceKillTimer = null;
+    const terminate = (signal, message = null) => {
+      if (message) {
+        stderr += `\n${message}\n`;
+      }
+      terminateProcess(child, signal, options);
+      const forceKillAfterMs = options.forceKillAfterMs ?? 5000;
+      if (forceKillAfterMs > 0 && signal !== "SIGKILL") {
+        forceKillTimer ??= setTimeout(
+          () => terminateProcess(child, "SIGKILL", options),
+          forceKillAfterMs,
+        );
+      }
+    };
+    const onAbort = () => {
+      if (settled || aborted || timedOut) {
+        return;
+      }
+      aborted = true;
+      terminate("SIGTERM", options.abortMessage ?? "Process aborted by benchmark fail-fast.");
+    };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) {
+      onAbort();
+    }
     const timeoutTimer = options.timeoutMs
       ? setTimeout(() => {
+          if (settled || aborted) {
+            return;
+          }
           timedOut = true;
           const message = options.timeoutMessage ?? `Process timed out after ${options.timeoutMs}ms.`;
-          stderr += `\n${message}\n`;
-          terminateProcess(child, "SIGTERM", options);
-          if (options.forceKillAfterMs) {
-            forceKillTimer = setTimeout(
-              () => terminateProcess(child, "SIGKILL", options),
-              options.forceKillAfterMs,
-            );
-          }
+          terminate("SIGTERM", message);
         }, options.timeoutMs)
       : null;
     function finish(payload) {
@@ -1219,7 +1255,8 @@ async function runProcess(command, args, options = {}) {
       if (forceKillTimer) {
         clearTimeout(forceKillTimer);
       }
-      resolve({ timedOut, ...payload });
+      options.signal?.removeEventListener("abort", onAbort);
+      resolve({ timedOut, aborted, ...payload });
     }
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
@@ -1232,7 +1269,7 @@ async function runProcess(command, args, options = {}) {
     }
     child.on("error", (error) => {
       finish({
-        status: timedOut ? "timeout" : "error",
+        status: timedOut ? "timeout" : aborted ? "aborted" : "error",
         exitCode: null,
         signal: null,
         stdout,
@@ -1242,7 +1279,7 @@ async function runProcess(command, args, options = {}) {
     });
     child.on("close", (exitCode, signal) => {
       finish({
-        status: timedOut ? "timeout" : exitCode === 0 ? "pass" : "fail",
+        status: timedOut ? "timeout" : aborted ? "aborted" : exitCode === 0 ? "pass" : "fail",
         exitCode,
         signal,
         stdout,
@@ -1369,12 +1406,19 @@ function assertManifestRepoMaterializationAllowed(tasks, opts = {}) {
   }
 }
 
-async function gitCheckedOutput(args, cwd, timeoutMs) {
-  const result = await runCheckedProcess("git", args, { cwd, timeoutMs });
+async function gitCheckedOutput(args, cwd, options = {}) {
+  const normalizedOptions = typeof options === "number"
+    ? { timeoutMs: options }
+    : options;
+  const result = await runCheckedProcess("git", args, {
+    ...normalizedOptions,
+    cwd,
+  });
   return result.stdout.trim();
 }
 
 async function installCodestoryProjectManifest(config, checkoutPath, opts) {
+  opts.signal?.throwIfAborted();
   const manifest = config.manifest_codestory_project_manifest ?? null;
   if (!manifest) {
     return null;
@@ -1392,7 +1436,11 @@ async function installCodestoryProjectManifest(config, checkoutPath, opts) {
   }
   const tracked = await runProcess("git", ["-C", checkoutPath, "ls-files", "--error-unmatch", "--", relativeDestination], {
     timeoutMs: opts.timeoutMs,
+    signal: opts.signal,
+    spawnProcess: opts.spawnProcess,
+    forceKillAfterMs: opts.forceKillAfterMs,
   });
+  opts.signal?.throwIfAborted();
   if (tracked.exitCode === 0) {
     throw new Error(`Refusing to replace upstream-tracked ${relativeDestination} in ${config.name}`);
   }
@@ -1415,8 +1463,14 @@ async function installCodestoryProjectManifest(config, checkoutPath, opts) {
   if (installedSha256 !== manifest.sha256) {
     throw new Error(`Installed CodeStory project manifest hash mismatch for ${config.name}`);
   }
-  await gitCheckedOutput(["-C", checkoutPath, "check-ignore", "-q", "--", relativeDestination], repoRoot, opts.timeoutMs);
-  const dirty = await gitCheckedOutput(["-C", checkoutPath, "status", "--porcelain"], repoRoot, opts.timeoutMs);
+  const gitOptions = {
+    timeoutMs: opts.timeoutMs,
+    signal: opts.signal,
+    spawnProcess: opts.spawnProcess,
+    forceKillAfterMs: opts.forceKillAfterMs,
+  };
+  await gitCheckedOutput(["-C", checkoutPath, "check-ignore", "-q", "--", relativeDestination], repoRoot, gitOptions);
+  const dirty = await gitCheckedOutput(["-C", checkoutPath, "status", "--porcelain"], repoRoot, gitOptions);
   if (dirty) {
     throw new Error(`Installing CodeStory project manifest dirtied ${config.name}: ${dirty}`);
   }
@@ -1430,21 +1484,27 @@ async function installCodestoryProjectManifest(config, checkoutPath, opts) {
 }
 
 async function scrubMaterializedCheckout(config, checkoutPath, opts) {
-  await runCheckedProcess("git", ["-C", checkoutPath, "reset", "--hard", config.ref], {
+  const processOptions = {
     timeoutMs: opts.timeoutMs,
+    signal: opts.signal,
+    spawnProcess: opts.spawnProcess,
+    forceKillAfterMs: opts.forceKillAfterMs,
+  };
+  await runCheckedProcess("git", ["-C", checkoutPath, "reset", "--hard", config.ref], {
+    ...processOptions,
   });
   await runCheckedProcess("git", ["-C", checkoutPath, "clean", "-ffdqx"], {
-    timeoutMs: opts.timeoutMs,
+    ...processOptions,
   });
-  const head = (await gitCheckedOutput(["-C", checkoutPath, "rev-parse", "HEAD"], repoRoot, opts.timeoutMs)).toLowerCase();
+  const head = (await gitCheckedOutput(["-C", checkoutPath, "rev-parse", "HEAD"], repoRoot, processOptions)).toLowerCase();
   if (head !== String(config.ref).toLowerCase()) {
     throw new Error(`Materialized repo ${config.name} HEAD ${head} does not match pinned ref ${config.ref}`);
   }
-  const dirty = await gitCheckedOutput(["-C", checkoutPath, "status", "--porcelain"], repoRoot, opts.timeoutMs);
+  const dirty = await gitCheckedOutput(["-C", checkoutPath, "status", "--porcelain"], repoRoot, processOptions);
   if (dirty) {
     throw new Error(`Materialized repo ${config.name} is dirty after scrub: ${dirty}`);
   }
-  const remaining = await gitCheckedOutput(["-C", checkoutPath, "clean", "-ffdqx", "-n"], repoRoot, opts.timeoutMs);
+  const remaining = await gitCheckedOutput(["-C", checkoutPath, "clean", "-ffdqx", "-n"], repoRoot, processOptions);
   if (remaining) {
     throw new Error(`Materialized repo ${config.name} retains untracked or ignored files after scrub: ${remaining}`);
   }
@@ -1458,6 +1518,13 @@ async function materializeRepos(tasks, opts) {
   }
   await mkdir(opts.repoCacheDir, { recursive: true });
   for (const [name, config] of repos) {
+    opts.signal?.throwIfAborted();
+    const processOptions = {
+      timeoutMs: opts.timeoutMs,
+      signal: opts.signal,
+      spawnProcess: opts.spawnProcess,
+      forceKillAfterMs: opts.forceKillAfterMs,
+    };
     const checkoutPath = path.resolve(config.checkout_path ?? path.join(opts.repoCacheDir, name));
     assertPathInside(opts.repoCacheDir, checkoutPath, "Materialized repo checkout path");
     assertPathInside(checkoutPath, config.path, `Materialized repo workspace path for ${name}`);
@@ -1465,11 +1532,11 @@ async function materializeRepos(tasks, opts) {
       await mkdir(path.dirname(checkoutPath), { recursive: true });
       console.log(`cloning ${name} ${redactUrlForDisplay(config.url)} -> ${checkoutPath}`);
       await runCheckedProcess("git", ["clone", "--filter=blob:none", "--no-checkout", config.url, checkoutPath], {
-        timeoutMs: opts.timeoutMs,
+        ...processOptions,
       });
     } else {
       const remote = await runCheckedProcess("git", ["-C", checkoutPath, "remote", "get-url", "origin"], {
-        timeoutMs: opts.timeoutMs,
+        ...processOptions,
       });
       if (remote.stdout.trim() !== config.url) {
         throw new Error(
@@ -1479,10 +1546,10 @@ async function materializeRepos(tasks, opts) {
     }
     console.log(`fetching ${name} ref ${config.ref}`);
     await runCheckedProcess("git", ["-C", checkoutPath, "fetch", "--depth=1", "origin", config.ref], {
-      timeoutMs: opts.timeoutMs,
+      ...processOptions,
     });
     await runCheckedProcess("git", ["-C", checkoutPath, "checkout", "--detach", "FETCH_HEAD"], {
-      timeoutMs: opts.timeoutMs,
+      ...processOptions,
     });
     await scrubMaterializedCheckout(config, checkoutPath, opts);
     if (!existsSync(config.path)) {
@@ -3174,6 +3241,7 @@ async function runBaselinePrelude(opts, run, repoConfig, outDir, runId) {
   const result = await runProcess("rg", args, {
     cwd: repoConfig.path,
     env,
+    signal: opts.signal,
     timeoutMs: Math.min(opts.timeoutMs ?? 60_000, 60_000),
     timeoutMessage: "Baseline repository search timed out after 60000ms.",
   });
@@ -3251,14 +3319,181 @@ function packetGraphEdgeOccurrences(packet) {
   );
 }
 
+function packetUniqueCitationFileCount(packet) {
+  return new Set(
+    (packet?.answer?.citations ?? [])
+      .filter((citation) => typeof citation?.file_path === "string")
+      .map((citation) => citation.file_path),
+  ).size;
+}
+
+function packetSourceReadSnippetCount(packet) {
+  return (packet?.answer?.retrieval_trace?.steps ?? []).filter(
+    (step) => step?.kind === "source_read" && step?.status === "ok",
+  ).length;
+}
+
 function packetFollowUpCount(packet) {
   const invocations = packet?.sufficiency?.follow_up_invocations;
-  if (Array.isArray(invocations)) {
-    return invocations.length;
+  const commands = packet?.sufficiency?.follow_up_commands;
+  return Math.max(
+    Array.isArray(invocations) ? invocations.length : 0,
+    Array.isArray(commands) ? commands.length : 0,
+  );
+}
+
+function managedRuntimeIdentityBlockers(identity, label) {
+  const versionMatches = [
+    identity?.plugin_version,
+    identity?.plugin_cli_version,
+    identity?.cli_version,
+  ].every((version) => version === REQUIRED_MANAGED_CODESTORY_VERSION);
+  return versionMatches &&
+    identity?.pinned_pair_matches === true &&
+    identity?.cli_source === "managed" &&
+    identity?.known_override_skew_channel === false
+    ? []
+    : [`${label} runtime identity is not managed ${REQUIRED_MANAGED_CODESTORY_VERSION}: ${JSON.stringify(identity ?? null)}`];
+}
+
+function packetMaterialObligationBucket(obligation) {
+  if (String(obligation?.proof_status ?? "").trim().toLowerCase() === "proven") {
+    return "proven";
   }
-  return Array.isArray(packet?.sufficiency?.follow_up_commands)
-    ? packet.sufficiency.follow_up_commands.length
-    : 0;
+  const reason = String(obligation?.reason ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!reason) {
+    return "missing_reason";
+  }
+  if (reason.startsWith("requested_claim_binding_limit_exceeded")) {
+    return "requested_claim_binding_limit_exceeded";
+  }
+  if ([
+    "packet_budget_truncated",
+    "carrier_not_sufficiency_eligible",
+    "carrier_does_not_satisfy_role_contract",
+    "required_evidence_edge_missing",
+  ].includes(reason)) {
+    return reason;
+  }
+  return `unclassified_reason:${reason}`;
+}
+
+function packetObligationAccounting(packet) {
+  const obligations = packet?.plan?.obligations?.claim_obligations;
+  if (!Array.isArray(obligations)) {
+    return null;
+  }
+  let material = 0;
+  let nonmaterial = 0;
+  const materialStatusBuckets = new Map();
+  for (const obligation of obligations) {
+    if (obligation?.material === true) {
+      material += 1;
+      const bucket = packetMaterialObligationBucket(obligation);
+      materialStatusBuckets.set(bucket, (materialStatusBuckets.get(bucket) ?? 0) + 1);
+    } else if (obligation?.material === false) {
+      nonmaterial += 1;
+    }
+  }
+  return {
+    total: obligations.length,
+    material,
+    nonmaterial,
+    material_status_buckets: Object.fromEntries(
+      [...materialStatusBuckets.entries()].sort(([left], [right]) =>
+        left < right ? -1 : left > right ? 1 : 0
+      ),
+    ),
+  };
+}
+
+function packetObligationAccountingError(accounting, label = "packet obligations") {
+  if (!accounting || typeof accounting !== "object" || Array.isArray(accounting)) {
+    return `${label} accounting is missing`;
+  }
+  if (["total", "material", "nonmaterial"].some(
+    (field) => !Number.isInteger(accounting[field]) || accounting[field] < 0
+  )) {
+    return `${label} counts are missing or invalid`;
+  }
+  const buckets = accounting.material_status_buckets;
+  if (!buckets || typeof buckets !== "object" || Array.isArray(buckets)) {
+    return `${label} material status buckets are missing or invalid`;
+  }
+  const bucketEntries = Object.entries(buckets);
+  if (bucketEntries.some(([status, count]) =>
+    !status || !Number.isInteger(count) || count < 0
+  )) {
+    return `${label} material status buckets are invalid`;
+  }
+  if (accounting.total !== accounting.material + accounting.nonmaterial) {
+    return `${label} total=${accounting.total} does not reconcile with material=${accounting.material} + nonmaterial=${accounting.nonmaterial}`;
+  }
+  const materialStatusTotal = bucketEntries.reduce((sum, [, count]) => sum + count, 0);
+  return accounting.material === materialStatusTotal
+    ? null
+    : `${label} material=${accounting.material} does not reconcile with material status buckets=${materialStatusTotal}`;
+}
+
+function resultPacketObligationAccounting(result) {
+  return result?.sufficiency?.obligation_accounting ??
+    result?.codestory_harness_prelude?.packet_sufficiency?.obligation_accounting ??
+    null;
+}
+
+function resultRequiresPacketObligationAccounting(result) {
+  return result?.arm === "with_codestory" || result?.mode != null;
+}
+
+function summarizePacketObligationAccounting(results, label) {
+  const aggregate = {
+    packets: 0,
+    total: 0,
+    material: 0,
+    nonmaterial: 0,
+    material_status_buckets: {},
+  };
+  for (const result of results) {
+    const accounting = resultPacketObligationAccounting(result);
+    if (!accounting) {
+      if (resultRequiresPacketObligationAccounting(result)) {
+        throw new Error(
+          `${label} ${result.repo ?? "unknown"}/${result.task_id ?? "unknown"}/${result.arm ?? result.mode ?? "unknown"}/repeat-${result.repeat ?? "unknown"} packet obligation accounting is missing`,
+        );
+      }
+      continue;
+    }
+    const rowLabel = `${label} ${result.repo ?? "unknown"}/${result.task_id ?? "unknown"}/${result.arm ?? result.mode ?? "unknown"}/repeat-${result.repeat ?? "unknown"}`;
+    const error = packetObligationAccountingError(accounting, rowLabel);
+    if (error) {
+      throw new Error(error);
+    }
+    aggregate.packets += 1;
+    aggregate.total += accounting.total;
+    aggregate.material += accounting.material;
+    aggregate.nonmaterial += accounting.nonmaterial;
+    for (const [status, count] of Object.entries(accounting.material_status_buckets)) {
+      aggregate.material_status_buckets[status] =
+        (aggregate.material_status_buckets[status] ?? 0) + count;
+    }
+  }
+  if (aggregate.packets === 0) {
+    return null;
+  }
+  aggregate.material_status_buckets = Object.fromEntries(
+    Object.entries(aggregate.material_status_buckets).sort(([left], [right]) =>
+      left < right ? -1 : left > right ? 1 : 0
+    ),
+  );
+  const error = packetObligationAccountingError(aggregate, label);
+  if (error) {
+    throw new Error(error);
+  }
+  return aggregate;
 }
 
 function packetPreludeContractBlockers(packet, stdout, options = {}) {
@@ -3272,6 +3507,8 @@ function packetPreludeContractBlockers(packet, stdout, options = {}) {
   const citationCount = Array.isArray(packet.answer?.citations)
     ? packet.answer.citations.length
     : 0;
+  const fileCount = packetUniqueCitationFileCount(packet);
+  const snippetCount = packetSourceReadSnippetCount(packet);
   const graphEdgeOccurrences = packetGraphEdgeOccurrences(packet);
   const boundedCounters = [
     ["anchors", used.anchors, limits.max_anchors],
@@ -3291,6 +3528,20 @@ function packetPreludeContractBlockers(packet, stdout, options = {}) {
       blockers.push(`budget.used.${name}=${observed} exceeds ${maximum}`);
     }
   }
+  for (const [name, observed, declared, publicMaximum] of [
+    ["anchors", used.anchors, limits.max_anchors, PUBLIC_PACKET_MAX_ANCHORS],
+    ["trail_edges", used.trail_edges, limits.max_trail_edges, PUBLIC_PACKET_MAX_TRAIL_EDGES],
+    ["output_bytes", used.output_bytes, limits.max_output_bytes, PUBLIC_PACKET_MAX_OUTPUT_BYTES],
+  ]) {
+    if (Number.isInteger(declared) && declared !== publicMaximum) {
+      blockers.push(
+        `budget.limits.max_${name}=${declared} does not equal public cap=${publicMaximum}`,
+      );
+    }
+    if (Number.isInteger(observed) && observed > publicMaximum) {
+      blockers.push(`budget.used.${name}=${observed} exceeds public cap=${publicMaximum}`);
+    }
+  }
   if (used.output_bytes !== actualStdoutBytes) {
     blockers.push(
       `budget.used.output_bytes=${used.output_bytes ?? "missing"} does not match CLI stdout bytes=${actualStdoutBytes}`,
@@ -3301,25 +3552,80 @@ function packetPreludeContractBlockers(packet, stdout, options = {}) {
       `budget.used.anchors=${used.anchors ?? "missing"} does not match citation count=${citationCount}`,
     );
   }
+  if (used.files !== fileCount) {
+    blockers.push(
+      `budget.used.files=${used.files ?? "missing"} does not match unique citation files=${fileCount}`,
+    );
+  }
+  if (used.snippets !== snippetCount) {
+    blockers.push(
+      `budget.used.snippets=${used.snippets ?? "missing"} does not match successful source reads=${snippetCount}`,
+    );
+  }
   if (used.trail_edges !== graphEdgeOccurrences) {
     blockers.push(
       `budget.used.trail_edges=${used.trail_edges ?? "missing"} does not match serialized graph edges=${graphEdgeOccurrences}`,
     );
   }
   if (options.requireSufficient) {
+    const obligationError = packetObligationAccountingError(
+      packetObligationAccounting(packet),
+      "packet obligations",
+    );
+    if (obligationError) {
+      blockers.push(obligationError);
+    }
     if (packet.sufficiency?.status !== "sufficient") {
       blockers.push(`packet sufficiency=${packet.sufficiency?.status ?? "missing"}; expected sufficient`);
+    }
+    const followUpInvocations = packet.sufficiency?.follow_up_invocations;
+    const followUpCommands = packet.sufficiency?.follow_up_commands;
+    if (
+      Array.isArray(followUpInvocations) &&
+      Array.isArray(followUpCommands) &&
+      followUpInvocations.length !== followUpCommands.length
+    ) {
+      blockers.push(
+        `packet follow-up surfaces disagree: invocations=${followUpInvocations.length} commands=${followUpCommands.length}`,
+      );
     }
     const followUpCount = packetFollowUpCount(packet);
     if (followUpCount !== 0) {
       blockers.push(`packet follow-ups=${followUpCount}; expected 0`);
     }
-    const materialGaps = packet.sufficiency?.coverage_report?.claim_obligations?.filter(
-      (obligation) => obligation?.material === true && obligation?.status !== "proven",
+    const materialGaps = packet.plan?.obligations?.claim_obligations?.filter(
+      (obligation) => obligation?.material === true && obligation?.proof_status !== "proven",
     ) ?? [];
     if (materialGaps.length) {
       blockers.push(`packet material gaps=${materialGaps.length}; expected 0`);
     }
+    const retrievalShadow = packetRetrievalShadow(packet);
+    if (!retrievalShadow) {
+      blockers.push("packet retrieval shadow is missing");
+    } else {
+      if (retrievalShadow.retrieval_mode !== "full") {
+        blockers.push(
+          `packet retrieval shadow mode=${retrievalShadow.retrieval_mode ?? "missing"}; expected full`,
+        );
+      }
+      for (const [field, value] of [
+        ["degraded_reason", retrievalShadow.degraded_reason],
+        ["error", retrievalShadow.error],
+        ["cancel_reason", retrievalShadow.cancel_reason],
+      ]) {
+        if (value) {
+          blockers.push(`packet retrieval shadow ${field}=${value}`);
+        }
+      }
+    }
+  }
+  if (options.requireManagedRuntime) {
+    blockers.push(
+      ...managedRuntimeIdentityBlockers(
+        packet?._meta?.codestory_publication?.contract_runtime,
+        "packet",
+      ),
+    );
   }
   return blockers;
 }
@@ -3334,6 +3640,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   const result = await runProcess(codestoryCli, args, {
     cwd: repoConfig.path,
     env,
+    signal: opts.signal,
     timeoutMs: opts.timeoutMs,
     timeoutMessage: `CodeStory packet prelude timed out after ${opts.timeoutMs}ms.`,
   });
@@ -3355,6 +3662,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     ? [`packet JSON parse failed: ${parseError}`]
     : packetPreludeContractBlockers(packet, result.stdout, {
         requireSufficient: opts.publishable,
+        requireManagedRuntime: opts.publishable,
       });
   if (opts.publishable && manifestQuality && !manifestQuality.pass) {
     contractBlockers.push("packet manifest quality failed");
@@ -3470,10 +3778,11 @@ async function runOne(opts, run, outDir) {
   );
   const shouldRunAgent = preludeFailure == null;
   const result = shouldRunAgent
-    ? await runProcess(command, args, {
+      ? await runProcess(command, args, {
         cwd: repoConfig.path,
         env,
         stdin,
+        signal: opts.signal,
         timeoutMs: opts.timeoutMs,
         timeoutMessage: `Benchmark runner timed out after ${opts.timeoutMs}ms.`,
         forceKillAfterMs: 5000,
@@ -3507,7 +3816,7 @@ async function runOne(opts, run, outDir) {
   const codexToolCalls = parsed.filter(isToolCallStartEvent).length;
   const toolCalls = analysisEvents.filter(isToolCallStartEvent).length;
   const analysis = analyzeTranscript(analysisEvents, repoConfig.path);
-  const provenance = await repoProvenance(repoConfig);
+  const provenance = await repoProvenance(repoConfig, opts.signal);
   const packetFirstRequired = run.arm === "with_codestory";
   const packetFirstPass =
     !packetFirstRequired || Boolean(analysis.packet_was_first_context_command);
@@ -3549,7 +3858,7 @@ async function runOne(opts, run, outDir) {
     codestory_cache_provenance: cacheProvenance,
     benchmark_contract: benchmarkContract,
     promotion_eligible: benchmarkContract.promotion_eligible,
-    status: result.timedOut ? "timeout" : result.exitCode === 0 ? "pass" : "fail",
+    status: opts.signal?.aborted || result.status === "aborted" ? "cancelled" : result.status,
     exit_code: result.exitCode,
     signal: result.signal,
     error: result.error,
@@ -3582,17 +3891,34 @@ function preludeAllowsAgentRun(publicPrelude, opts = {}) {
   return publicPrelude?.status === "pass" || (!opts.publishable && publicPrelude?.status === "pass_with_warnings");
 }
 
-async function gitOutput(args, cwd, timeoutMs = 10_000) {
-  const result = await runProcess("git", args, { cwd, timeoutMs });
+async function gitOutput(
+  args,
+  cwd,
+  timeoutMs = 10_000,
+  signal = null,
+  processOptions = {},
+) {
+  const result = await runProcess("git", args, {
+    ...processOptions,
+    cwd,
+    timeoutMs,
+    signal,
+  });
   if (result.exitCode !== 0) {
     return null;
   }
   return result.stdout.trim();
 }
 
-async function repoProvenance(config) {
+async function repoProvenance(config, signal = null, processOptions = {}) {
   const checkoutPath = path.resolve(config.checkout_path ?? config.path);
-  const statusShort = await gitOutput(["-C", checkoutPath, "status", "--short"], repoRoot);
+  const statusShort = await gitOutput(
+    ["-C", checkoutPath, "status", "--short"],
+    repoRoot,
+    10_000,
+    signal,
+    processOptions,
+  );
   return {
     resolved_path: config.path,
     checkout_path: checkoutPath,
@@ -3615,9 +3941,21 @@ async function repoProvenance(config) {
       languages: config.languages ?? [],
     },
     manifest_overridden_by_builtin: Boolean(config.manifest_overridden_by_builtin),
-    git_head: await gitOutput(["-C", checkoutPath, "rev-parse", "HEAD"], repoRoot),
+    git_head: await gitOutput(
+      ["-C", checkoutPath, "rev-parse", "HEAD"],
+      repoRoot,
+      10_000,
+      signal,
+      processOptions,
+    ),
     git_origin: redactUrlForDisplay(
-      await gitOutput(["-C", checkoutPath, "remote", "get-url", "origin"], repoRoot),
+      await gitOutput(
+        ["-C", checkoutPath, "remote", "get-url", "origin"],
+        repoRoot,
+        10_000,
+        signal,
+        processOptions,
+      ),
     ),
     git_dirty: statusShort == null ? null : statusShort.length > 0,
     git_status_short: statusShort,
@@ -3693,12 +4031,19 @@ function retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs) {
   };
 }
 
-async function codestoryDoctorSnapshot(codestoryCli, project, timeoutMs, env = benchmarkChildEnv(process.env)) {
+async function codestoryDoctorSnapshot(
+  codestoryCli,
+  project,
+  timeoutMs,
+  env = benchmarkChildEnv(process.env),
+  signal = null,
+  processOptions = {},
+) {
   const started = performance.now();
   const result = await runProcess(
     codestoryCli,
     ["doctor", "--project", project, "--format", "json"],
-    { timeoutMs, env },
+    { ...processOptions, timeoutMs, env, signal },
   );
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
   let output = null;
@@ -3718,12 +4063,14 @@ async function codestoryRetrievalStatusSnapshot(
   project,
   timeoutMs,
   env = benchmarkChildEnv(process.env),
+  signal = null,
+  processOptions = {},
 ) {
   const started = performance.now();
   const result = await runProcess(
     codestoryCli,
     retrievalStatusCommandArgs(project),
-    { timeoutMs, env },
+    { ...processOptions, timeoutMs, env, signal },
   );
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
   let output = null;
@@ -3817,9 +4164,17 @@ function cachePreparationCanaryBlockers(preparation, env = process.env) {
 
 function benchmarkHostClass(cachePreparation) {
   const retrieval = cachePreparation?.retrieval_status ?? {};
+  const cpus = os.cpus();
+  const cpuModel = String(cpus[0]?.model ?? "")
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s+/g, " ");
   return {
     platform: process.platform,
     arch: process.arch,
+    cpu_model: cpuModel || null,
+    logical_cpu_count: cpus.length,
+    total_memory_bytes: os.totalmem(),
     accelerator_backend: retrieval.embedding_backend ?? null,
     accelerator_adapter: retrieval.embedding_adapter ?? null,
     embedding_policy: retrieval.embedding_policy ?? null,
@@ -3851,14 +4206,13 @@ async function prepareCodeStoryCaches(opts, tasks) {
     console.log(`preparing CodeStory cache for ${repo}`);
     const preparationStarted = performance.now();
     const childEnv = selectedBenchmarkChildEnv(opts);
-    const before = await codestoryDoctorSnapshot(codestoryCli, config.path, 60_000, childEnv);
     const preparation = {
       repo,
       project: config.path,
       codestory_cli: path.resolve(codestoryCli),
-      action: cachePreparationAction(before),
+      action: null,
       preparation_wall_ms: null,
-      before,
+      before: null,
       index_status: null,
       index_exit_code: null,
       index_wall_ms: 0,
@@ -3867,49 +4221,74 @@ async function prepareCodeStoryCaches(opts, tasks) {
       retrieval_status: null,
       retrieval_index_stdout_tail: null,
       retrieval_index_stderr_tail: null,
-      after: before,
+      after: null,
     };
-
-    preparation.retrieval_contract = retrievalContractSummary(childEnv);
-    if (shouldPrepareRetrievalIndex(childEnv)) {
-      const retrievalStarted = performance.now();
-      const retrievalIndex = await runProcess(
-        codestoryCli,
-        retrievalIndexCommandArgs(config.path),
-        {
-          env: childEnv,
-          timeoutMs: opts.prepareCodestoryTimeoutMs,
-          timeoutMessage: `retrieval index timed out after ${opts.prepareCodestoryTimeoutMs}ms.`,
-        },
-      );
-      preparation.retrieval_index_status = retrievalIndex.status;
-      preparation.retrieval_index_exit_code = retrievalIndex.exitCode;
-      preparation.retrieval_index_wall_ms =
-        Math.round((performance.now() - retrievalStarted) * 1000) / 1000;
-      preparation.retrieval_index_stdout_tail = trimTail(retrievalIndex.stdout);
-      preparation.retrieval_index_stderr_tail = trimTail(retrievalIndex.stderr);
-      if (retrievalIndex.status !== "pass") {
-        throw new Error(
-          `mandatory retrieval index failed for ${repo}: ${trimTail(retrievalIndex.stderr || retrievalIndex.stdout)}`,
-        );
-      }
-      preparation.after = await codestoryDoctorSnapshot(codestoryCli, config.path, 60_000, childEnv);
-      preparation.retrieval_status = await codestoryRetrievalStatusSnapshot(
+    try {
+      const before = await codestoryDoctorSnapshot(
         codestoryCli,
         config.path,
         60_000,
         childEnv,
+        opts.signal,
       );
-      if (preparation.retrieval_status.retrieval_mode !== "full") {
-        throw new Error(
-          `mandatory retrieval index for ${repo} did not reach full mode: ${preparation.retrieval_status.retrieval_mode ?? "unknown"} ${preparation.retrieval_status.degraded_reason ?? ""}`.trim(),
+      preparation.before = before;
+      preparation.after = before;
+      preparation.action = cachePreparationAction(before);
+      preparation.retrieval_contract = retrievalContractSummary(childEnv);
+      if (shouldPrepareRetrievalIndex(childEnv)) {
+        const retrievalStarted = performance.now();
+        const retrievalIndex = await runProcess(
+          codestoryCli,
+          retrievalIndexCommandArgs(config.path),
+          {
+            env: childEnv,
+            signal: opts.signal,
+            timeoutMs: opts.prepareCodestoryTimeoutMs,
+            timeoutMessage: `retrieval index timed out after ${opts.prepareCodestoryTimeoutMs}ms.`,
+          },
         );
+        preparation.retrieval_index_status = retrievalIndex.status;
+        preparation.retrieval_index_exit_code = retrievalIndex.exitCode;
+        preparation.retrieval_index_wall_ms =
+          Math.round((performance.now() - retrievalStarted) * 1000) / 1000;
+        preparation.retrieval_index_stdout_tail = trimTail(retrievalIndex.stdout);
+        preparation.retrieval_index_stderr_tail = trimTail(retrievalIndex.stderr);
+        if (retrievalIndex.status !== "pass") {
+          throw new Error(
+            `mandatory retrieval index failed for ${repo}: ${trimTail(retrievalIndex.stderr || retrievalIndex.stdout)}`,
+          );
+        }
+        preparation.after = await codestoryDoctorSnapshot(
+          codestoryCli,
+          config.path,
+          60_000,
+          childEnv,
+          opts.signal,
+        );
+        preparation.retrieval_status = await codestoryRetrievalStatusSnapshot(
+          codestoryCli,
+          config.path,
+          60_000,
+          childEnv,
+          opts.signal,
+        );
+        if (preparation.retrieval_status.retrieval_mode !== "full") {
+          throw new Error(
+            `mandatory retrieval index for ${repo} did not reach full mode: ${preparation.retrieval_status.retrieval_mode ?? "unknown"} ${preparation.retrieval_status.degraded_reason ?? ""}`.trim(),
+          );
+        }
       }
+      return preparation;
+    } catch (error) {
+      preparation.error = error instanceof Error ? error.message : String(error);
+      if (error && typeof error === "object") {
+        error.preparation = preparation;
+      }
+      throw error;
+    } finally {
+      preparation.preparation_wall_ms =
+        Math.round((performance.now() - preparationStarted) * 1000) / 1000;
     }
-
-    preparation.preparation_wall_ms =
-      Math.round((performance.now() - preparationStarted) * 1000) / 1000;
-    return preparation;
   });
 }
 
@@ -4036,6 +4415,7 @@ async function codestoryCacheProvenance(opts, config, observations = {}) {
     config.path,
     Math.min(opts.timeoutMs ?? 600_000, 60_000),
     selectedBenchmarkChildEnv(opts),
+    opts.signal,
   );
   const retrievalStatus = observations.cache_preparation?.retrieval_status ??
     await codestoryRetrievalStatusSnapshot(
@@ -4043,6 +4423,7 @@ async function codestoryCacheProvenance(opts, config, observations = {}) {
       config.path,
       Math.min(opts.timeoutMs ?? 600_000, 60_000),
       selectedBenchmarkChildEnv(opts),
+      opts.signal,
     );
   return {
     codestory_cli: path.resolve(codestoryCli),
@@ -4208,6 +4589,10 @@ async function reanalyzeAgentRunDirectory(opts) {
   }
 
   const summary = summarizeRuns(reanalyzed);
+  const obligationAccounting = summarizePacketObligationAccounting(
+    reanalyzed,
+    "reanalyzed benchmark report",
+  );
   const costAccounting = summarizeCostAccounting(reanalyzed);
   const summaryOpts = {
     ...opts,
@@ -4222,6 +4607,7 @@ async function reanalyzeAgentRunDirectory(opts) {
     publishable: Boolean(opts.publishable || originalSummary.publishable),
     max_source_reads_after_packet: opts.maxSourceReadsAfterPacket,
     output_dir: runDir,
+    packet_obligation_accounting: obligationAccounting,
     summary,
     cost_accounting: costAccounting,
   };
@@ -4642,6 +5028,7 @@ function packetSufficiencyTelemetry(packet, quality) {
     unresolved_candidate_diagnostic_only: packetDiagnosticIsDiagnosticOnly(retrievalShadow),
     coverage_unresolved_count: unresolvedCoverage.total,
     coverage_unresolved_blocking_count: unresolvedCoverage.blocking,
+    obligation_accounting: packetObligationAccounting(packet),
     sufficient_quality_mismatch: status === "sufficient" && qualityPass === false,
   };
 }
@@ -4891,7 +5278,7 @@ function packetLatencyTelemetry(packet, wallMs) {
 async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const repoConfig = ALL_REPOS[task.repo];
   const codestoryCli = resolveCodeStoryCli(opts);
-  const provenance = await repoProvenance(repoConfig);
+  const provenance = await repoProvenance(repoConfig, opts.signal);
   const args = packetCommandArgs(repoConfig, task, opts);
   const started = performance.now();
   const result = await runProcess(codestoryCli, args, {
@@ -5116,7 +5503,7 @@ function createStdioClient(command, args, opts) {
 async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
   const repoConfig = ALL_REPOS[repoName];
   const codestoryCli = resolveCodeStoryCli(opts);
-  const provenance = await repoProvenance(repoConfig);
+  const provenance = await repoProvenance(repoConfig, opts.signal);
   const cacheProvenance = await codestoryCacheProvenance(
     opts,
     repoConfig,
@@ -5664,6 +6051,24 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
 }
 
 function addPacketSufficiencyPublishableReasons(sufficiency, productReasons, harnessReasons, label) {
+  const obligationAccounting = sufficiency.obligation_accounting;
+  const accountingError = packetObligationAccountingError(
+    obligationAccounting,
+    `${label} obligations`,
+  );
+  if (accountingError) {
+    harnessReasons.push(accountingError);
+  }
+  const provenMaterial = obligationAccounting?.material_status_buckets?.proven ?? 0;
+  if (
+    Number.isInteger(obligationAccounting?.material) &&
+    Number.isInteger(provenMaterial) &&
+    provenMaterial !== obligationAccounting.material
+  ) {
+    productReasons.push(
+      `${label} material obligations proven=${provenMaterial}/${obligationAccounting.material}; expected all`,
+    );
+  }
   if (sufficiency.status !== "sufficient") {
     productReasons.push(`${label} sufficiency status=${sufficiency.status ?? "unknown"}; expected sufficient`);
   }
@@ -5876,6 +6281,10 @@ async function runPacketRuntimeBenchmarkBody(opts, tasks) {
   }
   await writeJsonlRows(path.join(outDir, "packet-runtime-runs.jsonl"), results);
   const summary = summarizePacketRuntimeRuns(results);
+  const obligationAccounting = summarizePacketObligationAccounting(
+    results,
+    "packet runtime report",
+  );
   const blockers = packetRuntimePublishableBlockers(results, opts);
   const payload = {
     generated_at: new Date().toISOString(),
@@ -5898,6 +6307,7 @@ async function runPacketRuntimeBenchmarkBody(opts, tasks) {
       scorerPath: benchmarkScorerPath,
       cliIdentity: opts.codestoryCli ?? process.env.CODESTORY_CLI ?? null,
     }),
+    packet_obligation_accounting: obligationAccounting,
     ...(process.env.CODESTORY_RELEASE_EVIDENCE_COMMIT
       ? {
           release_evidence: {
@@ -6470,21 +6880,7 @@ function managedCodeStoryRuntimeIdentityBlockers(analysis) {
     );
   }
   for (const identity of identities) {
-    const versionMatches = [
-      identity.plugin_version,
-      identity.plugin_cli_version,
-      identity.cli_version,
-    ].every((version) => version === REQUIRED_MANAGED_CODESTORY_VERSION);
-    if (
-      !versionMatches ||
-      identity.pinned_pair_matches !== true ||
-      identity.cli_source !== "managed" ||
-      identity.known_override_skew_channel !== false
-    ) {
-      reasons.push(
-        `with_codestory arm runtime identity is not managed ${REQUIRED_MANAGED_CODESTORY_VERSION}: ${JSON.stringify(identity)}`,
-      );
-    }
+    reasons.push(...managedRuntimeIdentityBlockers(identity, "with_codestory arm"));
   }
   return reasons;
 }
@@ -6523,6 +6919,9 @@ function agentPublishableBlockers(results, opts = {}) {
         environmentReasons.push(
           ...managedCodeStoryRuntimeIdentityBlockers(result.transcript_analysis),
         );
+        if (!result.codestory_harness_prelude?.packet_sufficiency) {
+          harnessReasons.push("codestory prelude packet obligation accounting is missing");
+        }
       }
       if (
         result.arm === "without_codestory" &&
@@ -7217,6 +7616,15 @@ function sortAgentResultsCanonical(results, tasks, arms) {
   });
 }
 
+function withoutPooledLatency(summary) {
+  return summary.map((row) => Object.fromEntries(
+    Object.entries(row).map(([key, value]) => [
+      key,
+      key.includes("wall_ms") ? null : value,
+    ]),
+  ));
+}
+
 function agentRunIsolationGroupKey(run) {
   return run.repo;
 }
@@ -7248,6 +7656,88 @@ function benchmarkContractForRun(opts, run, env = process.env) {
     scorerPath: benchmarkScorerPath,
     cliIdentity: run.arm === "with_codestory" ? opts.codestoryCli ?? env.CODESTORY_CLI ?? null : null,
   });
+}
+
+function benchmarkContractEnvironment(contract) {
+  return {
+    contract_version: contract?.contract_version ?? null,
+    scorer_hash: contract?.scorer_hash ?? null,
+    harness_hash: contract?.harness_hash ?? null,
+    runner: contract?.runner ?? null,
+    model: contract?.model ?? null,
+    sandbox: contract?.sandbox ?? null,
+    retrieval_contract: contract?.retrieval_contract ?? null,
+    retrieval_env: contract?.retrieval_env ?? null,
+    packet_threshold_config: contract?.packet_threshold_config ?? null,
+  };
+}
+
+function benchmarkContractEnvironmentSha256(contract) {
+  return sha256Bytes(stableJsonForHash(benchmarkContractEnvironment(contract)));
+}
+
+function benchmarkContractProjection(contract, { pathNeutral = false } = {}) {
+  return Object.fromEntries([
+    "contract_version",
+    "task_id",
+    "task_manifest_hash",
+    "scorer_hash",
+    "harness_hash",
+    "runner",
+    "model",
+    "sandbox",
+    ...(!pathNeutral ? ["codestory_cli"] : []),
+    "retrieval_contract",
+    "retrieval_env",
+    "packet_threshold_config",
+  ].map((key) => [key, contract?.[key] ?? null]));
+}
+
+function benchmarkContractContentSha256(contract) {
+  return sha256Bytes(stableJsonForHash(benchmarkContractProjection(contract)));
+}
+
+function benchmarkShardContractSha256(contract) {
+  return sha256Bytes(stableJsonForHash(
+    benchmarkContractProjection(contract, { pathNeutral: true }),
+  ));
+}
+
+function benchmarkContractIntegrityError(contract, label) {
+  if (!contract || typeof contract !== "object" || Array.isArray(contract)) {
+    return `${label} benchmark contract is missing`;
+  }
+  const recomputed = benchmarkContractContentSha256(contract);
+  return contract.compatibility_fingerprint === recomputed
+    ? null
+    : `${label} benchmark contract compatibility fingerprint does not match its contents`;
+}
+
+function benchmarkContractFingerprints(results) {
+  return Object.fromEntries(
+    [...results]
+      .sort((left, right) => agentRunKey(left).localeCompare(agentRunKey(right)))
+      .map((row) => [agentRunKey(row), benchmarkShardContractSha256(row.benchmark_contract)]),
+  );
+}
+
+function benchmarkHostClassError(hostClass, label) {
+  if (!hostClass || typeof hostClass !== "object" || Array.isArray(hostClass)) {
+    return `${label} host class is missing`;
+  }
+  if (!String(hostClass.platform ?? "").trim() || !String(hostClass.arch ?? "").trim()) {
+    return `${label} host class must name platform and architecture`;
+  }
+  if (!String(hostClass.cpu_model ?? "").trim()) {
+    return `${label} host class must name the CPU model`;
+  }
+  if (!Number.isInteger(hostClass.logical_cpu_count) || hostClass.logical_cpu_count < 1) {
+    return `${label} host class has an invalid logical CPU count`;
+  }
+  if (!Number.isInteger(hostClass.total_memory_bytes) || hostClass.total_memory_bytes < 1) {
+    return `${label} host class has invalid total memory`;
+  }
+  return null;
 }
 
 function resolveRunArtifactPath(runDir, artifactPath) {
@@ -7414,6 +7904,29 @@ function deterministicAgentRunFailure(result, opts) {
     : null;
 }
 
+function plannedAgentRunExceptionFailure(run, error) {
+  const reason = error instanceof Error ? error.message : String(error);
+  const taskId = run.task?.id ?? run.task_id ?? null;
+  return {
+    kind: "run_exception",
+    benchmark_run_id: benchmarkRunId([
+      run.repo,
+      ...(taskId ? [taskId] : []),
+      run.arm,
+      String(run.repeat).padStart(2, "0"),
+    ]),
+    repo: run.repo,
+    task_id: taskId,
+    arm: run.arm,
+    repeat: run.repeat,
+    error: reason,
+    blockers: [{
+      category: "harness-contract",
+      reasons: [`agent run raised an exception: ${reason}`],
+    }],
+  };
+}
+
 async function runPlannedAgentRuns(
   opts,
   plannedRuns,
@@ -7424,31 +7937,52 @@ async function runPlannedAgentRuns(
   let stopScheduling = false;
   let firstFailure = null;
   const results = [];
-  const record = async (result) => {
-    results.push(result);
-    await options.onResult?.(result);
-    const failure = deterministicAgentRunFailure(result, opts);
-    if (failure && !firstFailure) {
-      firstFailure = failure;
+  const executeRun = options.runOne ?? runPlannedAgentRun;
+  const runOnePlanned = (run) => executeRun(
+    { ...opts, signal: options.signal },
+    options.decorateRun?.(run) ?? run,
+    outDir,
+    reusableBaselines,
+  );
+  const rememberFailure = async (failure, forceStop = false) => {
+    if (firstFailure) {
+      return;
+    }
+    firstFailure = failure;
+    const shouldStop = forceStop || options.failFast;
+    if (shouldStop) {
+      stopScheduling = true;
+    }
+    try {
       await options.onFirstFailure?.(failure);
-      if (options.failFast) {
-        stopScheduling = true;
+    } finally {
+      if (shouldStop) {
+        options.abortController?.abort(failure);
       }
+    }
+  };
+  const record = async (result) => {
+    await options.onResult?.(result);
+    results.push(result);
+    const failure = deterministicAgentRunFailure(result, opts);
+    if (failure) {
+      await rememberFailure(failure);
+    }
+  };
+  const executeAndRecord = async (run) => {
+    try {
+      const result = await runOnePlanned(run);
+      await record(result);
+    } catch (error) {
+      await rememberFailure(plannedAgentRunExceptionFailure(run, error), true);
     }
   };
   if (opts.jobs <= 1 || plannedRuns.length <= 1) {
     for (const run of plannedRuns) {
-      if (stopScheduling || options.shouldSchedule?.(run) === false) {
+      if (stopScheduling || options.signal?.aborted || options.shouldSchedule?.(run) === false) {
         break;
       }
-      await record(
-        await runPlannedAgentRun(
-          opts,
-          options.decorateRun?.(run) ?? run,
-          outDir,
-          reusableBaselines,
-        ),
-      );
+      await executeAndRecord(run);
     }
     return { results, firstFailure };
   }
@@ -7457,17 +7991,10 @@ async function runPlannedAgentRuns(
   console.log(`running ${plannedRuns.length} planned agent rows across ${groups.length} repo groups with --jobs ${opts.jobs}`);
   await parallelMap(groups, opts.jobs, async (group) => {
     for (const run of group.runs) {
-      if (stopScheduling || options.shouldSchedule?.(run) === false) {
+      if (stopScheduling || options.signal?.aborted || options.shouldSchedule?.(run) === false) {
         break;
       }
-      await record(
-        await runPlannedAgentRun(
-          opts,
-          options.decorateRun?.(run) ?? run,
-          outDir,
-          reusableBaselines,
-        ),
-      );
+      await executeAndRecord(run);
     }
   });
   return { results, firstFailure };
@@ -7486,35 +8013,98 @@ function stableJsonForHash(value) {
   return JSON.stringify(value);
 }
 
-async function benchmarkShardAttestation(opts, allTasks, cachePreparation) {
-  const sourceCommit = await gitOutput(["-C", repoRoot, "rev-parse", "HEAD"], repoRoot);
-  const sourceTree = await gitOutput(["-C", repoRoot, "rev-parse", "HEAD^{tree}"], repoRoot);
-  let cliSha256 = null;
-  if (opts.arms.includes("with_codestory")) {
+async function benchmarkShardAttestation(
+  opts,
+  allTasks,
+  cachePreparation,
+  results = [],
+  dependencies = {},
+) {
+  const sourceCommit = dependencies.sourceCommit ??
+    await gitOutput(["-C", repoRoot, "rev-parse", "HEAD"], repoRoot);
+  const sourceTree = dependencies.sourceTree ??
+    await gitOutput(["-C", repoRoot, "rev-parse", "HEAD^{tree}"], repoRoot);
+  const trackedStatus = Object.hasOwn(dependencies, "trackedDirty")
+    ? null
+    : await gitOutput(
+      ["-C", repoRoot, "status", "--porcelain=v1", "--untracked-files=no"],
+      repoRoot,
+    );
+  if (!sourceCommit || !sourceTree || (!Object.hasOwn(dependencies, "trackedDirty") && trackedStatus == null)) {
+    throw new Error("Unable to attest the benchmark source checkout");
+  }
+  const trackedDirty = dependencies.trackedDirty ?? Boolean(trackedStatus);
+  if (trackedDirty) {
+    throw new Error("Benchmark shard attestation requires a clean tracked source checkout");
+  }
+  let cliSha256 = dependencies.cliSha256 ?? null;
+  if (!Object.hasOwn(dependencies, "cliSha256") && opts.arms.includes("with_codestory")) {
     const cli = resolveCodeStoryCli(opts);
     if (path.isAbsolute(cli) && existsSync(cli) && statSync(cli).isFile()) {
       cliSha256 = sha256Bytes(await readFile(cli));
     }
   }
-  const manifestContract = allTasks.map(taskSnapshotForResult);
+  const manifestContract = allTasks.map((task) => {
+    const { manifest_path: _manifestPath, ...snapshot } = taskSnapshotForResult(task);
+    return snapshot;
+  });
   const flags = {
     arms: opts.arms,
     repeats: opts.repeats,
     runner: opts.runner,
     model: opts.model,
     sandbox: opts.sandbox,
+    jobs: opts.jobs,
+    timeout_ms: opts.timeoutMs,
     task_suite: opts.taskSuite,
     max_source_reads_after_packet: opts.maxSourceReadsAfterPacket,
     publishable: opts.publishable,
+    prepare_codestory_cache: Boolean(opts.prepareCodestoryCache),
+    prepare_codestory_jobs: opts.prepareCodestoryJobs,
+    prepare_codestory_timeout_ms: opts.prepareCodestoryTimeoutMs,
+    packet_runtime: Boolean(opts.packetRuntime),
+    packet_runtime_mode: opts.packetRuntimeMode ?? null,
+    materialize_repos: Boolean(opts.materializeRepos),
+    canary_task_id: opts.canaryTaskId ?? opts.manifestCanaryTaskId ?? null,
+    diagnostic_extra_probes_from_manifest: Boolean(opts.diagnosticExtraProbesFromManifest),
+    collect_all_failures: Boolean(opts.collectAllFailures),
+    shard_count: opts.shardCount,
   };
+  const rowContractEnvironmentDigests = new Set(
+    results.map((row) => benchmarkContractEnvironmentSha256(row.benchmark_contract)),
+  );
+  if (rowContractEnvironmentDigests.size > 1) {
+    throw new Error("Benchmark rows do not share one benchmark contract environment");
+  }
+  for (const row of results) {
+    const integrityError = benchmarkContractIntegrityError(
+      row.benchmark_contract,
+      `row ${agentRunKey(row)}`,
+    );
+    if (integrityError) {
+      throw new Error(integrityError);
+    }
+  }
+  const benchmarkContractEnvironmentDigest = rowContractEnvironmentDigests.values().next().value ??
+    benchmarkContractEnvironmentSha256(
+      benchmarkContractForRun(opts, planAgentRuns(opts, allTasks)[0] ?? { task: null, arm: null }),
+    );
+  const contractFingerprints = benchmarkContractFingerprints(results);
+  if (Object.values(contractFingerprints).some((fingerprint) => !fingerprint)) {
+    throw new Error("Benchmark row is missing its compatibility fingerprint");
+  }
   return {
-    contract: "codestory.agent-benchmark-shard/v1",
+    contract: "codestory.agent-benchmark-shard/v2",
     source_commit: sourceCommit,
     source_tree: sourceTree,
+    tracked_dirty: false,
     cli_sha256: cliSha256,
     package_sha256: opts.candidatePackageSha256,
     manifest_sha256: sha256Bytes(stableJsonForHash(manifestContract)),
     flags_sha256: sha256Bytes(stableJsonForHash(flags)),
+    benchmark_contract_environment_sha256: benchmarkContractEnvironmentDigest,
+    benchmark_contract_fingerprints: contractFingerprints,
+    benchmark_contract_rows_sha256: sha256Bytes(stableJsonForHash(contractFingerprints)),
     model_sha256:
       cachePreparation.find((row) => row.retrieval_status?.embedding_model_sha256)
         ?.retrieval_status?.embedding_model_sha256 ?? null,
@@ -7533,6 +8123,9 @@ async function readJsonlRows(filePath) {
 async function aggregateShardRuns(opts, allTasks) {
   if (!opts.aggregateShards?.length) {
     throw new Error("aggregateShardRuns requires at least one shard directory");
+  }
+  if (opts.publishable) {
+    validatePublishableShape(opts, allTasks);
   }
   const shards = [];
   for (const directory of opts.aggregateShards) {
@@ -7556,7 +8149,11 @@ async function aggregateShardRuns(opts, allTasks) {
   if (!attestationReference) {
     throw new Error("Shard summary is missing its attestation");
   }
+  if (attestationReference.tracked_dirty !== false) {
+    throw new Error("Shard attestation does not prove a clean tracked source checkout");
+  }
   for (const field of [
+    "contract",
     "source_commit",
     "source_tree",
     "cli_sha256",
@@ -7564,32 +8161,136 @@ async function aggregateShardRuns(opts, allTasks) {
     "manifest_sha256",
     "model_sha256",
     "flags_sha256",
+    "benchmark_contract_environment_sha256",
   ]) {
     if (!attestationReference[field]) {
       throw new Error(`Shard attestation is missing ${field}`);
     }
   }
-  const commonAttestation = ({ host_class: _hostClass, ...common }) => common;
+  const commonAttestation = ({
+    host_class: _hostClass,
+    cli_sha256: _cliSha256,
+    package_sha256: _packageSha256,
+    benchmark_contract_fingerprints: _contractFingerprints,
+    benchmark_contract_rows_sha256: _contractRowsSha256,
+    ...common
+  }) => common;
+  const artifactAttestationByHostClass = new Map();
   for (const shard of shards) {
     const index = shard.summary?.shard?.index;
-    if (!Number.isInteger(index) || index < 0 || index >= shardCount || indices.has(index)) {
+    if (
+      shard.summary?.shard?.count !== shardCount ||
+      !Number.isInteger(index) ||
+      index < 0 ||
+      index >= shardCount ||
+      indices.has(index)
+    ) {
       throw new Error(`Invalid or duplicate shard index: ${index}`);
     }
     indices.add(index);
     const attestation = shard.summary?.shard?.attestation;
+    if (attestation?.contract !== "codestory.agent-benchmark-shard/v2") {
+      throw new Error(`Shard ${index} attestation contract is not v2`);
+    }
+    if (attestation.tracked_dirty !== false) {
+      throw new Error(`Shard ${index} attestation does not prove a clean tracked source checkout`);
+    }
+    const hostClassError = benchmarkHostClassError(attestation?.host_class, `shard ${index}`);
+    if (hostClassError) {
+      throw new Error(hostClassError);
+    }
     if (
       stableJsonForHash(commonAttestation(attestation ?? {})) !==
       stableJsonForHash(commonAttestation(attestationReference))
     ) {
       throw new Error(`Shard ${index} candidate or benchmark attestation does not match`);
     }
+    const hostClassKey = stableJsonForHash(attestation.host_class);
+    const artifactAttestation = {
+      cli_sha256: attestation.cli_sha256 ?? null,
+      package_sha256: attestation.package_sha256 ?? null,
+    };
+    if (
+      artifactAttestationByHostClass.has(hostClassKey) &&
+      stableJsonForHash(artifactAttestationByHostClass.get(hostClassKey)) !==
+        stableJsonForHash(artifactAttestation)
+    ) {
+      throw new Error(`Shard ${index} platform artifacts do not match its host class`);
+    }
+    artifactAttestationByHostClass.set(hostClassKey, artifactAttestation);
+    if (opts.publishable && (
+      shard.summary?.publishable !== true ||
+      shard.summary?.first_failure != null ||
+      shard.summary?.comparative_failure != null ||
+      shard.summary?.comparative_publishable !== true ||
+      !Number.isInteger(shard.summary?.expected_rows) ||
+      shard.summary.expected_rows !== shard.summary?.completed_rows ||
+      shard.summary.completed_rows !== shard.rows.length
+    )) {
+      throw new Error(`Shard ${index} summary is not publishable and complete`);
+    }
+    if (shard.summary?.packet_obligation_accounting) {
+      const error = packetObligationAccountingError(
+        shard.summary.packet_obligation_accounting,
+        `shard ${index} summary packet obligations`,
+      );
+      if (error) {
+        throw new Error(error);
+      }
+    }
+    const attestedFingerprints = attestation.benchmark_contract_fingerprints;
+    if (
+      !attestedFingerprints ||
+      typeof attestedFingerprints !== "object" ||
+      Array.isArray(attestedFingerprints) ||
+      attestation.benchmark_contract_rows_sha256 !==
+        sha256Bytes(stableJsonForHash(attestedFingerprints))
+    ) {
+      throw new Error(`Shard ${index} benchmark contract fingerprint attestation is invalid`);
+    }
+    const expectedFingerprintKeys = new Set(shard.rows.map(agentRunKey));
+    if (
+      Object.keys(attestedFingerprints).length !== expectedFingerprintKeys.size ||
+      Object.keys(attestedFingerprints).some((key) => !expectedFingerprintKeys.has(key))
+    ) {
+      throw new Error(`Shard ${index} benchmark contract fingerprint rows do not match its ledger`);
+    }
     for (const row of shard.rows) {
       if (taskShardIndex(row.task_id, shardCount) !== index) {
         throw new Error(`Row ${agentRunKey(row)} is recorded on the wrong shard`);
       }
+      if (
+        benchmarkContractEnvironmentSha256(row.benchmark_contract) !==
+        attestation.benchmark_contract_environment_sha256
+      ) {
+        throw new Error(
+          `Row ${agentRunKey(row)} benchmark contract environment does not match shard ${index} attestation`,
+        );
+      }
+      const integrityError = benchmarkContractIntegrityError(
+        row.benchmark_contract,
+        `row ${agentRunKey(row)}`,
+      );
+      if (integrityError) {
+        throw new Error(integrityError);
+      }
+      if (
+        attestedFingerprints[agentRunKey(row)] !==
+          benchmarkShardContractSha256(row.benchmark_contract)
+      ) {
+        throw new Error(
+          `Row ${agentRunKey(row)} benchmark contract fingerprint does not match shard ${index} attestation`,
+        );
+      }
     }
   }
-  const rows = shards.flatMap((shard) => shard.rows);
+  const rows = shards.flatMap((shard) =>
+    shard.rows.map((row) => ({
+      ...row,
+      host_class: shard.summary.shard.attestation.host_class,
+      shard_index: shard.summary.shard.index,
+    }))
+  );
   const byKey = new Map();
   for (const row of rows) {
     const key = agentRunKey(row);
@@ -7599,16 +8300,92 @@ async function aggregateShardRuns(opts, allTasks) {
     byKey.set(key, row);
   }
   const expectedRuns = planAgentRuns(opts, allTasks);
+  const expectedByKey = new Map(expectedRuns.map((run) => [agentRunKey(run), run]));
+  for (const row of rows) {
+    const planned = expectedByKey.get(agentRunKey(row));
+    if (!planned) {
+      throw new Error(`Unexpected benchmark row across shards: ${agentRunKey(row)}`);
+    }
+    const expectedContractFingerprint = benchmarkShardContractSha256(
+      benchmarkContractForRun(opts, planned),
+    );
+    const observedContractFingerprint = benchmarkShardContractSha256(row.benchmark_contract);
+    if (expectedContractFingerprint !== observedContractFingerprint) {
+      throw new Error(
+        `Shard row ${agentRunKey(row)} benchmark contract is incompatible`,
+      );
+    }
+  }
   const missing = expectedRuns.filter((run) => !byKey.has(agentRunKey(run)));
   if (missing.length || rows.length !== expectedRuns.length) {
     throw new Error(
       `Shard aggregation is incomplete: expected ${expectedRuns.length}, found ${rows.length}, missing ${missing.length}`,
     );
   }
+  const declaredCanary = opts.canaryTaskId ?? opts.manifestCanaryTaskId ?? null;
+  if (
+    declaredCanary &&
+    opts.arms.includes("with_codestory") &&
+    allTasks.some((task) => task.id === declaredCanary)
+  ) {
+    const canaryRows = rows.filter((row) => row.canary === true);
+    const canaryRow = canaryRows[0] ?? null;
+    const ownerShard = taskShardIndex(declaredCanary, shardCount);
+    const effectiveCanarySummaries = shards.filter(
+      (shard) => shard.summary?.effective_canary_task_id === declaredCanary,
+    );
+    if (
+      canaryRows.length !== 1 ||
+      canaryRow?.task_id !== declaredCanary ||
+      canaryRow?.arm !== "with_codestory" ||
+      canaryRow?.repeat !== 1 ||
+      canaryRow?.shard_index !== ownerShard ||
+      effectiveCanarySummaries.length !== 1 ||
+      effectiveCanarySummaries[0]?.summary?.shard?.index !== ownerShard ||
+      shards.some((shard) => shard.summary?.canary_task_id !== declaredCanary) ||
+      shards.some((shard) =>
+        shard.summary?.shard?.index !== ownerShard &&
+        shard.summary?.effective_canary_task_id != null
+      )
+    ) {
+      throw new Error(
+        `Declared canary '${declaredCanary}' must appear exactly once across shard rows and summaries`,
+      );
+    }
+  }
   const canonicalRows = sortAgentResultsCanonical(rows, allTasks, opts.arms);
+  if (opts.publishable) {
+    const blockers = agentPublishableBlockers(canonicalRows, opts);
+    if (blockers.length) {
+      throw new Error(
+        `Publishable shard rows failed: ${blockers.map(formatAgentPublishableBlocker).join(" | ")}`,
+      );
+    }
+  }
+  const pooledSummary = summarizeRuns(canonicalRows);
+  const obligationAccounting = summarizePacketObligationAccounting(
+    canonicalRows,
+    "shard aggregation",
+  );
   const hostClasses = new Set(
     shards.map((shard) => stableJsonForHash(shard.summary.shard.attestation.host_class)),
   );
+  const latencySummariesByHostClass = [...hostClasses]
+    .sort()
+    .map((hostClassKey) => ({
+      host_class: JSON.parse(hostClassKey),
+      platform_artifacts: artifactAttestationByHostClass.get(hostClassKey),
+      summary: summarizeRuns(
+        canonicalRows.filter((row) => stableJsonForHash(row.host_class) === hostClassKey),
+      ),
+      cost_accounting: summarizeCostAccounting(
+        canonicalRows.filter((row) => stableJsonForHash(row.host_class) === hostClassKey),
+      ),
+    }));
+  const latencyPoolingEligible = hostClasses.size === 1;
+  const summary = latencyPoolingEligible
+    ? pooledSummary
+    : withoutPooledLatency(pooledSummary);
   const outDir = path.resolve(
     opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", `aggregate-${Date.now()}`),
   );
@@ -7622,12 +8399,19 @@ async function aggregateShardRuns(opts, allTasks) {
         aggregate: true,
         shard_count: shardCount,
         source_attestation: commonAttestation(attestationReference),
-        latency_pooling_eligible: hostClasses.size === 1,
-        latency_host_classes: [...hostClasses].map((entry) => JSON.parse(entry)),
+        platform_artifacts_by_host_class: latencySummariesByHostClass.map((entry) => ({
+          host_class: entry.host_class,
+          platform_artifacts: entry.platform_artifacts,
+        })),
+        latency_pooling_eligible: latencyPoolingEligible,
+        latency_host_classes: latencySummariesByHostClass.map((entry) => entry.host_class),
+        latency_summaries_by_host_class: latencySummariesByHostClass,
+        pooled_latency_summary: latencyPoolingEligible ? pooledSummary : null,
         expected_rows: expectedRuns.length,
         completed_rows: canonicalRows.length,
-        summary: summarizeRuns(canonicalRows),
-        cost_accounting: summarizeCostAccounting(canonicalRows),
+        packet_obligation_accounting: obligationAccounting,
+        summary,
+        cost_accounting: latencyPoolingEligible ? summarizeCostAccounting(canonicalRows) : null,
       },
       null,
       2,
@@ -7635,6 +8419,322 @@ async function aggregateShardRuns(opts, allTasks) {
     "utf8",
   );
   console.log(`wrote ${outDir}`);
+}
+
+function pipelineStageFailure(stage, group, error) {
+  const reason = error instanceof Error ? error.message : String(error);
+  return {
+    kind: `${stage}_failed`,
+    repo: group?.repo ?? null,
+    task_id: group?.tasks?.[0]?.id ?? null,
+    error: reason,
+    blockers: [{
+      category: stage === "preparation" ? "environment" : "harness-contract",
+      reasons: [reason],
+    }],
+  };
+}
+
+async function runAgentBenchmarkPipeline({
+  opts,
+  tasks,
+  plannedRuns,
+  executeRun = runPlannedAgentRun,
+  reusableBaselines = new Map(),
+  outDir = null,
+  materializeGroup = async () => {},
+  prepareGroup = async () => [],
+  prepareIsolation = async () => null,
+  recordResult = async () => {},
+  recordPreparation = async () => {},
+  recordPreparationState = async () => {},
+  recordFirstFailure = async () => {},
+  recordComparativeFailure = async () => {},
+}) {
+  const results = [];
+  const cachePreparation = [];
+  const abortController = new AbortController();
+  const comparativeAbortController = new AbortController();
+  opts.cachePreparationByRepo ??= new Map();
+  let firstFailure = null;
+  let comparativeFailure = null;
+  let agentCodexIsolation = null;
+
+  const rememberFirstFailure = async (failure, abort = false) => {
+    if (firstFailure) {
+      return;
+    }
+    firstFailure = { recorded_at: new Date().toISOString(), ...failure };
+    await recordFirstFailure(firstFailure);
+    if (abort) {
+      abortController.abort(firstFailure);
+    }
+  };
+  const persistPreparation = async (row) => {
+    cachePreparation.push(row);
+    opts.cachePreparationByRepo.set(row.repo, row);
+    await recordPreparation(row);
+  };
+  const rememberComparativeFailure = async (failure) => {
+    if (comparativeFailure) {
+      return;
+    }
+    comparativeFailure = {
+      recorded_at: new Date().toISOString(),
+      kind: "comparative_baseline_failure",
+      ...failure,
+    };
+    await recordComparativeFailure(comparativeFailure);
+    comparativeAbortController.abort(comparativeFailure);
+  };
+  const runBatch = async (batchOpts, runs, options = {}) => {
+    const batchSignal = options.comparativeOnly
+      ? AbortSignal.any([abortController.signal, comparativeAbortController.signal])
+      : abortController.signal;
+    if (!runs.length || batchSignal.aborted) {
+      return { results: [], firstFailure: null };
+    }
+    return await runPlannedAgentRuns(
+      { ...batchOpts, signal: batchSignal },
+      runs,
+      reusableBaselines,
+      outDir,
+      {
+        ...options,
+        runOne: executeRun,
+        signal: batchSignal,
+        abortController: options.comparativeOnly
+          ? comparativeAbortController
+          : abortController,
+        onResult: async (result) => {
+          await recordResult(result);
+          await options.onResult?.(result);
+          results.push(result);
+        },
+        onFirstFailure: async (failure) => {
+          if (options.comparativeOnly && failure.kind !== "run_exception") {
+            await rememberComparativeFailure(failure);
+          } else {
+            await rememberFirstFailure(
+              failure,
+              !options.comparativeOnly && options.failFast === true,
+            );
+          }
+          await options.onFirstFailure?.(failure);
+        },
+      },
+    );
+  };
+  const prepareTaskGroup = async (group, canary = false) => {
+    if (!group || abortController.signal.aborted) {
+      return;
+    }
+    try {
+      await materializeGroup(group, abortController.signal);
+      await recordPreparationState({ kind: "materialized", repo: group.repo });
+    } catch (error) {
+      await rememberFirstFailure(pipelineStageFailure("materialization", group, error), true);
+      await recordPreparationState({ kind: "materialization_failed", repo: group.repo });
+      return;
+    }
+    try {
+      const prepared = await prepareGroup(group, abortController.signal);
+      for (const row of prepared ?? []) {
+        await persistPreparation(row);
+      }
+      await recordPreparationState({ kind: "prepared", repo: group.repo });
+      if (canary) {
+        const canaryPreparation = prepared?.[0] ?? null;
+        const blockers = cachePreparationCanaryBlockers(
+          canaryPreparation,
+          selectedBenchmarkChildEnv(opts),
+        );
+        if (blockers.length) {
+          await rememberFirstFailure({
+            kind: "canary_preparation",
+            repo: group.repo,
+            task_id: group.tasks[0]?.id ?? null,
+            blockers: [{ category: "environment", reasons: blockers }],
+          }, true);
+        }
+      }
+    } catch (error) {
+      if (error?.preparation) {
+        await persistPreparation(error.preparation);
+      }
+      await rememberFirstFailure(pipelineStageFailure("preparation", group, error), true);
+      await recordPreparationState({ kind: "preparation_failed", repo: group.repo });
+    }
+  };
+
+  const hasCodeStoryArm = opts.arms.includes("with_codestory");
+  const declaredCanary = opts.canaryTaskId ?? opts.manifestCanaryTaskId ?? null;
+  const canaryTask = hasCodeStoryArm && declaredCanary
+    ? tasks.find((task) => task.id === declaredCanary) ?? null
+    : null;
+  const taskGroups = [...groupTasksByRepo(tasks)].map(([repo, repoTasks]) => ({
+    repo,
+    tasks: repoTasks,
+  }));
+  const canaryGroup = canaryTask
+    ? taskGroups.find((group) => group.repo === canaryTask.repo) ?? null
+    : null;
+
+  if (canaryGroup) {
+    await prepareTaskGroup(canaryGroup, true);
+  }
+  if (!firstFailure) {
+    try {
+      agentCodexIsolation = await prepareIsolation();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      await rememberFirstFailure({
+        kind: "agent_isolation_failed",
+        repo: canaryGroup?.repo ?? null,
+        task_id: canaryTask?.id ?? null,
+        error: reason,
+        blockers: [{ category: "environment", reasons: [reason] }],
+      }, true);
+      await recordPreparationState({
+        kind: "agent_isolation_failed",
+        repo: canaryGroup?.repo ?? null,
+        error: reason,
+      });
+    }
+  }
+  if (!firstFailure && canaryTask) {
+    const canaryRun = plannedRuns.find(
+      (run) => run.task?.id === canaryTask.id &&
+        run.arm === "with_codestory" &&
+        run.repeat === 1,
+    );
+    if (!canaryRun) {
+      throw new Error(`Canary task '${canaryTask.id}' has no with_codestory repeat-1 row`);
+    }
+    await runBatch(
+      { ...opts, jobs: 1 },
+      [{ ...canaryRun, canary: true }],
+      { failFast: true },
+    );
+  }
+
+  if (!firstFailure) {
+    const completedKeys = new Set(results.map(agentRunKey));
+    const baselineRuns = plannedRuns.filter(
+      (run) => run.arm === "without_codestory" && !completedKeys.has(agentRunKey(run)),
+    );
+    const otherGroups = canaryGroup
+      ? taskGroups.filter((group) => group.repo !== canaryGroup.repo)
+      : taskGroups;
+    const readyBaselines = createAsyncQueue();
+    const preparationState = { drained: !otherGroups.length };
+    if (canaryGroup) {
+      const runs = baselineRuns.filter((run) => run.repo === canaryGroup.repo);
+      if (runs.length) {
+        readyBaselines.push({ repo: canaryGroup.repo, runs });
+      }
+    }
+    const baselineWorkers = Promise.all(
+      Array.from({ length: Math.min(4, Math.max(1, taskGroups.length)) }, async () => {
+        for (;;) {
+          const group = await readyBaselines.shift();
+          if (
+            !group ||
+            preparationState.drained ||
+            abortController.signal.aborted ||
+            comparativeAbortController.signal.aborted
+          ) {
+            return;
+          }
+          await runBatch(
+            { ...opts, jobs: 1 },
+            group.runs,
+            {
+              failFast: true,
+              comparativeOnly: true,
+              shouldSchedule: () => !preparationState.drained,
+              decorateRun: (run) => ({
+                ...run,
+                preparation_overlap: true,
+                comparative_wall_time_eligible: false,
+              }),
+            },
+          );
+        }
+      }),
+    );
+
+    try {
+      await parallelMap(
+        otherGroups,
+        Math.min(2, Math.max(1, opts.prepareCodestoryJobs ?? 2)),
+        async (group) => {
+          if (abortController.signal.aborted) {
+            return;
+          }
+          await prepareTaskGroup(group, false);
+          if (!abortController.signal.aborted && !comparativeAbortController.signal.aborted) {
+            const runs = baselineRuns.filter((run) => run.repo === group.repo);
+            if (runs.length) {
+              readyBaselines.push({ repo: group.repo, runs });
+            }
+          }
+        },
+      );
+    } finally {
+      preparationState.drained = true;
+      await recordPreparationState({ kind: "drained", repos: otherGroups.map((group) => group.repo) });
+      readyBaselines.close();
+      await baselineWorkers;
+    }
+
+    if (!abortController.signal.aborted) {
+      const completedAfterOverlap = new Set(results.map(agentRunKey));
+      const codeStoryRuns = plannedRuns.filter(
+        (run) => run.arm === "with_codestory" &&
+          !completedAfterOverlap.has(agentRunKey(run)),
+      );
+      const codeStoryOutcome = await runBatch(
+        { ...opts, jobs: Math.min(4, opts.jobs) },
+        codeStoryRuns,
+        { failFast: opts.publishable && !opts.collectAllFailures },
+      );
+      if (
+        !codeStoryOutcome.firstFailure &&
+        !abortController.signal.aborted &&
+        !comparativeFailure
+      ) {
+        const completedAfterCodeStory = new Set(results.map(agentRunKey));
+        const remainingBaselines = plannedRuns.filter(
+          (run) => run.arm === "without_codestory" &&
+            !completedAfterCodeStory.has(agentRunKey(run)),
+        );
+        await runBatch(
+          { ...opts, jobs: opts.jobs },
+          remainingBaselines,
+          {
+            failFast: true,
+            comparativeOnly: true,
+            decorateRun: (run) => ({
+              ...run,
+              preparation_overlap: false,
+              comparative_wall_time_eligible: true,
+            }),
+          },
+        );
+      }
+    }
+  }
+
+  return {
+    results,
+    firstFailure,
+    comparativeFailure,
+    comparativePublishable: comparativeFailure == null,
+    cachePreparation,
+    agentCodexIsolation,
+    aborted: abortController.signal.aborted,
+  };
 }
 
 async function main() {
@@ -7711,220 +8811,74 @@ async function main() {
     throw new Error(`Refusing to append a new benchmark to an existing ledger: ${runsPath}`);
   }
   const ledger = await createDurableJsonlAppender(runsPath);
+  const preparationLedger = await createDurableJsonlAppender(
+    path.join(outDir, "preparations.jsonl"),
+  );
   const reusableBaselines = await loadReusableBaselines(opts, plannedRuns, outDir);
-  const cachePreparation = [];
   opts.cachePreparationByRepo = new Map();
-  const results = [];
-  let firstFailure = null;
   let agentCodexIsolation = null;
-  const rememberFirstFailure = async (failure) => {
-    if (firstFailure) {
-      return;
-    }
-    firstFailure = {
-      recorded_at: new Date().toISOString(),
-      ...failure,
-    };
-    await writeFile(
-      path.join(outDir, "first-failure.json"),
-      `${JSON.stringify(firstFailure, null, 2)}\n`,
-      "utf8",
-    );
-  };
-  const runBatch = async (batchOpts, runs, options = {}) => {
-    if (!runs.length) {
-      return { results: [], firstFailure: null };
-    }
-    const outcome = await runPlannedAgentRuns(
-      batchOpts,
-      runs,
+  let pipeline = null;
+  try {
+    pipeline = await runAgentBenchmarkPipeline({
+      opts,
+      tasks,
+      plannedRuns,
       reusableBaselines,
       outDir,
-      {
-        ...options,
-        onResult: async (result) => {
-          await ledger.append(result);
-          await options.onResult?.(result);
-        },
-        onFirstFailure: async (failure) => {
-          await rememberFirstFailure(failure);
-          await options.onFirstFailure?.(failure);
-        },
-      },
-    );
-    results.push(...outcome.results);
-    return outcome;
-  };
-
-  try {
-    const hasCodeStoryArm = opts.arms.includes("with_codestory");
-    const declaredCanary = opts.canaryTaskId ?? opts.manifestCanaryTaskId;
-    const canaryTask = hasCodeStoryArm && tasks.length
-      ? tasks.find((task) => task.id === declaredCanary) ?? tasks[0]
-      : null;
-    const taskGroups = [...groupTasksByRepo(tasks)].map(([repo, repoTasks]) => ({
-      repo,
-      tasks: repoTasks,
-    }));
-    const canaryGroup = canaryTask
-      ? taskGroups.find((group) => group.repo === canaryTask.repo)
-      : null;
-
-    if (opts.materializeRepos && canaryGroup) {
-      assertManifestRepoMaterializationAllowed(canaryGroup.tasks, opts);
-      await materializeRepos(canaryGroup.tasks, opts);
-    } else if (opts.materializeRepos && !canaryGroup) {
-      assertManifestRepoMaterializationAllowed(tasks, opts);
-      await materializeRepos(tasks, opts);
-    }
-
-    if (canaryTask && opts.prepareCodestoryCache) {
-      const [canaryPreparation] = await prepareCodeStoryCaches(opts, canaryGroup.tasks);
-      if (canaryPreparation) {
-        cachePreparation.push(canaryPreparation);
-        opts.cachePreparationByRepo.set(canaryPreparation.repo, canaryPreparation);
-      }
-      const preparationBlockers = cachePreparationCanaryBlockers(
-        canaryPreparation,
-        selectedBenchmarkChildEnv(opts),
-      );
-      if (preparationBlockers.length) {
-        await rememberFirstFailure({
-          kind: "canary_preparation",
-          repo: canaryTask.repo,
-          task_id: canaryTask.id,
-          blockers: [{ category: "environment", reasons: preparationBlockers }],
-        });
-      }
-    }
-
-    if (!firstFailure) {
-      agentCodexIsolation =
-        opts.runner === "codex" ? await prepareAgentCodexIsolation(outDir, opts) : null;
-      opts.agentCodexHomes = agentCodexIsolation?.homes ?? null;
-    }
-
-    if (!firstFailure && canaryTask) {
-      const canaryRun = plannedRuns.find(
-        (run) =>
-          run.task?.id === canaryTask.id &&
-          run.arm === "with_codestory" &&
-          run.repeat === 1,
-      );
-      if (!canaryRun) {
-        throw new Error(`Canary task '${canaryTask.id}' has no with_codestory repeat-1 row`);
-      }
-      await runBatch(
-        { ...opts, jobs: 1 },
-        [{ ...canaryRun, canary: true }],
-        { failFast: true },
-      );
-    }
-
-    if (!firstFailure) {
-      const completedKeys = new Set(results.map(agentRunKey));
-      const baselineRuns = plannedRuns.filter(
-        (run) => run.arm === "without_codestory" && !completedKeys.has(agentRunKey(run)),
-      );
-      const otherGroups = canaryGroup
-        ? taskGroups.filter((group) => group.repo !== canaryGroup.repo)
-        : taskGroups;
-      const readyBaselines = createAsyncQueue();
-      const preparationState = { drained: !otherGroups.length };
-      if (canaryGroup) {
-        const runs = baselineRuns.filter((run) => run.repo === canaryGroup.repo);
-        if (runs.length) {
-          readyBaselines.push({ repo: canaryGroup.repo, runs });
-        }
-      }
-
-      const baselineWorkers = Promise.all(
-        Array.from({ length: Math.min(4, Math.max(1, taskGroups.length)) }, async () => {
-          for (;;) {
-            const group = await readyBaselines.shift();
-            if (!group || preparationState.drained) {
-              return;
-            }
-            await runBatch(
-              { ...opts, jobs: 1 },
-              group.runs,
-              {
-                failFast: false,
-                shouldSchedule: () => !preparationState.drained,
-                decorateRun: (run) => ({
-                  ...run,
-                  preparation_overlap: !preparationState.drained,
-                  comparative_wall_time_eligible: preparationState.drained,
-                }),
-              },
-            );
-          }
-        }),
-      );
-
-      await parallelMap(otherGroups, Math.min(2, opts.prepareCodestoryJobs), async (group) => {
+      materializeGroup: async (group, signal) => {
         if (opts.materializeRepos) {
           assertManifestRepoMaterializationAllowed(group.tasks, opts);
-          await materializeRepos(group.tasks, opts);
+          await materializeRepos(group.tasks, { ...opts, signal });
         }
-        const runs = baselineRuns.filter((run) => run.repo === group.repo);
-        if (runs.length) {
-          readyBaselines.push({ repo: group.repo, runs });
-        }
-        if (opts.prepareCodestoryCache) {
-          const prepared = await prepareCodeStoryCaches(
-            { ...opts, prepareCodestoryJobs: 1 },
-            group.tasks,
-          );
-          for (const row of prepared) {
-            cachePreparation.push(row);
-            opts.cachePreparationByRepo.set(row.repo, row);
-          }
-        }
-      });
-      preparationState.drained = true;
-      readyBaselines.close();
-      await baselineWorkers;
-
-      const completedAfterOverlap = new Set(results.map(agentRunKey));
-      const codeStoryRuns = plannedRuns.filter(
-        (run) =>
-          run.arm === "with_codestory" &&
-          !completedAfterOverlap.has(agentRunKey(run)),
-      );
-      const codeStoryOutcome = await runBatch(
-        { ...opts, jobs: Math.min(4, opts.jobs) },
-        codeStoryRuns,
-        { failFast: opts.publishable && !opts.collectAllFailures },
-      );
-
-      if (!codeStoryOutcome.firstFailure) {
-        const completedAfterCodeStory = new Set(results.map(agentRunKey));
-        const remainingBaselines = plannedRuns.filter(
-          (run) =>
-            run.arm === "without_codestory" &&
-            !completedAfterCodeStory.has(agentRunKey(run)),
-        );
-        await runBatch(
-          { ...opts, jobs: opts.jobs },
-          remainingBaselines,
-          {
-            failFast: false,
-            decorateRun: (run) => ({
-              ...run,
-              preparation_overlap: false,
-              comparative_wall_time_eligible: true,
-            }),
-          },
-        );
-      }
-    }
+      },
+      prepareGroup: async (group, signal) => opts.prepareCodestoryCache
+        ? await prepareCodeStoryCaches(
+          { ...opts, signal, prepareCodestoryJobs: 1 },
+          group.tasks,
+        )
+        : [],
+      prepareIsolation: async () => {
+        agentCodexIsolation =
+          opts.runner === "codex" ? await prepareAgentCodexIsolation(outDir, opts) : null;
+        opts.agentCodexHomes = agentCodexIsolation?.homes ?? null;
+        return agentCodexIsolation;
+      },
+      recordResult: (result) => ledger.append(result),
+      recordPreparation: (row) => preparationLedger.append({
+        kind: "preparation",
+        recorded_at: new Date().toISOString(),
+        ...row,
+      }),
+      recordPreparationState: (state) => preparationLedger.append({
+        recorded_at: new Date().toISOString(),
+        ...state,
+      }),
+      recordFirstFailure: (failure) => writeFile(
+        path.join(outDir, "first-failure.json"),
+        `${JSON.stringify(failure, null, 2)}\n`,
+        "utf8",
+      ),
+      recordComparativeFailure: (failure) => writeFile(
+        path.join(outDir, "comparative-failure.json"),
+        `${JSON.stringify(failure, null, 2)}\n`,
+        "utf8",
+      ),
+    });
   } finally {
     await ledger.close();
+    await preparationLedger.close();
     if (agentCodexIsolation?.root) {
       await rm(agentCodexIsolation.root, { recursive: true, force: true });
     }
   }
+
+  const {
+    results,
+    firstFailure,
+    comparativeFailure,
+    comparativePublishable,
+    cachePreparation,
+  } = pipeline;
 
   const canonicalResults = sortAgentResultsCanonical(results, tasks, opts.arms);
   if (cachePreparation.length) {
@@ -7936,11 +8890,16 @@ async function main() {
   }
 
   const summary = summarizeRuns(canonicalResults);
+  const obligationAccounting = summarizePacketObligationAccounting(
+    canonicalResults,
+    "agent benchmark report",
+  );
   const costAccounting = summarizeCostAccounting(canonicalResults);
   const shardAttestation = await benchmarkShardAttestation(
     opts,
     allTasks,
     cachePreparation,
+    canonicalResults,
   );
   const summaryPayload = {
     generated_at: new Date().toISOString(),
@@ -7983,6 +8942,9 @@ async function main() {
     expected_rows: plannedRuns.length,
     completed_rows: canonicalResults.length,
     first_failure: firstFailure,
+    comparative_failure: comparativeFailure,
+    comparative_publishable: comparativePublishable,
+    packet_obligation_accounting: obligationAccounting,
     summary,
     cost_accounting: costAccounting,
   };
@@ -8032,6 +8994,8 @@ export {
   agentPublishableBlockers,
   assertSafeWindowsCmdArgs,
   benchmarkRunId,
+  benchmarkContractEnvironmentSha256,
+  benchmarkContractForRun,
   benchmarkShardAttestation,
   baselineSearchPreludeStatus,
   buildPacketQualityDeltas,
@@ -8039,6 +9003,8 @@ export {
   copyResultArtifact,
   qualityFailureReasons,
   commandCategory,
+  codestoryDoctorSnapshot,
+  codestoryRetrievalStatusSnapshot,
   extractCommandExecutions,
   isPathInside,
   isTrustedPublishableRepoUrl,
@@ -8060,12 +9026,15 @@ export {
   packetForAgentPrompt,
   packetManifestExtraProbes,
   packetManifestQualitySummary,
+  packetObligationAccounting,
   packetPreludeContractBlockers,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetRuntimeCacheObservations,
   packetEmbeddingExecutionProof,
   groupPacketRuntimeColdJobs,
+  gitCheckedOutput,
+  gitOutput,
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
   prepareAgentCodexIsolation,
@@ -8075,17 +9044,23 @@ export {
   packetCompositionFileScore,
   packetFirstCommandForPrompt,
   publicCoreCorpusAudit,
+  planAgentRuns,
   repoProvenanceBlockers,
+  repoProvenance,
   runnerCommand,
   resolveRunArtifactPath,
   repoConfigFromManifest,
   resolveCodeStoryCli,
   scoreQuality,
   summarizeCostAccounting,
+  summarizePacketObligationAccounting,
   summarizePacketRuntimeRuns,
   taskSnapshotForResult,
   taskShardIndex,
   tasksForShard,
+  runAgentBenchmarkPipeline,
+  runPlannedAgentRuns,
+  runProcess,
 };
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

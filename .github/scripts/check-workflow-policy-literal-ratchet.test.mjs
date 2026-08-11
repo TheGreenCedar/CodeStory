@@ -320,8 +320,8 @@ const EXPECTED_LITERAL_SITES = {
   protectedRunnerReservationViolations: { stepNames: 7, workflowNames: 1 },
   releaseFreezeBarrierWorkflowViolations: {
     permissionTuples: 7,
-    stepNames: 18,
-    workflowNames: 25,
+    stepNames: 36,
+    workflowNames: 32,
   },
   releaseProofWorkflowFiles: { workflowNames: 2 },
   releaseWorkflowContractViolations: { stepNames: 2, workflowNames: 7 },

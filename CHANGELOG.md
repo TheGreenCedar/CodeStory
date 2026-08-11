@@ -2,38 +2,17 @@
 
 ## Unreleased
 
-- Cursor users can now install CodeStory as one plugin from Customize instead of copying a rule and MCP configuration by hand. The plugin includes the grounding rule and skill, session-start guidance, the managed runtime launcher, and a repository marketplace manifest for team distribution; Cursor still requires users to enable the MCP server once in Customize.
-
 ## 0.17.0
 
-CodeStory 0.17 focuses on more trustworthy answers and a more predictable installed experience. Grounding is centered on project architecture, packet and search results separate proven evidence from gaps, and the embedding model stays resident for work across projects instead of being loaded for each command.
+CodeStory 0.17 gives agents broader, more dependable context from a repository. Questions can now combine names, files, concepts, relationships, and ordered flows, and search keeps exact, semantic, and graph evidence separate while ranking them together. Exact definitions remain easy to find, related callers and routes stay attached to the result, and weak semantic matches are dropped instead of being presented as useful evidence.
 
-### Added
+Packets are built around the parts of the question that must be proved. CodeStory reserves a citation and the relevant code relationship for each required step before adding background context, keeps exact-file questions tied to those files, and checks the complete CLI or MCP response against its size limit. If the evidence cannot support a step, the packet names the missing part and remains partial rather than claiming a complete answer.
 
-- The installed plugin now shares one accelerated embedding server across projects for the same OS account. It keeps model residency between commands, separates query and bulk work with bounded queues, returns useful retry state under pressure, and refuses CPU fallback rather than quietly changing the performance and quality contract.
-- Grounding now leads with real entry points, ownership boundaries, and distinct production subsystems. Compact results report typed confidence and uncertainty when the view is compressed or the index cannot support a stronger architectural claim.
-- Bookmarks now live outside the rebuildable index, follow symbols through ordinary moves and renames when identity is unambiguous, and survive reindexing, cache resets, interrupted migration, and temporary symbol disappearance.
-- Every MCP response identifies the response contract that produced it. Contract v2 validates tool arguments against the published tool list and reports the protocol revision CodeStory actually negotiated.
+Indexing and semantic search now preserve more of the structure that explains how code works: entry points, symbol roles, incoming and outgoing calls, routes, SQL relationships, and receiver calls in Go and Dart. Ambiguous calls remain gaps instead of guessed links. Refreshes reuse unchanged semantic documents, while the accelerated embedding runtime remains warm across projects for the same user.
 
-### Improved
+The installed experience is more predictable under load and across upgrades. One failed or cancelled request no longer takes down unrelated project work, bookmarks survive index rebuilds and unambiguous symbol moves, and CodeStory refuses to combine a plugin with an incompatible CLI. The 0.17 bookmark store is separate from the index, so 0.16.3 will refuse to open the same cache rather than risk writing incompatible data; bookmark export and import remain the supported way to move them between machines or volumes.
 
-- Packet and route answers now reserve proof for every required step before adding background context, keep exact-file questions tied to those files, stay within the public response limit, and name the precise missing obligation when the available evidence cannot support a complete answer.
-- Search keeps lexical, semantic, and graph evidence independent instead of turning one lane's total into another lane's score. It combines those ranks deterministically, keeps exact definitions prominent without suppressing unresolved flow questions, and leaves out semantically unrelated results instead of filling the page with weak matches.
-- Natural-language questions can carry symbols, paths, concepts, relations, and ordered flow stages at the same time. A slash inside a concept no longer turns the whole question into a file lookup, and graph expansion now follows typed direction and fanout rather than artifact order.
-- Large repositories check unchanged source with bounded parallel work without weakening content freshness, and source groups that share the same discovery root are walked once. Broad questions share one ready search view across their related lookups, while incremental updates reuse embeddings for documents whose meaning has not changed.
-- Files admitted by the larger source-size limit now reach lexical, repository-text, and semantic search consistently, while unsupported binary images are reported by file type instead of as oversized source.
-
-### Fixed
-
-- Directory names such as `target`, `build`, `views`, `runtime`, or `store` no longer make unrelated symbols look like architecture or flow evidence. Flow coverage now uses the symbol, its source role, and typed relationships; SQL table and foreign-key structure, Go and Dart receiver calls, and parser-backed routes can support answers without inventing ambiguous edges.
-- A failed request is contained to that request and project instead of taking down every project in the editor session. Request admission is bounded by count and memory, overload refusals are immediate, cancellation frees capacity promptly, and shutdown has a three-second upper bound.
-- Route packets now follow registration through dispatch and any requested response boundary, preserve typed capacity failures, and enforce the public CLI JSON limit against the bytes actually emitted. Compact packets retain their per-step trace and obligation evidence instead of becoming misleading after trimming.
-- Exact file queries, filenames from every supported language, same-file overloads, and case-sensitive searches now resolve consistently. Questions are no longer misrouted because of capitalization or punctuation.
-
-### Compatibility
-
-- CodeStory refuses a `CODESTORY_CLI` binary whose version does not match the installed plugin instead of mixing incompatible contracts.
-- The 0.17 bookmark store is intentionally separate from the index. Opening a 0.17 cache with 0.16.3 is refused rather than allowing the older version to write data the newer version will not read; use bookmark export/import when moving a project between machines or volumes.
+Cursor users can now install CodeStory from Customize as one plugin instead of copying a rule and MCP configuration by hand. The package includes the grounding rule and skill, session-start hook, and managed runtime launcher; after installation, Cursor still requires its MCP server to be enabled once and the window reloaded. The portable plugin core follows Agent Plugins v1, so CodeStory can share the same package structure across supported agent hosts without pretending their setup steps are identical.
 
 ## 0.16.3
 

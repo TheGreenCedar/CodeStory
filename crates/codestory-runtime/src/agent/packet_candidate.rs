@@ -33,6 +33,7 @@ pub(crate) struct PacketSearchHit {
 }
 
 impl PacketSearchHit {
+    #[cfg(test)]
     pub(crate) fn without_graph(hit: SearchHit) -> Self {
         Self {
             hit,

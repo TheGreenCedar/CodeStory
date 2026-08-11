@@ -640,7 +640,9 @@ fn flow_requirement_requires_call_edge(requirement: &FlowRequirement) -> bool {
         CoverageMode::RequiresResolvedSourceOrGraph
     ) && matches!(
         requirement.evidence,
-        EvidencePredicate::CitedRoles { .. } | EvidencePredicate::CitedRolesOrCallBoundary { .. }
+        EvidencePredicate::CitedRoles { .. }
+            | EvidencePredicate::CitedRolesOrCallBoundary { .. }
+            | EvidencePredicate::CitedRolesOrOrderedCallBoundary { .. }
     )
 }
 
@@ -1511,6 +1513,50 @@ fn citation_edge_proof_for_flow_requirement(
     requirement: &FlowRequirement,
     answer: &AgentAnswerDto,
 ) -> Option<PacketObligationCarrierEdgeProofDto> {
+    if let Some((incoming_source, outgoing_target)) =
+        requirement.evidence.ordered_call_boundary(citation)
+    {
+        if required_edge_kind != EdgeKind::CALL {
+            return None;
+        }
+        let graphs = packet_execution_graphs(answer);
+        let cited_edge_ids = citation.evidence_edge_ids.iter().collect::<HashSet<_>>();
+        return graphs
+            .iter()
+            .flat_map(|graph| graph.edges.iter().map(move |edge| (*graph, edge)))
+            .filter(|(_, edge)| {
+                edge.kind == EdgeKind::CALL
+                    && cited_edge_ids.contains(&edge.id)
+                    && (edge.source == citation.node_id || edge.target == citation.node_id)
+                    && !is_speculative_trail_edge(edge)
+            })
+            .filter(|(graph, edge)| {
+                let (neighbor_id, matches_neighbor) = if edge.target == citation.node_id {
+                    (&edge.source, incoming_source)
+                } else {
+                    (&edge.target, outgoing_target)
+                };
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == *neighbor_id)
+                    .map(|node| node.label.as_str())
+                    .or_else(|| {
+                        answer
+                            .citations
+                            .iter()
+                            .find(|candidate| candidate.node_id == *neighbor_id)
+                            .map(|candidate| candidate.display_name.as_str())
+                    })
+                    .is_some_and(matches_neighbor)
+            })
+            .min_by(|(_, left), (_, right)| left.id.0.cmp(&right.id.0))
+            .map(|(_, edge)| PacketObligationCarrierEdgeProofDto {
+                carrier_node_id: citation.node_id.clone(),
+                edge_id: edge.id.clone(),
+                edge_kind: edge.kind,
+            });
+    }
     let Some(call_target) = requirement.evidence.call_boundary_target(citation) else {
         return citation_edge_proof(citation, required_edge_kind, answer);
     };
@@ -3626,13 +3672,6 @@ mod tests {
                 ),
                 lexical_citation("TelemetryManager", "src/interceptors.rs", NodeKind::STRUCT),
             ),
-            (
-                "Trace request dispatch through an interceptor and transport adapter.",
-                PacketTaskClassDto::RouteTracing,
-                "request_terminal",
-                lexical_citation("HttpTransportAdapter", "src/transport.rs", NodeKind::CLASS),
-                lexical_citation("ArrayAdapter", "src/transport.rs", NodeKind::CLASS),
-            ),
         ];
 
         for (question, task_class, obligation_id, lawful, false_carrier) in cases {
@@ -3662,6 +3701,35 @@ mod tests {
             );
             assert_eq!(obligation.required_edge_kind, None);
         }
+    }
+
+    #[test]
+    fn transport_adapter_type_alone_is_not_adapter_selection_proof() {
+        let question = "Trace request dispatch through an interceptor and transport adapter.";
+        let adapter = lexical_citation("HttpTransportAdapter", "src/transport.rs", NodeKind::CLASS);
+        let adapter_id = adapter.node_id.clone();
+        let mut answer = answer(vec![adapter]);
+        answer.prompt = question.to_string();
+        let mut plan =
+            build_packet_obligation_plan(question, PacketTaskClassDto::RouteTracing, &[]);
+        finalize_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &mut plan,
+            &answer,
+            &budget(),
+        );
+        let obligation = plan
+            .claim_obligations
+            .iter()
+            .find(|obligation| obligation.id == "request_terminal")
+            .expect("request terminal obligation");
+
+        assert_eq!(
+            obligation.proof_status,
+            PacketObligationProofStatusDto::Unsupported
+        );
+        assert!(!obligation.carrier_node_ids.contains(&adapter_id));
     }
 
     #[test]
@@ -4264,12 +4332,17 @@ mod tests {
 
     #[test]
     fn client_request_obligations_protect_distinct_lawful_carriers_before_capping() {
-        let question = "Explain how an HTTP client session accepts a request, dispatches it through the session, and reaches a transport adapter.";
+        let question = "Explain how an HTTP client session accepts a request, dispatches it through the session, selects a transport adapter, and calls the adapter send boundary.";
         let mut request = citation("HttpClient.request", "src/client.rs", NodeKind::METHOD);
         request.evidence_edge_ids = vec![EdgeId("request-call".to_string())];
         let mut send = citation("HttpClient.send", "src/client.rs", NodeKind::METHOD);
         send.evidence_edge_ids = vec![EdgeId("send-call".to_string())];
-        let adapter = citation(
+        let selector = citation(
+            "HttpClient.selectAdapter",
+            "src/client.rs",
+            NodeKind::METHOD,
+        );
+        let transport = citation(
             "HttpTransportAdapter.send",
             "src/transport.rs",
             NodeKind::METHOD,
@@ -4278,7 +4351,8 @@ mod tests {
         let mut carried_answer = answer(vec![
             request.clone(),
             send.clone(),
-            adapter.clone(),
+            selector.clone(),
+            transport.clone(),
             prepared.clone(),
         ]);
         carried_answer.prompt = question.to_string();
@@ -4302,7 +4376,7 @@ mod tests {
                     GraphEdgeDto {
                         id: EdgeId("send-call".to_string()),
                         source: send.node_id.clone(),
-                        target: adapter.node_id.clone(),
+                        target: selector.node_id.clone(),
                         kind: EdgeKind::CALL,
                         confidence: Some(1.0),
                         certainty: Some("certain".to_string()),
@@ -4323,7 +4397,10 @@ mod tests {
         plan.claim_obligations.retain(|obligation| {
             matches!(
                 obligation.id.as_str(),
-                "request_entrypoint" | "request_dispatch" | "request_terminal"
+                "request_entrypoint"
+                    | "request_dispatch"
+                    | "request_terminal"
+                    | "client_transport_send"
             )
         });
         plan.query_obligations.clear();
@@ -4335,7 +4412,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             material_ids,
-            ["request_entrypoint", "request_dispatch", "request_terminal"]
+            [
+                "request_entrypoint",
+                "request_dispatch",
+                "request_terminal",
+                "client_transport_send"
+            ]
         );
 
         let snapshot = capture_packet_obligation_edge_proofs_before_budget(
@@ -4346,7 +4428,12 @@ mod tests {
         );
         assert_eq!(
             protected_packet_obligation_carrier_node_ids(&snapshot),
-            &[request.node_id, send.node_id, adapter.node_id,]
+            &[
+                request.node_id,
+                send.node_id,
+                selector.node_id,
+                transport.node_id,
+            ]
         );
         assert_eq!(
             protected_packet_obligation_edge_ids(&snapshot),
@@ -4373,6 +4460,160 @@ mod tests {
             !protected_packet_obligation_edge_ids(&wrong_target_snapshot)
                 .contains(&EdgeId("request-call".to_string())),
             "matching carrier morphology cannot consume an unrelated outgoing call"
+        );
+    }
+
+    #[test]
+    fn client_request_dispatch_rejects_an_unrelated_incident_call() {
+        let question = "Explain how an HTTP client session accepts a request, dispatches it through the session, selects a transport adapter, and calls the adapter send boundary.";
+        let mut send = citation("HttpClient.send", "src/client.rs", NodeKind::METHOD);
+        send.evidence_edge_ids = vec![
+            EdgeId("logging-call".to_string()),
+            EdgeId("metrics-call".to_string()),
+            EdgeId("adapter-metrics-call".to_string()),
+        ];
+        let logger = citation("Logger.record", "src/logging.rs", NodeKind::METHOD);
+        let metrics = citation(
+            "ClientRequestMetrics.record",
+            "src/metrics.rs",
+            NodeKind::METHOD,
+        );
+        let adapter_metrics = citation(
+            "AdapterResolveMetrics.record",
+            "src/metrics.rs",
+            NodeKind::METHOD,
+        );
+        let mut carried_answer = answer(vec![
+            send.clone(),
+            logger.clone(),
+            metrics.clone(),
+            adapter_metrics.clone(),
+        ]);
+        carried_answer.prompt = question.to_string();
+        carried_answer.graphs.push(GraphArtifactDto::Uml {
+            id: "client-dispatch-logging".to_string(),
+            title: "Unrelated incident call".to_string(),
+            graph: GraphResponse {
+                center_id: send.node_id.clone(),
+                nodes: Vec::new(),
+                edges: vec![
+                    GraphEdgeDto {
+                        id: EdgeId("logging-call".to_string()),
+                        source: send.node_id.clone(),
+                        target: logger.node_id.clone(),
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:logging".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: EdgeId("metrics-call".to_string()),
+                        source: metrics.node_id,
+                        target: send.node_id.clone(),
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:metrics".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: EdgeId("adapter-metrics-call".to_string()),
+                        source: send.node_id.clone(),
+                        target: adapter_metrics.node_id,
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:adapter-metrics".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                ],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        });
+        let mut plan = build_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        plan.claim_obligations
+            .retain(|obligation| obligation.id == "request_dispatch");
+        plan.query_obligations.clear();
+
+        finalize_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &carried_answer,
+            &budget(),
+        );
+
+        assert_eq!(plan.claim_obligations.len(), 1);
+        assert_eq!(
+            plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Reported
+        );
+        assert_eq!(
+            plan.claim_obligations[0].reason.as_deref(),
+            Some("required_evidence_edge_missing")
+        );
+        assert!(plan.claim_obligations[0].carrier_edge_proofs.is_empty());
+
+        let request = citation("HttpClient.request", "src/client.rs", NodeKind::METHOD);
+        let mut incoming_send = send;
+        incoming_send.evidence_edge_ids = vec![EdgeId("request-to-send".to_string())];
+        let mut incoming_answer = answer(vec![request.clone(), incoming_send.clone()]);
+        incoming_answer.prompt = question.to_string();
+        incoming_answer.graphs.push(GraphArtifactDto::Uml {
+            id: "client-dispatch-incoming".to_string(),
+            title: "Preceding request call".to_string(),
+            graph: GraphResponse {
+                center_id: incoming_send.node_id.clone(),
+                nodes: Vec::new(),
+                edges: vec![GraphEdgeDto {
+                    id: EdgeId("request-to-send".to_string()),
+                    source: request.node_id,
+                    target: incoming_send.node_id,
+                    kind: EdgeKind::CALL,
+                    confidence: Some(1.0),
+                    certainty: Some("certain".to_string()),
+                    callsite_identity: Some("test:request-to-send".to_string()),
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        });
+        let mut incoming_plan = build_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        incoming_plan
+            .claim_obligations
+            .retain(|obligation| obligation.id == "request_dispatch");
+        incoming_plan.query_obligations.clear();
+        finalize_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut incoming_plan,
+            &incoming_answer,
+            &budget(),
+        );
+        assert_eq!(
+            incoming_plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Proven
+        );
+        assert_eq!(
+            incoming_plan.claim_obligations[0]
+                .carrier_edge_proofs
+                .iter()
+                .map(|proof| proof.edge_id.clone())
+                .collect::<Vec<_>>(),
+            [EdgeId("request-to-send".to_string())]
         );
     }
 

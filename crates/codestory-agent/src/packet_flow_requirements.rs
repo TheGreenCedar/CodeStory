@@ -21,7 +21,8 @@ use crate::packet_evidence_carriers::{
     citation_owns_shell_function_dispatch, citation_owns_shell_installer_bootstrap,
     citation_owns_site_lifecycle, citation_owns_site_terminal,
     citation_owns_string_blank_predicate, citation_owns_string_empty_predicate,
-    citation_owns_string_region_handoff, client_request_entrypoint_call_target,
+    citation_owns_string_region_handoff, client_request_dispatch_predecessor_call_source,
+    client_request_dispatch_successor_call_target, client_request_entrypoint_call_target,
     flow_belongs_to_client_request, flow_belongs_to_command_dispatch,
     flow_belongs_to_command_server, flow_belongs_to_event_loop, flow_belongs_to_indexing,
     flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
@@ -142,6 +143,16 @@ pub enum EvidencePredicate {
         carrier: fn(&AgentCitationDto) -> bool,
         call_target: Option<fn(&str) -> bool>,
     },
+    /// Covered by a lawful ordered-stage carrier with an exact CALL either from the preceding
+    /// stage or to the following stage. This keeps an unrelated incident CALL from proving the
+    /// stage merely because the carrier itself has the right name.
+    CitedRolesOrOrderedCallBoundary {
+        subsystem: fn(&AgentCitationDto) -> bool,
+        roles: &'static [PacketEvidenceRole],
+        carrier: fn(&AgentCitationDto) -> bool,
+        incoming_source: fn(&str) -> bool,
+        outgoing_target: fn(&str) -> bool,
+    },
     /// Covered by a citation that passes a structural ownership check, used where the evidence
     /// role is too coarse to separate a requirement from its siblings. The carriers carry their own
     /// subsystem factor.
@@ -159,6 +170,12 @@ impl EvidencePredicate {
                 roles,
                 carrier,
                 ..
+            }
+            | Self::CitedRolesOrOrderedCallBoundary {
+                subsystem,
+                roles,
+                carrier,
+                ..
             } => citation_has_named_role(citation, subsystem, roles) || carrier(citation),
             Self::CitedCarrier(carrier) => carrier(citation),
         }
@@ -168,7 +185,9 @@ impl EvidencePredicate {
     /// their own structural contract and return an empty list to mean "predicate-owned".
     pub fn allowed_node_kinds(self) -> &'static [NodeKind] {
         let roles = match self {
-            Self::CitedRoles { roles, .. } | Self::CitedRolesOrCallBoundary { roles, .. } => roles,
+            Self::CitedRoles { roles, .. }
+            | Self::CitedRolesOrCallBoundary { roles, .. }
+            | Self::CitedRolesOrOrderedCallBoundary { roles, .. } => roles,
             Self::CitedCarrier(_) => return &[],
         };
         if roles.iter().any(|role| {
@@ -199,6 +218,9 @@ impl EvidencePredicate {
             Self::CitedRoles { subsystem, roles }
             | Self::CitedRolesOrCallBoundary {
                 subsystem, roles, ..
+            }
+            | Self::CitedRolesOrOrderedCallBoundary {
+                subsystem, roles, ..
             } => citation_has_named_role(citation, subsystem, roles),
             Self::CitedCarrier(carrier) => carrier(citation),
         }
@@ -217,6 +239,24 @@ impl EvidencePredicate {
         (!citation_has_named_role(citation, subsystem, roles) && carrier(citation))
             .then_some(call_target)
             .flatten()
+    }
+
+    pub fn ordered_call_boundary(
+        self,
+        citation: &AgentCitationDto,
+    ) -> Option<(fn(&str) -> bool, fn(&str) -> bool)> {
+        let Self::CitedRolesOrOrderedCallBoundary {
+            subsystem,
+            roles,
+            carrier,
+            incoming_source,
+            outgoing_target,
+        } = self
+        else {
+            return None;
+        };
+        (citation_has_named_role(citation, subsystem, roles) || carrier(citation))
+            .then_some((incoming_source, outgoing_target))
     }
 }
 
@@ -671,13 +711,12 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Dispatch,
         query_seeds: &["request dispatch", "adapters", "transport adapter"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+        evidence: EvidencePredicate::CitedRolesOrOrderedCallBoundary {
             subsystem: flow_belongs_to_client_request,
             roles: &[PacketEvidenceRole::RequestDispatch],
             carrier: citation_owns_client_request_dispatch,
-            // An exact incoming CALL from the preceding request stage or an exact outgoing CALL
-            // to the following adapter stage is sufficient for this ordered carrier.
-            call_target: None,
+            incoming_source: client_request_dispatch_predecessor_call_source,
+            outgoing_target: client_request_dispatch_successor_call_target,
         },
     },
     FlowRequirement {
@@ -2574,6 +2613,7 @@ mod tests {
             "loop",
             "poll",
             "select",
+            "choose",
             "epoll",
             "reactor",
             "tick",
