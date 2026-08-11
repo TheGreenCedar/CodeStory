@@ -2492,8 +2492,8 @@ pub(super) fn semantic_file_is_package_callable_surface(path: Option<&str>) -> b
     let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
     let source_extension = [
         ".bash", ".c", ".cc", ".cjs", ".cpp", ".cs", ".dart", ".fish", ".go", ".h", ".hpp",
-        ".java", ".js", ".jsx", ".kt", ".kts", ".mjs", ".php", ".py", ".rb", ".rs", ".sh",
-        ".swift", ".ts", ".tsx", ".zsh",
+        ".java", ".js", ".jsx", ".kt", ".kts", ".mjs", ".php", ".py", ".rb", ".sh", ".swift",
+        ".ts", ".tsx", ".zsh",
     ]
     .iter()
     .any(|suffix| file_name.ends_with(suffix));

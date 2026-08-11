@@ -730,7 +730,7 @@ fn dense_policy_skips_private_trivial_helpers() {
 
 #[test]
 fn package_callable_surfaces_accept_relative_roots_without_admitting_tests() {
-    for path in ["lib/application.js", "src/server.rs"] {
+    for path in ["lib/application.js", "src/server.js"] {
         assert!(semantic_file_is_package_callable_surface(Some(path)));
 
         let node = semantic_policy_node(11, NodeKind::FUNCTION, "handle", 1);
