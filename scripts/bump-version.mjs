@@ -30,7 +30,9 @@ const WORKSPACE_MEMBERS = workspaceMemberNames(
 );
 
 const PLUGIN_MANIFESTS = [
+  "plugins/codestory/plugin.json",
   "plugins/codestory/.codex-plugin/plugin.json",
+  "plugins/codestory/.cursor-plugin/plugin.json",
   "plugins/codestory/.claude-plugin/plugin.json",
   "plugins/codestory/.github/plugin/plugin.json",
 ];

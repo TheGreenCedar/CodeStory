@@ -28,7 +28,7 @@ function readHookInput() {
 }
 
 function contextFor(event) {
-  return event === 'SessionStart' ? SESSION_CONTEXT : null;
+  return event === 'SessionStart' || event === 'sessionStart' ? SESSION_CONTEXT : null;
 }
 
 async function main() {

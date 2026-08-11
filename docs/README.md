@@ -24,7 +24,7 @@ with portable prompts.
 | Pick a host and install | [User guides](users/README.md) |
 | When to trust agent output | [Trust and readiness](users/trust-and-readiness.md) |
 | Codex plugin path | [Codex guide](users/codex.md) |
-| Cursor rule and MCP | [Cursor guide](users/cursor.md) |
+| Cursor plugin | [Cursor guide](users/cursor.md) |
 | Claude Code hooks | [Claude Code guide](users/claude-code.md) |
 | GitHub Copilot | [Copilot guide](users/copilot.md) |
 | Session blocked or stale output | [Troubleshooting](users/troubleshooting.md) |

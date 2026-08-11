@@ -17,7 +17,9 @@ SEMVER_RE = re.compile(
 STABLE_RELEASE_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 
 PLUGIN_MANIFESTS = (
+    Path("plugins/codestory/plugin.json"),
     Path("plugins/codestory/.codex-plugin/plugin.json"),
+    Path("plugins/codestory/.cursor-plugin/plugin.json"),
     Path("plugins/codestory/.claude-plugin/plugin.json"),
     Path("plugins/codestory/.github/plugin/plugin.json"),
 )
