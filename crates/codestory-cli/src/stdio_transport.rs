@@ -1919,6 +1919,7 @@ fn compact_stdio_status(runtime: &RuntimeContext, status: &serde_json::Value) ->
 /// out-of-repo consumer can read — including the packet vocabulary EV-5 added,
 /// where `proof_status: "reported"` names a carrier lead rather than proof —
 /// must arrive with the schema version that defines that vocabulary.
+#[cfg(test)]
 fn stdio_jsonrpc_tool_call_from_legacy(
     id: serde_json::Value,
     response: serde_json::Value,
