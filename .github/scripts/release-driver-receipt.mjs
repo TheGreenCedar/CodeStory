@@ -10,7 +10,7 @@ const CONSTANT_SET_PATH =
   "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
 const PHASES = ["pre-freeze", "frozen", "published", "closeout"];
 const RUN_GROUPS = new Set([
-  "calibration-source-acceptance",
+  "source-stabilization",
   "calibration",
   "frozen-candidate-acceptance",
   "source-proof",
@@ -22,7 +22,8 @@ const RUN_GROUPS = new Set([
 const PRE_FREEZE_GROUPS = [
   "calibration-source",
   "pull-requests",
-  "calibration-source-acceptance",
+  "source-stabilization",
+  "source-proof",
   "evidence",
   "next-action",
 ];
@@ -31,7 +32,6 @@ const FROZEN_GROUPS = [
   "calibration",
   "frozen-candidate",
   "frozen-candidate-acceptance",
-  "source-proof",
   "package",
   "hardware",
   "installed-candidate",
@@ -59,12 +59,12 @@ const ALL_GROUPS = new Set([...CLOSEOUT_GROUPS, ...OPTIONAL_GROUPS]);
 const POST_CALIBRATION_CASCADE = [
   "calibration-source",
   "pull-requests",
-  "calibration-source-acceptance",
+  "source-stabilization",
   "evidence",
+  "source-proof",
   "calibration",
   "frozen-candidate",
   "frozen-candidate-acceptance",
-  "source-proof",
   "package",
   "hardware",
   "installed-candidate",
@@ -79,7 +79,6 @@ const POST_CALIBRATION_CASCADE = [
 const POST_FREEZE_CASCADE = [
   "frozen-candidate",
   "frozen-candidate-acceptance",
-  "source-proof",
   "package",
   "hardware",
   "installed-candidate",
@@ -522,7 +521,13 @@ export function validatePhase(receiptValue, phase) {
   const calibrationSource = receipt.groups["calibration-source"].value;
   requireRunIdentity(
     receipt,
-    "calibration-source-acceptance",
+    "source-stabilization",
+    calibrationSource.commit,
+    calibrationSource.tree,
+  );
+  requireRunIdentity(
+    receipt,
+    "source-proof",
     calibrationSource.commit,
     calibrationSource.tree,
   );
@@ -536,7 +541,6 @@ export function validatePhase(receiptValue, phase) {
     const frozenCandidate = receipt.groups["frozen-candidate"].value;
     for (const group of [
       "frozen-candidate-acceptance",
-      "source-proof",
       "package",
       "hardware",
       "installed-candidate",

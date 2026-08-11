@@ -349,7 +349,7 @@ function reusedRunMetadata(groupId, { runId = 777, headSha = "b".repeat(40), con
       });
     }
   }
-  return { runId: String(runId), headSha, bindingValue: "t".repeat(64), artifacts, jobsByAttempt: jobs };
+  return { runId: String(runId), headSha, bindingValue: "t".repeat(40), artifacts, jobsByAttempt: jobs };
 }
 
 test("a reuse-bound group accepts binding-verified evidence from a prior run", () => {
@@ -372,7 +372,7 @@ test("a reuse-bound group accepts binding-verified evidence from a prior run", (
   });
   const row = map.producers.find(({ cell_id: cellId }) => cellId === "source_behavior");
   assert.equal(row.producer_run_id, "777");
-  assert.equal(row.reused_from.binding, "source_tree");
+  assert.equal(row.reused_from.binding, "calibration_source_lineage");
   assert.equal(row.reused_from.head_sha, "b".repeat(40));
   assert.equal(row.artifact.workflow_run_id, "777");
   // Non-reused cells stay bound to the current run.
@@ -401,7 +401,7 @@ test("the cumulative 22-cell post-publish map retains the preflight source reuse
   assert.equal(new Set(map.producers.map(({ cell_id: cellId }) => cellId)).size, 22);
   const source = map.producers.find(({ cell_id: cellId }) => cellId === "source_behavior");
   assert.equal(source.producer_run_id, "777");
-  assert.equal(source.reused_from.binding, "source_tree");
+  assert.equal(source.reused_from.binding, "calibration_source_lineage");
   assert.equal(source.artifact.workflow_run_id, "777");
   assert.ok(map.artifacts.some(({ id }) => id === source.artifact.id));
   assert.ok(map.producers

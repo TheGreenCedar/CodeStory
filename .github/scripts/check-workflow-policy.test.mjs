@@ -3355,7 +3355,14 @@ test("source proof keeps retrieval generalization parallel on the resolved head"
     }, /hostile matrix must run its exact blocking Node command/u],
     ["full source reuse guard widened", workflow => {
       workflow.jobs["full-source-gate"].if = "always()";
-    }, /full source gate may skip only a completed exact-head proof/u],
+    }, /full source gate must run exactly once during source stabilization/u],
+    ["workspace test regains fail-fast", workflow => {
+      const step = draftStep(
+        workflow.jobs["full-source-gate"],
+        "Test the complete workspace once",
+      );
+      step.run = step.run.replace(" --no-fail-fast", "");
+    }, /complete workspace without fail-fast/u],
   ];
 
   for (const [name, mutate, expectedReason] of mutations) {
@@ -3393,13 +3400,13 @@ test("source proof reuse accepts only whole successful workflow runs", async (t)
     ["packaged prior proof lookup", workflows => {
       const step = draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       );
       step.run = step.run.replace(
         '.event == "workflow_dispatch" and .conclusion == "success"',
         '.event == "workflow_dispatch"',
       );
-    }, /packaged-platform-pr\.yml step Require successful exact-head source proof.*conclusion/u],
+    }, /packaged-platform-pr\.yml step Require successful source-stabilization proof.*conclusion/u],
   ];
 
   for (const [name, mutate, expectedReason] of mutations) {
@@ -3746,7 +3753,7 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
     ["acceptance publisher stops waiting for Windows", workflows => {
       workflows.get("source-proof.yml").jobs["freeze-acceptance"].needs
         = ["resolve", "freeze-hostile-mutations"];
-    }, /publisher must depend on both exact successful mutation jobs/u],
+    }, /publisher must require broad source success for source stabilization/u],
     ["acceptance publisher stops downloading the Actions receipt", workflows => {
       const job = workflows.get("source-proof.yml").jobs["freeze-acceptance"];
       job.steps = job.steps.filter(({ name }) =>
@@ -3776,16 +3783,16 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       );
       step.run = step.run.replace("verify-status", "verify-pending");
     }, /caller-authored pending status/u],
-    ["broad source proof accepts a calibration-source receipt", workflows => {
+    ["broad source proof accepts a frozen-candidate receipt", workflows => {
       const step = draftStep(
         workflows.get("source-proof.yml").jobs.resolve,
         "Require executable release freeze",
       );
       step.run = step.run.replace(
+        "--phase source_stabilization",
         "--phase frozen_candidate",
-        "--phase calibration_source",
       );
-    }, /Require executable release freeze.*frozen_candidate/u],
+    }, /Require executable release freeze.*source_stabilization/u],
     ["acceptance publisher loses Actions provenance", workflows => {
       const step = draftStep(
         workflows.get("source-proof.yml").jobs["freeze-acceptance"],
@@ -3812,38 +3819,35 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         "Require executable release freeze",
       ).if = "steps.resolve.outputs.mode != 'qualification'";
     }, /every packaged proof mode must authenticate the exact candidate head/u],
-    ["calibration regains a pre-freeze source proof", workflows => {
+    ["calibration repeats the stabilized source proof", workflows => {
       draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if = "steps.resolve.outputs.mode != 'integration'";
-    }, /calibration must precede the sole frozen-candidate source proof/u],
-    ["qualification loses the frozen-head source proof", workflows => {
+    }, /frozen candidates must reuse the pre-calibration source-stabilization proof/u],
+    ["qualification loses the stabilized source proof", workflows => {
       draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if
         = "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration' && steps.resolve.outputs.mode != 'qualification'";
-    }, /calibration must precede the sole frozen-candidate source proof/u],
-    ["release searches the calibration source instead of the frozen tree", workflows => {
+    }, /frozen candidates must reuse the pre-calibration source-stabilization proof/u],
+    ["release searches the frozen head instead of the selected source", workflows => {
       const step = draftStep(
         workflows.get("release.yml").jobs.preflight,
         "Resolve reusable prior evidence",
       );
-      step.run = step.run.replace(
-        'release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"',
-        'release_tree="$(git rev-parse "$SOURCE_SHA^{tree}")"',
-      );
-    }, /Resolve reusable prior evidence.*release_tree/u],
-    ["release restores post-calibration fallback", workflows => {
+      step.env.SOURCE_SHA = "${{ github.sha }}";
+    }, /SOURCE_SHA/u],
+    ["release restores a second source-proof fallback", workflows => {
       workflows.get("release.yml").jobs["source-proof"].if = "always()";
-    }, /post-calibration source-proof fallback unreachable/u],
+    }, /second source-proof fallback unreachable/u],
     ["source reuse accepts an expired cell", workflows => {
       const step = draftStep(
         workflows.get("source-proof.yml").jobs.resolve,
         "Reuse a completed gate for this exact head",
       );
-      step.run = step.run.replace(".expired == false", "true");
+      step.run = step.run.replaceAll(".expired == false", "true");
     }, /Reuse a completed gate.*expired/u],
     ["release accepts an expired source cell", workflows => {
       const step = draftStep(
@@ -4126,27 +4130,27 @@ test("release freeze policy authenticates the complete acceptance job manifest",
   }
 });
 
-test("calibration precedes the sole frozen-candidate source proof", async (t) => {
+test("frozen candidates reuse the pre-calibration source-stabilization proof", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
   const coordinatorFile = "packaged-platform-pr.yml";
   const mutations = [
-    ["calibration regains a pre-freeze source proof", workflow => {
+    ["calibration repeats the stabilized source proof", workflow => {
       draftStep(
         workflow.jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if = "steps.resolve.outputs.mode != 'integration'";
     }],
-    ["qualification loses the frozen-head source proof", workflow => {
+    ["qualification loses the stabilized source proof", workflow => {
       draftStep(
         workflow.jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if
         = "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration' && steps.resolve.outputs.mode != 'qualification'";
     }],
-    ["every mode loses the exact-head source proof", workflow => {
+    ["every mode loses the source-stabilization proof", workflow => {
       draftStep(
         workflow.jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if = "false";
     }],
   ];
@@ -4157,7 +4161,7 @@ test("calibration precedes the sole frozen-candidate source proof", async (t) =>
       mutate(workflows.get(coordinatorFile));
       assert.match(
         validateWorkflows(workflows).join("\n"),
-        /calibration must precede the sole frozen-candidate source proof/u,
+        /frozen candidates must reuse the pre-calibration source-stabilization proof/u,
       );
     });
   }

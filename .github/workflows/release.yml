@@ -212,46 +212,49 @@ jobs:
         id: reuse
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.lineage.outputs.selection_commit }}
         shell: bash
         run: |
           set -euo pipefail
           entries=()
 
-          # The one source proof belongs to the frozen candidate. A tree-preserving promotion
-          # may reuse it, but a calibration-source proof cannot stand in for the generated
-          # constant-set child.
-          release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"
+          # The authoritative source proof belongs to the stabilized calibration source.
+          # Calibration lineage has already proved that the release differs only by the
+          # generated constant set (plus an optional tree-preserving promotion commit).
           while IFS= read -r run_id; do
             head_sha="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq .head_sha)"
-            git cat-file -e "$head_sha^{commit}" 2>/dev/null || continue
-            test "$(git rev-parse "$head_sha^{tree}")" = "$release_tree" || continue
-            git merge-base --is-ancestor "$head_sha" "$GITHUB_SHA" || continue
-            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
-              --jq '.jobs[] | select(.name == "full-source-gate" and .conclusion == "success") | .id' \
-              | grep -q . || continue
+            test "$head_sha" = "$SOURCE_SHA" || continue
+            jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100")"
+            jq -e '
+              any(.jobs[]; .name == "full-source-gate" and .conclusion == "success")
+              and any(.jobs[]; .name == "freeze-acceptance" and .conclusion == "success")
+            ' <<<"$jobs" >/dev/null || continue
             run_attempt="$(
               gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.run_attempt'
             )"
             artifact_name="release-cell-prepublish-source-attempt-$run_attempt"
-            artifact_count="$(
-              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
-                | jq --arg name "$artifact_name" \
-                  '[.artifacts[] | select(.name == $name and .expired == false)] | length'
+            artifacts="$(
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100"
             )"
-            test "$artifact_count" = 1 || continue
+            jq -e \
+              --arg receipt "release-freeze-receipt-attempt-$run_attempt" \
+              --arg source "$artifact_name" \
+              '([.artifacts[] | select(.name == $receipt and .expired == false)] | length) == 1
+               and ([.artifacts[] | select(.name == $source and .expired == false)] | length) == 1' \
+              <<<"$artifacts" >/dev/null || continue
             entries+=("source_behavior=$run_id:$head_sha")
-            echo "Reusing frozen-candidate source proof and $artifact_name from run $run_id (tree $release_tree)."
+            echo "Reusing source-stabilization proof and $artifact_name from run $run_id ($SOURCE_SHA)."
             break
           done < <(
             gh api --paginate \
-              "repos/$GITHUB_REPOSITORY/actions/runs?status=completed&per_page=100" \
+              "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SOURCE_SHA&status=completed&per_page=100" \
               | jq -r --arg repo "$GITHUB_REPOSITORY" \
                 '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .event == "workflow_dispatch" and .conclusion == "success") | .id'
           )
 
           reuse="$(IFS=,; echo "${entries[*]:-}")"
           test -n "$reuse" || {
-            echo "::error::The frozen candidate has no reusable full-source-gate. The release workflow will not start a broad proof."
+            echo "::error::The calibrated source has no reusable source-stabilization proof."
             exit 1
           }
 
@@ -313,7 +316,7 @@ jobs:
 
   source-proof:
     needs: preflight
-    # Preflight fails unless the one frozen-candidate source proof is reusable. Keep this
+    # Preflight fails unless the one source-stabilization proof is reusable. Keep this
     # structural DAG placeholder fail-closed without calling the broad source workflow again.
     if: needs.preflight.outputs.source_proof_reused != 'true'
     runs-on: ubuntu-latest
@@ -327,7 +330,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$SOURCE_SHA" = "$GITHUB_SHA"
-          echo "::error::Preflight did not resolve reusable exact-head source proof; refusing to start a second broad proof."
+          echo "::error::Preflight did not resolve reusable source-stabilization proof; refusing to start a second broad proof."
           exit 1
 
   packaged-proof:

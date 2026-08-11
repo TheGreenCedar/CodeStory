@@ -35,8 +35,8 @@ cargo test --locked -p codestory-indexer --test tictactoe_language_coverage
 That lane has its own exact-key Cargo cache, derives the key from the Rust host
 and manifests plus `Cargo.lock`, and saves only after all three commands pass.
 It does not emit artifacts or turn unrelated crate changes into durability
-work. Run broad source proof once on the frozen candidate rather than using
-this focused durability lane as a second source-proof coordinator.
+work. Run source stabilization once on the final pre-calibration source head
+rather than using this focused durability lane as a second proof coordinator.
 
 The same universal `linux-contracts` job also runs the merged proof suites as
 a blocking per-PR lane, so evidence classification, packet sufficiency,
@@ -98,15 +98,20 @@ their error-only file outcomes must use the fallback replacement path without
 discarding the previous projection. Journal/checkpoint policy and
 multiple-writer changes remain separate lanes.
 
-## Exact-head source gate
+## Source stabilization gate
 
-After independent review finds no blocker, run once on the unchanged head:
+After every implementation, plugin, documentation, and workflow change is
+integrated and independent review finds no blocker, run once on the unchanged
+pre-calibration source head. The coordinator runs the generalization lane,
+Windows source contracts, and the Linux compile/lint/test lane concurrently.
+The Linux lane uses:
 
 ```sh
 cargo fmt --all -- --check
 cargo check --workspace --locked
-cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo nextest run --workspace --locked --no-fail-fast
+cargo test --workspace --doc --locked
 ```
 
 Run the two indexer acceptance binaries in full when parser, extraction,
@@ -116,6 +121,11 @@ resolution, language coverage, or retrieval document production changed:
 cargo test --locked -p codestory-indexer --test fidelity_regression
 cargo test --locked -p codestory-indexer --test tictactoe_language_coverage
 ```
+
+The resulting `source_stabilization` receipt is required before calibration.
+The generated constant-set-only child reuses this source-behavior evidence
+through calibration lineage and must not repeat the full workspace suite. Any
+other source change invalidates the receipt.
 
 The repo-scale stats lane runs once on the final merge-ready head only when
 default indexing, symbol/dense persistence, embedding reuse, or cold-start

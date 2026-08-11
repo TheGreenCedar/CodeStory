@@ -2526,10 +2526,12 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     // to resolve) are rule instances and live in release-claims.json under
     // workflow_policy.structural_pins; structuralPinViolations evaluates them.
     const full = object(object(source.jobs)["full-source-gate"]);
+    const sourceStabilizationCondition = "${{ (!inputs.acceptance_only || inputs.acceptance_phase == 'source_stabilization') && needs.resolve.outputs.reuse != 'true' }}";
+    const workflowExpression = value => String(value ?? "").replace(/\s+/gu, " ").trim();
     add(
       violations,
-      full.if === "${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}",
-      `${sourceFile} full source gate may skip only a completed exact-head proof`,
+      workflowExpression(full.if) === sourceStabilizationCondition,
+      `${sourceFile} full source gate must run exactly once during source stabilization`,
     );
     // The retrieval generalization job's structural pin (job existence) is a
     // rule instance and lives in release-claims.json under
@@ -2551,8 +2553,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       violations,
       generalization.name === "retrieval-generalization"
         && sameMembers(needs(generalization), ["resolve"])
-        && generalization.if
-          === "${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}"
+        && workflowExpression(generalization.if) === sourceStabilizationCondition
         && generalization["runs-on"] === "ubuntu-latest"
         && generalization["timeout-minutes"] === 5
         && generalization["continue-on-error"] === undefined,
@@ -2616,8 +2617,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       ])
         && windowsNative.name === "windows-native-contracts"
         && sameMembers(needs(windowsNative), ["resolve"])
-        && windowsNative.if
-          === "${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}"
+        && workflowExpression(windowsNative.if) === sourceStabilizationCondition
         && windowsNative["runs-on"] === "windows-latest"
         && windowsNative["timeout-minutes"] === 15
         && object(windowsNative.env).CMAKE_GENERATOR === "Ninja"
@@ -5557,6 +5557,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     calibrationPolicy.coordinator_workflow === file
       && calibrationPolicy.mode === "calibration"
       && calibrationPolicy.assembly_job === "calibration-assemble"
+      && calibrationPolicy.pre_collection_source_proof_required === true
+      && calibrationPolicy.source_proof_stage === "source_stabilization_before_calibration"
       && calibrationPolicy.runs_per_required_cell === 3
       && calibrationPolicy.samples_per_metric_per_run === 1
       && list(calibrationPolicy.required_cells).length === 1
@@ -5744,12 +5746,12 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   requireStepEnv(violations, file, route, "Require executable release freeze", {
     RESOLVED_MODE: "${{ steps.resolve.outputs.mode }}",
   });
-  const exactHeadSourceProof = namedStep(route, "Require successful exact-head source proof");
+  const exactHeadSourceProof = namedStep(route, "Require successful source-stabilization proof");
   add(
     violations,
     exactHeadSourceProof?.if
       === "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'",
-    `${file} calibration must precede the sole frozen-candidate source proof`,
+    `${file} frozen candidates must reuse the pre-calibration source-stabilization proof`,
   );
   // The mode the scope selector branches on now arrives as a variable, so the branch text alone no
   // longer says which mode it read. This binds the variable back to the resolver's own output.
@@ -8425,7 +8427,7 @@ export function releaseFreezeBarrierWorkflowViolations(
   const freeze = object(graph.workflow_policy.release_freeze_barrier);
   const acceptance = object(freeze.acceptance);
   const acceptancePhases = object(acceptance.phases);
-  const calibrationSourcePhase = object(acceptancePhases.calibration_source);
+  const sourceStabilizationPhase = object(acceptancePhases.source_stabilization);
   const frozenCandidatePhase = object(acceptancePhases.frozen_candidate);
   let acceptanceManifest = {};
   try {
@@ -8481,24 +8483,22 @@ export function releaseFreezeBarrierWorkflowViolations(
         === ".github/scripts/release-freeze-acceptance-jobs.json"
       && /^[0-9a-f]{64}$/u.test(String(acceptance.job_manifest_sha256 ?? ""))
       && acceptance.job_manifest_sha256 === acceptanceManifestDigest
-      && sameMembers(list(calibrationSourcePhase.known_future_source_changes), [
+      && sameMembers(list(sourceStabilizationPhase.known_future_source_changes), [
         "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
       ])
-      && JSON.stringify(list(calibrationSourcePhase.planned_actions)) === JSON.stringify([
-        "calibration-source-acceptance",
+      && JSON.stringify(list(sourceStabilizationPhase.planned_actions)) === JSON.stringify([
+        "source-stabilization",
         "calibration",
         "generated-constant-freeze",
         "frozen-candidate-acceptance",
-        "source-proof",
         "qualification",
         "release",
       ])
-      && calibrationSourcePhase.next_permitted_mutation
+      && sourceStabilizationPhase.next_permitted_mutation
         === "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
       && list(frozenCandidatePhase.known_future_source_changes).length === 0
       && JSON.stringify(list(frozenCandidatePhase.planned_actions)) === JSON.stringify([
         "frozen-candidate-acceptance",
-        "source-proof",
         "qualification",
         "release",
       ])
@@ -8705,7 +8705,7 @@ export function releaseFreezeBarrierWorkflowViolations(
           && acceptancePhaseInput.type === "choice"
           && acceptancePhaseInput.default === "frozen_candidate"
           && JSON.stringify(list(acceptancePhaseInput.options))
-            === JSON.stringify(["calibration_source", "frozen_candidate"])
+            === JSON.stringify(["source_stabilization", "frozen_candidate"])
           && at(workflow, "on", "workflow_dispatch", "inputs", "emit_release_cells")
             === undefined
           && at(workflow, "on", "workflow_call", "inputs", "emit_release_cells")
@@ -8745,6 +8745,31 @@ export function releaseFreezeBarrierWorkflowViolations(
     violations,
     sameMembers(Object.keys(object(sourceWorkflow.jobs)), sourceJobNames),
     "[freeze_barrier] source-proof.yml must use the closed source and acceptance job contract",
+  );
+  for (const jobName of [
+    "full-source-gate",
+    "retrieval-generalization",
+    "windows-native-contracts",
+  ]) {
+    const condition = String(at(sourceWorkflow, "jobs", jobName, "if") ?? "");
+    add(
+      violations,
+      condition.includes("!inputs.acceptance_only")
+        && condition.includes("inputs.acceptance_phase == 'source_stabilization'")
+        && condition.includes("needs.resolve.outputs.reuse != 'true'"),
+      `[freeze_barrier] source-proof.yml ${jobName} must run during source stabilization and skip frozen acceptance`,
+    );
+  }
+  const fullSourceTest = namedStep(
+    object(at(sourceWorkflow, "jobs", "full-source-gate")),
+    "Test the complete workspace once",
+  );
+  add(
+    violations,
+    executableRunText(String(fullSourceTest?.run ?? "")).includes(
+      "cargo nextest run --workspace --locked --no-fail-fast",
+    ),
+    "[freeze_barrier] source stabilization must run the complete workspace without fail-fast",
   );
   const actualWorkflowContextDigest = createHash("sha256")
     .update(canonicalJson(workflowExecutionContext(sourceWorkflow)))
@@ -8905,6 +8930,9 @@ export function releaseFreezeBarrierWorkflowViolations(
       "resolve",
       acceptance.hostile_job,
       acceptance.windows_job,
+      "full-source-gate",
+      "retrieval-generalization",
+      "windows-native-contracts",
     ])
       && publisherJob["runs-on"] === "ubuntu-latest"
       && publisherJob["timeout-minutes"] === 5
@@ -8913,8 +8941,12 @@ export function releaseFreezeBarrierWorkflowViolations(
           "inputs.acceptance_only",
           `needs.${acceptance.hostile_job}.result == 'success'`,
           `needs.${acceptance.windows_job}.result == 'success'`,
+          "inputs.acceptance_phase != 'source_stabilization'",
+          "needs.full-source-gate.result == 'success'",
+          "needs.retrieval-generalization.result == 'success'",
+          "needs.windows-native-contracts.result == 'success'",
         ].every(fragment => String(publisherJob.if ?? "").includes(fragment)),
-    "[freeze_barrier] acceptance publisher must depend on both exact successful mutation jobs",
+    "[freeze_barrier] acceptance publisher must require broad source success for source stabilization",
   );
   const receiptDownload = namedStep(
     publisherJob,
@@ -8980,12 +9012,12 @@ export function releaseFreezeBarrierWorkflowViolations(
       RESOLVED_MODE: "${{ steps.resolve.outputs.mode }}",
     },
   );
-  const packagedSourceProof = namedStep(route, "Require successful exact-head source proof");
+  const packagedSourceProof = namedStep(route, "Require successful source-stabilization proof");
   add(
     violations,
     packagedSourceProof?.if
       === "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'",
-    "[freeze_barrier] calibration must precede the sole frozen-candidate source proof",
+    "[freeze_barrier] frozen candidates must reuse the pre-calibration source-stabilization proof",
   );
   // The coordinator source-proof job's structural pin (job existence) is a
   // rule instance and lives in release-claims.json under
@@ -9025,6 +9057,15 @@ export function releaseFreezeBarrierWorkflowViolations(
   // pins; stepFragmentViolations evaluates them all.
   const preflight = requireJob(violations, "release.yml", release, "preflight");
   const sourceJob = requireJob(violations, "release.yml", release, "source-proof");
+  requireStepEnv(
+    violations,
+    "release.yml",
+    preflight,
+    "Resolve reusable prior evidence",
+    {
+      SOURCE_SHA: "${{ steps.lineage.outputs.selection_commit }}",
+    },
+  );
   add(
     violations,
     sourceJob.if === "needs.preflight.outputs.source_proof_reused != 'true'"
@@ -9033,7 +9074,7 @@ export function releaseFreezeBarrierWorkflowViolations(
       && sourceJob.uses === undefined
       && sourceJob.with === undefined
       && namedStep(sourceJob, "Refuse a second source proof") !== undefined,
-    "[freeze_barrier] release must make the post-calibration source-proof fallback unreachable",
+    "[freeze_barrier] release must make a second source-proof fallback unreachable",
   );
 
   const lineageSource = fs.readFileSync(

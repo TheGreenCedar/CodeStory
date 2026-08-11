@@ -24,14 +24,13 @@ const ACTIVE_RUN_STATES = new Set([
 const CONSTANT_SET_PATH =
   "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
 const PHASE_CONTRACTS = Object.freeze({
-  calibration_source: Object.freeze({
+  source_stabilization: Object.freeze({
     knownFutureSourceChanges: Object.freeze([CONSTANT_SET_PATH]),
     plannedProofActions: Object.freeze([
-      "calibration-source-acceptance",
+      "source-stabilization",
       "calibration",
       "generated-constant-freeze",
       "frozen-candidate-acceptance",
-      "source-proof",
       "qualification",
       "release",
     ]),
@@ -41,7 +40,6 @@ const PHASE_CONTRACTS = Object.freeze({
     knownFutureSourceChanges: Object.freeze([]),
     plannedProofActions: Object.freeze([
       "frozen-candidate-acceptance",
-      "source-proof",
       "qualification",
       "release",
     ]),
@@ -68,7 +66,7 @@ function fail(message) {
 function phaseContract(phase) {
   const contract = PHASE_CONTRACTS[phase];
   if (!contract) {
-    fail("freeze phase must be calibration_source or frozen_candidate");
+    fail("freeze phase must be source_stabilization or frozen_candidate");
   }
   return contract;
 }

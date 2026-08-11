@@ -36,7 +36,7 @@ on:
         required: true
         type: string
       acceptance_only:
-        description: Execute only the hostile mutation and protected Windows native-probe freeze barrier.
+        description: Execute the exact phase barrier. Source stabilization also runs the authoritative source jobs.
         required: false
         default: false
         type: boolean
@@ -46,7 +46,7 @@ on:
         default: frozen_candidate
         type: choice
         options:
-          - calibration_source
+          - source_stabilization
           - frozen_candidate
       support_prs_json:
         description: JSON array of support PR numbers already merged into the release head.
@@ -283,7 +283,7 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --commit "$HEAD_SHA" \
             --tree "$tree" \
-            --phase frozen_candidate \
+            --phase source_stabilization \
             --receipt-digest "$FREEZE_RECEIPT_DIGEST"
 
   freeze-hostile-mutations:
@@ -415,11 +415,22 @@ jobs:
       inputs.acceptance_only &&
       needs.resolve.result == 'success' &&
       needs.freeze-hostile-mutations.result == 'success' &&
-      needs.freeze-windows-native-probe.result == 'success'
+      needs.freeze-windows-native-probe.result == 'success' &&
+      (
+        inputs.acceptance_phase != 'source_stabilization' ||
+        (
+          needs.full-source-gate.result == 'success' &&
+          needs.retrieval-generalization.result == 'success' &&
+          needs.windows-native-contracts.result == 'success'
+        )
+      )
     needs:
       - resolve
       - freeze-hostile-mutations
       - freeze-windows-native-probe
+      - full-source-gate
+      - retrieval-generalization
+      - windows-native-contracts
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -468,11 +479,13 @@ jobs:
   full-source-gate:
     name: full-source-gate
     needs: resolve
-    # A completed gate for this exact head already proves this tree. Re-running it costs an hour
-    # and cannot reach a different answer, which is what made re-labelling a PR expensive. Release
-    # runs (workflow_call, which always supplies `ref`) never take this path: their chain requires
-    # the job to execute.
-    if: ${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}
+    # Source stabilization owns the one authoritative broad source gate. Frozen-candidate
+    # acceptance intentionally skips it because that head may differ only by generated constants.
+    if: >-
+      ${{
+        (!inputs.acceptance_only || inputs.acceptance_phase == 'source_stabilization') &&
+        needs.resolve.outputs.reuse != 'true'
+      }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -714,7 +727,7 @@ jobs:
       # seconds, and it means a future doctest can never silently stop being run.
       - name: Test the complete workspace once
         run: |
-          cargo nextest run --workspace --locked
+          cargo nextest run --workspace --locked --no-fail-fast
           cargo test --workspace --doc --locked
 
       - name: Emit authenticated source release cell
@@ -748,7 +761,11 @@ jobs:
   retrieval-generalization:
     name: retrieval-generalization
     needs: resolve
-    if: ${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}
+    if: >-
+      ${{
+        (!inputs.acceptance_only || inputs.acceptance_phase == 'source_stabilization') &&
+        needs.resolve.outputs.reuse != 'true'
+      }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -770,7 +787,11 @@ jobs:
   windows-native-contracts:
     name: windows-native-contracts
     needs: resolve
-    if: ${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}
+    if: >-
+      ${{
+        (!inputs.acceptance_only || inputs.acceptance_phase == 'source_stabilization') &&
+        needs.resolve.outputs.reuse != 'true'
+      }}
     runs-on: windows-latest
     timeout-minutes: 15
     env:

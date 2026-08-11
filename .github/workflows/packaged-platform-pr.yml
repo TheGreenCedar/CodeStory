@@ -216,6 +216,7 @@ jobs:
                 '[.artifacts[] | select(.name == $name and .expired == false)] | length'
           )"
           test "$artifact_count" = 1
+          echo "source_sha=$producer_sha" >> "$GITHUB_OUTPUT"
 
       - name: Require executable release freeze
         shell: bash
@@ -228,7 +229,7 @@ jobs:
           set -euo pipefail
           printf '%s' "$FREEZE_RECEIPT_DIGEST" | grep -Eq '^[0-9a-f]{64}$'
           if [ "$RESOLVED_MODE" = calibration ]; then
-            freeze_phase=calibration_source
+            freeze_phase=source_stabilization
           else
             freeze_phase=frozen_candidate
           fi
@@ -242,32 +243,60 @@ jobs:
             --phase "$freeze_phase" \
             --receipt-digest "$FREEZE_RECEIPT_DIGEST"
 
-      - name: Require successful exact-head source proof
+      - name: Require successful source-stabilization proof
         if: steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'
         shell: bash
         env:
+          CALIBRATION_SOURCE_SHA: ${{ steps.calibration.outputs.source_sha }}
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
         run: |
           set -euo pipefail
+          source_sha="$CALIBRATION_SOURCE_SHA"
+          if [ -z "$source_sha" ]; then
+            source_sha="$(
+              jq -r '.freeze_record.selection_source_commit // empty' \
+                crates/codestory-llama-sys/per-user-embedding-server-constant-set.json
+            )"
+          fi
+          printf '%s' "$source_sha" | grep -Eq '^[0-9a-f]{40}$' || {
+            echo "::error::The frozen candidate does not name its source-stabilization commit."
+            exit 1
+          }
+          git merge-base --is-ancestor "$source_sha" "$HEAD_SHA" || {
+            echo "::error::Source-stabilization commit $source_sha is not an ancestor of candidate $HEAD_SHA."
+            exit 1
+          }
           accepted=false
           while IFS= read -r run_id; do
-            if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
-              --jq '.jobs[] | select(.name == "full-source-gate" and .conclusion == "success") | .id' \
-              | grep -q .
-            then
-              accepted=true
-              echo "Accepted exact-head source proof run $run_id for $HEAD_SHA."
-              break
-            fi
+            jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100")"
+            jq -e '
+              any(.jobs[]; .name == "full-source-gate" and .conclusion == "success")
+              and any(.jobs[]; .name == "freeze-acceptance" and .conclusion == "success")
+            ' <<<"$jobs" >/dev/null || continue
+            run_attempt="$(
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.run_attempt'
+            )"
+            artifacts="$(
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100"
+            )"
+            jq -e \
+              --arg receipt "release-freeze-receipt-attempt-$run_attempt" \
+              --arg source "release-cell-prepublish-source-attempt-$run_attempt" \
+              '([.artifacts[] | select(.name == $receipt and .expired == false)] | length) == 1
+               and ([.artifacts[] | select(.name == $source and .expired == false)] | length) == 1' \
+              <<<"$artifacts" >/dev/null || continue
+            accepted=true
+            echo "Accepted source-stabilization run $run_id for $source_sha."
+            break
           done < <(
             gh api --paginate \
-              "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$HEAD_SHA&status=completed&per_page=100" \
+              "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$source_sha&status=completed&per_page=100" \
               | jq -r --arg repo "$GITHUB_REPOSITORY" \
                 '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .event == "workflow_dispatch" and .conclusion == "success") | .id'
           )
           test "$accepted" = true || {
-            echo "::error::No successful full-source-gate job exists for exact head $HEAD_SHA."
+            echo "::error::No successful source-stabilization full-source-gate exists for $source_sha."
             exit 1
           }
 

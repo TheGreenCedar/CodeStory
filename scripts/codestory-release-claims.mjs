@@ -451,12 +451,18 @@ export function deriveTrustedGitIdentity({ repoRoot, expectedSha }) {
 ///   * `source_tree` proves the reused commit resolves to this release's own tree. Nothing needs
 ///     substituting: every tree-derived identity a reused row declares is still checkable directly
 ///     against this release, and equating one would replace a live check with nothing. Hence [].
+///   * `calibration_source_lineage` runs the canonical calibration-lineage verifier against the
+///     release commit and proves that the reused commit is the selected source whose only product
+///     delta is the generated constant set. That determines the source tree exercised by the
+///     authoritative pre-calibration source gate, so that tree may replace the release tree for
+///     source-behavior evidence and nothing else.
 ///   * `native_fingerprint` proves the two commits' native build inputs -- crates/**, Cargo.lock,
 ///     vendor/**, the packaging scripts, the toolchain pins, version-normalized -- hash equal. That
 ///     determines the built accelerator, so accelerator execution evidence transfers across the
 ///     source_tree difference the binding exists to tolerate. It determines nothing about the
 ///     repository, the packaged bytes, the host, or the version, so none of those may be equated.
 const REUSE_BINDING_EQUATABLE_IDENTITY = Object.freeze({
+  calibration_source_lineage: Object.freeze(["source_tree"]),
   source_tree: Object.freeze([]),
   native_fingerprint: Object.freeze(["source_tree"]),
 });
@@ -487,6 +493,41 @@ export function verifyReuseBinding({ binding, repository, releaseCommit, reusedC
       fail(`reused commit ${reusedCommit} tree ${reusedTree} does not match release tree ${releaseTree}`);
     }
     return releaseTree;
+  }
+  if (binding === "calibration_source_lineage") {
+    const script = fileURLToPath(new URL(
+      "../.github/scripts/check-calibration-release-lineage.py",
+      import.meta.url,
+    ));
+    const result = spawnSync("python3", [
+      script,
+      "--repo",
+      repository,
+      "--expected-sha",
+      releaseCommit,
+      "--allow-promotion-commit",
+    ], {
+      cwd: repository,
+      encoding: "utf8",
+    });
+    if (result.status !== 0) {
+      fail(`calibration lineage of ${releaseCommit} failed: ${result.stderr.trim()}`);
+    }
+    let lineage;
+    try {
+      lineage = JSON.parse(result.stdout);
+    } catch (error) {
+      fail(`calibration lineage of ${releaseCommit} returned invalid JSON: ${error.message}`);
+    }
+    if (lineage.status !== "passed" || lineage.selection_commit !== reusedCommit) {
+      fail(
+        `reused commit ${reusedCommit} is not the calibrated source selected by ${releaseCommit}`,
+      );
+    }
+    if (!FULL_SHA.test(String(lineage.selection_tree ?? ""))) {
+      fail(`calibration lineage of ${releaseCommit} returned an invalid source tree`);
+    }
+    return lineage.selection_tree;
   }
   if (binding === "native_fingerprint") {
     const script = fileURLToPath(new URL("./native-fingerprint.mjs", import.meta.url));
@@ -947,10 +988,10 @@ function validateCalibrationPolicy(value) {
     calibration.coordinator_workflow !== "packaged-platform-pr.yml"
     || calibration.mode !== "calibration"
     || calibration.assembly_job !== "calibration-assemble"
-    || calibration.pre_collection_source_proof_required !== false
-    || calibration.source_proof_stage !== "frozen_candidate_before_qualification"
+    || calibration.pre_collection_source_proof_required !== true
+    || calibration.source_proof_stage !== "source_stabilization_before_calibration"
   ) {
-    fail("workflow_policy.calibration must collect before the sole frozen-candidate source proof");
+    fail("workflow_policy.calibration must require source stabilization before collection");
   }
   if (calibration.runs_per_required_cell !== 3) {
     fail("workflow_policy.calibration must require exactly three clean runs per required cell");
@@ -2389,45 +2430,44 @@ export function validateReleaseClaimGraph(graph) {
   );
   if (
     JSON.stringify(Object.keys(freezePhases).sort())
-      !== JSON.stringify(["calibration_source", "frozen_candidate"])
+      !== JSON.stringify(["frozen_candidate", "source_stabilization"])
   ) {
     fail(
       "workflow_policy.release_freeze_barrier.acceptance.phases must define "
-      + "exactly calibration_source and frozen_candidate",
+      + "exactly source_stabilization and frozen_candidate",
     );
   }
   const constantSet =
     "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
-  const calibrationSource = object(
-    freezePhases.calibration_source,
-    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source",
+  const sourceStabilization = object(
+    freezePhases.source_stabilization,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.source_stabilization",
   );
-  const calibrationFuture = stringArray(
-    calibrationSource.known_future_source_changes,
-    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source.known_future_source_changes",
+  const stabilizationFuture = stringArray(
+    sourceStabilization.known_future_source_changes,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.source_stabilization.known_future_source_changes",
     { nonEmpty: true },
   );
-  const calibrationActions = stringArray(
-    calibrationSource.planned_actions,
-    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source.planned_actions",
+  const stabilizationActions = stringArray(
+    sourceStabilization.planned_actions,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.source_stabilization.planned_actions",
     { nonEmpty: true },
   );
   if (
-    JSON.stringify(calibrationFuture) !== JSON.stringify([constantSet])
-    || JSON.stringify(calibrationActions) !== JSON.stringify([
-      "calibration-source-acceptance",
+    JSON.stringify(stabilizationFuture) !== JSON.stringify([constantSet])
+    || JSON.stringify(stabilizationActions) !== JSON.stringify([
+      "source-stabilization",
       "calibration",
       "generated-constant-freeze",
       "frozen-candidate-acceptance",
-      "source-proof",
       "qualification",
       "release",
     ])
-    || calibrationSource.next_permitted_mutation !== constantSet
+    || sourceStabilization.next_permitted_mutation !== constantSet
   ) {
     fail(
-      "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source "
-      + "must permit only calibration then the generated constant-set freeze before source proof",
+      "workflow_policy.release_freeze_barrier.acceptance.phases.source_stabilization "
+      + "must finish source proof before permitting only calibration and the generated constant-set freeze",
     );
   }
   const frozenCandidate = object(
@@ -2447,7 +2487,6 @@ export function validateReleaseClaimGraph(graph) {
     frozenFuture.length !== 0
     || JSON.stringify(frozenActions) !== JSON.stringify([
       "frozen-candidate-acceptance",
-      "source-proof",
       "qualification",
       "release",
     ])

@@ -188,18 +188,17 @@ test("versioned claim graph has one deterministic digest and all declared contro
       status_creator: "github-actions[bot]",
       job_manifest: ".github/scripts/release-freeze-acceptance-jobs.json",
       job_manifest_sha256:
-        "66c5e5b27c28f9602a8f1307018fce00b4dd23922c9f3ad8baf805feb24dd65a",
+        "402574e11bdb083f9f3d7a3d0c7ee1fd38abbe5ff5fe4bf1d35f908c0f1899f3",
       phases: {
-        calibration_source: {
+        source_stabilization: {
           known_future_source_changes: [
             "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
           ],
           planned_actions: [
-            "calibration-source-acceptance",
+            "source-stabilization",
             "calibration",
             "generated-constant-freeze",
             "frozen-candidate-acceptance",
-            "source-proof",
             "qualification",
             "release",
           ],
@@ -210,7 +209,6 @@ test("versioned claim graph has one deterministic digest and all declared contro
           known_future_source_changes: [],
           planned_actions: [
             "frozen-candidate-acceptance",
-            "source-proof",
             "qualification",
             "release",
           ],
@@ -460,10 +458,10 @@ test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => 
   assert.equal(calibration.optional_cells[0].feeds_constant_selection, false);
   assert.equal(calibration.runs_per_required_cell, 3);
   assert.equal(calibration.samples_per_metric_per_run, 1);
-  assert.equal(calibration.pre_collection_source_proof_required, false);
+  assert.equal(calibration.pre_collection_source_proof_required, true);
   assert.equal(
     calibration.source_proof_stage,
-    "frozen_candidate_before_qualification",
+    "source_stabilization_before_calibration",
   );
   assert.deepEqual(calibration.forbidden_environment, [
     "CODESTORY_EMBED_ALLOW_CPU=1",
@@ -489,11 +487,11 @@ test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => 
       draft.workflow_policy.calibration.samples_per_metric_per_run = 3;
     }, /exactly one sample per metric per run/u],
     [draft => {
-      draft.workflow_policy.calibration.pre_collection_source_proof_required = true;
-    }, /sole frozen-candidate source proof/u],
+      draft.workflow_policy.calibration.pre_collection_source_proof_required = false;
+    }, /require source stabilization/u],
     [draft => {
       draft.workflow_policy.calibration.source_proof_stage = "before_calibration";
-    }, /sole frozen-candidate source proof/u],
+    }, /require source stabilization/u],
     [draft => {
       draft.workflow_policy.calibration.forbidden_environment = [
         "CODESTORY_EMBED_ALLOW_CPU=0",
@@ -1229,19 +1227,19 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
     /release_freeze_barrier\.acceptance/u,
   );
 
-  const preCalibrationSourceProof = structuredClone(graph);
-  preCalibrationSourceProof.workflow_policy.release_freeze_barrier
-    .acceptance.phases.calibration_source.planned_actions = [
-      "calibration-source-acceptance",
-      "source-proof",
+  const sourceProofAfterCalibration = structuredClone(graph);
+  sourceProofAfterCalibration.workflow_policy.release_freeze_barrier
+    .acceptance.phases.source_stabilization.planned_actions = [
+      "source-stabilization",
       "calibration",
       "generated-constant-freeze",
+      "source-proof",
       "qualification",
       "release",
     ];
   assert.throws(
-    () => validateReleaseClaimGraph(preCalibrationSourceProof),
-    /calibration_source.*calibration.*generated constant-set freeze before source proof/u,
+    () => validateReleaseClaimGraph(sourceProofAfterCalibration),
+    /source_stabilization.*finish source proof before/u,
   );
 
   const mutableFrozenCandidate = structuredClone(graph);
@@ -1914,6 +1912,41 @@ test("reuse bindings verify tree identity and fingerprint equality against real 
     reusedCommit: releaseTag,
   });
   assert.match(tree, /^[0-9a-f]{40}$/u);
+  const lineageRepository = mkdtempSync(path.join(os.tmpdir(), "codestory-calibration-lineage-"));
+  try {
+    gitIn(lineageRepository, ["init", "--quiet", "--initial-branch", "main"]);
+    gitIn(lineageRepository, ["config", "user.name", "CodeStory Test"]);
+    gitIn(lineageRepository, ["config", "user.email", "codestory-test@example.invalid"]);
+    const constantPath = path.join(
+      lineageRepository,
+      "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+    );
+    mkdirSync(path.dirname(constantPath), { recursive: true });
+    writeFileSync(constantPath, `${JSON.stringify({ status: "unfrozen", freeze_record: null })}\n`);
+    gitIn(lineageRepository, ["add", "."]);
+    gitIn(lineageRepository, ["commit", "--quiet", "-m", "source"]);
+    const sourceCommit = gitIn(lineageRepository, ["rev-parse", "HEAD"]);
+    const sourceTree = gitIn(lineageRepository, ["rev-parse", "HEAD^{tree}"]);
+    writeFileSync(constantPath, `${JSON.stringify({
+      status: "frozen",
+      freeze_record: {
+        selection_source_commit: sourceCommit,
+        selection_source_tree: sourceTree,
+      },
+    })}\n`);
+    gitIn(lineageRepository, ["add", "."]);
+    gitIn(lineageRepository, ["commit", "--quiet", "-m", "freeze constants"]);
+    const frozenCommit = gitIn(lineageRepository, ["rev-parse", "HEAD"]);
+    const calibratedSourceTree = verifyReuseBinding({
+      binding: "calibration_source_lineage",
+      repository: lineageRepository,
+      releaseCommit: frozenCommit,
+      reusedCommit: sourceCommit,
+    });
+    assert.equal(calibratedSourceTree, sourceTree);
+  } finally {
+    rmSync(lineageRepository, { recursive: true, force: true });
+  }
   // A binding name the claim graph never declared proves nothing.
   assert.throws(
     () => verifyReuseBinding({
@@ -2148,8 +2181,16 @@ test("a reuse binding may equate only identities its own construction determines
   // graph, with a reason -- never per cell group, and never by narrowing a group's
   // required_identity, which would drop the check for fresh evidence too (#1567).
   const declared = graph.evidence_policy.reuse.bindings;
-  assert.deepEqual(Object.keys(declared).sort(), ["native_fingerprint", "source_tree"]);
+  assert.deepEqual(Object.keys(declared).sort(), [
+    "calibration_source_lineage",
+    "native_fingerprint",
+    "source_tree",
+  ]);
   assert.deepEqual(declared.source_tree.equates, []);
+  assert.deepEqual(
+    declared.calibration_source_lineage.equates.map(({ identity }) => identity),
+    ["source_tree"],
+  );
   assert.deepEqual(declared.native_fingerprint.equates.map(({ identity }) => identity), ["source_tree"]);
   assert.ok(declared.native_fingerprint.equates[0].justification.length > 0);
 
@@ -2200,7 +2241,7 @@ test("a reuse binding may equate only identities its own construction determines
   delete undeclaredBinding.evidence_policy.reuse.bindings.native_fingerprint;
   assert.throws(
     () => validateReleaseClaimGraph(undeclaredBinding),
-    /reuse bindings must declare exactly native_fingerprint, source_tree/u,
+    /reuse bindings must declare exactly calibration_source_lineage, native_fingerprint, source_tree/u,
   );
 
   // And a cell group admits cross-run evidence only under a binding the policy declares.

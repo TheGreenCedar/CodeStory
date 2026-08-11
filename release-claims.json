@@ -119,6 +119,15 @@
           "admits": "Evidence from a prior run is admissible when its producing commit resolves to the identical source tree and is an ancestor of the release commit on the promotion path.",
           "equates": []
         },
+        "calibration_source_lineage": {
+          "admits": "Source-behavior evidence from the stabilized calibration source is admissible when the canonical calibration-lineage verifier proves that commit is the selected source and that the release differs only by the generated constant set plus an optional tree-preserving promotion commit.",
+          "equates": [
+            {
+              "identity": "source_tree",
+              "justification": "The canonical calibration-lineage proof binds the reused commit and tree as the exact source whose behavior was compiled, linted, tested, and checked on Windows before calibration. The generated constant-set child does not change source behavior, so the stabilized source tree is the one source_behavior evidence must continue to name."
+            }
+          ]
+        },
         "native_fingerprint": {
           "admits": "Accelerator evidence from the previous published release is admissible when the reused commit is an ancestor of the release commit and the version-normalized native fingerprint (scripts/native-fingerprint.mjs) of both commits is identical: the built inputs differ only by the embedded version string. Packaging and signing always rerun; only accelerator behavior is inherited.",
           "equates": [
@@ -615,7 +624,7 @@
           "producer_artifact": "release-cell-prepublish-source-attempt-{attempt}"
         },
         "archive_role": "none",
-        "reuse_binding": "source_tree"
+        "reuse_binding": "calibration_source_lineage"
       },
       {
         "id": "package_identity",
@@ -1239,8 +1248,8 @@
       "coordinator_workflow": "packaged-platform-pr.yml",
       "mode": "calibration",
       "assembly_job": "calibration-assemble",
-      "pre_collection_source_proof_required": false,
-      "source_proof_stage": "frozen_candidate_before_qualification",
+      "pre_collection_source_proof_required": true,
+      "source_proof_stage": "source_stabilization_before_calibration",
       "required_cells": [
         {
           "id": "protected_macos_arm64_metal",
@@ -1666,18 +1675,17 @@
         "publisher_step": "Publish executable release freeze",
         "status_creator": "github-actions[bot]",
         "job_manifest": ".github/scripts/release-freeze-acceptance-jobs.json",
-        "job_manifest_sha256": "66c5e5b27c28f9602a8f1307018fce00b4dd23922c9f3ad8baf805feb24dd65a",
+        "job_manifest_sha256": "402574e11bdb083f9f3d7a3d0c7ee1fd38abbe5ff5fe4bf1d35f908c0f1899f3",
         "phases": {
-          "calibration_source": {
+          "source_stabilization": {
             "known_future_source_changes": [
               "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
             ],
             "planned_actions": [
-              "calibration-source-acceptance",
+              "source-stabilization",
               "calibration",
               "generated-constant-freeze",
               "frozen-candidate-acceptance",
-              "source-proof",
               "qualification",
               "release"
             ],
@@ -1687,7 +1695,6 @@
             "known_future_source_changes": [],
             "planned_actions": [
               "frozen-candidate-acceptance",
-              "source-proof",
               "qualification",
               "release"
             ],
@@ -1772,7 +1779,7 @@
       "packaged_platform_pr_workflow": {
         "subject": "parsed_workflow_json",
         "file": "packaged-platform-pr.yml",
-        "sha256": "f8b1694f36a4ee1892ea00e4336a382e04d768c1afa4254c354048b7e8d0f289",
+        "sha256": "a633fd7e6def5305940844aca96a6869fca77622050dc79f0c4682f5e0a9c1c3",
         "reason": "The frozen-candidate coordinator is a small release-control program, not a loose collection of independently safe fragments. Its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
       },
       "frozen_candidate_quality_workflow": {
@@ -1803,7 +1810,7 @@
         "subject": "parsed_job_json",
         "file": "release.yml",
         "job": "source-proof",
-        "sha256": "91ee8bc1a6a055e9297e81747c37d167b123d0a2e5dc60d5c6e2bdcfbef9c351",
+        "sha256": "522027695f3fe82d01f7dc00514661d45483ef44e61e8f399955593444ec0d0d",
         "reason": "The release chain's source-proof job is a fail-closed placeholder that must refuse to run a second source proof; its complete parsed job body is pinned so the refusal cannot be disabled, made conditional, or made advisory."
       },
       "packaged_sccache_identity": {
@@ -2249,7 +2256,7 @@
         "job": "full-source-gate",
         "step": "Test the complete workspace once",
         "fragments": [
-          "cargo nextest run --workspace --locked",
+          "cargo nextest run --workspace --locked --no-fail-fast",
           "cargo test --workspace --doc --locked"
         ],
         "reason": "nextest owns unit and integration execution; the doc pass rides along so a future doctest can never silently stop being run, because nextest does not execute doctests. Both locked invocations are pinned."
@@ -3076,18 +3083,18 @@
         "job": "preflight",
         "step": "Resolve reusable prior evidence",
         "fragments": [
-          "release_tree=\"$(git rev-parse \"$GITHUB_SHA^{tree}\")\"",
-          "test \"$(git rev-parse \"$head_sha^{tree}\")\" = \"$release_tree\"",
-          "git merge-base --is-ancestor \"$head_sha\" \"$GITHUB_SHA\"",
+          "test \"$head_sha\" = \"$SOURCE_SHA\"",
           "full-source-gate",
+          "freeze-acceptance",
           ".path == \".github/workflows/source-proof.yml\"",
           ".event == \"workflow_dispatch\" and .conclusion == \"success\"",
-          "The release workflow will not start a broad proof",
+          "The calibrated source has no reusable source-stabilization proof",
           "artifact_name=\"release-cell-prepublish-source-attempt-$run_attempt\"",
+          "release-freeze-receipt-attempt-$run_attempt",
           ".expired == false",
-          "test \"$artifact_count\" = 1 || continue"
+          "source_proof_reused=true"
         ],
-        "reason": "Prior source evidence is reusable only from a successful dispatched source-proof run whose head is an ancestor with this exact tree and whose unexpired attempt-qualified evidence artifact exists exactly once; each fragment pins one conjunct of that resolution."
+        "reason": "Prior source evidence is reusable only from the calibration lineage's selected source commit and a successful source-stabilization run carrying both the immutable freeze receipt and source release cell; each fragment pins one conjunct of that resolution."
       },
       "release_preflight_resolve_no_freeze_replay": {
         "kind": "forbid",
@@ -3107,7 +3114,7 @@
         "step": "Refuse a second source proof",
         "fragments": [
           "test \"$SOURCE_SHA\" = \"$GITHUB_SHA\"",
-          "Preflight did not resolve reusable exact-head source proof",
+          "Preflight did not resolve reusable source-stabilization proof",
           "exit 1"
         ],
         "reason": "The placeholder's only step must fail closed when preflight did not resolve reusable exact-head evidence, so the release chain can never quietly start a second broad source proof."
@@ -3392,25 +3399,29 @@
           "release-freeze-barrier.mjs verify-status",
           "--commit \"$HEAD_SHA\"",
           "if [ \"$RESOLVED_MODE\" = calibration ]; then",
-          "freeze_phase=calibration_source",
+          "freeze_phase=source_stabilization",
           "freeze_phase=frozen_candidate",
           "--phase \"$freeze_phase\"",
           "--receipt-digest \"$FREEZE_RECEIPT_DIGEST\""
         ],
-        "reason": "Every broad proof mode must verify the executable freeze against the commit the API reports, selecting the calibration_source phase for calibration and frozen_candidate otherwise, with the receipt digest bound in; the fragments pin that phase selection and verification chain."
+        "reason": "Every broad proof mode must verify the executable freeze against the commit the API reports, selecting source_stabilization for calibration and frozen_candidate otherwise, with the receipt digest bound in; the fragments pin that phase selection and verification chain."
       },
       "packaged_platform_pr_route_exact_head_source_proof": {
         "kind": "require",
         "file": "packaged-platform-pr.yml",
         "job": "route",
-        "step": "Require successful exact-head source proof",
+        "step": "Require successful source-stabilization proof",
         "fragments": [
-          "actions/runs?head_sha=$HEAD_SHA",
+          "actions/runs?head_sha=$source_sha",
+          "freeze_record.selection_source_commit",
           ".path == \".github/workflows/source-proof.yml\"",
           ".event == \"workflow_dispatch\" and .conclusion == \"success\"",
-          ".name == \"full-source-gate\" and .conclusion == \"success\""
+          ".name == \"full-source-gate\" and .conclusion == \"success\"",
+          ".name == \"freeze-acceptance\" and .conclusion == \"success\"",
+          "release-freeze-receipt-attempt-$run_attempt",
+          "release-cell-prepublish-source-attempt-$run_attempt"
         ],
-        "reason": "A frozen-candidate proof may start only after a successful dispatched source proof of the exact head whose full-source-gate job succeeded; the fragments pin the head-scoped run lookup and both success conjuncts."
+        "reason": "A frozen-candidate proof may start only after the selected calibration source has a successful source-stabilization run, full-source gate, published receipt, and source cell; the fragments pin that lineage-scoped lookup and its proof artifacts."
       },
       "packaged_platform_pr_route_scope_selection": {
         "kind": "require",
@@ -3623,10 +3634,10 @@
           "release-freeze-barrier.mjs verify-status",
           "--commit \"$HEAD_SHA\"",
           "--tree \"$tree\"",
-          "--phase frozen_candidate",
+          "--phase source_stabilization",
           "--receipt-digest \"$FREEZE_RECEIPT_DIGEST\""
         ],
-        "reason": "Broad source proof must verify the frozen_candidate freeze status for the exact commit and tree with the caller's receipt digest bound in; the fragments pin that verify-status invocation beside the source family's own wider pin so neither can drop alone."
+        "reason": "Broad source proof must verify the source_stabilization freeze status for the exact commit and tree with the caller's receipt digest bound in; the fragments pin that verify-status invocation beside the source family's own wider pin so neither can drop alone."
       },
       "source_proof_freeze_hostile_mutation_suites": {
         "kind": "require",
@@ -3707,24 +3718,25 @@
           "release-freeze-barrier.mjs verify-status",
           "--commit \"$HEAD_SHA\"",
           "if [ \"$RESOLVED_MODE\" = calibration ]; then",
-          "freeze_phase=calibration_source",
+          "freeze_phase=source_stabilization",
           "freeze_phase=frozen_candidate",
           "--phase \"$freeze_phase\"",
           "--receipt-digest \"$FREEZE_RECEIPT_DIGEST\""
         ],
-        "reason": "The freeze family independently pins the router's phase-selecting verify-status call so the packaged coordinator cannot drop calibration_source or frozen_candidate authentication while the coordinator family's wider pin survives; the fragments pin the invocation, the commit and phase bindings, and the receipt digest."
+        "reason": "The freeze family independently pins the router's phase-selecting verify-status call so the packaged coordinator cannot drop source_stabilization or frozen_candidate authentication while the coordinator family's wider pin survives; the fragments pin the invocation, the commit and phase bindings, and the receipt digest."
       },
       "freeze_barrier_packaged_route_source_proof": {
         "kind": "require",
         "file": "packaged-platform-pr.yml",
         "job": "route",
-        "step": "Require successful exact-head source proof",
+        "step": "Require successful source-stabilization proof",
         "fragments": [
-          "actions/runs?head_sha=$HEAD_SHA",
+          "actions/runs?head_sha=$source_sha",
           ".event == \"workflow_dispatch\" and .conclusion == \"success\"",
-          ".name == \"full-source-gate\" and .conclusion == \"success\""
+          ".name == \"full-source-gate\" and .conclusion == \"success\"",
+          ".name == \"freeze-acceptance\" and .conclusion == \"success\""
         ],
-        "reason": "The freeze family independently pins the head-scoped source-proof lookup and its dispatched-success and full-source-gate conjuncts, so packaged proof cannot start from an unproved head even if the coordinator family's wider pin changes."
+        "reason": "The freeze family independently pins the lineage-scoped source-stabilization lookup and its dispatched, full-source, and acceptance success conjuncts, so packaged proof cannot start from an unproved source even if the coordinator family's wider pin changes."
       },
       "freeze_barrier_release_reuse_resolution": {
         "kind": "require",
@@ -3732,16 +3744,14 @@
         "job": "preflight",
         "step": "Resolve reusable prior evidence",
         "fragments": [
-          "release_tree=\"$(git rev-parse \"$GITHUB_SHA^{tree}\")\"",
-          "test \"$(git rev-parse \"$head_sha^{tree}\")\" = \"$release_tree\"",
-          "git merge-base --is-ancestor \"$head_sha\" \"$GITHUB_SHA\"",
+          "test \"$head_sha\" = \"$SOURCE_SHA\"",
           "artifact_name=\"release-cell-prepublish-source-attempt-$run_attempt\"",
+          "release-freeze-receipt-attempt-$run_attempt",
           ".expired == false",
-          "test \"$artifact_count\" = 1 || continue",
-          "The release workflow will not start a broad proof",
+          "The calibrated source has no reusable source-stabilization proof",
           "source_proof_reused=true"
         ],
-        "reason": "The freeze family independently pins the reuse resolver's exact-tree, ancestry, attempt-qualified artifact, and reuse-signal conjuncts, so release-time reuse cannot widen even if the release family's own pin changes; the fragments pin those conjuncts and the reuse output."
+        "reason": "The freeze family independently pins the reuse resolver's selected source commit, attempt-qualified receipt and source cell, and reuse signal, so release-time reuse cannot widen even if the release family's own pin changes."
       },
       "freeze_barrier_release_no_freeze_replay": {
         "kind": "forbid",
