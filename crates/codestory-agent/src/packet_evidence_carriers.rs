@@ -190,8 +190,8 @@ fn names_token_prefix(citation: &AgentCitationDto, prefixes: &[&str]) -> bool {
 }
 
 /// Match a callable whose terminal segment names an action and whose owner, or the remainder of
-/// that same compound terminal, independently names the subsystem. `Session.send` and
-/// `sendRequest` have two factors; a bare `send` or `dispatch_hook` does not.
+/// that same compound terminal, independently names the subsystem. An owner-qualified send
+/// method and `sendRequest` have two factors; a bare `send` or `dispatch_hook` does not.
 fn callable_owns_terminal_action_for_subject(
     citation: &AgentCitationDto,
     actions: &[&str],
