@@ -27,7 +27,7 @@ const SCIP_PARSED_INDEX_RECEIPT_CAPACITY: usize = 1;
 
 static SCIP_PARSED_INDEX_RECEIPTS: SealedReceiptCache<
     (PathBuf, String, String),
-    Option<Arc<ScipSymbolsIndex>>,
+    Option<Arc<ScipQueryView>>,
 > = SealedReceiptCache::new(SCIP_PARSED_INDEX_RECEIPT_CAPACITY);
 
 /// Header of the graph-projection `index.scip` marker.
@@ -451,6 +451,195 @@ pub struct ScipSymbolsIndex {
     pub symbols: Vec<ScipSymbolRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proofs: Vec<ScipProofRecord>,
+}
+
+/// Generation-bound query state derived once from one sealed SCIP artifact.
+///
+/// The JSON records remain the serialized source of truth. This view only
+/// removes repeated hot-path parsing, normalization, symbol-map construction,
+/// and whole-proof scans. It is cached under the same sealed file identity as
+/// the parsed artifact and cannot outlive that receipt.
+#[derive(Debug)]
+pub(crate) struct ScipQueryView {
+    index: Arc<ScipSymbolsIndex>,
+    normalized_symbols: Vec<ScipNormalizedSymbol>,
+    by_node_id: HashMap<String, usize>,
+    adjacency_by_node: HashMap<String, Vec<ScipTypedAdjacency>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ScipNormalizedSymbol {
+    pub(crate) symbol_lower: String,
+    pub(crate) path_lower: String,
+    pub(crate) terminal_lower: String,
+    pub(crate) file_stem_lower: Option<String>,
+    pub(crate) path_segments_lower: Vec<String>,
+    pub(crate) path_segments_compact: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScipTypedAdjacency {
+    pub(crate) proof_ordinal: usize,
+    pub(crate) neighbor_symbol_index: usize,
+    pub(crate) direction: ScipAdjacencyDirection,
+    pub(crate) edge_kind: EdgeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScipAdjacencyDirection {
+    Outgoing,
+    Incoming,
+}
+
+impl ScipQueryView {
+    fn build(index: Arc<ScipSymbolsIndex>, generation: &str) -> Result<Self> {
+        index
+            .validate_records(generation)
+            .map_err(anyhow::Error::new)?;
+
+        let normalized_symbols = index
+            .symbols
+            .iter()
+            .map(ScipNormalizedSymbol::new)
+            .collect::<Vec<_>>();
+        let mut by_node_id = HashMap::new();
+        for (symbol_index, symbol) in index.symbols.iter().enumerate() {
+            if let Some(node_id) = symbol.node_id.as_ref() {
+                by_node_id.entry(node_id.clone()).or_insert(symbol_index);
+            }
+        }
+
+        let mut adjacency_by_node = HashMap::<String, Vec<ScipTypedAdjacency>>::new();
+        if index.contract.evidence_source() == Some(ScipEvidenceSource::GraphProjection) {
+            for (proof_ordinal, proof) in index.proofs.iter().enumerate() {
+                if !proof.is_reference() {
+                    continue;
+                }
+                let (Some(node_id), Some(target_node_id), Some(edge_kind)) = (
+                    proof.node_id.as_ref(),
+                    proof.target_node_id.as_ref(),
+                    proof.edge_kind,
+                ) else {
+                    continue;
+                };
+                let Some(&source_symbol_index) = by_node_id.get(node_id) else {
+                    continue;
+                };
+                let Some(&target_symbol_index) = by_node_id.get(target_node_id) else {
+                    continue;
+                };
+                adjacency_by_node
+                    .entry(node_id.clone())
+                    .or_default()
+                    .push(ScipTypedAdjacency {
+                        proof_ordinal,
+                        neighbor_symbol_index: target_symbol_index,
+                        direction: ScipAdjacencyDirection::Outgoing,
+                        edge_kind,
+                    });
+                adjacency_by_node
+                    .entry(target_node_id.clone())
+                    .or_default()
+                    .push(ScipTypedAdjacency {
+                        proof_ordinal,
+                        neighbor_symbol_index: source_symbol_index,
+                        direction: ScipAdjacencyDirection::Incoming,
+                        edge_kind,
+                    });
+            }
+        }
+
+        Ok(Self {
+            index,
+            normalized_symbols,
+            by_node_id,
+            adjacency_by_node,
+        })
+    }
+
+    pub(crate) fn index(&self) -> &ScipSymbolsIndex {
+        &self.index
+    }
+
+    pub(crate) fn index_arc(&self) -> Arc<ScipSymbolsIndex> {
+        Arc::clone(&self.index)
+    }
+
+    pub(crate) fn symbols(
+        &self,
+    ) -> impl Iterator<Item = (&ScipSymbolRecord, &ScipNormalizedSymbol)> {
+        self.index.symbols.iter().zip(&self.normalized_symbols)
+    }
+
+    pub(crate) fn symbol_at(&self, index: usize) -> Option<&ScipSymbolRecord> {
+        self.index.symbols.get(index)
+    }
+
+    pub(crate) fn symbol_for_node(&self, node_id: &str) -> Option<&ScipSymbolRecord> {
+        self.by_node_id
+            .get(node_id)
+            .and_then(|index| self.symbol_at(*index))
+    }
+
+    pub(crate) fn adjacency(&self, node_id: &str) -> &[ScipTypedAdjacency] {
+        self.adjacency_by_node
+            .get(node_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+impl ScipNormalizedSymbol {
+    fn new(symbol: &ScipSymbolRecord) -> Self {
+        let symbol_lower = symbol.symbol.to_ascii_lowercase();
+        let path_lower = symbol.path.to_ascii_lowercase();
+        let terminal_lower = symbol_lower
+            .rsplit("::")
+            .next()
+            .unwrap_or(&symbol_lower)
+            .rsplit('.')
+            .next()
+            .unwrap_or(&symbol_lower)
+            .to_string();
+        let file_name = symbol
+            .path
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|file_name| !file_name.is_empty());
+        let file_stem_lower = file_name.map(|file_name| {
+            file_name
+                .rsplit_once('.')
+                .map_or(file_name, |(stem, _)| stem)
+                .to_ascii_lowercase()
+        });
+        let path_segments_lower = symbol
+            .path
+            .replace('\\', "/")
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        let path_segments_compact = path_segments_lower
+            .iter()
+            .map(|segment| compact_alphanumeric(segment))
+            .collect();
+        Self {
+            symbol_lower,
+            path_lower,
+            terminal_lower,
+            file_stem_lower,
+            path_segments_lower,
+            path_segments_compact,
+        }
+    }
+}
+
+fn compact_alphanumeric(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 impl ScipSymbolsIndex {
@@ -1008,8 +1197,21 @@ pub(crate) fn load_fresh_scip_symbols(
     expected_revision: &str,
     generation: &str,
 ) -> Result<Option<Arc<ScipSymbolsIndex>>> {
+    Ok(
+        load_fresh_scip_query_view(project_dir, expected_revision, generation)?
+            .map(|view| view.index_arc()),
+    )
+}
+
+pub(crate) fn load_fresh_scip_query_view(
+    project_dir: &Path,
+    expected_revision: &str,
+    generation: &str,
+) -> Result<Option<Arc<ScipQueryView>>> {
     let path = project_dir.join(SCIP_SYMBOLS_FILE);
-    if !path.is_file() {
+    let revision_path = project_dir.join("revision.txt");
+    let marker_path = project_dir.join(SCIP_INDEX_FILE);
+    if !path.is_file() || !revision_path.is_file() || !marker_path.is_file() {
         return Ok(None);
     }
     let key = (
@@ -1017,14 +1219,32 @@ pub(crate) fn load_fresh_scip_symbols(
         expected_revision.to_string(),
         generation.to_string(),
     );
-    SCIP_PARSED_INDEX_RECEIPTS.validate_sealed(key, &[path], || {
-        let Some(index) = load_scip_symbols(project_dir)? else {
-            return Ok(None);
-        };
-        Ok(index
-            .is_fresh_for(expected_revision, generation)
-            .then(|| Arc::new(index)))
-    })
+    SCIP_PARSED_INDEX_RECEIPTS.validate_sealed(
+        key,
+        &[path.clone(), revision_path.clone(), marker_path],
+        || {
+            let stored_revision = std::fs::read_to_string(&revision_path)
+                .context("read scip revision")?
+                .trim()
+                .to_string();
+            if stored_revision != expected_revision {
+                return Ok(None);
+            }
+            if parse_scip_index_marker(project_dir, expected_revision).is_err() {
+                return Ok(None);
+            }
+            let Some(index) = load_scip_symbols(project_dir)? else {
+                return Ok(None);
+            };
+            if !index.is_fresh_for(expected_revision, generation) || index.symbols.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(ScipQueryView::build(
+                Arc::new(index),
+                generation,
+            )?)))
+        },
+    )
 }
 
 #[cfg(test)]

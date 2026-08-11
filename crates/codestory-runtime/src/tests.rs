@@ -80,9 +80,10 @@ use crate::search_terms::search_plan_terms;
 use crate::semantic_projection::{
     LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION, SEMANTIC_POLICY_VERSION,
     SemanticProjectionSourcePolicyCompatibility, SemanticProjectionStats,
-    build_component_report_docs_with_policy, dense_anchor_reason_for_node_with_flow_neighbors,
-    flow_neighbor_edge_is_eligible, retain_bounded_flow_neighbor_candidate,
-    route_endpoint_is_parser_backed, semantic_component_key_for_path, semantic_doc_field_budgets,
+    build_component_report_docs_with_policy, build_llm_symbol_doc_text_with_policy,
+    dense_anchor_reason_for_node_with_flow_neighbors, flow_neighbor_edge_is_eligible,
+    retain_bounded_flow_neighbor_candidate, route_endpoint_is_parser_backed,
+    semantic_component_key_for_path, semantic_doc_field_budgets,
     semantic_graph_dependent_file_ids_by_seed, semantic_projection_source_policy_compatibility,
 };
 use crate::semantic_republish::semantic_projection_republish_for_runtime;
@@ -748,7 +749,7 @@ fn semantic_projection_v3_flow_neighbor_only_fills_a_missing_base_reason() {
             &helper,
             "helper",
             Some("src/internal/helper.rs"),
-            "semantic_doc_version: 8\nsymbol: helper\n",
+            "semantic_doc_version: 9\nsymbol: helper\n",
             Some(AccessKind::Private),
             &flow_neighbors,
         ),
@@ -760,7 +761,7 @@ fn semantic_projection_v3_flow_neighbor_only_fills_a_missing_base_reason() {
             &public,
             "PublicType",
             Some("src/lib.rs"),
-            "semantic_doc_version: 8\nsymbol: PublicType\n",
+            "semantic_doc_version: 9\nsymbol: PublicType\n",
             Some(AccessKind::Public),
             &flow_neighbors,
         ),
@@ -776,7 +777,7 @@ fn semantic_projection_v3_flow_neighbor_admission_is_typed_primary_and_determini
             semantic_policy_node(
                 300 + index,
                 NodeKind::FUNCTION,
-                &format!("helper_{index}"),
+                &format!("helper_{}", 8 - index),
                 10 + index,
             )
         })
@@ -826,13 +827,32 @@ fn semantic_projection_v3_flow_neighbor_admission_is_typed_primary_and_determini
     ));
 
     let mut bounded = Vec::new();
-    for candidate in candidates.iter().cloned() {
-        retain_bounded_flow_neighbor_candidate(&mut bounded, candidate, &file_paths);
+    for (edge_id, candidate) in candidates.iter().enumerate() {
+        let candidate_edge = Edge {
+            id: EdgeId(100 + edge_id as i64),
+            source: seed.id,
+            target: candidate.id,
+            kind: EdgeKind::CALL,
+            file_node_id: seed.file_node_id,
+            line: candidate.start_line,
+            resolved_target: Some(candidate.id),
+            certainty: Some(ResolutionCertainty::Certain),
+            callsite_identity: candidate
+                .start_line
+                .map(|line| format!("1:{line}:1:{}", candidate.id.0)),
+            ..Default::default()
+        };
+        retain_bounded_flow_neighbor_candidate(
+            &mut bounded,
+            &candidate_edge,
+            candidate,
+            &file_paths,
+        );
     }
-    retain_bounded_flow_neighbor_candidate(&mut bounded, candidates[0].clone(), &file_paths);
+    retain_bounded_flow_neighbor_candidate(&mut bounded, &edge, &candidates[0], &file_paths);
     let selected = bounded
         .iter()
-        .map(|candidate| candidate.id)
+        .map(|candidate| candidate.node_id())
         .collect::<Vec<_>>();
     assert_eq!(selected, (300..308).map(CoreNodeId).collect::<Vec<_>>());
 
@@ -1239,10 +1259,10 @@ fn semantic_projection_v3_component_reports_keep_graph_evidence_after_source_com
         128,
     );
     let doc = &reports[0].symbol_doc.doc_text;
-    assert!(doc.contains("semantic_doc_version: 8"));
+    assert!(doc.contains("semantic_doc_version: 9"));
     assert!(
         doc.contains("god_nodes:"),
-        "v8 report lost graph fragment: {doc}"
+        "v9 report lost graph fragment: {doc}"
     );
 }
 
@@ -1335,6 +1355,105 @@ fn semantic_graph_context_keeps_normalized_paths_once_per_file() {
             .doc_text
             .contains("component_report: dir:.")
     );
+}
+
+#[test]
+fn semantic_graph_text_binds_direction_certainty_and_source_order() {
+    let mut storage = Storage::new_in_memory().expect("storage");
+    let file = Node {
+        id: CoreNodeId(1),
+        kind: NodeKind::FILE,
+        serialized_name: "semantic.rs".to_string(),
+        ..Default::default()
+    };
+    let caller = semantic_policy_node(401, NodeKind::FUNCTION, "Caller", 1);
+    let worker = semantic_policy_node(402, NodeKind::FUNCTION, "Worker", 1);
+    let controller = semantic_policy_node(403, NodeKind::FUNCTION, "Controller", 1);
+    let speculative = semantic_policy_node(404, NodeKind::FUNCTION, "Speculative", 1);
+    let type_record = semantic_policy_node(405, NodeKind::STRUCT, "TypeRecord", 1);
+    let nodes = vec![
+        file,
+        caller.clone(),
+        worker.clone(),
+        controller.clone(),
+        speculative.clone(),
+        type_record.clone(),
+    ];
+    storage.insert_nodes_batch(&nodes).expect("nodes");
+    storage
+        .insert_edges_batch(&[
+            Edge {
+                id: EdgeId(1),
+                source: caller.id,
+                target: worker.id,
+                kind: EdgeKind::CALL,
+                line: Some(40),
+                resolved_target: Some(worker.id),
+                certainty: Some(ResolutionCertainty::Certain),
+                callsite_identity: Some("1:40:5:402".into()),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(2),
+                source: controller.id,
+                target: caller.id,
+                kind: EdgeKind::CALL,
+                line: Some(10),
+                resolved_target: Some(caller.id),
+                certainty: Some(ResolutionCertainty::Probable),
+                callsite_identity: Some("1:10:3:401".into()),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(3),
+                source: caller.id,
+                target: speculative.id,
+                kind: EdgeKind::CALL,
+                line: Some(1),
+                resolved_target: Some(speculative.id),
+                certainty: Some(ResolutionCertainty::Uncertain),
+                callsite_identity: Some("1:1:1:404".into()),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(4),
+                source: caller.id,
+                target: type_record.id,
+                kind: EdgeKind::TYPE_USAGE,
+                line: Some(1),
+                resolved_target: Some(type_record.id),
+                certainty: Some(ResolutionCertainty::Certain),
+                ..Default::default()
+            },
+        ])
+        .expect("edges");
+
+    let context = SemanticDocGraphContext::build(&storage, &[&caller], &nodes).expect("context");
+    assert_eq!(
+        context.typed_relations.get(&caller.id),
+        Some(&vec![
+            "called_by pkg::Controller [probable@line:10:col:3]".to_string(),
+            "calls pkg::Worker [certain@line:40:col:5]".to_string(),
+            "uses_type pkg::TypeRecord [certain@line:1]".to_string(),
+        ])
+    );
+    assert_eq!(
+        context.edge_digests.get(&caller.id),
+        Some(&vec!["CALL=2".to_string(), "TYPE_USAGE=1".to_string()])
+    );
+
+    let doc = build_llm_symbol_doc_text_with_policy(
+        &context,
+        &caller,
+        "Caller",
+        None,
+        &HashMap::new(),
+        SemanticDocAliasMode::NoAlias,
+        256,
+    );
+    assert!(doc.contains("typed_relations: called_by pkg::Controller [probable@line:10:col:3]; calls pkg::Worker [certain@line:40:col:5]; uses_type pkg::TypeRecord [certain@line:1]"));
+    assert!(!doc.contains("Speculative"));
+    assert!(!doc.contains("related_symbols:"));
 }
 
 #[test]
@@ -1624,16 +1743,19 @@ fn semantic_doc_text_adds_kind_role_owner_and_path_alias_context() {
 }
 
 #[test]
-fn semantic_doc_text_keeps_comments_before_long_file_path() {
+fn semantic_doc_text_reserves_signature_and_body_before_comments_without_fragments() {
     let _lock = process_env_test_lock();
     let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
     let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "128");
     let file_path = r"\\?\C:\Users\alber\AppData\Local\Temp\codestory-search-quality-fixture-with-a-long-path\src\architecture.ts";
-    let file_text = r#"// Project source groups create indexing commands and storage access.
-export class SourceGroupCxxCdb {
-  getIndexerCommands() { return []; }
-}
-"#;
+    let oversized_comment = "OVERSIZED_COMMENT_TOKEN".repeat(24);
+    let file_text = format!(
+        r#"// {oversized_comment}
+export class SourceGroupCxxCdb {{
+  getIndexerCommands() {{ return []; }}
+}}
+"#
+    );
     let node = Node {
         id: CoreNodeId(10),
         kind: NodeKind::CLASS,
@@ -1645,7 +1767,7 @@ export class SourceGroupCxxCdb {
         ..Default::default()
     };
     let mut file_text_cache = HashMap::new();
-    file_text_cache.insert(file_path.to_string(), Some(file_text.to_string()));
+    file_text_cache.insert(file_path.to_string(), Some(file_text));
 
     let doc = build_llm_symbol_doc_text(
         &SemanticDocGraphContext::default(),
@@ -1655,11 +1777,20 @@ export class SourceGroupCxxCdb {
         &file_text_cache,
     );
 
+    let signature = doc
+        .find("signature: export class SourceGroupCxxCdb {")
+        .expect("signature");
+    let body = doc
+        .find("body_summary: getIndexerCommands() { return []; }")
+        .expect("body");
+    let comments = doc.find("comments:").expect("comment field");
     assert!(
-        doc.contains(
-            "comments: // Project source groups create indexing commands and storage access."
-        ),
-        "symbol docs should preserve nearby comments before long file paths consume the token budget:\n{doc}"
+        signature < body && body < comments,
+        "source priority changed:\n{doc}"
+    );
+    assert!(
+        !doc.contains("OVERSIZED_COMMENT_TOKEN"),
+        "oversized source tokens must be omitted whole rather than emitted as prefixes:\n{doc}"
     );
 }
 
@@ -1684,8 +1815,8 @@ fn semantic_doc_text_token_budget_respects_configured_limit() {
         "budgeted semantic doc should preserve the leading version field:\n{doc}"
     );
     assert!(
-        doc.contains("symbol: App"),
-        "budgeted semantic doc should preserve a bounded symbol identity prefix:\n{doc}"
+        !doc.contains("symbol: App"),
+        "budgeted semantic docs must not emit partial identifier prefixes:\n{doc}"
     );
     assert!(
         doc.contains("file: crates/codestory-runtime/src/lib.rs"),
@@ -5797,6 +5928,7 @@ fn staged_semantic_graph_context_bounds_high_degree_endpoint_state() {
                 source: hub.id,
                 target: CoreNodeId(10_000 + offset),
                 kind: EdgeKind::CALL,
+                certainty: Some(ResolutionCertainty::Certain),
                 ..Default::default()
             })
             .collect::<Vec<_>>(),
@@ -5829,6 +5961,7 @@ fn staged_semantic_graph_context_bounds_high_degree_endpoint_state() {
 
     assert_eq!(streamed.child_labels, legacy.child_labels);
     assert_eq!(streamed.referenced_labels, legacy.referenced_labels);
+    assert_eq!(streamed.typed_relations, legacy.typed_relations);
     assert_eq!(streamed.edge_digests, legacy.edge_digests);
     assert_eq!(streamed.centrality, legacy.centrality);
     assert!(
@@ -5843,18 +5976,26 @@ fn staged_semantic_graph_context_bounds_high_degree_endpoint_state() {
             .get(&hub.id)
             .expect("bounded related labels")
             .len(),
-        6
+        8
+    );
+    assert_eq!(
+        streamed
+            .typed_relations
+            .get(&hub.id)
+            .expect("bounded typed relations")
+            .len(),
+        8
     );
     assert_eq!(
         streamed.edge_digests.get(&hub.id),
-        Some(&vec![format!("CALL={}", INCIDENT_EDGE_COUNT + 1)])
+        Some(&vec![format!("CALL={INCIDENT_EDGE_COUNT}")])
     );
     assert_eq!(
         streamed.centrality.get(&hub.id),
         Some(&DenseAnchorCentrality {
             child_count: 0,
             related_count: INCIDENT_EDGE_COUNT as usize,
-            edge_count: INCIDENT_EDGE_COUNT as usize + 1,
+            edge_count: INCIDENT_EDGE_COUNT as usize,
         })
     );
     assert!(dense_anchor_is_central(&streamed, hub.id));
@@ -5900,6 +6041,7 @@ fn staged_semantic_graph_context_counts_cross_seed_chunk_edge_once_per_endpoint(
             source: nodes[0].id,
             target: nodes[BUILD_EDGE_SEED_BATCH_SIZE].id,
             kind: EdgeKind::USAGE,
+            certainty: Some(ResolutionCertainty::Certain),
             ..Default::default()
         }])
         .expect("insert cross-chunk edge");
@@ -5929,6 +6071,7 @@ fn staged_semantic_graph_context_counts_cross_seed_chunk_edge_once_per_endpoint(
 
     assert_eq!(streamed.child_labels, legacy.child_labels);
     assert_eq!(streamed.referenced_labels, legacy.referenced_labels);
+    assert_eq!(streamed.typed_relations, legacy.typed_relations);
     assert_eq!(streamed.edge_digests, legacy.edge_digests);
     for endpoint in [nodes[0].id, nodes[BUILD_EDGE_SEED_BATCH_SIZE].id] {
         assert_eq!(
@@ -6015,8 +6158,11 @@ fn staged_semantic_stream_matches_legacy_bytes_order_pruning_and_component_repor
             kind: EdgeKind::CALL,
             resolved_target: (*node_id == SYMBOL_COUNT).then_some(CoreNodeId(2)),
             confidence: (*node_id == SYMBOL_COUNT).then_some(0.2),
-            certainty: (*node_id == SYMBOL_COUNT)
-                .then_some(codestory_contracts::graph::ResolutionCertainty::Uncertain),
+            certainty: Some(if *node_id == SYMBOL_COUNT {
+                codestory_contracts::graph::ResolutionCertainty::Uncertain
+            } else {
+                codestory_contracts::graph::ResolutionCertainty::Certain
+            }),
             ..Default::default()
         })
         .collect::<Vec<_>>();

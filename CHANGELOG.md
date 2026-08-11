@@ -18,7 +18,7 @@ CodeStory 0.17 focuses on more trustworthy answers and a more predictable instal
 - Packet and route answers now reserve proof for every required step before adding background context, keep exact-file questions tied to those files, stay within the public response limit, and name the precise missing obligation when the available evidence cannot support a complete answer.
 - Search keeps lexical, semantic, and graph evidence independent instead of turning one lane's total into another lane's score. It combines those ranks deterministically, keeps exact definitions prominent without suppressing unresolved flow questions, and leaves out semantically unrelated results instead of filling the page with weak matches.
 - Natural-language questions can carry symbols, paths, concepts, relations, and ordered flow stages at the same time. A slash inside a concept no longer turns the whole question into a file lookup, and graph expansion now follows typed direction and fanout rather than artifact order.
-- Large repositories check unchanged source with bounded parallel work without weakening content freshness, and source groups that share the same discovery root are walked once.
+- Large repositories check unchanged source with bounded parallel work without weakening content freshness, and source groups that share the same discovery root are walked once. Broad questions share one ready search view across their related lookups, while incremental updates reuse embeddings for documents whose meaning has not changed.
 - Files admitted by the larger source-size limit now reach lexical, repository-text, and semantic search consistently, while unsupported binary images are reported by file type instead of as oversized source.
 
 ### Fixed

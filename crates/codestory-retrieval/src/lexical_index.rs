@@ -438,6 +438,82 @@ fn search_lexical_index_with_cancel_inner(
         None,
         cancelled.as_ref(),
     )?;
+    let document_count: usize = connection.query_row(
+        "SELECT file_count FROM lexical_metadata WHERE id = 1",
+        [],
+        |row| row.get::<_, u32>(0).map(|count| count as usize),
+    )?;
+    search_lexical_index_on_connection(
+        &connection,
+        query,
+        limit,
+        document_count,
+        &mut HashMap::new(),
+        cancelled.as_ref(),
+    )
+}
+
+pub(crate) fn search_lexical_index_batch_with_cancel(
+    shard_dir: &Path,
+    expected_sidecar_input_hash: &str,
+    queries: &[(String, usize)],
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<Vec<Vec<LexicalHit>>> {
+    if queries.is_empty() {
+        return Ok(Vec::new());
+    }
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
+    let Some(project_id) = shard_dir.file_name().and_then(|name| name.to_str()) else {
+        bail!("lexical shard path has no generation directory");
+    };
+    let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
+    let connection = open_read_only(&index_path)?;
+    let progress_cancelled = Arc::clone(&cancelled);
+    connection.progress_handler(1_000, Some(move || progress_cancelled()))?;
+    let _metadata = validate_open_database_metadata(
+        &connection,
+        project_id,
+        expected_sidecar_input_hash,
+        None,
+        cancelled.as_ref(),
+    )?;
+    let document_count: usize = connection.query_row(
+        "SELECT file_count FROM lexical_metadata WHERE id = 1",
+        [],
+        |row| row.get::<_, u32>(0).map(|count| count as usize),
+    )?;
+    let mut token_frequencies = HashMap::new();
+    queries
+        .iter()
+        .map(|(query, limit)| {
+            search_lexical_index_on_connection(
+                &connection,
+                query,
+                *limit,
+                document_count,
+                &mut token_frequencies,
+                cancelled.as_ref(),
+            )
+        })
+        .collect()
+}
+
+fn search_lexical_index_on_connection(
+    connection: &Connection,
+    query: &str,
+    limit: usize,
+    document_count: usize,
+    frequency_cache: &mut HashMap<String, usize>,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<Vec<LexicalHit>> {
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let tokens = lexical_query_tokens(query);
     if tokens.is_empty() {
         return Ok(Vec::new());
@@ -450,17 +526,20 @@ fn search_lexical_index_with_cancel_inner(
     let candidate_limit = limit.saturating_mul(64).clamp(256, MAX_CANDIDATES);
 
     let mandatory_tokens = quoted_query_tokens(query);
-    let document_count: usize = connection.query_row(
-        "SELECT file_count FROM lexical_metadata WHERE id = 1",
-        [],
-        |row| row.get::<_, u32>(0).map(|count| count as usize),
-    )?;
     let mut token_frequencies = Vec::with_capacity(tokens.len());
     for token in &tokens {
         if cancelled() {
             bail!("lexical search cancelled");
         }
-        token_frequencies.push(fts_document_frequency(&connection, token)?);
+        let frequency = match frequency_cache.get(token) {
+            Some(frequency) => *frequency,
+            None => {
+                let frequency = fts_document_frequency(connection, token)?;
+                frequency_cache.insert(token.clone(), frequency);
+                frequency
+            }
+        };
+        token_frequencies.push(frequency);
     }
     let token_weights = token_frequencies
         .iter()
@@ -476,21 +555,21 @@ fn search_lexical_index_with_cancel_inner(
     let total_weight = token_weights.iter().sum::<f32>();
     let required_weight = required_lexical_match_weight(tokens.len(), total_weight);
 
-    let exact_candidates = query_exact_candidates(&connection, query, candidate_limit)?;
+    let exact_candidates = query_exact_candidates(connection, query, candidate_limit)?;
     let path_candidates = query_fts_candidates(
-        &connection,
+        connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::Path,
     )?;
     let content_candidates = query_fts_candidates(
-        &connection,
+        connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::Content,
     )?;
     let mut symbol_candidates = query_fts_candidates(
-        &connection,
+        connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::SymbolDocument,
@@ -648,7 +727,7 @@ fn query_fts_candidates(
              LIMIT ?2"
         }
     };
-    let mut statement = connection.prepare(sql)?;
+    let mut statement = connection.prepare_cached(sql)?;
     let rows = statement.query_map(params![scoped_query, candidate_limit as i64], |row| {
         let document = LexicalDocument {
             path: row.get(0)?,
@@ -688,7 +767,7 @@ fn query_exact_candidates(
     needles.dedup();
 
     let mut candidates = Vec::new();
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT d.path, d.content, lower(lexical_fts.path), lower(lexical_fts.content),
                 d.source, d.node_id, d.symbol_name, d.start_line
          FROM lexical_documents d
@@ -1693,11 +1772,10 @@ fn lexical_source_target(
 fn fts_document_frequency(connection: &Connection, token: &str) -> Result<usize> {
     let query = format!("\"{}\"*", token.replace('"', "\"\""));
     connection
-        .query_row(
-            "SELECT count(*) FROM lexical_fts WHERE lexical_fts MATCH ?1",
-            [query],
-            |row| row.get::<_, u32>(0).map(|count| count as usize),
-        )
+        .prepare_cached("SELECT count(*) FROM lexical_fts WHERE lexical_fts MATCH ?1")?
+        .query_row([query], |row| {
+            row.get::<_, u32>(0).map(|count| count as usize)
+        })
         .map_err(Into::into)
 }
 
@@ -2018,7 +2096,59 @@ mod tests {
     }
 
     #[test]
-    fn lexical_union_retains_content_candidates_beyond_the_path_rank_window() {
+    fn lexical_batch_is_serial_equivalent() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("src/alpha_handler.rs"),
+            "fn alpha_handler() { beta_router(); }",
+        )
+        .expect("alpha");
+        std::fs::write(
+            project.path().join("src/beta_router.rs"),
+            "fn beta_router() {}",
+        )
+        .expect("beta");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "batch", "input");
+        let requests = vec![
+            ("alpha handler".to_string(), 4),
+            ("beta router".to_string(), 2),
+        ];
+
+        let batched =
+            search_lexical_index_batch_with_cancel(&shard, "input", &requests, Arc::new(|| false))
+                .expect("batch search");
+        let serial = requests
+            .iter()
+            .map(|(query, limit)| search_lexical_index(&shard, "input", query, *limit))
+            .collect::<Result<Vec<_>>>()
+            .expect("serial searches");
+        let identity = |hits: &[LexicalHit]| {
+            hits.iter()
+                .map(|hit| {
+                    (
+                        hit.path.clone(),
+                        hit.node_id.clone(),
+                        hit.symbol_name.clone(),
+                        hit.start_line,
+                        hit.score.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            batched
+                .iter()
+                .map(|hits| identity(hits))
+                .collect::<Vec<_>>(),
+            serial.iter().map(|hits| identity(hits)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn lexical_union_retains_an_independent_content_candidate() {
         let project = TempDir::new().expect("project");
         let path_matches = project.path().join("needle");
         std::fs::create_dir_all(&path_matches).expect("path matches");
@@ -2036,11 +2166,11 @@ mod tests {
         let data = TempDir::new().expect("data");
         let shard = build(project.path(), data.path(), "union", "input");
 
-        let hits = search_lexical_index(&shard, "input", "needle", 1).expect("search");
+        let hits = search_lexical_index(&shard, "input", "needle", 8).expect("search");
 
-        assert_eq!(
-            hits.first().map(|hit| hit.path.as_str()),
-            Some("src/content_match.rs")
+        assert!(
+            hits.iter().any(|hit| hit.path == "src/content_match.rs"),
+            "the content lane must survive a large independent path lane: {hits:#?}"
         );
     }
 

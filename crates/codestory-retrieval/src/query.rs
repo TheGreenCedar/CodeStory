@@ -14,21 +14,22 @@ use crate::generation::manifest_unavailable_reason_for_runtime;
 use crate::health::probe_sidecar_health_for_runtime;
 use crate::index::{query_fingerprint, sidecar_project_id_for_runtime};
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
-use crate::query_features::classify_query;
+use crate::query_features::{QueryLookupMode, classify_query};
 use crate::ranker::rank_candidates;
 use crate::retention::GenerationRetentionLease;
 use crate::sidecar::validate_strict_sidecar_readiness_for_runtime;
-use crate::sidecar_search::LiveSidecarSearch;
-use crate::sidecar_search::SidecarSearch;
+use crate::sidecar_search::{LiveSidecarSearch, SearchExecutionContext, SidecarSearch};
 use anyhow::{Context, Result, bail};
 use codestory_contracts::graph::NodeId;
 use codestory_store::{FileRole, RetrievalIndexManifest, Store};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 const STRICT_BATCH_WORKER_CAP: usize = 4;
+const STRICT_BATCH_PREFETCH_MAX_MS: u64 = 100;
 pub const RETRIEVAL_PUBLICATION_CHANGED_CODE: &str = "publication_changed";
 
 /// Typed signal that the complete query session must be discarded and retried by its caller.
@@ -575,6 +576,10 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
         }
     }
 
+    let (sidecars, prefetch_elapsed) =
+        prepare_batched_sidecars(sidecars, manifest.as_ref(), &misses, &cancelled);
+    let prefetch_elapsed_ms = duration_millis_ceil(prefetch_elapsed);
+
     for wave in misses.chunks(worker_limit.max(1)) {
         if cancelled.load(Ordering::Acquire) {
             bail!("retrieval query batch cancelled before worker wave");
@@ -586,6 +591,8 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
                 let file_roles = Arc::clone(&file_roles);
                 let cancelled = Arc::clone(&cancelled);
                 let sidecars = Arc::clone(&sidecars);
+                let total_budget_ms = effective_query_budget_ms(query, *budget_ms);
+                let remaining_budget_ms = total_budget_ms.saturating_sub(prefetch_elapsed_ms);
                 handles.push(scope.spawn(move || {
                     let mut worker_cache = RetrievalCache::new();
                     let mut executor = QueryExecutor {
@@ -596,7 +603,16 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
                         cancelled,
                         mode_override: Some(mode),
                     };
-                    (*index, executor.execute(query, *budget_ms))
+                    let result =
+                        executor
+                            .execute(query, Some(remaining_budget_ms))
+                            .map(|mut result| {
+                                result.trace.total_budget_ms = total_budget_ms;
+                                result.trace.elapsed_ms =
+                                    result.trace.elapsed_ms.saturating_add(prefetch_elapsed_ms);
+                                result
+                            });
+                    (*index, result)
                 }));
             }
             handles
@@ -623,6 +639,220 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
         .into_iter()
         .map(|result| result.context("strict retrieval batch dropped a query result"))
         .collect()
+}
+
+fn prepare_batched_sidecars(
+    sidecars: Arc<dyn SidecarSearch>,
+    manifest: Option<&RetrievalIndexManifest>,
+    misses: &[(usize, String, Option<u64>)],
+    cancelled: &Arc<AtomicBool>,
+) -> (Arc<dyn SidecarSearch>, Duration) {
+    let started = Instant::now();
+    let mut seen = HashSet::new();
+    let all_queries = misses
+        .iter()
+        .map(|(_, query, _)| query)
+        .filter(|query| seen.insert((*query).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if all_queries.len() < 2 || cancelled.load(Ordering::Acquire) {
+        return (sidecars, Duration::ZERO);
+    }
+    let smallest_budget_ms = misses
+        .iter()
+        .map(|(_, query, budget_ms)| effective_query_budget_ms(query, *budget_ms))
+        .min()
+        .unwrap_or_default();
+    if smallest_budget_ms == 0 {
+        return (sidecars, Duration::ZERO);
+    }
+    let prefetch_budget_ms = smallest_budget_ms
+        .saturating_div(2)
+        .clamp(1, STRICT_BATCH_PREFETCH_MAX_MS);
+    let prefetch_deadline = Instant::now()
+        .checked_add(Duration::from_millis(prefetch_budget_ms))
+        .unwrap_or_else(Instant::now);
+    let prefetch_cancelled = Arc::new(AtomicBool::new(false));
+    let context =
+        SearchExecutionContext::new(prefetch_deadline, Arc::clone(cancelled), prefetch_cancelled);
+    let lexical_requests = all_queries
+        .iter()
+        .cloned()
+        .map(|query| (query, crate::planner::LEXICAL_FUSION_WINDOW))
+        .collect::<Vec<_>>();
+    let prepared_lexical = match sidecars.lexical_search_batch(&lexical_requests, &context) {
+        Ok(Some(results))
+            if results.len() == all_queries.len() && context.check_cancelled().is_ok() =>
+        {
+            all_queries
+                .iter()
+                .cloned()
+                .zip(results)
+                .collect::<HashMap<_, _>>()
+        }
+        _ => HashMap::new(),
+    };
+
+    seen.clear();
+    let semantic_queries = misses
+        .iter()
+        .map(|(_, query, _)| query)
+        .filter(|query| {
+            let features = classify_query(query);
+            !features.intent.standalone_path
+                && !(features.intent.lookup_mode == QueryLookupMode::Definition
+                    && features.intent.standalone_symbol
+                    && !features.intent.relationship)
+        })
+        .filter(|query| seen.insert((*query).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let dense_anchor_count = manifest
+        .and_then(|manifest| {
+            manifest
+                .dense_projection_count
+                .or(manifest.projection_count)
+        })
+        .unwrap_or(0);
+    let prepared_semantic = if dense_anchor_count > 0
+        && semantic_queries.len() >= 2
+        && context.check_cancelled().is_ok()
+    {
+        match sidecars.semantic_search_batch(
+            &semantic_queries,
+            crate::planner::SEMANTIC_CALIBRATION_WINDOW,
+            &context,
+        ) {
+            Ok(Some(results))
+                if results.len() == semantic_queries.len() && context.check_cancelled().is_ok() =>
+            {
+                semantic_queries
+                    .into_iter()
+                    .zip(results)
+                    .collect::<HashMap<_, _>>()
+            }
+            _ => HashMap::new(),
+        }
+    } else {
+        HashMap::new()
+    };
+    if prepared_lexical.is_empty() && prepared_semantic.is_empty() {
+        return (sidecars, started.elapsed());
+    }
+    (
+        Arc::new(PreparedBatchSidecars {
+            inner: sidecars,
+            prepared_lexical,
+            prepared_semantic,
+        }),
+        started.elapsed(),
+    )
+}
+
+fn effective_query_budget_ms(query: &str, budget_ms: Option<u64>) -> u64 {
+    budget_ms
+        .unwrap_or_else(|| {
+            crate::planner::plan_query(&classify_query(query), RetrievalDegradedMode::Full)
+                .total_budget_ms
+        })
+        .min(crate::executor::MAX_RETRIEVAL_BUDGET_MS)
+}
+
+fn duration_millis_ceil(duration: Duration) -> u64 {
+    let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    millis.saturating_add(u64::from(duration.subsec_nanos() % 1_000_000 != 0))
+}
+
+struct PreparedBatchSidecars {
+    inner: Arc<dyn SidecarSearch>,
+    prepared_lexical: HashMap<String, Vec<CandidateHit>>,
+    prepared_semantic: HashMap<String, Vec<CandidateHit>>,
+}
+
+impl SidecarSearch for PreparedBatchSidecars {
+    fn layout(&self) -> Option<&crate::config::SidecarLayout> {
+        self.inner.layout()
+    }
+
+    fn embedding_device_readiness(&self) -> Option<&EmbeddingDeviceReadiness> {
+        self.inner.embedding_device_readiness()
+    }
+
+    fn runtime_config(&self) -> Option<&SidecarRuntimeConfig> {
+        self.inner.runtime_config()
+    }
+
+    fn enrich_candidates(&self, candidates: &mut [CandidateHit]) -> Result<()> {
+        self.inner.enrich_candidates(candidates)
+    }
+
+    fn lexical_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
+        if let Some(prepared) = self.prepared_lexical.get(query) {
+            let mut hits = prepared.clone();
+            hits.truncate(limit);
+            return Ok(hits);
+        }
+        self.inner.lexical_search(query, limit)
+    }
+
+    fn lexical_search_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        context.check_cancelled()?;
+        let hits = self.lexical_search(query, limit)?;
+        context.check_cancelled()?;
+        Ok(hits)
+    }
+
+    fn semantic_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
+        if let Some(prepared) = self.prepared_semantic.get(query) {
+            let mut hits = prepared.clone();
+            hits.truncate(limit);
+            return Ok(hits);
+        }
+        self.inner.semantic_search(query, limit)
+    }
+
+    fn semantic_search_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        context.check_cancelled()?;
+        let hits = self.semantic_search(query, limit)?;
+        context.check_cancelled()?;
+        Ok(hits)
+    }
+
+    fn scip_anchor(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
+        self.inner.scip_anchor(query, limit)
+    }
+
+    fn scip_anchor_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        self.inner.scip_anchor_with_context(query, limit, context)
+    }
+
+    fn scip_expand(&self, anchors: &[CandidateHit], limit: usize) -> Result<Vec<CandidateHit>> {
+        self.inner.scip_expand(anchors, limit)
+    }
+
+    fn scip_expand_with_context(
+        &self,
+        anchors: &[CandidateHit],
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        self.inner.scip_expand_with_context(anchors, limit, context)
+    }
 }
 
 fn cached_batch_result(
@@ -1027,6 +1257,170 @@ mod tests {
             ]
         );
         assert_eq!(sidecars.max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn strict_batch_slow_prefetch_falls_back_within_item_budgets() {
+        struct SlowPrefetchSidecars;
+
+        impl SidecarSearch for SlowPrefetchSidecars {
+            fn lexical_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(vec![CandidateHit::lexical_stub(
+                    format!("src/{query}.rs"),
+                    1.0,
+                )])
+            }
+
+            fn lexical_search_batch(
+                &self,
+                _queries: &[(String, usize)],
+                context: &SearchExecutionContext,
+            ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+                while !context.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                anyhow::bail!("simulated slow lexical prefetch")
+            }
+
+            fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let queries = [
+            QueryBatchItem {
+                query: "alpha flow",
+                budget_ms: Some(100),
+            },
+            QueryBatchItem {
+                query: "beta flow",
+                budget_ms: Some(100),
+            },
+        ];
+        let results = execute_strict_retrieval_query_batch_against_sidecars(
+            Arc::new(SlowPrefetchSidecars),
+            Some(manifest_for("testproj", "slow-prefetch", 2)),
+            Arc::new(HashMap::new()),
+            cancellation_flag(),
+            RetrievalDegradedMode::Full,
+            &queries,
+            &mut RetrievalCache::new(),
+            2,
+        )
+        .expect("slow prefetch falls back");
+
+        assert!(results.iter().all(|result| {
+            result.trace.total_budget_ms == 100
+                && result
+                    .hits
+                    .iter()
+                    .any(|hit| hit.provenance.iter().any(|label| label == "lexical_source"))
+        }));
+    }
+
+    #[test]
+    fn strict_batch_semantic_prefetch_error_preserves_prepared_lexical_evidence() {
+        struct PartialPrefetchSidecars {
+            ordinary_lexical_calls: AtomicUsize,
+        }
+
+        impl SidecarSearch for PartialPrefetchSidecars {
+            fn lexical_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                self.ordinary_lexical_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![CandidateHit::lexical_stub(
+                    format!("src/ordinary-{query}.rs"),
+                    0.5,
+                )])
+            }
+
+            fn lexical_search_batch(
+                &self,
+                queries: &[(String, usize)],
+                _context: &SearchExecutionContext,
+            ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+                Ok(Some(
+                    queries
+                        .iter()
+                        .map(|(query, _)| {
+                            vec![CandidateHit::lexical_stub(
+                                format!("src/prepared-{query}.rs"),
+                                1.0,
+                            )]
+                        })
+                        .collect(),
+                ))
+            }
+
+            fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn semantic_search_batch(
+                &self,
+                _queries: &[String],
+                _limit: usize,
+                _context: &SearchExecutionContext,
+            ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+                anyhow::bail!("simulated semantic prefetch failure")
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let sidecars = Arc::new(PartialPrefetchSidecars {
+            ordinary_lexical_calls: AtomicUsize::new(0),
+        });
+        let queries = [
+            QueryBatchItem {
+                query: "alpha behavior",
+                budget_ms: Some(100),
+            },
+            QueryBatchItem {
+                query: "beta behavior",
+                budget_ms: Some(100),
+            },
+        ];
+        let results = execute_strict_retrieval_query_batch_against_sidecars(
+            sidecars.clone(),
+            Some(manifest_for("testproj", "semantic-prefetch-error", 2)),
+            Arc::new(HashMap::new()),
+            cancellation_flag(),
+            RetrievalDegradedMode::Full,
+            &queries,
+            &mut RetrievalCache::new(),
+            2,
+        )
+        .expect("semantic prefetch failure is opportunistic");
+
+        assert_eq!(sidecars.ordinary_lexical_calls.load(Ordering::SeqCst), 0);
+        assert!(results.iter().all(|result| {
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.file_path.starts_with("src/prepared-"))
+        }));
     }
 
     #[test]

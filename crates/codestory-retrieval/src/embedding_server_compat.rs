@@ -138,6 +138,28 @@ pub fn embed_prepared_query_via_server_with_control(
     )
 }
 
+pub fn embed_prepared_queries_via_server_with_control(
+    runtime: &SidecarRuntimeConfig,
+    inputs: &[String],
+    maximum_timeout: Option<Duration>,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Vec<Vec<f32>>> {
+    let raw = inputs
+        .iter()
+        .map(|input| {
+            input
+                .strip_prefix(crate::embedding_contract::CODERANK_QUERY_PREFIX)
+                .unwrap_or(input)
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    PerUserEmbeddingClient::for_runtime(runtime)?.embed_queries_with_control(
+        &raw,
+        maximum_timeout,
+        cancelled,
+    )
+}
+
 fn compatibility_identity(identity: EmbeddingEngineIdentity) -> Result<ProductEmbeddingIdentity> {
     let residency = stable_name(&identity.residency)?;
     let policy = stable_name(&identity.policy)?;

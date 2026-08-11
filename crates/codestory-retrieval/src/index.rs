@@ -1011,6 +1011,44 @@ fn ensure_semantic_index(
         );
         point_count
     } else {
+        let reusable_vectors = retention
+            .previous_manifest
+            .filter(|previous| previous.semantic_generation != semantic.collection)
+            .and_then(|previous| {
+                match EmbeddedVectorIndex::load_reusable_vectors(
+                    semantic.layout,
+                    &previous.semantic_generation,
+                    &evidence,
+                    &contract,
+                ) {
+                    Ok(vectors) => Some(vectors),
+                    Err(error) => {
+                        warn!(
+                            project_id = %project_id,
+                            semantic_generation = %previous.semantic_generation,
+                            error = %format!("{error:#}"),
+                            "previous vector generation is not reusable"
+                        );
+                        None
+                    }
+                }
+            })
+            .unwrap_or_default();
+        let reusable_vector_count = anchors
+            .iter()
+            .filter(|anchor| {
+                reusable_vectors
+                    .contains_key(&(anchor.node_id.0.to_string(), anchor.document_hash.clone()))
+            })
+            .count();
+        if reusable_vector_count > 0 {
+            info!(
+                project_id = %project_id,
+                reusable_vector_count,
+                embedding_miss_count = anchors.len().saturating_sub(reusable_vector_count),
+                "compatible unchanged vectors retained for candidate generation"
+            );
+        }
         let attestation = with_finalize_progress(progress, "embedded vectors", || {
             EmbeddedVectorIndex::build_attested_with_points_with_cancel(
                 crate::embedded_vector::AttestedVectorPublication {
@@ -1028,31 +1066,62 @@ fn ensure_semantic_index(
                         anchors.chunks(retention.runtime.retrieval.llm_doc_embed_batch_size.max(1))
                     {
                         ensure_retrieval_index_not_cancelled(cancelled, "embedding batch")?;
-                        let texts = batch
+                        let missing = batch
+                            .iter()
+                            .filter(|anchor| {
+                                !reusable_vectors.contains_key(&(
+                                    anchor.node_id.0.to_string(),
+                                    anchor.document_hash.clone(),
+                                ))
+                            })
+                            .collect::<Vec<_>>();
+                        let texts = missing
                             .iter()
                             .map(|anchor| anchor.text.clone())
                             .collect::<Vec<_>>();
-                        let vectors = client
-                            .embed_documents_with_control(&texts, None, &|| {
-                                cancelled.load(Ordering::Acquire)
-                            })
-                            .context("embed pinned dense anchor batch")?;
+                        let vectors = if texts.is_empty() {
+                            Vec::new()
+                        } else {
+                            client
+                                .embed_documents_with_control(&texts, None, &|| {
+                                    cancelled.load(Ordering::Acquire)
+                                })
+                                .context("embed pinned dense anchor batch")?
+                        };
                         ensure_retrieval_index_not_cancelled(
                             cancelled,
                             "persisting an embedding batch",
                         )?;
-                        if vectors.len() != batch.len() {
+                        if vectors.len() != missing.len() {
                             bail!(
                                 "embedding engine returned {} vectors for {} anchors",
                                 vectors.len(),
-                                batch.len()
+                                missing.len()
                             );
                         }
-                        for (anchor, vector) in batch.iter().zip(vectors) {
+                        let mut embedded =
+                            missing.into_iter().zip(vectors).map(|(anchor, vector)| {
+                                Ok::<_, anyhow::Error>((anchor.node_id, normalize_vector(vector)?))
+                            });
+                        let mut next_embedded = embedded.next().transpose()?;
+                        for anchor in batch {
                             ensure_retrieval_index_not_cancelled(
                                 cancelled,
                                 "persisting an embedded vector",
                             )?;
+                            let key = (anchor.node_id.0.to_string(), anchor.document_hash.clone());
+                            let vector = if let Some(vector) = reusable_vectors.get(&key) {
+                                vector.clone()
+                            } else {
+                                let (node_id, vector) = next_embedded
+                                    .take()
+                                    .context("embedding output dropped a missing anchor")?;
+                                if node_id != anchor.node_id {
+                                    bail!("embedding output order changed for a missing anchor");
+                                }
+                                next_embedded = embedded.next().transpose()?;
+                                vector
+                            };
                             visit(AttestedSemanticPoint {
                                 point: SemanticPoint {
                                     display_name: anchor
@@ -1063,10 +1132,13 @@ fn ensure_semantic_index(
                                     file_path: anchor.file_path.clone(),
                                     file_role: Some(anchor.file_role),
                                     dense_reason: Some(anchor.selection_reason.clone()),
-                                    vector: normalize_vector(vector)?,
+                                    vector,
                                 },
                                 document_hash: anchor.document_hash.clone(),
                             })?;
+                        }
+                        if next_embedded.is_some() || embedded.next().is_some() {
+                            bail!("embedding output retained an unexpected anchor");
                         }
                     }
                     Ok(())

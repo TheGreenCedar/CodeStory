@@ -2,8 +2,7 @@ use crate::agent::citation::{evidence_edge_ids_for_node, to_citation_from_hit};
 #[cfg(test)]
 use crate::agent::eval_probes::source_derived_claims_for_citation as packet_source_derived_claims_for_citation;
 use crate::agent::packet_batch::{
-    PacketLatencyBudget, packet_anchor_probe_queries, run_packet_anchor_expansion,
-    run_packet_planned_subqueries,
+    PacketLatencyBudget, packet_anchor_probe_queries, run_packet_planned_subqueries,
 };
 #[cfg(test)]
 use crate::agent::packet_batch::{
@@ -466,18 +465,9 @@ pub(crate) fn agent_packet(
             )));
     }
     let rank_terms = packet_rank_terms(&question);
-    run_packet_anchor_expansion(
-        controller,
-        &plan,
-        req.budget,
-        &limits,
-        req.include_evidence,
-        packet_latency,
-        &rank_terms,
-        &mut answer,
-    )?;
     run_packet_planned_subqueries(
         controller,
+        &question,
         &plan,
         req.budget,
         &limits,
@@ -621,9 +611,6 @@ pub(crate) fn agent_packet(
         retrieval_trace_summary,
     };
     append_packet_non_trace_phase(&mut packet.answer, "packet_dto", phase_started);
-    let phase_started = Instant::now();
-    enforce_packet_output_budget(&project_root, &mut packet);
-    append_packet_non_trace_phase(&mut packet.answer, "output_budget", phase_started);
     enforce_packet_output_budget(&project_root, &mut packet);
 
     if let Some(diagnostic) = trace_export::write_packet_step_trace_from_env(&packet.answer) {
@@ -633,13 +620,6 @@ pub(crate) fn agent_packet(
             .retrieval_trace
             .annotations
             .push(RetrievalAnnotationDto::observation(diagnostic));
-        let phase_started = Instant::now();
-        enforce_packet_output_budget(&project_root, &mut packet);
-        append_packet_non_trace_phase(
-            &mut packet.answer,
-            "trace_artifact_output_budget",
-            phase_started,
-        );
         enforce_packet_output_budget(&project_root, &mut packet);
     }
 

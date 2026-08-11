@@ -78,8 +78,8 @@ pub struct RetrievalPlan {
 const DEFAULT_TOTAL_BUDGET_MS: u64 = 1_000;
 const MARGINAL_GAIN_THRESHOLD: f32 = 0.05;
 const LOW_GAIN_STREAK: u32 = 2;
-const LEXICAL_FUSION_WINDOW: usize = 4_096;
-const SEMANTIC_CALIBRATION_WINDOW: usize = 64;
+pub(crate) const LEXICAL_FUSION_WINDOW: usize = 4_096;
+pub(crate) const SEMANTIC_CALIBRATION_WINDOW: usize = 64;
 
 /// Build the sidecar plan for a classified query and live retrieval mode.
 ///

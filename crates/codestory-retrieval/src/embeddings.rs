@@ -2,8 +2,8 @@
 
 use crate::config::SidecarRuntimeConfig;
 use crate::embedding_server_compat::{
-    ProductEmbeddingIdentity, embed_prepared_query_via_server_with_control,
-    embed_prepared_via_server_with_control,
+    ProductEmbeddingIdentity, embed_prepared_queries_via_server_with_control,
+    embed_prepared_query_via_server_with_control, embed_prepared_via_server_with_control,
 };
 #[cfg(not(feature = "test-support"))]
 use crate::embedding_server_compat::{
@@ -158,6 +158,36 @@ impl ProductEmbeddingClient {
         #[cfg(feature = "semantic-calibration-support")]
         capture_semantic_calibration_query_vector(text, &vector)?;
         Ok(vector)
+    }
+
+    pub fn embed_queries_with_control(
+        &self,
+        texts: &[String],
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<Vec<f32>>> {
+        ensure_test_embedding_available(&self.runtime.cache_root)?;
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if texts.iter().any(|text| text.trim().is_empty()) {
+            bail!("cannot embed an empty query");
+        }
+        let prepared = texts
+            .iter()
+            .map(|text| format!("{CODERANK_QUERY_PREFIX_DEFAULT}{text}"))
+            .collect::<Vec<_>>();
+        let vectors = embed_prepared_queries_via_server_with_control(
+            &self.runtime,
+            &prepared,
+            maximum_timeout,
+            cancelled,
+        )?;
+        #[cfg(feature = "semantic-calibration-support")]
+        for (text, vector) in texts.iter().zip(&vectors) {
+            capture_semantic_calibration_query_vector(text, vector)?;
+        }
+        Ok(vectors)
     }
 
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {

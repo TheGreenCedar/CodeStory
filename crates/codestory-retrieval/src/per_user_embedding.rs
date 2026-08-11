@@ -68,10 +68,11 @@ pub use protocol::{
     PER_USER_EMBEDDING_MAX_INPUT_BYTES, PER_USER_EMBEDDING_MAX_METADATA_BYTES,
     PER_USER_EMBEDDING_MAX_PAYLOAD_BYTES, PER_USER_EMBEDDING_MEASUREMENT_PROTOCOL_SHA256,
     PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION, PER_USER_EMBEDDING_PROTOCOL_SHA256,
-    PER_USER_EMBEDDING_PROTOCOL_V1, PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
-    PER_USER_EMBEDDING_SERVER_PROOF_MARKER, PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION,
-    PerUserEmbeddingError, embedding_capacity_pressure,
-    embedding_qualification_watchdog_marker_filename, embedding_retry_state,
+    PER_USER_EMBEDDING_PROTOCOL_V1, PER_USER_EMBEDDING_QUERY_BATCH_MAX,
+    PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS, PER_USER_EMBEDDING_SERVER_PROOF_MARKER,
+    PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION, PerUserEmbeddingError,
+    embedding_capacity_pressure, embedding_qualification_watchdog_marker_filename,
+    embedding_retry_state,
 };
 use qualification_control::ServerQualificationControl;
 #[cfg(all(test, windows))]

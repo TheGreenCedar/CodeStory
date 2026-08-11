@@ -89,7 +89,22 @@ pub trait SidecarSearch: Send + Sync {
     }
 
     fn lexical_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
+    fn lexical_search_batch(
+        &self,
+        _queries: &[(String, usize)],
+        _context: &SearchExecutionContext,
+    ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+        Ok(None)
+    }
     fn semantic_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
+    fn semantic_search_batch(
+        &self,
+        _queries: &[String],
+        _limit: usize,
+        _context: &SearchExecutionContext,
+    ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+        Ok(None)
+    }
     fn scip_anchor(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn scip_expand(&self, anchors: &[CandidateHit], limit: usize) -> Result<Vec<CandidateHit>>;
 
@@ -288,8 +303,32 @@ impl SidecarSearch for LiveSidecarSearch {
         )
     }
 
+    fn lexical_search_batch(
+        &self,
+        queries: &[(String, usize)],
+        context: &SearchExecutionContext,
+    ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+        let context = context.clone();
+        Ok(Some(self.lexical.search_batch_with_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            &self.sidecar_input_hash,
+            queries,
+            Arc::new(move || context.is_cancelled()),
+        )?))
+    }
+
     fn semantic_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
         self.semantic.search(query, limit)
+    }
+
+    fn semantic_search_batch(
+        &self,
+        queries: &[String],
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+        Ok(Some(self.semantic.search_batch(queries, limit, context)?))
     }
 
     fn semantic_search_with_context(

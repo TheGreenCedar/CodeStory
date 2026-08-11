@@ -2,13 +2,16 @@ use crate::candidate::{CandidateGraphDirection, CandidateGraphEvidence};
 use crate::config::SidecarLayout;
 use crate::scip_index::{
     SCIP_GRAPH_PROJECTION_PROVENANCE, SCIP_STUB_MARKER_FILE, SCIP_SYMBOLS_FILE,
-    ScipIndexMarkerError, ScipSymbolLookup, ScipSymbolRecord, load_fresh_scip_symbols,
-    load_scip_symbols, parse_scip_index_marker, reference_defect,
+    ScipAdjacencyDirection, ScipIndexMarkerError, ScipNormalizedSymbol, ScipSymbolRecord,
+    load_fresh_scip_query_view, parse_scip_index_marker,
 };
 use codestory_contracts::graph::EdgeKind;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+#[cfg(test)]
+use crate::scip_index::load_scip_symbols;
 
 /// Bound graph work while retaining independently ranked anchors from more
 /// than one file and retrieval lane.
@@ -117,20 +120,20 @@ impl ScipClient {
             return Ok(Vec::new());
         };
         let project_dir = layout.scip_project_dir(generation);
-        let Some(index) = load_fresh_scip_symbols(&project_dir, &revision, generation)? else {
+        let Some(view) = load_fresh_scip_query_view(&project_dir, &revision, generation)? else {
             return Ok(Vec::new());
         };
-        let Some(provenance) = index.contract.provenance_label() else {
+        let Some(provenance) = view.index().contract.provenance_label() else {
             return Ok(Vec::new());
         };
         let profile = ScipQueryProfile::new(query);
         let mut hits = Vec::new();
-        for (index, symbol) in index.symbols.iter().enumerate() {
+        for (index, (symbol, normalized)) in view.symbols().enumerate() {
             if index % 64 == 0 && cancelled() {
                 anyhow::bail!("SCIP anchor search cancelled");
             }
-            if symbol_matches_query(symbol, &profile) {
-                let score = score_symbol_match(symbol, &profile);
+            if symbol_matches_query(normalized, &profile) {
+                let score = score_symbol_match(normalized, &profile);
                 let mut hit = symbol_to_hit(
                     symbol,
                     score,
@@ -145,7 +148,7 @@ impl ScipClient {
                         direction_weight: 1.0,
                     }),
                 );
-                if symbol_is_exact_query_match(&symbol, &profile) {
+                if symbol_is_exact_query_match(normalized, &profile) {
                     hit.add_provenance("exact");
                     hit.record_lane(crate::candidate::CandidateLane::Graph, score, 0, "exact");
                 }
@@ -201,13 +204,10 @@ impl ScipClient {
             return Ok(Vec::new());
         };
         let project_dir = layout.scip_project_dir(generation);
-        let Some(index) = load_fresh_scip_symbols(&project_dir, &revision, generation)? else {
+        let Some(view) = load_fresh_scip_query_view(&project_dir, &revision, generation)? else {
             return Ok(Vec::new());
         };
-        let Some(evidence_source) = index.contract.evidence_source() else {
-            return Ok(Vec::new());
-        };
-        let Some(provenance) = index.contract.provenance_label() else {
+        let Some(provenance) = view.index().contract.provenance_label() else {
             return Ok(Vec::new());
         };
 
@@ -230,73 +230,56 @@ impl ScipClient {
             return Ok(Vec::new());
         }
 
-        let lookup = ScipSymbolLookup::new(&index.symbols);
         let emitted: HashSet<&str> = anchor_hops.iter().map(|(node_id, _, _)| *node_id).collect();
         let mut expansions = Vec::new();
         let mut fanout_by_anchor = HashMap::<&str, u32>::new();
-        for (position, proof) in index.proofs.iter().enumerate() {
-            if position % 64 == 0 && cancelled() {
+        for (anchor_position, (anchor_node_id, anchor_hop, anchor_relevance)) in
+            anchor_hops.iter().enumerate()
+        {
+            if anchor_position % 8 == 0 && cancelled() {
                 anyhow::bail!("SCIP reference adjacency cancelled");
             }
-            if !proof.is_reference() || reference_defect(proof, &lookup, evidence_source).is_some()
-            {
+            if view.symbol_for_node(anchor_node_id).is_none() {
                 continue;
             }
-            let (Some(node_id), Some(target_node_id), Some(edge_kind)) = (
-                proof.node_id.as_deref(),
-                proof.target_node_id.as_deref(),
-                proof.edge_kind,
-            ) else {
-                continue;
-            };
-            let Some((anchor_node_id, neighbor_node_id, anchor_hop, anchor_relevance, direction)) =
-                anchor_hops
-                    .iter()
-                    .find_map(|(anchor_node_id, hop, relevance)| {
-                        if *anchor_node_id == node_id {
-                            Some((
-                                *anchor_node_id,
-                                target_node_id,
-                                *hop,
-                                *relevance,
-                                CandidateGraphDirection::Outgoing,
-                            ))
-                        } else if *anchor_node_id == target_node_id {
-                            Some((
-                                *anchor_node_id,
-                                node_id,
-                                *hop,
-                                *relevance,
-                                CandidateGraphDirection::Incoming,
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-            else {
-                continue;
-            };
-            if emitted.contains(neighbor_node_id) {
-                continue;
+            let mut distinct_neighbors = HashSet::new();
+            for adjacency in view.adjacency(anchor_node_id) {
+                let Some(neighbor) = view.symbol_at(adjacency.neighbor_symbol_index) else {
+                    continue;
+                };
+                let Some(neighbor_node_id) = neighbor.node_id.as_deref() else {
+                    continue;
+                };
+                if emitted.contains(neighbor_node_id) {
+                    continue;
+                }
+                distinct_neighbors.insert(neighbor_node_id);
+                let direction = match adjacency.direction {
+                    ScipAdjacencyDirection::Outgoing => CandidateGraphDirection::Outgoing,
+                    ScipAdjacencyDirection::Incoming => CandidateGraphDirection::Incoming,
+                };
+                expansions.push((
+                    adjacency.proof_ordinal,
+                    neighbor_node_id,
+                    neighbor,
+                    *anchor_node_id,
+                    *anchor_hop,
+                    *anchor_relevance,
+                    direction,
+                    adjacency.edge_kind,
+                ));
             }
-            let Some(neighbor) = lookup.symbol_for_node(neighbor_node_id) else {
-                continue;
-            };
-            *fanout_by_anchor.entry(anchor_node_id).or_default() += 1;
-            expansions.push((
-                neighbor_node_id,
-                neighbor,
-                anchor_node_id,
-                anchor_hop,
-                anchor_relevance,
-                direction,
-                edge_kind,
-            ));
+            fanout_by_anchor.insert(
+                *anchor_node_id,
+                u32::try_from(distinct_neighbors.len()).unwrap_or(u32::MAX),
+            );
         }
+        expansions.sort_by_key(|(proof_ordinal, ..)| *proof_ordinal);
         let mut hits_by_node = HashMap::<String, super::CandidateHit>::new();
         for (
             position,
             (
+                _,
                 neighbor_node_id,
                 neighbor,
                 anchor_node_id,
@@ -525,71 +508,65 @@ fn qualified_symbol_query(query: &str) -> Option<QualifiedSymbolQuery> {
     })
 }
 
-fn symbol_matches_query(symbol: &ScipSymbolRecord, profile: &ScipQueryProfile) -> bool {
-    let symbol_lower = symbol.symbol.to_ascii_lowercase();
-    let path_lower = symbol.path.to_ascii_lowercase();
+fn symbol_matches_query(symbol: &ScipNormalizedSymbol, profile: &ScipQueryProfile) -> bool {
     if profile.tokens.is_empty() {
-        return symbol_lower.contains(&profile.query_lower)
-            || path_lower.contains(&profile.query_lower);
+        return symbol.symbol_lower.contains(&profile.query_lower)
+            || symbol.path_lower.contains(&profile.query_lower);
     }
     if profile
         .tokens
         .iter()
-        .all(|token| symbol_lower.contains(token) || path_lower.contains(token))
+        .all(|token| symbol.symbol_lower.contains(token) || symbol.path_lower.contains(token))
     {
         return true;
     }
     let Some(qualified) = profile.qualified.as_ref() else {
         return false;
     };
-    symbol_terminal(&symbol_lower) == qualified.terminal_lower
-        && qualified_prefix_path_score(&qualified.prefix_lower, &symbol.path) > 0
+    symbol.terminal_lower == qualified.terminal_lower
+        && qualified_prefix_path_score(&qualified.prefix_lower, symbol) > 0
 }
 
-fn symbol_is_exact_query_match(symbol: &ScipSymbolRecord, profile: &ScipQueryProfile) -> bool {
-    let symbol_lower = symbol.symbol.to_ascii_lowercase();
-    if symbol_lower == profile.query_lower
+fn symbol_is_exact_query_match(symbol: &ScipNormalizedSymbol, profile: &ScipQueryProfile) -> bool {
+    if symbol.symbol_lower == profile.query_lower
         || (profile.tokens.len() == 1
             && !profile.query_lower.contains('/')
             && !profile.query_lower.contains('\\')
-            && symbol_terminal(&symbol_lower) == profile.query_lower)
+            && symbol.terminal_lower == profile.query_lower)
     {
         return true;
     }
     profile.qualified.as_ref().is_some_and(|qualified| {
-        symbol_terminal(&symbol_lower) == qualified.terminal_lower
-            && qualified_prefix_path_score(&qualified.prefix_lower, &symbol.path) > 0
+        symbol.terminal_lower == qualified.terminal_lower
+            && qualified_prefix_path_score(&qualified.prefix_lower, symbol) > 0
     })
 }
 
-fn score_symbol_match(symbol: &ScipSymbolRecord, profile: &ScipQueryProfile) -> f32 {
-    let symbol_lower = symbol.symbol.to_ascii_lowercase();
-    let path_lower = symbol.path.to_ascii_lowercase();
+fn score_symbol_match(symbol: &ScipNormalizedSymbol, profile: &ScipQueryProfile) -> f32 {
     let mut score = 0.70_f32;
-    if symbol_lower == profile.query_lower {
+    if symbol.symbol_lower == profile.query_lower {
         score += 0.22;
-    } else if symbol_lower.contains(&profile.query_lower) {
+    } else if symbol.symbol_lower.contains(&profile.query_lower) {
         score += 0.14;
     }
-    if path_lower == profile.query_lower {
+    if symbol.path_lower == profile.query_lower {
         score += 0.08;
-    } else if path_lower.contains(&profile.query_lower) {
+    } else if symbol.path_lower.contains(&profile.query_lower) {
         score += 0.04;
     }
     for token in &profile.tokens {
-        if symbol_lower == *token {
+        if symbol.symbol_lower == *token {
             score += 0.05;
-        } else if symbol_lower.contains(token) {
+        } else if symbol.symbol_lower.contains(token) {
             score += 0.03;
         }
-        if path_lower.contains(token) {
+        if symbol.path_lower.contains(token) {
             score += 0.01;
         }
     }
     if let Some(qualified) = profile.qualified.as_ref() {
-        let terminal = symbol_terminal(&symbol_lower);
-        let prefix_path_score = qualified_prefix_path_score(&qualified.prefix_lower, &symbol.path);
-        if terminal == qualified.terminal_lower {
+        let prefix_path_score = qualified_prefix_path_score(&qualified.prefix_lower, symbol);
+        if symbol.terminal_lower == qualified.terminal_lower {
             score += 0.18;
         }
         score += match prefix_path_score {
@@ -598,13 +575,13 @@ fn score_symbol_match(symbol: &ScipSymbolRecord, profile: &ScipQueryProfile) -> 
             1 => 0.05,
             _ => 0.0,
         };
-        if terminal == qualified.terminal_lower
-            && file_stem_lower(&symbol.path).as_deref() == Some(qualified.terminal_lower.as_str())
+        if symbol.terminal_lower == qualified.terminal_lower
+            && symbol.file_stem_lower.as_deref() == Some(qualified.terminal_lower.as_str())
         {
             score += 0.16;
         }
-        if symbol_lower == profile.query_lower
-            && file_stem_lower(&symbol.path).as_deref() != Some(qualified.terminal_lower.as_str())
+        if symbol.symbol_lower == profile.query_lower
+            && symbol.file_stem_lower.as_deref() != Some(qualified.terminal_lower.as_str())
         {
             score -= 0.12;
         }
@@ -612,29 +589,17 @@ fn score_symbol_match(symbol: &ScipSymbolRecord, profile: &ScipQueryProfile) -> 
     score.min(1.20)
 }
 
-fn symbol_terminal(symbol: &str) -> String {
-    symbol
-        .rsplit("::")
-        .next()
-        .unwrap_or(symbol)
-        .rsplit('.')
-        .next()
-        .unwrap_or(symbol)
-        .to_ascii_lowercase()
-}
-
-fn qualified_prefix_path_score(prefix_lower: &str, path: &str) -> u8 {
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let segments = normalized_path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if segments.is_empty() {
+fn qualified_prefix_path_score(prefix_lower: &str, symbol: &ScipNormalizedSymbol) -> u8 {
+    if symbol.path_segments_lower.is_empty() {
         return 0;
     }
 
     let hyphenated_prefix = prefix_lower.replace('_', "-");
-    if !hyphenated_prefix.is_empty() && segments.iter().any(|segment| *segment == hyphenated_prefix)
+    if !hyphenated_prefix.is_empty()
+        && symbol
+            .path_segments_lower
+            .iter()
+            .any(|segment| segment == &hyphenated_prefix)
     {
         return 3;
     }
@@ -645,18 +610,20 @@ fn qualified_prefix_path_score(prefix_lower: &str, path: &str) -> u8 {
         .unwrap_or(prefix_lower)
         .replace('_', "-");
     if trailing_prefix_segment.len() >= 3
-        && segments
+        && symbol
+            .path_segments_lower
             .iter()
-            .any(|segment| *segment == trailing_prefix_segment)
+            .any(|segment| segment == &trailing_prefix_segment)
     {
         return 2;
     }
 
     let compact_prefix = compact_alphanumeric(prefix_lower);
     if compact_prefix.len() >= 3
-        && segments
+        && symbol
+            .path_segments_compact
             .iter()
-            .any(|segment| compact_alphanumeric(segment) == compact_prefix)
+            .any(|segment| segment == &compact_prefix)
     {
         return 1;
     }
@@ -670,17 +637,6 @@ fn compact_alphanumeric(value: &str) -> String {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
-}
-
-fn file_stem_lower(path: &str) -> Option<String> {
-    let file_name = path
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|file_name| !file_name.is_empty())?;
-    let stem = file_name
-        .rsplit_once('.')
-        .map_or(file_name, |(stem, _)| stem);
-    Some(stem.to_ascii_lowercase())
 }
 
 fn count_scip_artifacts(dir: &Path) -> u32 {
@@ -718,15 +674,11 @@ fn scip_artifact_status(project_dir: &Path, revision: &str, generation: &str) ->
             damaged => damaged.code(),
         };
     }
-    load_scip_symbols(project_dir)
+    load_fresh_scip_query_view(project_dir, revision, generation)
         .ok()
         .flatten()
-        .filter(|index| !index.symbols.is_empty())
-        .map_or("scip_stub", |index| {
-            if !index.is_fresh_for(revision, generation) {
-                return "scip_stale";
-            }
-            if index.contract.evidence_source == SCIP_GRAPH_PROJECTION_PROVENANCE {
+        .map_or("scip_stale", |view| {
+            if view.index().contract.evidence_source == SCIP_GRAPH_PROJECTION_PROVENANCE {
                 SCIP_READY_STATUS
             } else {
                 "scip_imported_diagnostic_only"
@@ -1434,6 +1386,28 @@ mod tests {
 
         assert!(wide_target.score < narrow_target.score);
         assert_eq!(wide_target.graph_evidence.as_ref().unwrap().fanout, 2);
+    }
+
+    #[test]
+    fn stage_two_fanout_counts_distinct_eligible_neighbors() {
+        let root = TempDir::new().expect("root");
+        let layout = adjacency_layout(&root);
+        let symbols = adjacency_symbols();
+        let duplicate = graph_reference_proof(&symbols[0], &symbols[2]);
+        write_adjacency_artifact(
+            &layout,
+            "generation-a",
+            "generation-a",
+            vec![duplicate.clone(), duplicate],
+        );
+
+        let hits =
+            ScipClient::expand_reference_adjacency(&layout, "generation-a", &[client_anchor()], 8)
+                .expect("expand");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node_id.as_deref(), Some("4"));
+        assert_eq!(hits[0].graph_evidence.as_ref().unwrap().fanout, 1);
     }
 
     #[test]

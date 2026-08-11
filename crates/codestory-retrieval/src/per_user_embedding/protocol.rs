@@ -15,6 +15,7 @@ pub const PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION: u32 = 1;
 pub const PER_USER_EMBEDDING_PROTOCOL_V1: &str = "codestory.per-user-embedding/v1";
 pub const PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS: u64 = 60_000;
+pub const PER_USER_EMBEDDING_QUERY_BATCH_MAX: usize = 8;
 pub const PER_USER_EMBEDDING_PROTOCOL_SHA256: &str =
     codestory_llama_sys::PER_USER_EMBEDDING_PROTOCOL_SHA256;
 pub const PER_USER_EMBEDDING_CONSTANT_SET_SHA256: &str =
@@ -315,6 +316,14 @@ pub enum EmbeddingOperation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cancel_token: Option<String>,
         input: String,
+    },
+    EmbedQueries {
+        scope_id: String,
+        deadline_ms: u64,
+        retry_after_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel_token: Option<String>,
+        inputs: Vec<String>,
     },
     EmbedDocuments {
         scope_id: String,

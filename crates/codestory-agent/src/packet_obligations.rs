@@ -61,9 +61,9 @@ pub fn build_packet_obligation_plan(
         ));
     }
     if requirements.is_empty() {
-        let needs_material_fallback = !claim_obligations
-            .iter()
-            .any(|obligation| obligation.material);
+        let needs_material_fallback = !claim_obligations.iter().any(|obligation| {
+            obligation.material && obligation.kind != PacketClaimObligationKindDto::ExactProbe
+        }) && task_class != PacketTaskClassDto::SymbolOwnership;
         claim_obligations.extend(default_profile_guards(
             task_class,
             requires_complete_discovery,
@@ -672,6 +672,26 @@ pub fn finalize_packet_obligation_plan(
         PacketObligationEvidenceView::from_budget(budget),
     );
     finalize_query_obligations(plan, answer, budget);
+}
+
+/// Evaluate the current uncapped answer against the planned proof ledger so retrieval can spend
+/// its next query on evidence that is still missing. This preview never changes the public plan:
+/// finalization still runs after citation, graph, and byte caps have selected the carried proof.
+pub fn preview_packet_obligation_plan_before_budget(
+    question: &str,
+    task_class: PacketTaskClassDto,
+    plan: &PacketObligationPlanDto,
+    answer: &AgentAnswerDto,
+) -> PacketObligationPlanDto {
+    let mut preview = plan.clone();
+    finalize_packet_claim_obligations(
+        question,
+        task_class,
+        &mut preview,
+        answer,
+        PacketObligationEvidenceView::complete(answer.citations.len()),
+    );
+    preview
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2484,6 +2504,33 @@ mod tests {
     }
 
     #[test]
+    fn exact_identity_does_not_hide_a_behavioral_fallback_or_pollute_pure_ownership() {
+        let architecture = build_packet_obligation_plan(
+            "Explain how RuntimeService::run participates in the architecture.",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        assert!(architecture.claim_obligations.iter().any(|obligation| {
+            obligation.id == "profile_architecture_behavior" && obligation.material
+        }));
+        assert!(architecture.claim_obligations.iter().any(|obligation| {
+            obligation.kind == PacketClaimObligationKindDto::ExactProbe && obligation.material
+        }));
+
+        let ownership = build_packet_obligation_plan(
+            "RuntimeService::run",
+            PacketTaskClassDto::SymbolOwnership,
+            &[],
+        );
+        assert!(ownership.claim_obligations.iter().any(|obligation| {
+            obligation.kind == PacketClaimObligationKindDto::ExactProbe && obligation.material
+        }));
+        assert!(ownership.claim_obligations.iter().all(|obligation| {
+            obligation.id != "profile_symbol_ownership_behavior" || !obligation.material
+        }));
+    }
+
+    #[test]
     fn natural_language_search_flow_does_not_mint_prose_claims() {
         let question = "Find the production packet/search path that turns ranked search results into packet evidence and agent handoff.";
         let plan = build_packet_obligation_plan(
@@ -3677,11 +3724,24 @@ mod tests {
                 .iter()
                 .filter(|obligation| obligation.material)
                 .collect::<Vec<_>>();
-            assert_eq!(requested.len(), 1, "{task_class:?}");
+            let expected_material = if task_class == PacketTaskClassDto::SymbolOwnership {
+                1
+            } else {
+                2
+            };
+            assert_eq!(requested.len(), expected_material, "{task_class:?}");
+            let exact = requested
+                .iter()
+                .find(|obligation| obligation.kind == PacketClaimObligationKindDto::ExactProbe)
+                .unwrap_or_else(|| panic!("missing exact identity for {task_class:?}"));
+            assert_eq!(exact.binding_terms, vec!["Widget::run"], "{task_class:?}");
             assert_eq!(
-                requested[0].binding_terms,
-                vec!["Widget::run"],
-                "{task_class:?}"
+                requested
+                    .iter()
+                    .filter(|obligation| obligation.binding_terms.is_empty())
+                    .count(),
+                usize::from(task_class != PacketTaskClassDto::SymbolOwnership),
+                "non-ownership tasks retain one behavioral fallback: {task_class:?}"
             );
             assert!(
                 plan.claim_obligations.iter().all(|obligation| {
@@ -3705,8 +3765,8 @@ mod tests {
                 }),
                 "only concrete requested claims are material: {task_class:?}"
             );
-            assert_eq!(requested[0].kind, PacketClaimObligationKindDto::ExactProbe);
-            assert_eq!(requested[0].required_edge_kind, None);
+            assert_eq!(exact.kind, PacketClaimObligationKindDto::ExactProbe);
+            assert_eq!(exact.required_edge_kind, None);
             assert_eq!(
                 plan.claim_obligations
                     .iter()

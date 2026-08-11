@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 const STAGE_WORKER_LIMIT: usize = 16;
 const STAGE_WAIT_POLL: Duration = Duration::from_millis(5);
-const MAX_RETRIEVAL_BUDGET_MS: u64 = 120_000;
+pub(crate) const MAX_RETRIEVAL_BUDGET_MS: u64 = 120_000;
 static STAGE_WORKER_POOL: OnceLock<StageWorkerPool> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1395,6 +1395,32 @@ mod tests {
                 Some("unique_exact_definition")
             );
         }
+    }
+
+    #[test]
+    fn exact_definition_suppression_requires_explicit_definition_intent() {
+        let mut exact = CandidateHit::with_source(
+            "src/authentication.rs",
+            Some("authentication".into()),
+            0.95,
+            CandidateSource::Scip,
+        );
+        exact.node_id = Some("authentication-definition".into());
+        exact.add_provenance("exact");
+        let candidates = vec![exact];
+
+        assert!(!unique_exact_definition_suppresses_broad_lanes(
+            &classify_query("authentication"),
+            &candidates,
+        ));
+        assert!(unique_exact_definition_suppresses_broad_lanes(
+            &classify_query("`authentication`"),
+            &candidates,
+        ));
+        assert!(!unique_exact_definition_suppresses_broad_lanes(
+            &classify_query("Authentication dispatch"),
+            &candidates,
+        ));
     }
 
     #[test]

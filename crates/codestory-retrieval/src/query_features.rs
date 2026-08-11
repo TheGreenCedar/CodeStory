@@ -72,6 +72,39 @@ pub struct QueryFeatures {
     pub looks_like_qualified_symbol: bool,
 }
 
+const RELATION_WORDS: &[&str] = &[
+    "call",
+    "called",
+    "caller",
+    "callers",
+    "calls",
+    "depend",
+    "dependencies",
+    "dependency",
+    "depends",
+    "dispatch",
+    "dispatched",
+    "dispatches",
+    "dispatching",
+    "flow",
+    "flows",
+    "handoff",
+    "handoffs",
+    "owner",
+    "owns",
+    "route",
+    "routed",
+    "routes",
+    "through",
+    "use",
+    "used",
+    "uses",
+];
+
+const ORDERED_FLOW_WORDS: &[&str] = &[
+    "after", "before", "finally", "first", "flow", "next", "pipeline", "stages", "then",
+];
+
 pub fn classify_query(query: &str) -> QueryFeatures {
     let trimmed = query.trim();
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
@@ -94,6 +127,12 @@ pub fn classify_query(query: &str) -> QueryFeatures {
         .iter()
         .any(|token| !looks_like_path_token(token, standalone_token) && is_qualified_symbol(token));
 
+    let explicitly_exact = standalone_token && is_explicit_exact_token(trimmed);
+    let standalone_code_shaped = standalone_token && {
+        let token = trim_query_token(trimmed);
+        token.chars().any(char::is_uppercase) || token.contains('_') || is_qualified_symbol(token)
+    };
+
     let path_like = tokens
         .iter()
         .any(|token| looks_like_path_token(token, token_count == 1))
@@ -101,9 +140,10 @@ pub fn classify_query(query: &str) -> QueryFeatures {
     let symbol_like = looks_like_qualified_symbol
         || has_camel_case_token
         || has_snake_case_token
-        || (token_count == 1 && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_'));
+        || explicitly_exact
+        || standalone_code_shaped;
 
-    let nl_like = (token_count == 1 && !path_like && !symbol_like)
+    let mut nl_like = (token_count == 1 && !path_like && !symbol_like)
         || token_count >= 3
         || trimmed.split_whitespace().any(|word| {
             matches!(
@@ -112,35 +152,14 @@ pub fn classify_query(query: &str) -> QueryFeatures {
             )
         });
 
-    let relationship = tokens.iter().any(|word| {
-        matches!(
-            normalized_word(word).as_str(),
-            "call"
-                | "calls"
-                | "called"
-                | "caller"
-                | "callers"
-                | "depend"
-                | "depends"
-                | "dependency"
-                | "dependencies"
-                | "flow"
-                | "flows"
-                | "through"
-                | "use"
-                | "uses"
-                | "used"
-                | "owner"
-                | "owns"
-        )
-    });
     let exact_symbols = unique_labels(tokens.iter().filter_map(|token| {
         let token = trim_query_token(token);
         (!looks_like_path_token(token, standalone_token)
             && (is_qualified_symbol(token)
                 || has_internal_camel_hump(token)
-                || token.contains('_')))
-        .then(|| token.to_string())
+                || token.contains('_')
+                || (explicitly_exact && standalone_token)))
+            .then(|| token.to_string())
     }));
     let paths = unique_labels(tokens.iter().filter_map(|token| {
         let token = trim_query_token(token);
@@ -151,48 +170,20 @@ pub fn classify_query(query: &str) -> QueryFeatures {
         .flat_map(|token| intent_words(token))
         .collect::<Vec<_>>();
     let relations = unique_labels(normalized_tokens.iter().filter_map(|token| {
-        matches!(
-            token.as_str(),
-            "call"
-                | "calls"
-                | "called"
-                | "caller"
-                | "callers"
-                | "depend"
-                | "depends"
-                | "dependency"
-                | "dependencies"
-                | "flow"
-                | "flows"
-                | "through"
-                | "use"
-                | "uses"
-                | "used"
-                | "owner"
-                | "owns"
-                | "route"
-                | "routes"
-                | "dispatch"
-                | "handoff"
-        )
-        .then(|| token.clone())
+        RELATION_WORDS
+            .contains(&token.as_str())
+            .then(|| token.clone())
     }));
     let ordered_flow_stages = unique_labels(normalized_tokens.iter().filter_map(|token| {
-        matches!(
-            token.as_str(),
-            "before"
-                | "after"
-                | "then"
-                | "first"
-                | "next"
-                | "finally"
-                | "flow"
-                | "pipeline"
-                | "stages"
-                | "handoff"
-        )
-        .then(|| token.clone())
+        (ORDERED_FLOW_WORDS.contains(&token.as_str()) || token == "handoff").then(|| token.clone())
     }));
+    let relationship = !relations.is_empty();
+    nl_like |= relationship && token_count > 1;
+    let ordered_flow = relationship
+        && normalized_tokens.len() > 1
+        && normalized_tokens
+            .iter()
+            .any(|token| ORDERED_FLOW_WORDS.contains(&token.as_str()));
     let evidence_roles = unique_labels(normalized_tokens.iter().filter_map(|token| {
         matches!(
             token.as_str(),
@@ -245,7 +236,7 @@ pub fn classify_query(query: &str) -> QueryFeatures {
             && !structural_kinds.iter().any(|kind| kind == token))
         .then(|| token.clone())
     }));
-    let lookup_mode = if !ordered_flow_stages.is_empty() && relationship {
+    let lookup_mode = if ordered_flow {
         QueryLookupMode::OrderedFlow
     } else if relationship {
         QueryLookupMode::Relation
@@ -318,16 +309,20 @@ fn trim_query_token(token: &str) -> &str {
     })
 }
 
+fn is_explicit_exact_token(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() >= 2
+        && matches!(
+            (bytes.first(), bytes.last()),
+            (Some(b'`'), Some(b'`')) | (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"'))
+        )
+}
+
 fn unique_labels(values: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut values = values.into_iter().collect::<Vec<_>>();
     values.sort();
     values.dedup();
     values
-}
-
-fn normalized_word(word: &str) -> String {
-    word.trim_matches(|character: char| !character.is_alphanumeric() && character != '_')
-        .to_ascii_lowercase()
 }
 
 fn intent_words(value: &str) -> Vec<String> {
@@ -448,6 +443,61 @@ mod tests {
         assert_eq!(features.shape, QueryShape::SymbolLike);
         let features = classify_query("foo::Bar");
         assert!(features.looks_like_qualified_symbol);
+    }
+
+    #[test]
+    fn lowercase_single_words_default_to_concepts_unless_exact_is_explicit() {
+        for query in ["authentication", "routing", "caching"] {
+            let features = classify_query(query);
+            assert_eq!(features.shape, QueryShape::NaturalLanguage, "{query}");
+            assert_eq!(features.intent.lookup_mode, QueryLookupMode::Explanation);
+            assert!(features.intent.natural_language);
+            assert!(!features.intent.standalone_symbol);
+            assert!(features.intent.concepts.contains(&query.to_string()));
+        }
+
+        for query in [
+            "`authentication`",
+            "\"routing\"",
+            "SearchWorker",
+            "search_worker",
+            "worker.search",
+        ] {
+            let features = classify_query(query);
+            assert_eq!(features.shape, QueryShape::SymbolLike, "{query}");
+            assert_eq!(features.intent.lookup_mode, QueryLookupMode::Definition);
+            assert!(features.intent.standalone_symbol);
+        }
+
+        assert_eq!(
+            classify_query("`authentication`").intent.exact_symbols,
+            ["authentication"]
+        );
+    }
+
+    #[test]
+    fn canonical_relation_vocabulary_drives_lookup_mode() {
+        for relation in ["route", "dispatch", "handoff"] {
+            let query = format!("RequestWorker {relation}");
+            let features = classify_query(&query);
+            assert!(features.intent.relationship, "{query}");
+            assert!(features.intent.relations.contains(&relation.to_string()));
+            assert_eq!(features.intent.lookup_mode, QueryLookupMode::Relation);
+            assert!(features.intent.natural_language);
+            assert_eq!(features.shape, QueryShape::Mixed);
+        }
+
+        for query in [
+            "RequestWorker dispatch before persistence",
+            "RequestWorker handoff then response",
+            "RequestWorker route pipeline stages",
+        ] {
+            assert_eq!(
+                classify_query(query).intent.lookup_mode,
+                QueryLookupMode::OrderedFlow,
+                "{query}"
+            );
+        }
     }
 
     #[test]
