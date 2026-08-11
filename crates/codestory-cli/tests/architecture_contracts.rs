@@ -2332,10 +2332,10 @@ fn owned_artifact_identities_are_declared_only_in_the_registry() {
 }
 
 #[test]
-fn packet_claim_profile_contracts_are_enforced_at_runtime_not_only_in_debug_builds() {
-    // ARCH-005 shipped the claim-profile contract behind `debug_assert!`, so a release
-    // binary answered from a profile whose calibration no longer held. Validation has to
-    // run in the shipped build and skip the profile it rejects.
+fn retired_packet_claim_profile_registry_stays_empty_versioned_and_fail_closed() {
+    // Source-text claim profiles are retired. The empty versioned registry remains in the
+    // shipped telemetry path, and its loader must keep rejecting malformed or incompatible
+    // documents rather than letting a heuristic profile re-enter production.
     let profiles = read("crates/codestory-agent/src/packet_claim_profiles.rs");
     let production = production_source_prefix(&profiles);
     let registry = read("crates/codestory-agent/src/packet_claim_profile_registry.rs");
@@ -2347,19 +2347,19 @@ fn packet_claim_profile_contracts_are_enforced_at_runtime_not_only_in_debug_buil
         );
     }
     for required in [
-        "telemetry.record_profile_skipped(profile_id, violation.code());",
         // The registry is versioned data now, and the loader is the only way in.
         "include_str!(\"data/claim_profiles.v2.json\")",
+        "load_claim_profile_registry(CLAIM_PROFILE_DOCUMENT, &[])",
     ] {
         assert!(
             production.contains(required),
-            "packet claim-profile registry must keep runtime validate-or-skip: missing {required}"
+            "retired packet claim-profile registry must stay empty and versioned: missing {required}"
         );
     }
     for required in [
         "-> Result<(), ClaimProfileContractViolation>",
         "enum ClaimProfileContractViolation",
-        "const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize",
+        "const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize = 0",
         // Every load failure removes profiles; none may add one.
         "ClaimProfileRegistry::refused(ClaimProfileDocumentRejection::Malformed)",
         "ClaimProfileRegistry::refused(ClaimProfileDocumentRejection::SchemaVersionMismatch)",
@@ -2805,12 +2805,11 @@ const PRODUCTION_GAP_ANNOTATION_PRODUCERS: &[(&str, &[&str])] = &[
         "crates/codestory-runtime/src/agent/packet_batch.rs",
         &[
             "\"packet_subqueries skipped budget=tiny\"",
+            "format!(\"packet_material_queries skipped reason=latency_budget_exhausted count={}\", pending.len())",
             "format!(\"packet_fused_subquery_batch_failed error={error:?}\")",
             "format!(\"packet_fused_blocking_cancel_retry skipped reason=latency_budget_exhausted count={}\", retry_pending.len())",
             "format!(\"packet_fused_blocking_cancel_retry_failed error={error:?}\")",
             "format!(\"packet_fused_blocking_cancel_retry exhausted count={}\", retry_outcome.retryable_queries.len())",
-            "format!(\"packet_anchor_probes skipped reason={reason}\")",
-            "format!(\"packet_anchor_probe_failed query=`{}` error={}\", query.replace('`', \"'\"), message)",
         ],
     ),
     ("crates/codestory-runtime/src/agent/trace.rs", &["message"]),

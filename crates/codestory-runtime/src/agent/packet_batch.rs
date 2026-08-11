@@ -950,6 +950,39 @@ mod tests {
     }
 
     #[test]
+    fn material_queries_dropped_for_latency_are_published_as_an_evidence_gap() {
+        // The material queries were planned but never dispatched, so the packet must report
+        // missing evidence and the missed SLA instead of retaining clean confidence.
+        let mut answer = empty_answer();
+        let packet_latency = PacketLatencyBudget {
+            started_at: Instant::now() - std::time::Duration::from_secs(2),
+            target_ms: 1_000,
+        };
+        run_packet_planned_subqueries(
+            &AppController::new(),
+            "Trace how StringUtils normalizes request routes",
+            &ev6c_plan(),
+            PacketBudgetModeDto::Compact,
+            &ev6c_limits(),
+            false,
+            packet_latency,
+            &[],
+            &mut answer,
+        )
+        .expect("dropping material queries for latency is not an execution error");
+
+        assert_eq!(
+            kind_of(
+                &answer,
+                "packet_material_queries skipped reason=latency_budget_exhausted count="
+            ),
+            RetrievalAnnotationKindDto::Gap,
+            "an SLA-driven material-query drop must publish an evidence gap"
+        );
+        assert!(answer.retrieval_trace.sla_missed);
+    }
+
+    #[test]
     fn failed_fused_subquery_batch_is_published_as_an_evidence_gap() {
         // EV-6c (#1775). The fused batch failing means none of the planned subqueries returned
         // evidence. The sibling `packet_subqueries fused_batch=` note on the same path is
