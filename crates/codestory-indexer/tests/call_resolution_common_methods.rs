@@ -1584,6 +1584,115 @@ def run():
 }
 
 #[test]
+fn test_python_annotated_factory_local_resolves_declared_interface_not_implementation()
+-> anyhow::Result<()> {
+    let adapters_source = r#"
+class BaseAdapter:
+    def send(self, request):
+        pass
+
+class HTTPAdapter(BaseAdapter):
+    def send(self, request):
+        pass
+"#;
+    let sessions_source = r#"
+from .adapters import BaseAdapter
+
+class Session:
+    def get_adapter(self, request) -> BaseAdapter:
+        raise NotImplementedError
+
+    def send(self, request):
+        adapter = self.get_adapter(request)
+        return adapter.send(request)
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("requests/adapters.py", adapters_source),
+        ("requests/sessions.py", sessions_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "python annotated factory interface receiver",
+        &nodes,
+        &edges,
+        "Session.send",
+        "BaseAdapter",
+        "send",
+        "requests/adapters.py",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "python annotated factory does not guess implementation",
+        &nodes,
+        &edges,
+        "Session.send",
+        "HTTPAdapter",
+        "send",
+        "requests/adapters.py",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_python_factory_receiver_without_one_precise_return_type_stays_unresolved()
+-> anyhow::Result<()> {
+    let source = r#"
+class BaseAdapter:
+    def send(self, request):
+        pass
+
+class HTTPAdapter(BaseAdapter):
+    def send(self, request):
+        pass
+
+class UnannotatedSession:
+    def get_adapter(self, request):
+        return BaseAdapter()
+
+    def send(self, request):
+        adapter = self.get_adapter(request)
+        return adapter.send(request)
+
+class UnionSession:
+    def get_adapter(self, request) -> BaseAdapter | HTTPAdapter:
+        return BaseAdapter()
+
+    def send(self, request):
+        adapter = self.get_adapter(request)
+        return adapter.send(request)
+
+class ReassignedSession:
+    def get_adapter(self, request) -> BaseAdapter:
+        return BaseAdapter()
+
+    def send(self, request, runtime_adapter):
+        adapter = self.get_adapter(request)
+        adapter = runtime_adapter
+        return adapter.send(request)
+"#;
+
+    let (nodes, edges) = index_single_file("requests/sessions.py", source)?;
+    for caller in [
+        "UnannotatedSession.send",
+        "UnionSession.send",
+        "ReassignedSession.send",
+    ] {
+        for owner in ["BaseAdapter", "HTTPAdapter"] {
+            assert_no_resolved_call_to_method_owner(
+                "python imprecise factory return",
+                &nodes,
+                &edges,
+                caller,
+                owner,
+                "send",
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_python_imported_constructor_local_receiver_resolves_to_imported_owner_method()
 -> anyhow::Result<()> {
     let workflow_source = r#"

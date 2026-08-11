@@ -1,8 +1,9 @@
 //! Packet batch retrieval orchestration for missing material proof.
 #![allow(clippy::items_after_test_module)]
 
+use super::packet_candidate::PacketSearchHit;
 #[cfg(test)]
-use super::citation::to_citation_from_hit;
+use super::packet_candidate::merge_packet_candidate_graph;
 use super::packet_required_probes::packet_sufficiency_required_probe_queries_from_terms;
 use super::packet_scoring::{
     normalize_identifier, packet_stage_citation_carry_limit, packet_subquery_hit_limit,
@@ -18,6 +19,7 @@ use super::packet_trace::{
 #[cfg(test)]
 use super::trace::field;
 use crate::{AppController, clamp_u128_to_u32};
+use codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms;
 use codestory_agent::packet_obligations::preview_packet_obligation_plan_before_budget;
 pub(crate) use codestory_agent::packet_scoring::packet_file_stem_matches_query;
 use codestory_contracts::api::{
@@ -255,6 +257,7 @@ pub(crate) fn run_packet_planned_subqueries(
         include_evidence,
         rank_terms,
         stage_carry_limit,
+        &packet_flow_requirements_for_terms(&packet_probe_terms(question), plan.task_class),
     );
     packet_latency.apply_to_trace(answer);
     Ok(())
@@ -281,8 +284,8 @@ fn packet_fused_retry_is_live() -> bool {
 }
 
 fn replace_packet_fused_results(
-    results: &mut [(String, Vec<SearchHit>)],
-    retry_results: Vec<(String, Vec<SearchHit>)>,
+    results: &mut [(String, Vec<PacketSearchHit>)],
+    retry_results: Vec<(String, Vec<PacketSearchHit>)>,
 ) {
     for (retry_query, retry_hits) in retry_results {
         if let Some((_, hits)) = results.iter_mut().find(|(query, _)| *query == retry_query) {
@@ -560,12 +563,15 @@ pub(crate) fn run_packet_anchor_expansion(
                 let mut citations = hits
                     .iter()
                     .filter(|hit| packet_anchor_hit_is_relevant(&query, hit))
-                    .map(|hit| to_citation_from_hit(hit, None, None, include_evidence))
+                    .map(|hit| (hit.citation(include_evidence), hit))
                     .collect::<Vec<_>>();
-                sort_by_cached_rank_desc(&mut citations, |citation| {
+                sort_by_cached_rank_desc(&mut citations, |(citation, _)| {
                     packet_citation_rank(citation, rank_terms, true)
                 });
-                for citation in citations.into_iter().take(stage_carry_limit) {
+                for (citation, hit) in citations.into_iter().take(stage_carry_limit) {
+                    if include_evidence {
+                        merge_packet_candidate_graph(answer, hit);
+                    }
                     if citation_keys.insert(packet_citation_key(&citation)) {
                         answer.citations.push(citation);
                         added = added.saturating_add(1);

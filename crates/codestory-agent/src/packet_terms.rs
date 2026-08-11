@@ -187,8 +187,23 @@ fn title_case_brand_token_term(token: &str) -> Option<String> {
 pub fn packet_terms_have(terms: &[String], needle: &str) -> bool {
     let normalized_needle = normalize_identifier(needle);
     terms.iter().any(|value| {
-        value.eq_ignore_ascii_case(needle) || normalize_identifier(value) == normalized_needle
+        let normalized_value = normalize_identifier(value);
+        value.eq_ignore_ascii_case(needle)
+            || normalized_value == normalized_needle
+            || bounded_action_lemma(&normalized_value) == bounded_action_lemma(&normalized_needle)
     })
+}
+
+/// Collapse only the finite action forms packet planning explicitly understands.
+///
+/// This deliberately is not stemming or prefix matching: `sender`, `sending_hook`, and
+/// `dispatch_hook` remain unrelated tokens while the grammatical forms of `send` share one
+/// intent.
+fn bounded_action_lemma(term: &str) -> &str {
+    match term {
+        "send" | "sends" | "sending" | "sent" => "send",
+        _ => term,
+    }
 }
 
 pub fn packet_terms_have_any(terms: &[String], needles: &[&str]) -> bool {
@@ -555,15 +570,23 @@ pub fn packet_terms_indicate_client_send_flow(terms: &[String]) -> bool {
     let explicit_client_or_http_intent =
         packet_terms_have_any(terms, &["client", "clients", "http", "httpclient"]);
     let request_intent = packet_terms_have_any(terms, &["request", "requests"]);
-    let send_or_transport_intent = packet_terms_have_any(
-        terms,
-        &["send", "sending", "sent", "transport", "transports"],
-    );
+    let send_or_transport_intent =
+        packet_terms_have_any(terms, &["send", "transport", "transports"]);
     let convenience_or_helper_intent =
         packet_terms_have_any(terms, &["convenience", "helper", "helpers"]);
 
     (explicit_client_or_http_intent && (send_or_transport_intent || convenience_or_helper_intent))
         || (request_intent && send_or_transport_intent)
+}
+
+pub fn packet_terms_indicate_full_outbound_request_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["request", "requests"])
+        && packet_terms_have(terms, "send")
+        && packet_terms_have_any(terms, &["adapter", "adapters", "transport", "transports"])
+        && packet_terms_have_any(
+            terms,
+            &["client", "clients", "http", "httpclient", "session"],
+        )
 }
 
 fn packet_terms_indicate_process_transport_flow(terms: &[String]) -> bool {
@@ -802,6 +825,25 @@ mod tests {
             "Trace how Express creates an application, registers middleware routes, and handles an incoming request through the router and response helpers.",
         );
         assert!(!packet_terms_indicate_client_send_flow(&route_terms));
+    }
+
+    #[test]
+    fn bounded_send_morphology_is_exact_and_shared() {
+        for action in ["send", "sends", "sending", "sent"] {
+            let terms = packet_probe_terms(&format!(
+                "Explain how a session {action} a request through an adapter."
+            ));
+            assert!(packet_terms_have(&terms, "send"), "{action}: {terms:?}");
+            assert!(packet_terms_indicate_client_send_flow(&terms));
+            assert!(packet_terms_indicate_full_outbound_request_flow(&terms));
+        }
+
+        for unrelated in ["sender", "sending_hook", "dispatch_hook"] {
+            let terms =
+                packet_probe_terms(&format!("Explain the session request adapter {unrelated}."));
+            assert!(!packet_terms_have(&terms, "send"), "{unrelated}: {terms:?}");
+            assert!(!packet_terms_indicate_full_outbound_request_flow(&terms));
+        }
     }
 
     #[test]

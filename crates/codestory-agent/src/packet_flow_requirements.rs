@@ -3,9 +3,10 @@
 use crate::packet_evidence_carriers::{
     SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS, SEARCH_EVIDENCE_OUTPUT_ACTIONS,
     citation_owns_buffer_read_write, citation_owns_buffer_storage,
-    citation_owns_client_request_dispatch, citation_owns_client_request_entrypoint,
-    citation_owns_client_request_finalization, citation_owns_client_request_method,
-    citation_owns_client_response_materialization, citation_owns_css_animation_entrypoint,
+    citation_owns_client_adapter_selection, citation_owns_client_request_dispatch,
+    citation_owns_client_request_entrypoint, citation_owns_client_request_finalization,
+    citation_owns_client_request_method, citation_owns_client_response_materialization,
+    citation_owns_client_transport_send, citation_owns_css_animation_entrypoint,
     citation_owns_css_animation_structure, citation_owns_css_structure,
     citation_owns_form_custom_validation, citation_owns_form_native_constraint,
     citation_owns_form_submit_guard, citation_owns_format_arguments,
@@ -20,13 +21,13 @@ use crate::packet_evidence_carriers::{
     citation_owns_shell_function_dispatch, citation_owns_shell_installer_bootstrap,
     citation_owns_site_lifecycle, citation_owns_site_terminal,
     citation_owns_string_blank_predicate, citation_owns_string_empty_predicate,
-    citation_owns_string_region_handoff, client_request_dispatch_call_target,
-    client_request_entrypoint_call_target, flow_belongs_to_client_request,
-    flow_belongs_to_command_dispatch, flow_belongs_to_command_server, flow_belongs_to_event_loop,
-    flow_belongs_to_indexing, flow_belongs_to_network_input, flow_belongs_to_request_terminal,
-    flow_belongs_to_search, flow_belongs_to_server_request, flow_belongs_to_sql_schema,
-    flow_belongs_to_url_session, server_request_dispatch_call_target,
-    server_request_entrypoint_call_target, server_response_terminal_call_target,
+    citation_owns_string_region_handoff, client_request_entrypoint_call_target,
+    flow_belongs_to_client_request, flow_belongs_to_command_dispatch,
+    flow_belongs_to_command_server, flow_belongs_to_event_loop, flow_belongs_to_indexing,
+    flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
+    flow_belongs_to_server_request, flow_belongs_to_sql_schema, flow_belongs_to_url_session,
+    server_request_dispatch_call_target, server_request_entrypoint_call_target,
+    server_response_terminal_call_target,
 };
 use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
@@ -37,8 +38,9 @@ use crate::packet_terms::{
     packet_terms_indicate_command_event_loop_flow,
     packet_terms_indicate_command_server_bootstrap_flow,
     packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_form_validation_flow,
-    packet_terms_indicate_hook_cache_flow, packet_terms_indicate_html_css_template_structure_flow,
-    packet_terms_indicate_indexing_flow, packet_terms_indicate_log_record_handler_flow,
+    packet_terms_indicate_full_outbound_request_flow, packet_terms_indicate_hook_cache_flow,
+    packet_terms_indicate_html_css_template_structure_flow, packet_terms_indicate_indexing_flow,
+    packet_terms_indicate_log_record_handler_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_network_command_input_flow, packet_terms_indicate_request_dispatch_flow,
     packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
@@ -132,12 +134,13 @@ pub enum EvidencePredicate {
         roles: &'static [PacketEvidenceRole],
     },
     /// Preserve an established role-backed surface while admitting a structural carrier only when
-    /// its cited outgoing CALL reaches the next action at this exact flow boundary.
+    /// its cited CALL reaches the next action at this exact flow boundary. A boundary without a
+    /// target predicate accepts either an incoming predecessor CALL or an outgoing successor CALL.
     CitedRolesOrCallBoundary {
         subsystem: fn(&AgentCitationDto) -> bool,
         roles: &'static [PacketEvidenceRole],
         carrier: fn(&AgentCitationDto) -> bool,
-        call_target: fn(&str) -> bool,
+        call_target: Option<fn(&str) -> bool>,
     },
     /// Covered by a citation that passes a structural ownership check, used where the evidence
     /// role is too coarse to separate a requirement from its siblings. The carriers carry their own
@@ -213,6 +216,7 @@ impl EvidencePredicate {
         };
         (!citation_has_named_role(citation, subsystem, roles) && carrier(citation))
             .then_some(call_target)
+            .flatten()
     }
 }
 
@@ -304,6 +308,7 @@ pub fn packet_flow_requirements_for_terms(
     let server_request_dispatch = packet_terms_indicate_server_request_dispatch_flow(terms);
     let server_route_dispatch = packet_terms_indicate_server_route_dispatch_flow(terms);
     let client_request_dispatch = packet_terms_indicate_request_dispatch_flow(terms);
+    let full_outbound_request = packet_terms_indicate_full_outbound_request_flow(terms);
     if server_request_dispatch {
         requirements.extend_from_slice(SERVER_REQUEST_DISPATCH_FLOW);
     } else if server_route_dispatch {
@@ -317,12 +322,16 @@ pub fn packet_flow_requirements_for_terms(
                 }),
         );
     } else if client_request_dispatch {
-        requirements.extend_from_slice(CLIENT_REQUEST_DISPATCH_FLOW);
+        if full_outbound_request {
+            push_full_client_outbound_request_flow(terms, &mut requirements);
+        } else {
+            requirements.extend_from_slice(CLIENT_REQUEST_DISPATCH_FLOW);
+        }
         if packet_terms_have_any(terms, &["interceptor", "interceptors"]) {
             requirements.push(REQUEST_INTERCEPTOR_REQUIREMENT);
         }
     }
-    if packet_terms_indicate_client_send_flow(terms) {
+    if packet_terms_indicate_client_send_flow(terms) && !full_outbound_request {
         push_client_send_requirements_for_terms(terms, &mut requirements);
     }
     if packet_terms_indicate_hook_cache_flow(terms) {
@@ -481,7 +490,7 @@ fn push_client_send_requirements_for_terms(
     ]) {
         requirements.push(CLIENT_REQUEST_FINALIZATION_REQUIREMENT);
     }
-    if has_any(&["send", "sending", "sent"])
+    if has_any(&["send"])
         || (has_any(&["transport", "transports"]) && has_any(&["implementation", "implements"]))
     {
         requirements.push(CLIENT_TRANSPORT_SEND_REQUIREMENT);
@@ -502,6 +511,42 @@ fn push_client_send_requirements_for_terms(
         .all(|requirement| !requirement.id.starts_with("client_"))
     {
         requirements.push(CLIENT_TRANSPORT_SEND_REQUIREMENT);
+    }
+}
+
+fn push_full_client_outbound_request_flow(
+    terms: &[String],
+    requirements: &mut Vec<FlowRequirement>,
+) {
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+    requirements.push(CLIENT_PUBLIC_FACADE_REQUIREMENT);
+    if has_any(&[
+        "convenience",
+        "conveniences",
+        "method",
+        "methods",
+        "interface",
+        "interfaces",
+        "helper",
+        "helpers",
+    ]) {
+        requirements.push(CLIENT_INTERFACE_HELPERS_REQUIREMENT);
+    }
+    requirements.push(CLIENT_REQUEST_DISPATCH_FLOW[0]);
+    requirements.push(CLIENT_REQUEST_FINALIZATION_REQUIREMENT);
+    requirements.push(CLIENT_REQUEST_DISPATCH_FLOW[1]);
+    requirements.push(CLIENT_REQUEST_DISPATCH_FLOW[2]);
+    requirements.push(CLIENT_TRANSPORT_SEND_REQUIREMENT);
+    if has_any(&[
+        "response",
+        "responses",
+        "materialize",
+        "materializes",
+        "materialization",
+        "stream",
+        "boundary",
+    ]) {
+        requirements.push(CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT);
     }
 }
 
@@ -568,7 +613,7 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
                 PacketEvidenceRole::AppServerRequestProtocol,
             ],
             carrier: citation_owns_server_request_entrypoint,
-            call_target: server_request_entrypoint_call_target,
+            call_target: Some(server_request_entrypoint_call_target),
         },
     },
     FlowRequirement {
@@ -584,7 +629,7 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
                 PacketEvidenceRole::RuntimeOrchestration,
             ],
             carrier: citation_owns_server_request_dispatch,
-            call_target: server_request_dispatch_call_target,
+            call_target: Some(server_request_dispatch_call_target),
         },
     },
     FlowRequirement {
@@ -600,7 +645,7 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
                 PacketEvidenceRole::BufferedIo,
             ],
             carrier: citation_owns_server_response_terminal,
-            call_target: server_response_terminal_call_target,
+            call_target: Some(server_response_terminal_call_target),
         },
     },
 ];
@@ -618,7 +663,7 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
                 PacketEvidenceRole::CommandEntrypoint,
             ],
             carrier: citation_owns_client_request_entrypoint,
-            call_target: client_request_entrypoint_call_target,
+            call_target: Some(client_request_entrypoint_call_target),
         },
     },
     FlowRequirement {
@@ -630,18 +675,17 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
             subsystem: flow_belongs_to_client_request,
             roles: &[PacketEvidenceRole::RequestDispatch],
             carrier: citation_owns_client_request_dispatch,
-            call_target: client_request_dispatch_call_target,
+            // An exact incoming CALL from the preceding request stage or an exact outgoing CALL
+            // to the following adapter stage is sufficient for this ordered carrier.
+            call_target: None,
         },
     },
     FlowRequirement {
         id: "request_terminal",
-        role: FlowRole::TerminalBoundary,
-        query_seeds: &["response finalization", "transport send"],
-        coverage_mode: CoverageMode::AllowsSourceRange,
-        evidence: EvidencePredicate::CitedRoles {
-            subsystem: flow_belongs_to_request_terminal,
-            roles: &[PacketEvidenceRole::TransportAdapter],
-        },
+        role: FlowRole::Dispatch,
+        query_seeds: &["session adapter selection", "get adapter"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_client_adapter_selection),
     },
 ];
 
@@ -714,16 +758,10 @@ const CLIENT_REQUEST_FINALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement
 
 const CLIENT_TRANSPORT_SEND_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "client_transport_send",
-    role: FlowRole::Dispatch,
+    role: FlowRole::TerminalBoundary,
     query_seeds: &["transport send", "client send implementation"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-    evidence: EvidencePredicate::CitedRoles {
-        subsystem: flow_belongs_to_client_request,
-        roles: &[
-            PacketEvidenceRole::TransportAdapter,
-            PacketEvidenceRole::RequestDispatch,
-        ],
-    },
+    evidence: EvidencePredicate::CitedCarrier(citation_owns_client_transport_send),
 };
 
 const CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -1238,6 +1276,44 @@ mod tests {
     }
 
     #[test]
+    fn inflected_outbound_request_plans_one_ordered_six_stage_lifecycle() {
+        for action in ["send", "sends", "sending", "sent"] {
+            let prompt = format!(
+                "Explain how a top-level request call becomes a prepared request and {action} it through a session adapter."
+            );
+            let terms = packet_probe_terms(&prompt);
+            let requirements =
+                packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::DataFlow);
+            assert_eq!(
+                requirements
+                    .iter()
+                    .map(|requirement| requirement.id)
+                    .collect::<Vec<_>>(),
+                [
+                    "client_public_facade",
+                    "request_entrypoint",
+                    "client_request_finalization",
+                    "request_dispatch",
+                    "request_terminal",
+                    "client_transport_send",
+                ],
+                "{action}: {terms:?}"
+            );
+
+            let queries =
+                packet_flow_requirement_queries_for_terms(&terms, PacketTaskClassDto::DataFlow);
+            assert_eq!(
+                queries
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                queries.len(),
+                "the lifecycle must not dispatch duplicate queries: {queries:?}"
+            );
+        }
+    }
+
+    #[test]
     fn focused_client_finalization_prompt_does_not_require_full_lifecycle() {
         assert_eq!(
             client_requirement_ids(
@@ -1480,7 +1556,7 @@ mod tests {
         "client_public_facade | entrypoint | RequiresResolvedSourceOrGraph",
         "client_request_finalization | transform_or_validate | RequiresResolvedSourceOrGraph",
         "client_response_materialization | terminal_boundary | RequiresResolvedSourceOrGraph",
-        "client_transport_send | dispatch | RequiresResolvedSourceOrGraph",
+        "client_transport_send | terminal_boundary | RequiresResolvedSourceOrGraph",
         "command_dispatch | dispatch | RequiresResolvedSourceOrGraph",
         "command_event_loop | dispatch | RequiresResolvedSourceOrGraph",
         "command_network_input | dispatch | RequiresResolvedSourceOrGraph",
@@ -1508,7 +1584,7 @@ mod tests {
         "request_entrypoint | entrypoint | RequiresResolvedSourceOrGraph",
         "request_entrypoint | registration | RequiresResolvedSourceOrGraph",
         "request_interceptor_management | dispatch | RequiresResolvedSourceOrGraph",
-        "request_terminal | terminal_boundary | AllowsSourceRange",
+        "request_terminal | dispatch | RequiresResolvedSourceOrGraph",
         "request_terminal | terminal_boundary | RequiresResolvedSourceOrGraph",
         "search_dispatch | dispatch | RequiresResolvedSourceOrGraph",
         "search_evidence_classification | transform_or_validate | RequiresResolvedSourceOrGraph",
@@ -1614,6 +1690,14 @@ mod tests {
                 ),
             ),
             (
+                ("request_terminal", "dispatch"),
+                witness(
+                    "Session.get_adapter",
+                    "src/requests/sessions.py",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
                 ("request_interceptor_management", "dispatch"),
                 witness(
                     "InterceptorManager",
@@ -1654,10 +1738,10 @@ mod tests {
                 ),
             ),
             (
-                ("client_transport_send", "dispatch"),
+                ("client_transport_send", "terminal_boundary"),
                 witness(
-                    "IOClient.sendAdapter",
-                    "lib/io_client.dart",
+                    "BaseAdapter.send",
+                    "src/requests/adapters.py",
                     NodeKind::METHOD,
                 ),
             ),

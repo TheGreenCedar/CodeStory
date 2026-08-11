@@ -1,14 +1,20 @@
 //! Mandatory sidecar retrieval integration for packet and agent ask paths.
 
 use crate::agent::nucleo_policy::with_sidecar_primary_retrieval;
+use crate::agent::packet_candidate::{
+    PacketGraphDirection, PacketGraphEdgeProvenance, PacketSearchHit,
+};
 use crate::agent::packet_degradation::semantic_stage_degradation;
 use crate::agent::packet_evidence::decorate_search_hit_evidence;
-use crate::{AppController, HybridSearchScoredHit};
+use crate::{
+    AppController, HybridSearchScoredHit, app_graph_flags, graph_edge_dto, member_access_dto,
+    node_display_name,
+};
 use anyhow::Error as AnyhowError;
 use codestory_contracts::api::NodeKind as ApiNodeKind;
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentPacketDto, ApiError, EmbeddingVectorPublicationIdentityDto,
-    PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto,
+    AgentAnswerDto, AgentPacketDto, ApiError, EmbeddingVectorPublicationIdentityDto, GraphNodeDto,
+    GraphResponse, PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto,
     RetrievalCandidateResolutionCountDto, RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto,
     RetrievalShadowDto, RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchResultsDto,
 };
@@ -16,9 +22,10 @@ use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 #[cfg(test)]
 use codestory_retrieval::SidecarRuntimeConfig;
 use codestory_retrieval::{
-    CandidateHit, CandidateSource, PinnedQuerySession, QueryBatchItem, QueryRequest, QueryResult,
-    QueryTrace, SidecarProfile, execute_retrieval_query_with_cache_for_runtime,
-    is_phantom_sidecar_hit, is_retrieval_publication_changed, sidecar_project_id_for_root,
+    CandidateGraphDirection, CandidateHit, CandidateSource, PinnedQuerySession, QueryBatchItem,
+    QueryRequest, QueryResult, QueryTrace, SidecarProfile,
+    execute_retrieval_query_with_cache_for_runtime, is_phantom_sidecar_hit,
+    is_retrieval_publication_changed, sidecar_project_id_for_root,
     strict_sidecar_status_for_runtime,
 };
 use codestory_store::Store;
@@ -916,13 +923,14 @@ pub(crate) fn search_sidecar_packet_batch(
 
 #[derive(Debug)]
 pub(crate) struct SidecarPacketBatchOutcome {
-    pub results: Vec<(String, Vec<SearchHit>)>,
+    pub results: Vec<(String, Vec<PacketSearchHit>)>,
     pub retryable_queries: Vec<String>,
     pub diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
 }
 
 pub(crate) struct SidecarCandidateResolutionOutcome {
     pub(crate) resolved_hits: Vec<SearchHit>,
+    pub(crate) packet_hits: Vec<PacketSearchHit>,
     unresolved_candidate_count: usize,
     blocking_unresolved_candidate_count: usize,
     attempted_candidate_indices: HashSet<usize>,
@@ -1126,6 +1134,7 @@ fn build_sidecar_packet_batch_outcome(
             candidate_resolution_ms,
             batch_query_wall_ms,
         ));
+        let packet_hits = resolution.packet_hits;
         let resolved_hits = resolution.resolved_hits;
         if let Some(reason) = sidecar_packet_batch_rejection_reason(&query_result, &resolved_hits) {
             if let Some("deadline" | "stage_deadline") =
@@ -1144,7 +1153,8 @@ fn build_sidecar_packet_batch_outcome(
                 ),
             ));
         }
-        results.push((query.clone(), resolved_hits));
+        debug_assert_eq!(packet_hits.len(), resolved_hits.len());
+        results.push((query.clone(), packet_hits));
     }
     Ok(SidecarPacketBatchOutcome {
         results,
@@ -1965,6 +1975,145 @@ fn resolve_sidecar_candidates_in_read(
     )
 }
 
+fn packet_graph_for_resolved_candidate(
+    storage: &Store,
+    node_names: &HashMap<CoreNodeId, String>,
+    node_id: CoreNodeId,
+    candidate: &CandidateHit,
+) -> Result<(Vec<PacketGraphEdgeProvenance>, Option<GraphResponse>), ApiError> {
+    let Some(candidate_evidence) = candidate.graph_evidence.as_ref() else {
+        return Ok((Vec::new(), None));
+    };
+    let (direction, edge_kind) = match (candidate_evidence.direction, candidate_evidence.edge_kind)
+    {
+        (CandidateGraphDirection::Outgoing, Some(edge_kind)) => {
+            (PacketGraphDirection::Outgoing, edge_kind)
+        }
+        (CandidateGraphDirection::Incoming, Some(edge_kind)) => {
+            (PacketGraphDirection::Incoming, edge_kind)
+        }
+        (CandidateGraphDirection::Anchor, _) | (_, None) => {
+            return Ok((Vec::new(), None));
+        }
+    };
+
+    let mut edges = storage
+        .get_edges_for_node_ids(&[node_id])
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to resolve packet candidate graph provenance: {error}"
+            ))
+        })?
+        .remove(&node_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|edge| {
+            if edge.kind != edge_kind {
+                return false;
+            }
+            let (source, target) = edge.effective_endpoints();
+            match direction {
+                // The sidecar direction is anchor-relative: an outgoing expansion lands on the
+                // target candidate, while an incoming expansion lands on the source candidate.
+                PacketGraphDirection::Outgoing => target == node_id,
+                PacketGraphDirection::Incoming => source == node_id,
+            }
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by(|left, right| {
+        packet_graph_certainty_priority(left.certainty)
+            .cmp(&packet_graph_certainty_priority(right.certainty))
+            .then(left.id.0.cmp(&right.id.0))
+    });
+    edges.truncate(12);
+    if edges.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+
+    let graph_flags = app_graph_flags();
+    let edge_dtos = edges
+        .into_iter()
+        .map(|edge| graph_edge_dto(edge.with_effective_endpoints(), graph_flags))
+        .collect::<Vec<_>>();
+    let mut endpoint_ids = edge_dtos
+        .iter()
+        .flat_map(|edge| [edge.source.to_core(), edge.target.to_core()])
+        .collect::<Result<Vec<_>, _>>()?;
+    endpoint_ids.sort_unstable_by_key(|id| id.0);
+    endpoint_ids.dedup();
+    endpoint_ids.sort_by_key(|id| (*id != node_id, id.0));
+
+    let mut nodes = Vec::with_capacity(endpoint_ids.len());
+    for endpoint_id in endpoint_ids {
+        let Some(node) = storage.get_node(endpoint_id).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to resolve packet candidate graph endpoint: {error}"
+            ))
+        })?
+        else {
+            continue;
+        };
+        let file_path = AppController::file_path_for_node(storage, &node)?;
+        let access = storage.get_component_access(node.id).ok().flatten();
+        nodes.push(GraphNodeDto {
+            id: node.id.into(),
+            label: node_names
+                .get(&node.id)
+                .cloned()
+                .unwrap_or_else(|| node_display_name(&node)),
+            kind: node.kind.into(),
+            depth: u32::from(node.id != node_id),
+            label_policy: Some("qualified_or_serialized".to_string()),
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path,
+            qualified_name: node.qualified_name,
+            member_access: member_access_dto(access),
+        });
+    }
+
+    let mut producers = candidate.provenance.clone();
+    if let Some(graph_lane) = candidate.lane_scores.graph.as_ref() {
+        producers.extend(graph_lane.provenance.iter().cloned());
+    }
+    producers.sort();
+    producers.dedup();
+    let provenance = edge_dtos
+        .iter()
+        .map(|edge| PacketGraphEdgeProvenance {
+            edge_id: edge.id.clone(),
+            direction,
+            hop: candidate_evidence.hop,
+            producers: producers.clone(),
+            certainty: edge.certainty.clone(),
+        })
+        .collect::<Vec<_>>();
+    Ok((
+        provenance,
+        Some(GraphResponse {
+            center_id: node_id.into(),
+            nodes,
+            edges: edge_dtos,
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: None,
+        }),
+    ))
+}
+
+fn packet_graph_certainty_priority(
+    certainty: Option<codestory_contracts::graph::ResolutionCertainty>,
+) -> u8 {
+    use codestory_contracts::graph::ResolutionCertainty;
+    match certainty {
+        Some(ResolutionCertainty::Certain) => 0,
+        Some(ResolutionCertainty::Probable) => 1,
+        Some(ResolutionCertainty::Uncertain) => 2,
+        None => 3,
+    }
+}
+
 fn resolve_sidecar_candidates_in_storage(
     storage: &Store,
     node_names: &HashMap<CoreNodeId, String>,
@@ -1973,6 +2122,7 @@ fn resolve_sidecar_candidates_in_storage(
     max_results: usize,
 ) -> Result<SidecarCandidateResolutionOutcome, ApiError> {
     let mut hits = Vec::new();
+    let mut packet_hits = Vec::new();
     let mut unresolved_candidates = Vec::new();
     let mut attempted_candidate_indices = HashSet::new();
     let mut seen = HashSet::new();
@@ -2007,7 +2157,15 @@ fn resolve_sidecar_candidates_in_storage(
             unresolved_candidates.push((candidate, "hit_build_failed"));
             continue;
         };
-        hits.push(classify_resolved_candidate_hit(hit, candidate));
+        let hit = classify_resolved_candidate_hit(hit, candidate);
+        let (graph_provenance, graph) =
+            packet_graph_for_resolved_candidate(storage, node_names, node_id, candidate)?;
+        packet_hits.push(PacketSearchHit {
+            hit: hit.clone(),
+            graph_provenance,
+            graph,
+        });
+        hits.push(hit);
     }
 
     let has_resolved_hit = !hits.is_empty();
@@ -2021,6 +2179,7 @@ fn resolve_sidecar_candidates_in_storage(
 
     Ok(SidecarCandidateResolutionOutcome {
         resolved_hits: hits,
+        packet_hits,
         unresolved_candidate_count,
         blocking_unresolved_candidate_count,
         attempted_candidate_indices,
@@ -3011,6 +3170,117 @@ mod tests {
     }
 
     #[test]
+    fn packet_candidate_keeps_exact_scip_edge_provenance_without_public_hit_fields() {
+        use codestory_retrieval::CandidateGraphEvidence;
+        use codestory_store::{FileInfo, FileRole};
+
+        let mut storage = Store::new_in_memory().expect("storage");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: PathBuf::from("requests/sessions.py"),
+                language: "python".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 10,
+                file_role: FileRole::Source,
+            })
+            .expect("insert file");
+        storage
+            .insert_nodes_batch(&[
+                codestory_contracts::graph::Node {
+                    id: CoreNodeId(1),
+                    kind: NodeKind::FILE,
+                    serialized_name: "requests/sessions.py".into(),
+                    ..Default::default()
+                },
+                codestory_contracts::graph::Node {
+                    id: CoreNodeId(2),
+                    kind: NodeKind::METHOD,
+                    serialized_name: "Session.request".into(),
+                    qualified_name: Some("Session.request".into()),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(2),
+                    ..Default::default()
+                },
+                codestory_contracts::graph::Node {
+                    id: CoreNodeId(3),
+                    kind: NodeKind::METHOD,
+                    serialized_name: "Session.send".into(),
+                    qualified_name: Some("Session.send".into()),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(5),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert nodes");
+        storage
+            .insert_edges_batch(&[codestory_contracts::graph::Edge {
+                id: codestory_contracts::graph::EdgeId(7),
+                source: CoreNodeId(2),
+                target: CoreNodeId(3),
+                kind: codestory_contracts::graph::EdgeKind::CALL,
+                resolved_target: Some(CoreNodeId(3)),
+                certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
+                ..Default::default()
+            }])
+            .expect("insert edge");
+
+        let mut candidate = CandidateHit::with_source(
+            "requests/sessions.py",
+            Some("Session.send".into()),
+            0.8,
+            CandidateSource::Scip,
+        );
+        candidate.node_id = Some("3".into());
+        candidate.provenance = vec!["scip_graph_projection".into(), "graph_neighbor".into()];
+        candidate.graph_evidence = Some(CandidateGraphEvidence {
+            edge_kind: Some(codestory_contracts::graph::EdgeKind::CALL),
+            direction: CandidateGraphDirection::Outgoing,
+            hop: 1,
+            fanout: 1,
+            edge_weight: 1.0,
+            direction_weight: 1.0,
+        });
+
+        let outcome = resolve_sidecar_candidates_in_storage(
+            &storage,
+            &HashMap::new(),
+            Path::new("."),
+            &[candidate],
+            1,
+        )
+        .expect("resolve packet candidate");
+        assert_eq!(outcome.resolved_hits.len(), 1);
+        let packet_hit = outcome.packet_hits.first().expect("packet hit");
+        assert_eq!(
+            packet_hit
+                .graph_provenance
+                .iter()
+                .map(|provenance| provenance.edge_id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["7"]
+        );
+        assert_eq!(
+            packet_hit.graph_provenance[0].direction,
+            PacketGraphDirection::Outgoing
+        );
+        assert_eq!(packet_hit.graph_provenance[0].hop, 1);
+        assert_eq!(
+            packet_hit.graph_provenance[0].certainty.as_deref(),
+            Some("certain")
+        );
+        assert!(
+            packet_hit.graph_provenance[0]
+                .producers
+                .iter()
+                .any(|producer| producer == "scip_graph_projection")
+        );
+        assert_eq!(packet_hit.citation(true).evidence_edge_ids[0].0, "7");
+    }
+
+    #[test]
     fn unresolved_sidecar_candidates_are_diagnostic_only() {
         let result = QueryResult {
             publication_identity: None,
@@ -3034,6 +3304,7 @@ mod tests {
         };
         let resolution = SidecarCandidateResolutionOutcome {
             resolved_hits: Vec::new(),
+            packet_hits: Vec::new(),
             unresolved_candidate_count: 1,
             blocking_unresolved_candidate_count: 1,
             attempted_candidate_indices: HashSet::from([0]),
@@ -3090,6 +3361,7 @@ mod tests {
     fn empty_resolution() -> SidecarCandidateResolutionOutcome {
         SidecarCandidateResolutionOutcome {
             resolved_hits: Vec::new(),
+            packet_hits: Vec::new(),
             unresolved_candidate_count: 0,
             blocking_unresolved_candidate_count: 0,
             attempted_candidate_indices: HashSet::new(),
@@ -3842,6 +4114,7 @@ mod tests {
         let empty_resolution = |_: &QueryResult, _: usize| {
             Ok(SidecarCandidateResolutionOutcome {
                 resolved_hits: Vec::new(),
+                packet_hits: Vec::new(),
                 unresolved_candidate_count: 0,
                 blocking_unresolved_candidate_count: 0,
                 attempted_candidate_indices: HashSet::new(),
@@ -4353,6 +4626,7 @@ mod tests {
         };
         let empty_resolution = SidecarCandidateResolutionOutcome {
             resolved_hits: Vec::new(),
+            packet_hits: Vec::new(),
             unresolved_candidate_count: 0,
             blocking_unresolved_candidate_count: 0,
             attempted_candidate_indices: HashSet::new(),
@@ -4390,6 +4664,7 @@ mod tests {
         };
         let unresolved_resolution = SidecarCandidateResolutionOutcome {
             resolved_hits: Vec::new(),
+            packet_hits: Vec::new(),
             unresolved_candidate_count: 1,
             blocking_unresolved_candidate_count: 1,
             attempted_candidate_indices: HashSet::from([0]),
@@ -4430,8 +4705,10 @@ mod tests {
                 stages: Vec::new(),
             },
         };
+        let cancelled_hit = search_hit_for_candidate(&cancelled.hits[0]);
         let cancelled_resolution = SidecarCandidateResolutionOutcome {
-            resolved_hits: vec![search_hit_for_candidate(&cancelled.hits[0])],
+            resolved_hits: vec![cancelled_hit.clone()],
+            packet_hits: vec![PacketSearchHit::without_graph(cancelled_hit)],
             unresolved_candidate_count: 0,
             blocking_unresolved_candidate_count: 0,
             attempted_candidate_indices: HashSet::from([0]),

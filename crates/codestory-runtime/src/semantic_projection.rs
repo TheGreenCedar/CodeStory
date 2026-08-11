@@ -361,6 +361,10 @@ pub(super) fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {
     )
 }
 
+/// Version 10 reserves one certain incoming and one certain outgoing CALL when both exist before
+/// filling the remaining graph-neighbor budget. Version 9 could fill the bounded relation text
+/// from one direction and omit the other half of a callable flow.
+///
 /// Version 9 binds graph neighbors to typed direction and certainty, orders
 /// them by parser-backed source location, and reserves source space for a
 /// signature and behavior body without emitting partial token fragments. A
@@ -373,7 +377,7 @@ pub(super) fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {
 /// admission cap. A version-6 document cannot prove an over-default file body
 /// was available when it was built, so retained cores must repair it from
 /// source instead of restamping it through `StoredCore` republish.
-pub(super) const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 9;
+pub(super) const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 10;
 pub(super) const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
 #[cfg(test)]
 pub(super) const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
@@ -935,6 +939,48 @@ fn semantic_graph_neighbor_order(
         .then(left.label.cmp(&right.label))
 }
 
+fn retain_balanced_semantic_neighbors(neighbors: &mut Vec<SemanticGraphNeighbor>, limit: usize) {
+    neighbors.sort_by(semantic_graph_neighbor_order);
+    let mut seen = HashSet::new();
+    neighbors
+        .retain(|neighbor| seen.insert((neighbor.node_id, neighbor.edge_kind, neighbor.direction)));
+    if neighbors.len() <= limit {
+        return;
+    }
+
+    use codestory_contracts::graph::{EdgeKind, ResolutionCertainty};
+    let reserved = [
+        SemanticRelationDirection::Incoming,
+        SemanticRelationDirection::Outgoing,
+    ]
+    .into_iter()
+    .filter_map(|direction| {
+        neighbors.iter().find(|neighbor| {
+            neighbor.edge_kind == EdgeKind::CALL
+                && neighbor.direction == direction
+                && neighbor.certainty == ResolutionCertainty::Certain
+        })
+    })
+    .map(|neighbor| neighbor.edge_id)
+    .collect::<HashSet<_>>();
+
+    let mut retained = neighbors
+        .iter()
+        .filter(|neighbor| reserved.contains(&neighbor.edge_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for neighbor in neighbors.iter() {
+        if retained.len() >= limit {
+            break;
+        }
+        if !reserved.contains(&neighbor.edge_id) {
+            retained.push(neighbor.clone());
+        }
+    }
+    retained.sort_by(semantic_graph_neighbor_order);
+    *neighbors = retained;
+}
+
 fn semantic_neighbor_text(neighbor: &SemanticGraphNeighbor) -> String {
     let certainty = neighbor.certainty.as_str();
     let provenance = match (neighbor.source_line, neighbor.source_column) {
@@ -1024,12 +1070,7 @@ impl SemanticNodeGraphSummary {
             source_column: semantic_callsite_column(edge.callsite_identity.as_deref()),
             edge_id: edge.id.0,
         });
-        self.neighbors.sort_by(semantic_graph_neighbor_order);
-        let mut seen = HashSet::new();
-        self.neighbors.retain(|neighbor| {
-            seen.insert((neighbor.node_id, neighbor.edge_kind, neighbor.direction))
-        });
-        self.neighbors.truncate(FLOW_NEIGHBORS_PER_SEED);
+        retain_balanced_semantic_neighbors(&mut self.neighbors, FLOW_NEIGHBORS_PER_SEED);
     }
 
     fn finish(

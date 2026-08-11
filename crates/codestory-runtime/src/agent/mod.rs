@@ -42,6 +42,7 @@ pub(crate) mod nucleo_policy;
 pub(crate) mod orchestrator;
 pub(crate) mod packet_batch;
 pub(crate) mod packet_budget;
+pub(crate) mod packet_candidate;
 pub(crate) mod packet_capping;
 pub(crate) mod packet_follow_up;
 

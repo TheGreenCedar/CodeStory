@@ -247,8 +247,8 @@ pub use cache_clean::{
     plan_cache_clean,
 };
 pub use candidate::{
-    CandidateHit, CandidateLane, CandidateLaneEvidence, CandidateLaneScores, CandidateSource,
-    RankFeatures,
+    CandidateGraphDirection, CandidateGraphEvidence, CandidateHit, CandidateLane,
+    CandidateLaneEvidence, CandidateLaneScores, CandidateSource, RankFeatures,
 };
 pub use candidate::{is_phantom_sidecar_hit, phantom_sidecar_candidates_only};
 pub use capabilities::SidecarCapabilities;

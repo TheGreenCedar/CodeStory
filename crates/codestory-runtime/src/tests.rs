@@ -1496,6 +1496,75 @@ fn semantic_graph_text_binds_direction_certainty_and_source_order() {
 }
 
 #[test]
+fn semantic_graph_text_reserves_certain_calls_in_both_directions() {
+    let mut storage = Storage::new_in_memory().expect("storage");
+    let file = Node {
+        id: CoreNodeId(1),
+        kind: NodeKind::FILE,
+        serialized_name: "semantic.rs".to_string(),
+        ..Default::default()
+    };
+    let center = semantic_policy_node(500, NodeKind::FUNCTION, "Center", 1);
+    let incoming = semantic_policy_node(501, NodeKind::FUNCTION, "Incoming", 1);
+    let outgoing = (0..9)
+        .map(|index| {
+            semantic_policy_node(
+                510 + index,
+                NodeKind::FUNCTION,
+                &format!("Outgoing{index}"),
+                1,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut nodes = vec![file, center.clone(), incoming.clone()];
+    nodes.extend(outgoing.iter().cloned());
+    storage.insert_nodes_batch(&nodes).expect("nodes");
+
+    let mut edges = outgoing
+        .iter()
+        .enumerate()
+        .map(|(index, target)| Edge {
+            id: EdgeId(index as i64 + 1),
+            source: center.id,
+            target: target.id,
+            kind: EdgeKind::CALL,
+            line: Some(index as u32 + 1),
+            resolved_target: Some(target.id),
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    edges.push(Edge {
+        id: EdgeId(100),
+        source: incoming.id,
+        target: center.id,
+        kind: EdgeKind::CALL,
+        line: Some(100),
+        resolved_target: Some(center.id),
+        certainty: Some(ResolutionCertainty::Certain),
+        ..Default::default()
+    });
+    storage.insert_edges_batch(&edges).expect("edges");
+
+    let context = SemanticDocGraphContext::build(&storage, &[&center], &nodes).expect("context");
+    let relations = context
+        .typed_relations
+        .get(&center.id)
+        .expect("typed relations");
+    assert_eq!(relations.len(), 8);
+    assert!(
+        relations
+            .iter()
+            .any(|relation| relation.starts_with("called_by pkg::Incoming"))
+    );
+    assert!(
+        relations
+            .iter()
+            .any(|relation| relation.starts_with("calls pkg::Outgoing"))
+    );
+}
+
+#[test]
 fn semantic_refresh_scope_includes_files_connected_to_changed_graph_nodes() {
     let mut storage = Storage::new_in_memory().expect("storage");
     storage

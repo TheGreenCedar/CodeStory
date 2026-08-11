@@ -179,6 +179,17 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             span: ts_node_graph_span(callable),
         };
         let mut local_receiver_callsites = HashSet::new();
+        collect_python_annotated_factory_receiver_call_specs(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &imported_type_bindings,
+            &mut local_receiver_callsites,
+            &mut edges,
+        );
         collect_python_constructor_receiver_call_specs(
             callable,
             source,
@@ -231,6 +242,164 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
         edges.extend(fallback_specs);
     });
     edges
+}
+
+/// Resolve a local receiver assigned from an enclosing class method whose return annotation names
+/// one unambiguous interface type, for example `adapter = self.get_adapter(...)` followed by
+/// `adapter.send(...)`. The declared return type is authoritative; this never guesses a concrete
+/// runtime implementation from naming or nearby constructors.
+fn collect_python_annotated_factory_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = member_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let Some(owner) = python_visible_local_annotated_factory_receiver_owner(
+            callable,
+            node,
+            &receiver_name,
+            source,
+            imported_type_bindings,
+        ) else {
+            return;
+        };
+        let method_col = member_call_method_col(node, source, &method_name);
+        local_receiver_callsites.insert(ReceiverCallSiteKey {
+            receiver_name: receiver_name.clone(),
+            method_name: method_name.clone(),
+            line: Some(node.start_position().row as u32 + 1),
+            method_col,
+        });
+        if let Some((owner_name, owner_module)) = owner {
+            edges.push(ManualReceiverCallSpec {
+                source_name: call_source.name.to_string(),
+                source_span: call_source.span,
+                receiver_name,
+                owner_name,
+                owner_module,
+                method_name,
+                method_col,
+                line: Some(node.start_position().row as u32 + 1),
+                allow_global_fallback: false,
+            });
+        }
+    });
+}
+
+fn python_visible_local_annotated_factory_receiver_owner(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    let mut visible_bindings = Vec::new();
+    walk_tree_nodes(callable, &mut |node| {
+        if node.kind() != "assignment"
+            || !receiver_call_belongs_to_callable(node, callable)
+            || node.end_byte() > call_node.start_byte()
+        {
+            return;
+        }
+        let Some(left) = node.child_by_field_name("left") else {
+            return;
+        };
+        if !python_assignment_target_binds_name(left, receiver_name, source) {
+            return;
+        }
+        let owner = if python_plain_identifier_name(left, source).as_deref() == Some(receiver_name)
+        {
+            python_annotated_factory_receiver_owner(node, callable, source, imported_type_bindings)
+        } else {
+            None
+        };
+        visible_bindings.push((node.end_byte(), owner));
+    });
+    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
+    visible_bindings.pop().map(|(_, owner)| owner)
+}
+
+fn python_annotated_factory_receiver_owner(
+    assignment: TsNode<'_>,
+    callable: TsNode<'_>,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> OptionalReceiverOwnerBinding {
+    let class_node = enclosing_node_with_kind(callable, &["class_definition"])?;
+    let self_name = python_instance_self_parameter(callable, source)?;
+    let factory_name = assignment
+        .child_by_field_name("right")
+        .and_then(|right| python_self_method_call_name(right, source, &self_name))?;
+    let return_type = python_unique_class_method_return_type(class_node, &factory_name, source)?;
+    if let Some(binding) = imported_type_bindings.get(&return_type) {
+        return Some((
+            binding.owner_name.clone(),
+            Some(binding.module_name.clone()),
+        ));
+    }
+    python_constructor_name_looks_like_type(&return_type).then_some((return_type, None))
+}
+
+fn python_self_method_call_name(node: TsNode<'_>, source: &str, self_name: &str) -> Option<String> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "attribute"
+        || trimmed_node_text(function.child_by_field_name("object")?, source).as_deref()
+            != Some(self_name)
+    {
+        return None;
+    }
+    function
+        .child_by_field_name("attribute")
+        .and_then(|attribute| trimmed_node_text(attribute, source))
+        .and_then(|name| normalize_parameter_name(&name))
+}
+
+fn python_unique_class_method_return_type(
+    class_node: TsNode<'_>,
+    method_name: &str,
+    source: &str,
+) -> Option<String> {
+    let mut return_types = Vec::new();
+    walk_tree_nodes(class_node, &mut |node| {
+        if node.kind() != "function_definition"
+            || !python_method_belongs_to_class(node, class_node)
+            || declaration_name(node, source).as_deref() != Some(method_name)
+        {
+            return;
+        }
+        let return_type = node
+            .child_by_field_name("return_type")
+            .and_then(|annotation| python_simple_return_type_name(annotation, source));
+        return_types.push(return_type);
+    });
+    if return_types.len() != 1 {
+        return None;
+    }
+    return_types.pop().flatten()
+}
+
+fn python_simple_return_type_name(annotation: TsNode<'_>, source: &str) -> Option<String> {
+    let identifier = match annotation.kind() {
+        "identifier" => annotation,
+        "type" if annotation.named_child_count() == 1 => annotation.named_child(0)?,
+        _ => return None,
+    };
+    if identifier.kind() != "identifier" {
+        return None;
+    }
+    trimmed_node_text(identifier, source).and_then(|name| normalize_parameter_name(&name))
 }
 
 pub(crate) fn is_implicit_receiver(receiver_name: &str) -> bool {

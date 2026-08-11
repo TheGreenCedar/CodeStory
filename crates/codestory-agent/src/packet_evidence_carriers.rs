@@ -321,6 +321,28 @@ pub fn citation_owns_client_request_dispatch(citation: &AgentCitationDto) -> boo
         )
 }
 
+/// The session/client step that chooses the transport interface used for an outbound request.
+/// Both the client/session owner and the adapter/transport subject must be present in the symbol;
+/// a generic hook or a directory name cannot satisfy this boundary.
+pub fn citation_owns_client_adapter_selection(citation: &AgentCitationDto) -> bool {
+    callable_owns_terminal_action_for_two_subjects(
+        citation,
+        &["get", "select", "choose", "resolve"],
+        &["client", "session"],
+        &["adapter", "adapters", "transport", "transports"],
+    )
+}
+
+/// The declared adapter/transport send boundary. This excludes the session's own `send` method,
+/// which is the preceding dispatch stage.
+pub fn citation_owns_client_transport_send(citation: &AgentCitationDto) -> bool {
+    callable_owns_terminal_action_for_subject(
+        citation,
+        &["send"],
+        &["adapter", "adapters", "transport", "transports"],
+    )
+}
+
 /// Registration of an inbound server request surface.
 pub fn citation_owns_server_request_entrypoint(citation: &AgentCitationDto) -> bool {
     callable_has_exact_owner_and_terminal_action(citation, &["app"], &["route", "use", "listen"])
@@ -2056,6 +2078,41 @@ mod tests {
                 negative,
                 "src/client.rs",
                 NodeKind::FUNCTION,
+            )));
+        }
+
+        for positive in ["Session.get_adapter", "HttpClient.selectTransport"] {
+            assert!(citation_owns_client_adapter_selection(&citation(
+                positive,
+                "src/client.rs",
+                NodeKind::METHOD,
+            )));
+        }
+        for negative in [
+            "dispatch_hook",
+            "Session.send",
+            "BaseAdapter.send",
+            "AdapterRegistry.get",
+        ] {
+            assert!(!citation_owns_client_adapter_selection(&citation(
+                negative,
+                "src/client.rs",
+                NodeKind::METHOD,
+            )));
+        }
+
+        for positive in ["BaseAdapter.send", "HttpTransport.send"] {
+            assert!(citation_owns_client_transport_send(&citation(
+                positive,
+                "src/client.rs",
+                NodeKind::METHOD,
+            )));
+        }
+        for negative in ["dispatch_hook", "Session.send", "HttpCache.send"] {
+            assert!(!citation_owns_client_transport_send(&citation(
+                negative,
+                "src/client.rs",
+                NodeKind::METHOD,
             )));
         }
 

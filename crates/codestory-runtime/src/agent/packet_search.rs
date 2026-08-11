@@ -1,15 +1,16 @@
 //! AppController batch search paths for packet retrieval.
 
 use crate::AppController;
+use crate::agent::packet_candidate::PacketSearchHit;
 use crate::agent::retrieval_primary::{
     packet_batch_should_use_sidecar, search_sidecar_packet_batch,
     sidecar_retrieval_unavailable_error, sidecar_retrieval_unavailable_reason,
 };
-use codestory_contracts::api::{ApiError, PacketSidecarQueryDiagnosticDto, SearchHit};
+use codestory_contracts::api::{ApiError, PacketSidecarQueryDiagnosticDto};
 
 #[derive(Debug)]
 pub(crate) struct PacketFusedBatchOutcome {
-    pub results: Vec<(String, Vec<SearchHit>)>,
+    pub results: Vec<(String, Vec<PacketSearchHit>)>,
     pub retryable_queries: Vec<String>,
     pub sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
 }
