@@ -128,6 +128,7 @@ const RUST_RESOLVED: &[ResolvedCallExpectation] = &[
     ("run", "Notifier", "notify_event"),
     ("run", "Repository", "save"),
     ("run", "Workflow", "persist"),
+    ("run", "Workflow", "audit"),
 ];
 const RUST_RESOLVED_BY_NAME: &[ResolvedNameExpectation] = &[];
 const JAVASCRIPT_RESOLVED: &[ResolvedCallExpectation] = &[
@@ -13365,6 +13366,71 @@ fn run(factory: &Factory) -> Result<(), ()> {
         "run",
         "Worker",
         "execute",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_rust_trait_default_self_calls_keep_trait_owner() -> anyhow::Result<()>
+{
+    let source = r#"
+trait Workflow {
+    fn persist(&self);
+    fn audit(&self) {}
+
+    fn run(&self) {
+        self.persist();
+        self.audit();
+    }
+}
+
+trait OtherWorkflow {
+    fn persist(&self);
+    fn audit(&self);
+}
+
+struct Other;
+impl Other {
+    fn inspect(&self) {}
+}
+
+trait ConstructorWorkflow {
+    fn new() -> Other;
+    fn inspect(&self) {}
+
+    fn run_constructor(&self) {
+        let value = Self::new();
+        value.inspect();
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("workflow.rs", source)?;
+    for method in ["persist", "audit"] {
+        assert_resolved_call_to_method_owner(
+            "rust trait default self call",
+            &nodes,
+            &edges,
+            "run",
+            "Workflow",
+            method,
+        );
+        assert_no_resolved_call_to_method_owner(
+            "rust trait default self call",
+            &nodes,
+            &edges,
+            "run",
+            "OtherWorkflow",
+            method,
+        );
+    }
+    assert_no_resolved_call_to_method_owner(
+        "rust trait constructor return remains fail closed",
+        &nodes,
+        &edges,
+        "run_constructor",
+        "ConstructorWorkflow",
+        "inspect",
     );
     Ok(())
 }

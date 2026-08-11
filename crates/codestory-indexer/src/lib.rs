@@ -5312,6 +5312,7 @@ fn collect_rust_receiver_call_hints(tree: &Tree, source: &str) -> Vec<RustReceiv
             return;
         };
         let impl_owner = rust_enclosing_impl_owner(node, source, &aliases);
+        let self_owner = rust_enclosing_self_owner(node, source, &aliases);
         // One scope per enclosing function, advanced to this call rather than
         // rebuilt for it. `no_scope` covers a call outside any function, which
         // previously produced an empty map by finding no `function_item`.
@@ -5333,16 +5334,27 @@ fn collect_rust_receiver_call_hints(tree: &Tree, source: &str) -> Vec<RustReceiv
             }
             None => &empty_value_types,
         };
-        let Some(mut owner_name) = infer_rust_receiver_owner(
-            receiver_node,
-            source,
-            impl_owner.as_deref(),
-            &field_types,
-            &method_return_types,
-            value_types,
-            &aliases,
-        )
-        .filter(|value| is_rust_type_like_name(value)) else {
+        let direct_self_owner = match receiver_node.kind() {
+            "self" => self_owner.clone(),
+            "identifier" if node_source_text(receiver_node, source).as_deref() == Some("Self") => {
+                self_owner.clone()
+            }
+            _ => None,
+        };
+        let Some(mut owner_name) = direct_self_owner
+            .or_else(|| {
+                infer_rust_receiver_owner(
+                    receiver_node,
+                    source,
+                    impl_owner.as_deref(),
+                    &field_types,
+                    &method_return_types,
+                    value_types,
+                    &aliases,
+                )
+            })
+            .filter(|value| is_rust_type_like_name(value))
+        else {
             return;
         };
         if rust_enclosing_generic_type_params(node, source).contains(&owner_name) {
@@ -5739,6 +5751,29 @@ fn rust_enclosing_impl_owner(
                 .child_by_field_name("type")
                 .and_then(|ty| node_source_text(ty, source))
                 .and_then(|ty| normalize_rust_type_owner_name(&ty, aliases));
+        }
+        cursor = current.parent();
+    }
+    None
+}
+
+fn rust_enclosing_self_owner(
+    node: TsNode<'_>,
+    source: &str,
+    aliases: &RustTypeAliases,
+) -> Option<String> {
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        let owner = match current.kind() {
+            "impl_item" => current.child_by_field_name("type"),
+            "trait_item" => current.child_by_field_name("name"),
+            _ => None,
+        };
+        if let Some(owner) = owner
+            .and_then(|owner| node_source_text(owner, source))
+            .and_then(|owner| normalize_rust_type_owner_name(&owner, aliases))
+        {
+            return Some(owner);
         }
         cursor = current.parent();
     }
