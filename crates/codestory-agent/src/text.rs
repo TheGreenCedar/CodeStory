@@ -36,7 +36,7 @@ pub fn normalize_identifier(value: &str) -> String {
 
 pub fn exact_symbol_query_terms(query: &str) -> Vec<String> {
     let trimmed = trim_symbol_candidate(query);
-    if looks_like_standalone_symbol_query(trimmed) {
+    if looks_like_standalone_symbol_query(trimmed) && !ambiguous_single_slash_concept(trimmed) {
         let mut terms = Vec::new();
         let mut seen = HashSet::new();
         push_exact_symbol_query_term(trimmed, &mut terms, &mut seen);
@@ -66,7 +66,35 @@ pub fn exact_symbol_query_terms(query: &str) -> Vec<String> {
         candidate.clear();
     }
     push_embedded_symbol_candidate(&candidate, &mut terms, &mut seen);
+    for candidate in case_distinct_slash_symbol_candidates(query) {
+        push_exact_symbol_query_term(&candidate, &mut terms, &mut seen);
+    }
     terms
+}
+
+fn case_distinct_slash_symbol_candidates(query: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut candidate = String::new();
+    for ch in query.chars().chain(std::iter::once(' ')) {
+        if is_symbol_query_char(ch) {
+            candidate.push(ch);
+            continue;
+        }
+        let trimmed = trim_symbol_candidate(&candidate);
+        if trimmed.matches('/').count() == 1 && looks_like_standalone_symbol_query(trimmed) {
+            candidates.push(trimmed.to_string());
+        }
+        candidate.clear();
+    }
+    candidates
+        .iter()
+        .filter(|candidate| {
+            candidates
+                .iter()
+                .any(|peer| peer != *candidate && peer.eq_ignore_ascii_case(candidate.as_str()))
+        })
+        .cloned()
+        .collect()
 }
 
 fn push_exact_symbol_query_term(raw: &str, terms: &mut Vec<String>, seen: &mut HashSet<String>) {
@@ -156,9 +184,20 @@ fn has_embedded_exact_symbol_signal(value: &str) -> bool {
     value.contains('_')
         || value.contains("::")
         || value.contains('.')
-        || value.contains('/')
+        || (value.contains('/') && !ambiguous_single_slash_concept(value))
         || value.contains('$')
         || value.chars().skip(1).any(|ch| ch.is_ascii_uppercase())
+}
+
+fn ambiguous_single_slash_concept(value: &str) -> bool {
+    value.matches('/').count() == 1
+        && !value.starts_with('/')
+        && !value.starts_with("./")
+        && !value.starts_with("../")
+        && !value.contains(['.', '_', '$'])
+        && !value
+            .chars()
+            .any(|character| character.is_ascii_digit() || character.is_ascii_uppercase())
 }
 
 fn qualified_symbol_query_parts(query: &str) -> Option<(&str, &str)> {

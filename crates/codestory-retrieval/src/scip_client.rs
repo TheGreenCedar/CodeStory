@@ -1,9 +1,11 @@
+use crate::candidate::{CandidateGraphDirection, CandidateGraphEvidence};
 use crate::config::SidecarLayout;
 use crate::scip_index::{
     SCIP_GRAPH_PROJECTION_PROVENANCE, SCIP_STUB_MARKER_FILE, SCIP_SYMBOLS_FILE,
     ScipIndexMarkerError, ScipSymbolLookup, ScipSymbolRecord, load_fresh_scip_symbols,
     load_scip_symbols, parse_scip_index_marker, reference_defect,
 };
+use codestory_contracts::graph::EdgeKind;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -12,6 +14,7 @@ use std::path::Path;
 /// than one file and retrieval lane.
 const SCIP_ADJACENCY_ANCHOR_LIMIT: usize = 8;
 const SCIP_ADJACENCY_ANCHORS_PER_FILE: usize = 2;
+const SCIP_ADJACENCY_FUSED_WINDOW: usize = 24;
 
 /// Artifact status meaning "the graph lane is ready to serve".
 const SCIP_READY_STATUS: &str = "ready";
@@ -122,13 +125,31 @@ impl ScipClient {
         };
         let profile = ScipQueryProfile::new(query);
         let mut hits = Vec::new();
-        for (index, symbol) in index.symbols.into_iter().enumerate() {
+        for (index, symbol) in index.symbols.iter().enumerate() {
             if index % 64 == 0 && cancelled() {
                 anyhow::bail!("SCIP anchor search cancelled");
             }
-            if symbol_matches_query(&symbol, &profile) {
-                let score = score_symbol_match(&symbol, &profile);
-                hits.push(symbol_to_hit(&symbol, score, 0, provenance));
+            if symbol_matches_query(symbol, &profile) {
+                let score = score_symbol_match(symbol, &profile);
+                let mut hit = symbol_to_hit(
+                    symbol,
+                    score,
+                    0,
+                    provenance,
+                    Some(CandidateGraphEvidence {
+                        edge_kind: None,
+                        direction: CandidateGraphDirection::Anchor,
+                        hop: 0,
+                        fanout: 0,
+                        edge_weight: 1.0,
+                        direction_weight: 1.0,
+                    }),
+                );
+                if symbol_is_exact_query_match(&symbol, &profile) {
+                    hit.add_provenance("exact");
+                    hit.record_lane(crate::candidate::CandidateLane::Graph, score, 0, "exact");
+                }
+                hits.push(hit);
             }
         }
         if cancelled() {
@@ -211,27 +232,43 @@ impl ScipClient {
 
         let lookup = ScipSymbolLookup::new(&index.symbols);
         let emitted: HashSet<&str> = anchor_hops.iter().map(|(node_id, _, _)| *node_id).collect();
-        let mut hits_by_node = HashMap::<String, super::CandidateHit>::new();
+        let mut expansions = Vec::new();
+        let mut fanout_by_anchor = HashMap::<&str, u32>::new();
         for (position, proof) in index.proofs.iter().enumerate() {
             if position % 64 == 0 && cancelled() {
                 anyhow::bail!("SCIP reference adjacency cancelled");
             }
-            if !proof.is_reference() {
+            if !proof.is_reference() || reference_defect(proof, &lookup, evidence_source).is_some()
+            {
                 continue;
             }
-            let (Some(node_id), Some(target_node_id)) =
-                (proof.node_id.as_deref(), proof.target_node_id.as_deref())
-            else {
+            let (Some(node_id), Some(target_node_id), Some(edge_kind)) = (
+                proof.node_id.as_deref(),
+                proof.target_node_id.as_deref(),
+                proof.edge_kind,
+            ) else {
                 continue;
             };
-            let Some((neighbor_node_id, anchor_hop, anchor_relevance, direction_weight)) =
+            let Some((anchor_node_id, neighbor_node_id, anchor_hop, anchor_relevance, direction)) =
                 anchor_hops
                     .iter()
                     .find_map(|(anchor_node_id, hop, relevance)| {
                         if *anchor_node_id == node_id {
-                            Some((target_node_id, *hop, *relevance, 1.0))
+                            Some((
+                                *anchor_node_id,
+                                target_node_id,
+                                *hop,
+                                *relevance,
+                                CandidateGraphDirection::Outgoing,
+                            ))
                         } else if *anchor_node_id == target_node_id {
-                            Some((node_id, *hop, *relevance, 0.9))
+                            Some((
+                                *anchor_node_id,
+                                node_id,
+                                *hop,
+                                *relevance,
+                                CandidateGraphDirection::Incoming,
+                            ))
                         } else {
                             None
                         }
@@ -242,15 +279,68 @@ impl ScipClient {
             if emitted.contains(neighbor_node_id) {
                 continue;
             }
-            if reference_defect(proof, &lookup, evidence_source).is_some() {
-                continue;
-            }
             let Some(neighbor) = lookup.symbol_for_node(neighbor_node_id) else {
                 continue;
             };
+            *fanout_by_anchor.entry(anchor_node_id).or_default() += 1;
+            expansions.push((
+                neighbor_node_id,
+                neighbor,
+                anchor_node_id,
+                anchor_hop,
+                anchor_relevance,
+                direction,
+                edge_kind,
+            ));
+        }
+        let mut hits_by_node = HashMap::<String, super::CandidateHit>::new();
+        for (
+            position,
+            (
+                neighbor_node_id,
+                neighbor,
+                anchor_node_id,
+                anchor_hop,
+                anchor_relevance,
+                direction,
+                edge_kind,
+            ),
+        ) in expansions.into_iter().enumerate()
+        {
+            if position % 64 == 0 && cancelled() {
+                anyhow::bail!("SCIP reference adjacency cancelled");
+            }
             let hop = anchor_hop.saturating_add(1);
-            let score = (anchor_relevance * direction_weight / hop.max(1) as f32).clamp(0.0, 1.0);
-            let hit = symbol_to_hit(neighbor, score, hop, provenance);
+            let fanout = fanout_by_anchor
+                .get(anchor_node_id)
+                .copied()
+                .unwrap_or(1)
+                .max(1);
+            let edge_weight = scip_edge_weight(edge_kind);
+            let direction_weight = match direction {
+                CandidateGraphDirection::Outgoing => 1.0,
+                CandidateGraphDirection::Incoming => 0.9,
+                CandidateGraphDirection::Anchor => 1.0,
+            };
+            let score = (anchor_relevance * edge_weight * direction_weight
+                / ((1 + hop) as f32 * (1.0 + fanout as f32).sqrt()))
+            .clamp(0.0, 1.0);
+            let mut hit = symbol_to_hit(
+                neighbor,
+                score,
+                hop,
+                provenance,
+                Some(CandidateGraphEvidence {
+                    edge_kind: Some(edge_kind),
+                    direction,
+                    hop,
+                    fanout,
+                    edge_weight,
+                    direction_weight,
+                }),
+            );
+            hit.add_provenance(format!("scip_edge:{edge_kind:?}"));
+            hit.add_provenance(format!("scip_direction:{direction:?}"));
             match hits_by_node.entry(neighbor_node_id.to_string()) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     if hit.score > entry.get().score
@@ -284,56 +374,48 @@ impl ScipClient {
 }
 
 fn selected_adjacency_anchors(anchors: &[super::CandidateHit]) -> Vec<&super::CandidateHit> {
-    let mut selected = anchors
+    let fused_window = anchors
         .iter()
+        .take(SCIP_ADJACENCY_FUSED_WINDOW)
         .filter(|anchor| anchor.node_id.is_some())
         .collect::<Vec<_>>();
-    selected.sort_by(|left, right| {
-        let left_exact = left.provenance.iter().any(|label| label == "exact");
-        let right_exact = right.provenance.iter().any(|label| label == "exact");
-        right_exact
-            .cmp(&left_exact)
-            .then_with(|| best_lane_rank(left).cmp(&best_lane_rank(right)))
-            .then_with(|| {
-                adjacency_anchor_relevance(right)
-                    .partial_cmp(&adjacency_anchor_relevance(left))
-                    .unwrap_or(Ordering::Equal)
-            })
-            .then_with(|| left.file_path.cmp(&right.file_path))
-            .then_with(|| left.symbol_name.cmp(&right.symbol_name))
-            .then_with(|| left.start_line.cmp(&right.start_line))
-    });
-    let mut per_file = HashMap::<&str, usize>::new();
-    selected.retain(|anchor| {
-        let count = per_file.entry(anchor.file_path.as_str()).or_default();
-        if *count >= SCIP_ADJACENCY_ANCHORS_PER_FILE {
-            return false;
+    let mut selected: Vec<&super::CandidateHit> = Vec::with_capacity(SCIP_ADJACENCY_ANCHOR_LIMIT);
+    for exact_pass in [true, false] {
+        for anchor in &fused_window {
+            let exact = anchor.provenance.iter().any(|label| label == "exact");
+            if exact != exact_pass
+                || selected.len() == SCIP_ADJACENCY_ANCHOR_LIMIT
+                || selected
+                    .iter()
+                    .filter(|selected_anchor| {
+                        same_anchor_file(&selected_anchor.file_path, &anchor.file_path)
+                    })
+                    .count()
+                    >= SCIP_ADJACENCY_ANCHORS_PER_FILE
+            {
+                continue;
+            }
+            selected.push(*anchor);
         }
-        *count += 1;
-        true
-    });
-    selected.truncate(SCIP_ADJACENCY_ANCHOR_LIMIT);
+    }
     selected
 }
 
-fn best_lane_rank(candidate: &super::CandidateHit) -> u32 {
-    [
-        candidate.lane_scores.lexical.as_ref(),
-        candidate.lane_scores.semantic.as_ref(),
-        candidate.lane_scores.graph.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(|evidence| (evidence.rank > 0).then_some(evidence.rank))
-    .min()
-    .unwrap_or(u32::MAX)
+fn same_anchor_file(left: &str, right: &str) -> bool {
+    if left == right || codestory_workspace::same_workspace_path(Path::new(left), Path::new(right))
+    {
+        return true;
+    }
+    match (
+        codestory_workspace::workspace_path_lexical_identity(Path::new(left)),
+        codestory_workspace::workspace_path_lexical_identity(Path::new(right)),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn adjacency_anchor_relevance(candidate: &super::CandidateHit) -> f32 {
-    let rank = best_lane_rank(candidate);
-    if rank != u32::MAX {
-        return ((20.0 + 1.0) / (20.0 + rank as f32)).clamp(0.0, 1.0);
-    }
     candidate.score.clamp(0.0, 1.0)
 }
 
@@ -342,6 +424,7 @@ fn symbol_to_hit(
     score: f32,
     hop: u32,
     provenance: &str,
+    graph_evidence: Option<CandidateGraphEvidence>,
 ) -> super::CandidateHit {
     use super::candidate::{CandidateHit, CandidateSource};
     let mut hit = CandidateHit {
@@ -352,6 +435,8 @@ fn symbol_to_hit(
         },
         file_path: symbol.path.clone(),
         symbol_name: Some(symbol.symbol.clone()),
+        qualified_name: None,
+        structural_kind: None,
         start_line: Some(symbol.start_line),
         target: None,
         source_excerpt: None,
@@ -361,15 +446,35 @@ fn symbol_to_hit(
         provenance: vec![provenance.into()],
         file_role: None,
         scip_hop_distance: Some(hop),
+        graph_evidence,
         rank_features: None,
     };
     hit.record_lane(
         CandidateSource::Scip.lane(),
         score,
         0,
-        if hop == 0 { "exact" } else { "graph_neighbor" },
+        if hop == 0 {
+            "scip_anchor"
+        } else {
+            "graph_neighbor"
+        },
     );
     hit
+}
+
+fn scip_edge_weight(kind: EdgeKind) -> f32 {
+    match kind {
+        EdgeKind::CALL => 1.0,
+        EdgeKind::OVERRIDE => 0.95,
+        EdgeKind::INHERITANCE => 0.90,
+        EdgeKind::ANNOTATION_USAGE => 0.85,
+        EdgeKind::TYPE_USAGE => 0.80,
+        EdgeKind::USAGE => 0.75,
+        EdgeKind::TYPE_ARGUMENT | EdgeKind::TEMPLATE_SPECIALIZATION => 0.70,
+        EdgeKind::MACRO_USAGE => 0.65,
+        EdgeKind::IMPORT | EdgeKind::INCLUDE => 0.60,
+        EdgeKind::MEMBER | EdgeKind::UNKNOWN => 0.0,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,6 +544,22 @@ fn symbol_matches_query(symbol: &ScipSymbolRecord, profile: &ScipQueryProfile) -
     };
     symbol_terminal(&symbol_lower) == qualified.terminal_lower
         && qualified_prefix_path_score(&qualified.prefix_lower, &symbol.path) > 0
+}
+
+fn symbol_is_exact_query_match(symbol: &ScipSymbolRecord, profile: &ScipQueryProfile) -> bool {
+    let symbol_lower = symbol.symbol.to_ascii_lowercase();
+    if symbol_lower == profile.query_lower
+        || (profile.tokens.len() == 1
+            && !profile.query_lower.contains('/')
+            && !profile.query_lower.contains('\\')
+            && symbol_terminal(&symbol_lower) == profile.query_lower)
+    {
+        return true;
+    }
+    profile.qualified.as_ref().is_some_and(|qualified| {
+        symbol_terminal(&symbol_lower) == qualified.terminal_lower
+            && qualified_prefix_path_score(&qualified.prefix_lower, &symbol.path) > 0
+    })
 }
 
 fn score_symbol_match(symbol: &ScipSymbolRecord, profile: &ScipQueryProfile) -> f32 {
@@ -670,6 +791,7 @@ mod tests {
                 target_symbol: None,
                 node_id: symbol.node_id.clone(),
                 target_node_id: None,
+                edge_kind: None,
             })
             .collect()
     }
@@ -689,6 +811,7 @@ mod tests {
             target_symbol: Some(target.symbol.clone()),
             node_id: source.node_id.clone(),
             target_node_id: target.node_id.clone(),
+            edge_kind: Some(codestory_contracts::graph::EdgeKind::CALL),
         }
     }
 
@@ -733,6 +856,7 @@ mod tests {
                 target_symbol: None,
                 node_id: None,
                 target_node_id: None,
+                edge_kind: None,
             },
             ScipProofRecord {
                 role: SCIP_REFERENCE_ROLE.into(),
@@ -745,6 +869,7 @@ mod tests {
                 target_symbol: Some("fixture_package::run".into()),
                 node_id: None,
                 target_node_id: None,
+                edge_kind: None,
             },
         ]
     }
@@ -969,6 +1094,7 @@ mod tests {
             1.0,
             0,
             loaded.contract.provenance_label().expect("provenance"),
+            None,
         );
         assert_eq!(hit.node_id, None);
 
@@ -1142,6 +1268,46 @@ mod tests {
         anchor
     }
 
+    #[test]
+    fn adjacency_anchor_selection_preserves_fused_order_and_file_breadth() {
+        let mut anchors = (0..10)
+            .map(|index| {
+                let path = if index < 3 {
+                    "src/shared.rs".to_string()
+                } else {
+                    format!("src/file_{index}.rs")
+                };
+                let mut anchor = CandidateHit::with_source(
+                    path,
+                    Some(format!("symbol_{index}")),
+                    1.0 - index as f32 / 20.0,
+                    CandidateSource::Lexical,
+                );
+                anchor.node_id = Some(format!("node_{index}"));
+                anchor
+            })
+            .collect::<Vec<_>>();
+        anchors[9].add_provenance("exact");
+
+        let selected = selected_adjacency_anchors(&anchors);
+        let node_ids = selected
+            .iter()
+            .filter_map(|anchor| anchor.node_id.as_deref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(node_ids[0], "node_9", "exact anchor remains mandatory");
+        assert_eq!(
+            node_ids[1..],
+            [
+                "node_0", "node_1", "node_3", "node_4", "node_5", "node_6", "node_7"
+            ]
+        );
+        assert!(
+            !node_ids.contains(&"node_2"),
+            "third same-file anchor is dropped"
+        );
+    }
+
     fn write_adjacency_artifact(
         layout: &SidecarLayout,
         generation: &str,
@@ -1188,6 +1354,14 @@ mod tests {
         );
         assert_eq!(hits[0].node_id.as_deref(), Some("4"));
         assert_eq!(hits[0].scip_hop_distance, Some(1));
+        assert_eq!(
+            hits[0].graph_evidence.as_ref().map(|evidence| (
+                evidence.edge_kind,
+                evidence.direction,
+                evidence.fanout
+            )),
+            Some((Some(EdgeKind::CALL), CandidateGraphDirection::Outgoing, 1))
+        );
     }
 
     #[test]
@@ -1222,6 +1396,44 @@ mod tests {
                 .map(|hit| (&hit.file_path, &hit.symbol_name, hit.score))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn stage_two_penalizes_high_fanout_before_truncation() {
+        let root = TempDir::new().expect("root");
+        let layout = adjacency_layout(&root);
+        let symbols = adjacency_symbols();
+        let target = graph_reference_proof(&symbols[0], &symbols[2]);
+        write_adjacency_artifact(
+            &layout,
+            "generation-a",
+            "generation-a",
+            vec![target.clone()],
+        );
+        write_adjacency_artifact(
+            &layout,
+            "generation-b",
+            "generation-b",
+            vec![target, graph_reference_proof(&symbols[0], &symbols[1])],
+        );
+
+        let narrow =
+            ScipClient::expand_reference_adjacency(&layout, "generation-a", &[client_anchor()], 8)
+                .expect("narrow fanout");
+        let wide =
+            ScipClient::expand_reference_adjacency(&layout, "generation-b", &[client_anchor()], 8)
+                .expect("wide fanout");
+        let narrow_target = narrow
+            .iter()
+            .find(|hit| hit.node_id.as_deref() == Some("4"))
+            .expect("narrow target");
+        let wide_target = wide
+            .iter()
+            .find(|hit| hit.node_id.as_deref() == Some("4"))
+            .expect("wide target");
+
+        assert!(wide_target.score < narrow_target.score);
+        assert_eq!(wide_target.graph_evidence.as_ref().unwrap().fanout, 2);
     }
 
     #[test]
@@ -1326,6 +1538,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["parse_client".to_string()],
             "a symbol that references the anchor is adjacent to it: {hits:#?}"
+        );
+        assert_eq!(
+            hits[0]
+                .graph_evidence
+                .as_ref()
+                .map(|evidence| evidence.direction),
+            Some(CandidateGraphDirection::Incoming)
         );
 
         let polls = AtomicUsize::new(0);

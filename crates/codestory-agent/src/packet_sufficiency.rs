@@ -288,7 +288,11 @@ fn assemble_packet_sufficiency_with_probe_context(
     let has_minimum_coverage = eligible_citation_count >= min_citations;
     let has_minimum_claims = sufficiency_claims.len() >= min_claims;
     let claim_family_count = packet_supported_claim_family_count(&sufficiency_claims);
-    let has_minimum_claim_families = claim_family_count >= min_claim_families;
+    // A finalized obligation ledger is the typed family system. Requiring the older prose-family
+    // classifier as well rejects exact ordered-flow proofs merely because their receipt wording
+    // does not map to a legacy family label.
+    let has_minimum_claim_families =
+        obligations.is_some() || claim_family_count >= min_claim_families;
     let missing_exact_path_claims = packet_missing_exact_path_claims(
         path_identity,
         project_root,
@@ -834,6 +838,14 @@ fn packet_route_proof_assessment(
                 answer,
                 obligations,
             ));
+            node_ids.extend(
+                answer
+                    .citations
+                    .iter()
+                    .filter(|citation| packet_route_citation_is_endpoint(citation))
+                    .filter(|citation| packet_route_label_matches_citation(stage, citation))
+                    .map(|citation| citation.node_id.0.clone()),
+            );
         }
         node_ids.sort();
         node_ids.dedup();
@@ -2119,6 +2131,7 @@ fn packet_missing_required_flow_roles(
     packet_missing_requirement_roles(&missing)
 }
 
+#[cfg(test)]
 fn packet_missing_required_flow_requirements(
     question: &str,
     task_class: PacketTaskClassDto,
@@ -8297,16 +8310,6 @@ fn packet_follow_up_search_argv(project: &str, queries: &[String]) -> Vec<Vec<St
         push_unique_argv(&mut commands, packet_search_argv(project, query));
     }
     commands
-}
-
-#[cfg(test)]
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
-}
-
-#[cfg(test)]
-fn contains_all(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().all(|needle| haystack.contains(needle))
 }
 
 fn push_unique_argv(commands: &mut Vec<Vec<String>>, argv: Vec<String>) {

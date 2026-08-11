@@ -1,6 +1,7 @@
 use crate::cache::RetrievalCache;
 #[cfg(test)]
 use crate::cache::RetrievalCacheKey;
+use crate::candidate::CandidateHit;
 use crate::config::SidecarRuntimeConfig;
 use crate::embeddings::{
     EmbeddingDeviceReadiness, ProductEmbeddingResidencyLease,
@@ -14,11 +15,13 @@ use crate::health::probe_sidecar_health_for_runtime;
 use crate::index::{query_fingerprint, sidecar_project_id_for_runtime};
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
 use crate::query_features::classify_query;
+use crate::ranker::rank_candidates;
 use crate::retention::GenerationRetentionLease;
 use crate::sidecar::validate_strict_sidecar_readiness_for_runtime;
 use crate::sidecar_search::LiveSidecarSearch;
 use crate::sidecar_search::SidecarSearch;
 use anyhow::{Context, Result, bail};
+use codestory_contracts::graph::NodeId;
 use codestory_store::{FileRole, RetrievalIndexManifest, Store};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -220,13 +223,16 @@ impl PinnedQuerySession {
             embedding_residency.identity(),
         )
         .context("validate attested vector generation")?;
-        let sidecars = Arc::new(LiveSidecarSearch::new_for_runtime_with_embedding_device(
-            runtime,
-            runtime.layout.clone(),
-            project_id.clone(),
-            Some(&manifest),
-            Some(embedding_device.clone()),
-        )?);
+        let sidecars = Arc::new(
+            LiveSidecarSearch::new_for_runtime_with_embedding_device(
+                runtime,
+                runtime.layout.clone(),
+                project_id.clone(),
+                Some(&manifest),
+                Some(embedding_device.clone()),
+            )?
+            .with_core_candidate_context(project_root, storage_path),
+        );
 
         Ok(Self {
             storage,
@@ -285,9 +291,10 @@ impl PinnedQuerySession {
             cancelled,
             mode_override: None,
         };
-        executor
-            .execute(query, budget_ms)
-            .map(|result| result.with_publication_identity(&self.publication_identity))
+        let mut result = executor.execute(query, budget_ms)?;
+        self.enrich_and_rerank_candidates(&mut result)?;
+        refresh_cached_query_result(cache, &self.manifest, &result);
+        Ok(result.with_publication_identity(&self.publication_identity))
     }
 
     pub fn execute_batch_with_cache(
@@ -328,9 +335,17 @@ impl PinnedQuerySession {
             strict_batch_worker_limit(queries.len()),
         )?;
         for result in &mut results {
+            self.enrich_and_rerank_candidates(result)?;
+            refresh_cached_query_result(cache, &self.manifest, result);
             result.publication_identity = Some(self.publication_identity.clone());
         }
         Ok(results)
+    }
+
+    fn enrich_and_rerank_candidates(&self, result: &mut QueryResult) -> Result<()> {
+        enrich_candidates_from_core(&self.storage, &self.project_root, &mut result.hits)?;
+        result.hits = rank_candidates(&result.features, std::mem::take(&mut result.hits));
+        Ok(())
     }
 
     pub fn ensure_result_identity(
@@ -382,6 +397,89 @@ impl PinnedQuerySession {
             .into());
         }
         Ok(())
+    }
+}
+
+pub(crate) fn enrich_candidates_from_core(
+    storage: &Store,
+    project_root: &Path,
+    candidates: &mut [CandidateHit],
+) -> Result<()> {
+    let node_ids = candidates
+        .iter()
+        .filter_map(|candidate| candidate.node_id.as_deref())
+        .filter_map(|node_id| node_id.parse::<i64>().ok())
+        .map(NodeId)
+        .collect::<Vec<_>>();
+    let nodes = storage
+        .get_nodes_by_ids(&node_ids)
+        .context("load structural kinds for retrieval candidates")?;
+    for candidate in candidates {
+        let Some(node_id) = candidate
+            .node_id
+            .as_deref()
+            .and_then(|node_id| node_id.parse::<i64>().ok())
+            .map(NodeId)
+        else {
+            continue;
+        };
+        let Some(node) = nodes.get(&node_id) else {
+            continue;
+        };
+        candidate.structural_kind = Some(node.kind);
+        candidate.qualified_name = node.qualified_name.clone();
+        candidate.start_line = candidate.start_line.or(node.start_line);
+        if candidate
+            .qualified_name
+            .as_deref()
+            .is_some_and(qualified_name_is_test_scope)
+            || (requires_enclosing_test_scope(node.kind)
+                && candidate.start_line.is_some_and(|line| {
+                    let path = project_root.join(&candidate.file_path);
+                    storage
+                        .get_nodes_for_file_line(&path.to_string_lossy(), line)
+                        .ok()
+                        .is_some_and(|nodes| {
+                            nodes.iter().any(|node| {
+                                node.qualified_name
+                                    .as_deref()
+                                    .is_some_and(qualified_name_is_test_scope)
+                            })
+                        })
+                }))
+        {
+            candidate.file_role = Some(FileRole::Test);
+        }
+    }
+    Ok(())
+}
+
+fn qualified_name_is_test_scope(name: &str) -> bool {
+    name.starts_with("tests::")
+        || name.contains("::tests::")
+        || name.starts_with("test::")
+        || name.contains("::test::")
+}
+
+fn requires_enclosing_test_scope(kind: codestory_contracts::graph::NodeKind) -> bool {
+    matches!(
+        kind,
+        codestory_contracts::graph::NodeKind::MACRO
+            | codestory_contracts::graph::NodeKind::ANNOTATION
+    )
+}
+
+fn refresh_cached_query_result(
+    cache: &mut RetrievalCache,
+    manifest: &RetrievalIndexManifest,
+    result: &QueryResult,
+) {
+    if result.trace.cancel_reason.is_some() {
+        return;
+    }
+    let key = cache.key_for_manifest(manifest, query_fingerprint(&result.features.raw_query));
+    if cache.get(&key).is_some() {
+        cache.insert(key, result.hits.clone());
     }
 }
 

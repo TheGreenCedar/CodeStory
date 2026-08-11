@@ -234,10 +234,10 @@ mod tests {
 
     fn registry() -> PacketClaimProfileRegistrySummary {
         PacketClaimProfileRegistrySummary {
-            registered: 20,
+            registered: 7,
             contracted: 7,
-            pending: 13,
-            pending_ratchet: 13,
+            pending: 0,
+            pending_ratchet: 0,
             rejected: 0,
             rejection_codes: Vec::new(),
             document_rejection: None,
@@ -306,10 +306,10 @@ mod tests {
     fn typed_telemetry_publishes_the_contract_version_and_registry_shape() {
         let dto = PacketClaimTelemetry::default().to_dto(registry());
         assert_eq!(dto.contract_version, PACKET_CLAIM_PROFILE_CONTRACT_VERSION);
-        assert_eq!(dto.registered_profiles, 20);
+        assert_eq!(dto.registered_profiles, 7);
         assert_eq!(dto.contracted_profiles, 7);
-        assert_eq!(dto.pending_profiles, 13);
-        assert_eq!(dto.pending_ratchet, 13);
+        assert_eq!(dto.pending_profiles, 0);
+        assert_eq!(dto.pending_ratchet, 0);
         assert_eq!(dto.citations_considered, 0);
         assert_eq!(dto.profiles_fired, 0);
         assert_eq!(dto.profiles_skipped_invalid, 0);

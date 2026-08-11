@@ -708,6 +708,10 @@ fn refresh_packet_claim_markdown(packet: &mut AgentPacketDto) {
         while boundary > 0 && !refreshed.is_char_boundary(boundary) {
             boundary -= 1;
         }
+        boundary = refreshed[..boundary]
+            .rfind('\n')
+            .map(|newline| newline + 1)
+            .unwrap_or(0);
         refreshed.truncate(boundary);
         refreshed.push_str(PACKET_MARKDOWN_TRUNCATION_SUFFIX);
     }
@@ -1444,7 +1448,7 @@ pub(super) mod tests {
             .expect("packet claim markdown");
         assert!(refreshed.contains("[`R`]"), "{refreshed}");
         assert!(!refreshed.contains("[`P`]"), "{refreshed}");
-        assert_eq!(refreshed.len(), initial_markdown.len());
+        assert!(refreshed.len() <= initial_markdown.len());
     }
 
     #[test]

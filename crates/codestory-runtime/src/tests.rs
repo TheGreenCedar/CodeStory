@@ -64,6 +64,7 @@ use crate::search_plan::{
     search_plan_anchor_groups, search_plan_eligible, search_plan_next_actions,
     search_plan_path_is_test_or_bench, search_plan_rejected_hits,
     search_plan_runtime_call_is_speculative, search_plan_subqueries,
+    select_broad_search_result_breadth,
 };
 use crate::search_publication::{
     SearchGenerationCatalogGuard, prune_search_generations, read_search_generation_completion,

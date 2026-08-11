@@ -89,6 +89,13 @@ fn owns_behavior(citation: &AgentCitationDto) -> bool {
     )
 }
 
+fn owns_callable_behavior(citation: &AgentCitationDto) -> bool {
+    matches!(
+        citation.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    )
+}
+
 fn path_has_any_extension(citation: &AgentCitationDto, extensions: &[&str]) -> bool {
     let path = path(citation);
     extensions.iter().any(|extension| path.ends_with(extension))
@@ -1333,6 +1340,56 @@ pub fn flow_belongs_to_search(citation: &AgentCitationDto) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Search evidence handoff
+//
+// A search implementation has two proof-bearing boundaries after execution: deciding what kind
+// of evidence a result carries, and writing that evidence into the returned surface. Neither is
+// interchangeable with generic search execution. Keeping the two factors in the citation's own
+// callable name prevents a helper filed under `search/` from inheriting either obligation.
+// ---------------------------------------------------------------------------
+
+const SEARCH_EVIDENCE_CONTEXT_TOKENS: &[&str] = &["search", "result", "hit", "citation"];
+pub(crate) const SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS: &[&str] = &[
+    "classify",
+    "classification",
+    "tier",
+    "provenance",
+    "resolve",
+    "resolution",
+    "eligibility",
+];
+pub(crate) const SEARCH_EVIDENCE_OUTPUT_ACTIONS: &[&str] = &[
+    "append",
+    "decorate",
+    "emit",
+    "render",
+    "serialize",
+    "write",
+    "output",
+];
+
+fn owns_search_evidence_subject(citation: &AgentCitationDto) -> bool {
+    let tokens = name_tokens(citation);
+    taxonomy_has_token(&tokens, &["evidence"])
+        && taxonomy_has_token(&tokens, SEARCH_EVIDENCE_CONTEXT_TOKENS)
+}
+
+pub fn citation_owns_search_evidence_classification(citation: &AgentCitationDto) -> bool {
+    owns_callable_behavior(citation)
+        && owns_search_evidence_subject(citation)
+        && taxonomy_has_token(
+            &name_tokens(citation),
+            SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS,
+        )
+}
+
+pub fn citation_owns_search_evidence_output(citation: &AgentCitationDto) -> bool {
+    owns_callable_behavior(citation)
+        && owns_search_evidence_subject(citation)
+        && taxonomy_has_token(&name_tokens(citation), SEARCH_EVIDENCE_OUTPUT_ACTIONS)
+}
+
 /// A schema requirement is proved by the schema file, so here the file *is* the subsystem: a `.sql`
 /// anchor has no identifier of its own to scope by.
 pub fn flow_belongs_to_sql_schema(citation: &AgentCitationDto) -> bool {
@@ -1370,6 +1427,10 @@ pub(crate) fn carrier_taxonomy_vocabulary() -> Vec<String> {
         .chain(INDEXING_DIRECT_OBJECT_TOKENS)
         .chain(SHELL_FUNCTION_SUBJECT_TOKENS)
         .chain(SHELL_FUNCTION_ACTION_TOKENS)
+        .chain(SEARCH_EVIDENCE_CONTEXT_TOKENS)
+        .chain(SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS)
+        .chain(SEARCH_EVIDENCE_OUTPUT_ACTIONS)
+        .chain(["evidence"].iter())
         .flat_map(|term| [(*term).to_string(), taxonomy_plural(term)])
         .collect::<Vec<_>>();
     vocabulary.sort();
@@ -1478,6 +1539,51 @@ mod tests {
                 "a {kind:?} named like a shell dispatcher is not callable evidence",
             );
         }
+    }
+
+    #[test]
+    fn search_evidence_carriers_require_subject_action_and_callable_shape() {
+        for (name, kind) in [
+            ("SearchHitEvidence::tier", NodeKind::METHOD),
+            ("classify_result_evidence", NodeKind::FUNCTION),
+        ] {
+            assert!(
+                citation_owns_search_evidence_classification(&citation(
+                    name,
+                    "src/retrieval/evidence.rs",
+                    kind,
+                )),
+                "{name} classifies search-result evidence",
+            );
+        }
+        for (name, kind) in [
+            ("append_search_evidence_packet", NodeKind::FUNCTION),
+            ("SearchEvidence::render_output", NodeKind::METHOD),
+        ] {
+            assert!(
+                citation_owns_search_evidence_output(&citation(
+                    name,
+                    "src/runtime/output.rs",
+                    kind,
+                )),
+                "{name} writes search evidence to an output surface",
+            );
+        }
+
+        let wrong_action = citation(
+            "SearchHitEvidence::rank",
+            "src/retrieval/ranker.rs",
+            NodeKind::METHOD,
+        );
+        assert!(!citation_owns_search_evidence_classification(&wrong_action));
+        assert!(!citation_owns_search_evidence_output(&wrong_action));
+
+        let non_callable = citation(
+            "SearchHitEvidenceTier",
+            "src/retrieval/evidence.rs",
+            NodeKind::STRUCT,
+        );
+        assert!(!citation_owns_search_evidence_classification(&non_callable));
     }
 
     #[test]

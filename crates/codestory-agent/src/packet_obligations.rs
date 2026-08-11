@@ -8,15 +8,10 @@ use super::packet_flow_requirements::{
 use super::packet_required_probes::{
     packet_prompt_exact_symbol_probe_queries, packet_sufficiency_required_probe_queries_from_terms,
 };
-use super::packet_scoring::{
-    normalize_identifier, packet_adjacent_query_stop_term, packet_display_path,
-    packet_query_stop_term,
-};
+use super::packet_scoring::{normalize_identifier, packet_display_path};
 use super::packet_terms::packet_probe_terms;
 use crate::packet_execution_graphs::packet_execution_graphs;
-use crate::text::{
-    exact_symbol_query_terms, looks_like_standalone_symbol_query, symbol_query_tokens,
-};
+use crate::text::{exact_symbol_query_terms, looks_like_standalone_symbol_query};
 use crate::trail::is_speculative_trail_edge;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
@@ -48,7 +43,7 @@ pub fn build_packet_obligation_plan(
     let exact_symbol_queries =
         packet_prioritized_exact_symbol_queries(question, &terms, task_class);
     let (binding_terms, omitted_binding_term_count) =
-        requested_claim_binding_terms(question, &exact_symbol_queries, !requirements.is_empty());
+        requested_claim_binding_terms(&exact_symbol_queries);
     let mut claim_obligations = requirements
         .iter()
         .map(|requirement| claim_obligation(requirement, requires_complete_discovery))
@@ -429,10 +424,14 @@ fn claim_obligation(
 
 fn default_profile_requested_claim_obligations(
     binding_terms: &[String],
-    task_class: PacketTaskClassDto,
+    _task_class: PacketTaskClassDto,
     requires_complete_discovery: bool,
 ) -> Vec<PacketClaimObligationDto> {
-    let kind = default_profile_obligation_kind(task_class);
+    // Requested identities prove that the named callable was actually carried. Flow predicates
+    // independently prove how it participates in behavior. Giving every requested identity the
+    // task's default behavioral role fabricated orchestration/dispatch claims and forced a CALL
+    // edge even for an ordinary exact lookup.
+    let kind = PacketClaimObligationKindDto::ExactProbe;
     binding_terms
         .iter()
         .enumerate()
@@ -443,7 +442,7 @@ fn default_profile_requested_claim_obligations(
             probe_binding: None,
             material: true,
             allowed_node_kinds: allowed_node_kinds_for_obligation(kind),
-            required_edge_kind: Some(EdgeKind::CALL),
+            required_edge_kind: None,
             requires_complete_discovery,
             proof_status: PacketObligationProofStatusDto::Planned,
             reason: None,
@@ -502,24 +501,10 @@ fn default_profile_guards(
         .collect()
 }
 
-fn requested_claim_binding_terms(
-    question: &str,
-    exact_symbol_queries: &[String],
-    has_recognized_flow: bool,
-) -> (Vec<String>, usize) {
+fn requested_claim_binding_terms(exact_symbol_queries: &[String]) -> (Vec<String>, usize) {
     let mut candidates = Vec::new();
-    let mut exact_symbol_components = HashSet::new();
     let mut omitted_exact_symbol_count = 0;
     for term in exact_symbol_queries {
-        // Consume a qualified exact symbol atomically. The ordinary prompt tokenizer may retain a
-        // CamelCase owner as one token while `symbol_query_tokens` splits it, so record both forms
-        // and prevent either owner or member fragments from becoming extra material claim rows.
-        for segment in symbol_identity_segments(term) {
-            exact_symbol_components.insert(segment);
-        }
-        for component in symbol_query_tokens(term) {
-            exact_symbol_components.insert(normalize_identifier(&component));
-        }
         let bounded_identity_loss =
             term.chars().count() > PACKET_OBLIGATION_BINDING_TERM_CHAR_LIMIT;
         let inserted = push_exact_requested_claim_binding_candidate(&mut candidates, term);
@@ -530,40 +515,15 @@ fn requested_claim_binding_terms(
         }
     }
 
-    // A recognized flow's ordinary nouns describe the flow profile; code-shaped exact symbols
-    // remain independent requested claims. Without a recognized flow, retain the old natural-
-    // language fallback for concrete identifiers while avoiding owner/member fragments already
-    // represented by an exact qualified symbol.
-    if !has_recognized_flow {
-        for term in packet_probe_terms(question)
-            .into_iter()
-            .filter(|term| packet_obligation_binding_term_is_concrete(term))
-            .filter(|term| !exact_symbol_components.contains(&normalize_identifier(term)))
-        {
-            push_requested_claim_binding_candidate(&mut candidates, &term);
-        }
-    }
-
+    // Natural-language terms describe retrieval intent; they are not independent code claims.
+    // Only the exact-symbol parser may mint a requested-identity obligation. This prevents prose
+    // such as "participates", "evidence", or "path" from consuming the bounded material ledger.
     let omitted = omitted_exact_symbol_count
         + candidates
             .len()
             .saturating_sub(PACKET_OBLIGATION_BINDING_TERM_LIMIT);
     candidates.truncate(PACKET_OBLIGATION_BINDING_TERM_LIMIT);
     (candidates, omitted)
-}
-
-fn push_requested_claim_binding_candidate(candidates: &mut Vec<String>, term: &str) {
-    let bounded = term
-        .chars()
-        .take(PACKET_OBLIGATION_BINDING_TERM_CHAR_LIMIT)
-        .collect::<String>();
-    if !bounded.is_empty()
-        && !candidates
-            .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(&bounded))
-    {
-        candidates.push(bounded);
-    }
 }
 
 fn push_exact_requested_claim_binding_candidate(candidates: &mut Vec<String>, term: &str) -> bool {
@@ -602,39 +562,6 @@ fn requested_claim_overflow_obligation(
         carrier_edge_proofs: Vec::new(),
         open_next_candidates: Vec::new(),
     }
-}
-
-fn packet_obligation_binding_term_is_concrete(term: &str) -> bool {
-    term.len() >= 4
-        && !packet_query_stop_term(term)
-        && !packet_adjacent_query_stop_term(term)
-        && !matches!(
-            term,
-            "architecture"
-                | "assess"
-                | "behavior"
-                | "behaviour"
-                | "callers"
-                | "change"
-                | "dispatch"
-                | "entrypoint"
-                | "external"
-                | "handler"
-                | "handlers"
-                | "locate"
-                | "orchestration"
-                | "ownership"
-                | "plan"
-                | "persistence"
-                | "references"
-                | "router"
-                | "runtime"
-                | "service"
-                | "state"
-                | "storage"
-                | "trace"
-                | "tracing"
-        )
 }
 
 fn claim_obligation_kind_id(kind: PacketClaimObligationKindDto) -> &'static str {
@@ -1325,6 +1252,7 @@ fn finalize_default_profile_obligation(
     evidence_view: PacketObligationEvidenceView,
     previous_edge_proofs: &[PacketObligationCarrierEdgeProofDto],
 ) {
+    let has_requested_identity = !binding_terms.is_empty();
     let reported_citations = answer
         .citations
         .iter()
@@ -1334,7 +1262,8 @@ fn finalize_default_profile_obligation(
                 binding_terms,
                 exact_binding_terms,
                 requested_paths,
-            ) && citation_plausibly_reports_obligation(citation, obligation.kind)
+            ) && (has_requested_identity
+                || citation_plausibly_reports_obligation(citation, obligation.kind))
         })
         .collect::<Vec<_>>();
     record_obligation_carriers(
@@ -2555,6 +2484,77 @@ mod tests {
     }
 
     #[test]
+    fn natural_language_search_flow_does_not_mint_prose_claims() {
+        let question = "Find the production packet/search path that turns ranked search results into packet evidence and agent handoff.";
+        let plan = build_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        let material_ids = plan
+            .claim_obligations
+            .iter()
+            .filter(|obligation| obligation.material)
+            .map(|obligation| obligation.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(plan.binding_terms.is_empty(), "{plan:#?}");
+        assert_eq!(
+            material_ids,
+            [
+                "search_entrypoint",
+                "search_dispatch",
+                "search_evidence_classification",
+                "search_evidence_output",
+            ]
+        );
+        assert!(
+            plan.claim_obligations
+                .iter()
+                .all(|obligation| { !obligation.id.starts_with("requested_claim:") })
+        );
+        assert!(
+            plan.query_obligations
+                .iter()
+                .all(|obligation| { obligation.query != "packet/search" || !obligation.material })
+        );
+    }
+
+    #[test]
+    fn exact_search_symbol_is_separate_from_typed_search_flow() {
+        let question = "Explain how LiveSidecarSearch::semantic_search participates in the live sidecar search path and why packet/search evidence cannot be promoted when retrieval sidecars are unavailable or stale.";
+        let plan = build_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        let requested = plan
+            .claim_obligations
+            .iter()
+            .find(|obligation| obligation.binding_terms == ["LiveSidecarSearch::semantic_search"])
+            .expect("exact symbol identity obligation");
+
+        assert_eq!(requested.kind, PacketClaimObligationKindDto::ExactProbe);
+        assert_eq!(requested.required_edge_kind, None);
+        assert!(requested.material);
+        assert!(
+            plan.claim_obligations
+                .iter()
+                .any(|obligation| { obligation.id == "search_entrypoint" && obligation.material })
+        );
+        assert!(
+            plan.claim_obligations
+                .iter()
+                .any(|obligation| { obligation.id == "search_dispatch" && obligation.material })
+        );
+        assert!(
+            plan.claim_obligations
+                .iter()
+                .all(|obligation| { obligation.binding_terms != ["packet/search"] })
+        );
+    }
+
+    #[test]
     fn requested_claim_cap_records_the_ninth_symbol_as_a_material_overflow() {
         let eight = "Find SymbolOne SymbolTwo SymbolThree SymbolFour SymbolFive SymbolSix SymbolSeven SymbolEight.";
         let nine = "Find SymbolOne SymbolTwo SymbolThree SymbolFour SymbolFive SymbolSix SymbolSeven SymbolEight SymbolNine.";
@@ -2966,11 +2966,18 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
             &[],
         );
+        assert!(
+            plan.claim_obligations
+                .iter()
+                .all(|obligation| { !obligation.id.starts_with("requested_claim:") })
+        );
+        assert!(
+            plan.claim_obligations
+                .iter()
+                .all(|obligation| { obligation.id != REQUESTED_CLAIM_OVERFLOW_ID })
+        );
         assert!(plan.claim_obligations.iter().any(|obligation| {
-            obligation.id.starts_with("requested_claim:") && obligation.material
-        }));
-        assert!(plan.claim_obligations.iter().any(|obligation| {
-            obligation.id == REQUESTED_CLAIM_OVERFLOW_ID && obligation.material
+            obligation.id == "profile_architecture_behavior" && obligation.material
         }));
         let resolution = PacketProbeResolutionDto {
             input_index: 0,
@@ -2995,9 +3002,11 @@ mod tests {
         assert!(plan.claim_obligations.iter().all(|obligation| {
             !obligation.id.starts_with("requested_claim:") || !obligation.material
         }));
-        assert!(plan.claim_obligations.iter().any(|obligation| {
-            obligation.id == REQUESTED_CLAIM_OVERFLOW_ID && !obligation.material
-        }));
+        assert!(
+            plan.claim_obligations
+                .iter()
+                .all(|obligation| { obligation.id != REQUESTED_CLAIM_OVERFLOW_ID })
+        );
         assert!(
             plan.claim_obligations
                 .iter()
@@ -3173,9 +3182,12 @@ mod tests {
         let mixed_question = "Explain RuntimeService::run alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo.";
         let mixed_task_class = PacketTaskClassDto::SymbolOwnership;
         let mut mixed_plan = build_packet_obligation_plan(mixed_question, mixed_task_class, &[]);
-        assert!(mixed_plan.claim_obligations.iter().any(|obligation| {
-            obligation.id == REQUESTED_CLAIM_OVERFLOW_ID && obligation.material
-        }));
+        assert!(
+            mixed_plan
+                .claim_obligations
+                .iter()
+                .all(|obligation| { obligation.id != REQUESTED_CLAIM_OVERFLOW_ID })
+        );
         let mixed_resolution = PacketProbeResolutionDto {
             input_index: 5,
             probe: PacketProbeDto::ExactPath {
@@ -3199,9 +3211,12 @@ mod tests {
                 && obligation.id.contains("RuntimeService::run")
                 && obligation.material
         }));
-        assert!(mixed_plan.claim_obligations.iter().any(|obligation| {
-            obligation.id == REQUESTED_CLAIM_OVERFLOW_ID && !obligation.material
-        }));
+        assert!(
+            mixed_plan
+                .claim_obligations
+                .iter()
+                .all(|obligation| { obligation.id != REQUESTED_CLAIM_OVERFLOW_ID })
+        );
 
         let long_owner = "A".repeat(PACKET_OBLIGATION_BINDING_TERM_CHAR_LIMIT + 24);
         let long_question = format!("Explain {long_owner}::run.");
@@ -3690,13 +3705,15 @@ mod tests {
                 }),
                 "only concrete requested claims are material: {task_class:?}"
             );
+            assert_eq!(requested[0].kind, PacketClaimObligationKindDto::ExactProbe);
+            assert_eq!(requested[0].required_edge_kind, None);
             assert_eq!(
                 plan.claim_obligations
                     .iter()
                     .map(|obligation| obligation.kind)
                     .collect::<HashSet<_>>()
                     .len(),
-                5,
+                6,
                 "{task_class:?}"
             );
         }
@@ -3957,7 +3974,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_profile_name_match_without_edge_stays_reported() {
+    fn exact_symbol_lookup_does_not_invent_a_behavioral_edge_requirement() {
         let question = "Find RuntimeService::run.";
         let mut answer = answer(vec![citation(
             "RuntimeService::run",
@@ -3977,13 +3994,14 @@ mod tests {
 
         assert_eq!(
             plan.claim_obligations[0].proof_status,
-            PacketObligationProofStatusDto::Reported
+            PacketObligationProofStatusDto::Proven
         );
         assert_eq!(
-            plan.claim_obligations[0].reason.as_deref(),
-            Some("selected_claim_profile_requires_typed_flow")
+            plan.claim_obligations[0].kind,
+            PacketClaimObligationKindDto::ExactProbe
         );
-        assert!(!material_packet_obligations_are_proven(&plan));
+        assert_eq!(plan.claim_obligations[0].required_edge_kind, None);
+        assert_eq!(plan.claim_obligations[0].reason, None);
     }
 
     #[test]

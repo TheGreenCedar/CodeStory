@@ -4,12 +4,14 @@ use anyhow::{Context, Result, bail};
 use codestory_contracts::api::SearchTargetDto;
 use codestory_contracts::owned_artifacts::sqlite_file_with_sidecars;
 use codestory_contracts::validation_receipts::SealedReceiptCache;
-use codestory_store::{FileRole, SourcePolicyExclusionPolicyIdentity, Store, SymbolSearchDoc};
+#[cfg(test)]
+use codestory_store::FileRole;
+use codestory_store::{SourcePolicyExclusionPolicyIdentity, Store, SymbolSearchDoc};
 use codestory_workspace::paths::sqlite_open_path;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -447,7 +449,7 @@ fn search_lexical_index_with_cancel_inner(
         .join(" OR ");
     let candidate_limit = limit.saturating_mul(64).clamp(256, MAX_CANDIDATES);
 
-    let command_tokens = command_query_tokens(query);
+    let mandatory_tokens = quoted_query_tokens(query);
     let document_count: usize = connection.query_row(
         "SELECT file_count FROM lexical_metadata WHERE id = 1",
         [],
@@ -465,7 +467,7 @@ fn search_lexical_index_with_cancel_inner(
         .zip(tokens.iter())
         .map(|(frequency, token)| {
             let mut weight = lexical_token_weight(*frequency, document_count);
-            if command_tokens.iter().any(|command| command == token) {
+            if mandatory_tokens.iter().any(|mandatory| mandatory == token) {
                 weight *= 2.0;
             }
             weight
@@ -474,18 +476,49 @@ fn search_lexical_index_with_cancel_inner(
     let total_weight = token_weights.iter().sum::<f32>();
     let required_weight = required_lexical_match_weight(tokens.len(), total_weight);
 
-    let mut candidates = query_fts_candidates(
+    let exact_candidates = query_exact_candidates(&connection, query, candidate_limit)?;
+    let path_candidates = query_fts_candidates(
         &connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::Path,
     )?;
-    candidates.extend(query_fts_candidates(
+    let content_candidates = query_fts_candidates(
         &connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::Content,
-    )?);
+    )?;
+    let mut symbol_candidates = query_fts_candidates(
+        &connection,
+        &fts_query,
+        candidate_limit,
+        LexicalCandidateOrder::SymbolDocument,
+    )?;
+    rank_symbol_candidates_by_identifier_overlap(&mut symbol_candidates, &tokens, &token_weights);
+
+    // Exact, path-BM25, content-BM25, and focused symbol documents are
+    // independent lexical recall lanes. Preserve every deterministic rank a
+    // document earned and fuse those ranks instead of comparing incompatible
+    // raw BM25 scores or collapsing them to one best lane. The coverage rule
+    // below remains the admission threshold.
+    let query_shape = crate::query_features::classify_query(query).shape;
+    let mut best_sublane_ranks = HashMap::new();
+    for (lane, candidates) in [
+        (LexicalSublane::Exact, exact_candidates.as_slice()),
+        (LexicalSublane::Path, path_candidates.as_slice()),
+        (LexicalSublane::Content, content_candidates.as_slice()),
+        (LexicalSublane::SymbolDocument, symbol_candidates.as_slice()),
+    ] {
+        record_lexical_sublane_ranks(&mut best_sublane_ranks, candidates, lane);
+    }
+
+    let mut candidates = exact_candidates;
+    candidates.extend(interleave_candidate_lanes(vec![
+        path_candidates,
+        content_candidates,
+        symbol_candidates,
+    ]));
 
     let mut hits = Vec::new();
     let mut seen = HashSet::new();
@@ -495,9 +528,18 @@ fn search_lexical_index_with_cancel_inner(
         if index % 64 == 0 && cancelled() {
             bail!("lexical search cancelled");
         }
-        if !seen.insert(lexical_candidate_identity(&document)) {
+        let identity = lexical_candidate_identity(&document);
+        let sublane_ranks = best_sublane_ranks
+            .get(&identity)
+            .copied()
+            .unwrap_or_default();
+        if seen.contains(&identity) {
             continue;
         }
+        if seen.len() == MAX_CANDIDATES {
+            break;
+        }
+        seen.insert(identity);
         let token_match = lexical_token_match(
             &tokens,
             &token_weights,
@@ -505,7 +547,7 @@ fn search_lexical_index_with_cancel_inner(
             &normalized_content,
         );
         if token_match.matched_weight >= required_weight
-            && lexical_match_is_eligible(tokens.len(), &document.path, &token_match)
+            && mandatory_tokens_match(&mandatory_tokens, &normalized_path, &normalized_content)
         {
             let (target, matched_line, source_excerpt) =
                 if document.source == LexicalDocumentSource::LexicalSource {
@@ -519,7 +561,7 @@ fn search_lexical_index_with_cancel_inner(
                     (None, None, None)
                 };
             hits.push(LexicalHit {
-                score: score_lexical_match(&document.path, document.source, &token_match),
+                score: lexical_sublane_score(sublane_ranks, query_shape),
                 path: document.path,
                 source: document.source,
                 node_id: document.node_id,
@@ -550,8 +592,8 @@ fn search_lexical_index_with_cancel_inner(
 
 fn lexical_source_rank(source: LexicalDocumentSource) -> u8 {
     match source {
-        LexicalDocumentSource::LexicalSource => 0,
-        LexicalDocumentSource::SymbolDoc => 1,
+        LexicalDocumentSource::SymbolDoc => 0,
+        LexicalDocumentSource::LexicalSource => 1,
         LexicalDocumentSource::ComponentReport => 2,
     }
 }
@@ -560,6 +602,7 @@ fn lexical_source_rank(source: LexicalDocumentSource) -> u8 {
 enum LexicalCandidateOrder {
     Path,
     Content,
+    SymbolDocument,
 }
 
 type LexicalCandidate = (LexicalDocument, String, String);
@@ -570,6 +613,12 @@ fn query_fts_candidates(
     candidate_limit: usize,
     order: LexicalCandidateOrder,
 ) -> Result<Vec<LexicalCandidate>> {
+    let scoped_query = match order {
+        LexicalCandidateOrder::Path => format!("path : ({fts_query})"),
+        LexicalCandidateOrder::Content | LexicalCandidateOrder::SymbolDocument => {
+            format!("content : ({fts_query})")
+        }
+    };
     let sql = match order {
         LexicalCandidateOrder::Path => {
             "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
@@ -589,9 +638,18 @@ fn query_fts_candidates(
              ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
              LIMIT ?2"
         }
+        LexicalCandidateOrder::SymbolDocument => {
+            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1 AND d.source = 'symbol_doc'
+             ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
+             LIMIT ?2"
+        }
     };
     let mut statement = connection.prepare(sql)?;
-    let rows = statement.query_map(params![fts_query, candidate_limit as i64], |row| {
+    let rows = statement.query_map(params![scoped_query, candidate_limit as i64], |row| {
         let document = LexicalDocument {
             path: row.get(0)?,
             content: row.get(1)?,
@@ -612,9 +670,192 @@ fn query_fts_candidates(
         .map_err(Into::into)
 }
 
-fn lexical_candidate_identity(
+fn query_exact_candidates(
+    connection: &Connection,
+    query: &str,
+    candidate_limit: usize,
+) -> Result<Vec<LexicalCandidate>> {
+    let mut needles = quoted_query_tokens(query);
+    let intent = crate::query_features::classify_query(query).intent;
+    needles.extend(
+        intent
+            .exact_symbols
+            .into_iter()
+            .chain(intent.paths)
+            .map(|needle| needle.to_ascii_lowercase()),
+    );
+    needles.sort();
+    needles.dedup();
+
+    let mut candidates = Vec::new();
+    let mut statement = connection.prepare(
+        "SELECT d.path, d.content, lower(lexical_fts.path), lower(lexical_fts.content),
+                d.source, d.node_id, d.symbol_name, d.start_line
+         FROM lexical_documents d
+         JOIN lexical_fts ON lexical_fts.rowid = d.id
+         WHERE lower(d.path) = ?1
+            OR lower(d.symbol_name) = ?1
+            OR lower(d.symbol_name) LIKE '%::' || ?1
+            OR lower(d.symbol_name) LIKE '%.' || ?1
+         ORDER BY d.path, d.source, d.node_id, d.symbol_name, d.start_line, d.id
+         LIMIT ?2",
+    )?;
+    for needle in needles {
+        let rows = statement.query_map(params![needle, candidate_limit as i64], |row| {
+            let document = LexicalDocument {
+                path: row.get(0)?,
+                content: row.get(1)?,
+                source: LexicalDocumentSource::parse(&row.get::<_, String>(4)?).map_err(
+                    |error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            error.into(),
+                        )
+                    },
+                )?,
+                node_id: row.get(5)?,
+                symbol_name: row.get(6)?,
+                start_line: row.get(7)?,
+            };
+            Ok((document, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+        })?;
+        candidates.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+        if candidates.len() >= candidate_limit {
+            break;
+        }
+    }
+    candidates.truncate(candidate_limit);
+    Ok(candidates)
+}
+
+fn interleave_candidate_lanes(lanes: Vec<Vec<LexicalCandidate>>) -> Vec<LexicalCandidate> {
+    let mut lanes = lanes.into_iter().map(Vec::into_iter).collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    loop {
+        let mut added = false;
+        for lane in &mut lanes {
+            if let Some(candidate) = lane.next() {
+                candidates.push(candidate);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    candidates
+}
+
+type LexicalCandidateIdentity = (String, u8, Option<String>, Option<String>, Option<u32>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexicalSublane {
+    Exact,
+    Path,
+    Content,
+    SymbolDocument,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LexicalSublaneRanks {
+    exact: Option<u32>,
+    path: Option<u32>,
+    content: Option<u32>,
+    symbol_document: Option<u32>,
+}
+
+impl LexicalSublaneRanks {
+    fn record(&mut self, lane: LexicalSublane, rank: u32) {
+        let slot = match lane {
+            LexicalSublane::Exact => &mut self.exact,
+            LexicalSublane::Path => &mut self.path,
+            LexicalSublane::Content => &mut self.content,
+            LexicalSublane::SymbolDocument => &mut self.symbol_document,
+        };
+        *slot = Some(slot.map_or(rank, |current| current.min(rank)));
+    }
+}
+
+fn record_lexical_sublane_ranks(
+    ranks: &mut HashMap<LexicalCandidateIdentity, LexicalSublaneRanks>,
+    candidates: &[LexicalCandidate],
+    lane: LexicalSublane,
+) {
+    for (index, (document, _, _)) in candidates.iter().enumerate() {
+        let candidate_rank = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        ranks
+            .entry(lexical_candidate_identity(document))
+            .or_default()
+            .record(lane, candidate_rank);
+    }
+}
+
+fn rank_symbol_candidates_by_identifier_overlap(
+    candidates: &mut [LexicalCandidate],
+    tokens: &[String],
+    token_weights: &[f32],
+) {
+    let original_order = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, (document, _, _))| (lexical_candidate_identity(document), index))
+        .collect::<HashMap<_, _>>();
+    candidates.sort_by(|left, right| {
+        symbol_identifier_overlap(&right.0, tokens, token_weights)
+            .partial_cmp(&symbol_identifier_overlap(&left.0, tokens, token_weights))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                original_order[&lexical_candidate_identity(&left.0)]
+                    .cmp(&original_order[&lexical_candidate_identity(&right.0)])
+            })
+    });
+}
+
+fn symbol_identifier_overlap(
     document: &LexicalDocument,
-) -> (String, u8, Option<String>, Option<String>, Option<u32>) {
+    tokens: &[String],
+    token_weights: &[f32],
+) -> f32 {
+    let Some(symbol_name) = document.symbol_name.as_deref() else {
+        return 0.0;
+    };
+    let normalized = normalize_lexical_text(symbol_name);
+    let symbol_tokens = normalized.split_whitespace().collect::<HashSet<_>>();
+    tokens
+        .iter()
+        .zip(token_weights.iter().copied())
+        .filter_map(|(token, weight)| symbol_tokens.contains(token.as_str()).then_some(weight))
+        .sum()
+}
+
+fn lexical_sublane_score(
+    ranks: LexicalSublaneRanks,
+    shape: crate::query_features::QueryShape,
+) -> f32 {
+    // Fuse only deterministic ranks. BM25 values from different FTS column
+    // weightings are not comparable, and aggregate file coverage must not
+    // erase a focused symbol-document signal. k=20 matches the outer hybrid
+    // ranker; the denominator normalizes a candidate ranked first in every
+    // lexical sublane to 1.0.
+    const RRF_K: f32 = 20.0;
+    let (exact_weight, path_weight, content_weight, symbol_weight) = match shape {
+        crate::query_features::QueryShape::PathLike => (2.0, 1.25, 1.0, 1.0),
+        crate::query_features::QueryShape::SymbolLike => (2.0, 0.75, 1.0, 1.5),
+        crate::query_features::QueryShape::NaturalLanguage
+        | crate::query_features::QueryShape::Mixed => (2.0, 1.0, 1.0, 1.25),
+    };
+    let weighted_rank =
+        |rank: Option<u32>, weight: f32| rank.map_or(0.0, |rank| weight / (RRF_K + rank as f32));
+    let score = weighted_rank(ranks.exact, exact_weight)
+        + weighted_rank(ranks.path, path_weight)
+        + weighted_rank(ranks.content, content_weight)
+        + weighted_rank(ranks.symbol_document, symbol_weight);
+    let maximum = (exact_weight + path_weight + content_weight + symbol_weight) / (RRF_K + 1.0);
+    (score / maximum).clamp(0.0, 1.0)
+}
+
+fn lexical_candidate_identity(document: &LexicalDocument) -> LexicalCandidateIdentity {
     let source = match document.source {
         LexicalDocumentSource::LexicalSource => 0,
         LexicalDocumentSource::SymbolDoc => 1,
@@ -1475,13 +1716,13 @@ fn lexical_query_tokens(query: &str) -> Vec<String> {
     tokens
 }
 
-fn command_query_tokens(query: &str) -> Vec<String> {
+fn quoted_query_tokens(query: &str) -> Vec<String> {
     let mut tokens = Vec::new();
-    let mut in_backticks = false;
+    let mut delimiter = None;
     let mut current = String::new();
     for character in query.chars() {
-        if character == '`' {
-            if in_backticks {
+        if delimiter == Some(character) {
+            if !current.is_empty() {
                 for token in lexical_query_tokens(&current) {
                     if !tokens.iter().any(|existing| existing == &token) {
                         tokens.push(token);
@@ -1489,8 +1730,10 @@ fn command_query_tokens(query: &str) -> Vec<String> {
                 }
                 current.clear();
             }
-            in_backticks = !in_backticks;
-        } else if in_backticks {
+            delimiter = None;
+        } else if delimiter.is_none() && matches!(character, '`' | '"') {
+            delimiter = Some(character);
+        } else if delimiter.is_some() {
             current.push(character);
         }
     }
@@ -1513,7 +1756,7 @@ fn required_lexical_match_weight(token_count: usize, total_weight: f32) -> f32 {
         0 => 0.0,
         1 => total_weight,
         2 | 3 => total_weight * 0.60,
-        _ => (total_weight * 0.35).max(2.5),
+        _ => total_weight * 0.40,
     }
 }
 
@@ -1564,25 +1807,17 @@ fn path_match_factor(normalized_path: &str, token: &str) -> f32 {
     }
 }
 
-fn lexical_match_is_eligible(
-    token_count: usize,
-    path: &str,
-    token_match: &LexicalTokenMatch,
+fn mandatory_tokens_match(
+    mandatory_tokens: &[String],
+    normalized_path: &str,
+    normalized_content: &str,
 ) -> bool {
-    if token_count < 8 || token_match.path_weight > 0.0 {
-        return true;
-    }
-    let coverage = if token_match.total_weight <= 0.0 {
-        0.0
-    } else {
-        token_match.matched_weight / token_match.total_weight
-    };
-    matches!(
-        lexical_file_role(path),
-        FileRole::Entrypoint | FileRole::Source
-    ) && coverage >= 0.45
+    mandatory_tokens.iter().all(|token| {
+        normalized_path.contains(token.as_str()) || normalized_content.contains(token.as_str())
+    })
 }
 
+#[cfg(test)]
 fn score_lexical_match(
     path: &str,
     source: LexicalDocumentSource,
@@ -1625,6 +1860,7 @@ fn score_lexical_match(
         .clamp(0.0, 1.0)
 }
 
+#[cfg(test)]
 fn lexical_file_role(path: &str) -> FileRole {
     let path = Path::new(path);
     if path
@@ -1806,6 +2042,145 @@ mod tests {
             hits.first().map(|hit| hit.path.as_str()),
             Some("src/content_match.rs")
         );
+    }
+
+    #[test]
+    fn focused_symbol_lane_beats_scattered_whole_file_term_coverage() {
+        let root = TempDir::new().expect("root");
+        let generation = "focused-symbol";
+        let shard = shard_dir_for(root.path(), generation);
+        std::fs::create_dir_all(&shard).expect("shard");
+        let documents = vec![
+            LexicalDocument {
+                path: "src/broad.rs".to_string(),
+                content: "request dispatch output evidence indexed symbol hits retrieval shadow"
+                    .to_string(),
+                source: LexicalDocumentSource::LexicalSource,
+                node_id: None,
+                symbol_name: None,
+                start_line: None,
+            },
+            LexicalDocument {
+                path: "src/primary.rs".to_string(),
+                content:
+                    "fn request_dispatch_output_evidence_indexed_symbol_hits_retrieval_shadow()"
+                        .to_string(),
+                source: LexicalDocumentSource::SymbolDoc,
+                node_id: Some("symbol:primary-request-dispatch".to_string()),
+                symbol_name: Some(
+                    "request_dispatch_output_evidence_indexed_symbol_hits_retrieval_shadow"
+                        .to_string(),
+                ),
+                start_line: Some(4),
+            },
+            LexicalDocument {
+                path: "src/output.rs".to_string(),
+                content: "fn append_request_evidence_symbol() // indexed output dispatch result"
+                    .to_string(),
+                source: LexicalDocumentSource::SymbolDoc,
+                node_id: Some("symbol:append-request-evidence".to_string()),
+                symbol_name: Some("append_request_evidence_symbol".to_string()),
+                start_line: Some(12),
+            },
+        ];
+        let coverage = LexicalCoverage {
+            discovered_files: 3,
+            indexed_files: 3,
+            ..Default::default()
+        };
+        let fingerprint = LexicalInputFingerprint {
+            file_count: documents.len() as u32,
+            hash: lexical_documents_hash(&documents, &coverage),
+            coverage: coverage.clone(),
+        };
+        write_lexical_database(
+            &shard.join(LEXICAL_INDEX_FILE),
+            generation,
+            "focused-symbol-input",
+            &fingerprint,
+            |visit| {
+                for document in &documents {
+                    visit(document)?;
+                }
+                Ok(coverage.clone())
+            },
+        )
+        .expect("write focused lexical shard");
+
+        let hits = search_lexical_index(
+            &shard,
+            "focused-symbol-input",
+            "request dispatch output evidence indexed symbol hits retrieval shadow",
+            3,
+        )
+        .expect("search");
+
+        let focused_position = hits
+            .iter()
+            .position(|hit| hit.symbol_name.as_deref() == Some("append_request_evidence_symbol"))
+            .expect("second-ranked focused symbol is retained");
+        let broad_position = hits
+            .iter()
+            .position(|hit| hit.path == "src/broad.rs")
+            .expect("broad source candidate is retained");
+        assert!(
+            focused_position < broad_position,
+            "a focused symbol-document rank must survive independent sublane fusion"
+        );
+    }
+
+    #[test]
+    fn lexical_sublane_fusion_does_not_collapse_to_the_minimum_rank() {
+        let broad_file = LexicalSublaneRanks {
+            content: Some(1),
+            ..Default::default()
+        };
+        let focused_symbol = LexicalSublaneRanks {
+            symbol_document: Some(2),
+            ..Default::default()
+        };
+
+        assert!(
+            lexical_sublane_score(focused_symbol, crate::query_features::QueryShape::Mixed)
+                > lexical_sublane_score(broad_file, crate::query_features::QueryShape::Mixed)
+        );
+    }
+
+    #[test]
+    fn lexical_recall_requires_quoted_entities_without_a_long_query_path_gate() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("src/flow.rs"),
+            "packet search dispatch builds ranked results through semantic graph retrieval",
+        )
+        .expect("complete source");
+        std::fs::write(
+            project.path().join("src/distractor.rs"),
+            "packet search dispatch builds ranked results through semantic graph",
+        )
+        .expect("missing quoted entity");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "quoted", "input");
+
+        let hits = search_lexical_index(
+            &shard,
+            "input",
+            "explain packet search dispatch builds ranked results through semantic graph `retrieval`",
+            8,
+        )
+        .expect("search");
+
+        assert_eq!(
+            hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/flow.rs"]
+        );
+    }
+
+    #[test]
+    fn lexical_long_query_requires_forty_percent_of_non_stopwords() {
+        assert_eq!(required_lexical_match_weight(4, 10.0), 4.0);
+        assert_eq!(required_lexical_match_weight(12, 10.0), 4.0);
     }
 
     #[test]

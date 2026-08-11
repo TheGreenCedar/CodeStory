@@ -719,7 +719,6 @@ fn is_packet_path_like_query(query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::packet_plan::build_packet_plan;
     use codestory_contracts::api::{
         AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto,
         PacketPlanDto, PacketPlanQueryDto, PacketTaskClassDto, RetrievalAnnotationKindDto,
@@ -1298,27 +1297,6 @@ mod tests {
         assert!(queries.contains(&"run".to_string()));
         assert!(queries.contains(&"entrypoint".to_string()));
         assert!(!queries.contains(&"architecture entrypoint".to_string()));
-    }
-
-    #[test]
-    fn compact_search_flow_reserves_main_anchor_query() {
-        let plan = build_packet_plan(
-            "Explain how a search command parses CLI flags, walks candidate inputs, and executes sequential or parallel searches through matcher, searcher, and printer components.",
-            Some(PacketTaskClassDto::ArchitectureExplanation),
-            PacketBudgetModeDto::Compact,
-        );
-
-        assert_eq!(
-            plan.queries.len(),
-            32,
-            "fixture should exercise the plan cap"
-        );
-        let selected = packet_anchor_probe_queries(&plan)
-            .into_iter()
-            .take(packet_anchor_probe_limit(PacketBudgetModeDto::Compact))
-            .collect::<Vec<_>>();
-
-        assert!(selected.iter().any(|query| query == "main"));
     }
 
     #[test]

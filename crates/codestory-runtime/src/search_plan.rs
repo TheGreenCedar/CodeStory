@@ -12,8 +12,8 @@ use super::{
     retrieval_state_from_storage_for_runtime, should_expand_symbol_query, terminal_symbol_segment,
 };
 use crate::root_rank::{
-    self, CallDegrees, SEARCH_ORIENTATION_WINDOW, degree_tier, entry_evidence,
-    helper_like_name_or_path, structural_path_rank, subsystem_key_for_path,
+    CallDegrees, SEARCH_ORIENTATION_WINDOW, degree_tier, entry_evidence, helper_like_name_or_path,
+    structural_path_rank, subsystem_key_for_path,
 };
 use crate::search_intent::{
     SearchIntentFilter, SearchIntentQuery, annotate_search_hit_match_quality,
@@ -36,10 +36,62 @@ use codestory_contracts::api::{GroundingOrientationDto, GroundingOrientationUnce
 use codestory_contracts::graph::STRUCTURAL_COLLECTION_CANONICAL_ID_PREFIXES;
 use codestory_store::FileRole;
 use std::cmp::Reverse;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The only search-plan intent label there is now.
 pub(super) const SEARCH_PLAN_ORIENTATION_INTENT: &str = "orientation";
+const SIDECAR_SEARCH_RESOLUTION_WINDOW: usize = 50;
+const ORDINARY_SEARCH_HITS_PER_FILE: usize = 2;
+
+fn search_result_absolute_path(project_root: &Path, hit: &SearchHit) -> Option<PathBuf> {
+    let file_path = hit.file_path.as_deref()?;
+    let path = Path::new(file_path);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    })
+}
+
+/// Preserve canonical score order while preventing one implementation file
+/// from consuming a broad query's entire public result window. Exact matches
+/// remain mandatory; this is presentation admission, not a second ranker.
+pub(super) fn select_broad_search_result_breadth(
+    project_root: &Path,
+    query: &str,
+    hits: Vec<SearchHit>,
+) -> Vec<SearchHit> {
+    let mut ordinary_per_file = Vec::<(PathBuf, usize)>::new();
+    hits.into_iter()
+        .filter(|hit| {
+            if matches!(
+                search_hit_match_quality(query, hit),
+                SearchMatchQualityDto::Exact | SearchMatchQualityDto::NormalizedExact
+            ) {
+                return true;
+            }
+            let Some(file_path) = search_result_absolute_path(project_root, hit) else {
+                return true;
+            };
+            let file_index = ordinary_per_file.iter().position(|(seen, _)| {
+                codestory_workspace::same_workspace_path(seen.as_path(), file_path.as_path())
+            });
+            let file_index = match file_index {
+                Some(index) => index,
+                None => {
+                    ordinary_per_file.push((file_path, 0));
+                    ordinary_per_file.len() - 1
+                }
+            };
+            let count = &mut ordinary_per_file[file_index].1;
+            if *count >= ORDINARY_SEARCH_HITS_PER_FILE {
+                return false;
+            }
+            *count += 1;
+            true
+        })
+        .collect()
+}
 
 fn is_low_confidence_search_plan_bridge(bridge: &SearchPlanBridgeDto) -> bool {
     bridge.confidence == SearchPlanBridgeConfidenceDto::Low
@@ -1780,7 +1832,7 @@ impl AppController {
         let (query_result, resolution) = agent::retrieval_primary::run_and_resolve_sidecar_query(
             self,
             &query,
-            limit_per_source,
+            SIDECAR_SEARCH_RESOLUTION_WINDOW,
             None,
         )?;
         let mut indexed_symbol_hits = resolution.resolved_hits.clone();
@@ -1804,20 +1856,10 @@ impl AppController {
         let initial_sidecar_hits = indexed_symbol_hits.clone();
 
         apply_search_intent_filters(&mut indexed_symbol_hits, &intent_query.filters);
-        let project_root = self.require_project_root()?;
-        indexed_symbol_hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(
-                Some(project_root.as_path()),
-                &query,
-                left,
-                right,
-                None,
-            )
-        });
         dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
-        indexed_symbol_hits.truncate(limit_per_source);
         annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
 
+        let project_root = self.require_project_root()?;
         let storage = self.open_storage_read_only()?;
         let retrieval = retrieval_state_from_storage_for_runtime(
             &storage,
@@ -1844,7 +1886,6 @@ impl AppController {
         // it is decided before the plan and the evidence is built inside it.
         let orientation_regime = orientation_query(&query);
         let mut orientation_evidence: Option<OrientationEvidence> = None;
-        let mut search_plan_anchor_rank = HashMap::<NodeId, usize>::new();
         let search_plan = if expand_search_plan {
             match self.build_search_plan(
                 &storage,
@@ -1865,11 +1906,8 @@ impl AppController {
             )? {
                 Some(plan_build) => {
                     orientation_evidence = plan_build.orientation;
-                    for (rank, group) in plan_build.plan.anchor_groups.iter().enumerate() {
+                    for group in &plan_build.plan.anchor_groups {
                         if let Some(symbol) = &group.chosen_symbol {
-                            search_plan_anchor_rank
-                                .entry(symbol.node_id.clone())
-                                .or_insert(rank);
                             merge_search_hits_by_node_id(
                                 &mut indexed_symbol_hits,
                                 vec![symbol.clone()],
@@ -1901,49 +1939,18 @@ impl AppController {
             );
         }
         let orientation = orientation_evidence.as_ref();
-        indexed_symbol_hits.sort_by(|left, right| {
-            let anchor_order = match (
-                search_plan_anchor_rank.get(&left.node_id),
-                search_plan_anchor_rank.get(&right.node_id),
-            ) {
-                (Some(left_rank), Some(right_rank)) => left_rank.cmp(right_rank),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            };
-            anchor_order.then_with(|| {
-                compare_search_hits_with_project_root(
-                    Some(project_root.as_path()),
-                    &query,
-                    left,
-                    right,
-                    orientation,
-                )
-            })
-        });
         dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
         let total_root_candidates = indexed_symbol_hits.len();
-        if let Some(orientation) = orientation {
-            // Diversify the whole list and let the limit truncate it, so results
-            // at a smaller limit stay an exact prefix of a larger one. Exact
-            // matches are pinned: breadth never displaces what the caller named.
-            indexed_symbol_hits = root_rank::diversify_root_order(
+        // QueryResult already carries weighted-RRF-v2 order. Search plans may
+        // append new evidence but must not replace that canonical score with a
+        // second runtime comparator or an anchor-order prior.
+        if query_result.features.intent.lookup_mode
+            != codestory_retrieval::QueryLookupMode::Definition
+        {
+            indexed_symbol_hits = select_broad_search_result_breadth(
+                project_root.as_path(),
+                &query,
                 indexed_symbol_hits,
-                |hit| {
-                    matches!(
-                        search_hit_match_quality(&query, hit),
-                        SearchMatchQualityDto::Exact | SearchMatchQualityDto::NormalizedExact
-                    )
-                },
-                |hit| {
-                    let evidence = orientation.get(&hit.node_id);
-                    (
-                        evidence
-                            .map(|evidence| evidence.subsystem.clone())
-                            .unwrap_or_default(),
-                        terminal_symbol_segment(&hit.display_name),
-                    )
-                },
             );
         }
         indexed_symbol_hits.truncate(limit_per_source);

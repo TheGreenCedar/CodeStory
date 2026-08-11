@@ -1,6 +1,7 @@
 //! Generic packet flow requirements shared by planning, probes, and sufficiency.
 
 use crate::packet_evidence_carriers::{
+    SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS, SEARCH_EVIDENCE_OUTPUT_ACTIONS,
     citation_owns_buffer_read_write, citation_owns_buffer_storage,
     citation_owns_client_request_finalization, citation_owns_client_request_method,
     citation_owns_client_response_materialization, citation_owns_css_animation_entrypoint,
@@ -12,6 +13,7 @@ use crate::packet_evidence_carriers::{
     citation_owns_hook_public_export, citation_owns_html_app_shell,
     citation_owns_log_handler_processing, citation_owns_log_record_creation,
     citation_owns_mapper_configuration, citation_owns_mapper_execution,
+    citation_owns_search_evidence_classification, citation_owns_search_evidence_output,
     citation_owns_shell_completion, citation_owns_shell_function_dispatch,
     citation_owns_shell_installer_bootstrap, citation_owns_site_lifecycle,
     citation_owns_site_terminal, citation_owns_string_blank_predicate,
@@ -313,6 +315,25 @@ pub fn packet_flow_requirements_for_terms(
     }
     if packet_terms_indicate_search_execution_flow(terms) {
         requirements.extend_from_slice(SEARCH_EXECUTION_FLOW);
+    }
+    let search_evidence_requested = packet_terms_have_any(terms, &["search", "searches"])
+        && packet_terms_have_any(terms, &["evidence", "proof", "provenance"]);
+    if search_evidence_requested {
+        let output_requested = packet_terms_have_any(terms, SEARCH_EVIDENCE_OUTPUT_ACTIONS)
+            || packet_terms_have_any(terms, &["surface", "handoff", "packet"]);
+        let classification_requested =
+            packet_terms_have_any(terms, SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS)
+                || (output_requested
+                    && packet_terms_have_any(
+                        terms,
+                        &["result", "results", "hit", "hits", "citation", "citations"],
+                    ));
+        if classification_requested {
+            requirements.push(SEARCH_EVIDENCE_FLOW[0]);
+        }
+        if output_requested {
+            requirements.push(SEARCH_EVIDENCE_FLOW[1]);
+        }
     }
     dedupe_requirements(requirements)
 }
@@ -1029,6 +1050,23 @@ const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
     },
 ];
 
+const SEARCH_EVIDENCE_FLOW: &[FlowRequirement] = &[
+    FlowRequirement {
+        id: "search_evidence_classification",
+        role: FlowRole::TransformOrValidate,
+        query_seeds: &["search result evidence classification", "evidence tier"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_evidence_classification),
+    },
+    FlowRequirement {
+        id: "search_evidence_output",
+        role: FlowRole::TerminalBoundary,
+        query_seeds: &["search result evidence output", "packet evidence handoff"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_evidence_output),
+    },
+];
+
 /// Every requirement table, grouped the way a single question raises them. Requirements that share
 /// a group and a `FlowRole` are the ones that must stay separable by evidence, so tests need the
 /// grouping and not just a flat list.
@@ -1084,6 +1122,7 @@ pub fn all_flow_requirement_groups() -> Vec<(&'static str, Vec<FlowRequirement>)
         ("runtime_formatting", RUNTIME_FORMATTING_FLOW.to_vec()),
         ("string_predicates", STRING_PREDICATE_FLOW.to_vec()),
         ("search_execution", SEARCH_EXECUTION_FLOW.to_vec()),
+        ("search_evidence", SEARCH_EVIDENCE_FLOW.to_vec()),
     ]
 }
 
@@ -1150,6 +1189,77 @@ mod tests {
             client_requirement_ids("Explain how an HTTP client performs transport send."),
             vec!["client_transport_send"]
         );
+    }
+
+    #[test]
+    fn search_evidence_handoff_adds_classification_and_output_obligations() {
+        let full_flow = packet_flow_requirements_for_terms(
+            &packet_probe_terms(
+                "Explain how search results are ranked and turned into the final evidence packet.",
+            ),
+            PacketTaskClassDto::DataFlow,
+        );
+        let full_flow_ids = full_flow
+            .iter()
+            .map(|requirement| requirement.id)
+            .collect::<Vec<_>>();
+
+        assert!(full_flow_ids.contains(&"search_entrypoint"));
+        assert!(full_flow_ids.contains(&"search_dispatch"));
+        assert!(full_flow_ids.contains(&"search_evidence_classification"));
+        assert!(full_flow_ids.contains(&"search_evidence_output"));
+
+        let focused = packet_flow_requirements_for_terms(
+            &packet_probe_terms("Explain search result evidence classification and output."),
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        let focused_ids = focused
+            .iter()
+            .map(|requirement| requirement.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            focused_ids,
+            ["search_evidence_classification", "search_evidence_output"]
+        );
+
+        let verb_ids = packet_flow_requirements_for_terms(
+            &packet_probe_terms("How does search classify evidence and emit it?"),
+            PacketTaskClassDto::DataFlow,
+        )
+        .into_iter()
+        .map(|requirement| requirement.id)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            verb_ids,
+            ["search_evidence_classification", "search_evidence_output"]
+        );
+
+        let classification_only = packet_flow_requirements_for_terms(
+            &packet_probe_terms("How is the search evidence tier assigned?"),
+            PacketTaskClassDto::ArchitectureExplanation,
+        )
+        .into_iter()
+        .map(|requirement| requirement.id)
+        .collect::<Vec<_>>();
+        assert_eq!(classification_only, ["search_evidence_classification"]);
+
+        let output_only = packet_flow_requirements_for_terms(
+            &packet_probe_terms("How does search emit evidence?"),
+            PacketTaskClassDto::ArchitectureExplanation,
+        )
+        .into_iter()
+        .map(|requirement| requirement.id)
+        .collect::<Vec<_>>();
+        assert_eq!(output_only, ["search_evidence_output"]);
+
+        let surface_output = packet_flow_requirements_for_terms(
+            &packet_probe_terms("How does search surface evidence?"),
+            PacketTaskClassDto::ArchitectureExplanation,
+        )
+        .into_iter()
+        .map(|requirement| requirement.id)
+        .collect::<Vec<_>>();
+        assert_eq!(surface_output, ["search_evidence_output"]);
     }
 
     #[test]
@@ -1336,6 +1446,8 @@ mod tests {
         "request_interceptor_management | dispatch | RequiresResolvedSourceOrGraph",
         "request_terminal | terminal_boundary | AllowsSourceRange",
         "search_dispatch | dispatch | RequiresResolvedSourceOrGraph",
+        "search_evidence_classification | transform_or_validate | RequiresResolvedSourceOrGraph",
+        "search_evidence_output | terminal_boundary | RequiresResolvedSourceOrGraph",
         "search_entrypoint | entrypoint | RequiresResolvedSourceOrGraph",
         "session_callbacks | dispatch | AllowsSourceRange",
         "client_request_entry | entrypoint | RequiresResolvedSourceOrGraph",
@@ -1668,7 +1780,27 @@ mod tests {
             ),
             (
                 ("search_dispatch", "dispatch"),
-                witness("SearchWorker", "crates/core/search.rs", NodeKind::STRUCT),
+                witness(
+                    "SearchWorker::execute_search",
+                    "crates/core/search.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_evidence_classification", "transform_or_validate"),
+                witness(
+                    "SearchHitEvidence::tier",
+                    "crates/core/evidence.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_evidence_output", "terminal_boundary"),
+                witness(
+                    "append_search_evidence_packet",
+                    "crates/core/output.rs",
+                    NodeKind::FUNCTION,
+                ),
             ),
             (
                 ("string_blank_predicate", "transform_or_validate"),

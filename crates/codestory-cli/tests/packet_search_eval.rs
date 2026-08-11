@@ -574,7 +574,7 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
             retrieval_mode: "full".to_string(),
             ranked_files: vec![
                 "crates/codestory-cli/src/output.rs".to_string(),
-                "crates/codestory-runtime/src/agent/packet_evidence.rs".to_string(),
+                "crates/codestory-agent/src/packet_evidence.rs".to_string(),
             ],
             ranked_symbols: vec![
                 "append_search_evidence_packet".to_string(),
@@ -792,6 +792,37 @@ fn packet_search_eval_readiness_mode_uses_verdict_status_not_sidecar_mode() {
 }
 
 #[test]
+fn packet_search_live_eval_readiness_uses_full_accelerated_status() {
+    let ready = serde_json::json!({
+        "retrieval_mode": "full",
+        "embedding_device_state": "accelerated",
+        "embedding_device_observation_source": "per_user_server",
+        "embedding_cpu_allowed": false,
+        "embedding_accelerator_requested": true
+    });
+    assert_eq!(live_eval_readiness_mode(&ready), "ready");
+
+    for (field, value) in [
+        ("retrieval_mode", serde_json::json!("unavailable")),
+        ("embedding_device_state", serde_json::json!("cpu")),
+        (
+            "embedding_device_observation_source",
+            serde_json::json!("test_support"),
+        ),
+        ("embedding_cpu_allowed", serde_json::json!(true)),
+        ("embedding_accelerator_requested", serde_json::json!(false)),
+    ] {
+        let mut unavailable = ready.clone();
+        unavailable[field] = value;
+        assert_eq!(
+            live_eval_readiness_mode(&unavailable),
+            "unavailable",
+            "{field} must fail closed"
+        );
+    }
+}
+
+#[test]
 fn packet_search_eval_reads_production_search_hit_fields() {
     let search = serde_json::json!({
         "indexed_symbol_hits": [
@@ -835,7 +866,7 @@ fn packet_search_live_eval_uses_fixed_run_id() {
         ]
     );
     assert_eq!(
-        live_eval_ready_args(),
+        live_eval_index_args(),
         [
             "retrieval",
             "index",
@@ -963,15 +994,13 @@ fn packet_search_eval_live_runs_production_cli_path() {
     let baseline = load_baseline();
     let project = repo_root();
     let eval_started = Instant::now();
-    let readiness = live_eval_run_cli(&project, &live_eval_ready_args());
+    let index = live_eval_run_cli(&project, &live_eval_index_args());
     assert!(
-        readiness.status.success(),
-        "agent readiness failed: {}",
-        String::from_utf8_lossy(&readiness.stderr)
+        index.status.success(),
+        "retrieval index failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&index.stdout),
+        String::from_utf8_lossy(&index.stderr)
     );
-    let readiness_json: Value =
-        serde_json::from_slice(&readiness.stdout).expect("parse readiness json");
-    let readiness_mode = readiness_mode(&readiness_json);
 
     let status = live_eval_run_cli(&project, &live_eval_status_args());
     assert!(
@@ -984,9 +1013,11 @@ fn packet_search_eval_live_runs_production_cli_path() {
         .as_str()
         .unwrap_or("unavailable")
         .to_string();
+    assert_live_eval_status_binding(&status_json, &project);
+    assert_live_eval_device_truth(&status_json);
+    let readiness_mode = live_eval_readiness_mode(&status_json);
     assert_eq!(readiness_mode, baseline.required_full_modes.readiness_mode);
     assert_eq!(retrieval_mode, baseline.required_full_modes.retrieval_mode);
-    assert_live_eval_device_truth(&status_json);
 
     let mut runs = Vec::new();
     for (index, fixture) in fixtures.fixtures.iter().enumerate() {
@@ -1239,7 +1270,7 @@ fn packet_verdict_evidence(packet: &Value) -> (String, Vec<String>, Vec<String>)
     )
 }
 
-fn live_eval_ready_args() -> [&'static str; 10] {
+fn live_eval_index_args() -> [&'static str; 10] {
     [
         "retrieval",
         "index",
@@ -1393,18 +1424,6 @@ fn join_pipe(handle: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
 }
 
 fn assert_live_eval_device_truth(status: &Value) {
-    assert_json_path_str(status, &["ownership", "profile"], "agent");
-    assert_json_path_suffix(
-        status,
-        &["ownership", "namespace"],
-        &format!("-{LIVE_EVAL_RUN_ID}"),
-    );
-    assert_json_path_contains(status, &["ownership", "state_file"], LIVE_EVAL_RUN_ID);
-    assert_json_path_contains(
-        status,
-        &["ownership", "cleanup_command"],
-        "--profile agent --run-id packet-search-eval",
-    );
     assert_json_path_str(status, &["embedding_device_policy"], "accelerator_required");
     assert_json_path_str(status, &["embedding_device_state"], "accelerated");
     assert_json_path_str(
@@ -1442,15 +1461,18 @@ fn assert_live_eval_device_truth(status: &Value) {
     assert_json_path_non_empty(status, &["embedding_detected_gpu"]);
 }
 
+fn assert_live_eval_status_binding(status: &Value, project: &Path) {
+    assert_eq!(
+        json_path(status, &["manifest_contract", "source_root"]).and_then(Value::as_str),
+        project.to_str(),
+        "live eval status must bind the indexed source root: {status:#}"
+    );
+    assert_json_path_contains(status, &["scip", "detail"], LIVE_EVAL_RUN_ID);
+}
+
 #[test]
 fn packet_search_live_eval_accepts_a_real_accelerator_identity() {
     assert_live_eval_device_truth(&serde_json::json!({
-        "ownership": {
-            "profile": "agent",
-            "namespace": "codestory-agent-packet-search-eval",
-            "state_file": "/tmp/codestory-agent-packet-search-eval.json",
-            "cleanup_command": "codestory-cli retrieval cleanup --profile agent --run-id packet-search-eval"
-        },
         "embedding_device_policy": "accelerator_required",
         "embedding_device_state": "accelerated",
         "embedding_device_observation_source": "per_user_server",
@@ -1467,12 +1489,6 @@ fn packet_search_live_eval_accepts_a_real_accelerator_identity() {
 #[should_panic(expected = "per_user_server")]
 fn packet_search_live_eval_rejects_test_support_accelerator_identity() {
     assert_live_eval_device_truth(&serde_json::json!({
-        "ownership": {
-            "profile": "agent",
-            "namespace": "codestory-agent-packet-search-eval",
-            "state_file": "/tmp/codestory-agent-packet-search-eval.json",
-            "cleanup_command": "codestory-cli retrieval cleanup --profile agent --run-id packet-search-eval"
-        },
         "embedding_device_policy": "accelerator_required",
         "embedding_device_state": "accelerated",
         "embedding_device_observation_source": "test_support",
@@ -1523,16 +1539,6 @@ fn assert_json_path_contains(status: &Value, path: &[&str], expected: &str) {
     );
 }
 
-fn assert_json_path_suffix(status: &Value, path: &[&str], expected: &str) {
-    assert!(
-        json_path(status, path)
-            .and_then(Value::as_str)
-            .is_some_and(|value| value.ends_with(expected)),
-        "live eval status must report {} ending with {expected}: {status:#}",
-        path.join(".")
-    );
-}
-
 fn json_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     path.iter()
         .try_fold(value, |current, field| current.get(*field))
@@ -1550,6 +1556,15 @@ fn readiness_mode(json: &Value) -> String {
         })
         .unwrap_or("unavailable")
         .to_string()
+}
+
+fn live_eval_readiness_mode(status: &Value) -> String {
+    let ready = status["retrieval_mode"].as_str() == Some("full")
+        && status["embedding_device_state"].as_str() == Some("accelerated")
+        && status["embedding_device_observation_source"].as_str() == Some("per_user_server")
+        && status["embedding_cpu_allowed"].as_bool() == Some(false)
+        && status["embedding_accelerator_requested"].as_bool() == Some(true);
+    if ready { "ready" } else { "unavailable" }.to_string()
 }
 
 fn ranked_files(json: &Value) -> Vec<String> {

@@ -3,6 +3,7 @@ use crate::candidate::{
     is_phantom_sidecar_hit,
 };
 use crate::query_features::{QueryFeatures, QueryShape};
+use codestory_contracts::graph::NodeKind;
 use codestory_store::FileRole;
 use std::path::Path;
 
@@ -14,11 +15,12 @@ struct RrfLaneWeights {
 }
 
 const RRF_K: f32 = 20.0;
+pub const RANKING_POLICY_VERSION: &str = "weighted_rrf_v2";
 const FUSED_RRF_WEIGHT: f32 = 0.70;
-const TOKEN_OVERLAP_WEIGHT: f32 = 0.15;
-const GRAPH_QUALITY_WEIGHT: f32 = 0.05;
-const FILE_ROLE_WEIGHT: f32 = 0.05;
-const DEFINITION_QUALITY_WEIGHT: f32 = 0.05;
+const GRAPH_SUPPORT_WEIGHT: f32 = 0.15;
+const TEXT_QUALITY_WEIGHT: f32 = 0.05;
+const REQUESTED_ROLE_WEIGHT: f32 = 0.05;
+const QUERY_OVERLAP_WEIGHT: f32 = 0.05;
 
 pub fn rank_candidates(
     features: &QueryFeatures,
@@ -26,32 +28,42 @@ pub fn rank_candidates(
 ) -> Vec<CandidateHit> {
     let query_tokens = tokenize(&features.raw_query);
     candidates.retain(|candidate| !is_phantom_sidecar_hit(candidate));
+    retain_primary_candidates_for_query(features, &mut candidates);
     for candidate in &mut candidates {
         candidate.ensure_source_lane();
     }
     assign_missing_lane_ranks(&mut candidates, CandidateLane::Lexical);
     assign_missing_lane_ranks(&mut candidates, CandidateLane::Semantic);
     assign_missing_lane_ranks(&mut candidates, CandidateLane::Graph);
+    let pinned_exact_node = unique_exact_definition(features, &candidates);
 
     let lane_weights = rrf_weights_for_shape(features.shape);
     for candidate in &mut candidates {
-        let file_role = effective_file_role(candidate);
-        candidate.file_role = Some(file_role);
-        let rank_features = build_rank_features(candidate, &query_tokens);
+        let rank_features = build_rank_features(candidate, features, &query_tokens);
         let rrf = weighted_rrf(candidate, lane_weights);
         candidate.score = FUSED_RRF_WEIGHT * rrf
-            + TOKEN_OVERLAP_WEIGHT * rank_features.token_overlap
-            + GRAPH_QUALITY_WEIGHT * rank_features.scip_distance.clamp(0.0, 1.0)
-            + FILE_ROLE_WEIGHT * rank_features.file_role_prior
-            + DEFINITION_QUALITY_WEIGHT * rank_features.definition_quality;
+            + GRAPH_SUPPORT_WEIGHT * rank_features.scip_distance.clamp(0.0, 1.0)
+            + TEXT_QUALITY_WEIGHT * rank_features.text_quality
+            + REQUESTED_ROLE_WEIGHT * rank_features.requested_role_agreement
+            + QUERY_OVERLAP_WEIGHT * rank_features.token_overlap;
         candidate.rank_features = Some(rank_features);
     }
 
     candidates.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let left_pinned = pinned_exact_node
+            .as_deref()
+            .is_some_and(|node_id| left.node_id.as_deref() == Some(node_id));
+        let right_pinned = pinned_exact_node
+            .as_deref()
+            .is_some_and(|node_id| right.node_id.as_deref() == Some(node_id));
+        right_pinned
+            .cmp(&left_pinned)
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| file_role_sort_rank(left).cmp(&file_role_sort_rank(right)))
             .then_with(|| source_sort_rank(left).cmp(&source_sort_rank(right)))
             .then_with(|| left.file_path.cmp(&right.file_path))
@@ -60,6 +72,42 @@ pub fn rank_candidates(
             .then_with(|| left.node_id.cmp(&right.node_id))
     });
     candidates
+}
+
+pub(crate) fn retain_primary_candidates_for_query(
+    features: &QueryFeatures,
+    candidates: &mut Vec<CandidateHit>,
+) {
+    let query_tokens = tokenize(&features.raw_query);
+    for candidate in candidates.iter_mut() {
+        candidate.file_role = Some(effective_file_role(candidate));
+    }
+    if candidates
+        .iter()
+        .all(|candidate| candidate.file_role.is_some_and(non_primary_search_role))
+    {
+        return;
+    }
+    candidates.retain(|candidate| {
+        let role = candidate.file_role.unwrap_or(FileRole::Source);
+        !non_primary_search_role(role)
+            || query_requests_file_role(&query_tokens, role)
+            || candidate.provenance.iter().any(|label| label == "exact")
+    });
+}
+
+fn unique_exact_definition(
+    _features: &QueryFeatures,
+    candidates: &[CandidateHit],
+) -> Option<String> {
+    let mut node_ids = candidates
+        .iter()
+        .filter(|candidate| candidate.provenance.iter().any(|label| label == "exact"))
+        .filter_map(|candidate| candidate.node_id.clone())
+        .collect::<Vec<_>>();
+    node_ids.sort();
+    node_ids.dedup();
+    (node_ids.len() == 1).then(|| node_ids.remove(0))
 }
 
 fn rrf_weights_for_shape(shape: QueryShape) -> RrfLaneWeights {
@@ -147,10 +195,13 @@ fn lane_evidence_mut(
 }
 
 fn weighted_rrf(candidate: &CandidateHit, weights: RrfLaneWeights) -> f32 {
+    let graph = candidate_has_typed_graph_support(candidate)
+        .then_some(candidate.lane_scores.graph.as_ref())
+        .flatten();
     let weighted = [
         (candidate.lane_scores.lexical.as_ref(), weights.lexical),
         (candidate.lane_scores.semantic.as_ref(), weights.semantic),
-        (candidate.lane_scores.graph.as_ref(), weights.graph),
+        (graph, weights.graph),
     ]
     .into_iter()
     .filter_map(|(evidence, weight)| {
@@ -169,10 +220,19 @@ fn weighted_rrf(candidate: &CandidateHit, weights: RrfLaneWeights) -> f32 {
     }
 }
 
-fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> RankFeatures {
+fn build_rank_features(
+    candidate: &CandidateHit,
+    query: &QueryFeatures,
+    query_tokens: &[String],
+) -> RankFeatures {
     let path_lower = candidate.file_path.to_ascii_lowercase();
     let symbol_lower = candidate
         .symbol_name
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let qualified_lower = candidate
+        .qualified_name
         .as_deref()
         .unwrap_or("")
         .to_ascii_lowercase();
@@ -189,25 +249,81 @@ fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> Ran
         .as_ref()
         .map(|evidence| evidence.raw_score)
         .unwrap_or(0.0);
-    let scip_distance = candidate
-        .lane_scores
-        .graph
-        .as_ref()
-        .map(|evidence| evidence.raw_score)
-        .unwrap_or(0.0);
+    let scip_distance = if candidate_has_typed_graph_support(candidate) {
+        candidate
+            .lane_scores
+            .graph
+            .as_ref()
+            .map(|evidence| evidence.raw_score)
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
 
     let file_role_prior = file_role_prior(effective_file_role(candidate));
     let definition_quality = definition_quality(candidate);
-    let token_overlap = token_overlap_score(query_tokens, &path_lower, &symbol_lower);
+    let token_overlap = token_overlap_score(
+        query_tokens,
+        &path_lower,
+        &format!("{symbol_lower} {qualified_lower}"),
+    );
+    let text_quality = (0.75 * text_file_quality(effective_file_role(candidate), query_tokens)
+        + 0.25 * definition_quality)
+        .clamp(0.0, 1.0);
+    let requested_role_agreement = requested_role_agreement(
+        &query.intent.evidence_roles,
+        &query.intent.structural_kinds,
+        &path_lower,
+        &symbol_lower,
+        candidate.structural_kind,
+    );
 
     RankFeatures {
+        ranking_policy: RANKING_POLICY_VERSION.into(),
         lexical,
         semantic,
         scip_distance,
         file_role_prior,
         definition_quality,
         token_overlap,
+        text_quality,
+        requested_role_agreement,
     }
+}
+
+fn candidate_has_typed_graph_support(candidate: &CandidateHit) -> bool {
+    candidate.graph_evidence.is_some()
+        || candidate.scip_hop_distance.is_some()
+        || candidate
+            .provenance
+            .iter()
+            .any(|label| matches!(label.as_str(), "graph_neighbor" | "scip_graph_projection"))
+}
+
+fn requested_role_agreement(
+    evidence_roles: &[String],
+    structural_kinds: &[String],
+    path_lower: &str,
+    symbol_lower: &str,
+    structural_kind: Option<NodeKind>,
+) -> f32 {
+    let requested = evidence_roles
+        .iter()
+        .chain(structural_kinds)
+        .collect::<Vec<_>>();
+    if requested.is_empty() {
+        return 0.0;
+    }
+    let structural_label = structural_kind.map(structural_kind_label);
+    let matched = requested
+        .iter()
+        .filter(|term| {
+            path_lower.contains(term.as_str())
+                || symbol_lower.contains(term.as_str())
+                || structural_label.is_some_and(|label| label == term.as_str())
+        })
+        .count();
+    matched as f32 / requested.len() as f32
 }
 
 /// Definition quality claims a definition, so a bare display name cannot earn
@@ -218,8 +334,63 @@ fn definition_quality(candidate: &CandidateHit) -> f32 {
         .symbol_name
         .as_deref()
         .is_some_and(|symbol_name| !symbol_name.trim().is_empty());
-    let anchored = candidate.node_id.is_some() || candidate.start_line.is_some();
-    if named && anchored { 0.85 } else { 0.45 }
+    let anchored = candidate.node_id.is_some() && candidate.start_line.is_some();
+    if !named || !anchored {
+        return 0.0;
+    }
+    match candidate.structural_kind {
+        Some(
+            NodeKind::FUNCTION
+            | NodeKind::METHOD
+            | NodeKind::STRUCT
+            | NodeKind::CLASS
+            | NodeKind::INTERFACE
+            | NodeKind::ENUM
+            | NodeKind::UNION
+            | NodeKind::TYPEDEF
+            | NodeKind::MODULE
+            | NodeKind::NAMESPACE
+            | NodeKind::PACKAGE,
+        ) => 1.0,
+        Some(
+            NodeKind::ANNOTATION
+            | NodeKind::GLOBAL_VARIABLE
+            | NodeKind::FIELD
+            | NodeKind::VARIABLE
+            | NodeKind::CONSTANT
+            | NodeKind::ENUM_CONSTANT,
+        ) => 0.65,
+        Some(NodeKind::MACRO) => 0.25,
+        Some(NodeKind::FILE | NodeKind::UNKNOWN | NodeKind::BUILTIN_TYPE) | None => 0.0,
+        Some(NodeKind::TYPE_PARAMETER) => 0.45,
+    }
+}
+
+fn structural_kind_label(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::MODULE => "module",
+        NodeKind::NAMESPACE => "namespace",
+        NodeKind::PACKAGE => "package",
+        NodeKind::FILE => "file",
+        NodeKind::STRUCT => "struct",
+        NodeKind::CLASS => "class",
+        NodeKind::INTERFACE => "interface",
+        NodeKind::ANNOTATION => "annotation",
+        NodeKind::UNION => "union",
+        NodeKind::ENUM => "enum",
+        NodeKind::TYPEDEF => "typedef",
+        NodeKind::TYPE_PARAMETER => "type_parameter",
+        NodeKind::BUILTIN_TYPE => "builtin_type",
+        NodeKind::FUNCTION => "function",
+        NodeKind::METHOD => "method",
+        NodeKind::MACRO => "macro",
+        NodeKind::GLOBAL_VARIABLE => "global_variable",
+        NodeKind::FIELD => "field",
+        NodeKind::VARIABLE => "variable",
+        NodeKind::CONSTANT => "constant",
+        NodeKind::ENUM_CONSTANT => "enum_constant",
+        NodeKind::UNKNOWN => "unknown",
+    }
 }
 
 fn file_role_prior(file_role: FileRole) -> f32 {
@@ -234,7 +405,69 @@ fn file_role_prior(file_role: FileRole) -> f32 {
     }
 }
 
+fn text_file_quality(file_role: FileRole, query_tokens: &[String]) -> f32 {
+    let asks_for = |labels: &[&str]| {
+        query_tokens
+            .iter()
+            .any(|token| labels.contains(&token.as_str()))
+    };
+    match file_role {
+        FileRole::Entrypoint => 1.0,
+        FileRole::Source => 0.80,
+        FileRole::Test
+            if asks_for(&[
+                "test", "tests", "testing", "spec", "specs", "fixture", "fixtures",
+            ]) =>
+        {
+            1.0
+        }
+        FileRole::Docs if asks_for(&["doc", "docs", "documentation", "readme"]) => 1.0,
+        FileRole::Benchmark if asks_for(&["bench", "benchmark", "benchmarks", "performance"]) => {
+            1.0
+        }
+        FileRole::Generated if asks_for(&["generated", "codegen"]) => 1.0,
+        FileRole::Vendor
+            if asks_for(&["vendor", "dependency", "dependencies", "third", "party"]) =>
+        {
+            1.0
+        }
+        FileRole::Docs => 0.35,
+        FileRole::Benchmark => 0.20,
+        FileRole::Test | FileRole::Generated | FileRole::Vendor => 0.0,
+    }
+}
+
+fn non_primary_search_role(role: FileRole) -> bool {
+    matches!(
+        role,
+        FileRole::Test | FileRole::Benchmark | FileRole::Generated | FileRole::Vendor
+    )
+}
+
+fn query_requests_file_role(query_tokens: &[String], role: FileRole) -> bool {
+    let asks_for = |labels: &[&str]| {
+        query_tokens
+            .iter()
+            .any(|token| labels.contains(&token.as_str()))
+    };
+    match role {
+        FileRole::Test => asks_for(&["test", "tests", "testing", "spec", "specs", "fixture"]),
+        FileRole::Benchmark => asks_for(&["bench", "benchmark", "benchmarks", "performance"]),
+        FileRole::Generated => asks_for(&["generated", "codegen"]),
+        FileRole::Vendor => asks_for(&["vendor", "dependency", "dependencies", "third", "party"]),
+        FileRole::Entrypoint | FileRole::Source | FileRole::Docs => true,
+    }
+}
+
 fn effective_file_role(candidate: &CandidateHit) -> FileRole {
+    if candidate.qualified_name.as_deref().is_some_and(|name| {
+        name.starts_with("tests::")
+            || name.contains("::tests::")
+            || name.starts_with("test::")
+            || name.contains("::test::")
+    }) {
+        return FileRole::Test;
+    }
     let path = Path::new(&candidate.file_path);
     if path
         .extension()
@@ -417,14 +650,14 @@ mod tests {
     }
 
     #[test]
-    fn ranker_keeps_lane_rank_authoritative_for_structural_files() {
+    fn ranker_combines_lane_rank_with_query_overlap_for_structural_files() {
         let features = classify_query("UserService class method");
         let mut structural = CandidateHit::lexical_stub("schema/users.sql", 0.99);
         let mut graph = CandidateHit::lexical_stub("src/user_service.rs", 0.8);
         structural.source = CandidateSource::Lexical;
         graph.source = CandidateSource::Lexical;
         let ranked = rank_candidates(&features, vec![structural, graph]);
-        assert_eq!(ranked[0].file_path, "schema/users.sql");
+        assert_eq!(ranked[0].file_path, "src/user_service.rs");
     }
 
     #[test]
@@ -465,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn ranker_infers_missing_roles_without_post_fusion_caps() {
+    fn ranker_excludes_non_primary_roles_from_an_ordinary_source_query() {
         let features = classify_query("explain request json output event processing");
         let semantic_test = CandidateHit::with_source(
             "workspace/app/tests/event_processor_with_json_output.rs",
@@ -495,9 +728,7 @@ mod tests {
         assert!(
             ranked
                 .iter()
-                .filter(|hit| hit.file_role == Some(FileRole::Test))
-                .count()
-                >= 2
+                .all(|hit| hit.file_role != Some(FileRole::Test))
         );
     }
 
@@ -552,19 +783,17 @@ mod tests {
 
     #[test]
     fn ranker_prefers_lexical_source_anchor_over_dense_dto_distractor() {
-        let features = classify_query(
-            "packet search output evidence packet indexed symbol hits retrieval shadow",
-        );
+        let features = classify_query("delivery adapter emits ranked findings with provenance");
         let mut source = CandidateHit::with_source(
-            "crates/codestory-cli/src/output.rs",
-            Some("append_search_evidence_packet".into()),
+            "src/delivery/output.rs",
+            Some("append_ranked_findings".into()),
             0.92,
             CandidateSource::Lexical,
         );
         source.file_role = Some(FileRole::Source);
         let mut dense_dto = CandidateHit::with_source(
-            "crates/codestory-contracts/src/api/dto.rs",
-            Some("PacketRetrievalTraceSummaryDto".into()),
+            "src/contracts/delivery.rs",
+            Some("DeliveryTraceSummary".into()),
             0.99,
             CandidateSource::Semantic,
         );
@@ -574,43 +803,26 @@ mod tests {
 
         assert_eq!(
             ranked.first().map(|hit| hit.file_path.as_str()),
-            Some("crates/codestory-cli/src/output.rs")
+            Some("src/delivery/output.rs")
         );
     }
 
     #[test]
     fn ranker_keeps_broad_lexical_source_anchor_inside_resolved_window() {
-        let features = classify_query(
-            "packet search output evidence packet indexed symbol hits retrieval shadow",
-        );
+        let features = classify_query("delivery adapter emits ranked findings with provenance");
         let mut source = CandidateHit::with_source(
-            "crates/codestory-runtime/src/agent/packet_evidence.rs",
-            Some("decorate_search_hit_evidence".into()),
+            "src/delivery/evidence.rs",
+            Some("decorate_ranked_finding".into()),
             0.82,
             CandidateSource::Lexical,
         );
         source.file_role = Some(FileRole::Source);
         let dense_distractors = [
-            (
-                "PacketTraceDto",
-                "crates/codestory-contracts/src/api/dto.rs",
-            ),
-            (
-                "RetrievalTraceDto",
-                "crates/codestory-contracts/src/api/retrieval.rs",
-            ),
-            (
-                "SearchResultDto",
-                "crates/codestory-contracts/src/api/search.rs",
-            ),
-            (
-                "IndexedSymbolDto",
-                "crates/codestory-contracts/src/api/symbol.rs",
-            ),
-            (
-                "SearchShadowDto",
-                "crates/codestory-contracts/src/api/shadow.rs",
-            ),
+            ("DeliveryTraceDto", "src/contracts/delivery.rs"),
+            ("FindingTraceDto", "src/contracts/findings.rs"),
+            ("RankedResultDto", "src/contracts/results.rs"),
+            ("IndexedRecordDto", "src/contracts/records.rs"),
+            ("FindingShadowDto", "src/contracts/shadow.rs"),
         ]
         .into_iter()
         .map(|(symbol, path)| {
@@ -628,8 +840,8 @@ mod tests {
 
         assert!(
             ranked.iter().take(5).any(|hit| {
-                hit.file_path == "crates/codestory-runtime/src/agent/packet_evidence.rs"
-                    && hit.symbol_name.as_deref() == Some("decorate_search_hit_evidence")
+                hit.file_path == "src/delivery/evidence.rs"
+                    && hit.symbol_name.as_deref() == Some("decorate_ranked_finding")
             }),
             "direct lexical source evidence should stay inside the resolved top-5 window: {ranked:#?}"
         );
@@ -702,6 +914,7 @@ mod tests {
         let mut anchored = unanchored.clone();
         anchored.node_id = Some("77".into());
         anchored.start_line = Some(31);
+        anchored.structural_kind = Some(NodeKind::FUNCTION);
 
         let unanchored_quality = rank_candidates(&features, vec![unanchored])[0]
             .rank_features
@@ -714,11 +927,46 @@ mod tests {
             .expect("rank features")
             .definition_quality;
 
-        assert_eq!(anchored_quality, 0.85);
+        assert_eq!(anchored_quality, 1.0);
         assert_eq!(
-            unanchored_quality, 0.45,
+            unanchored_quality, 0.0,
             "a display name with no definition site is not definition evidence"
         );
+    }
+
+    #[test]
+    fn structural_kind_prevents_macro_invocations_from_claiming_definition_quality() {
+        let features = classify_query("how does packet evidence reach the output adapter");
+        let mut function = CandidateHit::with_source(
+            "src/output.rs",
+            Some("append_packet_evidence".into()),
+            0.7,
+            CandidateSource::Semantic,
+        );
+        function.node_id = Some("1".into());
+        function.start_line = Some(40);
+        function.structural_kind = Some(NodeKind::FUNCTION);
+        let mut invocation = CandidateHit::with_source(
+            "src/output.rs",
+            Some("assert_eq".into()),
+            0.7,
+            CandidateSource::Semantic,
+        );
+        invocation.node_id = Some("2".into());
+        invocation.start_line = Some(90);
+        invocation.structural_kind = Some(NodeKind::MACRO);
+
+        let ranked = rank_candidates(&features, vec![invocation, function]);
+        let quality = |name: &str| {
+            ranked
+                .iter()
+                .find(|candidate| candidate.symbol_name.as_deref() == Some(name))
+                .and_then(|candidate| candidate.rank_features.as_ref())
+                .map(|features| features.definition_quality)
+                .expect("ranked candidate")
+        };
+        assert_eq!(quality("append_packet_evidence"), 1.0);
+        assert_eq!(quality("assert_eq"), 0.25);
     }
 
     #[test]
@@ -752,6 +1000,7 @@ mod tests {
         );
         candidate.record_lane(CandidateLane::Semantic, 0.83, 4, "dense_anchor");
         candidate.record_lane(CandidateLane::Graph, 0.57, 2, "graph_neighbor");
+        candidate.add_provenance("graph_neighbor");
 
         let ranked = rank_candidates(&features, vec![candidate]);
         let rank_features = ranked[0].rank_features.as_ref().expect("rank features");
@@ -809,15 +1058,16 @@ mod tests {
         candidate.node_id = Some("7".into());
         candidate.record_lane(CandidateLane::Semantic, 0.81, 1, "dense_anchor");
         candidate.record_lane(CandidateLane::Graph, 0.60, 1, "graph_neighbor");
+        candidate.add_provenance("graph_neighbor");
 
         let ranked = rank_candidates(&features, vec![candidate]);
         let candidate = &ranked[0];
         let rank_features = candidate.rank_features.as_ref().expect("rank features");
         let expected = 0.70
-            + 0.15 * rank_features.token_overlap
-            + 0.05 * rank_features.scip_distance
-            + 0.05 * rank_features.file_role_prior
-            + 0.05 * rank_features.definition_quality;
+            + 0.15 * rank_features.scip_distance
+            + 0.05 * rank_features.text_quality
+            + 0.05 * rank_features.requested_role_agreement
+            + 0.05 * rank_features.token_overlap;
 
         assert!((candidate.score - expected).abs() < f32::EPSILON * 8.0);
         assert!((0.0..=1.0).contains(&candidate.score));

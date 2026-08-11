@@ -1379,14 +1379,18 @@ fn sidecar_candidate_admission_labels(
                 resolve_candidate_node_id(storage, &node_names, project_root, &rel_path, candidate)
             });
             let resolved_node_id_text = resolved_node_id.map(|node_id| node_id.0.to_string());
-            let search_hit_rank = resolved_node_id_text
-                .as_deref()
-                .and_then(|node_id| search_nodes.get(node_id).copied())
-                .or_else(|| search_paths.get(&rel_path).copied());
-            let final_rank = resolved_node_id_text
-                .as_deref()
-                .and_then(|node_id| final_nodes.get(node_id).copied())
-                .or_else(|| final_paths.get(&rel_path).copied());
+            let search_hit_rank = candidate_admission_rank(
+                resolved_node_id_text.as_deref(),
+                &rel_path,
+                &search_nodes,
+                &search_paths,
+            );
+            let final_rank = candidate_admission_rank(
+                resolved_node_id_text.as_deref(),
+                &rel_path,
+                &final_nodes,
+                &final_paths,
+            );
             if let Some(final_rank) = final_rank {
                 SidecarCandidateAdmissionLabel {
                     admission_status: "admitted".to_string(),
@@ -1413,6 +1417,18 @@ fn sidecar_candidate_admission_labels(
             }
         })
         .collect()
+}
+
+fn candidate_admission_rank(
+    resolved_node_id: Option<&str>,
+    relative_path: &str,
+    ranked_nodes: &HashMap<String, u32>,
+    ranked_paths: &HashMap<String, u32>,
+) -> Option<u32> {
+    match resolved_node_id {
+        Some(node_id) => ranked_nodes.get(node_id).copied(),
+        None => ranked_paths.get(relative_path).copied(),
+    }
 }
 
 fn ranked_hit_nodes(hits: &[SearchHit]) -> HashMap<String, u32> {
@@ -1733,12 +1749,13 @@ fn candidate_path_resolvable(project_root: &Path, file_path: &str) -> bool {
             .any(|path| path.exists())
 }
 
-/// Order the resolvable candidates ahead of the unresolvable ones, by score.
+/// Stable-partition resolvable candidates ahead of unresolvable ones.
 ///
 /// `path_resolvable` stats the filesystem, so it is decorated once per surviving
 /// candidate instead of once per comparison, and the resolved verdict is handed
-/// back for the unresolved-candidate label. The comparator is unchanged, so a
-/// NaN score still compares equal and stable sorting keeps input order for ties.
+/// back for the unresolved-candidate label. Retrieval already assigned the
+/// canonical fused order, including its exact-definition bucket and stable
+/// tie-breaks, so resolution must not create a second score comparator.
 fn ordered_sidecar_candidates<F>(
     candidates: &[CandidateHit],
     mut path_resolvable: F,
@@ -1755,14 +1772,13 @@ where
             (index, candidate, resolvable)
         })
         .collect::<Vec<_>>();
-    ordered.sort_by(|(_, left, left_resolvable), (_, right, right_resolvable)| {
-        right_resolvable.cmp(left_resolvable).then(
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
-    });
+    ordered.sort_by(
+        |(left_index, _, left_resolvable), (right_index, _, right_resolvable)| {
+            right_resolvable
+                .cmp(left_resolvable)
+                .then_with(|| left_index.cmp(right_index))
+        },
+    );
     ordered
 }
 
@@ -2095,7 +2111,7 @@ fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBrea
         tier_cap: None,
         boosts: Vec::new(),
         dampening: Vec::new(),
-        final_rank_reason: None,
+        final_rank_reason: Some(codestory_retrieval::RANKING_POLICY_VERSION.into()),
         provenance,
     }
 }
@@ -2784,10 +2800,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_candidate_order_matches_the_recomputing_comparator() {
-        // The zero-movement claim rests on this: decorating the resolvable
-        // verdict must be a permutation-for-permutation replacement of the
-        // comparator that stat'ed the filesystem on every comparison.
+    fn sidecar_candidate_order_preserves_canonical_rank_within_resolution_buckets() {
         let scores = [
             1.0_f32,
             f32::NAN,
@@ -2811,17 +2824,18 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
 
-                let mut previous = candidates.iter().enumerate().collect::<Vec<_>>();
-                previous.sort_by(|(_, left), (_, right)| {
-                    let left_resolvable = resolvable(&left.file_path);
-                    let right_resolvable = resolvable(&right.file_path);
-                    right_resolvable.cmp(&left_resolvable).then(
-                        right
-                            .score
-                            .partial_cmp(&left.score)
-                            .unwrap_or(std::cmp::Ordering::Equal),
+                let expected = candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| resolvable(&candidate.file_path))
+                    .chain(
+                        candidates
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, candidate)| !resolvable(&candidate.file_path)),
                     )
-                });
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
 
                 let current = ordered_sidecar_candidates(&candidates, |candidate| {
                     resolvable(&candidate.file_path)
@@ -2832,7 +2846,7 @@ mod tests {
                         .iter()
                         .map(|(index, _, _)| *index)
                         .collect::<Vec<_>>(),
-                    previous.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+                    expected,
                     "candidate order moved for window={window} offset={offset}"
                 );
             }
@@ -3237,12 +3251,15 @@ mod tests {
             "graph_neighbor".into(),
         ];
         candidate.rank_features = Some(codestory_retrieval::RankFeatures {
+            ranking_policy: codestory_retrieval::RANKING_POLICY_VERSION.into(),
             lexical: 0.91,
             semantic: 0.82,
             scip_distance: 0.5,
             file_role_prior: 0.72,
             definition_quality: 0.85,
             token_overlap: 0.25,
+            text_quality: 0.81,
+            requested_role_agreement: 0.75,
         });
 
         let breakdown = score_breakdown_for_candidate(&candidate);
@@ -3437,7 +3454,7 @@ mod tests {
             hit.score_breakdown
                 .as_ref()
                 .map(|breakdown| breakdown.graph),
-            Some(0.5),
+            Some(0.65),
             "validated hop-1 reference adjacency publishes the graph feature: {hit:?}"
         );
         assert_eq!(
@@ -3756,6 +3773,27 @@ mod tests {
         assert_eq!(
             shadow.unresolved_candidate_count, 0,
             "resolved candidates rejected by the final result window are not unresolved sidecar candidates"
+        );
+    }
+
+    #[test]
+    fn resolved_candidate_admission_never_borrows_another_symbol_rank_from_its_file() {
+        let ranked_nodes = HashMap::from([("kept".to_string(), 1)]);
+        let ranked_paths = HashMap::from([("src/shared.rs".to_string(), 1)]);
+
+        assert_eq!(
+            candidate_admission_rank(
+                Some("dropped"),
+                "src/shared.rs",
+                &ranked_nodes,
+                &ranked_paths,
+            ),
+            None
+        );
+        assert_eq!(
+            candidate_admission_rank(None, "src/shared.rs", &ranked_nodes, &ranked_paths),
+            Some(1),
+            "path fallback remains available only when no symbol identity was resolved"
         );
     }
 

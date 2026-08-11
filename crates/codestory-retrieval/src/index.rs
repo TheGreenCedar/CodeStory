@@ -4138,6 +4138,7 @@ mod tests {
                     target_symbol: None,
                     node_id: symbol.node_id.clone(),
                     target_node_id: None,
+                    edge_kind: None,
                 }
             })
             .collect();

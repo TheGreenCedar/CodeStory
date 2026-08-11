@@ -6,6 +6,7 @@ use crate::lexical_client::LexicalClient;
 use crate::scip_client::ScipClient;
 use anyhow::Result;
 use codestory_store::RetrievalIndexManifest;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -78,6 +79,15 @@ pub trait SidecarSearch: Send + Sync {
         None
     }
 
+    /// Attach core structural identity before candidates enter cross-lane fusion.
+    ///
+    /// Live retrieval uses this to keep node kind, qualified name, and test
+    /// ownership alongside each lane's independent score. Test sidecars and
+    /// callers without a core publication retain the no-op default.
+    fn enrich_candidates(&self, _candidates: &mut [CandidateHit]) -> Result<()> {
+        Ok(())
+    }
+
     fn lexical_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn semantic_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn scip_anchor(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
@@ -130,6 +140,13 @@ pub struct LiveSidecarSearch {
     embedding_device: Option<EmbeddingDeviceReadiness>,
     lexical: LexicalClient,
     semantic: EmbeddedVectorIndex,
+    core_context: Option<CoreCandidateContext>,
+}
+
+#[derive(Debug, Clone)]
+struct CoreCandidateContext {
+    project_root: PathBuf,
+    storage_path: PathBuf,
 }
 
 impl LiveSidecarSearch {
@@ -194,7 +211,20 @@ impl LiveSidecarSearch {
             embedding_device,
             lexical,
             semantic,
+            core_context: None,
         })
+    }
+
+    pub(crate) fn with_core_candidate_context(
+        mut self,
+        project_root: &Path,
+        storage_path: &Path,
+    ) -> Self {
+        self.core_context = Some(CoreCandidateContext {
+            project_root: project_root.to_path_buf(),
+            storage_path: storage_path.to_path_buf(),
+        });
+        self
     }
 
     pub fn layout(&self) -> &SidecarLayout {
@@ -221,6 +251,14 @@ impl SidecarSearch for LiveSidecarSearch {
 
     fn runtime_config(&self) -> Option<&SidecarRuntimeConfig> {
         Some(&self.runtime)
+    }
+
+    fn enrich_candidates(&self, candidates: &mut [CandidateHit]) -> Result<()> {
+        let Some(context) = self.core_context.as_ref() else {
+            return Ok(());
+        };
+        let storage = codestory_store::Store::open_read_only(&context.storage_path)?;
+        crate::query::enrich_candidates_from_core(&storage, &context.project_root, candidates)
     }
 
     fn lexical_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {

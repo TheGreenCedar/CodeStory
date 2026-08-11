@@ -242,11 +242,13 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
             || path.contains("/flags/"))
     {
         Some(PacketEvidenceRole::ArgumentPlanning)
-    } else if normalized_display.contains("search")
-        && (normalized_display.contains("worker")
-            || normalized_display.contains("runner")
-            || normalized_display.contains("executor"))
-    {
+    } else if citation_owns_search_execution(
+        &citation.display_name,
+        &display_tokens,
+        behavioral_node,
+        &normalized_display,
+        &path,
+    ) {
         Some(PacketEvidenceRole::SearchExecutionUnit)
     } else if normalized_display.contains("candidate")
         && (normalized_display.contains("file") || normalized_display.contains("source"))
@@ -257,6 +259,7 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
         && (normalized_display.contains("driver")
             || normalized_display.contains("entrypoint")
             || normalized_display.contains("parallel")
+            || names("run")
             || display_is_command_entrypoint(&citation.display_name, &normalized_display, &path))
     {
         Some(PacketEvidenceRole::SearchDriver)
@@ -330,6 +333,85 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
     } else {
         None
     }
+}
+
+fn citation_owns_search_execution(
+    display_name: &str,
+    tokens: &[String],
+    behavioral_node: bool,
+    normalized_display: &str,
+    path: &str,
+) -> bool {
+    if !behavioral_node
+        || display_is_command_entrypoint(display_name, normalized_display, path)
+        || (tokens.iter().any(|token| token == "run")
+            && tokens.iter().any(|token| token == "search"))
+        || tokens.last().is_some_and(|token| {
+            matches!(
+                token.as_str(),
+                "config"
+                    | "configuration"
+                    | "id"
+                    | "key"
+                    | "location"
+                    | "metadata"
+                    | "options"
+                    | "status"
+            )
+        })
+    {
+        return false;
+    }
+    let subject = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "candidate" | "packet" | "retrieval" | "search" | "semantic" | "sidecar"
+        )
+    });
+    let action = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "batch"
+                | "execute"
+                | "expand"
+                | "fuse"
+                | "fused"
+                | "query"
+                | "rank"
+                | "retrieve"
+                | "run"
+                | "scan"
+                | "search"
+                | "worker"
+                | "runner"
+                | "executor"
+        )
+    });
+    let distinct_action = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "batch"
+                | "execute"
+                | "expand"
+                | "fuse"
+                | "fused"
+                | "query"
+                | "rank"
+                | "retrieve"
+                | "run"
+                | "scan"
+                | "worker"
+                | "runner"
+                | "executor"
+        )
+    }) || (tokens.iter().any(|token| token == "search")
+        && tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "candidate" | "packet" | "retrieval" | "semantic" | "sidecar"
+            )
+        }));
+    subject && action && distinct_action
 }
 
 /// A per-source indexing action implemented by the indexer is extraction work, even though the
@@ -667,6 +749,37 @@ mod tests {
                 Some(PacketEvidenceRole::RequestDispatch | PacketEvidenceRole::CommandEntrypoint)
             ),
             "configuration names must not claim process-launch behavior"
+        );
+    }
+
+    #[test]
+    fn search_execution_role_requires_behavioral_action_and_subject() {
+        for name in [
+            "LiveSidecarSearch::semantic_search",
+            "AppController::search_packet_fused_batch",
+            "candidate_search_executor",
+        ] {
+            assert_eq!(
+                packet_evidence_role(&citation(name, "src/retrieval/search.rs")),
+                Some(PacketEvidenceRole::SearchExecutionUnit),
+                "{name}"
+            );
+        }
+        for name in [
+            "search_hit_location_key",
+            "SearchStatus",
+            "semantic_search_config",
+        ] {
+            assert_ne!(
+                packet_evidence_role(&citation(name, "src/retrieval/search.rs")),
+                Some(PacketEvidenceRole::SearchExecutionUnit),
+                "{name} is search data, not execution"
+            );
+        }
+        assert_eq!(
+            packet_evidence_role(&citation("run_search", "src/commands.rs")),
+            Some(PacketEvidenceRole::SearchDriver),
+            "the command entrypoint remains the driver instead of being consumed by dispatch"
         );
     }
 

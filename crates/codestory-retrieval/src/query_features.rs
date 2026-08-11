@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub const QUERY_INTENT_POLICY_VERSION: &str = "multi_label_v2";
+
 /// High-level query shape used by the planner (repo-agnostic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -8,6 +10,21 @@ pub enum QueryShape {
     PathLike,
     NaturalLanguage,
     Mixed,
+}
+
+/// How the query expects retrieved evidence to be used.
+///
+/// This stays internal to retrieval planning. It is deliberately independent
+/// from the legacy `QueryShape`: one mixed question can still carry symbol,
+/// path, relationship, and flow intent at the same time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryLookupMode {
+    Definition,
+    Relation,
+    OrderedFlow,
+    #[default]
+    Explanation,
 }
 
 /// Independent query intents used to plan complementary retrieval lanes.
@@ -22,11 +39,29 @@ pub struct QueryIntent {
     pub relationship: bool,
     pub standalone_symbol: bool,
     pub standalone_path: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exact_symbols: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub concepts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ordered_flow_stages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub structural_kinds: Vec<String>,
+    #[serde(default)]
+    pub lookup_mode: QueryLookupMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryFeatures {
     pub raw_query: String,
+    #[serde(default = "current_query_intent_policy")]
+    pub intent_policy: String,
     pub shape: QueryShape,
     #[serde(default)]
     pub intent: QueryIntent,
@@ -99,6 +134,126 @@ pub fn classify_query(query: &str) -> QueryFeatures {
                 | "owns"
         )
     });
+    let exact_symbols = unique_labels(tokens.iter().filter_map(|token| {
+        let token = trim_query_token(token);
+        (!looks_like_path_token(token, standalone_token)
+            && (is_qualified_symbol(token)
+                || has_internal_camel_hump(token)
+                || token.contains('_')))
+        .then(|| token.to_string())
+    }));
+    let paths = unique_labels(tokens.iter().filter_map(|token| {
+        let token = trim_query_token(token);
+        looks_like_path_token(token, token_count == 1).then(|| token.replace('\\', "/"))
+    }));
+    let normalized_tokens = tokens
+        .iter()
+        .flat_map(|token| intent_words(token))
+        .collect::<Vec<_>>();
+    let relations = unique_labels(normalized_tokens.iter().filter_map(|token| {
+        matches!(
+            token.as_str(),
+            "call"
+                | "calls"
+                | "called"
+                | "caller"
+                | "callers"
+                | "depend"
+                | "depends"
+                | "dependency"
+                | "dependencies"
+                | "flow"
+                | "flows"
+                | "through"
+                | "use"
+                | "uses"
+                | "used"
+                | "owner"
+                | "owns"
+                | "route"
+                | "routes"
+                | "dispatch"
+                | "handoff"
+        )
+        .then(|| token.clone())
+    }));
+    let ordered_flow_stages = unique_labels(normalized_tokens.iter().filter_map(|token| {
+        matches!(
+            token.as_str(),
+            "before"
+                | "after"
+                | "then"
+                | "first"
+                | "next"
+                | "finally"
+                | "flow"
+                | "pipeline"
+                | "stages"
+                | "handoff"
+        )
+        .then(|| token.clone())
+    }));
+    let evidence_roles = unique_labels(normalized_tokens.iter().filter_map(|token| {
+        matches!(
+            token.as_str(),
+            "adapter"
+                | "controller"
+                | "dispatch"
+                | "dispatcher"
+                | "driver"
+                | "entrypoint"
+                | "executor"
+                | "handler"
+                | "indexer"
+                | "parser"
+                | "reader"
+                | "retrieval"
+                | "router"
+                | "runner"
+                | "search"
+                | "service"
+                | "storage"
+                | "store"
+                | "worker"
+                | "writer"
+        )
+        .then(|| token.clone())
+    }));
+    let structural_kinds = unique_labels(normalized_tokens.iter().filter_map(|token| {
+        matches!(
+            token.as_str(),
+            "class"
+                | "enum"
+                | "file"
+                | "function"
+                | "interface"
+                | "macro"
+                | "method"
+                | "module"
+                | "namespace"
+                | "route"
+                | "struct"
+                | "trait"
+        )
+        .then(|| token.clone())
+    }));
+    let concepts = unique_labels(normalized_tokens.iter().filter_map(|token| {
+        (token.len() >= 3
+            && !QUERY_STOPWORDS.contains(&token.as_str())
+            && !relations.iter().any(|relation| relation == token)
+            && !evidence_roles.iter().any(|role| role == token)
+            && !structural_kinds.iter().any(|kind| kind == token))
+        .then(|| token.clone())
+    }));
+    let lookup_mode = if !ordered_flow_stages.is_empty() && relationship {
+        QueryLookupMode::OrderedFlow
+    } else if relationship {
+        QueryLookupMode::Relation
+    } else if (symbol_like || path_like) && !nl_like {
+        QueryLookupMode::Definition
+    } else {
+        QueryLookupMode::Explanation
+    };
     let intent = QueryIntent {
         symbol: symbol_like,
         path: path_like,
@@ -106,6 +261,14 @@ pub fn classify_query(query: &str) -> QueryFeatures {
         relationship,
         standalone_symbol: symbol_like && !path_like && !nl_like && token_count == 1,
         standalone_path: path_like && !nl_like && token_count == 1,
+        exact_symbols,
+        paths,
+        concepts,
+        relations,
+        ordered_flow_stages,
+        evidence_roles,
+        structural_kinds,
+        lookup_mode,
     };
 
     let shape = if nl_like && (path_like || symbol_like) {
@@ -126,6 +289,7 @@ pub fn classify_query(query: &str) -> QueryFeatures {
 
     QueryFeatures {
         raw_query: trimmed.to_string(),
+        intent_policy: QUERY_INTENT_POLICY_VERSION.into(),
         shape,
         intent,
         token_count,
@@ -136,12 +300,62 @@ pub fn classify_query(query: &str) -> QueryFeatures {
     }
 }
 
+fn current_query_intent_policy() -> String {
+    QUERY_INTENT_POLICY_VERSION.into()
+}
+
+const QUERY_STOPWORDS: &[&str] = &[
+    "and", "are", "does", "explain", "find", "for", "from", "how", "into", "the", "this", "what",
+    "when", "where", "which", "why", "with",
+];
+
+fn trim_query_token(token: &str) -> &str {
+    token.trim_matches(|character: char| {
+        matches!(
+            character,
+            '`' | '\'' | '"' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    })
+}
+
+fn unique_labels(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
 fn normalized_word(word: &str) -> String {
     word.trim_matches(|character: char| !character.is_alphanumeric() && character != '_')
         .to_ascii_lowercase()
 }
 
-fn looks_like_path_token(token: &str, standalone: bool) -> bool {
+fn intent_words(value: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    for segment in value.split(|character: char| !character.is_alphanumeric()) {
+        if segment.is_empty() {
+            continue;
+        }
+        let mut start = 0;
+        let characters = segment.char_indices().collect::<Vec<_>>();
+        for window in characters.windows(2) {
+            let (left_index, left) = window[0];
+            let (right_index, right) = window[1];
+            if (left.is_lowercase() || left.is_ascii_digit()) && right.is_uppercase() {
+                if left_index + left.len_utf8() > start {
+                    words.push(segment[start..right_index].to_ascii_lowercase());
+                }
+                start = right_index;
+            }
+        }
+        if start < segment.len() {
+            words.push(segment[start..].to_ascii_lowercase());
+        }
+    }
+    words
+}
+
+fn looks_like_path_token(token: &str, _standalone: bool) -> bool {
     let token = token.trim_matches(|character: char| {
         matches!(
             character,
@@ -163,17 +377,11 @@ fn looks_like_path_token(token: &str, standalone: bool) -> bool {
     if has_supported_file_extension(final_component) {
         return true;
     }
-    let conventional_root = matches!(
-        normalized.split('/').next().unwrap_or_default(),
-        "app" | "apps" | "bin" | "crates" | "docs" | "lib" | "packages" | "src" | "test" | "tests"
-    );
-    conventional_root
-        || (standalone
-            && normalized
-                .split('/')
-                .filter(|component| !component.is_empty())
-                .count()
-                >= 3)
+    normalized
+        .chars()
+        .filter(|character| *character == '/')
+        .count()
+        >= 2
 }
 
 /// A camel hump is an interior lowercase-to-uppercase transition.
@@ -252,6 +460,7 @@ mod tests {
     fn slash_separated_concepts_do_not_suppress_natural_language_intent() {
         for query in [
             "input/output",
+            "src/runtime",
             "how does input/output validation work",
             "explain producer/consumer ownership",
         ] {
@@ -271,6 +480,49 @@ mod tests {
         assert!(features.intent.natural_language);
         assert!(features.intent.relationship);
         assert!(!features.intent.standalone_path);
+        assert_eq!(features.intent.exact_symbols, ["SearchWorker"]);
+        assert_eq!(features.intent.paths, ["src/worker.rs"]);
+        assert!(features.intent.relations.contains(&"calls".to_string()));
+        assert!(
+            features
+                .intent
+                .evidence_roles
+                .contains(&"worker".to_string())
+        );
+        assert_eq!(features.intent.lookup_mode, QueryLookupMode::Relation);
+    }
+
+    #[test]
+    fn ordered_flow_intent_keeps_roles_and_stages_independent() {
+        let features = classify_query(
+            "Explain how results flow through the search driver first and then reach a worker",
+        );
+
+        assert_eq!(features.intent.lookup_mode, QueryLookupMode::OrderedFlow);
+        assert!(
+            features
+                .intent
+                .evidence_roles
+                .contains(&"driver".to_string())
+        );
+        assert!(
+            features
+                .intent
+                .evidence_roles
+                .contains(&"worker".to_string())
+        );
+        assert!(
+            features
+                .intent
+                .ordered_flow_stages
+                .contains(&"first".to_string())
+        );
+        assert!(
+            features
+                .intent
+                .ordered_flow_stages
+                .contains(&"then".to_string())
+        );
     }
 
     #[test]

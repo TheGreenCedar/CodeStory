@@ -1,15 +1,39 @@
 use codestory_contracts::api::SearchTargetDto;
+use codestory_contracts::graph::{EdgeKind, NodeKind};
 use codestory_store::FileRole;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RankFeatures {
+    pub ranking_policy: String,
     pub lexical: f32,
     pub semantic: f32,
     pub scip_distance: f32,
     pub file_role_prior: f32,
     pub definition_quality: f32,
     pub token_overlap: f32,
+    pub text_quality: f32,
+    pub requested_role_agreement: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateGraphDirection {
+    Anchor,
+    Outgoing,
+    Incoming,
+}
+
+/// Typed graph evidence retained independently from the fused score.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateGraphEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_kind: Option<EdgeKind>,
+    pub direction: CandidateGraphDirection,
+    pub hop: u32,
+    pub fanout: u32,
+    pub edge_weight: f32,
+    pub direction_weight: f32,
 }
 
 /// Lane-local evidence retained until reciprocal-rank fusion.
@@ -69,6 +93,10 @@ pub struct CandidateHit {
     pub node_id: Option<String>,
     pub file_path: String,
     pub symbol_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualified_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_kind: Option<NodeKind>,
     pub start_line: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<SearchTargetDto>,
@@ -85,6 +113,8 @@ pub struct CandidateHit {
     /// SCIP graph hops from anchor (lower is better).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scip_hop_distance: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_evidence: Option<CandidateGraphEvidence>,
     /// Populated by the feature ranker after fusion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rank_features: Option<RankFeatures>,
@@ -137,6 +167,8 @@ impl CandidateHit {
             node_id: None,
             file_path: file_path.into(),
             symbol_name: None,
+            qualified_name: None,
+            structural_kind: None,
             start_line: None,
             target: None,
             source_excerpt: None,
@@ -153,6 +185,7 @@ impl CandidateHit {
             provenance: vec!["lexical_source".into()],
             file_role: None,
             scip_hop_distance: None,
+            graph_evidence: None,
             rank_features: None,
         }
     }
@@ -167,6 +200,8 @@ impl CandidateHit {
             node_id: None,
             file_path: file_path.into(),
             symbol_name,
+            qualified_name: None,
+            structural_kind: None,
             start_line: None,
             target: None,
             source_excerpt: None,
@@ -176,6 +211,7 @@ impl CandidateHit {
             provenance: Vec::new(),
             file_role: None,
             scip_hop_distance: None,
+            graph_evidence: None,
             rank_features: None,
         };
         hit.record_lane(source.lane(), score, 0, source.default_provenance());

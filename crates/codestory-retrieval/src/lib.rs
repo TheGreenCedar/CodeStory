@@ -353,8 +353,11 @@ pub use query::{
     execute_strict_retrieval_query_batch_with_cache_for_runtime, is_retrieval_publication_changed,
     retrieval_publication_identity_from_storage,
 };
-pub use query_features::{QueryFeatures, QueryIntent, QueryShape, classify_query};
-pub use ranker::rank_candidates;
+pub use query_features::{
+    QUERY_INTENT_POLICY_VERSION, QueryFeatures, QueryIntent, QueryLookupMode, QueryShape,
+    classify_query,
+};
+pub use ranker::{RANKING_POLICY_VERSION, rank_candidates};
 pub use retention::{
     GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport, GenerationRetentionLock,
     GenerationRetentionPlan, MarkerRetirement, ObservedRetentionLock, RETENTION_MARKER_SCHEMA_V1,

@@ -278,53 +278,6 @@ fn packet_claim_covers_file_scoped_probe(
 }
 
 #[cfg(test)]
-fn packet_css_custom_property_probe_is_covered(
-    query: &str,
-    answer: &AgentAnswerDto,
-    supported_claims: &[PacketClaimDto],
-) -> bool {
-    let Some(parts) = packet_file_scoped_symbol_probe_parts(query) else {
-        return false;
-    };
-    if !parts.file_name.eq_ignore_ascii_case("_vars.css") {
-        return false;
-    }
-    if parts.symbols.is_empty()
-        || !parts
-            .symbols
-            .iter()
-            .all(|symbol| symbol.starts_with("animate"))
-    {
-        return false;
-    }
-    let cites_variables_file = answer.citations.iter().any(|citation| {
-        citation
-            .file_path
-            .as_deref()
-            .map(packet_display_path)
-            .map(|path| {
-                path.rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or(path.as_str())
-                    .eq_ignore_ascii_case("_vars.css")
-            })
-            .unwrap_or(false)
-    });
-    if !cites_variables_file {
-        return false;
-    }
-
-    supported_claims.iter().any(|claim| {
-        let normalized_claim = normalize_identifier(&claim.claim);
-        normalized_claim.contains("csscustomproperties")
-            && parts
-                .symbols
-                .iter()
-                .all(|symbol| normalized_claim.contains(symbol))
-    })
-}
-
-#[cfg(test)]
 fn packet_probe_query_allows_claim_coverage(query: &str) -> bool {
     let trimmed = query.trim();
     packet_concept_probe_allows_claim_coverage(&normalize_identifier(trimmed))
@@ -370,14 +323,6 @@ fn packet_concept_probe_allows_claim_coverage(normalized_query: &str) -> bool {
             | "schemaconstraints"
             | "sqlschemascripts"
             | "schemadialectscripts"
-    )
-}
-
-#[cfg(test)]
-fn packet_required_probe_requires_citation(query: &str) -> bool {
-    matches!(
-        normalize_identifier(query).as_str(),
-        "routetreeaddroute" | "sourcereadbuffer" | "sinkwritebuffer"
     )
 }
 
@@ -2383,9 +2328,16 @@ mod tests {
         );
         assert_role_match(
             "search execution unit",
-            "SearchExecutor",
+            "SearchExecutor::execute_search",
             "src/search/executor.rs",
-            NodeKind::STRUCT,
+            NodeKind::METHOD,
+        );
+        let mut search_type = test_packet_citation("SearchExecutor", "src/search/executor.rs", 0.7);
+        search_type.kind = NodeKind::STRUCT;
+        assert_ne!(
+            packet_citation_probe_match_rank("search execution unit", &search_type),
+            Some(6),
+            "a named type is not behavioral execution evidence"
         );
         assert_role_match(
             "flag parsing",
