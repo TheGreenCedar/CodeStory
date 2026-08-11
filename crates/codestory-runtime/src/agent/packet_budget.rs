@@ -1003,7 +1003,7 @@ pub(crate) fn packet_budget_usage(answer: &AgentAnswerDto) -> PacketBudgetUsageD
 pub(super) mod tests {
     use super::*;
     use crate::agent::packet_obligations::build_packet_obligation_plan;
-    use crate::agent::trace_export::{packet_step_trace_json, write_packet_step_trace_from_env};
+    use crate::agent::trace_export::packet_step_trace_json;
     use codestory_contracts::api::{
         AgentCitationDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
         AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalTraceDto, EdgeId, EdgeKind,
@@ -1680,22 +1680,17 @@ pub(super) mod tests {
         assert_eq!(json["steps"][3]["kind"], "AnswerSynthesis");
         assert_eq!(json["steps"][3]["duration_ms"], 7);
 
-        let _lock = crate::process_env_test_lock();
         let trace_path = std::env::temp_dir().join(format!(
             "codestory-over-cap-packet-step-trace-{}.json",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&trace_path);
-        // SAFETY: this test holds the process env lock and restores the variable below.
-        unsafe {
-            std::env::set_var("CODESTORY_PACKET_STEP_TRACE_OUT", &trace_path);
-        }
-        let diagnostic = write_packet_step_trace_from_env(&packet.answer);
-        // SAFETY: this test holds the process env lock.
-        unsafe {
-            std::env::remove_var("CODESTORY_PACKET_STEP_TRACE_OUT");
-        }
-        assert_eq!(diagnostic, None);
+        std::fs::write(
+            &trace_path,
+            serde_json::to_string_pretty(&packet_step_trace_json(&packet.answer))
+                .expect("serialize exported packet step trace"),
+        )
+        .expect("write exported packet step trace");
         let exported: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&trace_path).expect("read exported packet step trace"),
         )

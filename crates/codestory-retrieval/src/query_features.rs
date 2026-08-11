@@ -60,10 +60,10 @@ pub struct QueryIntent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryFeatures {
     pub raw_query: String,
-    #[serde(default = "current_query_intent_policy")]
+    #[serde(default = "current_query_intent_policy", skip_serializing)]
     pub intent_policy: String,
     pub shape: QueryShape,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub intent: QueryIntent,
     pub token_count: usize,
     pub has_path_separators: bool,

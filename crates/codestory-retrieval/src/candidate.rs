@@ -103,7 +103,7 @@ pub struct CandidateHit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_excerpt: Option<String>,
     pub score: f32,
-    #[serde(default, skip_serializing_if = "CandidateLaneScores::is_empty")]
+    #[serde(default, skip_serializing)]
     pub lane_scores: CandidateLaneScores,
     pub source: CandidateSource,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

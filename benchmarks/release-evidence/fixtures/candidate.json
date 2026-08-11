@@ -14,7 +14,7 @@
   "artifacts": {
     "stats": {
       "path": "candidate-stats.json",
-      "sha256": "e30621e112169f65eaae05e1f5b3720f90399a8399f6cf457108645ac47b1e8a",
+      "sha256": "f77378f6e630a9818be4201fc9e369049c05e1aca1aba5fa8b6bfd2dd959e7fd",
       "bytes": 1088
     },
     "packet": {
