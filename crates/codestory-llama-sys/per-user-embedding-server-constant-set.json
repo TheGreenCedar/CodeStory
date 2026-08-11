@@ -1,7 +1,7 @@
 {
   "calibration_required_values": {
     "capacity_retry_policy": {
-      "retry_after_ms": 44,
+      "retry_after_ms": 43,
       "retry_class": "after_capacity_change",
       "retry_condition_source": "named_condition_from_typed_capacity_response"
     },
@@ -9,7 +9,7 @@
     "election_backoff_policy": {
       "initial_backoff_ms": 7,
       "jitter": "sha256(process_start_id||attempt) modulo inclusive [initial_backoff_ms,maximum_backoff_ms]",
-      "maximum_backoff_ms": 122
+      "maximum_backoff_ms": 110
     },
     "hard_native_no_progress_ms": 385431,
     "request_deadlines_ms": {
@@ -43,7 +43,22 @@
     "query_queue_capacity": 64,
     "true_idle_observation_grace_ms": 2500
   },
-  "freeze_record": null,
+  "freeze_record": {
+    "calibration_bundle_sha256": "214d626739b80d4626e5c1d788e39e6cc5e0159469cd7bf1a644f3537b699510",
+    "calibration_freeze_digest": "08774e2b178d82674f6e2251f8c02ba47a4446f8cc235b1554df30db1c965556",
+    "input_constant_set_sha256": "5017b90db395f5208b8e8cb61888f5498e8ea563909b7951cf79fde227f15241",
+    "measurement_protocol_sha256": "d1bb9b2c7eb354fe98990aa32eedc0e165b0cf804212966e0a2ee362a2f5bf8e",
+    "protocol_sha256": "25373a136cc1da119ed6829769b90aab075084406b0489f9f7698b370f5ee447",
+    "run_artifact_sha256s": [
+      "5c5744c8143f515438d49701cfc9f577ad9339aa95bba70ab67ce9f07bfa3d89",
+      "7756f3e575edca758d923ed5e2f7fc678b506f11a670488a4620c718579da99b",
+      "c2919012926a05a365ba12bef0e3232f019118903701831e4d32e6ad3de676aa"
+    ],
+    "selected_at": "github-actions-run:31488604233:1",
+    "selection_rule": "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
+    "selection_source_commit": "4ca64b075ff65d3135d4f1ae96455f4b703c4dbf",
+    "selection_source_tree": "8971610dd750ca98ae931ae3d8a1cbcb639f63aa"
+  },
   "qualification_thresholds": {
     "backend_observed_accelerator_residency": 1,
     "bulk_documents_per_second": 2,
@@ -60,5 +75,5 @@
   },
   "schema_version": 1,
   "selection_protocol": "codestory-per-user-embedding-server-v1",
-  "status": "unfrozen"
+  "status": "frozen"
 }
