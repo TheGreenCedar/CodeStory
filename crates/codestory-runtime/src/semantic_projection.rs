@@ -2090,51 +2090,49 @@ pub(super) fn build_llm_symbol_doc_text_with_policy(
     let mut source_body = Vec::new();
     let mut source_comments = Vec::new();
     let mut graph = Vec::new();
-    let mut push_identity = |line: String| identity.push(line);
-    let mut push_graph = |line: String| graph.push(line);
-    push_identity(format!(
+    identity.push(format!(
         "{LLM_SYMBOL_DOC_VERSION_PREFIX} {LLM_SYMBOL_DOC_SCHEMA_VERSION}"
     ));
-    push_identity(format!("symbol: {display_name}"));
+    identity.push(format!("symbol: {display_name}"));
     let (signature, comments, body) = symbol_excerpt(node, file_path, file_text_cache);
     if !comments.is_empty() {
         source_comments.push(format!("comments: {}", comments.join(" ")));
     }
     if alias_mode != SemanticDocAliasMode::NoAlias {
         if let Some(language) = semantic_doc_language_from_path(file_path) {
-            push_identity(format!("language: {language}"));
+            identity.push(format!("language: {language}"));
         }
 
         let aliases = semantic_symbol_aliases(display_name, node.qualified_name.as_deref());
         if let Some(terminal_alias) = aliases.terminal_alias {
-            push_identity(format!("terminal_alias: {terminal_alias}"));
+            identity.push(format!("terminal_alias: {terminal_alias}"));
         }
         if !aliases.owner_aliases.is_empty() {
-            push_identity(format!(
+            identity.push(format!(
                 "owner_aliases: {}",
                 aliases.owner_aliases.join(", ")
             ));
         }
-        push_identity(format!(
+        identity.push(format!(
             "symbol_role: {}",
             semantic_symbol_role_aliases(node.kind)
         ));
         if alias_mode == SemanticDocAliasMode::CurrentAlias {
             let path_aliases = semantic_path_aliases(file_path, 8);
             if !path_aliases.is_empty() {
-                push_identity(format!("path_aliases: {}", path_aliases.join(", ")));
+                identity.push(format!("path_aliases: {}", path_aliases.join(", ")));
             }
             if !aliases.name_aliases.is_empty() {
-                push_identity(format!("name_aliases: {}", aliases.name_aliases.join(", ")));
+                identity.push(format!("name_aliases: {}", aliases.name_aliases.join(", ")));
             }
         }
     }
-    push_identity(format!("kind: {:?}", node.kind));
+    identity.push(format!("kind: {:?}", node.kind));
     if let Some(line) = node.start_line {
-        push_identity(format!("line: {line}"));
+        identity.push(format!("line: {line}"));
     }
     if let Some(qualified_name) = node.qualified_name.as_deref() {
-        push_identity(format!("qualified_name: {qualified_name}"));
+        identity.push(format!("qualified_name: {qualified_name}"));
     }
     if !signature.is_empty() {
         source_signature.push(format!("signature: {}", signature.join(" ")));
@@ -2143,15 +2141,15 @@ pub(super) fn build_llm_symbol_doc_text_with_policy(
         source_body.push(format!("body_summary: {}", body.join(" ")));
     }
     if let Some(path) = file_path {
-        push_graph(format!("file: {path}"));
+        graph.push(format!("file: {path}"));
         let path_lower = path.to_ascii_lowercase();
         if path_lower.contains("/tests/") || path_lower.contains("\\tests\\") {
-            push_graph("file_role: test".to_string());
+            graph.push("file_role: test".to_string());
         } else if path_lower.contains("/docs/")
             || path_lower.contains("\\docs\\")
             || path_lower.ends_with(".md")
         {
-            push_graph("file_role: docs".to_string());
+            graph.push("file_role: docs".to_string());
         }
     }
 
@@ -2161,7 +2159,7 @@ pub(super) fn build_llm_symbol_doc_text_with_policy(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     if !children.is_empty() {
-        push_graph(format!("members: {}", children.join(", ")));
+        graph.push(format!("members: {}", children.join(", ")));
     }
 
     let typed_relations = graph_context
@@ -2170,7 +2168,7 @@ pub(super) fn build_llm_symbol_doc_text_with_policy(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     if !typed_relations.is_empty() {
-        push_graph(format!("typed_relations: {}", typed_relations.join("; ")));
+        graph.push(format!("typed_relations: {}", typed_relations.join("; ")));
     }
 
     let edge_digest = graph_context
@@ -2183,10 +2181,8 @@ pub(super) fn build_llm_symbol_doc_text_with_policy(
         for digest in edge_digest {
             let _ = write!(line, " {digest};");
         }
-        push_graph(line);
+        graph.push(line);
     }
-    drop(push_identity);
-    drop(push_graph);
     compact_semantic_symbol_doc_sections(
         identity,
         source_signature,
@@ -3688,6 +3684,7 @@ struct PreparedIncrementalSemanticContext {
     file_cache_build_ns: u128,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_incremental_semantic_context(
     storage: &Storage,
     nodes: &[GraphNode],

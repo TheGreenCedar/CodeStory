@@ -318,8 +318,7 @@ fn assemble_packet_sufficiency_with_probe_context(
     let (mut covered_required_flow_requirements, mut missing_required_flow_requirements) =
         packet_required_flow_requirement_coverage(question, task_class, &sufficiency_claims);
     if task_class == PacketTaskClassDto::RouteTracing && route_proof.complete {
-        covered_required_flow_requirements.extend(missing_required_flow_requirements.drain(..));
-        missing_required_flow_requirements.clear();
+        covered_required_flow_requirements.append(&mut missing_required_flow_requirements);
     }
     let obligations_proven = obligations
         .map(material_packet_obligations_are_proven)

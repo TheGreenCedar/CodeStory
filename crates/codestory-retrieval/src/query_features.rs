@@ -169,14 +169,18 @@ pub fn classify_query(query: &str) -> QueryFeatures {
         .iter()
         .flat_map(|token| intent_words(token))
         .collect::<Vec<_>>();
-    let relations = unique_labels(normalized_tokens.iter().filter_map(|token| {
-        RELATION_WORDS
-            .contains(&token.as_str())
-            .then(|| token.clone())
-    }));
-    let ordered_flow_stages = unique_labels(normalized_tokens.iter().filter_map(|token| {
-        (ORDERED_FLOW_WORDS.contains(&token.as_str()) || token == "handoff").then(|| token.clone())
-    }));
+    let relations = unique_labels(
+        normalized_tokens
+            .iter()
+            .filter(|token| RELATION_WORDS.contains(&token.as_str()))
+            .cloned(),
+    );
+    let ordered_flow_stages = unique_labels(
+        normalized_tokens
+            .iter()
+            .filter(|token| ORDERED_FLOW_WORDS.contains(&token.as_str()) || *token == "handoff")
+            .cloned(),
+    );
     let relationship = !relations.is_empty();
     nl_like |= relationship && token_count > 1;
     let ordered_flow = relationship
@@ -184,58 +188,70 @@ pub fn classify_query(query: &str) -> QueryFeatures {
         && normalized_tokens
             .iter()
             .any(|token| ORDERED_FLOW_WORDS.contains(&token.as_str()));
-    let evidence_roles = unique_labels(normalized_tokens.iter().filter_map(|token| {
-        matches!(
-            token.as_str(),
-            "adapter"
-                | "controller"
-                | "dispatch"
-                | "dispatcher"
-                | "driver"
-                | "entrypoint"
-                | "executor"
-                | "handler"
-                | "indexer"
-                | "parser"
-                | "reader"
-                | "retrieval"
-                | "router"
-                | "runner"
-                | "search"
-                | "service"
-                | "storage"
-                | "store"
-                | "worker"
-                | "writer"
-        )
-        .then(|| token.clone())
-    }));
-    let structural_kinds = unique_labels(normalized_tokens.iter().filter_map(|token| {
-        matches!(
-            token.as_str(),
-            "class"
-                | "enum"
-                | "file"
-                | "function"
-                | "interface"
-                | "macro"
-                | "method"
-                | "module"
-                | "namespace"
-                | "route"
-                | "struct"
-                | "trait"
-        )
-        .then(|| token.clone())
-    }));
-    let concepts = unique_labels(normalized_tokens.iter().filter_map(|token| {
-        (token.len() >= 3
-            && !QUERY_STOPWORDS.contains(&token.as_str())
-            && !relations.iter().any(|relation| relation == token)
-            && !evidence_roles.iter().any(|role| role == token)
-            && !structural_kinds.iter().any(|kind| kind == token))
-        .then(|| token.clone())
-    }));
+    let evidence_roles = unique_labels(
+        normalized_tokens
+            .iter()
+            .filter(|token| {
+                matches!(
+                    token.as_str(),
+                    "adapter"
+                        | "controller"
+                        | "dispatch"
+                        | "dispatcher"
+                        | "driver"
+                        | "entrypoint"
+                        | "executor"
+                        | "handler"
+                        | "indexer"
+                        | "parser"
+                        | "reader"
+                        | "retrieval"
+                        | "router"
+                        | "runner"
+                        | "search"
+                        | "service"
+                        | "storage"
+                        | "store"
+                        | "worker"
+                        | "writer"
+                )
+            })
+            .cloned(),
+    );
+    let structural_kinds = unique_labels(
+        normalized_tokens
+            .iter()
+            .filter(|token| {
+                matches!(
+                    token.as_str(),
+                    "class"
+                        | "enum"
+                        | "file"
+                        | "function"
+                        | "interface"
+                        | "macro"
+                        | "method"
+                        | "module"
+                        | "namespace"
+                        | "route"
+                        | "struct"
+                        | "trait"
+                )
+            })
+            .cloned(),
+    );
+    let concepts = unique_labels(
+        normalized_tokens
+            .iter()
+            .filter(|token| {
+                token.len() >= 3
+                    && !QUERY_STOPWORDS.contains(&token.as_str())
+                    && !relations.iter().any(|relation| relation == *token)
+                    && !evidence_roles.iter().any(|role| role == *token)
+                    && !structural_kinds.iter().any(|kind| kind == *token)
+            })
+            .cloned(),
+    );
     let lookup_mode = if ordered_flow {
         QueryLookupMode::OrderedFlow
     } else if relationship {

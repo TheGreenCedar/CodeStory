@@ -116,6 +116,7 @@ pub(crate) fn apply_packet_budget_with_extra(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_packet_budget_with_extra_and_obligation_carriers(
     project_root: &Path,
     question: &str,

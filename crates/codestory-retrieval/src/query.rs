@@ -699,10 +699,10 @@ fn prepare_batched_sidecars(
         .map(|(_, query, _)| query)
         .filter(|query| {
             let features = classify_query(query);
-            !features.intent.standalone_path
-                && !(features.intent.lookup_mode == QueryLookupMode::Definition
+            !(features.intent.standalone_path
+                || (features.intent.lookup_mode == QueryLookupMode::Definition
                     && features.intent.standalone_symbol
-                    && !features.intent.relationship)
+                    && !features.intent.relationship))
         })
         .filter(|query| seen.insert((*query).clone()))
         .cloned()
@@ -760,7 +760,9 @@ fn effective_query_budget_ms(query: &str, budget_ms: Option<u64>) -> u64 {
 
 fn duration_millis_ceil(duration: Duration) -> u64 {
     let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-    millis.saturating_add(u64::from(duration.subsec_nanos() % 1_000_000 != 0))
+    millis.saturating_add(u64::from(
+        !duration.subsec_nanos().is_multiple_of(1_000_000),
+    ))
 }
 
 struct PreparedBatchSidecars {
