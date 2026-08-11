@@ -552,8 +552,10 @@ fn search_lexical_index_on_connection(
             weight
         })
         .collect::<Vec<_>>();
-    let total_weight = token_weights.iter().sum::<f32>();
-    let required_weight = required_lexical_match_weight(tokens.len(), total_weight);
+    // Coverage is a count of distinct query terms. Rarity weights order
+    // candidates within lexical lanes; an unmatched rare term must not veto
+    // the documented two-of-three or forty-percent admission contracts.
+    let required_match_count = required_lexical_match_count(tokens.len());
 
     let exact_candidates = query_exact_candidates(connection, query, candidate_limit)?;
     let path_candidates = query_fts_candidates(
@@ -625,7 +627,7 @@ fn search_lexical_index_on_connection(
             &normalized_path,
             &normalized_content,
         );
-        if token_match.matched_weight >= required_weight
+        if token_match.matched_count >= required_match_count
             && mandatory_tokens_match(&mandatory_tokens, &normalized_path, &normalized_content)
         {
             let (target, matched_line, source_excerpt) =
@@ -1829,17 +1831,18 @@ fn lexical_token_weight(document_frequency: usize, document_count: usize) -> f32
     (1.0 + rarity).clamp(0.25, 5.0)
 }
 
-fn required_lexical_match_weight(token_count: usize, total_weight: f32) -> f32 {
+fn required_lexical_match_count(token_count: usize) -> usize {
     match token_count {
-        0 => 0.0,
-        1 => total_weight,
-        2 | 3 => total_weight * 0.60,
-        _ => total_weight * 0.40,
+        0 => 0,
+        1 => 1,
+        2 | 3 => 2,
+        _ => token_count.saturating_mul(2).saturating_add(4) / 5,
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct LexicalTokenMatch {
+    matched_count: usize,
     matched_weight: f32,
     path_weight: f32,
     content_weight: f32,
@@ -1853,6 +1856,7 @@ fn lexical_token_match(
     content_lower: &str,
 ) -> LexicalTokenMatch {
     let mut result = LexicalTokenMatch {
+        matched_count: 0,
         matched_weight: 0.0,
         path_weight: 0.0,
         content_weight: 0.0,
@@ -1863,6 +1867,7 @@ fn lexical_token_match(
         let path_factor = path_match_factor(path_lower, token);
         let content_match = content_lower.contains(token.as_str());
         if path_factor > 0.0 || content_match {
+            result.matched_count += 1;
             result.matched_weight += weight;
         }
         if path_factor > 0.0 {
@@ -2308,9 +2313,42 @@ mod tests {
     }
 
     #[test]
-    fn lexical_long_query_requires_forty_percent_of_non_stopwords() {
-        assert_eq!(required_lexical_match_weight(4, 10.0), 4.0);
-        assert_eq!(required_lexical_match_weight(12, 10.0), 4.0);
+    fn lexical_admission_counts_terms_and_keeps_quoted_terms_mandatory() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("src/text_checks.rs"),
+            "fn isEmpty() -> bool { true }",
+        )
+        .expect("two-term source");
+        std::fs::write(
+            project.path().join("src/cache_state.rs"),
+            "fn isEmpty() -> bool { false }",
+        )
+        .expect("one-term source");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "term-count", "input");
+
+        let hits = search_lexical_index(&shard, "input", "text empty predicate", 8)
+            .expect("unquoted search");
+        assert_eq!(
+            hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/text_checks.rs"],
+            "two of three non-stopwords qualify while one of three does not"
+        );
+
+        let quoted = search_lexical_index(&shard, "input", "text empty `predicate`", 8)
+            .expect("quoted search");
+        assert!(
+            quoted.is_empty(),
+            "count-based admission must not weaken quoted-term requirements"
+        );
+
+        assert_eq!(required_lexical_match_count(1), 1);
+        assert_eq!(required_lexical_match_count(2), 2);
+        assert_eq!(required_lexical_match_count(3), 2);
+        assert_eq!(required_lexical_match_count(4), 2);
+        assert_eq!(required_lexical_match_count(12), 5);
     }
 
     #[test]
@@ -2745,7 +2783,7 @@ mod tests {
         assert_eq!(rebuilt, before);
         let shard = shard_dir_for(data.path(), "owned-exclusions");
         assert!(
-            search_lexical_index(&shard, "input", "generation_owned_json", 8)
+            search_lexical_index(&shard, "input", "`generation_owned_json`", 8)
                 .expect("search owned token")
                 .is_empty()
         );
@@ -3087,7 +3125,7 @@ mod tests {
             .iter()
             .map(|frequency| lexical_token_weight(*frequency, documents.len()))
             .collect::<Vec<_>>();
-        let required = required_lexical_match_weight(tokens.len(), weights.iter().sum());
+        let required = required_lexical_match_count(tokens.len());
         let mut hits = documents
             .iter()
             .filter_map(|document| {
@@ -3097,7 +3135,7 @@ mod tests {
                     &document.path.to_ascii_lowercase(),
                     &document.content.to_ascii_lowercase(),
                 );
-                (token_match.matched_weight >= required).then(|| {
+                (token_match.matched_count >= required).then(|| {
                     let (target, matched_line, source_excerpt) =
                         if document.source == LexicalDocumentSource::LexicalSource {
                             lexical_source_target(

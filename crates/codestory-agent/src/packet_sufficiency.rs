@@ -309,6 +309,7 @@ fn assemble_packet_sufficiency_with_probe_context(
     };
     let route_proof = packet_route_proof_assessment(
         task_class,
+        question,
         answer,
         route_claims,
         &route_stages,
@@ -317,6 +318,21 @@ fn assemble_packet_sufficiency_with_probe_context(
     );
     let (mut covered_required_flow_requirements, mut missing_required_flow_requirements) =
         packet_required_flow_requirement_coverage(question, task_class, &sufficiency_claims);
+    if let Some(plan) = obligations {
+        let mut still_missing = Vec::new();
+        for requirement in missing_required_flow_requirements {
+            if plan.claim_obligations.iter().any(|obligation| {
+                obligation.material
+                    && obligation.id == requirement.id
+                    && obligation.proof_status == PacketObligationProofStatusDto::Proven
+            }) {
+                covered_required_flow_requirements.push(requirement);
+            } else {
+                still_missing.push(requirement);
+            }
+        }
+        missing_required_flow_requirements = still_missing;
+    }
     if task_class == PacketTaskClassDto::RouteTracing && route_proof.complete {
         covered_required_flow_requirements.append(&mut missing_required_flow_requirements);
     }
@@ -792,6 +808,7 @@ impl RouteProofAssessment {
 
 fn packet_route_proof_assessment(
     task_class: PacketTaskClassDto,
+    question: &str,
     answer: &AgentAnswerDto,
     claims: &[PacketClaimDto],
     stages: &[String],
@@ -802,6 +819,17 @@ fn packet_route_proof_assessment(
         return RouteProofAssessment::not_required();
     }
     if stages.len() < 2 {
+        // Natural-language flow wording such as "registers routes, then dispatches through a
+        // router" is already represented by the ordered material obligation plan. A lone prose
+        // marker must not invent explicit endpoints and then fail them. Explicit arrows and
+        // `from ... to ...` syntax keep the stronger connected-route proof below.
+        if !packet_question_has_explicit_route_order(question)
+            && obligations.is_some_and(|plan| {
+                packet_ordered_material_flow_obligations_are_proven(question, task_class, plan)
+            })
+        {
+            return RouteProofAssessment::not_required();
+        }
         return RouteProofAssessment::blocked(
             ROUTE_ORDER_GAP.to_string(),
             vec!["route order: unresolved endpoints".to_string()],
@@ -911,6 +939,60 @@ fn packet_route_proof_assessment(
         );
     }
     RouteProofAssessment::not_required()
+}
+
+fn packet_question_has_explicit_route_order(question: &str) -> bool {
+    let normalized = question.replace('→', "->");
+    if normalized.contains("->") {
+        return true;
+    }
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    let Some(from) = words
+        .iter()
+        .position(|word| packet_route_word_is(word, "from"))
+    else {
+        return false;
+    };
+    words[from + 1..].iter().any(|word| {
+        ["through", "via", "to"]
+            .iter()
+            .any(|marker| packet_route_word_is(word, marker))
+    })
+}
+
+fn packet_ordered_material_flow_obligations_are_proven(
+    question: &str,
+    task_class: PacketTaskClassDto,
+    plan: &PacketObligationPlanDto,
+) -> bool {
+    let requirements =
+        packet_flow_requirements_for_terms(&packet_probe_terms(question), task_class)
+            .into_iter()
+            .filter(|requirement| requirement.coverage_mode != CoverageMode::DiagnosticOnly)
+            .collect::<Vec<_>>();
+    if requirements.len() < 2 {
+        return false;
+    }
+    let mut previous_position = None;
+    requirements.iter().all(|requirement| {
+        let Some((position, _)) =
+            plan.claim_obligations
+                .iter()
+                .enumerate()
+                .find(|(_, obligation)| {
+                    obligation.material
+                        && obligation.id == requirement.id
+                        && obligation.proof_status == PacketObligationProofStatusDto::Proven
+                })
+        else {
+            return false;
+        };
+        if previous_position.is_some_and(|previous| position <= previous) {
+            return false;
+        }
+        previous_position = Some(position);
+        true
+    })
 }
 
 fn packet_route_obligation_node_ids(
@@ -2116,7 +2198,11 @@ impl PacketFlowContext {
                 .citations
                 .iter()
                 .filter(|citation| citation_sufficiency_eligible(citation))
-                .any(|citation| requirement.evidence.citation_proves(citation))
+                .any(|citation| {
+                    requirement
+                        .evidence
+                        .citation_proves_without_call_boundary(citation)
+                })
     }
 }
 
@@ -3709,6 +3795,59 @@ mod tests {
                 "SymbolExtraction",
                 "StoragePersistence"
             ]
+        );
+    }
+
+    #[test]
+    fn natural_language_route_flow_uses_the_ordered_material_obligation_plan() {
+        let question = "Trace how an application registers middleware and routes, then dispatches an incoming request through router layers to a route handler and sends the response.";
+        assert!(!packet_question_has_explicit_route_order(question));
+        let mut obligations = crate::packet_obligations::build_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &[],
+        );
+        let material = obligations
+            .claim_obligations
+            .iter_mut()
+            .filter(|obligation| obligation.material)
+            .collect::<Vec<_>>();
+        assert_eq!(material.len(), 3);
+        for obligation in material {
+            obligation.proof_status = PacketObligationProofStatusDto::Proven;
+        }
+        assert!(packet_ordered_material_flow_obligations_are_proven(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &obligations,
+        ));
+
+        let assessment = packet_route_proof_assessment(
+            PacketTaskClassDto::RouteTracing,
+            question,
+            &answer_fixture(question),
+            &[],
+            &[],
+            &[],
+            Some(&obligations),
+        );
+        assert!(assessment.complete, "{assessment:?}");
+
+        let explicit = "Trace the route from RequestIngress to ResponseEgress.";
+        assert!(packet_question_has_explicit_route_order(explicit));
+        let explicit_assessment = packet_route_proof_assessment(
+            PacketTaskClassDto::RouteTracing,
+            explicit,
+            &answer_fixture(explicit),
+            &[],
+            &[],
+            &[],
+            Some(&obligations),
+        );
+        assert!(!explicit_assessment.complete);
+        assert_eq!(
+            explicit_assessment.missing,
+            ["route order: unresolved endpoints"]
         );
     }
 

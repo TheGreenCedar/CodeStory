@@ -189,6 +189,72 @@ fn names_token_prefix(citation: &AgentCitationDto, prefixes: &[&str]) -> bool {
     any_token_starts_with(&name_tokens(citation), prefixes)
 }
 
+/// Match a callable whose terminal segment names an action and whose owner, or the remainder of
+/// that same compound terminal, independently names the subsystem. `Session.send` and
+/// `sendRequest` have two factors; a bare `send` or `dispatch_hook` does not.
+fn callable_owns_terminal_action_for_subject(
+    citation: &AgentCitationDto,
+    actions: &[&str],
+    subjects: &[&str],
+) -> bool {
+    if !owns_callable_behavior(citation) {
+        return false;
+    }
+    let terminal_tokens = identifier_tokens(terminal_segment_raw(&citation.display_name));
+    if !has_token(&terminal_tokens, actions) {
+        return false;
+    }
+    let tokens = name_tokens(citation);
+    let owner_token_count = tokens.len().saturating_sub(terminal_tokens.len());
+    has_token(&tokens[..owner_token_count], subjects)
+        || terminal_tokens.iter().any(|token| {
+            subjects.iter().any(|subject| token == subject)
+                && !actions.iter().any(|action| token == action)
+        })
+}
+
+fn callable_has_exact_owner_and_terminal_action(
+    citation: &AgentCitationDto,
+    owners: &[&str],
+    actions: &[&str],
+) -> bool {
+    if !owns_callable_behavior(citation) {
+        return false;
+    }
+    let mut segments = citation
+        .display_name
+        .rsplit(['.', ':', '#', '/', '\\'])
+        .filter(|segment| !segment.is_empty());
+    let Some(terminal) = segments.next() else {
+        return false;
+    };
+    let Some(owner) = segments.next() else {
+        return false;
+    };
+    owners
+        .iter()
+        .any(|expected| normalize_identifier(owner) == *expected)
+        && has_token(&identifier_tokens(terminal), actions)
+}
+
+fn callable_owns_terminal_action_for_two_subjects(
+    citation: &AgentCitationDto,
+    actions: &[&str],
+    primary_subjects: &[&str],
+    boundary_subjects: &[&str],
+) -> bool {
+    if !owns_callable_behavior(citation)
+        || !has_token(
+            &identifier_tokens(terminal_segment_raw(&citation.display_name)),
+            actions,
+        )
+    {
+        return false;
+    }
+    let tokens = name_tokens(citation);
+    has_token(&tokens, primary_subjects) && has_token(&tokens, boundary_subjects)
+}
+
 // ---------------------------------------------------------------------------
 // HTTP client lifecycle
 // ---------------------------------------------------------------------------
@@ -213,6 +279,140 @@ pub fn citation_owns_client_request_method(citation: &AgentCitationDto) -> bool 
             terminal(citation).as_str(),
             "request" | "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
         )
+}
+
+/// A public outbound-request entrypoint. Unlike the broader request-method ranking predicate, a
+/// bare `request` is insufficient here: the symbol must independently name a client/session
+/// subject so `FrameKind.request` cannot become a material packet carrier.
+pub fn citation_owns_client_request_entrypoint(citation: &AgentCitationDto) -> bool {
+    (callable_has_exact_owner_and_terminal_action(citation, &["session"], &["request"])
+        && has_token(
+            &path_tokens(citation),
+            &["http", "https", "request", "requests", "client"],
+        ))
+        || callable_owns_terminal_action_for_two_subjects(
+            citation,
+            &[
+                "request", "get", "post", "put", "patch", "delete", "head", "options",
+            ],
+            &["client", "session"],
+            &["http", "https", "requests", "fetch"],
+        )
+}
+
+/// The callable that hands an assembled outbound request to the selected transport. Adapters and
+/// transports are deliberately excluded: they are the terminal boundary, while this carrier is
+/// the session/client dispatch immediately before it.
+pub fn citation_owns_client_request_dispatch(citation: &AgentCitationDto) -> bool {
+    ((callable_has_exact_owner_and_terminal_action(citation, &["session"], &["send"])
+        && has_token(
+            &path_tokens(citation),
+            &["http", "https", "request", "requests", "client"],
+        ))
+        || callable_owns_terminal_action_for_two_subjects(
+            citation,
+            &["send"],
+            &["client", "session"],
+            &["http", "https", "requests", "fetch"],
+        ))
+        && !names_token(
+            citation,
+            &["adapter", "adapters", "transport", "transports"],
+        )
+}
+
+/// Registration of an inbound server request surface.
+pub fn citation_owns_server_request_entrypoint(citation: &AgentCitationDto) -> bool {
+    callable_has_exact_owner_and_terminal_action(citation, &["app"], &["route", "use", "listen"])
+        || callable_owns_terminal_action_for_subject(
+            citation,
+            &["route", "use", "listen"],
+            &["router", "middleware", "wsgi", "asgi", "servlet"],
+        )
+}
+
+/// The callable that selects or invokes an inbound request handler.
+pub fn citation_owns_server_request_dispatch(citation: &AgentCitationDto) -> bool {
+    callable_has_exact_owner_and_terminal_action(citation, &["app"], &["handle"])
+        || callable_owns_terminal_action_for_subject(
+            citation,
+            &["dispatch", "handle", "invoke"],
+            &[
+                "router",
+                "controller",
+                "middleware",
+                "wsgi",
+                "asgi",
+                "servlet",
+            ],
+        )
+}
+
+/// The response-side callable that leaves a server handler for its writer or transport.
+pub fn citation_owns_server_response_terminal(citation: &AgentCitationDto) -> bool {
+    callable_has_exact_owner_and_terminal_action(
+        citation,
+        &["res", "response", "reply"],
+        &["send", "end", "write", "flush", "finish"],
+    ) || callable_owns_terminal_action_for_two_subjects(
+        citation,
+        &["send", "end", "write", "flush", "finish"],
+        &["response", "responses", "reply"],
+        &[
+            "writer",
+            "sender",
+            "transport",
+            "socket",
+            "stream",
+            "output",
+        ],
+    )
+}
+
+fn display_name_has_token(display_name: &str, tokens: &[&str]) -> bool {
+    has_token(&identifier_tokens(display_name), tokens)
+}
+
+/// Typed CALL targets that advance an outbound public request into preparation or dispatch.
+pub fn client_request_entrypoint_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    (has_token(&tokens, &["prepare", "prepared", "build"])
+        && has_token(&tokens, &["request", "requests"]))
+        || (has_token(&tokens, &["send"]) && has_token(&tokens, &["client", "session", "requests"]))
+}
+
+/// Typed CALL targets that cross from the client/session dispatcher into its send boundary.
+pub fn client_request_dispatch_call_target(display_name: &str) -> bool {
+    display_name_has_token(display_name, &["send"])
+}
+
+/// Typed CALL targets that implement route or middleware registration.
+pub fn server_request_entrypoint_call_target(display_name: &str) -> bool {
+    display_name_has_token(display_name, &["route", "routes", "use", "listen"])
+}
+
+/// Typed CALL targets that select or invoke the inbound handler.
+pub fn server_request_dispatch_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    has_token(&tokens, &["handle", "handler", "finalhandler"])
+        || (has_token(&tokens, &["dispatch", "invoke"])
+            && has_token(
+                &tokens,
+                &[
+                    "server",
+                    "router",
+                    "controller",
+                    "middleware",
+                    "wsgi",
+                    "asgi",
+                    "servlet",
+                ],
+            ))
+}
+
+/// Typed CALL targets that perform the response write or flush.
+pub fn server_response_terminal_call_target(display_name: &str) -> bool {
+    display_name_has_token(display_name, &["end", "write", "flush", "finish"])
 }
 
 /// Anchors that belong to an HTTP client at all. `Uri.prepare` is a URL utility that happens to be
@@ -1809,6 +2009,129 @@ mod tests {
 
         assert!(!citation_owns_client_request_method(&factory));
         assert!(citation_owns_client_request_method(&request));
+    }
+
+    #[test]
+    fn request_flow_carriers_require_independent_subject_and_action_tokens() {
+        for positive in ["Session.request", "HttpClient.get"] {
+            assert!(citation_owns_client_request_entrypoint(&citation(
+                positive,
+                "src/client.rs",
+                NodeKind::METHOD,
+            )));
+        }
+        for negative in [
+            "FrameKind.request",
+            "Session.get",
+            "ClientCache.get",
+            "HttpCache.get",
+        ] {
+            assert!(!citation_owns_client_request_entrypoint(&citation(
+                negative,
+                "src/client.rs",
+                NodeKind::METHOD,
+            )));
+        }
+        assert!(!citation_owns_client_request_entrypoint(&citation(
+            "Session.request",
+            "src/storage.rs",
+            NodeKind::METHOD,
+        )));
+
+        for positive in ["Session.send", "HttpClient.send"] {
+            assert!(citation_owns_client_request_dispatch(&citation(
+                positive,
+                "src/client.rs",
+                NodeKind::METHOD,
+            )));
+        }
+        for negative in [
+            "dispatch_hook",
+            "HttpTransportAdapter.send",
+            "Connection.execute",
+            "RequestRouter.dispatch",
+            "HttpCache.send",
+        ] {
+            assert!(!citation_owns_client_request_dispatch(&citation(
+                negative,
+                "src/client.rs",
+                NodeKind::FUNCTION,
+            )));
+        }
+
+        for positive in ["app.route", "RequestRouter.route"] {
+            assert!(citation_owns_server_request_entrypoint(&citation(
+                positive,
+                "lib/application.js",
+                NodeKind::FUNCTION,
+            )));
+        }
+        for negative in [
+            "WidgetFactory.create",
+            "ApplicationFactory.create",
+            "HttpClient.new",
+            "ServerPluginRegistry.registerPlugin",
+        ] {
+            assert!(!citation_owns_server_request_entrypoint(&citation(
+                negative,
+                "lib/application.js",
+                NodeKind::FUNCTION,
+            )));
+        }
+
+        for positive in ["app.handle", "RequestRouter.dispatch"] {
+            assert!(citation_owns_server_request_dispatch(&citation(
+                positive,
+                "lib/application.js",
+                NodeKind::FUNCTION,
+            )));
+        }
+        for negative in [
+            "EventProcessor.handle",
+            "EventHandler.handle",
+            "HttpClient.dispatch",
+        ] {
+            assert!(!citation_owns_server_request_dispatch(&citation(
+                negative,
+                "lib/application.js",
+                NodeKind::FUNCTION,
+            )));
+        }
+
+        for positive in ["res.send", "ResponseWriter.flush"] {
+            assert!(citation_owns_server_response_terminal(&citation(
+                positive,
+                "lib/response.js",
+                NodeKind::FUNCTION,
+            )));
+        }
+        for negative in [
+            "EmailSender.send",
+            "StreamWriter.write",
+            "ResponseParser.finish",
+        ] {
+            assert!(!citation_owns_server_response_terminal(&citation(
+                negative,
+                "lib/response.js",
+                NodeKind::FUNCTION,
+            )));
+        }
+
+        assert!(client_request_entrypoint_call_target(
+            "Session.prepare_request"
+        ));
+        assert!(!client_request_entrypoint_call_target("CacheBuilder.build"));
+        assert!(client_request_dispatch_call_target("BaseAdapter.send"));
+        assert!(server_request_entrypoint_call_target("Router.route"));
+        assert!(server_request_dispatch_call_target("finalhandler"));
+        assert!(server_response_terminal_call_target("ServerResponse.end"));
+        assert!(!server_request_entrypoint_call_target(
+            "PluginRegistry.registerPlugin"
+        ));
+        assert!(!server_request_dispatch_call_target("HttpClient.dispatch"));
+        assert!(!server_response_terminal_call_target(
+            "ResponseParser.parse"
+        ));
     }
 
     #[test]

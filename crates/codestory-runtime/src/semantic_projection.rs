@@ -2492,8 +2492,8 @@ pub(super) fn semantic_file_is_package_callable_surface(path: Option<&str>) -> b
     let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
     let source_extension = [
         ".bash", ".c", ".cc", ".cjs", ".cpp", ".cs", ".dart", ".fish", ".go", ".h", ".hpp",
-        ".java", ".js", ".jsx", ".kt", ".kts", ".mjs", ".php", ".py", ".rb", ".sh", ".swift",
-        ".ts", ".tsx", ".zsh",
+        ".java", ".js", ".jsx", ".kt", ".kts", ".mjs", ".php", ".py", ".rb", ".rs", ".sh",
+        ".swift", ".ts", ".tsx", ".zsh",
     ]
     .iter()
     .any(|suffix| file_name.ends_with(suffix));
@@ -2505,15 +2505,20 @@ pub(super) fn semantic_file_is_package_callable_surface(path: Option<&str>) -> b
     // production and what the widened generalization lint now refuses. Those
     // files still qualify through the markers below whenever the repository
     // actually lays them out as a package surface.
-    normalized.contains("/lib/")
-        || normalized.contains("/src/")
-        || normalized.contains("/pkg/")
-        || normalized.contains("/packages/")
-        || normalized.contains("/routes/")
-        || normalized.contains("/router/")
-        || normalized.contains("/controllers/")
-        || normalized.contains("/middleware/")
-        || normalized.contains("/sources/")
+    normalized.split('/').any(|segment| {
+        matches!(
+            segment,
+            "lib"
+                | "src"
+                | "pkg"
+                | "packages"
+                | "routes"
+                | "router"
+                | "controllers"
+                | "middleware"
+                | "sources"
+        )
+    })
 }
 
 pub(super) fn semantic_doc_is_documented_nontrivial(doc_text: &str) -> bool {

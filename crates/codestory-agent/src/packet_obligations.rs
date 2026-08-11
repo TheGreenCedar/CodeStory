@@ -638,7 +638,10 @@ fn flow_requirement_requires_call_edge(requirement: &FlowRequirement) -> bool {
     matches!(
         requirement.coverage_mode,
         CoverageMode::RequiresResolvedSourceOrGraph
-    ) && matches!(requirement.evidence, EvidencePredicate::CitedRoles { .. })
+    ) && matches!(
+        requirement.evidence,
+        EvidencePredicate::CitedRoles { .. } | EvidencePredicate::CitedRolesOrCallBoundary { .. }
+    )
 }
 
 fn push_query_obligation(
@@ -1202,7 +1205,13 @@ fn finalize_claim_obligation(
             obligation
                 .required_edge_kind
                 .is_none_or(|required_edge_kind| {
-                    citation_edge_proof(citation, required_edge_kind, answer).is_some()
+                    citation_edge_proof_for_flow_requirement(
+                        citation,
+                        required_edge_kind,
+                        requirement,
+                        answer,
+                    )
+                    .is_some()
                 })
         })
         .collect::<Vec<_>>();
@@ -1251,10 +1260,11 @@ fn finalize_claim_obligation(
         evidence_view.max_carriers,
     );
     if let Some(required_edge_kind) = obligation.required_edge_kind {
-        record_obligation_edge_proofs(
+        record_obligation_edge_proofs_for_flow_requirement(
             obligation,
             &proven_citations,
             required_edge_kind,
+            requirement,
             answer,
             evidence_view.max_carriers,
         );
@@ -1557,6 +1567,52 @@ fn citation_edge_proof(
         })
 }
 
+fn citation_edge_proof_for_flow_requirement(
+    citation: &AgentCitationDto,
+    required_edge_kind: EdgeKind,
+    requirement: &FlowRequirement,
+    answer: &AgentAnswerDto,
+) -> Option<PacketObligationCarrierEdgeProofDto> {
+    let Some(call_target) = requirement.evidence.call_boundary_target(citation) else {
+        return citation_edge_proof(citation, required_edge_kind, answer);
+    };
+    if required_edge_kind != EdgeKind::CALL {
+        return None;
+    }
+    let graphs = packet_execution_graphs(answer);
+    let cited_edge_ids = citation.evidence_edge_ids.iter().collect::<HashSet<_>>();
+    graphs
+        .iter()
+        .flat_map(|graph| graph.edges.iter().map(move |edge| (*graph, edge)))
+        .filter(|(_, edge)| {
+            edge.kind == EdgeKind::CALL
+                && cited_edge_ids.contains(&edge.id)
+                && edge.source == citation.node_id
+                && !is_speculative_trail_edge(edge)
+        })
+        .filter(|(graph, edge)| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == edge.target)
+                .map(|node| node.label.as_str())
+                .or_else(|| {
+                    answer
+                        .citations
+                        .iter()
+                        .find(|candidate| candidate.node_id == edge.target)
+                        .map(|candidate| candidate.display_name.as_str())
+                })
+                .is_some_and(call_target)
+        })
+        .min_by(|(_, left), (_, right)| left.id.0.cmp(&right.id.0))
+        .map(|(_, edge)| PacketObligationCarrierEdgeProofDto {
+            carrier_node_id: citation.node_id.clone(),
+            edge_id: edge.id.clone(),
+            edge_kind: edge.kind,
+        })
+}
+
 fn record_obligation_edge_proofs(
     obligation: &mut PacketClaimObligationDto,
     citations: &[&AgentCitationDto],
@@ -1572,6 +1628,46 @@ fn record_obligation_edge_proofs(
     let mut proofs = citations
         .iter()
         .filter_map(|citation| citation_edge_proof(citation, required_edge_kind, answer))
+        .filter(|proof| retained_carrier_node_ids.contains(&proof.carrier_node_id))
+        .collect::<Vec<_>>();
+    proofs.sort_by(|left, right| {
+        left.carrier_node_id
+            .0
+            .cmp(&right.carrier_node_id.0)
+            .then_with(|| left.edge_id.0.cmp(&right.edge_id.0))
+    });
+    proofs.dedup_by(|left, right| {
+        left.carrier_node_id == right.carrier_node_id
+            && left.edge_id == right.edge_id
+            && left.edge_kind == right.edge_kind
+    });
+    proofs.truncate(max_proofs.max(1));
+    obligation.carrier_edge_proofs = proofs;
+}
+
+fn record_obligation_edge_proofs_for_flow_requirement(
+    obligation: &mut PacketClaimObligationDto,
+    citations: &[&AgentCitationDto],
+    required_edge_kind: EdgeKind,
+    requirement: &FlowRequirement,
+    answer: &AgentAnswerDto,
+    max_proofs: usize,
+) {
+    let retained_carrier_node_ids = obligation
+        .carrier_node_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut proofs = citations
+        .iter()
+        .filter_map(|citation| {
+            citation_edge_proof_for_flow_requirement(
+                citation,
+                required_edge_kind,
+                requirement,
+                answer,
+            )
+        })
         .filter(|proof| retained_carrier_node_ids.contains(&proof.carrier_node_id))
         .collect::<Vec<_>>();
     proofs.sort_by(|left, right| {
@@ -4282,6 +4378,120 @@ mod tests {
             &truncated_budget,
         );
         assert_eq!(plan.claim_obligations[0].carrier_edge_proofs, receipt);
+    }
+
+    #[test]
+    fn client_request_obligations_protect_distinct_lawful_carriers_before_capping() {
+        let question = "Explain how an HTTP client session accepts a request, dispatches it through the session, and reaches a transport adapter.";
+        let mut request = citation("HttpClient.request", "src/client.rs", NodeKind::METHOD);
+        request.evidence_edge_ids = vec![EdgeId("request-call".to_string())];
+        let mut send = citation("HttpClient.send", "src/client.rs", NodeKind::METHOD);
+        send.evidence_edge_ids = vec![EdgeId("send-call".to_string())];
+        let adapter = citation(
+            "HttpTransportAdapter.send",
+            "src/transport.rs",
+            NodeKind::METHOD,
+        );
+        let prepared = citation("PreparedRequest.build", "src/model.rs", NodeKind::METHOD);
+        let mut carried_answer = answer(vec![
+            request.clone(),
+            send.clone(),
+            adapter.clone(),
+            prepared.clone(),
+        ]);
+        carried_answer.prompt = question.to_string();
+        carried_answer.graphs.push(GraphArtifactDto::Uml {
+            id: "client-request-flow".to_string(),
+            title: "Client request flow".to_string(),
+            graph: GraphResponse {
+                center_id: request.node_id.clone(),
+                nodes: Vec::new(),
+                edges: vec![
+                    GraphEdgeDto {
+                        id: EdgeId("request-call".to_string()),
+                        source: request.node_id.clone(),
+                        target: prepared.node_id,
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:request".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: EdgeId("send-call".to_string()),
+                        source: send.node_id.clone(),
+                        target: adapter.node_id.clone(),
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:send".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                ],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        });
+        let mut plan = build_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        plan.claim_obligations.retain(|obligation| {
+            matches!(
+                obligation.id.as_str(),
+                "request_entrypoint" | "request_dispatch" | "request_terminal"
+            )
+        });
+        plan.query_obligations.clear();
+        let material_ids = plan
+            .claim_obligations
+            .iter()
+            .filter(|obligation| obligation.material)
+            .map(|obligation| obligation.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            material_ids,
+            ["request_entrypoint", "request_dispatch", "request_terminal"]
+        );
+
+        let snapshot = capture_packet_obligation_edge_proofs_before_budget(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &plan,
+            &carried_answer,
+        );
+        assert_eq!(
+            protected_packet_obligation_carrier_node_ids(&snapshot),
+            &[request.node_id, send.node_id, adapter.node_id,]
+        );
+        assert_eq!(
+            protected_packet_obligation_edge_ids(&snapshot),
+            &[
+                EdgeId("request-call".to_string()),
+                EdgeId("send-call".to_string()),
+            ]
+        );
+
+        let mut wrong_target_answer = carried_answer.clone();
+        wrong_target_answer
+            .citations
+            .iter_mut()
+            .find(|citation| citation.display_name == "PreparedRequest.build")
+            .expect("request edge target")
+            .display_name = "PluginRegistry.registerPlugin".to_string();
+        let wrong_target_snapshot = capture_packet_obligation_edge_proofs_before_budget(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &plan,
+            &wrong_target_answer,
+        );
+        assert!(
+            !protected_packet_obligation_edge_ids(&wrong_target_snapshot)
+                .contains(&EdgeId("request-call".to_string())),
+            "matching carrier morphology cannot consume an unrelated outgoing call"
+        );
     }
 
     #[test]

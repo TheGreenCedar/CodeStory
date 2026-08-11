@@ -84,7 +84,8 @@ use crate::semantic_projection::{
     dense_anchor_reason_for_node_with_flow_neighbors, flow_neighbor_edge_is_eligible,
     retain_bounded_flow_neighbor_candidate, route_endpoint_is_parser_backed,
     semantic_component_key_for_path, semantic_doc_field_budgets,
-    semantic_graph_dependent_file_ids_by_seed, semantic_projection_source_policy_compatibility,
+    semantic_file_is_package_callable_surface, semantic_graph_dependent_file_ids_by_seed,
+    semantic_projection_source_policy_compatibility,
 };
 use crate::semantic_republish::semantic_projection_republish_for_runtime;
 use crate::snippets::bounded_direct_markdown_snippet;
@@ -725,6 +726,44 @@ fn dense_policy_skips_private_trivial_helpers() {
     );
 
     assert_eq!(reason, None);
+}
+
+#[test]
+fn package_callable_surfaces_accept_relative_roots_without_admitting_tests() {
+    for path in ["lib/application.js", "src/server.rs"] {
+        assert!(semantic_file_is_package_callable_surface(Some(path)));
+
+        let node = semantic_policy_node(11, NodeKind::FUNCTION, "handle", 1);
+        let context = semantic_policy_context(path, &node);
+        assert_eq!(
+            dense_anchor_reason_for_node(
+                &context,
+                &node,
+                "handle",
+                Some(path),
+                "semantic_doc_version: 9\nsymbol: handle\n",
+                Some(AccessKind::Private),
+            ),
+            Some(DenseAnchorReason::PublicApi),
+            "top-level package callable surface {path}"
+        );
+    }
+
+    let test_path = "test/lib/application.js";
+    let test_node = semantic_policy_node(12, NodeKind::FUNCTION, "handle", 1);
+    let test_context = semantic_policy_context(test_path, &test_node);
+    assert_eq!(
+        dense_anchor_reason_for_node(
+            &test_context,
+            &test_node,
+            "handle",
+            Some(test_path),
+            "semantic_doc_version: 9\nsymbol: handle\n",
+            Some(AccessKind::Private),
+        ),
+        None,
+        "a package-like segment cannot bypass the non-primary source policy"
+    );
 }
 
 #[test]

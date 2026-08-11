@@ -3,6 +3,7 @@
 use crate::packet_evidence_carriers::{
     SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS, SEARCH_EVIDENCE_OUTPUT_ACTIONS,
     citation_owns_buffer_read_write, citation_owns_buffer_storage,
+    citation_owns_client_request_dispatch, citation_owns_client_request_entrypoint,
     citation_owns_client_request_finalization, citation_owns_client_request_method,
     citation_owns_client_response_materialization, citation_owns_css_animation_entrypoint,
     citation_owns_css_animation_structure, citation_owns_css_structure,
@@ -14,14 +15,18 @@ use crate::packet_evidence_carriers::{
     citation_owns_log_handler_processing, citation_owns_log_record_creation,
     citation_owns_mapper_configuration, citation_owns_mapper_execution,
     citation_owns_search_evidence_classification, citation_owns_search_evidence_output,
-    citation_owns_shell_completion, citation_owns_shell_function_dispatch,
-    citation_owns_shell_installer_bootstrap, citation_owns_site_lifecycle,
-    citation_owns_site_terminal, citation_owns_string_blank_predicate,
-    citation_owns_string_empty_predicate, citation_owns_string_region_handoff,
-    flow_belongs_to_client_request, flow_belongs_to_command_dispatch,
-    flow_belongs_to_command_server, flow_belongs_to_event_loop, flow_belongs_to_indexing,
-    flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
-    flow_belongs_to_server_request, flow_belongs_to_sql_schema, flow_belongs_to_url_session,
+    citation_owns_server_request_dispatch, citation_owns_server_request_entrypoint,
+    citation_owns_server_response_terminal, citation_owns_shell_completion,
+    citation_owns_shell_function_dispatch, citation_owns_shell_installer_bootstrap,
+    citation_owns_site_lifecycle, citation_owns_site_terminal,
+    citation_owns_string_blank_predicate, citation_owns_string_empty_predicate,
+    citation_owns_string_region_handoff, client_request_dispatch_call_target,
+    client_request_entrypoint_call_target, flow_belongs_to_client_request,
+    flow_belongs_to_command_dispatch, flow_belongs_to_command_server, flow_belongs_to_event_loop,
+    flow_belongs_to_indexing, flow_belongs_to_network_input, flow_belongs_to_request_terminal,
+    flow_belongs_to_search, flow_belongs_to_server_request, flow_belongs_to_sql_schema,
+    flow_belongs_to_url_session, server_request_dispatch_call_target,
+    server_request_entrypoint_call_target, server_response_terminal_call_target,
 };
 use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
@@ -126,6 +131,14 @@ pub enum EvidencePredicate {
         subsystem: fn(&AgentCitationDto) -> bool,
         roles: &'static [PacketEvidenceRole],
     },
+    /// Preserve an established role-backed surface while admitting a structural carrier only when
+    /// its cited outgoing CALL reaches the next action at this exact flow boundary.
+    CitedRolesOrCallBoundary {
+        subsystem: fn(&AgentCitationDto) -> bool,
+        roles: &'static [PacketEvidenceRole],
+        carrier: fn(&AgentCitationDto) -> bool,
+        call_target: fn(&str) -> bool,
+    },
     /// Covered by a citation that passes a structural ownership check, used where the evidence
     /// role is too coarse to separate a requirement from its siblings. The carriers carry their own
     /// subsystem factor.
@@ -136,10 +149,14 @@ impl EvidencePredicate {
     pub fn citation_proves(self, citation: &AgentCitationDto) -> bool {
         match self {
             Self::CitedRoles { subsystem, roles } => {
-                subsystem(citation)
-                    && packet_evidence_role(citation).is_some_and(|role| roles.contains(&role))
-                    && role_survives_without_its_path(citation, roles)
+                citation_has_named_role(citation, subsystem, roles)
             }
+            Self::CitedRolesOrCallBoundary {
+                subsystem,
+                roles,
+                carrier,
+                ..
+            } => citation_has_named_role(citation, subsystem, roles) || carrier(citation),
             Self::CitedCarrier(carrier) => carrier(citation),
         }
     }
@@ -147,8 +164,9 @@ impl EvidencePredicate {
     /// Secondary node-kind policy for role-based predicates. Carrier predicates already encode
     /// their own structural contract and return an empty list to mean "predicate-owned".
     pub fn allowed_node_kinds(self) -> &'static [NodeKind] {
-        let Self::CitedRoles { roles, .. } = self else {
-            return &[];
+        let roles = match self {
+            Self::CitedRoles { roles, .. } | Self::CitedRolesOrCallBoundary { roles, .. } => roles,
+            Self::CitedCarrier(_) => return &[],
         };
         if roles.iter().any(|role| {
             matches!(
@@ -170,6 +188,42 @@ impl EvidencePredicate {
             CALLABLE_NODE_KINDS
         }
     }
+
+    /// Role-backed evidence can be evaluated from a citation alone. A call-boundary carrier is
+    /// only proof after packet finalization validates its exact outgoing edge and target.
+    pub fn citation_proves_without_call_boundary(self, citation: &AgentCitationDto) -> bool {
+        match self {
+            Self::CitedRoles { subsystem, roles }
+            | Self::CitedRolesOrCallBoundary {
+                subsystem, roles, ..
+            } => citation_has_named_role(citation, subsystem, roles),
+            Self::CitedCarrier(carrier) => carrier(citation),
+        }
+    }
+
+    pub fn call_boundary_target(self, citation: &AgentCitationDto) -> Option<fn(&str) -> bool> {
+        let Self::CitedRolesOrCallBoundary {
+            subsystem,
+            roles,
+            carrier,
+            call_target,
+        } = self
+        else {
+            return None;
+        };
+        (!citation_has_named_role(citation, subsystem, roles) && carrier(citation))
+            .then_some(call_target)
+    }
+}
+
+fn citation_has_named_role(
+    citation: &AgentCitationDto,
+    subsystem: fn(&AgentCitationDto) -> bool,
+    roles: &[PacketEvidenceRole],
+) -> bool {
+    subsystem(citation)
+        && packet_evidence_role(citation).is_some_and(|role| roles.contains(&role))
+        && role_survives_without_its_path(citation, roles)
 }
 
 /// Whether the citation still earns one of `roles` once its path is taken away.
@@ -507,12 +561,14 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Registration,
         query_seeds: &["request entrypoint", "route registration"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles {
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_server_request,
             roles: &[
                 PacketEvidenceRole::RouteHandling,
                 PacketEvidenceRole::AppServerRequestProtocol,
             ],
+            carrier: citation_owns_server_request_entrypoint,
+            call_target: server_request_entrypoint_call_target,
         },
     },
     FlowRequirement {
@@ -520,27 +576,31 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Dispatch,
         query_seeds: &["request dispatch", "handler dispatch"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles {
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_server_request,
             roles: &[
                 PacketEvidenceRole::RequestDispatch,
                 PacketEvidenceRole::CommandDispatch,
                 PacketEvidenceRole::RuntimeOrchestration,
             ],
+            carrier: citation_owns_server_request_dispatch,
+            call_target: server_request_dispatch_call_target,
         },
     },
     FlowRequirement {
         id: "request_terminal",
         role: FlowRole::TerminalBoundary,
         query_seeds: &["response finalization", "transport send"],
-        coverage_mode: CoverageMode::AllowsSourceRange,
-        evidence: EvidencePredicate::CitedRoles {
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_request_terminal,
             roles: &[
                 PacketEvidenceRole::TransportAdapter,
                 PacketEvidenceRole::EventOutputProcessing,
                 PacketEvidenceRole::BufferedIo,
             ],
+            carrier: citation_owns_server_response_terminal,
+            call_target: server_response_terminal_call_target,
         },
     },
 ];
@@ -551,12 +611,14 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["default instance", "request method", "request entrypoint"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles {
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_client_request,
             roles: &[
                 PacketEvidenceRole::ClientFactory,
                 PacketEvidenceRole::CommandEntrypoint,
             ],
+            carrier: citation_owns_client_request_entrypoint,
+            call_target: client_request_entrypoint_call_target,
         },
     },
     FlowRequirement {
@@ -564,9 +626,11 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Dispatch,
         query_seeds: &["request dispatch", "adapters", "transport adapter"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles {
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_client_request,
             roles: &[PacketEvidenceRole::RequestDispatch],
+            carrier: citation_owns_client_request_dispatch,
+            call_target: client_request_dispatch_call_target,
         },
     },
     FlowRequirement {
@@ -1445,6 +1509,7 @@ mod tests {
         "request_entrypoint | registration | RequiresResolvedSourceOrGraph",
         "request_interceptor_management | dispatch | RequiresResolvedSourceOrGraph",
         "request_terminal | terminal_boundary | AllowsSourceRange",
+        "request_terminal | terminal_boundary | RequiresResolvedSourceOrGraph",
         "search_dispatch | dispatch | RequiresResolvedSourceOrGraph",
         "search_evidence_classification | transform_or_validate | RequiresResolvedSourceOrGraph",
         "search_evidence_output | terminal_boundary | RequiresResolvedSourceOrGraph",
@@ -2518,6 +2583,7 @@ mod tests {
             "download",
             "completion",
             "prepare",
+            "prepared",
             "finalize",
             "materialize",
             "interceptor",
@@ -2628,8 +2694,17 @@ mod tests {
             "logs",
             "loggers",
             "handle",
+            "finalhandler",
             "add",
             "create",
+            "initialize",
+            "new",
+            "application",
+            "invoke",
+            "end",
+            "finish",
+            "res",
+            "reply",
             "push",
             "pop",
             "remove",
