@@ -1,4 +1,5 @@
 {
+  "canary_task_id": "python-requests-session-flow",
   "tasks": [
     {
       "id": "python-requests-session-flow",

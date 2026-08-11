@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { copyFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -147,7 +147,7 @@ function usage() {
   node scripts/codestory-agent-ab-benchmark.mjs --self-test
   node scripts/codestory-agent-ab-benchmark.mjs --reanalyze-dir target/agent-benchmark/<run-dir>
   node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite <suite> [--materialize-repos] [--repeats n]
-  node scripts/codestory-agent-ab-benchmark.mjs [--quick] [--repos names] [--arms names] [--task-suite name] [--task-ids ids] [--task-manifest path] [--include-local-repos] [--repeats n] [--runner codex] [--model model] [--sandbox mode] [--out-dir path] [--timeout-ms ms] [--prepare-codestory-cache] [--allow-failures] [--publishable]
+  node scripts/codestory-agent-ab-benchmark.mjs [--quick] [--repos names] [--arms names] [--task-suite name] [--task-ids ids] [--task-manifest path] [--include-local-repos] [--repeats n] [--runner codex] [--model model] [--sandbox mode] [--out-dir path] [--timeout-ms ms] [--prepare-codestory-cache] [--canary-task-id id] [--shard-count n --shard-index n] [--allow-failures] [--publishable]
 
 Options:
   --list          Print configured benchmark repositories or selected manifest tasks and exit.
@@ -187,7 +187,17 @@ Options:
   --no-prepare-codestory-cache
                   Unsupported; retrieval preparation is mandatory.
   --prepare-codestory-jobs
-                  Parallel jobs for CodeStory cache preparation across independent repos. Default: 1.
+                  Parallel jobs for CodeStory cache preparation across independent repos. Default: 2.
+  --canary-task-id
+                  Task to prepare and run first as a real with-CodeStory repeat-1 row. A manifest can declare canary_task_id.
+  --shard-count   Number of deterministic whole-task shards. Default: 1.
+  --shard-index   Zero-based shard index. Default: 0.
+  --aggregate-shards
+                  Comma-separated completed shard directories to validate and aggregate without running agents.
+  --candidate-package-sha256
+                  SHA-256 of the exact installed candidate archive; required for publishable multi-host shards.
+  --collect-all-failures
+                  Diagnostic mode only. Continue after deterministic row failures; incompatible with --publishable.
   --prepare-codestory-timeout-ms
                   Timeout for each pre-run CodeStory index refresh. Default: 1800000.
   --max-source-reads-after-packet
@@ -248,6 +258,12 @@ function parseArgs(argv) {
       "no-prepare-codestory-cache": { type: "boolean" },
       "prepare-codestory-timeout-ms": { type: "string" },
       "prepare-codestory-jobs": { type: "string" },
+      "canary-task-id": { type: "string" },
+      "shard-count": { type: "string" },
+      "shard-index": { type: "string" },
+      "aggregate-shards": { type: "string" },
+      "candidate-package-sha256": { type: "string" },
+      "collect-all-failures": { type: "boolean" },
       "max-source-reads-after-packet": { type: "string" },
     },
   });
@@ -277,11 +293,18 @@ function parseArgs(argv) {
     jobs: 1,
     reuseBaselineFrom: null,
     prepareCodestoryCache: null,
-    prepareCodestoryJobs: 1,
+    prepareCodestoryJobs: 2,
     prepareCodestoryTimeoutMs: 1_800_000,
     cachePreparationByRepo: null,
     maxSourceReadsAfterPacket: null,
     diagnosticExtraProbesFromManifest: false,
+    canaryTaskId: null,
+    manifestCanaryTaskId: null,
+    shardCount: 1,
+    shardIndex: 0,
+    aggregateShards: null,
+    candidatePackageSha256: null,
+    collectAllFailures: false,
     allowFailures: false,
     publishable: false,
   };
@@ -300,6 +323,14 @@ function parseArgs(argv) {
   opts.publishable = values.publishable === true;
   opts.allowFailures = values["allow-failures"] === true;
   opts.diagnosticExtraProbesFromManifest = values["diagnostic-extra-probes-from-manifest"] === true;
+  opts.canaryTaskId = values["canary-task-id"] ?? null;
+  opts.shardCount = values["shard-count"] == null ? 1 : Number.parseInt(values["shard-count"], 10);
+  opts.shardIndex = values["shard-index"] == null ? 0 : Number.parseInt(values["shard-index"], 10);
+  opts.aggregateShards = values["aggregate-shards"]
+    ? commaSeparatedList(values["aggregate-shards"]).map((entry) => path.resolve(entry))
+    : null;
+  opts.candidatePackageSha256 = values["candidate-package-sha256"] ?? null;
+  opts.collectAllFailures = values["collect-all-failures"] === true;
   opts.includeLocalRepos = values["include-local-repos"] === true;
   opts.materializeRepos = values["materialize-repos"] === true;
   opts.packetRuntime = values["packet-runtime"] === true;
@@ -375,6 +406,24 @@ function parseArgs(argv) {
   }
   if (!Number.isInteger(opts.prepareCodestoryJobs) || opts.prepareCodestoryJobs < 1) {
     throw new Error("--prepare-codestory-jobs must be a positive integer");
+  }
+  if (!Number.isInteger(opts.shardCount) || opts.shardCount < 1) {
+    throw new Error("--shard-count must be a positive integer");
+  }
+  if (!Number.isInteger(opts.shardIndex) || opts.shardIndex < 0 || opts.shardIndex >= opts.shardCount) {
+    throw new Error("--shard-index must be zero-based and smaller than --shard-count");
+  }
+  if (opts.publishable && opts.collectAllFailures) {
+    throw new Error("--collect-all-failures is diagnostic-only and cannot be combined with --publishable");
+  }
+  if (opts.candidatePackageSha256 != null) {
+    opts.candidatePackageSha256 = normalizeSha256(
+      opts.candidatePackageSha256,
+      "--candidate-package-sha256",
+    );
+  }
+  if (opts.publishable && opts.shardCount > 1 && !opts.candidatePackageSha256) {
+    throw new Error("publishable multi-host shards require --candidate-package-sha256");
   }
   if (!["read-only", "workspace-write", "danger-full-access"].includes(opts.sandbox)) {
     throw new Error("--sandbox must be one of: read-only, workspace-write, danger-full-access");
@@ -913,18 +962,38 @@ async function loadTasks(opts) {
   }
 
   const tasks = [];
+  let manifestCanaryTaskId = null;
   for (const filePath of await listManifestFiles(manifestPath)) {
     const raw = await loadJsonFile(filePath);
+    const declaredCanary = !Array.isArray(raw)
+      ? String(raw?.canary_task_id ?? raw?.canaryTaskId ?? "").trim()
+      : "";
     const rows = Array.isArray(raw.tasks) ? raw.tasks : Array.isArray(raw) ? raw : [raw];
+    let selectedRows = 0;
     for (const row of rows) {
       const task = normalizeManifestTask(filePath, row, opts);
       if (!opts.taskSuite || task.suite === opts.taskSuite || row.suite === opts.taskSuite) {
         tasks.push(task);
+        selectedRows += 1;
       }
+    }
+    if (declaredCanary && selectedRows > 0) {
+      validateManifestTaskId(filePath, declaredCanary);
+      if (manifestCanaryTaskId && manifestCanaryTaskId !== declaredCanary) {
+        throw new Error(
+          `Task manifests declare conflicting canary_task_id values: ${manifestCanaryTaskId}, ${declaredCanary}`,
+        );
+      }
+      manifestCanaryTaskId = declaredCanary;
     }
   }
   if (!tasks.length) {
     throw new Error(`Task manifest path contained no tasks: ${manifestPath}`);
+  }
+  opts.manifestCanaryTaskId = manifestCanaryTaskId;
+  opts.canaryTaskId ??= manifestCanaryTaskId;
+  if (opts.canaryTaskId && !tasks.some((task) => task.id === opts.canaryTaskId)) {
+    throw new Error(`Canary task '${opts.canaryTaskId}' was not found in the selected task manifest`);
   }
   if (opts.taskIds?.length) {
     const wanted = new Set(opts.taskIds);
@@ -937,6 +1006,18 @@ async function loadTasks(opts) {
     return filtered;
   }
   return tasks;
+}
+
+function taskShardIndex(taskId, shardCount) {
+  if (!Number.isInteger(shardCount) || shardCount < 1) {
+    throw new Error("shardCount must be a positive integer");
+  }
+  const prefix = createHash("sha256").update(String(taskId)).digest("hex").slice(0, 12);
+  return Number.parseInt(prefix, 16) % shardCount;
+}
+
+function tasksForShard(tasks, shardCount, shardIndex) {
+  return tasks.filter((task) => taskShardIndex(task.id, shardCount) === shardIndex);
 }
 
 function sortedUniqueStrings(values, label) {
@@ -1189,6 +1270,43 @@ async function parallelMap(items, jobs, mapper) {
     }),
   );
   return results;
+}
+
+function createAsyncQueue() {
+  const values = [];
+  const waiters = [];
+  let closed = false;
+  return {
+    push(value) {
+      if (closed) {
+        throw new Error("cannot push to a closed queue");
+      }
+      const waiter = waiters.shift();
+      if (waiter) {
+        waiter(value);
+      } else {
+        values.push(value);
+      }
+    },
+    async shift() {
+      if (values.length) {
+        return values.shift();
+      }
+      if (closed) {
+        return null;
+      }
+      return await new Promise((resolve) => waiters.push(resolve));
+    },
+    close() {
+      closed = true;
+      while (waiters.length) {
+        waiters.shift()(null);
+      }
+    },
+    remaining() {
+      return [...values];
+    },
+  };
 }
 
 function terminateProcess(child, signal, options = {}) {
@@ -3126,6 +3244,86 @@ async function runBaselinePrelude(opts, run, repoConfig, outDir, runId) {
   };
 }
 
+function packetGraphEdgeOccurrences(packet) {
+  return (packet?.answer?.graphs ?? []).reduce(
+    (count, artifact) => count + (Array.isArray(artifact?.graph?.edges) ? artifact.graph.edges.length : 0),
+    0,
+  );
+}
+
+function packetFollowUpCount(packet) {
+  const invocations = packet?.sufficiency?.follow_up_invocations;
+  if (Array.isArray(invocations)) {
+    return invocations.length;
+  }
+  return Array.isArray(packet?.sufficiency?.follow_up_commands)
+    ? packet.sufficiency.follow_up_commands.length
+    : 0;
+}
+
+function packetPreludeContractBlockers(packet, stdout, options = {}) {
+  if (!packet || typeof packet !== "object") {
+    return ["packet JSON is missing"];
+  }
+  const blockers = [];
+  const limits = packet.budget?.limits ?? {};
+  const used = packet.budget?.used ?? {};
+  const actualStdoutBytes = Buffer.byteLength(String(stdout ?? ""), "utf8");
+  const citationCount = Array.isArray(packet.answer?.citations)
+    ? packet.answer.citations.length
+    : 0;
+  const graphEdgeOccurrences = packetGraphEdgeOccurrences(packet);
+  const boundedCounters = [
+    ["anchors", used.anchors, limits.max_anchors],
+    ["files", used.files, limits.max_files],
+    ["snippets", used.snippets, limits.max_snippets],
+    ["trail_edges", used.trail_edges, limits.max_trail_edges],
+    ["output_bytes", used.output_bytes, limits.max_output_bytes],
+  ];
+  for (const [name, observed, maximum] of boundedCounters) {
+    if (!Number.isInteger(observed) || observed < 0) {
+      blockers.push(`budget.used.${name} is missing or invalid`);
+    }
+    if (!Number.isInteger(maximum) || maximum < 0) {
+      blockers.push(`budget.limits.max_${name} is missing or invalid`);
+    }
+    if (Number.isInteger(observed) && Number.isInteger(maximum) && observed > maximum) {
+      blockers.push(`budget.used.${name}=${observed} exceeds ${maximum}`);
+    }
+  }
+  if (used.output_bytes !== actualStdoutBytes) {
+    blockers.push(
+      `budget.used.output_bytes=${used.output_bytes ?? "missing"} does not match CLI stdout bytes=${actualStdoutBytes}`,
+    );
+  }
+  if (used.anchors !== citationCount) {
+    blockers.push(
+      `budget.used.anchors=${used.anchors ?? "missing"} does not match citation count=${citationCount}`,
+    );
+  }
+  if (used.trail_edges !== graphEdgeOccurrences) {
+    blockers.push(
+      `budget.used.trail_edges=${used.trail_edges ?? "missing"} does not match serialized graph edges=${graphEdgeOccurrences}`,
+    );
+  }
+  if (options.requireSufficient) {
+    if (packet.sufficiency?.status !== "sufficient") {
+      blockers.push(`packet sufficiency=${packet.sufficiency?.status ?? "missing"}; expected sufficient`);
+    }
+    const followUpCount = packetFollowUpCount(packet);
+    if (followUpCount !== 0) {
+      blockers.push(`packet follow-ups=${followUpCount}; expected 0`);
+    }
+    const materialGaps = packet.sufficiency?.coverage_report?.claim_obligations?.filter(
+      (obligation) => obligation?.material === true && obligation?.status !== "proven",
+    ) ?? [];
+    if (materialGaps.length) {
+      blockers.push(`packet material gaps=${materialGaps.length}; expected 0`);
+    }
+  }
+  return blockers;
+}
+
 async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, codestoryCli, env) {
   const args = packetCommandArgs(repoConfig, run.task, opts);
   const extraProbes = packetCommandExtraProbes(run.task, opts);
@@ -3153,14 +3351,22 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     }
   }
   const manifestQuality = packetManifestQualitySummary(packet, run.task);
+  const contractBlockers = parseError
+    ? [`packet JSON parse failed: ${parseError}`]
+    : packetPreludeContractBlockers(packet, result.stdout, {
+        requireSufficient: opts.publishable,
+      });
+  if (opts.publishable && manifestQuality && !manifestQuality.pass) {
+    contractBlockers.push("packet manifest quality failed");
+  }
   const publicPrelude = preludePublicFields({
     command,
     args,
-    status: result.status === "pass" && !parseError ? "pass" : "fail",
+    status: result.status === "pass" && !parseError && !contractBlockers.length ? "pass" : "fail",
     process_status: result.status,
     exit_code: result.exitCode,
     signal: result.signal,
-    error: result.error ?? parseError,
+    error: result.error ?? parseError ?? contractBlockers[0] ?? null,
     wall_ms: wallMs,
     stdout_path: stdoutPath,
     stderr_path: stderrPath,
@@ -3179,6 +3385,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     packet_contract_runtime: packet?._meta?.codestory_publication?.contract_runtime ?? null,
     packet_extra_probe_count: extraProbes.length,
     packet_extra_probe_strategy: packetExtraProbeStrategy(extraProbes),
+    packet_contract_blockers: contractBlockers,
   });
   return {
     public: publicPrelude,
@@ -3326,6 +3533,9 @@ async function runOne(opts, run, outDir) {
     task_manifest_snapshot: taskSnapshotForResult(run.task),
     arm: run.arm,
     repeat: run.repeat,
+    canary: run.canary === true,
+    preparation_overlap: run.preparation_overlap === true,
+    comparative_wall_time_eligible: run.comparative_wall_time_eligible !== false,
     runner: opts.runner,
     model: opts.model,
     sandbox: opts.sandbox,
@@ -3572,6 +3782,48 @@ function compactCachePreparation(preparation) {
     after_semantic_ready: preparation.after?.semantic_ready ?? null,
     before_semantic_doc_count: preparation.before?.semantic_doc_count ?? null,
     after_semantic_doc_count: preparation.after?.semantic_doc_count ?? null,
+  };
+}
+
+function cachePreparationCanaryBlockers(preparation, env = process.env) {
+  const blockers = [];
+  if (!preparation) {
+    return ["canary cache preparation is missing"];
+  }
+  const retrieval = preparation.retrieval_status ?? {};
+  if (preparation.retrieval_index_status !== "pass") {
+    blockers.push(`retrieval preparation status=${preparation.retrieval_index_status ?? "missing"}`);
+  }
+  if (retrieval.retrieval_mode !== "full") {
+    blockers.push(`retrieval mode=${retrieval.retrieval_mode ?? "missing"}; expected full`);
+  }
+  if (retrieval.embedding_policy !== "accelerated") {
+    blockers.push(`embedding policy=${retrieval.embedding_policy ?? "missing"}; expected accelerated`);
+  }
+  if (retrieval.embedding_accelerator_execution_verified !== true) {
+    blockers.push("accelerator execution was not verified");
+  }
+  if (!retrieval.embedding_backend) {
+    blockers.push("accelerator backend identity is missing");
+  }
+  if (!retrieval.embedding_engine_instance_id) {
+    blockers.push("embedding engine instance identity is missing");
+  }
+  if (String(env.CODESTORY_EMBED_ALLOW_CPU ?? "0") !== "0") {
+    blockers.push("CPU embeddings are enabled");
+  }
+  return blockers;
+}
+
+function benchmarkHostClass(cachePreparation) {
+  const retrieval = cachePreparation?.retrieval_status ?? {};
+  return {
+    platform: process.platform,
+    arch: process.arch,
+    accelerator_backend: retrieval.embedding_backend ?? null,
+    accelerator_adapter: retrieval.embedding_adapter ?? null,
+    embedding_policy: retrieval.embedding_policy ?? null,
+    model_sha256: retrieval.embedding_model_sha256 ?? null,
   };
 }
 
@@ -3852,6 +4104,25 @@ function eventTypeCounts(events) {
 
 async function writeJsonlRows(filePath, rows) {
   await writeFile(filePath, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "utf8");
+}
+
+async function createDurableJsonlAppender(filePath) {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const handle = await open(filePath, "a");
+  let pending = Promise.resolve();
+  return {
+    append(row) {
+      pending = pending.then(async () => {
+        await handle.write(`${JSON.stringify(row)}\n`, null, "utf8");
+        await handle.sync();
+      });
+      return pending;
+    },
+    async close() {
+      await pending;
+      await handle.close();
+    },
+  };
 }
 
 async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
@@ -5851,6 +6122,9 @@ function resourceAccountingForResult(result) {
 
 function summarizeArmCostAccounting(rows) {
   const successful = rows.filter((row) => row.status === "pass");
+  const latencyEligible = successful.filter(
+    (row) => row.comparative_wall_time_eligible !== false,
+  );
   const wallMs = sumFinite(rows.map((row) => row.wall_ms));
   const agentRunnerWallMs = sumFinite(
     rows.map((row) => row.agent_runner_wall_ms ?? row.wall_ms),
@@ -5867,6 +6141,8 @@ function summarizeArmCostAccounting(rows) {
   return {
     runs: rows.length,
     successful_runs: successful.length,
+    comparative_wall_time_eligible_runs: latencyEligible.length,
+    comparative_wall_time_eligible: latencyEligible.length === successful.length,
     failed_runs: rows.filter((row) => row.status === "fail").length,
     timeout_runs: rows.filter((row) => row.status === "timeout").length,
     missing_token_usage_runs: rows.filter((row) => row.usage?.total_tokens == null).length,
@@ -5954,14 +6230,22 @@ function summarizeCostAccounting(results) {
   const withVsWithout =
     withCodeStory && withoutCodeStory
       ? {
-          runner_wall_ms: accountingComparison(
-            withCodeStory.time_spent_ms.runner_wall,
-            withoutCodeStory.time_spent_ms.runner_wall,
-          ),
-          all_in_wall_ms: accountingComparison(
-            withCodeStory.time_spent_ms.all_in,
-            withoutCodeStory.time_spent_ms.all_in,
-          ),
+          runner_wall_ms:
+            withCodeStory.comparative_wall_time_eligible &&
+            withoutCodeStory.comparative_wall_time_eligible
+              ? accountingComparison(
+                  withCodeStory.time_spent_ms.runner_wall,
+                  withoutCodeStory.time_spent_ms.runner_wall,
+                )
+              : null,
+          all_in_wall_ms:
+            withCodeStory.comparative_wall_time_eligible &&
+            withoutCodeStory.comparative_wall_time_eligible
+              ? accountingComparison(
+                  withCodeStory.time_spent_ms.all_in,
+                  withoutCodeStory.time_spent_ms.all_in,
+                )
+              : null,
           total_tokens: accountingComparison(
             withCodeStory.tokens_spent.total_tokens,
             withoutCodeStory.tokens_spent.total_tokens,
@@ -6013,6 +6297,9 @@ function summarizeRuns(results) {
   for (const [key, rows] of groups) {
     const [repo, taskId, arm] = key.split("\t");
     const successful = rows.filter((row) => row.status === "pass");
+    const latencyEligible = successful.filter(
+      (row) => row.comparative_wall_time_eligible !== false,
+    );
     const qualityRows = successful.filter((row) => row.quality);
     const packetFirstRows = successful.filter((row) => row.packet_first_required);
     const packetManifestRows = successful.filter(
@@ -6042,6 +6329,7 @@ function summarizeRuns(results) {
       arm,
       runs: rows.length,
       successful_runs: successful.length,
+      comparative_wall_time_eligible_runs: latencyEligible.length,
       packet_first_pass_runs: packetFirstRows.filter((row) => row.packet_first_pass).length,
       packet_first_required_runs: packetFirstRows.length,
       packet_manifest_quality_pass_runs: packetManifestRows.filter(
@@ -6070,7 +6358,8 @@ function summarizeRuns(results) {
         successful.map((row) => row.transcript_analysis?.direct_source_reads_total),
       ),
       missing_token_usage_runs: successful.filter((row) => row.usage?.total_tokens == null).length,
-      median_wall_ms: median(successful.map((row) => row.wall_ms)),
+      median_wall_ms: median(latencyEligible.map((row) => row.wall_ms)),
+      observed_median_wall_ms: median(successful.map((row) => row.wall_ms)),
       median_codestory_cache_preparation_wall_ms: median(
         successful.map((row) => cachePreparationWallMs(row.codestory_cache_provenance?.cache_preparation)),
       ),
@@ -6912,6 +7201,22 @@ function agentRunKey(run) {
   return [run.repo, taskId, run.arm, String(run.repeat)].join("\t");
 }
 
+function sortAgentResultsCanonical(results, tasks, arms) {
+  const taskOrder = new Map(tasks.map((task, index) => [task.id, index]));
+  const armOrder = new Map(arms.map((arm, index) => [arm, index]));
+  return [...results].sort((left, right) => {
+    const leftTask = taskOrder.get(left.task_id) ?? Number.MAX_SAFE_INTEGER;
+    const rightTask = taskOrder.get(right.task_id) ?? Number.MAX_SAFE_INTEGER;
+    return (
+      leftTask - rightTask ||
+      (armOrder.get(left.arm) ?? Number.MAX_SAFE_INTEGER) -
+        (armOrder.get(right.arm) ?? Number.MAX_SAFE_INTEGER) ||
+      left.repeat - right.repeat ||
+      String(left.repo).localeCompare(String(right.repo))
+    );
+  });
+}
+
 function agentRunIsolationGroupKey(run) {
   return run.repo;
 }
@@ -7091,29 +7396,245 @@ async function runPlannedAgentRun(opts, run, outDir, reusableBaselines) {
   return await runOne(opts, run, outDir);
 }
 
-async function runPlannedAgentRuns(opts, plannedRuns, reusableBaselines, outDir) {
-  const runsPath = path.join(outDir, "runs.jsonl");
-  if (opts.jobs <= 1 || plannedRuns.length <= 1) {
-    const results = [];
-    for (const run of plannedRuns) {
-      results.push(await runPlannedAgentRun(opts, run, outDir, reusableBaselines));
-      await writeJsonlRows(runsPath, results);
+function deterministicAgentRunFailure(result, opts) {
+  const blockers = opts.publishable
+    ? agentPublishableBlockers([result], opts)
+    : result.status === "pass"
+      ? []
+      : [{ result, category: "product", reasons: [`status=${result.status}`] }];
+  return blockers.length
+    ? {
+        benchmark_run_id: result.benchmark_run_id,
+        repo: result.repo,
+        task_id: result.task_id,
+        arm: result.arm,
+        repeat: result.repeat,
+        blockers: blockers.map(({ category, reasons }) => ({ category, reasons })),
+      }
+    : null;
+}
+
+async function runPlannedAgentRuns(
+  opts,
+  plannedRuns,
+  reusableBaselines,
+  outDir,
+  options = {},
+) {
+  let stopScheduling = false;
+  let firstFailure = null;
+  const results = [];
+  const record = async (result) => {
+    results.push(result);
+    await options.onResult?.(result);
+    const failure = deterministicAgentRunFailure(result, opts);
+    if (failure && !firstFailure) {
+      firstFailure = failure;
+      await options.onFirstFailure?.(failure);
+      if (options.failFast) {
+        stopScheduling = true;
+      }
     }
-    return results;
+  };
+  if (opts.jobs <= 1 || plannedRuns.length <= 1) {
+    for (const run of plannedRuns) {
+      if (stopScheduling || options.shouldSchedule?.(run) === false) {
+        break;
+      }
+      await record(
+        await runPlannedAgentRun(
+          opts,
+          options.decorateRun?.(run) ?? run,
+          outDir,
+          reusableBaselines,
+        ),
+      );
+    }
+    return { results, firstFailure };
   }
 
   const groups = groupPlannedAgentRuns(plannedRuns);
   console.log(`running ${plannedRuns.length} planned agent rows across ${groups.length} repo groups with --jobs ${opts.jobs}`);
-  const groupedResults = await parallelMap(groups, opts.jobs, async (group) => {
-    const rows = [];
+  await parallelMap(groups, opts.jobs, async (group) => {
     for (const run of group.runs) {
-      rows.push(await runPlannedAgentRun(opts, run, outDir, reusableBaselines));
+      if (stopScheduling || options.shouldSchedule?.(run) === false) {
+        break;
+      }
+      await record(
+        await runPlannedAgentRun(
+          opts,
+          options.decorateRun?.(run) ?? run,
+          outDir,
+          reusableBaselines,
+        ),
+      );
     }
-    return rows;
   });
-  const results = groupedResults.flat();
-  await writeJsonlRows(runsPath, results);
-  return results;
+  return { results, firstFailure };
+}
+
+function stableJsonForHash(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJsonForHash).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJsonForHash(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function benchmarkShardAttestation(opts, allTasks, cachePreparation) {
+  const sourceCommit = await gitOutput(["-C", repoRoot, "rev-parse", "HEAD"], repoRoot);
+  const sourceTree = await gitOutput(["-C", repoRoot, "rev-parse", "HEAD^{tree}"], repoRoot);
+  let cliSha256 = null;
+  if (opts.arms.includes("with_codestory")) {
+    const cli = resolveCodeStoryCli(opts);
+    if (path.isAbsolute(cli) && existsSync(cli) && statSync(cli).isFile()) {
+      cliSha256 = sha256Bytes(await readFile(cli));
+    }
+  }
+  const manifestContract = allTasks.map(taskSnapshotForResult);
+  const flags = {
+    arms: opts.arms,
+    repeats: opts.repeats,
+    runner: opts.runner,
+    model: opts.model,
+    sandbox: opts.sandbox,
+    task_suite: opts.taskSuite,
+    max_source_reads_after_packet: opts.maxSourceReadsAfterPacket,
+    publishable: opts.publishable,
+  };
+  return {
+    contract: "codestory.agent-benchmark-shard/v1",
+    source_commit: sourceCommit,
+    source_tree: sourceTree,
+    cli_sha256: cliSha256,
+    package_sha256: opts.candidatePackageSha256,
+    manifest_sha256: sha256Bytes(stableJsonForHash(manifestContract)),
+    flags_sha256: sha256Bytes(stableJsonForHash(flags)),
+    model_sha256:
+      cachePreparation.find((row) => row.retrieval_status?.embedding_model_sha256)
+        ?.retrieval_status?.embedding_model_sha256 ?? null,
+    host_class: benchmarkHostClass(cachePreparation[0] ?? null),
+  };
+}
+
+async function readJsonlRows(filePath) {
+  return (await readFile(filePath, "utf8"))
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+async function aggregateShardRuns(opts, allTasks) {
+  if (!opts.aggregateShards?.length) {
+    throw new Error("aggregateShardRuns requires at least one shard directory");
+  }
+  const shards = [];
+  for (const directory of opts.aggregateShards) {
+    const summaryPath = path.join(directory, "summary.json");
+    const runsPath = path.join(directory, "runs.jsonl");
+    if (!existsSync(summaryPath) || !existsSync(runsPath)) {
+      throw new Error(`Shard is missing summary.json or runs.jsonl: ${directory}`);
+    }
+    shards.push({
+      directory,
+      summary: JSON.parse(await readFile(summaryPath, "utf8")),
+      rows: await readJsonlRows(runsPath),
+    });
+  }
+  const shardCount = shards[0].summary?.shard?.count;
+  if (!Number.isInteger(shardCount) || shardCount < 1 || shards.length !== shardCount) {
+    throw new Error(`Expected exactly ${shardCount ?? "unknown"} shard directories, found ${shards.length}`);
+  }
+  const indices = new Set();
+  const attestationReference = shards[0].summary?.shard?.attestation;
+  if (!attestationReference) {
+    throw new Error("Shard summary is missing its attestation");
+  }
+  for (const field of [
+    "source_commit",
+    "source_tree",
+    "cli_sha256",
+    "package_sha256",
+    "manifest_sha256",
+    "model_sha256",
+    "flags_sha256",
+  ]) {
+    if (!attestationReference[field]) {
+      throw new Error(`Shard attestation is missing ${field}`);
+    }
+  }
+  const commonAttestation = ({ host_class: _hostClass, ...common }) => common;
+  for (const shard of shards) {
+    const index = shard.summary?.shard?.index;
+    if (!Number.isInteger(index) || index < 0 || index >= shardCount || indices.has(index)) {
+      throw new Error(`Invalid or duplicate shard index: ${index}`);
+    }
+    indices.add(index);
+    const attestation = shard.summary?.shard?.attestation;
+    if (
+      stableJsonForHash(commonAttestation(attestation ?? {})) !==
+      stableJsonForHash(commonAttestation(attestationReference))
+    ) {
+      throw new Error(`Shard ${index} candidate or benchmark attestation does not match`);
+    }
+    for (const row of shard.rows) {
+      if (taskShardIndex(row.task_id, shardCount) !== index) {
+        throw new Error(`Row ${agentRunKey(row)} is recorded on the wrong shard`);
+      }
+    }
+  }
+  const rows = shards.flatMap((shard) => shard.rows);
+  const byKey = new Map();
+  for (const row of rows) {
+    const key = agentRunKey(row);
+    if (byKey.has(key)) {
+      throw new Error(`Duplicate benchmark row across shards: ${key}`);
+    }
+    byKey.set(key, row);
+  }
+  const expectedRuns = planAgentRuns(opts, allTasks);
+  const missing = expectedRuns.filter((run) => !byKey.has(agentRunKey(run)));
+  if (missing.length || rows.length !== expectedRuns.length) {
+    throw new Error(
+      `Shard aggregation is incomplete: expected ${expectedRuns.length}, found ${rows.length}, missing ${missing.length}`,
+    );
+  }
+  const canonicalRows = sortAgentResultsCanonical(rows, allTasks, opts.arms);
+  const hostClasses = new Set(
+    shards.map((shard) => stableJsonForHash(shard.summary.shard.attestation.host_class)),
+  );
+  const outDir = path.resolve(
+    opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", `aggregate-${Date.now()}`),
+  );
+  await mkdir(outDir, { recursive: true });
+  await writeJsonlRows(path.join(outDir, "runs.jsonl"), canonicalRows);
+  await writeFile(
+    path.join(outDir, "summary.json"),
+    `${JSON.stringify(
+      {
+        generated_at: new Date().toISOString(),
+        aggregate: true,
+        shard_count: shardCount,
+        source_attestation: commonAttestation(attestationReference),
+        latency_pooling_eligible: hostClasses.size === 1,
+        latency_host_classes: [...hostClasses].map((entry) => JSON.parse(entry)),
+        expected_rows: expectedRuns.length,
+        completed_rows: canonicalRows.length,
+        summary: summarizeRuns(canonicalRows),
+        cost_accounting: summarizeCostAccounting(canonicalRows),
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  console.log(`wrote ${outDir}`);
 }
 
 async function main() {
@@ -7126,16 +7647,27 @@ async function main() {
     await reanalyzeAgentRunDirectory(opts);
     return;
   }
-  const tasks = await loadTasks(opts);
-  opts.releaseEvidenceCorpusContract = await loadReleaseEvidenceCorpusContract(tasks, opts);
-  if (opts.publishable) {
-    validatePublishableShape(opts, tasks);
+  const allTasks = await loadTasks(opts);
+  opts.releaseEvidenceCorpusContract = await loadReleaseEvidenceCorpusContract(allTasks, opts);
+  if (opts.aggregateShards) {
+    await aggregateShardRuns(opts, allTasks);
+    return;
   }
-  if (opts.materializeRepos) {
-    assertManifestRepoMaterializationAllowed(tasks, opts);
-    await materializeRepos(tasks, opts);
+  let tasks = allTasks;
+  if (tasks.length && opts.shardCount > 1) {
+    tasks = tasksForShard(tasks, opts.shardCount, opts.shardIndex);
+    if (!tasks.length) {
+      throw new Error(`Shard ${opts.shardIndex}/${opts.shardCount} owns no selected tasks`);
+    }
+  }
+  if (opts.publishable) {
+    validatePublishableShape(opts, allTasks);
   }
   if (opts.list) {
+    if (opts.materializeRepos) {
+      assertManifestRepoMaterializationAllowed(tasks, opts);
+      await materializeRepos(tasks, opts);
+    }
     if (tasks.length) {
       for (const task of tasks) {
         const config = ALL_REPOS[task.repo];
@@ -7153,6 +7685,10 @@ async function main() {
   }
 
   if (opts.packetRuntime) {
+    if (opts.materializeRepos) {
+      assertManifestRepoMaterializationAllowed(tasks, opts);
+      await materializeRepos(tasks, opts);
+    }
     await runPacketRuntimeBenchmark(opts, tasks);
     return;
   }
@@ -7170,11 +7706,227 @@ async function main() {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = path.resolve(opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", timestamp));
   await mkdir(outDir, { recursive: true });
+  const runsPath = path.join(outDir, "runs.jsonl");
+  if (existsSync(runsPath)) {
+    throw new Error(`Refusing to append a new benchmark to an existing ledger: ${runsPath}`);
+  }
+  const ledger = await createDurableJsonlAppender(runsPath);
   const reusableBaselines = await loadReusableBaselines(opts, plannedRuns, outDir);
-  const cachePreparation = opts.prepareCodestoryCache
-    ? await prepareCodeStoryCaches(opts, tasks)
-    : [];
-  opts.cachePreparationByRepo = new Map(cachePreparation.map((row) => [row.repo, row]));
+  const cachePreparation = [];
+  opts.cachePreparationByRepo = new Map();
+  const results = [];
+  let firstFailure = null;
+  let agentCodexIsolation = null;
+  const rememberFirstFailure = async (failure) => {
+    if (firstFailure) {
+      return;
+    }
+    firstFailure = {
+      recorded_at: new Date().toISOString(),
+      ...failure,
+    };
+    await writeFile(
+      path.join(outDir, "first-failure.json"),
+      `${JSON.stringify(firstFailure, null, 2)}\n`,
+      "utf8",
+    );
+  };
+  const runBatch = async (batchOpts, runs, options = {}) => {
+    if (!runs.length) {
+      return { results: [], firstFailure: null };
+    }
+    const outcome = await runPlannedAgentRuns(
+      batchOpts,
+      runs,
+      reusableBaselines,
+      outDir,
+      {
+        ...options,
+        onResult: async (result) => {
+          await ledger.append(result);
+          await options.onResult?.(result);
+        },
+        onFirstFailure: async (failure) => {
+          await rememberFirstFailure(failure);
+          await options.onFirstFailure?.(failure);
+        },
+      },
+    );
+    results.push(...outcome.results);
+    return outcome;
+  };
+
+  try {
+    const hasCodeStoryArm = opts.arms.includes("with_codestory");
+    const declaredCanary = opts.canaryTaskId ?? opts.manifestCanaryTaskId;
+    const canaryTask = hasCodeStoryArm && tasks.length
+      ? tasks.find((task) => task.id === declaredCanary) ?? tasks[0]
+      : null;
+    const taskGroups = [...groupTasksByRepo(tasks)].map(([repo, repoTasks]) => ({
+      repo,
+      tasks: repoTasks,
+    }));
+    const canaryGroup = canaryTask
+      ? taskGroups.find((group) => group.repo === canaryTask.repo)
+      : null;
+
+    if (opts.materializeRepos && canaryGroup) {
+      assertManifestRepoMaterializationAllowed(canaryGroup.tasks, opts);
+      await materializeRepos(canaryGroup.tasks, opts);
+    } else if (opts.materializeRepos && !canaryGroup) {
+      assertManifestRepoMaterializationAllowed(tasks, opts);
+      await materializeRepos(tasks, opts);
+    }
+
+    if (canaryTask && opts.prepareCodestoryCache) {
+      const [canaryPreparation] = await prepareCodeStoryCaches(opts, canaryGroup.tasks);
+      if (canaryPreparation) {
+        cachePreparation.push(canaryPreparation);
+        opts.cachePreparationByRepo.set(canaryPreparation.repo, canaryPreparation);
+      }
+      const preparationBlockers = cachePreparationCanaryBlockers(
+        canaryPreparation,
+        selectedBenchmarkChildEnv(opts),
+      );
+      if (preparationBlockers.length) {
+        await rememberFirstFailure({
+          kind: "canary_preparation",
+          repo: canaryTask.repo,
+          task_id: canaryTask.id,
+          blockers: [{ category: "environment", reasons: preparationBlockers }],
+        });
+      }
+    }
+
+    if (!firstFailure) {
+      agentCodexIsolation =
+        opts.runner === "codex" ? await prepareAgentCodexIsolation(outDir, opts) : null;
+      opts.agentCodexHomes = agentCodexIsolation?.homes ?? null;
+    }
+
+    if (!firstFailure && canaryTask) {
+      const canaryRun = plannedRuns.find(
+        (run) =>
+          run.task?.id === canaryTask.id &&
+          run.arm === "with_codestory" &&
+          run.repeat === 1,
+      );
+      if (!canaryRun) {
+        throw new Error(`Canary task '${canaryTask.id}' has no with_codestory repeat-1 row`);
+      }
+      await runBatch(
+        { ...opts, jobs: 1 },
+        [{ ...canaryRun, canary: true }],
+        { failFast: true },
+      );
+    }
+
+    if (!firstFailure) {
+      const completedKeys = new Set(results.map(agentRunKey));
+      const baselineRuns = plannedRuns.filter(
+        (run) => run.arm === "without_codestory" && !completedKeys.has(agentRunKey(run)),
+      );
+      const otherGroups = canaryGroup
+        ? taskGroups.filter((group) => group.repo !== canaryGroup.repo)
+        : taskGroups;
+      const readyBaselines = createAsyncQueue();
+      const preparationState = { drained: !otherGroups.length };
+      if (canaryGroup) {
+        const runs = baselineRuns.filter((run) => run.repo === canaryGroup.repo);
+        if (runs.length) {
+          readyBaselines.push({ repo: canaryGroup.repo, runs });
+        }
+      }
+
+      const baselineWorkers = Promise.all(
+        Array.from({ length: Math.min(4, Math.max(1, taskGroups.length)) }, async () => {
+          for (;;) {
+            const group = await readyBaselines.shift();
+            if (!group || preparationState.drained) {
+              return;
+            }
+            await runBatch(
+              { ...opts, jobs: 1 },
+              group.runs,
+              {
+                failFast: false,
+                shouldSchedule: () => !preparationState.drained,
+                decorateRun: (run) => ({
+                  ...run,
+                  preparation_overlap: !preparationState.drained,
+                  comparative_wall_time_eligible: preparationState.drained,
+                }),
+              },
+            );
+          }
+        }),
+      );
+
+      await parallelMap(otherGroups, Math.min(2, opts.prepareCodestoryJobs), async (group) => {
+        if (opts.materializeRepos) {
+          assertManifestRepoMaterializationAllowed(group.tasks, opts);
+          await materializeRepos(group.tasks, opts);
+        }
+        const runs = baselineRuns.filter((run) => run.repo === group.repo);
+        if (runs.length) {
+          readyBaselines.push({ repo: group.repo, runs });
+        }
+        if (opts.prepareCodestoryCache) {
+          const prepared = await prepareCodeStoryCaches(
+            { ...opts, prepareCodestoryJobs: 1 },
+            group.tasks,
+          );
+          for (const row of prepared) {
+            cachePreparation.push(row);
+            opts.cachePreparationByRepo.set(row.repo, row);
+          }
+        }
+      });
+      preparationState.drained = true;
+      readyBaselines.close();
+      await baselineWorkers;
+
+      const completedAfterOverlap = new Set(results.map(agentRunKey));
+      const codeStoryRuns = plannedRuns.filter(
+        (run) =>
+          run.arm === "with_codestory" &&
+          !completedAfterOverlap.has(agentRunKey(run)),
+      );
+      const codeStoryOutcome = await runBatch(
+        { ...opts, jobs: Math.min(4, opts.jobs) },
+        codeStoryRuns,
+        { failFast: opts.publishable && !opts.collectAllFailures },
+      );
+
+      if (!codeStoryOutcome.firstFailure) {
+        const completedAfterCodeStory = new Set(results.map(agentRunKey));
+        const remainingBaselines = plannedRuns.filter(
+          (run) =>
+            run.arm === "without_codestory" &&
+            !completedAfterCodeStory.has(agentRunKey(run)),
+        );
+        await runBatch(
+          { ...opts, jobs: opts.jobs },
+          remainingBaselines,
+          {
+            failFast: false,
+            decorateRun: (run) => ({
+              ...run,
+              preparation_overlap: false,
+              comparative_wall_time_eligible: true,
+            }),
+          },
+        );
+      }
+    }
+  } finally {
+    await ledger.close();
+    if (agentCodexIsolation?.root) {
+      await rm(agentCodexIsolation.root, { recursive: true, force: true });
+    }
+  }
+
+  const canonicalResults = sortAgentResultsCanonical(results, tasks, opts.arms);
   if (cachePreparation.length) {
     await writeFile(
       path.join(outDir, "codestory-cache-preparation.json"),
@@ -7183,20 +7935,13 @@ async function main() {
     );
   }
 
-  const agentCodexIsolation =
-    opts.runner === "codex" ? await prepareAgentCodexIsolation(outDir, opts) : null;
-  opts.agentCodexHomes = agentCodexIsolation?.homes ?? null;
-  let results;
-  try {
-    results = await runPlannedAgentRuns(opts, plannedRuns, reusableBaselines, outDir);
-  } finally {
-    if (agentCodexIsolation?.root) {
-      await rm(agentCodexIsolation.root, { recursive: true, force: true });
-    }
-  }
-
-  const summary = summarizeRuns(results);
-  const costAccounting = summarizeCostAccounting(results);
+  const summary = summarizeRuns(canonicalResults);
+  const costAccounting = summarizeCostAccounting(canonicalResults);
+  const shardAttestation = await benchmarkShardAttestation(
+    opts,
+    allTasks,
+    cachePreparation,
+  );
   const summaryPayload = {
     generated_at: new Date().toISOString(),
     runner: opts.runner,
@@ -7206,6 +7951,14 @@ async function main() {
     task_suite: opts.taskSuite,
     task_ids: opts.taskIds,
     task_manifest: opts.taskManifest,
+    canary_task_id: opts.canaryTaskId ?? opts.manifestCanaryTaskId ?? null,
+    effective_canary_task_id:
+      canonicalResults.find((row) => row.canary === true)?.task_id ?? null,
+    shard: {
+      count: opts.shardCount,
+      index: opts.shardIndex,
+      attestation: shardAttestation,
+    },
     prepare_codestory_cache: opts.prepareCodestoryCache,
     cache_preparation: cachePreparation,
     tasks: tasks.map((task) => ({
@@ -7218,7 +7971,7 @@ async function main() {
     publishable: opts.publishable,
     max_source_reads_after_packet: opts.maxSourceReadsAfterPacket,
     reuse_baseline_from: opts.reuseBaselineFrom,
-    reused_baseline_runs: results.filter((row) => row.reused_from).length,
+    reused_baseline_runs: canonicalResults.filter((row) => row.reused_from).length,
     allow_failures: opts.allowFailures,
     timeout_ms: opts.timeoutMs,
     sandbox: opts.sandbox,
@@ -7226,14 +7979,18 @@ async function main() {
     retrieval_env: retrievalEnv(),
     retrieval_contract: retrievalContractSummary(benchmarkChildEnv(process.env)),
     codex_agent_isolation: agentCodexIsolation?.receipt ?? null,
+    host_class: benchmarkHostClass(cachePreparation[0] ?? null),
+    expected_rows: plannedRuns.length,
+    completed_rows: canonicalResults.length,
+    first_failure: firstFailure,
     summary,
     cost_accounting: costAccounting,
   };
   await writeFile(path.join(outDir, "summary.json"), `${JSON.stringify(summaryPayload, null, 2)}\n`, "utf8");
   await writeFile(path.join(outDir, "summary.md"), markdownSummary(summary, opts, costAccounting), "utf8");
 
-  const failedRuns = results.filter((result) => result.status !== "pass");
-  let exitCode = 0;
+  const failedRuns = canonicalResults.filter((result) => result.status !== "pass");
+  let exitCode = firstFailure ? 1 : 0;
   if (failedRuns.length && !opts.allowFailures) {
     console.error("benchmark failed: every run must pass unless --allow-failures is set.");
     for (const failed of failedRuns) {
@@ -7243,7 +8000,16 @@ async function main() {
   }
 
   if (opts.publishable) {
-    const blockers = agentPublishableBlockers(results, opts);
+    const blockers = agentPublishableBlockers(canonicalResults, opts);
+    const completedKeys = new Set(canonicalResults.map(agentRunKey));
+    const missingRuns = plannedRuns.filter((run) => !completedKeys.has(agentRunKey(run)));
+    if (missingRuns.length) {
+      blockers.push({
+        result: { repo: "benchmark", arm: "all", repeat: 0, task_id: null },
+        category: "harness-contract",
+        reasons: [`missing completed rows=${missingRuns.length}; expected ${plannedRuns.length}`],
+      });
+    }
     if (blockers.length) {
       console.error("--publishable failed: every run must pass, report total token usage, pass preludes without warnings, pass manifest quality gates when present, run packet first when required, report sufficient packets with zero follow-ups or unresolved diagnostics, and stay within the post-packet source-read budget.");
       for (const blocker of blockers) {
@@ -7260,11 +8026,13 @@ async function main() {
 }
 
 export {
+  aggregateShardRuns,
   agentRunnerEnv,
   analyzeTranscript,
   agentPublishableBlockers,
   assertSafeWindowsCmdArgs,
   benchmarkRunId,
+  benchmarkShardAttestation,
   baselineSearchPreludeStatus,
   buildPacketQualityDeltas,
   buildQualityDebugPayload,
@@ -7282,6 +8050,8 @@ export {
   parseArgs,
   parseJsonLines,
   cachePolicyForRun,
+  cachePreparationCanaryBlockers,
+  createDurableJsonlAppender,
   benchmarkAgentScopeArgs,
   retrievalIndexCommandArgs,
   retrievalStatusCommandArgs,
@@ -7290,6 +8060,7 @@ export {
   packetForAgentPrompt,
   packetManifestExtraProbes,
   packetManifestQualitySummary,
+  packetPreludeContractBlockers,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetRuntimeCacheObservations,
@@ -7313,6 +8084,8 @@ export {
   summarizeCostAccounting,
   summarizePacketRuntimeRuns,
   taskSnapshotForResult,
+  taskShardIndex,
+  tasksForShard,
 };
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

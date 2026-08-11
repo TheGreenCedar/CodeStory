@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  aggregateShardRuns,
   agentRunnerEnv,
   analyzeTranscript,
   agentPublishableBlockers,
@@ -15,6 +16,7 @@ import {
   baselineSearchPreludeStatus,
   benchmarkAgentScopeArgs,
   benchmarkRunId,
+  cachePreparationCanaryBlockers,
   commandCategory,
   copyResultArtifact,
   groupPacketRuntimeColdJobs,
@@ -35,6 +37,7 @@ import {
   packetForAgentPrompt,
   packetManifestExtraProbes,
   packetManifestQualitySummary,
+  packetPreludeContractBlockers,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetFirstCommandForPrompt,
@@ -53,6 +56,8 @@ import {
   buildQualityDebugPayload,
   qualityFailureReasons,
   taskSnapshotForResult,
+  taskShardIndex,
+  tasksForShard,
   cachePolicyForRun,
   cacheProvenanceBlockers,
 } from "../codestory-agent-ab-benchmark.mjs";
@@ -175,6 +180,187 @@ test("parses packet-runtime benchmark run id", () => {
       ]),
     /--prepare-codestory-jobs must be a positive integer/,
   );
+});
+
+test("defaults preparation concurrency to two and validates deterministic shard options", () => {
+  const opts = parseBenchmarkArgs([
+    "--task-suite",
+    "language-expansion-holdout",
+    "--shard-count",
+    "3",
+    "--shard-index",
+    "1",
+  ]);
+  assert.equal(opts.prepareCodestoryJobs, 2);
+  assert.equal(opts.shardCount, 3);
+  assert.equal(opts.shardIndex, 1);
+  assert.throws(
+    () => parseBenchmarkArgs(["--shard-count", "2", "--shard-index", "2"]),
+    /--shard-index must be zero-based/,
+  );
+});
+
+test("manifest declares the real Requests canary and sharding keeps whole tasks", async () => {
+  const opts = {
+    taskSuite: "language-expansion-holdout",
+    taskManifest: null,
+    taskIds: null,
+    repoCacheDir: path.join(os.tmpdir(), "codestory-shard-fixture"),
+    canaryTaskId: null,
+  };
+  const tasks = await loadTasks(opts);
+  assert.equal(opts.manifestCanaryTaskId, "python-requests-session-flow");
+  assert.equal(opts.canaryTaskId, "python-requests-session-flow");
+  const shard = taskShardIndex(opts.canaryTaskId, 4);
+  assert.ok(tasksForShard(tasks, 4, shard).some((task) => task.id === opts.canaryTaskId));
+  assert.ok(!tasksForShard(tasks, 4, (shard + 1) % 4).some((task) => task.id === opts.canaryTaskId));
+});
+
+function exactPacketStdout(packet) {
+  for (;;) {
+    const stdout = `${JSON.stringify(packet, null, 2)}\n`;
+    const bytes = Buffer.byteLength(stdout, "utf8");
+    if (packet.budget.used.output_bytes === bytes) {
+      return stdout;
+    }
+    packet.budget.used.output_bytes = bytes;
+  }
+}
+
+test("packet canary rejects exact byte and graph-limit escapes before the agent", () => {
+  const packet = {
+    answer: {
+      citations: [{ node_id: "carrier" }],
+      graphs: [
+        { graph: { edges: [{ id: "protected" }] } },
+        { graph: { edges: [{ id: "protected" }] } },
+      ],
+    },
+    sufficiency: {
+      status: "sufficient",
+      follow_up_invocations: [],
+      coverage_report: { claim_obligations: [] },
+    },
+    budget: {
+      limits: {
+        max_anchors: 1,
+        max_files: 1,
+        max_output_bytes: 98_304,
+        max_snippets: 0,
+        max_trail_edges: 1,
+      },
+      used: { anchors: 1, files: 1, output_bytes: 0, snippets: 0, trail_edges: 2 },
+    },
+  };
+  const stdout = exactPacketStdout(packet);
+  const blockers = packetPreludeContractBlockers(packet, stdout, { requireSufficient: true });
+  assert.ok(blockers.some((blocker) => blocker.includes("trail_edges=2 exceeds 1")));
+  assert.equal(blockers.some((blocker) => blocker.includes("stdout bytes")), false);
+
+  packet.answer.graphs.pop();
+  packet.budget.used.trail_edges = 1;
+  const validStdout = exactPacketStdout(packet);
+  assert.deepEqual(packetPreludeContractBlockers(packet, validStdout, { requireSufficient: true }), []);
+});
+
+test("canary preparation requires full accelerated execution with CPU disabled", () => {
+  const preparation = {
+    retrieval_index_status: "pass",
+    retrieval_status: {
+      retrieval_mode: "full",
+      embedding_policy: "accelerated",
+      embedding_accelerator_execution_verified: true,
+      embedding_backend: "Metal",
+      embedding_engine_instance_id: "engine-1",
+    },
+  };
+  assert.deepEqual(cachePreparationCanaryBlockers(preparation, { CODESTORY_EMBED_ALLOW_CPU: "0" }), []);
+  assert.match(
+    cachePreparationCanaryBlockers(
+      { ...preparation, retrieval_status: { ...preparation.retrieval_status, embedding_accelerator_execution_verified: false } },
+      { CODESTORY_EMBED_ALLOW_CPU: "0" },
+    ).join("\n"),
+    /accelerator execution was not verified/,
+  );
+});
+
+test("shard aggregation rejects missing, duplicate, and mismatched rows", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-shards-"));
+  try {
+    const taskIds = [null, null];
+    for (let index = 0; taskIds.some((value) => value == null); index += 1) {
+      const id = `task-${index}`;
+      taskIds[taskShardIndex(id, 2)] ??= id;
+    }
+    const tasks = taskIds.map((id, index) => ({ id, repo: `repo-${index}` }));
+    const attestation = {
+      contract: "codestory.agent-benchmark-shard/v1",
+      source_commit: "source",
+      source_tree: "tree",
+      cli_sha256: "cli",
+      package_sha256: "package",
+      manifest_sha256: "manifest",
+      flags_sha256: "flags",
+      model_sha256: "model",
+      host_class: { platform: "darwin", arch: "arm64", accelerator_backend: "Metal" },
+    };
+    const shardDirs = await Promise.all(
+      [0, 1].map(async (index) => {
+        const directory = path.join(root, `shard-${index}`);
+        await mkdir(directory);
+        await writeFile(
+          path.join(directory, "summary.json"),
+          `${JSON.stringify({ shard: { count: 2, index, attestation } })}\n`,
+        );
+        const task = tasks.find((candidate) => taskShardIndex(candidate.id, 2) === index);
+        await writeFile(
+          path.join(directory, "runs.jsonl"),
+          `${JSON.stringify({ repo: task.repo, task_id: task.id, arm: "with_codestory", repeat: 1, status: "pass" })}\n`,
+        );
+        return directory;
+      }),
+    );
+    const opts = {
+      aggregateShards: shardDirs,
+      outDir: path.join(root, "aggregate"),
+      arms: ["with_codestory"],
+      repeats: 1,
+    };
+    await aggregateShardRuns(opts, tasks);
+
+    await writeFile(path.join(shardDirs[1], "runs.jsonl"), "", "utf8");
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, outDir: path.join(root, "missing") }, tasks),
+      /aggregation is incomplete/,
+    );
+
+    const task0 = tasks.find((candidate) => taskShardIndex(candidate.id, 2) === 0);
+    const duplicate = `${JSON.stringify({ repo: task0.repo, task_id: task0.id, arm: "with_codestory", repeat: 1, status: "pass" })}\n`;
+    await writeFile(path.join(shardDirs[0], "runs.jsonl"), `${duplicate}${duplicate}`, "utf8");
+    const task1 = tasks.find((candidate) => taskShardIndex(candidate.id, 2) === 1);
+    await writeFile(
+      path.join(shardDirs[1], "runs.jsonl"),
+      `${JSON.stringify({ repo: task1.repo, task_id: task1.id, arm: "with_codestory", repeat: 1, status: "pass" })}\n`,
+      "utf8",
+    );
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, outDir: path.join(root, "duplicate") }, tasks),
+      /Duplicate benchmark row/,
+    );
+
+    const mismatched = { ...attestation, package_sha256: "different" };
+    await writeFile(
+      path.join(shardDirs[1], "summary.json"),
+      `${JSON.stringify({ shard: { count: 2, index: 1, attestation: mismatched } })}\n`,
+      "utf8",
+    );
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, outDir: path.join(root, "mismatch") }, tasks),
+      /attestation does not match/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("packet-runtime cache observations preserve prepared cache provenance", () => {
