@@ -64,6 +64,9 @@ const BEHAVIORAL_OWNER_NODE_KINDS: &[NodeKind] = &[
 ];
 const SQL_SCHEMA_NODE_KINDS: &[NodeKind] = &[NodeKind::FILE, NodeKind::ANNOTATION];
 
+type SymbolPredicate = fn(&str) -> bool;
+type OrderedCallBoundary = (SymbolPredicate, SymbolPredicate);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FlowRole {
     Entrypoint,
@@ -141,7 +144,7 @@ pub enum EvidencePredicate {
         subsystem: fn(&AgentCitationDto) -> bool,
         roles: &'static [PacketEvidenceRole],
         carrier: fn(&AgentCitationDto) -> bool,
-        call_target: Option<fn(&str) -> bool>,
+        call_target: Option<SymbolPredicate>,
     },
     /// Covered by a lawful ordered-stage carrier with an exact CALL either from the preceding
     /// stage or to the following stage. This keeps an unrelated incident CALL from proving the
@@ -150,8 +153,8 @@ pub enum EvidencePredicate {
         subsystem: fn(&AgentCitationDto) -> bool,
         roles: &'static [PacketEvidenceRole],
         carrier: fn(&AgentCitationDto) -> bool,
-        incoming_source: fn(&str) -> bool,
-        outgoing_target: fn(&str) -> bool,
+        incoming_source: SymbolPredicate,
+        outgoing_target: SymbolPredicate,
     },
     /// Covered by a citation that passes a structural ownership check, used where the evidence
     /// role is too coarse to separate a requirement from its siblings. The carriers carry their own
@@ -226,7 +229,7 @@ impl EvidencePredicate {
         }
     }
 
-    pub fn call_boundary_target(self, citation: &AgentCitationDto) -> Option<fn(&str) -> bool> {
+    pub fn call_boundary_target(self, citation: &AgentCitationDto) -> Option<SymbolPredicate> {
         let Self::CitedRolesOrCallBoundary {
             subsystem,
             roles,
@@ -241,10 +244,7 @@ impl EvidencePredicate {
             .flatten()
     }
 
-    pub fn ordered_call_boundary(
-        self,
-        citation: &AgentCitationDto,
-    ) -> Option<(fn(&str) -> bool, fn(&str) -> bool)> {
+    pub fn ordered_call_boundary(self, citation: &AgentCitationDto) -> Option<OrderedCallBoundary> {
         let Self::CitedRolesOrOrderedCallBoundary {
             subsystem,
             roles,
