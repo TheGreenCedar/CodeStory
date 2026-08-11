@@ -61,6 +61,7 @@ function fixtureRoot(version) {
   );
   for (const manifest of [
     "plugins/codestory/.codex-plugin/plugin.json",
+    "plugins/codestory/.cursor-plugin/plugin.json",
     "plugins/codestory/.claude-plugin/plugin.json",
     "plugins/codestory/.github/plugin/plugin.json",
   ]) {
@@ -137,6 +138,7 @@ function readVersions(root) {
     cli: crateVersion("codestory-cli"),
     bench: crateVersion("codestory-bench"),
     codexPlugin: jsonVersion("plugins/codestory/.codex-plugin/plugin.json", ["version"]),
+    cursorPlugin: jsonVersion("plugins/codestory/.cursor-plugin/plugin.json", ["version"]),
     claudePlugin: jsonVersion("plugins/codestory/.claude-plugin/plugin.json", ["version"]),
     githubPlugin: jsonVersion("plugins/codestory/.github/plugin/plugin.json", ["version"]),
     producer: jsonVersion("crates/codestory-llama-sys/model-contract.json", [
@@ -284,6 +286,7 @@ test("the plugin lane pins published CLI digests without moving native versions"
     assert.equal(after.producer, "0.16.1");
     assert.equal(after.cargoLock, before.cargoLock);
     assert.equal(after.codexPlugin, "0.16.2");
+    assert.equal(after.cursorPlugin, "0.16.2");
     assert.equal(after.claudePlugin, "0.16.2");
     assert.equal(after.githubPlugin, "0.16.2");
     assert.equal(after.pin.cli_version, "0.16.1");

@@ -1967,6 +1967,7 @@ function versionSurfaceRepository(ref) {
     "crates/codestory-llama-sys/model-contract.json",
     "plugins/codestory/cli-version.json",
     "plugins/codestory/.codex-plugin/plugin.json",
+    "plugins/codestory/.cursor-plugin/plugin.json",
     "plugins/codestory/.claude-plugin/plugin.json",
     "plugins/codestory/.github/plugin/plugin.json",
     ...workspaceMemberManifests(show("Cargo.toml")),

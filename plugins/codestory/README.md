@@ -9,8 +9,8 @@ explicitly.
 
 | Host | Plugin surface | User guide |
 | --- | --- | --- |
-| Codex | `.codex-plugin/plugin.json`, `.mcp.json`, hooks, skill | [Codex](../../docs/users/codex.md) |
-| Cursor | `.cursor/rules/codestory.mdc`, `.cursor/mcp.json` | [Cursor](../../docs/users/cursor.md) |
+| Codex | `.codex-plugin/plugin.json`, `mcp.json`, hooks, skill | [Codex](../../docs/users/codex.md) |
+| Cursor | `.cursor-plugin/plugin.json`, `rules/`, `mcp.json`, `hooks/cursor-hooks.json`, skill | [Cursor](../../docs/users/cursor.md) |
 | Claude Code | `.claude-plugin/plugin.json`, session hooks | [Claude Code](../../docs/users/claude-code.md) |
 | Copilot CLI | `.github/plugin/plugin.json`, session hooks | [Copilot](../../docs/users/copilot.md#copilot-cli) |
 | Copilot editor | Repository instructions | [Copilot editor](../../docs/users/copilot.md#copilot-editor) |
@@ -22,6 +22,7 @@ privacy, and readiness behavior.
 
 - `scripts/codestory-mcp.cjs` is the stdio adapter and managed CLI launcher.
 - `hooks/` records bounded lifecycle state for hosts that support hooks.
+- `rules/codestory.mdc` is Cursor's always-on grounding rule.
 - `skills/codestory-grounding/` defines the canonical direct-tool and evidence
   contract.
 - host manifests and rules point those pieces at Codex, Cursor, Claude Code,
@@ -80,7 +81,20 @@ Marketplace refresh updates the catalog only. Package refresh replaces the
 installed plugin, and a fresh host session loads that replacement. See the
 [Codex update guide](../../docs/users/codex.md#update).
 
-## CodeStoryDev refresh
+## Cursor install
+
+Open **Customize → Plugins**, install **codestory**, enable its MCP server once,
+and reload the Cursor window. The package supplies the rule, grounding skill,
+session-start context, and managed CLI launcher. The MCP toggle is a Cursor
+platform setting, so installing the plugin cannot enable it on your behalf.
+
+Teams can import this repository through
+[`.cursor-plugin/marketplace.json`](../../.cursor-plugin/marketplace.json) in
+the Cursor Dashboard instead of copying individual files.
+
+## CodeStoryDev / Cursor refresh
+
+### Codex CodeStoryDev
 
 Maintainers dogfood an unpublished head through the local `CodeStoryDev`
 marketplace. Build the exact CLI, commit the plugin package, then run:
@@ -102,6 +116,19 @@ The installed launcher validates the cached receipt again with an empty
 production release installer. Start a fresh Codex host after a successful
 refresh to load the new adapter.
 
+### Cursor local package
+
+After committing the plugin package, link the checkout into Cursor with:
+
+```sh
+node scripts/install-codestory-cursor-plugin.mjs
+```
+
+Pass `--cli "$(pwd)/target/release/codestory-cli"` to use an exact local CLI
+build. The installer writes only that path to Cursor's private CodeStory data
+directory; no repository or process environment is copied. Reload Cursor,
+enable **codestory** MCP in Customize, and start a fresh agent session.
+
 ## Diagnostics
 
 Normal calls prepare the repository automatically. Agents call the intended
@@ -119,6 +146,7 @@ Blocked session steps: [Troubleshooting](../../docs/users/troubleshooting.md).
 ```sh
 node scripts/generate-codestory-skill-syntax.mjs --check
 node --test scripts/tests/install-codestory-dev-plugin.test.mjs
+node --test scripts/tests/install-codestory-cursor-plugin.test.mjs
 node --test plugins/codestory/tests/plugin-static.test.mjs
 node .github/scripts/check-doc-links.mjs
 git diff --check

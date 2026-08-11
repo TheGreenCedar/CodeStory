@@ -476,6 +476,7 @@ const protectedNonRustExtensions = new Set([
 const agentInstructionExtensions = new Set([".md", ".mdc"]);
 const agentInstructionPathFragments = [
   path.join("plugins", "codestory", "skills", "codestory-grounding"),
+  path.join("plugins", "codestory", "rules"),
   path.join(".cursor", "rules"),
 ];
 

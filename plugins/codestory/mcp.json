@@ -3,7 +3,7 @@
     "codestory": {
       "command": "node",
       "args": ["./scripts/codestory-mcp.cjs"],
-      "cwd": ".",
+      "cwd": "${PLUGIN_ROOT}",
       "env": {},
       "tool_timeout_sec": 300
     }

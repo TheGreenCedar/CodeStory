@@ -263,6 +263,7 @@ adapter to compensate for incorrect upstream state.
   only when the embeddings themselves change -- model, llama.cpp commit,
   pooling, normalization, dimension, prefixes, or vector schema.)
   - `plugins/codestory/.codex-plugin/plugin.json`
+  - `plugins/codestory/.cursor-plugin/plugin.json`
   - `plugins/codestory/.claude-plugin/plugin.json`
   - `plugins/codestory/.github/plugin/plugin.json`
 - For a plugin-only release, use

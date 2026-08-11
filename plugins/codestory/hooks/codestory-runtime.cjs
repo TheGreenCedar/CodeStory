@@ -1,20 +1,79 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { createHash } = require('crypto');
 
-const isCopilot = Boolean(process.env.COPILOT_PLUGIN_DATA);
-const isCodex = !isCopilot && Boolean(process.env.PLUGIN_DATA);
+const pluginRoot = path.dirname(__dirname);
+const isCursor = Boolean(process.env.CURSOR_VERSION || process.env.CURSOR_PROJECT_DIR);
+const isCopilot = !isCursor && Boolean(process.env.COPILOT_PLUGIN_DATA);
+const isCodex = !isCursor && !isCopilot && Boolean(process.env.PLUGIN_DATA);
 
 const STATE_FILE = '.codestory-active';
 const THREAD_STATE_PREFIX = '.codestory-active-thread-';
 const DIRTY_MARKER_SCHEMA_VERSION = 1;
 const DIRTY_MARKER_SAMPLE_LIMIT = 20;
 
-function pluginDataDir() {
-  if (process.env.PLUGIN_DATA) return process.env.PLUGIN_DATA;
-  if (process.env.COPILOT_PLUGIN_DATA) return process.env.COPILOT_PLUGIN_DATA;
-  if (process.env.CODESTORY_PLUGIN_DATA) return process.env.CODESTORY_PLUGIN_DATA;
+function usablePluginDataDir(dataDir) {
+  try {
+    if (fs.existsSync(dataDir)) return fs.statSync(dataDir).isDirectory();
+    const dataRoot = path.dirname(dataDir);
+    if (fs.existsSync(dataRoot)) return fs.statSync(dataRoot).isDirectory();
+    fs.accessSync(path.dirname(dataRoot), fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function inferredCodexPluginDataDir(root = pluginRoot) {
+  const parts = path.resolve(root).split(/[\\/]+/u);
+  for (let index = 0; index <= parts.length - 6; index += 1) {
+    if (
+      parts[index].toLowerCase() !== '.codex'
+      || parts[index + 1] !== 'plugins'
+      || parts[index + 2] !== 'cache'
+      || parts[index + 4] !== 'codestory'
+    ) {
+      continue;
+    }
+    const codexRoot = parts.slice(0, index + 1).join(path.sep);
+    const dataDir = path.join(codexRoot, 'plugins', 'data', `codestory-${parts[index + 3]}`);
+    if (usablePluginDataDir(dataDir)) return dataDir;
+  }
   return null;
+}
+
+function inferredCursorPluginDataDir(
+  root = pluginRoot,
+  home = process.env.HOME || process.env.USERPROFILE || os.homedir(),
+) {
+  const parts = path.resolve(root).split(/[\\/]+/u);
+  for (let index = 0; index <= parts.length - 5; index += 1) {
+    if (
+      parts[index].toLowerCase() !== '.cursor'
+      || parts[index + 1] !== 'plugins'
+      || parts[index + 2] !== 'cache'
+    ) {
+      continue;
+    }
+    const packageIndex = parts.findIndex(
+      (part, candidateIndex) => candidateIndex >= index + 3 && part.toLowerCase() === 'codestory',
+    );
+    if (packageIndex === -1 || packageIndex === parts.length - 1) continue;
+    const cursorRoot = parts.slice(0, index + 1).join(path.sep);
+    const dataDir = path.join(cursorRoot, 'plugins', 'data', 'codestory');
+    if (usablePluginDataDir(dataDir)) return dataDir;
+  }
+  const fallback = path.join(home, '.cursor', 'plugins', 'data', 'codestory');
+  return usablePluginDataDir(fallback) ? fallback : null;
+}
+
+function pluginDataDir() {
+  return process.env.PLUGIN_DATA
+    || process.env.COPILOT_PLUGIN_DATA
+    || process.env.CODESTORY_PLUGIN_DATA
+    || inferredCodexPluginDataDir()
+    || inferredCursorPluginDataDir();
 }
 
 function stateFilePath() {
@@ -126,6 +185,11 @@ function writeDirtyMarker(projectRoot, options = {}) {
 }
 
 function writeHookOutput(event, context) {
+  if (isCursor) {
+    process.stdout.write(JSON.stringify({ additional_context: context }));
+    return;
+  }
+
   if (isCopilot) {
     process.stdout.write(JSON.stringify({ additionalContext: context }));
     return;
@@ -150,6 +214,9 @@ function writeHookOutput(event, context) {
 
 module.exports = {
   dirtyMarkerPathForProject,
+  inferredCodexPluginDataDir,
+  inferredCursorPluginDataDir,
+  pluginDataDir,
   readActiveState,
   rememberActiveState,
   writeDirtyMarker,

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Cursor users can now install CodeStory as one plugin from Customize instead of copying a rule and MCP configuration by hand. The plugin includes the grounding rule and skill, session-start guidance, the managed runtime launcher, and a repository marketplace manifest for team distribution; Cursor still requires users to enable the MCP server once in Customize.
+
 ## 0.17.0
 
 CodeStory 0.17 focuses on more trustworthy answers and a more predictable installed experience. Grounding is centered on project architecture, packet and search results separate proven evidence from gaps, and the embedding model stays resident for work across projects instead of being loaded for each command.

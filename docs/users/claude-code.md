@@ -49,8 +49,9 @@ If the plugin does not register MCP for you, point a server at the adapter:
 }
 ```
 
-Use a persistent per-user plugin-data directory outside the repository. The
-same adapter shape is explained in the [Cursor guide](cursor.md#2-configure-mcp).
+Use a persistent per-user plugin-data directory outside the repository.
+Cursor's repository-managed alternative is explained in the
+[Cursor guide](cursor.md#advanced-repository-managed-setup).
 
 ## Verify the install
 

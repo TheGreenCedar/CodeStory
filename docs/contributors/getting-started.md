@@ -152,7 +152,7 @@ node scripts/install-codestory-dev-plugin.mjs \
 The installer requires the exact platform filename and matching plugin/CLI
 version, rejects plugin-source drift, stages a package-and-CLI receipt, refreshes
 only `codestory@CodeStoryDev`, and leaves plugin data intact. Start a fresh
-Codex host after the package refresh. Do not edit the checked-in `.mcp.json` or
+Codex host after the package refresh. Do not edit the checked-in `mcp.json` or
 add `CODESTORY_CLI` to it; production packages continue to use the authenticated
 managed-release path.
 
