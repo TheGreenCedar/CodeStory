@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -19,11 +19,14 @@ import {
   benchmarkAgentScopeArgs,
   benchmarkContractEnvironmentSha256,
   benchmarkContractForRun,
+  benchmarkHostClass,
   benchmarkRunId,
   benchmarkShardAttestation,
   cachePreparationCanaryBlockers,
+  cachePreparationIdentityBlockers,
   commandCategory,
   codestoryDoctorSnapshot,
+  codestoryRetrievalEngineDiagnosticsSnapshot,
   codestoryRetrievalStatusSnapshot,
   copyResultArtifact,
   createDurableJsonlAppender,
@@ -36,6 +39,7 @@ import {
   loadTasks,
   manifestRepoMaterializationBlockers,
   materializeRepos,
+  mergeRetrievalStatusWithEngineDiagnostics,
   MAX_REUSED_ARTIFACT_BYTES,
   parseArgs as parseBenchmarkArgs,
   parseJsonLines,
@@ -54,6 +58,7 @@ import {
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
   publicCoreCorpusAudit,
+  projectResourceUri,
   planAgentRuns,
   repoProvenance,
   repoProvenanceBlockers,
@@ -62,6 +67,9 @@ import {
   runnerCommand,
   retrievalIndexCommandArgs,
   retrievalStatusCommandArgs,
+  retrievalEngineDiagnosticsSnapshotFromOutput,
+  retrievalStatusSnapshotFromOutput,
+  resourceUriMatches,
   scoreQuality,
   summarizeCostAccounting,
   summarizePacketObligationAccounting,
@@ -510,40 +518,535 @@ test("packet obligation accounting rejects unreconciled summaries", () => {
   }
 });
 
-test("canary preparation requires full accelerated execution with CPU disabled", () => {
-  const preparation = {
-    retrieval_index_status: "pass",
-    retrieval_status: {
-      retrieval_mode: "full",
-      embedding_policy: "accelerated",
-      embedding_accelerator_execution_verified: true,
-      embedding_backend: "Metal",
-      embedding_engine_instance_id: "engine-1",
-    },
-  };
-  assert.deepEqual(cachePreparationCanaryBlockers(preparation, { CODESTORY_EMBED_ALLOW_CPU: "0" }), []);
-  assert.match(
-    cachePreparationCanaryBlockers(
-      { ...preparation, retrieval_status: { ...preparation.retrieval_status, embedding_accelerator_execution_verified: false } },
-      { CODESTORY_EMBED_ALLOW_CPU: "0" },
-    ).join("\n"),
-    /accelerator execution was not verified/,
-  );
-});
+const FIXTURE_MODEL_SHA256 = "a".repeat(64);
+const FIXTURE_SERVER_SHA256 = "b".repeat(64);
 
-function pipelinePreparation(repo) {
+function eligibleRetrievalStatus(overrides = {}) {
+  const serverOverrides = overrides.embedding_server_identity ?? {};
   return {
-    repo,
-    retrieval_index_status: "pass",
-    retrieval_status: {
-      retrieval_mode: "full",
-      embedding_policy: "accelerated",
-      embedding_accelerator_execution_verified: true,
-      embedding_backend: "Metal",
-      embedding_engine_instance_id: `engine-${repo}`,
+    status: "pass",
+    retrieval_mode: "full",
+    degraded_reason: null,
+    semantic_generation: "semantic-generation-1",
+    engine_diagnostics_status: "pass",
+    engine_diagnostics_error: null,
+    embedding_device_policy: "accelerator_required",
+    embedding_device_state: "accelerated",
+    embedding_device_observation_source: "runtime_probe",
+    embedding_cpu_allowed: false,
+    embedding_model_sha256: FIXTURE_MODEL_SHA256,
+    manifest_embedding_backend:
+      `per-user-server:coderank-embed:q8_0:sha256-${FIXTURE_MODEL_SHA256}:fixture`,
+    embedding_ggml_build_identity: "ggml-fixture",
+    embedding_backend: "Metal",
+    embedding_adapter: "Apple M5 GPU",
+    embedding_adapter_description: "Apple family 9 GPU",
+    embedding_policy: "accelerated",
+    embedding_engine_instance_id: "engine-1",
+    embedding_engine_residency: "resident",
+    embedding_engine_load_generation: 1,
+    embedding_engine_load_error: null,
+    embedding_model_load_count: 1,
+    embedding_smoke_ms: 1,
+    embedding_initialization_ms: 2,
+    embedding_materialized_reused: false,
+    embedding_accelerator_execution_verified: true,
+    embedding_execution_devices: ["Apple M5 GPU"],
+    embedding_execution_backends: ["Metal"],
+    embedding_execution_observation_source: "ggml_eval_callback",
+    embedding_encode_count: 2,
+    embedding_execution_node_count: 3,
+    embedding_resident_accelerator_tensor_count: 4,
+    embedding_resident_accelerator_tensor_bytes: 4096,
+    embedding_model_layer_count: 13,
+    embedding_offloaded_layer_count: 13,
+    local_only: true,
+    embedding_server_identity: {
+      lifecycle: "resident",
+      peer_verified: true,
+      server_instance_id: "engine-1",
+      executable_sha256: FIXTURE_SERVER_SHA256,
+      executable_version: "0.17.0",
+      load_generation: 1,
+      model_load_count: 1,
+      successful_encode_count: 2,
+      ...serverOverrides,
+    },
+    ...overrides,
+    embedding_server_identity: {
+      lifecycle: "resident",
+      peer_verified: true,
+      server_instance_id: "engine-1",
+      executable_sha256: FIXTURE_SERVER_SHA256,
+      executable_version: "0.17.0",
+      load_generation: 1,
+      model_load_count: 1,
+      successful_encode_count: 2,
+      ...serverOverrides,
     },
   };
 }
+
+function pipelinePreparation(repo, retrievalOverrides = {}) {
+  return {
+    repo,
+    retrieval_index_status: "pass",
+    retrieval_status: eligibleRetrievalStatus(retrievalOverrides),
+  };
+}
+
+test("canary preparation requires complete live accelerator and server identity", () => {
+  const preparation = pipelinePreparation("canary");
+  assert.deepEqual(
+    cachePreparationCanaryBlockers(preparation, { CODESTORY_EMBED_ALLOW_CPU: "0" }),
+    [],
+  );
+  for (const [overrides, expected] of [
+    [{ degraded_reason: "semantic stale" }, /retrieval is degraded/],
+    [{ embedding_accelerator_execution_verified: false }, /accelerator execution was not verified/],
+    [{ embedding_model_sha256: "bad" }, /model digest is missing or malformed/],
+    [{ embedding_adapter: "llvmpipe" }, /software accelerator adapter/],
+    [{ embedding_execution_observation_source: "inferred_from_request" }, /not backend-measured/],
+    [{ embedding_execution_devices: [] }, /execution devices are missing/],
+    [{ embedding_offloaded_layer_count: 12 }, /not every embedding model layer was offloaded/],
+    [{ embedding_server_identity: { peer_verified: false } }, /peer identity is not verified/],
+    [{ embedding_server_identity: { load_generation: 2 } }, /load identities disagree/],
+    [{ embedding_server_identity: { executable_version: "0.16.0" } }, /expected 0\.17\.0/],
+  ]) {
+    const blockers = cachePreparationCanaryBlockers(
+      pipelinePreparation("canary", overrides),
+      { CODESTORY_EMBED_ALLOW_CPU: "0" },
+    );
+    assert.match(blockers.join("\n"), expected);
+  }
+});
+
+function retrievalEngineDiagnosticsPayload(overrides = {}) {
+  const engineOverrides = overrides.engine ?? {};
+  const serverOverrides = overrides.embedding_server ?? {};
+  return {
+    retrieval_mode: "full",
+    degraded_reason: null,
+    engine: {
+      ...eligibleRetrievalStatus(),
+      embedding_adapter: "Métal GPU",
+      embedding_materialized_path: "/private/host/model.gguf",
+      ...engineOverrides,
+    },
+    embedding_server: {
+      lifecycle: "resident",
+      authority: { peer_verified: true },
+      process: {
+        server_instance_id: "engine-1",
+        executable_sha256: FIXTURE_SERVER_SHA256,
+        executable_version: "0.17.0",
+        pid: 4242,
+        endpoint: "/private/host/server.sock",
+      },
+      engine: {
+        load_generation: 1,
+        model_load_count: 1,
+        successful_encode_count: 2,
+      },
+      ...serverOverrides,
+    },
+    ...overrides,
+    engine: {
+      ...eligibleRetrievalStatus(),
+      embedding_adapter: "Métal GPU",
+      embedding_materialized_path: "/private/host/model.gguf",
+      ...engineOverrides,
+    },
+    embedding_server: {
+      lifecycle: "resident",
+      authority: { peer_verified: true },
+      process: {
+        server_instance_id: "engine-1",
+        executable_sha256: FIXTURE_SERVER_SHA256,
+        executable_version: "0.17.0",
+        pid: 4242,
+        endpoint: "/private/host/server.sock",
+        ...(serverOverrides.process ?? {}),
+      },
+      engine: {
+        load_generation: 1,
+        model_load_count: 1,
+        successful_encode_count: 2,
+        ...(serverOverrides.engine ?? {}),
+      },
+      ...serverOverrides,
+    },
+  };
+}
+
+function retrievalEngineResourceResponse(uri, diagnostics = retrievalEngineDiagnosticsPayload()) {
+  return {
+    jsonrpc: "2.0",
+    id: "benchmark-retrieval-engine",
+    result: {
+      contents: [{ uri, mimeType: "application/json", text: JSON.stringify(diagnostics) }],
+    },
+  };
+}
+
+function scriptedStdioChild(onFrame, options = {}) {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = new PassThrough();
+  child.frames = [];
+  child.signals = [];
+  let input = "";
+  let closed = false;
+  const close = (exitCode, signal = null) => {
+    if (closed) return;
+    closed = true;
+    child.stdout.end();
+    child.stderr.end();
+    queueMicrotask(() => child.emit("close", exitCode, signal));
+  };
+  const respond = (value, splitUnicode = false) => {
+    const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+    if (!splitUnicode) {
+      child.stdout.write(bytes);
+      return;
+    }
+    const marker = Buffer.from("é", "utf8");
+    const index = bytes.indexOf(marker);
+    assert.ok(index >= 0, "scripted response lacks the split Unicode marker");
+    child.stdout.write(bytes.subarray(0, index + 1));
+    child.stdout.write(bytes.subarray(index + 1));
+  };
+  child.stdin.on("data", (chunk) => {
+    input += chunk.toString();
+    for (;;) {
+      const newline = input.indexOf("\n");
+      if (newline < 0) break;
+      const line = input.slice(0, newline).trim();
+      input = input.slice(newline + 1);
+      if (!line) continue;
+      const frame = JSON.parse(line);
+      child.frames.push(frame);
+      onFrame?.(frame, { respond, close, child });
+    }
+  });
+  child.stdin.on("finish", () => {
+    if (!options.hangOnEnd) close(0);
+  });
+  child.kill = (signal) => {
+    child.signals.push(signal);
+    if (signal === "SIGKILL" || options.closeOnTerm) close(null, signal);
+    return true;
+  };
+  return child;
+}
+
+test("retrieval engine diagnostics follows MCP lifecycle and redacts host state", async () => {
+  const project = "/tmp/CodeStory space !'()*é";
+  const expectedUri = projectResourceUri("codestory://diagnostics/retrieval-engine", project);
+  let spawnCall = null;
+  const initializeSeen = deferred();
+  let releaseInitialize = null;
+  const child = scriptedStdioChild((frame, { respond }) => {
+    if (frame.method === "initialize") {
+      releaseInitialize = () => respond({
+          jsonrpc: "2.0",
+          id: frame.id,
+          result: {
+            protocolVersion: "2024-11-05",
+            _meta: { codestory_protocol: { status: "agreed", compatible: true } },
+          },
+        });
+      initializeSeen.resolve();
+    } else if (frame.method === "resources/read") {
+      respond(retrievalEngineResourceResponse(
+        expectedUri,
+        retrievalEngineDiagnosticsPayload({
+          engine: {
+            embedding_engine_load_error: "/private/host/load-error.gguf could not be read",
+          },
+        }),
+      ), true);
+    }
+  });
+  const snapshotPromise = codestoryRetrievalEngineDiagnosticsSnapshot(
+    "/fixture/codestory-cli",
+    project,
+    1_000,
+    { CODESTORY_RETRIEVAL_RUN_ID: "hostile-run" },
+    null,
+    {
+      spawnProcess: (command, args, options) => {
+        spawnCall = { command, args, options };
+        return child;
+      },
+    },
+  );
+  await initializeSeen.promise;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(child.frames.map((frame) => frame.method), ["initialize"]);
+  releaseInitialize();
+  const snapshot = await snapshotPromise;
+
+  assert.equal(snapshot.status, "pass");
+  assert.equal(snapshot.engine.embedding_adapter, "Métal GPU");
+  assert.deepEqual(child.frames.map((frame) => frame.method), [
+    "initialize",
+    "notifications/initialized",
+    "resources/read",
+  ]);
+  assert.deepEqual(child.frames[0].params.clientInfo, {
+    name: "codestory-benchmark",
+    version: "1",
+  });
+  assert.equal(child.frames[2].params.uri, expectedUri);
+  assert.equal(spawnCall.command, "/fixture/codestory-cli");
+  assert.deepEqual(spawnCall.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
+  assert.equal(spawnCall.options.env.CODESTORY_RETRIEVAL_PROFILE, "agent");
+  assert.equal(spawnCall.options.env.CODESTORY_RETRIEVAL_RUN_ID, "shared-agent");
+  assert.deepEqual(child.signals, []);
+  const retained = JSON.stringify(snapshot);
+  assert.doesNotMatch(retained, /model\.gguf|server\.sock|4242/);
+  assert.doesNotMatch(retained, /load-error\.gguf/);
+  assert.equal(snapshot.engine.embedding_engine_load_error, "present");
+});
+
+test("retrieval engine diagnostics refuses invalid negotiation before resource reads", async () => {
+  for (const response of [
+    { jsonrpc: "2.0", id: "benchmark-initialize", error: { code: -32000, message: "no" } },
+    {
+      jsonrpc: "2.0",
+      id: "benchmark-initialize",
+      result: {
+        protocolVersion: "2025-01-01",
+        _meta: { codestory_protocol: { status: "agreed", compatible: true } },
+      },
+    },
+  ]) {
+    const child = scriptedStdioChild((frame, { respond }) => {
+      if (frame.method === "initialize") respond(response);
+    }, { closeOnTerm: true });
+    const snapshot = await codestoryRetrievalEngineDiagnosticsSnapshot(
+      "fixture-cli",
+      "/fixture/project",
+      1_000,
+      {},
+      null,
+      { spawnProcess: () => child },
+    );
+    assert.equal(snapshot.status, "fail");
+    assert.deepEqual(child.frames.map((frame) => frame.method), ["initialize"]);
+  }
+});
+
+test("retrieval engine diagnostics rejects malformed resource envelopes", () => {
+  const uri = projectResourceUri("codestory://diagnostics/retrieval-engine", "/fixture/project");
+  const valid = retrievalEngineResourceResponse(uri);
+  const cases = [
+    { ...valid, error: { code: -32000, message: "failed" }, result: undefined },
+    { ...valid, result: { contents: [{ ...valid.result.contents[0], uri: `${uri}-wrong` }] } },
+    { ...valid, result: { contents: [valid.result.contents[0], valid.result.contents[0]] } },
+    { ...valid, result: { contents: [{ ...valid.result.contents[0], mimeType: "text/plain" }] } },
+    { ...valid, result: { contents: [{ ...valid.result.contents[0], text: "{" }] } },
+    { ...valid, result: { contents: [{ ...valid.result.contents[0], text: "[]" }] } },
+    {
+      ...valid,
+      result: { contents: [{ ...valid.result.contents[0], text: JSON.stringify({ retrieval_mode: "full" }) }] },
+    },
+  ];
+  for (const response of cases) {
+    const snapshot = retrievalEngineDiagnosticsSnapshotFromOutput(response, uri, 1);
+    assert.equal(snapshot.status, "fail");
+    assert.ok(snapshot.error);
+  }
+});
+
+test("retrieval engine resource URIs are strict and filesystem-identity aware", async () => {
+  const base = "codestory://diagnostics/retrieval-engine";
+  assert.equal(
+    projectResourceUri(base, "/tmp/space !'()*é"),
+    `${base}?project=%2Ftmp%2Fspace%20%21%27%28%29%2A%C3%A9`,
+  );
+  assert.equal(
+    projectResourceUri(base, String.raw`\\?\C:\Repo Space\!`, "win32"),
+    `${base}?project=C%3A%2FRepo%20Space%2F%21`,
+  );
+  assert.equal(
+    projectResourceUri(base, String.raw`\\?\UNC\server\share\repo`, "win32"),
+    `${base}?project=%2F%2Fserver%2Fshare%2Frepo`,
+  );
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-resource-uri-"));
+  const real = path.join(root, "real");
+  const alias = path.join(root, "alias");
+  await mkdir(real);
+  await symlink(real, alias, process.platform === "win32" ? "junction" : "dir");
+  assert.equal(
+    resourceUriMatches(projectResourceUri(base, alias), projectResourceUri(base, real), process.platform),
+    true,
+  );
+  const other = path.join(root, "other");
+  await mkdir(other);
+  assert.equal(
+    resourceUriMatches(projectResourceUri(base, real), projectResourceUri(base, other), process.platform),
+    false,
+  );
+  assert.equal(
+    resourceUriMatches(
+      projectResourceUri(base, "C:/repo", "win32"),
+      projectResourceUri(base, "c:/REPO", "win32"),
+      "win32",
+      () => true,
+    ),
+    true,
+  );
+  await rm(root, { recursive: true, force: true });
+});
+
+test("retrieval status and diagnostics merge preserve public ownership", () => {
+  const uri = projectResourceUri("codestory://diagnostics/retrieval-engine", "/fixture/project");
+  const diagnostics = retrievalEngineDiagnosticsSnapshotFromOutput(
+    retrievalEngineResourceResponse(uri),
+    uri,
+    3,
+  );
+  const publicStatus = {
+    status: "pass",
+    retrieval_mode: "full",
+    degraded_reason: null,
+    semantic_generation: "semantic-generation-1",
+    manifest_embedding_backend:
+      `per-user-server:coderank-embed:q8_0:sha256-${FIXTURE_MODEL_SHA256}:fixture`,
+    embedding_device_policy: "accelerator_required",
+    embedding_device_state: "accelerated",
+    embedding_cpu_allowed: false,
+  };
+  const merged = mergeRetrievalStatusWithEngineDiagnostics(publicStatus, diagnostics);
+  assert.equal(merged.engine_diagnostics_status, "pass");
+  assert.equal(merged.embedding_device_policy, "accelerator_required");
+  assert.equal(merged.embedding_device_state, "accelerated");
+  assert.equal(merged.embedding_model_sha256, FIXTURE_MODEL_SHA256);
+  assert.equal(merged.local_only, true);
+  assert.deepEqual(
+    cachePreparationCanaryBlockers(
+      { retrieval_index_status: "pass", retrieval_status: merged },
+      { CODESTORY_EMBED_ALLOW_CPU: "0" },
+    ),
+    [],
+  );
+  const disagreement = mergeRetrievalStatusWithEngineDiagnostics(
+    publicStatus,
+    { ...diagnostics, retrieval_mode: "degraded" },
+  );
+  assert.equal(disagreement.engine_diagnostics_status, "fail");
+  assert.match(disagreement.engine_diagnostics_error, /disagree/);
+});
+
+test("public retrieval status cannot inject maintainer engine identity", () => {
+  const snapshot = retrievalStatusSnapshotFromOutput(
+    { status: "pass", exitCode: 0, timedOut: false },
+    {
+      retrieval_mode: "full",
+      degraded_reason: null,
+      embedding_device_policy: "accelerator_required",
+      embedding_device_state: "accelerated",
+      embedding_cpu_allowed: false,
+      embedding_backend: "hostile-backend",
+      embedding_policy: "hostile-policy",
+      embedding_engine_instance_id: "hostile-engine",
+      embedding_accelerator_execution_verified: true,
+      local_only: true,
+    },
+    null,
+    1,
+  );
+  assert.equal(snapshot.embedding_device_policy, "accelerator_required");
+  assert.equal(snapshot.embedding_device_state, "accelerated");
+  assert.equal(snapshot.embedding_cpu_allowed, false);
+  assert.equal(snapshot.embedding_backend, null);
+  assert.equal(snapshot.embedding_policy, null);
+  assert.equal(snapshot.embedding_engine_instance_id, null);
+  assert.equal(snapshot.embedding_accelerator_execution_verified, null);
+  assert.equal(snapshot.local_only, null);
+});
+
+test("retrieval engine diagnostics abort and EOF hang terminate task-owned children", async () => {
+  const abortSignals = [];
+  const abortChild = scriptedStdioChild(null, { hangOnEnd: true });
+  abortChild.kill = (signal) => {
+    abortSignals.push(signal);
+    if (signal === "SIGKILL") queueMicrotask(() => abortChild.emit("close", null, signal));
+    return true;
+  };
+  const controller = new AbortController();
+  const aborted = codestoryRetrievalEngineDiagnosticsSnapshot(
+    "fixture-cli",
+    "/fixture/project",
+    60_000,
+    {},
+    controller.signal,
+    { forceKillAfterMs: 5, spawnProcess: () => abortChild },
+  );
+  controller.abort();
+  assert.equal((await aborted).status, "aborted");
+  assert.deepEqual(abortSignals, ["SIGTERM", "SIGKILL"]);
+
+  const eofSignals = [];
+  const uri = projectResourceUri("codestory://diagnostics/retrieval-engine", "/fixture/project");
+  const eofChild = scriptedStdioChild((frame, { respond }) => {
+    if (frame.method === "initialize") {
+      respond({
+        jsonrpc: "2.0",
+        id: frame.id,
+        result: {
+          protocolVersion: "2024-11-05",
+          _meta: { codestory_protocol: { status: "agreed", compatible: true } },
+        },
+      });
+    } else if (frame.method === "resources/read") {
+      respond(retrievalEngineResourceResponse(uri));
+    }
+  }, { hangOnEnd: true });
+  eofChild.kill = (signal) => {
+    eofSignals.push(signal);
+    if (signal === "SIGKILL") queueMicrotask(() => eofChild.emit("close", null, signal));
+    return true;
+  };
+  const timedOut = await codestoryRetrievalEngineDiagnosticsSnapshot(
+    "fixture-cli",
+    "/fixture/project",
+    20,
+    {},
+    null,
+    { forceKillAfterMs: 5, spawnProcess: () => eofChild },
+  );
+  assert.equal(timedOut.status, "timeout");
+  assert.deepEqual(eofSignals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("retrieval engine diagnostics bounds cumulative output and stream errors", async () => {
+  for (const emitFailure of [
+    (child) => {
+      for (let index = 0; index < 1100; index += 1) child.stdout.write(`${" ".repeat(1024)}\n`);
+    },
+    (child) => child.stdout.emit("error", new Error("fixture stdout broke")),
+    (child) => child.stderr.emit("error", new Error("fixture stderr broke")),
+  ]) {
+    const child = scriptedStdioChild((frame, { child: runningChild }) => {
+      if (frame.method === "initialize") emitFailure(runningChild);
+    }, { hangOnEnd: true });
+    const snapshot = await codestoryRetrievalEngineDiagnosticsSnapshot(
+      "fixture-cli",
+      "/fixture/project",
+      1_000,
+      {},
+      null,
+      { forceKillAfterMs: 5, spawnProcess: () => child },
+    );
+    assert.notEqual(snapshot.status, "pass");
+    assert.match(snapshot.error, /exceeded 1 MiB|stdout error|stderr error/);
+    assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+  }
+});
 
 const CLEAN_SHARD_ATTESTATION = {
   sourceCommit: "source",
@@ -648,6 +1151,193 @@ test("benchmark pipeline fences a failed canary and counts a passing canary once
     executeRun: async (_opts, run) => pipelineResult(run),
   });
   assert.equal(nonOwnerResult.results.some((row) => row.canary), false);
+});
+
+test("benchmark pipeline rejects missing or wrong-repository canary preparation before agents", async () => {
+  for (const prepared of [[], [pipelinePreparation("wrong-repo")]]) {
+    const launched = [];
+    const outcome = await runAgentBenchmarkPipeline({
+      ...pipelineFixture({ repos: ["canary", "second"] }),
+      materializeGroup: async () => {},
+      prepareGroup: async () => prepared,
+      executeRun: async (_opts, run) => {
+        launched.push(run.repo);
+        return pipelineResult(run);
+      },
+    });
+    assert.equal(outcome.firstFailure.kind, "preparation_contract_failed");
+    assert.deepEqual(outcome.cachePreparation, []);
+    assert.deepEqual(launched, []);
+  }
+});
+
+test("preparation identity drift aborts before later rows and remains evidence only", async () => {
+  for (const [field, value] of [
+    ["embedding_model_sha256", "c".repeat(64)],
+    ["embedding_backend", "Vulkan"],
+    ["embedding_adapter", "Different GPU"],
+    ["embedding_policy", "different-policy"],
+    ["embedding_engine_instance_id", "engine-2"],
+  ]) {
+    const evidence = [];
+    const launched = [];
+    const fixture = pipelineFixture({ repos: ["canary", "second"] });
+    const outcome = await runAgentBenchmarkPipeline({
+      ...fixture,
+      materializeGroup: async () => {},
+      prepareGroup: async (group) => [
+        pipelinePreparation(group.repo, group.repo === "second" ? { [field]: value } : {}),
+      ],
+      recordPreparation: async (row) => evidence.push(row),
+      executeRun: async (_opts, run) => {
+        launched.push(`${run.repo}/${run.arm}`);
+        return pipelineResult(run);
+      },
+    });
+    assert.equal(outcome.firstFailure.kind, "preparation_identity_mismatch", field);
+    assert.deepEqual(outcome.cachePreparation.map((row) => row.repo), ["canary"]);
+    assert.deepEqual(evidence.map((row) => row.repo), ["canary", "second"]);
+    assert.equal(fixture.opts.cachePreparationByRepo.has("canary"), true);
+    assert.equal(fixture.opts.cachePreparationByRepo.has("second"), false);
+    assert.equal(launched.some((row) => row.startsWith("second/")), false);
+  }
+});
+
+test("nonowner shard establishes a local preparation identity reference", async () => {
+  const fixture = pipelineFixture({
+    repos: ["first", "second"],
+    canaryTaskId: "global-canary-not-on-this-shard",
+  });
+  const launched = [];
+  const outcome = await runAgentBenchmarkPipeline({
+    ...fixture,
+    materializeGroup: async () => {},
+    prepareGroup: async (group) => [
+      pipelinePreparation(group.repo, group.repo === "second"
+        ? { embedding_engine_instance_id: "engine-2" }
+        : {}),
+    ],
+    executeRun: async (_opts, run) => {
+      launched.push(run.repo);
+      return pipelineResult(run);
+    },
+  });
+  assert.equal(outcome.firstFailure.kind, "preparation_identity_mismatch");
+  assert.deepEqual(outcome.cachePreparation.map((row) => row.repo), ["first"]);
+  assert.equal(launched.includes("second"), false);
+  assert.equal(
+    outcome.results.some((row) => row.arm === "with_codestory"),
+    false,
+  );
+});
+
+test("identity failure aborts sibling preparation before durable failure recording completes", async () => {
+  const fixture = pipelineFixture({ repos: ["canary", "failing", "sibling"] });
+  const bothStarted = deferred();
+  const siblingObservedAbort = deferred();
+  const releaseFailureWrite = deferred();
+  const launched = [];
+  let activePreparations = 0;
+  const pipelinePromise = runAgentBenchmarkPipeline({
+    ...fixture,
+    materializeGroup: async () => {},
+    prepareGroup: async (group, signal) => {
+      if (group.repo === "canary") return [pipelinePreparation(group.repo)];
+      activePreparations += 1;
+      if (activePreparations === 2) bothStarted.resolve();
+      await bothStarted.promise;
+      if (group.repo === "failing") {
+        return [pipelinePreparation(group.repo, { embedding_engine_instance_id: "engine-2" })];
+      }
+      await new Promise((resolve) => {
+        if (signal.aborted) return resolve();
+        signal.addEventListener("abort", resolve, { once: true });
+      });
+      siblingObservedAbort.resolve();
+      return [pipelinePreparation(group.repo)];
+    },
+    recordFirstFailure: async (failure) => {
+      if (failure.kind === "preparation_identity_mismatch") {
+        await releaseFailureWrite.promise;
+      }
+    },
+    executeRun: async (_opts, run) => {
+      launched.push(run.repo);
+      return pipelineResult(run);
+    },
+  });
+  await siblingObservedAbort.promise;
+  assert.equal(fixture.opts.cachePreparationByRepo.has("failing"), false);
+  assert.equal(fixture.opts.cachePreparationByRepo.has("sibling"), false);
+  assert.equal(launched.includes("failing"), false);
+  assert.equal(launched.includes("sibling"), false);
+  releaseFailureWrite.resolve();
+  const outcome = await pipelinePromise;
+  assert.equal(outcome.firstFailure.kind, "preparation_identity_mismatch");
+});
+
+test("host class and shard attestation reject inconsistent preparation identity", async () => {
+  const first = pipelinePreparation("first");
+  const second = pipelinePreparation("second");
+  const hostClass = benchmarkHostClass([first, second]);
+  assert.equal(hostClass.model_sha256, FIXTURE_MODEL_SHA256);
+  assert.equal(Object.hasOwn(hostClass, "embedding_engine_instance_id"), false);
+  for (const [field, value] of [
+    ["embedding_model_sha256", "c".repeat(64)],
+    ["embedding_backend", "Vulkan"],
+    ["embedding_adapter", "Different GPU"],
+    ["embedding_policy", "different-policy"],
+    ["embedding_engine_instance_id", "engine-2"],
+  ]) {
+    const changed = pipelinePreparation("second", { [field]: value });
+    assert.match(cachePreparationIdentityBlockers(first, changed).join("\n"), new RegExp(field));
+    assert.throws(
+      () => benchmarkHostClass([first, changed]),
+      /do not share one retrieval engine identity/,
+    );
+  }
+  const fixture = pipelineFixture({ repos: ["first", "second"] });
+  fixture.opts.prepareCodestoryCache = true;
+  fixture.opts.shardCount = 1;
+  fixture.opts.shardIndex = 0;
+  const attestation = await benchmarkShardAttestation(
+    fixture.opts,
+    fixture.tasks,
+    [first, second],
+    [],
+    CLEAN_SHARD_ATTESTATION,
+  );
+  assert.equal(attestation.model_sha256, attestation.host_class.model_sha256);
+  await assert.rejects(
+    () => benchmarkShardAttestation(
+      fixture.opts,
+      fixture.tasks,
+      [first, first],
+      [],
+      CLEAN_SHARD_ATTESTATION,
+    ),
+    /preparation rows do not match/,
+  );
+  await assert.rejects(
+    () => benchmarkShardAttestation(
+      fixture.opts,
+      fixture.tasks,
+      [first, second, pipelinePreparation("extra")],
+      [],
+      CLEAN_SHARD_ATTESTATION,
+    ),
+    /preparation rows do not match/,
+  );
+  await assert.rejects(
+    () => benchmarkShardAttestation(
+      fixture.opts,
+      fixture.tasks,
+      [first, pipelinePreparation("second", { embedding_engine_instance_id: "engine-2" })],
+      [],
+      CLEAN_SHARD_ATTESTATION,
+    ),
+    /do not share one retrieval engine identity/,
+  );
 });
 
 test("benchmark pipeline retains product rows after an overlap baseline failure", async () => {
@@ -1176,22 +1866,17 @@ test("shard aggregation binds canary, contract, accounting, and host-class laten
         packet_sufficiency: { obligation_accounting: emptyAccounting },
       },
     }));
-    const preparation = [{
-      retrieval_status: {
-        embedding_backend: "Metal",
-        embedding_policy: "accelerated",
-        embedding_model_sha256: "model",
-      },
-    }];
-
     const writeShards = async (rowValues = rows, summaryMutator = (summary) => summary) => {
       const directories = [];
       for (const index of [0, 1]) {
         const directory = path.join(root, `shard-${index}`);
         await mkdir(directory, { recursive: true });
         const shardRows = rowValues.filter((row) => taskShardIndex(row.task_id, 2) === index);
+        const preparation = tasksForShard(tasks, 2, index).map((task) =>
+          pipelinePreparation(task.repo)
+        );
         const attestation = await benchmarkShardAttestation(
-          opts,
+          { ...opts, shardIndex: index },
           tasks,
           preparation,
           shardRows,
@@ -1224,12 +1909,15 @@ test("shard aggregation binds canary, contract, accounting, and host-class laten
     assert.equal(aggregate.latency_pooling_eligible, true);
     assert.equal(aggregate.pooled_latency_summary.length, 2);
     const shardOneRows = rows.filter((row) => taskShardIndex(row.task_id, 2) === 1);
+    const shardOnePreparation = tasksForShard(tasks, 2, 1).map((task) =>
+      pipelinePreparation(task.repo)
+    );
     const shardOneSummaryPath = path.join(shardDirs[1], "summary.json");
     const shardOneSummary = JSON.parse(await readFile(shardOneSummaryPath, "utf8"));
     shardOneSummary.shard.attestation = await benchmarkShardAttestation(
-      { ...opts, jobs: 8 },
+      { ...opts, jobs: 8, shardIndex: 1 },
       tasks,
-      preparation,
+      shardOnePreparation,
       shardOneRows,
       CLEAN_SHARD_ATTESTATION,
     );
@@ -1239,10 +1927,16 @@ test("shard aggregation binds canary, contract, accounting, and host-class laten
       /attestation does not match/,
     );
     await assert.rejects(
-      () => benchmarkShardAttestation(opts, tasks, preparation, rows, {
+      () => benchmarkShardAttestation(
+        { ...opts, shardIndex: 1 },
+        tasks,
+        shardOnePreparation,
+        shardOneRows,
+        {
         ...CLEAN_SHARD_ATTESTATION,
         trackedDirty: true,
-      }),
+        },
+      ),
       /clean tracked source checkout/,
     );
     shardDirs = await writeShards(rows, (summary, index) => index === 1
@@ -1336,7 +2030,7 @@ test("shard aggregation binds canary, contract, accounting, and host-class laten
             accelerator_backend: "Metal",
             accelerator_adapter: "MTL0",
             embedding_policy: "accelerated",
-            model_sha256: "model",
+            model_sha256: FIXTURE_MODEL_SHA256,
           },
         },
       },
@@ -1349,6 +2043,60 @@ test("shard aggregation binds canary, contract, accounting, and host-class laten
     assert.equal(cpuClassAggregate.latency_pooling_eligible, false);
     assert.equal(cpuClassAggregate.pooled_latency_summary, null);
     assert.equal(cpuClassAggregate.latency_summaries_by_host_class.length, 2);
+
+    for (const [field, value, expected] of [
+      ["accelerator_backend", null, /accelerator backend and adapter/],
+      ["accelerator_adapter", "llvmpipe", /software accelerator/],
+      ["embedding_policy", "cpu_explicit", /policy is not accelerated/],
+      ["model_sha256", "bad", /model digest is missing or malformed/],
+    ]) {
+      shardDirs = await writeShards(rows, (summary, index) => index === 1
+        ? {
+            ...summary,
+            shard: {
+              ...summary.shard,
+              attestation: {
+                ...summary.shard.attestation,
+                host_class: {
+                  ...summary.shard.attestation.host_class,
+                  [field]: value,
+                },
+              },
+            },
+          }
+        : summary);
+      await assert.rejects(
+        () => aggregateShardRuns({
+          ...opts,
+          aggregateShards: shardDirs,
+          outDir: path.join(root, `bad-host-${field}`),
+        }, tasks),
+        expected,
+      );
+    }
+    shardDirs = await writeShards(rows, (summary, index) => index === 1
+      ? {
+          ...summary,
+          shard: {
+            ...summary.shard,
+            attestation: {
+              ...summary.shard.attestation,
+              host_class: {
+                ...summary.shard.attestation.host_class,
+                model_sha256: "c".repeat(64),
+              },
+            },
+          },
+        }
+      : summary);
+    await assert.rejects(
+      () => aggregateShardRuns({
+        ...opts,
+        aggregateShards: shardDirs,
+        outDir: path.join(root, "host-model-disagreement"),
+      }, tasks),
+      /host-class model does not match/,
+    );
 
     const mixedRows = rows.map((row) => {
       if (taskShardIndex(row.task_id, 2) !== 1) return row;
@@ -3538,6 +4286,7 @@ test("publishable shard aggregation rejects incomplete, failed, and low-quality 
       materializeRepos: true,
       collectAllFailures: false,
       shardCount: 1,
+      shardIndex: 0,
       runner: "codex",
       model: "gpt-5.6-sol",
       sandbox: "read-only",
@@ -3559,13 +4308,7 @@ test("publishable shard aggregation rejects incomplete, failed, and low-quality 
       canary: run.repeat === 1,
       benchmark_contract: benchmarkContractForRun(opts, run),
     }));
-    const preparation = [{
-      retrieval_status: {
-        embedding_backend: "Metal",
-        embedding_policy: "accelerated",
-        embedding_model_sha256: "model",
-      },
-    }];
+    const preparation = [pipelinePreparation(task.repo)];
     const writeFixture = async (rows, summaryOverrides = {}) => {
       const attestation = await benchmarkShardAttestation(
         opts,

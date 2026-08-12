@@ -2,11 +2,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { copyFile, mkdir, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { parseArgs as parseNodeArgs } from "node:util";
 
@@ -4009,26 +4010,400 @@ function retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs) {
     manifest_embedding_backend: output?.manifest?.embedding_backend ?? null,
     manifest_embedding_dim: output?.manifest?.embedding_dim ?? null,
     semantic_generation: output?.manifest?.semantic_generation ?? null,
-    embedding_model_sha256: output?.embedding_model_sha256 ?? null,
-    embedding_ggml_build_identity: output?.embedding_ggml_build_identity ?? null,
-    embedding_backend: output?.embedding_backend ?? null,
-    embedding_adapter: output?.embedding_adapter ?? null,
-    embedding_policy: output?.embedding_policy ?? null,
-    embedding_engine_instance_id: output?.embedding_engine_instance_id ?? null,
-    embedding_model_load_count: output?.embedding_model_load_count ?? null,
-    embedding_smoke_ms: output?.embedding_smoke_ms ?? null,
-    embedding_initialization_ms: output?.embedding_initialization_ms ?? null,
-    embedding_materialized_reused: output?.embedding_materialized_reused ?? null,
-    embedding_accelerator_execution_verified: output?.embedding_accelerator_execution_verified ?? null,
-    local_only: true,
-    locality_kind: "same_user_local_ipc",
-    locality_evidence: "retrieval embeddings execute in the authenticated per-user CodeStory server",
+    embedding_device_policy: output?.embedding_device_policy ?? null,
+    embedding_device_state: output?.embedding_device_state ?? null,
+    embedding_device_observation_source: output?.embedding_device_observation_source ?? null,
+    embedding_detected_provider: output?.embedding_detected_provider ?? null,
+    embedding_detected_gpu: output?.embedding_detected_gpu ?? null,
+    embedding_accelerator_requested: output?.embedding_accelerator_requested ?? null,
+    embedding_accelerator_request_provider: output?.embedding_accelerator_request_provider ?? null,
+    embedding_accelerator_request_device: output?.embedding_accelerator_request_device ?? null,
+    embedding_cpu_allowed: output?.embedding_cpu_allowed ?? null,
+    embedding_model_sha256: null,
+    embedding_ggml_build_identity: null,
+    embedding_backend: null,
+    embedding_adapter: null,
+    embedding_policy: null,
+    embedding_engine_instance_id: null,
+    embedding_model_load_count: null,
+    embedding_smoke_ms: null,
+    embedding_initialization_ms: null,
+    embedding_materialized_reused: null,
+    embedding_accelerator_execution_verified: null,
+    local_only: null,
+    locality_kind: null,
+    locality_evidence: null,
     lexical_capabilities: output?.lexical?.capabilities ?? null,
     semantic_capabilities: output?.semantic?.capabilities ?? null,
     scip_capabilities: output?.scip?.capabilities ?? null,
     stdout_tail: result.status === "pass" ? null : trimTail(result.stdout),
     stderr_tail: result.status === "pass" ? null : trimTail(result.stderr),
   };
+}
+
+const RETRIEVAL_ENGINE_DIAGNOSTICS_URI = "codestory://diagnostics/retrieval-engine";
+const RETRIEVAL_ENGINE_IDENTITY_FIELDS = [
+  "embedding_model_sha256",
+  "embedding_ggml_build_identity",
+  "embedding_backend",
+  "embedding_adapter",
+  "embedding_adapter_description",
+  "embedding_policy",
+  "embedding_engine_instance_id",
+  "embedding_engine_residency",
+  "embedding_engine_load_generation",
+  "embedding_engine_load_error",
+  "embedding_model_load_count",
+  "embedding_smoke_ms",
+  "embedding_initialization_ms",
+  "embedding_materialized_reused",
+  "embedding_accelerator_execution_verified",
+  "embedding_execution_devices",
+  "embedding_execution_backends",
+  "embedding_execution_observation_source",
+  "embedding_encode_count",
+  "embedding_execution_node_count",
+  "embedding_resident_accelerator_tensor_count",
+  "embedding_resident_accelerator_tensor_bytes",
+  "embedding_model_layer_count",
+  "embedding_offloaded_layer_count",
+];
+
+function strictUriComponent(value) {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (character) =>
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+}
+
+function projectResourcePath(project, platform = process.platform) {
+  let value = String(project);
+  if (platform === "win32") {
+    value = value.replaceAll("\\", "/");
+    if (value.startsWith("//?/UNC/")) {
+      value = `//${value.slice("//?/UNC/".length)}`;
+    } else if (value.startsWith("//?/")) {
+      value = value.slice("//?/".length);
+    }
+  }
+  return value;
+}
+
+function projectResourceUri(baseUri, project, platform = process.platform) {
+  return `${baseUri}?project=${strictUriComponent(projectResourcePath(project, platform))}`;
+}
+
+function projectResourceUriParts(uri) {
+  const marker = "?project=";
+  const index = String(uri).indexOf(marker);
+  if (index <= 0 || String(uri).indexOf(marker, index + marker.length) >= 0) return null;
+  const baseUri = String(uri).slice(0, index);
+  const encodedProject = String(uri).slice(index + marker.length);
+  if (!encodedProject) return null;
+  try {
+    const project = decodeURIComponent(encodedProject);
+    if (strictUriComponent(project) !== encodedProject) return null;
+    return { baseUri, project };
+  } catch {
+    return null;
+  }
+}
+
+function resourceUriMatches(expectedUri, actualUri, platform = process.platform, sameFile = null) {
+  if (actualUri === expectedUri) return true;
+  const expected = projectResourceUriParts(expectedUri);
+  const actual = projectResourceUriParts(actualUri);
+  if (!expected || !actual || expected.baseUri !== actual.baseUri) return false;
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  if (!pathApi.isAbsolute(expected.project) || !pathApi.isAbsolute(actual.project)) return false;
+  const identityProbe = sameFile ?? ((left, right) => {
+    const leftStat = statSync(left, { bigint: true });
+    const rightStat = statSync(right, { bigint: true });
+    if (leftStat.ino !== 0n || rightStat.ino !== 0n) {
+      return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
+    }
+    const leftReal = realpathSync(left);
+    const rightReal = realpathSync(right);
+    return platform === "win32"
+      ? leftReal.toLowerCase() === rightReal.toLowerCase()
+      : leftReal === rightReal;
+  });
+  try {
+    return identityProbe(expected.project, actual.project) === true;
+  } catch {
+    return false;
+  }
+}
+
+function retrievalEngineDiagnosticsSnapshotFromOutput(
+  response,
+  expectedUri,
+  wallMs,
+) {
+  const snapshot = {
+    status: "fail",
+    error: null,
+    wall_ms: wallMs,
+    resource_uri: expectedUri,
+    retrieval_mode: null,
+    degraded_reason: null,
+    engine: null,
+    server: null,
+  };
+
+  try {
+    if (response.error) {
+      throw new Error(`retrieval-engine resource failed: ${JSON.stringify(response.error)}`);
+    }
+    const contents = response?.result?.contents;
+    if (!Array.isArray(contents)) {
+      throw new Error("retrieval-engine resource response lacks contents");
+    }
+    const matching = contents.filter((content) =>
+      typeof content?.uri === "string" && resourceUriMatches(expectedUri, content.uri),
+    );
+    if (matching.length !== 1 || contents.length !== 1) {
+      throw new Error(
+        `retrieval-engine resource content mismatch: matching=${matching.length} total=${contents.length}`,
+      );
+    }
+    if (matching[0].mimeType !== "application/json") {
+      throw new Error(`retrieval-engine resource MIME type=${matching[0].mimeType ?? "missing"}`);
+    }
+    const diagnostics = JSON.parse(matching[0].text);
+    if (!diagnostics || typeof diagnostics !== "object" || Array.isArray(diagnostics)) {
+      throw new Error("retrieval-engine resource text is not an object");
+    }
+    if (!diagnostics.engine || typeof diagnostics.engine !== "object" || Array.isArray(diagnostics.engine)) {
+      throw new Error("retrieval-engine resource lacks engine diagnostics");
+    }
+    snapshot.status = "pass";
+    snapshot.retrieval_mode = diagnostics.retrieval_mode ?? null;
+    snapshot.degraded_reason = diagnostics.degraded_reason ?? null;
+    snapshot.engine = Object.fromEntries(
+      RETRIEVAL_ENGINE_IDENTITY_FIELDS.map((field) => [
+        field,
+        field === "embedding_engine_load_error"
+          ? (diagnostics.engine[field] == null ? null : "present")
+          : diagnostics.engine[field] ?? null,
+      ]),
+    );
+    const server = diagnostics.embedding_server;
+    snapshot.server = server && typeof server === "object" && !Array.isArray(server)
+      ? {
+          lifecycle: server.lifecycle ?? null,
+          peer_verified: server.authority?.peer_verified ?? null,
+          server_instance_id: server.process?.server_instance_id ?? null,
+          executable_sha256: server.process?.executable_sha256 ?? null,
+          executable_version: server.process?.executable_version ?? null,
+          load_generation: server.engine?.load_generation ?? null,
+          model_load_count: server.engine?.model_load_count ?? null,
+          successful_encode_count: server.engine?.successful_encode_count ?? null,
+        }
+      : null;
+  } catch (error) {
+    snapshot.status = "fail";
+    snapshot.error = error instanceof Error ? error.message : String(error);
+  }
+  return snapshot;
+}
+
+function mergeRetrievalStatusWithEngineDiagnostics(retrievalStatus, diagnostics) {
+  const merged = {
+    ...retrievalStatus,
+    engine_diagnostics_status: diagnostics?.status ?? "missing",
+    engine_diagnostics_error: diagnostics?.error ?? null,
+    engine_diagnostics_wall_ms: diagnostics?.wall_ms ?? null,
+  };
+  if (diagnostics?.status !== "pass") {
+    return merged;
+  }
+  const publicMode = retrievalStatus?.retrieval_mode ?? null;
+  const diagnosticMode = diagnostics.retrieval_mode ?? null;
+  const publicDegraded = retrievalStatus?.degraded_reason ?? null;
+  const diagnosticDegraded = diagnostics.degraded_reason ?? null;
+  if (publicMode !== diagnosticMode || publicDegraded !== diagnosticDegraded) {
+    merged.engine_diagnostics_status = "fail";
+    merged.engine_diagnostics_error =
+      `retrieval status/engine diagnostics disagree: mode=${publicMode ?? "missing"}/${diagnosticMode ?? "missing"} `
+      + `degraded=${publicDegraded ?? "none"}/${diagnosticDegraded ?? "none"}`;
+    return merged;
+  }
+  for (const field of RETRIEVAL_ENGINE_IDENTITY_FIELDS) {
+    merged[field] = diagnostics.engine?.[field] ?? null;
+  }
+  merged.embedding_server_identity = diagnostics.server ?? null;
+  merged.local_only = diagnostics.server?.peer_verified === true;
+  merged.locality_kind = merged.local_only ? "same_user_local_ipc" : null;
+  merged.locality_evidence = merged.local_only
+    ? "retrieval embeddings execute in the peer-verified per-user CodeStory server"
+    : null;
+  return merged;
+}
+
+function createSequencedStdioSession(command, args, options) {
+  const child = (options.spawnProcess ?? spawn)(command, args, {
+    env: options.env,
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let stdoutBuffer = "";
+  let stdoutBytes = 0;
+  const stdoutDecoder = new StringDecoder("utf8");
+  let stderr = "";
+  let terminalError = null;
+  let exited = false;
+  let terminationStarted = false;
+  let forceKillTimer = null;
+  const queuedResponses = [];
+  const responseWaiters = [];
+  let exitResolve;
+  const exitPromise = new Promise((resolve) => {
+    exitResolve = resolve;
+  });
+
+  function rejectWaiters(error) {
+    while (responseWaiters.length) {
+      responseWaiters.shift().reject(error);
+    }
+  }
+  function terminate(signal) {
+    if (exited) return;
+    if (signal !== "SIGKILL" && terminationStarted) return;
+    if (signal !== "SIGKILL") terminationStarted = true;
+    terminateProcess(child, signal, options);
+    if (signal !== "SIGKILL" && (options.forceKillAfterMs ?? 5000) > 0) {
+      forceKillTimer ??= setTimeout(
+        () => terminateProcess(child, "SIGKILL", options),
+        options.forceKillAfterMs ?? 5000,
+      );
+    }
+  }
+  function fail(status, message) {
+    if (terminalError) return;
+    terminalError = Object.assign(new Error(message), { status });
+    rejectWaiters(terminalError);
+    terminate("SIGTERM");
+  }
+  function dispatchResponse(response) {
+    if (queuedResponses.length >= 4) {
+      fail("fail", "retrieval-engine stdio emitted too many unmatched responses");
+      return;
+    }
+    const waiter = responseWaiters.shift();
+    if (waiter) waiter.resolve(response);
+    else queuedResponses.push(response);
+  }
+
+  child.stdout.on("data", (chunk) => {
+    stdoutBytes += chunk.length;
+    if (stdoutBytes > 1_048_576) {
+      stdoutBuffer = trimTail(stdoutBuffer, 4096);
+      child.stdout.pause();
+      fail("fail", "retrieval-engine stdio response exceeded 1 MiB");
+      return;
+    }
+    stdoutBuffer += stdoutDecoder.write(chunk);
+    for (;;) {
+      const newline = stdoutBuffer.indexOf("\n");
+      if (newline < 0) break;
+      const line = stdoutBuffer.slice(0, newline).trim();
+      stdoutBuffer = stdoutBuffer.slice(newline + 1);
+      if (!line) continue;
+      try {
+        dispatchResponse(JSON.parse(line));
+      } catch (error) {
+        fail("fail", `retrieval-engine stdio emitted malformed JSON: ${error.message}`);
+      }
+    }
+  });
+  child.stdout.on("end", () => {
+    stdoutBuffer += stdoutDecoder.end();
+  });
+  child.stdout.on("error", (error) => {
+    fail("error", `retrieval-engine stdio stdout error: ${error.message}`);
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr = trimTail(stderr + chunk.toString(), 65_536);
+  });
+  child.stderr.on("error", (error) => {
+    fail("error", `retrieval-engine stdio stderr error: ${error.message}`);
+  });
+  child.stdin.on("error", (error) => {
+    fail("error", `retrieval-engine stdio stdin error: ${error.message}`);
+  });
+  child.on("error", (error) => {
+    fail("error", `retrieval-engine stdio process error: ${error.message}`);
+  });
+  child.on("close", (exitCode, signal) => {
+    exited = true;
+    if (forceKillTimer) clearTimeout(forceKillTimer);
+    exitResolve({ exitCode, signal });
+    if (!terminalError && (exitCode !== 0 || signal || responseWaiters.length)) {
+      terminalError = Object.assign(
+        new Error(
+          `retrieval-engine stdio exited before completing responses: code=${exitCode ?? ""} signal=${signal ?? ""} stderr=${trimTail(stderr)}`,
+        ),
+        { status: "fail" },
+      );
+      rejectWaiters(terminalError);
+    }
+  });
+
+  const onAbort = () => fail("aborted", "retrieval-engine stdio aborted by benchmark fail-fast");
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  if (options.signal?.aborted) onAbort();
+  const timeoutTimer = setTimeout(
+    () => fail("timeout", `retrieval-engine stdio timed out after ${options.timeoutMs}ms`),
+    options.timeoutMs,
+  );
+
+  async function nextResponse() {
+    if (terminalError) throw terminalError;
+    if (queuedResponses.length) return queuedResponses.shift();
+    if (exited) throw Object.assign(new Error("retrieval-engine stdio already exited"), { status: "fail" });
+    return await new Promise((resolve, reject) => responseWaiters.push({ resolve, reject }));
+  }
+  function send(payload) {
+    if (terminalError) throw terminalError;
+    if (exited) throw Object.assign(new Error("retrieval-engine stdio already exited"), { status: "fail" });
+    child.stdin.write(`${JSON.stringify(payload)}\n`);
+  }
+  async function request(payload) {
+    send(payload);
+    const response = await nextResponse();
+    const ownsResult = Object.prototype.hasOwnProperty.call(response ?? {}, "result");
+    const ownsError = Object.prototype.hasOwnProperty.call(response ?? {}, "error");
+    if (response?.jsonrpc !== "2.0" || response?.id !== payload.id || ownsResult === ownsError) {
+      fail(
+        "fail",
+        `retrieval-engine stdio response envelope mismatch for id=${JSON.stringify(payload.id)}`,
+      );
+      throw terminalError;
+    }
+    return response;
+  }
+  async function close() {
+    if (!terminalError) child.stdin.end();
+    else terminate("SIGTERM");
+    const exit = await exitPromise;
+    clearTimeout(timeoutTimer);
+    options.signal?.removeEventListener("abort", onAbort);
+    if (terminalError) throw terminalError;
+    if (stdoutBuffer.trim() || queuedResponses.length || responseWaiters.length) {
+      throw Object.assign(new Error("retrieval-engine stdio retained unmatched output"), { status: "fail" });
+    }
+    if (exit.exitCode !== 0 || exit.signal) {
+      throw Object.assign(new Error("retrieval-engine stdio did not exit cleanly"), { status: "fail" });
+    }
+  }
+  async function stop() {
+    if (!exited) terminate("SIGTERM");
+    await exitPromise;
+    clearTimeout(timeoutTimer);
+    options.signal?.removeEventListener("abort", onAbort);
+  }
+  return { request, send, close, stop, stderr: () => stderr };
 }
 
 async function codestoryDoctorSnapshot(
@@ -4085,6 +4460,80 @@ async function codestoryRetrievalStatusSnapshot(
   return retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs);
 }
 
+async function codestoryRetrievalEngineDiagnosticsSnapshot(
+  codestoryCli,
+  project,
+  timeoutMs,
+  env = benchmarkChildEnv(process.env),
+  signal = null,
+  processOptions = {},
+) {
+  const uri = projectResourceUri(RETRIEVAL_ENGINE_DIAGNOSTICS_URI, project);
+  const started = performance.now();
+  const session = createSequencedStdioSession(
+    codestoryCli,
+    ["serve", "--stdio", "--multi-project", "--refresh", "none"],
+    {
+      ...processOptions,
+      timeoutMs,
+      env: {
+        ...env,
+        CODESTORY_RETRIEVAL_PROFILE: "agent",
+        CODESTORY_RETRIEVAL_RUN_ID: BENCHMARK_AGENT_RUN_ID,
+      },
+      signal,
+    },
+  );
+  try {
+    const initialize = await session.request({
+      jsonrpc: "2.0",
+      id: "benchmark-initialize",
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "codestory-benchmark", version: "1" },
+      },
+    });
+    if (initialize.error) {
+      throw new Error(`retrieval-engine stdio initialize failed: ${JSON.stringify(initialize.error)}`);
+    }
+    const negotiation = initialize?.result?._meta?.codestory_protocol;
+    if (
+      initialize?.result?.protocolVersion !== "2024-11-05"
+      || negotiation?.status !== "agreed"
+      || negotiation?.compatible !== true
+    ) {
+      throw new Error(
+        `retrieval-engine stdio protocol negotiation failed: ${JSON.stringify(negotiation ?? null)}`,
+      );
+    }
+    session.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const response = await session.request({
+      jsonrpc: "2.0",
+      id: "benchmark-retrieval-engine",
+      method: "resources/read",
+      params: { uri },
+    });
+    await session.close();
+    const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
+    return retrievalEngineDiagnosticsSnapshotFromOutput(response, uri, wallMs);
+  } catch (error) {
+    await session.stop();
+    return {
+      status: error?.status ?? "fail",
+      error: error instanceof Error ? error.message : String(error),
+      wall_ms: Math.round((performance.now() - started) * 1000) / 1000,
+      resource_uri: uri,
+      retrieval_mode: null,
+      degraded_reason: null,
+      engine: null,
+      server: null,
+      stderr_tail: trimTail(session.stderr()),
+    };
+  }
+}
+
 function cacheNeedsPreparation(snapshot) {
   if (snapshot.status !== "pass") {
     return true;
@@ -4138,11 +4587,40 @@ function cachePreparationCanaryBlockers(preparation, env = process.env) {
     return ["canary cache preparation is missing"];
   }
   const retrieval = preparation.retrieval_status ?? {};
+  if (retrieval.status !== "pass") {
+    blockers.push(`retrieval status=${retrieval.status ?? "missing"}; expected pass`);
+  }
   if (preparation.retrieval_index_status !== "pass") {
     blockers.push(`retrieval preparation status=${preparation.retrieval_index_status ?? "missing"}`);
   }
   if (retrieval.retrieval_mode !== "full") {
     blockers.push(`retrieval mode=${retrieval.retrieval_mode ?? "missing"}; expected full`);
+  }
+  if (!retrieval.semantic_generation) {
+    blockers.push("semantic generation identity is missing");
+  }
+  if (retrieval.degraded_reason != null) {
+    blockers.push(`retrieval is degraded: ${retrieval.degraded_reason}`);
+  }
+  if (retrieval.engine_diagnostics_status !== "pass") {
+    blockers.push(
+      `retrieval engine diagnostics=${retrieval.engine_diagnostics_status ?? "missing"}: ${retrieval.engine_diagnostics_error ?? "identity unavailable"}`,
+    );
+  } else if (retrieval.engine_diagnostics_error != null) {
+    blockers.push(`retrieval engine diagnostics retained an error: ${retrieval.engine_diagnostics_error}`);
+  }
+  if (retrieval.embedding_device_policy !== "accelerator_required") {
+    blockers.push(
+      `embedding device policy=${retrieval.embedding_device_policy ?? "missing"}; expected accelerator_required`,
+    );
+  }
+  if (retrieval.embedding_device_state !== "accelerated") {
+    blockers.push(
+      `embedding device state=${retrieval.embedding_device_state ?? "missing"}; expected accelerated`,
+    );
+  }
+  if (retrieval.embedding_cpu_allowed !== false) {
+    blockers.push("runtime did not prove CPU embeddings disabled");
   }
   if (retrieval.embedding_policy !== "accelerated") {
     blockers.push(`embedding policy=${retrieval.embedding_policy ?? "missing"}; expected accelerated`);
@@ -4153,8 +4631,101 @@ function cachePreparationCanaryBlockers(preparation, env = process.env) {
   if (!retrieval.embedding_backend) {
     blockers.push("accelerator backend identity is missing");
   }
+  const modelSha = String(retrieval.embedding_model_sha256 ?? "");
+  if (!/^[0-9a-f]{64}$/i.test(modelSha)) {
+    blockers.push("embedding model digest is missing or malformed");
+  } else if (!String(retrieval.manifest_embedding_backend ?? "")
+    .startsWith(`per-user-server:coderank-embed:q8_0:sha256-${modelSha}:`)) {
+    blockers.push("live embedding model identity does not match the retrieval manifest");
+  }
+  if (!retrieval.embedding_ggml_build_identity) {
+    blockers.push("linked ggml build identity is missing");
+  }
+  const adapter = String(retrieval.embedding_adapter ?? "");
+  const adapterEvidence = `${retrieval.embedding_backend ?? ""} ${adapter} ${retrieval.embedding_adapter_description ?? ""}`;
+  if (!adapter) {
+    blockers.push("physical accelerator adapter identity is missing");
+  } else if (["llvmpipe", "lavapipe", "warp", "software rasterizer", "swiftshader", "microsoft basic render driver"]
+    .some((token) => adapterEvidence.toLowerCase().includes(token))) {
+    blockers.push(`software accelerator adapter is not eligible: ${adapter}`);
+  }
   if (!retrieval.embedding_engine_instance_id) {
     blockers.push("embedding engine instance identity is missing");
+  }
+  if (retrieval.embedding_engine_residency !== "resident") {
+    blockers.push(`embedding engine residency=${retrieval.embedding_engine_residency ?? "missing"}; expected resident`);
+  }
+  if (!Number.isInteger(retrieval.embedding_engine_load_generation)
+      || retrieval.embedding_engine_load_generation <= 0) {
+    blockers.push("embedding engine load generation is missing");
+  }
+  if (!Number.isInteger(retrieval.embedding_model_load_count)
+      || retrieval.embedding_model_load_count <= 0) {
+    blockers.push("embedding model load count is missing");
+  }
+  if (retrieval.embedding_engine_load_error != null) {
+    blockers.push(`embedding engine retained a load error: ${retrieval.embedding_engine_load_error}`);
+  }
+  if (typeof retrieval.embedding_materialized_reused !== "boolean") {
+    blockers.push("embedding model materialization reuse identity is missing");
+  }
+  for (const [field, label] of [
+    ["embedding_smoke_ms", "embedding smoke timing"],
+    ["embedding_initialization_ms", "embedding initialization timing"],
+  ]) {
+    if (!Number.isFinite(retrieval[field]) || retrieval[field] < 0) {
+      blockers.push(`${label} is missing`);
+    }
+  }
+  if (retrieval.embedding_execution_observation_source !== "ggml_eval_callback") {
+    blockers.push("accelerator execution observation is not backend-measured");
+  }
+  for (const [field, label] of [
+    ["embedding_execution_devices", "execution devices"],
+    ["embedding_execution_backends", "execution backends"],
+  ]) {
+    if (!Array.isArray(retrieval[field]) || retrieval[field].length === 0) {
+      blockers.push(`${label} are missing`);
+    }
+  }
+  for (const [field, label] of [
+    ["embedding_encode_count", "successful encode count"],
+    ["embedding_execution_node_count", "accelerator execution node count"],
+    ["embedding_resident_accelerator_tensor_count", "resident accelerator tensor count"],
+    ["embedding_resident_accelerator_tensor_bytes", "resident accelerator tensor bytes"],
+  ]) {
+    if (!Number.isInteger(retrieval[field]) || retrieval[field] <= 0) {
+      blockers.push(`${label} is missing`);
+    }
+  }
+  if (!Number.isInteger(retrieval.embedding_model_layer_count)
+      || retrieval.embedding_model_layer_count <= 0) {
+    blockers.push("embedding model layer count is missing");
+  } else if (retrieval.embedding_offloaded_layer_count !== retrieval.embedding_model_layer_count) {
+    blockers.push("not every embedding model layer was offloaded");
+  }
+  const server = retrieval.embedding_server_identity;
+  if (server?.peer_verified !== true) blockers.push("embedding server peer identity is not verified");
+  if (server?.lifecycle !== "resident") blockers.push("embedding server is not resident");
+  if (!/^[0-9a-f]{64}$/i.test(String(server?.executable_sha256 ?? ""))) {
+    blockers.push("embedding server executable digest is missing or malformed");
+  }
+  if (server?.executable_version !== REQUIRED_MANAGED_CODESTORY_VERSION) {
+    blockers.push(`embedding server version=${server?.executable_version ?? "missing"}; expected ${REQUIRED_MANAGED_CODESTORY_VERSION}`);
+  }
+  if (!server?.server_instance_id || server.server_instance_id !== retrieval.embedding_engine_instance_id) {
+    blockers.push("embedding server and engine instance identities disagree");
+  }
+  if (server?.load_generation !== retrieval.embedding_engine_load_generation
+      || server?.model_load_count !== retrieval.embedding_model_load_count) {
+    blockers.push("embedding server and engine load identities disagree");
+  }
+  if (!Number.isInteger(server?.successful_encode_count)
+      || server.successful_encode_count < retrieval.embedding_encode_count) {
+    blockers.push("embedding server successful encode count is missing");
+  }
+  if (retrieval.local_only !== true) {
+    blockers.push("same-user local embedding execution is not proven");
   }
   if (String(env.CODESTORY_EMBED_ALLOW_CPU ?? "0") !== "0") {
     blockers.push("CPU embeddings are enabled");
@@ -4162,8 +4733,20 @@ function cachePreparationCanaryBlockers(preparation, env = process.env) {
   return blockers;
 }
 
-function benchmarkHostClass(cachePreparation) {
-  const retrieval = cachePreparation?.retrieval_status ?? {};
+function benchmarkHostClass(cachePreparations) {
+  const successful = (cachePreparations ?? []).filter((row) => row?.retrieval_status);
+  const reference = successful[0] ?? null;
+  if (reference) {
+    for (const preparation of successful.slice(1)) {
+      const blockers = cachePreparationIdentityBlockers(reference, preparation);
+      if (blockers.length) {
+        throw new Error(
+          `Benchmark preparations do not share one retrieval engine identity: ${blockers.join("; ")}`,
+        );
+      }
+    }
+  }
+  const retrieval = reference?.retrieval_status ?? {};
   const cpus = os.cpus();
   const cpuModel = String(cpus[0]?.model ?? "")
     .normalize("NFKC")
@@ -4180,6 +4763,34 @@ function benchmarkHostClass(cachePreparation) {
     embedding_policy: retrieval.embedding_policy ?? null,
     model_sha256: retrieval.embedding_model_sha256 ?? null,
   };
+}
+
+const BENCHMARK_PREPARATION_IDENTITY_FIELDS = [
+  "embedding_model_sha256",
+  "embedding_backend",
+  "embedding_adapter",
+  "embedding_policy",
+  "embedding_engine_instance_id",
+];
+
+function cachePreparationIdentity(preparation) {
+  const retrieval = preparation?.retrieval_status ?? {};
+  return Object.fromEntries(
+    BENCHMARK_PREPARATION_IDENTITY_FIELDS.map((field) => [field, retrieval[field] ?? null]),
+  );
+}
+
+function cachePreparationIdentityBlockers(referencePreparation, preparation) {
+  const expected = cachePreparationIdentity(referencePreparation);
+  const observed = cachePreparationIdentity(preparation);
+  return BENCHMARK_PREPARATION_IDENTITY_FIELDS.flatMap((field) =>
+    observed[field] === expected[field]
+      ? []
+      : [
+          `retrieval preparation identity changed for ${field}: `
+          + `${observed[field] ?? "missing"}; expected ${expected[field] ?? "missing"}`,
+        ]
+  );
 }
 
 async function prepareCodeStoryCaches(opts, tasks) {
@@ -4219,6 +4830,7 @@ async function prepareCodeStoryCaches(opts, tasks) {
       index_stdout_tail: null,
       index_stderr_tail: null,
       retrieval_status: null,
+      retrieval_engine_diagnostics: null,
       retrieval_index_stdout_tail: null,
       retrieval_index_stderr_tail: null,
       after: null,
@@ -4265,12 +4877,24 @@ async function prepareCodeStoryCaches(opts, tasks) {
           childEnv,
           opts.signal,
         );
-        preparation.retrieval_status = await codestoryRetrievalStatusSnapshot(
+        const publicRetrievalStatus = await codestoryRetrievalStatusSnapshot(
           codestoryCli,
           config.path,
           60_000,
           childEnv,
           opts.signal,
+        );
+        preparation.retrieval_engine_diagnostics =
+          await codestoryRetrievalEngineDiagnosticsSnapshot(
+            codestoryCli,
+            preparation.after?.project ?? config.path,
+            60_000,
+            childEnv,
+            opts.signal,
+          );
+        preparation.retrieval_status = mergeRetrievalStatusWithEngineDiagnostics(
+          publicRetrievalStatus,
+          preparation.retrieval_engine_diagnostics,
         );
         if (preparation.retrieval_status.retrieval_mode !== "full") {
           throw new Error(
@@ -7393,6 +8017,13 @@ function runSelfTest() {
           },
         },
       },
+      plan: {
+        obligations: {
+          claim_obligations: [
+            { material: true, proof_status: "proven" },
+          ],
+        },
+      },
     },
     { pass: true },
   );
@@ -7520,17 +8151,21 @@ function runSelfTest() {
     { status: "pass", exitCode: 0, timedOut: false },
     {
       retrieval_mode: "full",
-      embedding_backend: "Metal",
-      embedding_policy: "accelerated",
-      embedding_engine_instance_id: "engine-1",
+      degraded_reason: null,
+      embedding_device_policy: "accelerator_required",
+      embedding_device_state: "accelerated",
+      embedding_cpu_allowed: false,
     },
     null,
     1,
   );
-  assert.equal(engineStatus.locality_kind, "same_user_local_ipc");
-  assert.equal(engineStatus.embedding_backend, "Metal");
-  assert.equal(engineStatus.embedding_policy, "accelerated");
-  assert.equal(engineStatus.embedding_engine_instance_id, "engine-1");
+  assert.equal(engineStatus.embedding_device_policy, "accelerator_required");
+  assert.equal(engineStatus.embedding_device_state, "accelerated");
+  assert.equal(engineStatus.embedding_cpu_allowed, false);
+  assert.equal(engineStatus.locality_kind, null);
+  assert.equal(engineStatus.embedding_backend, null);
+  assert.equal(engineStatus.embedding_policy, null);
+  assert.equal(engineStatus.embedding_engine_instance_id, null);
   const packetRuntimePreparation = [
     {
       repo: "codestory",
@@ -7736,6 +8371,21 @@ function benchmarkHostClassError(hostClass, label) {
   }
   if (!Number.isInteger(hostClass.total_memory_bytes) || hostClass.total_memory_bytes < 1) {
     return `${label} host class has invalid total memory`;
+  }
+  const backend = String(hostClass.accelerator_backend ?? "").trim();
+  const adapter = String(hostClass.accelerator_adapter ?? "").trim();
+  if (!backend || !adapter) {
+    return `${label} host class must name the accelerator backend and adapter`;
+  }
+  if (["llvmpipe", "lavapipe", "warp", "software rasterizer", "swiftshader", "microsoft basic render driver"]
+    .some((token) => `${backend} ${adapter}`.toLowerCase().includes(token))) {
+    return `${label} host class names a software accelerator`;
+  }
+  if (hostClass.embedding_policy !== "accelerated") {
+    return `${label} host class embedding policy is not accelerated`;
+  }
+  if (!SHA256_PATTERN.test(String(hostClass.model_sha256 ?? ""))) {
+    return `${label} host class model digest is missing or malformed`;
   }
   return null;
 }
@@ -8093,6 +8743,23 @@ async function benchmarkShardAttestation(
   if (Object.values(contractFingerprints).some((fingerprint) => !fingerprint)) {
     throw new Error("Benchmark row is missing its compatibility fingerprint");
   }
+  if (opts.prepareCodestoryCache || opts.publishable) {
+    const ownedRepos = new Set(
+      tasksForShard(allTasks, opts.shardCount, opts.shardIndex).map((task) => task.repo),
+    );
+    const preparedRepos = cachePreparation.map((row) => row?.repo ?? null);
+    if (
+      preparedRepos.length !== ownedRepos.size
+      || new Set(preparedRepos).size !== preparedRepos.length
+      || preparedRepos.some((repo) => !ownedRepos.has(repo))
+      || [...ownedRepos].some((repo) => !preparedRepos.includes(repo))
+    ) {
+      throw new Error(
+        "Benchmark preparation rows do not match the repositories owned by this shard",
+      );
+    }
+  }
+  const hostClass = benchmarkHostClass(cachePreparation);
   return {
     contract: "codestory.agent-benchmark-shard/v2",
     source_commit: sourceCommit,
@@ -8105,10 +8772,8 @@ async function benchmarkShardAttestation(
     benchmark_contract_environment_sha256: benchmarkContractEnvironmentDigest,
     benchmark_contract_fingerprints: contractFingerprints,
     benchmark_contract_rows_sha256: sha256Bytes(stableJsonForHash(contractFingerprints)),
-    model_sha256:
-      cachePreparation.find((row) => row.retrieval_status?.embedding_model_sha256)
-        ?.retrieval_status?.embedding_model_sha256 ?? null,
-    host_class: benchmarkHostClass(cachePreparation[0] ?? null),
+    model_sha256: hostClass.model_sha256,
+    host_class: hostClass,
   };
 }
 
@@ -8198,6 +8863,9 @@ async function aggregateShardRuns(opts, allTasks) {
     const hostClassError = benchmarkHostClassError(attestation?.host_class, `shard ${index}`);
     if (hostClassError) {
       throw new Error(hostClassError);
+    }
+    if (attestation.host_class.model_sha256 !== attestation.model_sha256) {
+      throw new Error(`Shard ${index} host-class model does not match its attested model`);
     }
     if (
       stableJsonForHash(commonAttestation(attestation ?? {})) !==
@@ -8459,21 +9127,23 @@ async function runAgentBenchmarkPipeline({
   let firstFailure = null;
   let comparativeFailure = null;
   let agentCodexIsolation = null;
+  let preparationIdentityReference = null;
+  let stopScheduling = false;
 
   const rememberFirstFailure = async (failure, abort = false) => {
     if (firstFailure) {
       return;
     }
     firstFailure = { recorded_at: new Date().toISOString(), ...failure };
-    await recordFirstFailure(firstFailure);
     if (abort) {
+      stopScheduling = true;
       abortController.abort(firstFailure);
     }
+    await recordFirstFailure(firstFailure);
   };
-  const persistPreparation = async (row) => {
+  const acceptPreparation = (row) => {
     cachePreparation.push(row);
     opts.cachePreparationByRepo.set(row.repo, row);
-    await recordPreparation(row);
   };
   const rememberComparativeFailure = async (failure) => {
     if (comparativeFailure) {
@@ -8491,7 +9161,7 @@ async function runAgentBenchmarkPipeline({
     const batchSignal = options.comparativeOnly
       ? AbortSignal.any([abortController.signal, comparativeAbortController.signal])
       : abortController.signal;
-    if (!runs.length || batchSignal.aborted) {
+    if (!runs.length || stopScheduling || batchSignal.aborted) {
       return { results: [], firstFailure: null };
     }
     return await runPlannedAgentRuns(
@@ -8532,6 +9202,7 @@ async function runAgentBenchmarkPipeline({
     try {
       await materializeGroup(group, abortController.signal);
       await recordPreparationState({ kind: "materialized", repo: group.repo });
+      if (stopScheduling || abortController.signal.aborted) return;
     } catch (error) {
       await rememberFirstFailure(pipelineStageFailure("materialization", group, error), true);
       await recordPreparationState({ kind: "materialization_failed", repo: group.repo });
@@ -8539,28 +9210,73 @@ async function runAgentBenchmarkPipeline({
     }
     try {
       const prepared = await prepareGroup(group, abortController.signal);
-      for (const row of prepared ?? []) {
-        await persistPreparation(row);
+      const requirePreparationRow = canary || opts.prepareCodestoryCache || opts.publishable;
+      const preparationContractInvalid = !Array.isArray(prepared)
+        || prepared.length > 1
+        || (prepared.length === 1 && prepared[0]?.repo !== group.repo)
+        || (requirePreparationRow && prepared.length !== 1);
+      if (preparationContractInvalid) {
+        const failure = {
+          kind: "preparation_contract_failed",
+          repo: group.repo,
+          task_id: group.tasks[0]?.id ?? null,
+          blockers: [{
+            category: "harness-contract",
+            reasons: [
+              `preparation must return exactly one row for ${group.repo}; received `
+              + `${Array.isArray(prepared) ? prepared.length : "non-array"}`,
+            ],
+          }],
+        };
+        for (const row of Array.isArray(prepared) ? prepared : []) {
+          await recordPreparation(row);
+        }
+        await rememberFirstFailure(failure, true);
+        await recordPreparationState({
+          kind: "preparation_contract_failed",
+          repo: group.repo,
+          returned_repos: Array.isArray(prepared)
+            ? prepared.map((row) => row?.repo ?? null)
+            : null,
+        });
+        return;
       }
-      await recordPreparationState({ kind: "prepared", repo: group.repo });
-      if (canary) {
-        const canaryPreparation = prepared?.[0] ?? null;
-        const blockers = cachePreparationCanaryBlockers(
-          canaryPreparation,
+      for (const row of prepared) {
+        await recordPreparation(row);
+        if (stopScheduling || firstFailure) return;
+        const eligibilityBlockers = cachePreparationCanaryBlockers(
+          row,
           selectedBenchmarkChildEnv(opts),
         );
+        const identityBlockers = preparationIdentityReference
+          ? cachePreparationIdentityBlockers(preparationIdentityReference, row)
+          : [];
+        const blockers = [...eligibilityBlockers, ...identityBlockers];
         if (blockers.length) {
           await rememberFirstFailure({
-            kind: "canary_preparation",
+            kind: identityBlockers.length
+              ? "preparation_identity_mismatch"
+              : (canary ? "canary_preparation" : "preparation_eligibility"),
             repo: group.repo,
             task_id: group.tasks[0]?.id ?? null,
             blockers: [{ category: "environment", reasons: blockers }],
           }, true);
+          await recordPreparationState({
+            kind: eligibilityBlockers.length
+              ? "preparation_eligibility_failed"
+              : "preparation_identity_failed",
+            repo: group.repo,
+            blockers,
+          });
+          return;
         }
+        preparationIdentityReference ??= row;
+        acceptPreparation(row);
       }
+      await recordPreparationState({ kind: "prepared", repo: group.repo });
     } catch (error) {
       if (error?.preparation) {
-        await persistPreparation(error.preparation);
+        await recordPreparation(error.preparation);
       }
       await rememberFirstFailure(pipelineStageFailure("preparation", group, error), true);
       await recordPreparationState({ kind: "preparation_failed", repo: group.repo });
@@ -8583,7 +9299,7 @@ async function runAgentBenchmarkPipeline({
   if (canaryGroup) {
     await prepareTaskGroup(canaryGroup, true);
   }
-  if (!firstFailure) {
+  if (!firstFailure && !stopScheduling) {
     try {
       agentCodexIsolation = await prepareIsolation();
     } catch (error) {
@@ -8602,7 +9318,7 @@ async function runAgentBenchmarkPipeline({
       });
     }
   }
-  if (!firstFailure && canaryTask) {
+  if (!firstFailure && !stopScheduling && canaryTask) {
     const canaryRun = plannedRuns.find(
       (run) => run.task?.id === canaryTask.id &&
         run.arm === "with_codestory" &&
@@ -8618,7 +9334,7 @@ async function runAgentBenchmarkPipeline({
     );
   }
 
-  if (!firstFailure) {
+  if (!firstFailure && !stopScheduling) {
     const completedKeys = new Set(results.map(agentRunKey));
     const baselineRuns = plannedRuns.filter(
       (run) => run.arm === "without_codestory" && !completedKeys.has(agentRunKey(run)),
@@ -8641,6 +9357,7 @@ async function runAgentBenchmarkPipeline({
           if (
             !group ||
             preparationState.drained ||
+            stopScheduling ||
             abortController.signal.aborted ||
             comparativeAbortController.signal.aborted
           ) {
@@ -8669,11 +9386,11 @@ async function runAgentBenchmarkPipeline({
         otherGroups,
         Math.min(2, Math.max(1, opts.prepareCodestoryJobs ?? 2)),
         async (group) => {
-          if (abortController.signal.aborted) {
+          if (stopScheduling || abortController.signal.aborted) {
             return;
           }
           await prepareTaskGroup(group, false);
-          if (!abortController.signal.aborted && !comparativeAbortController.signal.aborted) {
+          if (!stopScheduling && !abortController.signal.aborted && !comparativeAbortController.signal.aborted) {
             const runs = baselineRuns.filter((run) => run.repo === group.repo);
             if (runs.length) {
               readyBaselines.push({ repo: group.repo, runs });
@@ -8688,7 +9405,7 @@ async function runAgentBenchmarkPipeline({
       await baselineWorkers;
     }
 
-    if (!abortController.signal.aborted) {
+    if (!stopScheduling && !abortController.signal.aborted) {
       const completedAfterOverlap = new Set(results.map(agentRunKey));
       const codeStoryRuns = plannedRuns.filter(
         (run) => run.arm === "with_codestory" &&
@@ -8938,7 +9655,7 @@ async function main() {
     retrieval_env: retrievalEnv(),
     retrieval_contract: retrievalContractSummary(benchmarkChildEnv(process.env)),
     codex_agent_isolation: agentCodexIsolation?.receipt ?? null,
-    host_class: benchmarkHostClass(cachePreparation[0] ?? null),
+    host_class: benchmarkHostClass(cachePreparation),
     expected_rows: plannedRuns.length,
     completed_rows: canonicalResults.length,
     first_failure: firstFailure,
@@ -8996,6 +9713,7 @@ export {
   benchmarkRunId,
   benchmarkContractEnvironmentSha256,
   benchmarkContractForRun,
+  benchmarkHostClass,
   benchmarkShardAttestation,
   baselineSearchPreludeStatus,
   buildPacketQualityDeltas,
@@ -9004,6 +9722,7 @@ export {
   qualityFailureReasons,
   commandCategory,
   codestoryDoctorSnapshot,
+  codestoryRetrievalEngineDiagnosticsSnapshot,
   codestoryRetrievalStatusSnapshot,
   extractCommandExecutions,
   isPathInside,
@@ -9017,9 +9736,15 @@ export {
   parseJsonLines,
   cachePolicyForRun,
   cachePreparationCanaryBlockers,
+  cachePreparationIdentityBlockers,
+  mergeRetrievalStatusWithEngineDiagnostics,
+  projectResourceUri,
+  retrievalEngineDiagnosticsSnapshotFromOutput,
+  resourceUriMatches,
   createDurableJsonlAppender,
   benchmarkAgentScopeArgs,
   retrievalIndexCommandArgs,
+  retrievalStatusSnapshotFromOutput,
   retrievalStatusCommandArgs,
   packetComposition,
   packetCommandArgs,
