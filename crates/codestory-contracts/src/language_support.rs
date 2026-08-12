@@ -762,6 +762,27 @@ pub fn structural_source_path_exclusion(path: &str) -> Option<&'static str> {
         return None;
     }
     let file_name = components.last().copied().unwrap_or_default();
+    let controlled_negative_fixture = is_structural_source_path(&normalized)
+        && components
+            .get(..components.len().saturating_sub(1))
+            .is_some_and(|parents| parents.contains(&"fixtures"))
+        && file_name
+            .rsplit_once('.')
+            .map(|(stem, _)| stem)
+            .is_some_and(|stem| {
+                ["invalid", "malformed"].iter().any(|marker| {
+                    stem == *marker
+                        || stem.strip_suffix(marker).is_some_and(|prefix| {
+                            prefix
+                                .as_bytes()
+                                .last()
+                                .is_some_and(|byte| matches!(byte, b'-' | b'_' | b'.'))
+                        })
+                })
+            });
+    if controlled_negative_fixture {
+        return Some("controlled_negative_fixture");
+    }
     if components.iter().any(|component| {
         matches!(
             *component,
@@ -1445,5 +1466,47 @@ mod tests {
             );
         }
         assert!(!is_structural_source_path("config.jsonc"));
+    }
+
+    #[test]
+    fn structural_exclusion_classifies_only_controlled_negative_structural_fixtures() {
+        for path in [
+            "fixtures/invalid.yml",
+            ".github/scripts/fixtures/actionlint-invalid.yml",
+            "tests/fixtures/schema.malformed.json",
+            "tests/fixtures/settings_invalid.yaml",
+            r"TESTS\FIXTURES\SCHEMA.MALFORMED.JSON",
+        ] {
+            assert!(is_structural_source_path(path), "{path}");
+            assert_eq!(
+                structural_source_path_exclusion(path),
+                Some("controlled_negative_fixture"),
+                "{path}"
+            );
+        }
+
+        for path in [
+            "src/actionlint-invalid.yml",
+            ".github/workflows/actionlint-invalid.yml",
+            "fixtures/valid.yml",
+            "fixtures/invalidity.yml",
+            "fixtures/preinvalid.yml",
+            "fixtures/notmalformed.yml",
+            "myfixtures/actionlint-invalid.yml",
+            "tests/fixtures/actionlint-invalid.rs",
+            "tests/fixtures/actionlint-invalid.ts",
+        ] {
+            assert_eq!(structural_source_path_exclusion(path), None, "{path}");
+        }
+
+        for path in [
+            "/tmp/fixtures/invalid.yml",
+            r"C:\fixtures\invalid.yml",
+            r"\\server\fixtures\invalid.yml",
+            "../fixtures/invalid.yml",
+            "fixtures/../invalid.yml",
+        ] {
+            assert_eq!(structural_source_path_exclusion(path), None, "{path}");
+        }
     }
 }

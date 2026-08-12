@@ -7579,6 +7579,48 @@ fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_in
 }
 
 #[test]
+fn full_refresh_excludes_controlled_negative_fixture_but_rejects_production_malformed_source() {
+    let workspace = tempdir().expect("workspace dir");
+    let fixture = workspace
+        .path()
+        .join(".github/scripts/fixtures/actionlint-invalid.yml");
+    fs::create_dir_all(fixture.parent().expect("fixture parent")).expect("create fixture parent");
+    fs::write(workspace.path().join("lib.rs"), "pub fn ready() {}\n").expect("write parser source");
+    fs::write(&fixture, "jobs: [\n").expect("write controlled invalid fixture");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new();
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("controlled negative fixture must not block full publication");
+    Store::database_index_publication(&storage_path)
+        .expect("read publication")
+        .expect("complete publication");
+
+    fs::write(
+        workspace.path().join("production-malformed.json"),
+        "{\"missing_value\":",
+    )
+    .expect("write malformed production source");
+    let error = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect_err("malformed production source must still fail closed");
+    assert_eq!(error.code, "source_malformed");
+    assert!(error.details.as_ref().is_some_and(|details| {
+        details
+            .coverage_gaps
+            .iter()
+            .any(|gap| gap.reason == FileCoverageReason::Malformed)
+    }));
+}
+
+#[test]
 fn structural_publication_survives_unreadable_and_partial_discovery_failures() {
     for scenario in ["unreadable", "partial-discovery"] {
         let workspace = tempdir().expect("workspace dir");

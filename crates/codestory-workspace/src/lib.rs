@@ -3022,6 +3022,92 @@ mod tests {
     }
 
     #[test]
+    fn controlled_negative_structural_fixtures_are_omitted_without_hiding_real_sources()
+    -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let controlled_fixture = root
+            .join(".github")
+            .join("scripts")
+            .join("fixtures")
+            .join("actionlint-invalid.yml");
+        let valid_fixture = root.join("tests/fixtures/valid.yml");
+        let parser_fixture = root.join("tests/fixtures/actionlint-invalid.rs");
+        let production_structural = root.join("src/actionlint-invalid.yml");
+        let workflow = root.join(".github/workflows/ci.yml");
+        for path in [
+            &controlled_fixture,
+            &valid_fixture,
+            &parser_fixture,
+            &production_structural,
+            &workflow,
+        ] {
+            fs::create_dir_all(path.parent().expect("source parent"))?;
+        }
+        fs::write(&controlled_fixture, "jobs: [\n")?;
+        fs::write(&valid_fixture, "enabled: true\n")?;
+        fs::write(&parser_fixture, "pub fn fixture() {}\n")?;
+        fs::write(&production_structural, "enabled: true\n")?;
+        fs::write(
+            &workflow,
+            "name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n",
+        )?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(!inventory.files.contains(&controlled_fixture));
+        for admitted in [
+            valid_fixture,
+            parser_fixture,
+            production_structural,
+            workflow,
+        ] {
+            assert!(inventory.files.contains(&admitted), "{admitted:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_negative_fixture_schedules_pre_policy_row_removal() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let excluded = root.join("tests/fixtures/schema.malformed.json");
+        fs::create_dir_all(excluded.parent().expect("excluded parent"))?;
+        fs::write(&excluded, "{\"legacy\":")?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let outcome = WorkspaceDiscovery.build_refresh_outcome(
+            &manifest,
+            &RefreshInputs {
+                stored_files: Vec::new(),
+                policy_exclusions: Vec::new(),
+                inventory: WorkspaceInventory::from_records([(
+                    excluded,
+                    IndexedFileRecord {
+                        file_id: 45,
+                        modification_time: 0,
+                        content_hash: Some("b".repeat(64)),
+                        indexed: true,
+                        complete: false,
+                        retry_required: true,
+                    },
+                )]),
+            },
+        )?;
+
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert_eq!(outcome.plan.mode, RefreshMode::Incremental);
+        assert!(outcome.plan.files_to_index.is_empty());
+        assert_eq!(outcome.plan.files_to_remove, vec![45]);
+        assert!(outcome.plan.existing_file_ids.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn declared_json_lockfiles_are_excluded_without_hiding_ordinary_json() -> Result<()> {
         let temp = tempdir()?;
         let root = temp.path().join("repo");
