@@ -4336,6 +4336,7 @@ fn test_runtime_import_call_suppression_uses_callsite_column() {
         suppress_line: 42,
         suppress_start_col: 1,
         suppress_callee_name: "require".to_string(),
+        exact_bare_call_target_spans: Vec::new(),
     }];
 
     suppress_runtime_import_call_edges(&nodes, &mut edges, &specs);
