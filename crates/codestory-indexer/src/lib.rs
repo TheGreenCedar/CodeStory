@@ -7560,7 +7560,6 @@ fn append_manual_member_edges(
 }
 
 fn annotate_python_context_manager_self_return_members(
-    language_name: &str,
     tree: &Tree,
     source: &str,
     unique_nodes: &HashMap<NodeId, Node>,
@@ -7569,9 +7568,6 @@ fn annotate_python_context_manager_self_return_members(
     edge_keys: &mut HashSet<EdgeDedupKey>,
     flags: IndexFeatureFlags,
 ) {
-    if language_name != "python" {
-        return;
-    }
     for spec in languages::python::context_manager_self_return_member_specs(tree, source) {
         let Some(source_id) = node_id_by_name_and_span(
             unique_nodes,
@@ -14258,16 +14254,17 @@ pub fn index_file(
         &mut result_edges,
         &mut edge_keys,
     );
-    annotate_python_context_manager_self_return_members(
-        language_config.language_name,
-        &tree,
-        source,
-        &unique_nodes,
-        file_id,
-        &mut result_edges,
-        &mut edge_keys,
-        flags,
-    );
+    if language_config.language_name == "python" {
+        annotate_python_context_manager_self_return_members(
+            &tree,
+            source,
+            &unique_nodes,
+            file_id,
+            &mut result_edges,
+            &mut edge_keys,
+            flags,
+        );
+    }
     append_manual_receiver_call_edges(
         language_config.language_name,
         &tree,
