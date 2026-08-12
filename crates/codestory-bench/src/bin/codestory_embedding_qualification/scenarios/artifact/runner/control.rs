@@ -5,7 +5,7 @@ use super::super::{
 use super::analysis::{control_key, elapsed, same_server_authority, validated_idle_epoch};
 use super::process::{
     existing_control_events_for_nonce, load_establishment_timeout, qualification_command_path,
-    query_parameters, require_worker_success,
+    query_parameters, require_worker_success, wait_for_exact_process_exit,
 };
 use super::{ControlCommand, ControlCommandParameters, ScenarioRunner, WorkerOutput};
 use crate::qualification::output::write_atomic_json;
@@ -224,19 +224,35 @@ impl<'a> ScenarioRunner<'a> {
     }
 
     pub(super) fn reset_owner(&mut self, phase: &str) -> Result<()> {
-        if self.observe(&format!("{phase}_before"))?.is_some() {
-            self.control("crash_server", None)?;
-        }
-        // Not a poll budget and not load establishment: `wait_for_absence`
-        // spawns a fresh worker and this value is that worker's kill budget,
-        // covering its start, captures, connect and absence loop. The worker's
-        // own self-enforced bound for the operation is the contract idle
-        // timeout plus its 30s absence grace (90s), and that longer bound is
-        // deliberately not honored here: `crash_server` is only accepted
-        // asynchronously, so the shorter flat budget is the driver asserting
-        // that an already-triggered exit lands promptly rather than waiting out
-        // an idle exit that is not being tested.
-        self.wait_for_absence(phase, SNAPSHOT_TIMEOUT)
+        let Some(before) = self.observe(&format!("{phase}_before"))? else {
+            return Ok(());
+        };
+        let accepted = self.control("crash_server", None)?;
+        validate_reset_crash_event(&before, &accepted, phase)?;
+        wait_for_exact_process_exit(
+            &self.clock,
+            before.process.pid,
+            &before.process.process_start_id,
+            SNAPSHOT_TIMEOUT,
+        )?;
+
+        // The accepted crash event pins the predecessor. Once that exact native
+        // process is gone, run one observation worker and require it to see no
+        // owner at either edge of its operation. This keeps a replacement that
+        // appears in the handoff from being mistaken for predecessor absence,
+        // without asking the generic wait-for-absence operation to wait out a
+        // different owner.
+        let worker = self.spawn_worker("observe", query_parameters(1), None)?;
+        let output = self.finish_worker(worker, SNAPSHOT_TIMEOUT)?;
+        require_reset_absence(&output, phase)?;
+        self.artifact
+            .process_observations
+            .push(ProcessObservation::from_snapshot(
+                phase,
+                self.clock.now_ns(),
+                None,
+            ));
+        Ok(())
     }
 
     pub(super) fn wait_for_absence_output(&mut self, timeout: Duration) -> Result<WorkerOutput> {
@@ -364,5 +380,279 @@ impl<'a> ScenarioRunner<'a> {
             ("crash_server", None) => self.active_controls.clear(),
             _ => {}
         }
+    }
+}
+
+fn validate_reset_crash_event(
+    before: &EmbeddingServerSnapshot,
+    accepted: &ControlEvent,
+    phase: &str,
+) -> Result<()> {
+    let snapshot = accepted.snapshot.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("embedding_qualification_reset_crash_snapshot_missing:{phase}")
+    })?;
+    if before.process.pid == 0
+        || before.process.process_start_id.is_empty()
+        || snapshot.process.pid == 0
+        || snapshot.process.process_start_id.is_empty()
+        || accepted.action != "crash_server"
+        || accepted.status != "accepted"
+        || !same_server_authority(before, snapshot)
+    {
+        bail!("embedding_qualification_reset_crash_owner_mismatch:{phase}");
+    }
+    Ok(())
+}
+
+fn require_reset_absence(output: &WorkerOutput, phase: &str) -> Result<()> {
+    require_worker_success(output, phase)?;
+    let result = output.result.as_ref().expect("success requires result");
+    if result.scenario != "observe"
+        || result.initial_snapshot.is_some()
+        || result.final_snapshot.is_some()
+    {
+        bail!("embedding_qualification_owner_replaced_before_absence:{phase}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::ControlEventClock;
+    use super::*;
+    use codestory_retrieval::{
+        EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, EmbeddingQualificationOperationResult,
+        EmbeddingQualificationResult, EmbeddingServerAuthoritySnapshot,
+        EmbeddingServerClockSnapshot, EmbeddingServerProcessSnapshot,
+        EmbeddingServerProtocolSnapshot, EmbeddingServerSchedulerSnapshot,
+    };
+
+    fn snapshot() -> EmbeddingServerSnapshot {
+        EmbeddingServerSnapshot {
+            schema_version: 1,
+            event_sequence: 8,
+            lifecycle: "listening".into(),
+            clock: EmbeddingServerClockSnapshot {
+                domain: "awake_monotonic".into(),
+                api: "test".into(),
+                boot_id: "boot".into(),
+                resolution_ns: 1,
+            },
+            protocol: EmbeddingServerProtocolSnapshot::current(),
+            authority: EmbeddingServerAuthoritySnapshot {
+                endpoint_namespace_id: "endpoint".into(),
+                lifetime_authority_id: "lifetime".into(),
+                listener_id: "listener".into(),
+                peer_verified: true,
+            },
+            process: EmbeddingServerProcessSnapshot {
+                server_instance_id: "9edfb3ab".into(),
+                pid: 41732,
+                process_start_id: "windows:639221697923142260".into(),
+                executable_sha256: "a".repeat(64),
+                executable_version: "0.16.1".into(),
+            },
+            scheduler: EmbeddingServerSchedulerSnapshot {
+                query_capacity: 8,
+                query_depth: 0,
+                bulk_capacity: 1,
+                bulk_depth: 0,
+                connection_count: 0,
+                active_request_count: 0,
+                lease_count: 0,
+                active_request: None,
+            },
+            engine: None,
+            failure: None,
+        }
+    }
+
+    fn accepted_crash(snapshot: Option<EmbeddingServerSnapshot>) -> ControlEvent {
+        ControlEvent {
+            schema_version: 1,
+            sequence: 1,
+            action: "crash_server".into(),
+            status: "accepted".into(),
+            authenticated_nonce_sha256: "b".repeat(64),
+            server_event_sequence: 9,
+            clock: ControlEventClock {
+                domain: "awake_monotonic".into(),
+                api: "test".into(),
+                boot_id: "boot".into(),
+                observed_ns: 1,
+            },
+            snapshot,
+            details: None,
+        }
+    }
+
+    fn absence_output(
+        initial_snapshot: Option<EmbeddingServerSnapshot>,
+        final_snapshot: Option<EmbeddingServerSnapshot>,
+    ) -> WorkerOutput {
+        WorkerOutput {
+            schema_version: EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
+            pid: 42,
+            process_start_id: "worker-start".into(),
+            executable_sha256: "c".repeat(64),
+            executable_version: "0.16.1".into(),
+            project_identity_sha256: "d".repeat(64),
+            clock: EmbeddingServerClockSnapshot {
+                domain: "awake_monotonic".into(),
+                api: "test".into(),
+                boot_id: "boot".into(),
+                resolution_ns: 1,
+            },
+            started_ns: 1,
+            finished_ns: 2,
+            inclusive_clock_api: "test".into(),
+            inclusive_started_ns: 1,
+            inclusive_finished_ns: 2,
+            boot_id_started: "boot".into(),
+            boot_id_finished: "boot".into(),
+            result: Some(EmbeddingQualificationResult {
+                schema_version: 1,
+                scenario: "observe".into(),
+                started_ns: 1,
+                finished_ns: 2,
+                operations: vec![EmbeddingQualificationOperationResult {
+                    correlation_id: "observe-1".into(),
+                    class: "observe".into(),
+                    submitted_ns: 1,
+                    completed_ns: 2,
+                    status: "ok".into(),
+                    error_code: None,
+                    server_instance_id: None,
+                    load_generation: None,
+                    attempts: Vec::new(),
+                }],
+                initial_snapshot,
+                final_snapshot,
+            }),
+            protocol_exchange: None,
+            queue_operations: None,
+            engine_identity: None,
+            measurement: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn reset_crash_event_must_carry_the_exact_accepted_predecessor() {
+        let before = snapshot();
+        validate_reset_crash_event(
+            &before,
+            &accepted_crash(Some(before.clone())),
+            "measurement_rebind",
+        )
+        .expect("exact accepted crash snapshot");
+
+        let missing_snapshot = accepted_crash(None);
+        assert_eq!(
+            validate_reset_crash_event(&before, &missing_snapshot, "measurement_rebind")
+                .expect_err("missing crash snapshot")
+                .to_string(),
+            "embedding_qualification_reset_crash_snapshot_missing:measurement_rebind"
+        );
+
+        let mut missing_pid = before.clone();
+        missing_pid.process.pid = 0;
+        let mut missing_start = before.clone();
+        missing_start.process.process_start_id.clear();
+        let mut mismatched_pid = before.clone();
+        mismatched_pid.process.pid = 41733;
+        let mut mismatched_start = before.clone();
+        mismatched_start.process.process_start_id = "windows:reused".into();
+        for (case, hostile) in [
+            ("missing pid", missing_pid),
+            ("missing process start", missing_start),
+            ("mismatched pid", mismatched_pid),
+            ("mismatched process start", mismatched_start),
+        ] {
+            assert_eq!(
+                validate_reset_crash_event(
+                    &before,
+                    &accepted_crash(Some(hostile)),
+                    "measurement_rebind"
+                )
+                .expect_err(case)
+                .to_string(),
+                "embedding_qualification_reset_crash_owner_mismatch:measurement_rebind"
+            );
+        }
+
+        let mut missing_observed_pid = before.clone();
+        missing_observed_pid.process.pid = 0;
+        let mut missing_observed_start = before.clone();
+        missing_observed_start.process.process_start_id.clear();
+        for (case, hostile_before) in [
+            ("missing observed pid", missing_observed_pid),
+            ("missing observed process start", missing_observed_start),
+        ] {
+            assert_eq!(
+                validate_reset_crash_event(
+                    &hostile_before,
+                    &accepted_crash(Some(hostile_before.clone())),
+                    "measurement_rebind"
+                )
+                .expect_err(case)
+                .to_string(),
+                "embedding_qualification_reset_crash_owner_mismatch:measurement_rebind"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_absence_rejects_a_replacement_at_either_observation_edge() {
+        require_reset_absence(&absence_output(None, None), "measurement_rebind")
+            .expect("owner remains absent");
+
+        for (case, output) in [
+            (
+                "replacement present initially",
+                absence_output(Some(snapshot()), None),
+            ),
+            (
+                "replacement present finally",
+                absence_output(None, Some(snapshot())),
+            ),
+        ] {
+            assert_eq!(
+                require_reset_absence(&output, "measurement_rebind")
+                    .expect_err(case)
+                    .to_string(),
+                "embedding_qualification_owner_replaced_before_absence:measurement_rebind"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_owner_keeps_the_absent_fast_path_and_fences_before_one_observation_worker() {
+        let source = include_str!("control.rs");
+        let start = source
+            .find("pub(super) fn reset_owner")
+            .expect("reset owner");
+        let end = source[start..]
+            .find("pub(super) fn wait_for_absence_output")
+            .map(|offset| start.saturating_add(offset))
+            .expect("reset owner end");
+        let body = &source[start..end];
+        let absent = body.find("let Some(before)").expect("absent fast path");
+        let crash = body
+            .find("self.control(\"crash_server\"")
+            .expect("accepted crash event");
+        let validate = body
+            .find("validate_reset_crash_event")
+            .expect("crash identity validation");
+        let fence = body
+            .find("wait_for_exact_process_exit")
+            .expect("exact predecessor fence");
+        let observe = body
+            .find("self.spawn_worker(\"observe\"")
+            .expect("absence observation worker");
+        assert!(absent < crash && crash < validate && validate < fence && fence < observe);
+        assert!(body[absent..crash].contains("return Ok(())"));
+        assert_eq!(body.matches("self.spawn_worker(\"observe\"").count(), 1);
+        assert!(!body.contains("self.wait_for_absence("));
     }
 }
