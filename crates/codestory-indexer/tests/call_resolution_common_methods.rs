@@ -1813,6 +1813,8 @@ from . import sessions
 
 def request(method, url):
     """Send one outbound request."""
+    # Session owns request preparation and adapter selection.
+    # Closing the context releases session-owned resources.
     with sessions.Session() as session:
         return session.request(method=method, url=url)
 "#;

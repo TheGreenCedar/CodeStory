@@ -498,7 +498,10 @@ fn python_callable_has_exact_top_level_with_body(
         return false;
     };
     let mut cursor = body.walk();
-    let mut statements = body.named_children(&mut cursor).collect::<Vec<_>>();
+    let mut statements = body
+        .named_children(&mut cursor)
+        .filter(|statement| statement.kind() != "comment")
+        .collect::<Vec<_>>();
     let Some(last_statement) = statements.pop() else {
         return false;
     };
