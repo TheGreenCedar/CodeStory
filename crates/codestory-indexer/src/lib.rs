@@ -4446,6 +4446,7 @@ struct ReceiverPlaceholderAnnotation<'a> {
     method_name: &'a str,
     owner_name: &'a str,
     owner_module: Option<&'a str>,
+    extra_callsite_marker: Option<&'a str>,
 }
 
 struct CallPlaceholderMarkerAnnotation<'a> {
@@ -7558,6 +7559,63 @@ fn append_manual_member_edges(
     }
 }
 
+fn annotate_python_context_manager_self_return_members(
+    language_name: &str,
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &HashMap<NodeId, Node>,
+    file_id: NodeId,
+    result_edges: &mut Vec<Edge>,
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+) {
+    if language_name != "python" {
+        return;
+    }
+    for spec in languages::python::context_manager_self_return_member_specs(tree, source) {
+        let Some(source_id) = node_id_by_name_and_span(
+            unique_nodes,
+            &spec.source_name,
+            spec.source_span,
+            manual_member_source_kind,
+        ) else {
+            continue;
+        };
+        let Some(target_id) =
+            node_id_by_name_and_span(unique_nodes, &spec.target_name, spec.target_span, |kind| {
+                matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
+            })
+        else {
+            continue;
+        };
+        if let Some(edge) = result_edges.iter_mut().find(|edge| {
+            edge.kind == EdgeKind::MEMBER && edge.source == source_id && edge.target == target_id
+        }) {
+            edge.callsite_identity =
+                Some(languages::python::CONTEXT_MANAGER_SELF_RETURN_MEMBER_MARKER.to_string());
+            continue;
+        }
+
+        let mut edge = Edge {
+            id: EdgeId(0),
+            source: source_id,
+            target: target_id,
+            kind: EdgeKind::MEMBER,
+            file_node_id: Some(file_id),
+            line: spec.line,
+            certainty: parser_direct_structural_certainty(EdgeKind::MEMBER),
+            ..Default::default()
+        };
+        edge.callsite_identity =
+            Some(languages::python::CONTEXT_MANAGER_SELF_RETURN_MEMBER_MARKER.to_string());
+        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+            continue;
+        }
+        edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+        result_edges.push(edge);
+    }
+}
+
 fn manual_member_source_kind(kind: NodeKind) -> bool {
     is_type_like_kind(kind) || matches!(kind, NodeKind::MODULE | NodeKind::NAMESPACE)
 }
@@ -7601,7 +7659,16 @@ fn append_manual_receiver_call_edges(
         );
     }
 
+    let context_manager_alias_callsites = if language_name == "python" {
+        languages::python::context_manager_alias_callsites(tree, source)
+    } else {
+        HashSet::new()
+    };
+
     for spec in language_receiver_call_specs(language_name, tree, source) {
+        let extra_callsite_marker = context_manager_alias_callsites
+            .contains(&receiver_callsite_key(&spec))
+            .then_some(languages::python::CONTEXT_MANAGER_SELF_RETURN_REQUIRED_MARKER);
         let Some(source_id) =
             node_id_by_name_and_span(unique_nodes, &spec.source_name, spec.source_span, |kind| {
                 matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
@@ -7609,6 +7676,43 @@ fn append_manual_receiver_call_edges(
         else {
             continue;
         };
+        if extra_callsite_marker.is_some() && spec.owner_module.is_none() {
+            let annotated_index = annotate_receiver_call_placeholder_owner(
+                unique_nodes,
+                result_edges,
+                edge_keys,
+                flags,
+                ReceiverPlaceholderAnnotation {
+                    line: spec.line,
+                    method_col: spec.method_col,
+                    method_name: &spec.method_name,
+                    owner_name: &spec.owner_name,
+                    owner_module: None,
+                    extra_callsite_marker,
+                },
+                receiver_annotation_required_callsite_marker(language_name),
+            );
+            if annotated_index.is_none() {
+                append_manual_receiver_call_placeholder_edge(
+                    unique_nodes,
+                    result_edges,
+                    edge_keys,
+                    flags,
+                    ManualReceiverCallPlaceholder {
+                        source_id,
+                        file_id,
+                        line: spec.line,
+                        method_col: spec.method_col,
+                        method_name: &spec.method_name,
+                        owner_name: &spec.owner_name,
+                        owner_module: None,
+                        extra_callsite_marker,
+                    },
+                    callsite_ordinals,
+                );
+            }
+            continue;
+        }
         if let Some(owner_module) = spec.owner_module.as_deref() {
             let annotated_index = annotate_receiver_call_placeholder_owner(
                 unique_nodes,
@@ -7621,6 +7725,7 @@ fn append_manual_receiver_call_edges(
                     method_name: &spec.method_name,
                     owner_name: &spec.owner_name,
                     owner_module: Some(owner_module),
+                    extra_callsite_marker,
                 },
                 receiver_annotation_required_callsite_marker(language_name),
             );
@@ -7649,6 +7754,7 @@ fn append_manual_receiver_call_edges(
                         method_name: &spec.method_name,
                         owner_name: &spec.owner_name,
                         owner_module: Some(owner_module),
+                        extra_callsite_marker,
                     },
                     callsite_ordinals,
                 );
@@ -7681,6 +7787,7 @@ fn append_manual_receiver_call_edges(
                         method_name: &spec.method_name,
                         owner_name: &spec.owner_name,
                         owner_module: spec.owner_module.as_deref(),
+                        extra_callsite_marker,
                     },
                     receiver_annotation_required_callsite_marker(language_name),
                 );
@@ -7704,6 +7811,7 @@ fn append_manual_receiver_call_edges(
                             method_name: &spec.method_name,
                             owner_name: &spec.owner_name,
                             owner_module: None,
+                            extra_callsite_marker,
                         },
                         callsite_ordinals,
                     );
@@ -7739,6 +7847,9 @@ fn append_manual_receiver_call_edges(
             let next = callsite_ordinals.entry(key).or_insert(0);
             *next = next.saturating_add(1);
             ensure_callsite_identity(&mut edge, Some(*next));
+        }
+        if let Some(marker) = extra_callsite_marker {
+            append_callsite_part(&mut edge, marker);
         }
         if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
             continue;
@@ -7869,6 +7980,9 @@ fn annotate_receiver_call_placeholder_owner(
     if let Some(marker) = module_marker.as_deref() {
         append_callsite_part(edge, marker);
     }
+    if let Some(marker) = annotation.extra_callsite_marker {
+        append_callsite_part(edge, marker);
+    }
     edge_keys.insert(edge_dedup_key(edge, flags));
     Some(index)
 }
@@ -7881,6 +7995,7 @@ struct ManualReceiverCallPlaceholder<'a> {
     method_name: &'a str,
     owner_name: &'a str,
     owner_module: Option<&'a str>,
+    extra_callsite_marker: Option<&'a str>,
 }
 
 fn append_manual_receiver_call_placeholder_edge(
@@ -7934,6 +8049,9 @@ fn append_manual_receiver_call_placeholder_edge(
             &mut edge,
             &format!("{RECEIVER_MODULE_CALLSITE_PREFIX}{owner_module}"),
         );
+    }
+    if let Some(marker) = placeholder.extra_callsite_marker {
+        append_callsite_part(&mut edge, marker);
     }
     if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
         return;
@@ -14139,6 +14257,16 @@ pub fn index_file(
         },
         &mut result_edges,
         &mut edge_keys,
+    );
+    annotate_python_context_manager_self_return_members(
+        language_config.language_name,
+        &tree,
+        source,
+        &unique_nodes,
+        file_id,
+        &mut result_edges,
+        &mut edge_keys,
+        flags,
     );
     append_manual_receiver_call_edges(
         language_config.language_name,

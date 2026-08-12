@@ -8777,6 +8777,26 @@ async function benchmarkShardAttestation(
   };
 }
 
+async function benchmarkShardAttestationForCloseout(
+  opts,
+  allTasks,
+  cachePreparation,
+  results,
+  firstFailure,
+  dependencies = {},
+) {
+  if (firstFailure) {
+    return null;
+  }
+  return await benchmarkShardAttestation(
+    opts,
+    allTasks,
+    cachePreparation,
+    results,
+    dependencies,
+  );
+}
+
 async function readJsonlRows(filePath) {
   return (await readFile(filePath, "utf8"))
     .split(/\r?\n/)
@@ -9612,11 +9632,12 @@ async function main() {
     "agent benchmark report",
   );
   const costAccounting = summarizeCostAccounting(canonicalResults);
-  const shardAttestation = await benchmarkShardAttestation(
+  const shardAttestation = await benchmarkShardAttestationForCloseout(
     opts,
     allTasks,
     cachePreparation,
     canonicalResults,
+    firstFailure,
   );
   const summaryPayload = {
     generated_at: new Date().toISOString(),
@@ -9715,6 +9736,7 @@ export {
   benchmarkContractForRun,
   benchmarkHostClass,
   benchmarkShardAttestation,
+  benchmarkShardAttestationForCloseout,
   baselineSearchPreludeStatus,
   buildPacketQualityDeltas,
   buildQualityDebugPayload,

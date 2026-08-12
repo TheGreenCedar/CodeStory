@@ -1790,6 +1790,279 @@ def run():
 }
 
 #[test]
+fn test_python_with_item_constructor_receiver_resolves_to_exact_owner_method() -> anyhow::Result<()>
+{
+    let sessions_source = r#"
+class Session:
+    def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+"#;
+    let shadow_source = r#"
+class Session:
+    def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+"#;
+    let api_source = r#"
+from . import sessions
+
+def request(method, url):
+    """Send one outbound request."""
+    with sessions.Session() as session:
+        return session.request(method=method, url=url)
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("src/requests/sessions.py", sessions_source),
+        ("src/shadow/sessions.py", shadow_source),
+        ("src/requests/api.py", api_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "python with-item imported module constructor",
+        &nodes,
+        &edges,
+        "request",
+        "Session",
+        "request",
+        "src/requests/sessions.py",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "python with-item imported module constructor",
+        &nodes,
+        &edges,
+        "request",
+        "Session",
+        "request",
+        "src/shadow/sessions.py",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_python_with_item_constructor_receiver_fails_closed_on_imprecise_bindings()
+-> anyhow::Result<()> {
+    let sessions_source = r#"
+class Session:
+    def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+
+class UnannotatedSession:
+    def request(self, method, url):
+        pass
+
+class OtherSession:
+    def request(self, method, url):
+        pass
+
+class WrongReturnSession:
+    def __enter__(self) -> OtherSession:
+        return OtherSession()
+
+    def request(self, method, url):
+        pass
+
+class StaticEnterSession:
+    @staticmethod
+    def __enter__() -> Self:
+        return StaticEnterSession()
+
+    def request(self, method, url):
+        pass
+
+class DuplicateEnterSession:
+    def __enter__(self) -> Self:
+        return self
+
+    def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+
+class AsyncEnterSession:
+    async def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+"#;
+    let api_source = r#"
+from . import sessions
+from .sessions import Session
+
+def unannotated_context(method, url):
+    with sessions.UnannotatedSession() as session:
+        return session.request(method, url)
+
+def wrong_return_context(method, url):
+    with sessions.WrongReturnSession() as session:
+        return session.request(method, url)
+
+def static_enter_context(method, url):
+    with sessions.StaticEnterSession() as session:
+        return session.request(method, url)
+
+def duplicate_enter_context(method, url):
+    with sessions.DuplicateEnterSession() as session:
+        return session.request(method, url)
+
+def parameter_shadowed_module(sessions, method, url):
+    with sessions.Session() as session:
+        return session.request(method, url)
+
+def parameter_shadowed_type(Session, method, url):
+    with Session() as session:
+        return session.request(method, url)
+
+def defaulted_parameter_shadowed_module(method, url, sessions=alternate):
+    with sessions.Session() as session:
+        return session.request(method, url)
+
+def defaulted_parameter_shadowed_type(method, url, Session=Other):
+    with Session() as session:
+        return session.request(method, url)
+
+def imported_bare_type_context(method, url):
+    with Session() as session:
+        return session.request(method, url)
+
+def constructor_argument_context(method, url):
+    with sessions.Session(option := make_option()) as session:
+        return session.request(method, url)
+
+def multi_with_item_context(method, url):
+    with sessions.Session() as session, sessions.Session() as other:
+        return session.request(method, url)
+
+async def async_with_context(method, url):
+    async with sessions.AsyncEnterSession() as session:
+        return session.request(method, url)
+
+def async_enter_context(method, url):
+    with sessions.AsyncEnterSession() as session:
+        return session.request(method, url)
+
+def except_alias_context(method, url):
+    with sessions.Session() as session:
+        try:
+            raise RuntimeError()
+        except RuntimeError as session:
+            return session.request(method, url)
+
+def walrus_branch_context(method, url):
+    with sessions.Session() as session:
+        if session := make_session():
+            return session.request(method, url)
+
+def comprehension_context(method, url):
+    with sessions.Session() as session:
+        return [session.request(method, url) for session in sessions]
+
+def enclosing_except_context(method, url):
+    try:
+        raise RuntimeError()
+    except RuntimeError:
+        with sessions.Session() as session:
+            return session.request(method, url)
+
+def untyped_factory(method, url):
+    with make_session() as session:
+        return session.request(method, url)
+
+def context_expression(method, url):
+    with sessions.open_session() as session:
+        return session.request(method, url)
+
+def subscript_alias(method, url):
+    with sessions.Session() as state["session"]:
+        return state["session"].request(method, url)
+
+def shadowed_alias(method, url):
+    with sessions.Session() as session:
+        session = make_session()
+        return session.request(method, url)
+
+def loop_shadow(method, url):
+    with sessions.Session() as session:
+        for session in pool:
+            return session.request(method, url)
+
+def nested_scope(method, url):
+    with sessions.Session() as session:
+        def inner():
+            return session.request(method, url)
+        return inner()
+
+def shadowed_module(method, url):
+    sessions = load_sessions()
+    with sessions.Session() as session:
+        return session.request(method, url)
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("src/requests/sessions.py", sessions_source),
+        ("src/requests/api.py", api_source),
+    ])?;
+    for caller in [
+        "unannotated_context",
+        "wrong_return_context",
+        "static_enter_context",
+        "duplicate_enter_context",
+        "parameter_shadowed_module",
+        "parameter_shadowed_type",
+        "defaulted_parameter_shadowed_module",
+        "defaulted_parameter_shadowed_type",
+        "imported_bare_type_context",
+        "constructor_argument_context",
+        "multi_with_item_context",
+        "async_with_context",
+        "async_enter_context",
+        "except_alias_context",
+        "walrus_branch_context",
+        "comprehension_context",
+        "enclosing_except_context",
+        "untyped_factory",
+        "context_expression",
+        "subscript_alias",
+        "shadowed_alias",
+        "loop_shadow",
+        "nested_scope",
+        "shadowed_module",
+    ] {
+        for owner in [
+            "Session",
+            "UnannotatedSession",
+            "OtherSession",
+            "WrongReturnSession",
+            "StaticEnterSession",
+            "DuplicateEnterSession",
+            "AsyncEnterSession",
+        ] {
+            assert_no_resolved_call_to_method_owner_in_file(
+                "python with-item fail-closed guard",
+                &nodes,
+                &edges,
+                caller,
+                owner,
+                "request",
+                "src/requests/sessions.py",
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_python_constructor_local_visibility_and_shadows_fail_closed() -> anyhow::Result<()> {
     let workflow_source = r#"
 class Workflow:

@@ -22,6 +22,7 @@ import {
   benchmarkHostClass,
   benchmarkRunId,
   benchmarkShardAttestation,
+  benchmarkShardAttestationForCloseout,
   cachePreparationCanaryBlockers,
   cachePreparationIdentityBlockers,
   commandCategory,
@@ -1337,6 +1338,45 @@ test("host class and shard attestation reject inconsistent preparation identity"
       CLEAN_SHARD_ATTESTATION,
     ),
     /do not share one retrieval engine identity/,
+  );
+});
+
+test("fail-fast closeout keeps the first failure instead of requiring unfinished shard preparation", async () => {
+  const fixture = pipelineFixture({ repos: ["canary", "second"] });
+  fixture.opts.prepareCodestoryCache = true;
+  fixture.opts.publishable = true;
+  fixture.opts.shardCount = 1;
+  fixture.opts.shardIndex = 0;
+  const retainedPreparation = [pipelinePreparation("canary")];
+  const firstFailure = {
+    kind: "canary_preparation",
+    repo: "canary",
+    task_id: "canary-task",
+    blockers: [{ category: "environment", reasons: ["fixture canary failed"] }],
+  };
+
+  assert.equal(
+    await benchmarkShardAttestationForCloseout(
+      fixture.opts,
+      fixture.tasks,
+      retainedPreparation,
+      [],
+      firstFailure,
+      CLEAN_SHARD_ATTESTATION,
+    ),
+    null,
+  );
+  await assert.rejects(
+    () => benchmarkShardAttestationForCloseout(
+      fixture.opts,
+      fixture.tasks,
+      retainedPreparation,
+      [],
+      null,
+      CLEAN_SHARD_ATTESTATION,
+    ),
+    /preparation rows do not match/,
+    "a successful publishable closeout must still reconcile every owned repository",
   );
 });
 

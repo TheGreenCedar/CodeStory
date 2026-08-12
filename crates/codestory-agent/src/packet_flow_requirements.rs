@@ -3,25 +3,26 @@
 use crate::packet_evidence_carriers::{
     SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS, SEARCH_EVIDENCE_OUTPUT_ACTIONS,
     citation_owns_buffer_read_write, citation_owns_buffer_storage,
-    citation_owns_client_adapter_selection, citation_owns_client_request_dispatch,
-    citation_owns_client_request_entrypoint, citation_owns_client_request_finalization,
-    citation_owns_client_request_method, citation_owns_client_response_materialization,
-    citation_owns_client_transport_send, citation_owns_css_animation_entrypoint,
-    citation_owns_css_animation_structure, citation_owns_css_structure,
-    citation_owns_form_custom_validation, citation_owns_form_native_constraint,
-    citation_owns_form_submit_guard, citation_owns_format_arguments,
-    citation_owns_formatter_fallback, citation_owns_hook_cache_helper,
-    citation_owns_hook_key_serialization, citation_owns_hook_mutation_flow,
-    citation_owns_hook_public_export, citation_owns_html_app_shell,
-    citation_owns_log_handler_processing, citation_owns_log_record_creation,
-    citation_owns_mapper_configuration, citation_owns_mapper_execution,
-    citation_owns_search_evidence_classification, citation_owns_search_evidence_output,
-    citation_owns_server_request_dispatch, citation_owns_server_request_entrypoint,
-    citation_owns_server_response_terminal, citation_owns_shell_completion,
-    citation_owns_shell_function_dispatch, citation_owns_shell_installer_bootstrap,
-    citation_owns_site_lifecycle, citation_owns_site_terminal,
-    citation_owns_string_blank_predicate, citation_owns_string_empty_predicate,
-    citation_owns_string_region_handoff, client_request_dispatch_predecessor_call_source,
+    citation_owns_client_adapter_selection, citation_owns_client_public_facade_helper,
+    citation_owns_client_request_dispatch, citation_owns_client_request_entrypoint,
+    citation_owns_client_request_finalization, citation_owns_client_request_method,
+    citation_owns_client_response_materialization, citation_owns_client_transport_send,
+    citation_owns_css_animation_entrypoint, citation_owns_css_animation_structure,
+    citation_owns_css_structure, citation_owns_form_custom_validation,
+    citation_owns_form_native_constraint, citation_owns_form_submit_guard,
+    citation_owns_format_arguments, citation_owns_formatter_fallback,
+    citation_owns_hook_cache_helper, citation_owns_hook_key_serialization,
+    citation_owns_hook_mutation_flow, citation_owns_hook_public_export,
+    citation_owns_html_app_shell, citation_owns_log_handler_processing,
+    citation_owns_log_record_creation, citation_owns_mapper_configuration,
+    citation_owns_mapper_execution, citation_owns_search_evidence_classification,
+    citation_owns_search_evidence_output, citation_owns_server_request_dispatch,
+    citation_owns_server_request_entrypoint, citation_owns_server_response_terminal,
+    citation_owns_shell_completion, citation_owns_shell_function_dispatch,
+    citation_owns_shell_installer_bootstrap, citation_owns_site_lifecycle,
+    citation_owns_site_terminal, citation_owns_string_blank_predicate,
+    citation_owns_string_empty_predicate, citation_owns_string_region_handoff,
+    client_public_facade_successor_call_target, client_request_dispatch_predecessor_call_source,
     client_request_dispatch_successor_call_target, client_request_entrypoint_call_target,
     flow_belongs_to_client_request, flow_belongs_to_command_dispatch,
     flow_belongs_to_command_server, flow_belongs_to_event_loop, flow_belongs_to_indexing,
@@ -773,9 +774,11 @@ const CLIENT_PUBLIC_FACADE_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Entrypoint,
     query_seeds: &["http top level helper", "public client facade"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-    evidence: EvidencePredicate::CitedRoles {
+    evidence: EvidencePredicate::CitedRolesOrCallBoundary {
         subsystem: flow_belongs_to_client_request,
         roles: &[PacketEvidenceRole::ClientFactory],
+        carrier: citation_owns_client_public_facade_helper,
+        call_target: Some(client_public_facade_successor_call_target),
     },
 };
 
@@ -2063,6 +2066,79 @@ mod tests {
     }
 
     #[test]
+    fn client_public_facade_helper_requires_its_exact_outgoing_request_boundary() {
+        let requirement = CLIENT_PUBLIC_FACADE_REQUIREMENT;
+        let established_factory = witness("createClient", "lib/client.dart", NodeKind::FUNCTION);
+        assert!(
+            requirement
+                .evidence
+                .citation_proves_without_call_boundary(&established_factory)
+        );
+        assert!(
+            requirement
+                .evidence
+                .call_boundary_target(&established_factory)
+                .is_none()
+        );
+
+        let helper = witness("request", "src/requests/api.py", NodeKind::FUNCTION);
+        assert!(requirement.evidence.citation_proves(&helper));
+        assert!(
+            !requirement
+                .evidence
+                .citation_proves_without_call_boundary(&helper)
+        );
+        let target = requirement
+            .evidence
+            .call_boundary_target(&helper)
+            .expect("the public helper needs an outgoing CALL boundary");
+        assert!(target("Session.request"));
+
+        let other_package_helper =
+            witness("request", "lib/transportkit/api.py", NodeKind::FUNCTION);
+        assert!(requirement.evidence.citation_proves(&other_package_helper));
+        assert!(
+            requirement
+                .evidence
+                .call_boundary_target(&other_package_helper)
+                .is_some_and(|target| target("HttpClient.request"))
+        );
+        for negative in [
+            "request",
+            "requests.api.request",
+            "Cache.request",
+            "CacheClient.request",
+            "Database.request",
+            "DatabaseClient.request",
+            "TelemetryClient.request",
+            "MonitoringClient.request",
+            "dispatch_hook",
+        ] {
+            assert!(
+                !target(negative),
+                "{negative} is not the next request stage"
+            );
+        }
+
+        for wrong_carrier in [
+            witness("request", "src/cache.py", NodeKind::FUNCTION),
+            witness("request", "src/database/api.py", NodeKind::FUNCTION),
+            witness("request", "src/telemetry/api.py", NodeKind::FUNCTION),
+            witness("request", "src/monitoring/api.py", NodeKind::FUNCTION),
+            witness("FrameKind.request", "src/requests/api.py", NodeKind::METHOD),
+            witness("dispatch_hook", "src/requests/api.py", NodeKind::FUNCTION),
+        ] {
+            assert!(!requirement.evidence.citation_proves(&wrong_carrier));
+            assert!(
+                requirement
+                    .evidence
+                    .call_boundary_target(&wrong_carrier)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn requirements_sharing_a_flow_role_stay_separable_by_evidence() {
         let witnesses = requirement_witnesses();
         let witness_for = |requirement: &FlowRequirement| {
@@ -2946,6 +3022,16 @@ mod tests {
             // removal widens it, and the sweep is what would notice.
             "sitemap",
             "sitemaps",
+            // Public-facade carrier scope and its exact close negatives.
+            "api",
+            "hook",
+            "hooks",
+            "database",
+            "db",
+            "metrics",
+            "telemetry",
+            "monitoring",
+            "observability",
         ]
         .into_iter()
         .map(str::to_string)

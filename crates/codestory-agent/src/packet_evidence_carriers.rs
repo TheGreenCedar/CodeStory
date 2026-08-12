@@ -281,6 +281,37 @@ pub fn citation_owns_client_request_method(citation: &AgentCitationDto) -> bool 
         )
 }
 
+/// The package-level HTTP helper that opens the outbound-request lifecycle. A bare `request`
+/// citation is lawful here only on the public API module; the exact outgoing CALL to the following
+/// client/session request stage remains mandatory and is checked by the flow requirement.
+pub fn citation_owns_client_public_facade_helper(citation: &AgentCitationDto) -> bool {
+    if citation.kind != NodeKind::FUNCTION
+        || !matches!(
+            terminal(citation).as_str(),
+            "request" | "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
+        )
+    {
+        return false;
+    }
+    let path_tokens = path_tokens(citation);
+    has_token(&path_tokens, &["api"])
+        && !names_or_path_token(
+            citation,
+            &[
+                "hook",
+                "hooks",
+                "cache",
+                "caches",
+                "database",
+                "db",
+                "telemetry",
+                "monitoring",
+                "observability",
+                "metrics",
+            ],
+        )
+}
+
 /// A public outbound-request entrypoint. Unlike the broader request-method ranking predicate, a
 /// bare `request` is insufficient here: the symbol must independently name a client/session
 /// subject so `FrameKind.request` cannot become a material packet carrier.
@@ -401,6 +432,28 @@ pub fn client_request_entrypoint_call_target(display_name: &str) -> bool {
     (has_token(&tokens, &["prepare", "prepared", "build"])
         && has_token(&tokens, &["request", "requests"]))
         || (has_token(&tokens, &["send"]) && has_token(&tokens, &["client", "session", "requests"]))
+}
+
+/// Typed CALL targets that advance a top-level package helper into the session/client request
+/// entrypoint. The final adjacent owner/action pair keeps another package helper, a request-shaped
+/// metrics symbol, or a similarly named hook from satisfying the boundary.
+pub fn client_public_facade_successor_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    !has_token(
+        &tokens,
+        &[
+            "cache",
+            "database",
+            "db",
+            "hook",
+            "metrics",
+            "telemetry",
+            "monitoring",
+            "observability",
+        ],
+    ) && tokens.windows(2).last().is_some_and(|tail| {
+        tail[1] == "request" && matches!(tail[0].as_str(), "client" | "session")
+    })
 }
 
 /// Typed CALL sources that precede the client/session dispatch stage.
@@ -2050,6 +2103,33 @@ mod tests {
 
     #[test]
     fn request_flow_carriers_require_independent_subject_and_action_tokens() {
+        for (name, path) in [
+            ("request", "src/requests/api.py"),
+            ("get", "lib/transportkit/api.py"),
+        ] {
+            assert!(citation_owns_client_public_facade_helper(&citation(
+                name,
+                path,
+                NodeKind::FUNCTION,
+            )));
+        }
+        for (name, path, kind) in [
+            ("request", "src/client.py", NodeKind::FUNCTION),
+            ("request", "src/database/api.py", NodeKind::FUNCTION),
+            ("get", "src/cache/api.py", NodeKind::FUNCTION),
+            ("request", "src/telemetry/api.py", NodeKind::FUNCTION),
+            ("get", "src/monitoring/api.py", NodeKind::FUNCTION),
+            ("request", "src/requests/api.py", NodeKind::METHOD),
+            ("FrameKind.request", "src/requests/api.py", NodeKind::METHOD),
+            ("Session.request", "src/requests/api.py", NodeKind::METHOD),
+            ("Cache.request", "src/requests/api.py", NodeKind::METHOD),
+            ("dispatch_hook", "src/requests/api.py", NodeKind::FUNCTION),
+        ] {
+            assert!(!citation_owns_client_public_facade_helper(&citation(
+                name, path, kind,
+            )));
+        }
+
         for positive in ["Session.request", "HttpClient.get"] {
             assert!(citation_owns_client_request_entrypoint(&citation(
                 positive,
@@ -2193,6 +2273,28 @@ mod tests {
             "Session.prepare_request"
         ));
         assert!(!client_request_entrypoint_call_target("CacheBuilder.build"));
+        for positive in [
+            "Session.request",
+            "HttpClient.request",
+            "requests.sessions.Session.request",
+        ] {
+            assert!(client_public_facade_successor_call_target(positive));
+        }
+        for negative in [
+            "request",
+            "requests.api.request",
+            "FrameKind.request",
+            "ClientRequestMetrics.request",
+            "CacheClient.request",
+            "DatabaseClient.request",
+            "TelemetryClient.request",
+            "MonitoringClient.request",
+            "Session.prepare_request",
+            "Session.send",
+            "dispatch_hook",
+        ] {
+            assert!(!client_public_facade_successor_call_target(negative));
+        }
         assert!(client_request_dispatch_predecessor_call_source(
             "Session.request"
         ));

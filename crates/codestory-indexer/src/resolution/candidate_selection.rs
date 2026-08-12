@@ -394,6 +394,14 @@ pub(super) fn compute_call_resolution(
         selected = None;
     }
 
+    if requires_python_context_manager_self_return(callsite_identity.as_deref()) {
+        if selected.is_some_and(|(candidate, _, _)| {
+            !candidate_index.has_context_manager_self_return_contract(candidate)
+        }) {
+            selected = None;
+        }
+    }
+
     let strategy = selected.map(|(_, _, strategy)| strategy);
     let selected_pair = selected.map(|(candidate, confidence, _)| (candidate, confidence));
     let update = build_resolved_edge_update(*edge_id, selected_pair, candidate_ids.as_slice())?;
