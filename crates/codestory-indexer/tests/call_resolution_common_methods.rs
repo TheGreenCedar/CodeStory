@@ -7701,22 +7701,22 @@ function loneLoopWriteExternal(body) {
     let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
     let mut external_markers = edges
         .iter()
-        .filter_map(|edge| {
-            (edge.kind == EdgeKind::CALL
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
                 && node_by_id.get(&edge.source).is_some_and(|source| {
                     is_matching_name(&source.serialized_name, "externalCalls")
                 })
                 && edge
                     .callsite_identity
                     .as_deref()
-                    .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call")))
-            .then(|| {
-                node_by_id
-                    .get(&edge.target)
-                    .expect("runtime import call target")
-                    .serialized_name
-                    .clone()
-            })
+                    .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call"))
+        })
+        .map(|edge| {
+            node_by_id
+                .get(&edge.target)
+                .expect("runtime import call target")
+                .serialized_name
+                .clone()
         })
         .collect::<Vec<_>>();
     external_markers.sort();
