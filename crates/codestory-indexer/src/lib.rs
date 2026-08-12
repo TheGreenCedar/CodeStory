@@ -4896,6 +4896,7 @@ struct RuntimeImportSpec {
     suppress_line: u32,
     suppress_start_col: u32,
     suppress_callee_name: String,
+    exact_bare_call_target_spans: Vec<GraphNodeSpan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6570,6 +6571,17 @@ fn js_like_callable_source_name(node: TsNode<'_>, source: &str) -> Option<String
         "arrow_function" => node
             .parent()
             .and_then(|parent| tsx_callable_binding_name(parent, source)),
+        "function_expression" => node
+            .parent()
+            .filter(|parent| {
+                parent.kind() == "assignment_expression"
+                    && parent
+                        .child_by_field_name("right")
+                        .is_some_and(|right| same_ts_span(right, node))
+            })
+            .and_then(|assignment| assignment.child_by_field_name("left"))
+            .filter(|left| left.kind() == "member_expression")
+            .and_then(|left| normalized_receiver_variable(left, source)),
         _ => None,
     }
 }
@@ -6873,6 +6885,447 @@ fn runtime_import_binding_node_id(
     None
 }
 
+fn collect_javascript_binding_identifier_nodes<'tree>(
+    node: TsNode<'tree>,
+    bindings: &mut Vec<TsNode<'tree>>,
+) {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => bindings.push(node),
+        "pair_pattern" => {
+            if let Some(value) = node.child_by_field_name("value") {
+                collect_javascript_binding_identifier_nodes(value, bindings);
+            }
+        }
+        "assignment_pattern" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                collect_javascript_binding_identifier_nodes(left, bindings);
+            }
+        }
+        "rest_pattern" => {
+            if let Some(argument) = node.child_by_field_name("argument") {
+                collect_javascript_binding_identifier_nodes(argument, bindings);
+            }
+        }
+        "required_parameter" | "optional_parameter" => {
+            if let Some(pattern) = node
+                .child_by_field_name("pattern")
+                .or_else(|| node.child_by_field_name("name"))
+                .or_else(|| node.named_child(0))
+            {
+                collect_javascript_binding_identifier_nodes(pattern, bindings);
+            }
+        }
+        "object_pattern" | "array_pattern" | "formal_parameters" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_javascript_binding_identifier_nodes(child, bindings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn javascript_runtime_import_bindings<'tree>(
+    tree: &'tree Tree,
+    source: &str,
+    import_call: TsNode<'tree>,
+) -> Vec<JavaScriptRuntimeImportBinding<'tree>> {
+    let mut current = import_call;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "parenthesized_expression"
+            | "await_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "type_assertion"
+            | "non_null_expression" => current = parent,
+            "member_expression"
+                if parent
+                    .child_by_field_name("object")
+                    .is_some_and(|object| same_ts_span(object, current)) =>
+            {
+                current = parent;
+            }
+            "variable_declarator"
+                if parent
+                    .child_by_field_name("value")
+                    .is_some_and(|value| same_ts_span(value, current)) =>
+            {
+                let mut bindings = Vec::new();
+                if let Some(name) = parent.child_by_field_name("name") {
+                    collect_javascript_binding_identifier_nodes(name, &mut bindings);
+                }
+                let activation_end_byte = parent.parent().unwrap_or(parent).end_byte();
+                return bindings
+                    .into_iter()
+                    .map(|declaration_binding| JavaScriptRuntimeImportBinding {
+                        declaration_binding,
+                        activation_end_byte,
+                    })
+                    .collect();
+            }
+            "assignment_expression"
+                if parent
+                    .child_by_field_name("right")
+                    .is_some_and(|right| same_ts_span(right, current)) =>
+            {
+                let Some(left) = parent
+                    .child_by_field_name("left")
+                    .filter(|left| left.kind() == "identifier")
+                else {
+                    return Vec::new();
+                };
+                let Some(name) = trimmed_node_text(left, source) else {
+                    return Vec::new();
+                };
+                let mut declarations =
+                    collect_javascript_binding_occurrences(tree.root_node(), source, &name)
+                        .into_iter()
+                        .filter(|occurrence| ts_node_contains(occurrence.scope, parent))
+                        .collect::<Vec<_>>();
+                declarations.sort_by_key(|occurrence| {
+                    (
+                        occurrence.scope.start_byte(),
+                        occurrence.binding.start_byte(),
+                    )
+                });
+                let Some(declaration) = declarations.pop() else {
+                    return Vec::new();
+                };
+                if declarations
+                    .iter()
+                    .any(|other| same_ts_span(other.scope, declaration.scope))
+                {
+                    return Vec::new();
+                }
+                if declaration.binding.start_byte() >= parent.start_byte()
+                    || javascript_variable_declarator_for_binding(declaration.binding)
+                        .is_none_or(|declarator| declarator.child_by_field_name("value").is_some())
+                {
+                    return Vec::new();
+                }
+                return vec![JavaScriptRuntimeImportBinding {
+                    declaration_binding: declaration.binding,
+                    activation_end_byte: parent.end_byte(),
+                }];
+            }
+            _ => return Vec::new(),
+        }
+    }
+    Vec::new()
+}
+
+fn javascript_variable_declarator_for_binding(mut binding: TsNode<'_>) -> Option<TsNode<'_>> {
+    while let Some(parent) = binding.parent() {
+        if parent.kind() == "variable_declarator" {
+            return Some(parent);
+        }
+        if matches!(parent.kind(), "program" | "statement_block") {
+            return None;
+        }
+        binding = parent;
+    }
+    None
+}
+
+fn javascript_callable_scope(node: TsNode<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_expression"
+            | "generator_function_declaration"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+    )
+}
+
+fn javascript_nearest_scope<'tree>(
+    mut node: TsNode<'tree>,
+    lexical: bool,
+) -> Option<TsNode<'tree>> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "program"
+            || javascript_callable_scope(parent)
+            || (lexical
+                && matches!(
+                    parent.kind(),
+                    "statement_block" | "catch_clause" | "for_statement" | "for_in_statement"
+                ))
+        {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JavaScriptBindingOccurrence<'tree> {
+    binding: TsNode<'tree>,
+    scope: TsNode<'tree>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JavaScriptRuntimeImportBinding<'tree> {
+    declaration_binding: TsNode<'tree>,
+    activation_end_byte: usize,
+}
+
+fn collect_javascript_binding_occurrences<'tree>(
+    root: TsNode<'tree>,
+    source: &str,
+    name: &str,
+) -> Vec<JavaScriptBindingOccurrence<'tree>> {
+    let mut occurrences = Vec::new();
+    walk_tree_nodes(root, &mut |node| {
+        match node.kind() {
+            "variable_declarator" => {
+                let Some(pattern) = node.child_by_field_name("name") else {
+                    return;
+                };
+                let lexical = node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() != "variable_declaration");
+                let Some(scope) = javascript_nearest_scope(node, lexical) else {
+                    return;
+                };
+                let mut bindings = Vec::new();
+                collect_javascript_binding_identifier_nodes(pattern, &mut bindings);
+                occurrences.extend(bindings.into_iter().filter_map(|binding| {
+                    (trimmed_node_text(binding, source).as_deref() == Some(name))
+                        .then_some(JavaScriptBindingOccurrence { binding, scope })
+                }));
+            }
+            "function_declaration" | "generator_function_declaration" | "class_declaration" => {
+                if let Some(binding) = node.child_by_field_name("name")
+                    && trimmed_node_text(binding, source).as_deref() == Some(name)
+                    && let Some(scope) = javascript_nearest_scope(node, true)
+                {
+                    occurrences.push(JavaScriptBindingOccurrence { binding, scope });
+                }
+            }
+            "function_expression" | "generator_function" | "class" => {
+                if let Some(binding) = node.child_by_field_name("name")
+                    && trimmed_node_text(binding, source).as_deref() == Some(name)
+                {
+                    occurrences.push(JavaScriptBindingOccurrence {
+                        binding,
+                        scope: node,
+                    });
+                }
+            }
+            "catch_clause" => {
+                let Some(parameter) = node.child_by_field_name("parameter") else {
+                    return;
+                };
+                let mut bindings = Vec::new();
+                collect_javascript_binding_identifier_nodes(parameter, &mut bindings);
+                occurrences.extend(bindings.into_iter().filter_map(|binding| {
+                    (trimmed_node_text(binding, source).as_deref() == Some(name)).then_some(
+                        JavaScriptBindingOccurrence {
+                            binding,
+                            scope: node,
+                        },
+                    )
+                }));
+            }
+            _ => {}
+        }
+
+        if javascript_callable_scope(node) {
+            let parameters = node
+                .child_by_field_name("parameters")
+                .or_else(|| node.child_by_field_name("parameter"));
+            let Some(parameters) = parameters else {
+                return;
+            };
+            let mut bindings = Vec::new();
+            collect_javascript_binding_identifier_nodes(parameters, &mut bindings);
+            occurrences.extend(bindings.into_iter().filter_map(|binding| {
+                (trimmed_node_text(binding, source).as_deref() == Some(name)).then_some(
+                    JavaScriptBindingOccurrence {
+                        binding,
+                        scope: node,
+                    },
+                )
+            }));
+        }
+    });
+    occurrences
+}
+
+fn ts_node_contains(outer: TsNode<'_>, inner: TsNode<'_>) -> bool {
+    outer.start_byte() <= inner.start_byte() && outer.end_byte() >= inner.end_byte()
+}
+
+fn javascript_binding_has_prior_write(
+    root: TsNode<'_>,
+    source: &str,
+    declaration_binding: TsNode<'_>,
+    after_byte: usize,
+    proof_node: TsNode<'_>,
+) -> bool {
+    let Some(name) = trimmed_node_text(declaration_binding, source) else {
+        return true;
+    };
+    let occurrences = collect_javascript_binding_occurrences(root, source, &name);
+    let Some(declaration) = occurrences
+        .iter()
+        .find(|occurrence| same_ts_span(occurrence.binding, declaration_binding))
+    else {
+        return true;
+    };
+    let declaration_callable = javascript_enclosing_callable(declaration_binding);
+    let proof_callable = javascript_enclosing_callable(proof_node);
+
+    let mut written = false;
+    walk_tree_nodes(root, &mut |node| {
+        if written || !matches!(node.kind(), "assignment_expression" | "update_expression") {
+            return;
+        }
+        let target = if node.kind() == "assignment_expression" {
+            node.child_by_field_name("left")
+        } else {
+            node.named_child(0)
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let mut bindings = Vec::new();
+        collect_javascript_binding_identifier_nodes(target, &mut bindings);
+        if !bindings
+            .into_iter()
+            .any(|binding| trimmed_node_text(binding, source).as_deref() == Some(name.as_str()))
+        {
+            return;
+        }
+        let write_callable = javascript_enclosing_callable(node);
+        let unordered_nested_write = write_callable.is_some_and(|write_callable| {
+            !declaration_callable.is_some_and(|owner| same_ts_span(owner, write_callable))
+                && !proof_callable.is_some_and(|owner| same_ts_span(owner, write_callable))
+                && ts_node_contains(declaration.scope, write_callable)
+        });
+        let cyclic_write = javascript_nodes_share_enclosing_cycle(node, proof_node);
+        if !unordered_nested_write
+            && !cyclic_write
+            && (node.start_byte() < after_byte || node.end_byte() >= proof_node.start_byte())
+        {
+            return;
+        }
+        if !ts_node_contains(declaration.scope, node)
+            || occurrences.iter().any(|occurrence| {
+                !same_ts_span(occurrence.binding, declaration.binding)
+                    && ts_node_contains(declaration.scope, occurrence.scope)
+                    && ts_node_contains(occurrence.scope, node)
+            })
+        {
+            return;
+        }
+        written = true;
+    });
+    written
+}
+
+fn javascript_nodes_share_enclosing_cycle(left: TsNode<'_>, right: TsNode<'_>) -> bool {
+    let mut current = left;
+    while let Some(parent) = current.parent() {
+        if matches!(
+            parent.kind(),
+            "for_statement" | "for_in_statement" | "while_statement" | "do_statement"
+        ) && ts_node_contains(parent, right)
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn javascript_enclosing_callable(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
+    while let Some(parent) = node.parent() {
+        if javascript_callable_scope(parent) {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn javascript_runtime_import_binding_visible_at_call(
+    tree: &Tree,
+    source: &str,
+    import_binding: TsNode<'_>,
+    activation_end_byte: usize,
+    call_callee: TsNode<'_>,
+) -> bool {
+    let Some(name) = trimmed_node_text(import_binding, source) else {
+        return false;
+    };
+    if call_callee.start_byte() <= activation_end_byte {
+        return false;
+    }
+    let occurrences = collect_javascript_binding_occurrences(tree.root_node(), source, &name);
+    let Some(import_occurrence) = occurrences
+        .iter()
+        .find(|occurrence| same_ts_span(occurrence.binding, import_binding))
+    else {
+        return false;
+    };
+    if !ts_node_contains(import_occurrence.scope, call_callee) {
+        return false;
+    }
+    if occurrences.iter().any(|occurrence| {
+        !same_ts_span(occurrence.binding, import_binding)
+            && ts_node_contains(import_occurrence.scope, occurrence.scope)
+            && ts_node_contains(occurrence.scope, call_callee)
+    }) {
+        return false;
+    }
+
+    !javascript_binding_has_prior_write(
+        tree.root_node(),
+        source,
+        import_binding,
+        activation_end_byte,
+        call_callee,
+    )
+}
+
+fn javascript_runtime_import_bare_call_target_spans(
+    tree: &Tree,
+    source: &str,
+    import_binding: TsNode<'_>,
+    activation_end_byte: usize,
+) -> Vec<GraphNodeSpan> {
+    let Some(name) = trimmed_node_text(import_binding, source) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "call_expression" {
+            return;
+        }
+        let Some(callee) = node.child_by_field_name("function") else {
+            return;
+        };
+        if callee.kind() != "identifier"
+            || trimmed_node_text(callee, source).as_deref() != Some(name.as_str())
+            || !javascript_runtime_import_binding_visible_at_call(
+                tree,
+                source,
+                import_binding,
+                activation_end_byte,
+                callee,
+            )
+        {
+            return;
+        }
+        spans.push(ts_node_graph_span(callee));
+    });
+    spans
+}
+
 fn collect_runtime_import_specs(
     language_name: &str,
     file_name: &str,
@@ -6920,6 +7373,7 @@ fn collect_javascript_runtime_import_specs(
     symbol_table: Option<&Arc<SymbolTable>>,
 ) -> Vec<RuntimeImportSpec> {
     let mut specs = Vec::new();
+    let mut exact_bindings = Vec::new();
     walk_tree_nodes(tree.root_node(), &mut |node| {
         if node.kind() != "call_expression" {
             return;
@@ -6981,21 +7435,55 @@ fn collect_javascript_runtime_import_specs(
         if let Some(table) = symbol_table {
             table.insert(module_node_id.0, NodeKind::MODULE);
         }
-        specs.push(RuntimeImportSpec {
-            binding_node_id: runtime_import_binding_node_id(
-                node,
+        let bindings = javascript_runtime_import_bindings(tree, source, node);
+        if bindings.is_empty() {
+            specs.push(RuntimeImportSpec {
+                binding_node_id: runtime_import_binding_node_id(
+                    node,
+                    source,
+                    file_name,
+                    unique_nodes,
+                    symbol_table,
+                ),
+                module_node_id,
+                line,
+                suppress_line,
+                suppress_start_col,
+                suppress_callee_name: callee_name,
+                exact_bare_call_target_spans: Vec::new(),
+            });
+            return;
+        }
+        for binding in bindings {
+            let binding_node_id = runtime_import_binding_target_id(
+                binding.declaration_binding,
                 source,
                 file_name,
                 unique_nodes,
                 symbol_table,
-            ),
-            module_node_id,
-            line,
-            suppress_line,
-            suppress_start_col,
-            suppress_callee_name: callee_name,
-        });
+            );
+            let spec_index = specs.len();
+            specs.push(RuntimeImportSpec {
+                binding_node_id,
+                module_node_id,
+                line,
+                suppress_line,
+                suppress_start_col,
+                suppress_callee_name: callee_name.clone(),
+                exact_bare_call_target_spans: Vec::new(),
+            });
+            exact_bindings.push((spec_index, binding));
+        }
     });
+    for (spec_index, binding) in exact_bindings {
+        specs[spec_index].exact_bare_call_target_spans =
+            javascript_runtime_import_bare_call_target_spans(
+                tree,
+                source,
+                binding.declaration_binding,
+                binding.activation_end_byte,
+            );
+    }
     specs
 }
 
@@ -7071,6 +7559,7 @@ fn collect_ruby_runtime_import_specs(
             suppress_line,
             suppress_start_col,
             suppress_callee_name: callee_name,
+            exact_bare_call_target_spans: Vec::new(),
         });
     });
     specs
@@ -7143,6 +7632,7 @@ fn collect_bash_source_import_specs(
             suppress_line,
             suppress_start_col,
             suppress_callee_name: callee_name,
+            exact_bare_call_target_spans: Vec::new(),
         });
     });
     specs
@@ -7758,6 +8248,32 @@ fn append_manual_receiver_call_edges(
             continue;
         }
 
+        let javascript_property_alias_provenance_only = language_name == "javascript"
+            && !spec.receiver_name.starts_with("this")
+            && spec.source_name.rsplit_once('.').is_some_and(|(owner, _)| {
+                spec.owner_name
+                    .strip_prefix(owner)
+                    .is_some_and(|suffix| suffix.starts_with('.') && suffix.len() > 1)
+            });
+        if javascript_property_alias_provenance_only {
+            annotate_receiver_call_placeholder_owner(
+                unique_nodes,
+                result_edges,
+                edge_keys,
+                flags,
+                ReceiverPlaceholderAnnotation {
+                    line: spec.line,
+                    method_col: spec.method_col,
+                    method_name: &spec.method_name,
+                    owner_name: &spec.owner_name,
+                    owner_module: None,
+                    extra_callsite_marker,
+                },
+                receiver_annotation_required_callsite_marker(language_name),
+            );
+            continue;
+        }
+
         let Some(target_id) = member_target_id_by_owner_and_method(
             unique_nodes,
             result_edges,
@@ -7769,6 +8285,10 @@ fn append_manual_receiver_call_edges(
             let should_annotate = match language_name {
                 "python" => !languages::python::is_implicit_receiver(&spec.receiver_name),
                 "go" | "dart" => true,
+                "javascript" => {
+                    spec.source_name.contains('.')
+                        && (spec.receiver_name == "this" || spec.receiver_name.starts_with("this."))
+                }
                 _ => false,
             };
             if should_annotate {
@@ -8345,6 +8865,7 @@ fn receiver_call_belongs_to_callable(node: TsNode<'_>, callable: TsNode<'_>) -> 
         "lambda",
         "lambda_expression",
         "arrow_function",
+        "function_expression",
         "anonymous_function",
         "closure_expression",
         "class_definition",
@@ -8798,6 +9319,45 @@ fn append_runtime_import_edges(
             continue;
         }
         result_edges.push(edge);
+    }
+}
+
+fn annotate_exact_runtime_import_bare_calls(
+    specs: &[RuntimeImportSpec],
+    unique_nodes: &HashMap<NodeId, Node>,
+    edges: &mut [Edge],
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+) {
+    let exact_target_spans = specs
+        .iter()
+        .flat_map(|spec| spec.exact_bare_call_target_spans.iter())
+        .map(|span| (span.start_line, span.start_col, span.end_line, span.end_col))
+        .collect::<HashSet<_>>();
+    if exact_target_spans.is_empty() {
+        return;
+    }
+
+    for edge in edges {
+        if edge.kind != EdgeKind::CALL
+            || !unique_nodes
+                .get(&edge.target)
+                .and_then(|target| {
+                    Some((
+                        target.start_line?,
+                        target.start_col?,
+                        target.end_line?,
+                        target.end_col?,
+                    ))
+                })
+                .is_some_and(|span| exact_target_spans.contains(&span))
+        {
+            continue;
+        }
+        edge_keys.remove(&edge_dedup_key(edge, flags));
+        append_callsite_marker(edge, languages::javascript::RUNTIME_IMPORT_CALLSITE_MARKER);
+        edge.id = EdgeId(generate_edge_id_for_edge(edge, flags));
+        edge_keys.insert(edge_dedup_key(edge, flags));
     }
 }
 
@@ -14280,6 +14840,13 @@ pub fn index_file(
         &runtime_import_specs,
         &unique_nodes,
         file_id,
+        &mut result_edges,
+        &mut edge_keys,
+        flags,
+    );
+    annotate_exact_runtime_import_bare_calls(
+        &runtime_import_specs,
+        &unique_nodes,
         &mut result_edges,
         &mut edge_keys,
         flags,

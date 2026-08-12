@@ -7804,6 +7804,34 @@ mod tests {
     }
 
     #[test]
+    fn route_tracing_packet_plan_uses_neutral_carrier_queries_without_eval_probes() {
+        let question = "Trace how a server application registers middleware and routes, handles an incoming request through a router, and sends the response.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::RouteTracing),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+
+        for expected in ["application use", "application handle", "response send"] {
+            assert!(
+                queries.contains(&expected),
+                "production route tracing should carry neutral owner/action query {expected}: {queries:?}"
+            );
+        }
+        for evaluation_only in ["createApplication", "app.use", "res.send"] {
+            assert!(
+                !queries.contains(&evaluation_only),
+                "production route tracing must not emit evaluation-shaped query {evaluation_only}: {queries:?}"
+            );
+        }
+    }
+
+    #[test]
     fn packet_supported_claims_use_generic_evidence_roles() {
         let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
         let mut answer = AgentAnswerDto {

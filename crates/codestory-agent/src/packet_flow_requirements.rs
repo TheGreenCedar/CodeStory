@@ -53,7 +53,9 @@ use crate::packet_terms::{
     packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
-use codestory_contracts::api::{AgentCitationDto, NodeKind, PacketTaskClassDto};
+use codestory_contracts::api::{
+    AgentCitationDto, EdgeKind, GraphEdgeDto, NodeKind, PacketTaskClassDto,
+};
 
 const CALLABLE_NODE_KINDS: &[NodeKind] = &[NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::MACRO];
 const BEHAVIORAL_OWNER_NODE_KINDS: &[NodeKind] = &[
@@ -215,34 +217,35 @@ impl EvidencePredicate {
         }
     }
 
-    /// Role-backed evidence can be evaluated from a citation alone. A call-boundary carrier is
-    /// only proof after packet finalization validates its exact outgoing edge and target.
+    /// Role-only evidence can be evaluated without the predicate's exact target. A citation that
+    /// also satisfies a call-boundary carrier is only proof after packet finalization validates
+    /// that declared boundary, even when its evidence role would otherwise be sufficient.
     pub fn citation_proves_without_call_boundary(self, citation: &AgentCitationDto) -> bool {
         match self {
             Self::CitedRoles { subsystem, roles }
-            | Self::CitedRolesOrCallBoundary {
-                subsystem, roles, ..
-            }
             | Self::CitedRolesOrOrderedCallBoundary {
                 subsystem, roles, ..
             } => citation_has_named_role(citation, subsystem, roles),
+            Self::CitedRolesOrCallBoundary {
+                subsystem,
+                roles,
+                carrier,
+                ..
+            } => citation_has_named_role(citation, subsystem, roles) && !carrier(citation),
             Self::CitedCarrier(carrier) => carrier(citation),
         }
     }
 
     pub fn call_boundary_target(self, citation: &AgentCitationDto) -> Option<SymbolPredicate> {
         let Self::CitedRolesOrCallBoundary {
-            subsystem,
-            roles,
             carrier,
             call_target,
+            ..
         } = self
         else {
             return None;
         };
-        (!citation_has_named_role(citation, subsystem, roles) && carrier(citation))
-            .then_some(call_target)
-            .flatten()
+        carrier(citation).then_some(call_target).flatten()
     }
 
     pub fn ordered_call_boundary(self, citation: &AgentCitationDto) -> Option<OrderedCallBoundary> {
@@ -259,6 +262,107 @@ impl EvidencePredicate {
         (citation_has_named_role(citation, subsystem, roles) || carrier(citation))
             .then_some((incoming_source, outgoing_target))
     }
+}
+
+/// Validate one cited CALL as a proof receipt for a flow requirement after the caller resolves the
+/// incident neighbor. This is deliberately stricter than general graph context: explicit
+/// uncertainty never proves a material boundary, and an unresolved syntax-only target needs both
+/// parser CALL provenance and a receiver/action pair that satisfies the declared target predicate.
+///
+/// Callers still own citation-edge identity and graph-neighbor lookup. Keeping the receipt rule in
+/// the agent contract lets prebudget reservation, finalization, and runtime candidate filtering use
+/// one definition without moving product orchestration into this crate.
+pub fn ordinary_incident_call_receipt_is_valid(
+    citation: &AgentCitationDto,
+    edge: &GraphEdgeDto,
+    neighbor_kind: NodeKind,
+) -> bool {
+    edge.kind == EdgeKind::CALL
+        && (edge.source == citation.node_id || edge.target == citation.node_id)
+        && neighbor_kind != NodeKind::UNKNOWN
+        && match edge.certainty.as_deref() {
+            Some(certainty) => certainty.eq_ignore_ascii_case("certain"),
+            None => true,
+        }
+}
+
+pub fn flow_requirement_call_receipt_is_valid(
+    requirement: &FlowRequirement,
+    citation: &AgentCitationDto,
+    edge: &GraphEdgeDto,
+    neighbor_label: &str,
+    neighbor_kind: NodeKind,
+) -> bool {
+    if edge.kind != EdgeKind::CALL {
+        return false;
+    }
+    let target_predicate = if let Some((incoming_source, outgoing_target)) =
+        requirement.evidence.ordered_call_boundary(citation)
+    {
+        if edge.target == citation.node_id {
+            Some(incoming_source)
+        } else if edge.source == citation.node_id {
+            Some(outgoing_target)
+        } else {
+            return false;
+        }
+    } else if let Some(outgoing_target) = requirement.evidence.call_boundary_target(citation) {
+        if edge.source != citation.node_id {
+            return false;
+        }
+        Some(outgoing_target)
+    } else {
+        if !requirement
+            .evidence
+            .citation_proves_without_call_boundary(citation)
+        {
+            return false;
+        }
+        return ordinary_incident_call_receipt_is_valid(citation, edge, neighbor_kind);
+    };
+
+    match edge.certainty.as_deref() {
+        Some(certainty) if !certainty.eq_ignore_ascii_case("certain") => return false,
+        Some(_) if neighbor_kind != NodeKind::UNKNOWN => {
+            return target_predicate.is_none_or(|predicate| predicate(neighbor_label));
+        }
+        Some(_) => return false,
+        None if neighbor_kind != NodeKind::UNKNOWN => {
+            return target_predicate.is_none_or(|predicate| predicate(neighbor_label));
+        }
+        None => {}
+    }
+
+    let Some(target_predicate) = target_predicate else {
+        return false;
+    };
+    if edge.confidence.is_some() || edge.source != citation.node_id {
+        return false;
+    }
+    let Some(receiver_owner) = parser_call_receiver_owner(edge.callsite_identity.as_deref()) else {
+        return false;
+    };
+    let target = neighbor_label
+        .rsplit(['.', ':', '#'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(neighbor_label);
+    target_predicate(&format!("{receiver_owner}.{target}"))
+}
+
+fn parser_call_receiver_owner(callsite_identity: Option<&str>) -> Option<&str> {
+    let identity = callsite_identity?;
+    let parser_proven = identity
+        .split('|')
+        .any(|segment| segment.starts_with("syntax:") && segment.ends_with("-call"));
+    if !parser_proven {
+        return None;
+    }
+    identity.split('|').find_map(|segment| {
+        segment
+            .strip_prefix("receiver-owner:")
+            .map(str::trim)
+            .filter(|owner| !owner.is_empty())
+    })
 }
 
 fn citation_has_named_role(
@@ -645,7 +749,7 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "request_entrypoint",
         role: FlowRole::Registration,
-        query_seeds: &["request entrypoint", "route registration"],
+        query_seeds: &["application use", "route registration"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
         evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_server_request,
@@ -660,7 +764,7 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "request_dispatch",
         role: FlowRole::Dispatch,
-        query_seeds: &["request dispatch", "handler dispatch"],
+        query_seeds: &["application handle", "request dispatch"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
         evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_server_request,
@@ -676,7 +780,7 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "request_terminal",
         role: FlowRole::TerminalBoundary,
-        query_seeds: &["response finalization", "transport send"],
+        query_seeds: &["response send", "response finalization"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
         evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_request_terminal,
@@ -1473,7 +1577,11 @@ mod tests {
                 "client request flow should probe {expected}"
             );
         }
-        for server_only in ["route registration", "handler dispatch"] {
+        for server_only in [
+            "application use",
+            "application handle",
+            "route registration",
+        ] {
             assert!(
                 !queries.contains(&server_only),
                 "client request flow should not probe {server_only}"
@@ -1482,7 +1590,7 @@ mod tests {
     }
 
     #[test]
-    fn server_request_flow_retains_route_registration_and_handler_dispatch() {
+    fn server_request_flow_leads_with_carrier_aligned_symbols() {
         let requirements = packet_flow_requirements_for_terms(
             &packet_probe_terms(
                 "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.",
@@ -1499,7 +1607,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(entrypoint.role, FlowRole::Registration);
-        for expected in ["route registration", "handler dispatch"] {
+        for expected in [
+            "application use",
+            "route registration",
+            "application handle",
+            "request dispatch",
+            "response send",
+            "response finalization",
+        ] {
             assert!(
                 queries.contains(&expected),
                 "server request flow should probe {expected}"
@@ -1537,13 +1652,19 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ids, ["request_entrypoint", "request_dispatch"]);
-        for expected in ["route registration", "handler dispatch"] {
+        for expected in [
+            "application use",
+            "route registration",
+            "application handle",
+            "request dispatch",
+        ] {
             assert!(
                 queries.contains(&expected),
                 "server route flow should probe {expected}"
             );
         }
         for out_of_scope in [
+            "response send",
             "response finalization",
             "transport send",
             "transport adapter",
@@ -1576,7 +1697,7 @@ mod tests {
             ids,
             ["request_entrypoint", "request_dispatch", "request_terminal"]
         );
-        for expected in ["response finalization", "transport send"] {
+        for expected in ["response send", "response finalization"] {
             assert!(
                 queries.contains(&expected),
                 "response-helper route flow should probe {expected}"
@@ -2136,6 +2257,115 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn hybrid_role_carriers_keep_their_declared_call_boundary() {
+        let cases = [
+            (
+                "server request entrypoint",
+                SERVER_REQUEST_DISPATCH_FLOW[0],
+                witness("Router.use", "src/router.js", NodeKind::METHOD),
+                witness("Router.map", "src/router.js", NodeKind::METHOD),
+                "Router.route",
+            ),
+            (
+                "server request dispatch",
+                SERVER_REQUEST_DISPATCH_FLOW[1],
+                witness("Router.dispatch", "src/router.js", NodeKind::METHOD),
+                witness(
+                    "RequestDispatcher.execute",
+                    "src/dispatcher.js",
+                    NodeKind::METHOD,
+                ),
+                "finalhandler",
+            ),
+            (
+                "server response terminal",
+                SERVER_REQUEST_DISPATCH_FLOW[2],
+                witness("Response.writeBuffer", "src/response.js", NodeKind::METHOD),
+                witness("ResponseBuffer.read", "src/response.js", NodeKind::METHOD),
+                "Socket.end",
+            ),
+            (
+                "client request entrypoint",
+                CLIENT_REQUEST_DISPATCH_FLOW[0],
+                witness(
+                    "HttpClientFactory.request",
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                ),
+                witness("createClient", "src/client.rs", NodeKind::FUNCTION),
+                "PreparedRequest.build",
+            ),
+            (
+                "client public facade",
+                CLIENT_PUBLIC_FACADE_REQUIREMENT,
+                witness(
+                    "createClient.request",
+                    "src/requests/api.py",
+                    NodeKind::FUNCTION,
+                ),
+                witness("createClient", "src/requests/api.py", NodeKind::FUNCTION),
+                "Session.request",
+            ),
+        ];
+
+        for (label, requirement, hybrid, role_only, lawful_target) in cases {
+            assert!(
+                requirement.evidence.citation_proves(&hybrid),
+                "{label}: fixture must satisfy the hybrid predicate"
+            );
+            assert!(
+                !requirement
+                    .evidence
+                    .citation_proves_without_call_boundary(&hybrid),
+                "{label}: a named role must not bypass carrier boundary proof"
+            );
+            let target = requirement
+                .evidence
+                .call_boundary_target(&hybrid)
+                .unwrap_or_else(|| panic!("{label}: hybrid carrier lost its declared target"));
+            assert!(target(lawful_target), "{label}: lawful target rejected");
+            assert!(
+                !target("Metrics.record"),
+                "{label}: unrelated target admitted"
+            );
+
+            assert!(
+                requirement.evidence.citation_proves(&role_only),
+                "{label}: role-only fixture must retain the established role surface"
+            );
+            assert!(
+                requirement
+                    .evidence
+                    .citation_proves_without_call_boundary(&role_only),
+                "{label}: role-only evidence should keep the ordinary CALL contract"
+            );
+            assert!(
+                requirement
+                    .evidence
+                    .call_boundary_target(&role_only)
+                    .is_none(),
+                "{label}: role-only evidence must not invent an exact target"
+            );
+        }
+
+        let ordered = CLIENT_REQUEST_DISPATCH_FLOW[1];
+        let ordered_hybrid = witness("HttpClient.dispatchSend", "src/client.rs", NodeKind::METHOD);
+        assert!(ordered.evidence.citation_proves(&ordered_hybrid));
+        assert!(
+            ordered
+                .evidence
+                .citation_proves_without_call_boundary(&ordered_hybrid),
+            "the ordered-boundary predicate keeps its established role behavior"
+        );
+        assert!(
+            ordered
+                .evidence
+                .ordered_call_boundary(&ordered_hybrid)
+                .is_some()
+        );
     }
 
     #[test]

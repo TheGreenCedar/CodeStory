@@ -1,3 +1,4 @@
+use crate::agent::packet_candidate::is_packet_candidate_selection_view_id;
 use crate::agent::packet_capping::cap_packet_citations_with_obligation_carriers;
 use crate::agent::packet_claims::{
     packet_flow_claims_markdown, packet_supported_claims_with_telemetry,
@@ -949,50 +950,93 @@ fn cap_graph_edges(
     protected_edge_ids: &[EdgeId],
 ) -> bool {
     let max_edges = max_edges as usize;
+    // Ordinary packet graphs keep one canonical owner per edge ID. A fingerprinted packet
+    // candidate graph is instead one bounded source view: its opaque omission count is meaningful
+    // only beside that view's own retained edge occurrences. Preserve those occurrences across
+    // views, even when IDs overlap; they consume the same unchanged global edge budget.
     let mut canonical_owners = HashMap::<EdgeId, (String, usize, usize)>::new();
+    let mut selectable_occurrences = Vec::<(EdgeId, String, usize, usize)>::new();
     for (artifact_index, artifact) in answer.graphs.iter().enumerate() {
         let GraphArtifactDto::Uml { id, graph, .. } = artifact else {
             continue;
         };
         for (edge_index, edge) in graph.edges.iter().enumerate() {
             let candidate = (id.clone(), artifact_index, edge_index);
-            canonical_owners
-                .entry(edge.id.clone())
-                .and_modify(|current| {
-                    if candidate < current.clone() {
-                        *current = candidate.clone();
-                    }
-                })
-                .or_insert(candidate);
-        }
-    }
-
-    let mut selected = Vec::new();
-    let mut selected_set = HashSet::new();
-    if max_edges > 0 {
-        for edge_id in protected_edge_ids {
-            if canonical_owners.contains_key(edge_id) && selected_set.insert(edge_id.clone()) {
-                selected.push(edge_id.clone());
-                if selected.len() >= max_edges {
-                    break;
-                }
+            if is_packet_candidate_selection_view_id(id) {
+                selectable_occurrences.push((
+                    edge.id.clone(),
+                    id.clone(),
+                    artifact_index,
+                    edge_index,
+                ));
+            } else {
+                canonical_owners
+                    .entry(edge.id.clone())
+                    .and_modify(|current| {
+                        if candidate < current.clone() {
+                            *current = candidate.clone();
+                        }
+                    })
+                    .or_insert(candidate);
             }
         }
     }
-    let mut ordinary = canonical_owners.keys().cloned().collect::<Vec<_>>();
-    ordinary.sort_by(|left, right| left.0.cmp(&right.0));
-    for edge_id in ordinary {
-        if selected.len() >= max_edges {
-            break;
-        }
-        if selected_set.insert(edge_id.clone()) {
-            selected.push(edge_id);
+    selectable_occurrences.extend(canonical_owners.iter().map(
+        |(edge_id, (artifact_id, artifact_index, edge_index))| {
+            (
+                edge_id.clone(),
+                artifact_id.clone(),
+                *artifact_index,
+                *edge_index,
+            )
+        },
+    ));
+    selectable_occurrences.sort_by(
+        |(left_edge, left_artifact, left_artifact_index, left_edge_index),
+         (right_edge, right_artifact, right_artifact_index, right_edge_index)| {
+            left_edge
+                .0
+                .cmp(&right_edge.0)
+                .then(left_artifact.cmp(right_artifact))
+                .then(left_artifact_index.cmp(right_artifact_index))
+                .then(left_edge_index.cmp(right_edge_index))
+        },
+    );
+
+    let mut selected_occurrences = Vec::<(usize, usize)>::new();
+    let mut selected_set = HashSet::<(usize, usize)>::new();
+    if max_edges > 0 {
+        let mut protected_ids_selected = HashSet::new();
+        for edge_id in protected_edge_ids {
+            if !protected_ids_selected.insert(edge_id.clone()) {
+                continue;
+            }
+            if let Some((_, _, artifact_index, edge_index)) = selectable_occurrences.iter().find(
+                |(candidate_id, _, artifact_index, edge_index)| {
+                    candidate_id == edge_id
+                        && !selected_set.contains(&(*artifact_index, *edge_index))
+                },
+            ) && selected_set.insert((*artifact_index, *edge_index))
+            {
+                selected_occurrences.push((*artifact_index, *edge_index));
+            }
+            if selected_occurrences.len() >= max_edges {
+                break;
+            }
         }
     }
-    let selected_order = selected
+    for (_, _, artifact_index, edge_index) in &selectable_occurrences {
+        if selected_occurrences.len() >= max_edges {
+            break;
+        }
+        if selected_set.insert((*artifact_index, *edge_index)) {
+            selected_occurrences.push((*artifact_index, *edge_index));
+        }
+    }
+    let selected_order = selected_occurrences
         .iter()
         .enumerate()
-        .map(|(index, edge_id)| (edge_id.clone(), index))
+        .map(|(index, occurrence)| (*occurrence, index))
         .collect::<HashMap<_, _>>();
 
     let mut truncated = false;
@@ -1003,18 +1047,13 @@ fn cap_graph_edges(
         let original_len = graph.edges.len();
         let mut retained = Vec::with_capacity(original_len.min(max_edges));
         for (edge_index, edge) in graph.edges.drain(..).enumerate() {
-            if selected_set.contains(&edge.id)
-                && canonical_owners
-                    .get(&edge.id)
-                    .is_some_and(|(_, owner_artifact, owner_edge)| {
-                        *owner_artifact == artifact_index && *owner_edge == edge_index
-                    })
-            {
-                retained.push(edge);
+            let occurrence = (artifact_index, edge_index);
+            if let Some(order) = selected_order.get(&occurrence) {
+                retained.push((*order, edge));
             }
         }
-        retained.sort_by_key(|edge| selected_order[&edge.id]);
-        graph.edges = retained;
+        retained.sort_by_key(|(order, _)| *order);
+        graph.edges = retained.into_iter().map(|(_, edge)| edge).collect();
         if graph.edges.len() < original_len {
             let omitted = original_len - graph.edges.len();
             graph.truncated = true;
@@ -1035,6 +1074,15 @@ fn cap_graph_edges(
     truncated |= answer.graphs.len() != original_graph_count;
     truncated |= prune_packet_graph_references(answer);
     truncated
+}
+
+#[cfg(test)]
+pub(crate) fn cap_packet_graph_edges_for_test(
+    answer: &mut AgentAnswerDto,
+    max_edges: u32,
+    protected_edge_ids: &[EdgeId],
+) -> bool {
+    cap_graph_edges(answer, max_edges, protected_edge_ids)
 }
 
 fn canonicalize_packet_graphs_and_references(answer: &mut AgentAnswerDto) -> bool {
@@ -1372,6 +1420,89 @@ pub(super) mod tests {
                 canonical_layout: None,
             },
         }
+    }
+
+    fn candidate_view_artifact(
+        fingerprint: char,
+        edge_ids: &[&str],
+        omitted_edge_count: u32,
+    ) -> GraphArtifactDto {
+        let id = format!(
+            "packet-search-provenance-{}",
+            fingerprint.to_string().repeat(64)
+        );
+        let mut artifact = budget_graph_artifact(&id, edge_ids);
+        let GraphArtifactDto::Uml { graph, .. } = &mut artifact else {
+            unreachable!();
+        };
+        graph.truncated = omitted_edge_count > 0;
+        graph.omitted_edge_count = omitted_edge_count;
+        artifact
+    }
+
+    #[test]
+    fn final_graph_cap_preserves_overlapping_candidate_view_omissions_and_replay() {
+        // View A retains {a,b} and omits {c}; view B retains {b,c} and omits {a}. The
+        // unconditional final canonicalization must keep both physical `b` occurrences because
+        // their opaque counts are local to different bounded views.
+        let mut answer = test_packet("Trace overlapping candidate views.", 96 * 1024).answer;
+        answer.graphs = vec![
+            candidate_view_artifact('a', &["a", "b"], 1),
+            candidate_view_artifact('b', &["b", "c"], 1),
+        ];
+        answer.subgraph_ids = answer
+            .graphs
+            .iter()
+            .map(|artifact| match artifact {
+                GraphArtifactDto::Uml { id, .. } | GraphArtifactDto::Mermaid { id, .. } => {
+                    id.clone()
+                }
+            })
+            .collect();
+
+        assert!(!canonicalize_packet_graphs_and_references(&mut answer));
+        assert!(!canonicalize_packet_graphs_and_references(&mut answer));
+        assert_eq!(answer.graphs.len(), 2);
+        assert_eq!(packet_budget_usage(&answer).trail_edges, 4);
+        let graph_shapes = answer
+            .graphs
+            .iter()
+            .map(|artifact| match artifact {
+                GraphArtifactDto::Uml { graph, .. } => {
+                    let mut ids = graph
+                        .edges
+                        .iter()
+                        .map(|edge| edge.id.0.as_str())
+                        .collect::<Vec<_>>();
+                    ids.sort_unstable();
+                    (ids, graph.truncated, graph.omitted_edge_count)
+                }
+                GraphArtifactDto::Mermaid { .. } => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(graph_shapes[0], (vec!["a", "b"], true, 1));
+        assert_eq!(graph_shapes[1], (vec!["b", "c"], true, 1));
+
+        let mut capped = answer.clone();
+        assert!(cap_graph_edges(&mut capped, 3, &[]));
+        let first_pass = capped.clone();
+        assert!(!cap_graph_edges(&mut capped, 3, &[]));
+        assert_eq!(
+            serde_json::to_value(&capped).unwrap(),
+            serde_json::to_value(&first_pass).unwrap()
+        );
+        assert_eq!(packet_budget_usage(&capped).trail_edges, 3);
+        let local_counts = capped
+            .graphs
+            .iter()
+            .map(|artifact| match artifact {
+                GraphArtifactDto::Uml { graph, .. } => {
+                    (graph.edges.len(), graph.truncated, graph.omitted_edge_count)
+                }
+                GraphArtifactDto::Mermaid { .. } => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(local_counts, [(2, true, 1), (1, true, 2)]);
     }
 
     #[test]

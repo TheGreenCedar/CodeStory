@@ -422,16 +422,25 @@ pub fn citation_owns_server_response_terminal(citation: &AgentCitationDto) -> bo
     )
 }
 
-fn display_name_has_token(display_name: &str, tokens: &[&str]) -> bool {
-    has_token(&identifier_tokens(display_name), tokens)
-}
-
 /// Typed CALL targets that advance an outbound public request into preparation or dispatch.
 pub fn client_request_entrypoint_call_target(display_name: &str) -> bool {
     let tokens = identifier_tokens(display_name);
-    (has_token(&tokens, &["prepare", "prepared", "build"])
-        && has_token(&tokens, &["request", "requests"]))
-        || (has_token(&tokens, &["send"]) && has_token(&tokens, &["client", "session", "requests"]))
+    if has_token(
+        &tokens,
+        &["metrics", "telemetry", "monitoring", "observability"],
+    ) {
+        return false;
+    }
+    let terminal = identifier_tokens(terminal_segment_raw(display_name));
+    let owns_client_lifecycle = has_token(&tokens, &["client", "session"]);
+    let owns_prepared_artifact =
+        has_token(&tokens, &["prepared"]) && has_token(&tokens, &["request", "requests"]);
+    let prepares_request =
+        has_token(&terminal, &["prepare"]) && has_token(&terminal, &["request", "requests"]);
+    let dispatches_request = has_token(&terminal, &["request", "send"]);
+    let builds_prepared_artifact = has_token(&terminal, &["build"]);
+    (owns_client_lifecycle && (prepares_request || dispatches_request))
+        || (owns_prepared_artifact && builds_prepared_artifact)
 }
 
 /// Typed CALL targets that advance a top-level package helper into the session/client request
@@ -478,31 +487,71 @@ pub fn client_request_dispatch_successor_call_target(display_name: &str) -> bool
 
 /// Typed CALL targets that implement route or middleware registration.
 pub fn server_request_entrypoint_call_target(display_name: &str) -> bool {
-    display_name_has_token(display_name, &["route", "routes", "use", "listen"])
+    display_terminal_owner_action_matches(
+        display_name,
+        &["router"],
+        &["route", "routes", "use", "listen"],
+    ) || display_terminal_owner_action_matches(display_name, &["server"], &["listen"])
 }
 
 /// Typed CALL targets that select or invoke the inbound handler.
 pub fn server_request_dispatch_call_target(display_name: &str) -> bool {
     let tokens = identifier_tokens(display_name);
-    has_token(&tokens, &["handle", "handler", "finalhandler"])
-        || (has_token(&tokens, &["dispatch", "invoke"])
-            && has_token(
-                &tokens,
-                &[
-                    "server",
-                    "router",
-                    "controller",
-                    "middleware",
-                    "wsgi",
-                    "asgi",
-                    "servlet",
-                ],
-            ))
+    tokens.as_slice() == ["finalhandler"]
+        || display_terminal_owner_action_matches(
+            display_name,
+            &[
+                "app",
+                "router",
+                "controller",
+                "middleware",
+                "wsgi",
+                "asgi",
+                "servlet",
+            ],
+            &["dispatch", "handle", "invoke"],
+        )
 }
 
 /// Typed CALL targets that perform the response write or flush.
 pub fn server_response_terminal_call_target(display_name: &str) -> bool {
-    display_name_has_token(display_name, &["end", "write", "flush", "finish"])
+    let tokens = identifier_tokens(display_name);
+    display_terminal_owner_action_matches(
+        display_name,
+        &[
+            "res",
+            "response",
+            "reply",
+            "writer",
+            "transport",
+            "socket",
+            "stream",
+        ],
+        &["end", "write", "flush", "finish"],
+    ) || tokens.windows(3).last().is_some_and(|tail| {
+        matches!(tail[0].as_str(), "response" | "reply")
+            && tail[1] == "sender"
+            && matches!(tail[2].as_str(), "end" | "write" | "flush" | "finish")
+    }) || (tokens.len() == 2
+        && tokens[0] == "output"
+        && matches!(tokens[1].as_str(), "end" | "write" | "flush" | "finish"))
+}
+
+fn display_terminal_owner_action_matches(
+    display_name: &str,
+    owners: &[&str],
+    actions: &[&str],
+) -> bool {
+    let tokens = identifier_tokens(display_name);
+    let Some(tail) = tokens.windows(2).last() else {
+        return false;
+    };
+    owners.contains(&tail[0].as_str())
+        && actions.contains(&tail[1].as_str())
+        && !has_token(
+            &tokens[..tokens.len().saturating_sub(2)],
+            &["metrics", "telemetry", "monitoring", "observability"],
+        )
 }
 
 /// Anchors that belong to an HTTP client at all. `Uri.prepare` is a URL utility that happens to be
@@ -2269,10 +2318,21 @@ mod tests {
             )));
         }
 
-        assert!(client_request_entrypoint_call_target(
-            "Session.prepare_request"
-        ));
-        assert!(!client_request_entrypoint_call_target("CacheBuilder.build"));
+        for target in [
+            "Session.prepare_request",
+            "PreparedRequest.build",
+            "Session.send",
+            "Client.send",
+        ] {
+            assert!(client_request_entrypoint_call_target(target), "{target}");
+        }
+        for target in [
+            "Telemetry.prepareRequest",
+            "CacheBuilder.build",
+            "Telemetry.send",
+        ] {
+            assert!(!client_request_entrypoint_call_target(target), "{target}");
+        }
         for positive in [
             "Session.request",
             "HttpClient.request",
@@ -2314,14 +2374,57 @@ mod tests {
             "AdapterResolveMetrics.record"
         ));
         assert!(server_request_entrypoint_call_target("Router.route"));
+        assert!(server_request_entrypoint_call_target("Router.use"));
+        assert!(server_request_entrypoint_call_target("Router.listen"));
+        assert!(server_request_entrypoint_call_target("Server.listen"));
+        assert!(!server_request_entrypoint_call_target("Server.route"));
+        assert!(!server_request_entrypoint_call_target("Server.use"));
         assert!(server_request_dispatch_call_target("finalhandler"));
+        for target in [
+            "app.handle",
+            "Router.dispatch",
+            "Controller.handle",
+            "Middleware.invoke",
+            "Wsgi.handle",
+            "Asgi.dispatch",
+            "Servlet.invoke",
+        ] {
+            assert!(server_request_dispatch_call_target(target), "{target}");
+        }
         assert!(server_response_terminal_call_target("ServerResponse.end"));
+        for target in [
+            "response.write",
+            "ResponseSender.finish",
+            "reply.flush",
+            "writer.finish",
+            "transport.write",
+            "socket.end",
+            "stream.flush",
+            "output.finish",
+        ] {
+            assert!(server_response_terminal_call_target(target), "{target}");
+        }
         assert!(!server_request_entrypoint_call_target(
             "PluginRegistry.registerPlugin"
         ));
+        assert!(!server_request_entrypoint_call_target("Metrics.use"));
+        assert!(!server_request_entrypoint_call_target("MetricsRouter.use"));
         assert!(!server_request_dispatch_call_target("HttpClient.dispatch"));
+        assert!(!server_request_dispatch_call_target("Telemetry.handle"));
+        assert!(!server_request_dispatch_call_target(
+            "TelemetryRouter.handle"
+        ));
         assert!(!server_response_terminal_call_target(
             "ResponseParser.parse"
+        ));
+        assert!(!server_response_terminal_call_target("Telemetry.end"));
+        assert!(!server_response_terminal_call_target("Cache.write"));
+        assert!(!server_response_terminal_call_target("EmailSender.finish"));
+        assert!(!server_response_terminal_call_target(
+            "TelemetryOutput.finish"
+        ));
+        assert!(!server_response_terminal_call_target(
+            "MetricsOutput.finish"
         ));
     }
 

@@ -161,6 +161,21 @@ pub(super) fn compute_call_resolution(
     let is_common_unqualified = is_common_unqualified_call_name(&prepared_name.original);
     let is_owner_qualified = is_owner_qualified_call_name(&prepared_name.original);
 
+    // The parser proved that this bare JavaScript-family call shares an exact local name with a
+    // runtime import binding. That proves a lexical external boundary, not the implementation
+    // behind it, so do not let semantic fallback redirect it to a same-named local method.
+    if callsite_identity.as_deref().is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::languages::javascript::RUNTIME_IMPORT_CALLSITE_MARKER)
+    }) {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
     for candidate in semantic_candidates {
         if pass.flags.store_candidates {
             candidate_ids.push(candidate.target_node_id);

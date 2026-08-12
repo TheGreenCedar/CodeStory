@@ -18,7 +18,9 @@ use codestory_contracts::api::{
     RetrievalCandidateResolutionCountDto, RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto,
     RetrievalShadowDto, RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchResultsDto,
 };
-use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
+use codestory_contracts::graph::{
+    EdgeKind, NodeId as CoreNodeId, NodeKind, TrailCallerScope, TrailConfig, TrailDirection,
+};
 #[cfg(test)]
 use codestory_retrieval::SidecarRuntimeConfig;
 use codestory_retrieval::{
@@ -1981,59 +1983,122 @@ fn packet_graph_for_resolved_candidate(
     node_id: CoreNodeId,
     candidate: &CandidateHit,
 ) -> Result<(Vec<PacketGraphEdgeProvenance>, Option<GraphResponse>), ApiError> {
-    let Some(candidate_evidence) = candidate.graph_evidence.as_ref() else {
-        return Ok((Vec::new(), None));
-    };
-    let (direction, edge_kind) = match (candidate_evidence.direction, candidate_evidence.edge_kind)
-    {
-        (CandidateGraphDirection::Outgoing, Some(edge_kind)) => {
-            (PacketGraphDirection::Outgoing, edge_kind)
-        }
-        (CandidateGraphDirection::Incoming, Some(edge_kind)) => {
-            (PacketGraphDirection::Incoming, edge_kind)
-        }
-        (CandidateGraphDirection::Anchor, _) | (_, None) => {
-            return Ok((Vec::new(), None));
-        }
-    };
+    const PACKET_CANDIDATE_DIRECTION_NODE_LIMIT: usize = 65;
 
-    let mut edges = storage
-        .get_edges_for_node_ids(&[node_id])
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to resolve packet candidate graph provenance: {error}"
-            ))
-        })?
-        .remove(&node_id)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|edge| {
-            if edge.kind != edge_kind {
-                return false;
+    let candidate_node = storage.get_node(node_id).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to load packet candidate for CALL hydration: {error}"
+        ))
+    })?;
+    let hydrate_outgoing_calls = candidate.target.is_none()
+        && candidate_node.as_ref().is_some_and(|node| {
+            matches!(
+                node.kind,
+                NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+            )
+        });
+    let specific_evidence = candidate.graph_evidence.as_ref().and_then(|evidence| {
+        let edge_kind = evidence.edge_kind?;
+        match evidence.direction {
+            CandidateGraphDirection::Outgoing => {
+                Some((PacketGraphDirection::Outgoing, edge_kind, evidence.hop))
             }
+            CandidateGraphDirection::Incoming => {
+                Some((PacketGraphDirection::Incoming, edge_kind, evidence.hop))
+            }
+            CandidateGraphDirection::Anchor => None,
+        }
+    });
+    if specific_evidence.is_none() && !hydrate_outgoing_calls {
+        return Ok((Vec::new(), None));
+    }
+
+    let mut edge_filter = vec![EdgeKind::CALL];
+    if let Some((_, edge_kind, _)) = specific_evidence
+        && !edge_filter.contains(&edge_kind)
+    {
+        edge_filter.push(edge_kind);
+    }
+    let bounded_trail = |direction| {
+        storage.get_trail(&TrailConfig {
+            root_id: node_id,
+            depth: 1,
+            direction,
+            caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+            edge_filter: edge_filter.clone(),
+            show_utility_calls: true,
+            max_nodes: PACKET_CANDIDATE_DIRECTION_NODE_LIMIT,
+            ..TrailConfig::default()
+        })
+    };
+    // Scan the two directions independently. The trail accessor bounds materialization before it
+    // returns, so high incoming fanout cannot consume the outgoing scan that may carry a packet
+    // boundary. A proof outside either scan remains absent and therefore fails closed; the trail's
+    // truncation metadata is carried into the candidate graph below.
+    let incoming = bounded_trail(TrailDirection::Incoming).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to resolve bounded incoming packet candidate graph provenance: {error}"
+        ))
+    })?;
+    let outgoing = bounded_trail(TrailDirection::Outgoing).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to resolve bounded outgoing packet candidate graph provenance: {error}"
+        ))
+    })?;
+    let scan_truncated = incoming.truncated || outgoing.truncated;
+    let scan_omitted_edge_count = incoming
+        .omitted_edge_count
+        .saturating_add(outgoing.omitted_edge_count);
+    let mut seen_incident_edge_ids = HashSet::new();
+    let incident_edges = incoming
+        .edges
+        .into_iter()
+        .chain(outgoing.edges)
+        .filter(|edge| seen_incident_edge_ids.insert(edge.id));
+    let mut edges = Vec::new();
+    for edge in incident_edges {
+        let mut selected_direction = None;
+        if let Some((direction, edge_kind, hop)) = specific_evidence
+            && edge.kind == edge_kind
+        {
             let (source, target) = edge.effective_endpoints();
-            match direction {
+            let matches_specific = match direction {
                 // The sidecar direction is anchor-relative: an outgoing expansion lands on the
                 // target candidate, while an incoming expansion lands on the source candidate.
                 PacketGraphDirection::Outgoing => target == node_id,
                 PacketGraphDirection::Incoming => source == node_id,
+            };
+            if matches_specific {
+                selected_direction = Some((direction, hop, false));
             }
-        })
-        .collect::<Vec<_>>();
-    edges.sort_by(|left, right| {
-        packet_graph_certainty_priority(left.certainty)
-            .cmp(&packet_graph_certainty_priority(right.certainty))
-            .then(left.id.0.cmp(&right.id.0))
-    });
-    edges.truncate(12);
+        }
+        let (source, _) = edge.effective_endpoints();
+        if hydrate_outgoing_calls && edge.kind == EdgeKind::CALL && source == node_id {
+            selected_direction.get_or_insert((PacketGraphDirection::Outgoing, 1, true));
+        }
+        if let Some((direction, hop, hydrated)) = selected_direction {
+            edges.push((edge, direction, hop, hydrated));
+        }
+    }
+    edges.sort_by(
+        |(left, _, _, left_hydrated), (right, _, _, right_hydrated)| {
+            left_hydrated
+                .cmp(right_hydrated)
+                .then_with(|| {
+                    packet_graph_certainty_priority(left.certainty)
+                        .cmp(&packet_graph_certainty_priority(right.certainty))
+                })
+                .then_with(|| left.id.0.cmp(&right.id.0))
+        },
+    );
     if edges.is_empty() {
         return Ok((Vec::new(), None));
     }
 
     let graph_flags = app_graph_flags();
     let edge_dtos = edges
-        .into_iter()
-        .map(|edge| graph_edge_dto(edge.with_effective_endpoints(), graph_flags))
+        .iter()
+        .map(|(edge, _, _, _)| graph_edge_dto(edge.clone().with_effective_endpoints(), graph_flags))
         .collect::<Vec<_>>();
     let mut endpoint_ids = edge_dtos
         .iter()
@@ -2073,20 +2138,29 @@ fn packet_graph_for_resolved_candidate(
         });
     }
 
-    let mut producers = candidate.provenance.clone();
+    let mut specific_producers = candidate.provenance.clone();
     if let Some(graph_lane) = candidate.lane_scores.graph.as_ref() {
-        producers.extend(graph_lane.provenance.iter().cloned());
+        specific_producers.extend(graph_lane.provenance.iter().cloned());
     }
-    producers.sort();
-    producers.dedup();
-    let provenance = edge_dtos
+    specific_producers.sort();
+    specific_producers.dedup();
+    let provenance = edges
         .iter()
-        .map(|edge| PacketGraphEdgeProvenance {
-            edge_id: edge.id.clone(),
-            direction,
-            hop: candidate_evidence.hop,
-            producers: producers.clone(),
-            certainty: edge.certainty.clone(),
+        .zip(edge_dtos.iter())
+        .map(|((_, direction, hop, hydrated), edge)| {
+            let mut producers = specific_producers.clone();
+            if *hydrated {
+                producers.push("core_incident_call".to_string());
+                producers.sort();
+                producers.dedup();
+            }
+            PacketGraphEdgeProvenance {
+                edge_id: edge.id.clone(),
+                direction: *direction,
+                hop: *hop,
+                producers,
+                certainty: edge.certainty.clone(),
+            }
         })
         .collect::<Vec<_>>();
     Ok((
@@ -2095,8 +2169,8 @@ fn packet_graph_for_resolved_candidate(
             center_id: node_id.into(),
             nodes,
             edges: edge_dtos,
-            truncated: false,
-            omitted_edge_count: 0,
+            truncated: scan_truncated,
+            omitted_edge_count: scan_omitted_edge_count,
             canonical_layout: None,
         }),
     ))
@@ -3278,6 +3352,197 @@ mod tests {
                 .any(|producer| producer == "scip_graph_projection")
         );
         assert_eq!(packet_hit.citation(true).evidence_edge_ids[0].0, "7");
+    }
+
+    #[test]
+    fn packet_candidate_keeps_more_than_twenty_specific_incoming_and_late_outgoing_callsites() {
+        use codestory_retrieval::CandidateGraphEvidence;
+        use codestory_store::{FileInfo, FileRole};
+
+        let mut storage = Store::new_in_memory().expect("storage");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: PathBuf::from("src/server.js"),
+                language: "javascript".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 32,
+                file_role: FileRole::Source,
+            })
+            .expect("insert file");
+        let mut nodes = vec![
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(1),
+                kind: NodeKind::FILE,
+                serialized_name: "src/server.js".into(),
+                ..Default::default()
+            },
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(2),
+                kind: NodeKind::METHOD,
+                serialized_name: "response.send".into(),
+                qualified_name: Some("response.send".into()),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(2),
+                ..Default::default()
+            },
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(24),
+                kind: NodeKind::METHOD,
+                serialized_name: "response.json".into(),
+                qualified_name: Some("response.json".into()),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(1),
+                ..Default::default()
+            },
+        ];
+        nodes.extend((0..21).map(|index| codestory_contracts::graph::Node {
+            id: CoreNodeId(3 + index),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: if index == 16 {
+                "end".into()
+            } else {
+                format!("boundary_{index}")
+            },
+            file_node_id: Some(CoreNodeId(1)),
+            start_line: Some(3 + index as u32),
+            ..Default::default()
+        }));
+        nodes.extend((0..80).map(|index| codestory_contracts::graph::Node {
+            id: CoreNodeId(3_000 + index),
+            kind: NodeKind::METHOD,
+            serialized_name: format!("high_fanout_incoming_{index}"),
+            file_node_id: Some(CoreNodeId(1)),
+            start_line: Some(50 + index as u32),
+            ..Default::default()
+        }));
+        nodes.extend((0..21).map(|index| codestory_contracts::graph::Node {
+            id: CoreNodeId(1_000 + index),
+            kind: NodeKind::METHOD,
+            serialized_name: format!("incoming_{index}"),
+            file_node_id: Some(CoreNodeId(1)),
+            start_line: Some(25 + index as u32),
+            ..Default::default()
+        }));
+        storage.insert_nodes_batch(&nodes).expect("insert nodes");
+        let mut edges = (0..21)
+            .map(|index| codestory_contracts::graph::Edge {
+                id: codestory_contracts::graph::EdgeId(100 + index),
+                source: CoreNodeId(2),
+                target: CoreNodeId(3 + index),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(CoreNodeId(1)),
+                line: Some(3 + index as u32),
+                callsite_identity: Some(format!(
+                    "src/server.js:{}:1:{}|syntax:js-member-call",
+                    3 + index,
+                    3 + index
+                )),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        edges.push(codestory_contracts::graph::Edge {
+            id: codestory_contracts::graph::EdgeId(7),
+            source: CoreNodeId(24),
+            target: CoreNodeId(2),
+            kind: EdgeKind::CALL,
+            resolved_target: Some(CoreNodeId(2)),
+            certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
+            file_node_id: Some(CoreNodeId(1)),
+            line: Some(1),
+            ..Default::default()
+        });
+        edges.extend((0..21).map(|index| codestory_contracts::graph::Edge {
+            id: codestory_contracts::graph::EdgeId(2_000 + index),
+            source: CoreNodeId(1_000 + index),
+            target: CoreNodeId(2),
+            kind: EdgeKind::CALL,
+            resolved_target: Some(CoreNodeId(2)),
+            certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
+            file_node_id: Some(CoreNodeId(1)),
+            line: Some(25 + index as u32),
+            ..Default::default()
+        }));
+        edges.extend((0..80).map(|index| codestory_contracts::graph::Edge {
+            id: codestory_contracts::graph::EdgeId(4_000 + index),
+            source: CoreNodeId(3_000 + index),
+            target: CoreNodeId(2),
+            kind: EdgeKind::CALL,
+            resolved_target: Some(CoreNodeId(2)),
+            certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
+            file_node_id: Some(CoreNodeId(1)),
+            line: Some(50 + index as u32),
+            ..Default::default()
+        }));
+        storage.insert_edges_batch(&edges).expect("insert edges");
+
+        let mut candidate = CandidateHit::with_source(
+            "src/server.js",
+            Some("response.send".into()),
+            0.8,
+            CandidateSource::Scip,
+        );
+        candidate.node_id = Some("2".into());
+        candidate.provenance = vec!["scip_graph_projection".into()];
+        candidate.graph_evidence = Some(CandidateGraphEvidence {
+            edge_kind: Some(EdgeKind::CALL),
+            direction: CandidateGraphDirection::Outgoing,
+            hop: 1,
+            fanout: 1,
+            edge_weight: 1.0,
+            direction_weight: 1.0,
+        });
+
+        let outcome = resolve_sidecar_candidates_in_storage(
+            &storage,
+            &HashMap::new(),
+            Path::new("."),
+            &[candidate],
+            1,
+        )
+        .expect("resolve packet candidate");
+        let packet_hit = outcome.packet_hits.first().expect("packet hit");
+        let graph = packet_hit.graph.as_ref().expect("incident CALL graph");
+
+        assert_eq!(graph.edges.len(), 85);
+        assert_eq!(packet_hit.graph_provenance.len(), 85);
+        assert!(graph.truncated);
+        assert_eq!(graph.omitted_edge_count, 38);
+        assert!(graph.edges.iter().any(|edge| edge.id.0 == "7"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.id.0 == "116" && edge.target == NodeId("19".into())),
+            "the response end edge occurs after the old 12-edge cutoff"
+        );
+        let specific = packet_hit
+            .graph_provenance
+            .iter()
+            .find(|provenance| provenance.edge_id.0 == "7")
+            .expect("specific incoming proof");
+        assert!(
+            specific
+                .producers
+                .iter()
+                .any(|producer| producer == "scip_graph_projection")
+        );
+        let hydrated = packet_hit
+            .graph_provenance
+            .iter()
+            .find(|provenance| provenance.edge_id.0 == "116")
+            .expect("hydrated outgoing end proof");
+        assert_eq!(hydrated.direction, PacketGraphDirection::Outgoing);
+        assert_eq!(hydrated.hop, 1);
+        assert!(
+            hydrated
+                .producers
+                .iter()
+                .any(|producer| producer == "core_incident_call")
+        );
+        assert!(packet_hit.has_proof_call_provenance());
     }
 
     #[test]

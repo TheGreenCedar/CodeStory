@@ -3,7 +3,9 @@
 use super::packet_evidence::citation_sufficiency_eligible;
 use super::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 use super::packet_flow_requirements::{
-    CoverageMode, EvidencePredicate, FlowRequirement, FlowRole, packet_flow_requirements_for_terms,
+    CoverageMode, EvidencePredicate, FlowRequirement, FlowRole,
+    flow_requirement_call_receipt_is_valid, ordinary_incident_call_receipt_is_valid,
+    packet_flow_requirements_for_terms,
 };
 use super::packet_required_probes::{
     packet_prompt_exact_symbol_probe_queries, packet_sufficiency_required_probe_queries_from_terms,
@@ -15,12 +17,13 @@ use crate::text::{exact_symbol_query_terms, looks_like_standalone_symbol_query};
 use crate::trail::is_speculative_trail_edge;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
-    EdgeId, EdgeKind, GraphArtifactDto, NodeId, NodeKind, PACKET_OBLIGATION_PLAN_VERSION,
-    PacketBudgetDto, PacketClaimDto, PacketClaimObligationDto, PacketClaimObligationKindDto,
-    PacketObligationCarrierEdgeProofDto, PacketObligationPlanDto, PacketObligationProofStatusDto,
-    PacketPlanQueryDto, PacketProbeDto, PacketProbeRejectionCodeDto, PacketProbeResolutionDto,
-    PacketProbeResolutionStatusDto, PacketProofStatusDto, PacketQueryCompletionDto,
-    PacketQueryObligationDto, PacketQueryObligationKindDto, PacketTaskClassDto,
+    EdgeId, EdgeKind, GraphArtifactDto, GraphEdgeDto, GraphResponse, NodeId, NodeKind,
+    PACKET_OBLIGATION_PLAN_VERSION, PacketBudgetDto, PacketClaimDto, PacketClaimObligationDto,
+    PacketClaimObligationKindDto, PacketObligationCarrierEdgeProofDto, PacketObligationPlanDto,
+    PacketObligationProofStatusDto, PacketPlanQueryDto, PacketProbeDto,
+    PacketProbeRejectionCodeDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto,
+    PacketProofStatusDto, PacketQueryCompletionDto, PacketQueryObligationDto,
+    PacketQueryObligationKindDto, PacketTaskClassDto,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -1665,15 +1668,18 @@ fn citation_edge_proof(
     let cited_edge_ids = citation.evidence_edge_ids.iter().collect::<HashSet<_>>();
     graphs
         .iter()
-        .flat_map(|graph| graph.edges.iter())
-        .filter(|edge| {
+        .flat_map(|graph| graph.edges.iter().map(move |edge| (*graph, edge)))
+        .filter(|(graph, edge)| {
             edge.kind == required_edge_kind
                 && cited_edge_ids.contains(&edge.id)
                 && (edge.source == citation.node_id || edge.target == citation.node_id)
-                && !is_speculative_trail_edge(edge)
+                && receipt_neighbor(graph, answer, citation, edge).is_some_and(|(_, kind)| {
+                    required_edge_kind != EdgeKind::CALL
+                        || ordinary_incident_call_receipt_is_valid(citation, edge, kind)
+                })
         })
-        .min_by(|left, right| left.id.0.cmp(&right.id.0))
-        .map(|edge| PacketObligationCarrierEdgeProofDto {
+        .min_by(|(_, left), (_, right)| left.id.0.cmp(&right.id.0))
+        .map(|(_, edge)| PacketObligationCarrierEdgeProofDto {
             carrier_node_id: citation.node_id.clone(),
             edge_id: edge.id.clone(),
             edge_kind: edge.kind,
@@ -1686,55 +1692,8 @@ fn citation_edge_proof_for_flow_requirement(
     requirement: &FlowRequirement,
     answer: &AgentAnswerDto,
 ) -> Option<PacketObligationCarrierEdgeProofDto> {
-    if let Some((incoming_source, outgoing_target)) =
-        requirement.evidence.ordered_call_boundary(citation)
-    {
-        if required_edge_kind != EdgeKind::CALL {
-            return None;
-        }
-        let graphs = packet_execution_graphs(answer);
-        let cited_edge_ids = citation.evidence_edge_ids.iter().collect::<HashSet<_>>();
-        return graphs
-            .iter()
-            .flat_map(|graph| graph.edges.iter().map(move |edge| (*graph, edge)))
-            .filter(|(_, edge)| {
-                edge.kind == EdgeKind::CALL
-                    && cited_edge_ids.contains(&edge.id)
-                    && (edge.source == citation.node_id || edge.target == citation.node_id)
-                    && !is_speculative_trail_edge(edge)
-            })
-            .filter(|(graph, edge)| {
-                let (neighbor_id, matches_neighbor) = if edge.target == citation.node_id {
-                    (&edge.source, incoming_source)
-                } else {
-                    (&edge.target, outgoing_target)
-                };
-                graph
-                    .nodes
-                    .iter()
-                    .find(|node| node.id == *neighbor_id)
-                    .map(|node| node.label.as_str())
-                    .or_else(|| {
-                        answer
-                            .citations
-                            .iter()
-                            .find(|candidate| candidate.node_id == *neighbor_id)
-                            .map(|candidate| candidate.display_name.as_str())
-                    })
-                    .is_some_and(matches_neighbor)
-            })
-            .min_by(|(_, left), (_, right)| left.id.0.cmp(&right.id.0))
-            .map(|(_, edge)| PacketObligationCarrierEdgeProofDto {
-                carrier_node_id: citation.node_id.clone(),
-                edge_id: edge.id.clone(),
-                edge_kind: edge.kind,
-            });
-    }
-    let Some(call_target) = requirement.evidence.call_boundary_target(citation) else {
-        return citation_edge_proof(citation, required_edge_kind, answer);
-    };
     if required_edge_kind != EdgeKind::CALL {
-        return None;
+        return citation_edge_proof(citation, required_edge_kind, answer);
     }
     let graphs = packet_execution_graphs(answer);
     let cited_edge_ids = citation.evidence_edge_ids.iter().collect::<HashSet<_>>();
@@ -1744,29 +1703,45 @@ fn citation_edge_proof_for_flow_requirement(
         .filter(|(_, edge)| {
             edge.kind == EdgeKind::CALL
                 && cited_edge_ids.contains(&edge.id)
-                && edge.source == citation.node_id
-                && !is_speculative_trail_edge(edge)
+                && (edge.source == citation.node_id || edge.target == citation.node_id)
         })
         .filter(|(graph, edge)| {
-            graph
-                .nodes
-                .iter()
-                .find(|node| node.id == edge.target)
-                .map(|node| node.label.as_str())
-                .or_else(|| {
-                    answer
-                        .citations
-                        .iter()
-                        .find(|candidate| candidate.node_id == edge.target)
-                        .map(|candidate| candidate.display_name.as_str())
-                })
-                .is_some_and(call_target)
+            receipt_neighbor(graph, answer, citation, edge).is_some_and(|(label, kind)| {
+                flow_requirement_call_receipt_is_valid(requirement, citation, edge, label, kind)
+            })
         })
         .min_by(|(_, left), (_, right)| left.id.0.cmp(&right.id.0))
         .map(|(_, edge)| PacketObligationCarrierEdgeProofDto {
             carrier_node_id: citation.node_id.clone(),
             edge_id: edge.id.clone(),
             edge_kind: edge.kind,
+        })
+}
+
+fn receipt_neighbor<'a>(
+    graph: &'a GraphResponse,
+    answer: &'a AgentAnswerDto,
+    citation: &AgentCitationDto,
+    edge: &GraphEdgeDto,
+) -> Option<(&'a str, NodeKind)> {
+    let neighbor_id = if edge.source == citation.node_id {
+        &edge.target
+    } else if edge.target == citation.node_id {
+        &edge.source
+    } else {
+        return None;
+    };
+    graph
+        .nodes
+        .iter()
+        .find(|node| node.id == *neighbor_id)
+        .map(|node| (node.label.as_str(), node.kind))
+        .or_else(|| {
+            answer
+                .citations
+                .iter()
+                .find(|candidate| candidate.node_id == *neighbor_id)
+                .map(|candidate| (candidate.display_name.as_str(), candidate.kind))
         })
 }
 
@@ -2381,11 +2356,11 @@ mod tests {
     use super::*;
     use codestory_contracts::api::{
         AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto, EdgeId,
-        GraphArtifactDto, GraphEdgeDto, GraphResponse, IndexFreshnessDto, IndexFreshnessStatusDto,
-        NodeId, PACKET_PROBE_CONTRACT_VERSION, PacketBudgetLimitsDto, PacketBudgetModeDto,
-        PacketBudgetUsageDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
-        PacketProbeAmbiguityCandidateDto, PacketProbeRejectionDto, PacketSidecarQueryDiagnosticDto,
-        SearchHitOrigin,
+        GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphResponse, IndexFreshnessDto,
+        IndexFreshnessStatusDto, NodeId, PACKET_PROBE_CONTRACT_VERSION, PacketBudgetLimitsDto,
+        PacketBudgetModeDto, PacketBudgetUsageDto, PacketEvidenceResolutionDto,
+        PacketEvidenceTierDto, PacketProbeAmbiguityCandidateDto, PacketProbeRejectionDto,
+        PacketSidecarQueryDiagnosticDto, SearchHitOrigin,
     };
 
     const INDEXING_QUESTION: &str = "Explain the indexing runtime, persistence, and snapshot flow.";
@@ -2531,7 +2506,19 @@ mod tests {
             title: "Requested flow".to_string(),
             graph: GraphResponse {
                 center_id: carrier.node_id.clone(),
-                nodes: Vec::new(),
+                nodes: vec![GraphNodeDto {
+                    id: target.node_id.clone(),
+                    label: target.display_name.clone(),
+                    kind: target.kind,
+                    depth: 1,
+                    label_policy: None,
+                    badge_visible_members: None,
+                    badge_total_members: None,
+                    merged_symbol_examples: Vec::new(),
+                    file_path: target.file_path.clone(),
+                    qualified_name: None,
+                    member_access: None,
+                }],
                 edges: vec![GraphEdgeDto {
                     id: EdgeId("requested-call".to_string()),
                     source: carrier.node_id,
@@ -2548,6 +2535,189 @@ mod tests {
             },
         });
         answer
+    }
+
+    #[derive(Clone, Copy)]
+    struct FlowBoundaryCase {
+        label: &'static str,
+        question: &'static str,
+        task_class: PacketTaskClassDto,
+        obligation_id: &'static str,
+        carrier_name: &'static str,
+        carrier_path: &'static str,
+        carrier_kind: NodeKind,
+        lawful_target: &'static str,
+        role_only_name: &'static str,
+        role_only_path: &'static str,
+        role_only_kind: NodeKind,
+    }
+
+    fn evaluate_flow_boundary(
+        case: FlowBoundaryCase,
+        target_name: &str,
+        outgoing: bool,
+    ) -> (
+        PacketObligationProofStatusDto,
+        Option<String>,
+        Vec<NodeId>,
+        Vec<EdgeId>,
+    ) {
+        let edge_id = EdgeId(format!("{}-call", case.obligation_id));
+        let mut carrier = citation(case.carrier_name, case.carrier_path, case.carrier_kind);
+        carrier.evidence_edge_ids = vec![edge_id.clone()];
+        let target = citation(target_name, "src/boundary_target.rs", NodeKind::METHOD);
+        let (source, destination) = if outgoing {
+            (carrier.node_id.clone(), target.node_id.clone())
+        } else {
+            (target.node_id.clone(), carrier.node_id.clone())
+        };
+        let mut carried_answer = answer(vec![carrier, target]);
+        carried_answer.prompt = case.question.to_string();
+        carried_answer.graphs.push(GraphArtifactDto::Uml {
+            id: format!("{}-flow", case.obligation_id),
+            title: format!("{} flow", case.label),
+            graph: GraphResponse {
+                center_id: source.clone(),
+                nodes: Vec::new(),
+                edges: vec![GraphEdgeDto {
+                    id: edge_id,
+                    source,
+                    target: destination,
+                    kind: EdgeKind::CALL,
+                    confidence: Some(1.0),
+                    certainty: Some("certain".to_string()),
+                    callsite_identity: Some(format!("test:{}", case.obligation_id)),
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        });
+        let mut plan = build_packet_obligation_plan(case.question, case.task_class, &[]);
+        plan.claim_obligations
+            .retain(|obligation| obligation.id == case.obligation_id);
+        plan.query_obligations.clear();
+        assert_eq!(
+            plan.claim_obligations.len(),
+            1,
+            "{}: question did not select exactly one {} obligation",
+            case.label,
+            case.obligation_id
+        );
+
+        let snapshot = capture_packet_obligation_edge_proofs_before_budget(
+            case.question,
+            case.task_class,
+            &plan,
+            &carried_answer,
+        );
+        let protected_carriers = protected_packet_obligation_carrier_node_ids(&snapshot).to_vec();
+        let protected_edges = protected_packet_obligation_edge_ids(&snapshot).to_vec();
+        finalize_packet_obligation_plan(
+            case.question,
+            case.task_class,
+            &mut plan,
+            &carried_answer,
+            &budget(),
+        );
+        let obligation = &plan.claim_obligations[0];
+        (
+            obligation.proof_status,
+            obligation.reason.clone(),
+            protected_carriers,
+            protected_edges,
+        )
+    }
+
+    fn raw_server_dispatch_answer(
+        target_label: &str,
+        target_kind: NodeKind,
+        certainty: Option<&str>,
+        confidence: Option<f32>,
+        callsite_identity: Option<&str>,
+        outgoing: bool,
+    ) -> AgentAnswerDto {
+        let mut carrier = citation("app.handle", "lib/application.js", NodeKind::METHOD);
+        carrier.evidence_edge_ids = vec![EdgeId("dispatch-call".to_string())];
+        let target_id = NodeId("dispatch-target".to_string());
+        let (source, target) = if outgoing {
+            (carrier.node_id.clone(), target_id.clone())
+        } else {
+            (target_id.clone(), carrier.node_id.clone())
+        };
+        let mut answer = answer(vec![carrier]);
+        answer.prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.".to_string();
+        answer.graphs.push(GraphArtifactDto::Uml {
+            id: "dispatch-flow".to_string(),
+            title: "Dispatch flow".to_string(),
+            graph: GraphResponse {
+                center_id: source.clone(),
+                nodes: vec![GraphNodeDto {
+                    id: target_id,
+                    label: target_label.to_string(),
+                    kind: target_kind,
+                    depth: 1,
+                    label_policy: None,
+                    badge_visible_members: None,
+                    badge_total_members: None,
+                    merged_symbol_examples: Vec::new(),
+                    file_path: Some("lib/tiny.js".to_string()),
+                    qualified_name: None,
+                    member_access: None,
+                }],
+                edges: vec![GraphEdgeDto {
+                    id: EdgeId("dispatch-call".to_string()),
+                    source,
+                    target,
+                    kind: EdgeKind::CALL,
+                    confidence,
+                    certainty: certainty.map(str::to_string),
+                    callsite_identity: callsite_identity.map(str::to_string),
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        });
+        answer
+    }
+
+    fn finalize_server_dispatch_answer(
+        answer: &AgentAnswerDto,
+    ) -> (
+        PacketObligationProofStatusDto,
+        Option<String>,
+        Vec<NodeId>,
+        Vec<EdgeId>,
+    ) {
+        let question = answer.prompt.as_str();
+        let mut plan =
+            build_packet_obligation_plan(question, PacketTaskClassDto::RouteTracing, &[]);
+        plan.claim_obligations
+            .retain(|obligation| obligation.id == "request_dispatch");
+        plan.query_obligations.clear();
+        let snapshot = capture_packet_obligation_edge_proofs_before_budget(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &plan,
+            answer,
+        );
+        finalize_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &mut plan,
+            answer,
+            &budget(),
+        );
+        let obligation = &plan.claim_obligations[0];
+        (
+            obligation.proof_status,
+            obligation.reason.clone(),
+            protected_packet_obligation_carrier_node_ids(&snapshot).to_vec(),
+            protected_packet_obligation_edge_ids(&snapshot).to_vec(),
+        )
     }
 
     fn indexing_entrypoint_plan() -> PacketObligationPlanDto {
@@ -4501,6 +4671,620 @@ mod tests {
             &truncated_budget,
         );
         assert!(plan.claim_obligations[0].carrier_edge_proofs.is_empty());
+    }
+
+    #[test]
+    fn hybrid_role_carriers_cannot_bypass_any_declared_target() {
+        const SERVER_QUESTION: &str = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
+        const CLIENT_QUESTION: &str = "Explain how an HTTP client session accepts a request, dispatches it through the session, selects a transport adapter, and calls the adapter send boundary.";
+        const FULL_CLIENT_QUESTION: &str = "Explain how a top-level request call becomes a prepared request and sends it through a session adapter.";
+        let cases = [
+            FlowBoundaryCase {
+                label: "server request entrypoint",
+                question: SERVER_QUESTION,
+                task_class: PacketTaskClassDto::RouteTracing,
+                obligation_id: "request_entrypoint",
+                carrier_name: "Router.use",
+                carrier_path: "src/router.js",
+                carrier_kind: NodeKind::METHOD,
+                lawful_target: "Router.route",
+                role_only_name: "Router.map",
+                role_only_path: "src/router.js",
+                role_only_kind: NodeKind::METHOD,
+            },
+            FlowBoundaryCase {
+                label: "server request dispatch",
+                question: SERVER_QUESTION,
+                task_class: PacketTaskClassDto::RouteTracing,
+                obligation_id: "request_dispatch",
+                carrier_name: "Router.dispatch",
+                carrier_path: "src/router.js",
+                carrier_kind: NodeKind::METHOD,
+                lawful_target: "finalhandler",
+                role_only_name: "RequestDispatcher.execute",
+                role_only_path: "src/dispatcher.js",
+                role_only_kind: NodeKind::METHOD,
+            },
+            FlowBoundaryCase {
+                label: "server response terminal",
+                question: SERVER_QUESTION,
+                task_class: PacketTaskClassDto::RouteTracing,
+                obligation_id: "request_terminal",
+                carrier_name: "Response.writeBuffer",
+                carrier_path: "src/response.js",
+                carrier_kind: NodeKind::METHOD,
+                lawful_target: "Socket.end",
+                role_only_name: "ResponseBuffer.read",
+                role_only_path: "src/response.js",
+                role_only_kind: NodeKind::METHOD,
+            },
+            FlowBoundaryCase {
+                label: "client request entrypoint",
+                question: CLIENT_QUESTION,
+                task_class: PacketTaskClassDto::ArchitectureExplanation,
+                obligation_id: "request_entrypoint",
+                carrier_name: "HttpClientFactory.request",
+                carrier_path: "src/client.rs",
+                carrier_kind: NodeKind::METHOD,
+                lawful_target: "PreparedRequest.build",
+                role_only_name: "createClient",
+                role_only_path: "src/client.rs",
+                role_only_kind: NodeKind::FUNCTION,
+            },
+            FlowBoundaryCase {
+                label: "client public facade",
+                question: FULL_CLIENT_QUESTION,
+                task_class: PacketTaskClassDto::DataFlow,
+                obligation_id: "client_public_facade",
+                carrier_name: "createClient.request",
+                carrier_path: "src/requests/api.py",
+                carrier_kind: NodeKind::FUNCTION,
+                lawful_target: "Session.request",
+                role_only_name: "createClient",
+                role_only_path: "src/requests/api.py",
+                role_only_kind: NodeKind::FUNCTION,
+            },
+        ];
+
+        for case in cases {
+            let (status, reason, protected_carriers, protected_edges) =
+                evaluate_flow_boundary(case, "Metrics.record", true);
+            assert_eq!(
+                status,
+                PacketObligationProofStatusDto::Reported,
+                "{}: a resolved, certain wrong-target CALL must not prove the boundary",
+                case.label
+            );
+            assert_eq!(
+                reason.as_deref(),
+                Some("required_evidence_edge_missing"),
+                "{}",
+                case.label
+            );
+            assert!(
+                protected_carriers.is_empty() && protected_edges.is_empty(),
+                "{}: prebudget protection admitted a wrong-target carrier",
+                case.label
+            );
+
+            let (status, reason, protected_carriers, protected_edges) =
+                evaluate_flow_boundary(case, case.lawful_target, true);
+            assert_eq!(
+                status,
+                PacketObligationProofStatusDto::Proven,
+                "{}: lawful exact target rejected",
+                case.label
+            );
+            assert_eq!(reason, None, "{}", case.label);
+            assert_eq!(
+                protected_carriers,
+                [NodeId(case.carrier_name.to_string())],
+                "{}: exact carrier was not reserved",
+                case.label
+            );
+            assert_eq!(
+                protected_edges,
+                [EdgeId(format!("{}-call", case.obligation_id))],
+                "{}: exact edge was not reserved",
+                case.label
+            );
+
+            let role_only = FlowBoundaryCase {
+                carrier_name: case.role_only_name,
+                carrier_path: case.role_only_path,
+                carrier_kind: case.role_only_kind,
+                ..case
+            };
+            let (status, reason, protected_carriers, protected_edges) =
+                evaluate_flow_boundary(role_only, "Worker.run", true);
+            assert_eq!(
+                status,
+                PacketObligationProofStatusDto::Proven,
+                "{}: role-only witness lost the ordinary cited-CALL contract",
+                case.label
+            );
+            assert_eq!(reason, None, "{}", case.label);
+            assert_eq!(
+                protected_carriers,
+                [NodeId(case.role_only_name.to_string())],
+                "{}: role-only carrier was not reserved",
+                case.label
+            );
+            assert_eq!(
+                protected_edges,
+                [EdgeId(format!("{}-call", case.obligation_id))],
+                "{}: role-only edge was not reserved",
+                case.label
+            );
+        }
+    }
+
+    #[test]
+    fn requests_public_facade_requires_the_exact_outgoing_session_call() {
+        let case = FlowBoundaryCase {
+            label: "Requests public facade",
+            question: "Explain how a top-level request call becomes a prepared request and sends it through a session adapter.",
+            task_class: PacketTaskClassDto::DataFlow,
+            obligation_id: "client_public_facade",
+            carrier_name: "request",
+            carrier_path: "src/requests/api.py",
+            carrier_kind: NodeKind::FUNCTION,
+            lawful_target: "Session.request",
+            role_only_name: "createClient",
+            role_only_path: "src/requests/api.py",
+            role_only_kind: NodeKind::FUNCTION,
+        };
+
+        let (status, reason, protected_carriers, protected_edges) =
+            evaluate_flow_boundary(case, case.lawful_target, true);
+        assert_eq!(status, PacketObligationProofStatusDto::Proven);
+        assert_eq!(reason, None);
+        assert_eq!(protected_carriers, [NodeId("request".to_string())]);
+        assert_eq!(
+            protected_edges,
+            [EdgeId("client_public_facade-call".to_string())]
+        );
+
+        for (target, outgoing) in [("Metrics.request", true), ("Session.request", false)] {
+            let (status, reason, protected_carriers, protected_edges) =
+                evaluate_flow_boundary(case, target, outgoing);
+            assert_eq!(
+                status,
+                PacketObligationProofStatusDto::Reported,
+                "target={target} outgoing={outgoing}"
+            );
+            assert_eq!(reason.as_deref(), Some("required_evidence_edge_missing"));
+            assert!(protected_carriers.is_empty());
+            assert!(protected_edges.is_empty());
+        }
+    }
+
+    #[test]
+    fn express_server_carriers_require_the_exact_outgoing_boundary() {
+        const QUESTION: &str = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
+        let cases = [
+            FlowBoundaryCase {
+                label: "app.use",
+                question: QUESTION,
+                task_class: PacketTaskClassDto::RouteTracing,
+                obligation_id: "request_entrypoint",
+                carrier_name: "app.use",
+                carrier_path: "lib/application.js",
+                carrier_kind: NodeKind::METHOD,
+                lawful_target: "Router.use",
+                role_only_name: "Router.map",
+                role_only_path: "lib/router.js",
+                role_only_kind: NodeKind::METHOD,
+            },
+            FlowBoundaryCase {
+                label: "app.handle",
+                question: QUESTION,
+                task_class: PacketTaskClassDto::RouteTracing,
+                obligation_id: "request_dispatch",
+                carrier_name: "app.handle",
+                carrier_path: "lib/application.js",
+                carrier_kind: NodeKind::METHOD,
+                lawful_target: "finalhandler",
+                role_only_name: "RequestDispatcher.execute",
+                role_only_path: "lib/router.js",
+                role_only_kind: NodeKind::METHOD,
+            },
+            FlowBoundaryCase {
+                label: "res.send",
+                question: QUESTION,
+                task_class: PacketTaskClassDto::RouteTracing,
+                obligation_id: "request_terminal",
+                carrier_name: "res.send",
+                carrier_path: "lib/response.js",
+                carrier_kind: NodeKind::METHOD,
+                lawful_target: "res.end",
+                role_only_name: "ResponseBuffer.read",
+                role_only_path: "lib/response.js",
+                role_only_kind: NodeKind::METHOD,
+            },
+        ];
+
+        for case in cases {
+            let (status, reason, protected_carriers, protected_edges) =
+                evaluate_flow_boundary(case, case.lawful_target, true);
+            assert_eq!(
+                status,
+                PacketObligationProofStatusDto::Proven,
+                "{}",
+                case.label
+            );
+            assert_eq!(reason, None, "{}", case.label);
+            assert_eq!(protected_carriers, [NodeId(case.carrier_name.to_string())]);
+            assert_eq!(
+                protected_edges,
+                [EdgeId(format!("{}-call", case.obligation_id))]
+            );
+
+            for (target, outgoing) in [("Metrics.record", true), (case.lawful_target, false)] {
+                let (status, reason, protected_carriers, protected_edges) =
+                    evaluate_flow_boundary(case, target, outgoing);
+                assert_eq!(
+                    status,
+                    PacketObligationProofStatusDto::Reported,
+                    "{} target={target} outgoing={outgoing}",
+                    case.label
+                );
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("required_evidence_edge_missing"),
+                    "{}",
+                    case.label
+                );
+                assert!(protected_carriers.is_empty(), "{}", case.label);
+                assert!(protected_edges.is_empty(), "{}", case.label);
+            }
+        }
+    }
+
+    #[test]
+    fn asymmetric_owner_pairs_prove_only_their_declared_boundaries() {
+        const SERVER_QUESTION: &str = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
+        const CLIENT_QUESTION: &str = "Explain how an HTTP client session accepts a request, dispatches it through the session, selects a transport adapter, and calls the adapter send boundary.";
+        let cases = [
+            FlowBoundaryCase {
+                label: "app.listen to Server.listen",
+                question: SERVER_QUESTION,
+                task_class: PacketTaskClassDto::RouteTracing,
+                obligation_id: "request_entrypoint",
+                carrier_name: "app.listen",
+                carrier_path: "lib/application.js",
+                carrier_kind: NodeKind::METHOD,
+                lawful_target: "Server.listen",
+                role_only_name: "Router.map",
+                role_only_path: "lib/router.js",
+                role_only_kind: NodeKind::METHOD,
+            },
+            FlowBoundaryCase {
+                label: "Controller.dispatch to Controller.handle",
+                question: SERVER_QUESTION,
+                task_class: PacketTaskClassDto::RouteTracing,
+                obligation_id: "request_dispatch",
+                carrier_name: "Controller.dispatch",
+                carrier_path: "lib/controller.js",
+                carrier_kind: NodeKind::METHOD,
+                lawful_target: "Controller.handle",
+                role_only_name: "RequestDispatcher.execute",
+                role_only_path: "lib/router.js",
+                role_only_kind: NodeKind::METHOD,
+            },
+            FlowBoundaryCase {
+                label: "ResponseSender.send to ResponseSender.finish",
+                question: SERVER_QUESTION,
+                task_class: PacketTaskClassDto::RouteTracing,
+                obligation_id: "request_terminal",
+                carrier_name: "ResponseSender.send",
+                carrier_path: "lib/response.js",
+                carrier_kind: NodeKind::METHOD,
+                lawful_target: "ResponseSender.finish",
+                role_only_name: "ResponseBuffer.read",
+                role_only_path: "lib/response.js",
+                role_only_kind: NodeKind::METHOD,
+            },
+            FlowBoundaryCase {
+                label: "HttpClient.request to PreparedRequest.build",
+                question: CLIENT_QUESTION,
+                task_class: PacketTaskClassDto::ArchitectureExplanation,
+                obligation_id: "request_entrypoint",
+                carrier_name: "HttpClient.request",
+                carrier_path: "src/client.rs",
+                carrier_kind: NodeKind::METHOD,
+                lawful_target: "PreparedRequest.build",
+                role_only_name: "createClient",
+                role_only_path: "src/client.rs",
+                role_only_kind: NodeKind::FUNCTION,
+            },
+        ];
+
+        for case in cases {
+            let (status, reason, protected_carriers, protected_edges) =
+                evaluate_flow_boundary(case, case.lawful_target, true);
+            assert_eq!(
+                status,
+                PacketObligationProofStatusDto::Proven,
+                "{}",
+                case.label
+            );
+            assert_eq!(reason, None, "{}", case.label);
+            assert_eq!(protected_carriers, [NodeId(case.carrier_name.to_string())]);
+            assert_eq!(
+                protected_edges,
+                [EdgeId(format!("{}-call", case.obligation_id))]
+            );
+        }
+
+        let client_case = cases[3];
+        let (status, reason, protected_carriers, protected_edges) =
+            evaluate_flow_boundary(client_case, "Telemetry.prepareRequest", true);
+        assert_eq!(status, PacketObligationProofStatusDto::Reported);
+        assert_eq!(reason.as_deref(), Some("required_evidence_edge_missing"));
+        assert!(protected_carriers.is_empty());
+        assert!(protected_edges.is_empty());
+    }
+
+    #[test]
+    fn tiny_unknown_dispatch_receipts_require_parser_receiver_proof() {
+        let cases = [
+            (
+                "ownerless early return",
+                raw_server_dispatch_answer("handle", NodeKind::UNKNOWN, None, None, None, true),
+                false,
+            ),
+            (
+                "missing callsite receiver",
+                raw_server_dispatch_answer(
+                    "handle",
+                    NodeKind::UNKNOWN,
+                    None,
+                    None,
+                    Some("lib/tiny.js:1|syntax:js-member-call"),
+                    true,
+                ),
+                false,
+            ),
+            (
+                "matching parser receiver",
+                raw_server_dispatch_answer(
+                    "handle",
+                    NodeKind::UNKNOWN,
+                    None,
+                    None,
+                    Some("lib/tiny.js:1|syntax:js-member-call|receiver-owner:app"),
+                    true,
+                ),
+                true,
+            ),
+            (
+                "certain but unresolved target",
+                raw_server_dispatch_answer(
+                    "handle",
+                    NodeKind::UNKNOWN,
+                    Some("certain"),
+                    None,
+                    Some("lib/tiny.js:1|syntax:js-member-call|receiver-owner:app"),
+                    true,
+                ),
+                false,
+            ),
+            (
+                "confidence-only wrong receiver",
+                raw_server_dispatch_answer(
+                    "handle",
+                    NodeKind::UNKNOWN,
+                    None,
+                    Some(1.0),
+                    Some("lib/tiny.js:1|syntax:js-member-call|receiver-owner:telemetry"),
+                    true,
+                ),
+                false,
+            ),
+            (
+                "incoming syntax call",
+                raw_server_dispatch_answer(
+                    "handle",
+                    NodeKind::UNKNOWN,
+                    None,
+                    None,
+                    Some("lib/tiny.js:1|syntax:js-member-call|receiver-owner:app"),
+                    false,
+                ),
+                false,
+            ),
+        ];
+
+        for (label, answer, expected_proven) in cases {
+            let (status, reason, protected_carriers, protected_edges) =
+                finalize_server_dispatch_answer(&answer);
+            assert_eq!(
+                status,
+                if expected_proven {
+                    PacketObligationProofStatusDto::Proven
+                } else {
+                    PacketObligationProofStatusDto::Reported
+                },
+                "{label}"
+            );
+            assert_eq!(reason.is_none(), expected_proven, "{label}");
+            assert_eq!(
+                !protected_carriers.is_empty(),
+                expected_proven,
+                "{label}: prebudget carrier reservation diverged"
+            );
+            assert_eq!(
+                !protected_edges.is_empty(),
+                expected_proven,
+                "{label}: prebudget edge reservation diverged"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_dispatch_receipts_reject_uncertain_and_wrong_owner_targets() {
+        let cases = [
+            (
+                "resolved certain exact target",
+                raw_server_dispatch_answer(
+                    "app.handle",
+                    NodeKind::METHOD,
+                    Some("certain"),
+                    None,
+                    Some("lib/tiny.js:1"),
+                    true,
+                ),
+                true,
+            ),
+            (
+                "concrete target without certainty",
+                raw_server_dispatch_answer("app.handle", NodeKind::METHOD, None, None, None, true),
+                true,
+            ),
+            (
+                "probable concrete target",
+                raw_server_dispatch_answer(
+                    "app.handle",
+                    NodeKind::METHOD,
+                    Some("probable"),
+                    None,
+                    Some("lib/tiny.js:1"),
+                    true,
+                ),
+                false,
+            ),
+            (
+                "resolved same-action wrong owner",
+                raw_server_dispatch_answer(
+                    "Telemetry.handle",
+                    NodeKind::METHOD,
+                    Some("certain"),
+                    Some(1.0),
+                    Some("lib/tiny.js:1"),
+                    true,
+                ),
+                false,
+            ),
+            (
+                "resolved incoming exact target",
+                raw_server_dispatch_answer(
+                    "app.handle",
+                    NodeKind::METHOD,
+                    Some("certain"),
+                    Some(1.0),
+                    Some("lib/tiny.js:1"),
+                    false,
+                ),
+                false,
+            ),
+        ];
+        for (label, answer, expected_proven) in cases {
+            let (status, reason, protected_carriers, protected_edges) =
+                finalize_server_dispatch_answer(&answer);
+            assert_eq!(
+                status,
+                if expected_proven {
+                    PacketObligationProofStatusDto::Proven
+                } else {
+                    PacketObligationProofStatusDto::Reported
+                },
+                "{label}"
+            );
+            assert_eq!(reason.is_none(), expected_proven, "{label}");
+            assert_eq!(!protected_carriers.is_empty(), expected_proven, "{label}");
+            assert_eq!(!protected_edges.is_empty(), expected_proven, "{label}");
+        }
+    }
+
+    #[test]
+    fn role_only_incident_call_requires_resolved_metadata() {
+        let terms = packet_probe_terms("Trace HTTP server request handler dispatch.");
+        let requirement =
+            packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::RouteTracing)
+                .into_iter()
+                .find(|requirement| requirement.id == "request_dispatch")
+                .expect("server dispatch requirement");
+        let role_only = citation(
+            "RequestDispatcher.execute",
+            "src/dispatcher.js",
+            NodeKind::METHOD,
+        );
+        assert!(
+            requirement
+                .evidence
+                .citation_proves_without_call_boundary(&role_only)
+        );
+        for (label, neighbor_kind, certainty, expected) in [
+            ("resolved certain", NodeKind::METHOD, Some("certain"), true),
+            ("resolved implicit", NodeKind::METHOD, None, true),
+            ("unknown", NodeKind::UNKNOWN, None, false),
+            ("certain unknown", NodeKind::UNKNOWN, Some("certain"), false),
+            ("probable", NodeKind::METHOD, Some("probable"), false),
+        ] {
+            let edge = GraphEdgeDto {
+                id: EdgeId(label.to_string()),
+                source: role_only.node_id.clone(),
+                target: NodeId("Worker.run".to_string()),
+                kind: EdgeKind::CALL,
+                confidence: None,
+                certainty: certainty.map(str::to_string),
+                callsite_identity: Some("src/dispatcher.js:1".to_string()),
+                candidate_targets: Vec::new(),
+            };
+            assert_eq!(
+                flow_requirement_call_receipt_is_valid(
+                    &requirement,
+                    &role_only,
+                    &edge,
+                    "Worker.run",
+                    neighbor_kind,
+                ),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_boundary_rejects_probable_receipts() {
+        let carrier = citation("HttpClient.send", "src/client.rs", NodeKind::METHOD);
+        let terms = packet_probe_terms(
+            "Explain how an HTTP client session accepts a request and dispatches it through an adapter.",
+        );
+        let requirement = packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::DataFlow)
+            .into_iter()
+            .find(|requirement| {
+                requirement.id == "request_dispatch"
+                    && requirement
+                        .evidence
+                        .ordered_call_boundary(&carrier)
+                        .is_some()
+            })
+            .expect("ordered client dispatch requirement");
+        let edge = GraphEdgeDto {
+            id: EdgeId("ordered-probable".to_string()),
+            source: carrier.node_id.clone(),
+            target: NodeId("Session.get_adapter".to_string()),
+            kind: EdgeKind::CALL,
+            confidence: None,
+            certainty: Some("probable".to_string()),
+            callsite_identity: Some("src/client.rs:1".to_string()),
+            candidate_targets: Vec::new(),
+        };
+        assert!(
+            requirement
+                .evidence
+                .ordered_call_boundary(&carrier)
+                .is_some()
+        );
+        assert!(!flow_requirement_call_receipt_is_valid(
+            &requirement,
+            &carrier,
+            &edge,
+            "Session.get_adapter",
+            NodeKind::METHOD,
+        ));
     }
 
     #[test]

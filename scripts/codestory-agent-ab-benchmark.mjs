@@ -3447,7 +3447,23 @@ function resultPacketObligationAccounting(result) {
 }
 
 function resultRequiresPacketObligationAccounting(result) {
-  return result?.arm === "with_codestory" || result?.mode != null;
+  if (result?.arm !== "with_codestory" && result?.mode == null) {
+    return false;
+  }
+  const prelude = result?.codestory_harness_prelude;
+  const packetEvidencePresent =
+    result?.sufficiency != null ||
+    result?.packet_shape != null ||
+    result?.packet_latency != null ||
+    result?.packet_composition != null ||
+    prelude?.packet_sufficiency != null;
+  if (packetEvidencePresent) {
+    return true;
+  }
+  // Missing legacy status stays fail-closed because it cannot prove that no packet was emitted.
+  // Only an explicitly failed/cancelled row with no bounded packet evidence is exempt: fail-fast
+  // siblings can be stopped before their packet process begins and therefore own no accounting.
+  return result?.status == null || result.status === "pass";
 }
 
 function summarizePacketObligationAccounting(results, label) {
@@ -7612,7 +7628,16 @@ function agentPublishableBlockers(results, opts = {}) {
         environmentReasons.push(
           ...managedCodeStoryRuntimeIdentityBlockers(result),
         );
-        if (!result.codestory_harness_prelude?.packet_sufficiency) {
+        const obligationAccounting = resultPacketObligationAccounting(result);
+        if (obligationAccounting) {
+          const accountingError = packetObligationAccountingError(
+            obligationAccounting,
+            "codestory prelude packet obligations",
+          );
+          if (accountingError) {
+            harnessReasons.push(accountingError);
+          }
+        } else if (resultRequiresPacketObligationAccounting(result)) {
           harnessReasons.push("codestory prelude packet obligation accounting is missing");
         }
       }
@@ -9870,6 +9895,7 @@ export {
   repoConfigFromManifest,
   resolveCodeStoryCli,
   scoreQuality,
+  sortAgentResultsCanonical,
   summarizeCostAccounting,
   summarizePacketObligationAccounting,
   summarizePacketRuntimeRuns,

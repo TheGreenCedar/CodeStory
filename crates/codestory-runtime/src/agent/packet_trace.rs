@@ -2,7 +2,7 @@
 
 #![allow(clippy::items_after_test_module)]
 
-use super::packet_candidate::{PacketSearchHit, merge_packet_candidate_graph};
+use super::packet_candidate::{PacketSearchHit, merge_packet_candidate_graph_for_requirements};
 use super::packet_scoring::{packet_citation_key, packet_citation_rank, sort_by_cached_rank_desc};
 use super::trace::field;
 use codestory_agent::packet_flow_requirements::FlowRequirement;
@@ -59,7 +59,12 @@ pub(crate) fn merge_packet_fused_subquery_batch(
         let mut added = 0usize;
         let mut candidates = hits
             .iter()
-            .map(|hit| (hit.citation(include_evidence), hit))
+            .map(|hit| {
+                (
+                    hit.citation_for_requirements(include_evidence, flow_requirements),
+                    hit,
+                )
+            })
             .collect::<Vec<_>>();
         sort_by_cached_rank_desc(&mut candidates, |(citation, _)| {
             packet_citation_rank(citation, rank_terms, true)
@@ -69,11 +74,17 @@ pub(crate) fn merge_packet_fused_subquery_batch(
         for candidate_index in selected {
             let (citation, hit) = &candidates[candidate_index];
             if include_evidence {
-                merge_packet_candidate_graph(answer, hit);
+                merge_packet_candidate_graph_for_requirements(answer, hit, flow_requirements);
             }
             let key = packet_citation_key(citation);
             if let Some(existing_index) = citation_indices.get(&key).copied() {
-                merge_packet_citation_provenance(&mut answer.citations[existing_index], citation);
+                let proof_edge_ids =
+                    hit.proof_edge_ids_for_requirements(citation, flow_requirements);
+                merge_packet_citation_provenance(
+                    &mut answer.citations[existing_index],
+                    citation,
+                    &proof_edge_ids,
+                );
             } else {
                 let citation_index = answer.citations.len();
                 citation_indices.insert(key, citation_index);
@@ -140,7 +151,7 @@ fn select_packet_candidate_indices(
                     && (requirement
                         .evidence
                         .citation_proves_without_call_boundary(citation)
-                        || hit.has_certain_call_provenance())
+                        || hit.has_proof_call_provenance_for_requirement(citation, requirement))
             })
         else {
             continue;
@@ -162,30 +173,77 @@ fn select_packet_candidate_indices(
     selected
 }
 
-fn merge_packet_citation_provenance(existing: &mut AgentCitationDto, candidate: &AgentCitationDto) {
-    existing
-        .evidence_edge_ids
-        .extend(candidate.evidence_edge_ids.iter().cloned());
-    existing
-        .evidence_edge_ids
-        .sort_by(|left, right| left.0.cmp(&right.0));
-    existing.evidence_edge_ids.dedup();
-    existing.evidence_edge_ids.truncate(12);
-    if existing.retrieval_score_breakdown.is_none() {
+fn merge_packet_citation_provenance(
+    existing: &mut AgentCitationDto,
+    candidate: &AgentCitationDto,
+    proof_edge_ids: &[codestory_contracts::api::EdgeId],
+) {
+    let mut merged_edge_ids = Vec::new();
+    for edge_id in proof_edge_ids
+        .iter()
+        .chain(existing.evidence_edge_ids.iter())
+        .chain(candidate.evidence_edge_ids.iter())
+    {
+        if !merged_edge_ids.contains(edge_id) {
+            merged_edge_ids.push(edge_id.clone());
+        }
+    }
+    merged_edge_ids.truncate(12);
+    existing.evidence_edge_ids = merged_edge_ids;
+
+    if packet_candidate_evidence_lane_is_stronger(existing, candidate) {
+        existing.score = candidate.score;
         existing.retrieval_score_breakdown = candidate.retrieval_score_breakdown.clone();
-    }
-    if existing.evidence_tier.is_none() {
         existing.evidence_tier = candidate.evidence_tier;
-    }
-    if existing.evidence_producer.is_none() {
         existing.evidence_producer = candidate.evidence_producer.clone();
-    }
-    if existing.resolution_status.is_none() {
         existing.resolution_status = candidate.resolution_status;
-    }
-    if existing.eligible_for_sufficiency.is_none() {
         existing.eligible_for_sufficiency = candidate.eligible_for_sufficiency;
     }
+}
+
+fn packet_candidate_evidence_lane_is_stronger(
+    existing: &AgentCitationDto,
+    candidate: &AgentCitationDto,
+) -> bool {
+    let existing_eligible =
+        codestory_agent::packet_evidence::citation_sufficiency_eligible(existing);
+    let candidate_eligible =
+        codestory_agent::packet_evidence::citation_sufficiency_eligible(candidate);
+    if existing_eligible != candidate_eligible {
+        return candidate_eligible;
+    }
+
+    let resolution_rank = |resolution| match resolution {
+        Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved) => 4,
+        Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly) => 3,
+        Some(codestory_contracts::api::PacketEvidenceResolutionDto::Unresolved) => 2,
+        Some(codestory_contracts::api::PacketEvidenceResolutionDto::DiagnosticOnly) => 1,
+        None => 0,
+    };
+    let existing_resolution = resolution_rank(existing.resolution_status);
+    let candidate_resolution = resolution_rank(candidate.resolution_status);
+    if existing_resolution != candidate_resolution {
+        return candidate_resolution > existing_resolution;
+    }
+
+    let tier_rank = |tier| match tier {
+        Some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource) => 9,
+        Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph) => 8,
+        Some(codestory_contracts::api::PacketEvidenceTierDto::LexicalSource) => 7,
+        Some(codestory_contracts::api::PacketEvidenceTierDto::SymbolDoc) => 6,
+        Some(codestory_contracts::api::PacketEvidenceTierDto::ComponentReport) => 5,
+        Some(codestory_contracts::api::PacketEvidenceTierDto::DenseSemantic) => 4,
+        Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText) => 3,
+        Some(codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan) => 2,
+        Some(codestory_contracts::api::PacketEvidenceTierDto::GeneratedSummary) => 1,
+        None => 0,
+    };
+    let existing_tier = tier_rank(existing.evidence_tier);
+    let candidate_tier = tier_rank(candidate.evidence_tier);
+    if existing_tier != candidate_tier {
+        return candidate_tier > existing_tier;
+    }
+    candidate.score > existing.score
 }
 
 pub(crate) fn packet_query_diagnostic<'a>(
@@ -268,12 +326,249 @@ mod golden_tests {
     use super::*;
     use crate::agent::packet_candidate::{PacketGraphDirection, PacketGraphEdgeProvenance};
     use codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms;
+    use codestory_agent::packet_obligations::{
+        build_packet_obligation_plan, finalize_packet_obligation_plan,
+    };
     use codestory_agent::packet_terms::packet_probe_terms;
     use codestory_contracts::api::{
         AgentAnswerDto, AgentRetrievalTraceDto, EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto,
-        GraphResponse, NodeId, NodeKind, PacketPlanQueryDto, PacketTaskClassDto, SearchHit,
-        SearchHitOrigin,
+        GraphResponse, NodeId, NodeKind, PacketBudgetDto, PacketBudgetLimitsDto,
+        PacketBudgetModeDto, PacketBudgetUsageDto, PacketEvidenceResolutionDto,
+        PacketEvidenceTierDto, PacketObligationProofStatusDto, PacketPlanQueryDto,
+        PacketTaskClassDto, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
     };
+
+    fn empty_answer(prompt: &str) -> AgentAnswerDto {
+        AgentAnswerDto {
+            answer_id: "packet-trace".into(),
+            prompt: prompt.into(),
+            summary: "summary".into(),
+            freshness: None,
+            sections: Vec::new(),
+            citations: Vec::new(),
+            subgraph_ids: Vec::new(),
+            retrieval_version: "hybrid-v1".into(),
+            graphs: Vec::new(),
+            source_coverage: Vec::new(),
+            retrieval_trace: AgentRetrievalTraceDto {
+                request_id: "request".into(),
+                retrieval_publication: None,
+                resolved_profile: codestory_contracts::api::AgentRetrievalPresetDto::Architecture,
+                policy_mode: codestory_contracts::api::AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 0,
+                sla_target_ms: None,
+                sla_missed: false,
+                semantic_fallback_count: 0,
+                semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
+                annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
+                steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
+                retrieval_shadow: None,
+            },
+        }
+    }
+
+    fn call_boundary_hit(
+        center_id: &str,
+        display_name: &str,
+        target_id: &str,
+        target_label: &str,
+        edge_id: &str,
+        file_path: &str,
+    ) -> PacketSearchHit {
+        let receiver_owner = target_label
+            .rsplit_once('.')
+            .map(|(owner, _)| owner)
+            .or_else(|| display_name.rsplit_once('.').map(|(owner, _)| owner))
+            .unwrap_or(display_name);
+        call_boundary_hit_with_receiver_owner(
+            center_id,
+            display_name,
+            target_id,
+            target_label,
+            edge_id,
+            file_path,
+            receiver_owner,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_boundary_hit_with_receiver_owner(
+        center_id: &str,
+        display_name: &str,
+        target_id: &str,
+        target_label: &str,
+        edge_id: &str,
+        file_path: &str,
+        receiver_owner: &str,
+    ) -> PacketSearchHit {
+        let center_id = NodeId(center_id.into());
+        let target_id = NodeId(target_id.into());
+        PacketSearchHit {
+            hit: SearchHit {
+                node_id: center_id.clone(),
+                display_name: display_name.into(),
+                kind: NodeKind::METHOD,
+                file_path: Some(file_path.into()),
+                line: Some(10),
+                score: 0.6,
+                origin: SearchHitOrigin::IndexedSymbol,
+                target: None,
+                resolvable: true,
+                match_quality: None,
+                evidence_tier: Some(PacketEvidenceTierDto::LexicalSource),
+                evidence_producer: Some("symbol_doc".into()),
+                resolution_status: Some(PacketEvidenceResolutionDto::Resolved),
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: Some(true),
+                source_excerpt: None,
+                verification_targets: Vec::new(),
+                score_breakdown: Some(RetrievalScoreBreakdownDto {
+                    lexical: 0.6,
+                    semantic: 0.0,
+                    graph: 0.0,
+                    total: 0.6,
+                    tier_cap: None,
+                    boosts: Vec::new(),
+                    dampening: Vec::new(),
+                    final_rank_reason: Some("lexical source".into()),
+                    provenance: vec!["symbol_doc".into()],
+                }),
+            },
+            graph_provenance: vec![PacketGraphEdgeProvenance {
+                edge_id: EdgeId(edge_id.into()),
+                direction: PacketGraphDirection::Outgoing,
+                hop: 1,
+                producers: vec!["core_incident_call".into()],
+                certainty: None,
+            }],
+            graph: Some(GraphResponse {
+                center_id: center_id.clone(),
+                nodes: vec![
+                    GraphNodeDto {
+                        id: center_id.clone(),
+                        label: display_name.into(),
+                        kind: NodeKind::METHOD,
+                        depth: 0,
+                        label_policy: None,
+                        badge_visible_members: None,
+                        badge_total_members: None,
+                        merged_symbol_examples: Vec::new(),
+                        file_path: Some(file_path.into()),
+                        qualified_name: Some(display_name.into()),
+                        member_access: None,
+                    },
+                    GraphNodeDto {
+                        id: target_id.clone(),
+                        label: target_label.into(),
+                        kind: NodeKind::UNKNOWN,
+                        depth: 1,
+                        label_policy: None,
+                        badge_visible_members: None,
+                        badge_total_members: None,
+                        merged_symbol_examples: Vec::new(),
+                        file_path: Some(file_path.into()),
+                        qualified_name: Some(target_label.into()),
+                        member_access: None,
+                    },
+                ],
+                edges: vec![GraphEdgeDto {
+                    id: EdgeId(edge_id.into()),
+                    source: center_id,
+                    target: target_id,
+                    kind: EdgeKind::CALL,
+                    confidence: None,
+                    certainty: None,
+                    callsite_identity: Some(format!(
+                        "{file_path}:10:1:20|syntax:js-member-call|receiver-owner:{receiver_owner}"
+                    )),
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            }),
+        }
+    }
+
+    fn complete_packet_budget(answer: &AgentAnswerDto) -> PacketBudgetDto {
+        let trail_edges = answer
+            .graphs
+            .iter()
+            .filter_map(|artifact| match artifact {
+                codestory_contracts::api::GraphArtifactDto::Uml { graph, .. } => {
+                    Some(graph.edges.len())
+                }
+                codestory_contracts::api::GraphArtifactDto::Mermaid { .. } => None,
+            })
+            .sum::<usize>();
+        PacketBudgetDto {
+            requested: PacketBudgetModeDto::Compact,
+            limits: PacketBudgetLimitsDto {
+                max_anchors: 13,
+                max_files: 13,
+                max_snippets: 13,
+                max_trail_edges: 20,
+                max_output_bytes: 98_304,
+            },
+            used: PacketBudgetUsageDto {
+                anchors: u32::try_from(answer.citations.len()).unwrap_or(u32::MAX),
+                files: 3,
+                snippets: 0,
+                trail_edges: u32::try_from(trail_edges).unwrap_or(u32::MAX),
+                output_bytes: 1_024,
+            },
+            truncated: false,
+            omitted_sections: Vec::new(),
+            next_deeper_command: None,
+        }
+    }
+
+    fn mark_dense_only(hit: &mut PacketSearchHit) {
+        hit.hit.evidence_tier = Some(PacketEvidenceTierDto::DenseSemantic);
+        hit.hit.evidence_producer = Some("dense_anchor".into());
+        hit.hit.eligible_for_sufficiency = Some(false);
+        hit.hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
+            lexical: 0.0,
+            semantic: hit.hit.score,
+            graph: 0.0,
+            total: hit.hit.score,
+            tier_cap: Some(0.4),
+            boosts: Vec::new(),
+            dampening: vec!["dense_only".into()],
+            final_rank_reason: Some("dense anchor".into()),
+            provenance: vec!["dense_anchor".into()],
+        });
+    }
+
+    fn dense_distractor(id: &str) -> PacketSearchHit {
+        PacketSearchHit::without_graph(SearchHit {
+            node_id: NodeId(id.into()),
+            display_name: format!("metrics_hook_{id}"),
+            kind: NodeKind::FUNCTION,
+            file_path: Some("src/telemetry.js".into()),
+            line: Some(1),
+            score: 0.99,
+            origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
+            resolvable: true,
+            match_quality: None,
+            evidence_tier: Some(PacketEvidenceTierDto::DenseSemantic),
+            evidence_producer: Some("dense_anchor".into()),
+            resolution_status: Some(PacketEvidenceResolutionDto::Resolved),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(false),
+            source_excerpt: None,
+            verification_targets: Vec::new(),
+            score_breakdown: None,
+        })
+    }
 
     #[test]
     fn merge_fused_batch_golden_trace_shape() {
@@ -530,5 +825,627 @@ mod golden_tests {
             codestory_contracts::api::GraphArtifactDto::Uml { graph, .. }
                 if graph.edges.iter().any(|edge| edge.id.0 == "request-to-send")
         )));
+    }
+
+    #[test]
+    fn duplicate_citation_promotes_the_strongest_admissible_lane_atomically() {
+        let hit = call_boundary_hit(
+            "application-handle",
+            "app.handle",
+            "router-handle",
+            "Router.handle",
+            "handle-proof",
+            "src/application.js",
+        );
+        let candidate = hit.citation(true);
+        let mut existing = candidate.clone();
+        existing.score = 0.99;
+        existing.evidence_edge_ids = vec![EdgeId("dense-context".into())];
+        existing.retrieval_score_breakdown = Some(RetrievalScoreBreakdownDto {
+            lexical: 0.0,
+            semantic: 0.99,
+            graph: 0.0,
+            total: 0.99,
+            tier_cap: Some(0.4),
+            boosts: Vec::new(),
+            dampening: vec!["dense_only".into()],
+            final_rank_reason: Some("dense anchor".into()),
+            provenance: vec!["dense_anchor".into()],
+        });
+        existing.evidence_tier = Some(PacketEvidenceTierDto::DenseSemantic);
+        existing.evidence_producer = Some("dense_anchor".into());
+        existing.resolution_status = Some(PacketEvidenceResolutionDto::Resolved);
+        existing.eligible_for_sufficiency = Some(false);
+
+        merge_packet_citation_provenance(
+            &mut existing,
+            &candidate,
+            &[EdgeId("handle-proof".into())],
+        );
+
+        assert_eq!(existing.score, 0.6);
+        assert_eq!(
+            existing.evidence_edge_ids,
+            [
+                EdgeId("handle-proof".into()),
+                EdgeId("dense-context".into())
+            ]
+        );
+        assert_eq!(
+            existing.evidence_tier,
+            Some(PacketEvidenceTierDto::LexicalSource)
+        );
+        assert_eq!(existing.evidence_producer.as_deref(), Some("symbol_doc"));
+        assert_eq!(
+            existing.resolution_status,
+            Some(PacketEvidenceResolutionDto::Resolved)
+        );
+        assert_eq!(existing.eligible_for_sufficiency, Some(true));
+        let breakdown = existing
+            .retrieval_score_breakdown
+            .as_ref()
+            .expect("lexical score breakdown");
+        assert_eq!(breakdown.lexical, 0.6);
+        assert_eq!(breakdown.semantic, 0.0);
+        assert_eq!(breakdown.provenance, ["symbol_doc"]);
+    }
+
+    #[test]
+    fn compact_server_flow_reserves_all_three_exact_call_boundaries() {
+        let prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
+        let terms = packet_probe_terms(prompt);
+        let requirements =
+            packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::RouteTracing);
+        assert_eq!(requirements.len(), 3);
+
+        let mut carriers = [
+            call_boundary_hit_with_receiver_owner(
+                "application-route",
+                "app.route",
+                "route",
+                "route",
+                "route-proof",
+                "src/application.js",
+                "app.router",
+            ),
+            call_boundary_hit_with_receiver_owner(
+                "application-handle",
+                "app.handle",
+                "router-handle",
+                "handle",
+                "handle-proof",
+                "src/application.js",
+                "app.router",
+            ),
+            call_boundary_hit(
+                "response-send",
+                "res.send",
+                "response-end",
+                "end",
+                "send-proof",
+                "src/response.js",
+            ),
+        ];
+        for carrier in &mut carriers {
+            mark_dense_only(carrier);
+        }
+        let queries = [
+            PacketPlanQueryDto {
+                query: "application use".into(),
+                purpose: "registration".into(),
+            },
+            PacketPlanQueryDto {
+                query: "application handle".into(),
+                purpose: "dispatch".into(),
+            },
+            PacketPlanQueryDto {
+                query: "response send".into(),
+                purpose: "terminal".into(),
+            },
+        ];
+        let pending = queries
+            .iter()
+            .enumerate()
+            .collect::<Vec<(usize, &PacketPlanQueryDto)>>();
+        let results = queries
+            .iter()
+            .zip(carriers.iter())
+            .enumerate()
+            .map(|(query_index, (query, carrier))| {
+                let mut hits = (0..14)
+                    .map(|index| dense_distractor(&format!("{query_index}-{index}")))
+                    .collect::<Vec<_>>();
+                hits.push(carrier.clone());
+                (query.query.clone(), hits)
+            })
+            .collect::<Vec<_>>();
+        let mut answer = empty_answer(prompt);
+
+        merge_packet_fused_subquery_batch(
+            &mut answer,
+            &pending,
+            &results,
+            3,
+            &[],
+            true,
+            &terms,
+            1,
+            &requirements,
+        );
+
+        assert_eq!(answer.citations.len(), 3);
+        assert!(
+            answer
+                .citations
+                .iter()
+                .all(|citation| !citation.display_name.contains("metrics_hook"))
+        );
+        for (display_name, edge_id) in [
+            ("app.route", "route-proof"),
+            ("app.handle", "handle-proof"),
+            ("res.send", "send-proof"),
+        ] {
+            let citation = answer
+                .citations
+                .iter()
+                .find(|citation| citation.display_name == display_name)
+                .expect("reserved flow carrier");
+            assert_eq!(citation.evidence_edge_ids[0], EdgeId(edge_id.into()));
+            assert_eq!(
+                citation.evidence_tier,
+                Some(PacketEvidenceTierDto::ResolvedGraph)
+            );
+            assert_eq!(citation.eligible_for_sufficiency, Some(true));
+            assert!(answer.graphs.iter().any(|artifact| matches!(
+                artifact,
+                codestory_contracts::api::GraphArtifactDto::Uml { graph, .. }
+                    if graph.edges.iter().any(|edge| edge.id.0 == edge_id)
+            )));
+        }
+
+        let mut obligation_plan =
+            build_packet_obligation_plan(prompt, PacketTaskClassDto::RouteTracing, &queries);
+        finalize_packet_obligation_plan(
+            prompt,
+            PacketTaskClassDto::RouteTracing,
+            &mut obligation_plan,
+            &answer,
+            &complete_packet_budget(&answer),
+        );
+        for requirement_id in ["request_entrypoint", "request_dispatch", "request_terminal"] {
+            let obligation = obligation_plan
+                .claim_obligations
+                .iter()
+                .find(|obligation| obligation.id == requirement_id)
+                .unwrap_or_else(|| panic!("missing {requirement_id} obligation"));
+            assert_eq!(
+                obligation.proof_status,
+                PacketObligationProofStatusDto::Proven,
+                "receiver-matched CALL must survive full obligation finalization: {obligation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_invalid_unresolved_call_context_stays_non_proven_after_full_merge() {
+        let prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
+        let terms = packet_probe_terms(prompt);
+        let requirements =
+            packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::RouteTracing);
+        let mut bad_carriers = [
+            call_boundary_hit_with_receiver_owner(
+                "bad-application-use",
+                "app.use",
+                "metrics-use",
+                "use",
+                "metrics-use-context",
+                "src/application.js",
+                "Metrics",
+            ),
+            {
+                let mut hit = call_boundary_hit_with_receiver_owner(
+                    "bad-application-handle",
+                    "app.handle",
+                    "telemetry-handle",
+                    "handle",
+                    "telemetry-handle-context",
+                    "src/application.js",
+                    "Telemetry",
+                );
+                hit.graph.as_mut().expect("graph").edges[0].confidence = Some(1.0);
+                hit
+            },
+            call_boundary_hit_with_receiver_owner(
+                "bad-response-send",
+                "res.send",
+                "telemetry-end",
+                "end",
+                "telemetry-end-context",
+                "src/response.js",
+                "Telemetry",
+            ),
+            call_boundary_hit_with_receiver_owner(
+                "bad-response-write",
+                "res.send",
+                "cache-write",
+                "write",
+                "cache-write-context",
+                "src/response.js",
+                "Cache",
+            ),
+        ];
+        for carrier in &mut bad_carriers {
+            mark_dense_only(carrier);
+        }
+        let queries = [
+            PacketPlanQueryDto {
+                query: "application use".into(),
+                purpose: "registration".into(),
+            },
+            PacketPlanQueryDto {
+                query: "application handle".into(),
+                purpose: "dispatch".into(),
+            },
+            PacketPlanQueryDto {
+                query: "response send".into(),
+                purpose: "terminal".into(),
+            },
+            PacketPlanQueryDto {
+                query: "response finalization".into(),
+                purpose: "terminal fallback".into(),
+            },
+        ];
+        let pending = queries
+            .iter()
+            .enumerate()
+            .collect::<Vec<(usize, &PacketPlanQueryDto)>>();
+        let results = queries
+            .iter()
+            .zip(bad_carriers)
+            .map(|(query, carrier)| (query.query.clone(), vec![carrier]))
+            .collect::<Vec<_>>();
+        let mut answer = empty_answer(prompt);
+
+        merge_packet_fused_subquery_batch(
+            &mut answer,
+            &pending,
+            &results,
+            3,
+            &[],
+            true,
+            &terms,
+            1,
+            &requirements,
+        );
+
+        assert_eq!(answer.citations.len(), 4);
+        assert!(
+            answer
+                .citations
+                .iter()
+                .all(|citation| citation.evidence_edge_ids.is_empty()),
+            "owner-invalid unresolved CALLs must remain graph-only context"
+        );
+        for edge_id in [
+            "metrics-use-context",
+            "telemetry-handle-context",
+            "telemetry-end-context",
+            "cache-write-context",
+        ] {
+            assert!(answer.graphs.iter().any(|artifact| matches!(
+                artifact,
+                codestory_contracts::api::GraphArtifactDto::Uml { graph, .. }
+                    if graph.edges.iter().any(|edge| edge.id.0 == edge_id)
+            )));
+        }
+
+        let mut obligation_plan =
+            build_packet_obligation_plan(prompt, PacketTaskClassDto::RouteTracing, &queries);
+        finalize_packet_obligation_plan(
+            prompt,
+            PacketTaskClassDto::RouteTracing,
+            &mut obligation_plan,
+            &answer,
+            &complete_packet_budget(&answer),
+        );
+        for requirement_id in ["request_entrypoint", "request_dispatch", "request_terminal"] {
+            let obligation = obligation_plan
+                .claim_obligations
+                .iter()
+                .find(|obligation| obligation.id == requirement_id)
+                .unwrap_or_else(|| panic!("missing {requirement_id} obligation"));
+            assert_ne!(
+                obligation.proof_status,
+                PacketObligationProofStatusDto::Proven,
+                "metrics/telemetry receiver context must not become proof: {obligation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_ownerless_unknown_receipt_stays_non_proven_on_all_early_paths() {
+        let prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
+        let mut hit = call_boundary_hit_with_receiver_owner(
+            "raw-application-handle",
+            "app.handle",
+            "raw-handle",
+            "handle",
+            "raw-ownerless-handle",
+            "src/application.js",
+            "app.router",
+        );
+        hit.graph.as_mut().expect("graph").edges[0].callsite_identity = None;
+
+        let mut raw_answer = empty_answer(prompt);
+        raw_answer.citations = vec![hit.citation_for_requirements(true, &[])];
+        raw_answer
+            .graphs
+            .push(codestory_contracts::api::GraphArtifactDto::Uml {
+                id: "raw-early-path-context".into(),
+                title: "Raw early-path context".into(),
+                graph: hit.graph.clone().expect("graph"),
+            });
+        assert_eq!(
+            raw_answer.citations[0].evidence_edge_ids,
+            [EdgeId("raw-ownerless-handle".into())],
+            "the finalizer must reject raw presentation context without a runtime sanitizer"
+        );
+
+        for path in ["tiny", "empty_query_batch", "latency_exhausted"] {
+            let mut answer = raw_answer.clone();
+            let mut budget = complete_packet_budget(&answer);
+            match path {
+                "tiny" => {
+                    budget.requested = PacketBudgetModeDto::Tiny;
+                    budget.limits.max_anchors = 3;
+                    budget.limits.max_files = 3;
+                    budget.limits.max_snippets = 6;
+                    budget.limits.max_trail_edges = 12;
+                    budget.limits.max_output_bytes = 24 * 1_024;
+                }
+                "empty_query_batch" => assert!(answer.retrieval_trace.steps.is_empty()),
+                "latency_exhausted" => {
+                    answer.retrieval_trace.total_latency_ms = 1_000;
+                    answer.retrieval_trace.sla_target_ms = Some(1);
+                    answer.retrieval_trace.sla_missed = true;
+                }
+                _ => unreachable!(),
+            }
+
+            let mut plan =
+                build_packet_obligation_plan(prompt, PacketTaskClassDto::RouteTracing, &[]);
+            finalize_packet_obligation_plan(
+                prompt,
+                PacketTaskClassDto::RouteTracing,
+                &mut plan,
+                &answer,
+                &budget,
+            );
+            let obligation = plan
+                .claim_obligations
+                .iter()
+                .find(|obligation| obligation.id == "request_dispatch")
+                .expect("dispatch obligation");
+            assert_ne!(
+                obligation.proof_status,
+                PacketObligationProofStatusDto::Proven,
+                "{path} raw ownerless UNKNOWN became proof: {obligation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_dispatch_negatives_never_promote_or_finalize_as_proven() {
+        let prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
+        let terms = packet_probe_terms(prompt);
+        let requirements =
+            packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::RouteTracing);
+        let requirement = requirements
+            .iter()
+            .find(|requirement| requirement.id == "request_dispatch")
+            .expect("dispatch requirement");
+
+        let wrong_owner = call_boundary_hit_with_receiver_owner(
+            "wrong-owner",
+            "app.handle",
+            "telemetry-handle",
+            "handle",
+            "wrong-owner-edge",
+            "src/application.js",
+            "telemetry",
+        );
+        let mut confidence_only_wrong_owner = wrong_owner.clone();
+        confidence_only_wrong_owner
+            .graph
+            .as_mut()
+            .expect("graph")
+            .edges[0]
+            .confidence = Some(1.0);
+
+        let mut wrong_target = call_boundary_hit_with_receiver_owner(
+            "wrong-target",
+            "app.handle",
+            "metrics-record",
+            "Metrics.record",
+            "wrong-target-edge",
+            "src/application.js",
+            "app.router",
+        );
+        {
+            let graph = wrong_target.graph.as_mut().expect("graph");
+            graph.nodes[1].kind = NodeKind::METHOD;
+            graph.edges[0].certainty = Some("certain".into());
+            graph.edges[0].confidence = Some(1.0);
+            wrong_target.graph_provenance[0].certainty = Some("certain".into());
+        }
+
+        let mut speculative = call_boundary_hit_with_receiver_owner(
+            "speculative",
+            "app.handle",
+            "router-handle",
+            "handle",
+            "speculative-edge",
+            "src/application.js",
+            "app.router",
+        );
+        {
+            let graph = speculative.graph.as_mut().expect("graph");
+            graph.edges[0].certainty = Some("probable".into());
+            graph.edges[0].confidence = None;
+            speculative.graph_provenance[0].certainty = Some("probable".into());
+        }
+
+        let mut incoming = call_boundary_hit_with_receiver_owner(
+            "incoming",
+            "app.handle",
+            "router-handle",
+            "handle",
+            "incoming-edge",
+            "src/application.js",
+            "app.router",
+        );
+        {
+            let graph = incoming.graph.as_mut().expect("graph");
+            graph.nodes[1].kind = NodeKind::METHOD;
+            let edge = &mut graph.edges[0];
+            edge.certainty = Some("certain".into());
+            edge.confidence = Some(1.0);
+            std::mem::swap(&mut edge.source, &mut edge.target);
+            incoming.graph_provenance[0].direction = PacketGraphDirection::Incoming;
+            incoming.graph_provenance[0].certainty = Some("certain".into());
+        }
+
+        let mut no_callsite = call_boundary_hit_with_receiver_owner(
+            "no-callsite",
+            "app.handle",
+            "router-handle",
+            "handle",
+            "no-callsite-edge",
+            "src/application.js",
+            "app.router",
+        );
+        no_callsite.graph.as_mut().expect("graph").edges[0].callsite_identity = None;
+
+        let preexisting_context = [
+            ("resolved_wrong_target", wrong_target.clone()),
+            ("resolved_incoming", incoming.clone()),
+        ];
+
+        for (shape, mut hit) in [
+            ("wrong_owner", wrong_owner),
+            ("confidence_only_wrong_owner", confidence_only_wrong_owner),
+            ("wrong_target", wrong_target),
+            ("speculative", speculative),
+            ("incoming", incoming),
+            ("no_callsite", no_callsite),
+        ] {
+            mark_dense_only(&mut hit);
+            let query = PacketPlanQueryDto {
+                query: "application handle".into(),
+                purpose: "dispatch".into(),
+            };
+            let results = vec![(query.query.clone(), vec![hit])];
+            let mut answer = empty_answer(prompt);
+            merge_packet_fused_subquery_batch(
+                &mut answer,
+                &[(0, &query)],
+                &results,
+                1,
+                &[],
+                true,
+                &terms,
+                1,
+                &requirements,
+            );
+            let citation = answer
+                .citations
+                .iter()
+                .find(|citation| citation.display_name == "app.handle")
+                .expect("generic fill retains the carrier");
+            assert_eq!(
+                citation.evidence_tier,
+                Some(PacketEvidenceTierDto::DenseSemantic),
+                "{shape} must not promote"
+            );
+            assert_eq!(citation.eligible_for_sufficiency, Some(false));
+            assert!(citation.evidence_edge_ids.is_empty());
+            assert!(
+                !results[0].1[0].has_proof_call_provenance_for_requirement(citation, requirement)
+            );
+
+            let mut plan = build_packet_obligation_plan(
+                prompt,
+                PacketTaskClassDto::RouteTracing,
+                std::slice::from_ref(&query),
+            );
+            finalize_packet_obligation_plan(
+                prompt,
+                PacketTaskClassDto::RouteTracing,
+                &mut plan,
+                &answer,
+                &complete_packet_budget(&answer),
+            );
+            let obligation = plan
+                .claim_obligations
+                .iter()
+                .find(|obligation| obligation.id == "request_dispatch")
+                .expect("dispatch obligation");
+            assert_ne!(
+                obligation.proof_status,
+                PacketObligationProofStatusDto::Proven,
+                "{shape} became proof: {obligation:?}"
+            );
+        }
+
+        for (shape, mut hit) in preexisting_context {
+            mark_dense_only(&mut hit);
+            let mut answer = empty_answer(prompt);
+            answer.citations = vec![hit.citation_for_requirements(true, &[])];
+            answer
+                .graphs
+                .push(codestory_contracts::api::GraphArtifactDto::Uml {
+                    id: format!("{shape}-context"),
+                    title: "preexisting packet context".into(),
+                    graph: hit.graph.clone().expect("graph"),
+                });
+            assert_eq!(answer.citations[0].evidence_edge_ids.len(), 1);
+
+            merge_packet_fused_subquery_batch(
+                &mut answer,
+                &[],
+                &[],
+                0,
+                &[],
+                true,
+                &terms,
+                1,
+                &requirements,
+            );
+            assert_eq!(
+                answer.citations[0].evidence_edge_ids.len(),
+                1,
+                "{shape} stays presentation context; the owning finalizer must reject it"
+            );
+
+            let mut plan =
+                build_packet_obligation_plan(prompt, PacketTaskClassDto::RouteTracing, &[]);
+            finalize_packet_obligation_plan(
+                prompt,
+                PacketTaskClassDto::RouteTracing,
+                &mut plan,
+                &answer,
+                &complete_packet_budget(&answer),
+            );
+            let obligation = plan
+                .claim_obligations
+                .iter()
+                .find(|obligation| obligation.id == "request_dispatch")
+                .expect("dispatch obligation");
+            assert_ne!(
+                obligation.proof_status,
+                PacketObligationProofStatusDto::Proven,
+                "preexisting {shape} became proof: {obligation:?}"
+            );
+        }
     }
 }

@@ -2485,10 +2485,10 @@ mod tests {
             PacketTaskClassDto::RouteTracing,
         );
         for expected in [
-            "request entrypoint",
+            "application use",
             "route registration",
+            "application handle",
             "request dispatch",
-            "handler dispatch",
         ] {
             assert!(
                 route_queries.iter().any(|query| query == expected),

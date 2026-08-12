@@ -74,6 +74,7 @@ import {
   retrievalStatusSnapshotFromOutput,
   resourceUriMatches,
   scoreQuality,
+  sortAgentResultsCanonical,
   summarizeCostAccounting,
   summarizePacketObligationAccounting,
   summarizePacketRuntimeRuns,
@@ -511,14 +512,123 @@ test("packet obligation accounting rejects unreconciled summaries", () => {
     null,
   );
   for (const missing of [
-    { repo: "fixture", task_id: "measured", arm: "with_codestory", repeat: 1 },
-    { repo: "fixture", task_id: "runtime", mode: "cold_cli_packet", repeat: 1 },
+    { repo: "fixture", task_id: "measured", arm: "with_codestory", repeat: 1, status: "pass" },
+    { repo: "fixture", task_id: "runtime", mode: "cold_cli_packet", repeat: 1, status: "pass" },
+    { repo: "fixture", task_id: "legacy", arm: "with_codestory", repeat: 1 },
   ]) {
     assert.throws(
       () => summarizePacketObligationAccounting([missing], "benchmark summary"),
       /packet obligation accounting is missing/,
     );
   }
+  for (const status of ["cancelled", "fail", "failed", "partial"]) {
+    assert.equal(
+      summarizePacketObligationAccounting([{
+        repo: "fixture",
+        task_id: status,
+        arm: "with_codestory",
+        repeat: 1,
+        status,
+      }], "benchmark summary"),
+      null,
+      `${status} rows that emitted no packet have no packet accounting to report`,
+    );
+  }
+  for (const emitted of [
+    { sufficiency: { status: "partial" } },
+    { packet_shape: {} },
+    { codestory_harness_prelude: { packet_sufficiency: { status: "partial" } } },
+  ]) {
+    assert.throws(
+      () => summarizePacketObligationAccounting([{
+        repo: "fixture",
+        task_id: "failed-packet",
+        mode: "cold_cli_packet",
+        repeat: 1,
+        status: "fail",
+        ...emitted,
+      }], "benchmark summary"),
+      /packet obligation accounting is missing/,
+      "a failed row with evidence that its packet path began cannot omit accounting",
+    );
+  }
+  assert.equal(
+    summarizePacketObligationAccounting([{
+      repo: "fixture",
+      task_id: "aborted-before-packet",
+      arm: "with_codestory",
+      repeat: 1,
+      status: "cancelled",
+      response_bytes: 0,
+      codestory_harness_prelude: {
+        status: "fail",
+        process_status: "aborted",
+        stdout_bytes: 0,
+        packet_parse_error: null,
+        packet_sufficiency_status: null,
+        packet_sufficiency: null,
+      },
+    }], "benchmark summary"),
+    null,
+    "an aborted prelude with no parsed packet has no packet accounting to report",
+  );
+});
+
+test("packet obligation accounting aggregates valid failed packets and skips cancelled omissions", () => {
+  const accounting = (proven, reported = 0) => ({
+    total: proven + reported,
+    material: proven + reported,
+    nonmaterial: 0,
+    material_status_buckets: {
+      ...(proven ? { proven } : {}),
+      ...(reported ? { required_evidence_edge_missing: reported } : {}),
+    },
+  });
+  const rows = [
+    {
+      repo: "z-pass",
+      task_id: "pass",
+      arm: "with_codestory",
+      repeat: 1,
+      status: "pass",
+      sufficiency: { obligation_accounting: accounting(2) },
+    },
+    {
+      repo: "a-cancelled",
+      task_id: "cancelled",
+      arm: "with_codestory",
+      repeat: 1,
+      status: "cancelled",
+    },
+    {
+      repo: "m-partial",
+      task_id: "partial",
+      arm: "with_codestory",
+      repeat: 1,
+      status: "fail",
+      sufficiency: { obligation_accounting: accounting(1, 1) },
+    },
+    {
+      repo: "n-failed-before-packet",
+      task_id: "failed-before-packet",
+      arm: "with_codestory",
+      repeat: 1,
+      status: "fail",
+    },
+  ];
+  assert.deepEqual(
+    summarizePacketObligationAccounting(rows, "fail-fast summary"),
+    {
+      packets: 2,
+      total: 4,
+      material: 4,
+      nonmaterial: 0,
+      material_status_buckets: {
+        proven: 3,
+        required_evidence_edge_missing: 1,
+      },
+    },
+  );
 });
 
 const FIXTURE_MODEL_SHA256 = "a".repeat(64);
@@ -1532,6 +1642,76 @@ test("agent fail-fast aborts active siblings and stops queued repo groups", asyn
   assert.equal(controller.signal.aborted, true);
   assert.equal(outcome.results.length, 2);
   assert.equal(recorded.length, 2);
+});
+
+test("fail-fast pipeline summary retains the causal partial packet and cancelled sibling", async () => {
+  const fixture = pipelineFixture({ repos: ["apache", "express", "ripgrep"], jobs: 3 });
+  const runs = fixture.plannedRuns.filter((run) => run.arm === "with_codestory");
+  const allStarted = deferred();
+  const launched = [];
+  const controller = new AbortController();
+  const partialAccounting = {
+    total: 2,
+    material: 2,
+    nonmaterial: 0,
+    material_status_buckets: {
+      proven: 1,
+      required_evidence_edge_missing: 1,
+    },
+  };
+  const outcome = await runPlannedAgentRuns(
+    fixture.opts,
+    runs,
+    new Map(),
+    null,
+    {
+      signal: controller.signal,
+      abortController: controller,
+      failFast: true,
+      runOne: async (runOpts, run) => {
+        launched.push(run.repo);
+        if (launched.length === runs.length) allStarted.resolve();
+        await allStarted.promise;
+        if (run.repo === "express") {
+          return {
+            ...pipelineResult(run, "fail"),
+            sufficiency: {
+              status: "partial",
+              obligation_accounting: partialAccounting,
+            },
+          };
+        }
+        await new Promise((resolve) => {
+          if (runOpts.signal.aborted) return resolve();
+          runOpts.signal.addEventListener("abort", resolve, { once: true });
+        });
+        return pipelineResult(run, "cancelled");
+      },
+    },
+  );
+
+  assert.equal(outcome.firstFailure.repo, "express");
+  const canonical = sortAgentResultsCanonical(
+    outcome.results,
+    [...fixture.tasks].sort((left, right) => left.repo.localeCompare(right.repo)),
+    fixture.opts.arms,
+  );
+  assert.equal(canonical[0].repo, "apache");
+  assert.equal(canonical[0].status, "cancelled");
+  assert.deepEqual(
+    summarizePacketObligationAccounting(canonical, "agent benchmark report"),
+    {
+      packets: 1,
+      total: 2,
+      material: 2,
+      nonmaterial: 0,
+      material_status_buckets: {
+        proven: 1,
+        required_evidence_edge_missing: 1,
+      },
+    },
+    "summary closeout must not let a cancelled alphabetically earlier sibling mask Express",
+  );
 });
 
 test("agent scheduler durably retains sibling rows after an active run exception", async () => {
@@ -4592,6 +4772,26 @@ test("publishable packet obligation accounting rejects mismatched rows", () => {
   assert.match(
     runtimeBlockers.flatMap((blocker) => blocker.reasons).join("\n"),
     /material=2 does not reconcile with material status buckets=1/,
+  );
+
+  const failedWithoutPacket = publishableWithCodeStoryResult({
+    status: "cancelled",
+    codestory_harness_prelude: null,
+    transcript_analysis: {
+      command_count: 0,
+      codestory_mcp_tool_calls_observed: 0,
+      codestory_mcp_completed_calls_observed: 0,
+      codestory_mcp_runtime_identities: [],
+    },
+  });
+  const failedReasons = agentPublishableBlockers(
+    [failedWithoutPacket],
+    { publishable: true, maxSourceReadsAfterPacket: 0 },
+  ).flatMap((blocker) => blocker.reasons);
+  assert.equal(
+    failedReasons.includes("codestory prelude packet obligation accounting is missing"),
+    false,
+    "a cancelled row with no packet must not claim that packet accounting was omitted",
   );
 });
 
