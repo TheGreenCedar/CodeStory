@@ -27,7 +27,7 @@ from .managed_layout import verify_flat_managed_layout
 from .managed_runtime import verify_managed_runtime_status
 from .server_engine_identity import engine_identity
 from .server_identity import server_snapshot
-from .subprocess_control import McpProcess
+from .subprocess_control import McpProcess, mcp_search_arguments
 
 
 def _qualification_environment(
@@ -160,7 +160,7 @@ def _prove_server_readiness(
     manifest: dict,
 ) -> dict:
     _, search_attempts = host.search_until_ready(
-        {"project": str(project), "query": args.query, "why": True},
+        mcp_search_arguments(project, args.query),
         "server-readiness-search",
     )
     diagnostics = host.engine_diagnostics(project, "server-readiness-diagnostics")

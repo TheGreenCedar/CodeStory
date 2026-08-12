@@ -12,6 +12,7 @@ from .runtime_bootstrap_types import ColdProof, HostPair, RuntimeSetup
 from .server_cleanup import pin_temporary_package_server
 from .server_engine_identity import engine_identity
 from .server_identity import assert_public_status, server_snapshot, shared_server_identity
+from .subprocess_control import mcp_search_arguments
 
 
 def _cold_shared_proof(
@@ -41,11 +42,11 @@ def _cold_shared_proof(
     results = run_parallel(
         {
             "search-a": lambda: hosts.host_a.search_until_ready(
-                {"project": str(setup.project_a), "query": args.query, "why": True},
+                mcp_search_arguments(setup.project_a, args.query),
                 "cold-search-a",
             ),
             "search-b": lambda: hosts.host_b.search_until_ready(
-                {"project": str(setup.project_b), "query": setup.query_b, "why": True},
+                mcp_search_arguments(setup.project_b, setup.query_b),
                 "cold-search-b",
             ),
         }
