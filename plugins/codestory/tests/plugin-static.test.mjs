@@ -1629,6 +1629,20 @@ test("candidate managed CLI metadata is accepted only for the exact proof archiv
       ).verified,
       true,
     );
+    delete manifest.archive_bytes;
+    await writeFile(
+      join(fixture.versionDir, "manifest.json"),
+      JSON.stringify(manifest),
+      "utf8",
+    );
+    const missingArchiveBytes = launcherTest.verifyPublishedManagedCli(
+      fixture.versionDir,
+      version,
+      target,
+      probe,
+    );
+    assert.equal(missingArchiveBytes.verified, false);
+    assert.equal(missingArchiveBytes.reason, "manifest_release_metadata_invalid");
   } finally {
     delete process.env.CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256;
     delete process.env.CODESTORY_EMBED_QUALIFICATION_DIR;

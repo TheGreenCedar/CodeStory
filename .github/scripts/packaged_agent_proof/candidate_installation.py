@@ -94,6 +94,7 @@ def _managed_manifest(
         "archive": archive.name,
         "archive_url": f"candidate-archive:{archive_sha256}",
         "archive_sha256": archive_sha256,
+        "archive_bytes": archive.stat().st_size,
         "target": manifest["asset_target"],
         "stdio_initialize_verified": True,
         "provisioned_at": f"candidate-proof:{manifest['source']['commit']}",
