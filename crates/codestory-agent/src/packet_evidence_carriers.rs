@@ -427,7 +427,16 @@ pub fn client_request_entrypoint_call_target(display_name: &str) -> bool {
     let tokens = identifier_tokens(display_name);
     if has_token(
         &tokens,
-        &["metrics", "telemetry", "monitoring", "observability"],
+        &[
+            "cache",
+            "database",
+            "db",
+            "hook",
+            "metrics",
+            "telemetry",
+            "monitoring",
+            "observability",
+        ],
     ) {
         return false;
     }
@@ -2330,6 +2339,11 @@ mod tests {
             "Telemetry.prepareRequest",
             "CacheBuilder.build",
             "Telemetry.send",
+            "CacheClient.send",
+            "CacheClient.prepareRequest",
+            "DatabaseClient.send",
+            "HookClient.send",
+            "HookClient.prepareRequest",
         ] {
             assert!(!client_request_entrypoint_call_target(target), "{target}");
         }

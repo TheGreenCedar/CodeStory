@@ -17,6 +17,7 @@ use crate::agent::packet_budget::{
     apply_packet_budget_with_extra_and_obligation_carriers, enforce_packet_output_budget,
     packet_budget_limits,
 };
+use crate::agent::packet_candidate::PacketSearchHit;
 #[cfg(test)]
 use crate::agent::packet_capping::{
     cap_citations, cap_packet_citations_with_obligation_carriers,
@@ -66,7 +67,8 @@ use crate::agent::packet_required_probes::{
 #[cfg(test)]
 use crate::agent::packet_scoring::packet_citation_key;
 use crate::agent::packet_scoring::{
-    normalize_identifier, packet_citation_rank, packet_display_path, sort_by_cached_rank_desc,
+    normalize_identifier, packet_citation_rank, packet_display_path,
+    packet_stage_citation_carry_limit, sort_by_cached_rank_desc,
 };
 use crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context;
 #[cfg(test)]
@@ -92,6 +94,7 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
+use crate::agent::packet_trace::merge_packet_initial_search_hits;
 use crate::agent::path_identity::RuntimeWorkspacePathIdentity;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
@@ -208,6 +211,7 @@ fn should_truncate_phase(
 #[derive(Debug, Clone, Default)]
 struct RetrievalBundle {
     hits: Vec<SearchHit>,
+    packet_hits: Vec<PacketSearchHit>,
     citations: Vec<AgentCitationDto>,
     graphs: Vec<GraphArtifactDto>,
     focus_node_id: Option<codestory_contracts::api::NodeId>,
@@ -228,6 +232,13 @@ pub(crate) fn agent_ask(
     controller: &AppController,
     req: AgentAskRequest,
 ) -> Result<AgentAnswerDto, ApiError> {
+    agent_ask_with_packet_hits(controller, req).map(|(answer, _)| answer)
+}
+
+fn agent_ask_with_packet_hits(
+    controller: &AppController,
+    req: AgentAskRequest,
+) -> Result<(AgentAnswerDto, Vec<PacketSearchHit>), ApiError> {
     let prompt = req.prompt.trim().to_string();
     if prompt.is_empty() {
         return Err(ApiError::invalid_argument("Prompt cannot be empty."));
@@ -367,7 +378,8 @@ pub(crate) fn agent_ask(
 
     let summary = summarize_response(&resolved_profile, &bundle);
 
-    Ok(AgentAnswerDto {
+    let packet_hits = std::mem::take(&mut bundle.packet_hits);
+    let answer = AgentAnswerDto {
         source_coverage: Vec::new(),
         answer_id: request_id,
         prompt,
@@ -386,7 +398,8 @@ pub(crate) fn agent_ask(
         retrieval_version: retrieval_version(controller).to_string(),
         graphs: bundle.graphs,
         retrieval_trace: trace_payload,
-    })
+    };
+    Ok((answer, packet_hits))
 }
 
 pub(crate) fn agent_packet(
@@ -425,7 +438,7 @@ pub(crate) fn agent_packet(
     let packet_latency = PacketLatencyBudget::new(req.latency_budget_ms);
     let retrieval_profile = packet_retrieval_profile(Some(plan.task_class), req.budget, &limits);
     let retrieval_prompt = packet_retrieval_prompt(&question, &plan, req.budget);
-    let mut answer = agent_ask(
+    let (mut answer, initial_packet_hits) = agent_ask_with_packet_hits(
         controller,
         AgentAskRequest {
             prompt: question.clone(),
@@ -438,6 +451,29 @@ pub(crate) fn agent_packet(
             hybrid_weights: None,
         },
     )?;
+    let rank_terms = packet_rank_terms(&question);
+    if !initial_packet_hits.is_empty() {
+        let flow_requirements =
+            crate::agent::packet_flow_requirements::packet_flow_requirements_for_terms(
+                &packet_probe_terms(&question),
+                plan.task_class,
+            );
+        let selected = merge_packet_initial_search_hits(
+            &mut answer,
+            &initial_packet_hits,
+            req.include_evidence,
+            &rank_terms,
+            packet_stage_citation_carry_limit(&limits),
+            &flow_requirements,
+        );
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(format!(
+                "packet_initial_search_provenance hits={} selected={selected}",
+                initial_packet_hits.len()
+            )));
+    }
     if !exact_probe_citations.is_empty() {
         answer
             .retrieval_trace
@@ -464,7 +500,6 @@ pub(crate) fn agent_packet(
                 retrieval_prompt.len().saturating_sub(question.len())
             )));
     }
-    let rank_terms = packet_rank_terms(&question);
     run_packet_planned_subqueries(
         controller,
         &question,
@@ -3680,6 +3715,26 @@ fn cap_graph_artifacts(
     }
 }
 
+fn retain_packet_hits_for_final_hits(
+    packet_hits: Vec<PacketSearchHit>,
+    final_hits: &[SearchHit],
+) -> Vec<PacketSearchHit> {
+    let retained_identities = final_hits
+        .iter()
+        .map(|hit| (hit.node_id.clone(), hit.file_path.clone(), hit.line))
+        .collect::<HashSet<_>>();
+    packet_hits
+        .into_iter()
+        .filter(|packet_hit| {
+            retained_identities.contains(&(
+                packet_hit.hit.node_id.clone(),
+                packet_hit.hit.file_path.clone(),
+                packet_hit.hit.line,
+            ))
+        })
+        .collect()
+}
+
 fn execute_retrieval(
     controller: &AppController,
     req: &AgentAskRequest,
@@ -3697,10 +3752,11 @@ fn execute_retrieval(
         .unwrap_or(DEFAULT_MAX_RESULTS)
         .clamp(1, resolved_profile.max_search_results) as usize;
 
-    let (mut scored_hits, hits) =
+    let (mut scored_hits, hits, initial_packet_hits) =
         match try_sidecar_primary_search(controller, prompt, max_results, req.latency_budget_ms) {
             Some(SidecarPrimarySearchOutcome::Served {
                 hits,
+                packet_hits,
                 scored_hits,
                 shadow,
             }) => {
@@ -3761,7 +3817,7 @@ fn execute_retrieval(
                     hybrid_rerank_step,
                     vec![field("ranked", hits.len().to_string())],
                 );
-                (scored_hits, hits)
+                (scored_hits, hits, packet_hits)
             }
             Some(SidecarPrimarySearchOutcome::Rejected { shadow, reason }) => {
                 trace.set_retrieval_shadow(shadow);
@@ -4186,6 +4242,7 @@ fn execute_retrieval(
         .collect::<Vec<_>>();
 
     bundle.hits = hits;
+    bundle.packet_hits = retain_packet_hits_for_final_hits(initial_packet_hits, &bundle.hits);
     bundle.citations = citations;
     bundle.focus_node_id = focus_node_id;
     bundle.focused_node = focused_node;
@@ -5232,6 +5289,30 @@ mod tests {
             provenance: Vec::new(),
         });
         hit
+    }
+
+    #[test]
+    fn packet_only_primary_hits_follow_exact_final_search_identity() {
+        let mut retained = test_search_hit("session-request", 0.9);
+        retained.file_path = Some("src/requests/sessions.py".into());
+        retained.line = Some(557);
+        let mut stale_location = retained.clone();
+        stale_location.line = Some(558);
+        let mut discarded = test_search_hit("telemetry-request", 0.8);
+        discarded.file_path = Some("src/telemetry.py".into());
+        discarded.line = Some(10);
+
+        let packet_hits = vec![
+            PacketSearchHit::without_graph(retained.clone()),
+            PacketSearchHit::without_graph(stale_location),
+            PacketSearchHit::without_graph(discarded),
+        ];
+        let kept = retain_packet_hits_for_final_hits(packet_hits, &[retained.clone()]);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].hit.node_id, retained.node_id);
+        assert_eq!(kept[0].hit.file_path, retained.file_path);
+        assert_eq!(kept[0].hit.line, retained.line);
     }
 
     fn test_packet_citation(display_name: &str, file_path: &str, score: f32) -> AgentCitationDto {

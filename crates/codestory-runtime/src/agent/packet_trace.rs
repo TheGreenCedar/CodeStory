@@ -14,6 +14,78 @@ use codestory_contracts::api::{
 };
 use std::collections::{HashMap, HashSet};
 
+pub(crate) fn merge_packet_initial_search_hits(
+    answer: &mut AgentAnswerDto,
+    hits: &[PacketSearchHit],
+    include_evidence: bool,
+    rank_terms: &[String],
+    stage_carry_limit: usize,
+    flow_requirements: &[FlowRequirement],
+) -> usize {
+    merge_packet_search_hits(
+        answer,
+        hits,
+        include_evidence,
+        rank_terms,
+        stage_carry_limit,
+        flow_requirements,
+    )
+}
+
+fn merge_packet_search_hits(
+    answer: &mut AgentAnswerDto,
+    hits: &[PacketSearchHit],
+    include_evidence: bool,
+    rank_terms: &[String],
+    stage_carry_limit: usize,
+    flow_requirements: &[FlowRequirement],
+) -> usize {
+    let mut citation_indices = answer
+        .citations
+        .iter()
+        .enumerate()
+        .map(|(index, citation)| (packet_citation_key(citation), index))
+        .collect::<HashMap<_, _>>();
+    let mut candidates = hits
+        .iter()
+        .map(|hit| {
+            (
+                hit.citation_for_requirements(include_evidence, flow_requirements),
+                hit,
+            )
+        })
+        .collect::<Vec<_>>();
+    sort_by_cached_rank_desc(&mut candidates, |(citation, _)| {
+        packet_citation_rank(citation, rank_terms, true)
+    });
+    let selected =
+        select_packet_candidate_indices(&candidates, flow_requirements, stage_carry_limit);
+    for candidate_index in &selected {
+        let (citation, hit) = &candidates[*candidate_index];
+        if include_evidence {
+            merge_packet_candidate_graph_for_requirements(answer, hit, flow_requirements);
+        }
+        let key = packet_citation_key(citation);
+        if let Some(existing_index) = citation_indices.get(&key).copied() {
+            let proof_edge_ids = if include_evidence {
+                hit.proof_edge_ids_for_requirements(citation, flow_requirements)
+            } else {
+                Vec::new()
+            };
+            merge_packet_citation_provenance(
+                &mut answer.citations[existing_index],
+                citation,
+                &proof_edge_ids,
+            );
+        } else {
+            let citation_index = answer.citations.len();
+            citation_indices.insert(key, citation_index);
+            answer.citations.push(citation.clone());
+        }
+    }
+    selected.len()
+}
+
 fn sanitize_section_id(value: &str) -> String {
     let mut id = value
         .chars()
@@ -42,13 +114,6 @@ pub(crate) fn merge_packet_fused_subquery_batch(
     stage_carry_limit: usize,
     flow_requirements: &[FlowRequirement],
 ) {
-    let mut citation_indices = answer
-        .citations
-        .iter()
-        .enumerate()
-        .map(|(index, citation)| (packet_citation_key(citation), index))
-        .collect::<HashMap<_, _>>();
-
     for (diagnostic_index, ((plan_index, query), (result_query, hits))) in
         pending.iter().zip(results.iter()).enumerate()
     {
@@ -56,42 +121,16 @@ pub(crate) fn merge_packet_fused_subquery_batch(
         let diagnostic = packet_query_diagnostic(diagnostics, diagnostic_index, result_query);
         let step_duration = packet_query_duration_ms(diagnostic)
             .unwrap_or(duration_ms / pending.len().max(1) as u32);
-        let mut added = 0usize;
-        let mut candidates = hits
-            .iter()
-            .map(|hit| {
-                (
-                    hit.citation_for_requirements(include_evidence, flow_requirements),
-                    hit,
-                )
-            })
-            .collect::<Vec<_>>();
-        sort_by_cached_rank_desc(&mut candidates, |(citation, _)| {
-            packet_citation_rank(citation, rank_terms, true)
-        });
-        let selected =
-            select_packet_candidate_indices(&candidates, flow_requirements, stage_carry_limit);
-        for candidate_index in selected {
-            let (citation, hit) = &candidates[candidate_index];
-            if include_evidence {
-                merge_packet_candidate_graph_for_requirements(answer, hit, flow_requirements);
-            }
-            let key = packet_citation_key(citation);
-            if let Some(existing_index) = citation_indices.get(&key).copied() {
-                let proof_edge_ids =
-                    hit.proof_edge_ids_for_requirements(citation, flow_requirements);
-                merge_packet_citation_provenance(
-                    &mut answer.citations[existing_index],
-                    citation,
-                    &proof_edge_ids,
-                );
-            } else {
-                let citation_index = answer.citations.len();
-                citation_indices.insert(key, citation_index);
-                answer.citations.push(citation.clone());
-                added = added.saturating_add(1);
-            }
-        }
+        let before = answer.citations.len();
+        merge_packet_search_hits(
+            answer,
+            hits,
+            include_evidence,
+            rank_terms,
+            stage_carry_limit,
+            flow_requirements,
+        );
+        let added = answer.citations.len().saturating_sub(before);
         let mut output = vec![
             field("hits", hits.len().to_string()),
             field("citations_added", added.to_string()),
@@ -324,15 +363,21 @@ fn packet_query_timing_annotation(diagnostic: Option<&PacketSidecarQueryDiagnost
 #[cfg(test)]
 mod golden_tests {
     use super::*;
+    use crate::agent::packet_budget::{
+        apply_packet_budget_with_extra_and_obligation_carriers, cap_packet_graph_edges_for_test,
+        packet_budget_limits,
+    };
     use crate::agent::packet_candidate::{PacketGraphDirection, PacketGraphEdgeProvenance};
     use codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms;
     use codestory_agent::packet_obligations::{
-        build_packet_obligation_plan, finalize_packet_obligation_plan,
+        build_packet_obligation_plan, capture_packet_obligation_edge_proofs_before_budget,
+        finalize_packet_obligation_plan, install_retained_packet_obligation_edge_proofs,
+        protected_packet_obligation_carrier_node_ids, protected_packet_obligation_edge_ids,
     };
     use codestory_agent::packet_terms::packet_probe_terms;
     use codestory_contracts::api::{
-        AgentAnswerDto, AgentRetrievalTraceDto, EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto,
-        GraphResponse, NodeId, NodeKind, PacketBudgetDto, PacketBudgetLimitsDto,
+        AgentAnswerDto, AgentRetrievalTraceDto, EdgeId, EdgeKind, GraphArtifactDto, GraphEdgeDto,
+        GraphNodeDto, GraphResponse, NodeId, NodeKind, PacketBudgetDto, PacketBudgetLimitsDto,
         PacketBudgetModeDto, PacketBudgetUsageDto, PacketEvidenceResolutionDto,
         PacketEvidenceTierDto, PacketObligationProofStatusDto, PacketPlanQueryDto,
         PacketTaskClassDto, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
@@ -568,6 +613,108 @@ mod golden_tests {
             verification_targets: Vec::new(),
             score_breakdown: None,
         })
+    }
+
+    fn requests_session_request_hit() -> PacketSearchHit {
+        let session_request = NodeId("5296498989960597280".into());
+        let prepare_request = NodeId("9192115447235681128".into());
+        let mut hit = PacketSearchHit {
+            hit: SearchHit {
+                node_id: session_request.clone(),
+                display_name: "Session.request".into(),
+                kind: NodeKind::METHOD,
+                file_path: Some("src/requests/sessions.py".into()),
+                line: Some(557),
+                score: 0.22,
+                origin: SearchHitOrigin::IndexedSymbol,
+                target: None,
+                resolvable: true,
+                match_quality: None,
+                evidence_tier: Some(PacketEvidenceTierDto::DenseSemantic),
+                evidence_producer: Some("dense_anchor".into()),
+                resolution_status: Some(PacketEvidenceResolutionDto::Resolved),
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: Some(false),
+                source_excerpt: None,
+                verification_targets: Vec::new(),
+                score_breakdown: None,
+            },
+            graph_provenance: vec![
+                PacketGraphEdgeProvenance {
+                    edge_id: EdgeId("-6363172310279055617".into()),
+                    direction: PacketGraphDirection::Outgoing,
+                    hop: 1,
+                    producers: vec!["core_incident_call".into()],
+                    certainty: Some("certain".into()),
+                },
+                PacketGraphEdgeProvenance {
+                    edge_id: EdgeId("2489411124501892282".into()),
+                    direction: PacketGraphDirection::Outgoing,
+                    hop: 1,
+                    producers: vec!["core_incident_call".into()],
+                    certainty: Some("certain".into()),
+                },
+            ],
+            graph: Some(GraphResponse {
+                center_id: session_request.clone(),
+                nodes: vec![
+                    GraphNodeDto {
+                        id: session_request.clone(),
+                        label: "Session.request".into(),
+                        kind: NodeKind::METHOD,
+                        depth: 0,
+                        label_policy: None,
+                        badge_visible_members: None,
+                        badge_total_members: None,
+                        merged_symbol_examples: Vec::new(),
+                        file_path: Some("src/requests/sessions.py".into()),
+                        qualified_name: Some("Session.request".into()),
+                        member_access: None,
+                    },
+                    GraphNodeDto {
+                        id: prepare_request.clone(),
+                        label: "Session.prepare_request".into(),
+                        kind: NodeKind::METHOD,
+                        depth: 1,
+                        label_policy: None,
+                        badge_visible_members: None,
+                        badge_total_members: None,
+                        merged_symbol_examples: Vec::new(),
+                        file_path: Some("src/requests/sessions.py".into()),
+                        qualified_name: Some("Session.prepare_request".into()),
+                        member_access: None,
+                    },
+                ],
+                edges: vec![
+                    GraphEdgeDto {
+                        id: EdgeId("-6363172310279055617".into()),
+                        source: session_request.clone(),
+                        target: session_request.clone(),
+                        kind: EdgeKind::CALL,
+                        confidence: Some(0.95),
+                        certainty: Some("certain".into()),
+                        callsite_identity: None,
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: EdgeId("2489411124501892282".into()),
+                        source: session_request,
+                        target: prepare_request,
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".into()),
+                        callsite_identity: None,
+                        candidate_targets: Vec::new(),
+                    },
+                ],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            }),
+        };
+        mark_dense_only(&mut hit);
+        hit
     }
 
     #[test]
@@ -825,6 +972,227 @@ mod golden_tests {
             codestory_contracts::api::GraphArtifactDto::Uml { graph, .. }
                 if graph.edges.iter().any(|edge| edge.id.0 == "request-to-send")
         )));
+    }
+
+    #[test]
+    fn initial_session_request_hit_keeps_lawful_receipt_and_duplicate_merge_is_idempotent() {
+        let prompt = "Trace how a top-level request call becomes a prepared request and sends it through a session adapter.";
+        let terms = packet_probe_terms(prompt);
+        let task_class = PacketTaskClassDto::ArchitectureExplanation;
+        let requirements = packet_flow_requirements_for_terms(&terms, task_class);
+        let entrypoint = requirements
+            .iter()
+            .find(|requirement| requirement.id == "request_entrypoint")
+            .expect("client request entrypoint requirement");
+        let hit = requests_session_request_hit();
+        let plain_initial_citation = hit.citation_for_requirements(false, &requirements);
+        assert!(plain_initial_citation.evidence_edge_ids.is_empty());
+
+        let mut evidence_disabled = empty_answer(prompt);
+        evidence_disabled
+            .citations
+            .push(plain_initial_citation.clone());
+        merge_packet_initial_search_hits(
+            &mut evidence_disabled,
+            std::slice::from_ref(&hit),
+            false,
+            &terms,
+            8,
+            &requirements,
+        );
+        assert!(evidence_disabled.citations[0].evidence_edge_ids.is_empty());
+        assert!(evidence_disabled.graphs.is_empty());
+
+        let mut answer = empty_answer(prompt);
+        answer.citations.push(plain_initial_citation);
+        let mut primary_hits = (0..20)
+            .map(|index| dense_distractor(&format!("primary-{index}")))
+            .collect::<Vec<_>>();
+        primary_hits.push(hit.clone());
+        let selected = merge_packet_initial_search_hits(
+            &mut answer,
+            &primary_hits,
+            true,
+            &terms,
+            8,
+            &requirements,
+        );
+        assert_eq!(selected, 8);
+
+        let session_citations = answer
+            .citations
+            .iter()
+            .filter(|citation| citation.node_id == hit.hit.node_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            session_citations.len(),
+            1,
+            "initial citation enriches in place"
+        );
+        let session_citation = session_citations[0];
+        assert_eq!(
+            session_citation.evidence_edge_ids,
+            [EdgeId("2489411124501892282".into())],
+            "the lawful prepare receipt must beat the resolved false self-loop"
+        );
+        assert_eq!(
+            session_citation.evidence_tier,
+            Some(PacketEvidenceTierDto::ResolvedGraph)
+        );
+        assert_eq!(
+            session_citation.evidence_producer.as_deref(),
+            Some("core_incident_call")
+        );
+        assert_eq!(session_citation.eligible_for_sufficiency, Some(true));
+        assert!(hit.has_proof_call_provenance_for_requirement(session_citation, entrypoint));
+        assert!(answer.graphs.iter().any(|artifact| matches!(
+            artifact,
+            codestory_contracts::api::GraphArtifactDto::Uml { graph, .. }
+                if graph.center_id == hit.hit.node_id
+                    && graph.edges.iter().any(|edge| edge.id.0 == "2489411124501892282")
+        )));
+
+        let query = PacketPlanQueryDto {
+            query: "request entrypoint".into(),
+            purpose: "client entrypoint".into(),
+        };
+        let pending = vec![(0usize, &query)];
+        let results = vec![(query.query.clone(), vec![hit])];
+        let citation_count = answer.citations.len();
+        let graph_count = answer.graphs.len();
+        let subgraph_ids = answer.subgraph_ids.clone();
+        for _ in 0..2 {
+            merge_packet_fused_subquery_batch(
+                &mut answer,
+                &pending,
+                &results,
+                1,
+                &[],
+                true,
+                &terms,
+                8,
+                &requirements,
+            );
+            assert_eq!(answer.citations.len(), citation_count);
+            assert_eq!(answer.graphs.len(), graph_count);
+            assert_eq!(answer.subgraph_ids, subgraph_ids);
+            let citation = answer
+                .citations
+                .iter()
+                .find(|citation| citation.node_id.0 == "5296498989960597280")
+                .expect("session request citation");
+            assert_eq!(
+                citation.evidence_edge_ids,
+                [EdgeId("2489411124501892282".into())]
+            );
+            assert_eq!(
+                citation.evidence_tier,
+                Some(PacketEvidenceTierDto::ResolvedGraph)
+            );
+        }
+
+        assert!(cap_packet_graph_edges_for_test(
+            &mut answer,
+            1,
+            &[EdgeId("2489411124501892282".into())],
+        ));
+        let GraphArtifactDto::Uml { id, graph, .. } = &answer.graphs[0] else {
+            panic!("expected candidate selection view");
+        };
+        let immutable_selection_view_id = id.clone();
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].id.0, "2489411124501892282");
+        assert!(graph.truncated);
+        assert_eq!(graph.omitted_edge_count, 1);
+
+        merge_packet_fused_subquery_batch(
+            &mut answer,
+            &pending,
+            &results,
+            1,
+            &[],
+            true,
+            &terms,
+            8,
+            &requirements,
+        );
+        let GraphArtifactDto::Uml { id, graph, .. } = &answer.graphs[0] else {
+            panic!("expected replayed candidate selection view");
+        };
+        assert_eq!(id, &immutable_selection_view_id);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].id.0, "2489411124501892282");
+        assert_eq!(graph.omitted_edge_count, 1);
+
+        answer.citations.extend((0..20).map(|index| {
+            let mut distractor = dense_distractor(&format!("final-cap-{index}"));
+            distractor.hit.score = 20.0 - index as f32 / 100.0;
+            distractor.citation(false)
+        }));
+        let mut obligation_plan = build_packet_obligation_plan(prompt, task_class, &[query]);
+        let snapshot = capture_packet_obligation_edge_proofs_before_budget(
+            prompt,
+            task_class,
+            &obligation_plan,
+            &answer,
+        );
+        assert_eq!(
+            protected_packet_obligation_carrier_node_ids(&snapshot),
+            [NodeId("5296498989960597280".into())]
+        );
+        assert_eq!(
+            protected_packet_obligation_edge_ids(&snapshot),
+            [EdgeId("2489411124501892282".into())]
+        );
+        let temp = tempfile::tempdir().expect("packet budget root");
+        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
+        let budget = apply_packet_budget_with_extra_and_obligation_carriers(
+            temp.path(),
+            prompt,
+            task_class,
+            PacketBudgetModeDto::Compact,
+            limits.clone(),
+            &mut answer,
+            &[],
+            protected_packet_obligation_carrier_node_ids(&snapshot),
+            protected_packet_obligation_edge_ids(&snapshot),
+        );
+        assert!(
+            budget.truncated,
+            "compact citation cap must run in this fixture"
+        );
+        assert!(
+            answer
+                .citations
+                .iter()
+                .any(|citation| citation.node_id.0 == "5296498989960597280")
+        );
+        assert!(answer.graphs.iter().any(|artifact| matches!(
+            artifact,
+            GraphArtifactDto::Uml { graph, .. }
+                if graph.edges.iter().any(|edge| edge.id.0 == "2489411124501892282")
+        )));
+        install_retained_packet_obligation_edge_proofs(
+            &mut obligation_plan,
+            &answer,
+            &budget,
+            &snapshot,
+            limits.max_anchors as usize,
+        );
+        finalize_packet_obligation_plan(prompt, task_class, &mut obligation_plan, &answer, &budget);
+        let obligation = obligation_plan
+            .claim_obligations
+            .iter()
+            .find(|obligation| obligation.id == "request_entrypoint")
+            .expect("request entrypoint obligation");
+        assert_eq!(
+            obligation.proof_status,
+            PacketObligationProofStatusDto::Proven
+        );
+        assert!(obligation.carrier_edge_proofs.iter().any(|proof| {
+            proof.edge_id == EdgeId("2489411124501892282".into())
+                && proof.carrier_node_id == NodeId("5296498989960597280".into())
+        }));
     }
 
     #[test]

@@ -808,6 +808,7 @@ pub(crate) enum SidecarPrimarySearchOutcome {
     },
     Served {
         hits: Vec<SearchHit>,
+        packet_hits: Vec<PacketSearchHit>,
         scored_hits: Vec<HybridSearchScoredHit>,
         shadow: RetrievalShadowDto,
     },
@@ -894,9 +895,12 @@ fn sidecar_primary_search_outcome_from_resolution(
         .cloned()
         .map(HybridSearchScoredHit::from_search_hit)
         .collect();
+    let packet_hits = resolution.packet_hits;
+    debug_assert_eq!(packet_hits.len(), hits.len());
 
     SidecarPrimarySearchOutcome::Served {
         hits,
+        packet_hits,
         scored_hits,
         shadow,
     }
@@ -5463,8 +5467,15 @@ mod tests {
             sidecar_primary_search_outcome_from_query_result(&controller, query_result, 5);
 
         match outcome {
-            SidecarPrimarySearchOutcome::Served { hits, shadow, .. } => {
+            SidecarPrimarySearchOutcome::Served {
+                hits,
+                packet_hits,
+                shadow,
+                ..
+            } => {
                 assert_eq!(hits.len(), 1);
+                assert_eq!(packet_hits.len(), 1);
+                assert_eq!(packet_hits[0].hit.node_id, hits[0].node_id);
                 assert_eq!(shadow.cancel_reason.as_deref(), Some("stage_deadline"));
                 assert_eq!(shadow.resolved_hit_count, 1);
             }

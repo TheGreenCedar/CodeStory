@@ -279,6 +279,7 @@ pub fn ordinary_incident_call_receipt_is_valid(
 ) -> bool {
     edge.kind == EdgeKind::CALL
         && (edge.source == citation.node_id || edge.target == citation.node_id)
+        && edge.source != edge.target
         && neighbor_kind != NodeKind::UNKNOWN
         && match edge.certainty.as_deref() {
             Some(certainty) => certainty.eq_ignore_ascii_case("certain"),
@@ -293,7 +294,7 @@ pub fn flow_requirement_call_receipt_is_valid(
     neighbor_label: &str,
     neighbor_kind: NodeKind,
 ) -> bool {
-    if edge.kind != EdgeKind::CALL {
+    if edge.kind != EdgeKind::CALL || edge.source == edge.target {
         return false;
     }
     let target_predicate = if let Some((incoming_source, outgoing_target)) =
@@ -1387,7 +1388,7 @@ mod tests {
     use super::*;
     use crate::packet_evidence_carriers::carrier_taxonomy_vocabulary;
     use crate::packet_terms::packet_probe_terms;
-    use codestory_contracts::api::{NodeId, NodeKind, SearchHitOrigin};
+    use codestory_contracts::api::{EdgeId, NodeId, NodeKind, SearchHitOrigin};
     use std::collections::BTreeMap;
 
     fn client_requirement_ids(prompt: &str) -> Vec<&'static str> {
@@ -2366,6 +2367,83 @@ mod tests {
                 .ordered_call_boundary(&ordered_hybrid)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn request_entrypoint_receipts_reject_self_loops_and_storage_clients() {
+        let requirement = CLIENT_REQUEST_DISPATCH_FLOW[0];
+        let carrier = witness(
+            "Session.request",
+            "src/requests/sessions.py",
+            NodeKind::METHOD,
+        );
+        let receipt = |id: &str, source: NodeId, target: NodeId| GraphEdgeDto {
+            id: EdgeId(id.to_string()),
+            source,
+            target,
+            kind: EdgeKind::CALL,
+            confidence: Some(1.0),
+            certainty: Some("certain".to_string()),
+            callsite_identity: Some("src/requests/sessions.py:1".to_string()),
+            candidate_targets: Vec::new(),
+        };
+
+        for target in [
+            "Session.prepare_request",
+            "PreparedRequest.build",
+            "Session.send",
+            "Client.send",
+        ] {
+            let lawful = receipt(target, carrier.node_id.clone(), NodeId(target.to_string()));
+            assert!(
+                flow_requirement_call_receipt_is_valid(
+                    &requirement,
+                    &carrier,
+                    &lawful,
+                    target,
+                    NodeKind::METHOD,
+                ),
+                "{target}"
+            );
+        }
+
+        for target in [
+            "CacheClient.send",
+            "CacheClient.prepareRequest",
+            "DatabaseClient.send",
+            "HookClient.send",
+            "HookClient.prepareRequest",
+        ] {
+            let unlawful = receipt(target, carrier.node_id.clone(), NodeId(target.to_string()));
+            assert!(
+                !flow_requirement_call_receipt_is_valid(
+                    &requirement,
+                    &carrier,
+                    &unlawful,
+                    target,
+                    NodeKind::METHOD,
+                ),
+                "{target}"
+            );
+        }
+
+        let self_loop = receipt(
+            "self-loop",
+            carrier.node_id.clone(),
+            carrier.node_id.clone(),
+        );
+        assert!(!flow_requirement_call_receipt_is_valid(
+            &requirement,
+            &carrier,
+            &self_loop,
+            "PreparedRequest.build",
+            NodeKind::METHOD,
+        ));
+        assert!(!ordinary_incident_call_receipt_is_valid(
+            &carrier,
+            &self_loop,
+            NodeKind::METHOD,
+        ));
     }
 
     #[test]
