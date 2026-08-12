@@ -1,11 +1,15 @@
 //! Versioned packet obligations planned before retrieval and finalized from carried evidence.
 
 use super::packet_evidence::citation_sufficiency_eligible;
+use super::packet_evidence_carriers::{
+    citation_owns_server_request_dispatch, citation_owns_server_request_entrypoint,
+    citation_owns_server_response_terminal,
+};
 use super::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 use super::packet_flow_requirements::{
     CoverageMode, EvidencePredicate, FlowRequirement, FlowRole,
     flow_requirement_call_receipt_is_valid, ordinary_incident_call_receipt_is_valid,
-    packet_flow_requirements_for_terms,
+    packet_flow_requirements_for_terms, server_flow_requirement_for_obligation_id,
 };
 use super::packet_required_probes::{
     packet_prompt_exact_symbol_probe_queries, packet_sufficiency_required_probe_queries_from_terms,
@@ -2068,7 +2072,7 @@ fn append_packet_obligation_receipt_claims(
             && obligation.proof_status == PacketObligationProofStatusDto::Proven
             && has_carried_citation;
         claims.push(PacketClaimDto {
-            claim: packet_obligation_receipt_text(obligation, &citations),
+            claim: packet_obligation_receipt_text(answer, obligation, &citations),
             required_obligation_ids: vec![obligation.id.clone()],
             required_obligation_kinds: vec![obligation.kind],
             proof_status: Some(status),
@@ -2097,10 +2101,14 @@ fn packet_obligation_receipt_proof_status(
 }
 
 fn packet_obligation_receipt_text(
+    answer: &AgentAnswerDto,
     obligation: &PacketClaimObligationDto,
     citations: &[AgentCitationDto],
 ) -> String {
     if obligation.proof_status == PacketObligationProofStatusDto::Proven && !citations.is_empty() {
+        if let Some(receipt) = proven_server_flow_receipt_text(answer, obligation, citations) {
+            return receipt;
+        }
         let anchors = citations
             .iter()
             .map(|citation| format!("`{}`", citation.display_name))
@@ -2129,6 +2137,129 @@ fn packet_obligation_receipt_text(
         "Material obligation `{}` is `{status}`: `{reason}`.",
         obligation.id
     )
+}
+
+fn proven_server_flow_receipt_text(
+    answer: &AgentAnswerDto,
+    obligation: &PacketClaimObligationDto,
+    citations: &[AgentCitationDto],
+) -> Option<String> {
+    let requirement = server_semantic_requirement(obligation)?;
+    obligation.carrier_edge_proofs.iter().find_map(|proof| {
+        if proof.edge_kind != EdgeKind::CALL {
+            return None;
+        }
+        let citation = citations.iter().find(|citation| {
+            citation.node_id == proof.carrier_node_id
+                && citation.evidence_edge_ids.contains(&proof.edge_id)
+                && server_semantic_carrier_matches(&obligation.id, citation)
+        })?;
+        packet_execution_graphs(answer).iter().find_map(|graph| {
+            let edge = graph.edges.iter().find(|edge| edge.id == proof.edge_id)?;
+            let (target_label, target_kind) = receipt_neighbor(graph, answer, citation, edge)?;
+            if !flow_requirement_call_receipt_is_valid(
+                &requirement,
+                citation,
+                edge,
+                target_label,
+                target_kind,
+            ) {
+                return None;
+            }
+            let target = server_receipt_target(edge, target_label, target_kind);
+            server_semantic_receipt(&obligation.id, &citation.display_name, &target)
+        })
+    })
+}
+
+fn server_semantic_requirement(obligation: &PacketClaimObligationDto) -> Option<FlowRequirement> {
+    let requirement = server_flow_requirement_for_obligation_id(&obligation.id)?;
+    // Server and client flows deliberately share stable obligation IDs. Kind plus the planned
+    // server query seeds preserve which requirement produced this row without consulting prompt
+    // prose or letting a coincidentally server-shaped client citation mint server semantics.
+    (obligation.kind == claim_obligation_kind(requirement.role)
+        && requirement.query_seeds.iter().all(|seed| {
+            obligation
+                .open_next_candidates
+                .iter()
+                .any(|candidate| candidate == seed)
+        }))
+    .then_some(requirement)
+}
+
+fn server_semantic_carrier_matches(obligation_id: &str, citation: &AgentCitationDto) -> bool {
+    match obligation_id {
+        "request_entrypoint" => citation_owns_server_request_entrypoint(citation),
+        "request_dispatch" => citation_owns_server_request_dispatch(citation),
+        "request_terminal" => citation_owns_server_response_terminal(citation),
+        _ => false,
+    }
+}
+
+fn server_receipt_target(edge: &GraphEdgeDto, target_label: &str, target_kind: NodeKind) -> String {
+    if target_kind != NodeKind::UNKNOWN {
+        return target_label.to_string();
+    }
+    let leaf = target_label
+        .rsplit(['.', ':', '#'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(target_label);
+    edge.callsite_identity
+        .as_deref()
+        .and_then(|identity| {
+            identity.split('|').find_map(|segment| {
+                segment
+                    .strip_prefix("receiver-owner:")
+                    .map(str::trim)
+                    .filter(|owner| !owner.is_empty())
+            })
+        })
+        .map_or_else(
+            || target_label.to_string(),
+            |owner| format!("{owner}.{leaf}"),
+        )
+}
+
+fn server_semantic_receipt(obligation_id: &str, carrier: &str, target: &str) -> Option<String> {
+    let receipt_action = |display: &str| {
+        normalize_identifier(
+            display
+                .rsplit(['.', ':', '#'])
+                .find(|segment| !segment.is_empty())
+                .unwrap_or(display),
+        )
+    };
+    let carrier_action = receipt_action(carrier);
+    let target_action = receipt_action(target);
+    match obligation_id {
+        "request_entrypoint" => match carrier_action.as_str() {
+            "use" => Some(format!(
+                "`{carrier}` registers middleware through the retained `{target}` call on the router."
+            )),
+            "route" | "routes" => Some(format!(
+                "`{carrier}` registers routes through the retained `{target}` call on the router."
+            )),
+            "listen" => Some(format!(
+                "`{carrier}` starts the server listener through the retained `{target}` call."
+            )),
+            _ => Some(format!(
+                "`{carrier}` registers the server request surface through the retained `{target}` call."
+            )),
+        },
+        "request_dispatch" => Some(format!(
+            "`{carrier}` delegates request handling through the retained `{target}` call."
+        )),
+        "request_terminal" if matches!(target_action.as_str(), "end" | "finish") => Some(format!(
+            "`{carrier}` sends output through the retained `{target}` call, completing the response body."
+        )),
+        "request_terminal" if target_action == "write" => Some(format!(
+            "`{carrier}` writes response output through the retained `{target}` call."
+        )),
+        "request_terminal" if target_action == "flush" => Some(format!(
+            "`{carrier}` flushes response output through the retained `{target}` call."
+        )),
+        _ => None,
+    }
 }
 
 pub fn material_packet_obligations_are_proven(plan: &PacketObligationPlanDto) -> bool {
@@ -2684,6 +2815,57 @@ mod tests {
         answer
     }
 
+    fn raw_server_receipt_answer(
+        carrier_name: &str,
+        target_label: &str,
+        receiver_owner: &str,
+        edge_id: &str,
+    ) -> AgentAnswerDto {
+        let mut carrier = citation(carrier_name, "lib/server.js", NodeKind::METHOD);
+        carrier.evidence_edge_ids = vec![EdgeId(edge_id.to_string())];
+        let target_id = NodeId(format!("{edge_id}-target"));
+        let mut answer = answer(vec![carrier.clone()]);
+        answer.prompt =
+            "Trace how a server routes an incoming request through a handler and sends the response."
+                .to_string();
+        answer.graphs.push(GraphArtifactDto::Uml {
+            id: format!("{edge_id}-graph"),
+            title: "Server flow".to_string(),
+            graph: GraphResponse {
+                center_id: carrier.node_id.clone(),
+                nodes: vec![GraphNodeDto {
+                    id: target_id.clone(),
+                    label: target_label.to_string(),
+                    kind: NodeKind::UNKNOWN,
+                    depth: 1,
+                    label_policy: None,
+                    badge_visible_members: None,
+                    badge_total_members: None,
+                    merged_symbol_examples: Vec::new(),
+                    file_path: Some("lib/server.js".to_string()),
+                    qualified_name: None,
+                    member_access: None,
+                }],
+                edges: vec![GraphEdgeDto {
+                    id: EdgeId(edge_id.to_string()),
+                    source: carrier.node_id,
+                    target: target_id,
+                    kind: EdgeKind::CALL,
+                    confidence: None,
+                    certainty: None,
+                    callsite_identity: Some(format!(
+                        "lib/server.js:1|syntax:js-member-call|receiver-owner:{receiver_owner}"
+                    )),
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        });
+        answer
+    }
+
     fn finalize_server_dispatch_answer(
         answer: &AgentAnswerDto,
     ) -> (
@@ -2718,6 +2900,28 @@ mod tests {
             protected_packet_obligation_carrier_node_ids(&snapshot).to_vec(),
             protected_packet_obligation_edge_ids(&snapshot).to_vec(),
         )
+    }
+
+    fn finalized_server_receipt_claim(
+        answer: &AgentAnswerDto,
+        obligation_id: &str,
+    ) -> (PacketObligationPlanDto, PacketClaimDto) {
+        let mut plan =
+            build_packet_obligation_plan(&answer.prompt, PacketTaskClassDto::RouteTracing, &[]);
+        plan.claim_obligations
+            .retain(|obligation| obligation.id == obligation_id);
+        assert_eq!(plan.claim_obligations.len(), 1, "missing {obligation_id}");
+        plan.query_obligations.clear();
+        finalize_packet_obligation_plan(
+            &answer.prompt,
+            PacketTaskClassDto::RouteTracing,
+            &mut plan,
+            answer,
+            &budget(),
+        );
+        let claims = packet_claims_with_obligation_receipts(answer, &plan, (Vec::new(), ()));
+        assert_eq!(claims.len(), 1);
+        (plan, claims.into_iter().next().expect("receipt claim"))
     }
 
     fn indexing_entrypoint_plan() -> PacketObligationPlanDto {
@@ -5120,6 +5324,170 @@ mod tests {
                 "{label}: prebudget edge reservation diverged"
             );
         }
+    }
+
+    #[test]
+    fn server_receipt_prose_comes_only_from_its_exact_retained_call() {
+        let answer = raw_server_receipt_answer("res.send", "end", "res", "z-terminal");
+        let (plan, claim) = finalized_server_receipt_claim(&answer, "request_terminal");
+        assert_eq!(
+            plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Proven
+        );
+        assert_eq!(
+            claim.claim,
+            "`res.send` sends output through the retained `res.end` call, completing the response body."
+        );
+
+        for (label, mutate) in [
+            (
+                "citation edge removed",
+                Box::new(|changed: &mut AgentAnswerDto| {
+                    changed.citations[0].evidence_edge_ids.clear();
+                }) as Box<dyn Fn(&mut AgentAnswerDto)>,
+            ),
+            (
+                "receiver proof removed",
+                Box::new(|changed: &mut AgentAnswerDto| {
+                    let GraphArtifactDto::Uml { graph, .. } = &mut changed.graphs[0] else {
+                        panic!("expected UML graph");
+                    };
+                    graph.edges[0].callsite_identity =
+                        Some("lib/server.js:1|syntax:js-member-call".to_string());
+                }),
+            ),
+            (
+                "unknown edge gained confidence",
+                Box::new(|changed: &mut AgentAnswerDto| {
+                    let GraphArtifactDto::Uml { graph, .. } = &mut changed.graphs[0] else {
+                        panic!("expected UML graph");
+                    };
+                    graph.edges[0].confidence = Some(1.0);
+                }),
+            ),
+        ] {
+            let mut changed = answer.clone();
+            mutate(&mut changed);
+            let semantic = proven_server_flow_receipt_text(
+                &changed,
+                &plan.claim_obligations[0],
+                &changed.citations,
+            );
+            assert_eq!(semantic, None, "{label}");
+            let (_, changed_claim) = finalized_server_receipt_claim(&changed, "request_terminal");
+            assert!(
+                !changed_claim.claim.contains("completing the response body"),
+                "{label}: {}",
+                changed_claim.claim
+            );
+        }
+
+        let write = raw_server_receipt_answer("res.send", "write", "res", "write-terminal");
+        let (_, write_claim) = finalized_server_receipt_claim(&write, "request_terminal");
+        assert_eq!(
+            write_claim.claim,
+            "`res.send` writes response output through the retained `res.write` call."
+        );
+        assert!(!write_claim.claim.contains("completing"));
+    }
+
+    #[test]
+    fn semantic_server_receipts_skip_earlier_role_only_proofs() {
+        let mut answer =
+            raw_server_receipt_answer("app.handle", "handle", "app.router", "z-dispatch");
+        let role = citation(
+            "RequestDispatcher.execute",
+            "lib/dispatch.js",
+            NodeKind::METHOD,
+        );
+        answer.citations.insert(0, role.clone());
+        let (mut plan, _) = finalized_server_receipt_claim(&answer, "request_dispatch");
+        let obligation = &mut plan.claim_obligations[0];
+        obligation.carrier_node_ids.insert(0, role.node_id.clone());
+        obligation.carrier_edge_proofs.insert(
+            0,
+            PacketObligationCarrierEdgeProofDto {
+                carrier_node_id: role.node_id,
+                edge_id: EdgeId("a-role-proof".to_string()),
+                edge_kind: EdgeKind::CALL,
+            },
+        );
+
+        let receipt = proven_server_flow_receipt_text(&answer, obligation, &answer.citations)
+            .expect("later exact structural proof should produce semantic receipt");
+        assert_eq!(
+            receipt,
+            "`app.handle` delegates request handling through the retained `app.router.handle` call."
+        );
+    }
+
+    #[test]
+    fn semantic_server_receipts_require_server_obligation_provenance() {
+        const CLIENT_QUESTION: &str = "Explain how an HTTP client session accepts a request, dispatches it through the session, selects a transport adapter, and calls the adapter send boundary.";
+        let mut answer =
+            raw_server_receipt_answer("app.listen", "listen", "app.router", "client-overlap");
+        answer.prompt = CLIENT_QUESTION.to_string();
+        let mut plan = build_packet_obligation_plan(
+            CLIENT_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        plan.claim_obligations
+            .retain(|obligation| obligation.id == "request_entrypoint");
+        let obligation = &mut plan.claim_obligations[0];
+        obligation.proof_status = PacketObligationProofStatusDto::Proven;
+        obligation.carrier_node_ids = vec![answer.citations[0].node_id.clone()];
+        obligation.carrier_edge_proofs = vec![PacketObligationCarrierEdgeProofDto {
+            carrier_node_id: answer.citations[0].node_id.clone(),
+            edge_id: answer.citations[0].evidence_edge_ids[0].clone(),
+            edge_kind: EdgeKind::CALL,
+        }];
+
+        assert_eq!(
+            proven_server_flow_receipt_text(&answer, obligation, &answer.citations),
+            None
+        );
+        let receipt = packet_obligation_receipt_text(&answer, obligation, &answer.citations);
+        assert_eq!(
+            receipt,
+            "Material obligation `request_entrypoint` has independently cited carrier evidence at `app.listen`."
+        );
+    }
+
+    #[test]
+    fn semantic_server_receipts_prefer_resolved_targets_and_describe_listeners_truthfully() {
+        let mut dispatch = raw_server_receipt_answer(
+            "app.handle",
+            "Router.handle",
+            "stale.receiver",
+            "resolved-dispatch",
+        );
+        let GraphArtifactDto::Uml { graph, .. } = &mut dispatch.graphs[0] else {
+            panic!("expected UML graph");
+        };
+        graph.nodes[0].kind = NodeKind::METHOD;
+        let (_, dispatch_claim) = finalized_server_receipt_claim(&dispatch, "request_dispatch");
+        assert_eq!(
+            dispatch_claim.claim,
+            "`app.handle` delegates request handling through the retained `Router.handle` call."
+        );
+        assert!(!dispatch_claim.claim.contains("stale.receiver"));
+
+        let mut listener = raw_server_receipt_answer(
+            "app.listen()",
+            "Server.listen",
+            "stale.receiver",
+            "resolved-listen",
+        );
+        let GraphArtifactDto::Uml { graph, .. } = &mut listener.graphs[0] else {
+            panic!("expected UML graph");
+        };
+        graph.nodes[0].kind = NodeKind::METHOD;
+        let (_, listener_claim) = finalized_server_receipt_claim(&listener, "request_entrypoint");
+        assert_eq!(
+            listener_claim.claim,
+            "`app.listen()` starts the server listener through the retained `Server.listen` call."
+        );
     }
 
     #[test]

@@ -38,6 +38,7 @@ import {
   loadTaskForResult,
   loadReleaseEvidenceCorpusContract,
   loadTasks,
+  markdownCostAccounting,
   manifestRepoMaterializationBlockers,
   materializeRepos,
   mergeRetrievalStatusWithEngineDiagnostics,
@@ -3649,6 +3650,59 @@ test("summarizes A/B cost accounting totals and ratios", () => {
   assert.equal(costAccounting.with_vs_without.tool_calls.with_minus_without, -2);
 });
 
+test("renders ineligible comparative wall time without losing other accounting", () => {
+  const costAccounting = summarizeCostAccounting([
+    {
+      arm: "without_codestory",
+      status: "pass",
+      wall_ms: 200,
+      comparative_wall_time_eligible: false,
+      usage: { input_tokens: 80, output_tokens: 20, total_tokens: 100 },
+      tool_calls_observed: 4,
+      transcript_analysis: { command_count: 4, command_categories: {} },
+    },
+    {
+      arm: "with_codestory",
+      status: "pass",
+      wall_ms: 50,
+      comparative_wall_time_eligible: true,
+      usage: { input_tokens: 30, output_tokens: 10, total_tokens: 40 },
+      tool_calls_observed: 1,
+      transcript_analysis: { command_count: 1, command_categories: {} },
+    },
+    {
+      arm: "with_codestory",
+      status: "fail",
+      wall_ms: 5,
+      usage: null,
+      tool_calls_observed: 1,
+      transcript_analysis: { command_count: 1, command_categories: {} },
+    },
+    {
+      arm: "with_codestory",
+      status: "cancelled",
+      wall_ms: 1,
+      usage: null,
+      tool_calls_observed: 0,
+      transcript_analysis: { command_count: 0, command_categories: {} },
+    },
+  ]);
+
+  assert.equal(costAccounting.with_vs_without.runner_wall_ms, null);
+  assert.equal(costAccounting.with_vs_without.all_in_wall_ms, null);
+  const markdown = markdownCostAccounting(costAccounting).join("\n");
+  assert.match(
+    markdown,
+    /\| runner_wall_ms \| ineligible \| ineligible \| ineligible \| ineligible \|/,
+  );
+  assert.match(
+    markdown,
+    /\| all_in_wall_ms \| ineligible \| ineligible \| ineligible \| ineligible \|/,
+  );
+  assert.match(markdown, /\| total_tokens \| 40 \| 100 \| -60 \| 0\.4 \|/);
+  assert.match(markdown, /\| tool_calls \| 2 \| 4 \| -2 \| 0\.5 \|/);
+});
+
 test("parses JSONL transcript text before analysis", () => {
   const jsonl = [
     JSON.stringify(commandEvent("cmd_1", "item.started", "codestory-cli packet --project . --question flow")),
@@ -4162,6 +4216,59 @@ test("packet manifest completion is gated by packet quality evidence", () => {
     }),
     false,
   );
+});
+
+test("packet manifest quality counts exact edge-derived server flow receipts", () => {
+  const task = manifestFixture({
+    id: "server-flow-receipts",
+    task_class: "route_tracing",
+    expected_files: ["lib/express.js", "lib/application.js", "lib/request.js", "lib/response.js"],
+    expected_symbols: ["createApplication", "app.init", "app.handle", "app.use", "app.route", "res.send"],
+    expected_claims: [
+      "createApplication builds a callable app object and mixes in request and response prototypes.",
+      "app.use registers middleware on the router.",
+      "app.handle delegates request handling to the router.",
+      "res.send prepares and sends the response body.",
+    ],
+    quality_thresholds: {
+      min_expected_anchor_recall: 0.62,
+      min_expected_file_recall: 0.6,
+      min_expected_symbol_recall: 0.55,
+      min_expected_claim_recall: 0.65,
+      min_citation_coverage: 0.6,
+      max_forbidden_claims: 0,
+    },
+  });
+  const citations = [
+    ["createApplication", "lib/express.js"],
+    ["app.init", "lib/application.js"],
+    ["app.handle", "lib/application.js"],
+    ["app.use", "lib/application.js"],
+    ["app.route", "lib/application.js"],
+    ["res.send", "lib/response.js"],
+    ["req.header", "lib/request.js"],
+  ].map(([display_name, file_path], index) => ({ display_name, file_path, line: index + 1 }));
+  const packet = {
+    answer: { summary: "Server request flow", sections: [], citations },
+    sufficiency: {
+      covered_claims: [
+        {
+          claim:
+            "`app.use` registers middleware through the retained `app.router.use` call on the router.",
+        },
+        { claim: "`app.handle` delegates request handling through the retained `handle` call boundary." },
+        {
+          claim:
+            "`res.send` sends output through the retained `end` call, completing the response body.",
+        },
+      ],
+    },
+  };
+
+  const quality = packetManifestQualitySummary(packet, task);
+  assert.equal(quality.expected_claim_recall, 0.75);
+  assert.equal(quality.expected_symbol_recall, 1);
+  assert.equal(quality.pass, true);
 });
 
 test("baseline prelude tolerates benign ripgrep missing-path warnings when matches exist", () => {

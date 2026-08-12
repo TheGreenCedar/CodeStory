@@ -7802,6 +7802,10 @@ function markdownCostAccounting(costAccounting) {
       "| --- | ---: | ---: | ---: | ---: |",
     );
     for (const [label, values] of Object.entries(comparison)) {
+      if (values == null) {
+        lines.push(`| ${label} | ineligible | ineligible | ineligible | ineligible |`);
+        continue;
+      }
       lines.push(
         `| ${label} | ${formatValue(values.with_codestory)} | ${formatValue(values.without_codestory)} | ${formatValue(values.with_minus_without)} | ${formatValue(values.ratio)} |`,
       );
@@ -9846,6 +9850,7 @@ export {
   loadTaskForResult,
   loadReleaseEvidenceCorpusContract,
   loadTasks,
+  markdownCostAccounting,
   manifestRepoMaterializationBlockers,
   materializeRepos,
   parseArgs,
