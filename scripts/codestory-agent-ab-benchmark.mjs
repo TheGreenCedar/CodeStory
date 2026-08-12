@@ -533,7 +533,7 @@ async function prepareAgentCodexIsolation(outDir, opts = {}) {
 
   const receipt = {
     contract: "codestory.agent-benchmark-codex-isolation/v2",
-    codestory_surface: "managed_plugin",
+    codestory_surface: "managed_cli_packet_prelude",
     with_codestory_config: "normal_user_config",
     without_codestory_config: "ignore_user_config",
     shared_auth: true,
@@ -3823,13 +3823,16 @@ async function runOne(opts, run, outDir) {
     !packetFirstRequired || Boolean(analysis.packet_was_first_context_command);
   const quality = scoreQuality(analysisEvents, run.task);
   const cacheProvenance = run.arm === "with_codestory"
-    ? await codestoryCacheProvenance(opts, repoConfig, {
-        codestory_index_commands_observed: analysis.codestory_index_commands_observed,
-        indexing_in_timed_run: analysis.codestory_index_commands_observed > 0,
-        cache_prepared: opts.cachePreparationByRepo?.has(run.repo) ?? false,
-        cache_preparation: opts.cachePreparationByRepo?.get(run.repo) ?? null,
-        transport_mode: "agent_runner",
-      })
+    ? await codestoryCacheProvenance(
+        opts,
+        repoConfig,
+        agentPacketPreludeCacheObservations(
+          opts,
+          run.repo,
+          codestoryPrelude?.packet ?? null,
+          analysis,
+        ),
+      )
     : null;
   const benchmarkContract = benchmarkContractForRun(opts, run, env);
 
@@ -4973,6 +4976,24 @@ function packetRuntimeCacheObservations(opts, repoName, transportMode) {
   };
 }
 
+function agentPacketPreludeCacheObservations(opts, repoName, packet, analysis) {
+  const observations = packetRuntimeCacheObservations(
+    opts,
+    repoName,
+    "agent_harness_prelude",
+  );
+  observations.codestory_index_commands_observed =
+    analysis?.codestory_index_commands_observed ?? 0;
+  observations.indexing_in_timed_run =
+    observations.codestory_index_commands_observed > 0;
+  observations.packet_embedding_execution = packetEmbeddingExecutionProof(
+    packet,
+    observations.cache_preparation,
+    observations.transport_mode,
+  );
+  return observations;
+}
+
 function packetEmbeddingExecutionProof(packet, cachePreparation, transportMode) {
   const trace = packet?.answer?.retrieval_trace ?? null;
   const diagnostics = Array.isArray(trace?.packet_sidecar_diagnostics)
@@ -5579,6 +5600,39 @@ function packetDiagnosticIsDiagnosticOnly(value) {
   );
 }
 
+function packetCoverageQueryObligations(packet) {
+  const obligations = packet?.plan?.obligations?.query_obligations;
+  return Array.isArray(obligations) ? obligations : null;
+}
+
+function packetCoverageUnresolvedEntryBlocks(entry, queryObligations) {
+  if (packetDiagnosticIsDiagnosticOnly(entry)) {
+    return false;
+  }
+  if (!queryObligations) {
+    return true;
+  }
+  const query = String(
+    typeof entry === "string" ? entry : entry?.query ?? "",
+  ).trim();
+  if (!query) {
+    return true;
+  }
+  const matching = queryObligations.filter(
+    (obligation) => String(obligation?.query ?? "").trim() === query,
+  );
+  if (!matching.length) {
+    return true;
+  }
+  const material = matching.filter((obligation) => obligation?.material === true);
+  if (!material.length) {
+    return false;
+  }
+  return material.some(
+    (obligation) => String(obligation?.completion?.status ?? "") !== "completed",
+  );
+}
+
 function packetCoverageUnresolvedCounts(packet) {
   const unresolved =
     packet?.coverage_report?.unresolved ??
@@ -5586,9 +5640,12 @@ function packetCoverageUnresolvedCounts(packet) {
     packet?.sufficiency?.coverage_report?.unresolved ??
     null;
   if (Array.isArray(unresolved)) {
+    const queryObligations = packetCoverageQueryObligations(packet);
     return {
       total: unresolved.length,
-      blocking: unresolved.filter((entry) => !packetDiagnosticIsDiagnosticOnly(entry)).length,
+      blocking: unresolved.filter((entry) =>
+        packetCoverageUnresolvedEntryBlocks(entry, queryObligations)
+      ).length,
     };
   }
   const number = finiteNumber(unresolved);
@@ -7487,13 +7544,25 @@ function usefulAnchorHitsPer10kContextChars(row) {
   return hits / Math.max(1, contextChars / 10_000);
 }
 
-function managedCodeStoryRuntimeIdentityBlockers(analysis) {
+function managedCodeStoryRuntimeIdentityBlockers(result) {
   const reasons = [];
+  const analysis = result?.transcript_analysis;
   const started = analysis?.codestory_mcp_tool_calls_observed ?? 0;
   const completed = analysis?.codestory_mcp_completed_calls_observed ?? 0;
   const identities = analysis?.codestory_mcp_runtime_identities ?? [];
   if (started <= 0) {
-    reasons.push("with_codestory arm did not call the managed CodeStory MCP");
+    const prelude = result?.codestory_harness_prelude;
+    if (prelude?.status !== "pass") {
+      reasons.push("with_codestory arm has no passing managed CodeStory packet prelude");
+      return reasons;
+    }
+    reasons.push(
+      ...managedRuntimeIdentityBlockers(
+        prelude.packet_contract_runtime,
+        "with_codestory packet prelude",
+      ),
+    );
+    return reasons;
   }
   if (identities.length <= 0) {
     reasons.push("with_codestory arm has no managed CodeStory runtime identity");
@@ -7541,7 +7610,7 @@ function agentPublishableBlockers(results, opts = {}) {
       }
       if (opts.publishable && result.arm === "with_codestory") {
         environmentReasons.push(
-          ...managedCodeStoryRuntimeIdentityBlockers(result.transcript_analysis),
+          ...managedCodeStoryRuntimeIdentityBlockers(result),
         );
         if (!result.codestory_harness_prelude?.packet_sufficiency) {
           harnessReasons.push("codestory prelude packet obligation accounting is missing");
@@ -9778,7 +9847,9 @@ export {
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetRuntimeCacheObservations,
+  agentPacketPreludeCacheObservations,
   packetEmbeddingExecutionProof,
+  packetSufficiencyTelemetry,
   groupPacketRuntimeColdJobs,
   gitCheckedOutput,
   gitOutput,

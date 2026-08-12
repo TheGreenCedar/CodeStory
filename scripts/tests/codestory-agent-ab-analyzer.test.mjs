@@ -47,7 +47,9 @@ import {
   packetComposition,
   packetCommandArgs,
   packetRuntimeCacheObservations,
+  agentPacketPreludeCacheObservations,
   packetEmbeddingExecutionProof,
+  packetSufficiencyTelemetry,
   packetForAgentPrompt,
   packetManifestExtraProbes,
   packetManifestQualitySummary,
@@ -2201,6 +2203,63 @@ test("packet-runtime cache observations preserve prepared cache provenance", () 
   }
 });
 
+test("agent packet prelude carries exact semantic execution after the server idles", () => {
+  const preparation = {
+    repo: "codestory",
+    retrieval_contract: {
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      execution_policy: "accelerated",
+    },
+    retrieval_status: { semantic_generation: "semantic-1" },
+  };
+  const packet = {
+    answer: {
+      retrieval_trace: {
+        retrieval_publication: { semantic_generation: "semantic-1" },
+        semantic_fallback_count: 0,
+        packet_sidecar_diagnostics: [{ retrieval_mode: "full" }],
+        retrieval_shadow: {
+          degraded_reason: null,
+          error: null,
+          cancel_reason: null,
+          stage_timings: [{
+            stage: "stage1b_semantic",
+            completion_status: "completed",
+            degraded: false,
+            stub_reason: null,
+            cancel_reason: null,
+          }],
+        },
+      },
+    },
+  };
+  const observations = agentPacketPreludeCacheObservations(
+    { cachePreparationByRepo: new Map([[preparation.repo, preparation]]) },
+    preparation.repo,
+    packet,
+    { codestory_index_commands_observed: 0 },
+  );
+  const provenance = localCacheProvenance({
+    semantic_ready: false,
+    embedding_engine_instance_id: null,
+    semantic_generation: "semantic-1",
+    transport_mode: observations.transport_mode,
+    packet_embedding_execution: observations.packet_embedding_execution,
+  });
+
+  assert.equal(observations.transport_mode, "agent_harness_prelude");
+  assert.equal(observations.cache_preparation, preparation);
+  assert.deepEqual(cacheProvenanceBlockers({ codestory_cache_provenance: provenance }), []);
+
+  observations.packet_embedding_execution.semantic_generation = "other-generation";
+  provenance.packet_embedding_execution = observations.packet_embedding_execution;
+  assert.match(
+    cacheProvenanceBlockers({ codestory_cache_provenance: provenance }).join("\n"),
+    /does not match the prepared generation/,
+  );
+});
+
 test("cold packet embedding execution binds full retrieval to the prepared semantic generation", () => {
   const preparation = {
     retrieval_contract: {
@@ -3280,6 +3339,55 @@ test("publishable measured rows fail closed without managed runtime identity", (
     blockers.flatMap((blocker) => blocker.reasons).join("\n"),
     /no managed CodeStory runtime identity/,
   );
+});
+
+test("publishable measured rows accept a validated managed packet prelude without a redundant MCP call", () => {
+  const transcriptAnalysis = {
+    codestory_mcp_tool_calls_observed: 0,
+    codestory_mcp_completed_calls_observed: 0,
+    codestory_mcp_runtime_identities: [],
+  };
+  const managedRuntime = {
+    plugin_version: "0.17.0",
+    plugin_cli_version: "0.17.0",
+    cli_version: "0.17.0",
+    cli_source: "managed",
+    pinned_pair_matches: true,
+    known_override_skew_channel: false,
+  };
+  const valid = publishableWithCodeStoryResult({
+    transcript_analysis: transcriptAnalysis,
+    codestory_harness_prelude: { packet_contract_runtime: managedRuntime },
+  });
+
+  assert.deepEqual(
+    agentPublishableBlockers([valid], {
+      publishable: true,
+      maxSourceReadsAfterPacket: 0,
+    }),
+    [],
+  );
+
+  for (const codestoryPrelude of [
+    { status: "fail", packet_contract_runtime: managedRuntime },
+    {
+      packet_contract_runtime: {
+        ...managedRuntime,
+        cli_source: "override",
+      },
+    },
+  ]) {
+    const invalid = publishableWithCodeStoryResult({
+      transcript_analysis: transcriptAnalysis,
+      codestory_harness_prelude: codestoryPrelude,
+    });
+    assert.ok(
+      agentPublishableBlockers([invalid], {
+        publishable: true,
+        maxSourceReadsAfterPacket: 0,
+      }).length > 0,
+    );
+  }
 });
 
 test("summarizes A/B cost accounting totals and ratios", () => {
@@ -5028,6 +5136,53 @@ test("packet runtime publishable gate rejects diagnostic packet probes", () => {
 
   assert.equal(blockers.length, 1);
   assert.match(blockers[0].reasons.join("\n"), /diagnostic packet extra probes used/);
+});
+
+test("packet coverage unresolved accounting follows material query completion", () => {
+  const packet = {
+    plan: {
+      obligations: {
+        query_obligations: [
+          {
+            query: "public facade",
+            material: true,
+            completion: { status: "completed" },
+          },
+          {
+            query: "supplemental wording",
+            material: false,
+            completion: { status: "cancelled", reason: "not_dispatched" },
+          },
+        ],
+      },
+    },
+    sufficiency: {
+      status: "sufficient",
+      coverage_report: {
+        unresolved: ["public facade", "supplemental wording"],
+      },
+    },
+  };
+
+  let telemetry = packetSufficiencyTelemetry(packet, { pass: true });
+  assert.equal(telemetry.coverage_unresolved_count, 2);
+  assert.equal(telemetry.coverage_unresolved_blocking_count, 0);
+
+  packet.plan.obligations.query_obligations[0].completion = {
+    status: "cancelled",
+    reason: "deadline",
+  };
+  telemetry = packetSufficiencyTelemetry(packet, { pass: true });
+  assert.equal(telemetry.coverage_unresolved_blocking_count, 1);
+
+  packet.sufficiency.coverage_report.unresolved = ["unknown query"];
+  telemetry = packetSufficiencyTelemetry(packet, { pass: true });
+  assert.equal(telemetry.coverage_unresolved_blocking_count, 1);
+
+  delete packet.plan.obligations;
+  packet.sufficiency.coverage_report.unresolved = ["public facade"];
+  telemetry = packetSufficiencyTelemetry(packet, { pass: true });
+  assert.equal(telemetry.coverage_unresolved_blocking_count, 1);
 });
 
 test("packet runtime publishable gate blocks unresolved packet diagnostics as product blockers", () => {
