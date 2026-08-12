@@ -745,7 +745,7 @@ mod tests {
         assert_eq!(answer.graphs.len(), 1, "exact replay must be idempotent");
         assert_eq!(graph.edges.len(), 1);
         assert!(id.starts_with(PACKET_CANDIDATE_SELECTION_VIEW_ID));
-        assert_eq!(answer.subgraph_ids, [id.clone()]);
+        assert_eq!(answer.subgraph_ids, std::slice::from_ref(id));
     }
 
     #[test]
@@ -1303,7 +1303,10 @@ mod tests {
             preserved.omitted_edge_count,
             candidate_graph.omitted_edge_count
         );
-        assert_eq!(duplicate_owner.subgraph_ids, [candidate_id.clone()]);
+        assert_eq!(
+            duplicate_owner.subgraph_ids,
+            std::slice::from_ref(candidate_id)
+        );
     }
 
     #[test]
