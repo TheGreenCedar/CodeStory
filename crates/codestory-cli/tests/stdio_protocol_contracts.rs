@@ -886,10 +886,15 @@ fn assert_tool_safety_metadata(tool: &Value) {
         .or_else(|| tool.get("metadata"))
         .unwrap_or_else(|| panic!("{name} should include safety metadata: {tool}"));
 
+    // Every tool is read-only with respect to the caller's repository, activation or not:
+    // managed activation writes only to a per-user cache outside the checkout. A
+    // non-read-only hint is auto-cancelled by non-interactive clients, which silently
+    // disabled 19 of these 20 tools. Managed activation stays disclosed via `effect`,
+    // `sideEffects`, and `activatesProject`, asserted below.
     assert!(
-        annotations.get("readOnlyHint").and_then(Value::as_bool) == Some(observational)
-            && safety.get("readOnly").and_then(Value::as_bool) == Some(observational),
-        "{name} should distinguish observation from managed activation: {tool}"
+        annotations.get("readOnlyHint").and_then(Value::as_bool) == Some(true)
+            && safety.get("readOnly").and_then(Value::as_bool) == Some(true),
+        "{name} should report repository-read-only regardless of managed activation: {tool}"
     );
     assert_eq!(
         safety.get("effect").and_then(Value::as_str),

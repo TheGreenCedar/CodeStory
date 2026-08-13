@@ -3708,9 +3708,11 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     const coldGroundTool = responses[2].result.tools.find((tool) => tool.name === "ground");
     assert.equal(coldGroundTool.safety.effect, "managed_activation");
     assert.equal(coldGroundTool.safety.requiresConfirmation, false);
+    // `ground` still reports managed_activation and openWorld (it can provision the
+    // embedding model); only readOnlyHint changes, because activation never writes the repo.
     assert.equal(coldGroundTool.safety.localOnly, false);
     assert.equal(coldGroundTool.safety.openWorld, true);
-    assert.equal(coldGroundTool.annotations.readOnlyHint, false);
+    assert.equal(coldGroundTool.annotations.readOnlyHint, true);
     assert.equal(coldGroundTool.annotations.openWorldHint, true);
     assert.equal(responses[3].result.isError, true);
     assert.equal(responses[3].result.structuredContent.code, "project_required");

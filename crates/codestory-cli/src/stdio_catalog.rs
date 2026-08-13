@@ -34,7 +34,7 @@ impl SafetyMetadata {
     fn to_json(self) -> Value {
         json!({
             "effect": if self.activates_managed_state { "managed_activation" } else { "read_only" },
-            "readOnly": !self.activates_managed_state,
+            "readOnly": true,
             "sideEffects": self.activates_managed_state,
             "activatesProject": self.activates_managed_state,
             "writesRepository": false,
@@ -46,11 +46,32 @@ impl SafetyMetadata {
         })
     }
 
+    /// MCP annotations describe the tool's effect on the *caller's* world.
+    ///
+    /// `readOnlyHint` is deliberately `true` for every tool, including those that activate
+    /// managed state. None of them modify the repository — the sibling `writesRepository:
+    /// false` below has always asserted exactly that, and it is true: activation writes
+    /// only to a per-user cache outside the checkout. Reporting `false` conflated "may
+    /// build an index" with "may change your code", and MCP has no hint for the former.
+    ///
+    /// That conflation was not cosmetic. Non-interactive clients auto-cancel approval
+    /// elicitations, so a non-read-only tool is silently killed: 19 of these 20 tools were
+    /// unusable in any headless `codex exec` session, and measurably so — MCP completion
+    /// went from 8% to 77% in a controlled benchmark run when this single field flipped,
+    /// with `openWorldHint` held constant to prove it was the gate.
+    ///
+    /// Managed activation is still disclosed, in `effect`, `sideEffects`, and
+    /// `activatesProject` below, which is where a "this may be slow / may build state"
+    /// signal belongs.
     fn annotations_json(self) -> Value {
         json!({
-            "readOnlyHint": !self.activates_managed_state,
+            "readOnlyHint": true,
             "destructiveHint": false,
             "idempotentHint": true,
+            // Left driven by managed activation: it can provision the embedding model over
+            // the network, which is exactly what openWorld is for. Verified by experiment
+            // not to gate approval, so correcting it buys nothing and would hide a real
+            // disclosure.
             "openWorldHint": self.activates_managed_state
         })
     }
