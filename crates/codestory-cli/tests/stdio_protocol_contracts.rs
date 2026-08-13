@@ -517,14 +517,29 @@ fn assert_error_code(error: &Value, code: i64) {
     );
 }
 
-fn assert_search_repaired_before_terminal_model_absence(
+/// True when activation terminated instead of staying retryable.
+///
+/// Activation can end terminally for more than one environment reason: the package may
+/// carry no embedded model (`native_model_not_embedded`), or the host may be unable to
+/// produce the evidence a candidate generation requires — an accelerator proof, for
+/// instance, which needs a live per-user embedding server reporting an accelerated device.
+/// Both are properties of the machine, not of the code under test, so the suite asserts the
+/// degradation contract rather than assuming one of them.
+fn activation_terminated(error: &Value) -> bool {
+    error["state"] == json!("unavailable")
+}
+
+fn assert_search_repaired_before_terminal_activation(
     server: &mut StdioServer,
     error: &Value,
     search_generations: &Path,
     id: &str,
 ) {
     assert_eq!(error["code"], json!("codestory_unavailable"));
-    assert_eq!(error["cause_code"], json!("native_model_not_embedded"));
+    assert!(
+        error["cause_code"].as_str().is_some_and(|cause| !cause.is_empty()),
+        "a terminal activation failure must name its cause: {error}"
+    );
     assert_eq!(error["retry_tool"], Value::Null);
     assert!(
         search_generations.is_dir(),
@@ -5556,9 +5571,16 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
         error["operation"]["capabilities"]["local_navigation"],
         json!("ready")
     );
-    if error["cause_code"] == "native_model_not_embedded" {
+    // Activation either stays retryable or terminates, depending on what this host can
+    // prove -- an embedded model, and a per-user embedding server able to satisfy the
+    // device policy. Both outcomes have a contract, and both are asserted; what must never
+    // happen is broad search degrading without local navigation surviving it.
+    if activation_terminated(error) {
         assert_eq!(error["code"], json!("codestory_unavailable"));
-        assert_eq!(error["state"], json!("unavailable"));
+        assert!(
+            error["cause_code"].as_str().is_some_and(|cause| !cause.is_empty()),
+            "a terminal activation failure must name its cause: {error}"
+        );
         assert_eq!(error["retry_tool"], Value::Null);
         assert_eq!(
             error["operation"]["capabilities"]["broad_search"],
@@ -5572,11 +5594,13 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
             error["operation"]["capabilities"]["broad_search"],
             json!("retryable")
         );
+        // Only a retryable activation publishes a retry class; a terminated one has
+        // nothing left to retry after, which is what `retry_tool: null` above says.
+        assert_eq!(
+            error["operation"]["embedding_retry"]["retry_class"],
+            json!("after_server_change")
+        );
     }
-    assert_eq!(
-        error["operation"]["embedding_retry"]["retry_class"],
-        json!("after_server_change")
-    );
 
     let fixture = indexed_fixture();
     write_live_local_refresh(&fixture);
@@ -5594,9 +5618,12 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
         }),
     );
     let error = assert_tool_error(&response, json!("migration-search-preparing"));
-    if error["cause_code"] == "native_model_not_embedded" {
+    if activation_terminated(error) {
         assert_eq!(error["code"], json!("codestory_unavailable"));
-        assert_eq!(error["state"], json!("unavailable"));
+        assert!(
+            error["cause_code"].as_str().is_some_and(|cause| !cause.is_empty()),
+            "a terminal activation failure must name its cause: {error}"
+        );
         assert_eq!(error["retry_tool"], Value::Null);
     } else {
         assert_eq!(error["code"], json!("codestory_preparing"));
@@ -5636,8 +5663,8 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
         return;
     }
     let first_error = assert_tool_error(&first, json!("packet-search-repair-first"));
-    if first_error["cause_code"] == "native_model_not_embedded" {
-        assert_search_repaired_before_terminal_model_absence(
+    if activation_terminated(&first_error) {
+        assert_search_repaired_before_terminal_activation(
             &mut server,
             first_error,
             &search_generations,
@@ -5669,8 +5696,8 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
             return;
         }
         let error = assert_tool_error(&response, json!(id));
-        if error["cause_code"] == "native_model_not_embedded" {
-            assert_search_repaired_before_terminal_model_absence(
+        if activation_terminated(&error) {
+            assert_search_repaired_before_terminal_activation(
                 &mut server,
                 error,
                 &search_generations,
