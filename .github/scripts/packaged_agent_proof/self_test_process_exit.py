@@ -55,7 +55,8 @@ def _start_handshaken_child() -> subprocess.Popen:
         [
             sys.executable,
             "-c",
-            "import sys; print('ready', flush=True); sys.stdin.buffer.read(1)",
+            "import sys; sys.stdout.buffer.write(b'ready\\n');"
+            " sys.stdout.buffer.flush(); sys.stdin.buffer.read(1)",
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
