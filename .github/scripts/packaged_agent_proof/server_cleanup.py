@@ -61,6 +61,7 @@ def pin_temporary_package_server(
     )
     entry = {
         "identity": (pid, process_start_id),
+        "target_os": target_os,
         "server_instance_id": require_nonempty_string(
             server_process.get("server_instance_id"),
             f"{label} server instance",
@@ -73,7 +74,7 @@ def pin_temporary_package_server(
 
 
 def native_server_exit_wait_required(target_os: str, proof_tier: str) -> bool:
-    return target_os == "windows" and proof_tier in {
+    return target_os in {"linux", "macos", "windows"} and proof_tier in {
         "calibration",
         "hosted_package",
         "protected_hardware",
@@ -156,11 +157,22 @@ def retained_final_native_server_exit_evidence(
     authenticated_process_count: int,
     superseded_process_count: int,
 ) -> dict:
-    require(
+    target_os = require_nonempty_string(
+        final_entry.get("target_os"),
+        "final server cleanup target OS",
+    )
+    valid_exit = (
         evidence.get("status") == "normal_idle_exit"
         and evidence.get("exit_code") == 0
-        and evidence.get("clean_exit_required") is True,
-        "final authenticated server did not prove its clean idle exit",
+        and evidence.get("clean_exit_required") is True
+        if target_os == "windows"
+        else evidence.get("status") == "observed_exit"
+        and evidence.get("exit_code") is None
+        and evidence.get("clean_exit_required") is False
+    )
+    require(
+        valid_exit,
+        "final authenticated server did not prove its exact idle exit",
     )
     require(
         (evidence.get("pid"), evidence.get("process_start_id"))
@@ -348,9 +360,12 @@ def _wait_for_pinned_servers(
                 shared_deadline,
                 timeout_ms,
             )
+            clean_exit_observable = entry.get("target_os") == "windows"
             exit_evidence[entry["identity"]] = waiter.wait(
                 process_timeout_ms,
-                require_clean_exit=require_final_server and not superseded,
+                require_clean_exit=(
+                    clean_exit_observable and require_final_server and not superseded
+                ),
             )
         except BaseException as error:
             errors.append(str(error))

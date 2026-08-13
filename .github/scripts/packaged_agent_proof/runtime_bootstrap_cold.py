@@ -63,14 +63,13 @@ def _cold_shared_proof(
     snapshot_a = server_snapshot(diagnostics_a, manifest, require_resident=True)
     snapshot_b = server_snapshot(diagnostics_b, manifest, require_resident=True)
     shared_identity = shared_server_identity(snapshot_a, snapshot_b)
-    if setup.target_os == "windows":
-        pin_temporary_package_server(
-            cleanup_control,
-            snapshot_a["process"],
-            manifest,
-            setup.target_os,
-            "initial temporary package embedding server",
-        )
+    pin_temporary_package_server(
+        cleanup_control,
+        snapshot_a["process"],
+        manifest,
+        setup.target_os,
+        "initial temporary package embedding server",
+    )
     require(
         identity_a["embedding_engine_instance_id"]
         == identity_b["embedding_engine_instance_id"],

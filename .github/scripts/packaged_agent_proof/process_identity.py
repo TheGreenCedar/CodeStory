@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from enum import Enum
 from pathlib import Path
 
 from .contract_primitives import require_nonempty_string, require_sha256
@@ -47,6 +48,12 @@ class _ProcBsdInfo(ctypes.Structure):
         ("pbi_start_tvsec", ctypes.c_uint64),
         ("pbi_start_tvusec", ctypes.c_uint64),
     ]
+
+
+class _UnixExitProbeState(Enum):
+    GONE_OR_REUSED = "gone_or_reused"
+    MATCHING = "matching"
+    UNKNOWN = "unknown"
 
 
 def _windows_handle_process_identity(
@@ -360,6 +367,8 @@ class ExactProcessExitWaiter:
         self.target_os = target_os
         self.handle = None
         self._already_exited_reason = None
+        self._unix_probe_state = None
+        self._unix_probe_detail = None
         host_os = (
             "windows"
             if os.name == "nt"
@@ -422,11 +431,11 @@ class ExactProcessExitWaiter:
                 raise
             return
         try:
-            reason = self._unix_exit_reason()
+            state, reason = self._observe_unix_identity()
         except BaseException:
             self.close()
             raise
-        if reason is not None:
+        if state is _UnixExitProbeState.GONE_OR_REUSED:
             if allow_already_exited:
                 self._already_exited_reason = reason
                 return
@@ -434,37 +443,57 @@ class ExactProcessExitWaiter:
                 f"exact process {pid} {reason} before exit wait"
             )
 
-    def _unix_exit_reason(self) -> str | None:
+        # A transiently unreadable Unix identity is not exit evidence and is
+        # not a constructor failure. Preserve it so observational callers can
+        # fail closed, while the bounded waiter can reclassify until its
+        # deadline. MATCHING needs no additional constructor work.
+
+    def _classify_unix_identity(self) -> tuple[_UnixExitProbeState, str | None]:
         terminated = terminated_process_state(self.pid)
         if terminated is not None:
-            return terminated
+            return _UnixExitProbeState.GONE_OR_REUSED, terminated
         try:
             observed = process_start_identity(self.pid)
         except (FileNotFoundError, ProcessLookupError):
-            return "no longer exists"
+            return _UnixExitProbeState.GONE_OR_REUSED, "no longer exists"
         except (ProofFailure, OSError) as error:
             # An inspection error is not exit evidence. Confirm only process
-            # absence; a present but unreadable process fails closed.
+            # absence. A present but unreadable identity stays explicitly
+            # unknown so a bounded waiter can keep polling without calling it
+            # matching or gone.
             try:
                 os.kill(self.pid, 0)
             except ProcessLookupError:
-                return "no longer exists"
+                return _UnixExitProbeState.GONE_OR_REUSED, "no longer exists"
             except (PermissionError, OSError) as liveness_error:
-                raise ProofFailure(
+                return (
+                    _UnixExitProbeState.UNKNOWN,
                     f"could not prove exact process {self.pid} exited after"
                     f" identity inspection failed ({error}); liveness probe"
-                    f" also failed ({liveness_error})"
-                ) from error
-            raise ProofFailure(
+                    f" also failed ({liveness_error})",
+                )
+            return (
+                _UnixExitProbeState.UNKNOWN,
                 f"could not inspect exact process {self.pid} start identity"
-                f" while the PID remains present: {error}"
-            ) from error
+                f" while the PID remains present: {error}",
+            )
         if observed != self.expected_start_id:
             return (
+                _UnixExitProbeState.GONE_OR_REUSED,
                 f"now carries start identity {observed}, replacing"
-                f" {self.expected_start_id}"
+                f" {self.expected_start_id}",
             )
-        return None
+        return _UnixExitProbeState.MATCHING, None
+
+    def _record_unix_identity(
+        self,
+        classification: tuple[_UnixExitProbeState, str | None],
+    ) -> tuple[_UnixExitProbeState, str | None]:
+        self._unix_probe_state, self._unix_probe_detail = classification
+        return classification
+
+    def _observe_unix_identity(self) -> tuple[_UnixExitProbeState, str | None]:
+        return self._record_unix_identity(self._classify_unix_identity())
 
     def exited(self) -> bool:
         """Whether the exact held process is proven gone, never merely unreadable."""
@@ -482,11 +511,13 @@ class ExactProcessExitWaiter:
             raise ProofFailure(
                 f"exact process {self.pid} exit probe failed with result {result}"
             )
-        reason = self._unix_exit_reason()
-        if reason is None:
+        state, reason = self._observe_unix_identity()
+        if state is _UnixExitProbeState.MATCHING:
             return False
-        self._already_exited_reason = reason
-        return True
+        if state is _UnixExitProbeState.GONE_OR_REUSED:
+            self._already_exited_reason = reason
+            return True
+        raise ProofFailure(reason)
 
     def _windows_expired_wait_state(self, kernel) -> str:
         exit_code = ctypes.c_uint32()
@@ -534,23 +565,70 @@ class ExactProcessExitWaiter:
             )
         return exit_code.value
 
-    def _wait_unix(self, timeout_ms: int) -> None:
-        started = time.monotonic()
+    def _wait_unix(
+        self,
+        timeout_ms: int,
+        *,
+        now=None,
+        sleep=None,
+        classify=None,
+    ) -> None:
+        now = time.monotonic if now is None else now
+        sleep = time.sleep if sleep is None else sleep
+        classify = self._classify_unix_identity if classify is None else classify
+
+        def observe() -> tuple[_UnixExitProbeState, str | None]:
+            return self._record_unix_identity(classify())
+
+        started = now()
         deadline = started + (timeout_ms / 1000)
+
+        def timeout(
+            current: float,
+            state: _UnixExitProbeState,
+            detail: str | None,
+        ) -> ProofFailure:
+            waited_ms = int(max(0, current - started) * 1000)
+            if state is _UnixExitProbeState.GONE_OR_REUSED:
+                evidence = "exit was first observed only after the wait expired"
+            elif state is _UnixExitProbeState.MATCHING:
+                evidence = "left it still running with its start identity unchanged"
+            else:
+                evidence = f"left its exact identity uncertain: {detail}"
+            return ProofFailure(
+                f"exact process {self.pid} (start identity"
+                f" {self.expected_start_id}) did not exit within"
+                f" {timeout_ms}ms: waited {waited_ms}ms and {evidence}"
+            )
+
+        # Phase one classifies the exact identity once without a deadline gate.
+        # A process already gone or a PID already reused satisfies the fence,
+        # even with a zero budget or a slow initial native inspection.
+        state, detail = observe()
+        if state is _UnixExitProbeState.GONE_OR_REUSED:
+            self._already_exited_reason = detail
+            return
+
+        # Phase two is strictly deadline-gated. No later probe begins after an
+        # overshooting sleep, and an exit first learned by a slow probe at or
+        # after the deadline cannot satisfy the bounded fence. Unknown identity
+        # is nonterminal but remains distinct from a proven matching process so
+        # timeout evidence fails closed without claiming it was still running.
         while True:
-            if self.exited():
+            current = now()
+            if current >= deadline:
+                raise timeout(current, state, detail)
+            sleep(0.01)
+            current = now()
+            if current >= deadline:
+                raise timeout(current, state, detail)
+            state, detail = observe()
+            current = now()
+            if current >= deadline:
+                raise timeout(current, state, detail)
+            if state is _UnixExitProbeState.GONE_OR_REUSED:
+                self._already_exited_reason = detail
                 return
-            if time.monotonic() >= deadline:
-                # Match the Windows timeout evidence: exact identity, real
-                # waited duration, and the state the process was left in.
-                waited_ms = int((time.monotonic() - started) * 1000)
-                raise ProofFailure(
-                    f"exact process {self.pid} (start identity"
-                    f" {self.expected_start_id}) did not exit within"
-                    f" {timeout_ms}ms: waited {waited_ms}ms and left it still"
-                    " running with its start identity unchanged"
-                )
-            time.sleep(0.01)
 
     def wait(self, timeout_ms: int, *, require_clean_exit: bool = True) -> dict:
         require(timeout_ms > 0, "exact process exit wait requires a positive timeout")
