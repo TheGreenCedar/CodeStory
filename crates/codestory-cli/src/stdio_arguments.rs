@@ -952,14 +952,22 @@ mod source_range_tests {
         assert_eq!(validate_tool_arguments("snippet", Some(&arguments)), Ok(()));
     }
 
-    /// Each entry needs a path and both bounds; a partial entry is a caller error, not a
-    /// silently-defaulted read of the whole file.
+    /// A hit reports `file_path` and a single `line`. Pasting exactly that must work, because
+    /// requiring callers to invent an `end_line` is why the batch went unused: 8 of 507
+    /// snippet events mentioned `paths` at all.
     #[test]
-    fn snippet_range_entries_require_path_and_bounds() {
+    fn snippet_accepts_the_line_field_hits_actually_emit() {
         let arguments = json!({
             "project": "/tmp/repo",
-            "paths": [{"path": "src/a.rs", "start_line": 10}]
+            "paths": [{"path": "ChinookDatabase/DataSources/Chinook.sql", "line": 34}]
         });
+        assert_eq!(validate_tool_arguments("snippet", Some(&arguments)), Ok(()));
+    }
+
+    /// A range entry still has to name a file.
+    #[test]
+    fn snippet_range_entries_require_a_path() {
+        let arguments = json!({"project": "/tmp/repo", "paths": [{"line": 10}]});
         assert!(validate_tool_arguments("snippet", Some(&arguments)).is_err());
     }
 }

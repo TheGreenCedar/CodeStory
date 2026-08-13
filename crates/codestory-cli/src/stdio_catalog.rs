@@ -1761,13 +1761,17 @@ static TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
 .with_one_of_required(&[&["query"], &["id"]]);
 
 static SOURCE_RANGE_SCHEMA: SchemaObject = SchemaObject::object(
-    "One file range to read.",
+    "One file range to read. Paste `file_path` and `line` straight from a search, trail, or packet hit.",
     &[
-        SchemaProperty::string("path", "Repository-relative file path.").with_min_length(1),
-        SchemaProperty::integer("start_line", "First line to return, 1-based.").with_bounds(1, 1_000_000),
-        SchemaProperty::integer("end_line", "Last line to return, 1-based.").with_bounds(1, 1_000_000),
+        SchemaProperty::string("path", "Repository-relative file path, as returned in `file_path`.").with_min_length(1),
+        SchemaProperty::integer("line", "Line of interest, 1-based, as returned in `line`. A window is returned around it.")
+            .with_bounds(1, 1_000_000),
+        SchemaProperty::integer("start_line", "First line to return, 1-based. Alternative to `line`.")
+            .with_bounds(1, 1_000_000),
+        SchemaProperty::integer("end_line", "Last line to return, 1-based. Defaults to a bounded window after the start.")
+            .with_bounds(1, 1_000_000),
     ],
-    &["path", "start_line", "end_line"],
+    &["path"],
 );
 
 static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(

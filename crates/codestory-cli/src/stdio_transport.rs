@@ -2720,6 +2720,9 @@ fn stdio_snippet_request(
 
     // Reading by path is an alternative target, not an addition to one.
     const MAX_SOURCE_RANGES: usize = 12;
+    // Lines returned when a caller supplies only the `line` a hit reported. Roughly one
+    // screen, so a single hit expands into useful context without a second round trip.
+    const SOURCE_RANGE_DEFAULT_SPAN: u32 = 60;
     let paths = match arguments.get("paths") {
         None => Vec::new(),
         Some(value) => {
@@ -2749,19 +2752,23 @@ fn stdio_snippet_request(
                                 "each snippet.paths entry needs a non-empty path",
                             )
                         })?;
-                    let line = |name: &str| {
+                    // A hit reports one `line`; asking callers to invent an `end_line` is
+                    // why this went unused. Accept the field the hits actually emit and
+                    // return a window around it.
+                    let read = |name: &str| {
                         entry
                             .get(name)
                             .and_then(serde_json::Value::as_u64)
                             .filter(|value| *value >= 1)
-                            .ok_or_else(|| {
-                                ApiError::invalid_argument(format!(
-                                    "each snippet.paths entry needs a 1-based {name}"
-                                ))
-                            })
                     };
-                    let start_line = line("start_line")? as u32;
-                    let end_line = line("end_line")? as u32;
+                    let start_line = read("start_line").or_else(|| read("line")).ok_or_else(|| {
+                        ApiError::invalid_argument(format!(
+                            "snippet.paths entry for {path} needs a 1-based `line` or `start_line`"
+                        ))
+                    })? as u32;
+                    let end_line = read("end_line").map(|value| value as u32).unwrap_or_else(|| {
+                        start_line.saturating_add(SOURCE_RANGE_DEFAULT_SPAN)
+                    });
                     if end_line < start_line {
                         return Err(ApiError::invalid_argument(format!(
                             "snippet.paths entry for {path} has end_line before start_line"

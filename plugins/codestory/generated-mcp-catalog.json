@@ -3882,30 +3882,34 @@
             "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
             "items": {
               "additionalProperties": false,
-              "description": "One file range to read.",
+              "description": "One file range to read. Paste `file_path` and `line` straight from a search, trail, or packet hit.",
               "properties": {
                 "end_line": {
-                  "description": "Last line to return, 1-based.",
+                  "description": "Last line to return, 1-based. Defaults to a bounded window after the start.",
+                  "maximum": 1000000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "line": {
+                  "description": "Line of interest, 1-based, as returned in `line`. A window is returned around it.",
                   "maximum": 1000000,
                   "minimum": 1,
                   "type": "integer"
                 },
                 "path": {
-                  "description": "Repository-relative file path.",
+                  "description": "Repository-relative file path, as returned in `file_path`.",
                   "minLength": 1,
                   "type": "string"
                 },
                 "start_line": {
-                  "description": "First line to return, 1-based.",
+                  "description": "First line to return, 1-based. Alternative to `line`.",
                   "maximum": 1000000,
                   "minimum": 1,
                   "type": "integer"
                 }
               },
               "required": [
-                "path",
-                "start_line",
-                "end_line"
+                "path"
               ],
               "type": "object"
             },
