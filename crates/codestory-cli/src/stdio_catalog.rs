@@ -2239,7 +2239,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "snippet",
-        description: "Return a focused source snippet after packet, search, or graph evidence selects a concrete target.",
+        description: "Return line-numbered source after packet, search, or graph evidence selects targets: one symbol, or many file ranges in a single call via `paths` rather than one file at a time.",
         input_schema: SNIPPET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SNIPPET_CONTEXT_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),

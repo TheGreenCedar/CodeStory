@@ -3828,7 +3828,7 @@
         "openWorldHint": true,
         "readOnlyHint": true
       },
-      "description": "Return a focused source snippet after packet, search, or graph evidence selects a concrete target.",
+      "description": "Return line-numbered source after packet, search, or graph evidence selects targets: one symbol, or many file ranges in a single call via `paths` rather than one file at a time.",
       "inputSchema": {
         "additionalProperties": false,
         "description": "Return bounded source: either resolve one symbol, or read line ranges from files named by earlier evidence.",
