@@ -1760,9 +1760,24 @@ static TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
 )
 .with_one_of_required(&[&["query"], &["id"]]);
 
-static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Resolve a symbol and return bounded line or function-body source context.",
+static SOURCE_RANGE_SCHEMA: SchemaObject = SchemaObject::object(
+    "One file range to read.",
     &[
+        SchemaProperty::string("path", "Repository-relative file path.").with_min_length(1),
+        SchemaProperty::integer("start_line", "First line to return, 1-based.").with_bounds(1, 1_000_000),
+        SchemaProperty::integer("end_line", "Last line to return, 1-based.").with_bounds(1, 1_000_000),
+    ],
+    &["path", "start_line", "end_line"],
+);
+
+static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Return bounded source: either resolve one symbol, or read line ranges from files named by earlier evidence.",
+    &[
+        SchemaProperty::array(
+            "paths",
+            "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+            &SOURCE_RANGE_SCHEMA,
+        ),
         SchemaProperty::string("query", "Symbol query.").with_min_length(1),
         SchemaProperty::string("id", "Stable node id.").with_min_length(1),
         SchemaProperty::integer(
@@ -1791,7 +1806,7 @@ static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_one_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"], &["paths"]]);
 
 static GRAPH_TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Resolve a single indexed graph node by stable id or query.",

@@ -933,3 +933,33 @@ mod synonym_tests {
         assert!(validate_tool_arguments("symbol", Some(&arguments)).is_err());
     }
 }
+
+#[cfg(test)]
+mod source_range_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Reading by path is a declared target, so schema validation must accept it.
+    #[test]
+    fn snippet_accepts_batched_file_ranges() {
+        let arguments = json!({
+            "project": "/tmp/repo",
+            "paths": [
+                {"path": "src/a.rs", "start_line": 10, "end_line": 40},
+                {"path": "src/b.rs", "start_line": 1, "end_line": 12}
+            ]
+        });
+        assert_eq!(validate_tool_arguments("snippet", Some(&arguments)), Ok(()));
+    }
+
+    /// Each entry needs a path and both bounds; a partial entry is a caller error, not a
+    /// silently-defaulted read of the whole file.
+    #[test]
+    fn snippet_range_entries_require_path_and_bounds() {
+        let arguments = json!({
+            "project": "/tmp/repo",
+            "paths": [{"path": "src/a.rs", "start_line": 10}]
+        });
+        assert!(validate_tool_arguments("snippet", Some(&arguments)).is_err());
+    }
+}

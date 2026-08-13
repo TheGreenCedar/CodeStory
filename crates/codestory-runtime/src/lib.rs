@@ -361,6 +361,9 @@ pub use activation_status::{
     RetrievalStatusSelection, process_owner_state, process_start_identity,
 };
 pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
+// Separate export so the pinned read-only-browser boundary line above stays byte-exact for
+// `runtime_exposes_read_only_browser_service_boundary`.
+pub use browser::{SourceRangeRequest, SourceRangeSnippet};
 pub use cache_rehydrate::{CacheRehydrateOutput, CacheRehydrateRequest, rehydrate_cache};
 pub use codestory_contracts as contracts;
 pub(crate) use graph_dto::{

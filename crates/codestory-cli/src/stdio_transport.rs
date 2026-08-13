@@ -2660,10 +2660,12 @@ enum PreparedStdioToolCall {
     Snippet(StdioSnippetRequest),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct StdioSnippetRequest {
     context: usize,
     function_body: bool,
+    /// Batched file ranges, when the caller read by path instead of resolving a symbol.
+    paths: Vec<codestory_runtime::SourceRangeRequest>,
 }
 
 fn prepare_stdio_tool_call(
@@ -2698,6 +2700,7 @@ fn stdio_snippet_request(
         "context",
         "lines",
         "function_body",
+        "paths",
     ];
     let mut unknown = arguments
         .keys()
@@ -2715,14 +2718,86 @@ fn stdio_snippet_request(
         ));
     }
 
+    // Reading by path is an alternative target, not an addition to one.
+    const MAX_SOURCE_RANGES: usize = 12;
+    let paths = match arguments.get("paths") {
+        None => Vec::new(),
+        Some(value) => {
+            let entries = value.as_array().ok_or_else(|| {
+                ApiError::invalid_argument("snippet.paths must be an array of file ranges")
+            })?;
+            if entries.is_empty() {
+                return Err(ApiError::invalid_argument(
+                    "snippet.paths must name at least one file range",
+                ));
+            }
+            if entries.len() > MAX_SOURCE_RANGES {
+                return Err(ApiError::invalid_argument(format!(
+                    "snippet.paths accepts at most {MAX_SOURCE_RANGES} ranges per call;                      split the request"
+                )));
+            }
+            entries
+                .iter()
+                .map(|entry| {
+                    let path = entry
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty())
+                        .ok_or_else(|| {
+                            ApiError::invalid_argument(
+                                "each snippet.paths entry needs a non-empty path",
+                            )
+                        })?;
+                    let line = |name: &str| {
+                        entry
+                            .get(name)
+                            .and_then(serde_json::Value::as_u64)
+                            .filter(|value| *value >= 1)
+                            .ok_or_else(|| {
+                                ApiError::invalid_argument(format!(
+                                    "each snippet.paths entry needs a 1-based {name}"
+                                ))
+                            })
+                    };
+                    let start_line = line("start_line")? as u32;
+                    let end_line = line("end_line")? as u32;
+                    if end_line < start_line {
+                        return Err(ApiError::invalid_argument(format!(
+                            "snippet.paths entry for {path} has end_line before start_line"
+                        )));
+                    }
+                    Ok(codestory_runtime::SourceRangeRequest {
+                        path: path.to_string(),
+                        start_line,
+                        end_line,
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, ApiError>>()?
+        }
+    };
+
     let query = arguments.get("query");
     let id = arguments.get("id");
     let query_present = query.is_some();
     let id_present = id.is_some();
+    if !paths.is_empty() {
+        if query_present || id_present {
+            return Err(ApiError::new(
+                "snippet_target_conflict",
+                "snippet.paths reads files directly; it does not combine with query or id",
+            ));
+        }
+        return Ok(StdioSnippetRequest {
+            context: 0,
+            function_body: false,
+            paths,
+        });
+    }
     if query_present == id_present {
         return Err(ApiError::new(
             "snippet_target_conflict",
-            "snippet accepts exactly one target property: query or id",
+            "snippet accepts exactly one target property: query, id, or paths",
         ));
     }
     for (name, value) in [("query", query), ("id", id)] {
@@ -2802,6 +2877,7 @@ fn stdio_snippet_request(
     Ok(StdioSnippetRequest {
         context,
         function_body,
+        paths: Vec::new(),
     })
 }
 
@@ -2864,7 +2940,7 @@ fn handle_stdio_tool_call(
         "symbols" => handle_stdio_symbols(runtime, request),
         "snippet" => match prepared {
             PreparedStdioToolCall::Snippet(snippet) => {
-                handle_stdio_snippet(runtime, request, *snippet)
+                handle_stdio_snippet(runtime, request, snippet.clone())
             }
             _ => serde_json::json!({
                 "error": stdio_api_error_value(ApiError::invalid_argument(
@@ -4174,11 +4250,45 @@ fn handle_stdio_symbols(
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
 }
 
+/// Total bytes one batched `snippet.paths` call may return.
+///
+/// Sized from measured demand rather than guessed: over a 54-row benchmark the agent's own
+/// file reading averaged ~68 KB per row across 7.6 files. A single call therefore covers a
+/// typical row's whole appetite, and a wider request truncates instead of returning the
+/// repository.
+const SOURCE_RANGES_MAX_TOTAL_BYTES: usize = 64 * 1024;
+
 fn handle_stdio_snippet(
     runtime: &RuntimeContext,
     request: &serde_json::Value,
     snippet: StdioSnippetRequest,
 ) -> serde_json::Value {
+    if !snippet.paths.is_empty() {
+        return match runtime
+            .browser
+            .source_ranges(&snippet.paths, SOURCE_RANGES_MAX_TOTAL_BYTES)
+            .map_err(map_api_error)
+        {
+            Ok(ranges) => serde_json::json!({
+                "result": {
+                    "ranges": ranges
+                        .iter()
+                        .map(|range| serde_json::json!({
+                            "path": range.path,
+                            "start_line": range.start_line,
+                            "end_line": range.end_line,
+                            "snippet": range.snippet,
+                            "snippet_truncated": range.truncated,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "max_total_bytes": SOURCE_RANGES_MAX_TOTAL_BYTES,
+                }
+            }),
+            Err(error) => {
+                serde_json::json!({"error": stdio_typed_error_value(runtime, &error)})
+            }
+        };
+    }
     resolve_source_target(runtime, stdio_target_selection(request), None)
         .and_then(|target| {
             let target = if snippet.function_body {
