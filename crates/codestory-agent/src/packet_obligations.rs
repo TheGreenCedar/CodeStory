@@ -1,15 +1,11 @@
 //! Versioned packet obligations planned before retrieval and finalized from carried evidence.
 
 use super::packet_evidence::citation_sufficiency_eligible;
-use super::packet_evidence_carriers::{
-    citation_owns_server_request_dispatch, citation_owns_server_request_entrypoint,
-    citation_owns_server_response_terminal,
-};
 use super::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 use super::packet_flow_requirements::{
     CoverageMode, EvidencePredicate, FlowRequirement, FlowRole,
     flow_requirement_call_receipt_is_valid, ordinary_incident_call_receipt_is_valid,
-    packet_flow_requirements_for_terms, server_flow_requirement_for_obligation_id,
+    packet_flow_requirements_for_terms,
 };
 use super::packet_required_probes::{
     packet_prompt_exact_symbol_probe_queries, packet_sufficiency_required_probe_queries_from_terms,
@@ -1968,11 +1964,13 @@ fn packet_unproven_claim_status(
 
 pub fn packet_claims_with_obligation_receipts<T>(
     answer: &AgentAnswerDto,
+    task_class: PacketTaskClassDto,
     plan: &PacketObligationPlanDto,
     supported_claims_with_telemetry: (Vec<PacketClaimDto>, T),
 ) -> Vec<PacketClaimDto> {
     packet_claims_with_obligation_receipts_and_telemetry(
         answer,
+        task_class,
         plan,
         supported_claims_with_telemetry,
     )
@@ -1981,11 +1979,12 @@ pub fn packet_claims_with_obligation_receipts<T>(
 
 pub fn packet_claims_with_obligation_receipts_and_telemetry<T>(
     answer: &AgentAnswerDto,
+    task_class: PacketTaskClassDto,
     plan: &PacketObligationPlanDto,
     (mut claims, telemetry): (Vec<PacketClaimDto>, T),
 ) -> (Vec<PacketClaimDto>, T) {
     bind_role_claims_to_exact_path_obligations(plan, &mut claims);
-    append_packet_obligation_receipt_claims(answer, plan, &mut claims);
+    append_packet_obligation_receipt_claims(answer, task_class, plan, &mut claims);
     (claims, telemetry)
 }
 
@@ -2042,6 +2041,7 @@ fn exact_path_role_claim_matches_obligation(
 
 fn append_packet_obligation_receipt_claims(
     answer: &AgentAnswerDto,
+    task_class: PacketTaskClassDto,
     plan: &PacketObligationPlanDto,
     claims: &mut Vec<PacketClaimDto>,
 ) {
@@ -2072,7 +2072,7 @@ fn append_packet_obligation_receipt_claims(
             && obligation.proof_status == PacketObligationProofStatusDto::Proven
             && has_carried_citation;
         claims.push(PacketClaimDto {
-            claim: packet_obligation_receipt_text(answer, obligation, &citations),
+            claim: packet_obligation_receipt_text(answer, task_class, obligation, &citations),
             required_obligation_ids: vec![obligation.id.clone()],
             required_obligation_kinds: vec![obligation.kind],
             proof_status: Some(status),
@@ -2102,11 +2102,14 @@ fn packet_obligation_receipt_proof_status(
 
 fn packet_obligation_receipt_text(
     answer: &AgentAnswerDto,
+    task_class: PacketTaskClassDto,
     obligation: &PacketClaimObligationDto,
     citations: &[AgentCitationDto],
 ) -> String {
     if obligation.proof_status == PacketObligationProofStatusDto::Proven && !citations.is_empty() {
-        if let Some(receipt) = proven_server_flow_receipt_text(answer, obligation, citations) {
+        if let Some(receipt) =
+            proven_server_flow_receipt_text(answer, task_class, obligation, citations)
+        {
             return receipt;
         }
         let anchors = citations
@@ -2139,20 +2142,32 @@ fn packet_obligation_receipt_text(
     )
 }
 
+/// Render a proven material obligation as a concrete typed relation.
+///
+/// This used to serve three hardcoded server obligation ids, so every other flow family —
+/// site build, client request, SQL schema, form validation, shell install, buffered IO,
+/// log handler, mapper, formatting, string predicate, and the rest — fell through to
+/// "Material obligation `x` has independently cited carrier evidence at …", a pointer at
+/// evidence rather than an explanation of it. The data needed for the real sentence was
+/// already resolved for all of them; only the lookup was narrow.
 fn proven_server_flow_receipt_text(
     answer: &AgentAnswerDto,
+    task_class: PacketTaskClassDto,
     obligation: &PacketClaimObligationDto,
     citations: &[AgentCitationDto],
 ) -> Option<String> {
-    let requirement = server_semantic_requirement(obligation)?;
+    let requirement = flow_requirement_for_obligation(answer, task_class, obligation)?;
     obligation.carrier_edge_proofs.iter().find_map(|proof| {
         if proof.edge_kind != EdgeKind::CALL {
             return None;
         }
+        // The carrier predicate check that used to sit here was a second, narrower copy of
+        // work `flow_requirement_call_receipt_is_valid` already does below: it runs the
+        // requirement's own `EvidencePredicate`, which is the authority on whether this
+        // citation may carry this requirement.
         let citation = citations.iter().find(|citation| {
             citation.node_id == proof.carrier_node_id
                 && citation.evidence_edge_ids.contains(&proof.edge_id)
-                && server_semantic_carrier_matches(&obligation.id, citation)
         })?;
         packet_execution_graphs(answer).iter().find_map(|graph| {
             let edge = graph.edges.iter().find(|edge| edge.id == proof.edge_id)?;
@@ -2167,33 +2182,66 @@ fn proven_server_flow_receipt_text(
                 return None;
             }
             let target = server_receipt_target(edge, target_label, target_kind);
-            server_semantic_receipt(&obligation.id, &citation.display_name, &target)
+            Some(flow_relation_receipt(
+                requirement.role,
+                proof.edge_kind,
+                &citation.display_name,
+                &target,
+            ))
         })
     })
 }
 
-fn server_semantic_requirement(obligation: &PacketClaimObligationDto) -> Option<FlowRequirement> {
-    let requirement = server_flow_requirement_for_obligation_id(&obligation.id)?;
-    // Server and client flows deliberately share stable obligation IDs. Kind plus the planned
-    // server query seeds preserve which requirement produced this row without consulting prompt
-    // prose or letting a coincidentally server-shaped client citation mint server semantics.
-    (obligation.kind == claim_obligation_kind(requirement.role)
-        && requirement.query_seeds.iter().all(|seed| {
-            obligation
-                .open_next_candidates
-                .iter()
-                .any(|candidate| candidate == seed)
-        }))
-    .then_some(requirement)
+/// Recover the flow requirement that minted this obligation.
+///
+/// `claim_obligation` stamps `id` from the requirement and copies its `query_seeds` into
+/// `open_next_candidates`, so replaying the same lookup `finalize_packet_claim_obligations`
+/// performs is exact identity recovery, not inference. Kind plus full seed containment keeps
+/// families that deliberately share an obligation id (server and client request flows) from
+/// borrowing each other's semantics.
+fn flow_requirement_for_obligation(
+    answer: &AgentAnswerDto,
+    task_class: PacketTaskClassDto,
+    obligation: &PacketClaimObligationDto,
+) -> Option<FlowRequirement> {
+    packet_flow_requirements_for_terms(&packet_probe_terms(&answer.prompt), task_class)
+        .into_iter()
+        .find(|requirement| {
+            requirement.id == obligation.id
+                && obligation.kind == claim_obligation_kind(requirement.role)
+                && requirement.query_seeds.iter().all(|seed| {
+                    obligation
+                        .open_next_candidates
+                        .iter()
+                        .any(|candidate| candidate == seed)
+                })
+        })
 }
 
-fn server_semantic_carrier_matches(obligation_id: &str, citation: &AgentCitationDto) -> bool {
-    match obligation_id {
-        "request_entrypoint" => citation_owns_server_request_entrypoint(citation),
-        "request_dispatch" => citation_owns_server_request_dispatch(citation),
-        "request_terminal" => citation_owns_server_response_terminal(citation),
-        _ => false,
-    }
+/// One sentence naming what this carrier does in the flow and the typed edge that proves it.
+///
+/// The verb comes from the requirement's declared `FlowRole` and the relation from the
+/// `EdgeKind`; the carrier, target, and their spelling come from the graph. Nothing here
+/// knows a repository, a language, or a framework noun — the previous version keyed English
+/// words off the carrier's terminal segment (`use` → "middleware"), which is why it could
+/// only ever describe a handful of shapes.
+fn flow_relation_receipt(
+    role: FlowRole,
+    edge_kind: EdgeKind,
+    carrier: &str,
+    target: &str,
+) -> String {
+    let action = match role {
+        FlowRole::Entrypoint => "enters this flow",
+        FlowRole::Registration => "registers this flow's handlers",
+        FlowRole::Configuration => "configures this flow",
+        FlowRole::StateOrStorage => "reaches this flow's state",
+        FlowRole::Dispatch => "delegates this flow",
+        FlowRole::TransformOrValidate => "transforms this flow's data",
+        FlowRole::TerminalBoundary => "completes this flow",
+        FlowRole::ErrorOrFallback => "handles this flow's failure",
+    };
+    format!("`{carrier}` {action} through the retained {edge_kind:?} to `{target}`.")
 }
 
 fn server_receipt_target(edge: &GraphEdgeDto, target_label: &str, target_kind: NodeKind) -> String {
@@ -2218,48 +2266,6 @@ fn server_receipt_target(edge: &GraphEdgeDto, target_label: &str, target_kind: N
             || target_label.to_string(),
             |owner| format!("{owner}.{leaf}"),
         )
-}
-
-fn server_semantic_receipt(obligation_id: &str, carrier: &str, target: &str) -> Option<String> {
-    let receipt_action = |display: &str| {
-        normalize_identifier(
-            display
-                .rsplit(['.', ':', '#'])
-                .find(|segment| !segment.is_empty())
-                .unwrap_or(display),
-        )
-    };
-    let carrier_action = receipt_action(carrier);
-    let target_action = receipt_action(target);
-    match obligation_id {
-        "request_entrypoint" => match carrier_action.as_str() {
-            "use" => Some(format!(
-                "`{carrier}` registers middleware through the retained `{target}` call on the router."
-            )),
-            "route" | "routes" => Some(format!(
-                "`{carrier}` registers routes through the retained `{target}` call on the router."
-            )),
-            "listen" => Some(format!(
-                "`{carrier}` starts the server listener through the retained `{target}` call."
-            )),
-            _ => Some(format!(
-                "`{carrier}` registers the server request surface through the retained `{target}` call."
-            )),
-        },
-        "request_dispatch" => Some(format!(
-            "`{carrier}` delegates request handling through the retained `{target}` call."
-        )),
-        "request_terminal" if matches!(target_action.as_str(), "end" | "finish") => Some(format!(
-            "`{carrier}` sends output through the retained `{target}` call, completing the response body."
-        )),
-        "request_terminal" if target_action == "write" => Some(format!(
-            "`{carrier}` writes response output through the retained `{target}` call."
-        )),
-        "request_terminal" if target_action == "flush" => Some(format!(
-            "`{carrier}` flushes response output through the retained `{target}` call."
-        )),
-        _ => None,
-    }
 }
 
 pub fn material_packet_obligations_are_proven(plan: &PacketObligationPlanDto) -> bool {

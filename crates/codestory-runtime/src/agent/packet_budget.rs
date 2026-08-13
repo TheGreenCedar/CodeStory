@@ -1,5 +1,6 @@
 use crate::agent::packet_candidate::is_packet_candidate_selection_view_id;
 use crate::agent::packet_capping::cap_packet_citations_with_obligation_carriers;
+use codestory_agent::packet_command::render_packet_command;
 use crate::agent::packet_claims::{
     packet_flow_claims_markdown, packet_supported_claims_with_telemetry,
 };
@@ -539,7 +540,26 @@ fn minimize_packet_for_hard_budget(packet: &mut AgentPacketDto) -> bool {
     packet.sufficiency.avoid_opening.clear();
     packet.sufficiency.avoid_opening_paths.clear();
     packet.sufficiency.gaps = gaps;
-    packet.sufficiency.follow_up_commands.clear();
+    // Republish the retained invocation as a command instead of clearing the field.
+    //
+    // A `partial` packet's contract tells the agent to run
+    // `sufficiency.follow_up_commands`; clearing it here left that field empty in every
+    // packet ever emitted, while `follow_up_invocations` stayed populated. The agent was
+    // told to read a list the minimizer had just emptied, so it improvised its own
+    // recovery instead of running the one command this code had already chosen.
+    //
+    // Rendering costs a single short string, and it is the canonical renderer, so the
+    // text is identical to what the sufficiency builder would have published.
+    packet.sufficiency.follow_up_commands = deeper
+        .as_ref()
+        .map(|invocation| {
+            let argv = std::iter::once(invocation.program.clone())
+                .chain(invocation.args.iter().cloned())
+                .collect::<Vec<_>>();
+            render_packet_command(&argv)
+        })
+        .into_iter()
+        .collect();
     packet.sufficiency.follow_up_invocations = deeper.into_iter().collect();
     packet.sufficiency.coverage_report = None;
     true
@@ -864,6 +884,7 @@ fn refresh_packet_claim_markdown(packet: &mut AgentPacketDto) {
     let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&packet.answer);
     let mut claims = packet_claims_with_obligation_receipts(
         &packet.answer,
+        packet.plan.task_class,
         &packet.plan.obligations,
         supported_claims_with_telemetry,
     );

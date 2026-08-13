@@ -153,7 +153,7 @@ fn build_packet_sufficiency_with_optional_obligation_context(
 ) -> PacketSufficiencyDto {
     let supported_claims = if let Some(plan) = obligations {
         let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(answer);
-        packet_claims_with_obligation_receipts(answer, plan, supported_claims_with_telemetry)
+        packet_claims_with_obligation_receipts(answer, task_class, plan, supported_claims_with_telemetry)
     } else {
         packet_supported_claims(answer)
     };
@@ -1597,15 +1597,54 @@ fn packet_sufficiency_gaps(
 }
 
 fn unresolved_sidecar_queries(answer: &AgentAnswerDto) -> Vec<String> {
+    let cited_file_paths = answer
+        .citations
+        .iter()
+        .filter_map(|citation| citation.file_path.as_deref())
+        .map(|path| path.replace('\\', "/").to_ascii_lowercase())
+        .collect::<Vec<_>>();
     let mut seen = HashSet::new();
     answer
         .retrieval_trace
         .packet_sidecar_diagnostics
         .iter()
         .filter(|diagnostic| sidecar_diagnostic_blocks_sufficiency(diagnostic))
+        .filter(|diagnostic| !sidecar_probe_target_is_cited(&diagnostic.query, &cited_file_paths))
         .filter(|diagnostic| seen.insert(diagnostic.query.clone()))
         .map(|diagnostic| diagnostic.query.clone())
         .collect()
+}
+
+/// A sidecar probe naming a file the packet already cites is not an unresolved coverage
+/// gap.
+///
+/// Path-like probes (`StringUtils.java`, `lib/src/client.dart`) exist to pull one named
+/// file into evidence. When that file ends up cited, the lexical candidates inside it
+/// that never bound to a symbol are a resolution diagnostic, not missing coverage —
+/// the packet demonstrably covered the file. Reporting them as unresolved contradicts
+/// the packet's own citation set, and a consumer matching unresolved entries against
+/// query obligations cannot reconcile a bare path with a query string, so it reads
+/// every one of them as blocking. That is how a packet that cites and covers
+/// `StringUtils.java` still reported it unresolved.
+fn sidecar_probe_target_is_cited(query: &str, cited_file_paths: &[String]) -> bool {
+    let normalized = query.trim().replace('\\', "/").to_ascii_lowercase();
+    let Some(base) = normalized.rsplit('/').next() else {
+        return false;
+    };
+    // A probe without an extension is a symbol or phrase, not a file probe; those keep
+    // blocking, because nothing in the citation set can vouch for them.
+    if !base.contains('.') || base.starts_with('.') {
+        return false;
+    }
+    // Match on a whole trailing path segment, so a probe for `foo/client.dart` is not
+    // vouched for by a cited `bar/client.dart`, and `utils.java` never matches a cited
+    // `StringUtils.java`.
+    cited_file_paths.iter().any(|cited| {
+        cited == &normalized
+            || cited
+                .strip_suffix(&normalized)
+                .is_some_and(|prefix| prefix.ends_with('/'))
+    })
 }
 
 fn sidecar_diagnostic_blocks_sufficiency(diagnostic: &PacketSidecarQueryDiagnosticDto) -> bool {

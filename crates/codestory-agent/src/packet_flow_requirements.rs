@@ -796,17 +796,6 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     },
 ];
 
-pub(crate) fn server_flow_requirement_for_obligation_id(
-    obligation_id: &str,
-) -> Option<FlowRequirement> {
-    match obligation_id {
-        "request_entrypoint" => Some(SERVER_REQUEST_DISPATCH_FLOW[0]),
-        "request_dispatch" => Some(SERVER_REQUEST_DISPATCH_FLOW[1]),
-        "request_terminal" => Some(SERVER_REQUEST_DISPATCH_FLOW[2]),
-        _ => None,
-    }
-}
-
 const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "request_entrypoint",

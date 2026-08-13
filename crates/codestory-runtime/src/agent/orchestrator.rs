@@ -113,7 +113,8 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentCustomRetrievalConfigDto,
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, AgentResponseBlockDto,
     AgentResponseModeDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
-    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AgentRetrievalStepKindDto,
+    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AgentRetrievalStepDto,
+    AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
     ApiError, GraphArtifactDto, GraphRequest, GraphResponse, GroundingBudgetDto, IndexFreshnessDto,
     IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
     NodeOccurrencesRequest, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketObligationPlanDto,
@@ -123,7 +124,7 @@ use codestory_contracts::api::{
 };
 #[cfg(test)]
 use codestory_contracts::api::{
-    AgentRetrievalStepDto, AgentRetrievalStepStatusDto, EdgeId, PacketBudgetDto,
+    EdgeId, PacketBudgetDto,
     PacketBudgetUsageDto, PacketClaimDto, PacketPlanQueryDto, PacketQueryCompletionDto,
     PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto, PacketSufficiencyStatusDto,
     RetrievalAnnotationKindDto, RetrievalShadowDto, SearchMatchQualityDto,
@@ -609,6 +610,7 @@ pub(crate) fn agent_packet(
         &limits,
         Some(&plan.obligations),
     );
+    append_packet_carrier_source_sections(controller, &mut answer, &limits);
     append_packet_non_trace_phase(&mut answer, "evidence_sections", phase_started);
     let phase_started = Instant::now();
     let sufficiency = build_packet_sufficiency_with_obligation_context(
@@ -902,7 +904,7 @@ fn packet_candidate_trace_row(
 
 fn append_packet_evidence_sections(
     answer: &mut AgentAnswerDto,
-    _task_class: PacketTaskClassDto,
+    task_class: PacketTaskClassDto,
     limits: &PacketBudgetLimitsDto,
     obligations: Option<&PacketObligationPlanDto>,
 ) {
@@ -926,6 +928,7 @@ fn append_packet_evidence_sections(
         let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(answer);
         packet_claims_with_obligation_receipts_and_telemetry(
             answer,
+            task_class,
             obligations,
             supported_claims_with_telemetry,
         )
@@ -952,6 +955,96 @@ fn append_packet_evidence_sections(
             },
         );
     }
+}
+
+/// Byte ceilings for the carrier-source section. The packet's own output cap is the real
+/// constraint and the cap fixpoint still runs after this; these only stop one long function
+/// body from spending the whole snippet allowance before the rest of the evidence is placed.
+const CARRIER_SOURCE_MAX_TOTAL_BYTES: usize = 14_336;
+const CARRIER_SOURCE_MAX_SNIPPET_BYTES: usize = 1_536;
+
+/// Truncate on a UTF-8 character boundary, never mid-codepoint.
+fn truncate_carrier_source(body: &str, max_bytes: usize) -> &str {
+    if body.len() <= max_bytes {
+        return body;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    &body[..end]
+}
+
+/// Attach each material carrier's own source to the packet.
+///
+/// The packet is the agent's only view of the repository — the packet-first contract holds
+/// it to zero source reads afterwards — and `budget.limits.max_snippets` has always reserved
+/// room for exactly this. Nothing ever filled it: every packet shipped `snippets: 0` against
+/// an allowance of twelve. So a packet named a carrier, cited its file and line, and asserted
+/// a receipt about it, while the code itself stayed unreadable at answering time. What a
+/// carrier says about itself — its doc comment, the call it makes, the prototype it mixes in —
+/// is evidence the graph cannot restate, and it was being dropped on the floor.
+fn append_packet_carrier_source_sections(
+    controller: &AppController,
+    answer: &mut AgentAnswerDto,
+    limits: &PacketBudgetLimitsDto,
+) {
+    if answer.citations.is_empty() || limits.max_snippets == 0 {
+        return;
+    }
+
+    let mut rendered = String::new();
+    let mut steps = Vec::new();
+
+    for citation in answer.citations.iter() {
+        if steps.len() >= limits.max_snippets as usize {
+            break;
+        }
+        // Only behaviour-bearing anchors have a body worth quoting; a bare FILE citation
+        // would spend the allowance on the head of a file nobody asked about.
+        if !matches!(
+            citation.kind,
+            NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::CLASS | NodeKind::STRUCT
+        ) {
+            continue;
+        }
+        let started = Instant::now();
+        let Ok(snippet) = controller.snippet_function_body_context(citation.node_id.clone(), 0)
+        else {
+            continue;
+        };
+        let body = snippet.snippet.trim_end();
+        if body.is_empty() {
+            continue;
+        }
+        let entry = format!(
+            "### {}\n\n{}\n\n",
+            citation.display_name,
+            truncate_carrier_source(body, CARRIER_SOURCE_MAX_SNIPPET_BYTES)
+        );
+        if rendered.len() + entry.len() > CARRIER_SOURCE_MAX_TOTAL_BYTES {
+            break;
+        }
+        rendered.push_str(&entry);
+        steps.push(AgentRetrievalStepDto {
+            kind: AgentRetrievalStepKindDto::SourceRead,
+            status: AgentRetrievalStepStatusDto::Ok,
+            duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u32::MAX),
+            input: Vec::new(),
+            output: Vec::new(),
+            message: Some(format!("carrier source for {}", citation.display_name)),
+        });
+    }
+
+    if rendered.is_empty() {
+        return;
+    }
+    answer.retrieval_trace.steps.extend(steps);
+    answer.sections.push(AgentResponseSectionDto {
+        id: "packet-carrier-source".to_string(),
+        title: "Carrier Source".to_string(),
+        blocks: vec![AgentResponseBlockDto::Markdown { markdown: rendered }],
+    });
 }
 
 fn packet_evidence_ledger_markdown(
