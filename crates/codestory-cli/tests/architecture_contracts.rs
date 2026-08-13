@@ -2962,3 +2962,29 @@ fn every_production_gap_annotation_producer_is_pinned_to_the_gap_kind() {
          PRODUCTION_GAP_ANNOTATION_PRODUCERS"
     );
 }
+
+/// Repo-text search must not be disabled by a constant on any search path.
+///
+/// The sidecar path -- the one the MCP tool surface and the packet both use -- once built
+/// its results with `let repo_text_hits = Vec::new();` and `repo_text_enabled: false`,
+/// while still honouring the caller's `repo_text` argument everywhere else. The tool
+/// accepted the request, returned nothing, and advised running an index refresh to restore
+/// a mode the caller was already in. It went unnoticed because nothing asserted the field:
+/// across a 54-row benchmark, agents asked for repo text on 582 of 582 searches and every
+/// one of the 569 that completed reported a zero count.
+///
+/// A literal `false` here is indistinguishable from "this path does not support repo text",
+/// which is why the regression was invisible. The flag has to follow the requested mode.
+#[test]
+fn search_paths_do_not_hardcode_repo_text_disabled() {
+    let source = read("crates/codestory-runtime/src/search_plan.rs");
+    assert!(
+        !source.contains("repo_text_enabled: false"),
+        "search_plan.rs disables repo text with a constant; it must follow the requested \
+         SearchRepoTextMode so a caller that asks for literal matches receives them"
+    );
+    assert!(
+        source.contains("let repo_text_enabled = repo_text_mode != SearchRepoTextMode::Off;"),
+        "the sidecar search path must derive repo_text_enabled from the requested mode"
+    );
+}

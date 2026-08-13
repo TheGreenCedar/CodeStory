@@ -1867,21 +1867,48 @@ impl AppController {
             &self.runtime_config,
         )?;
         let freshness = self.index_freshness().ok();
-        let repo_text_hits = Vec::new();
+        let indexed_hit_ids = indexed_symbol_hits
+            .iter()
+            .map(|hit| hit.node_id.clone())
+            .collect::<HashSet<_>>();
+        // Literal repository text, on the path MCP actually uses.
+        //
+        // This branch hardcoded an empty hit set and a permanently disabled flag, so every
+        // caller that asked for repo text got none and was told to "run retrieval index to
+        // restore full sidecar mode" -- advice to repair the very mode it was already in.
+        // Across a 54-row census agents requested repo text on 582 of 582 searches and
+        // received a zero count on all 569 that completed.
+        //
+        // It matters most where the symbol graph is thinnest: shell, CSS, HTML and SQL have
+        // few resolvable symbols but plenty of literal identifiers, and a symbol-only search
+        // cannot see them. The scan itself is the same one the non-sidecar path already
+        // runs, deduplicated against the indexed hits so repo text only ever adds evidence.
+        let repo_text_enabled = repo_text_mode != SearchRepoTextMode::Off;
+        let repo_text_hits = if repo_text_enabled {
+            let scan = Self::collect_repo_text_hits(
+                &storage,
+                Some(project_root.as_path()),
+                &self.source_index_policy,
+                &query,
+                limit_per_source,
+                &indexed_hit_ids,
+            )?;
+            let mut hits = scan.hits;
+            annotate_search_hit_match_quality(&query, &mut hits);
+            hits
+        } else {
+            Vec::new()
+        };
         let mut suggestions = Vec::new();
         let query_assessment = search_query_assessment(
             &query,
             &indexed_symbol_hits,
             &repo_text_hits,
             repo_text_mode,
-            false,
+            repo_text_enabled,
             None,
             None,
         );
-        let indexed_hit_ids = indexed_symbol_hits
-            .iter()
-            .map(|hit| hit.node_id.clone())
-            .collect::<HashSet<_>>();
         // The orientation regime is a property of the query, not of the plan, so
         // it is decided before the plan and the evidence is built inside it.
         let orientation_regime = orientation_query(&query);
@@ -1995,7 +2022,7 @@ impl AppController {
             freshness,
             limit_per_source: limit_per_source as u32,
             repo_text_mode,
-            repo_text_enabled: false,
+            repo_text_enabled,
             query_assessment: Some(query_assessment),
             search_plan,
             repo_text_stats: None,
