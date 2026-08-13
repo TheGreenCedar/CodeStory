@@ -2742,8 +2742,10 @@ fn stdio_snippet_request(
             entries
                 .iter()
                 .map(|entry| {
+                    // Accept `file_path` too: that is the key every hit reports.
                     let path = entry
                         .get("path")
+                        .or_else(|| entry.get("file_path"))
                         .and_then(serde_json::Value::as_str)
                         .map(str::trim)
                         .filter(|path| !path.is_empty())

@@ -841,7 +841,14 @@ mod tests {
 /// Reconciling here rather than in each schema keeps one published name per concept, so
 /// the catalog stays unambiguous while the server accepts its own output vocabulary.
 const ARGUMENT_SYNONYMS: &[&[&str]] = &[
+    // A hit's identifier. Emitted 1,978 times across a 54-row census as `node_id`.
     &["id", "node_id"],
+    // A hit's name. `display_name` appears 2,177 times, `qualified_name` 771, `label` 837 --
+    // and every consumer tool declares only `query`, so piping a result into the next call
+    // meant renaming the field by hand every time.
+    &["query", "display_name", "qualified_name", "label"],
+    // A hit's file. `file_path` appears 2,903 times; `snippet` range entries call it `path`.
+    &["path", "file_path"],
     &["depth", "max_depth"],
 ];
 
@@ -969,5 +976,46 @@ mod source_range_tests {
     fn snippet_range_entries_require_a_path() {
         let arguments = json!({"project": "/tmp/repo", "paths": [{"line": 10}]});
         assert!(validate_tool_arguments("snippet", Some(&arguments)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod emitted_vocabulary_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Every field a hit reports should be pasteable into the tool that consumes it.
+    /// Measured over a 54-row census, the consumers accepted none of them: `file_path`
+    /// (2,903 occurrences), `display_name` (2,177), `line` (2,110), `node_id` (1,978) and
+    /// `qualified_name` (771) were all undeclared, so piping one call into the next meant
+    /// renaming fields by hand on every hop.
+    #[test]
+    fn a_hit_display_name_can_be_pasted_as_a_query() {
+        for tool in ["symbol", "trail", "context"] {
+            let mut arguments = json!({"project": "/tmp/repo", "display_name": "Session.request"});
+            assert!(
+                validate_tool_arguments(tool, Some(&arguments)).is_err(),
+                "precondition: {tool} does not declare display_name"
+            );
+            reconcile_argument_synonyms(tool, &mut arguments);
+            assert_eq!(arguments["query"], json!("Session.request"), "{tool}");
+            assert_eq!(validate_tool_arguments(tool, Some(&arguments)), Ok(()), "{tool}");
+        }
+    }
+
+    #[test]
+    fn a_hit_qualified_name_resolves_to_the_query_selector() {
+        let mut arguments = json!({"project": "/tmp/repo", "qualified_name": "requests.Session.send"});
+        reconcile_argument_synonyms("symbol", &mut arguments);
+        assert_eq!(arguments["query"], json!("requests.Session.send"));
+        assert_eq!(validate_tool_arguments("symbol", Some(&arguments)), Ok(()));
+    }
+
+    /// An explicit `query` still wins; aliases never overwrite a declared name.
+    #[test]
+    fn an_explicit_query_is_not_overwritten_by_an_alias() {
+        let mut arguments = json!({"project": "/tmp/repo", "query": "keep", "display_name": "other"});
+        reconcile_argument_synonyms("symbol", &mut arguments);
+        assert_eq!(arguments["query"], json!("keep"));
     }
 }
