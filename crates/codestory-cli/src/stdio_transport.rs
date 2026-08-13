@@ -1432,7 +1432,7 @@ fn handle_stdio_message(
     line: &str,
     cancelled: &Arc<AtomicBool>,
 ) -> Option<serde_json::Value> {
-    let request: serde_json::Value = match serde_json::from_str(line) {
+    let mut request: serde_json::Value = match serde_json::from_str(line) {
         Ok(value) => value,
         Err(error) => {
             return Some(stdio_jsonrpc_error(
@@ -1610,6 +1610,14 @@ fn handle_stdio_message(
                     "Invalid params: tool arguments must be an object",
                 ));
             }
+            // Accept the server's own output vocabulary as input before anything reads
+            // these arguments, so validation and the handler agree on one spelling.
+            // `name` borrows from `request`, so take an owned copy for the mutation.
+            let tool_name = name.to_string();
+            if let Some(arguments) = request.pointer_mut("/params/arguments") {
+                crate::stdio_arguments::reconcile_argument_synonyms(&tool_name, arguments);
+            }
+            let name = tool_name.as_str();
             if let Err(violations) = crate::stdio_arguments::validate_tool_arguments(
                 name,
                 request.pointer("/params/arguments"),

@@ -826,3 +826,110 @@ mod tests {
         );
     }
 }
+
+/// Argument names that mean the same thing, one group per concept.
+///
+/// A tool's *output* calls a stable node identifier `node_id`; several tools' *input*
+/// schemas call it `id`. An agent that reads `node_id` from a search result and hands it
+/// straight back is doing the obvious thing, and the server rejected it as an undeclared
+/// property. Across a 54-row benchmark that single mismatch produced 98 `unknown_property`
+/// rejections, and the agent -- given an error that named the pointer but not the accepted
+/// spelling -- retried the same shape rather than renaming the field.
+///
+/// `depth` and `max_depth` are the same story between `trail` and `shortest_path`.
+///
+/// Reconciling here rather than in each schema keeps one published name per concept, so
+/// the catalog stays unambiguous while the server accepts its own output vocabulary.
+const ARGUMENT_SYNONYMS: &[&[&str]] = &[
+    &["id", "node_id"],
+    &["depth", "max_depth"],
+];
+
+/// Rewrite supplied argument names to the spelling this tool's schema declares.
+///
+/// Only ever renames when exactly one member of a synonym group is declared and the caller
+/// used a different member that the schema does not declare; an argument the schema already
+/// accepts is never touched, and a collision between two spellings is left alone so
+/// validation still reports it.
+pub(crate) fn reconcile_argument_synonyms(tool: &str, arguments: &mut Value) {
+    let Some(schema) = crate::stdio_catalog::tool_input_schema(tool) else {
+        return;
+    };
+    let Some(declared) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let Some(supplied) = arguments.as_object_mut() else {
+        return;
+    };
+    for group in ARGUMENT_SYNONYMS {
+        let mut accepted = group.iter().filter(|name| declared.contains_key(**name));
+        let (Some(canonical), None) = (accepted.next(), accepted.next()) else {
+            continue;
+        };
+        if supplied.contains_key(*canonical) {
+            continue;
+        }
+        let Some(alias) = group
+            .iter()
+            .find(|name| *name != canonical && supplied.contains_key(**name))
+        else {
+            continue;
+        };
+        if let Some(value) = supplied.remove(*alias) {
+            supplied.insert((*canonical).to_string(), value);
+        }
+    }
+}
+
+#[cfg(test)]
+mod synonym_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The server's search results name a stable identifier `node_id`; `symbol` declares
+    /// `id`. Handing a result field straight back must work.
+    #[test]
+    fn node_id_is_accepted_where_the_schema_declares_id() {
+        let mut arguments = json!({"project": "/tmp/repo", "node_id": "12345"});
+        assert!(
+            validate_tool_arguments("symbol", Some(&arguments)).is_err(),
+            "precondition: the published schema does not declare node_id"
+        );
+        reconcile_argument_synonyms("symbol", &mut arguments);
+        assert_eq!(arguments["id"], json!("12345"));
+        assert!(arguments.get("node_id").is_none());
+        assert_eq!(validate_tool_arguments("symbol", Some(&arguments)), Ok(()));
+    }
+
+    /// `trail` declares `depth`; `shortest_path` declares `max_depth`. An agent moving
+    /// between them should not have to remember which is which.
+    #[test]
+    fn max_depth_is_accepted_where_the_schema_declares_depth() {
+        let mut arguments = json!({"project": "/tmp/repo", "query": "Session", "max_depth": 2});
+        reconcile_argument_synonyms("trail", &mut arguments);
+        assert_eq!(arguments["depth"], json!(2));
+        assert_eq!(validate_tool_arguments("trail", Some(&arguments)), Ok(()));
+    }
+
+    /// A spelling the schema already declares is never rewritten.
+    #[test]
+    fn declared_names_are_left_alone() {
+        let mut arguments = json!({"project": "/tmp/repo", "id": "keep-me"});
+        reconcile_argument_synonyms("symbol", &mut arguments);
+        assert_eq!(arguments["id"], json!("keep-me"));
+    }
+
+    /// Supplying both spellings is a real ambiguity; leave it for validation to report
+    /// rather than silently picking one.
+    #[test]
+    fn colliding_spellings_are_not_silently_merged() {
+        let mut arguments = json!({"project": "/tmp/repo", "id": "a", "node_id": "b"});
+        reconcile_argument_synonyms("symbol", &mut arguments);
+        assert_eq!(arguments["id"], json!("a"));
+        assert_eq!(arguments["node_id"], json!("b"));
+        assert!(validate_tool_arguments("symbol", Some(&arguments)).is_err());
+    }
+}
