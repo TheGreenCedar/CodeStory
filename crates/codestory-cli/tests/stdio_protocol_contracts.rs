@@ -5596,9 +5596,19 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
         );
         // Only a retryable activation publishes a retry class; a terminated one has
         // nothing left to retry after, which is what `retry_tool: null` above says.
-        assert_eq!(
-            error["operation"]["embedding_retry"]["retry_class"],
-            json!("after_server_change")
+        //
+        // Which class appears depends on why the embedding runtime is unavailable, and both
+        // are correct: `after_server_change` when the live server's engine contract no
+        // longer matches, `after_owner_idle` when another CodeStory process on this machine
+        // currently owns it. Pinning one made the suite assert a property of the host rather
+        // than of the contract, which is that a retryable activation always tells the client
+        // what to wait for.
+        let retry_class = error["operation"]["embedding_retry"]["retry_class"]
+            .as_str()
+            .expect("a retryable activation publishes a retry class");
+        assert!(
+            matches!(retry_class, "after_server_change" | "after_owner_idle"),
+            "retry class should name a known wait condition, got {retry_class}: {error}"
         );
     }
 
