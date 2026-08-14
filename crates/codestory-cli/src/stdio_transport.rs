@@ -3680,6 +3680,25 @@ fn handle_stdio_packet(
         .pointer("/params/arguments/include_evidence")
         .and_then(|value| value.as_bool())
         .unwrap_or(true);
+    let parent_packet_id = request
+        .pointer("/params/arguments/parent_packet_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let option_ids = request
+        .pointer("/params/arguments/option_ids")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    let core_generation_id = request
+        .pointer("/params/arguments/core_generation_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let retrieval_generation = request
+        .pointer("/params/arguments/retrieval_generation")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
     let publication = stdio_active_product_publication(runtime);
     let cache_key = publication.clone().map(|publication| {
         stdio_packet_cache_key(StdioPacketCacheKeyInput {
@@ -3691,6 +3710,10 @@ fn handle_stdio_packet(
             extra_probes: &extra_probes,
             include_evidence,
             latency_budget_ms,
+            parent_packet_id: parent_packet_id.as_deref(),
+            option_ids: &option_ids,
+            core_generation_id: core_generation_id.as_deref(),
+            retrieval_generation: retrieval_generation.as_deref(),
         })
     });
     if let (Some(cache_key), Some(publication)) = (cache_key.as_ref(), publication.as_ref())
@@ -3710,25 +3733,10 @@ fn handle_stdio_packet(
             extra_probes,
             include_evidence,
             latency_budget_ms,
-            parent_packet_id: request
-                .pointer("/params/arguments/parent_packet_id")
-                .and_then(|value| value.as_str())
-                .map(str::to_string),
-            option_ids: request
-                .pointer("/params/arguments/option_ids")
-                .and_then(|value| value.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect(),
-            core_generation_id: request
-                .pointer("/params/arguments/core_generation_id")
-                .and_then(|value| value.as_str())
-                .map(str::to_string),
-            retrieval_generation: request
-                .pointer("/params/arguments/retrieval_generation")
-                .and_then(|value| value.as_str())
-                .map(str::to_string),
+            parent_packet_id,
+            option_ids,
+            core_generation_id,
+            retrieval_generation,
         })
         .map(|mut packet| {
             match std::env::current_exe() {
@@ -3851,6 +3859,10 @@ struct StdioPacketCacheKey {
     extra_probes: Vec<String>,
     include_evidence: bool,
     latency_budget_ms: Option<u32>,
+    parent_packet_id: Option<String>,
+    option_ids: Vec<String>,
+    core_generation_id: Option<String>,
+    retrieval_generation: Option<String>,
 }
 
 struct StdioLruCache<K> {
@@ -3923,6 +3935,10 @@ struct StdioPacketCacheKeyInput<'a> {
     extra_probes: &'a [String],
     include_evidence: bool,
     latency_budget_ms: Option<u32>,
+    parent_packet_id: Option<&'a str>,
+    option_ids: &'a [String],
+    core_generation_id: Option<&'a str>,
+    retrieval_generation: Option<&'a str>,
 }
 
 fn stdio_packet_cache_key(input: StdioPacketCacheKeyInput<'_>) -> StdioPacketCacheKey {
@@ -3935,6 +3951,10 @@ fn stdio_packet_cache_key(input: StdioPacketCacheKeyInput<'_>) -> StdioPacketCac
         extra_probes: input.extra_probes.to_vec(),
         include_evidence: input.include_evidence,
         latency_budget_ms: input.latency_budget_ms,
+        parent_packet_id: input.parent_packet_id.map(str::to_string),
+        option_ids: input.option_ids.to_vec(),
+        core_generation_id: input.core_generation_id.map(str::to_string),
+        retrieval_generation: input.retrieval_generation.map(str::to_string),
     }
 }
 
@@ -7246,6 +7266,10 @@ mod tests {
             extra_probes: &[],
             include_evidence: true,
             latency_budget_ms: Some(15_000),
+            parent_packet_id: None,
+            option_ids: &[],
+            core_generation_id: None,
+            retrieval_generation: None,
         }
     }
 
@@ -9043,6 +9067,35 @@ version = "0.11.20"
             base,
             stdio_packet_cache_key(StdioPacketCacheKeyInput {
                 probes: &probes,
+                ..base_packet_cache_key_input("Explain packet caching.")
+            })
+        );
+        assert_ne!(
+            base,
+            stdio_packet_cache_key(StdioPacketCacheKeyInput {
+                parent_packet_id: Some("parent-packet"),
+                ..base_packet_cache_key_input("Explain packet caching.")
+            })
+        );
+        let option_ids = ["omitted_mandatory_support:symbol%3A42".to_string()];
+        assert_ne!(
+            base,
+            stdio_packet_cache_key(StdioPacketCacheKeyInput {
+                option_ids: &option_ids,
+                ..base_packet_cache_key_input("Explain packet caching.")
+            })
+        );
+        assert_ne!(
+            base,
+            stdio_packet_cache_key(StdioPacketCacheKeyInput {
+                core_generation_id: Some("core-generation-1"),
+                ..base_packet_cache_key_input("Explain packet caching.")
+            })
+        );
+        assert_ne!(
+            base,
+            stdio_packet_cache_key(StdioPacketCacheKeyInput {
+                retrieval_generation: Some("retrieval-generation-1"),
                 ..base_packet_cache_key_input("Explain packet caching.")
             })
         );
