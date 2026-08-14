@@ -2485,6 +2485,12 @@ fn stdio_packet_text(packet: &serde_json::Value) -> String {
         Some("none"),
     );
 
+    // Anchors first, in one line each. The evidence-ledger section renders the same
+    // citations as markdown prose, but it now sits at the end of the packet where the byte
+    // cap reaches it, and this surface publishes `answer.citations` in structuredContent
+    // only -- so a text-only reader would otherwise be left with no anchors at all.
+    append_packet_anchor_list(&mut text, packet);
+
     for section in packet
         .pointer("/answer/sections")
         .and_then(|value| value.as_array())
@@ -2492,7 +2498,7 @@ fn stdio_packet_text(packet: &serde_json::Value) -> String {
         .flatten()
     {
         let id = section.get("id").and_then(|value| value.as_str());
-        if !matches!(id, Some("packet-evidence-ledger" | "packet-flow-claims")) {
+        if !stdio_packet_section_is_evidence(id) {
             continue;
         }
         if let Some(title) = section.get("title").and_then(|value| value.as_str()) {
@@ -2517,6 +2523,57 @@ fn stdio_packet_text(packet: &serde_json::Value) -> String {
         }
     }
     stdio_truncate_text(&text, STDIO_TEXT_MAX_BYTES)
+}
+
+/// Which packet sections are worth spending the compact-text budget on.
+///
+/// This used to admit only the evidence ledger and the claims list -- the two sections that
+/// re-render `answer.citations` and `sufficiency.covered_claims`, both of which this surface
+/// already publishes as structured fields. The retrieval evidence and the carrier source,
+/// which exist nowhere else in the response, were dropped entirely. Admit anything that
+/// carries evidence and let the packet's own section order decide what survives the cap;
+/// name only the presentational sections here, so a new evidence section is delivered by
+/// default rather than silently withheld.
+fn stdio_packet_section_is_evidence(id: Option<&str>) -> bool {
+    let Some(id) = id else {
+        return false;
+    };
+    !matches!(id, "diagrams" | "analysis" | "uml-neighborhood") && !id.starts_with("mermaid-")
+}
+
+/// One line per anchor: `display_name (kind) path:line`.
+fn append_packet_anchor_list(text: &mut String, packet: &serde_json::Value) {
+    let citations = packet
+        .pointer("/answer/citations")
+        .and_then(|value| value.as_array())
+        .map(|value| value.as_slice())
+        .unwrap_or_default();
+    if citations.is_empty() {
+        return;
+    }
+    text.push_str("\nanchors\n");
+    for citation in citations.iter().take(STDIO_TEXT_ITEM_LIMIT) {
+        let field = |key: &str| citation.get(key).and_then(|value| value.as_str());
+        let mut line = String::new();
+        if let Some(name) = field("display_name") {
+            line.push_str(&stdio_escape_text_scalar(name));
+        }
+        if let Some(kind) = field("kind") {
+            line.push_str(&format!(" ({kind})"));
+        }
+        if let Some(path) = field("file_path") {
+            line.push_str(&format!(" {}", stdio_escape_text_scalar(path)));
+            if let Some(line_number) = citation.get("line").and_then(|value| value.as_u64()) {
+                line.push_str(&format!(":{line_number}"));
+            }
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        text.push_str(&stdio_truncate_text(line, 300));
+        text.push('\n');
+    }
 }
 
 fn append_packet_text_field(text: &mut String, label: &str, value: Option<&str>) {
@@ -2768,9 +2825,9 @@ fn stdio_snippet_request(
                             "snippet.paths entry for {path} needs a 1-based `line` or `start_line`"
                         ))
                     })? as u32;
-                    let end_line = read("end_line").map(|value| value as u32).unwrap_or_else(|| {
-                        start_line.saturating_add(SOURCE_RANGE_DEFAULT_SPAN)
-                    });
+                    let end_line = read("end_line")
+                        .map(|value| value as u32)
+                        .unwrap_or_else(|| start_line.saturating_add(SOURCE_RANGE_DEFAULT_SPAN));
                     if end_line < start_line {
                         return Err(ApiError::invalid_argument(format!(
                             "snippet.paths entry for {path} has end_line before start_line"

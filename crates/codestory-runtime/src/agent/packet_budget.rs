@@ -1,6 +1,5 @@
 use crate::agent::packet_candidate::is_packet_candidate_selection_view_id;
 use crate::agent::packet_capping::cap_packet_citations_with_obligation_carriers;
-use codestory_agent::packet_command::render_packet_command;
 use crate::agent::packet_claims::{
     packet_flow_claims_markdown, packet_supported_claims_with_telemetry,
 };
@@ -19,6 +18,7 @@ use crate::agent::trace_export::{
     PACKET_STEP_TRACE_ANNOTATION_PREFIX, compact_retained_packet_step_trace_for_budget,
     packet_retrieval_trace_summary, retain_packet_step_trace_for_export,
 };
+use codestory_agent::packet_command::render_packet_command;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, AgentResponseBlockDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, ApiError, EdgeId, GraphArtifactDto, GraphResponse,
@@ -1315,14 +1315,22 @@ fn next_markdown_truncation_candidate(answer: &AgentAnswerDto) -> Option<(usize,
     candidate.map(|(section_index, block_index, _, len)| (section_index, block_index, len))
 }
 
+/// Lower is truncated first. This mirrors `packet_section_order_rank`: what leads the packet
+/// is what a capped consumer actually reads, so it is also what the hard-budget minimizer
+/// must protect. The ledger and claims sections render `answer.citations` and
+/// `sufficiency.covered_claims`, which survive truncation as structured fields, so cutting
+/// their markdown loses nothing a consumer cannot recover.
 fn packet_markdown_truncation_priority(section_id: &str) -> u8 {
     if section_id == "diagrams" {
         return 0;
     }
-    if section_id == "retrieval-evidence" || section_id.starts_with("packet-subquery-") {
+    if section_id == "packet-evidence-ledger" || section_id == "packet-flow-claims" {
         return 1;
     }
-    if section_id == "packet-evidence-ledger" || section_id == "packet-flow-claims" {
+    if section_id.starts_with("packet-subquery-") {
+        return 2;
+    }
+    if section_id == "retrieval-evidence" || section_id == "packet-carrier-source" {
         return 10;
     }
     5
@@ -1983,6 +1991,7 @@ pub(super) mod tests {
             packet_supported_claims_with_telemetry(&packet.answer);
         let mut initial_claims = packet_claims_with_obligation_receipts(
             &packet.answer,
+            packet.plan.task_class,
             &packet.plan.obligations,
             supported_claims_with_telemetry,
         );

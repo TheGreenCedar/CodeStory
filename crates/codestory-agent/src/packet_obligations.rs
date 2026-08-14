@@ -2233,7 +2233,10 @@ fn flow_relation_receipt(
 ) -> String {
     let action = match role {
         FlowRole::Entrypoint => "enters this flow",
-        FlowRole::Registration => "registers this flow's handlers",
+        // Covers both halves of what this role marks -- binding a listener and registering
+        // a handler -- without asserting either. "registers this flow's handlers" was a lie
+        // on a listener, which is the one shape the role's own test was written to check.
+        FlowRole::Registration => "makes this flow reachable",
         FlowRole::Configuration => "configures this flow",
         FlowRole::StateOrStorage => "reaches this flow's state",
         FlowRole::Dispatch => "delegates this flow",
@@ -2925,7 +2928,12 @@ mod tests {
             answer,
             &budget(),
         );
-        let claims = packet_claims_with_obligation_receipts(answer, &plan, (Vec::new(), ()));
+        let claims = packet_claims_with_obligation_receipts(
+            answer,
+            PacketTaskClassDto::RouteTracing,
+            &plan,
+            (Vec::new(), ()),
+        );
         assert_eq!(claims.len(), 1);
         (plan, claims.into_iter().next().expect("receipt claim"))
     }
@@ -3562,8 +3570,12 @@ mod tests {
             coverage_role: Some("command entrypoint".to_string()),
             eligible_for_sufficiency: Some(false),
         };
-        let mut claims =
-            packet_claims_with_obligation_receipts(&carried_answer, &plan, (vec![role_claim], ()));
+        let mut claims = packet_claims_with_obligation_receipts(
+            &carried_answer,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &plan,
+            (vec![role_claim], ()),
+        );
         bind_claims_to_packet_obligations(&plan, &mut claims);
         assert_eq!(claims.len(), 2);
         assert_eq!(
@@ -4144,7 +4156,8 @@ mod tests {
         );
         let supported =
             crate::packet_claims::packet_supported_claims_with_telemetry(&carried_answer);
-        let mut claims = packet_claims_with_obligation_receipts(&carried_answer, &plan, supported);
+        let mut claims =
+            packet_claims_with_obligation_receipts(&carried_answer, task_class, &plan, supported);
         bind_claims_to_packet_obligations(&plan, &mut claims);
 
         let bound = claims
@@ -5342,7 +5355,7 @@ mod tests {
         );
         assert_eq!(
             claim.claim,
-            "`res.send` sends output through the retained `res.end` call, completing the response body."
+            "`res.send` completes this flow through the retained CALL to `res.end`."
         );
 
         for (label, mutate) in [
@@ -5376,6 +5389,7 @@ mod tests {
             mutate(&mut changed);
             let semantic = proven_server_flow_receipt_text(
                 &changed,
+                PacketTaskClassDto::ArchitectureExplanation,
                 &plan.claim_obligations[0],
                 &changed.citations,
             );
@@ -5392,7 +5406,7 @@ mod tests {
         let (_, write_claim) = finalized_server_receipt_claim(&write, "request_terminal");
         assert_eq!(
             write_claim.claim,
-            "`res.send` writes response output through the retained `res.write` call."
+            "`res.send` completes this flow through the retained CALL to `res.write`."
         );
         assert!(!write_claim.claim.contains("completing"));
     }
@@ -5419,11 +5433,16 @@ mod tests {
             },
         );
 
-        let receipt = proven_server_flow_receipt_text(&answer, obligation, &answer.citations)
-            .expect("later exact structural proof should produce semantic receipt");
+        let receipt = proven_server_flow_receipt_text(
+            &answer,
+            PacketTaskClassDto::ArchitectureExplanation,
+            obligation,
+            &answer.citations,
+        )
+        .expect("later exact structural proof should produce semantic receipt");
         assert_eq!(
             receipt,
-            "`app.handle` delegates request handling through the retained `app.router.handle` call."
+            "`app.handle` delegates this flow through the retained CALL to `app.router.handle`."
         );
     }
 
@@ -5450,10 +5469,20 @@ mod tests {
         }];
 
         assert_eq!(
-            proven_server_flow_receipt_text(&answer, obligation, &answer.citations),
+            proven_server_flow_receipt_text(
+                &answer,
+                PacketTaskClassDto::ArchitectureExplanation,
+                obligation,
+                &answer.citations
+            ),
             None
         );
-        let receipt = packet_obligation_receipt_text(&answer, obligation, &answer.citations);
+        let receipt = packet_obligation_receipt_text(
+            &answer,
+            PacketTaskClassDto::ArchitectureExplanation,
+            obligation,
+            &answer.citations,
+        );
         assert_eq!(
             receipt,
             "Material obligation `request_entrypoint` has independently cited carrier evidence at `app.listen`."
@@ -5475,7 +5504,7 @@ mod tests {
         let (_, dispatch_claim) = finalized_server_receipt_claim(&dispatch, "request_dispatch");
         assert_eq!(
             dispatch_claim.claim,
-            "`app.handle` delegates request handling through the retained `Router.handle` call."
+            "`app.handle` delegates this flow through the retained CALL to `Router.handle`."
         );
         assert!(!dispatch_claim.claim.contains("stale.receiver"));
 
@@ -5492,7 +5521,7 @@ mod tests {
         let (_, listener_claim) = finalized_server_receipt_claim(&listener, "request_entrypoint");
         assert_eq!(
             listener_claim.claim,
-            "`app.listen()` starts the server listener through the retained `Server.listen` call."
+            "`app.listen()` makes this flow reachable through the retained CALL to `Server.listen`."
         );
     }
 

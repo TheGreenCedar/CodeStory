@@ -153,7 +153,12 @@ fn build_packet_sufficiency_with_optional_obligation_context(
 ) -> PacketSufficiencyDto {
     let supported_claims = if let Some(plan) = obligations {
         let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(answer);
-        packet_claims_with_obligation_receipts(answer, task_class, plan, supported_claims_with_telemetry)
+        packet_claims_with_obligation_receipts(
+            answer,
+            task_class,
+            plan,
+            supported_claims_with_telemetry,
+        )
     } else {
         packet_supported_claims(answer)
     };
@@ -2957,6 +2962,7 @@ mod tests {
         let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&answer);
         let claims = packet_claims_with_obligation_receipts(
             &answer,
+            PacketTaskClassDto::RouteTracing,
             &obligations,
             supported_claims_with_telemetry,
         );

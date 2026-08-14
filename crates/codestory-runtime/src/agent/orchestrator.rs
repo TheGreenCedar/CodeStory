@@ -114,20 +114,19 @@ use codestory_contracts::api::{
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, AgentResponseBlockDto,
     AgentResponseModeDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AgentRetrievalStepDto,
-    AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
-    ApiError, GraphArtifactDto, GraphRequest, GraphResponse, GroundingBudgetDto, IndexFreshnessDto,
-    IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
-    NodeOccurrencesRequest, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketObligationPlanDto,
-    PacketPlanDto, PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
-    SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, TrailConfigDto,
-    TrailFilterOptionsDto,
+    AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError, GraphArtifactDto,
+    GraphRequest, GraphResponse, GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto,
+    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
+    PacketBudgetLimitsDto, PacketBudgetModeDto, PacketObligationPlanDto, PacketPlanDto,
+    PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto, SearchHit,
+    SearchHitOrigin, SearchRepoTextMode, SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{
-    EdgeId, PacketBudgetDto,
-    PacketBudgetUsageDto, PacketClaimDto, PacketPlanQueryDto, PacketQueryCompletionDto,
-    PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto, PacketSufficiencyStatusDto,
-    RetrievalAnnotationKindDto, RetrievalShadowDto, SearchMatchQualityDto,
+    EdgeId, PacketBudgetDto, PacketBudgetUsageDto, PacketClaimDto, PacketPlanQueryDto,
+    PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto,
+    PacketSufficiencyStatusDto, RetrievalAnnotationKindDto, RetrievalShadowDto,
+    SearchMatchQualityDto,
 };
 use std::cmp::Ordering;
 #[cfg(test)]
@@ -611,6 +610,7 @@ pub(crate) fn agent_packet(
         Some(&plan.obligations),
     );
     append_packet_carrier_source_sections(controller, &mut answer, &limits);
+    order_packet_sections(&mut answer.sections);
     append_packet_non_trace_phase(&mut answer, "evidence_sections", phase_started);
     let phase_started = Instant::now();
     let sufficiency = build_packet_sufficiency_with_obligation_context(
@@ -913,16 +913,13 @@ fn append_packet_evidence_sections(
     }
 
     let ledger_markdown = packet_evidence_ledger_markdown(answer, limits);
-    answer.sections.insert(
-        0,
-        AgentResponseSectionDto {
-            id: "packet-evidence-ledger".to_string(),
-            title: "Packet Evidence Ledger".to_string(),
-            blocks: vec![AgentResponseBlockDto::Markdown {
-                markdown: ledger_markdown,
-            }],
-        },
-    );
+    answer.sections.push(AgentResponseSectionDto {
+        id: "packet-evidence-ledger".to_string(),
+        title: "Packet Evidence Ledger".to_string(),
+        blocks: vec![AgentResponseBlockDto::Markdown {
+            markdown: ledger_markdown,
+        }],
+    });
 
     let (mut claims, claim_telemetry) = if let Some(obligations) = obligations {
         let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(answer);
@@ -944,17 +941,40 @@ fn append_packet_evidence_sections(
     answer.retrieval_trace.packet_claim_profile_telemetry =
         Some(claim_telemetry.to_dto(packet_claim_profile_registry_summary()));
     if !claims.is_empty() {
-        answer.sections.insert(
-            1,
-            AgentResponseSectionDto {
-                id: "packet-flow-claims".to_string(),
-                title: "Packet Claims".to_string(),
-                blocks: vec![AgentResponseBlockDto::Markdown {
-                    markdown: packet_flow_claims_markdown(&claims),
-                }],
-            },
-        );
+        answer.sections.push(AgentResponseSectionDto {
+            id: "packet-flow-claims".to_string(),
+            title: "Packet Claims".to_string(),
+            blocks: vec![AgentResponseBlockDto::Markdown {
+                markdown: packet_flow_claims_markdown(&claims),
+            }],
+        });
     }
+}
+
+/// Where each answer section sits in the packet, lowest first.
+///
+/// Consumers do not read the whole packet. The agent-facing projection carries only the
+/// first few thousand characters of the concatenated sections, and the stdio surface caps
+/// its compact text the same way, so this order decides what reaches a model at all.
+///
+/// The evidence ledger and the claims list are renderings of `answer.citations` and
+/// `sufficiency.covered_claims`, which every consumer already receives as structured fields
+/// outside that cut. Leading with them spent the entire window restating data the reader
+/// held already and evicted the retrieval evidence and carrier source, which are sent
+/// nowhere else. They stay in the packet -- they are the anchor list for consumers that
+/// render sections only -- but they go last.
+fn packet_section_order_rank(id: &str) -> u8 {
+    match id {
+        "packet-carrier-source" => 1,
+        "packet-flow-claims" => 2,
+        "packet-evidence-ledger" => 3,
+        _ => 0,
+    }
+}
+
+/// Stable, so sections sharing a rank keep the order their builders produced.
+fn order_packet_sections(sections: &mut [AgentResponseSectionDto]) {
+    sections.sort_by_key(|section| packet_section_order_rank(&section.id));
 }
 
 /// Byte ceilings for the carrier-source section. The packet's own output cap is the real
@@ -5678,6 +5698,7 @@ mod tests {
         );
         finalize_packet_obligation_plan(question, task_class, &mut obligations, &answer, &budget);
         append_packet_evidence_sections(&mut answer, task_class, &limits, Some(&obligations));
+        order_packet_sections(&mut answer.sections);
         let sufficiency = build_packet_sufficiency_with_obligation_context(
             &RuntimeWorkspacePathIdentity,
             packet_fixture_project_root(),
@@ -9402,7 +9423,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_budget_skips_tiny_diagram_intro_and_truncates_verbose_sections_first() {
+    fn markdown_budget_skips_tiny_diagram_intro_and_truncates_restating_sections_first() {
         let question = "Explain compact packet proof retention.";
         let mut answer = packet_answer_fixture(
             question,
@@ -9449,13 +9470,10 @@ mod tests {
             },
         ];
 
-        let original_proof_sections = answer.sections[0..2]
-            .iter()
-            .map(|section| match &section.blocks[0] {
-                AgentResponseBlockDto::Markdown { markdown } => markdown.clone(),
-                AgentResponseBlockDto::Mermaid { .. } => String::new(),
-            })
-            .collect::<Vec<_>>();
+        let original_retrieval_markdown = match &answer.sections[2].blocks[0] {
+            AgentResponseBlockDto::Markdown { markdown } => markdown.clone(),
+            AgentResponseBlockDto::Mermaid { .. } => String::new(),
+        };
         let original_diagram_intro = match &answer.sections[3].blocks[0] {
             AgentResponseBlockDto::Markdown { markdown } => markdown.clone(),
             AgentResponseBlockDto::Mermaid { .. } => String::new(),
@@ -9464,15 +9482,16 @@ mod tests {
         let truncated = truncate_answer_markdown_to_byte_cap(&mut answer, original_bytes - 6_000);
 
         assert!(truncated);
-        for (section, original_markdown) in
-            answer.sections[0..2].iter().zip(original_proof_sections)
-        {
+        // The ledger and the claims list re-render `answer.citations` and the covered claims,
+        // which survive truncation as structured fields; the retrieval evidence exists only
+        // as this markdown. So the restating sections pay for the budget, not the evidence.
+        for section in &answer.sections[0..2] {
             let AgentResponseBlockDto::Markdown { markdown } = &section.blocks[0] else {
-                panic!("proof section should remain markdown");
+                panic!("restating section should remain markdown");
             };
-            assert_eq!(
-                markdown, &original_markdown,
-                "proof-bearing section `{}` should not be truncated before verbose sections",
+            assert!(
+                markdown.contains(PACKET_MARKDOWN_TRUNCATION_SUFFIX.trim()),
+                "restating section `{}` should absorb truncation first",
                 section.id
             );
         }
@@ -9482,9 +9501,9 @@ mod tests {
         else {
             panic!("retrieval evidence should remain markdown");
         };
-        assert!(
-            retrieval_markdown.contains(PACKET_MARKDOWN_TRUNCATION_SUFFIX.trim()),
-            "large retrieval evidence should absorb truncation before proof sections"
+        assert_eq!(
+            retrieval_markdown, &original_retrieval_markdown,
+            "retrieval evidence is carried nowhere else and should survive intact"
         );
         let AgentResponseBlockDto::Markdown {
             markdown: diagram_intro,
@@ -9799,8 +9818,24 @@ mod tests {
             ],
         );
 
-        assert_eq!(answer.sections[0].id, "packet-evidence-ledger");
-        assert_eq!(answer.sections[1].id, "packet-flow-claims");
+        // Both sections restate structured fields the consumer already holds, so they trail
+        // the sections that carry evidence found nowhere else. Consumers that read only the
+        // leading bytes of the packet get retrieval evidence rather than a second copy of
+        // `answer.citations`.
+        let section_ids = answer
+            .sections
+            .iter()
+            .map(|section| section.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &section_ids[section_ids.len() - 2..],
+            ["packet-flow-claims", "packet-evidence-ledger"],
+            "restating sections belong last: {section_ids:?}"
+        );
+        assert!(
+            section_ids.len() > 2,
+            "an evidence section should precede them: {section_ids:?}"
+        );
         let top_anchor_names = answer
             .citations
             .iter()
@@ -9822,11 +9857,19 @@ mod tests {
         assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
         assert!(sufficiency.follow_up_commands.is_empty());
         assert!(sufficiency.open_next.is_empty());
+        // Bind on the obligation this receipt discharges, not on its prose. A receipt that
+        // resolves to a real relation says what the carrier does and never repeats the
+        // obligation id, so matching the id inside the sentence only ever passed for the
+        // fallback wording.
         assert!(
-            sufficiency
-                .covered_claims
-                .iter()
-                .any(|claim| claim.claim.contains("indexing_entrypoint")),
+            sufficiency.covered_claims.iter().any(|claim| {
+                claim
+                    .required_obligation_ids
+                    .iter()
+                    .any(|id| id == "indexing_entrypoint")
+                    && claim.proof_status
+                        == Some(codestory_contracts::api::PacketProofStatusDto::Proven)
+            }),
             "generic packet should include a proven indexing-entrypoint obligation receipt: {sufficiency:?}"
         );
         assert!(

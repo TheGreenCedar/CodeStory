@@ -437,8 +437,12 @@ fn indexing_storage_claim_cannot_borrow_a_proven_runtime_entrypoint() {
     );
 
     let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&answer);
-    let mut claims =
-        packet_claims_with_obligation_receipts(&answer, &plan, supported_claims_with_telemetry);
+    let mut claims = packet_claims_with_obligation_receipts(
+        &answer,
+        PacketTaskClassDto::ArchitectureExplanation,
+        &plan,
+        supported_claims_with_telemetry,
+    );
     bind_claims_to_packet_obligations(&plan, &mut claims);
     let storage_claim = claims
         .iter()
@@ -490,8 +494,12 @@ fn obligation_receipts_use_only_their_exact_rows_own_carriers() {
     };
 
     let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&answer);
-    let mut claims =
-        packet_claims_with_obligation_receipts(&answer, &plan, supported_claims_with_telemetry);
+    let mut claims = packet_claims_with_obligation_receipts(
+        &answer,
+        PacketTaskClassDto::ArchitectureExplanation,
+        &plan,
+        supported_claims_with_telemetry,
+    );
     bind_claims_to_packet_obligations(&plan, &mut claims);
     let receipts = claims
         .iter()
@@ -564,8 +572,12 @@ fn receipt_rows_preserve_non_proven_status_reason_and_deduplicate_ids() {
     };
     let answer = answer(vec![reported_carrier]);
     let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&answer);
-    let mut claims =
-        packet_claims_with_obligation_receipts(&answer, &plan, supported_claims_with_telemetry);
+    let mut claims = packet_claims_with_obligation_receipts(
+        &answer,
+        PacketTaskClassDto::ArchitectureExplanation,
+        &plan,
+        supported_claims_with_telemetry,
+    );
     bind_claims_to_packet_obligations(&plan, &mut claims);
     let receipts = claims
         .iter()
