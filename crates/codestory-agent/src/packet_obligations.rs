@@ -2149,6 +2149,9 @@ fn packet_obligation_receipt_text(
         {
             return receipt;
         }
+        if let Some(receipt) = cited_graph_relation_receipt(answer, citations) {
+            return receipt;
+        }
         let anchors = citations
             .iter()
             .map(|citation| format!("`{}`", citation.display_name))
@@ -2253,6 +2256,67 @@ fn flow_requirement_for_obligation(
                         .any(|candidate| candidate == seed)
                 })
         })
+}
+
+/// Name a retained CALL/INHERITANCE among this obligation's carriers when the typed
+/// flow-requirement receipt did not fire. The verb and the two spellings come from
+/// the graph; Compact used to drop those edges, leaving only "has independently
+/// cited carrier evidence".
+fn cited_graph_relation_receipt(
+    answer: &AgentAnswerDto,
+    citations: &[AgentCitationDto],
+) -> Option<String> {
+    let cited = citations
+        .iter()
+        .map(|citation| citation.node_id.clone())
+        .collect::<HashSet<_>>();
+    let label = |graph: &GraphResponse, id: &NodeId| -> Option<String> {
+        graph
+            .nodes
+            .iter()
+            .find(|node| node.id == *id)
+            .map(|node| node.label.clone())
+            .or_else(|| {
+                citations
+                    .iter()
+                    .find(|citation| citation.node_id == *id)
+                    .map(|citation| citation.display_name.clone())
+            })
+    };
+    packet_execution_graphs(answer).iter().find_map(|graph| {
+        let mut both_endpoints = None;
+        let mut one_endpoint = None;
+        for edge in &graph.edges {
+            if !matches!(edge.kind, EdgeKind::CALL | EdgeKind::INHERITANCE) {
+                continue;
+            }
+            let source_cited = cited.contains(&edge.source);
+            let target_cited = cited.contains(&edge.target);
+            if !source_cited && !target_cited {
+                continue;
+            }
+            let Some(from) = label(graph, &edge.source) else {
+                continue;
+            };
+            let Some(to) = label(graph, &edge.target) else {
+                continue;
+            };
+            let verb = match edge.kind {
+                EdgeKind::CALL => "calls",
+                EdgeKind::INHERITANCE => "extends",
+                _ => "relates to",
+            };
+            let sentence = format!("`{from}` {verb} `{to}`.");
+            if source_cited && target_cited {
+                both_endpoints = Some(sentence);
+                break;
+            }
+            if one_endpoint.is_none() {
+                one_endpoint = Some(sentence);
+            }
+        }
+        both_endpoints.or(one_endpoint)
+    })
 }
 
 /// One sentence naming what this carrier does in the flow and the typed edge that proves it.
@@ -5548,10 +5612,7 @@ mod tests {
             obligation,
             &answer.citations,
         );
-        assert_eq!(
-            receipt,
-            "Material obligation `request_entrypoint` has independently cited carrier evidence at `app.listen`."
-        );
+        assert_eq!(receipt, "`app.listen` calls `listen`.");
     }
 
     #[test]

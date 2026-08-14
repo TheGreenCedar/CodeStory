@@ -1620,7 +1620,7 @@ static CONTEXT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
 );
 
 static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
-    "CodeStory broad task packet DTO with graph/sidecar evidence, budget truncation, unsafe-to-claim gaps, and follow-up commands.",
+    "CodeStory broad task packet DTO with compiled support units and a machine stop or one-round drill disposition.",
     &[
         SchemaProperty::string("packet_id", "Stable packet id."),
         SchemaProperty::string("question", "Packet question."),
@@ -1631,8 +1631,12 @@ static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::object("answer", "Underlying DB-first answer packet."),
         SchemaProperty::object("budget", "Budget limits, usage, and truncation metadata."),
         SchemaProperty::object(
-            "sufficiency",
-            "Covered claims, gaps, and follow-up contract.",
+            "support",
+            "Compiled evidence atoms: symbol locations, source ranges, typed graph edges, and complete-query negatives.",
+        ),
+        SchemaProperty::object(
+            "disposition",
+            "Machine stop or one-round drill decision: supported, drill_once, not_established, or unavailable.",
         ),
         SchemaProperty::object(
             "retrieval_trace_summary",
@@ -1645,7 +1649,8 @@ static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
         "plan",
         "answer",
         "budget",
-        "sufficiency",
+        "support",
+        "disposition",
         "retrieval_trace_summary",
     ],
 );
@@ -1768,6 +1773,11 @@ static SOURCE_RANGE_SCHEMA: SchemaObject = SchemaObject::object(
             "Repository-relative file path, as returned in `file_path`.",
         )
         .with_min_length(1),
+        SchemaProperty::string(
+            "file_path",
+            "Alias for `path`. Hits report this field name.",
+        )
+        .with_min_length(1),
         SchemaProperty::integer(
             "line",
             "Line of interest, 1-based, as returned in `line`. A window is returned around it.",
@@ -1784,8 +1794,9 @@ static SOURCE_RANGE_SCHEMA: SchemaObject = SchemaObject::object(
         )
         .with_bounds(1, 1_000_000),
     ],
-    &["path"],
-);
+    &[],
+)
+.with_one_of_required(&[&["path"], &["file_path"]]);
 
 static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Return bounded source: either resolve one symbol, or read line ranges from files named by earlier evidence.",
@@ -1795,8 +1806,38 @@ static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
             "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
             &SOURCE_RANGE_SCHEMA,
         ),
+        SchemaProperty::string(
+            "path",
+            "Single-file alias for `paths`: repository-relative path as returned in `file_path`. Combine with `line`.",
+        )
+        .with_min_length(1),
+        SchemaProperty::string(
+            "file_path",
+            "Alias for `path`. Hits report this field name.",
+        )
+        .with_min_length(1),
+        SchemaProperty::integer(
+            "line",
+            "1-based line from a search, trail, or packet hit. Used with `path`.",
+        )
+        .with_bounds(1, 1_000_000),
+        SchemaProperty::integer(
+            "start_line",
+            "First line to return with top-level `path`. Alternative to `line`.",
+        )
+        .with_bounds(1, 1_000_000),
+        SchemaProperty::integer(
+            "end_line",
+            "Last line to return with top-level `path`. Defaults to a bounded window after the start.",
+        )
+        .with_bounds(1, 1_000_000),
         SchemaProperty::string("query", "Symbol query.").with_min_length(1),
         SchemaProperty::string("id", "Stable node id.").with_min_length(1),
+        SchemaProperty::string(
+            "symbol_id",
+            "Alias for `id`. Hits report this field name.",
+        )
+        .with_min_length(1),
         SchemaProperty::integer(
             "choose",
             "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -1823,7 +1864,7 @@ static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_one_of_required(&[&["query"], &["id"], &["paths"]]);
+.with_one_of_required(&[&["query"], &["id"], &["paths"], &["path"], &["file_path"], &["symbol_id"]]);
 
 static GRAPH_TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Resolve a single indexed graph node by stable id or query.",
@@ -2085,7 +2126,7 @@ static PACKET_PROBE_SCHEMAS: &[&SchemaObject] = &[
 ];
 
 static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Build a broad task packet with budget and sufficiency metadata.",
+    "Build a broad task packet with compiled support units and a machine stop or one-round drill disposition.",
     &[
         SchemaProperty::string_required("question", "Broad repository question or task.")
             .with_min_length(1),
@@ -2119,6 +2160,24 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         )
         .with_bounds(1000, 120000)
         .nullable(),
+        SchemaProperty::string(
+            "parent_packet_id",
+            "Parent packet id for a generation-bound DrillOnce continuation.",
+        ),
+        SchemaProperty::string_array(
+            "option_ids",
+            "Drill option ids from the parent packet disposition. Execute them once; do not invent a second search.",
+        )
+        .with_item_bounds(1, 8)
+        .with_item_min_length(1),
+        SchemaProperty::string(
+            "core_generation_id",
+            "Pinned core publication generation for a DrillOnce continuation.",
+        ),
+        SchemaProperty::string(
+            "retrieval_generation",
+            "Pinned retrieval generation for a DrillOnce continuation.",
+        ),
     ],
     &["question"],
 )
@@ -2137,7 +2196,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "packet",
-        description: "Answer broad structural questions with repository evidence, sufficiency, truncation, and follow-up commands before source snippets. CodeStory prepares managed retrieval automatically.",
+        description: "Answer broad structural questions with compiled support units and a machine stop or one-round drill. Supported, NotEstablished, and Unavailable are terminal. DrillOnce means call packet again with parent_packet_id and the listed option_ids once. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
         input_schema: PACKET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(AGENT_PACKET_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),

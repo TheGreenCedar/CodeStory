@@ -28,9 +28,7 @@ use crate::agent::packet_claim_profiles::packet_claim_profile_registry_summary;
 use crate::agent::packet_claims::packet_claim_for_role as build_packet_claim_for_role;
 #[cfg(test)]
 use crate::agent::packet_claims::packet_supported_claims;
-use crate::agent::packet_claims::{
-    packet_flow_claims_markdown, packet_supported_claims_with_telemetry,
-};
+use crate::agent::packet_claims::packet_supported_claims_with_telemetry;
 use crate::agent::packet_degradation::apply_packet_semantic_degradation_counters;
 use crate::agent::packet_evidence::decorate_citation_from_hit;
 use crate::agent::packet_evidence_roles::{
@@ -70,15 +68,19 @@ use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path,
     packet_stage_citation_carry_limit, sort_by_cached_rank_desc,
 };
+use crate::agent::packet_compiler::{
+    apply_compiled_evidence, drill_options_from_ids,
+};
+#[cfg(test)]
 use crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context;
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
-    PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value, render_packet_command,
+    PacketSufficiencyDto, PacketSufficiencyStatusDto, build_packet_sufficiency,
+    packet_budget_exceeded_hard_output_cap, packet_claim_can_satisfy_sufficiency,
 };
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
-    build_packet_sufficiency, packet_budget_exceeded_hard_output_cap,
-    packet_claim_can_satisfy_sufficiency,
+    PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value, render_packet_command,
 };
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_search_execution_flow, prompt_search_terms,
@@ -95,6 +97,7 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_url_session_request_flow,
 };
 use crate::agent::packet_trace::merge_packet_initial_search_hits;
+#[cfg(test)]
 use crate::agent::path_identity::RuntimeWorkspacePathIdentity;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
@@ -117,16 +120,17 @@ use codestory_contracts::api::{
     AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError, EdgeKind, GraphArtifactDto,
     GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, IndexFreshnessDto,
     IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
-    NodeOccurrencesRequest, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketObligationPlanDto,
-    PacketPlanDto, PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
+    NodeOccurrencesRequest, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto,
+    PacketObligationPlanDto, PacketPlanDto, PacketProbeDto, PacketTaskClassDto,
+    RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
     SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, TrailConfigDto,
     TrailFilterOptionsDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{
     EdgeId, PacketBudgetDto, PacketBudgetUsageDto, PacketClaimDto, PacketPlanQueryDto,
-    PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto,
-    PacketSufficiencyStatusDto, RetrievalAnnotationKindDto, RetrievalShadowDto,
+    PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto, RetrievalAnnotationKindDto,
+    RetrievalShadowDto,
     SearchMatchQualityDto,
 };
 use std::cmp::Ordering;
@@ -416,7 +420,21 @@ pub(crate) fn agent_packet(
     let project_root = controller.require_project_root()?;
     controller.begin_packet_retrieval();
 
-    let probes = normalize_packet_probe_request(&req.probes, &req.extra_probes);
+    if !req.option_ids.is_empty() && req.parent_packet_id.is_none() {
+        return Err(ApiError::invalid_argument(
+            "packet option_ids require parent_packet_id for a generation-bound drill",
+        ));
+    }
+    let mut probes = normalize_packet_probe_request(&req.probes, &req.extra_probes);
+    for option in drill_options_from_ids(&req.option_ids) {
+        if let Some(path) = option.path {
+            probes.push(PacketProbeDto::ExactPath { path });
+        } else if let Some(symbol_id) = option.symbol_id {
+            probes.push(PacketProbeDto::SymbolId { id: symbol_id });
+        } else if let Some(query) = option.query {
+            probes.push(PacketProbeDto::FreeQuery { query });
+        }
+    }
     let probe_resolutions = resolve_packet_probes(controller, probes);
     let exact_probe_citations = exact_packet_probe_citations(
         controller,
@@ -616,19 +634,6 @@ pub(crate) fn agent_packet(
     }
     order_packet_sections(&mut answer.sections);
     append_packet_non_trace_phase(&mut answer, "evidence_sections", phase_started);
-    let phase_started = Instant::now();
-    let sufficiency = build_packet_sufficiency_with_obligation_context(
-        &RuntimeWorkspacePathIdentity,
-        &project_root,
-        &question,
-        plan.task_class,
-        &answer,
-        &budget,
-        &sufficiency_extra_probes,
-        &exact_probe_paths,
-        &plan.obligations,
-    );
-    append_packet_non_trace_phase(&mut answer, "sufficiency", phase_started);
     // Typed field, not `annotations`: readiness re-verification was previously
     // invisible, which is what let one packet pay for several full content
     // passes unnoticed. Publishing it here — before the trace summary is taken
@@ -647,8 +652,9 @@ pub(crate) fn agent_packet(
         task_class: Some(plan.task_class),
         plan,
         answer,
+        support: Vec::new(),
+        disposition: PacketDispositionDto::not_established("compile pending"),
         budget,
-        sufficiency,
         retrieval_trace_summary,
     };
     append_packet_non_trace_phase(&mut packet.answer, "packet_dto", phase_started);
@@ -663,6 +669,7 @@ pub(crate) fn agent_packet(
             .push(RetrievalAnnotationDto::observation(diagnostic));
         enforce_packet_output_budget(&project_root, &mut packet);
     }
+    apply_compiled_evidence(&mut packet, Some(&req));
 
     Ok(packet)
 }
@@ -944,15 +951,9 @@ fn append_packet_evidence_sections(
     // packet's confidence.
     answer.retrieval_trace.packet_claim_profile_telemetry =
         Some(claim_telemetry.to_dto(packet_claim_profile_registry_summary()));
-    if !claims.is_empty() {
-        answer.sections.push(AgentResponseSectionDto {
-            id: "packet-flow-claims".to_string(),
-            title: "Packet Claims".to_string(),
-            blocks: vec![AgentResponseBlockDto::Markdown {
-                markdown: packet_flow_claims_markdown(&claims),
-            }],
-        });
-    }
+    // Claims stay in structured sufficiency. Do not publish English flow-catalog
+    // sentences as agent-facing packet conclusions.
+    let _ = claims;
 }
 
 pub(crate) const PACKET_RESOLVED_RELATIONS_SECTION_ID: &str = "packet-resolved-relations";
@@ -8423,9 +8424,8 @@ mod tests {
         let lower = text.to_ascii_lowercase();
 
         assert!(
-            lower.contains("source evidence")
-                || lower.contains("`computeflow` in `src/domain/flow.rs`"),
-            "generic source claim should be present: {text}"
+            !lower.contains("ties ") && !lower.contains("adjacent ownership"),
+            "production must not emit navigation boilerplate as a claim: {text}"
         );
         for forbidden in [
             "supporting evidence",
@@ -8814,7 +8814,10 @@ mod tests {
                 "`POST /posts/:slug/comments` handles route dispatch or handler ownership"
             )
         );
-        assert!(text.contains("`getPayloadClient` in `src/lib/payload.ts`"));
+        assert!(
+            !text.contains("ties ") && !text.contains("`getPayloadClient` in `src/lib/payload.ts`"),
+            "generic source-evidence claims must be omitted rather than restated: {text}"
+        );
     }
 
     #[test]
@@ -9707,13 +9710,6 @@ mod tests {
             limits,
             &mut answer,
         );
-        let sufficiency = build_packet_sufficiency(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &answer,
-            &budget,
-        );
         let retrieval_trace_summary = trace_export::packet_retrieval_trace_summary(&answer);
         let mut packet = AgentPacketDto {
             packet_id: answer.answer_id.clone(),
@@ -9732,7 +9728,8 @@ mod tests {
             },
             answer,
             budget,
-            sufficiency,
+            support: Vec::new(),
+            disposition: PacketDispositionDto::supported(),
             retrieval_trace_summary,
         };
 
@@ -9778,12 +9775,17 @@ mod tests {
         );
         assert!(
             !packet
-                .sufficiency
-                .gaps
+                .disposition
+                .omission_receipts
                 .iter()
                 .any(|gap| gap.contains("packet_payload") || gap.contains("output_bytes")),
-            "sufficiency gaps should be rebuilt after final payload remeasurement clears stale omissions: {:?}",
-            packet.sufficiency
+            "budget remeasurement must not leave stale payload omissions on disposition: {:?}",
+            packet.disposition
+        );
+        assert_eq!(
+            packet.disposition.kind,
+            codestory_contracts::api::PacketDispositionKindDto::Supported,
+            "budget must not reclassify disposition"
         );
     }
 
@@ -9934,13 +9936,13 @@ mod tests {
             .map(|section| section.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(
-            &section_ids[section_ids.len() - 2..],
-            ["packet-flow-claims", "packet-evidence-ledger"],
-            "restating sections belong last: {section_ids:?}"
+            section_ids.last().copied(),
+            Some("packet-evidence-ledger"),
+            "the citation restatement belongs last: {section_ids:?}"
         );
         assert!(
-            section_ids.len() > 2,
-            "an evidence section should precede them: {section_ids:?}"
+            !section_ids.contains(&"packet-flow-claims"),
+            "English flow-catalog conclusions must not be agent-facing sections: {section_ids:?}"
         );
         let top_anchor_names = answer
             .citations

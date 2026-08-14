@@ -2148,10 +2148,10 @@ fn assert_packet_builds_broad_task_contract(workspace: &Path, cache_dir: &Path) 
     );
     assert!(
         packet
-            .pointer("/sufficiency/status")
+            .pointer("/disposition/kind")
             .and_then(Value::as_str)
             .is_some(),
-        "packet should expose sufficiency status: {packet:#}"
+        "packet should expose disposition kind: {packet:#}"
     );
     assert!(
         array_is_non_empty(&packet, &["answer", "retrieval_trace", "steps"]),

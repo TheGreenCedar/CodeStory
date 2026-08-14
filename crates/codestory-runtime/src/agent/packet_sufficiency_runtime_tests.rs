@@ -6,7 +6,10 @@
 //! `codestory-agent` a dev-dependency on the runtime.
 
 use crate::agent::packet_budget::{apply_packet_budget, packet_budget_limits};
-use crate::agent::packet_sufficiency::{PacketSufficiencyInput, assemble_packet_sufficiency};
+use crate::agent::packet_sufficiency::{
+    PacketSufficiencyDto, PacketSufficiencyInput, PacketSufficiencyStatusDto,
+    assemble_packet_sufficiency,
+};
 use codestory_contracts::api::*;
 use std::collections::HashSet;
 use std::path::Path;

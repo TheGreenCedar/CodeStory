@@ -208,38 +208,25 @@ function checkBroadSearch(repoName, searchJson) {
 }
 
 function checkPacket(repoName, packetJson) {
-  const sufficiency = packetJson?.sufficiency ?? {};
-  const status = sufficiency.status ?? null;
-  if (!["sufficient", "partial"].includes(status)) {
-    addGap(repoName, "packet_status_unusable", 1, "packet output is neither sufficient nor partial", {
-      status,
+  const disposition = packetJson?.disposition ?? {};
+  const kind = disposition.kind ?? null;
+  if (!["supported", "drill_once", "not_established", "unavailable"].includes(kind)) {
+    addGap(repoName, "packet_status_unusable", 1, "packet output has no typed disposition", {
+      kind,
     });
   }
   const citations = packetJson?.answer?.citations ?? [];
-  const avoidOpening = sufficiency.avoid_opening ?? [];
-  const avoidOpeningPaths = sufficiency.avoid_opening_paths ?? null;
+  const support = packetJson?.support ?? [];
   if (!Array.isArray(citations) || citations.length === 0) {
     addGap(repoName, "packet_missing_citations", 1, "packet answer has no structured citations");
   }
-  if (
-    status === "sufficient" &&
-    Array.isArray(sufficiency.follow_up_commands) &&
-    sufficiency.follow_up_commands.length > 0
-  ) {
-    addGap(repoName, "packet_sufficient_with_followups", 2, "sufficient packet still asks for follow-up commands", {
-      follow_up_commands: sufficiency.follow_up_commands,
+  if (kind === "supported" && disposition.drill != null) {
+    addGap(repoName, "packet_supported_with_drill", 2, "supported packet still asks for a drill", {
+      drill: disposition.drill,
     });
   }
-  if (avoidOpening != null && !Array.isArray(avoidOpening)) {
-    addGap(repoName, "packet_avoid_opening_malformed", 2, "packet sufficiency avoid_opening is not a list");
-  }
-  if (!Array.isArray(avoidOpeningPaths)) {
-    addGap(
-      repoName,
-      "packet_avoid_opening_paths_malformed",
-      2,
-      "packet sufficiency avoid_opening_paths is not a raw path list",
-    );
+  if (support != null && !Array.isArray(support)) {
+    addGap(repoName, "packet_support_malformed", 2, "packet support is not a list");
   }
   const retrievalTrace = packetJson?.answer?.retrieval_trace;
   if (!retrievalTrace || typeof retrievalTrace !== "object") {
@@ -247,9 +234,9 @@ function checkPacket(repoName, packetJson) {
   }
   const text = fieldText({
     citations,
-    sufficiency,
+    support,
+    disposition,
     sections: packetJson?.answer?.sections ?? [],
-    supported_claims: packetJson?.answer?.supported_claims ?? [],
     annotations: explanationAnnotations(retrievalTrace?.annotations),
   });
   for (const term of repoBadTerms(repoName)) {
@@ -292,8 +279,8 @@ function checkSkillGuidance(repoName) {
   if (!skillText.includes("start broad repo") || !skillText.includes("`packet`")) {
     addGap(repoName, "skill_missing_packet_flow", 1, "skill does not route broad repo explanations through packet");
   }
-  if (!skillText.includes("sufficiency.follow_up_commands")) {
-    addGap(repoName, "skill_missing_followup_contract", 2, "skill does not name the packet follow-up contract");
+  if (!skillText.includes("parent_packet_id") || !skillText.includes("drill_once")) {
+    addGap(repoName, "skill_missing_followup_contract", 2, "skill does not name the packet drill-once contract");
   }
   if (!skillText.includes("do not pass broad natural-language questions directly to `context`")) {
     addGap(repoName, "skill_missing_context_boundary", 2, "skill does not preserve packet-before-context boundary");

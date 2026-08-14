@@ -97,9 +97,10 @@ pub use agent::{
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod agent_test_support {
+    use crate::agent::packet_sufficiency::PacketSufficiencyDto;
     use codestory_contracts::api::{
         AgentAnswerDto, IndexFreshnessDto, PacketBudgetDto, PacketClaimDto,
-        PacketObligationPlanDto, PacketSufficiencyDto, PacketTaskClassDto,
+        PacketObligationPlanDto, PacketTaskClassDto,
     };
     use std::path::Path;
 

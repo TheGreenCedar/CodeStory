@@ -8,23 +8,18 @@ use crate::agent::packet_obligations::{
     packet_claims_with_obligation_receipts,
 };
 use crate::agent::packet_plan::{packet_explicit_request_probe_queries, push_unique_term};
-use crate::agent::packet_probe::exact_packet_probe_paths;
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries_with_extra;
-use crate::agent::packet_sufficiency::{
-    PACKET_MARKDOWN_TRUNCATION_SUFFIX, build_packet_sufficiency_with_obligation_context,
-};
-use crate::agent::path_identity::RuntimeWorkspacePathIdentity;
+use crate::agent::packet_sufficiency::PACKET_MARKDOWN_TRUNCATION_SUFFIX;
 use crate::agent::trace_export::{
     PACKET_STEP_TRACE_ANNOTATION_PREFIX, compact_retained_packet_step_trace_for_budget,
     packet_retrieval_trace_summary, retain_packet_step_trace_for_export,
 };
-use codestory_agent::packet_command::render_packet_command;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, AgentResponseBlockDto, AgentRetrievalStepKindDto,
-    AgentRetrievalStepStatusDto, ApiError, EdgeId, GraphArtifactDto, GraphResponse,
+    AgentRetrievalStepStatusDto, ApiError, EdgeId, EdgeKind, GraphArtifactDto, GraphResponse,
     PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketBudgetUsageDto,
-    PacketObligationProofStatusDto, PacketQueryCompletionDto, PacketSufficiencyStatusDto,
-    PacketTaskClassDto, RetrievalShadowDto, RetrievalStageTimingDto,
+    PacketObligationProofStatusDto, PacketQueryCompletionDto, PacketTaskClassDto,
+    RetrievalShadowDto, RetrievalStageTimingDto,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -35,11 +30,7 @@ pub(crate) use codestory_agent::packet_command::next_deeper_packet_command;
 
 const MARKDOWN_TRUNCATION_FLOOR_BYTES: usize = 256;
 const ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION: &str = "answer.retrieval_trace.diagnostics";
-const AVOID_OPENING_OMISSION: &str = "avoid_opening";
-const COVERAGE_REPORT_INELIGIBLE_OMISSION: &str = "coverage_report.ineligible";
-const FOLLOW_UP_COMMANDS_OMISSION: &str = "follow_up_commands";
 const MINIMAL_PARTIAL_OMISSION: &str = "minimal_partial";
-const OPEN_NEXT_OMISSION: &str = "open_next";
 const RETRIEVAL_TRACE_SUMMARY_OMISSION: &str = "retrieval_trace_summary";
 const RETAINED_STEP_TRACE_DETAIL_OMISSION: &str = "answer.retrieval_trace.step_details";
 const PACKET_PROOF_RESERVE_PERCENT: usize = 70;
@@ -152,7 +143,8 @@ pub(crate) fn apply_packet_budget_with_extra_and_obligation_carriers(
         truncated = true;
         omitted_sections.push("citations".to_string());
     }
-    if cap_graph_edges(answer, limits.max_trail_edges, obligation_edge_ids) {
+    let protected_edges = protected_graph_edge_ids_for_budget(answer, obligation_edge_ids);
+    if cap_graph_edges(answer, limits.max_trail_edges, &protected_edges) {
         truncated = true;
         omitted_sections.push("trail_edges".to_string());
     }
@@ -451,10 +443,6 @@ fn minimize_packet_for_hard_budget(packet: &mut AgentPacketDto) -> bool {
         "markdown_blocks",
         RETRIEVAL_TRACE_SUMMARY_OMISSION,
         ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION,
-        AVOID_OPENING_OMISSION,
-        COVERAGE_REPORT_INELIGIBLE_OMISSION,
-        OPEN_NEXT_OMISSION,
-        FOLLOW_UP_COMMANDS_OMISSION,
     ] {
         push_omitted_section(&mut packet.budget, section);
     }
@@ -508,9 +496,7 @@ fn minimize_packet_for_hard_budget(packet: &mut AgentPacketDto) -> bool {
     packet.answer.summary.clear();
     packet.answer.source_coverage.clear();
     packet.answer.sections.clear();
-    packet.answer.citations.clear();
     packet.answer.subgraph_ids.clear();
-    packet.answer.graphs.clear();
     packet.answer.retrieval_trace.request_id.clear();
     packet.answer.retrieval_trace.semantic_fallback_count = 0;
     packet.answer.retrieval_trace.semantic_fallbacks.clear();
@@ -526,42 +512,9 @@ fn minimize_packet_for_hard_budget(packet: &mut AgentPacketDto) -> bool {
         let _ = trim_retrieval_shadow_verbose_diagnostics(shadow);
     }
     packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
-
-    let deeper = packet
-        .sufficiency
-        .follow_up_invocations
-        .iter()
-        .find(|invocation| invocation.args.first().is_some_and(|arg| arg == "packet"))
-        .cloned()
-        .or_else(|| packet.sufficiency.follow_up_invocations.first().cloned());
-    packet.sufficiency.status = PacketSufficiencyStatusDto::Partial;
-    packet.sufficiency.covered_claims.clear();
-    packet.sufficiency.open_next.clear();
-    packet.sufficiency.avoid_opening.clear();
-    packet.sufficiency.avoid_opening_paths.clear();
-    packet.sufficiency.gaps = gaps;
-    // Republish the retained invocation as a command instead of clearing the field.
-    //
-    // A `partial` packet's contract tells the agent to run
-    // `sufficiency.follow_up_commands`; clearing it here left that field empty in every
-    // packet ever emitted, while `follow_up_invocations` stayed populated. The agent was
-    // told to read a list the minimizer had just emptied, so it improvised its own
-    // recovery instead of running the one command this code had already chosen.
-    //
-    // Rendering costs a single short string, and it is the canonical renderer, so the
-    // text is identical to what the sufficiency builder would have published.
-    packet.sufficiency.follow_up_commands = deeper
-        .as_ref()
-        .map(|invocation| {
-            let argv = std::iter::once(invocation.program.clone())
-                .chain(invocation.args.iter().cloned())
-                .collect::<Vec<_>>();
-            render_packet_command(&argv)
-        })
-        .into_iter()
-        .collect();
-    packet.sufficiency.follow_up_invocations = deeper.into_iter().collect();
-    packet.sufficiency.coverage_report = None;
+    packet.disposition.omission_receipts = gaps;
+    // Hard-budget minimizer may drop traces and duplicate ledgers. It must not
+    // change the compiled disposition or drop the only retained support units.
     true
 }
 
@@ -695,32 +648,14 @@ fn refresh_packet_budget_usage_for_representation(
 
 fn trim_packet_sufficiency_verbose_lists(packet: &mut AgentPacketDto) -> Vec<&'static str> {
     let mut trimmed_sections = Vec::new();
-
-    if !packet.sufficiency.open_next.is_empty() {
-        packet.sufficiency.open_next.clear();
-        trimmed_sections.push(OPEN_NEXT_OMISSION);
+    if !packet.plan.trace.is_empty() {
+        packet.plan.trace.clear();
+        trimmed_sections.push("plan.trace");
     }
-
-    if !packet.sufficiency.follow_up_commands.is_empty() {
-        packet.sufficiency.follow_up_commands.clear();
-        trimmed_sections.push(FOLLOW_UP_COMMANDS_OMISSION);
+    if !packet.plan.queries.is_empty() {
+        packet.plan.queries.clear();
+        trimmed_sections.push("plan.queries");
     }
-
-    if !packet.sufficiency.avoid_opening.is_empty()
-        || !packet.sufficiency.avoid_opening_paths.is_empty()
-    {
-        packet.sufficiency.avoid_opening.clear();
-        packet.sufficiency.avoid_opening_paths.clear();
-        trimmed_sections.push(AVOID_OPENING_OMISSION);
-    }
-
-    if let Some(report) = packet.sufficiency.coverage_report.as_mut()
-        && !report.ineligible.is_empty()
-    {
-        report.ineligible.clear();
-        trimmed_sections.push(COVERAGE_REPORT_INELIGIBLE_OMISSION);
-    }
-
     trimmed_sections
 }
 
@@ -808,12 +743,11 @@ fn trim_retrieval_stage_verbose_diagnostics(stage: &mut RetrievalStageTimingDto)
 }
 
 fn rebuild_packet_budget_dependents(
-    project_root: &Path,
+    _project_root: &Path,
     packet: &mut AgentPacketDto,
-    extra_probes: &[String],
+    _extra_probes: &[String],
 ) {
     packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
-    let exact_probe_paths = exact_packet_probe_paths(&packet.plan.probe_resolutions);
     let task_class = packet
         .task_class
         .unwrap_or(PacketTaskClassDto::ArchitectureExplanation);
@@ -825,62 +759,25 @@ fn rebuild_packet_budget_dependents(
         &packet.budget,
     );
     refresh_packet_claim_markdown(packet);
-    packet.sufficiency = build_packet_sufficiency_with_obligation_context(
-        &RuntimeWorkspacePathIdentity,
-        project_root,
-        &packet.question,
-        task_class,
-        &packet.answer,
-        &packet.budget,
-        extra_probes,
-        &exact_probe_paths,
-        &packet.plan.obligations,
-    );
-    let trim_avoid_opening = packet
-        .budget
-        .omitted_sections
-        .iter()
-        .any(|section| section == AVOID_OPENING_OMISSION);
-    let trim_ineligible = packet
-        .budget
-        .omitted_sections
-        .iter()
-        .any(|section| section == COVERAGE_REPORT_INELIGIBLE_OMISSION);
     let trim_trace_summary = packet
         .budget
         .omitted_sections
         .iter()
         .any(|section| section == RETRIEVAL_TRACE_SUMMARY_OMISSION);
-    let trim_open_next = packet
-        .budget
-        .omitted_sections
-        .iter()
-        .any(|section| section == OPEN_NEXT_OMISSION);
-    let trim_follow_up_commands = packet
-        .budget
-        .omitted_sections
-        .iter()
-        .any(|section| section == FOLLOW_UP_COMMANDS_OMISSION);
-
-    if trim_avoid_opening {
-        packet.sufficiency.avoid_opening.clear();
-        packet.sufficiency.avoid_opening_paths.clear();
-    }
-    if trim_ineligible && let Some(report) = packet.sufficiency.coverage_report.as_mut() {
-        report.ineligible.clear();
-    }
     if trim_trace_summary {
         let _ = trim_packet_retrieval_trace_summary(packet);
-    }
-    if trim_open_next {
-        packet.sufficiency.open_next.clear();
-    }
-    if trim_follow_up_commands {
-        packet.sufficiency.follow_up_commands.clear();
     }
 }
 
 fn refresh_packet_claim_markdown(packet: &mut AgentPacketDto) {
+    if !packet
+        .answer
+        .sections
+        .iter()
+        .any(|section| section.id == "packet-flow-claims")
+    {
+        return;
+    }
     let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&packet.answer);
     let mut claims = packet_claims_with_obligation_receipts(
         &packet.answer,
@@ -963,6 +860,70 @@ fn remove_omitted_section(budget: &mut PacketBudgetDto, section: &str) -> bool {
         .omitted_sections
         .retain(|existing| existing != section);
     budget.omitted_sections.len() != original_len
+}
+
+/// Edges the compact graph cap must keep so a later reader can still name what
+/// a cited carrier does. Obligation proofs come first; then CALL/INHERITANCE edges
+/// whose both endpoints are cited; then any remaining incident CALL/INHERITANCE and
+/// already-attached citation evidence ids. Compact used to pick the first 20
+/// edges by id, drop the rest, and strip `evidence_edge_ids` that no longer
+/// appeared in `answer.graphs` — which is how a packet that had resolved a CALL
+/// shipped a pointer receipt instead of the relation.
+fn protected_graph_edge_ids_for_budget(
+    answer: &AgentAnswerDto,
+    obligation_edge_ids: &[EdgeId],
+) -> Vec<EdgeId> {
+    let cited = answer
+        .citations
+        .iter()
+        .map(|citation| citation.node_id.clone())
+        .collect::<HashSet<_>>();
+    let mut both_endpoints = Vec::new();
+    let mut one_endpoint = Vec::new();
+    let mut seen_incident = HashSet::new();
+    for artifact in &answer.graphs {
+        let GraphArtifactDto::Uml { graph, .. } = artifact else {
+            continue;
+        };
+        for edge in &graph.edges {
+            if !matches!(edge.kind, EdgeKind::CALL | EdgeKind::INHERITANCE) {
+                continue;
+            }
+            if !seen_incident.insert(edge.id.clone()) {
+                continue;
+            }
+            let source_cited = cited.contains(&edge.source);
+            let target_cited = cited.contains(&edge.target);
+            if source_cited && target_cited {
+                both_endpoints.push(edge.id.clone());
+            } else if source_cited || target_cited {
+                one_endpoint.push(edge.id.clone());
+            }
+        }
+    }
+
+    let mut protected = Vec::new();
+    let mut seen = HashSet::new();
+    let push = |id: EdgeId, protected: &mut Vec<EdgeId>, seen: &mut HashSet<EdgeId>| {
+        if seen.insert(id.clone()) {
+            protected.push(id);
+        }
+    };
+    for id in obligation_edge_ids {
+        push(id.clone(), &mut protected, &mut seen);
+    }
+    for id in both_endpoints {
+        push(id, &mut protected, &mut seen);
+    }
+    for citation in &answer.citations {
+        for id in &citation.evidence_edge_ids {
+            push(id.clone(), &mut protected, &mut seen);
+        }
+    }
+    for id in one_endpoint {
+        push(id, &mut protected, &mut seen);
+    }
+    protected
 }
 
 fn cap_graph_edges(
@@ -1391,14 +1352,14 @@ pub(super) mod tests {
     use codestory_contracts::api::{
         AgentCitationDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
         AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalTraceDto, EdgeId, EdgeKind,
-        GraphEdgeDto, GraphNodeDto, NodeId, NodeKind, PacketClaimDto, PacketClaimObligationDto,
-        PacketClaimObligationKindDto, PacketCoverageReportDto, PacketEvidenceResolutionDto,
-        PacketEvidenceTierDto, PacketObligationCarrierEdgeProofDto, PacketObligationProofStatusDto,
-        PacketPlanDto, PacketPlanQueryDto, PacketProbeDto, PacketProbeRejectionCodeDto,
-        PacketProbeRejectionDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto,
-        PacketQueryCompletionDto, PacketQueryObligationDto, PacketQueryObligationKindDto,
-        PacketRetrievalTraceSummaryDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto,
-        PacketSufficiencyStatusDto, SearchHitOrigin,
+        GraphEdgeDto, GraphNodeDto, NodeId, NodeKind, PacketClaimObligationDto,
+        PacketClaimObligationKindDto, PacketDispositionDto, PacketDispositionKindDto,
+        PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketObligationCarrierEdgeProofDto,
+        PacketObligationProofStatusDto, PacketPlanDto, PacketPlanQueryDto, PacketProbeDto,
+        PacketProbeRejectionCodeDto, PacketProbeRejectionDto, PacketProbeResolutionDto,
+        PacketProbeResolutionStatusDto, PacketQueryCompletionDto, PacketQueryObligationDto,
+        PacketQueryObligationKindDto, PacketRetrievalTraceSummaryDto,
+        PacketSidecarQueryDiagnosticDto, SearchHitOrigin,
     };
 
     fn budget_graph_node(id: &str) -> GraphNodeDto {
@@ -1635,6 +1596,78 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn graph_cap_keeps_cited_incident_calls_ahead_of_unrelated_trail() {
+        let mut packet = test_packet("Trace a cited CALL.", 96 * 1024);
+        let cited = packet.answer.citations[0].node_id.clone();
+        let neighbor = NodeId("cited-call-target".to_string());
+        let cited_edge = EdgeId("cited-call".to_string());
+        packet.answer.graphs = vec![GraphArtifactDto::Uml {
+            id: "cited-graph".to_string(),
+            title: "Cited graph".to_string(),
+            graph: GraphResponse {
+                center_id: cited.clone(),
+                nodes: vec![
+                    budget_graph_node(&cited.0),
+                    GraphNodeDto {
+                        id: neighbor.clone(),
+                        label: "handle".to_string(),
+                        kind: NodeKind::METHOD,
+                        depth: 1,
+                        label_policy: None,
+                        badge_visible_members: None,
+                        badge_total_members: None,
+                        merged_symbol_examples: Vec::new(),
+                        file_path: Some("src/lib.rs".to_string()),
+                        qualified_name: None,
+                        member_access: None,
+                    },
+                ],
+                edges: vec![GraphEdgeDto {
+                    id: cited_edge.clone(),
+                    source: cited,
+                    target: neighbor,
+                    kind: EdgeKind::CALL,
+                    confidence: Some(1.0),
+                    certainty: Some("certain".to_string()),
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        }];
+        packet.answer.graphs.push(budget_graph_artifact(
+            "noise-graph",
+            &[
+                "noise-a", "noise-b", "noise-c", "noise-d", "noise-e", "noise-f",
+            ],
+        ));
+
+        let protected = protected_graph_edge_ids_for_budget(&packet.answer, &[]);
+        assert!(
+            protected.contains(&cited_edge),
+            "cited incident CALL must be protected: {protected:?}"
+        );
+        assert!(cap_graph_edges(&mut packet.answer, 2, &protected));
+        let retained = packet
+            .answer
+            .graphs
+            .iter()
+            .filter_map(|artifact| match artifact {
+                GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.iter()),
+                GraphArtifactDto::Mermaid { .. } => None,
+            })
+            .flatten()
+            .map(|edge| edge.id.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            retained.contains(&cited_edge),
+            "compact cap must keep the cited CALL: {retained:?}"
+        );
+    }
+
+    #[test]
     fn graph_cap_selection_is_invariant_to_artifact_insertion_order() {
         let protected = EdgeId("shared-proof".to_string());
         let mut first = test_packet("Trace stable graph selection.", 96 * 1024).answer;
@@ -1854,34 +1887,36 @@ pub(super) mod tests {
                     .as_ref(),
             ),
         ];
-        packet.sufficiency.status = PacketSufficiencyStatusDto::Sufficient;
-        packet.sufficiency.gaps.clear();
-        packet.sufficiency.follow_up_commands.clear();
+        packet.disposition = PacketDispositionDto::supported();
+        packet.disposition.omission_receipts.clear();
 
         enforce_packet_output_budget(project_root, &mut packet);
 
         assert_eq!(
-            packet.sufficiency.status,
-            PacketSufficiencyStatusDto::Partial,
-            "the final post-budget packet must fail closed when the retained answer has no proof-bearing claim from the requested runtime path"
+            packet.disposition.kind,
+            PacketDispositionKindDto::Supported,
+            "budget must not reclassify a compiled disposition: {:?}",
+            packet.disposition
+        );
+        crate::agent::packet_compiler::apply_compiled_evidence(&mut packet, None);
+        assert_eq!(
+            packet.disposition.kind,
+            PacketDispositionKindDto::DrillOnce,
+            "unread requested path must be closable by one drill, not auto-Supported: {:?}",
+            packet.disposition
         );
         assert!(
             packet
-                .sufficiency
-                .gaps
-                .iter()
-                .any(|gap| gap.contains(runtime_path)),
-            "the final packet should identify the uncovered requested path: {:?}",
-            packet.sufficiency
-        );
-        assert!(
-            packet
-                .sufficiency
-                .follow_up_commands
-                .iter()
-                .any(|command| command.contains(runtime_path)),
-            "the final packet should provide a targeted follow-up for the uncovered path: {:?}",
-            packet.sufficiency
+                .disposition
+                .drill
+                .as_ref()
+                .map(|drill| drill
+                    .options
+                    .iter()
+                    .any(|option| option.path.as_deref() == Some(runtime_path)))
+                .unwrap_or(false),
+            "the compiled drill should name the uncovered requested path: {:?}",
+            packet.disposition
         );
     }
 
@@ -2597,16 +2632,18 @@ pub(super) mod tests {
         assert!(final_len <= 24 * 1024, "{final_len} > 24576");
         assert_eq!(packet.budget.used.output_bytes as usize, final_len);
         assert_eq!(
-            packet.sufficiency.status,
-            PacketSufficiencyStatusDto::Partial
+            packet.disposition.kind,
+            PacketDispositionKindDto::Supported,
+            "hard-budget minimizer must not reclassify disposition: {:?}",
+            packet.disposition
         );
-        assert!(packet.sufficiency.gaps.iter().any(|gap| {
+        assert!(packet.disposition.omission_receipts.iter().any(|gap| {
             gap.contains("request_dispatch") && gap.contains("packet_budget_truncated")
         }));
         assert!(
             packet
-                .sufficiency
-                .gaps
+                .disposition
+                .omission_receipts
                 .iter()
                 .any(|gap| { gap.contains("query:dispatch") && gap.contains("stage_deadline") })
         );
@@ -2614,8 +2651,7 @@ pub(super) mod tests {
             packet.plan.obligations.claim_obligations[0].proof_status,
             PacketObligationProofStatusDto::Reported
         );
-        assert!(packet.answer.citations.is_empty());
-        assert!(packet.answer.graphs.is_empty());
+        assert!(!packet.answer.citations.is_empty());
 
         let converged = serde_json::to_vec(&packet).expect("serialize converged packet");
         enforce_packet_output_budget_for_representation(
@@ -2631,18 +2667,13 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn compact_budget_trims_ineligible_coverage_report_before_payload_omission() {
+    fn compact_budget_trims_plan_trace_before_payload_omission() {
         let question = "Explain symbol ownership for PacketBudget.";
         let mut packet = test_packet(question, 1);
-        packet
-            .sufficiency
-            .coverage_report
-            .as_mut()
-            .expect("coverage report")
-            .ineligible = (0..48)
+        packet.plan.trace = (0..48)
             .map(|index| {
                 format!(
-                    "claim=\"diagnostic claim {index} {}\" role=\"source evidence\" tier=\"diagnostic\" reason=\"claim marked diagnostic\"",
+                    "diagnostic claim {index} {}",
                     "padding ".repeat(80)
                 )
             })
@@ -2650,7 +2681,7 @@ pub(super) mod tests {
 
         let mut trimmed_probe = packet.clone();
         let trimmed_sections = trim_packet_sufficiency_verbose_lists(&mut trimmed_probe);
-        assert_eq!(trimmed_sections, vec![COVERAGE_REPORT_INELIGIBLE_OMISSION]);
+        assert_eq!(trimmed_sections, vec!["plan.trace", "plan.queries"]);
         let trimmed_len = serialized_packet_len(&trimmed_probe);
         let max_output_bytes = u32::try_from(trimmed_len + 4096).expect("test cap fits u32");
         packet.budget.limits.max_output_bytes = max_output_bytes;
@@ -2664,7 +2695,7 @@ pub(super) mod tests {
         let serialized_len = serialized_packet_len(&packet);
         assert!(
             serialized_len <= max_output_bytes as usize,
-            "trimming verbose ineligible diagnostics should bring the packet under cap: {serialized_len} > {max_output_bytes}"
+            "trimming plan traces should bring the packet under cap: {serialized_len} > {max_output_bytes}"
         );
         assert_eq!(packet.budget.used.output_bytes as usize, serialized_len);
         assert!(
@@ -2679,20 +2710,10 @@ pub(super) mod tests {
                 .omitted_sections
                 .contains(&"packet_payload".to_string())
         );
-        assert!(
-            packet
-                .budget
-                .omitted_sections
-                .contains(&COVERAGE_REPORT_INELIGIBLE_OMISSION.to_string())
-        );
-        assert!(
-            packet
-                .sufficiency
-                .coverage_report
-                .as_ref()
-                .expect("coverage report")
-                .ineligible
-                .is_empty()
+        assert!(packet.plan.trace.is_empty());
+        assert_eq!(
+            packet.disposition.kind,
+            PacketDispositionKindDto::Supported
         );
     }
 
@@ -3059,39 +3080,21 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn sufficiency_verbose_trimming_preserves_missing_and_blocking_report_entries() {
+    fn verbose_plan_trimming_clears_trace_and_queries_without_changing_disposition() {
         let mut packet = test_packet("Explain route dispatch gaps.", 4096);
-        packet.sufficiency.coverage_report = Some(PacketCoverageReportDto {
-            covered: vec!["request dispatch".to_string()],
-            provenance_labels: vec!["graph_neighbor".to_string()],
-            provenance_counts: std::collections::BTreeMap::from([(
-                "graph_neighbor".to_string(),
-                1,
-            )]),
-            missing: vec!["route handling".to_string()],
-            ineligible: vec!["claim=\"diagnostic\" reason=\"claim marked diagnostic\"".to_string()],
-            unresolved: vec!["RouteDispatcher".to_string()],
-            budget_omitted: vec!["packet_payload".to_string(), "output_bytes".to_string()],
-        });
+        packet.plan.trace = vec!["planner trace".to_string()];
+        packet.plan.queries = vec![PacketPlanQueryDto {
+            query: "route dispatch".to_string(),
+            purpose: "fixture".to_string(),
+        }];
+        let kind = packet.disposition.kind;
 
         let trimmed_sections = trim_packet_sufficiency_verbose_lists(&mut packet);
 
-        assert_eq!(trimmed_sections, vec![COVERAGE_REPORT_INELIGIBLE_OMISSION]);
-        let report = packet
-            .sufficiency
-            .coverage_report
-            .as_ref()
-            .expect("coverage report");
-        assert_eq!(report.covered, vec!["request dispatch".to_string()]);
-        assert_eq!(report.provenance_labels, vec!["graph_neighbor".to_string()]);
-        assert_eq!(report.provenance_counts.get("graph_neighbor"), Some(&1));
-        assert_eq!(report.missing, vec!["route handling".to_string()]);
-        assert!(report.ineligible.is_empty());
-        assert_eq!(report.unresolved, vec!["RouteDispatcher".to_string()]);
-        assert_eq!(
-            report.budget_omitted,
-            vec!["packet_payload".to_string(), "output_bytes".to_string()]
-        );
+        assert_eq!(trimmed_sections, vec!["plan.trace", "plan.queries"]);
+        assert!(packet.plan.trace.is_empty());
+        assert!(packet.plan.queries.is_empty());
+        assert_eq!(packet.disposition.kind, kind);
     }
 
     pub(in crate::agent) fn test_packet(question: &str, max_output_bytes: u32) -> AgentPacketDto {
@@ -3161,27 +3164,6 @@ pub(super) mod tests {
             omitted_sections: Vec::new(),
             next_deeper_command: None,
         };
-        let sufficiency = PacketSufficiencyDto {
-            status: PacketSufficiencyStatusDto::Sufficient,
-            covered_claims: vec![PacketClaimDto {
-                claim: "Packet budget ownership is covered by cited runtime and contract anchors."
-                    .to_string(),
-                required_obligation_ids: Vec::new(),
-                required_obligation_kinds: Vec::new(),
-                proof_status: None,
-                required_evidence_role: None,
-                citations: answer.citations.clone(),
-                coverage_role: Some("source evidence".to_string()),
-                eligible_for_sufficiency: Some(true),
-            }],
-            open_next: Vec::new(),
-            avoid_opening: Vec::new(),
-            avoid_opening_paths: Vec::new(),
-            gaps: Vec::new(),
-            follow_up_commands: Vec::new(),
-            follow_up_invocations: Vec::new(),
-            coverage_report: Some(PacketCoverageReportDto::default()),
-        };
         let retrieval_trace_summary = PacketRetrievalTraceSummaryDto {
             retrieval_trace: answer.retrieval_trace.clone(),
             source_read_steps: 0,
@@ -3206,7 +3188,8 @@ pub(super) mod tests {
             },
             answer,
             budget,
-            sufficiency,
+            support: Vec::new(),
+            disposition: PacketDispositionDto::supported(),
             retrieval_trace_summary,
         }
     }

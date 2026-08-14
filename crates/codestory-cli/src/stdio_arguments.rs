@@ -607,7 +607,10 @@ mod tests {
                     "task_class": null,
                     "probes": [{"kind": "free_query", "query": "router"}],
                     "extra_probes": ["router"],
-                    "latency_budget_ms": 5000
+                    "latency_budget_ms": 5000,
+                    "parent_packet_id": "packet-1",
+                    "option_ids": ["bounded_source_read:src%2Funread.rs"],
+                    "core_generation_id": "core-1"
                 }),
             ),
             (
@@ -632,6 +635,29 @@ mod tests {
                 validate_tool_arguments(tool, Some(&arguments)),
                 Ok(()),
                 "{tool} rejected its own advertised argument shape"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_schema_rejects_undocumented_cli_flags() {
+        for (flag, value) in [
+            ("file", json!("src/lib.rs")),
+            ("mode", json!("compact")),
+            ("max_snippet_bytes", json!(2048)),
+        ] {
+            let mut arguments = json!({
+                "project": "/repo",
+                "question": "how does routing work"
+            });
+            arguments
+                .as_object_mut()
+                .expect("object")
+                .insert(flag.to_string(), value);
+            assert_eq!(
+                codes("packet", arguments),
+                vec!["unknown_property"],
+                "packet must reject undocumented CLI flag {flag}"
             );
         }
     }
@@ -964,6 +990,34 @@ mod source_range_tests {
         let arguments = json!({
             "project": "/tmp/repo",
             "paths": [{"path": "ChinookDatabase/DataSources/Chinook.sql", "line": 34}]
+        });
+        assert_eq!(validate_tool_arguments("snippet", Some(&arguments)), Ok(()));
+    }
+
+    #[test]
+    fn snippet_accepts_top_level_path_and_line_from_a_hit() {
+        let arguments = json!({
+            "project": "/tmp/repo",
+            "path": "src/app.ts",
+            "line": 12
+        });
+        assert_eq!(validate_tool_arguments("snippet", Some(&arguments)), Ok(()));
+    }
+
+    #[test]
+    fn snippet_accepts_symbol_id_as_an_id_alias() {
+        let arguments = json!({
+            "project": "/tmp/repo",
+            "symbol_id": "42"
+        });
+        assert_eq!(validate_tool_arguments("snippet", Some(&arguments)), Ok(()));
+    }
+
+    #[test]
+    fn snippet_accepts_file_path_inside_a_paths_entry() {
+        let arguments = json!({
+            "project": "/tmp/repo",
+            "paths": [{"file_path": "src/app.ts", "line": 12}]
         });
         assert_eq!(validate_tool_arguments("snippet", Some(&arguments)), Ok(()));
     }

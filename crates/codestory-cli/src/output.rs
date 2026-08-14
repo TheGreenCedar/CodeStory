@@ -3125,30 +3125,19 @@ fn append_evidence_packet(markdown: &mut String, output: &DrillOutput) {
         markdown,
         "evidence_packet: id={} sufficiency={} citations={}",
         packet.packet_id,
-        crate::packet_sufficiency_label(packet.sufficiency.status),
+        crate::packet_sufficiency_label(packet.disposition.kind),
         packet.answer.citations.len()
     );
     let _ = writeln!(markdown, "- question: {}", packet.question);
-    if !packet.sufficiency.covered_claims.is_empty() {
-        let _ = writeln!(markdown, "- covered_claims:");
-        for claim in packet
-            .sufficiency
-            .covered_claims
-            .iter()
-            .take(EVIDENCE_PREVIEW_LIMIT)
-        {
-            let _ = writeln!(
-                markdown,
-                "  - {} citations={} proof={:?}",
-                claim.claim,
-                claim.citations.len(),
-                claim.proof_status
-            );
+    if !packet.support.is_empty() {
+        let _ = writeln!(markdown, "- support:");
+        for unit in packet.support.iter().take(EVIDENCE_PREVIEW_LIMIT) {
+            let _ = writeln!(markdown, "  - {}", unit.summary);
         }
     }
-    if !packet.sufficiency.gaps.is_empty() {
+    if !packet.disposition.omission_receipts.is_empty() {
         let _ = writeln!(markdown, "- gaps:");
-        for gap in packet.sufficiency.gaps.iter().take(EVIDENCE_PREVIEW_LIMIT) {
+        for gap in packet.disposition.omission_receipts.iter().take(EVIDENCE_PREVIEW_LIMIT) {
             let _ = writeln!(markdown, "  - {gap}");
         }
     }

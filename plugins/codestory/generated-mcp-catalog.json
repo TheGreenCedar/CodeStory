@@ -107,7 +107,7 @@
         "openWorldHint": true,
         "readOnlyHint": true
       },
-      "description": "Answer broad structural questions with repository evidence, sufficiency, truncation, and follow-up commands before source snippets. CodeStory prepares managed retrieval automatically.",
+      "description": "Answer broad structural questions with compiled support units and a machine stop or one-round drill. Supported, NotEstablished, and Unavailable are terminal. DrillOnce means call packet again with parent_packet_id and the listed option_ids once. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
       "inputSchema": {
         "additionalProperties": false,
         "allOf": [
@@ -368,7 +368,7 @@
             }
           }
         ],
-        "description": "Build a broad task packet with budget and sufficiency metadata.",
+        "description": "Build a broad task packet with compiled support units and a machine stop or one-round drill disposition.",
         "properties": {
           "budget": {
             "default": "compact",
@@ -379,6 +379,10 @@
               "standard",
               "deep"
             ],
+            "type": "string"
+          },
+          "core_generation_id": {
+            "description": "Pinned core publication generation for a DrillOnce continuation.",
             "type": "string"
           },
           "extra_probes": {
@@ -405,6 +409,20 @@
               "integer",
               "null"
             ]
+          },
+          "option_ids": {
+            "description": "Drill option ids from the parent packet disposition. Execute them once; do not invent a second search.",
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "type": "array"
+          },
+          "parent_packet_id": {
+            "description": "Parent packet id for a generation-bound DrillOnce continuation.",
+            "type": "string"
           },
           "probes": {
             "description": "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
@@ -592,6 +610,10 @@
             "minLength": 1,
             "type": "string"
           },
+          "retrieval_generation": {
+            "description": "Pinned retrieval generation for a DrillOnce continuation.",
+            "type": "string"
+          },
           "task_class": {
             "description": "Optional task class.",
             "enum": [
@@ -618,7 +640,7 @@
       "name": "packet",
       "outputSchema": {
         "additionalProperties": false,
-        "description": "CodeStory broad task packet DTO with graph/sidecar evidence, budget truncation, unsafe-to-claim gaps, and follow-up commands.",
+        "description": "CodeStory broad task packet DTO with compiled support units and a machine stop or one-round drill disposition.",
         "properties": {
           "answer": {
             "description": "Underlying DB-first answer packet.",
@@ -626,6 +648,10 @@
           },
           "budget": {
             "description": "Budget limits, usage, and truncation metadata.",
+            "type": "object"
+          },
+          "disposition": {
+            "description": "Machine stop or one-round drill decision: supported, drill_once, not_established, or unavailable.",
             "type": "object"
           },
           "packet_id": {
@@ -644,8 +670,8 @@
             "description": "Compact retrieval trace telemetry summary.",
             "type": "object"
           },
-          "sufficiency": {
-            "description": "Covered claims, gaps, and follow-up contract.",
+          "support": {
+            "description": "Compiled evidence atoms: symbol locations, source ranges, typed graph edges, and complete-query negatives.",
             "type": "object"
           },
           "task_class": {
@@ -671,7 +697,8 @@
           "plan",
           "answer",
           "budget",
-          "sufficiency",
+          "support",
+          "disposition",
           "retrieval_trace_summary"
         ],
         "type": "object"
@@ -3847,6 +3874,21 @@
             "required": [
               "paths"
             ]
+          },
+          {
+            "required": [
+              "path"
+            ]
+          },
+          {
+            "required": [
+              "file_path"
+            ]
+          },
+          {
+            "required": [
+              "symbol_id"
+            ]
           }
         ],
         "properties": {
@@ -3863,6 +3905,17 @@
             "minimum": 0,
             "type": "integer"
           },
+          "end_line": {
+            "description": "Last line to return with top-level `path`. Defaults to a bounded window after the start.",
+            "maximum": 1000000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "file_path": {
+            "description": "Alias for `path`. Hits report this field name.",
+            "minLength": 1,
+            "type": "string"
+          },
           "function_body": {
             "description": "CLI-compatible scope selector; true requests `function_body`, false requests `line_context`.",
             "type": "boolean"
@@ -3872,23 +3925,51 @@
             "minLength": 1,
             "type": "string"
           },
+          "line": {
+            "description": "1-based line from a search, trail, or packet hit. Used with `path`.",
+            "maximum": 1000000,
+            "minimum": 1,
+            "type": "integer"
+          },
           "lines": {
             "description": "Agent-friendly compatibility alias for `context`.",
             "maximum": 200,
             "minimum": 0,
             "type": "integer"
           },
+          "path": {
+            "description": "Single-file alias for `paths`: repository-relative path as returned in `file_path`. Combine with `line`.",
+            "minLength": 1,
+            "type": "string"
+          },
           "paths": {
             "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
             "items": {
               "additionalProperties": false,
               "description": "One file range to read. Paste `file_path` and `line` straight from a search, trail, or packet hit.",
+              "oneOf": [
+                {
+                  "required": [
+                    "path"
+                  ]
+                },
+                {
+                  "required": [
+                    "file_path"
+                  ]
+                }
+              ],
               "properties": {
                 "end_line": {
                   "description": "Last line to return, 1-based. Defaults to a bounded window after the start.",
                   "maximum": 1000000,
                   "minimum": 1,
                   "type": "integer"
+                },
+                "file_path": {
+                  "description": "Alias for `path`. Hits report this field name.",
+                  "minLength": 1,
+                  "type": "string"
                 },
                 "line": {
                   "description": "Line of interest, 1-based, as returned in `line`. A window is returned around it.",
@@ -3908,9 +3989,7 @@
                   "type": "integer"
                 }
               },
-              "required": [
-                "path"
-              ],
+              "required": [],
               "type": "object"
             },
             "type": "array"
@@ -3932,6 +4011,17 @@
               "line_context",
               "function_body"
             ],
+            "type": "string"
+          },
+          "start_line": {
+            "description": "First line to return with top-level `path`. Alternative to `line`.",
+            "maximum": 1000000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "symbol_id": {
+            "description": "Alias for `id`. Hits report this field name.",
+            "minLength": 1,
             "type": "string"
           }
         },

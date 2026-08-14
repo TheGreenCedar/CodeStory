@@ -1,4 +1,4 @@
-# `packet` - Broad Task Packet With Sufficiency Contract
+# `packet` - Broad Task Packet With Typed Stop/Drill
 
 Builds a bounded answer packet for a broad repository question. Use it before
 ordinary source-file reads when the task is explanation, planning, route
@@ -9,18 +9,26 @@ tracing, ownership discovery, or change-impact analysis.
 See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
 Use `<codestory-cli> <command> --help` for the complete option set.
 
+MCP `packet` arguments are the catalog fields (`question`, `budget`,
+`task_class`, `probes`, `extra_probes`, `include_evidence`,
+`latency_budget_ms`, and DrillOnce `parent_packet_id` / `option_ids` /
+generation pins). Do not send CLI flags such as `--file`, `mode`, or
+`max_snippet_bytes` as MCP arguments.
+
 ## Agent Paths
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Normal path | `<codestory-cli> packet --project <target-workspace> --question "How does indexing flow from CLI to storage?" --budget compact` | Markdown packet with cited claims, budget usage, gaps, and follow-up commands. |
-| Failure path | If the packet reports `partial` or `insufficient`, follow its `follow_up_commands`, usually deeper packet budget or concrete `search`, `context`, `trail`, or `snippet` calls. | Broad exploration is bounded by reported gaps instead of drifting into repeated file reads. |
-| Integration edge | Use JSON output for harnesses and stdio clients. If `sufficiency.status` is `sufficient` and `follow_up_commands` is empty, answer from packet supported claims and include a compact support-file list from `answer.citations` and `sufficiency.avoid_opening_paths`; budget truncation alone is not a gap. Preserve exact source identifiers and covered-claim phrases from `sufficiency.covered_claims` and citation display names. Do not merge repeated exact anchors into shorthand that drops required prefixes; write each exact anchor independently when naming declarations, tables, symbols, selectors, or other source-defined terms. Treat `sufficiency.avoid_opening` as compatibility prose only. | Makes benchmark traces and agent loops comparable across runs. |
+| Normal path | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Packet with compiled `support` units, then `disposition`. |
+| Supported / NotEstablished / Unavailable | Stop. Answer from `support`, say the repository does not establish the claim, or follow the typed preparation reason. | Terminal. Do not search. |
+| DrillOnce | Call `packet` once more with `parent_packet_id`, the listed `option_ids`, and the pinned `core_generation_id` / `retrieval_generation` when present. | One generation-bound continuation. Then AnswerNow. Merge cannot emit another drill. |
+| User-named exact target | `search`, `context`, `trail`, or `snippet` only when the user named that target. | Not packet recovery. |
+| Integration edge | Use JSON/MCP structured content. Compact text projects support units first, then disposition. Preserve exact source identifiers from support summaries and citation display names. | Comparable agent loops without a follow-up command list. |
 
 ## Notes
 
 - `packet` is for broad questions; `context` is for one concrete target.
-- Prefer `packet --budget compact` before manually opening source files for a broad explanation or plan.
+- Prefer a compact packet before manually opening source files for a broad explanation or plan.
 - `probes` uses tagged objects with `kind` equal to `exact_path`, `symbol_id`,
   `file_symbol`, `free_query`, or `continuation`. For example,
   `{"kind":"exact_path","path":"assets/desk.svg"}` selects that exact
@@ -29,31 +37,31 @@ Use `<codestory-cli> <command> --help` for the complete option set.
   one combined 16-item limit; every string field is limited to 240 characters.
 - Exact path, symbol-ID, file-symbol, and symbol-bound continuation probes add
   exact citations keyed by path or stable node ID. They are not converted back
-  into display-name searches. Each also creates a material `exact_probe`
-  obligation keyed by its input index, with the structured probe resolution in
-  `probe_binding`. Rejected and ambiguous probes remain blocking receipts;
-  resolved probes are proven only by their own exact path or node carrier, and
-  file-symbol carriers must also preserve the requested symbol identity.
+  into display-name searches.
 - A continuation also supplies `contract_version`, `project_id`,
   `core_generation_id`, optional `retrieval_generation`, optional exact
   `symbol_id`, and `query`; reuse fails closed when the selected evidence
   generation changes. Search and definition links emit this bound form.
 - `extra_probes` and CLI `--extra-probe` remain legacy compatibility inputs.
-  They enter the same runtime resolver. Neither typed nor legacy probes promote
-  packet sufficiency or choose route order.
-- Treat `sufficiency.status=partial` as useful but incomplete evidence. The packet should say which next command would deepen or verify the answer.
-- Architecture, data-flow, and route-tracing sufficiency requires causal flow-role coverage, not just citation or claim counts. Generic "inspect this anchor" claims may guide follow-up, but they do not make a packet safe to answer from.
-- JSON packets include `plan.obligations.version=1`. Material claim obligations must be
-  `proven`, and material query obligations must report `completion.status=completed`,
-  before they can support `sufficiency.status=sufficient`. A claim with
-  `proof_status=reported` names a carrier lead that did not satisfy its typed node-kind and
-  evidence-edge contract; do not treat it as proof or skip opening its file. Default-profile
-  packets retain one material obligation per concrete `binding_terms` request, including terms
-  for which retrieval found no carrier. Every citation carried by a multi-citation claim must bind
-  to a proven obligation; one proven carrier cannot promote another reported carrier.
-- The Markdown Packet Claims section uses fixed-width status markers: `P` proven, `R`
-  reported lead, `L` likely, `D` diagnostic, and `U` unsupported or unclassified. Only `P`
-  claims may be repeated as supported facts; the structured ledger remains authoritative.
+  They enter the same runtime resolver. Neither typed nor legacy probes replace
+  the compiled disposition.
+- Judge the answer from compiled support units (symbol locations, source
+  ranges, typed CALL/INHERITANCE/import edges, and complete-query negatives).
+  `disposition.kind=supported` means that evidence is present. It does not mean
+  an English flow-catalog family was closed. Do not treat a missing named
+  family such as `handler_processing` as a reason to search again.
+- `drill_once` is only for objectively missing, closable evidence: a deadline-
+  lost candidate, omitted mandatory support, or one bounded source read of a
+  known path. Execute the listed option ids once. Do not invent a second
+  search system. CLI `drill` remains the maintainer report and is not this
+  agent path.
+- `not_established` is a complete zero-hit or an ambiguous probe that needs a
+  user choice. Stop.
+- `unavailable` is stale publication, a dead sidecar, or a hard retrieval
+  error. Typed retry or preparation, not search.
+- JSON packets include `plan.obligations.version=1`. The obligation ledger
+  still records planned flow steps for query planning. It is not an
+  agent-facing conclusion.
 - CLI JSON, HTTP, and MCP consumers detect the `reported` proof-status value through
   `_meta.codestory_publication.schema_version`, which is `2` for this contract, and should also
   inspect `contract_runtime.pinned_pair_matches`. A configured `CODESTORY_CLI` override is

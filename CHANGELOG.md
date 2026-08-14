@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed
+
+- Packets now keep cited CALL and inheritance relations through the compact graph cap and state those relations in obligation receipts, instead of pointing at carriers with bookkeeping sentences.
+- The MCP `snippet` tool accepts the field names search and packet hits actually emit (`path`/`file_path`/`line`/`symbol_id`), so agents can paste a hit without renaming it.
+- Compact `context` text now includes evidence sections and CALL/inheritance relations after the trust boundary, the same way packet compact text already does.
+- Packets report whether retrieval can support an answer from ranked citations and graph relations. They no longer assert closed English flow-step conclusions, and they no longer stay `partial` merely because a named catalog family is unproven.
+- Packets now return compiled support units and a typed stop or one-round drill: `supported`, `drill_once`, `not_established`, or `unavailable`. The previous `sufficient` / `follow_up_commands` / `unsafe_to_claim` fields are gone. Compact text shows support first, then the disposition.
+
 ## 0.17.0
 
 CodeStory 0.17 gives agents broader, more dependable context from a repository. Questions can now combine names, files, concepts, relationships, and ordered flows, and search keeps exact, semantic, and graph evidence separate while ranking them together. Exact definitions remain easy to find, related callers and routes stay attached to the result, and weak semantic matches are dropped instead of being presented as useful evidence.

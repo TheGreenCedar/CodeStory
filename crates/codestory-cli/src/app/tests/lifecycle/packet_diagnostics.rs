@@ -30,7 +30,7 @@ fn packet_markdown_labels_use_public_wire_values() {
 #[test]
 fn packet_markdown_labels_repo_content_as_untrusted_evidence() {
     let mut packet = sample_task_brief_packet();
-    packet.sufficiency.covered_claims[0].citations[0].origin = SearchHitOrigin::TextMatch;
+    packet.answer.citations[0].origin = SearchHitOrigin::TextMatch;
     let markdown = render_packet_markdown(Path::new("C:/repo"), &packet);
 
     assert!(markdown.contains(REPO_CONTENT_BOUNDARY_LINE), "{markdown}");
@@ -47,7 +47,7 @@ fn packet_markdown_labels_repo_content_as_untrusted_evidence() {
 #[test]
 fn packet_markdown_labels_context_blocks_when_no_covered_claims() {
     let mut packet = sample_task_brief_packet();
-    packet.sufficiency.covered_claims.clear();
+    packet.support.clear();
     packet.answer.sections = vec![codestory_contracts::api::AgentResponseSectionDto {
         id: "answer".to_string(),
         title: "Answer".to_string(),

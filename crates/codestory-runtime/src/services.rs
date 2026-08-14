@@ -3464,15 +3464,13 @@ mod activation_tests {
             extra_probes: Vec::new(),
             include_evidence: true,
             latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
         }
     }
 
-    /// The readiness cost of a packet has to be readable off the packet itself.
-    ///
-    /// This drives the real production path — `ReadOnlyBrowserService::packet`
-    /// runs a public operation, pins retrieval, and builds a packet through the
-    /// orchestrator — and then reads the wire field the orchestrator populated,
-    /// instead of asserting on a hand-built DTO or on the counter helper. It
     /// The first packet on a ready lease performs exactly one fingerprint pass.
     /// A later wrapper on that same lease reuses the opaque fingerprint, while
     /// replacing the lease memo forces exactly one new pass.

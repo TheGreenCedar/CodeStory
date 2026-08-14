@@ -157,7 +157,7 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
   const snippet = catalog.tools.find(({ name }) => name === "snippet");
   assert.deepEqual(
     Object.keys(snippet.inputSchema.properties).sort(),
-    ["choose", "context", "function_body", "id", "lines", "project", "query", "scope"],
+    ["choose", "context", "end_line", "file_path", "function_body", "id", "line", "lines", "path", "paths", "project", "query", "scope", "start_line", "symbol_id"],
   );
 });
 

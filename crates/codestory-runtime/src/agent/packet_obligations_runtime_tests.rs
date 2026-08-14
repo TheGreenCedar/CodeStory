@@ -3,7 +3,9 @@
 use crate::agent::packet_claims::packet_supported_claims;
 use crate::agent::packet_freshness::fresh_index_observation;
 use crate::agent::packet_obligations::*;
-use crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context;
+use crate::agent::packet_sufficiency::{
+    PacketSufficiencyStatusDto, build_packet_sufficiency_with_obligation_context,
+};
 use crate::agent::path_identity::RuntimeWorkspacePathIdentity;
 use codestory_contracts::api::*;
 use std::path::Path;

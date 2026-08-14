@@ -1796,11 +1796,11 @@ fn tool_catalog_keeps_stable_product_tool_names() {
         .expect("packet description");
     assert!(
         packet_description.contains("broad structural questions")
-            && packet_description.contains("repository evidence")
-            && packet_description.contains("truncation")
-            && packet_description.contains("follow-up commands")
+            && packet_description.contains("compiled support units")
+            && packet_description.contains("one-round drill")
+            && packet_description.contains("option_ids")
             && packet_description.contains("before source snippets"),
-        "packet description should route broad questions to proof-bearing packet evidence first: {packet_description}"
+        "packet description should route broad questions to compiled support and a typed stop/drill: {packet_description}"
     );
     let search_description = tool_by_name(&tools, "search")["description"]
         .as_str()
@@ -2334,7 +2334,8 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 "plan",
                 "answer",
                 "budget",
-                "sufficiency",
+                "support",
+                "disposition",
                 "retrieval_trace_summary",
             ] {
                 assert!(
@@ -5495,8 +5496,11 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
         "agent guide should distinguish discovery clues from evidence: {guide}"
     );
     assert!(
-        guide_text.contains("unsafe to claim") && guide_text.contains("follow_up_commands"),
-        "agent guide should name unsafe-to-claim and follow-up states: {guide}"
+        guide_text.contains("supported")
+            && guide_text.contains("drillonce")
+            && guide_text.contains("option_ids")
+            && guide_text.contains("terminal"),
+        "agent guide should name the typed stop/drill contract: {guide}"
     );
     assert!(
         guide_text.contains("direct_source_reads")

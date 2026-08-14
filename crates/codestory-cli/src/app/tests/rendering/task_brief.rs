@@ -9,9 +9,9 @@ fn task_brief_output_contract_maps_packet_evidence_to_owner_workflow() {
     let brief = build_task_brief_output(Path::new("C:/repo"), &packet);
 
     assert_eq!(brief.task_brief_version, 1);
-    assert_eq!(brief.status, "needs_attention");
+    assert_eq!(brief.status, "ready");
     assert_eq!(brief.source_packet_id, "packet-task-brief");
-    assert_eq!(brief.source_packet_sufficiency, "partial");
+    assert_eq!(brief.source_packet_sufficiency, "supported");
     assert_eq!(
         brief.first_files[0].path,
         "crates/codestory-cli/src/`main_$env:SECRET$('x').rs"

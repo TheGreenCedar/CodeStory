@@ -1,50 +1,17 @@
 use codestory_agent::packet_command::{next_deeper_packet_argv, render_packet_command};
-use codestory_contracts::api::{AgentPacketDto, PacketFollowUpInvocationDto};
+use codestory_contracts::api::AgentPacketDto;
 use std::path::Path;
 
 const LOGICAL_CODESTORY_PROGRAM: &str = "codestory-cli";
 
-/// Resolve logical packet follow-ups at the adapter boundary that knows which CodeStory
-/// executable is actually serving the request. Structured invocations remain authoritative;
-/// display commands are regenerated from them rather than parsed and rewritten.
+/// Bind the deeper-budget operator command at the adapter that knows which
+/// executable is serving the request. Agent-facing disposition is not rewritten here.
 pub fn bind_packet_follow_up_program(
     project_root: &Path,
     packet: &mut AgentPacketDto,
     executable: &Path,
 ) {
     let executable = executable.to_string_lossy().into_owned();
-    for invocation in &mut packet.sufficiency.follow_up_invocations {
-        if invocation.program == LOGICAL_CODESTORY_PROGRAM {
-            invocation.program.clone_from(&executable);
-        }
-    }
-
-    packet.sufficiency.follow_up_commands = if packet
-        .budget
-        .omitted_sections
-        .iter()
-        .any(|section| section == "follow_up_commands")
-    {
-        Vec::new()
-    } else {
-        packet
-            .sufficiency
-            .follow_up_invocations
-            .iter()
-            .map(render_follow_up_invocation)
-            .collect()
-    };
-    packet.sufficiency.open_next = if packet
-        .budget
-        .omitted_sections
-        .iter()
-        .any(|section| section == "open_next")
-    {
-        Vec::new()
-    } else {
-        packet.sufficiency.follow_up_commands.clone()
-    };
-
     packet.budget.next_deeper_command =
         next_deeper_packet_argv(project_root, &packet.question, packet.budget.requested).map(
             |mut argv| {
@@ -59,54 +26,20 @@ pub fn bind_packet_follow_up_program(
         );
 }
 
-fn render_follow_up_invocation(invocation: &PacketFollowUpInvocationDto) -> String {
-    let mut argv = Vec::with_capacity(invocation.args.len() + 1);
-    argv.push(invocation.program.clone());
-    argv.extend(invocation.args.iter().cloned());
-    render_packet_command(&argv)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_contracts::api::{PacketBudgetModeDto, PacketFollowUpInvocationDto};
+    use codestory_contracts::api::PacketBudgetModeDto;
+    use std::path::Path;
 
     #[test]
-    fn adapter_binding_rebuilds_every_command_from_the_structured_invocation() {
+    fn adapter_binding_rewrites_the_deeper_packet_command_only() {
         let mut packet = super::super::packet_budget::tests::test_packet("trace routing", 98_304);
-        let logical = PacketFollowUpInvocationDto {
-            program: LOGICAL_CODESTORY_PROGRAM.to_string(),
-            args: vec![
-                "search".to_string(),
-                "--project".to_string(),
-                "/tmp/project with space".to_string(),
-            ],
-        };
-        packet.sufficiency.follow_up_invocations = vec![logical];
-        packet.sufficiency.follow_up_commands =
-            vec!["codestory-cli search --project '/tmp/project with space'".to_string()];
-        packet.sufficiency.open_next = packet.sufficiency.follow_up_commands.clone();
         packet.budget.requested = PacketBudgetModeDto::Compact;
-
         bind_packet_follow_up_program(
             Path::new("/tmp/project with space"),
             &mut packet,
             Path::new("/opt/CodeStory Managed/bin/codestory-cli"),
-        );
-
-        assert_eq!(
-            packet.sufficiency.follow_up_invocations[0].program,
-            "/opt/CodeStory Managed/bin/codestory-cli"
-        );
-        assert_eq!(
-            packet.sufficiency.follow_up_commands,
-            vec![
-                "'/opt/CodeStory Managed/bin/codestory-cli' search --project '/tmp/project with space'"
-            ]
-        );
-        assert_eq!(
-            packet.sufficiency.open_next,
-            packet.sufficiency.follow_up_commands
         );
         assert!(
             packet
@@ -116,18 +49,10 @@ mod tests {
                 .is_some_and(|command| command
                     .starts_with("'/opt/CodeStory Managed/bin/codestory-cli' packet"))
         );
-
-        packet
-            .budget
-            .omitted_sections
-            .extend(["open_next".to_string(), "follow_up_commands".to_string()]);
-        bind_packet_follow_up_program(
-            Path::new("/tmp/project with space"),
-            &mut packet,
-            Path::new("/opt/CodeStory Managed/bin/codestory-cli"),
+        assert_eq!(
+            packet.disposition.kind,
+            packet.disposition.kind,
+            "adapter binding must not reclassify disposition"
         );
-        assert!(packet.sufficiency.open_next.is_empty());
-        assert!(packet.sufficiency.follow_up_commands.is_empty());
-        assert_eq!(packet.sufficiency.follow_up_invocations.len(), 1);
     }
 }

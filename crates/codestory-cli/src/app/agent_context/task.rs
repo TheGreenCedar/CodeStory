@@ -2,8 +2,8 @@ use super::super::artifacts::{ensure_dot_only_for_trail, preflight_output_file};
 use super::super::lifecycle::{OpenedAgentSurface, open_agent_surface};
 use super::super::resolution::{quote_command_path, quote_command_value};
 use super::packet::{
-    packet_budget_mode_label, packet_budget_omitted_sections, packet_operator_status,
-    packet_sufficiency_label,
+    packet_budget_mode_label, packet_budget_omitted_sections, packet_disposition_label,
+    packet_operator_status,
 };
 use crate::args;
 use crate::args::{TaskAction, TaskBriefCommand, TaskCommand};
@@ -11,7 +11,9 @@ use crate::display;
 use crate::output::{RenderedPublicOutput, emit_public_operation};
 use crate::runtime::map_api_error;
 use anyhow::Result;
-use codestory_contracts::api::{AgentPacketDto, AgentPacketRequestDto, PacketTaskClassDto};
+use codestory_contracts::api::{
+    AgentPacketDto, AgentPacketRequestDto, PacketDispositionKindDto, PacketTaskClassDto,
+};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
@@ -40,6 +42,10 @@ fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
                 extra_probes: cmd.extra_probes.clone(),
                 include_evidence: !cmd.no_evidence,
                 latency_budget_ms: cmd.latency_budget_ms,
+                parent_packet_id: None,
+                option_ids: Vec::new(),
+                core_generation_id: None,
+                retrieval_generation: None,
             })
             .map_err(map_api_error)?;
         let brief = build_task_brief_output(&runtime.project_root, &packet);
@@ -97,9 +103,9 @@ pub(in crate::app) fn build_task_brief_output(
     TaskBriefOutput {
         task_brief_version: 1,
         prompt: packet.question.clone(),
-        status: packet_operator_status(packet.sufficiency.status).to_string(),
+        status: packet_operator_status(packet.disposition.kind).to_string(),
         source_packet_id: packet.packet_id.clone(),
-        source_packet_sufficiency: packet_sufficiency_label(packet.sufficiency.status).to_string(),
+        source_packet_sufficiency: packet_disposition_label(packet.disposition.kind).to_string(),
         first_files,
         relevant_symbols,
         likely_tests,
@@ -118,9 +124,6 @@ fn packet_task_brief_citations(
     packet: &AgentPacketDto,
 ) -> Vec<&codestory_contracts::api::AgentCitationDto> {
     let mut citations = Vec::new();
-    for claim in &packet.sufficiency.covered_claims {
-        citations.extend(claim.citations.iter());
-    }
     citations.extend(packet.answer.citations.iter());
     citations
 }
@@ -240,7 +243,7 @@ fn task_brief_risks_unknowns(
     packet: &AgentPacketDto,
     likely_tests: &[TaskBriefFileOutput],
 ) -> Vec<String> {
-    let mut risks = packet.sufficiency.gaps.clone();
+    let mut risks = packet.disposition.omission_receipts.clone();
     if packet.budget.truncated {
         risks.push(format!(
             "source packet was budget-truncated; omitted sections: {}",
@@ -249,6 +252,9 @@ fn task_brief_risks_unknowns(
     }
     if likely_tests.is_empty() {
         risks.push("no test files were cited by the source packet".to_string());
+    }
+    if packet.disposition.kind == PacketDispositionKindDto::Supported && risks.is_empty() {
+        risks.push("verify `changed` files after editing".to_string());
     }
     if risks.is_empty() {
         risks.push("none from packet sufficiency; verify cited files before editing".to_string());
@@ -282,7 +288,14 @@ fn task_brief_follow_up_commands(
         ));
     }
     commands.push(format!("codestory-cli affected --project {project} <path>"));
-    commands.extend(packet.sufficiency.follow_up_commands.iter().cloned());
+    if let Some(drill) = &packet.disposition.drill {
+        for option in &drill.options {
+            commands.push(format!(
+                "packet drill option {} (parent {})",
+                option.id, drill.parent_packet_id
+            ));
+        }
+    }
     commands
 }
 

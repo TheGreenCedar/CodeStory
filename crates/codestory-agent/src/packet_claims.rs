@@ -423,8 +423,8 @@ pub fn append_ranked_citation_claims(
                     continue;
                 }
             }
+            Some(PacketEvidenceRole::SourceEvidence) | None => continue,
             Some(role) => role,
-            None => PacketEvidenceRole::SourceEvidence,
         };
         let claim_key = packet_claim_key_for_citation(role, citation);
         if !seen_claims.insert(claim_key.clone()) {
@@ -768,6 +768,24 @@ mod tests {
             claims[0].required_evidence_role,
             Some(PacketEvidenceTierDto::ExactSource)
         );
+    }
+
+    #[test]
+    fn production_source_evidence_does_not_emit_ties_boilerplate() {
+        let answer = test_answer(
+            "Explain how Logger.addRecord writes a record through handlers.",
+            vec![
+                test_citation("Logger.addRecord", "src/Logger.php", 0.9),
+                test_citation("AbstractProcessingHandler.handle", "src/Handler.php", 0.8),
+            ],
+        );
+        let claims = packet_supported_claims(&answer);
+        for claim in &claims {
+            assert!(
+                !claim.claim.contains("ties ") && !claim.claim.contains("adjacent ownership"),
+                "ranked source-evidence claims must omit navigation boilerplate: {claim:?}"
+            );
+        }
     }
 
     #[test]
