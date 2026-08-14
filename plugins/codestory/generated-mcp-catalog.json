@@ -107,7 +107,7 @@
         "openWorldHint": true,
         "readOnlyHint": true
       },
-      "description": "Answer broad structural questions with compiled support units and a machine stop or one-round drill. Supported, NotEstablished, and Unavailable are terminal. DrillOnce means call packet again with parent_packet_id and the listed option_ids once. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
+      "description": "Answer broad structural questions with compiled support units and a machine stop or one-round drill. Supported, NotEstablished, and Unavailable are terminal. DrillOnce means call packet again once with the exact original question, parent_packet_id, and the listed option_ids. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
       "inputSchema": {
         "additionalProperties": false,
         "allOf": [
@@ -421,7 +421,7 @@
             "type": "array"
           },
           "parent_packet_id": {
-            "description": "Parent packet id for a generation-bound DrillOnce continuation.",
+            "description": "Parent packet id for a generation-bound DrillOnce continuation; repeat the original question unchanged.",
             "type": "string"
           },
           "probes": {
@@ -606,7 +606,7 @@
             "type": "string"
           },
           "question": {
-            "description": "Broad repository question or task.",
+            "description": "Broad repository question or task. Repeat it unchanged for a DrillOnce continuation.",
             "minLength": 1,
             "type": "string"
           },

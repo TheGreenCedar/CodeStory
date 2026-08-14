@@ -2128,8 +2128,11 @@ static PACKET_PROBE_SCHEMAS: &[&SchemaObject] = &[
 static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Build a broad task packet with compiled support units and a machine stop or one-round drill disposition.",
     &[
-        SchemaProperty::string_required("question", "Broad repository question or task.")
-            .with_min_length(1),
+        SchemaProperty::string_required(
+            "question",
+            "Broad repository question or task. Repeat it unchanged for a DrillOnce continuation.",
+        )
+        .with_min_length(1),
         SchemaProperty::string("budget", "Packet budget.")
             .with_enum(PACKET_BUDGETS)
             .with_default(ValueLiteral::String("compact")),
@@ -2162,7 +2165,7 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         .nullable(),
         SchemaProperty::string(
             "parent_packet_id",
-            "Parent packet id for a generation-bound DrillOnce continuation.",
+            "Parent packet id for a generation-bound DrillOnce continuation; repeat the original question unchanged.",
         ),
         SchemaProperty::string_array(
             "option_ids",
@@ -2196,7 +2199,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "packet",
-        description: "Answer broad structural questions with compiled support units and a machine stop or one-round drill. Supported, NotEstablished, and Unavailable are terminal. DrillOnce means call packet again with parent_packet_id and the listed option_ids once. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
+        description: "Answer broad structural questions with compiled support units and a machine stop or one-round drill. Supported, NotEstablished, and Unavailable are terminal. DrillOnce means call packet again once with the exact original question, parent_packet_id, and the listed option_ids. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
         input_schema: PACKET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(AGENT_PACKET_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),

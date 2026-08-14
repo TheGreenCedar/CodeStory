@@ -55,7 +55,7 @@ plugin result unless the user explicitly asks.
 | Find a symbol | `symbol`, then `definition` or `snippet`. |
 | Follow a call path | `callers`, `callees`, `trace`, or `trail`. |
 | Review change impact | `affected` with explicit Git-changed paths, then focused symbol or trace evidence. |
-| Broad structural question | `packet`; stop on Supported, NotEstablished, or Unavailable. For DrillOnce, call `packet` again with `parent_packet_id` and the listed `option_ids` once. Use `search` or `context` only for a user-named exact target, not as packet recovery. |
+| Broad structural question | `packet`; stop on Supported, NotEstablished, or Unavailable. For DrillOnce, call `packet` again once with the exact original `question`, `parent_packet_id`, and the listed `option_ids`. Use `search` or `context` only for a user-named exact target, not as packet recovery. |
 
 ## Evidence Rules
 
@@ -68,9 +68,9 @@ plugin result unless the user explicitly asks.
 - When `packet` reports `supported`, `not_established`, or `unavailable`, stop.
   Answer from the compiled support units, say the repository does not establish
   the claim, or follow the typed preparation reason. Do not search to recover.
-- When `packet` reports `drill_once`, call `packet` once more with
-  `parent_packet_id` and the listed `option_ids` (and the pinned generation ids
-  when present). Then answer. Do not start a free-form
+- When `packet` reports `drill_once`, call `packet` once more with the exact
+  original `question`, `parent_packet_id`, and the listed `option_ids` (and the
+  pinned generation ids when present). Then answer. Do not start a free-form
   `search` / `context` / `trail` / `snippet` loop from packet.
 - `affected` is planning evidence, not a guarantee that every runtime effect was
   found.

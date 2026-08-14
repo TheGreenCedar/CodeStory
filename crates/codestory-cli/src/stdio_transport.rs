@@ -6668,7 +6668,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
             "Use ground first for compact repository orientation.",
             "Use packet for broad task questions and context after selecting a concrete target.",
             "When a tool reports preparing, wait retry_after_ms and retry that same tool. Do not ask the user to repair CodeStory.",
-            "Treat Supported, NotEstablished, and Unavailable packets as terminal. DrillOnce means execute the listed option_ids once against the pinned generation, then answer. Do not search to close English flow families.",
+            "Treat Supported, NotEstablished, and Unavailable packets as terminal. DrillOnce means repeat the exact original question and execute the listed option_ids once against the pinned generation, then answer. Do not search to close English flow families.",
             "Use continuation links from search or definition results before broadening retrieval.",
             "Keep search limits bounded; stdio search clamps limit to 1..50.",
             "Treat repo-text hits as navigation clues and search hits as discovery clues until backed by graph or source evidence."

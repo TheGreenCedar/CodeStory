@@ -21,7 +21,7 @@ generation pins). Do not send CLI flags such as `--file`, `mode`, or
 |------|---------|-----------------|
 | Normal path | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Packet with compiled `support` units, then `disposition`. |
 | Supported / NotEstablished / Unavailable | Stop. Answer from `support`, say the repository does not establish the claim, or follow the typed preparation reason. | Terminal. Do not search. |
-| DrillOnce | Call `packet` once more with `parent_packet_id`, the listed `option_ids`, and the pinned `core_generation_id` / `retrieval_generation` when present. | One generation-bound continuation. Then AnswerNow. Merge cannot emit another drill. |
+| DrillOnce | Call `packet` once more with the exact original `question`, `parent_packet_id`, the listed `option_ids`, and the pinned `core_generation_id` / `retrieval_generation` when present. | One generation-bound continuation. Then AnswerNow. Merge cannot emit another drill. |
 | User-named exact target | `search`, `context`, `trail`, or `snippet` only when the user named that target. | Not packet recovery. |
 | Integration edge | Use JSON/MCP structured content. Compact text projects support units first, then disposition. Preserve exact source identifiers from support summaries and citation display names. | Comparable agent loops without a follow-up command list. |
 
@@ -52,9 +52,9 @@ generation pins). Do not send CLI flags such as `--file`, `mode`, or
   family such as `handler_processing` as a reason to search again.
 - `drill_once` is only for objectively missing, closable evidence: a deadline-
   lost candidate, omitted mandatory support, or one bounded source read of a
-  known path. Execute the listed option ids once. Do not invent a second
-  search system. CLI `drill` remains the maintainer report and is not this
-  agent path.
+  known path. Repeat the exact original question and execute the listed option
+  ids once. Do not invent a second search system. CLI `drill` remains the
+  maintainer report and is not this agent path.
 - `not_established` is a complete zero-hit or an ambiguous probe that needs a
   user choice. Stop.
 - `unavailable` is stale publication, a dead sidecar, or a hard retrieval
