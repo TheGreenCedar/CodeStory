@@ -390,21 +390,17 @@ fn collect_drill_options(
             .kind
             .eq(&codestory_contracts::api::PacketClaimObligationKindDto::ExactProbe)
             && obligation.carrier_paths.is_empty()
-        {
-            if let Some(path) = obligation
+            && let Some(path) = obligation
                 .probe_binding
                 .as_ref()
                 .and_then(|binding| binding.path.clone())
-            {
-                let display = packet_display_path(&path);
-                if !cited_paths.contains(&display) {
-                    let option = DrillOptionDto::bounded_source_read(
-                        format!("omitted-path:{display}"),
-                        display,
-                    );
-                    if seen.insert(option.id.clone()) {
-                        options.push(option);
-                    }
+        {
+            let display = packet_display_path(&path);
+            if !cited_paths.contains(&display) {
+                let option =
+                    DrillOptionDto::bounded_source_read(format!("omitted-path:{display}"), display);
+                if seen.insert(option.id.clone()) {
+                    options.push(option);
                 }
             }
         }

@@ -8,13 +8,17 @@
 //! is a compile error rather than a packet that silently compares paths with
 //! the wrong oracle.
 
+#[cfg(any(test, feature = "test-support"))]
 use codestory_agent::workspace_path_identity::WorkspacePathIdentity;
+#[cfg(any(test, feature = "test-support"))]
 use std::path::Path;
 
 /// The runtime's [`WorkspacePathIdentity`]: two paths name the same workspace
 /// file exactly when [`codestory_workspace::same_workspace_path`] says so.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct RuntimeWorkspacePathIdentity;
 
+#[cfg(any(test, feature = "test-support"))]
 impl WorkspacePathIdentity for RuntimeWorkspacePathIdentity {
     fn same_workspace_path(&self, left: &Path, right: &Path) -> bool {
         codestory_workspace::same_workspace_path(left, right)
