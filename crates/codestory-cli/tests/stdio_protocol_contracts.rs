@@ -537,7 +537,9 @@ fn assert_search_repaired_before_terminal_activation(
 ) {
     assert_eq!(error["code"], json!("codestory_unavailable"));
     assert!(
-        error["cause_code"].as_str().is_some_and(|cause| !cause.is_empty()),
+        error["cause_code"]
+            .as_str()
+            .is_some_and(|cause| !cause.is_empty()),
         "a terminal activation failure must name its cause: {error}"
     );
     assert_eq!(error["retry_tool"], Value::Null);
@@ -5578,7 +5580,9 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
     if activation_terminated(error) {
         assert_eq!(error["code"], json!("codestory_unavailable"));
         assert!(
-            error["cause_code"].as_str().is_some_and(|cause| !cause.is_empty()),
+            error["cause_code"]
+                .as_str()
+                .is_some_and(|cause| !cause.is_empty()),
             "a terminal activation failure must name its cause: {error}"
         );
         assert_eq!(error["retry_tool"], Value::Null);
@@ -5631,7 +5635,9 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
     if activation_terminated(error) {
         assert_eq!(error["code"], json!("codestory_unavailable"));
         assert!(
-            error["cause_code"].as_str().is_some_and(|cause| !cause.is_empty()),
+            error["cause_code"]
+                .as_str()
+                .is_some_and(|cause| !cause.is_empty()),
             "a terminal activation failure must name its cause: {error}"
         );
         assert_eq!(error["retry_tool"], Value::Null);

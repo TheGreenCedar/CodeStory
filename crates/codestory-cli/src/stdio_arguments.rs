@@ -862,10 +862,7 @@ pub(crate) fn reconcile_argument_synonyms(tool: &str, arguments: &mut Value) {
     let Some(schema) = crate::stdio_catalog::tool_input_schema(tool) else {
         return;
     };
-    let Some(declared) = schema
-        .get("properties")
-        .and_then(Value::as_object)
-    else {
+    let Some(declared) = schema.get("properties").and_then(Value::as_object) else {
         return;
     };
     let Some(supplied) = arguments.as_object_mut() else {
@@ -999,13 +996,18 @@ mod emitted_vocabulary_tests {
             );
             reconcile_argument_synonyms(tool, &mut arguments);
             assert_eq!(arguments["query"], json!("Session.request"), "{tool}");
-            assert_eq!(validate_tool_arguments(tool, Some(&arguments)), Ok(()), "{tool}");
+            assert_eq!(
+                validate_tool_arguments(tool, Some(&arguments)),
+                Ok(()),
+                "{tool}"
+            );
         }
     }
 
     #[test]
     fn a_hit_qualified_name_resolves_to_the_query_selector() {
-        let mut arguments = json!({"project": "/tmp/repo", "qualified_name": "requests.Session.send"});
+        let mut arguments =
+            json!({"project": "/tmp/repo", "qualified_name": "requests.Session.send"});
         reconcile_argument_synonyms("symbol", &mut arguments);
         assert_eq!(arguments["query"], json!("requests.Session.send"));
         assert_eq!(validate_tool_arguments("symbol", Some(&arguments)), Ok(()));
@@ -1014,7 +1016,8 @@ mod emitted_vocabulary_tests {
     /// An explicit `query` still wins; aliases never overwrite a declared name.
     #[test]
     fn an_explicit_query_is_not_overwritten_by_an_alias() {
-        let mut arguments = json!({"project": "/tmp/repo", "query": "keep", "display_name": "other"});
+        let mut arguments =
+            json!({"project": "/tmp/repo", "query": "keep", "display_name": "other"});
         reconcile_argument_synonyms("symbol", &mut arguments);
         assert_eq!(arguments["query"], json!("keep"));
     }
