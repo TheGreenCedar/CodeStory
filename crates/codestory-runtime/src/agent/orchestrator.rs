@@ -5190,16 +5190,21 @@ fn retrieval_markdown(
     bundle: &RetrievalBundle,
     source_context: Option<&FocusedSourceContext>,
 ) -> String {
+    // This section leads the packet, and a capped reader may see nothing else, so it opens
+    // with what it found in the repository and closes with how it looked. The question is
+    // not restated: whoever called `packet` supplied it, and it is a field on the packet
+    // besides -- echoing it back spent the top of the window telling the reader something
+    // it had already.
     let mut markdown = String::new();
+    let mut provenance = String::new();
 
-    let _ = writeln!(markdown, "Prompt: **{}**", prompt.trim().replace('\n', " "));
     let _ = writeln!(
-        markdown,
+        provenance,
         "Resolved profile: `{:?}` (`{:?}` mode)",
         profile.preset, profile.policy_mode
     );
     let _ = writeln!(
-        markdown,
+        provenance,
         "Indexed hits: `{}` | Graph artifacts: `{}`",
         bundle.hits.len(),
         bundle.graphs.len()
@@ -5223,18 +5228,18 @@ fn retrieval_markdown(
         markdown.push('\n');
     }
 
-    markdown.push_str("\nWhat I checked:\n");
-    markdown.push_str("- Initial indexed-symbol search with current hybrid ranking.\n");
+    provenance.push_str("\nWhat I checked:\n");
+    provenance.push_str("- Initial indexed-symbol search with current hybrid ranking.\n");
     if bundle.diagnostic_supplement_used {
-        markdown.push_str("- Deterministic query expansion because initial hits were weak.\n");
+        provenance.push_str("- Deterministic query expansion because initial hits were weak.\n");
     }
     if bundle.repo_explanation_supplement_used {
-        markdown.push_str(
+        provenance.push_str(
             "- Grounding snapshot diagnostic supplement for broad repo overview evidence.\n",
         );
     }
     if !bundle.diagnostic_supplement_used && should_investigate(profile) {
-        markdown.push_str("- Initial sidecar hits cleared the investigation confidence gate.\n");
+        provenance.push_str("- Initial sidecar hits cleared the investigation confidence gate.\n");
     }
 
     if bundle.hits.is_empty() {
@@ -5260,6 +5265,9 @@ fn retrieval_markdown(
         }
     }
 
+    // How the evidence above was gathered, after the evidence itself.
+    markdown.push('\n');
+    markdown.push_str(&provenance);
     markdown
 }
 
