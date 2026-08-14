@@ -5679,7 +5679,7 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
         return;
     }
     let first_error = assert_tool_error(&first, json!("packet-search-repair-first"));
-    if activation_terminated(&first_error) {
+    if activation_terminated(first_error) {
         assert_search_repaired_before_terminal_activation(
             &mut server,
             first_error,
@@ -5712,7 +5712,7 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
             return;
         }
         let error = assert_tool_error(&response, json!(id));
-        if activation_terminated(&error) {
+        if activation_terminated(error) {
             assert_search_repaired_before_terminal_activation(
                 &mut server,
                 error,

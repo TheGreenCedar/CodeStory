@@ -114,12 +114,13 @@ use codestory_contracts::api::{
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, AgentResponseBlockDto,
     AgentResponseModeDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AgentRetrievalStepDto,
-    AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError, GraphArtifactDto,
-    GraphRequest, GraphResponse, GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto,
-    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
-    PacketBudgetLimitsDto, PacketBudgetModeDto, PacketObligationPlanDto, PacketPlanDto,
-    PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto, SearchHit,
-    SearchHitOrigin, SearchRepoTextMode, SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
+    AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError, EdgeKind, GraphArtifactDto,
+    GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, IndexFreshnessDto,
+    IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketObligationPlanDto,
+    PacketPlanDto, PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
+    SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, TrailConfigDto,
+    TrailFilterOptionsDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{
@@ -610,6 +611,9 @@ pub(crate) fn agent_packet(
         Some(&plan.obligations),
     );
     append_packet_carrier_source_sections(controller, &mut answer, &limits);
+    if let Some(section) = packet_resolved_relations_section(&answer) {
+        answer.sections.push(section);
+    }
     order_packet_sections(&mut answer.sections);
     append_packet_non_trace_phase(&mut answer, "evidence_sections", phase_started);
     let phase_started = Instant::now();
@@ -951,6 +955,89 @@ fn append_packet_evidence_sections(
     }
 }
 
+pub(crate) const PACKET_RESOLVED_RELATIONS_SECTION_ID: &str = "packet-resolved-relations";
+
+/// The section is bounded so one densely-connected subgraph cannot spend the whole window;
+/// the packet's own cap fixpoint still runs after it.
+const RESOLVED_RELATIONS_MAX_BYTES: usize = 900;
+
+/// Turn `answer.graphs` into one assertible sentence per resolved relation.
+///
+/// The index resolves these edges and the packet already carries them in `answer.graphs`,
+/// but no section renders them, so they reach a text consumer in no form at all -- a model
+/// reading the packet sees the symbols and never sees what connects them. The verb comes
+/// from the edge kind and the spelling from the graph; nothing here knows a language or a
+/// framework.
+fn packet_resolved_relations_section(answer: &AgentAnswerDto) -> Option<AgentResponseSectionDto> {
+    let mut markdown = String::new();
+    let mut seen = HashSet::new();
+    for artifact in &answer.graphs {
+        let GraphArtifactDto::Uml { graph, .. } = artifact else {
+            continue;
+        };
+        let nodes = graph
+            .nodes
+            .iter()
+            .map(|node| (&node.id, node))
+            .collect::<HashMap<_, _>>();
+        for edge in &graph.edges {
+            let (Some(source), Some(target)) = (nodes.get(&edge.source), nodes.get(&edge.target))
+            else {
+                continue;
+            };
+            if !seen.insert((source.label.as_str(), target.label.as_str())) {
+                continue;
+            }
+            let line = format!(
+                "- `{}` ({:?}, {}) {} `{}` ({:?}, {}).\n",
+                source.label,
+                source.kind,
+                packet_relation_path(source),
+                packet_relation_verb(edge.kind),
+                target.label,
+                target.kind,
+                packet_relation_path(target),
+            );
+            if markdown.len() + line.len() > RESOLVED_RELATIONS_MAX_BYTES {
+                break;
+            }
+            markdown.push_str(&line);
+        }
+    }
+    if markdown.is_empty() {
+        return None;
+    }
+    Some(AgentResponseSectionDto {
+        id: PACKET_RESOLVED_RELATIONS_SECTION_ID.to_string(),
+        title: "Resolved Relations".to_string(),
+        blocks: vec![AgentResponseBlockDto::Markdown { markdown }],
+    })
+}
+
+fn packet_relation_path(node: &GraphNodeDto) -> String {
+    node.file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_else(|| "<unknown path>".to_string())
+}
+
+/// Reads as a sentence, and says only what the edge kind actually asserts.
+fn packet_relation_verb(kind: EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::CALL => "calls",
+        EdgeKind::IMPORT | EdgeKind::INCLUDE => "imports",
+        EdgeKind::INHERITANCE => "inherits from",
+        EdgeKind::OVERRIDE => "overrides",
+        EdgeKind::MEMBER => "declares",
+        EdgeKind::TYPE_USAGE | EdgeKind::TYPE_ARGUMENT => "uses the type",
+        EdgeKind::USAGE => "uses",
+        EdgeKind::MACRO_USAGE => "expands",
+        EdgeKind::ANNOTATION_USAGE => "is annotated by",
+        EdgeKind::TEMPLATE_SPECIALIZATION => "specializes",
+        EdgeKind::UNKNOWN => "is related to",
+    }
+}
+
 /// Where each answer section sits in the packet, lowest first.
 ///
 /// Consumers do not read the whole packet. The agent-facing projection carries only the
@@ -963,12 +1050,19 @@ fn append_packet_evidence_sections(
 /// held already and evicted the retrieval evidence and carrier source, which are sent
 /// nowhere else. They stay in the packet -- they are the anchor list for consumers that
 /// render sections only -- but they go last.
+///
+/// Between those extremes sit the presentational sections -- the analysis preamble, the
+/// diagram intros, the per-subquery trace sections. They are worth keeping for a reader of
+/// the whole packet and worth nothing to a reader who only ever sees the first few thousand
+/// characters, so they rank below the evidence and above the restatement. Ordering rather
+/// than dropping them costs a capped reader nothing and costs an uncapped reader nothing.
 fn packet_section_order_rank(id: &str) -> u8 {
     match id {
+        PACKET_RESOLVED_RELATIONS_SECTION_ID | "retrieval-evidence" => 0,
         "packet-carrier-source" => 1,
-        "packet-flow-claims" => 2,
-        "packet-evidence-ledger" => 3,
-        _ => 0,
+        "packet-flow-claims" => 3,
+        "packet-evidence-ledger" => 4,
+        _ => 2,
     }
 }
 
@@ -1094,9 +1188,13 @@ fn packet_evidence_ledger_row(citation: &AgentCitationDto) -> String {
     let role = packet_evidence_role(citation)
         .map(PacketEvidenceRole::as_str)
         .unwrap_or("source evidence");
+    // `display_name` is a host path for FILE-kind citations, so it needs the same
+    // normalisation as `file_path` -- otherwise the row prints an absolute checkout path
+    // next to the relative path it duplicates, and the reader cannot use either as an anchor.
+    let name = packet_display_path(&citation.display_name);
     format!(
         "- `{}` ({:?}) - `{}`{} - {} - score {:.3}",
-        citation.display_name, citation.kind, path, line, role, citation.score
+        name, citation.kind, path, line, role, citation.score
     )
 }
 
