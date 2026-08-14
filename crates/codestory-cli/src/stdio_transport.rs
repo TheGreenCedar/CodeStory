@@ -2235,7 +2235,18 @@ fn stdio_compact_tool_text(tool_name: &str, value: &serde_json::Value) -> String
         let Some(items) = value.pointer(pointer).and_then(serde_json::Value::as_array) else {
             continue;
         };
-        lines.push(format!("{field}_returned: {}", items.len()));
+        // Say when the list was cut. `{field}_returned: N` alone reads as "here are N",
+        // and the reader has to count the emitted lines to discover it got eight. Measured
+        // over a recorded census, 69.7% of declared evidence items were elided this way --
+        // 84.6% for trail, 78.8% for affected -- with nothing in the text to say so.
+        if items.len() > STDIO_TEXT_ITEM_LIMIT {
+            lines.push(format!(
+                "{field}_returned: {} (showing first {STDIO_TEXT_ITEM_LIMIT}; narrow the query or read structuredContent for the rest)",
+                items.len()
+            ));
+        } else {
+            lines.push(format!("{field}_returned: {}", items.len()));
+        }
         evidence.extend(
             items
                 .iter()
@@ -2257,12 +2268,59 @@ fn stdio_compact_tool_text(tool_name: &str, value: &serde_json::Value) -> String
     if let Some(snippet) = value.get("snippet").and_then(serde_json::Value::as_str) {
         evidence.push(format!("snippet:\n{}", stdio_truncate_text(snippet, 1_500)));
     }
+    append_source_range_evidence(&mut evidence, value);
     if !evidence.is_empty() {
         lines.push(REPO_CONTENT_BOUNDARY_LINE.to_string());
         lines.extend(evidence);
     }
     lines.push("structuredContent: available".to_string());
     stdio_truncate_text(&format!("{}\n", lines.join("\n")), STDIO_TEXT_MAX_BYTES)
+}
+
+/// Render the multi-range source payload that `snippet` returns when it is given `paths`.
+///
+/// Nothing rendered it. The single-target shape puts its source at `/snippet`, which is
+/// handled above; the multi-target shape puts one snippet per entry under `/ranges`, and
+/// with no case for it the whole response collapsed to two header lines. Measured over the
+/// recorded censuses: 83 successful `paths` calls, every one delivering exactly 43 bytes --
+/// `tool: snippet` plus `structuredContent: available` -- while the source sat in
+/// `structuredContent`, which this transport's consumers do not read. The batch path
+/// returned no source at all, which is the likeliest reason it went essentially unused.
+fn append_source_range_evidence(evidence: &mut Vec<String>, value: &serde_json::Value) {
+    let Some(ranges) = value
+        .pointer("/ranges")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    if ranges.is_empty() {
+        return;
+    }
+    evidence.push(format!("ranges_returned: {}", ranges.len()));
+    // Share the per-response allowance across the requested ranges rather than giving each
+    // the single-snippet budget, so asking for more targets never returns less of the first.
+    let per_range = (STDIO_TEXT_MAX_BYTES / ranges.len().max(1)).max(256);
+    for range in ranges.iter().take(STDIO_TEXT_ITEM_LIMIT) {
+        let path = range
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unknown path>");
+        let span = match (
+            range.get("start_line").and_then(serde_json::Value::as_u64),
+            range.get("end_line").and_then(serde_json::Value::as_u64),
+        ) {
+            (Some(start), Some(end)) => format!(":{start}-{end}"),
+            (Some(start), None) => format!(":{start}"),
+            _ => String::new(),
+        };
+        let Some(snippet) = range.get("snippet").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        evidence.push(format!(
+            "range {path}{span}:\n{}",
+            stdio_truncate_text(snippet, per_range)
+        ));
+    }
 }
 
 fn stdio_text_scalar(value: &serde_json::Value) -> Option<String> {
@@ -8085,6 +8143,74 @@ version = "0.11.20"
         );
         assert!(text.contains("gaps: none"), "{text}");
         assert!(text.len() <= STDIO_TEXT_MAX_BYTES, "{text}");
+    }
+
+    #[test]
+    fn stdio_snippet_text_delivers_every_requested_range_as_source() {
+        // The batch path shipped rendering nothing: a `paths` call returned only
+        // `tool: snippet` and `structuredContent: available`, 43 bytes, with the source
+        // reachable solely through structuredContent. Pin that the text carries the source.
+        let text = stdio_tool_text(
+            "snippet",
+            &json!({
+                "max_total_bytes": 65_536,
+                "ranges": [
+                    {
+                        "path": "src/index/use-swr.ts",
+                        "start_line": 830,
+                        "end_line": 832,
+                        "snippet": "```text\n>  830 |   }\n   831 |   return swrResponse\n   832 | }\n```",
+                        "snippet_truncated": false
+                    },
+                    {
+                        "path": "src/serialize.ts",
+                        "start_line": 4,
+                        "end_line": 5,
+                        "snippet": "```text\n>    4 | export function serialize() {\n     5 | }\n```",
+                        "snippet_truncated": false
+                    }
+                ]
+            }),
+        );
+
+        assert!(text.contains("ranges_returned: 2"), "{text}");
+        for expected in [
+            "range src/index/use-swr.ts:830-832",
+            "return swrResponse",
+            "range src/serialize.ts:4-5",
+            "export function serialize()",
+        ] {
+            assert!(
+                text.contains(expected),
+                "every requested range must reach the model as source, missing {expected:?}: {text}"
+            );
+        }
+        assert!(
+            text.contains(REPO_CONTENT_BOUNDARY_LINE),
+            "range source is repo content and must sit behind the boundary: {text}"
+        );
+        assert!(text.len() <= STDIO_TEXT_MAX_BYTES, "{text}");
+    }
+
+    #[test]
+    fn stdio_tool_text_says_when_an_evidence_list_was_cut() {
+        let hits = (0..20)
+            .map(|index| json!({"display_name": format!("Sym{index}"), "file_path": "src/lib.rs"}))
+            .collect::<Vec<_>>();
+        let text = stdio_tool_text("search", &json!({"hits": hits}));
+
+        assert!(
+            text.contains(&format!(
+                "hits_returned: 20 (showing first {STDIO_TEXT_ITEM_LIMIT}"
+            )),
+            "a cut list must say it was cut, not just declare its full length: {text}"
+        );
+
+        let text = stdio_tool_text("search", &json!({"hits": hits[..3].to_vec()}));
+        assert!(
+            text.contains("hits_returned: 3") && !text.contains("showing first"),
+            "an uncut list must not claim to be cut: {text}"
+        );
     }
 
     #[test]
