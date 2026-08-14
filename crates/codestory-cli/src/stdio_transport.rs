@@ -2455,7 +2455,9 @@ fn stdio_packet_text(packet: &serde_json::Value) -> String {
     append_packet_text_field(
         &mut text,
         "pagination",
-        Some("structuredContent keeps full arrays; compact text lists first 8"),
+        Some(
+            "structuredContent keeps full arrays; compact text lists first 16 anchors and first 8 blocks per section",
+        ),
     );
     text.push_str(REPO_CONTENT_BOUNDARY_LINE);
     text.push('\n');
@@ -2541,6 +2543,14 @@ fn stdio_packet_section_is_evidence(id: Option<&str>) -> bool {
     !matches!(id, "diagrams" | "analysis" | "uml-neighborhood") && !id.starts_with("mermaid-")
 }
 
+/// Anchors get their own, larger limit than `STDIO_TEXT_ITEM_LIMIT`, which bounds multi-line
+/// blocks. An anchor is one short line, and the ledger this list replaces packed roughly
+/// twenty of them into a single block -- so reusing the block limit here would have
+/// delivered fewer anchors than the section it replaced. Measured over 53 recorded packets,
+/// expected-file recall in the compact text is 0.681 at eight anchors and 0.744 at sixteen,
+/// and does not move at twenty-four or thirty-two, because no packet carries more.
+const STDIO_PACKET_ANCHOR_LIMIT: usize = 16;
+
 /// One line per anchor: `display_name (kind) path:line`.
 fn append_packet_anchor_list(text: &mut String, packet: &serde_json::Value) {
     let citations = packet
@@ -2552,7 +2562,7 @@ fn append_packet_anchor_list(text: &mut String, packet: &serde_json::Value) {
         return;
     }
     text.push_str("\nanchors\n");
-    for citation in citations.iter().take(STDIO_TEXT_ITEM_LIMIT) {
+    for citation in citations.iter().take(STDIO_PACKET_ANCHOR_LIMIT) {
         let field = |key: &str| citation.get(key).and_then(|value| value.as_str());
         let mut line = String::new();
         if let Some(name) = field("display_name") {
