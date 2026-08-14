@@ -3457,7 +3457,6 @@ pub struct PacketFollowUpInvocationDto {
     pub args: Vec<String>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct PacketRetrievalTraceSummaryDto {
     pub retrieval_trace: AgentRetrievalTraceDto,

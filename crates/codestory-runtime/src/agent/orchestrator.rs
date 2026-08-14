@@ -29,6 +29,7 @@ use crate::agent::packet_claims::packet_claim_for_role as build_packet_claim_for
 #[cfg(test)]
 use crate::agent::packet_claims::packet_supported_claims;
 use crate::agent::packet_claims::packet_supported_claims_with_telemetry;
+use crate::agent::packet_compiler::{apply_compiled_evidence, drill_options_from_ids};
 use crate::agent::packet_degradation::apply_packet_semantic_degradation_counters;
 use crate::agent::packet_evidence::decorate_citation_from_hit;
 use crate::agent::packet_evidence_roles::{
@@ -68,19 +69,16 @@ use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path,
     packet_stage_citation_carry_limit, sort_by_cached_rank_desc,
 };
-use crate::agent::packet_compiler::{
-    apply_compiled_evidence, drill_options_from_ids,
-};
 #[cfg(test)]
 use crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context;
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
-    PacketSufficiencyDto, PacketSufficiencyStatusDto, build_packet_sufficiency,
-    packet_budget_exceeded_hard_output_cap, packet_claim_can_satisfy_sufficiency,
+    PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value, render_packet_command,
 };
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
-    PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value, render_packet_command,
+    PacketSufficiencyDto, PacketSufficiencyStatusDto, build_packet_sufficiency,
+    packet_budget_exceeded_hard_output_cap, packet_claim_can_satisfy_sufficiency,
 };
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_search_execution_flow, prompt_search_terms,
@@ -122,16 +120,14 @@ use codestory_contracts::api::{
     IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
     NodeOccurrencesRequest, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto,
     PacketObligationPlanDto, PacketPlanDto, PacketProbeDto, PacketTaskClassDto,
-    RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
-    SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, TrailConfigDto,
-    TrailFilterOptionsDto,
+    RetrievalAnnotationDto, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
+    SearchRepoTextMode, SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{
     EdgeId, PacketBudgetDto, PacketBudgetUsageDto, PacketClaimDto, PacketPlanQueryDto,
     PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto, RetrievalAnnotationKindDto,
-    RetrievalShadowDto,
-    SearchMatchQualityDto,
+    RetrievalShadowDto, SearchMatchQualityDto,
 };
 use std::cmp::Ordering;
 #[cfg(test)]

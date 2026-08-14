@@ -1521,11 +1521,11 @@ fn packet_budget_omitted_obligation_evidence(budget: &PacketBudgetDto, section: 
 /// Case-sensitive carrier matching is right when someone typed an identifier and wrong when
 /// they wrote a product or language name, and the retrieval-side classifier that produces
 /// `exact_binding_terms` cannot tell those apart: it treats any word with an internal
-/// capital as an identifier, so `JavaScript`, `APIs`, and `AutoMapper` all arrive here as
-/// exact terms. Under case-sensitive matching a repository whose spelling convention
-/// differs from the question's then cannot satisfy its own obligation -- Alamofire cites
-/// `urlSession` and the term reads `URLSession`, so the packet holds the carrier and
-/// rejects it.
+/// capital as an identifier, so ordinary mixed-case product, language, and acronym terms
+/// all arrive here as exact terms. Under case-sensitive matching a repository whose spelling
+/// convention differs from the question's then cannot satisfy its own obligation: a cited
+/// lower-camel identifier and the equivalent acronym-prefixed term compare as different
+/// strings, so the packet holds the carrier and rejects it.
 ///
 /// Punctuation is the honest discriminator: prose does not put `_`, `::`, `.`, `/`, or `$`
 /// inside a word. Everything else falls back to case-insensitive matching, which still

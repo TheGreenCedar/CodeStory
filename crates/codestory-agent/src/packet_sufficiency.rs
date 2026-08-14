@@ -1425,14 +1425,14 @@ fn unresolved_sidecar_queries(answer: &AgentAnswerDto) -> Vec<String> {
 /// A sidecar probe naming a file the packet already cites is not an unresolved coverage
 /// gap.
 ///
-/// Path-like probes (`StringUtils.java`, `lib/src/client.dart`) exist to pull one named
+/// Path-like probes (`pkg/module.ext`, `lib/src/entry.ext`) exist to pull one named
 /// file into evidence. When that file ends up cited, the lexical candidates inside it
 /// that never bound to a symbol are a resolution diagnostic, not missing coverage —
 /// the packet demonstrably covered the file. Reporting them as unresolved contradicts
 /// the packet's own citation set, and a consumer matching unresolved entries against
 /// query obligations cannot reconcile a bare path with a query string, so it reads
-/// every one of them as blocking. That is how a packet that cites and covers
-/// `StringUtils.java` still reported it unresolved.
+/// every one of them as blocking. A packet that cites and covers the named file must not
+/// still report that same file probe as unresolved.
 fn sidecar_probe_target_is_cited(query: &str, cited_file_paths: &[String]) -> bool {
     let normalized = query.trim().replace('\\', "/").to_ascii_lowercase();
     let Some(base) = normalized.rsplit('/').next() else {
@@ -1443,9 +1443,9 @@ fn sidecar_probe_target_is_cited(query: &str, cited_file_paths: &[String]) -> bo
     if !base.contains('.') || base.starts_with('.') {
         return false;
     }
-    // Match on a whole trailing path segment, so a probe for `foo/client.dart` is not
-    // vouched for by a cited `bar/client.dart`, and `utils.java` never matches a cited
-    // `StringUtils.java`.
+    // Match on a whole trailing path segment, so a probe for `foo/module.ext` is not
+    // vouched for by a cited `bar/module.ext`, and `util.ext` never matches a cited
+    // `WidgetUtil.ext`.
     cited_file_paths.iter().any(|cited| {
         cited == &normalized
             || cited

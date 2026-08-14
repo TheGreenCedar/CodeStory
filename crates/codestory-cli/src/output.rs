@@ -3137,7 +3137,12 @@ fn append_evidence_packet(markdown: &mut String, output: &DrillOutput) {
     }
     if !packet.disposition.omission_receipts.is_empty() {
         let _ = writeln!(markdown, "- gaps:");
-        for gap in packet.disposition.omission_receipts.iter().take(EVIDENCE_PREVIEW_LIMIT) {
+        for gap in packet
+            .disposition
+            .omission_receipts
+            .iter()
+            .take(EVIDENCE_PREVIEW_LIMIT)
+        {
             let _ = writeln!(markdown, "  - {gap}");
         }
     }

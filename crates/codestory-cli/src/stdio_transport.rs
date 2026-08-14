@@ -8309,7 +8309,9 @@ version = "0.11.20"
             "stdio packet text should preserve the repo-content boundary: {text}"
         );
         let support_at = text.find("support:").expect("support units first");
-        let disposition_at = text.find("disposition:").expect("disposition after support");
+        let disposition_at = text
+            .find("disposition:")
+            .expect("disposition after support");
         assert!(
             support_at < disposition_at,
             "compact text must project support units before disposition: {text}"

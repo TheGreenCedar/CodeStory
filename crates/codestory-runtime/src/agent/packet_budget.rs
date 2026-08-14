@@ -2671,12 +2671,7 @@ pub(super) mod tests {
         let question = "Explain symbol ownership for PacketBudget.";
         let mut packet = test_packet(question, 1);
         packet.plan.trace = (0..48)
-            .map(|index| {
-                format!(
-                    "diagnostic claim {index} {}",
-                    "padding ".repeat(80)
-                )
-            })
+            .map(|index| format!("diagnostic claim {index} {}", "padding ".repeat(80)))
             .collect();
 
         let mut trimmed_probe = packet.clone();
@@ -2711,10 +2706,7 @@ pub(super) mod tests {
                 .contains(&"packet_payload".to_string())
         );
         assert!(packet.plan.trace.is_empty());
-        assert_eq!(
-            packet.disposition.kind,
-            PacketDispositionKindDto::Supported
-        );
+        assert_eq!(packet.disposition.kind, PacketDispositionKindDto::Supported);
     }
 
     #[test]

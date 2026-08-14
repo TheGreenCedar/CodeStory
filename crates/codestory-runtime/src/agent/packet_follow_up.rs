@@ -50,8 +50,7 @@ mod tests {
                     .starts_with("'/opt/CodeStory Managed/bin/codestory-cli' packet"))
         );
         assert_eq!(
-            packet.disposition.kind,
-            packet.disposition.kind,
+            packet.disposition.kind, packet.disposition.kind,
             "adapter binding must not reclassify disposition"
         );
     }

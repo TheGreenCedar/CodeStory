@@ -341,10 +341,8 @@ fn drill_packet_bridge_requires_shared_concrete_edge_evidence() {
 
     packet.answer.citations[0].subgraph_id = None;
     packet.answer.citations[1].subgraph_id = None;
-    packet.answer.citations[0].evidence_edge_ids =
-        vec![EdgeId("shared-edge".to_string())];
-    packet.answer.citations[1].evidence_edge_ids =
-        vec![EdgeId("shared-edge".to_string())];
+    packet.answer.citations[0].evidence_edge_ids = vec![EdgeId("shared-edge".to_string())];
+    packet.answer.citations[1].evidence_edge_ids = vec![EdgeId("shared-edge".to_string())];
     let bridges = drill_packet_bridges(Path::new("C:/repo"), &packet);
     assert_eq!(bridges[0].evidence.status, "graph_path");
 }

@@ -10,7 +10,9 @@ use crate::args::{
     DrillSummaryBridgeStatusOutput, DrillSummaryBridgesOutput, DrillSummaryMechanicalOutput,
     DrillSummaryOpenGapsOutput, DrillSummaryOutput, DrillSummarySourceTruthOutput,
 };
-use codestory_contracts::api::{ClaimReadinessDto, IndexFreshnessStatusDto, PacketDispositionKindDto};
+use codestory_contracts::api::{
+    ClaimReadinessDto, IndexFreshnessStatusDto, PacketDispositionKindDto,
+};
 
 pub(super) fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
     let anchors = drill_summary_anchors(output);

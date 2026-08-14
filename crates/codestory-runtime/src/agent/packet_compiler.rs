@@ -12,9 +12,10 @@ use crate::agent::packet_scoring::packet_display_path;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, AgentPacketRequestDto, BoundedDrillPlanDto, DrillOptionDto,
     EdgeKind, EmbeddingVectorPublicationIdentityDto, GraphArtifactDto, GraphResponse,
-    PACKET_DRILL_MAX_BYTES, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS, PACKET_DRILL_MAX_OPTIONS,
-    PacketDispositionDto, PacketDispositionKindDto, PacketPlanDto, PacketProbeResolutionStatusDto,
-    PacketQueryCompletionDto, SupportUnitDto, SupportUnitKindDto, decode_drill_option_id,
+    PACKET_DRILL_MAX_BYTES, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS,
+    PACKET_DRILL_MAX_OPTIONS, PacketDispositionDto, PacketDispositionKindDto, PacketPlanDto,
+    PacketProbeResolutionStatusDto, PacketQueryCompletionDto, SupportUnitDto, SupportUnitKindDto,
+    decode_drill_option_id,
 };
 use std::collections::BTreeSet;
 
@@ -282,9 +283,9 @@ fn classify_packet_disposition(input: ClassifyPacketDispositionInput<'_>) -> Pac
 }
 
 fn has_positive_support(support: &[SupportUnitDto]) -> bool {
-    support.iter().any(|unit| {
-        !matches!(unit.kind, SupportUnitKindDto::CompleteQueryNegative)
-    })
+    support
+        .iter()
+        .any(|unit| !matches!(unit.kind, SupportUnitKindDto::CompleteQueryNegative))
 }
 
 fn terminal_after_drill(
@@ -308,11 +309,8 @@ fn terminal_after_drill(
 
 fn first_ambiguous_probe(plan: &PacketPlanDto) -> Option<String> {
     plan.probe_resolutions.iter().find_map(|resolution| {
-        matches!(
-            resolution.status,
-            PacketProbeResolutionStatusDto::Ambiguous
-        )
-        .then(|| format!("probe-{}", resolution.input_index))
+        matches!(resolution.status, PacketProbeResolutionStatusDto::Ambiguous)
+            .then(|| format!("probe-{}", resolution.input_index))
     })
 }
 
@@ -412,9 +410,9 @@ fn collect_drill_options(
         }
     }
 
-    for token in question.split(|c: char| {
-        c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ',' | ';' | '(' | ')')
-    }) {
+    for token in question
+        .split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ',' | ';' | '(' | ')'))
+    {
         let token = token.trim_matches(|c: char| {
             !c.is_ascii_alphanumeric() && !matches!(c, '/' | '\\' | '.' | '_' | '-')
         });
@@ -425,8 +423,7 @@ fn collect_drill_options(
         if cited_paths.contains(&display) {
             continue;
         }
-        let option =
-            DrillOptionDto::bounded_source_read(format!("named-path:{display}"), display);
+        let option = DrillOptionDto::bounded_source_read(format!("named-path:{display}"), display);
         if seen.insert(option.id.clone()) {
             options.push(option);
         }
@@ -436,7 +433,10 @@ fn collect_drill_options(
     options
 }
 
-pub fn apply_compiled_evidence(packet: &mut AgentPacketDto, request: Option<&AgentPacketRequestDto>) {
+pub fn apply_compiled_evidence(
+    packet: &mut AgentPacketDto,
+    request: Option<&AgentPacketRequestDto>,
+) {
     let (support, disposition) = compile_packet_evidence(
         &packet.packet_id,
         &packet.question,
@@ -499,7 +499,9 @@ mod tests {
             retrieval_score_breakdown: None,
             evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource),
             evidence_producer: None,
-            resolution_status: Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            ),
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: Some(true),
@@ -541,8 +543,13 @@ mod tests {
             ..empty_plan()
         };
 
-        let (support, disposition) =
-            compile_packet_evidence(&packet.packet_id, &packet.question, &packet.plan, &packet.answer, None);
+        let (support, disposition) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            None,
+        );
         assert_eq!(support.len(), 1, "one citation still compiles as support");
         assert_eq!(disposition.kind, PacketDispositionKindDto::DrillOnce);
         let drill = disposition.drill.expect("drill plan");
@@ -588,9 +595,7 @@ mod tests {
             include_evidence: true,
             latency_budget_ms: None,
             parent_packet_id: Some(packet.packet_id.clone()),
-            option_ids: vec![
-                "bounded_source_read:src%2Funread.rs".to_string(),
-            ],
+            option_ids: vec!["bounded_source_read:src%2Funread.rs".to_string()],
             core_generation_id: None,
             retrieval_generation: None,
         };
@@ -612,8 +617,8 @@ mod tests {
         let mut packet = test_packet("no such symbol xyzzy", 98_304);
         packet.answer.freshness = Some(fresh_index_observation());
         packet.answer.citations.clear();
-        packet.answer.retrieval_trace.packet_sidecar_diagnostics = vec![
-            codestory_contracts::api::PacketSidecarQueryDiagnosticDto {
+        packet.answer.retrieval_trace.packet_sidecar_diagnostics =
+            vec![codestory_contracts::api::PacketSidecarQueryDiagnosticDto {
                 query: "xyzzy".to_string(),
                 completion: PacketQueryCompletionDto::Completed,
                 retrieval_mode: "full".to_string(),
@@ -630,11 +635,15 @@ mod tests {
                 semantic_stage_timeout_zero_hits: false,
                 semantic_abstained: false,
                 diagnostic: None,
-            },
-        ];
+            }];
 
-        let (support, disposition) =
-            compile_packet_evidence(&packet.packet_id, &packet.question, &packet.plan, &packet.answer, None);
+        let (support, disposition) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            None,
+        );
         assert!(
             support
                 .iter()
@@ -656,8 +665,13 @@ mod tests {
             message: Some("sidecar crashed".to_string()),
         }];
 
-        let (_support, disposition) =
-            compile_packet_evidence(&packet.packet_id, &packet.question, &packet.plan, &packet.answer, None);
+        let (_support, disposition) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            None,
+        );
         assert_eq!(disposition.kind, PacketDispositionKindDto::Unavailable);
     }
 
