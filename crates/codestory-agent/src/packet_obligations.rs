@@ -1516,6 +1516,42 @@ fn packet_budget_omitted_obligation_evidence(budget: &PacketBudgetDto, section: 
             .any(|omitted| omitted == section)
 }
 
+/// Whether a requested term is certainly a symbol rather than a capitalised English word.
+///
+/// Case-sensitive carrier matching is right when someone typed an identifier and wrong when
+/// they wrote a product or language name, and the retrieval-side classifier that produces
+/// `exact_binding_terms` cannot tell those apart: it treats any word with an internal
+/// capital as an identifier, so `JavaScript`, `APIs`, and `AutoMapper` all arrive here as
+/// exact terms. Under case-sensitive matching a repository whose spelling convention
+/// differs from the question's then cannot satisfy its own obligation -- Alamofire cites
+/// `urlSession` and the term reads `URLSession`, so the packet holds the carrier and
+/// rejects it.
+///
+/// Punctuation is the honest discriminator: prose does not put `_`, `::`, `.`, `/`, or `$`
+/// inside a word. Everything else falls back to case-insensitive matching, which still
+/// matches an exactly-spelled identifier -- it just also accepts the same identity under a
+/// different casing convention. That predicate is a property of the two spellings, not of
+/// any language or repository.
+///
+/// Deliberately scoped to obligation binding. The shared classifier also drives lexical
+/// search, scoring, and query intent, and changing it there would move retrieval itself.
+fn term_is_unambiguously_a_symbol(term: &str) -> bool {
+    let term = term.trim();
+    term.contains('_')
+        || term.contains("::")
+        || term.contains('.')
+        || term.contains('/')
+        || term.contains('\\')
+        || term.contains('$')
+        || term.contains('#')
+        // Lower-initial with an internal capital is camelCase, which English is not.
+        || (term
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase())
+            && term.chars().skip(1).any(|ch| ch.is_ascii_uppercase()))
+}
+
 fn citation_matches_default_profile_binding(
     citation: &AgentCitationDto,
     binding_terms: &[String],
@@ -1528,7 +1564,8 @@ fn citation_matches_default_profile_binding(
             citation_display_matches_requested_identity_with_case(
                 &citation.display_name,
                 term,
-                exact_binding_terms.iter().any(|exact| exact == term),
+                exact_binding_terms.iter().any(|exact| exact == term)
+                    && term_is_unambiguously_a_symbol(term),
             )
         });
     let path_scope_matches = requested_paths.is_empty()
@@ -4406,6 +4443,34 @@ mod tests {
         assert!(plan.claim_obligations.iter().any(|obligation| {
             obligation.material && obligation.binding_terms == ["Widget::run"]
         }));
+    }
+
+    #[test]
+    fn only_punctuated_or_camel_case_terms_earn_case_sensitive_binding() {
+        // Punctuation is not something English puts inside a word, so these are certainly
+        // identifiers and the repository's exact spelling is what was asked for.
+        for symbol in [
+            "RuntimeService::run",
+            "pkg.Foo.run",
+            "snake_case_name",
+            "src/lib.rs",
+            "$handler",
+            "Widget#render",
+            "urlSession",
+        ] {
+            assert!(
+                term_is_unambiguously_a_symbol(symbol),
+                "{symbol:?} is an identifier"
+            );
+        }
+        // A capitalised bare word is a product, language, or type name that the retrieval
+        // classifier cannot tell from an identifier, so it must not force exact casing.
+        for prose in ["JavaScript", "APIs", "AutoMapper", "URLSession", "HTTP"] {
+            assert!(
+                !term_is_unambiguously_a_symbol(prose),
+                "{prose:?} is prose-ambiguous and must fall back to case-insensitive binding"
+            );
+        }
     }
 
     #[test]
