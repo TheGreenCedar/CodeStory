@@ -25,6 +25,10 @@ from .qualification_retained_types import (
     RetainedMetric,
     RetainedQualificationContract,
 )
+from .qualification_thresholds import (
+    qualification_threshold_for,
+    verify_qualification_threshold_contract,
+)
 
 
 def _verified_scenario_artifact_names(scenario_id: str, artifacts: object) -> set[str]:
@@ -137,9 +141,9 @@ def _normalized_retained_metrics(
         set(metrics) == required_metrics,
         "retained qualification metric set is incomplete",
     )
-    thresholds = contract.measurement_contract["constant_set"][
-        "qualification_thresholds"
-    ]
+    constant_set = contract.measurement_contract["constant_set"]
+    verify_qualification_threshold_contract(constant_set, required_metrics)
+    matrix_cell_id = contract.evidence.host["matrix_cell_id"]
     metric_contracts = protocol["metric_contracts"]
     normalized = []
     for metric, result in metrics.items():
@@ -159,7 +163,8 @@ def _normalized_retained_metrics(
         )
         threshold = result.get("threshold")
         require(
-            threshold == thresholds[metric]
+            threshold
+            == qualification_threshold_for(constant_set, metric, matrix_cell_id)
             and isinstance(threshold, (int, float))
             and not isinstance(threshold, bool),
             f"metric {metric} threshold does not match the frozen constant set",

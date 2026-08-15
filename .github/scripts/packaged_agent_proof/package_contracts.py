@@ -13,6 +13,7 @@ from .contract_primitives import (
 )
 from .foundation import SERVER_LIFECYCLES, require
 from .measurement_protocol import load_server_measurement_contract
+from .qualification_thresholds import verify_qualification_threshold_contract
 
 
 def _verify_frozen_constant_set(measurement: dict, constant_set: dict) -> None:
@@ -128,11 +129,8 @@ def verify_package_server_contracts(
         "embedding server lifecycle states do not match the verifier",
     )
     required_metrics = set(measurement["required_metrics"])
-    thresholds = constant_set.get("qualification_thresholds")
-    require(
-        isinstance(thresholds, dict) and set(thresholds) == required_metrics,
-        "embedding server qualification thresholds do not match the measurement metrics",
-    )
+    verify_qualification_threshold_contract(constant_set, required_metrics)
+    thresholds = constant_set["qualification_thresholds"]
     fixed = constant_set.get("fixed_contract_values")
     threshold_contract = measurement.get("qualification_threshold_contract", {}).get(
         "true_idle_exit"

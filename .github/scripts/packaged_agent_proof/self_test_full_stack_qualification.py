@@ -12,6 +12,12 @@ from .foundation import (
 )
 from .native_manifest import runtime_executable_sha256
 from .qualification_retained import verify_retained_qualification
+from .qualification_thresholds import (
+    WINDOWS_SPAWN_METRIC,
+    WINDOWS_VULKAN_MATRIX_CELL,
+    qualification_threshold_for,
+    verify_qualification_threshold_contract,
+)
 from .self_test_full_stack_types import (
     ExternalEvidenceFixture,
     FullStackFixture,
@@ -208,6 +214,13 @@ def _retained_hostile_tests(
     stale_shared["shared_identity"]["server_instance_id"] = "stale-server"
     wrong_cell = json.loads(json.dumps(retained))
     wrong_cell["package"]["matrix_cell_id"] = "hosted_linux_x64_cpu"
+    wrong_cell_threshold = json.loads(json.dumps(retained))
+    windows_spawn_threshold = qualification_contract["constant_set"][
+        "qualification_threshold_overrides"
+    ][WINDOWS_VULKAN_MATRIX_CELL][WINDOWS_SPAWN_METRIC]
+    wrong_cell_threshold["metrics"][WINDOWS_SPAWN_METRIC][
+        "threshold"
+    ] = windows_spawn_threshold
     extra_quality_metric = json.loads(json.dumps(retained))
     extra_quality_metric["metrics"]["packet_quality"] = {
         "status": "pass",
@@ -225,6 +238,10 @@ def _retained_hostile_tests(
         (wrong_tier, "different-tier retained qualification was accepted"),
         (stale_shared, "stale retained shared server identity was accepted"),
         (wrong_cell, "wrong qualification matrix cell was accepted"),
+        (
+            wrong_cell_threshold,
+            "a Windows-only threshold override was accepted for the macOS matrix cell",
+        ),
         (
             extra_quality_metric,
             "optional retrieval quality re-entered frozen-candidate qualification",
@@ -380,7 +397,45 @@ def run_retained_qualification_self_tests(
     measurement_contract: dict,
 ) -> None:
     protocol = measurement_contract["measurement_protocol"]
-    thresholds = measurement_contract["constant_set"]["qualification_thresholds"]
+    constant_set = measurement_contract["constant_set"]
+    thresholds = constant_set["qualification_thresholds"]
+    verify_qualification_threshold_contract(
+        constant_set,
+        set(protocol["required_metrics"]),
+    )
+    windows_spawn_threshold = constant_set["qualification_threshold_overrides"][
+        WINDOWS_VULKAN_MATRIX_CELL
+    ][WINDOWS_SPAWN_METRIC]
+    require(
+        qualification_threshold_for(
+            constant_set,
+            WINDOWS_SPAWN_METRIC,
+            "protected_macos_arm64_metal",
+        )
+        == thresholds[WINDOWS_SPAWN_METRIC]
+        and qualification_threshold_for(
+            constant_set,
+            WINDOWS_SPAWN_METRIC,
+            WINDOWS_VULKAN_MATRIX_CELL,
+        )
+        == windows_spawn_threshold,
+        "qualification threshold selection did not preserve its matrix boundary",
+    )
+    mismatched_override = json.loads(json.dumps(constant_set))
+    mismatched_override["qualification_threshold_overrides"][
+        WINDOWS_VULKAN_MATRIX_CELL
+    ][WINDOWS_SPAWN_METRIC] += 1
+    try:
+        verify_qualification_threshold_contract(
+            mismatched_override,
+            set(protocol["required_metrics"]),
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure(
+            "a Windows spawn threshold detached from the selected slow-host bound was accepted"
+        )
     require(
         set(protocol["required_metrics"])
         == {

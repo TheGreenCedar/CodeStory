@@ -18,6 +18,7 @@ from .qualification_production_types import (
     QualificationRunnerEvidence,
     QualificationScenarioEvidence,
 )
+from .qualification_thresholds import qualification_threshold_for
 from .runtime_evidence_support import metric_passes
 from .runtime_memory import retain_five_process_memory_evidence
 
@@ -175,9 +176,11 @@ def _retained_qualification_metric(
             "value": value,
             "raw_evidence": raw_evidence,
         }
-    threshold = context.measurement_contract["constant_set"][
-        "qualification_thresholds"
-    ][metric]
+    threshold = qualification_threshold_for(
+        context.measurement_contract["constant_set"],
+        metric,
+        runner.matrix_cell_id,
+    )
     require(
         isinstance(threshold, (int, float)) and not isinstance(threshold, bool),
         f"qualification metric {metric} has no frozen threshold",
