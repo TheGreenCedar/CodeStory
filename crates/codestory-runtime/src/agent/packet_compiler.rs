@@ -19,6 +19,7 @@ use codestory_contracts::api::{
 };
 use std::collections::BTreeSet;
 
+#[cfg(test)]
 pub fn compile_packet_evidence(
     packet_id: &str,
     question: &str,
@@ -26,7 +27,18 @@ pub fn compile_packet_evidence(
     answer: &AgentAnswerDto,
     request: Option<&AgentPacketRequestDto>,
 ) -> (Vec<SupportUnitDto>, PacketDispositionDto) {
-    let support = compile_support_units(answer);
+    compile_packet_evidence_with_source_ranges(packet_id, question, plan, answer, &[], request)
+}
+
+fn compile_packet_evidence_with_source_ranges(
+    packet_id: &str,
+    question: &str,
+    plan: &PacketPlanDto,
+    answer: &AgentAnswerDto,
+    source_ranges: &[SupportUnitDto],
+    request: Option<&AgentPacketRequestDto>,
+) -> (Vec<SupportUnitDto>, PacketDispositionDto) {
+    let support = compile_support_units_with_source_ranges(answer, source_ranges);
     let publication = answer.retrieval_trace.retrieval_publication.as_ref();
     let already_drilled = request.is_some_and(|request| {
         request.parent_packet_id.is_some() || !request.option_ids.is_empty()
@@ -44,7 +56,10 @@ pub fn compile_packet_evidence(
     (support, disposition)
 }
 
-pub fn compile_support_units(answer: &AgentAnswerDto) -> Vec<SupportUnitDto> {
+fn compile_support_units_with_source_ranges(
+    answer: &AgentAnswerDto,
+    source_ranges: &[SupportUnitDto],
+) -> Vec<SupportUnitDto> {
     let mut units = Vec::new();
     let mut seen = BTreeSet::new();
 
@@ -79,6 +94,18 @@ pub fn compile_support_units(answer: &AgentAnswerDto) -> Vec<SupportUnitDto> {
             to_symbol: None,
             query: None,
         });
+        for source_range in source_ranges.iter().filter(|unit| {
+            unit.kind == SupportUnitKindDto::SourceRange
+                && unit.symbol_id.as_deref() == Some(citation.node_id.0.as_str())
+                && unit
+                    .snippet
+                    .as_deref()
+                    .is_some_and(|snippet| !snippet.is_empty())
+        }) {
+            if seen.insert(source_range.id.clone()) {
+                units.push(source_range.clone());
+            }
+        }
     }
 
     for artifact in &answer.graphs {
@@ -433,11 +460,12 @@ pub fn apply_compiled_evidence(
     packet: &mut AgentPacketDto,
     request: Option<&AgentPacketRequestDto>,
 ) {
-    let (support, disposition) = compile_packet_evidence(
+    let (support, disposition) = compile_packet_evidence_with_source_ranges(
         &packet.packet_id,
         &packet.question,
         &packet.plan,
         &packet.answer,
+        &packet.support,
         request,
     );
     packet.support = support;
@@ -513,6 +541,40 @@ mod tests {
             obligations: Default::default(),
             trace: Vec::new(),
         }
+    }
+
+    #[test]
+    fn source_range_support_stays_bound_to_its_retained_citation() {
+        let mut packet = test_packet("explain routing", 98_304);
+        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.rs")];
+        let source_range = |id: &str, symbol_id: &str, snippet: &str| SupportUnitDto {
+            id: id.to_string(),
+            kind: SupportUnitKindDto::SourceRange,
+            summary: "source for Router.dispatch at src/router.rs:10".to_string(),
+            path: Some("src/router.rs".to_string()),
+            symbol_id: Some(symbol_id.to_string()),
+            start_line: Some(10),
+            end_line: None,
+            snippet: Some(snippet.to_string()),
+            edge_kind: None,
+            from_symbol: None,
+            to_symbol: None,
+            query: None,
+        };
+
+        let support = compile_support_units_with_source_ranges(
+            &packet.answer,
+            &[
+                source_range("source:retained", "Router.dispatch", "fn dispatch() {}"),
+                source_range("source:dropped", "Dropped.symbol", "fn dropped() {}"),
+                source_range("source:empty", "Router.dispatch", ""),
+            ],
+        );
+
+        assert_eq!(support.len(), 2);
+        assert_eq!(support[0].kind, SupportUnitKindDto::SymbolLocation);
+        assert_eq!(support[1].kind, SupportUnitKindDto::SourceRange);
+        assert_eq!(support[1].id, "source:retained");
     }
 
     #[test]

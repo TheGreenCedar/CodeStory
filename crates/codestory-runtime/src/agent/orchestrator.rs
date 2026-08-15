@@ -110,7 +110,8 @@ use codestory_contracts::api::{
     NodeOccurrencesRequest, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto,
     PacketObligationPlanDto, PacketPlanDto, PacketProbeDto, PacketTaskClassDto,
     RetrievalAnnotationDto, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
-    SearchRepoTextMode, SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
+    SearchRepoTextMode, SearchRequest, SupportUnitDto, SupportUnitKindDto, TrailConfigDto,
+    TrailFilterOptionsDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{
@@ -547,30 +548,6 @@ pub(crate) fn agent_packet(
 
     let sufficiency_extra_probes = packet_plan_sufficiency_extra_probes(&plan, &extra_probes);
     let exact_probe_paths = exact_packet_probe_paths(&plan.probe_resolutions);
-
-    // Observed here, after every filesystem citation appender has run, because
-    // the uncapped route is a *cited* file rather than a probed one: a required
-    // file-scoped citation is minted `eligible_for_sufficiency`, so a packet
-    // could rest a proof-bearing claim on a file the index refused. Driving
-    // this off probe paths alone would leave exactly that route uncovered.
-    let mut covered_paths = exact_probe_paths.clone();
-    covered_paths.extend(
-        answer
-            .citations
-            .iter()
-            // Only citations that could carry a proof-bearing claim. A citation
-            // minted `eligible_for_sufficiency: false` — the SQL-schema and
-            // generic-shape appenders mint several — cannot make a packet
-            // Sufficient, so letting it cap would degrade ordinary answers for
-            // evidence they never rested on. Route B, the hole this closes, is
-            // eligible by construction.
-            .filter(|citation| {
-                crate::agent::packet_evidence::citation_sufficiency_eligible(citation)
-            })
-            .filter_map(|citation| citation.file_path.clone()),
-    );
-    answer.source_coverage =
-        crate::source_coverage::observe_source_coverage(controller, &covered_paths);
     let phase_started = Instant::now();
     let obligation_edge_proofs = capture_packet_obligation_edge_proofs_before_budget(
         &question,
@@ -590,6 +567,24 @@ pub(crate) fn agent_packet(
         protected_packet_obligation_edge_ids(&obligation_edge_proofs),
     );
     append_packet_non_trace_phase(&mut answer, "budget", phase_started);
+
+    // Coverage belongs to the evidence that survives the real citation cap. Observing the
+    // uncapped candidate set made a packet unavailable because of a partial file that the packet
+    // did not retain and therefore could not rest a claim on. Exact path probes remain included:
+    // a user-named unread path still fails closed even when it yielded no retained citation.
+    let mut covered_paths = exact_probe_paths;
+    covered_paths.extend(
+        answer
+            .citations
+            .iter()
+            .filter(|citation| {
+                crate::agent::packet_evidence::citation_sufficiency_eligible(citation)
+            })
+            .filter_map(|citation| citation.file_path.clone()),
+    );
+    answer.source_coverage =
+        crate::source_coverage::observe_source_coverage(controller, &covered_paths);
+
     let phase_started = Instant::now();
     install_retained_packet_obligation_edge_proofs(
         &mut plan.obligations,
@@ -611,12 +606,23 @@ pub(crate) fn agent_packet(
         &limits,
         Some(&plan.obligations),
     );
-    append_packet_carrier_source_sections(controller, &mut answer, &limits);
+    let source_support = append_packet_carrier_source_sections(controller, &mut answer, &limits);
     if let Some(section) = packet_resolved_relations_section(&answer) {
         answer.sections.push(section);
     }
     order_packet_sections(&mut answer.sections);
     append_packet_non_trace_phase(&mut answer, "evidence_sections", phase_started);
+
+    // `agent_packet` executes inside one stable retrieval-publication scope. Compile the packet
+    // while that pin is still active so a one-shot drill carries the exact generations it must
+    // send back. Attaching publication only to the returned DTO was too late: the compiler had
+    // already emitted empty drill pins, and the continuation could not validate them.
+    if let Some(publication) =
+        crate::agent::retrieval_primary::active_pinned_retrieval_publication(controller)
+    {
+        answer.retrieval_trace.retrieval_publication = Some(publication);
+    }
+
     // Typed field, not `annotations`: readiness re-verification was previously
     // invisible, which is what let one packet pay for several full content
     // passes unnoticed. Publishing it here — before the trace summary is taken
@@ -635,7 +641,7 @@ pub(crate) fn agent_packet(
         task_class: Some(plan.task_class),
         plan,
         answer,
-        support: Vec::new(),
+        support: source_support,
         disposition: PacketDispositionDto::not_established("compile pending"),
         budget,
         retrieval_trace_summary,
@@ -1086,13 +1092,14 @@ fn append_packet_carrier_source_sections(
     controller: &AppController,
     answer: &mut AgentAnswerDto,
     limits: &PacketBudgetLimitsDto,
-) {
+) -> Vec<SupportUnitDto> {
     if answer.citations.is_empty() || limits.max_snippets == 0 {
-        return;
+        return Vec::new();
     }
 
     let mut rendered = String::new();
     let mut steps = Vec::new();
+    let mut source_support = Vec::new();
 
     for citation in answer.citations.iter() {
         if steps.len() >= limits.max_snippets as usize {
@@ -1115,15 +1122,40 @@ fn append_packet_carrier_source_sections(
         if body.is_empty() {
             continue;
         }
-        let entry = format!(
-            "### {}\n\n{}\n\n",
-            citation.display_name,
-            truncate_carrier_source(body, CARRIER_SOURCE_MAX_SNIPPET_BYTES)
-        );
+        let retained_body = truncate_carrier_source(body, CARRIER_SOURCE_MAX_SNIPPET_BYTES);
+        let entry = format!("### {}\n\n{}\n\n", citation.display_name, retained_body);
         if rendered.len() + entry.len() > CARRIER_SOURCE_MAX_TOTAL_BYTES {
             break;
         }
         rendered.push_str(&entry);
+        if crate::agent::packet_evidence::citation_sufficiency_eligible(citation) {
+            let path = packet_display_path(&snippet.path);
+            let end_line = snippet.line.saturating_add(
+                retained_body
+                    .lines()
+                    .count()
+                    .saturating_sub(1)
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+            );
+            source_support.push(SupportUnitDto {
+                id: format!("source:{}:{}", citation.node_id.0, snippet.line),
+                kind: SupportUnitKindDto::SourceRange,
+                summary: format!(
+                    "source for {} at {path}:{}-{end_line}",
+                    citation.display_name, snippet.line,
+                ),
+                path: Some(path),
+                symbol_id: Some(citation.node_id.0.clone()),
+                start_line: Some(snippet.line),
+                end_line: Some(end_line),
+                snippet: Some(retained_body.to_string()),
+                edge_kind: None,
+                from_symbol: None,
+                to_symbol: None,
+                query: None,
+            });
+        }
         steps.push(AgentRetrievalStepDto {
             kind: AgentRetrievalStepKindDto::SourceRead,
             status: AgentRetrievalStepStatusDto::Ok,
@@ -1135,7 +1167,7 @@ fn append_packet_carrier_source_sections(
     }
 
     if rendered.is_empty() {
-        return;
+        return Vec::new();
     }
     answer.retrieval_trace.steps.extend(steps);
     answer.sections.push(AgentResponseSectionDto {
@@ -1143,6 +1175,7 @@ fn append_packet_carrier_source_sections(
         title: "Carrier Source".to_string(),
         blocks: vec![AgentResponseBlockDto::Markdown { markdown: rendered }],
     });
+    source_support
 }
 
 fn packet_evidence_ledger_markdown(
