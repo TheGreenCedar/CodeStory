@@ -3143,7 +3143,8 @@ mod platform {
     use super::{
         ENDPOINT_NAMESPACE, ExecutableAttestationStore, NativeConnectOutcome,
         QUALIFICATION_DIR_ENV, QUALIFICATION_NONCE_ENV, RetainedWindowsAuthorityState,
-        TransportIdentity, awake_deadline_ns, classify_windows_data_pipe_open_error, sha256_fields,
+        TransportIdentity, WindowsDataPipeOpenState, awake_deadline_ns,
+        classify_windows_data_pipe_open_error, remaining_awake_budget, sha256_fields,
         windows_pipe_read_failure_is_pollable, windows_pipe_write_failure_is_pollable,
     };
     use anyhow::{Context, Result, bail};
