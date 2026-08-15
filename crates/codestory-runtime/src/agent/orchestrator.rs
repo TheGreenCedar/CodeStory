@@ -1148,6 +1148,7 @@ fn order_packet_sections(sections: &mut [AgentResponseSectionDto]) {
 /// body from spending the whole snippet allowance before the rest of the evidence is placed.
 const CARRIER_SOURCE_MAX_TOTAL_BYTES: usize = 14_336;
 const CARRIER_SOURCE_MAX_SNIPPET_BYTES: usize = 1_536;
+const SOURCE_RECEIPT_NOT_RETAINED: &str = "source_receipt_not_retained";
 
 /// Truncate on a UTF-8 character boundary, never mid-codepoint.
 fn truncate_carrier_source(body: &str, max_bytes: usize) -> &str {
@@ -1170,15 +1171,53 @@ fn truncate_carrier_source(body: &str, max_bytes: usize) -> &str {
 /// a receipt about it, while the code itself stayed unreadable at answering time. What a
 /// carrier says about itself — its doc comment, the call it makes, the prototype it mixes in —
 /// is evidence the graph cannot restate, and it was being dropped on the floor.
+fn citation_is_lexical_source_range(citation: &AgentCitationDto) -> bool {
+    citation.evidence_tier == Some(PacketEvidenceTierDto::LexicalSource)
+        && citation.resolution_status == Some(PacketEvidenceResolutionDto::SourceRangeOnly)
+}
+
 fn citation_needs_bounded_source_read(citation: &AgentCitationDto) -> bool {
     let structural_source = citation.evidence_tier == Some(PacketEvidenceTierDto::StructuralText)
         && citation
             .evidence_producer
             .as_deref()
             .is_some_and(|producer| producer.starts_with("structural_"));
-    let lexical_source_range = citation.evidence_tier == Some(PacketEvidenceTierDto::LexicalSource)
-        && citation.resolution_status == Some(PacketEvidenceResolutionDto::SourceRangeOnly);
-    structural_source || lexical_source_range
+    structural_source || citation_is_lexical_source_range(citation)
+}
+
+fn demote_lexical_citations_without_source_receipts(
+    citations: &mut [AgentCitationDto],
+    source_support: &[SupportUnitDto],
+) {
+    let retained_receipts = source_support
+        .iter()
+        .filter(|unit| unit.kind == SupportUnitKindDto::SourceRange)
+        .filter_map(|unit| {
+            Some((
+                unit.symbol_id.clone()?,
+                packet_display_path(unit.path.as_deref()?),
+                unit.start_line,
+            ))
+        })
+        .collect::<HashSet<_>>();
+    for citation in citations
+        .iter_mut()
+        .filter(|citation| citation_is_lexical_source_range(citation))
+    {
+        let has_receipt = citation.file_path.as_deref().is_some_and(|path| {
+            retained_receipts.contains(&(
+                citation.node_id.0.clone(),
+                packet_display_path(path),
+                citation.line,
+            ))
+        });
+        if !has_receipt {
+            citation.eligible_for_sufficiency = Some(false);
+            citation
+                .loss_reason
+                .get_or_insert_with(|| SOURCE_RECEIPT_NOT_RETAINED.to_string());
+        }
+    }
 }
 
 fn append_packet_carrier_source_sections(
@@ -1296,6 +1335,11 @@ fn append_packet_carrier_source_sections(
             message: Some(format!("carrier source for {}", citation.display_name)),
         });
     }
+
+    // A lexical source-range hit is exact evidence only when its source text survives the packet.
+    // The snippet and byte caps are deliberate; demote overflow or failed reads instead of letting
+    // an unshipped receipt either count as support or make every stronger carrier unavailable.
+    demote_lexical_citations_without_source_receipts(&mut answer.citations, &source_support);
 
     if rendered.is_empty() {
         return Vec::new();
@@ -5728,6 +5772,44 @@ mod tests {
 
         citation.resolution_status = Some(PacketEvidenceResolutionDto::Unresolved);
         assert!(!citation_needs_bounded_source_read(&citation));
+    }
+
+    #[test]
+    fn lexical_source_range_without_a_retained_receipt_is_not_support() {
+        let mut retained =
+            test_packet_citation("args-file", "/checkout/repos/fmt/include/fmt/args.h", 0.9);
+        retained.kind = NodeKind::FILE;
+        retained.evidence_tier = Some(PacketEvidenceTierDto::LexicalSource);
+        retained.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+        let mut omitted = retained.clone();
+        omitted.node_id = NodeId("format-file".to_string());
+        omitted.display_name = "format-file".to_string();
+        omitted.file_path = Some("include/fmt/format.h".to_string());
+        let source_support = vec![SupportUnitDto {
+            id: "source:args-file:10".to_string(),
+            kind: SupportUnitKindDto::SourceRange,
+            summary: "source for args-file".to_string(),
+            path: Some("include/fmt/args.h".to_string()),
+            symbol_id: Some("args-file".to_string()),
+            start_line: Some(10),
+            end_line: Some(11),
+            snippet: Some("source".to_string()),
+            edge_kind: None,
+            from_symbol: None,
+            to_symbol: None,
+            query: None,
+        }];
+        let mut citations = vec![retained, omitted];
+
+        demote_lexical_citations_without_source_receipts(&mut citations, &source_support);
+
+        assert_eq!(citations[0].eligible_for_sufficiency, Some(true));
+        assert_eq!(citations[0].loss_reason, None);
+        assert_eq!(citations[1].eligible_for_sufficiency, Some(false));
+        assert_eq!(
+            citations[1].loss_reason.as_deref(),
+            Some(SOURCE_RECEIPT_NOT_RETAINED)
+        );
     }
 
     fn packet_answer_fixture(question: &str, citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
