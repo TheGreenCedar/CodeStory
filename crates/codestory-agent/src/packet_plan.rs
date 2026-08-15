@@ -3,7 +3,9 @@ use crate::eval_probes::{
     eval_probes_enabled, push_eval_architecture_flow_probe_terms,
     push_prompt_named_file_probe_queries,
 };
-use crate::packet_flow_requirements::packet_flow_requirement_queries_for_terms;
+use crate::packet_flow_requirements::{
+    packet_flow_requirement_context_queries_for_prompt, packet_flow_requirement_queries_for_terms,
+};
 use crate::packet_obligations::build_packet_obligation_plan;
 use crate::packet_required_probes::{
     packet_concrete_file_probe_queries_from_required, packet_named_schema_entity_symbol_queries,
@@ -476,6 +478,14 @@ fn packet_symbol_probe_query_specs(
             PACKET_CONCRETE_FILE_QUERY_PURPOSE,
         );
     }
+    push_unique_query_specs(
+        &mut queries,
+        &packet_flow_requirement_context_queries_for_prompt(question, &terms, task_class)
+            .into_iter()
+            .map(|(_, query)| query)
+            .collect::<Vec<_>>(),
+        PACKET_FLOW_ROLE_QUERY_PURPOSE,
+    );
     push_unique_query_specs(
         &mut queries,
         &packet_flow_requirement_queries_for_terms(&terms, task_class),

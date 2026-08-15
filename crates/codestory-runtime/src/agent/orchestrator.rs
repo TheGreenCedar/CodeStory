@@ -104,6 +104,7 @@ use crate::{
 };
 #[cfg(test)]
 use codestory_agent::packet_command::quote_packet_command_value;
+use codestory_agent::text::symbol_query_tokens;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentCustomRetrievalConfigDto,
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, AgentResponseBlockDto,
@@ -582,7 +583,8 @@ pub(crate) fn agent_packet(
     // Structural collectors are discovery aids until the runtime rereads the cited source range.
     // Enrich them before final obligation classification so an exact, retained source receipt can
     // prove a structural flow without globally trusting generated structural projections.
-    let source_support = append_packet_carrier_source_sections(controller, &mut answer, &limits);
+    let source_support =
+        append_packet_carrier_source_sections(controller, &question, &mut answer, &limits);
 
     // Coverage belongs to the evidence that survives the real citation cap. Observing the
     // uncapped candidate set made a packet unavailable because of a partial file that the packet
@@ -1176,7 +1178,16 @@ fn order_packet_sections(sections: &mut [AgentResponseSectionDto]) {
 /// body from spending the whole snippet allowance before the rest of the evidence is placed.
 const CARRIER_SOURCE_MAX_TOTAL_BYTES: usize = 14_336;
 const CARRIER_SOURCE_MAX_SNIPPET_BYTES: usize = 1_536;
+const CARRIER_SOURCE_FOCUSED_SNIPPET_BYTES: usize = CARRIER_SOURCE_MAX_SNIPPET_BYTES / 2;
+const CARRIER_SOURCE_FOCUS_CONTEXT_LINES: usize = 4;
+const CARRIER_SOURCE_MAX_FOCUSED_WINDOWS: usize = 2;
 const SOURCE_RECEIPT_NOT_RETAINED: &str = "source_receipt_not_retained";
+
+struct CarrierSourceRange {
+    path: String,
+    start_line: u32,
+    body: String,
+}
 
 /// Truncate on a UTF-8 character boundary, never mid-codepoint.
 fn truncate_carrier_source(body: &str, max_bytes: usize) -> &str {
@@ -1233,7 +1244,6 @@ fn demote_parser_partial_citations_without_source_receipts(
             Some((
                 unit.symbol_id.clone()?,
                 packet_display_path(unit.path.as_deref()?),
-                unit.start_line,
             ))
         })
         .collect::<HashSet<_>>();
@@ -1244,11 +1254,7 @@ fn demote_parser_partial_citations_without_source_receipts(
             .is_some_and(|path| parser_partial_paths.contains(&packet_display_path(path)))
     }) {
         let has_receipt = citation.file_path.as_deref().is_some_and(|path| {
-            retained_receipts.contains(&(
-                citation.node_id.0.clone(),
-                packet_display_path(path),
-                citation.line,
-            ))
+            retained_receipts.contains(&(citation.node_id.0.clone(), packet_display_path(path)))
         });
         if !has_receipt {
             citation.eligible_for_sufficiency = Some(false);
@@ -1261,6 +1267,7 @@ fn demote_parser_partial_citations_without_source_receipts(
 
 fn append_packet_carrier_source_sections(
     controller: &AppController,
+    question: &str,
     answer: &mut AgentAnswerDto,
     limits: &PacketBudgetLimitsDto,
 ) -> Vec<SupportUnitDto> {
@@ -1272,7 +1279,7 @@ fn append_packet_carrier_source_sections(
     let mut steps = Vec::new();
     let mut source_support = Vec::new();
 
-    for citation_index in 0..answer.citations.len() {
+    'citations: for citation_index in 0..answer.citations.len() {
         if steps.len() >= limits.max_snippets as usize {
             break;
         }
@@ -1292,7 +1299,7 @@ fn append_packet_carrier_source_sections(
             continue;
         }
         let started = Instant::now();
-        let source = if bounded_source_read {
+        let sources = if bounded_source_read {
             let (Some(path), Some(line)) = (citation.file_path.as_deref(), citation.line) else {
                 continue;
             };
@@ -1305,26 +1312,44 @@ fn append_packet_carrier_source_sections(
                     SOURCE_SNIPPET_TRUNCATION_SUFFIX,
                 )
                 .ok()
-                .map(|(path, snippet)| (path, line, snippet.markdown))
+                .map(|(path, snippet)| {
+                    vec![CarrierSourceRange {
+                        path,
+                        start_line: line,
+                        body: snippet.markdown,
+                    }]
+                })
+                .unwrap_or_default()
         } else {
             controller
                 .snippet_function_body_context(citation.node_id.clone(), 0)
                 .ok()
-                .map(|snippet| (snippet.path, snippet.line, snippet.snippet))
+                .map(|snippet| {
+                    if snippet.snippet_truncated
+                        || snippet.snippet.len() > CARRIER_SOURCE_MAX_SNIPPET_BYTES
+                    {
+                        let focused = focused_function_source_ranges(
+                            controller,
+                            question,
+                            &snippet.path,
+                            snippet.line,
+                            snippet.node.end_line,
+                        );
+                        if !focused.is_empty() {
+                            return focused;
+                        }
+                    }
+                    vec![CarrierSourceRange {
+                        path: snippet.path,
+                        start_line: snippet.line,
+                        body: snippet.snippet,
+                    }]
+                })
+                .unwrap_or_default()
         };
-        let Some((source_path, source_line, source_body)) = source else {
-            continue;
-        };
-        let body = source_body.trim_end();
-        if body.is_empty() {
+        if sources.is_empty() {
             continue;
         }
-        let retained_body = truncate_carrier_source(body, CARRIER_SOURCE_MAX_SNIPPET_BYTES);
-        let entry = format!("### {}\n\n{}\n\n", citation.display_name, retained_body);
-        if rendered.len() + entry.len() > CARRIER_SOURCE_MAX_TOTAL_BYTES {
-            break;
-        }
-        rendered.push_str(&entry);
         if structural_source {
             let citation = &mut answer.citations[citation_index];
             let producer = citation
@@ -1336,43 +1361,52 @@ fn append_packet_carrier_source_sections(
             citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
             citation.eligible_for_sufficiency = Some(true);
         }
-        let citation = &answer.citations[citation_index];
-        if crate::agent::packet_evidence::citation_sufficiency_eligible(citation) {
-            let path = packet_display_path(&source_path);
-            let end_line = source_line.saturating_add(
-                retained_body
-                    .lines()
-                    .count()
-                    .saturating_sub(1)
-                    .try_into()
-                    .unwrap_or(u32::MAX),
-            );
-            source_support.push(SupportUnitDto {
-                id: format!("source:{}:{source_line}", citation.node_id.0),
-                kind: SupportUnitKindDto::SourceRange,
-                summary: format!(
-                    "source for {} at {path}:{source_line}-{end_line}",
-                    citation.display_name,
-                ),
-                path: Some(path),
-                symbol_id: Some(citation.node_id.0.clone()),
-                start_line: Some(source_line),
-                end_line: Some(end_line),
-                snippet: Some(retained_body.to_string()),
-                edge_kind: None,
-                from_symbol: None,
-                to_symbol: None,
-                query: None,
+        for source in sources {
+            if steps.len() >= limits.max_snippets as usize {
+                break 'citations;
+            }
+            let body = source.body.trim_end();
+            if body.is_empty() {
+                continue;
+            }
+            let retained_body = truncate_carrier_source(body, CARRIER_SOURCE_MAX_SNIPPET_BYTES);
+            let entry = format!("### {}\n\n{}\n\n", citation.display_name, retained_body);
+            if rendered.len() + entry.len() > CARRIER_SOURCE_MAX_TOTAL_BYTES {
+                break 'citations;
+            }
+            rendered.push_str(&entry);
+            let citation = &answer.citations[citation_index];
+            if crate::agent::packet_evidence::citation_sufficiency_eligible(citation) {
+                let path = packet_display_path(&source.path);
+                let (start_line, end_line) =
+                    source_receipt_line_range(retained_body, source.start_line);
+                source_support.push(SupportUnitDto {
+                    id: format!("source:{}:{start_line}", citation.node_id.0),
+                    kind: SupportUnitKindDto::SourceRange,
+                    summary: format!(
+                        "source for {} at {path}:{start_line}-{end_line}",
+                        citation.display_name,
+                    ),
+                    path: Some(path),
+                    symbol_id: Some(citation.node_id.0.clone()),
+                    start_line: Some(start_line),
+                    end_line: Some(end_line),
+                    snippet: Some(retained_body.to_string()),
+                    edge_kind: None,
+                    from_symbol: None,
+                    to_symbol: None,
+                    query: None,
+                });
+            }
+            steps.push(AgentRetrievalStepDto {
+                kind: AgentRetrievalStepKindDto::SourceRead,
+                status: AgentRetrievalStepStatusDto::Ok,
+                duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u32::MAX),
+                input: Vec::new(),
+                output: Vec::new(),
+                message: Some(format!("carrier source for {}", citation.display_name)),
             });
         }
-        steps.push(AgentRetrievalStepDto {
-            kind: AgentRetrievalStepKindDto::SourceRead,
-            status: AgentRetrievalStepStatusDto::Ok,
-            duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u32::MAX),
-            input: Vec::new(),
-            output: Vec::new(),
-            message: Some(format!("carrier source for {}", citation.display_name)),
-        });
     }
 
     if rendered.is_empty() {
@@ -1385,6 +1419,203 @@ fn append_packet_carrier_source_sections(
         blocks: vec![AgentResponseBlockDto::Markdown { markdown: rendered }],
     });
     source_support
+}
+
+fn source_receipt_line_range(markdown: &str, fallback_start: u32) -> (u32, u32) {
+    let numbered_lines = markdown.lines().filter_map(|line| {
+        let line = line
+            .trim_start()
+            .strip_prefix("> ")
+            .unwrap_or(line.trim_start());
+        let (line_number, _) = line.split_once(" | ")?;
+        line_number.trim().parse::<u32>().ok()
+    });
+    let mut start = None;
+    let mut end = None;
+    for line in numbered_lines {
+        start = Some(start.map_or(line, |current: u32| current.min(line)));
+        end = Some(end.map_or(line, |current: u32| current.max(line)));
+    }
+    (
+        start.unwrap_or(fallback_start),
+        end.unwrap_or(fallback_start),
+    )
+}
+
+/// A long function is rarely best represented by its prologue. Select at most two bounded,
+/// non-overlapping windows whose source words match separate action clauses from the question.
+/// The ranges remain exact source receipts for the already selected symbol; this changes only
+/// which verified bytes spend the packet's fixed source budget.
+fn focused_function_source_ranges(
+    controller: &AppController,
+    question: &str,
+    path: &str,
+    start_line: u32,
+    end_line: Option<u32>,
+) -> Vec<CarrierSourceRange> {
+    let Some(end_line) = end_line.filter(|end_line| *end_line > start_line) else {
+        return Vec::new();
+    };
+    let Ok(source) = controller.read_file_text(codestory_contracts::api::ReadFileTextRequest {
+        path: path.to_string(),
+    }) else {
+        return Vec::new();
+    };
+    let lines = source.text.lines().collect::<Vec<_>>();
+    let focus_lines = focused_function_source_lines(&lines, start_line, end_line, question);
+    focus_lines
+        .into_iter()
+        .filter_map(|focus_line| {
+            let range_start = focus_line
+                .saturating_sub(CARRIER_SOURCE_FOCUS_CONTEXT_LINES as u32)
+                .max(start_line);
+            controller
+                .bounded_file_snippet(
+                    path,
+                    focus_line,
+                    CARRIER_SOURCE_FOCUS_CONTEXT_LINES,
+                    CARRIER_SOURCE_FOCUSED_SNIPPET_BYTES,
+                    SOURCE_SNIPPET_TRUNCATION_SUFFIX,
+                )
+                .ok()
+                .map(|(path, snippet)| CarrierSourceRange {
+                    path,
+                    start_line: range_start,
+                    body: snippet.markdown,
+                })
+        })
+        .collect()
+}
+
+fn focused_function_source_lines(
+    lines: &[&str],
+    start_line: u32,
+    end_line: u32,
+    question: &str,
+) -> Vec<u32> {
+    if lines.is_empty() || start_line == 0 {
+        return Vec::new();
+    }
+    let start_index = start_line.saturating_sub(1) as usize;
+    let end_index = (end_line as usize).min(lines.len());
+    if start_index >= end_index {
+        return Vec::new();
+    }
+    let clauses = source_focus_clauses(question);
+    let mut selected = Vec::new();
+    for clause_terms in clauses {
+        let best = (start_index..end_index)
+            .filter_map(|center| {
+                let window_start = center.saturating_sub(CARRIER_SOURCE_FOCUS_CONTEXT_LINES);
+                let window_end = (center + CARRIER_SOURCE_FOCUS_CONTEXT_LINES + 1).min(end_index);
+                let source_terms = source_focus_terms(&lines[window_start..window_end].join(" "));
+                let center_terms = source_focus_terms(lines[center]);
+                let score = clause_terms
+                    .iter()
+                    .filter(|term| {
+                        source_terms
+                            .iter()
+                            .any(|source_term| source_focus_terms_match(term, source_term))
+                    })
+                    .count();
+                let center_score = clause_terms
+                    .iter()
+                    .filter(|term| {
+                        center_terms
+                            .iter()
+                            .any(|source_term| source_focus_terms_match(term, source_term))
+                    })
+                    .count();
+                (score >= 2).then_some((score, center_score, center))
+            })
+            .max_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| right.2.cmp(&left.2))
+            });
+        let Some((_, _, center)) = best else {
+            continue;
+        };
+        let focus_line = (center + 1) as u32;
+        let overlaps_existing = selected.iter().any(|selected_line: &u32| {
+            selected_line.abs_diff(focus_line) <= (CARRIER_SOURCE_FOCUS_CONTEXT_LINES * 2) as u32
+        });
+        if !overlaps_existing {
+            selected.push(focus_line);
+        }
+        if selected.len() >= CARRIER_SOURCE_MAX_FOCUSED_WINDOWS {
+            break;
+        }
+    }
+    selected.sort_unstable();
+    selected
+}
+
+fn source_focus_clauses(question: &str) -> Vec<Vec<String>> {
+    question
+        .split([',', ';', '.', '?', '!', '\n', '\r'])
+        .flat_map(|clause| clause.split(" and "))
+        .map(source_focus_terms)
+        .filter(|terms| terms.len() >= 2)
+        .collect()
+}
+
+fn source_focus_terms(value: &str) -> Vec<String> {
+    symbol_query_tokens(value)
+        .into_iter()
+        .filter(|term| term.len() >= 3 && !source_focus_scaffolding(term))
+        .map(|term| source_focus_stem(&term).to_string())
+        .collect()
+}
+
+fn source_focus_scaffolding(term: &str) -> bool {
+    matches!(
+        term,
+        "cite"
+            | "cites"
+            | "across"
+            | "describe"
+            | "explain"
+            | "file"
+            | "files"
+            | "from"
+            | "how"
+            | "into"
+            | "its"
+            | "name"
+            | "names"
+            | "source"
+            | "sources"
+            | "supporting"
+            | "symbol"
+            | "symbols"
+            | "that"
+            | "the"
+            | "their"
+            | "then"
+            | "this"
+            | "through"
+            | "trace"
+            | "with"
+    )
+}
+
+fn source_focus_stem(term: &str) -> &str {
+    for suffix in ["ingly", "edly", "ation", "ment", "ing", "ed", "s"] {
+        if let Some(stem) = term.strip_suffix(suffix)
+            && stem.len() >= 4
+        {
+            return stem;
+        }
+    }
+    term
+}
+
+fn source_focus_terms_match(left: &str, right: &str) -> bool {
+    left == right
+        || (left.len().min(right.len()) >= 4
+            && (left.starts_with(right) || right.starts_with(left)))
 }
 
 fn packet_evidence_ledger_markdown(
@@ -5615,6 +5846,63 @@ mod tests {
     use crate::agent::planning::packet_plan_query_is_exact_symbol_identity;
     use crate::agent::profiles::ResolvedProfile;
 
+    #[test]
+    fn long_function_focus_covers_separate_question_actions() {
+        let source = [
+            "int run(void) {",
+            "    if (testing) return run_tests();",
+            "    parse_options();",
+            "    load_config();",
+            "    initializeRuntime();",
+            "    start_listeners();",
+            "    report_ready();",
+            "    flush_logs();",
+            "    update_metrics();",
+            "    collect_stats();",
+            "    flush_stats();",
+            "    check_health();",
+            "    report_health();",
+            "    flush_reports();",
+            "    update_clock();",
+            "    /* Enter the event loop. */",
+            "    eventLoopRun(runtime.loop);",
+            "    return 0;",
+            "}",
+        ];
+
+        let focus = focused_function_source_lines(
+            &source,
+            1,
+            source.len() as u32,
+            "Trace how the service initializes the runtime, then enters the event loop.",
+        );
+
+        assert_eq!(focus, [5, 16]);
+    }
+
+    #[test]
+    fn long_function_focus_requires_two_query_terms() {
+        let source = ["fn run() {", "    service();", "    unrelated_work();", "}"];
+
+        assert!(
+            focused_function_source_lines(
+                &source,
+                1,
+                source.len() as u32,
+                "Explain how the service enters its event loop.",
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn source_receipt_range_uses_rendered_source_lines_not_markdown_lines() {
+        let markdown = "```text\n  41 | before();\n> 42 | focus();\n  43 | after();\n```";
+
+        assert_eq!(source_receipt_line_range(markdown, 42), (41, 43));
+        assert_eq!(source_receipt_line_range("plain text", 42), (42, 42));
+    }
+
     struct EvalProbesGuard;
 
     impl EvalProbesGuard {
@@ -5825,13 +6113,13 @@ mod tests {
         indexed.display_name = "indexed-file".to_string();
         indexed.file_path = Some("include/fmt/indexed.h".to_string());
         let source_support = vec![SupportUnitDto {
-            id: "source:args-file:10".to_string(),
+            id: "source:args-file:24".to_string(),
             kind: SupportUnitKindDto::SourceRange,
             summary: "source for args-file".to_string(),
             path: Some("include/fmt/args.h".to_string()),
             symbol_id: Some("args-file".to_string()),
-            start_line: Some(10),
-            end_line: Some(11),
+            start_line: Some(24),
+            end_line: Some(25),
             snippet: Some("source".to_string()),
             edge_kind: None,
             from_symbol: None,

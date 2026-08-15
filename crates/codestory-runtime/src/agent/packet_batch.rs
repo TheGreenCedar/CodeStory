@@ -1293,14 +1293,17 @@ mod tests {
             .map(|query| query.query)
             .collect::<Vec<_>>();
         assert_eq!(
-            &queries[..4],
-            [
-                "indexing entrypoint",
-                "file discovery",
-                "symbol extraction",
-                "storage persistence"
-            ]
+            queries.first().map(String::as_str),
+            Some("indexing runtime")
         );
+        for expected in [
+            "indexing entrypoint",
+            "file discovery",
+            "symbol extraction",
+            "storage persistence",
+        ] {
+            assert!(queries.iter().any(|query| query == expected), "{queries:?}");
+        }
 
         answer
             .retrieval_trace
@@ -1328,7 +1331,10 @@ mod tests {
             .map(|query| query.query)
             .collect::<Vec<_>>();
         assert!(!queries.contains(&"indexing entrypoint".to_string()));
-        assert_eq!(queries.first().map(String::as_str), Some("file discovery"));
+        assert_eq!(
+            queries.first().map(String::as_str),
+            Some("indexing runtime")
+        );
     }
 
     #[test]

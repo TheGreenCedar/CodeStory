@@ -8,6 +8,7 @@ use super::packet_scoring::{
 };
 use super::trace::field;
 use codestory_agent::packet_flow_requirements::FlowRequirement;
+use codestory_agent::packet_terms::prompt_search_terms;
 use codestory_agent::planning::PACKET_OWNER_MEMBER_QUERY_PURPOSE;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentResponseSectionDto,
@@ -131,11 +132,17 @@ pub(crate) fn merge_packet_fused_subquery_batch(
         let step_duration = packet_query_duration_ms(diagnostic)
             .unwrap_or(duration_ms / pending.len().max(1) as u32);
         let before = answer.citations.len();
+        let query_rank_terms = prompt_search_terms(&query.query);
+        let effective_rank_terms = if query_rank_terms.is_empty() {
+            rank_terms
+        } else {
+            &query_rank_terms
+        };
         merge_packet_search_hits(
             answer,
             hits,
             include_evidence,
-            rank_terms,
+            effective_rank_terms,
             stage_carry_limit,
             flow_requirements,
             (query.purpose == PACKET_OWNER_MEMBER_QUERY_PURPOSE).then_some(query.query.as_str()),
@@ -641,6 +648,40 @@ mod golden_tests {
             verification_targets: Vec::new(),
             score_breakdown: None,
         })
+    }
+
+    #[test]
+    fn fused_subquery_ranking_preserves_the_subquery_intent() {
+        let mut relevant = dense_distractor("relevant");
+        relevant.hit.display_name = "readQueryFromClient".into();
+        relevant.hit.file_path = Some("src/networking.c".into());
+        relevant.hit.score = 0.1;
+        let mut whole_task_distractor = dense_distractor("whole-task");
+        whole_task_distractor.hit.display_name = "commandExecutionRouter".into();
+        whole_task_distractor.hit.file_path = Some("src/commands.c".into());
+        whole_task_distractor.hit.score = 0.1;
+        let query = PacketPlanQueryDto {
+            query: "reads client input".into(),
+            purpose: "material obligation command_network_input".into(),
+        };
+        let pending = vec![(0, &query)];
+        let results = vec![(query.query.clone(), vec![whole_task_distractor, relevant])];
+        let mut answer = empty_answer("Trace client input through command execution.");
+
+        merge_packet_fused_subquery_batch(
+            &mut answer,
+            &pending,
+            &results,
+            1,
+            &[],
+            false,
+            &["command".into(), "execution".into()],
+            1,
+            &[],
+        );
+
+        assert_eq!(answer.citations.len(), 1);
+        assert_eq!(answer.citations[0].display_name, "readQueryFromClient");
     }
 
     fn requests_session_request_hit() -> PacketSearchHit {

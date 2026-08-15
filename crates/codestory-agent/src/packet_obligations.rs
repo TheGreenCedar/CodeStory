@@ -5,7 +5,7 @@ use super::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 use super::packet_flow_requirements::{
     CoverageMode, EvidencePredicate, FlowRequirement, FlowRole,
     flow_requirement_call_receipt_is_valid, ordinary_incident_call_receipt_is_valid,
-    packet_flow_requirements_for_terms,
+    packet_flow_requirement_context_queries_for_prompt, packet_flow_requirements_for_terms,
 };
 use super::packet_required_probes::{
     packet_named_schema_entity_queries, packet_named_schema_entity_symbol_queries,
@@ -14,7 +14,9 @@ use super::packet_required_probes::{
 use super::packet_scoring::{normalize_identifier, packet_display_path};
 use super::packet_terms::{packet_probe_terms, packet_terms_indicate_sql_schema_flow};
 use crate::packet_execution_graphs::packet_execution_graphs;
-use crate::text::{exact_symbol_query_terms, looks_like_standalone_symbol_query};
+use crate::text::{
+    exact_symbol_query_terms, looks_like_standalone_symbol_query, symbol_query_tokens,
+};
 use crate::trail::is_speculative_trail_edge;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
@@ -43,6 +45,8 @@ pub fn build_packet_obligation_plan(
 ) -> PacketObligationPlanDto {
     let terms = packet_probe_terms(question);
     let requirements = packet_flow_requirements_for_terms(&terms, task_class);
+    let contextual_queries =
+        packet_flow_requirement_context_queries_for_prompt(question, &terms, task_class);
     let requires_complete_discovery =
         packet_question_requires_complete_discovery(question, task_class);
     let exact_symbol_queries =
@@ -51,7 +55,15 @@ pub fn build_packet_obligation_plan(
         requested_claim_binding_terms(&exact_symbol_queries);
     let mut claim_obligations = requirements
         .iter()
-        .map(|requirement| claim_obligation(requirement, requires_complete_discovery))
+        .map(|requirement| {
+            claim_obligation(
+                requirement,
+                requires_complete_discovery,
+                contextual_queries
+                    .iter()
+                    .find_map(|(id, query)| (*id == requirement.id).then_some(query.as_str())),
+            )
+        })
         .collect::<Vec<_>>();
     let named_schema_entities = if packet_terms_indicate_sql_schema_flow(&terms) {
         packet_named_schema_entity_queries(question)
@@ -103,6 +115,18 @@ pub fn build_packet_obligation_plan(
     for requirement in &requirements {
         if !flow_requirement_is_material(requirement) {
             continue;
+        }
+        if let Some(query) = contextual_queries
+            .iter()
+            .find_map(|(id, query)| (*id == requirement.id).then_some(query))
+            && required_queries.insert(query.clone())
+        {
+            push_query_obligation(
+                &mut query_obligations,
+                PacketQueryObligationKindDto::RequiredFlow,
+                query,
+                true,
+            );
         }
         for query in requirement.query_seeds {
             if required_queries.insert((*query).to_string()) {
@@ -418,9 +442,13 @@ fn packet_probe_open_next_candidates(resolution: &PacketProbeResolutionDto) -> V
 fn claim_obligation(
     requirement: &FlowRequirement,
     requires_complete_discovery: bool,
+    contextual_query: Option<&str>,
 ) -> PacketClaimObligationDto {
     let material = flow_requirement_is_material(requirement);
     let mut open_next_candidates = Vec::new();
+    if let Some(query) = contextual_query {
+        open_next_candidates.push(query.to_string());
+    }
     for query in requirement.query_seeds {
         if !open_next_candidates
             .iter()
@@ -1333,12 +1361,13 @@ fn finalize_claim_obligation(
 ) {
     let evidence_removed_by_budget =
         obligation.reason.as_deref() == Some(PACKET_BUDGET_TRUNCATED_REASON);
-    let matching_citations = answer
+    let mut matching_citations = answer
         .citations
         .iter()
         .filter(|citation| requirement.evidence.citation_proves(citation))
         .collect::<Vec<_>>();
-    let reported_citations = answer
+    rank_obligation_citations_by_context(obligation, &mut matching_citations);
+    let mut reported_citations = answer
         .citations
         .iter()
         .filter(|citation| {
@@ -1346,6 +1375,7 @@ fn finalize_claim_obligation(
                 || citation_plausibly_reports_obligation(citation, obligation.kind)
         })
         .collect::<Vec<_>>();
+    rank_obligation_citations_by_context(obligation, &mut reported_citations);
     record_obligation_carriers(
         obligation,
         reported_citations.iter().copied(),
@@ -1474,6 +1504,27 @@ fn finalize_claim_obligation(
     }
     obligation.proof_status = PacketObligationProofStatusDto::Proven;
     obligation.reason = None;
+}
+
+fn rank_obligation_citations_by_context(
+    obligation: &PacketClaimObligationDto,
+    citations: &mut Vec<&AgentCitationDto>,
+) {
+    let Some(query) = obligation.open_next_candidates.first() else {
+        return;
+    };
+    let query_terms = symbol_query_tokens(query);
+    citations.sort_by_key(|citation| {
+        let mut carrier_terms = symbol_query_tokens(&citation.display_name);
+        if let Some(path) = citation.file_path.as_deref() {
+            carrier_terms.extend(symbol_query_tokens(&packet_display_path(path)));
+        }
+        let overlap = query_terms
+            .iter()
+            .filter(|term| carrier_terms.iter().any(|carrier| carrier == *term))
+            .count();
+        std::cmp::Reverse(overlap)
+    });
 }
 
 fn citation_covers_named_schema_entity(citation: &AgentCitationDto, entity: &str) -> bool {
@@ -1702,22 +1753,25 @@ fn record_obligation_carriers<'a>(
     citations: impl IntoIterator<Item = &'a AgentCitationDto>,
     max_carriers: usize,
 ) {
-    let citations = citations
-        .into_iter()
-        .take(max_carriers.max(1))
-        .collect::<Vec<_>>();
-    obligation.carrier_node_ids = citations
-        .iter()
-        .map(|citation| citation.node_id.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    obligation.carrier_paths = citations
-        .iter()
-        .filter_map(|citation| citation.file_path.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let mut carrier_node_ids = Vec::new();
+    let mut seen_node_ids = HashSet::new();
+    let mut carrier_paths = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for citation in citations.into_iter().take(max_carriers.max(1)) {
+        if seen_node_ids.insert(citation.node_id.clone()) {
+            carrier_node_ids.push(citation.node_id.clone());
+        }
+        if let Some(path) = citation.file_path.clone()
+            && seen_paths.insert(path.clone())
+        {
+            carrier_paths.push(path);
+        }
+    }
+    // The caller relevance-ranks the input across every retrieval stage. Preserve that order: the
+    // pre-budget snapshot protects the first carrier, so sorting opaque node ids here made the
+    // retained proof depend on a hash rather than evidence quality.
+    obligation.carrier_node_ids = carrier_node_ids;
+    obligation.carrier_paths = carrier_paths;
 }
 
 fn citation_plausibly_reports_obligation(
@@ -2795,6 +2849,66 @@ mod tests {
         citation.evidence_tier = Some(PacketEvidenceTierDto::LexicalSource);
         citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
         citation
+    }
+
+    #[test]
+    fn obligation_carriers_preserve_ranked_input_order_instead_of_node_id_order() {
+        let mut best = citation("best", "src/best.rs", NodeKind::FUNCTION);
+        best.node_id = NodeId("z-ranked-first".to_string());
+        let mut weaker = citation("weaker", "src/weaker.rs", NodeKind::FUNCTION);
+        weaker.node_id = NodeId("a-ranked-second".to_string());
+        let mut plan = build_packet_obligation_plan(
+            "Trace how a command server starts and dispatches commands.",
+            PacketTaskClassDto::RouteTracing,
+            &[],
+        );
+        let obligation = plan
+            .claim_obligations
+            .first_mut()
+            .expect("command flow should create an obligation");
+
+        record_obligation_carriers(obligation, [&best, &weaker], 2);
+
+        assert_eq!(
+            obligation.carrier_node_ids,
+            [
+                NodeId("z-ranked-first".to_string()),
+                NodeId("a-ranked-second".to_string())
+            ]
+        );
+        assert_eq!(
+            obligation.carrier_paths,
+            ["src/best.rs".to_string(), "src/weaker.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn obligation_context_promotes_a_specific_late_retrieval_carrier() {
+        let generic = citation(
+            "putReplicasInPendingClientsToIOThreads",
+            "src/replication.c",
+            NodeKind::FUNCTION,
+        );
+        let specific = citation(
+            "readQueryFromClient",
+            "src/networking.c",
+            NodeKind::FUNCTION,
+        );
+        let plan = build_packet_obligation_plan(
+            "Trace how Redis initializes the server, enters the event loop, reads client input, and routes a command for execution.",
+            PacketTaskClassDto::RouteTracing,
+            &[],
+        );
+        let obligation = plan
+            .claim_obligations
+            .iter()
+            .find(|obligation| obligation.id == "command_network_input")
+            .expect("network-input obligation");
+        let mut carriers = vec![&generic, &specific];
+
+        rank_obligation_citations_by_context(obligation, &mut carriers);
+
+        assert_eq!(carriers[0].display_name, "readQueryFromClient");
     }
 
     fn answer_with_call_edge(

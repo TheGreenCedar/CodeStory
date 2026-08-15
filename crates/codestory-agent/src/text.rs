@@ -308,6 +308,7 @@ pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
         &["/benches/", "/bench/", "/benchmarks/", "/benchmark/"],
     ) || (marked.contains("/scripts/")
         && (marked.contains("bench") || marked.contains("benchmark")))
+        || benchmark_file_name(file_name)
     {
         return RetrievalFileRole::Benchmark;
     }
@@ -385,6 +386,14 @@ fn strip_materialized_repo_cache_prefix(path: &str) -> &str {
 
 fn path_contains_any(path: &str, markers: &[&str]) -> bool {
     markers.iter().any(|marker| path.contains(marker))
+}
+
+fn benchmark_file_name(file_name: &str) -> bool {
+    let stem = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(stem, _extension)| stem);
+    stem.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|segment| matches!(segment, "bench" | "benchmark" | "benchmarks"))
 }
 
 pub fn terms_contain_phrase(terms: &[String], phrase: &[&str]) -> bool {
@@ -465,4 +474,35 @@ fn is_non_primary_source_exclusion_context(terms: &[String], index: usize) -> bo
                 | "without"
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RetrievalFileRole, retrieval_file_role_from_path};
+
+    #[test]
+    fn classifies_delimited_benchmark_file_names_outside_benchmark_directories() {
+        for path in [
+            "src/redis-benchmark.c",
+            "src/router_benchmark.rs",
+            "lib/bench-http.ts",
+        ] {
+            assert_eq!(
+                retrieval_file_role_from_path(path),
+                RetrievalFileRole::Benchmark,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_classify_incidental_benchmark_substrings_as_benchmark_files() {
+        for path in ["src/workbench.rs", "src/benchmarking.rs", "src/benches.rs"] {
+            assert_eq!(
+                retrieval_file_role_from_path(path),
+                RetrievalFileRole::Source,
+                "{path}"
+            );
+        }
+    }
 }

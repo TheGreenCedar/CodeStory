@@ -51,7 +51,7 @@ use crate::packet_terms::{
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
     packet_terms_indicate_sql_schema_flow, packet_terms_indicate_string_predicate_flow,
     packet_terms_indicate_stylesheet_animation_flow,
-    packet_terms_indicate_url_session_request_flow,
+    packet_terms_indicate_url_session_request_flow, prompt_search_terms,
 };
 use codestory_contracts::api::{
     AgentCitationDto, EdgeKind, GraphEdgeDto, NodeKind, PacketTaskClassDto,
@@ -567,6 +567,133 @@ pub fn packet_flow_requirement_queries_for_terms(
         }
     }
     queries
+}
+
+/// Preserve the action phrasing next to each required flow step instead of replacing it with only
+/// the generic role seed. A prompt such as "reads client input" carries substantially more symbol
+/// identity than the seed "network input", while the seed still tells us which obligation owns
+/// that clause. The query stays repository-neutral: it is assembled entirely from the prompt and
+/// the declared requirement vocabulary.
+pub fn packet_flow_requirement_context_queries_for_prompt(
+    question: &str,
+    terms: &[String],
+    task_class: PacketTaskClassDto,
+) -> Vec<(&'static str, String)> {
+    let clauses = packet_prompt_flow_clauses(question);
+    let mut queries = Vec::new();
+    for requirement in packet_flow_requirements_for_terms(terms, task_class) {
+        let seed_terms = requirement
+            .query_seeds
+            .iter()
+            .map(|seed| prompt_search_terms(seed))
+            .filter(|seed| !seed.is_empty())
+            .collect::<Vec<_>>();
+        let best = clauses
+            .iter()
+            .filter_map(|clause| {
+                let clause_terms = prompt_search_terms(clause)
+                    .into_iter()
+                    .filter(|term| !packet_flow_context_scaffolding(term))
+                    .collect::<Vec<_>>();
+                if clause_terms.len() < 2 {
+                    return None;
+                }
+                let best_seed_match = seed_terms
+                    .iter()
+                    .map(|seed| {
+                        let matched = seed
+                            .iter()
+                            .filter(|seed_term| clause_terms.iter().any(|term| term == *seed_term))
+                            .count();
+                        (matched, seed.len())
+                    })
+                    .filter(|(matched, _)| *matched > 0)
+                    .max_by(|left, right| {
+                        (left.0 * right.1)
+                            .cmp(&(right.0 * left.1))
+                            .then_with(|| left.0.cmp(&right.0))
+                    })?;
+                let query_terms = packet_bounded_flow_context_terms(&clause_terms, &seed_terms);
+                let query = query_terms.join(" ");
+                let duplicates_seed = requirement.query_seeds.iter().any(|seed| {
+                    prompt_search_terms(seed)
+                        .join(" ")
+                        .eq_ignore_ascii_case(&query)
+                });
+                (!duplicates_seed && !query.is_empty()).then_some((
+                    best_seed_match.0,
+                    best_seed_match.1,
+                    query_terms.len(),
+                    query,
+                ))
+            })
+            .max_by(|left, right| {
+                (left.0 * right.1)
+                    .cmp(&(right.0 * left.1))
+                    .then_with(|| left.0.cmp(&right.0))
+                    .then_with(|| right.2.cmp(&left.2))
+            });
+        if let Some((_, _, _, query)) = best {
+            queries.push((requirement.id, query));
+        }
+    }
+    queries
+}
+
+fn packet_prompt_flow_clauses(question: &str) -> Vec<&str> {
+    question
+        .split([',', ';', '.', '?', '!', '\n', '\r'])
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .collect()
+}
+
+fn packet_flow_context_scaffolding(term: &str) -> bool {
+    matches!(
+        term,
+        "answer"
+            | "cite"
+            | "cites"
+            | "describe"
+            | "explain"
+            | "file"
+            | "files"
+            | "name"
+            | "names"
+            | "source"
+            | "sources"
+            | "supporting"
+            | "symbol"
+            | "symbols"
+            | "trace"
+    )
+}
+
+fn packet_bounded_flow_context_terms(
+    clause_terms: &[String],
+    seed_terms: &[Vec<String>],
+) -> Vec<String> {
+    const CONTEXT_TERM_LIMIT: usize = 6;
+    if clause_terms.len() <= CONTEXT_TERM_LIMIT {
+        return clause_terms.to_vec();
+    }
+    let seed_term_set = seed_terms
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let matching_positions = clause_terms
+        .iter()
+        .enumerate()
+        .filter_map(|(index, term)| seed_term_set.contains(term.as_str()).then_some(index))
+        .collect::<Vec<_>>();
+    let Some(center) = matching_positions.first().copied() else {
+        return clause_terms[..CONTEXT_TERM_LIMIT].to_vec();
+    };
+    let start = center
+        .saturating_sub(2)
+        .min(clause_terms.len().saturating_sub(CONTEXT_TERM_LIMIT));
+    clause_terms[start..start + CONTEXT_TERM_LIMIT].to_vec()
 }
 
 fn dedupe_requirements(requirements: Vec<FlowRequirement>) -> Vec<FlowRequirement> {
@@ -1416,6 +1543,36 @@ mod tests {
                 .then_some(requirement.id)
         })
         .collect()
+    }
+
+    #[test]
+    fn flow_queries_preserve_prompt_actions_near_each_required_step() {
+        let prompt = "Trace how Redis initializes the server, enters the event loop, reads client input, and routes a command for execution. Cite the source files and name the supporting symbols.";
+        let terms = packet_probe_terms(prompt);
+        let queries = packet_flow_requirement_context_queries_for_prompt(
+            prompt,
+            &terms,
+            PacketTaskClassDto::RouteTracing,
+        )
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            queries.get("command_server_bootstrap").map(String::as_str),
+            Some("redis initializes server")
+        );
+        assert_eq!(
+            queries.get("command_event_loop").map(String::as_str),
+            Some("enters event loop")
+        );
+        assert_eq!(
+            queries.get("command_network_input").map(String::as_str),
+            Some("reads client input")
+        );
+        assert_eq!(
+            queries.get("command_dispatch").map(String::as_str),
+            Some("routes command execution")
+        );
     }
 
     #[test]
