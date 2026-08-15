@@ -741,12 +741,7 @@ fn promote_retained_owner_member_probes(
     question: &str,
     answer: &mut AgentAnswerDto,
 ) -> Vec<String> {
-    let anchor_labels = answer
-        .citations
-        .iter()
-        .map(|citation| citation.display_name.clone())
-        .collect::<Vec<_>>();
-    let probes = packet_owner_member_probe_queries(question, &anchor_labels, 10)
+    let probes = packet_owner_member_probe_queries(question, &answer.citations, 10)
         .into_iter()
         .filter(|probe| {
             let probe = normalize_identifier(probe);
@@ -1180,7 +1175,9 @@ const CARRIER_SOURCE_MAX_TOTAL_BYTES: usize = 14_336;
 const CARRIER_SOURCE_MAX_SNIPPET_BYTES: usize = 1_536;
 const CARRIER_SOURCE_FOCUSED_SNIPPET_BYTES: usize = CARRIER_SOURCE_MAX_SNIPPET_BYTES / 2;
 const CARRIER_SOURCE_FOCUS_CONTEXT_LINES: usize = 4;
+const CARRIER_SOURCE_FILE_FOCUS_CONTEXT_LINES: usize = 17;
 const CARRIER_SOURCE_MAX_FOCUSED_WINDOWS: usize = 2;
+const CARRIER_SOURCE_MAX_FOCUS_FILE_BYTES: u64 = 512 * 1_024;
 const SOURCE_RECEIPT_NOT_RETAINED: &str = "source_receipt_not_retained";
 
 struct CarrierSourceRange {
@@ -1278,6 +1275,7 @@ fn append_packet_carrier_source_sections(
     let mut rendered = String::new();
     let mut steps = Vec::new();
     let mut source_support = Vec::new();
+    let file_focus_text = packet_file_source_focus_text(question, answer);
 
     'citations: for citation_index in 0..answer.citations.len() {
         if steps.len() >= limits.max_snippets as usize {
@@ -1303,23 +1301,31 @@ fn append_packet_carrier_source_sections(
             let (Some(path), Some(line)) = (citation.file_path.as_deref(), citation.line) else {
                 continue;
             };
-            controller
-                .bounded_file_snippet(
-                    path,
-                    line,
-                    6,
-                    CARRIER_SOURCE_MAX_SNIPPET_BYTES,
-                    SOURCE_SNIPPET_TRUNCATION_SUFFIX,
-                )
-                .ok()
-                .map(|(path, snippet)| {
-                    vec![CarrierSourceRange {
+            let focused = (citation.kind == NodeKind::FILE
+                && citation_is_lexical_source_range(&citation))
+            .then(|| focused_file_source_ranges(controller, &file_focus_text, path))
+            .unwrap_or_default();
+            if focused.is_empty() {
+                controller
+                    .bounded_file_snippet(
                         path,
-                        start_line: line,
-                        body: snippet.markdown,
-                    }]
-                })
-                .unwrap_or_default()
+                        line,
+                        6,
+                        CARRIER_SOURCE_MAX_SNIPPET_BYTES,
+                        SOURCE_SNIPPET_TRUNCATION_SUFFIX,
+                    )
+                    .ok()
+                    .map(|(path, snippet)| {
+                        vec![CarrierSourceRange {
+                            path,
+                            start_line: line,
+                            body: snippet.markdown,
+                        }]
+                    })
+                    .unwrap_or_default()
+            } else {
+                focused
+            }
         } else {
             controller
                 .snippet_function_body_context(citation.node_id.clone(), 0)
@@ -1419,6 +1425,175 @@ fn append_packet_carrier_source_sections(
         blocks: vec![AgentResponseBlockDto::Markdown { markdown: rendered }],
     });
     source_support
+}
+
+/// A file-level lexical hit often identifies the right file through its path or title while its
+/// reported range remains at the prologue. Spend the same fixed snippet budget on up to two
+/// distinct windows that match the material queries the packet actually executed. This is
+/// local representation of an already selected carrier, not another repository search.
+fn focused_file_source_ranges(
+    controller: &AppController,
+    focus_text: &str,
+    path: &str,
+) -> Vec<CarrierSourceRange> {
+    let Ok(candidate) = controller.resolve_project_file_path(path, false) else {
+        return Vec::new();
+    };
+    if std::fs::metadata(candidate)
+        .is_ok_and(|metadata| metadata.len() > CARRIER_SOURCE_MAX_FOCUS_FILE_BYTES)
+    {
+        return Vec::new();
+    }
+    let Ok(source) = controller.read_file_text(codestory_contracts::api::ReadFileTextRequest {
+        path: path.to_string(),
+    }) else {
+        return Vec::new();
+    };
+    let lines = source.text.lines().collect::<Vec<_>>();
+    focused_file_source_lines(&lines, focus_text)
+        .into_iter()
+        .filter_map(|focus_line| {
+            let range_start = focus_line
+                .saturating_sub(CARRIER_SOURCE_FILE_FOCUS_CONTEXT_LINES as u32)
+                .max(1);
+            controller
+                .bounded_file_snippet(
+                    path,
+                    focus_line,
+                    CARRIER_SOURCE_FILE_FOCUS_CONTEXT_LINES,
+                    CARRIER_SOURCE_FOCUSED_SNIPPET_BYTES,
+                    SOURCE_SNIPPET_TRUNCATION_SUFFIX,
+                )
+                .ok()
+                .map(|(path, snippet)| CarrierSourceRange {
+                    path,
+                    start_line: range_start,
+                    body: snippet.markdown,
+                })
+        })
+        .collect()
+}
+
+fn packet_file_source_focus_text(question: &str, answer: &AgentAnswerDto) -> String {
+    let mut focus = question.trim().to_string();
+    let mut seen = HashSet::new();
+    seen.insert(normalize_identifier(question));
+    for diagnostic in &answer.retrieval_trace.packet_sidecar_diagnostics {
+        let query = diagnostic.query.trim();
+        let key = normalize_identifier(query);
+        if query.is_empty() || key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        focus.push('\n');
+        focus.push_str(query);
+    }
+    focus
+}
+
+fn focused_file_source_lines(lines: &[&str], focus_text: &str) -> Vec<u32> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let clauses = source_focus_clauses(focus_text);
+    if clauses.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates = (0..lines.len())
+        .filter(|center| !source_focus_file_scaffolding_line(lines[*center]))
+        .filter_map(|center| {
+            let window_start = center.saturating_sub(CARRIER_SOURCE_FOCUS_CONTEXT_LINES);
+            let window_end = (center + CARRIER_SOURCE_FOCUS_CONTEXT_LINES + 1).min(lines.len());
+            if source_focus_file_window_is_scaffolding(&lines[window_start..window_end]) {
+                return None;
+            }
+            let source_terms = source_focus_terms(&lines[window_start..window_end].join(" "));
+            let center_terms = source_focus_terms(lines[center]);
+            let mut best_clause_score = 0;
+            let mut best_center_score = 0;
+            let mut covered_clauses = 0;
+            for clause_terms in &clauses {
+                let score = clause_terms
+                    .iter()
+                    .filter(|term| {
+                        source_terms
+                            .iter()
+                            .any(|source_term| source_focus_terms_match(term, source_term))
+                    })
+                    .count();
+                let center_score = clause_terms
+                    .iter()
+                    .filter(|term| {
+                        center_terms
+                            .iter()
+                            .any(|source_term| source_focus_terms_match(term, source_term))
+                    })
+                    .count();
+                best_clause_score = best_clause_score.max(score);
+                best_center_score = best_center_score.max(center_score);
+                covered_clauses += usize::from(score >= 2);
+            }
+            (best_clause_score > 0).then_some((
+                best_clause_score,
+                covered_clauses,
+                best_center_score,
+                center,
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+
+    let mut selected = Vec::new();
+    for (_, _, _, center) in candidates {
+        let focus_line = (center + 1) as u32;
+        let overlaps_existing = selected.iter().any(|selected_line: &u32| {
+            selected_line.abs_diff(focus_line) <= (CARRIER_SOURCE_FOCUS_CONTEXT_LINES * 2) as u32
+        });
+        if !overlaps_existing {
+            selected.push(focus_line);
+        }
+        if selected.len() >= CARRIER_SOURCE_MAX_FOCUSED_WINDOWS {
+            break;
+        }
+    }
+    selected.sort_unstable();
+    selected
+}
+
+fn source_focus_file_scaffolding_line(line: &str) -> bool {
+    let line = line.trim_start().to_ascii_lowercase();
+    line.is_empty()
+        || line.starts_with("<!doctype")
+        || line.starts_with("<head")
+        || line.starts_with("</head")
+        || line.starts_with("<meta")
+        || line.starts_with("<title")
+}
+
+fn source_focus_file_window_is_scaffolding(lines: &[&str]) -> bool {
+    let mut saw_content = false;
+    for line in lines {
+        let line = line.trim().to_ascii_lowercase();
+        if line.is_empty() {
+            continue;
+        }
+        saw_content = true;
+        if !(source_focus_file_scaffolding_line(&line)
+            || line.starts_with("<html")
+            || line.starts_with("</html")
+            || line.starts_with("<style")
+            || line.starts_with("</style"))
+        {
+            return false;
+        }
+    }
+    saw_content
 }
 
 fn source_receipt_line_range(markdown: &str, fallback_start: u32) -> (u32, u32) {
@@ -5893,6 +6068,58 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn file_focus_skips_title_and_covers_structure_and_behavior() {
+        let source = [
+            "<!DOCTYPE html>",
+            "<html>",
+            "<head>",
+            "<title>Detailed custom validation</title>",
+            "</head>",
+            "<body>",
+            "<form novalidate>",
+            "<input type=\"email\" required minlength=\"8\">",
+            "</form>",
+            "const form = document.querySelector('form');",
+            "form.addEventListener('submit', function (event) {",
+            "if (!email.validity.valid) {",
+            "showError();",
+            "event.preventDefault();",
+            "}",
+            "});",
+        ];
+
+        let focus = focused_file_source_lines(
+            &source,
+            "Explain how native form constraints combine with custom validation.\nsubmit prevent default\nvalidity state",
+        );
+
+        assert_eq!(focus, [7, 16]);
+        assert!(!focus.contains(&4), "the title is not behavioral evidence");
+    }
+
+    #[test]
+    fn file_focus_returns_no_window_without_a_material_term_match() {
+        let source = ["<title>Unrelated</title>", "plain content", "more content"];
+
+        assert!(focused_file_source_lines(&source, "network dispatch").is_empty());
+    }
+
+    #[test]
+    fn file_focus_does_not_promote_a_matching_document_header() {
+        let source = [
+            "<!DOCTYPE html>",
+            "<html>",
+            "<head>",
+            "<meta charset=\"utf-8\">",
+            "<title>Detailed custom validation</title>",
+            "</head>",
+            "</html>",
+        ];
+
+        assert!(focused_file_source_lines(&source, "custom validation").is_empty());
     }
 
     #[test]

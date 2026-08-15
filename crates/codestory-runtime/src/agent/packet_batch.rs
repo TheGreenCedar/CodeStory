@@ -437,12 +437,7 @@ fn packet_adaptive_material_queries(
         .iter()
         .any(|obligation| obligation.id.starts_with("sql_"));
     if !missing_material.is_empty() && !structural_schema_flow {
-        let anchor_labels = answer
-            .citations
-            .iter()
-            .map(|citation| citation.display_name.clone())
-            .collect::<Vec<_>>();
-        for query in packet_owner_member_probe_queries(question, &anchor_labels, limit.min(10)) {
+        for query in packet_owner_member_probe_queries(question, &answer.citations, limit.min(10)) {
             let _ = push(&query, PACKET_OWNER_MEMBER_QUERY_PURPOSE.to_string());
         }
     }
@@ -1395,7 +1390,12 @@ mod tests {
             trace: Vec::new(),
         };
 
-        let queries = packet_adaptive_material_queries(question, &plan, &empty_answer(), 16)
+        let mut answer = empty_answer();
+        for symbol in ["BaseClient.send", "BaseRequest.finalize", "IOClient.send"] {
+            answer.citations.push(anchor_citation(symbol));
+        }
+
+        let queries = packet_adaptive_material_queries(question, &plan, &answer, 16)
             .into_iter()
             .map(|query| query.query)
             .collect::<Vec<_>>();

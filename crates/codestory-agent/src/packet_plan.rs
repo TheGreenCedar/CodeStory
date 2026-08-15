@@ -30,7 +30,8 @@ use crate::text::{
     query_mentions_non_primary_source,
 };
 use codestory_contracts::api::{
-    PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto, PacketTaskClassDto,
+    AgentCitationDto, NodeKind, PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto,
+    PacketTaskClassDto, SearchHitOrigin,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub fn build_packet_plan(
@@ -160,18 +161,27 @@ pub fn packet_rank_terms(question: &str) -> Vec<String> {
     terms
 }
 
-/// Build bounded owner/member probes from owners explicitly named in the task or already present
-/// in the first retrieval, plus action words in the task. Broad semantic search is good at finding
-/// a relevant type but can miss its exact lifecycle members, so qualified probes combine the
+/// Build bounded owner/member probes from owners both named in the task and backed by a symbol in
+/// the first retrieval, plus action words in the task. Broad semantic search is good at finding a
+/// relevant type but can miss its exact lifecycle members, so qualified probes combine the
 /// retained owner with the task's verbs without adding repository-specific vocabulary.
 pub fn packet_owner_member_probe_queries(
     question: &str,
-    anchor_labels: &[String],
+    anchor_citations: &[AgentCitationDto],
     limit: usize,
 ) -> Vec<String> {
     if limit == 0 {
         return Vec::new();
     }
+    let anchor_labels = anchor_citations
+        .iter()
+        .filter(|citation| {
+            citation.origin == SearchHitOrigin::IndexedSymbol
+                && citation.resolvable
+                && !matches!(citation.kind, NodeKind::FILE | NodeKind::UNKNOWN)
+        })
+        .map(|citation| citation.display_name.as_str())
+        .collect::<Vec<_>>();
     let normalized_question = normalize_identifier(question);
     let prompt_terms = prompt_search_terms(question);
     let prompt_term_keys = prompt_terms
@@ -181,6 +191,26 @@ pub fn packet_owner_member_probe_queries(
     let mut owners = Vec::<(usize, String)>::new();
     let mut seen_owners = std::collections::HashSet::<String>::new();
     let exact_owner_candidates = exact_symbol_query_terms(question);
+    let backed_owner_keys = anchor_labels
+        .iter()
+        .filter(|label| !label.contains(['/', '\\']))
+        .filter_map(|label| {
+            let segments = label
+                .split(['.', ':', '#'])
+                .map(|segment| {
+                    segment.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                })
+                .filter(|segment| segment.len() >= 3)
+                .collect::<Vec<_>>();
+            let owner = if segments.len() >= 2 {
+                segments.get(segments.len().saturating_sub(2))
+            } else {
+                segments.first()
+            }?;
+            let key = normalize_identifier(owner);
+            (!key.is_empty()).then_some(key)
+        })
+        .collect::<std::collections::HashSet<_>>();
     for candidate in &exact_owner_candidates {
         if candidate.contains(['.', ':', '/', '\\'])
             || packet_camel_identifier_words(candidate).is_empty()
@@ -188,13 +218,16 @@ pub fn packet_owner_member_probe_queries(
             continue;
         }
         let key = normalize_identifier(candidate);
-        if key.len() < 3 || !seen_owners.insert(key.clone()) {
+        if key.len() < 3 || !backed_owner_keys.contains(&key) || !seen_owners.insert(key.clone()) {
             continue;
         }
         let position = normalized_question.rfind(&key).unwrap_or_default();
         owners.push((position, candidate.clone()));
     }
     for label in anchor_labels {
+        if label.contains(['/', '\\']) {
+            continue;
+        }
         let segments = label
             .split(['.', ':', '#', '/', '\\'])
             .map(|segment| {
@@ -205,17 +238,13 @@ pub fn packet_owner_member_probe_queries(
         let Some(owner) = segments.get(segments.len().saturating_sub(2)) else {
             continue;
         };
-        let mut candidates = vec![(*owner).to_string()];
-        candidates.extend(packet_camel_identifier_words(owner));
-        for candidate in candidates {
-            let key = normalize_identifier(&candidate);
-            if key.len() < 3 || !prompt_term_keys.contains(&key) || !seen_owners.insert(key.clone())
-            {
-                continue;
-            }
-            let position = normalized_question.rfind(&key).unwrap_or_default();
-            owners.push((position, candidate));
+        let candidate = (*owner).to_string();
+        let key = normalize_identifier(&candidate);
+        if key.len() < 3 || !prompt_term_keys.contains(&key) || !seen_owners.insert(key.clone()) {
+            continue;
         }
+        let position = normalized_question.rfind(&key).unwrap_or_default();
+        owners.push((position, candidate));
     }
     owners.sort_by(|left, right| {
         right
@@ -872,16 +901,55 @@ fn prompt_mentions_indexing_flow(lower: &str) -> bool {
 #[cfg(test)]
 mod owner_member_probe_tests {
     use super::packet_owner_member_probe_queries;
+    use codestory_contracts::api::{AgentCitationDto, NodeId, NodeKind, SearchHitOrigin};
+
+    fn citation(
+        display_name: &str,
+        kind: NodeKind,
+        origin: SearchHitOrigin,
+        resolvable: bool,
+    ) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(display_name.to_string()),
+            display_name: display_name.to_string(),
+            kind,
+            file_path: Some("src/example.rs".to_string()),
+            line: Some(1),
+            score: 1.0,
+            origin,
+            target: None,
+            resolvable,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+        }
+    }
+
+    fn symbols(display_names: &[&str]) -> Vec<AgentCitationDto> {
+        display_names
+            .iter()
+            .map(|display_name| {
+                citation(
+                    display_name,
+                    NodeKind::FUNCTION,
+                    SearchHitOrigin::IndexedSymbol,
+                    true,
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn exact_owner_members_cover_late_lifecycle_phases_without_task_specific_names() {
         let queries = packet_owner_member_probe_queries(
             "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases. Cite the source files and name the supporting symbols.",
-            &[
-                "Build.build".to_string(),
-                "Site.posts".to_string(),
-                "Command.process_site".to_string(),
-            ],
+            &symbols(&["Build.build", "Site.posts", "Command.process_site"]),
             10,
         );
 
@@ -898,11 +966,63 @@ mod owner_member_probe_tests {
     fn owner_member_probes_normalize_noun_and_verb_inflections() {
         let queries = packet_owner_member_probe_queries(
             "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.",
-            &[],
+            &symbols(&["BaseClient.send", "BaseRequest.finalize", "IOClient.send"]),
             6,
         );
 
         assert!(queries.iter().any(|query| query == "BaseRequest.finalize"));
         assert!(queries.iter().any(|query| query == "IOClient.send"));
+    }
+
+    #[test]
+    fn owner_member_probes_do_not_invent_generic_prompt_owners() {
+        let queries = packet_owner_member_probe_queries(
+            "Trace how Orion initializes the server, enters the event loop, reads client input, and routes a command for execution.",
+            &symbols(&["OrionClient.read", "readInput", "dispatchCommand"]),
+            10,
+        );
+
+        assert!(!queries.iter().any(|query| query.starts_with("Client.")));
+        assert!(!queries.iter().any(|query| query.starts_with("Orion.")));
+    }
+
+    #[test]
+    fn owner_member_probes_require_resolved_indexed_symbol_proof() {
+        let citations = vec![
+            citation(
+                "examples/forms/validation.html",
+                NodeKind::FILE,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            citation(
+                "validation.html",
+                NodeKind::FILE,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            citation(
+                "validation.check",
+                NodeKind::FUNCTION,
+                SearchHitOrigin::TextMatch,
+                true,
+            ),
+            citation(
+                "validation.handle",
+                NodeKind::FUNCTION,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+        ];
+        let queries = packet_owner_member_probe_queries(
+            "Explain how validation handles checks.",
+            &citations,
+            10,
+        );
+
+        assert!(
+            queries.is_empty(),
+            "untyped citation authorized owner/member probes: {queries:?}"
+        );
     }
 }
