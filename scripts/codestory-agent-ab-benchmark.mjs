@@ -65,6 +65,12 @@ const PACKET_TASK_CLASSES = new Set([
   "data_flow",
   "edit_planning",
 ]);
+const PACKET_DISPOSITIONS = new Set([
+  "supported",
+  "drill_once",
+  "not_established",
+  "unavailable",
+]);
 const COMMAND_ACCOUNTING_CATEGORIES = [
   "codestory_cli",
   "shell_search",
@@ -142,7 +148,7 @@ const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
-    "Use the installed managed CodeStory plugin first. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` calls for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Copy exact source identifiers, table names, declarations, and claim phrases from packet citations and sufficiency.covered_claims; do not compress exact anchors into comma shorthand that drops their repeated prefix, such as rewriting `CREATE TABLE A` and `CREATE TABLE B` as `CREATE TABLE A and B`. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening_paths, and any post-packet local source reads. Full retrieval is mandatory; if CodeStory is unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
+    "Use the CodeStory packet supplied by the harness as the only repository context. Judge its compiled support units directly. Supported, not_established, and unavailable are terminal: answer from support, state that the claim is not established, or report unavailability, then stop. Drill_once permits exactly one MCP packet continuation with the original question, parent_packet_id, listed option_ids, and the declared core_generation_id/retrieval_generation pins; stop after that result. Do not use search, context, trail, snippet, shell, git, or direct source reads as packet recovery. Preserve exact source identifiers and paths from support and citations. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
 };
 
 function usage() {
@@ -1570,7 +1576,7 @@ Task class: ${task.task_class ?? "unspecified"}`
     armName === "with_codestory"
       ? packetFirstCommandForPrompt(taskPrompt, task)
       : null;
-  const packetFirstBlock = packetFirstCommand
+  const packetFirstBlock = packetFirstCommand && !context.codestoryPrelude?.packet
     ? `
 Required first repository-context command:
 \`\`\`${packetFirstCommandFenceLanguage()}
@@ -1581,11 +1587,8 @@ Run that answer packet before any repository search, direct source read, git com
     : "";
   const stopContractBlock =
     armName === "with_codestory"
-      ? packetPreludeManifestComplete(context.codestoryPrelude?.public)
-        ? `
-The harness verified the CodeStory packet against this task manifest before starting you. Treat the packet as complete for this benchmark row even if its generic sufficiency status is partial. Do not run follow-up commands, ordinary source reads, \`rg\`, \`grep\`, \`git show\`, or file-open commands before answering.`
-        : `
-If the packet reports \`sufficiency.status: "sufficient"\` with no \`sufficiency.follow_up_commands\`, do not run ordinary source reads, \`rg\`, \`grep\`, \`git show\`, or file-open commands afterward. If the packet is partial or packet manifest quality is incomplete, close gaps with listed CodeStory follow-ups first; ordinary local source reads are allowed only after CodeStory attempts and count as post-packet overhead.`
+      ? `
+The packet's own \`disposition\` is the complete control contract. The benchmark's expected-answer manifest is never shown to you and does not authorize extra retrieval. Stop on \`supported\`, \`not_established\`, or \`unavailable\`. On \`drill_once\`, execute exactly the declared one-shot packet continuation and then stop regardless of its result.`
       : "";
   const harnessPacketBlock = packetPreludePromptBlock(context.codestoryPrelude);
   const baselineContextBlock = baselinePreludePromptBlock(context.baselinePrelude);
@@ -1626,29 +1629,16 @@ function packetPreludePromptBlock(prelude) {
   if (!prelude?.packet) {
     return "";
   }
-  const supportPaths = packetSupportPaths(prelude.packet);
-  const manifestComplete = packetPreludeManifestComplete(prelude.public);
-  const manifestBlock = manifestComplete
-    ? `
-Benchmark manifest coverage: complete. The harness matched this packet against the task's expected files, symbols, claims, and citations. Do not spend tokens trying follow-up commands for this row; answer from the packet.`
-    : prelude.public?.packet_manifest_quality
-      ? `
-Benchmark manifest coverage: incomplete. Packet manifest quality was ${JSON.stringify(prelude.public.packet_manifest_quality)}. Use the packet first, then close missing anchors with CodeStory follow-ups before any ordinary local source reads.`
-    : "";
-  const supportPathBlock = supportPaths.length
-    ? `
-CodeStory support paths extracted from the packet:
-${supportPaths.map((filePath) => `- ${filePath}`).join("\n")}`
-    : "";
   return `
 The benchmark harness already ran the required first repository-context command before starting you:
 \`\`\`${packetFirstCommandFenceLanguage()}
 ${prelude.public.command}
 \`\`\`
 
-Use this packet as the first CodeStory context source. If \`sufficiency.status\` is \`"sufficient"\` and \`sufficiency.follow_up_commands\` is empty, answer from this packet without ordinary source reads. Preserve exact source identifiers and covered-claim phrases from \`sufficiency.covered_claims\` and citation display names. Do not merge repeated exact anchors into shorthand that drops required prefixes; write each exact anchor independently when naming declarations, tables, symbols, or source-defined selectors. Include a compact \`Support files\` section with the packet citation and avoid-opening paths.
-${manifestBlock}
-${supportPathBlock}
+Use the compiled \`support\` units as evidence and obey only \`disposition\` for
+control flow. The task manifest is withheld and has no effect on whether you
+continue. Do not repeat the initial packet call. Preserve exact source
+identifiers and paths from support summaries and citations.
 
 CodeStory packet JSON excerpt:
 \`\`\`json
@@ -1661,21 +1651,15 @@ function packetForAgentPrompt(packet) {
     return packet;
   }
   return {
+    packet_id: packet.packet_id ?? null,
+    question: packet.question ?? null,
+    support: Array.isArray(packet.support) ? packet.support : [],
+    disposition: packet.disposition ?? null,
     answer: packet.answer
       ? {
           summary: packet.answer.summary ?? null,
           text: truncatePacketPromptText(packetAnswerText(packet), 4000),
           citations: (packet.answer.citations ?? []).map(leanPacketCitation),
-        }
-      : null,
-    sufficiency: packet.sufficiency
-      ? {
-          status: packet.sufficiency.status ?? null,
-          covered_claims: (packet.sufficiency.covered_claims ?? [])
-            .map((claim) => String(claim?.claim ?? "").trim())
-            .filter(Boolean),
-          avoid_opening: packetAvoidOpeningRawPaths(packet),
-          follow_up_commands: (packet.sufficiency.follow_up_commands ?? []).slice(0, 4),
         }
       : null,
   };
@@ -1686,15 +1670,10 @@ function packetPreludeManifestComplete(publicPrelude) {
   if (!quality?.pass) {
     return false;
   }
-  const sufficiency = publicPrelude?.packet_sufficiency;
-  const followUps = presentFiniteNumber(
-    sufficiency?.follow_up_commands_count ?? sufficiency?.follow_up_commands?.length,
-  );
-  if (
-    !sufficiency ||
-    sufficiency.status !== "sufficient" ||
-    followUps !== 0
-  ) {
+  if (publicPrelude?.packet_disposition_kind !== "supported") {
+    return false;
+  }
+  if ((presentFiniteNumber(publicPrelude?.packet_support_count) ?? 0) <= 0) {
     return false;
   }
   const composition = publicPrelude?.packet_composition;
@@ -1722,8 +1701,8 @@ function packetManifestQualitySummary(packet, task) {
     )
     .filter(Boolean)
     .join("\n");
-  const claimText = (packet.sufficiency?.covered_claims ?? [])
-    .map((claim) => String(claim?.claim ?? "").trim())
+  const claimText = (packet.support ?? [])
+    .map((support) => String(support?.summary ?? "").trim())
     .filter(Boolean)
     .join("\n");
   const text = [
@@ -2138,6 +2117,53 @@ function isPathInsideProject(filePath, projectRoot) {
   return normalized === root || normalized.startsWith(`${root}/`);
 }
 
+function interactionTurnTelemetry(events) {
+  let modelMessages = 0;
+  let toolActions = 0;
+  let failedToolActions = 0;
+  let reasoningItemsExcluded = 0;
+  let errorItemsExcluded = 0;
+  for (const event of events) {
+    const eventType = String(event?.type ?? event?.event ?? "").toLowerCase();
+    if (!(eventType === "item.completed" || eventType.endsWith(".completed"))) {
+      continue;
+    }
+    const item = itemOf(event);
+    const itemType = String(item.type ?? "").toLowerCase();
+    if (itemType === "reasoning") {
+      reasoningItemsExcluded += 1;
+      continue;
+    }
+    if (itemType === "error") {
+      errorItemsExcluded += 1;
+      continue;
+    }
+    if (itemType === "agent_message") {
+      modelMessages += 1;
+      continue;
+    }
+    if (isToolType(itemType)) {
+      toolActions += 1;
+      if (
+        item.error != null ||
+        event.error != null ||
+        String(item.status ?? "completed").toLowerCase() === "failed"
+      ) {
+        failedToolActions += 1;
+      }
+    }
+  }
+  return {
+    total: modelMessages + toolActions,
+    model_messages: modelMessages,
+    tool_actions: toolActions,
+    failed_tool_actions: failedToolActions,
+    reasoning_items_excluded: reasoningItemsExcluded,
+    error_items_excluded: errorItemsExcluded,
+    taxonomy: "completed_agent_messages_plus_tool_actions_v1",
+  };
+}
+
 function analyzeTranscript(events, projectRoot = null) {
   const commands = extractCommandExecutions(events);
   const toolCategories = toolCallCategories(events);
@@ -2185,6 +2211,7 @@ function analyzeTranscript(events, projectRoot = null) {
       : sourceReads.filter((read) => (read.event_index ?? -1) > (first.completed_event_index ?? first.started_event_index ?? -1)).length;
 
   return {
+    interaction_turns: interactionTurnTelemetry(events),
     tool_categories: toolCategories,
     codestory_mcp_tool_calls_observed: codestoryMcpToolCalls.length,
     codestory_mcp_completed_calls_observed: codestoryMcpCompletedCalls.length,
@@ -2270,9 +2297,43 @@ function codeStoryMcpRuntimeIdentity(event) {
     plugin_version: runtime.plugin_version ?? null,
     plugin_cli_version: runtime.plugin_cli_version ?? null,
     cli_version: runtime.cli_version ?? null,
+    cli_sha256: runtime.cli_sha256 ?? null,
     cli_source: runtime.cli_source ?? null,
     pinned_pair_matches: runtime.pinned_pair_matches ?? null,
     known_override_skew_channel: runtime.known_override_skew_channel ?? null,
+  };
+}
+
+function codeStoryBinaryIdentity(preludeCliSha256, analysis) {
+  const preludeSha = String(preludeCliSha256 ?? "").trim().toLowerCase();
+  const completedCalls = analysis?.codestory_mcp_completed_calls_observed ?? 0;
+  const identities = analysis?.codestory_mcp_runtime_identities ?? [];
+  const declaredMcpShas = identities
+    .map((identity) => String(identity?.cli_sha256 ?? "").trim().toLowerCase())
+    .filter(Boolean);
+  const uniqueMcpShas = [...new Set(declaredMcpShas)].sort();
+  let status;
+  if (!SHA256_PATTERN.test(preludeSha)) {
+    status = "prelude_sha_missing_or_invalid";
+  } else if (completedCalls === 0) {
+    status = "prelude_only";
+  } else if (
+    declaredMcpShas.length < completedCalls ||
+    declaredMcpShas.some((sha) => !SHA256_PATTERN.test(sha))
+  ) {
+    status = "mcp_sha_missing_or_invalid";
+  } else if (uniqueMcpShas.length === 1 && uniqueMcpShas[0] === preludeSha) {
+    status = "exact_match";
+  } else {
+    status = "mismatch";
+  }
+  return {
+    status,
+    exact_match: status === "exact_match",
+    prelude_cli_sha256: SHA256_PATTERN.test(preludeSha) ? preludeSha : null,
+    completed_mcp_calls: completedCalls,
+    mcp_identities_observed: identities.length,
+    mcp_cli_sha256_values: uniqueMcpShas,
   };
 }
 
@@ -2878,8 +2939,10 @@ function preludePublicFields(prelude) {
     stdout_bytes: prelude.stdout_bytes,
     stderr_bytes: prelude.stderr_bytes,
     packet_parse_error: prelude.packet_parse_error,
-    packet_sufficiency_status: prelude.packet_sufficiency_status,
-    packet_sufficiency: prelude.packet_sufficiency ?? null,
+    packet_disposition_kind: prelude.packet_disposition_kind ?? null,
+    packet_disposition: prelude.packet_disposition ?? null,
+    packet_support_count: prelude.packet_support_count ?? null,
+    packet_support_kind_counts: prelude.packet_support_kind_counts ?? null,
     packet_citation_count: prelude.packet_citation_count,
     packet_avoid_opening_count: prelude.packet_avoid_opening_count,
     packet_latency: prelude.packet_latency,
@@ -3451,6 +3514,13 @@ function resultRequiresPacketObligationAccounting(result) {
     return false;
   }
   const prelude = result?.codestory_harness_prelude;
+  if (
+    result?.disposition != null ||
+    prelude?.packet_disposition != null ||
+    prelude?.packet_disposition_kind != null
+  ) {
+    return false;
+  }
   const packetEvidencePresent =
     result?.sufficiency != null ||
     result?.packet_shape != null ||
@@ -3527,6 +3597,39 @@ function packetPreludeContractBlockers(packet, stdout, options = {}) {
   const fileCount = packetUniqueCitationFileCount(packet);
   const snippetCount = packetSourceReadSnippetCount(packet);
   const graphEdgeOccurrences = packetGraphEdgeOccurrences(packet);
+  const support = packet.support;
+  const disposition = packet.disposition;
+  const dispositionKind = disposition?.kind;
+  if (!Array.isArray(support)) {
+    blockers.push("packet support is missing or invalid");
+  }
+  if (!PACKET_DISPOSITIONS.has(dispositionKind)) {
+    blockers.push(`packet disposition=${dispositionKind ?? "missing"} is invalid`);
+  }
+  if (dispositionKind === "supported" && Array.isArray(support) && support.length === 0) {
+    blockers.push("supported packet has no support units");
+  }
+  if (dispositionKind === "drill_once") {
+    const drill = disposition?.drill;
+    if (!drill || typeof drill !== "object") {
+      blockers.push("drill_once packet has no drill plan");
+    } else {
+      if (drill.parent_packet_id !== packet.packet_id) {
+        blockers.push("drill_once parent_packet_id does not match packet_id");
+      }
+      if (!Array.isArray(drill.options) || drill.options.length === 0 || drill.options.length > 8) {
+        blockers.push(`drill_once option count=${drill.options?.length ?? "missing"}; expected 1..8`);
+      }
+      if (drill.remaining_rounds !== 1) {
+        blockers.push(`drill_once remaining_rounds=${drill.remaining_rounds ?? "missing"}; expected 1`);
+      }
+      if (!String(drill.core_generation_id ?? "").trim()) {
+        blockers.push("drill_once core_generation_id is missing");
+      }
+    }
+  } else if (disposition?.drill != null) {
+    blockers.push(`${dispositionKind ?? "unknown"} packet unexpectedly includes a drill plan`);
+  }
   const boundedCounters = [
     ["anchors", used.anchors, limits.max_anchors],
     ["files", used.files, limits.max_files],
@@ -3584,37 +3687,9 @@ function packetPreludeContractBlockers(packet, stdout, options = {}) {
       `budget.used.trail_edges=${used.trail_edges ?? "missing"} does not match serialized graph edges=${graphEdgeOccurrences}`,
     );
   }
-  if (options.requireSufficient) {
-    const obligationError = packetObligationAccountingError(
-      packetObligationAccounting(packet),
-      "packet obligations",
-    );
-    if (obligationError) {
-      blockers.push(obligationError);
-    }
-    if (packet.sufficiency?.status !== "sufficient") {
-      blockers.push(`packet sufficiency=${packet.sufficiency?.status ?? "missing"}; expected sufficient`);
-    }
-    const followUpInvocations = packet.sufficiency?.follow_up_invocations;
-    const followUpCommands = packet.sufficiency?.follow_up_commands;
-    if (
-      Array.isArray(followUpInvocations) &&
-      Array.isArray(followUpCommands) &&
-      followUpInvocations.length !== followUpCommands.length
-    ) {
-      blockers.push(
-        `packet follow-up surfaces disagree: invocations=${followUpInvocations.length} commands=${followUpCommands.length}`,
-      );
-    }
-    const followUpCount = packetFollowUpCount(packet);
-    if (followUpCount !== 0) {
-      blockers.push(`packet follow-ups=${followUpCount}; expected 0`);
-    }
-    const materialGaps = packet.plan?.obligations?.claim_obligations?.filter(
-      (obligation) => obligation?.material === true && obligation?.proof_status !== "proven",
-    ) ?? [];
-    if (materialGaps.length) {
-      blockers.push(`packet material gaps=${materialGaps.length}; expected 0`);
+  if (options.requireSupported) {
+    if (dispositionKind !== "supported") {
+      blockers.push(`packet disposition=${dispositionKind ?? "missing"}; expected supported`);
     }
     const retrievalShadow = packetRetrievalShadow(packet);
     if (!retrievalShadow) {
@@ -3678,12 +3753,10 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   const contractBlockers = parseError
     ? [`packet JSON parse failed: ${parseError}`]
     : packetPreludeContractBlockers(packet, result.stdout, {
-        requireSufficient: opts.publishable,
+        requireSupported: opts.publishable,
         requireManagedRuntime: opts.publishable,
       });
-  if (opts.publishable && manifestQuality && !manifestQuality.pass) {
-    contractBlockers.push("packet manifest quality failed");
-  }
+  const dispositionTelemetry = packetDispositionTelemetry(packet, manifestQuality);
   const publicPrelude = preludePublicFields({
     command,
     args,
@@ -3698,8 +3771,10 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     stdout_bytes: Buffer.byteLength(result.stdout, "utf8"),
     stderr_bytes: Buffer.byteLength(result.stderr, "utf8"),
     packet_parse_error: parseError,
-    packet_sufficiency_status: packet?.sufficiency?.status ?? null,
-    packet_sufficiency: packetSufficiencyTelemetry(packet, manifestQuality),
+    packet_disposition_kind: dispositionTelemetry?.kind ?? null,
+    packet_disposition: dispositionTelemetry,
+    packet_support_count: dispositionTelemetry?.support_count ?? null,
+    packet_support_kind_counts: dispositionTelemetry?.support_kind_counts ?? null,
     packet_citation_count: Array.isArray(packet?.answer?.citations)
       ? packet.answer.citations.length
       : null,
@@ -3761,6 +3836,9 @@ async function runOne(opts, run, outDir) {
     ? path.isAbsolute(resolvedCodeStoryCli) || /[\\/]/.test(resolvedCodeStoryCli)
       ? path.resolve(resolvedCodeStoryCli)
       : resolvedCodeStoryCli
+    : null;
+  const codestoryPreludeCliSha256 = codestoryPreludeCli && existsSync(codestoryPreludeCli)
+    ? sha256Bytes(await readFile(codestoryPreludeCli))
     : null;
   const env = agentRunnerEnv(process.env, opts.agentCodexHomes?.[run.arm] ?? null);
   const baselinePrelude =
@@ -3833,6 +3911,13 @@ async function runOne(opts, run, outDir) {
   const codexToolCalls = parsed.filter(isToolCallStartEvent).length;
   const toolCalls = analysisEvents.filter(isToolCallStartEvent).length;
   const analysis = analyzeTranscript(analysisEvents, repoConfig.path);
+  const codestoryBinaryIdentity = run.arm === "with_codestory"
+    ? codeStoryBinaryIdentity(codestoryPreludeCliSha256, analysis)
+    : null;
+  const binaryIdentityFailed = codestoryBinaryIdentity != null && ![
+    "prelude_only",
+    "exact_match",
+  ].includes(codestoryBinaryIdentity.status);
   const provenance = await repoProvenance(repoConfig, opts.signal);
   const packetFirstRequired = run.arm === "with_codestory";
   const packetFirstPass =
@@ -3873,15 +3958,25 @@ async function runOne(opts, run, outDir) {
     stdin: stdin == null ? null : "<prompt>",
     codestory_cli_env: null,
     codestory_prelude_cli: run.arm === "with_codestory" ? codestoryPreludeCli : null,
+    codestory_prelude_cli_sha256: run.arm === "with_codestory"
+      ? codestoryPreludeCliSha256
+      : null,
+    codestory_binary_identity: codestoryBinaryIdentity,
     repo_path: repoConfig.path,
     repo_provenance: provenance,
     codestory_cache_provenance: cacheProvenance,
     benchmark_contract: benchmarkContract,
     promotion_eligible: benchmarkContract.promotion_eligible,
-    status: opts.signal?.aborted || result.status === "aborted" ? "cancelled" : result.status,
+    status: opts.signal?.aborted || result.status === "aborted"
+      ? "cancelled"
+      : binaryIdentityFailed
+        ? "fail"
+        : result.status,
     exit_code: result.exitCode,
     signal: result.signal,
-    error: result.error,
+    error: binaryIdentityFailed
+      ? `CodeStory binary identity ${codestoryBinaryIdentity.status}`
+      : result.error,
     wall_ms: wallMs,
     agent_runner_wall_ms: runnerWallMs,
     baseline_harness_prelude: baselinePrelude?.public ?? null,
@@ -5698,6 +5793,45 @@ function packetShape(packet) {
   };
 }
 
+function packetDispositionTelemetry(packet, quality) {
+  if (!packet || typeof packet !== "object") {
+    return null;
+  }
+  const support = Array.isArray(packet.support) ? packet.support : [];
+  const supportKindCounts = {};
+  for (const unit of support) {
+    const kind = String(unit?.kind ?? "unknown");
+    supportKindCounts[kind] = (supportKindCounts[kind] ?? 0) + 1;
+  }
+  const disposition = packet.disposition ?? null;
+  const drill = disposition?.drill ?? null;
+  const retrievalShadow = packetRetrievalShadow(packet);
+  return {
+    kind: disposition?.kind ?? null,
+    terminal: disposition?.kind != null && disposition.kind !== "drill_once",
+    reason: disposition?.reason ?? null,
+    support_count: support.length,
+    support_kind_counts: Object.fromEntries(
+      Object.entries(supportKindCounts).sort(([left], [right]) => left.localeCompare(right)),
+    ),
+    omission_receipts_count: Array.isArray(disposition?.omission_receipts)
+      ? disposition.omission_receipts.length
+      : 0,
+    drill_option_count: Array.isArray(drill?.options) ? drill.options.length : 0,
+    drill_option_ids: Array.isArray(drill?.options)
+      ? drill.options.map((option) => option?.id).filter(Boolean)
+      : [],
+    parent_packet_id: drill?.parent_packet_id ?? null,
+    core_generation_id: drill?.core_generation_id ?? null,
+    retrieval_generation: drill?.retrieval_generation ?? null,
+    remaining_rounds: presentFiniteNumber(drill?.remaining_rounds),
+    retrieval_mode: retrievalShadow?.retrieval_mode ?? null,
+    degraded_reason: retrievalShadow?.degraded_reason ?? null,
+    supported_quality_mismatch:
+      disposition?.kind === "supported" && quality?.pass === false,
+  };
+}
+
 function packetSufficiencyTelemetry(packet, quality) {
   if (!packet || typeof packet !== "object") {
     return null;
@@ -7213,6 +7347,7 @@ function resourceAccountingForResult(result) {
       reasoning_tokens: usage.reasoning_tokens ?? null,
     },
     estimated_cost_usd: result.estimated_cost_usd ?? null,
+    interaction_turns: analysis.interaction_turns ?? null,
     tool_calls_observed: presentFiniteNumber(result.tool_calls_observed),
     codex_tool_calls_observed: presentFiniteNumber(result.codex_tool_calls_observed),
     tool_categories: analysis.tool_categories ?? {},
@@ -7269,6 +7404,25 @@ function summarizeArmCostAccounting(rows) {
       reasoning_tokens: sumPresentFinite(rows.map((row) => row.usage?.reasoning_tokens)),
     },
     estimated_cost_usd: sumPresentFinite(rows.map((row) => row.estimated_cost_usd)),
+    interaction_turns: {
+      total: sumFinite(rows.map((row) => row.transcript_analysis?.interaction_turns?.total)),
+      model_messages: sumFinite(
+        rows.map((row) => row.transcript_analysis?.interaction_turns?.model_messages),
+      ),
+      tool_actions: sumFinite(
+        rows.map((row) => row.transcript_analysis?.interaction_turns?.tool_actions),
+      ),
+      failed_tool_actions: sumFinite(
+        rows.map((row) => row.transcript_analysis?.interaction_turns?.failed_tool_actions),
+      ),
+      reasoning_items_excluded: sumFinite(
+        rows.map((row) => row.transcript_analysis?.interaction_turns?.reasoning_items_excluded),
+      ),
+      error_items_excluded: sumFinite(
+        rows.map((row) => row.transcript_analysis?.interaction_turns?.error_items_excluded),
+      ),
+      taxonomy: "completed_agent_messages_plus_tool_actions_v1",
+    },
     tool_calls: {
       observed: sumFinite(rows.map((row) => row.tool_calls_observed)),
       codex_observed: sumFinite(rows.map((row) => row.codex_tool_calls_observed)),
@@ -7373,6 +7527,10 @@ function summarizeCostAccounting(results) {
             withCodeStory.commands.observed,
             withoutCodeStory.commands.observed,
           ),
+          interaction_turns: accountingComparison(
+            withCodeStory.interaction_turns.total,
+            withoutCodeStory.interaction_turns.total,
+          ),
           estimated_cost_usd: accountingComparison(
             withCodeStory.estimated_cost_usd,
             withoutCodeStory.estimated_cost_usd,
@@ -7412,6 +7570,20 @@ function summarizeRuns(results) {
     const packetManifestRows = successful.filter(
       (row) => row.codestory_harness_prelude?.packet_manifest_quality,
     );
+    const packetDispositionCounts = {};
+    for (const row of successful) {
+      const kind = row.codestory_harness_prelude?.packet_disposition_kind;
+      if (kind) {
+        packetDispositionCounts[kind] = (packetDispositionCounts[kind] ?? 0) + 1;
+      }
+    }
+    const binaryIdentityStatusCounts = {};
+    for (const row of rows) {
+      const status = row.codestory_binary_identity?.status;
+      if (status) {
+        binaryIdentityStatusCounts[status] = (binaryIdentityStatusCounts[status] ?? 0) + 1;
+      }
+    }
     const categoryMedians = {};
     for (const category of COMMAND_ACCOUNTING_CATEGORIES) {
       categoryMedians[category] = median(
@@ -7443,9 +7615,13 @@ function summarizeRuns(results) {
         (row) => row.codestory_harness_prelude?.packet_manifest_quality?.pass,
       ).length,
       packet_manifest_quality_scored_runs: packetManifestRows.length,
-      packet_partial_runs: successful.filter(
-        (row) => row.codestory_harness_prelude?.packet_sufficiency_status === "partial",
-      ).length,
+      packet_disposition_counts: Object.fromEntries(
+        Object.entries(packetDispositionCounts).sort(([left], [right]) => left.localeCompare(right)),
+      ),
+      packet_drill_once_runs: packetDispositionCounts.drill_once ?? 0,
+      codestory_binary_identity_status_counts: Object.fromEntries(
+        Object.entries(binaryIdentityStatusCounts).sort(([left], [right]) => left.localeCompare(right)),
+      ),
       quality_scored_runs: qualityRows.length,
       quality_pass_runs: qualityRows.filter((row) => row.quality?.pass).length,
       total_wall_ms: totalWallMs,
@@ -7458,6 +7634,9 @@ function summarizeRuns(results) {
       total_estimated_cost_usd: sumPresentFinite(successful.map((row) => row.estimated_cost_usd)),
       total_tool_calls_observed: sumFinite(successful.map((row) => row.tool_calls_observed)),
       total_command_count: sumFinite(successful.map((row) => row.transcript_analysis?.command_count)),
+      total_interaction_turns: sumFinite(
+        successful.map((row) => row.transcript_analysis?.interaction_turns?.total),
+      ),
       total_web_search_tool_calls: sumFinite(
         successful.map((row) => row.transcript_analysis?.tool_categories?.web_search ?? 0),
       ),
@@ -7478,6 +7657,9 @@ function summarizeRuns(results) {
       median_output_tokens: median(successful.map((row) => row.usage?.output_tokens)),
       median_estimated_cost_usd: median(successful.map((row) => row.estimated_cost_usd)),
       median_command_count: median(successful.map((row) => row.transcript_analysis?.command_count)),
+      median_interaction_turns: median(
+        successful.map((row) => row.transcript_analysis?.interaction_turns?.total),
+      ),
       median_tool_calls_observed: median(successful.map((row) => row.tool_calls_observed)),
       median_web_search_tool_calls: median(
         successful.map((row) => row.transcript_analysis?.tool_categories?.web_search ?? 0),
@@ -7679,6 +7861,24 @@ function agentPublishableBlockers(results, opts = {}) {
         if (prelude.packet_manifest_quality && !prelude.packet_manifest_quality.pass) {
           productReasons.push(`${label} prelude packet manifest quality failed`);
         }
+        const preludeDisposition = prelude.packet_disposition;
+        if (preludeDisposition) {
+          if (!PACKET_DISPOSITIONS.has(preludeDisposition.kind)) {
+            harnessReasons.push(
+              `${label} prelude packet disposition=${preludeDisposition.kind ?? "missing"} is invalid`,
+            );
+          } else if (opts.publishable && preludeDisposition.kind !== "supported") {
+            productReasons.push(
+              `${label} prelude packet disposition=${preludeDisposition.kind}; expected supported`,
+            );
+          }
+          if (
+            preludeDisposition.kind === "supported" &&
+            (presentFiniteNumber(prelude.packet_support_count) ?? 0) <= 0
+          ) {
+            harnessReasons.push(`${label} prelude supported packet has no support units`);
+          }
+        }
         const preludeSufficiency =
           prelude.packet_sufficiency ??
           (prelude.packet_sufficiency_status
@@ -7703,6 +7903,7 @@ function agentPublishableBlockers(results, opts = {}) {
           }
         }
         const preludeRetrieval =
+          prelude.packet_disposition ??
           prelude.packet_sufficiency ??
           prelude.packet_latency?.retrieval_shadow ??
           null;
@@ -9809,7 +10010,7 @@ async function main() {
       });
     }
     if (blockers.length) {
-      console.error("--publishable failed: every run must pass, report total token usage, pass preludes without warnings, pass manifest quality gates when present, run packet first when required, report sufficient packets with zero follow-ups or unresolved diagnostics, and stay within the post-packet source-read budget.");
+      console.error("--publishable failed: every run must pass, report total token usage, pass preludes without warnings, pass manifest quality gates when present, obey packet dispositions, prove exact runtime identity when MCP is used, and stay within the post-packet source-read budget.");
       for (const blocker of blockers) {
         console.error(formatAgentPublishableBlocker(blocker));
       }
@@ -9841,10 +10042,12 @@ export {
   copyResultArtifact,
   qualityFailureReasons,
   commandCategory,
+  codeStoryBinaryIdentity,
   codestoryDoctorSnapshot,
   codestoryRetrievalEngineDiagnosticsSnapshot,
   codestoryRetrievalStatusSnapshot,
   extractCommandExecutions,
+  interactionTurnTelemetry,
   isPathInside,
   isTrustedPublishableRepoUrl,
   loadTaskForResult,
@@ -9873,6 +10076,7 @@ export {
   packetManifestExtraProbes,
   packetManifestQualitySummary,
   packetObligationAccounting,
+  packetDispositionTelemetry,
   packetPreludeContractBlockers,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,

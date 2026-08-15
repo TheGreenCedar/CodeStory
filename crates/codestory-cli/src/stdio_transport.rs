@@ -6405,6 +6405,7 @@ fn env_nonempty(name: &str) -> Option<String> {
 pub(crate) struct HostProvisioningIdentity {
     pub(crate) plugin_version: Option<String>,
     pub(crate) plugin_cli_version: Option<String>,
+    pub(crate) cli_sha256: Option<String>,
     /// `None` when the host declared nothing; callers supply their own label
     /// for a direct launch.
     pub(crate) cli_source: Option<String>,
@@ -6414,6 +6415,7 @@ pub(crate) fn host_provisioning_identity() -> HostProvisioningIdentity {
     HostProvisioningIdentity {
         plugin_version: env_nonempty("CODESTORY_PLUGIN_VERSION"),
         plugin_cli_version: env_nonempty("CODESTORY_PLUGIN_CLI_VERSION"),
+        cli_sha256: env_nonempty("CODESTORY_PLUGIN_CLI_SHA256"),
         cli_source: env_nonempty("CODESTORY_PLUGIN_CLI_SOURCE"),
     }
 }
@@ -9313,6 +9315,7 @@ version = "0.11.20"
             "0.16.3",
             None,
             None,
+            None,
             "direct_cli_launch".to_string(),
             false,
         );
@@ -9320,6 +9323,7 @@ version = "0.11.20"
             "0.16.3",
             Some("0.16.3".to_string()),
             Some("0.16.2".to_string()),
+            Some("a".repeat(64)),
             "managed_cli".to_string(),
             false,
         );
@@ -9327,6 +9331,7 @@ version = "0.11.20"
             "0.16.3",
             Some("0.16.3".to_string()),
             Some("0.16.3".to_string()),
+            Some("b".repeat(64)),
             "managed_cli".to_string(),
             false,
         );
@@ -9334,6 +9339,9 @@ version = "0.11.20"
         assert_eq!(direct["pinned_pair_matches"], serde_json::Value::Null);
         assert_eq!(mismatch["pinned_pair_matches"], json!(false));
         assert_eq!(matched["pinned_pair_matches"], json!(true));
+        assert_eq!(direct["cli_sha256"], serde_json::Value::Null);
+        assert_eq!(mismatch["cli_sha256"], json!("a".repeat(64)));
+        assert_eq!(matched["cli_sha256"], json!("b".repeat(64)));
     }
 
     #[test]

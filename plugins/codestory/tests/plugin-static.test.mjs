@@ -3892,6 +3892,7 @@ test("packaged initialize handshake carries the publication stamp the host reads
         "else process.exit(2);",
       ].join("\n"),
     );
+    const cliSha256 = createHash("sha256").update(await readFile(cliPath)).digest("hex");
     const overrideResult = packagedInitializeResult({
       ...process.env,
       CODESTORY_CLI: cliPath,
@@ -3915,6 +3916,7 @@ test("packaged initialize handshake carries the publication stamp the host reads
         cli_version: version,
         plugin_version: version,
         plugin_cli_version: version,
+        cli_sha256: cliSha256,
         cli_source: "local_dev_override",
         pinned_pair_matches: true,
         known_override_skew_channel: true,

@@ -2300,6 +2300,7 @@ function failOpenPublicationStamp(status) {
       cli_version: cliVersion,
       plugin_version: publicationStampText(plugin.plugin_version),
       plugin_cli_version: pluginCliVersion,
+      cli_sha256: publicationStampText(plugin.cli_sha256),
       cli_source: cliSource,
       // `null` is "cannot compare", not "mismatch": the launcher answers
       // `initialize` before any runtime is required to exist, so an unresolved

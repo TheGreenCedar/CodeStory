@@ -25,6 +25,7 @@ import {
   benchmarkShardAttestationForCloseout,
   cachePreparationCanaryBlockers,
   cachePreparationIdentityBlockers,
+  codeStoryBinaryIdentity,
   commandCategory,
   codestoryDoctorSnapshot,
   codestoryRetrievalEngineDiagnosticsSnapshot,
@@ -35,6 +36,7 @@ import {
   gitCheckedOutput,
   isTrustedPublishableRepoUrl,
   isPathInside,
+  interactionTurnTelemetry,
   loadTaskForResult,
   loadReleaseEvidenceCorpusContract,
   loadTasks,
@@ -55,6 +57,7 @@ import {
   packetManifestExtraProbes,
   packetManifestQualitySummary,
   packetObligationAccounting,
+  packetDispositionTelemetry,
   packetPreludeContractBlockers,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
@@ -270,6 +273,7 @@ function managedRuntimeIdentity(overrides = {}) {
 
 test("packet canary rejects exact byte and graph-limit escapes before the agent", () => {
   const packet = {
+    packet_id: "packet-1",
     _meta: {
       codestory_publication: { contract_runtime: managedRuntimeIdentity() },
     },
@@ -285,12 +289,8 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
         retrieval_shadow: { retrieval_mode: "full" },
       },
     },
-    sufficiency: {
-      status: "sufficient",
-      follow_up_invocations: [],
-      follow_up_commands: [],
-      coverage_report: { claim_obligations: [] },
-    },
+    support: [{ id: "support-1", kind: "symbol_location", summary: "carrier", path: "src/lib.rs" }],
+    disposition: { kind: "supported", omission_receipts: [] },
     budget: {
       limits: {
         max_anchors: 13,
@@ -304,7 +304,7 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
   };
   const stdout = exactPacketStdout(packet);
   const blockers = packetPreludeContractBlockers(packet, stdout, {
-    requireSufficient: true,
+    requireSupported: true,
     requireManagedRuntime: true,
   });
   assert.ok(blockers.some((blocker) => blocker.includes("trail_edges=21 exceeds 20")));
@@ -314,9 +314,26 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
   packet.budget.used.trail_edges = 20;
   const validStdout = exactPacketStdout(packet);
   assert.deepEqual(packetPreludeContractBlockers(packet, validStdout, {
-    requireSufficient: true,
+    requireSupported: true,
     requireManagedRuntime: true,
   }), []);
+  assert.deepEqual(packetDispositionTelemetry(packet, { pass: true }), {
+    kind: "supported",
+    terminal: true,
+    reason: null,
+    support_count: 1,
+    support_kind_counts: { symbol_location: 1 },
+    omission_receipts_count: 0,
+    drill_option_count: 0,
+    drill_option_ids: [],
+    parent_packet_id: null,
+    core_generation_id: null,
+    retrieval_generation: null,
+    remaining_rounds: null,
+    retrieval_mode: "full",
+    degraded_reason: null,
+    supported_quality_mismatch: false,
+  });
 
   for (const [field, lowered, publicCap] of [
     ["max_anchors", 12, 13],
@@ -328,7 +345,7 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
     const loweredLimitStdout = exactPacketStdout(packet);
     assert.ok(
       packetPreludeContractBlockers(packet, loweredLimitStdout, {
-        requireSufficient: true,
+        requireSupported: true,
         requireManagedRuntime: true,
       }).some((blocker) =>
         blocker.includes(
@@ -343,7 +360,7 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
   packet.budget.used.snippets = 0;
   const invalidStructuralCounts = exactPacketStdout(packet);
   const countBlockers = packetPreludeContractBlockers(packet, invalidStructuralCounts, {
-    requireSufficient: true,
+    requireSupported: true,
     requireManagedRuntime: true,
   });
   assert.ok(countBlockers.some((blocker) => blocker.includes("unique citation files=1")));
@@ -351,16 +368,25 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
   packet.budget.used.files = 1;
   packet.budget.used.snippets = 1;
 
-  packet.sufficiency.follow_up_commands = ["codestory packet --deeper"];
-  const mismatchedFollowUps = exactPacketStdout(packet);
+  packet.disposition = {
+    kind: "drill_once",
+    reason: "one bounded gap",
+    drill: {
+      parent_packet_id: "wrong-parent",
+      core_generation_id: "core-1",
+      options: [],
+      remaining_rounds: 2,
+    },
+  };
+  const invalidDrill = exactPacketStdout(packet);
   assert.match(
-    packetPreludeContractBlockers(packet, mismatchedFollowUps, {
-      requireSufficient: true,
+    packetPreludeContractBlockers(packet, invalidDrill, {
+      requireSupported: true,
       requireManagedRuntime: true,
     }).join("\n"),
-    /follow-up surfaces disagree.*packet follow-ups=1/s,
+    /parent_packet_id.*option count=0.*remaining_rounds=2.*expected supported/s,
   );
-  packet.sufficiency.follow_up_commands = [];
+  packet.disposition = { kind: "supported", omission_receipts: [] };
 
   packet.answer.retrieval_trace.retrieval_shadow = {
     retrieval_mode: "degraded",
@@ -369,7 +395,7 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
   const degradedRetrieval = exactPacketStdout(packet);
   assert.match(
     packetPreludeContractBlockers(packet, degradedRetrieval, {
-      requireSufficient: true,
+      requireSupported: true,
       requireManagedRuntime: true,
     }).join("\n"),
     /retrieval shadow mode=degraded.*degraded_reason=semantic unavailable/s,
@@ -382,7 +408,7 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
   assert.ok(packet.budget.used.output_bytes > 98_304);
   assert.match(
     packetPreludeContractBlockers(packet, raisedLimitStdout, {
-      requireSufficient: true,
+      requireSupported: true,
       requireManagedRuntime: true,
     }).join("\n"),
     /max_output_bytes=200000 does not equal public cap=98304.*used\.output_bytes=.*exceeds public cap=98304/s,
@@ -398,7 +424,7 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
     const staleStdout = exactPacketStdout(packet);
     assert.match(
       packetPreludeContractBlockers(packet, staleStdout, {
-        requireSufficient: true,
+        requireSupported: true,
         requireManagedRuntime: true,
       }).join("\n"),
       /runtime identity is not managed 0\.17\.0/,
@@ -408,14 +434,10 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
 
   packet.plan.obligations.claim_obligations.push({ material: null, proof_status: "proven" });
   const invalidObligationsStdout = exactPacketStdout(packet);
-  assert.match(
-    packetPreludeContractBlockers(packet, invalidObligationsStdout, {
-      requireSufficient: true,
-      requireManagedRuntime: true,
-    })
-      .join("\n"),
-    /total=1 does not reconcile with material=0 \+ nonmaterial=0/,
-  );
+  assert.deepEqual(packetPreludeContractBlockers(packet, invalidObligationsStdout, {
+    requireSupported: true,
+    requireManagedRuntime: true,
+  }), []);
 });
 
 test("packet obligation accounting preserves the historical material split", () => {
@@ -3436,6 +3458,45 @@ test("counts modern Codex JSONL tool categories including web search", () => {
   assert.match(blockers[0].reasons.join("\n"), /external web\/search tool calls=1 > 0/);
 });
 
+test("interaction turns count agent messages and tool actions but exclude reasoning and errors", () => {
+  const telemetry = interactionTurnTelemetry([
+    { type: "item.completed", item: { type: "reasoning" } },
+    { type: "item.completed", item: { type: "error" } },
+    { type: "item.completed", item: { type: "agent_message" } },
+    { type: "item.completed", item: { type: "command_execution", status: "completed" } },
+    { type: "item.completed", item: { type: "mcp_tool_call", status: "failed" } },
+  ]);
+  assert.deepEqual(telemetry, {
+    total: 3,
+    model_messages: 1,
+    tool_actions: 2,
+    failed_tool_actions: 1,
+    reasoning_items_excluded: 1,
+    error_items_excluded: 1,
+    taxonomy: "completed_agent_messages_plus_tool_actions_v1",
+  });
+});
+
+test("same-binary identity requires every completed MCP call to declare the prelude SHA", () => {
+  const sha = "a".repeat(64);
+  assert.equal(codeStoryBinaryIdentity(sha, {
+    codestory_mcp_completed_calls_observed: 0,
+    codestory_mcp_runtime_identities: [],
+  }).status, "prelude_only");
+  assert.equal(codeStoryBinaryIdentity(sha, {
+    codestory_mcp_completed_calls_observed: 1,
+    codestory_mcp_runtime_identities: [{ cli_sha256: sha }],
+  }).status, "exact_match");
+  assert.equal(codeStoryBinaryIdentity(sha, {
+    codestory_mcp_completed_calls_observed: 1,
+    codestory_mcp_runtime_identities: [{ cli_sha256: "b".repeat(64) }],
+  }).status, "mismatch");
+  assert.equal(codeStoryBinaryIdentity(sha, {
+    codestory_mcp_completed_calls_observed: 1,
+    codestory_mcp_runtime_identities: [{ cli_sha256: null }],
+  }).status, "mcp_sha_missing_or_invalid");
+});
+
 test("counts only started CodeStory MCP calls", () => {
   const events = [
     {
@@ -3468,6 +3529,7 @@ test("extracts managed runtime identity from completed CodeStory MCP results", (
     plugin_version: "0.17.0",
     plugin_cli_version: "0.17.0",
     cli_version: "0.17.0",
+    cli_sha256: "a".repeat(64),
     cli_source: "managed",
     pinned_pair_matches: true,
     known_override_skew_channel: false,
@@ -4094,31 +4156,19 @@ test("packet prompt excerpt keeps answer support while dropping bulky packet fie
         },
       ],
     },
-    sufficiency: {
-      status: "partial",
-      gaps: ["drop me"],
-      open_next: ["drop me too"],
-      avoid_opening: [
-        "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/legacy.py because legacy prose",
-      ],
-      avoid_opening_paths: [
-        "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/api.py",
-      ],
-      follow_up_commands: ["a", "b", "c", "d", "e"],
-      covered_claims: [
-        {
-          claim: "Session.request prepares requests.",
-          citations: [
-            {
-              display_name: "Session.request",
-              file_path:
-                "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/sessions.py",
-              line: 557,
-            },
-          ],
-        },
-      ],
-    },
+    packet_id: "packet-requests",
+    support: [
+      {
+        id: "support-1",
+        kind: "source_range",
+        summary: "Session.request prepares requests.",
+        path: "src/requests/sessions.py",
+        start_line: 557,
+        end_line: 557,
+        snippet: "def request(...)",
+      },
+    ],
+    disposition: { kind: "supported", omission_receipts: [] },
   });
 
   assert.equal(promptPacket.answer.summary, "Requests flow");
@@ -4132,14 +4182,12 @@ test("packet prompt excerpt keeps answer support while dropping bulky packet fie
       line: 557,
     },
   ]);
-  assert.deepEqual(promptPacket.sufficiency.avoid_opening, ["src/requests/api.py"]);
-  assert.deepEqual(promptPacket.sufficiency.follow_up_commands, ["a", "b", "c", "d"]);
-  assert.deepEqual(promptPacket.sufficiency.covered_claims, [
-    "Session.request prepares requests.",
-  ]);
+  assert.equal(promptPacket.packet_id, "packet-requests");
+  assert.deepEqual(promptPacket.disposition, { kind: "supported", omission_receipts: [] });
+  assert.equal(promptPacket.support.length, 1);
+  assert.equal(promptPacket.support[0].summary, "Session.request prepares requests.");
   assert.equal(Object.hasOwn(promptPacket.answer, "sections"), false);
-  assert.equal(Object.hasOwn(promptPacket.sufficiency, "gaps"), false);
-  assert.equal(Object.hasOwn(promptPacket.sufficiency, "open_next"), false);
+  assert.equal(Object.hasOwn(promptPacket, "sufficiency"), false);
 });
 
 test("packet manifest completion is gated by packet quality evidence", () => {
@@ -4160,9 +4208,8 @@ test("packet manifest completion is gated by packet quality evidence", () => {
         },
       ],
     },
-    sufficiency: {
-      covered_claims: [{ claim: "Session.request prepares requests." }],
-    },
+    support: [{ summary: "Session.request prepares requests." }],
+    disposition: { kind: "supported" },
   };
 
   const quality = packetManifestQualitySummary(packet, task);
@@ -4171,7 +4218,8 @@ test("packet manifest completion is gated by packet quality evidence", () => {
     packetPreludeManifestComplete({
       packet_manifest_quality: quality,
       packet_composition: packetComposition(packet, task),
-      packet_sufficiency: { status: "sufficient", follow_up_commands_count: 0 },
+      packet_disposition_kind: "supported",
+      packet_support_count: 1,
     }),
     true,
   );
@@ -4179,7 +4227,8 @@ test("packet manifest completion is gated by packet quality evidence", () => {
     packetPreludeManifestComplete({
       packet_manifest_quality: quality,
       packet_composition: packetComposition(packet, task),
-      packet_sufficiency: { status: "sufficient", follow_up_commands_count: 1 },
+      packet_disposition_kind: "supported",
+      packet_support_count: 0,
     }),
     false,
   );
@@ -4187,7 +4236,8 @@ test("packet manifest completion is gated by packet quality evidence", () => {
     packetPreludeManifestComplete({
       packet_manifest_quality: quality,
       packet_composition: packetComposition(packet, task),
-      packet_sufficiency: { status: "partial", follow_up_commands_count: 0 },
+      packet_disposition_kind: "drill_once",
+      packet_support_count: 1,
     }),
     false,
   );
@@ -4204,7 +4254,7 @@ test("packet manifest completion is gated by packet quality evidence", () => {
           },
         ],
       },
-      sufficiency: { covered_claims: [] },
+      support: [],
     },
     task,
   );
@@ -4250,19 +4300,17 @@ test("packet manifest quality counts exact edge-derived server flow receipts", (
   ].map(([display_name, file_path], index) => ({ display_name, file_path, line: index + 1 }));
   const packet = {
     answer: { summary: "Server request flow", sections: [], citations },
-    sufficiency: {
-      covered_claims: [
-        {
-          claim:
-            "`app.use` registers middleware through the retained `app.router.use` call on the router.",
-        },
-        { claim: "`app.handle` delegates request handling through the retained `handle` call boundary." },
-        {
-          claim:
-            "`res.send` sends output through the retained `end` call, completing the response body.",
-        },
-      ],
-    },
+    support: [
+      {
+        summary:
+          "`app.use` registers middleware through the retained `app.router.use` call on the router.",
+      },
+      { summary: "`app.handle` delegates request handling through the retained `handle` call boundary." },
+      {
+        summary:
+          "`res.send` sends output through the retained `end` call, completing the response body.",
+      },
+    ],
   };
 
   const quality = packetManifestQualitySummary(packet, task);
