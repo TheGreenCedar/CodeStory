@@ -3,9 +3,12 @@
 #![allow(clippy::items_after_test_module)]
 
 use super::packet_candidate::{PacketSearchHit, merge_packet_candidate_graph_for_requirements};
-use super::packet_scoring::{packet_citation_key, packet_citation_rank, sort_by_cached_rank_desc};
+use super::packet_scoring::{
+    normalize_identifier, packet_citation_key, packet_citation_rank, sort_by_cached_rank_desc,
+};
 use super::trace::field;
 use codestory_agent::packet_flow_requirements::FlowRequirement;
+use codestory_agent::planning::PACKET_OWNER_MEMBER_QUERY_PURPOSE;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentResponseSectionDto,
     AgentRetrievalStepDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
@@ -29,6 +32,7 @@ pub(crate) fn merge_packet_initial_search_hits(
         rank_terms,
         stage_carry_limit,
         flow_requirements,
+        None,
     )
 }
 
@@ -39,6 +43,7 @@ fn merge_packet_search_hits(
     rank_terms: &[String],
     stage_carry_limit: usize,
     flow_requirements: &[FlowRequirement],
+    exact_query: Option<&str>,
 ) -> usize {
     let mut citation_indices = answer
         .citations
@@ -58,8 +63,12 @@ fn merge_packet_search_hits(
     sort_by_cached_rank_desc(&mut candidates, |(citation, _)| {
         packet_citation_rank(citation, rank_terms, true)
     });
-    let selected =
-        select_packet_candidate_indices(&candidates, flow_requirements, stage_carry_limit);
+    let selected = select_packet_candidate_indices(
+        &candidates,
+        flow_requirements,
+        stage_carry_limit,
+        exact_query,
+    );
     for candidate_index in &selected {
         let (citation, hit) = &candidates[*candidate_index];
         if include_evidence {
@@ -129,6 +138,7 @@ pub(crate) fn merge_packet_fused_subquery_batch(
             rank_terms,
             stage_carry_limit,
             flow_requirements,
+            (query.purpose == PACKET_OWNER_MEMBER_QUERY_PURPOSE).then_some(query.query.as_str()),
         );
         let added = answer.citations.len().saturating_sub(before);
         let mut output = vec![
@@ -177,9 +187,27 @@ fn select_packet_candidate_indices(
     candidates: &[(AgentCitationDto, &PacketSearchHit)],
     flow_requirements: &[FlowRequirement],
     limit: usize,
+    exact_query: Option<&str>,
 ) -> Vec<usize> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let mut selected = Vec::new();
     let mut selected_set = HashSet::new();
+    if let Some(exact_query) = exact_query {
+        let exact_query = normalize_identifier(exact_query);
+        if let Some((index, _)) = candidates.iter().enumerate().find(|(_, (citation, _))| {
+            citation.origin == codestory_contracts::api::SearchHitOrigin::IndexedSymbol
+                && citation.resolvable
+                && normalize_identifier(&citation.display_name) == exact_query
+        }) {
+            selected.push(index);
+            selected_set.insert(index);
+            if selected.len() >= limit {
+                return selected;
+            }
+        }
+    }
     for requirement in flow_requirements {
         let Some((index, _)) = candidates
             .iter()
@@ -972,6 +1000,41 @@ mod golden_tests {
             codestory_contracts::api::GraphArtifactDto::Uml { graph, .. }
                 if graph.edges.iter().any(|edge| edge.id.0 == "request-to-send")
         )));
+    }
+
+    #[test]
+    fn owner_member_probe_carries_its_exact_hit_before_higher_ranked_distractors() {
+        let query = PacketPlanQueryDto {
+            query: "BaseRequest.finalize".to_string(),
+            purpose: PACKET_OWNER_MEMBER_QUERY_PURPOSE.to_string(),
+        };
+        let pending = vec![(0usize, &query)];
+        let mut exact = dense_distractor("exact-owner-member");
+        exact.hit.display_name = "BaseRequest.finalize".to_string();
+        exact.hit.file_path = Some("pkgs/http/lib/src/base_request.dart".to_string());
+        exact.hit.score = 0.01;
+        exact.hit.eligible_for_sufficiency = Some(true);
+        exact.hit.evidence_tier = Some(PacketEvidenceTierDto::ResolvedGraph);
+        let results = vec![(
+            query.query.clone(),
+            vec![dense_distractor("higher-ranked"), exact],
+        )];
+        let mut answer = empty_answer("Explain BaseRequest finalization.");
+
+        merge_packet_fused_subquery_batch(
+            &mut answer,
+            &pending,
+            &results,
+            1,
+            &[],
+            false,
+            &["unrelated".to_string()],
+            1,
+            &[],
+        );
+
+        assert_eq!(answer.citations.len(), 1);
+        assert_eq!(answer.citations[0].display_name, "BaseRequest.finalize");
     }
 
     #[test]

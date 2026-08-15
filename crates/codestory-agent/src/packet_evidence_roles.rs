@@ -162,7 +162,14 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
         NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
     );
 
-    if path.ends_with(".sql") && normalized_display.starts_with("createtable") {
+    if path.ends_with(".sql")
+        && (normalized_display.starts_with("createtable")
+            || (citation.kind == NodeKind::CLASS
+                && citation
+                    .evidence_producer
+                    .as_deref()
+                    .is_some_and(|producer| producer.contains("structural_sql"))))
+    {
         Some(PacketEvidenceRole::SqlTableDefinition)
     } else if path.ends_with(".sql")
         && display_is_sql_relationship_constraint(&citation.display_name)
@@ -932,6 +939,15 @@ mod tests {
         assert_eq!(
             packet_evidence_role(&citation("CHECK constraint", "db/schema.sql")),
             Some(PacketEvidenceRole::SqlSchemaFile)
+        );
+
+        let mut structural_table = citation("public.Invoice", "db/schema.sql");
+        structural_table.kind = NodeKind::CLASS;
+        structural_table.evidence_producer =
+            Some("verified_structural_sql_collector_source_read".to_string());
+        assert_eq!(
+            packet_evidence_role(&structural_table),
+            Some(PacketEvidenceRole::SqlTableDefinition)
         );
     }
 

@@ -13,7 +13,8 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, AgentPacketRequestDto, BoundedDrillPlanDto, DrillOptionDto,
     EdgeKind, EmbeddingVectorPublicationIdentityDto, GraphArtifactDto, GraphResponse,
     PACKET_DRILL_MAX_BYTES, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS,
-    PACKET_DRILL_MAX_OPTIONS, PacketDispositionDto, PacketDispositionKindDto, PacketPlanDto,
+    PACKET_DRILL_MAX_OPTIONS, PacketClaimObligationDto, PacketClaimObligationKindDto,
+    PacketDispositionDto, PacketDispositionKindDto, PacketObligationProofStatusDto, PacketPlanDto,
     PacketProbeResolutionStatusDto, PacketQueryCompletionDto, SupportUnitDto, SupportUnitKindDto,
     decode_drill_option_id,
 };
@@ -272,8 +273,9 @@ fn classify_packet_disposition(input: ClassifyPacketDispositionInput<'_>) -> Pac
     }
 
     let drill_options = collect_drill_options(input.question, input.plan, input.answer);
+    let has_unmet_material = packet_has_unmet_blocking_material(input.plan);
     if input.already_drilled {
-        return terminal_after_drill(input.support, drill_options);
+        return terminal_after_drill(input.support, drill_options, has_unmet_material);
     }
     if !drill_options.is_empty() {
         let gap_ids = drill_options
@@ -300,6 +302,12 @@ fn classify_packet_disposition(input: ClassifyPacketDispositionInput<'_>) -> Pac
             },
         );
     }
+    if has_unmet_material {
+        return PacketDispositionDto::not_established(
+            "material packet obligations remain unproven after the bounded retrieval pass"
+                .to_string(),
+        );
+    }
     if has_positive_support(input.support) {
         PacketDispositionDto::supported()
     } else {
@@ -317,9 +325,14 @@ fn has_positive_support(support: &[SupportUnitDto]) -> bool {
 
 fn terminal_after_drill(
     support: &[SupportUnitDto],
-    _unused_options: Vec<DrillOptionDto>,
+    remaining_options: Vec<DrillOptionDto>,
+    has_unmet_material: bool,
 ) -> PacketDispositionDto {
-    let disposition = if has_positive_support(support) {
+    let disposition = if has_unmet_material || !remaining_options.is_empty() {
+        PacketDispositionDto::not_established(
+            "the bounded drill did not establish every material evidence obligation".to_string(),
+        )
+    } else if has_positive_support(support) {
         PacketDispositionDto::supported()
     } else {
         PacketDispositionDto::not_established(
@@ -332,6 +345,28 @@ fn terminal_after_drill(
         "merge cannot emit another drill"
     );
     disposition
+}
+
+/// A generated free-text identity is a useful retrieval lead, but it is not an explicit typed
+/// probe and cannot turn an otherwise complete broad packet into a false negative. Behavioral and
+/// structural flow rows remain blocking, as do exact probes the caller explicitly bound.
+fn material_claim_blocks_supported(obligation: &PacketClaimObligationDto) -> bool {
+    obligation.material
+        && (obligation.kind != PacketClaimObligationKindDto::ExactProbe
+            || obligation.probe_binding.is_some())
+}
+
+fn packet_has_unmet_blocking_material(plan: &PacketPlanDto) -> bool {
+    plan.obligations.claim_obligations.iter().any(|obligation| {
+        material_claim_blocks_supported(obligation)
+            && obligation.proof_status != PacketObligationProofStatusDto::Proven
+    }) || plan.obligations.query_obligations.iter().any(|obligation| {
+        obligation.material
+            && !matches!(
+                obligation.completion,
+                Some(PacketQueryCompletionDto::Completed)
+            )
+    })
 }
 
 fn first_ambiguous_probe(plan: &PacketPlanDto) -> Option<String> {
@@ -396,7 +431,10 @@ fn collect_drill_options(
         .obligations
         .claim_obligations
         .iter()
-        .filter(|obligation| obligation.material)
+        .filter(|obligation| {
+            material_claim_blocks_supported(obligation)
+                && obligation.proof_status != PacketObligationProofStatusDto::Proven
+        })
     {
         if let Some(edge_kind) = obligation.required_edge_kind
             && matches!(edge_kind, EdgeKind::CALL | EdgeKind::INHERITANCE)
@@ -411,6 +449,30 @@ fn collect_drill_options(
                 DrillOptionDto::omitted_symbol(format!("omitted-edge:{}", obligation.id), target);
             if seen.insert(option.id.clone()) {
                 options.push(option);
+            }
+        }
+        let named_schema_gap = obligation
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("named_sql_table_carriers_missing:"));
+        if !named_schema_gap && let Some(node) = obligation.carrier_node_ids.first() {
+            let option = DrillOptionDto::omitted_symbol(
+                format!("omitted-material:{}", obligation.id),
+                &node.0,
+            );
+            if seen.insert(option.id.clone()) {
+                options.push(option);
+            }
+        } else if !named_schema_gap && let Some(path) = obligation.carrier_paths.first() {
+            let display = packet_display_path(path);
+            if !cited_paths.contains(&display) {
+                let option = DrillOptionDto::bounded_source_read(
+                    format!("omitted-material-path:{}", obligation.id),
+                    display,
+                );
+                if seen.insert(option.id.clone()) {
+                    options.push(option);
+                }
             }
         }
         if obligation
@@ -543,6 +605,143 @@ mod tests {
         }
     }
 
+    fn claim_obligation(
+        kind: PacketClaimObligationKindDto,
+        status: PacketObligationProofStatusDto,
+    ) -> PacketClaimObligationDto {
+        PacketClaimObligationDto {
+            id: "material-flow".to_string(),
+            kind,
+            binding_terms: Vec::new(),
+            probe_binding: None,
+            material: true,
+            allowed_node_kinds: Vec::new(),
+            required_edge_kind: None,
+            requires_complete_discovery: false,
+            proof_status: status,
+            reason: None,
+            carrier_node_ids: Vec::new(),
+            carrier_paths: Vec::new(),
+            carrier_edge_proofs: Vec::new(),
+            open_next_candidates: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn positive_support_cannot_hide_an_unproven_material_flow() {
+        let mut packet = test_packet("explain routing", 98_304);
+        packet.answer.freshness = Some(fresh_index_observation());
+        packet.answer.citations = vec![eligible_citation("Router.use", "src/router.rs")];
+        let mut obligation = claim_obligation(
+            PacketClaimObligationKindDto::Dispatch,
+            PacketObligationProofStatusDto::Reported,
+        );
+        obligation.carrier_node_ids = vec![NodeId("Router.use".to_string())];
+        packet.plan = empty_plan();
+        packet.plan.obligations.claim_obligations = vec![obligation];
+
+        let (_support, disposition) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            None,
+        );
+
+        assert_eq!(disposition.kind, PacketDispositionKindDto::DrillOnce);
+        let options = disposition.drill.expect("bounded drill").options;
+        assert!(
+            options
+                .iter()
+                .any(|option| { option.symbol_id.as_deref() == Some("Router.use") })
+        );
+    }
+
+    #[test]
+    fn a_material_flow_still_unproven_after_drill_is_terminal_not_established() {
+        let mut packet = test_packet("explain routing", 98_304);
+        packet.answer.freshness = Some(fresh_index_observation());
+        packet.answer.citations = vec![eligible_citation("Router.use", "src/router.rs")];
+        let mut obligation = claim_obligation(
+            PacketClaimObligationKindDto::Dispatch,
+            PacketObligationProofStatusDto::Reported,
+        );
+        obligation.carrier_node_ids = vec![NodeId("Router.use".to_string())];
+        packet.plan = empty_plan();
+        packet.plan.obligations.claim_obligations = vec![obligation];
+        let request = AgentPacketRequestDto {
+            question: packet.question.clone(),
+            budget: Default::default(),
+            task_class: None,
+            probes: Vec::new(),
+            extra_probes: Vec::new(),
+            include_evidence: true,
+            latency_budget_ms: None,
+            parent_packet_id: Some(packet.packet_id.clone()),
+            option_ids: vec!["omitted_mandatory_support:symbol%3ARouter.use".to_string()],
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+
+        let (_support, disposition) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            Some(&request),
+        );
+
+        assert_eq!(disposition.kind, PacketDispositionKindDto::NotEstablished);
+        assert!(disposition.is_terminal());
+    }
+
+    #[test]
+    fn generated_free_text_exact_lead_does_not_block_a_complete_broad_packet() {
+        let mut packet = test_packet("explain the AutoMapper APIs", 98_304);
+        packet.answer.freshness = Some(fresh_index_observation());
+        packet.answer.citations = vec![eligible_citation(
+            "MapperConfiguration.BuildExecutionPlan",
+            "src/mapper_configuration.cs",
+        )];
+        packet.plan = empty_plan();
+        packet.plan.obligations.claim_obligations = vec![claim_obligation(
+            PacketClaimObligationKindDto::ExactProbe,
+            PacketObligationProofStatusDto::Unsupported,
+        )];
+
+        let (_support, disposition) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            None,
+        );
+
+        assert_eq!(disposition.kind, PacketDispositionKindDto::Supported);
+    }
+
+    #[test]
+    fn proven_material_flow_with_positive_support_is_supported() {
+        let mut packet = test_packet("explain routing", 98_304);
+        packet.answer.freshness = Some(fresh_index_observation());
+        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.rs")];
+        packet.plan = empty_plan();
+        packet.plan.obligations.claim_obligations = vec![claim_obligation(
+            PacketClaimObligationKindDto::Dispatch,
+            PacketObligationProofStatusDto::Proven,
+        )];
+
+        let (_support, disposition) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            None,
+        );
+
+        assert_eq!(disposition.kind, PacketDispositionKindDto::Supported);
+    }
+
     #[test]
     fn source_range_support_stays_bound_to_its_retained_citation() {
         let mut packet = test_packet("explain routing", 98_304);
@@ -622,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_after_drill_cannot_emit_another_drill() {
+    fn unresolved_named_path_after_drill_is_terminal_not_established() {
         let mut packet = test_packet("explain routing", 98_304);
         packet.answer.freshness = Some(fresh_index_observation());
         packet.answer.citations = vec![eligible_citation(
@@ -667,7 +866,7 @@ mod tests {
         );
         assert_ne!(disposition.kind, PacketDispositionKindDto::DrillOnce);
         assert!(disposition.is_terminal());
-        assert_eq!(disposition.kind, PacketDispositionKindDto::Supported);
+        assert_eq!(disposition.kind, PacketDispositionKindDto::NotEstablished);
     }
 
     #[test]

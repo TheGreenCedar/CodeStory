@@ -17,6 +17,18 @@ use codestory_contracts::api::{
 };
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+pub(crate) const PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE: &str = "material owner/member probe";
+pub(crate) const PACKET_MATERIAL_SCHEMA_ENTITY_ROLE: &str = "material schema entity";
+
+fn packet_citation_has_protected_probe_role(citation: &AgentCitationDto) -> bool {
+    matches!(
+        citation.coverage_role.as_deref(),
+        Some("explicit exact probe")
+            | Some(PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE)
+            | Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE)
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PacketUtilityHeapEntry {
     candidate_index: usize,
@@ -53,7 +65,7 @@ pub(crate) fn cap_citations(answer: &mut AgentAnswerDto, limits: &PacketBudgetLi
     let protected = answer
         .citations
         .iter()
-        .filter(|citation| citation.coverage_role.as_deref() == Some("explicit exact probe"))
+        .filter(|citation| packet_citation_has_protected_probe_role(citation))
         .map(packet_citation_key)
         .collect::<HashSet<_>>();
     cap_citations_with_priorities(answer, limits, &protected, &protected)
@@ -753,7 +765,7 @@ pub(crate) fn cap_packet_citations_with_obligation_carriers(
         answer
             .citations
             .iter()
-            .filter(|citation| citation.coverage_role.as_deref() == Some("explicit exact probe"))
+            .filter(|citation| packet_citation_has_protected_probe_role(citation))
             .map(packet_citation_key),
     );
     let mut obligation_value_keys = required_probe_keys;
@@ -1638,6 +1650,45 @@ mod tests {
         assert!(cap_citations(&mut answer, &limits));
         assert_eq!(answer.citations.len(), 1);
         assert_eq!(answer.citations[0].display_name, "selected");
+    }
+
+    #[test]
+    fn material_owner_member_anchor_survives_citation_capping() {
+        let ordinary = citation("ordinary", "src/ordinary.rs", 500.0);
+        let mut material = citation("Site.render", "src/site.rb", 1.0);
+        material.coverage_role = Some(PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE.to_string());
+        let mut answer = answer_fixture(vec![ordinary, material]);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 1,
+            max_files: 1,
+            max_snippets: 1,
+            max_trail_edges: 1,
+            max_output_bytes: 1024,
+        };
+
+        assert!(cap_citations(&mut answer, &limits));
+        assert_eq!(answer.citations.len(), 1);
+        assert_eq!(answer.citations[0].display_name, "Site.render");
+    }
+
+    #[test]
+    fn material_schema_entity_survives_citation_capping() {
+        let ordinary = citation("ordinary", "src/ordinary.rs", 500.0);
+        let mut material = citation("public.Invoice", "db/schema.sql", 1.0);
+        material.coverage_role = Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
+        material.eligible_for_sufficiency = Some(false);
+        let mut answer = answer_fixture(vec![ordinary, material]);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 1,
+            max_files: 1,
+            max_snippets: 1,
+            max_trail_edges: 1,
+            max_output_bytes: 1024,
+        };
+
+        assert!(cap_citations(&mut answer, &limits));
+        assert_eq!(answer.citations.len(), 1);
+        assert_eq!(answer.citations[0].display_name, "public.Invoice");
     }
 
     #[test]

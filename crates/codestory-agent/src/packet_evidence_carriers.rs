@@ -294,7 +294,17 @@ pub fn citation_owns_client_public_facade_helper(citation: &AgentCitationDto) ->
         return false;
     }
     let path_tokens = path_tokens(citation);
-    has_token(&path_tokens, &["api"])
+    let public_api_surface = has_token(&path_tokens, &["api"])
+        || path(citation)
+            .rsplit_once("/lib/")
+            .is_some_and(|(_, relative)| {
+                !relative.contains('/')
+                    && has_token(
+                        &path_tokens,
+                        &["http", "https", "request", "requests", "client"],
+                    )
+            });
+    public_api_surface
         && !names_or_path_token(
             citation,
             &[
@@ -469,9 +479,12 @@ pub fn client_public_facade_successor_call_target(display_name: &str) -> bool {
             "monitoring",
             "observability",
         ],
-    ) && tokens.windows(2).last().is_some_and(|tail| {
+    ) && (tokens.windows(2).last().is_some_and(|tail| {
         tail[1] == "request" && matches!(tail[0].as_str(), "client" | "session")
-    })
+    }) || tokens
+        .windows(2)
+        .last()
+        .is_some_and(|tail| tail == ["with", "client"]))
 }
 
 /// Typed CALL sources that precede the client/session dispatch stage.
@@ -2164,6 +2177,7 @@ mod tests {
         for (name, path) in [
             ("request", "src/requests/api.py"),
             ("get", "lib/transportkit/api.py"),
+            ("get", "pkgs/http/lib/http.dart"),
         ] {
             assert!(citation_owns_client_public_facade_helper(&citation(
                 name,
@@ -2182,6 +2196,7 @@ mod tests {
             ("Session.request", "src/requests/api.py", NodeKind::METHOD),
             ("Cache.request", "src/requests/api.py", NodeKind::METHOD),
             ("dispatch_hook", "src/requests/api.py", NodeKind::FUNCTION),
+            ("get", "pkgs/http/lib/src/http.dart", NodeKind::FUNCTION),
         ] {
             assert!(!citation_owns_client_public_facade_helper(&citation(
                 name, path, kind,

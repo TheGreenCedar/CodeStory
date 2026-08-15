@@ -815,6 +815,85 @@ pub fn packet_prompt_exact_symbol_probe_queries(
     queries
 }
 
+/// Extract table identities from the ordinary relational-schema phrasing "between A, B, and C".
+/// These are bounded source anchors, not benchmark labels: the same parser turns "customers,
+/// orders, and order items" into `customer`, `order`, and `order item` queries.
+pub fn packet_named_schema_entity_queries(question: &str) -> Vec<String> {
+    let lower = question.to_ascii_lowercase();
+    let Some(start) = [" between ", " among "]
+        .into_iter()
+        .filter_map(|marker| lower.find(marker).map(|index| index + marker.len()))
+        .min()
+    else {
+        return Vec::new();
+    };
+    let tail = &lower[start..];
+    let end = [" across ", " within ", " using ", " from ", "."]
+        .into_iter()
+        .filter_map(|marker| tail.find(marker))
+        .min()
+        .unwrap_or(tail.len());
+    let segment = tail[..end].replace(" and ", ",");
+    let mut queries = Vec::new();
+    for phrase in segment.split(',') {
+        let words = phrase
+            .split_whitespace()
+            .map(|word| word.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')))
+            .filter(|word| !word.is_empty() && !matches!(*word, "a" | "an" | "the"))
+            .collect::<Vec<_>>();
+        if words.is_empty()
+            || words.len() > 3
+            || words.iter().any(|word| {
+                matches!(
+                    *word,
+                    "database"
+                        | "relation"
+                        | "relations"
+                        | "relationship"
+                        | "relationships"
+                        | "schema"
+                        | "sql"
+                        | "table"
+                        | "tables"
+                )
+            })
+        {
+            continue;
+        }
+        let mut normalized = words
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect::<Vec<_>>();
+        if let Some(last) = normalized.last_mut() {
+            if let Some(stem) = last.strip_suffix("ies") {
+                *last = format!("{stem}y");
+            } else if let Some(stem) = last.strip_suffix("sses") {
+                *last = format!("{stem}ss");
+            } else if last.ends_with('s') && !last.ends_with("ss") {
+                last.pop();
+            }
+        }
+        let query = normalized.join(" ");
+        if query.len() >= 3 && !queries.iter().any(|existing| existing == &query) {
+            queries.push(query);
+        }
+        if queries.len() == 8 {
+            break;
+        }
+    }
+    queries
+}
+
+/// Query the SQL collector's canonical default-schema identity for each named entity. The
+/// collector deliberately assigns unqualified tables to `public`, so this asks for its exact
+/// durable symbol instead of hoping a broad noun query outranks every seed file containing it.
+pub fn packet_named_schema_entity_symbol_queries(question: &str) -> Vec<String> {
+    packet_named_schema_entity_queries(question)
+        .into_iter()
+        .map(|entity| format!("public.{}", entity.replace(' ', "")))
+        .collect()
+}
+
 fn push_unique_exact_symbol_term(terms: &mut Vec<String>, value: &str) {
     let value = value.trim();
     if value.len() >= 3 && !terms.iter().any(|term| term == value) {
@@ -834,7 +913,14 @@ fn packet_prompt_exact_symbol_term_is_probe(term: &str) -> bool {
         .chars()
         .filter(|ch| ch.is_ascii_alphabetic())
         .collect::<Vec<_>>();
-    !letters.is_empty() && !letters.iter().all(|ch| ch.is_ascii_uppercase())
+    if letters.is_empty() || letters.iter().all(|ch| ch.is_ascii_uppercase()) {
+        return false;
+    }
+    let plural_acronym = letters.last() == Some(&'s')
+        && letters[..letters.len() - 1]
+            .iter()
+            .all(|ch| ch.is_ascii_uppercase());
+    !plural_acronym
 }
 
 fn packet_prompt_exact_symbol_term_is_source_path(term: &str) -> bool {
@@ -2191,6 +2277,40 @@ mod tests {
             coverage_role: None,
             eligible_for_sufficiency: None,
         }
+    }
+
+    #[test]
+    fn prompt_exact_symbol_queries_reject_plural_acronyms() {
+        let queries = packet_prompt_exact_symbol_probe_queries(
+            "Explain how the AutoMapper APIs build and execute a mapping plan",
+            &[],
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+
+        assert!(queries.iter().any(|query| query == "AutoMapper"));
+        assert!(!queries.iter().any(|query| query == "APIs"));
+    }
+
+    #[test]
+    fn named_schema_entities_are_bounded_and_singularized() {
+        assert_eq!(
+            packet_named_schema_entity_queries(
+                "Explain relationships between customers, orders, and order items across SQL scripts."
+            ),
+            ["customer", "order", "order item"]
+        );
+        assert_eq!(
+            packet_named_schema_entity_queries(
+                "Explain relationships between artists, albums, tracks, invoices, and invoice lines across the seed scripts."
+            ),
+            ["artist", "album", "track", "invoice", "invoice line"]
+        );
+        assert_eq!(
+            packet_named_schema_entity_symbol_queries(
+                "Explain relationships between artists, albums, and invoice lines across the seed scripts."
+            ),
+            ["public.artist", "public.album", "public.invoiceline"]
+        );
     }
 
     #[test]

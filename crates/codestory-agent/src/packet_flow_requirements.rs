@@ -65,7 +65,7 @@ const BEHAVIORAL_OWNER_NODE_KINDS: &[NodeKind] = &[
     NodeKind::STRUCT,
     NodeKind::CLASS,
 ];
-const SQL_SCHEMA_NODE_KINDS: &[NodeKind] = &[NodeKind::FILE, NodeKind::ANNOTATION];
+const SQL_SCHEMA_NODE_KINDS: &[NodeKind] = &[NodeKind::FILE, NodeKind::ANNOTATION, NodeKind::CLASS];
 
 type SymbolPredicate = fn(&str) -> bool;
 type OrderedCallBoundary = (SymbolPredicate, SymbolPredicate);
@@ -877,15 +877,27 @@ const URL_SESSION_FLOW: &[FlowRequirement] = &[
 const CLIENT_PUBLIC_FACADE_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "client_public_facade",
     role: FlowRole::Entrypoint,
-    query_seeds: &["http top level helper", "public client facade"],
+    query_seeds: &["http public get request", "public client facade"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     evidence: EvidencePredicate::CitedRolesOrCallBoundary {
-        subsystem: flow_belongs_to_client_request,
+        subsystem: flow_belongs_to_public_client_factory,
         roles: &[PacketEvidenceRole::ClientFactory],
         carrier: citation_owns_client_public_facade_helper,
         call_target: Some(client_public_facade_successor_call_target),
     },
 };
+
+fn flow_belongs_to_public_client_factory(citation: &AgentCitationDto) -> bool {
+    if citation.kind != NodeKind::FUNCTION || !flow_belongs_to_client_request(citation) {
+        return false;
+    }
+    let terminal = citation
+        .display_name
+        .rsplit(['.', ':', '#'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(citation.display_name.as_str());
+    !terminal.starts_with('_')
+}
 
 const CLIENT_INTERFACE_HELPERS_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "client_interface_helpers",
@@ -2202,6 +2214,20 @@ mod tests {
                 .call_boundary_target(&established_factory)
                 .is_none()
         );
+        for internal_factory in [
+            witness(
+                "CronetClient._createProfile",
+                "lib/src/cronet_client.dart",
+                NodeKind::METHOD,
+            ),
+            witness("_createClient", "lib/client.dart", NodeKind::FUNCTION),
+            witness("createClient", "lib/client.dart", NodeKind::METHOD),
+        ] {
+            assert!(
+                !requirement.evidence.citation_proves(&internal_factory),
+                "an internal helper is not the package's public facade: {internal_factory:?}"
+            );
+        }
 
         let helper = witness("request", "src/requests/api.py", NodeKind::FUNCTION);
         assert!(requirement.evidence.citation_proves(&helper));
@@ -2224,6 +2250,14 @@ mod tests {
                 .evidence
                 .call_boundary_target(&other_package_helper)
                 .is_some_and(|target| target("HttpClient.request"))
+        );
+        let library_entry_helper = witness("get", "pkgs/http/lib/http.dart", NodeKind::FUNCTION);
+        assert!(requirement.evidence.citation_proves(&library_entry_helper));
+        assert!(
+            requirement
+                .evidence
+                .call_boundary_target(&library_entry_helper)
+                .is_some_and(|target| target("_withClient"))
         );
         for negative in [
             "request",
@@ -2249,6 +2283,7 @@ mod tests {
             witness("request", "src/monitoring/api.py", NodeKind::FUNCTION),
             witness("FrameKind.request", "src/requests/api.py", NodeKind::METHOD),
             witness("dispatch_hook", "src/requests/api.py", NodeKind::FUNCTION),
+            witness("get", "pkgs/http/lib/src/http.dart", NodeKind::FUNCTION),
         ] {
             assert!(!requirement.evidence.citation_proves(&wrong_carrier));
             assert!(
@@ -3340,6 +3375,9 @@ mod tests {
             "telemetry",
             "monitoring",
             "observability",
+            // Exact public-facade successor `_withClient` is the bounded wrapper that owns the
+            // client lifetime before delegating to `Client`.
+            "with",
         ]
         .into_iter()
         .map(str::to_string)

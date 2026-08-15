@@ -21,7 +21,13 @@ use super::trace::field;
 use crate::{AppController, clamp_u128_to_u32};
 use codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms;
 use codestory_agent::packet_obligations::preview_packet_obligation_plan_before_budget;
+use codestory_agent::packet_plan::packet_owner_member_probe_queries;
 pub(crate) use codestory_agent::packet_scoring::packet_file_stem_matches_query;
+use codestory_agent::planning::{
+    PACKET_ADJACENT_VARIANT_QUERY_PURPOSE, PACKET_CONCRETE_FILE_QUERY_PURPOSE,
+    PACKET_FLOW_ROLE_QUERY_PURPOSE, PACKET_GENERIC_TERM_QUERY_PURPOSE,
+    PACKET_OWNER_MEMBER_QUERY_PURPOSE, packet_plan_query_is_exact_symbol_identity,
+};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError,
     PacketBudgetLimitsDto, PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto,
@@ -407,21 +413,45 @@ fn packet_adaptive_material_queries(
         true
     };
 
-    let mut missing_material_without_query = false;
-    for obligation in preview.claim_obligations.iter().filter(|obligation| {
-        obligation.material
-            && obligation.proof_status
-                != codestory_contracts::api::PacketObligationProofStatusDto::Proven
-    }) {
-        let mut added_query = false;
-        for query in obligation
-            .open_next_candidates
-            .iter()
-            .chain(obligation.carrier_paths.iter())
-        {
-            added_query |= push(query, format!("material obligation {}", obligation.id));
+    let missing_material = preview
+        .claim_obligations
+        .iter()
+        .filter(|obligation| {
+            obligation.material
+                && obligation.proof_status
+                    != codestory_contracts::api::PacketObligationProofStatusDto::Proven
+        })
+        .collect::<Vec<_>>();
+    let mut obligation_added_query = vec![false; missing_material.len()];
+
+    // Give every open material claim one semantic query before any claim can consume the
+    // remainder of the fixed batch with fallback paths.
+    for (index, obligation) in missing_material.iter().enumerate() {
+        if let Some(query) = obligation.open_next_candidates.first() {
+            obligation_added_query[index] |=
+                push(query, format!("material obligation {}", obligation.id));
         }
-        missing_material_without_query |= !added_query;
+    }
+
+    let structural_schema_flow = missing_material
+        .iter()
+        .any(|obligation| obligation.id.starts_with("sql_"));
+    if !missing_material.is_empty() && !structural_schema_flow {
+        let anchor_labels = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.clone())
+            .collect::<Vec<_>>();
+        for query in packet_owner_member_probe_queries(question, &anchor_labels, limit.min(10)) {
+            let _ = push(&query, PACKET_OWNER_MEMBER_QUERY_PURPOSE.to_string());
+        }
+    }
+
+    for (index, obligation) in missing_material.iter().enumerate() {
+        for query in obligation.open_next_candidates.iter().skip(1) {
+            obligation_added_query[index] |=
+                push(query, format!("material obligation {}", obligation.id));
+        }
     }
 
     for obligation in plan
@@ -436,6 +466,14 @@ fn packet_adaptive_material_queries(
         );
     }
 
+    for (index, obligation) in missing_material.iter().enumerate() {
+        for query in &obligation.carrier_paths {
+            obligation_added_query[index] |=
+                push(query, format!("material obligation {}", obligation.id));
+        }
+    }
+
+    let missing_material_without_query = obligation_added_query.iter().any(|added| !added);
     if missing_material_without_query {
         for query in packet_anchor_probe_queries(plan) {
             let _ = push(&query, "unresolved material behavior anchor".to_string());
@@ -692,10 +730,11 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
         .enumerate()
         .filter(|query| {
             let query = query.1;
-            query.purpose.contains("symbol probe")
-                || packet_task_seed_anchor_probe(&query.query)
-                || query.purpose.contains("concrete symbol")
-                || is_packet_code_like_term(&query.query)
+            !packet_anchor_probe_is_instruction_noise(query)
+                && (query.purpose.contains("symbol probe")
+                    || packet_task_seed_anchor_probe(&query.query)
+                    || query.purpose.contains("concrete symbol")
+                    || is_packet_code_like_term(&query.query))
         })
         .collect::<Vec<_>>();
     ranked.sort_by_key(|(index, query)| {
@@ -755,15 +794,55 @@ fn packet_anchor_required_probe_keys(plan: &PacketPlanDto) -> HashSet<String> {
 }
 
 fn packet_anchor_probe_priority(query: &PacketPlanQueryDto) -> u8 {
-    if query.purpose.contains("symbol probe") {
+    if packet_plan_query_is_exact_symbol_identity(query) {
         0
-    } else if packet_task_seed_anchor_probe(&query.query) {
+    } else if matches!(
+        query.purpose.as_str(),
+        PACKET_FLOW_ROLE_QUERY_PURPOSE | PACKET_CONCRETE_FILE_QUERY_PURPOSE
+    ) || (packet_anchor_probe_has_strong_code_shape(&query.query)
+        && !matches!(
+            query.purpose.as_str(),
+            PACKET_ADJACENT_VARIANT_QUERY_PURPOSE | PACKET_GENERIC_TERM_QUERY_PURPOSE
+        ))
+    {
         1
-    } else if packet_anchor_probe_has_strong_code_shape(&query.query) {
+    } else if query.purpose.contains("concrete symbol") {
         2
-    } else {
+    } else if packet_task_seed_anchor_probe(&query.query) {
         3
+    } else if matches!(
+        query.purpose.as_str(),
+        PACKET_ADJACENT_VARIANT_QUERY_PURPOSE | PACKET_GENERIC_TERM_QUERY_PURPOSE
+    ) {
+        5
+    } else {
+        4
     }
+}
+
+fn packet_anchor_probe_is_instruction_noise(query: &PacketPlanQueryDto) -> bool {
+    if packet_plan_query_is_exact_symbol_identity(query)
+        || packet_anchor_probe_has_strong_code_shape(&query.query)
+    {
+        return false;
+    }
+    matches!(
+        normalize_identifier(&query.query).as_str(),
+        "answer"
+            | "cite"
+            | "cites"
+            | "explain"
+            | "file"
+            | "files"
+            | "name"
+            | "names"
+            | "source"
+            | "sources"
+            | "supporting"
+            | "symbol"
+            | "symbols"
+            | "trace"
+    )
 }
 
 fn packet_task_seed_anchor_probe(query: &str) -> bool {
@@ -856,6 +935,31 @@ mod tests {
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
+        }
+    }
+
+    fn anchor_citation(display_name: &str) -> codestory_contracts::api::AgentCitationDto {
+        codestory_contracts::api::AgentCitationDto {
+            node_id: codestory_contracts::api::NodeId(display_name.to_string()),
+            display_name: display_name.to_string(),
+            kind: codestory_contracts::api::NodeKind::FUNCTION,
+            file_path: Some("src/site.rb".to_string()),
+            line: Some(1),
+            score: 1.0,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
         }
     }
 
@@ -1228,6 +1332,120 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_queries_use_retrieved_owners_for_missing_lifecycle_members() {
+        let question = "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases. Cite the source files and name the supporting symbols.";
+        let task_class = PacketTaskClassDto::RouteTracing;
+        let original = PacketPlanQueryDto {
+            query: question.to_string(),
+            purpose: "original task phrasing".to_string(),
+        };
+        let plan = PacketPlanDto {
+            task_class,
+            inferred_task_class: false,
+            queries: vec![original.clone()],
+            probe_resolutions: Vec::new(),
+            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
+                question,
+                task_class,
+                &[original],
+            ),
+            trace: Vec::new(),
+        };
+        let mut answer = empty_answer();
+        answer.citations.push(anchor_citation("Jekyll::Site.posts"));
+
+        let queries = packet_adaptive_material_queries(question, &plan, &answer, 16)
+            .into_iter()
+            .map(|query| query.query)
+            .collect::<Vec<_>>();
+
+        for expected in ["Site.read", "Site.generate", "Site.render", "Site.write"] {
+            assert!(
+                queries.iter().any(|query| query == expected),
+                "missing {expected} from {queries:?}"
+            );
+        }
+        assert!(queries.len() <= 16);
+    }
+
+    #[test]
+    fn adaptive_queries_reserve_batch_space_for_explicit_owner_members() {
+        let question = "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.";
+        let task_class = PacketTaskClassDto::DataFlow;
+        let original = PacketPlanQueryDto {
+            query: question.to_string(),
+            purpose: "original task phrasing".to_string(),
+        };
+        let plan = PacketPlanDto {
+            task_class,
+            inferred_task_class: false,
+            queries: vec![original.clone()],
+            probe_resolutions: Vec::new(),
+            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
+                question,
+                task_class,
+                &[original],
+            ),
+            trace: Vec::new(),
+        };
+
+        let queries = packet_adaptive_material_queries(question, &plan, &empty_answer(), 16)
+            .into_iter()
+            .map(|query| query.query)
+            .collect::<Vec<_>>();
+
+        for expected in ["BaseRequest.finalize", "IOClient.send"] {
+            assert!(
+                queries.iter().any(|query| query == expected),
+                "missing {expected} from {queries:?}"
+            );
+        }
+        assert!(queries.len() <= 16);
+    }
+
+    #[test]
+    fn adaptive_sql_queries_reserve_the_named_schema_entities() {
+        let question = "Explain schema relationships between artists, albums, tracks, invoices, and invoice lines across the SQL scripts.";
+        let task_class = PacketTaskClassDto::DataFlow;
+        let original = PacketPlanQueryDto {
+            query: question.to_string(),
+            purpose: "original task phrasing".to_string(),
+        };
+        let plan = PacketPlanDto {
+            task_class,
+            inferred_task_class: false,
+            queries: vec![original.clone()],
+            probe_resolutions: Vec::new(),
+            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
+                question,
+                task_class,
+                &[original],
+            ),
+            trace: Vec::new(),
+        };
+
+        let queries = packet_adaptive_material_queries(question, &plan, &empty_answer(), 16)
+            .into_iter()
+            .map(|query| query.query)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "public.artist",
+            "public.album",
+            "public.track",
+            "public.invoice",
+            "public.invoiceline",
+        ] {
+            assert!(
+                queries.iter().any(|query| query == expected),
+                "missing {expected} from {queries:?}"
+            );
+        }
+        assert!(!queries.iter().any(|query| query.starts_with("Chinook.")));
+        assert!(queries.len() <= 16);
+    }
+
+    #[test]
     fn packet_anchor_probe_queries_prioritize_symbol_probes_under_reduced_windows() {
         let plan = PacketPlanDto {
             task_class: PacketTaskClassDto::ArchitectureExplanation,
@@ -1426,6 +1644,80 @@ mod tests {
     }
 
     #[test]
+    fn packet_anchor_probe_queries_keep_distinct_late_phases_ahead_of_synthetic_variants() {
+        let plan = PacketPlanDto {
+            task_class: PacketTaskClassDto::RouteTracing,
+            inferred_task_class: false,
+            queries: vec![
+                PacketPlanQueryDto {
+                    query: "Trace how Jekyll builds a site through reading, rendering, and writing"
+                        .to_string(),
+                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
+                        .to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "Trace".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "Jekyll".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "build".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "reading".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "rendering".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "writing".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "build_site".to_string(),
+                    purpose: PACKET_ADJACENT_VARIANT_QUERY_PURPOSE.to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "reading_rendering".to_string(),
+                    purpose: PACKET_ADJACENT_VARIANT_QUERY_PURPOSE.to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "cite".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+            ],
+            probe_resolutions: Vec::new(),
+            obligations: Default::default(),
+            trace: Vec::new(),
+        };
+
+        let queries = packet_anchor_probe_queries(&plan);
+
+        assert_eq!(
+            &queries[..5],
+            &[
+                "Jekyll".to_string(),
+                "build".to_string(),
+                "reading".to_string(),
+                "rendering".to_string(),
+                "writing".to_string(),
+            ]
+        );
+        assert!(!queries.contains(&"Trace".to_string()));
+        assert!(!queries.contains(&"cite".to_string()));
+        assert!(
+            queries.iter().position(|query| query == "writing")
+                < queries.iter().position(|query| query == "build_site")
+        );
+    }
+
+    #[test]
     fn compact_flow_anchor_window_prioritizes_roles_over_generated_variants() {
         let mut queries = vec![PacketPlanQueryDto {
             query: "Explain the command execution flow".to_string(),
@@ -1439,7 +1731,7 @@ mod tests {
         ] {
             queries.push(PacketPlanQueryDto {
                 query: query.to_string(),
-                purpose: "symbol probe expanded from task wording".to_string(),
+                purpose: PACKET_FLOW_ROLE_QUERY_PURPOSE.to_string(),
             });
         }
         for index in 0..15 {

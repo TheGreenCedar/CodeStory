@@ -18,6 +18,9 @@ use crate::agent::packet_budget::{
     packet_budget_limits,
 };
 use crate::agent::packet_candidate::PacketSearchHit;
+use crate::agent::packet_capping::{
+    PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE, PACKET_MATERIAL_SCHEMA_ENTITY_ROLE,
+};
 #[cfg(test)]
 use crate::agent::packet_capping::{
     cap_citations, cap_packet_citations_with_obligation_carriers,
@@ -49,12 +52,14 @@ use crate::agent::packet_plan::{
     build_packet_plan, packet_concept_queries, packet_symbol_probe_queries,
 };
 use crate::agent::packet_plan::{
-    build_packet_plan_with_extra, packet_plan_annotation, packet_rank_terms,
+    build_packet_plan_with_extra, packet_owner_member_probe_queries, packet_plan_annotation,
+    packet_rank_terms,
 };
 use crate::agent::packet_probe::{
     exact_packet_probe_citations, exact_packet_probe_paths, normalize_packet_probe_request,
     resolve_packet_probes, resolved_packet_probe_queries,
 };
+use crate::agent::packet_required_probes::packet_named_schema_entity_symbol_queries;
 #[cfg(test)]
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries;
 #[cfg(test)]
@@ -108,10 +113,10 @@ use codestory_contracts::api::{
     GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, IndexFreshnessDto,
     IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
     NodeOccurrencesRequest, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto,
-    PacketObligationPlanDto, PacketPlanDto, PacketProbeDto, PacketTaskClassDto,
-    RetrievalAnnotationDto, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
-    SearchRepoTextMode, SearchRequest, SupportUnitDto, SupportUnitKindDto, TrailConfigDto,
-    TrailFilterOptionsDto,
+    PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketObligationPlanDto, PacketPlanDto,
+    PacketProbeDto, PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
+    SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, SupportUnitDto,
+    SupportUnitKindDto, TrailConfigDto, TrailFilterOptionsDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{
@@ -546,7 +551,11 @@ pub(crate) fn agent_packet(
     apply_packet_semantic_degradation_counters(&mut answer);
     append_packet_non_trace_phase(&mut answer, "shadow_and_trace", phase_started);
 
-    let sufficiency_extra_probes = packet_plan_sufficiency_extra_probes(&plan, &extra_probes);
+    let mut sufficiency_extra_probes = packet_plan_sufficiency_extra_probes(&plan, &extra_probes);
+    for probe in promote_retained_owner_member_probes(&question, &mut answer) {
+        push_packet_sufficiency_extra_probe(&mut sufficiency_extra_probes, &probe);
+    }
+    promote_retained_schema_entity_probes(&question, &mut answer);
     let exact_probe_paths = exact_packet_probe_paths(&plan.probe_resolutions);
     let phase_started = Instant::now();
     let obligation_edge_proofs = capture_packet_obligation_edge_proofs_before_budget(
@@ -567,6 +576,11 @@ pub(crate) fn agent_packet(
         protected_packet_obligation_edge_ids(&obligation_edge_proofs),
     );
     append_packet_non_trace_phase(&mut answer, "budget", phase_started);
+
+    // Structural collectors are discovery aids until the runtime rereads the cited source range.
+    // Enrich them before final obligation classification so an exact, retained source receipt can
+    // prove a structural flow without globally trusting generated structural projections.
+    let source_support = append_packet_carrier_source_sections(controller, &mut answer, &limits);
 
     // Coverage belongs to the evidence that survives the real citation cap. Observing the
     // uncapped candidate set made a packet unavailable because of a partial file that the packet
@@ -606,7 +620,6 @@ pub(crate) fn agent_packet(
         &limits,
         Some(&plan.obligations),
     );
-    let source_support = append_packet_carrier_source_sections(controller, &mut answer, &limits);
     if let Some(section) = packet_resolved_relations_section(&answer) {
         answer.sections.push(section);
     }
@@ -692,6 +705,75 @@ fn packet_plan_sufficiency_extra_probes(
         }
     }
     probes
+}
+
+fn promote_retained_owner_member_probes(
+    question: &str,
+    answer: &mut AgentAnswerDto,
+) -> Vec<String> {
+    let anchor_labels = answer
+        .citations
+        .iter()
+        .map(|citation| citation.display_name.clone())
+        .collect::<Vec<_>>();
+    let probes = packet_owner_member_probe_queries(question, &anchor_labels, 10)
+        .into_iter()
+        .filter(|probe| {
+            let probe = normalize_identifier(probe);
+            answer.citations.iter().any(|citation| {
+                citation.origin == SearchHitOrigin::IndexedSymbol
+                    && citation.resolvable
+                    && citation.eligible_for_sufficiency == Some(true)
+                    && normalize_identifier(&citation.display_name) == probe
+            })
+        })
+        .collect::<Vec<_>>();
+    let probe_keys = probes
+        .iter()
+        .map(|probe| normalize_identifier(probe))
+        .collect::<HashSet<_>>();
+    for citation in &mut answer.citations {
+        if citation.origin == SearchHitOrigin::IndexedSymbol
+            && citation.resolvable
+            && citation.eligible_for_sufficiency == Some(true)
+            && probe_keys.contains(&normalize_identifier(&citation.display_name))
+            && citation.coverage_role.is_none()
+        {
+            citation.coverage_role = Some(PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE.to_string());
+        }
+    }
+    probes
+}
+
+fn promote_retained_schema_entity_probes(question: &str, answer: &mut AgentAnswerDto) {
+    let probe_keys = packet_named_schema_entity_symbol_queries(question)
+        .into_iter()
+        .map(|probe| normalize_identifier(&probe))
+        .collect::<Vec<_>>();
+    if probe_keys.is_empty() {
+        return;
+    }
+    for probe in probe_keys {
+        let best = answer
+            .citations
+            .iter()
+            .enumerate()
+            .filter(|(_, citation)| {
+                citation.origin == SearchHitOrigin::IndexedSymbol
+                    && citation.resolvable
+                    && citation
+                        .evidence_producer
+                        .as_deref()
+                        .is_some_and(|producer| producer.contains("structural_sql"))
+                    && normalize_identifier(&citation.display_name) == probe
+            })
+            .max_by(|(_, left), (_, right)| left.score.total_cmp(&right.score))
+            .map(|(index, _)| index);
+        if let Some(index) = best {
+            answer.citations[index].coverage_role =
+                Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
+        }
+    }
 }
 
 fn packet_plan_query_can_gate_sufficiency(query: &str) -> bool {
@@ -1101,24 +1183,49 @@ fn append_packet_carrier_source_sections(
     let mut steps = Vec::new();
     let mut source_support = Vec::new();
 
-    for citation in answer.citations.iter() {
+    for citation_index in 0..answer.citations.len() {
         if steps.len() >= limits.max_snippets as usize {
             break;
         }
-        // Only behaviour-bearing anchors have a body worth quoting; a bare FILE citation
-        // would spend the allowance on the head of a file nobody asked about.
-        if !matches!(
+        let citation = answer.citations[citation_index].clone();
+        let structural_source = citation.evidence_tier
+            == Some(PacketEvidenceTierDto::StructuralText)
+            && citation
+                .evidence_producer
+                .as_deref()
+                .is_some_and(|producer| producer.starts_with("structural_"));
+        let behavioral_source = matches!(
             citation.kind,
             NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::CLASS | NodeKind::STRUCT
-        ) {
+        );
+        if !structural_source && !behavioral_source {
             continue;
         }
         let started = Instant::now();
-        let Ok(snippet) = controller.snippet_function_body_context(citation.node_id.clone(), 0)
-        else {
+        let source = if structural_source {
+            let (Some(path), Some(line)) = (citation.file_path.as_deref(), citation.line) else {
+                continue;
+            };
+            controller
+                .bounded_file_snippet(
+                    path,
+                    line,
+                    6,
+                    CARRIER_SOURCE_MAX_SNIPPET_BYTES,
+                    SOURCE_SNIPPET_TRUNCATION_SUFFIX,
+                )
+                .ok()
+                .map(|(path, snippet)| (path, line, snippet.markdown))
+        } else {
+            controller
+                .snippet_function_body_context(citation.node_id.clone(), 0)
+                .ok()
+                .map(|snippet| (snippet.path, snippet.line, snippet.snippet))
+        };
+        let Some((source_path, source_line, source_body)) = source else {
             continue;
         };
-        let body = snippet.snippet.trim_end();
+        let body = source_body.trim_end();
         if body.is_empty() {
             continue;
         }
@@ -1128,9 +1235,21 @@ fn append_packet_carrier_source_sections(
             break;
         }
         rendered.push_str(&entry);
+        if structural_source {
+            let citation = &mut answer.citations[citation_index];
+            let producer = citation
+                .evidence_producer
+                .as_deref()
+                .unwrap_or("structural_source_collector");
+            citation.evidence_tier = Some(PacketEvidenceTierDto::ExactSource);
+            citation.evidence_producer = Some(format!("verified_{producer}_source_read"));
+            citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+            citation.eligible_for_sufficiency = Some(true);
+        }
+        let citation = &answer.citations[citation_index];
         if crate::agent::packet_evidence::citation_sufficiency_eligible(citation) {
-            let path = packet_display_path(&snippet.path);
-            let end_line = snippet.line.saturating_add(
+            let path = packet_display_path(&source_path);
+            let end_line = source_line.saturating_add(
                 retained_body
                     .lines()
                     .count()
@@ -1139,15 +1258,15 @@ fn append_packet_carrier_source_sections(
                     .unwrap_or(u32::MAX),
             );
             source_support.push(SupportUnitDto {
-                id: format!("source:{}:{}", citation.node_id.0, snippet.line),
+                id: format!("source:{}:{source_line}", citation.node_id.0),
                 kind: SupportUnitKindDto::SourceRange,
                 summary: format!(
-                    "source for {} at {path}:{}-{end_line}",
-                    citation.display_name, snippet.line,
+                    "source for {} at {path}:{source_line}-{end_line}",
+                    citation.display_name,
                 ),
                 path: Some(path),
                 symbol_id: Some(citation.node_id.0.clone()),
-                start_line: Some(snippet.line),
+                start_line: Some(source_line),
                 end_line: Some(end_line),
                 snippet: Some(retained_body.to_string()),
                 edge_kind: None,
@@ -7349,6 +7468,78 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn budget_values_only_owner_member_probes_with_exact_retained_evidence() {
+        let question = "Explain BaseRequest finalization and IOClient send behavior.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation(
+                    "BaseRequest.finalize",
+                    "pkgs/http/lib/src/base_request.dart",
+                    0.9,
+                ),
+                test_packet_citation("IOClient.send", "pkgs/http/lib/src/io_client.dart", 0.9),
+                test_packet_citation(
+                    "BaseRequest.copy",
+                    "pkgs/http/lib/src/base_request.dart",
+                    0.8,
+                ),
+            ],
+        );
+
+        let probes = promote_retained_owner_member_probes(question, &mut answer);
+
+        assert!(probes.contains(&"BaseRequest.finalize".to_string()));
+        assert!(probes.contains(&"IOClient.send".to_string()));
+        assert!(!probes.contains(&"BaseRequest.behavior".to_string()));
+        assert!(!probes.contains(&"BaseRequest.copy".to_string()));
+        assert!(
+            answer
+                .citations
+                .iter()
+                .filter(|citation| matches!(
+                    citation.display_name.as_str(),
+                    "BaseRequest.finalize" | "IOClient.send"
+                ))
+                .all(|citation| citation.coverage_role.as_deref()
+                    == Some(PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE))
+        );
+    }
+
+    #[test]
+    fn budget_protects_exact_named_schema_entities_before_source_verification() {
+        let question = "Explain schema relationships between artists, albums, and invoice lines across SQL scripts.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("public.Artist", "db/schema.sql", 0.9),
+                test_packet_citation("public.Artist", "db/other.sql", 0.2),
+                test_packet_citation("public.InvoiceLine", "db/schema.sql", 0.8),
+                test_packet_citation("public.Customer", "db/schema.sql", 0.7),
+            ],
+        );
+        for citation in &mut answer.citations {
+            citation.evidence_producer = Some("structural_sql_collector".to_string());
+            citation.evidence_tier = Some(PacketEvidenceTierDto::StructuralText);
+            citation.eligible_for_sufficiency = Some(false);
+        }
+
+        promote_retained_schema_entity_probes(question, &mut answer);
+
+        assert_eq!(
+            answer.citations[0].coverage_role.as_deref(),
+            Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE)
+        );
+        assert_eq!(
+            answer.citations[2].coverage_role.as_deref(),
+            Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE)
+        );
+        assert_eq!(answer.citations[1].coverage_role, None);
+        assert_eq!(answer.citations[3].coverage_role, None);
+    }
+
     #[test]
     fn command_dispatch_flow_does_not_require_request_dispatch_probes() {
         let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);

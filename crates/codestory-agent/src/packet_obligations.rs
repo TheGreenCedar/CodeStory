@@ -8,10 +8,11 @@ use super::packet_flow_requirements::{
     packet_flow_requirements_for_terms,
 };
 use super::packet_required_probes::{
+    packet_named_schema_entity_queries, packet_named_schema_entity_symbol_queries,
     packet_prompt_exact_symbol_probe_queries, packet_sufficiency_required_probe_queries_from_terms,
 };
 use super::packet_scoring::{normalize_identifier, packet_display_path};
-use super::packet_terms::packet_probe_terms;
+use super::packet_terms::{packet_probe_terms, packet_terms_indicate_sql_schema_flow};
 use crate::packet_execution_graphs::packet_execution_graphs;
 use crate::text::{exact_symbol_query_terms, looks_like_standalone_symbol_query};
 use crate::trail::is_speculative_trail_edge;
@@ -52,6 +53,23 @@ pub fn build_packet_obligation_plan(
         .iter()
         .map(|requirement| claim_obligation(requirement, requires_complete_discovery))
         .collect::<Vec<_>>();
+    let named_schema_entities = if packet_terms_indicate_sql_schema_flow(&terms) {
+        packet_named_schema_entity_queries(question)
+    } else {
+        Vec::new()
+    };
+    if !named_schema_entities.is_empty()
+        && let Some(obligation) = claim_obligations
+            .iter_mut()
+            .find(|obligation| obligation.id == "sql_tables")
+    {
+        obligation.binding_terms = named_schema_entities.clone();
+        for query in packet_named_schema_entity_symbol_queries(question) {
+            if !obligation.open_next_candidates.contains(&query) {
+                obligation.open_next_candidates.push(query);
+            }
+        }
+    }
     claim_obligations.extend(default_profile_requested_claim_obligations(
         &binding_terms,
         task_class,
@@ -95,6 +113,16 @@ pub fn build_packet_obligation_plan(
                     true,
                 );
             }
+        }
+    }
+    for query in packet_named_schema_entity_symbol_queries(question) {
+        if required_queries.insert(query.clone()) {
+            push_query_obligation(
+                &mut query_obligations,
+                PacketQueryObligationKindDto::RequiredProbe,
+                &query,
+                true,
+            );
         }
     }
     for query in exact_symbol_queries
@@ -1375,6 +1403,31 @@ fn finalize_claim_obligation(
         );
         return;
     }
+    if obligation.id == "sql_tables" && !obligation.binding_terms.is_empty() {
+        let missing = obligation
+            .binding_terms
+            .iter()
+            .filter(|entity| {
+                !allowed_citations
+                    .iter()
+                    .any(|citation| citation_covers_named_schema_entity(citation, entity))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            record_obligation_carriers(
+                obligation,
+                allowed_citations.iter().copied(),
+                evidence_view.max_carriers,
+            );
+            obligation.proof_status = PacketObligationProofStatusDto::Reported;
+            obligation.reason = Some(format!(
+                "named_sql_table_carriers_missing:{}",
+                missing.join(",")
+            ));
+            return;
+        }
+    }
     let proven_citations = allowed_citations
         .iter()
         .copied()
@@ -1421,6 +1474,18 @@ fn finalize_claim_obligation(
     }
     obligation.proof_status = PacketObligationProofStatusDto::Proven;
     obligation.reason = None;
+}
+
+fn citation_covers_named_schema_entity(citation: &AgentCitationDto, entity: &str) -> bool {
+    if packet_evidence_role(citation) != Some(PacketEvidenceRole::SqlTableDefinition) {
+        return false;
+    }
+    let terminal = crate::text::terminal_symbol_segment(&citation.display_name);
+    let normalized = normalize_identifier(&terminal);
+    let normalized = normalized
+        .strip_prefix("createtable")
+        .unwrap_or(normalized.as_str());
+    normalized == normalize_identifier(entity)
 }
 
 fn finalize_default_profile_obligation(
@@ -4368,6 +4433,73 @@ mod tests {
             );
             assert_eq!(obligation.required_edge_kind, None);
         }
+    }
+
+    #[test]
+    fn named_sql_tables_are_material_queries_and_all_must_be_carried() {
+        let question = "Explain schema relationships between artists, albums, and tracks across the SQL scripts.";
+        let task_class = PacketTaskClassDto::ArchitectureExplanation;
+        let mut plan = build_packet_obligation_plan(question, task_class, &[]);
+        let table = plan
+            .claim_obligations
+            .iter()
+            .find(|obligation| obligation.id == "sql_tables")
+            .expect("sql table obligation");
+        assert_eq!(table.binding_terms, ["artist", "album", "track"]);
+        for query in ["public.artist", "public.album", "public.track"] {
+            assert!(
+                plan.query_obligations
+                    .iter()
+                    .any(|obligation| { obligation.material && obligation.query == query })
+            );
+        }
+
+        let structural_table = |name: &str| {
+            let mut citation = lexical_citation(name, "schema.sql", NodeKind::CLASS);
+            citation.evidence_producer =
+                Some("verified_structural_sql_collector_source_read".to_string());
+            citation
+        };
+        let mut partial_answer = answer(vec![
+            structural_table("public.Artist"),
+            structural_table("public.Album"),
+        ]);
+        partial_answer.prompt = question.to_string();
+        finalize_packet_obligation_plan(
+            question,
+            task_class,
+            &mut plan,
+            &partial_answer,
+            &budget(),
+        );
+        let table = plan
+            .claim_obligations
+            .iter()
+            .find(|obligation| obligation.id == "sql_tables")
+            .expect("sql table obligation");
+        assert_eq!(table.proof_status, PacketObligationProofStatusDto::Reported);
+        assert_eq!(
+            table.reason.as_deref(),
+            Some("named_sql_table_carriers_missing:track")
+        );
+
+        let mut complete_answer = partial_answer;
+        complete_answer
+            .citations
+            .push(structural_table("public.Track"));
+        finalize_packet_obligation_plan(
+            question,
+            task_class,
+            &mut plan,
+            &complete_answer,
+            &budget(),
+        );
+        let table = plan
+            .claim_obligations
+            .iter()
+            .find(|obligation| obligation.id == "sql_tables")
+            .expect("sql table obligation");
+        assert_eq!(table.proof_status, PacketObligationProofStatusDto::Proven);
     }
 
     #[test]
