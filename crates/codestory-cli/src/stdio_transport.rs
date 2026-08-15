@@ -3741,30 +3741,10 @@ fn handle_stdio_packet(
         .map(|mut packet| {
             match std::env::current_exe() {
                 Ok(executable) => {
-                    if let Err(error) =
-                        codestory_runtime::enforce_packet_output_budget_for_representation(
-                            &runtime.project_root,
-                            &mut packet,
-                            |candidate| {
-                                let mut public_packet = candidate.clone();
-                                codestory_runtime::bind_packet_follow_up_program(
-                                    &runtime.project_root,
-                                    &mut public_packet,
-                                    &executable,
-                                );
-                                serde_json::to_vec(&public_packet)
-                                    .expect("packet response is serializable")
-                                    .len()
-                            },
-                        )
-                    {
-                        return serde_json::json!({
-                            "error": {
-                                "code": error.code,
-                                "message": error.message,
-                            }
-                        });
-                    }
+                    // The JSON-RPC adapter applies the one packet-budget pass after
+                    // adding the text and metadata it owns. Enforcing here would
+                    // measure a smaller intermediate shape and then repeat the
+                    // fixpoint on every cached response.
                     codestory_runtime::bind_packet_follow_up_program(
                         &runtime.project_root,
                         &mut packet,
