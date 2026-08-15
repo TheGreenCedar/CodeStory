@@ -1395,7 +1395,12 @@ mod tests {
             trace: Vec::new(),
         };
 
-        let queries = packet_adaptive_material_queries(question, &plan, &empty_answer(), 16)
+        let mut answer = empty_answer();
+        for symbol in ["BaseClient.send", "BaseRequest.finalize", "IOClient.send"] {
+            answer.citations.push(anchor_citation(symbol));
+        }
+
+        let queries = packet_adaptive_material_queries(question, &plan, &answer, 16)
             .into_iter()
             .map(|query| query.query)
             .collect::<Vec<_>>();

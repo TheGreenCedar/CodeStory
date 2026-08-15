@@ -160,9 +160,9 @@ pub fn packet_rank_terms(question: &str) -> Vec<String> {
     terms
 }
 
-/// Build bounded owner/member probes from owners explicitly named in the task or already present
-/// in the first retrieval, plus action words in the task. Broad semantic search is good at finding
-/// a relevant type but can miss its exact lifecycle members, so qualified probes combine the
+/// Build bounded owner/member probes from owners both named in the task and backed by a symbol in
+/// the first retrieval, plus action words in the task. Broad semantic search is good at finding a
+/// relevant type but can miss its exact lifecycle members, so qualified probes combine the
 /// retained owner with the task's verbs without adding repository-specific vocabulary.
 pub fn packet_owner_member_probe_queries(
     question: &str,
@@ -181,6 +181,26 @@ pub fn packet_owner_member_probe_queries(
     let mut owners = Vec::<(usize, String)>::new();
     let mut seen_owners = std::collections::HashSet::<String>::new();
     let exact_owner_candidates = exact_symbol_query_terms(question);
+    let backed_owner_keys = anchor_labels
+        .iter()
+        .filter(|label| !label.contains(['/', '\\']))
+        .filter_map(|label| {
+            let segments = label
+                .split(['.', ':', '#'])
+                .map(|segment| {
+                    segment.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                })
+                .filter(|segment| segment.len() >= 3)
+                .collect::<Vec<_>>();
+            let owner = if segments.len() >= 2 {
+                segments.get(segments.len().saturating_sub(2))
+            } else {
+                segments.first()
+            }?;
+            let key = normalize_identifier(owner);
+            (!key.is_empty()).then_some(key)
+        })
+        .collect::<std::collections::HashSet<_>>();
     for candidate in &exact_owner_candidates {
         if candidate.contains(['.', ':', '/', '\\'])
             || packet_camel_identifier_words(candidate).is_empty()
@@ -188,7 +208,7 @@ pub fn packet_owner_member_probe_queries(
             continue;
         }
         let key = normalize_identifier(candidate);
-        if key.len() < 3 || !seen_owners.insert(key.clone()) {
+        if key.len() < 3 || !backed_owner_keys.contains(&key) || !seen_owners.insert(key.clone()) {
             continue;
         }
         let position = normalized_question.rfind(&key).unwrap_or_default();
@@ -205,17 +225,13 @@ pub fn packet_owner_member_probe_queries(
         let Some(owner) = segments.get(segments.len().saturating_sub(2)) else {
             continue;
         };
-        let mut candidates = vec![(*owner).to_string()];
-        candidates.extend(packet_camel_identifier_words(owner));
-        for candidate in candidates {
-            let key = normalize_identifier(&candidate);
-            if key.len() < 3 || !prompt_term_keys.contains(&key) || !seen_owners.insert(key.clone())
-            {
-                continue;
-            }
-            let position = normalized_question.rfind(&key).unwrap_or_default();
-            owners.push((position, candidate));
+        let candidate = (*owner).to_string();
+        let key = normalize_identifier(&candidate);
+        if key.len() < 3 || !prompt_term_keys.contains(&key) || !seen_owners.insert(key.clone()) {
+            continue;
         }
+        let position = normalized_question.rfind(&key).unwrap_or_default();
+        owners.push((position, candidate));
     }
     owners.sort_by(|left, right| {
         right
@@ -898,11 +914,48 @@ mod owner_member_probe_tests {
     fn owner_member_probes_normalize_noun_and_verb_inflections() {
         let queries = packet_owner_member_probe_queries(
             "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.",
-            &[],
+            &[
+                "BaseClient.send".to_string(),
+                "BaseRequest.finalize".to_string(),
+                "IOClient.send".to_string(),
+            ],
             6,
         );
 
         assert!(queries.iter().any(|query| query == "BaseRequest.finalize"));
         assert!(queries.iter().any(|query| query == "IOClient.send"));
+    }
+
+    #[test]
+    fn owner_member_probes_do_not_invent_generic_prompt_owners() {
+        let queries = packet_owner_member_probe_queries(
+            "Trace how Orion initializes the server, enters the event loop, reads client input, and routes a command for execution.",
+            &[
+                "OrionClient.read".to_string(),
+                "readInput".to_string(),
+                "dispatchCommand".to_string(),
+            ],
+            10,
+        );
+
+        assert!(!queries.iter().any(|query| query.starts_with("Client.")));
+        assert!(!queries.iter().any(|query| query.starts_with("Orion.")));
+    }
+
+    #[test]
+    fn owner_member_probes_ignore_file_paths_as_owner_proof() {
+        let queries = packet_owner_member_probe_queries(
+            "Explain how the HTML and JavaScript form validation examples combine native constraints with custom validation.",
+            &[
+                "/workspace/examples/forms/detailed-validation.html".to_string(),
+                "examples/forms/full-example.html".to_string(),
+            ],
+            10,
+        );
+
+        assert!(
+            queries.is_empty(),
+            "unexpected path-derived probes: {queries:?}"
+        );
     }
 }
