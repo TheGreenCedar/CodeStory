@@ -42,6 +42,7 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Instant;
 
 const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
+const PACKET_OWNER_MEMBER_QUERY_LIMIT: usize = 4;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PacketLatencyBudget {
     pub(crate) started_at: Instant,
@@ -437,7 +438,16 @@ fn packet_adaptive_material_queries(
         .iter()
         .any(|obligation| obligation.id.starts_with("sql_"));
     if !missing_material.is_empty() && !structural_schema_flow {
-        for query in packet_owner_member_probe_queries(question, &answer.citations, limit.min(10)) {
+        let anchor_labels = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.clone())
+            .collect::<Vec<_>>();
+        for query in packet_owner_member_probe_queries(
+            question,
+            &anchor_labels,
+            limit.min(PACKET_OWNER_MEMBER_QUERY_LIMIT),
+        ) {
             let _ = push(&query, PACKET_OWNER_MEMBER_QUERY_PURPOSE.to_string());
         }
     }
@@ -1390,22 +1400,29 @@ mod tests {
             trace: Vec::new(),
         };
 
-        let mut answer = empty_answer();
-        for symbol in ["BaseClient.send", "BaseRequest.finalize", "IOClient.send"] {
-            answer.citations.push(anchor_citation(symbol));
-        }
-
-        let queries = packet_adaptive_material_queries(question, &plan, &answer, 16)
-            .into_iter()
-            .map(|query| query.query)
-            .collect::<Vec<_>>();
+        let queries = packet_adaptive_material_queries(question, &plan, &empty_answer(), 16);
 
         for expected in ["BaseRequest.finalize", "IOClient.send"] {
             assert!(
-                queries.iter().any(|query| query == expected),
+                queries.iter().any(|query| query.query == expected),
                 "missing {expected} from {queries:?}"
             );
         }
+        let owner_probe_indexes = queries
+            .iter()
+            .enumerate()
+            .filter(|(_, query)| query.purpose == PACKET_OWNER_MEMBER_QUERY_PURPOSE)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(owner_probe_indexes.len(), PACKET_OWNER_MEMBER_QUERY_LIMIT);
+        let last_owner_probe = *owner_probe_indexes.last().expect("owner probes");
+        assert!(
+            queries.iter().skip(last_owner_probe + 1).any(|query| {
+                query.purpose.starts_with("material obligation ")
+                    || query.purpose.starts_with("material query obligation ")
+            }),
+            "owner probes starved the remaining material queries: {queries:?}"
+        );
         assert!(queries.len() <= 16);
     }
 
