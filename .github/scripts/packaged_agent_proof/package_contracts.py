@@ -129,7 +129,11 @@ def verify_package_server_contracts(
         "embedding server lifecycle states do not match the verifier",
     )
     required_metrics = set(measurement["required_metrics"])
-    verify_qualification_threshold_contract(constant_set, required_metrics)
+    verify_qualification_threshold_contract(
+        constant_set,
+        required_metrics,
+        measurement,
+    )
     thresholds = constant_set["qualification_thresholds"]
     fixed = constant_set.get("fixed_contract_values")
     threshold_contract = measurement.get("qualification_threshold_contract", {}).get(

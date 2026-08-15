@@ -402,6 +402,7 @@ def run_retained_qualification_self_tests(
     verify_qualification_threshold_contract(
         constant_set,
         set(protocol["required_metrics"]),
+        protocol,
     )
     windows_spawn_threshold = constant_set["qualification_threshold_overrides"][
         WINDOWS_VULKAN_MATRIX_CELL
@@ -429,6 +430,7 @@ def run_retained_qualification_self_tests(
         verify_qualification_threshold_contract(
             mismatched_override,
             set(protocol["required_metrics"]),
+            protocol,
         )
     except ProofFailure:
         pass

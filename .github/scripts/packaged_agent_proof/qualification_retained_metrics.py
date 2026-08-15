@@ -142,7 +142,11 @@ def _normalized_retained_metrics(
         "retained qualification metric set is incomplete",
     )
     constant_set = contract.measurement_contract["constant_set"]
-    verify_qualification_threshold_contract(constant_set, required_metrics)
+    verify_qualification_threshold_contract(
+        constant_set,
+        required_metrics,
+        protocol,
+    )
     matrix_cell_id = contract.evidence.host["matrix_cell_id"]
     metric_contracts = protocol["metric_contracts"]
     normalized = []

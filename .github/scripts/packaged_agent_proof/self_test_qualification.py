@@ -6,17 +6,24 @@ import copy
 from types import SimpleNamespace
 from unittest.mock import patch, sentinel
 
-from . import qualification_metrics, qualification_workflow
-from .foundation import ProofFailure, require
+from . import qualification_measurements, qualification_metrics, qualification_workflow
+from .foundation import MEASUREMENT_PROTOCOL, ProofFailure, require
 from .qualification_metrics import (
     _qualification_cache_state_from_scenarios,
     _qualification_host,
 )
+from .measurement_protocol import load_server_measurement_contract
 from .qualification_production_types import (
     QualificationRunnerEvidence,
     QualificationScenarioEvidence,
 )
 from .qualification_scenario_evidence import validate_replay_attempts, validate_retry_state
+from .qualification_thresholds import (
+    WINDOWS_VULKAN_MATRIX_CELL,
+    WINDOWS_WARM_CONNECT_METRIC,
+    qualification_metric_sample_policy,
+    verify_qualification_threshold_contract,
+)
 
 
 def _replay_attempt(
@@ -208,23 +215,19 @@ def _qualification_measurement_dataflow_self_test() -> None:
 
 
 def _qualification_threshold_selection_self_test() -> None:
+    measurement_contract = load_server_measurement_contract(MEASUREMENT_PROTOCOL)
+    protocol = measurement_contract["measurement_protocol"]
+    constant_set = measurement_contract["constant_set"]
+    verify_qualification_threshold_contract(
+        constant_set,
+        set(protocol["required_metrics"]),
+        protocol,
+    )
     context = SimpleNamespace(
         args=SimpleNamespace(proof_tier="protected_hardware"),
         measurement_contract={
-            "constant_set": {
-                "qualification_thresholds": {"spawn_convergence": 486},
-                "qualification_threshold_overrides": {
-                    "protected_windows_x64_vulkan": {"spawn_convergence": 2000}
-                },
-            },
-            "measurement_protocol": {
-                "metric_contracts": {
-                    "spawn_convergence": {
-                        "comparison": "less_than_or_equal",
-                        "unit": "milliseconds",
-                    }
-                }
-            },
+            "constant_set": constant_set,
+            "measurement_protocol": protocol,
         },
     )
     measurement = {
@@ -261,6 +264,81 @@ def _qualification_threshold_selection_self_test() -> None:
         pass
     else:
         raise ProofFailure("Windows threshold override leaked into another matrix cell")
+
+    warm_measurement = {
+        "values": {"existing_owner_connect": 98.0806},
+        "artifact": sentinel.raw_evidence,
+    }
+    retained_warm = qualification_metrics._retained_qualification_metric(
+        "existing_owner_connect",
+        context=context,
+        runner=windows_runner,
+        measurement=warm_measurement,
+        memory={},
+    )
+    require(
+        retained_warm["threshold"] == 125
+        and qualification_metric_sample_policy(
+            protocol,
+            WINDOWS_WARM_CONNECT_METRIC,
+            WINDOWS_VULKAN_MATRIX_CELL,
+        )
+        == {"sample_count": 30, "aggregation": "maximum"}
+        and qualification_metric_sample_policy(
+            protocol,
+            WINDOWS_WARM_CONNECT_METRIC,
+            "protected_macos_arm64_metal",
+        )
+        == {"sample_count": 3, "aggregation": "maximum"},
+        "Windows warm-connect probe did not preserve its platform boundary",
+    )
+    try:
+        qualification_metrics._retained_qualification_metric(
+            "existing_owner_connect",
+            context=context,
+            runner=SimpleNamespace(matrix_cell_id="protected_macos_arm64_metal"),
+            measurement=warm_measurement,
+            memory={},
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("Windows warm-connect threshold leaked into macOS")
+
+    failed_sample_derived = copy.deepcopy(constant_set)
+    failed_sample_derived["qualification_threshold_overrides"][
+        WINDOWS_VULKAN_MATRIX_CELL
+    ][WINDOWS_WARM_CONNECT_METRIC] = 99
+    try:
+        verify_qualification_threshold_contract(
+            failed_sample_derived,
+            set(protocol["required_metrics"]),
+            protocol,
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("failed Windows sample selected its own threshold")
+
+    qualification_measurements._verify_windows_warm_connect_probe_elapsed(
+        {"windows_warm_connect_probe_elapsed_wall_ns": 89_999_999_999},
+        validation=SimpleNamespace(
+            matrix_cell_id=WINDOWS_VULKAN_MATRIX_CELL,
+            protocol=protocol,
+        ),
+    )
+    try:
+        qualification_measurements._verify_windows_warm_connect_probe_elapsed(
+            {"windows_warm_connect_probe_elapsed_wall_ns": 90_000_000_000},
+            validation=SimpleNamespace(
+                matrix_cell_id=WINDOWS_VULKAN_MATRIX_CELL,
+                protocol=protocol,
+            ),
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("a 90-second Windows warm-connect probe was accepted")
 
 
 def _qualification_workflow_dataflow_self_test() -> None:
