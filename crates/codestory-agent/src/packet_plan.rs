@@ -384,44 +384,6 @@ fn packet_camel_identifier_words(identifier: &str) -> Vec<String> {
     words
 }
 
-#[cfg(test)]
-mod owner_member_probe_tests {
-    use super::packet_owner_member_probe_queries;
-
-    #[test]
-    fn exact_owner_members_cover_late_lifecycle_phases_without_task_specific_names() {
-        let queries = packet_owner_member_probe_queries(
-            "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases. Cite the source files and name the supporting symbols.",
-            &[
-                "Build.build".to_string(),
-                "Site.posts".to_string(),
-                "Command.process_site".to_string(),
-            ],
-            10,
-        );
-
-        for expected in ["Site.read", "Site.generate", "Site.render", "Site.write"] {
-            assert!(
-                queries.iter().any(|query| query == expected),
-                "missing {expected} from {queries:?}"
-            );
-        }
-        assert!(!queries.iter().any(|query| query.ends_with(".cite")));
-    }
-
-    #[test]
-    fn owner_member_probes_normalize_noun_and_verb_inflections() {
-        let queries = packet_owner_member_probe_queries(
-            "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.",
-            &[],
-            6,
-        );
-
-        assert!(queries.iter().any(|query| query == "BaseRequest.finalize"));
-        assert!(queries.iter().any(|query| query == "IOClient.send"));
-    }
-}
-
 pub fn packet_explicit_request_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
     plan.queries
         .iter()
@@ -905,4 +867,42 @@ fn prompt_mentions_indexing_flow(lower: &str) -> bool {
                 "workspace",
             ],
         )
+}
+
+#[cfg(test)]
+mod owner_member_probe_tests {
+    use super::packet_owner_member_probe_queries;
+
+    #[test]
+    fn exact_owner_members_cover_late_lifecycle_phases_without_task_specific_names() {
+        let queries = packet_owner_member_probe_queries(
+            "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases. Cite the source files and name the supporting symbols.",
+            &[
+                "Build.build".to_string(),
+                "Site.posts".to_string(),
+                "Command.process_site".to_string(),
+            ],
+            10,
+        );
+
+        for expected in ["Site.read", "Site.generate", "Site.render", "Site.write"] {
+            assert!(
+                queries.iter().any(|query| query == expected),
+                "missing {expected} from {queries:?}"
+            );
+        }
+        assert!(!queries.iter().any(|query| query.ends_with(".cite")));
+    }
+
+    #[test]
+    fn owner_member_probes_normalize_noun_and_verb_inflections() {
+        let queries = packet_owner_member_probe_queries(
+            "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.",
+            &[],
+            6,
+        );
+
+        assert!(queries.iter().any(|query| query == "BaseRequest.finalize"));
+        assert!(queries.iter().any(|query| query == "IOClient.send"));
+    }
 }
