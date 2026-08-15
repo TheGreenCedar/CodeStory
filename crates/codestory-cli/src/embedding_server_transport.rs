@@ -870,13 +870,25 @@ enum RetainedWindowsAuthorityState {
 }
 
 #[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsDataPipeOpenState {
+    NoOwner,
+    RetryLiveAuthority,
+}
+
+#[cfg(any(windows, test))]
 fn classify_windows_data_pipe_open_error(
     error_code: u32,
     authority: RetainedWindowsAuthorityState,
-) -> Option<NativeConnectOutcome> {
+) -> Option<WindowsDataPipeOpenState> {
     (error_code == WINDOWS_ERROR_FILE_NOT_FOUND_CODE).then(|| match authority {
-        RetainedWindowsAuthorityState::Absent => NativeConnectOutcome::NoOwner,
-        RetainedWindowsAuthorityState::Live => NativeConnectOutcome::OwnerUnresponsive,
+        RetainedWindowsAuthorityState::Absent => WindowsDataPipeOpenState::NoOwner,
+        // The listener creates the next Windows data-pipe instance after it
+        // hands the accepted instance to a connection handler. During that
+        // bounded handoff CreateFileW can report FILE_NOT_FOUND even though
+        // the retained authority proves the owner is live. Let the caller
+        // keep the existing connect deadline in charge of that transient gap.
+        RetainedWindowsAuthorityState::Live => WindowsDataPipeOpenState::RetryLiveAuthority,
     })
 }
 
@@ -3583,11 +3595,21 @@ mod platform {
             let error = std::io::Error::last_os_error();
             match error.raw_os_error().map(|code| code as u32) {
                 Some(ERROR_FILE_NOT_FOUND) => {
-                    return Ok(classify_windows_data_pipe_open_error(
+                    match classify_windows_data_pipe_open_error(
                         ERROR_FILE_NOT_FOUND,
                         probe_retained_authority(&authority_pipe_name)?,
                     )
-                    .expect("ERROR_FILE_NOT_FOUND is classified"));
+                    .expect("ERROR_FILE_NOT_FOUND is classified")
+                    {
+                        WindowsDataPipeOpenState::NoOwner => {
+                            return Ok(NativeConnectOutcome::NoOwner);
+                        }
+                        WindowsDataPipeOpenState::RetryLiveAuthority => {
+                            if !wait_for_live_data_pipe(started, budget) {
+                                return Ok(NativeConnectOutcome::OwnerUnresponsive);
+                            }
+                        }
+                    }
                 }
                 Some(ERROR_PIPE_BUSY) => {
                     let elapsed = Duration::from_nanos(awake_now_ns().saturating_sub(started));
@@ -3617,11 +3639,22 @@ mod platform {
                         if wait_error.raw_os_error().map(|code| code as u32)
                             == Some(ERROR_FILE_NOT_FOUND)
                         {
-                            return Ok(classify_windows_data_pipe_open_error(
+                            match classify_windows_data_pipe_open_error(
                                 ERROR_FILE_NOT_FOUND,
                                 probe_retained_authority(&authority_pipe_name)?,
                             )
-                            .expect("ERROR_FILE_NOT_FOUND is classified"));
+                            .expect("ERROR_FILE_NOT_FOUND is classified")
+                            {
+                                WindowsDataPipeOpenState::NoOwner => {
+                                    return Ok(NativeConnectOutcome::NoOwner);
+                                }
+                                WindowsDataPipeOpenState::RetryLiveAuthority => {
+                                    if !wait_for_live_data_pipe(started, budget) {
+                                        return Ok(NativeConnectOutcome::OwnerUnresponsive);
+                                    }
+                                    continue;
+                                }
+                            }
                         }
                         return Err(wait_error).context("wait for embedding named pipe");
                     }
@@ -3632,6 +3665,14 @@ mod platform {
                 _ => return Err(error).context("connect to embedding named pipe"),
             }
         }
+    }
+
+    fn wait_for_live_data_pipe(started_ns: u64, budget: Duration) -> bool {
+        let Some(remaining) = remaining_awake_budget(started_ns, awake_now_ns(), budget) else {
+            return false;
+        };
+        std::thread::sleep(remaining.min(PIPE_CONNECT_POLL));
+        true
     }
 
     pub(super) fn bind() -> Result<BindOutcome> {
@@ -4999,20 +5040,20 @@ mod tests {
     }
 
     #[test]
-    fn missing_windows_data_pipe_with_live_authority_is_owner_unresponsive() {
-        let outcome = classify_windows_data_pipe_open_error(
+    fn missing_windows_data_pipe_retries_only_while_authority_is_live() {
+        let state = classify_windows_data_pipe_open_error(
             WINDOWS_ERROR_FILE_NOT_FOUND_CODE,
             RetainedWindowsAuthorityState::Live,
         )
         .expect("missing data pipe is classified");
-        assert!(matches!(outcome, NativeConnectOutcome::OwnerUnresponsive));
+        assert_eq!(state, WindowsDataPipeOpenState::RetryLiveAuthority);
 
-        let outcome = classify_windows_data_pipe_open_error(
+        let state = classify_windows_data_pipe_open_error(
             WINDOWS_ERROR_FILE_NOT_FOUND_CODE,
             RetainedWindowsAuthorityState::Absent,
         )
         .expect("missing data pipe is classified");
-        assert!(matches!(outcome, NativeConnectOutcome::NoOwner));
+        assert_eq!(state, WindowsDataPipeOpenState::NoOwner);
     }
 
     #[test]
