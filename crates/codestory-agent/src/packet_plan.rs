@@ -30,7 +30,8 @@ use crate::text::{
     query_mentions_non_primary_source,
 };
 use codestory_contracts::api::{
-    PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto, PacketTaskClassDto,
+    AgentCitationDto, NodeKind, PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto,
+    PacketTaskClassDto, SearchHitOrigin,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub fn build_packet_plan(
@@ -166,12 +167,21 @@ pub fn packet_rank_terms(question: &str) -> Vec<String> {
 /// retained owner with the task's verbs without adding repository-specific vocabulary.
 pub fn packet_owner_member_probe_queries(
     question: &str,
-    anchor_labels: &[String],
+    anchor_citations: &[AgentCitationDto],
     limit: usize,
 ) -> Vec<String> {
     if limit == 0 {
         return Vec::new();
     }
+    let anchor_labels = anchor_citations
+        .iter()
+        .filter(|citation| {
+            citation.origin == SearchHitOrigin::IndexedSymbol
+                && citation.resolvable
+                && !matches!(citation.kind, NodeKind::FILE | NodeKind::UNKNOWN)
+        })
+        .map(|citation| citation.display_name.as_str())
+        .collect::<Vec<_>>();
     let normalized_question = normalize_identifier(question);
     let prompt_terms = prompt_search_terms(question);
     let prompt_term_keys = prompt_terms
@@ -215,6 +225,9 @@ pub fn packet_owner_member_probe_queries(
         owners.push((position, candidate.clone()));
     }
     for label in anchor_labels {
+        if label.contains(['/', '\\']) {
+            continue;
+        }
         let segments = label
             .split(['.', ':', '#', '/', '\\'])
             .map(|segment| {
@@ -888,16 +901,55 @@ fn prompt_mentions_indexing_flow(lower: &str) -> bool {
 #[cfg(test)]
 mod owner_member_probe_tests {
     use super::packet_owner_member_probe_queries;
+    use codestory_contracts::api::{AgentCitationDto, NodeId, NodeKind, SearchHitOrigin};
+
+    fn citation(
+        display_name: &str,
+        kind: NodeKind,
+        origin: SearchHitOrigin,
+        resolvable: bool,
+    ) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(display_name.to_string()),
+            display_name: display_name.to_string(),
+            kind,
+            file_path: Some("src/example.rs".to_string()),
+            line: Some(1),
+            score: 1.0,
+            origin,
+            target: None,
+            resolvable,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+        }
+    }
+
+    fn symbols(display_names: &[&str]) -> Vec<AgentCitationDto> {
+        display_names
+            .iter()
+            .map(|display_name| {
+                citation(
+                    display_name,
+                    NodeKind::FUNCTION,
+                    SearchHitOrigin::IndexedSymbol,
+                    true,
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn exact_owner_members_cover_late_lifecycle_phases_without_task_specific_names() {
         let queries = packet_owner_member_probe_queries(
             "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases. Cite the source files and name the supporting symbols.",
-            &[
-                "Build.build".to_string(),
-                "Site.posts".to_string(),
-                "Command.process_site".to_string(),
-            ],
+            &symbols(&["Build.build", "Site.posts", "Command.process_site"]),
             10,
         );
 
@@ -914,11 +966,7 @@ mod owner_member_probe_tests {
     fn owner_member_probes_normalize_noun_and_verb_inflections() {
         let queries = packet_owner_member_probe_queries(
             "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.",
-            &[
-                "BaseClient.send".to_string(),
-                "BaseRequest.finalize".to_string(),
-                "IOClient.send".to_string(),
-            ],
+            &symbols(&["BaseClient.send", "BaseRequest.finalize", "IOClient.send"]),
             6,
         );
 
@@ -930,11 +978,7 @@ mod owner_member_probe_tests {
     fn owner_member_probes_do_not_invent_generic_prompt_owners() {
         let queries = packet_owner_member_probe_queries(
             "Trace how Orion initializes the server, enters the event loop, reads client input, and routes a command for execution.",
-            &[
-                "OrionClient.read".to_string(),
-                "readInput".to_string(),
-                "dispatchCommand".to_string(),
-            ],
+            &symbols(&["OrionClient.read", "readInput", "dispatchCommand"]),
             10,
         );
 
@@ -943,19 +987,42 @@ mod owner_member_probe_tests {
     }
 
     #[test]
-    fn owner_member_probes_ignore_file_paths_as_owner_proof() {
+    fn owner_member_probes_require_resolved_indexed_symbol_proof() {
+        let citations = vec![
+            citation(
+                "examples/forms/validation.html",
+                NodeKind::FILE,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            citation(
+                "validation.html",
+                NodeKind::FILE,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            citation(
+                "validation.check",
+                NodeKind::FUNCTION,
+                SearchHitOrigin::TextMatch,
+                true,
+            ),
+            citation(
+                "validation.handle",
+                NodeKind::FUNCTION,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+        ];
         let queries = packet_owner_member_probe_queries(
-            "Explain how the HTML and JavaScript form validation examples combine native constraints with custom validation.",
-            &[
-                "/workspace/examples/forms/detailed-validation.html".to_string(),
-                "examples/forms/full-example.html".to_string(),
-            ],
+            "Explain how validation handles checks.",
+            &citations,
             10,
         );
 
         assert!(
             queries.is_empty(),
-            "unexpected path-derived probes: {queries:?}"
+            "untyped citation authorized owner/member probes: {queries:?}"
         );
     }
 }
