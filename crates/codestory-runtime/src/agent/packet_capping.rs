@@ -18,7 +18,6 @@ use codestory_contracts::api::{
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 pub(crate) const PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE: &str = "material owner/member probe";
-pub(crate) const PACKET_MATERIAL_QUERY_CARRIER_ROLE: &str = "material query carrier";
 pub(crate) const PACKET_MATERIAL_SCHEMA_ENTITY_ROLE: &str = "material schema entity";
 
 fn packet_citation_has_protected_probe_role(citation: &AgentCitationDto) -> bool {
@@ -26,7 +25,6 @@ fn packet_citation_has_protected_probe_role(citation: &AgentCitationDto) -> bool
         citation.coverage_role.as_deref(),
         Some("explicit exact probe")
             | Some(PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE)
-            | Some(PACKET_MATERIAL_QUERY_CARRIER_ROLE)
             | Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE)
     )
 }

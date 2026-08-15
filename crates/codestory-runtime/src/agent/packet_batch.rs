@@ -42,10 +42,6 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Instant;
 
 const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
-pub(crate) const PACKET_MATERIAL_OBLIGATION_QUERY_PURPOSE_PREFIX: &str = "material obligation ";
-pub(crate) const PACKET_MATERIAL_QUERY_OBLIGATION_QUERY_PURPOSE_PREFIX: &str =
-    "material query obligation ";
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PacketLatencyBudget {
     pub(crate) started_at: Instant,
@@ -432,13 +428,8 @@ fn packet_adaptive_material_queries(
     // remainder of the fixed batch with fallback paths.
     for (index, obligation) in missing_material.iter().enumerate() {
         if let Some(query) = obligation.open_next_candidates.first() {
-            obligation_added_query[index] |= push(
-                query,
-                format!(
-                    "{PACKET_MATERIAL_OBLIGATION_QUERY_PURPOSE_PREFIX}{}",
-                    obligation.id
-                ),
-            );
+            obligation_added_query[index] |=
+                push(query, format!("material obligation {}", obligation.id));
         }
     }
 
@@ -458,13 +449,8 @@ fn packet_adaptive_material_queries(
 
     for (index, obligation) in missing_material.iter().enumerate() {
         for query in obligation.open_next_candidates.iter().skip(1) {
-            obligation_added_query[index] |= push(
-                query,
-                format!(
-                    "{PACKET_MATERIAL_OBLIGATION_QUERY_PURPOSE_PREFIX}{}",
-                    obligation.id
-                ),
-            );
+            obligation_added_query[index] |=
+                push(query, format!("material obligation {}", obligation.id));
         }
     }
 
@@ -476,22 +462,14 @@ fn packet_adaptive_material_queries(
     {
         let _ = push(
             &obligation.query,
-            format!(
-                "{PACKET_MATERIAL_QUERY_OBLIGATION_QUERY_PURPOSE_PREFIX}{}",
-                obligation.id
-            ),
+            format!("material query obligation {}", obligation.id),
         );
     }
 
     for (index, obligation) in missing_material.iter().enumerate() {
         for query in &obligation.carrier_paths {
-            obligation_added_query[index] |= push(
-                query,
-                format!(
-                    "{PACKET_MATERIAL_OBLIGATION_QUERY_PURPOSE_PREFIX}{}",
-                    obligation.id
-                ),
-            );
+            obligation_added_query[index] |=
+                push(query, format!("material obligation {}", obligation.id));
         }
     }
 
