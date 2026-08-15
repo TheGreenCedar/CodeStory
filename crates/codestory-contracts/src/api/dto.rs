@@ -3157,10 +3157,6 @@ pub struct PacketBudgetDto {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SupportUnitKindDto {
-    /// A concise explanation compiled from one proven material obligation and
-    /// its retained citation or typed edge. This is evidence, not a catalog
-    /// template or a replacement for the underlying source units.
-    EvidenceClaim,
     SymbolLocation,
     SourceRange,
     TypedGraphEdge,
@@ -4193,10 +4189,6 @@ mod packet_tests {
         let decoded_support: SupportUnitDto =
             serde_json::from_value(support_json).expect("deserialize support");
         assert_eq!(decoded_support, support);
-        assert_eq!(
-            serde_json::to_value(SupportUnitKindDto::EvidenceClaim).expect("evidence claim kind"),
-            serde_json::json!("evidence_claim")
-        );
 
         let disposition_json = serde_json::to_value(&disposition).expect("serialize disposition");
         assert_eq!(disposition_json["kind"], "drill_once");

@@ -671,7 +671,7 @@
             "type": "object"
           },
           "support": {
-            "description": "Compiled evidence atoms: proven evidence claims, symbol locations, source ranges, typed graph edges, and complete-query negatives.",
+            "description": "Compiled evidence atoms: symbol locations, source ranges, typed graph edges, and complete-query negatives.",
             "type": "object"
           },
           "task_class": {

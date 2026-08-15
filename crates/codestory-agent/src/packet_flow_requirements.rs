@@ -262,30 +262,6 @@ impl EvidencePredicate {
         (citation_has_named_role(citation, subsystem, roles) || carrier(citation))
             .then_some((incoming_source, outgoing_target))
     }
-
-    /// Whether this citation carries enough requirement-specific semantics to
-    /// become a concise agent-facing explanation. Role-only classification is
-    /// useful for retrieval and sufficiency, but it is too broad to turn an
-    /// arbitrary incident edge into prose.
-    pub fn owns_agent_explanation(self, citation: &AgentCitationDto) -> bool {
-        match self {
-            Self::CitedCarrier(carrier) => carrier(citation),
-            Self::CitedRolesOrCallBoundary { carrier, .. }
-            | Self::CitedRolesOrOrderedCallBoundary { carrier, .. } => carrier(citation),
-            Self::CitedRoles { .. } => false,
-        }
-    }
-
-    /// Predicate-owned boundary carriers need their declared CALL boundary;
-    /// a carrier-only predicate may be explained directly from its retained
-    /// source role.
-    pub fn agent_explanation_requires_call_boundary(self, citation: &AgentCitationDto) -> bool {
-        match self {
-            Self::CitedRolesOrCallBoundary { carrier, .. }
-            | Self::CitedRolesOrOrderedCallBoundary { carrier, .. } => carrier(citation),
-            Self::CitedRoles { .. } | Self::CitedCarrier(_) => false,
-        }
-    }
 }
 
 /// Validate one cited CALL as a proof receipt for a flow requirement after the caller resolves the
