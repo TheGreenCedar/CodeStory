@@ -1170,6 +1170,17 @@ fn truncate_carrier_source(body: &str, max_bytes: usize) -> &str {
 /// a receipt about it, while the code itself stayed unreadable at answering time. What a
 /// carrier says about itself — its doc comment, the call it makes, the prototype it mixes in —
 /// is evidence the graph cannot restate, and it was being dropped on the floor.
+fn citation_needs_bounded_source_read(citation: &AgentCitationDto) -> bool {
+    let structural_source = citation.evidence_tier == Some(PacketEvidenceTierDto::StructuralText)
+        && citation
+            .evidence_producer
+            .as_deref()
+            .is_some_and(|producer| producer.starts_with("structural_"));
+    let lexical_source_range = citation.evidence_tier == Some(PacketEvidenceTierDto::LexicalSource)
+        && citation.resolution_status == Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+    structural_source || lexical_source_range
+}
+
 fn append_packet_carrier_source_sections(
     controller: &AppController,
     answer: &mut AgentAnswerDto,
@@ -1194,15 +1205,16 @@ fn append_packet_carrier_source_sections(
                 .evidence_producer
                 .as_deref()
                 .is_some_and(|producer| producer.starts_with("structural_"));
+        let bounded_source_read = citation_needs_bounded_source_read(&citation);
         let behavioral_source = matches!(
             citation.kind,
             NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::CLASS | NodeKind::STRUCT
         );
-        if !structural_source && !behavioral_source {
+        if !bounded_source_read && !behavioral_source {
             continue;
         }
         let started = Instant::now();
-        let source = if structural_source {
+        let source = if bounded_source_read {
             let (Some(path), Some(line)) = (citation.file_path.as_deref(), citation.line) else {
                 continue;
             };
@@ -5703,6 +5715,19 @@ mod tests {
             coverage_role: None,
             eligible_for_sufficiency: Some(true),
         }
+    }
+
+    #[test]
+    fn lexical_source_range_citation_gets_a_bounded_source_receipt() {
+        let mut citation = test_packet_citation("include/fmt/args.h", "include/fmt/args.h", 0.9);
+        citation.kind = NodeKind::FILE;
+        citation.evidence_tier = Some(PacketEvidenceTierDto::LexicalSource);
+        citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+
+        assert!(citation_needs_bounded_source_read(&citation));
+
+        citation.resolution_status = Some(PacketEvidenceResolutionDto::Unresolved);
+        assert!(!citation_needs_bounded_source_read(&citation));
     }
 
     fn packet_answer_fixture(question: &str, citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
