@@ -1571,7 +1571,7 @@ function validateProofFloor(value) {
     mergedLanes.commands,
     [
       "cargo test --locked -p codestory-runtime --lib agent::packet_evidence::",
-      "cargo test --locked -p codestory-runtime --lib agent::packet_sufficiency::",
+      "cargo test --locked -p codestory-runtime --lib agent::packet_compiler::tests",
       "cargo test --locked -p codestory-runtime --lib agent::packet_batch::",
       "cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::",
       "cargo test --locked -p codestory-runtime --lib services::",

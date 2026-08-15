@@ -10,8 +10,8 @@ use crate::agent::packet_batch::{
 };
 #[cfg(test)]
 use crate::agent::packet_budget::{
-    apply_packet_budget, next_deeper_packet_argv, next_deeper_packet_command,
-    truncate_answer_markdown_to_byte_cap,
+    PACKET_MARKDOWN_TRUNCATION_SUFFIX, apply_packet_budget, next_deeper_packet_argv,
+    next_deeper_packet_command, truncate_answer_markdown_to_byte_cap,
 };
 use crate::agent::packet_budget::{
     apply_packet_budget_with_extra_and_obligation_carriers, enforce_packet_output_budget,
@@ -69,17 +69,6 @@ use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path,
     packet_stage_citation_carry_limit, sort_by_cached_rank_desc,
 };
-#[cfg(test)]
-use crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context;
-#[cfg(test)]
-use crate::agent::packet_sufficiency::{
-    PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value, render_packet_command,
-};
-#[cfg(test)]
-use crate::agent::packet_sufficiency::{
-    PacketSufficiencyDto, PacketSufficiencyStatusDto, build_packet_sufficiency,
-    packet_budget_exceeded_hard_output_cap, packet_claim_can_satisfy_sufficiency,
-};
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_search_execution_flow, prompt_search_terms,
 };
@@ -95,8 +84,6 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_url_session_request_flow,
 };
 use crate::agent::packet_trace::merge_packet_initial_search_hits;
-#[cfg(test)]
-use crate::agent::path_identity::RuntimeWorkspacePathIdentity;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
     RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome, maybe_run_retrieval_shadow,
@@ -110,6 +97,8 @@ use crate::{
     fallback_mermaid as diagnostic_mermaid, hybrid_retrieval_enabled, mermaid_flowchart,
     mermaid_gantt, mermaid_sequence, query_mentions_non_primary_source,
 };
+#[cfg(test)]
+use codestory_agent::packet_command::quote_packet_command_value;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentCustomRetrievalConfigDto,
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, AgentResponseBlockDto,
@@ -125,9 +114,7 @@ use codestory_contracts::api::{
 };
 #[cfg(test)]
 use codestory_contracts::api::{
-    EdgeId, PacketBudgetDto, PacketBudgetUsageDto, PacketClaimDto, PacketPlanQueryDto,
-    PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto, RetrievalAnnotationKindDto,
-    RetrievalShadowDto, SearchMatchQualityDto,
+    EdgeId, PacketPlanQueryDto, RetrievalAnnotationKindDto, SearchMatchQualityDto,
 };
 use std::cmp::Ordering;
 #[cfg(test)]
@@ -5606,26 +5593,6 @@ mod tests {
         }
     }
 
-    fn mark_packet_fixture_full_retrieval_available(answer: &mut AgentAnswerDto) {
-        answer.retrieval_trace.retrieval_shadow = Some(RetrievalShadowDto {
-            retrieval_mode: "full".to_string(),
-            degraded_reason: None,
-            retrieval_total_ms: 1,
-            total_budget_ms: Some(500),
-            cancel_reason: None,
-            cache_hit: false,
-            stage_timings: Vec::new(),
-            candidates: Vec::new(),
-            would_rank: Vec::new(),
-            error: None,
-            candidate_count: 0,
-            resolved_hit_count: 0,
-            unresolved_candidate_count: 0,
-            diagnostic_only: false,
-            candidate_resolution_counts: Vec::new(),
-        });
-    }
-
     fn packet_fixture_project_root() -> &'static std::path::Path {
         std::path::Path::new("C:/workspace/project root")
     }
@@ -5648,229 +5615,6 @@ mod tests {
             .expect("create fixture parent directory");
         std::fs::write(&path, source).expect("write fixture source file");
         path
-    }
-
-    fn attach_packet_fixture_call_chain(answer: &mut AgentAnswerDto) {
-        let mut nodes = answer
-            .citations
-            .iter()
-            .map(|citation| codestory_contracts::api::GraphNodeDto {
-                id: citation.node_id.clone(),
-                label: citation.display_name.clone(),
-                kind: citation.kind,
-                depth: 1,
-                label_policy: None,
-                badge_visible_members: None,
-                badge_total_members: None,
-                merged_symbol_examples: Vec::new(),
-                file_path: citation.file_path.clone(),
-                qualified_name: Some(citation.display_name.clone()),
-                member_access: None,
-            })
-            .collect::<Vec<_>>();
-        if nodes.is_empty() {
-            return;
-        }
-
-        if nodes.len() == 1 {
-            nodes.push(codestory_contracts::api::GraphNodeDto {
-                id: NodeId("packet-fixture-receiver".to_string()),
-                label: "packet fixture receiver".to_string(),
-                kind: codestory_contracts::api::NodeKind::FUNCTION,
-                depth: 1,
-                label_policy: None,
-                badge_visible_members: None,
-                badge_total_members: None,
-                merged_symbol_examples: Vec::new(),
-                file_path: Some("tests/packet_fixture_receiver.rs".to_string()),
-                qualified_name: None,
-                member_access: None,
-            });
-        }
-
-        let edges = nodes
-            .windows(2)
-            .enumerate()
-            .map(|(index, pair)| codestory_contracts::api::GraphEdgeDto {
-                id: EdgeId(format!("packet-fixture-call-{index}")),
-                source: pair[0].id.clone(),
-                target: pair[1].id.clone(),
-                kind: codestory_contracts::api::EdgeKind::CALL,
-                confidence: Some(1.0),
-                certainty: Some("certain".to_string()),
-                callsite_identity: None,
-                candidate_targets: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        for citation in &mut answer.citations {
-            citation.evidence_edge_ids = edges
-                .iter()
-                .filter(|edge| edge.source == citation.node_id || edge.target == citation.node_id)
-                .map(|edge| edge.id.clone())
-                .collect();
-        }
-        answer.graphs.push(GraphArtifactDto::Uml {
-            id: "packet-fixture-call-chain".to_string(),
-            title: "Packet fixture call chain".to_string(),
-            graph: GraphResponse {
-                center_id: nodes[0].id.clone(),
-                nodes,
-                edges,
-                truncated: false,
-                omitted_edge_count: 0,
-                canonical_layout: None,
-            },
-        });
-    }
-
-    fn complete_material_packet_fixture_queries(
-        answer: &mut AgentAnswerDto,
-        obligations: &PacketObligationPlanDto,
-    ) {
-        answer.retrieval_trace.packet_sidecar_diagnostics.extend(
-            obligations
-                .query_obligations
-                .iter()
-                .filter(|query| query.material)
-                .map(|query| PacketSidecarQueryDiagnosticDto {
-                    query: query.query.clone(),
-                    completion: PacketQueryCompletionDto::Completed,
-                    retrieval_mode: "full".to_string(),
-                    sidecar_query_ms: Some(1),
-                    candidate_resolution_ms: Some(0),
-                    total_elapsed_ms: Some(1),
-                    sidecar_stage_count: 1,
-                    sidecar_stage_total_ms: Some(1),
-                    batch_query_wall_ms: Some(1),
-                    candidate_count: 1,
-                    resolved_hit_count: 1,
-                    unresolved_candidate_count: 0,
-                    blocking_unresolved_candidate_count: 0,
-                    semantic_stage_timeout_zero_hits: false,
-                    semantic_abstained: false,
-                    diagnostic: None,
-                }),
-        );
-    }
-
-    fn build_legacy_packet_fixture_sufficiency(
-        question: &str,
-        task_class: PacketTaskClassDto,
-        citations: Vec<AgentCitationDto>,
-    ) -> (AgentAnswerDto, PacketSufficiencyDto) {
-        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
-        let mut answer = packet_answer_fixture(question, citations);
-        rank_packet_evidence(question, &mut answer);
-        append_packet_evidence_sections(&mut answer, task_class, &limits, None);
-        let budget = apply_packet_budget(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            PacketBudgetModeDto::Compact,
-            limits,
-            &mut answer,
-        );
-        let sufficiency = build_packet_sufficiency(
-            packet_fixture_project_root(),
-            question,
-            task_class,
-            &answer,
-            &budget,
-        );
-        (answer, sufficiency)
-    }
-
-    fn build_finalized_sufficient_packet_fixture(
-        question: &str,
-        task_class: PacketTaskClassDto,
-        citations: Vec<AgentCitationDto>,
-    ) -> (AgentAnswerDto, PacketSufficiencyDto) {
-        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
-        let mut answer = packet_answer_fixture(question, citations);
-        rank_packet_evidence(question, &mut answer);
-        attach_packet_fixture_call_chain(&mut answer);
-        let mut obligations = build_packet_obligation_plan(question, task_class, &[]);
-        complete_material_packet_fixture_queries(&mut answer, &obligations);
-        let budget = apply_packet_budget(
-            packet_fixture_project_root(),
-            question,
-            task_class,
-            PacketBudgetModeDto::Compact,
-            limits.clone(),
-            &mut answer,
-        );
-        finalize_packet_obligation_plan(question, task_class, &mut obligations, &answer, &budget);
-        append_packet_evidence_sections(&mut answer, task_class, &limits, Some(&obligations));
-        order_packet_sections(&mut answer.sections);
-        let sufficiency = build_packet_sufficiency_with_obligation_context(
-            &RuntimeWorkspacePathIdentity,
-            packet_fixture_project_root(),
-            question,
-            task_class,
-            &answer,
-            &budget,
-            &[],
-            &[],
-            &obligations,
-        );
-        (answer, sufficiency)
-    }
-
-    fn build_claim_family_fixture_sufficiency(
-        question: &str,
-        citations: Vec<AgentCitationDto>,
-    ) -> (AgentAnswerDto, PacketSufficiencyDto) {
-        let mut answer = packet_answer_fixture(question, citations);
-        rank_packet_evidence(question, &mut answer);
-        let budget = apply_packet_budget(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            PacketBudgetModeDto::Compact,
-            packet_budget_limits(PacketBudgetModeDto::Compact),
-            &mut answer,
-        );
-        let sufficiency = build_packet_sufficiency(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &answer,
-            &budget,
-        );
-        (answer, sufficiency)
-    }
-
-    #[test]
-    fn packet_sufficiency_does_not_promote_summary_to_covered_claim() {
-        let question = "Explain packet sufficiency proof boundaries.";
-        let answer = packet_answer_fixture(question, Vec::new());
-        let budget = PacketBudgetDto {
-            requested: PacketBudgetModeDto::Compact,
-            limits: packet_budget_limits(PacketBudgetModeDto::Compact),
-            used: PacketBudgetUsageDto {
-                anchors: 0,
-                files: 0,
-                snippets: 0,
-                trail_edges: 0,
-                output_bytes: 0,
-            },
-            truncated: false,
-            omitted_sections: Vec::new(),
-            next_deeper_command: None,
-        };
-        let sufficiency = build_packet_sufficiency(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &answer,
-            &budget,
-        );
-
-        assert_ne!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
-        assert!(
-            sufficiency.covered_claims.is_empty(),
-            "covered_claims must only contain source-backed claims, not summary fallback: {sufficiency:?}"
-        );
     }
 
     #[test]
@@ -6203,53 +5947,6 @@ mod tests {
         assert!(
             focused_paths.contains(&"crates/acme-deploy/src/exec_events.rs"),
             "event definition files should survive compact focus carry: {focused_paths:?}"
-        );
-    }
-
-    #[test]
-    fn legacy_packet_treats_concrete_file_probe_as_nonblocking_hint() {
-        let _eval_probes = EvalProbesGuard::enabled();
-        let (_answer, sufficiency) = build_legacy_packet_fixture_sufficiency(
-            "Explain how `codex exec --json` flows from the top-level CLI into the exec runtime, app-server thread and turn start requests, and JSONL event output.",
-            PacketTaskClassDto::ArchitectureExplanation,
-            vec![
-                test_packet_citation("run_exec_session", "codex-rs/exec/src/lib.rs", 0.9),
-                test_packet_citation("ExecSharedCliOptions", "codex-rs/exec/src/cli.rs", 0.9),
-                test_packet_citation("Subcommand::Exec", "codex-rs/cli/src/main.rs", 0.8),
-                test_packet_citation("run_main", "codex-rs/exec/src/main.rs", 0.8),
-                test_packet_citation(
-                    "EventProcessorWithJsonOutput",
-                    "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
-                    0.8,
-                ),
-                test_packet_citation("exec_events", "codex-rs/exec/src/lib.rs", 0.8),
-                test_packet_citation(
-                    "ThreadStartParams",
-                    "codex-rs/app-server-protocol/schema/typescript/v2/ThreadStartParams.ts",
-                    0.7,
-                ),
-                test_packet_citation(
-                    "TurnStartParams",
-                    "codex-rs/app-server-protocol/schema/typescript/v2/TurnStartParams.ts",
-                    0.7,
-                ),
-            ],
-        );
-
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
-        assert!(
-            sufficiency
-                .gaps
-                .iter()
-                .all(|gap| !gap.contains("exec_events")),
-            "concrete file probes should be nonblocking hints when required flow roles are covered: {sufficiency:?}"
-        );
-        assert!(
-            sufficiency
-                .follow_up_commands
-                .iter()
-                .all(|command| !command.contains("exec_events")),
-            "concrete file probe hints should not emit targeted follow-up: {sufficiency:?}"
         );
     }
 
@@ -8130,87 +7827,6 @@ mod tests {
     }
 
     #[test]
-    fn packet_supported_claims_use_generic_evidence_roles() {
-        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
-        let mut answer = AgentAnswerDto {
-            source_coverage: Vec::new(),
-            answer_id: "generic-fixture".to_string(),
-            prompt: "Explain the packet evidence roles.".to_string(),
-            summary: "Generic evidence roles are covered.".to_string(),
-            freshness: None,
-            sections: Vec::new(),
-            citations: vec![
-                test_packet_citation("CliCommand", "crates/tool-cli/src/main.rs", 0.8),
-                test_packet_citation("RuntimeCoordinator", "crates/core/src/runtime.rs", 0.8),
-                test_packet_citation("WorkspacePlan", "crates/core/src/workspace/plan.rs", 0.8),
-                test_packet_citation("GraphIndexer", "crates/indexer/src/lib.rs", 0.8),
-                test_packet_citation("ProjectionStore", "crates/store/src/projection.rs", 0.8),
-                test_packet_citation("SnapshotRefresh", "crates/store/src/snapshot.rs", 0.8),
-                test_packet_citation("RouteHandler", "src/routes/user.rs", 0.8),
-                test_packet_citation("PacketRegression", "tests/packet_flow.rs", 0.8),
-            ],
-            subgraph_ids: Vec::new(),
-            retrieval_version: "test".to_string(),
-            graphs: Vec::new(),
-            retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
-                request_id: "generic-fixture".to_string(),
-                retrieval_publication: None,
-                resolved_profile: AgentRetrievalPresetDto::Architecture,
-                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
-                total_latency_ms: 1,
-                sla_target_ms: None,
-                sla_missed: false,
-                semantic_fallback_count: 0,
-                semantic_fallbacks: Vec::new(),
-                semantic_stage_timeout_zero_hits: 0,
-                semantic_abstained_count: 0,
-                annotations: Vec::new(),
-                packet_claim_profile_telemetry: None,
-                source_freshness_telemetry: None,
-                steps: Vec::new(),
-                packet_sidecar_diagnostics: Vec::new(),
-                retrieval_shadow: None,
-            },
-        };
-
-        append_packet_evidence_sections(
-            &mut answer,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &limits,
-            None,
-        );
-        let text = answer
-            .sections
-            .iter()
-            .flat_map(|section| &section.blocks)
-            .filter_map(|block| match block {
-                AgentResponseBlockDto::Markdown { markdown } => Some(markdown.as_str()),
-                AgentResponseBlockDto::Mermaid { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        for expected_claim in [
-            "The command or public entrypoint for this flow is `CliCommand`",
-            "`RuntimeCoordinator` coordinates runtime state transitions",
-            "`WorkspacePlan` handles workspace file selection",
-            "`GraphIndexer` extracts nodes, edges, occurrences",
-            "`ProjectionStore` persists or projects durable graph/search state",
-            "`SnapshotRefresh` refreshes post-write summaries",
-            "`RouteHandler` handles route dispatch or handler ownership",
-        ] {
-            assert!(
-                text.contains(expected_claim),
-                "generic packet claims should include {expected_claim}: {text}"
-            );
-        }
-        assert!(
-            !text.contains("`PacketRegression` covers regression behavior"),
-            "test-path regression claims should not crowd out primary flow claims: {text}"
-        );
-    }
-
-    #[test]
     fn packet_evidence_sections_publish_the_claim_telemetry_computed_with_the_claims() {
         let question = "Explain the packet evidence roles.";
         let citations = vec![
@@ -8341,66 +7957,6 @@ mod tests {
     }
 
     #[test]
-    fn packet_evidence_sections_render_unproven_carriers_as_reported_leads() {
-        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
-        let mut answer = packet_answer_fixture(
-            "Explain how RuntimeCoordinator coordinates runtime state transitions.",
-            vec![test_packet_citation(
-                "RuntimeCoordinator",
-                "crates/core/src/runtime.rs",
-                0.8,
-            )],
-        );
-        let obligations = PacketObligationPlanDto {
-            version: codestory_contracts::api::PACKET_OBLIGATION_PLAN_VERSION,
-            binding_terms: vec!["runtime coordinator".to_string()],
-            claim_obligations: vec![codestory_contracts::api::PacketClaimObligationDto {
-                id: "claim:orchestration".to_string(),
-                kind: codestory_contracts::api::PacketClaimObligationKindDto::Orchestration,
-                binding_terms: Vec::new(),
-                probe_binding: None,
-                material: true,
-                allowed_node_kinds: vec![NodeKind::FUNCTION],
-                required_edge_kind: Some(codestory_contracts::api::EdgeKind::CALL),
-                requires_complete_discovery: false,
-                proof_status: codestory_contracts::api::PacketObligationProofStatusDto::Reported,
-                reason: Some("required_evidence_edge_missing".to_string()),
-                carrier_node_ids: vec![NodeId("RuntimeCoordinator".to_string())],
-                carrier_paths: vec!["crates/core/src/runtime.rs".to_string()],
-                carrier_edge_proofs: Vec::new(),
-                open_next_candidates: vec!["crates/core/src/runtime.rs".to_string()],
-            }],
-            query_obligations: Vec::new(),
-        };
-
-        append_packet_evidence_sections(
-            &mut answer,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &limits,
-            Some(&obligations),
-        );
-
-        let markdown = answer
-            .sections
-            .iter()
-            .flat_map(|section| &section.blocks)
-            .filter_map(|block| match block {
-                AgentResponseBlockDto::Markdown { markdown } => Some(markdown.as_str()),
-                AgentResponseBlockDto::Mermaid { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            markdown.contains("[`R`] `RuntimeCoordinator` coordinates runtime state"),
-            "{markdown}"
-        );
-        assert!(
-            !markdown.contains("[`P`] `RuntimeCoordinator`"),
-            "{markdown}"
-        );
-    }
-
-    #[test]
     fn packet_supported_claims_generic_source_claims_are_domain_neutral_without_eval_probes() {
         let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
         let answer = packet_answer_fixture(
@@ -8523,74 +8079,6 @@ mod tests {
             ["index_file"],
             "indexing work-queue evidence cannot stand in for symbol-extraction/storage evidence"
         );
-    }
-
-    #[test]
-    fn packet_sufficiency_accepts_generic_indexing_flow_probes() {
-        let question = "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.";
-        let (_answer, sufficiency) = build_finalized_sufficient_packet_fixture(
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            vec![
-                test_packet_citation("CliDirection", "crates/codestory-cli/src/args.rs", 0.8),
-                test_packet_citation(
-                    "indexing entrypoint",
-                    "crates/codestory-runtime/src/services.rs",
-                    0.8,
-                ),
-                test_packet_citation(
-                    "file discovery",
-                    "crates/codestory-workspace/src/lib.rs",
-                    0.8,
-                ),
-                test_packet_citation(
-                    "symbol extraction",
-                    "crates/codestory-indexer/src/lib.rs",
-                    0.8,
-                ),
-                test_packet_citation(
-                    "storage persistence",
-                    "crates/codestory-store/src/storage_impl/mod.rs",
-                    0.8,
-                ),
-                test_packet_citation(
-                    "search projection",
-                    "crates/codestory-store/src/storage_impl/mod.rs",
-                    0.8,
-                ),
-                test_packet_citation(
-                    "snapshot refresh",
-                    "crates/codestory-store/src/snapshot_store.rs",
-                    0.8,
-                ),
-            ],
-        );
-
-        assert_eq!(
-            sufficiency.status,
-            PacketSufficiencyStatusDto::Sufficient,
-            "{sufficiency:?}"
-        );
-        for probe in [
-            "indexing entrypoint",
-            "file discovery",
-            "symbol extraction",
-            "storage persistence",
-            "search projection",
-            "snapshot refresh",
-        ] {
-            assert!(
-                sufficiency.gaps.iter().all(|gap| !gap.contains(probe)),
-                "generic indexing-flow probe {probe} should satisfy required probe gaps: {sufficiency:?}"
-            );
-            assert!(
-                sufficiency
-                    .follow_up_commands
-                    .iter()
-                    .all(|command| !command.contains(probe)),
-                "generic indexing-flow probe {probe} should not produce follow-up commands: {sufficiency:?}"
-            );
-        }
     }
 
     #[test]
@@ -9068,266 +8556,6 @@ mod tests {
     }
 
     #[test]
-    fn architecture_sufficiency_does_not_invent_flow_roles_without_requirements() {
-        let question = "Explain the module relationships.";
-        let citations = vec![
-            test_packet_citation("Alpha", "src/alpha.rs", 0.9),
-            test_packet_citation("Beta", "src/beta.rs", 0.85),
-            test_packet_citation("Gamma", "src/gamma.rs", 0.8),
-        ];
-        let (_answer, sufficiency) = build_claim_family_fixture_sufficiency(question, citations);
-
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
-        assert!(
-            sufficiency
-                .gaps
-                .iter()
-                .all(|gap| !gap.contains("flow-role coverage")),
-            "architecture sufficiency should only report flow-role gaps from shared requirements: {sufficiency:?}"
-        );
-    }
-
-    #[test]
-    fn generic_navigation_claims_do_not_satisfy_packet_sufficiency() {
-        let generic = PacketClaimDto {
-            claim: "Runtime orchestration is anchored by `RuntimeCoordinator`; inspect it there."
-                .to_string(),
-            required_obligation_ids: Vec::new(),
-            required_obligation_kinds: Vec::new(),
-            proof_status: None,
-            required_evidence_role: None,
-            citations: vec![test_packet_citation(
-                "RuntimeCoordinator",
-                "src/runtime.rs",
-                0.9,
-            )],
-            coverage_role: None,
-            eligible_for_sufficiency: None,
-        };
-        let causal = PacketClaimDto {
-            claim: "`RuntimeCoordinator` coordinates runtime state transitions and downstream service calls."
-                .to_string(),
-            required_obligation_ids: Vec::new(),
-            required_obligation_kinds: Vec::new(),
-            proof_status: None,
-            required_evidence_role: None,
-            citations: vec![test_packet_citation(
-                "RuntimeCoordinator",
-                "src/runtime.rs",
-                0.9,
-            )],
-            coverage_role: None,
-            eligible_for_sufficiency: None,
-        };
-        let adjacent = PacketClaimDto {
-            claim:
-                "`Session.send` in `src/requests/sessions.py` ties request, session in this flow to cited definitions and adjacent ownership."
-                    .to_string(),
-            required_obligation_ids: Vec::new(),
-            required_obligation_kinds: Vec::new(),
-            proof_status: None,
-            required_evidence_role: None,
-            citations: vec![test_packet_citation(
-                "Session.send",
-                "src/requests/sessions.py",
-                0.9,
-            )],
-            coverage_role: None,
-            eligible_for_sufficiency: None,
-        };
-        let definition = PacketClaimDto {
-            claim:
-                "`PreparedRequest` is defined in cited source `src/requests/models.py` and should be treated as an exact source anchor for this flow."
-                    .to_string(),
-            required_obligation_ids: Vec::new(),
-            required_obligation_kinds: Vec::new(),
-            proof_status: None,
-            required_evidence_role: None,
-            citations: vec![test_packet_citation(
-                "PreparedRequest",
-                "src/requests/models.py",
-                0.9,
-            )],
-            coverage_role: None,
-            eligible_for_sufficiency: None,
-        };
-
-        assert!(!packet_claim_can_satisfy_sufficiency(&generic));
-        assert!(!packet_claim_can_satisfy_sufficiency(&adjacent));
-        assert!(!packet_claim_can_satisfy_sufficiency(&definition));
-        assert!(packet_claim_can_satisfy_sufficiency(&causal));
-    }
-
-    #[test]
-    fn partial_and_insufficient_packets_recommend_targeted_followups() {
-        let question = "Explain route dispatch with enough evidence to stop.";
-        let mut partial_answer = packet_answer_fixture(
-            question,
-            vec![test_packet_citation(
-                "RouteDispatcher",
-                "src/router/dispatch.rs",
-                0.8,
-            )],
-        );
-        mark_packet_fixture_full_retrieval_available(&mut partial_answer);
-        let mut budget = apply_packet_budget(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::RouteTracing,
-            PacketBudgetModeDto::Tiny,
-            packet_budget_limits(PacketBudgetModeDto::Tiny),
-            &mut partial_answer,
-        );
-        budget.truncated = true;
-        budget.omitted_sections = vec!["output_bytes".to_string()];
-        let partial = build_packet_sufficiency(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::RouteTracing,
-            &partial_answer,
-            &budget,
-        );
-
-        assert_eq!(partial.status, PacketSufficiencyStatusDto::Partial);
-        assert!(
-            partial
-                .follow_up_commands
-                .iter()
-                .any(|command| command.contains("--budget compact")),
-            "partial packets should recommend the next deeper packet command: {partial:?}"
-        );
-        assert!(
-            partial
-                .follow_up_commands
-                .iter()
-                .any(|command| command.contains("codestory-cli search")),
-            "partial packets should recommend targeted CodeStory search, not broad source reads: {partial:?}"
-        );
-        assert!(
-            partial
-                .follow_up_commands
-                .iter()
-                .all(|command| !command.contains("<target-workspace>")),
-            "partial packet follow-up commands should be directly runnable: {partial:?}"
-        );
-        assert!(
-            partial
-                .follow_up_commands
-                .iter()
-                .all(|command| command.contains("--project 'C:/workspace/project root'")),
-            "partial packet follow-up commands should include the concrete project root: {partial:?}"
-        );
-
-        let mut weak_answer = packet_answer_fixture(
-            question,
-            vec![test_packet_citation(
-                "RouteDispatcher",
-                "src/router/dispatch.rs",
-                0.8,
-            )],
-        );
-        let weak_budget = apply_packet_budget(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::RouteTracing,
-            PacketBudgetModeDto::Compact,
-            packet_budget_limits(PacketBudgetModeDto::Compact),
-            &mut weak_answer,
-        );
-        let weak = build_packet_sufficiency(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::RouteTracing,
-            &weak_answer,
-            &weak_budget,
-        );
-        assert_eq!(weak.status, PacketSufficiencyStatusDto::Partial);
-        assert!(
-            weak.gaps
-                .iter()
-                .any(|gap| gap.contains("at least 3 are required")),
-            "single-citation route packets should name the coverage gap: {weak:?}"
-        );
-
-        let mut empty_answer = packet_answer_fixture(question, Vec::new());
-        mark_packet_fixture_full_retrieval_available(&mut empty_answer);
-        let empty_budget = apply_packet_budget(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::RouteTracing,
-            PacketBudgetModeDto::Compact,
-            packet_budget_limits(PacketBudgetModeDto::Compact),
-            &mut empty_answer,
-        );
-        let insufficient = build_packet_sufficiency(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::RouteTracing,
-            &empty_answer,
-            &empty_budget,
-        );
-
-        assert_eq!(
-            insufficient.status,
-            PacketSufficiencyStatusDto::Insufficient
-        );
-        assert!(
-            insufficient
-                .follow_up_commands
-                .iter()
-                .any(|command| command.contains("codestory-cli index")),
-            "insufficient packets should recommend indexing before broad exploration: {insufficient:?}"
-        );
-        assert!(
-            insufficient
-                .follow_up_commands
-                .iter()
-                .any(|command| command.contains("codestory-cli search")
-                    && command.contains("--why")
-                    && !command.contains("--repo-text on")),
-            "insufficient packets should recommend sidecar-primary search diagnostics: {insufficient:?}"
-        );
-
-        // CR-050: the invocation is the executable contract; the shell strings
-        // are only its rendering, so a caller never re-parses a quoted command.
-        assert_eq!(
-            insufficient.follow_up_invocations.len(),
-            insufficient.follow_up_commands.len(),
-            "every published follow-up must carry an executable invocation: {insufficient:?}"
-        );
-        assert_eq!(
-            insufficient
-                .follow_up_invocations
-                .iter()
-                .map(|invocation| {
-                    let mut argv = vec![invocation.program.clone()];
-                    argv.extend(invocation.args.iter().cloned());
-                    render_packet_command(&argv)
-                })
-                .collect::<Vec<_>>(),
-            insufficient.follow_up_commands,
-            "the displayed follow-up must be the rendering of its invocation: {insufficient:?}"
-        );
-        assert!(
-            insufficient.follow_up_invocations.iter().all(|invocation| {
-                invocation.program == "codestory-cli"
-                    && invocation
-                        .args
-                        .iter()
-                        .all(|argument| !argument.starts_with('\'') && !argument.is_empty())
-            }),
-            "invocation arguments must be unquoted: {insufficient:?}"
-        );
-        assert!(
-            insufficient
-                .follow_up_invocations
-                .iter()
-                .any(|invocation| invocation.args.contains(&question.to_string())),
-            "the question must reach the invocation verbatim: {insufficient:?}"
-        );
-    }
-
-    #[test]
     fn packet_follow_up_commands_single_quote_shell_sensitive_questions() {
         let question = "Inspect $env:SECRET and $(Get-ChildItem) and 'literal'";
         let quoted = quote_packet_command_value(question);
@@ -9623,59 +8851,6 @@ mod tests {
     }
 
     #[test]
-    fn hard_payload_budget_truncation_requires_deeper_packet() {
-        let question = "Explain the packet stop rule when evidence is clipped.";
-        let mut answer = packet_answer_fixture(
-            question,
-            vec![
-                test_packet_citation("CliCommand", "crates/tool-cli/src/main.rs", 0.8),
-                test_packet_citation("RuntimeCoordinator", "crates/core/src/runtime.rs", 0.8),
-                test_packet_citation("WorkspacePlan", "crates/core/src/workspace/plan.rs", 0.8),
-            ],
-        );
-        mark_packet_fixture_full_retrieval_available(&mut answer);
-        let mut budget = apply_packet_budget(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            PacketBudgetModeDto::Compact,
-            packet_budget_limits(PacketBudgetModeDto::Compact),
-            &mut answer,
-        );
-        budget.truncated = true;
-        budget.omitted_sections = vec!["packet_payload".to_string()];
-        budget.next_deeper_command = next_deeper_packet_command(
-            packet_fixture_project_root(),
-            question,
-            PacketBudgetModeDto::Compact,
-        );
-
-        let sufficiency = build_packet_sufficiency(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &answer,
-            &budget,
-        );
-
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
-        assert!(
-            sufficiency
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("answer-critical evidence")),
-            "hard payload truncation should be named as a sufficiency gap: {sufficiency:?}"
-        );
-        assert!(
-            sufficiency
-                .follow_up_commands
-                .iter()
-                .any(|command| command.contains("--budget standard")),
-            "partial packet should recommend the existing deeper packet command: {sufficiency:?}"
-        );
-    }
-
-    #[test]
     fn packet_output_budget_measures_serialized_packet_payload() {
         let question = "Explain the final packet payload budget.";
         let limits = PacketBudgetLimitsDto {
@@ -9786,38 +8961,6 @@ mod tests {
     }
 
     #[test]
-    fn packet_hard_output_cap_uses_current_usage_not_stale_omissions() {
-        let limits = PacketBudgetLimitsDto {
-            max_anchors: 4,
-            max_files: 4,
-            max_snippets: 4,
-            max_trail_edges: 4,
-            max_output_bytes: 1000,
-        };
-        let mut budget = PacketBudgetDto {
-            requested: PacketBudgetModeDto::Compact,
-            limits,
-            used: PacketBudgetUsageDto {
-                anchors: 4,
-                files: 4,
-                snippets: 0,
-                trail_edges: 0,
-                output_bytes: 900,
-            },
-            truncated: true,
-            omitted_sections: vec!["output_bytes".to_string(), "packet_payload".to_string()],
-            next_deeper_command: None,
-        };
-
-        assert!(
-            !packet_budget_exceeded_hard_output_cap(&budget),
-            "stale output_bytes omission should not force followups after final payload fits"
-        );
-        budget.used.output_bytes = 1001;
-        assert!(packet_budget_exceeded_hard_output_cap(&budget));
-    }
-
-    #[test]
     fn graph_budget_prunes_nodes_not_referenced_by_retained_edges() {
         fn node(id: &str) -> codestory_contracts::api::GraphNodeDto {
             codestory_contracts::api::GraphNodeDto {
@@ -9898,98 +9041,6 @@ mod tests {
         assert_eq!(node_ids, vec!["center", "kept"]);
         assert!(graph.truncated);
         assert!(budget.omitted_sections.contains(&"trail_edges".to_string()));
-    }
-
-    #[test]
-    fn generic_packet_sections_and_sufficiency_cover_agent_stop_contract() {
-        let question = "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.";
-        let (answer, sufficiency) = build_finalized_sufficient_packet_fixture(
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            vec![
-                test_packet_citation("FlowRegression", "tests/flow_regression.rs", 0.5),
-                test_packet_citation("CliCommand", "crates/app-cli/src/main.rs", 0.2),
-                test_packet_citation("BuildIndex::run", "crates/indexer/src/build.rs", 0.4),
-                test_packet_citation(
-                    "RuntimeCoordinator",
-                    "crates/app-runtime/src/services.rs",
-                    0.3,
-                ),
-                test_packet_citation("WorkspacePlan", "crates/workspace/src/plan.rs", 0.2),
-                test_packet_citation("GraphIndexer", "crates/indexer/src/lib.rs", 0.2),
-                test_packet_citation("ProjectionStore", "crates/store/src/projection.rs", 0.2),
-                test_packet_citation("SnapshotRefresh", "crates/store/src/snapshot.rs", 0.2),
-            ],
-        );
-
-        // Both sections restate structured fields the consumer already holds, so they trail
-        // the sections that carry evidence found nowhere else. Consumers that read only the
-        // leading bytes of the packet get retrieval evidence rather than a second copy of
-        // `answer.citations`.
-        let section_ids = answer
-            .sections
-            .iter()
-            .map(|section| section.id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            section_ids.last().copied(),
-            Some("packet-evidence-ledger"),
-            "the citation restatement belongs last: {section_ids:?}"
-        );
-        assert!(
-            !section_ids.contains(&"packet-flow-claims"),
-            "English flow-catalog conclusions must not be agent-facing sections: {section_ids:?}"
-        );
-        let top_anchor_names = answer
-            .citations
-            .iter()
-            .take(4)
-            .map(|citation| citation.display_name.as_str())
-            .collect::<Vec<_>>();
-        assert!(
-            top_anchor_names.contains(&"CliCommand"),
-            "command entrypoint should stay in the high-priority flow anchors: {top_anchor_names:?}"
-        );
-        assert!(
-            top_anchor_names.contains(&"RuntimeCoordinator"),
-            "runtime coordination should stay in the high-priority flow anchors: {top_anchor_names:?}"
-        );
-        assert!(
-            top_anchor_names.contains(&"BuildIndex::run"),
-            "a real indexing entrypoint should stay in the high-priority flow anchors: {top_anchor_names:?}"
-        );
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
-        assert!(sufficiency.follow_up_commands.is_empty());
-        assert!(sufficiency.open_next.is_empty());
-        // Bind on the obligation this receipt discharges, not on its prose. A receipt that
-        // resolves to a real relation says what the carrier does and never repeats the
-        // obligation id, so matching the id inside the sentence only ever passed for the
-        // fallback wording.
-        assert!(
-            sufficiency.covered_claims.iter().any(|claim| {
-                claim
-                    .required_obligation_ids
-                    .iter()
-                    .any(|id| id == "indexing_entrypoint")
-                    && claim.proof_status
-                        == Some(codestory_contracts::api::PacketProofStatusDto::Proven)
-            }),
-            "generic packet should include a proven indexing-entrypoint obligation receipt: {sufficiency:?}"
-        );
-        assert!(
-            sufficiency
-                .avoid_opening
-                .iter()
-                .any(|path| path.contains("crates/indexer/src/lib.rs")),
-            "sufficient packets should tell agents proven carrier files do not need broad re-opening: {sufficiency:?}"
-        );
-        assert!(
-            sufficiency
-                .avoid_opening_paths
-                .iter()
-                .any(|path| path == "crates/indexer/src/lib.rs"),
-            "sufficient packets should expose raw proven carrier paths separately from prose: {sufficiency:?}"
-        );
     }
 
     #[test]

@@ -2619,7 +2619,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && sameMembers(needs(windowsNative), ["resolve"])
         && workflowExpression(windowsNative.if) === sourceStabilizationCondition
         && windowsNative["runs-on"] === "windows-latest"
-        && windowsNative["timeout-minutes"] === 15
+        && windowsNative["timeout-minutes"] === 25
         && object(windowsNative.env).CMAKE_GENERATOR === "Ninja"
         && windowsNative["continue-on-error"] === undefined,
       `${sourceFile} Windows native source contracts must run in parallel on the resolved exact head`,

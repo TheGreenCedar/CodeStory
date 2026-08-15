@@ -911,7 +911,7 @@ jobs:
         needs.resolve.outputs.reuse != 'true'
       }}
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       CMAKE_GENERATOR: Ninja
     steps:

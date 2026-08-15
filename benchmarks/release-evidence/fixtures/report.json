@@ -26,7 +26,7 @@
       "type": "performance",
       "tier": "live_behavior",
       "status": "pass",
-      "graph_sha256": "4645b6e4e55a17720a28eae7b7ecd322b279d727d945a3a15a841d897f0b14f1",
+      "graph_sha256": "d3263fef491c5c98462b6be30ba450dbcd73aaa078983c7f657acbb853a1517e",
       "observed_at": "2026-08-09T12:50:08.593Z",
       "expires_at": "2026-08-10T12:50:08.593Z",
       "identity": {
@@ -47,7 +47,7 @@
       "type": "answer_quality",
       "tier": "answer_quality",
       "status": "pass",
-      "graph_sha256": "4645b6e4e55a17720a28eae7b7ecd322b279d727d945a3a15a841d897f0b14f1",
+      "graph_sha256": "d3263fef491c5c98462b6be30ba450dbcd73aaa078983c7f657acbb853a1517e",
       "observed_at": "2026-08-09T12:50:08.593Z",
       "expires_at": "2026-08-10T12:50:08.593Z",
       "identity": {
@@ -69,7 +69,7 @@
     "schema": "codestory.release-claim-evaluation/v1",
     "status": "pass",
     "graph_schema": "codestory.release-claims/v1",
-    "graph_sha256": "4645b6e4e55a17720a28eae7b7ecd322b279d727d945a3a15a841d897f0b14f1",
+    "graph_sha256": "d3263fef491c5c98462b6be30ba450dbcd73aaa078983c7f657acbb853a1517e",
     "evidence_selection": "all_matching_rows_must_pass",
     "expected_commit": "2222222222222222222222222222222222222222",
     "evaluated_at": "2026-08-09T12:50:08.593Z",

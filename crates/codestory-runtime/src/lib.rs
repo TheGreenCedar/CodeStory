@@ -97,12 +97,7 @@ pub use agent::{
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod agent_test_support {
-    use crate::agent::packet_sufficiency::PacketSufficiencyDto;
-    use codestory_contracts::api::{
-        AgentAnswerDto, IndexFreshnessDto, PacketBudgetDto, PacketClaimDto,
-        PacketObligationPlanDto, PacketTaskClassDto,
-    };
-    use std::path::Path;
+    use codestory_contracts::api::{AgentAnswerDto, IndexFreshnessDto, PacketClaimDto};
 
     pub fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
         crate::agent::packet_claims::packet_supported_claims_with_telemetry(answer).0
@@ -110,30 +105,6 @@ pub mod agent_test_support {
 
     pub fn fresh_index_observation() -> IndexFreshnessDto {
         crate::agent::packet_freshness::fresh_index_observation()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_packet_sufficiency_with_obligation_context(
-        project_root: &Path,
-        question: &str,
-        task_class: PacketTaskClassDto,
-        answer: &AgentAnswerDto,
-        budget: &PacketBudgetDto,
-        extra_probes: &[String],
-        exact_probe_paths: &[String],
-        obligations: &PacketObligationPlanDto,
-    ) -> PacketSufficiencyDto {
-        crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context(
-            &crate::agent::path_identity::RuntimeWorkspacePathIdentity,
-            project_root,
-            question,
-            task_class,
-            answer,
-            budget,
-            extra_probes,
-            exact_probe_paths,
-            obligations,
-        )
     }
 }
 use index_commit::*;

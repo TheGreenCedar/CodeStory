@@ -35,14 +35,10 @@ pub mod packet_probes;
 pub mod packet_profile_telemetry;
 pub mod packet_required_probes;
 pub mod packet_scoring;
-pub mod packet_sufficiency;
 pub mod packet_terms;
 pub mod pinned_reader;
 pub mod planning;
 pub mod profiles;
 pub mod text;
 pub mod trail;
-pub mod workspace_path_identity;
-
 pub use pinned_reader::{ContinuationRefusal, PinnedReader, admit_continuation_probe};
-pub use workspace_path_identity::WorkspacePathIdentity;

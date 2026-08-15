@@ -9,7 +9,6 @@ use crate::agent::packet_obligations::{
 };
 use crate::agent::packet_plan::{packet_explicit_request_probe_queries, push_unique_term};
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries_with_extra;
-use crate::agent::packet_sufficiency::PACKET_MARKDOWN_TRUNCATION_SUFFIX;
 use crate::agent::trace_export::{
     PACKET_STEP_TRACE_ANNOTATION_PREFIX, compact_retained_packet_step_trace_for_budget,
     packet_retrieval_trace_summary, retain_packet_step_trace_for_export,
@@ -29,6 +28,8 @@ pub(crate) use codestory_agent::packet_command::next_deeper_packet_argv;
 pub(crate) use codestory_agent::packet_command::next_deeper_packet_command;
 
 const MARKDOWN_TRUNCATION_FLOOR_BYTES: usize = 256;
+pub(super) const PACKET_MARKDOWN_TRUNCATION_SUFFIX: &str =
+    "\n\n... packet section truncated by budget ...\n";
 const ANSWER_RETRIEVAL_DIAGNOSTICS_OMISSION: &str = "answer.retrieval_trace.diagnostics";
 const MINIMAL_PARTIAL_OMISSION: &str = "minimal_partial";
 const RETRIEVAL_TRACE_SUMMARY_OMISSION: &str = "retrieval_trace_summary";

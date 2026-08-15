@@ -4396,6 +4396,9 @@ test("exact-head source proof owns Windows path and native-staging harnesses", a
     ["job becomes advisory", workflow => {
       workflow.jobs["windows-native-contracts"]["continue-on-error"] = true;
     }],
+    ["cold-build timeout is shortened", workflow => {
+      workflow.jobs["windows-native-contracts"]["timeout-minutes"] = 15;
+    }],
     ["checkout stops using the resolved head", workflow => {
       workflow.jobs["windows-native-contracts"].steps[0].with.ref = "dev/codestory-next";
     }],

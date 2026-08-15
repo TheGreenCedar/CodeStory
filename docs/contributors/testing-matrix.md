@@ -39,13 +39,13 @@ work. Run source stabilization once on the final pre-calibration source head
 rather than using this focused durability lane as a second proof coordinator.
 
 The same universal `linux-contracts` job also runs the merged proof suites as
-a blocking per-PR lane, so evidence classification, packet sufficiency,
+a blocking per-PR lane, so evidence classification, packet compilation,
 readiness leases, hook installation, and the confined workspace reader cannot
 regress between dispatch-gated workspace proofs:
 
 ```bash
 cargo test --locked -p codestory-runtime --lib agent::packet_evidence::
-cargo test --locked -p codestory-runtime --lib agent::packet_sufficiency::
+cargo test --locked -p codestory-runtime --lib agent::packet_compiler::tests
 cargo test --locked -p codestory-runtime --lib agent::packet_batch::
 cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::
 cargo test --locked -p codestory-runtime --lib services::
