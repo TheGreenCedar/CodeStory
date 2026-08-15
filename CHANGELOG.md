@@ -2,25 +2,28 @@
 
 ## Unreleased
 
-### Changed
-
-- Packets now keep cited CALL and inheritance relations through the compact graph cap and state those relations in obligation receipts, instead of pointing at carriers with bookkeeping sentences.
-- The MCP `snippet` tool accepts the field names search and packet hits actually emit (`path`/`file_path`/`line`/`symbol_id`), so agents can paste a hit without renaming it.
-- Compact `context` text now includes evidence sections and CALL/inheritance relations after the trust boundary, the same way packet compact text already does.
-- Packets report whether retrieval can support an answer from ranked citations and graph relations. They no longer assert closed English flow-step conclusions, and they no longer stay `partial` merely because a named catalog family is unproven.
-- Packets now return compiled support units and a typed stop or one-round drill: `supported`, `drill_once`, `not_established`, or `unavailable`. The previous `sufficient` / `follow_up_commands` / `unsafe_to_claim` fields are gone. Compact text shows support first, then the disposition.
-
 ## 0.17.0
 
 CodeStory 0.17 gives agents broader, more dependable context from a repository. Questions can now combine names, files, concepts, relationships, and ordered flows, and search keeps exact, semantic, and graph evidence separate while ranking them together. Exact definitions remain easy to find, related callers and routes stay attached to the result, and weak semantic matches are dropped instead of being presented as useful evidence.
 
-Packets are built around the parts of the question that must be proved. CodeStory reserves a citation and the relevant code relationship for each required step before adding background context, keeps exact-file questions tied to those files, and checks the complete CLI or MCP response against its size limit. If the evidence cannot support a step, the packet names the missing part and remains partial rather than claiming a complete answer.
+Packets are built around the parts of the question that need support. CodeStory reserves a citation and the relevant code relationship for each required step before adding background context, keeps exact-file questions tied to those files, and checks the complete CLI or MCP response against its size limit. Each packet now tells the agent to answer from the compiled support, make one bounded follow-up packet, decline an unsupported claim, or report that the project is unavailable. It no longer sends agents into an open-ended recovery loop.
 
 Indexing and semantic search now preserve more of the structure that explains how code works: entry points, symbol roles, incoming and outgoing calls, routes, SQL relationships, and receiver calls in Go and Dart. Ambiguous calls remain gaps instead of guessed links. Refreshes reuse unchanged semantic documents, while the accelerated embedding runtime remains warm across projects for the same user.
 
 The installed experience is more predictable under load and across upgrades. One failed or cancelled request no longer takes down unrelated project work, bookmarks survive index rebuilds and unambiguous symbol moves, and CodeStory refuses to combine a plugin with an incompatible CLI. The 0.17 bookmark store is separate from the index, so 0.16.3 will refuse to open the same cache rather than risk writing incompatible data; bookmark export and import remain the supported way to move them between machines or volumes.
 
 Cursor users can now install CodeStory from Customize as one plugin instead of copying a rule and MCP configuration by hand. The package includes the grounding rule and skill, session-start hook, and managed runtime launcher; after installation, Cursor still requires its MCP server to be enabled once and the window reloaded. The portable plugin core follows Agent Plugins v1, so CodeStory can share the same package structure across supported agent hosts without pretending their setup steps are identical.
+
+### Grounding details
+
+- Packets keep cited calls and inheritance relations through the compact graph cap instead of replacing them with bookkeeping text.
+- The MCP `snippet` tool accepts the field names emitted by search and packet hits, so an agent can use a hit without translating its fields first.
+- Compact `context` output includes evidence and call or inheritance relations after the trust boundary, matching packet output.
+- Packets return compiled support plus one disposition: `supported`, `drill_once`, `not_established`, or `unavailable`. A drill is limited to one packet, and compact output shows the support before the disposition.
+
+### Fixed
+
+- On Windows, a request no longer mistakes a live embedding runtime for a dead owner when its data pipe is briefly between listeners during a handoff.
 
 ## 0.16.3
 
