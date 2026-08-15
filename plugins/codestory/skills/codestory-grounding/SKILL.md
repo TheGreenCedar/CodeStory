@@ -66,8 +66,11 @@ plugin result unless the user explicitly asks.
 - Local repository-map output is navigation evidence. Broad packet/search
   output is stronger only when the response reports full retrieval readiness.
 - When `packet` reports `supported`, `not_established`, or `unavailable`, stop.
-  Answer from the compiled support units, say the repository does not establish
-  the claim, or follow the typed preparation reason. Do not search to recover.
+  For `supported`, answer from the compiled support units. For
+  `not_established`, answer every claim those units directly establish, then
+  name the material links or claims that remain unproven; do not turn a partial
+  chain into a complete one. For `unavailable`, report the typed preparation
+  reason. Do not search to recover.
 - When `packet` reports `drill_once`, call `packet` once more with the exact
   original `question`, `parent_packet_id`, and the listed `option_ids` (and the
   pinned generation ids when present). Then answer. Do not start a free-form

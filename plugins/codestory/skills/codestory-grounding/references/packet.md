@@ -20,7 +20,7 @@ generation pins). Do not send CLI flags such as `--file`, `mode`, or
 | Path | Command | Expected result |
 |------|---------|-----------------|
 | Normal path | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Packet with compiled `support` units, then `disposition`. |
-| Supported / NotEstablished / Unavailable | Stop. Answer from `support`, say the repository does not establish the claim, or follow the typed preparation reason. | Terminal. Do not search. |
+| Supported / NotEstablished / Unavailable | Stop. For Supported, answer from `support`. For NotEstablished, answer every directly supported claim and name the material gaps without completing the chain by inference. For Unavailable, report the typed preparation reason. | Terminal. Do not search. |
 | DrillOnce | Call `packet` once more with the exact original `question`, `parent_packet_id`, the listed `option_ids`, and the pinned `core_generation_id` / `retrieval_generation` when present. | One generation-bound continuation. Then AnswerNow. Merge cannot emit another drill. |
 | User-named exact target | `search`, `context`, `trail`, or `snippet` only when the user named that target. | Not packet recovery. |
 | Integration edge | Use JSON/MCP structured content. Compact text projects support units first, then disposition. Preserve exact source identifiers from support summaries and citation display names. | Comparable agent loops without a follow-up command list. |
@@ -50,13 +50,19 @@ generation pins). Do not send CLI flags such as `--file`, `mode`, or
   `disposition.kind=supported` means that evidence is present. It does not mean
   an English flow-catalog family was closed. Do not treat a missing named
   family such as `handler_processing` as a reason to search again.
+- A parser-partial coverage observation does not invalidate a retained exact
+  `source_range` from the same file. That range supports only what its source
+  text directly shows; the coverage warning still forbids file-wide absence or
+  completeness claims.
 - `drill_once` is only for objectively missing, closable evidence: a deadline-
   lost candidate, omitted mandatory support, or one bounded source read of a
   known path. Repeat the exact original question and execute the listed option
   ids once. Do not invent a second search system. CLI `drill` remains the
   maintainer report and is not this agent path.
-- `not_established` is a complete zero-hit or an ambiguous probe that needs a
-  user choice. Stop.
+- `not_established` is terminal. It may be a complete zero-hit, an ambiguous
+  probe that needs a user choice, or a packet with useful support whose material
+  chain is still incomplete after bounded retrieval. State the supported parts
+  and the exact gaps, then stop.
 - `unavailable` is stale publication, a dead sidecar, or a hard retrieval
   error. Typed retry or preparation, not search.
 - JSON packets include `plan.obligations.version=1`. The obligation ledger

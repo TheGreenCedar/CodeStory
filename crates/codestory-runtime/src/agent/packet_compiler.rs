@@ -15,9 +15,10 @@ use codestory_contracts::api::{
     PACKET_DRILL_MAX_BYTES, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS,
     PACKET_DRILL_MAX_OPTIONS, PacketClaimObligationDto, PacketClaimObligationKindDto,
     PacketDispositionDto, PacketDispositionKindDto, PacketObligationProofStatusDto, PacketPlanDto,
-    PacketProbeResolutionStatusDto, PacketQueryCompletionDto, SupportUnitDto, SupportUnitKindDto,
-    decode_drill_option_id,
+    PacketProbeResolutionStatusDto, PacketQueryCompletionDto, SourceCoverageStatusDto,
+    SupportUnitDto, SupportUnitKindDto, decode_drill_option_id,
 };
+use codestory_contracts::graph::FileCoverageReason;
 use std::collections::BTreeSet;
 
 #[cfg(test)]
@@ -248,7 +249,7 @@ fn classify_packet_disposition(input: ClassifyPacketDispositionInput<'_>) -> Pac
                 .unwrap_or_else(|| "publication freshness is not established".to_string()),
         );
     }
-    let coverage = PacketCoverageInput::from_observations(&input.answer.source_coverage);
+    let coverage = packet_coverage_for_disposition(input.answer, input.support);
     if coverage.caps_sufficiency() {
         return PacketDispositionDto::unavailable(
             coverage
@@ -315,6 +316,39 @@ fn classify_packet_disposition(input: ClassifyPacketDispositionInput<'_>) -> Pac
             "complete queries returned nothing that could support an answer".to_string(),
         )
     }
+}
+
+/// Preserve exact positive evidence from a parser-partial file without claiming the file was
+/// completely indexed. The runtime has reread every retained `SourceRange` from source after
+/// retrieval and before disposition. That range can therefore support what it literally shows;
+/// the index's parser-partial diagnostic remains serialized for the agent and still prevents any
+/// unsupported range from passing. Complete-discovery and absence claims remain guarded by their
+/// independently material obligations.
+fn packet_coverage_for_disposition(
+    answer: &AgentAnswerDto,
+    support: &[SupportUnitDto],
+) -> PacketCoverageInput {
+    let verified_source_paths = support
+        .iter()
+        .filter(|unit| unit.kind == SupportUnitKindDto::SourceRange)
+        .filter(|unit| {
+            unit.snippet
+                .as_deref()
+                .is_some_and(|snippet| !snippet.is_empty())
+        })
+        .filter_map(|unit| unit.path.as_deref().map(packet_display_path))
+        .collect::<BTreeSet<_>>();
+    let blocking_observations = answer
+        .source_coverage
+        .iter()
+        .filter(|observation| {
+            observation.status != SourceCoverageStatusDto::Incomplete
+                || observation.reason != Some(FileCoverageReason::ParserPartial)
+                || !verified_source_paths.contains(&packet_display_path(&observation.path))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    PacketCoverageInput::from_observations(&blocking_observations)
 }
 
 fn has_positive_support(support: &[SupportUnitDto]) -> bool {
@@ -565,7 +599,7 @@ mod tests {
         AgentCitationDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
         AgentRetrievalStepStatusDto, NodeId, NodeKind, PacketPlanDto, PacketProbeDto,
         PacketProbeResolutionDto, PacketProbeResolutionStatusDto, PacketTaskClassDto,
-        SearchHitOrigin,
+        SearchHitOrigin, SourceCoverageObservationDto,
     };
     use std::path::Path;
 
@@ -591,6 +625,37 @@ mod tests {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: Some(true),
+        }
+    }
+
+    fn retained_source_range(symbol_id: &str, path: &str) -> SupportUnitDto {
+        SupportUnitDto {
+            id: format!("source:{symbol_id}:10"),
+            kind: SupportUnitKindDto::SourceRange,
+            summary: format!("source for {symbol_id} at {path}:10-11"),
+            path: Some(path.to_string()),
+            symbol_id: Some(symbol_id.to_string()),
+            start_line: Some(10),
+            end_line: Some(11),
+            snippet: Some("fn verified_from_source() {}".to_string()),
+            edge_kind: None,
+            from_symbol: None,
+            to_symbol: None,
+            query: None,
+        }
+    }
+
+    fn incomplete_observation(
+        path: &str,
+        reason: FileCoverageReason,
+    ) -> SourceCoverageObservationDto {
+        SourceCoverageObservationDto {
+            path: path.to_string(),
+            status: SourceCoverageStatusDto::Incomplete,
+            reason: Some(reason),
+            not_established_cause: None,
+            observed_size: None,
+            byte_cap: None,
         }
     }
 
@@ -740,6 +805,101 @@ mod tests {
         );
 
         assert_eq!(disposition.kind, PacketDispositionKindDto::Supported);
+    }
+
+    #[test]
+    fn exact_source_range_preserves_positive_support_from_a_parser_partial_file() {
+        let mut packet = test_packet("explain routing", 98_304);
+        packet.answer.freshness = Some(fresh_index_observation());
+        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.ts")];
+        packet.answer.source_coverage = vec![incomplete_observation(
+            "/checkout/repos/example/src/router.ts",
+            FileCoverageReason::ParserPartial,
+        )];
+        packet.plan = empty_plan();
+        packet.support = vec![retained_source_range("Router.dispatch", "src/router.ts")];
+
+        apply_compiled_evidence(&mut packet, None);
+
+        assert_eq!(packet.disposition.kind, PacketDispositionKindDto::Supported);
+        assert!(packet.support.iter().any(|unit| {
+            unit.kind == SupportUnitKindDto::SourceRange
+                && unit.path.as_deref() == Some("src/router.ts")
+        }));
+        assert_eq!(
+            packet.answer.source_coverage[0].status,
+            SourceCoverageStatusDto::Incomplete,
+            "the parser-partial diagnostic stays visible"
+        );
+    }
+
+    #[test]
+    fn parser_partial_file_without_its_exact_source_range_remains_unavailable() {
+        let mut packet = test_packet("explain routing", 98_304);
+        packet.answer.freshness = Some(fresh_index_observation());
+        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.ts")];
+        packet.answer.source_coverage = vec![incomplete_observation(
+            "src/router.ts",
+            FileCoverageReason::ParserPartial,
+        )];
+        packet.plan = empty_plan();
+
+        let (_support, disposition) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            None,
+        );
+
+        assert_eq!(disposition.kind, PacketDispositionKindDto::Unavailable);
+    }
+
+    #[test]
+    fn exact_source_range_does_not_excuse_an_unreadable_file() {
+        let mut packet = test_packet("explain routing", 98_304);
+        packet.answer.freshness = Some(fresh_index_observation());
+        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.ts")];
+        packet.answer.source_coverage = vec![incomplete_observation(
+            "src/router.ts",
+            FileCoverageReason::Unreadable,
+        )];
+        packet.plan = empty_plan();
+        packet.support = vec![retained_source_range("Router.dispatch", "src/router.ts")];
+
+        apply_compiled_evidence(&mut packet, None);
+
+        assert_eq!(
+            packet.disposition.kind,
+            PacketDispositionKindDto::Unavailable
+        );
+    }
+
+    #[test]
+    fn exact_source_range_does_not_prove_complete_discovery() {
+        let mut packet = test_packet("is this route unused?", 98_304);
+        packet.answer.freshness = Some(fresh_index_observation());
+        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.ts")];
+        packet.answer.source_coverage = vec![incomplete_observation(
+            "src/router.ts",
+            FileCoverageReason::ParserPartial,
+        )];
+        packet.plan = empty_plan();
+        let mut obligation = claim_obligation(
+            PacketClaimObligationKindDto::Dispatch,
+            PacketObligationProofStatusDto::Reported,
+        );
+        obligation.requires_complete_discovery = true;
+        packet.plan.obligations.claim_obligations = vec![obligation];
+        packet.support = vec![retained_source_range("Router.dispatch", "src/router.ts")];
+
+        apply_compiled_evidence(&mut packet, None);
+
+        assert_ne!(packet.disposition.kind, PacketDispositionKindDto::Supported);
+        assert!(matches!(
+            packet.disposition.kind,
+            PacketDispositionKindDto::DrillOnce | PacketDispositionKindDto::NotEstablished
+        ));
     }
 
     #[test]

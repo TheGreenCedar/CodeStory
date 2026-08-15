@@ -148,7 +148,7 @@ const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
-    "Use the CodeStory packet supplied by the harness as the only repository context. Judge its compiled support units directly. Supported, not_established, and unavailable are terminal: answer from support, state that the claim is not established, or report unavailability, then stop. Drill_once permits exactly one MCP packet continuation with the original question, parent_packet_id, listed option_ids, and the declared core_generation_id/retrieval_generation pins; stop after that result. Do not use search, context, trail, snippet, shell, git, or direct source reads as packet recovery. Preserve exact source identifiers and paths from support and citations. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
+    "Use the CodeStory packet supplied by the harness as the only repository context. Judge its compiled support units directly. Supported, not_established, and unavailable are terminal. For supported, answer from support. For not_established, answer every directly established part and explicitly name the material gaps without inferring missing links. For unavailable, report the typed availability reason. Drill_once permits exactly one MCP packet continuation with the original question, parent_packet_id, listed option_ids, and the declared core_generation_id/retrieval_generation pins; after that result, apply the same terminal rules and stop. Do not use search, context, trail, snippet, shell, git, or direct source reads as packet recovery. Preserve exact source identifiers and paths from support and citations. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
 };
 
 function usage() {
@@ -1588,7 +1588,7 @@ Run that answer packet before any repository search, direct source read, git com
   const stopContractBlock =
     armName === "with_codestory"
       ? `
-The packet's own \`disposition\` is the complete control contract. The benchmark's expected-answer manifest is never shown to you and does not authorize extra retrieval. Stop on \`supported\`, \`not_established\`, or \`unavailable\`. On \`drill_once\`, execute exactly the declared one-shot packet continuation and then stop regardless of its result.`
+The packet's own \`disposition\` is the complete control contract. The benchmark's expected-answer manifest is never shown to you and does not authorize extra retrieval. Stop on \`supported\`, \`not_established\`, or \`unavailable\`. A \`not_established\` packet can still contain directly useful support: answer those established parts, identify the material gaps, and do not infer the missing links. On \`drill_once\`, execute exactly the declared one-shot packet continuation, apply the same terminal answer rule, and then stop regardless of its result.`
       : "";
   const harnessPacketBlock = packetPreludePromptBlock(context.codestoryPrelude);
   const baselineContextBlock = baselinePreludePromptBlock(context.baselinePrelude);
@@ -1962,8 +1962,8 @@ function normalizePathLike(value) {
     .replace(/(?:['"])+$/, "")
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
-    .replace(/^\?\/(?=[A-Za-z]:\/)/, "")
-    .replace(/^\.?\//, "");
+    .replace(/^\/\?\/(?=[A-Za-z]:\/)/, "")
+    .replace(/^\.\//, "");
 }
 
 function pathMatchesLike(actual, expected) {
@@ -8121,6 +8121,10 @@ function runSelfTest() {
     commandEvent("cmd_3", "item.completed", "Get-Content crates/codestory-cli/src/main.rs", "fn run_index() {}"),
     commandEvent("cmd_4", "item.started", "Get-Content crates/codestory-cli/src/main.rs"),
     commandEvent("cmd_4", "item.completed", "Get-Content crates/codestory-cli/src/main.rs", "fn run_index() {}"),
+    commandEvent("cmd_5", "item.started", "sed -n '1,80p' /opt/codestory/SKILL.md"),
+    commandEvent("cmd_5", "item.completed", "sed -n '1,80p' /opt/codestory/SKILL.md", "# Instructions"),
+    commandEvent("cmd_6", "item.started", "/bin/zsh -lc \"sed -n '1,80p' /opt/codestory/references/packet.md\""),
+    commandEvent("cmd_6", "item.completed", "/bin/zsh -lc \"sed -n '1,80p' /opt/codestory/references/packet.md\"", "# Packet"),
     {
       type: "item.completed",
       item: {
@@ -8132,10 +8136,11 @@ function runSelfTest() {
     { type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 } },
   ];
 
-  const analysis = analyzeTranscript(fixtureEvents);
+  const analysis = analyzeTranscript(fixtureEvents, "/workspace/repository");
   assert.equal(analysis.command_categories.codestory_cli, 1);
   assert.equal(analysis.command_categories.shell_search, 1);
-  assert.equal(analysis.command_categories.direct_file_read, 2);
+  assert.equal(analysis.command_categories.direct_file_read, 4);
+  assert.equal(analysis.direct_file_reads_total, 4);
   assert.equal(analysis.direct_source_reads_total, 2);
   assert.equal(analysis.ordinary_source_reads_after_first_codestory, 2);
   assert.equal(analysis.ordinary_source_reads_after_first_packet, 2);
