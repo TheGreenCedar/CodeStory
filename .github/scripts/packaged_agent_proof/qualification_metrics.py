@@ -150,6 +150,7 @@ def _retained_qualification_metric(
     metric: str,
     *,
     context: QualificationProducerContext,
+    runner: QualificationRunnerEvidence,
     measurement: dict,
     memory: dict,
 ) -> dict:
@@ -223,6 +224,7 @@ def collect_qualification_measurements(
         metric: _retained_qualification_metric(
             metric,
             context=context,
+            runner=runner,
             measurement=measurement,
             memory=memory,
         )

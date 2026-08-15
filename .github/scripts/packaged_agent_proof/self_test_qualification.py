@@ -141,6 +141,7 @@ def _qualification_measurement_dataflow_self_test() -> None:
     )
     retained_measurement = {"unplanned_suspend": False}
     real_cache_state = qualification_metrics._qualification_cache_state_from_scenarios
+    expected_runner = runner
 
     def derive_cache_state(actual_runner, actual_scenarios):
         require(
@@ -149,10 +150,11 @@ def _qualification_measurement_dataflow_self_test() -> None:
         )
         return real_cache_state(actual_runner, actual_scenarios)
 
-    def retain_metric(metric, *, context, measurement, memory):
+    def retain_metric(metric, *, context, runner, measurement, memory):
         require(
             metric == "sentinel_metric"
             and context is measurement_context
+            and runner is expected_runner
             and measurement is retained_measurement
             and memory is sentinel.memory,
             "qualification measurement collection replaced metric phase evidence",
@@ -203,6 +205,62 @@ def _qualification_measurement_dataflow_self_test() -> None:
         and retained.metrics == {"sentinel_metric": sentinel.metric},
         "qualification measurement collection returned stale phase evidence",
     )
+
+
+def _qualification_threshold_selection_self_test() -> None:
+    context = SimpleNamespace(
+        args=SimpleNamespace(proof_tier="protected_hardware"),
+        measurement_contract={
+            "constant_set": {
+                "qualification_thresholds": {"spawn_convergence": 486},
+                "qualification_threshold_overrides": {
+                    "protected_windows_x64_vulkan": {"spawn_convergence": 2000}
+                },
+            },
+            "measurement_protocol": {
+                "metric_contracts": {
+                    "spawn_convergence": {
+                        "comparison": "less_than_or_equal",
+                        "unit": "milliseconds",
+                    }
+                }
+            },
+        },
+    )
+    measurement = {
+        "values": {"spawn_convergence": 495.2198},
+        "artifact": sentinel.raw_evidence,
+    }
+    windows_runner = SimpleNamespace(
+        matrix_cell_id="protected_windows_x64_vulkan"
+    )
+    retained = qualification_metrics._retained_qualification_metric(
+        "spawn_convergence",
+        context=context,
+        runner=windows_runner,
+        measurement=measurement,
+        memory={},
+    )
+    require(
+        retained["status"] == "pass"
+        and retained["value"] == 495.2198
+        and retained["threshold"] == 2000
+        and retained["raw_evidence"] is sentinel.raw_evidence,
+        "Windows qualification metric did not select its matrix-cell threshold",
+    )
+
+    try:
+        qualification_metrics._retained_qualification_metric(
+            "spawn_convergence",
+            context=context,
+            runner=SimpleNamespace(matrix_cell_id="protected_macos_arm64_metal"),
+            measurement=measurement,
+            memory={},
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("Windows threshold override leaked into another matrix cell")
 
 
 def _qualification_workflow_dataflow_self_test() -> None:
@@ -279,6 +337,7 @@ def _qualification_workflow_dataflow_self_test() -> None:
 def run_qualification_self_tests() -> None:
     _qualification_cache_state_self_tests()
     _qualification_measurement_dataflow_self_test()
+    _qualification_threshold_selection_self_test()
     _qualification_workflow_dataflow_self_test()
     retry = validate_retry_state(
         {
