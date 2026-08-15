@@ -9,6 +9,7 @@ use crate::agent::packet_evidence::citation_sufficiency_eligible;
 use crate::agent::packet_freshness::PacketFreshnessInput;
 use crate::agent::packet_probe::exact_packet_probe_paths;
 use crate::agent::packet_scoring::packet_display_path;
+use codestory_agent::packet_obligations::proven_packet_obligation_explanations;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, AgentPacketRequestDto, BoundedDrillPlanDto, DrillOptionDto,
     EdgeKind, EmbeddingVectorPublicationIdentityDto, GraphArtifactDto, GraphResponse,
@@ -40,7 +41,7 @@ fn compile_packet_evidence_with_source_ranges(
     source_ranges: &[SupportUnitDto],
     request: Option<&AgentPacketRequestDto>,
 ) -> (Vec<SupportUnitDto>, PacketDispositionDto) {
-    let support = compile_support_units_with_source_ranges(answer, source_ranges);
+    let support = compile_support_units_with_source_ranges(plan, answer, source_ranges);
     let publication = answer.retrieval_trace.retrieval_publication.as_ref();
     let already_drilled = request.is_some_and(|request| {
         request.parent_packet_id.is_some() || !request.option_ids.is_empty()
@@ -59,11 +60,39 @@ fn compile_packet_evidence_with_source_ranges(
 }
 
 fn compile_support_units_with_source_ranges(
+    plan: &PacketPlanDto,
     answer: &AgentAnswerDto,
     source_ranges: &[SupportUnitDto],
 ) -> Vec<SupportUnitDto> {
     let mut units = Vec::new();
     let mut seen = BTreeSet::new();
+
+    for claim in proven_packet_obligation_explanations(answer, plan.task_class, &plan.obligations) {
+        let Some(obligation_id) = claim.required_obligation_ids.first() else {
+            continue;
+        };
+        let id = format!("claim:{obligation_id}");
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let citation = claim.citations.first();
+        units.push(SupportUnitDto {
+            id,
+            kind: SupportUnitKindDto::EvidenceClaim,
+            summary: claim.claim,
+            path: citation
+                .and_then(|citation| citation.file_path.as_deref())
+                .map(packet_display_path),
+            symbol_id: citation.map(|citation| citation.node_id.0.clone()),
+            start_line: citation.and_then(|citation| citation.line),
+            end_line: None,
+            snippet: None,
+            edge_kind: None,
+            from_symbol: None,
+            to_symbol: None,
+            query: None,
+        });
+    }
 
     for citation in answer
         .citations
@@ -922,6 +951,7 @@ mod tests {
         };
 
         let support = compile_support_units_with_source_ranges(
+            &packet.plan,
             &packet.answer,
             &[
                 source_range("source:retained", "Router.dispatch", "fn dispatch() {}"),

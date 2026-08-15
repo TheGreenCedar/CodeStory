@@ -1632,7 +1632,7 @@ static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::object("budget", "Budget limits, usage, and truncation metadata."),
         SchemaProperty::object(
             "support",
-            "Compiled evidence atoms: symbol locations, source ranges, typed graph edges, and complete-query negatives.",
+            "Compiled evidence atoms: proven evidence claims, symbol locations, source ranges, typed graph edges, and complete-query negatives.",
         ),
         SchemaProperty::object(
             "disposition",

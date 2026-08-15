@@ -45,8 +45,11 @@ generation pins). Do not send CLI flags such as `--file`, `mode`, or
 - `extra_probes` and CLI `--extra-probe` remain legacy compatibility inputs.
   They enter the same runtime resolver. Neither typed nor legacy probes replace
   the compiled disposition.
-- Judge the answer from compiled support units (symbol locations, source
-  ranges, typed CALL/INHERITANCE/import edges, and complete-query negatives).
+- Judge the answer from compiled support units (proven evidence claims, symbol
+  locations, source ranges, typed CALL/INHERITANCE/import edges, and
+  complete-query negatives). An `evidence_claim` is compiled only from a
+  proven material obligation and its own retained citation or typed edge; use
+  the adjacent source and edge units as the underlying proof.
   `disposition.kind=supported` means that evidence is present. It does not mean
   an English flow-catalog family was closed. Do not treat a missing named
   family such as `handler_processing` as a reason to search again.

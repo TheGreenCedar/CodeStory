@@ -8267,7 +8267,10 @@ version = "0.11.20"
             "packet_id": "packet-1",
             "question": "summarize repo docs",
             "task_class": "architecture_explanation",
-            "support": [{"id": "symbol:docs", "kind": "symbol_location", "summary": "Docs at README.md:1"}],
+            "support": [
+                {"id": "claim:docs", "kind": "evidence_claim", "summary": "Retained source at `Docs` supports the entrypoint evidence step."},
+                {"id": "symbol:docs", "kind": "symbol_location", "summary": "Docs at README.md:1"}
+            ],
             "disposition": {
                 "kind": "supported",
                 "reason": null,
@@ -8301,6 +8304,10 @@ version = "0.11.20"
         assert!(
             !text.contains("unsafe_to_claim") && !text.contains("follow_up_commands"),
             "compact text must not lead with the retired sufficiency control plane: {text}"
+        );
+        assert!(
+            text.contains("Retained source at `Docs` supports the entrypoint evidence step."),
+            "compiled evidence claims must survive the compact projection: {text}"
         );
         assert!(text.contains("Docs at README.md:1"), "{text}");
         assert!(text.len() <= STDIO_TEXT_MAX_BYTES, "{text}");

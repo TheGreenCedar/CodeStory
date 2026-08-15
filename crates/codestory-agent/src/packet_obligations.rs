@@ -2144,6 +2144,57 @@ pub fn packet_claims_with_obligation_receipts_and_telemetry<T>(
     (claims, telemetry)
 }
 
+/// Compile only explanations whose material obligation is proven by evidence
+/// retained in this packet.
+///
+/// This deliberately excludes the broader role/template claim catalog. A
+/// returned explanation is derived from the exact obligation row and its own
+/// carried citations; when a typed relation exists, the sentence also names
+/// that retained edge.
+pub fn proven_packet_obligation_explanations(
+    answer: &AgentAnswerDto,
+    task_class: PacketTaskClassDto,
+    plan: &PacketObligationPlanDto,
+) -> Vec<PacketClaimDto> {
+    let mut explanations = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for obligation in plan.claim_obligations.iter().filter(|obligation| {
+        obligation.material && obligation.proof_status == PacketObligationProofStatusDto::Proven
+    }) {
+        if !seen_ids.insert(obligation.id.as_str()) {
+            continue;
+        }
+        let mut seen_carriers = HashSet::new();
+        let citations = answer
+            .citations
+            .iter()
+            .filter(|citation| obligation.carrier_node_ids.contains(&citation.node_id))
+            .filter(|citation| citation_sufficiency_eligible(citation))
+            .filter(|citation| seen_carriers.insert(citation.node_id.0.clone()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if citations.is_empty() {
+            continue;
+        }
+        let Some((claim, citations)) =
+            agent_facing_packet_obligation_explanation(answer, task_class, obligation, &citations)
+        else {
+            continue;
+        };
+        explanations.push(PacketClaimDto {
+            claim,
+            required_obligation_ids: vec![obligation.id.clone()],
+            required_obligation_kinds: vec![obligation.kind],
+            proof_status: Some(PacketProofStatusDto::Proven),
+            required_evidence_role: None,
+            citations,
+            coverage_role: Some(PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE.to_string()),
+            eligible_for_sufficiency: Some(true),
+        });
+    }
+    explanations
+}
+
 fn bind_role_claims_to_exact_path_obligations(
     plan: &PacketObligationPlanDto,
     claims: &mut [PacketClaimDto],
@@ -2263,8 +2314,8 @@ fn packet_obligation_receipt_text(
     citations: &[AgentCitationDto],
 ) -> String {
     if obligation.proof_status == PacketObligationProofStatusDto::Proven && !citations.is_empty() {
-        if let Some(receipt) =
-            proven_server_flow_receipt_text(answer, task_class, obligation, citations)
+        if let Some((receipt, _)) =
+            agent_facing_packet_obligation_explanation(answer, task_class, obligation, citations)
         {
             return receipt;
         }
@@ -2299,6 +2350,66 @@ fn packet_obligation_receipt_text(
         "Material obligation `{}` is `{status}`: `{reason}`.",
         obligation.id
     )
+}
+
+fn agent_facing_packet_obligation_explanation(
+    answer: &AgentAnswerDto,
+    task_class: PacketTaskClassDto,
+    obligation: &PacketClaimObligationDto,
+    citations: &[AgentCitationDto],
+) -> Option<(String, Vec<AgentCitationDto>)> {
+    let requirement = flow_requirement_for_obligation(answer, task_class, obligation)?;
+    let citations = citations
+        .iter()
+        .filter(|citation| requirement.evidence.owns_agent_explanation(citation))
+        .cloned()
+        .collect::<Vec<_>>();
+    if citations.is_empty() {
+        return None;
+    }
+    let claim = if citations.iter().any(|citation| {
+        requirement
+            .evidence
+            .agent_explanation_requires_call_boundary(citation)
+    }) {
+        proven_server_flow_receipt_text(answer, task_class, obligation, &citations)?
+    } else {
+        proven_flow_role_receipt_text(answer, task_class, obligation, &citations)?
+    };
+    Some((claim, citations))
+}
+
+/// Explain a proven source carrier without inventing repository semantics.
+/// The role is the same requirement identity that finalized the obligation;
+/// the symbol spelling comes from the retained citation.
+fn proven_flow_role_receipt_text(
+    answer: &AgentAnswerDto,
+    task_class: PacketTaskClassDto,
+    obligation: &PacketClaimObligationDto,
+    citations: &[AgentCitationDto],
+) -> Option<String> {
+    let requirement = flow_requirement_for_obligation(answer, task_class, obligation)?;
+    let carriers = citations
+        .iter()
+        .map(|citation| {
+            let display = citation
+                .file_path
+                .as_deref()
+                .filter(|_| {
+                    citation.kind == NodeKind::FILE
+                        || citation.display_name.contains('/')
+                        || citation.display_name.contains('\\')
+                })
+                .map(packet_display_path)
+                .unwrap_or_else(|| citation.display_name.clone());
+            format!("`{display}`")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Retained source at {carriers} supports the {} evidence step.",
+        requirement.role.label()
+    ))
 }
 
 /// Render a proven material obligation as a concrete typed relation.
@@ -3216,6 +3327,127 @@ mod tests {
         );
         assert_eq!(claims.len(), 1);
         (plan, claims.into_iter().next().expect("receipt claim"))
+    }
+
+    #[test]
+    fn public_packet_explanations_keep_only_proven_retained_receipts() {
+        let answer = raw_server_receipt_answer(
+            "app.handle",
+            "Router.handle",
+            "app.router",
+            "public-explanation",
+        );
+        let (plan, expected) = finalized_server_receipt_claim(&answer, "request_dispatch");
+
+        let explanations =
+            proven_packet_obligation_explanations(&answer, PacketTaskClassDto::RouteTracing, &plan);
+        assert_eq!(explanations.len(), 1);
+        assert_eq!(explanations[0].claim, expected.claim);
+        assert_eq!(
+            explanations[0].required_obligation_ids,
+            ["request_dispatch"]
+        );
+        assert_eq!(
+            explanations[0].proof_status,
+            Some(PacketProofStatusDto::Proven)
+        );
+
+        let mut uncited = answer.clone();
+        uncited.citations.clear();
+        assert!(
+            proven_packet_obligation_explanations(
+                &uncited,
+                PacketTaskClassDto::RouteTracing,
+                &plan,
+            )
+            .is_empty(),
+            "a planned row cannot become agent-facing support after its citation is gone"
+        );
+
+        let mut unproven = plan.clone();
+        unproven.claim_obligations[0].proof_status = PacketObligationProofStatusDto::Reported;
+        assert!(
+            proven_packet_obligation_explanations(
+                &answer,
+                PacketTaskClassDto::RouteTracing,
+                &unproven,
+            )
+            .is_empty(),
+            "reported evidence is a lead, not a compiled explanation"
+        );
+    }
+
+    #[test]
+    fn public_packet_explanations_skip_role_only_incident_edges() {
+        let question = "Trace how a command server initializes, enters its event loop, reads client input, and dispatches commands.";
+        let carried = answer_with_call_edge(
+            question,
+            "unbindClientFromIOThreadEventLoop",
+            "src/iothread.c",
+        );
+        let mut plan =
+            build_packet_obligation_plan(question, PacketTaskClassDto::RouteTracing, &[]);
+        plan.claim_obligations
+            .retain(|obligation| obligation.id == "command_event_loop");
+        plan.query_obligations.clear();
+        finalize_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &mut plan,
+            &carried,
+            &budget(),
+        );
+        assert_eq!(
+            plan.claim_obligations[0].proof_status,
+            PacketObligationProofStatusDto::Proven
+        );
+        assert!(
+            proven_packet_obligation_explanations(
+                &carried,
+                PacketTaskClassDto::RouteTracing,
+                &plan,
+            )
+            .is_empty(),
+            "a broad evidence role cannot turn an arbitrary event-loop-named symbol into prose"
+        );
+    }
+
+    #[test]
+    fn public_packet_explanations_group_predicate_owned_source_carriers() {
+        let question =
+            "Trace how a site's build command runs the read, generate, render, and write phases.";
+        let mut carried = answer(vec![citation(
+            "Site.generate",
+            "lib/jekyll/site.rb",
+            NodeKind::METHOD,
+        )]);
+        carried.prompt = question.to_string();
+        let mut plan =
+            build_packet_obligation_plan(question, PacketTaskClassDto::RouteTracing, &[]);
+        plan.claim_obligations
+            .retain(|obligation| obligation.id == "site_lifecycle");
+        plan.query_obligations.clear();
+        finalize_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &mut plan,
+            &carried,
+            &budget(),
+        );
+        let explanations = proven_packet_obligation_explanations(
+            &carried,
+            PacketTaskClassDto::RouteTracing,
+            &plan,
+        );
+        assert_eq!(explanations.len(), 1);
+        assert_eq!(
+            explanations[0].claim,
+            "Retained source at `Site.generate` supports the entrypoint evidence step."
+        );
+        assert_eq!(
+            explanations[0].citations[0].node_id,
+            carried.citations[0].node_id
+        );
     }
 
     fn indexing_entrypoint_plan() -> PacketObligationPlanDto {
