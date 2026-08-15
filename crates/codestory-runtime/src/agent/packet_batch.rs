@@ -6,8 +6,7 @@ use super::packet_candidate::PacketSearchHit;
 use super::packet_candidate::merge_packet_candidate_graph;
 use super::packet_required_probes::packet_sufficiency_required_probe_queries_from_terms;
 use super::packet_scoring::{
-    normalize_identifier, packet_display_path, packet_stage_citation_carry_limit,
-    packet_subquery_hit_limit,
+    normalize_identifier, packet_stage_citation_carry_limit, packet_subquery_hit_limit,
 };
 #[cfg(test)]
 use super::packet_scoring::{packet_citation_key, packet_citation_rank, sort_by_cached_rank_desc};
@@ -424,28 +423,13 @@ fn packet_adaptive_material_queries(
         })
         .collect::<Vec<_>>();
     let mut obligation_added_query = vec![false; missing_material.len()];
-    let shared_material_scope = packet_material_scope_directory(
-        preview
-            .claim_obligations
-            .iter()
-            .filter(|obligation| obligation.material)
-            .flat_map(|obligation| obligation.carrier_paths.iter().map(String::as_str)),
-    );
 
     // Give every open material claim one semantic query before any claim can consume the
     // remainder of the fixed batch with fallback paths.
     for (index, obligation) in missing_material.iter().enumerate() {
         if let Some(query) = obligation.open_next_candidates.first() {
-            let purpose = format!("material obligation {}", obligation.id);
-            let scope = packet_material_scope_directory(
-                obligation.carrier_paths.iter().map(String::as_str),
-            )
-            .or_else(|| shared_material_scope.clone());
-            let scoped_query = scope.map(|scope| format!("{scope} {query}"));
-            obligation_added_query[index] |= scoped_query
-                .as_deref()
-                .is_some_and(|scoped_query| push(scoped_query, purpose.clone()))
-                || push(query, purpose);
+            obligation_added_query[index] |=
+                push(query, format!("material obligation {}", obligation.id));
         }
     }
 
@@ -497,41 +481,6 @@ fn packet_adaptive_material_queries(
     }
 
     queries
-}
-
-/// Pick one precise source directory shared by retained material evidence.
-///
-/// The directory narrows a later retrieval query; it never proves an obligation. Root-level
-/// source buckets such as `src/` stay unscoped because they are too broad to add signal.
-fn packet_material_scope_directory<'a>(paths: impl Iterator<Item = &'a str>) -> Option<String> {
-    let mut counts = std::collections::BTreeMap::<String, usize>::new();
-    for path in paths {
-        let display_path = packet_display_path(path);
-        let Some((directory, _)) = display_path.rsplit_once('/') else {
-            continue;
-        };
-        let depth = directory
-            .split('/')
-            .filter(|segment| !segment.is_empty() && *segment != ".")
-            .count();
-        if depth < 2 {
-            continue;
-        }
-        *counts.entry(directory.to_string()).or_default() += 1;
-    }
-    let mut ranked = counts.into_iter().collect::<Vec<_>>();
-    ranked.sort_by(|(left_path, left_count), (right_path, right_count)| {
-        right_count
-            .cmp(left_count)
-            .then_with(|| {
-                right_path
-                    .split('/')
-                    .count()
-                    .cmp(&left_path.split('/').count())
-            })
-            .then_with(|| left_path.cmp(right_path))
-    });
-    ranked.into_iter().next().map(|(path, _)| path)
 }
 
 fn packet_query_completed(answer: &AgentAnswerDto, query: &str) -> bool {
@@ -1409,9 +1358,7 @@ mod tests {
             trace: Vec::new(),
         };
         let mut answer = empty_answer();
-        let mut anchor = anchor_citation("Site.generate");
-        anchor.file_path = Some("/tmp/repos/example/lib/component/site.rb".to_string());
-        answer.citations.push(anchor);
+        answer.citations.push(anchor_citation("Jekyll::Site.posts"));
 
         let queries = packet_adaptive_material_queries(question, &plan, &answer, 16)
             .into_iter()
@@ -1424,30 +1371,7 @@ mod tests {
                 "missing {expected} from {queries:?}"
             );
         }
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.starts_with("lib/component ")),
-            "open material work should reuse the retained source neighborhood: {queries:?}"
-        );
         assert!(queries.len() <= 16);
-    }
-
-    #[test]
-    fn material_scope_prefers_the_repeated_precise_directory_and_skips_root_buckets() {
-        let paths = [
-            "/tmp/repos/example/packages/core/src/first.rs",
-            "/tmp/repos/example/packages/core/src/second.rs",
-            "/tmp/repos/example/packages/other/src/third.rs",
-        ];
-        assert_eq!(
-            packet_material_scope_directory(paths.into_iter()),
-            Some("packages/core/src".to_string())
-        );
-        assert_eq!(
-            packet_material_scope_directory(["src/first.rs", "lib.rs"].into_iter()),
-            None
-        );
     }
 
     #[test]
