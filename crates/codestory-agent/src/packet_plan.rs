@@ -162,9 +162,8 @@ pub fn packet_rank_terms(question: &str) -> Vec<String> {
 
 /// Build bounded owner/member probes from owners explicitly named in the task or already present
 /// in the first retrieval, plus action words in the task. Broad semantic search is good at finding
-/// a relevant type but can miss its exact lifecycle members; `Site` plus `read`, `render`, and
-/// `write`, for example, becomes the exact symbol probes `Site.read`, `Site.render`, and
-/// `Site.write` without any repository- or benchmark-specific vocabulary.
+/// a relevant type but can miss its exact lifecycle members, so qualified probes combine the
+/// retained owner with the task's verbs without adding repository-specific vocabulary.
 pub fn packet_owner_member_probe_queries(
     question: &str,
     anchor_labels: &[String],
