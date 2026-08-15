@@ -881,7 +881,7 @@ fn classify_windows_data_pipe_open_error(
     error_code: u32,
     authority: RetainedWindowsAuthorityState,
 ) -> Option<WindowsDataPipeOpenState> {
-    (error_code == WINDOWS_ERROR_FILE_NOT_FOUND_CODE).then(|| match authority {
+    (error_code == WINDOWS_ERROR_FILE_NOT_FOUND_CODE).then_some(match authority {
         RetainedWindowsAuthorityState::Absent => WindowsDataPipeOpenState::NoOwner,
         // The listener creates the next Windows data-pipe instance after it
         // hands the accepted instance to a connection handler. During that
