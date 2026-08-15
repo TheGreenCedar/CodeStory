@@ -115,13 +115,15 @@ use codestory_contracts::api::{
     NodeOccurrencesRequest, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto,
     PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketObligationPlanDto, PacketPlanDto,
     PacketProbeDto, PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
-    SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, SupportUnitDto,
-    SupportUnitKindDto, TrailConfigDto, TrailFilterOptionsDto,
+    SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, SourceCoverageObservationDto,
+    SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto, TrailConfigDto,
+    TrailFilterOptionsDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{
     EdgeId, PacketPlanQueryDto, RetrievalAnnotationKindDto, SearchMatchQualityDto,
 };
+use codestory_contracts::graph::FileCoverageReason;
 use std::cmp::Ordering;
 #[cfg(test)]
 use std::collections::VecDeque;
@@ -586,7 +588,7 @@ pub(crate) fn agent_packet(
     // uncapped candidate set made a packet unavailable because of a partial file that the packet
     // did not retain and therefore could not rest a claim on. Exact path probes remain included:
     // a user-named unread path still fails closed even when it yielded no retained citation.
-    let mut covered_paths = exact_probe_paths;
+    let mut covered_paths = exact_probe_paths.clone();
     covered_paths.extend(
         answer
             .citations
@@ -598,6 +600,32 @@ pub(crate) fn agent_packet(
     );
     answer.source_coverage =
         crate::source_coverage::observe_source_coverage(controller, &covered_paths);
+
+    // Parser-partial files are usable only for positive ranges that the runtime actually reread
+    // and retained. Demote any citation whose exact receipt missed the snippet/byte cap or failed
+    // to read, then drop its now-unused coverage observation. User-requested exact paths stay in
+    // the set and therefore continue to fail closed even when they produced no retained citation.
+    demote_parser_partial_citations_without_source_receipts(
+        &mut answer.citations,
+        &source_support,
+        &answer.source_coverage,
+    );
+    let retained_coverage_paths = exact_probe_paths
+        .into_iter()
+        .chain(
+            answer
+                .citations
+                .iter()
+                .filter(|citation| {
+                    crate::agent::packet_evidence::citation_sufficiency_eligible(citation)
+                })
+                .filter_map(|citation| citation.file_path.clone()),
+        )
+        .map(|path| packet_display_path(&path))
+        .collect::<HashSet<_>>();
+    answer.source_coverage.retain(|observation| {
+        retained_coverage_paths.contains(&packet_display_path(&observation.path))
+    });
 
     let phase_started = Instant::now();
     install_retained_packet_obligation_edge_proofs(
@@ -1185,10 +1213,19 @@ fn citation_needs_bounded_source_read(citation: &AgentCitationDto) -> bool {
     structural_source || citation_is_lexical_source_range(citation)
 }
 
-fn demote_lexical_citations_without_source_receipts(
+fn demote_parser_partial_citations_without_source_receipts(
     citations: &mut [AgentCitationDto],
     source_support: &[SupportUnitDto],
+    source_coverage: &[SourceCoverageObservationDto],
 ) {
+    let parser_partial_paths = source_coverage
+        .iter()
+        .filter(|observation| {
+            observation.status == SourceCoverageStatusDto::Incomplete
+                && observation.reason == Some(FileCoverageReason::ParserPartial)
+        })
+        .map(|observation| packet_display_path(&observation.path))
+        .collect::<HashSet<_>>();
     let retained_receipts = source_support
         .iter()
         .filter(|unit| unit.kind == SupportUnitKindDto::SourceRange)
@@ -1200,10 +1237,12 @@ fn demote_lexical_citations_without_source_receipts(
             ))
         })
         .collect::<HashSet<_>>();
-    for citation in citations
-        .iter_mut()
-        .filter(|citation| citation_is_lexical_source_range(citation))
-    {
+    for citation in citations.iter_mut().filter(|citation| {
+        citation
+            .file_path
+            .as_deref()
+            .is_some_and(|path| parser_partial_paths.contains(&packet_display_path(path)))
+    }) {
         let has_receipt = citation.file_path.as_deref().is_some_and(|path| {
             retained_receipts.contains(&(
                 citation.node_id.0.clone(),
@@ -1335,11 +1374,6 @@ fn append_packet_carrier_source_sections(
             message: Some(format!("carrier source for {}", citation.display_name)),
         });
     }
-
-    // A lexical source-range hit is exact evidence only when its source text survives the packet.
-    // The snippet and byte caps are deliberate; demote overflow or failed reads instead of letting
-    // an unshipped receipt either count as support or make every stronger carrier unavailable.
-    demote_lexical_citations_without_source_receipts(&mut answer.citations, &source_support);
 
     if rendered.is_empty() {
         return Vec::new();
@@ -5775,7 +5809,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_source_range_without_a_retained_receipt_is_not_support() {
+    fn parser_partial_citation_without_a_retained_receipt_is_not_support() {
         let mut retained =
             test_packet_citation("args-file", "/checkout/repos/fmt/include/fmt/args.h", 0.9);
         retained.kind = NodeKind::FILE;
@@ -5785,6 +5819,11 @@ mod tests {
         omitted.node_id = NodeId("format-file".to_string());
         omitted.display_name = "format-file".to_string();
         omitted.file_path = Some("include/fmt/format.h".to_string());
+        omitted.resolution_status = Some(PacketEvidenceResolutionDto::Resolved);
+        let mut indexed = omitted.clone();
+        indexed.node_id = NodeId("indexed-file".to_string());
+        indexed.display_name = "indexed-file".to_string();
+        indexed.file_path = Some("include/fmt/indexed.h".to_string());
         let source_support = vec![SupportUnitDto {
             id: "source:args-file:10".to_string(),
             kind: SupportUnitKindDto::SourceRange,
@@ -5799,9 +5838,39 @@ mod tests {
             to_symbol: None,
             query: None,
         }];
-        let mut citations = vec![retained, omitted];
+        let coverage = vec![
+            SourceCoverageObservationDto {
+                path: "/checkout/repos/fmt/include/fmt/args.h".to_string(),
+                status: SourceCoverageStatusDto::Incomplete,
+                reason: Some(FileCoverageReason::ParserPartial),
+                not_established_cause: None,
+                observed_size: None,
+                byte_cap: None,
+            },
+            SourceCoverageObservationDto {
+                path: "include/fmt/format.h".to_string(),
+                status: SourceCoverageStatusDto::Incomplete,
+                reason: Some(FileCoverageReason::ParserPartial),
+                not_established_cause: None,
+                observed_size: None,
+                byte_cap: None,
+            },
+            SourceCoverageObservationDto {
+                path: "include/fmt/indexed.h".to_string(),
+                status: SourceCoverageStatusDto::Indexed,
+                reason: None,
+                not_established_cause: None,
+                observed_size: None,
+                byte_cap: None,
+            },
+        ];
+        let mut citations = vec![retained, omitted, indexed];
 
-        demote_lexical_citations_without_source_receipts(&mut citations, &source_support);
+        demote_parser_partial_citations_without_source_receipts(
+            &mut citations,
+            &source_support,
+            &coverage,
+        );
 
         assert_eq!(citations[0].eligible_for_sufficiency, Some(true));
         assert_eq!(citations[0].loss_reason, None);
@@ -5810,6 +5879,8 @@ mod tests {
             citations[1].loss_reason.as_deref(),
             Some(SOURCE_RECEIPT_NOT_RETAINED)
         );
+        assert_eq!(citations[2].eligible_for_sufficiency, Some(true));
+        assert_eq!(citations[2].loss_reason, None);
     }
 
     fn packet_answer_fixture(question: &str, citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
