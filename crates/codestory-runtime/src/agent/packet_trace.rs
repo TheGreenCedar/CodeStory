@@ -2,7 +2,12 @@
 
 #![allow(clippy::items_after_test_module)]
 
+use super::packet_batch::{
+    PACKET_MATERIAL_OBLIGATION_QUERY_PURPOSE_PREFIX,
+    PACKET_MATERIAL_QUERY_OBLIGATION_QUERY_PURPOSE_PREFIX,
+};
 use super::packet_candidate::{PacketSearchHit, merge_packet_candidate_graph_for_requirements};
+use super::packet_capping::PACKET_MATERIAL_QUERY_CARRIER_ROLE;
 use super::packet_scoring::{
     normalize_identifier, packet_citation_key, packet_citation_rank, sort_by_cached_rank_desc,
 };
@@ -34,6 +39,7 @@ pub(crate) fn merge_packet_initial_search_hits(
         stage_carry_limit,
         flow_requirements,
         None,
+        None,
     )
 }
 
@@ -45,6 +51,7 @@ fn merge_packet_search_hits(
     stage_carry_limit: usize,
     flow_requirements: &[FlowRequirement],
     exact_query: Option<&str>,
+    first_selected_coverage_role: Option<&str>,
 ) -> usize {
     let mut citation_indices = answer
         .citations
@@ -70,7 +77,7 @@ fn merge_packet_search_hits(
         stage_carry_limit,
         exact_query,
     );
-    for candidate_index in &selected {
+    for (selected_index, candidate_index) in selected.iter().enumerate() {
         let (citation, hit) = &candidates[*candidate_index];
         if include_evidence {
             merge_packet_candidate_graph_for_requirements(answer, hit, flow_requirements);
@@ -87,10 +94,23 @@ fn merge_packet_search_hits(
                 citation,
                 &proof_edge_ids,
             );
+            if selected_index == 0
+                && answer.citations[existing_index].coverage_role.is_none()
+                && let Some(role) = first_selected_coverage_role
+            {
+                answer.citations[existing_index].coverage_role = Some(role.to_string());
+            }
         } else {
             let citation_index = answer.citations.len();
             citation_indices.insert(key, citation_index);
-            answer.citations.push(citation.clone());
+            let mut citation = citation.clone();
+            if selected_index == 0
+                && citation.coverage_role.is_none()
+                && let Some(role) = first_selected_coverage_role
+            {
+                citation.coverage_role = Some(role.to_string());
+            }
+            answer.citations.push(citation);
         }
     }
     selected.len()
@@ -146,6 +166,13 @@ pub(crate) fn merge_packet_fused_subquery_batch(
             stage_carry_limit,
             flow_requirements,
             (query.purpose == PACKET_OWNER_MEMBER_QUERY_PURPOSE).then_some(query.query.as_str()),
+            (query
+                .purpose
+                .starts_with(PACKET_MATERIAL_OBLIGATION_QUERY_PURPOSE_PREFIX)
+                || query
+                    .purpose
+                    .starts_with(PACKET_MATERIAL_QUERY_OBLIGATION_QUERY_PURPOSE_PREFIX))
+            .then_some(PACKET_MATERIAL_QUERY_CARRIER_ROLE),
         );
         let added = answer.citations.len().saturating_sub(before);
         let mut output = vec![
@@ -682,6 +709,69 @@ mod golden_tests {
 
         assert_eq!(answer.citations.len(), 1);
         assert_eq!(answer.citations[0].display_name, "readQueryFromClient");
+    }
+
+    #[test]
+    fn material_query_carrier_survives_the_real_citation_cap() {
+        let prompt = "Trace request intake through dispatch.";
+        let mut answer = empty_answer(prompt);
+        for index in 0..13 {
+            let mut distractor = dense_distractor(&format!("noise-{index}"));
+            distractor.hit.file_path = Some(format!("src/noise_{index}.rs"));
+            distractor.hit.score = 0.99 - index as f32 / 100.0;
+            answer.citations.push(distractor.citation(false));
+        }
+
+        let mut carrier = dense_distractor("request-intake");
+        carrier.hit.display_name = "decodeRequest".into();
+        carrier.hit.file_path = Some("src/request_intake.rs".into());
+        carrier.hit.score = 0.01;
+        let query = PacketPlanQueryDto {
+            query: "request intake".into(),
+            purpose: format!("{PACKET_MATERIAL_OBLIGATION_QUERY_PURPOSE_PREFIX}request_intake"),
+        };
+        let pending = vec![(0, &query)];
+        let results = vec![(query.query.clone(), vec![carrier])];
+
+        merge_packet_fused_subquery_batch(
+            &mut answer,
+            &pending,
+            &results,
+            1,
+            &[],
+            false,
+            &[],
+            1,
+            &[],
+        );
+
+        assert_eq!(answer.citations.len(), 14);
+        assert!(answer.citations.iter().any(|citation| {
+            citation.file_path.as_deref() == Some("src/request_intake.rs")
+                && citation.coverage_role.as_deref() == Some(PACKET_MATERIAL_QUERY_CARRIER_ROLE)
+        }));
+
+        let temp = tempfile::tempdir().expect("packet budget root");
+        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
+        let budget = apply_packet_budget_with_extra_and_obligation_carriers(
+            temp.path(),
+            prompt,
+            PacketTaskClassDto::RouteTracing,
+            PacketBudgetModeDto::Compact,
+            limits,
+            &mut answer,
+            &[],
+            &[],
+            &[],
+        );
+
+        assert!(budget.truncated, "compact citation cap must run");
+        assert!(
+            answer
+                .citations
+                .iter()
+                .any(|citation| { citation.file_path.as_deref() == Some("src/request_intake.rs") })
+        );
     }
 
     fn requests_session_request_hit() -> PacketSearchHit {
