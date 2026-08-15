@@ -18,7 +18,8 @@ use super::{
 use crate::qualification::request::REQUIRED_METRICS;
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
-    EmbeddingCapacityPressureWire, EmbeddingEngineIdentity, EmbeddingQualificationParameters,
+    EMBEDDING_BUSY_RETRY_QUEUE_CLASS, EmbeddingCapacityPressureWire, EmbeddingEngineIdentity,
+    EmbeddingQualificationParameters,
     EmbeddingQualificationWorkerMeasurementSpan as WorkerMeasurementSpan, EmbeddingServerSnapshot,
 };
 use serde_json::json;
@@ -637,13 +638,12 @@ impl<'a> ScenarioRunner<'a> {
     }
 
     /// The single-process saturated-65th-retry experiment: the driver holds
-    /// the bulk and query classes, spawns the busy-retry worker, releases the
-    /// classes once the worker's typed-retry marker appears, and validates
-    /// the returned pressure evidence.
+    /// the query class, spawns the busy-retry worker, releases that class once
+    /// the worker's typed-retry marker appears, and validates the returned
+    /// pressure evidence.
     fn measure_busy_retry(&mut self, repeat: u32) -> Result<MeasuredWorker> {
         self.ensure_owner("measurement_busy_owner")?;
-        self.control("hold_class", Some("bulk"))?;
-        self.control("hold_class", Some("query"))?;
+        self.control("hold_class", Some(EMBEDDING_BUSY_RETRY_QUEUE_CLASS))?;
         let marker = self
             .context
             .output_directory
@@ -658,8 +658,7 @@ impl<'a> ScenarioRunner<'a> {
         let marker_present =
             self.wait_for_retry_marker(&mut worker, &marker, busy_retry_marker_timeout())?;
         if marker_present {
-            self.control("release_class", Some("bulk"))?;
-            self.control("release_class", Some("query"))?;
+            self.control("release_class", Some(EMBEDDING_BUSY_RETRY_QUEUE_CLASS))?;
         }
         let output = self.finish_worker(worker, busy_retry_worker_timeout())?;
         self.cleanup_gate(&marker);
@@ -674,7 +673,7 @@ impl<'a> ScenarioRunner<'a> {
             anyhow::anyhow!("embedding_qualification_busy_retry_pressure_missing")
         })?;
         if pressure.reason != "queue_full"
-            || pressure.queue_class != "query"
+            || pressure.queue_class != EMBEDDING_BUSY_RETRY_QUEUE_CLASS
             || pressure.capacity != QUALIFICATION_QUEUE_CAPACITY
             || pressure.depth != pressure.capacity
             || pressure.retry_condition.trim().is_empty()

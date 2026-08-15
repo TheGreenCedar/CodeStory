@@ -26,10 +26,11 @@ pub use qualification_control::{
     run_per_user_embedding_qualification,
 };
 pub use qualification_worker::{
-    EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, EmbeddingQualificationWorkerError,
-    EmbeddingQualificationWorkerMeasurement, EmbeddingQualificationWorkerMeasurementSpan,
-    EmbeddingQualificationWorkerOutput, EmbeddingQualificationWorkerProtocolExchange,
-    EmbeddingQualificationWorkerQueueOperation, EmbeddingQualificationWorkerRequest,
+    EMBEDDING_BUSY_RETRY_QUEUE_CLASS, EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
+    EmbeddingQualificationWorkerError, EmbeddingQualificationWorkerMeasurement,
+    EmbeddingQualificationWorkerMeasurementSpan, EmbeddingQualificationWorkerOutput,
+    EmbeddingQualificationWorkerProtocolExchange, EmbeddingQualificationWorkerQueueOperation,
+    EmbeddingQualificationWorkerRequest,
 };
 pub use server::{
     EmbeddingServerBudgets, PerUserEmbeddingServerConfig, run_per_user_embedding_server,

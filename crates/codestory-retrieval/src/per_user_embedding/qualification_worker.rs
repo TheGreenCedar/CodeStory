@@ -16,6 +16,11 @@ use std::path::PathBuf;
 /// whole-worker window as a metric sample.
 pub const EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION: u32 = 2;
 
+/// Queue class used by both sides of the query-capacity recovery experiment.
+/// Keeping this beside the worker DTO prevents the external driver and the
+/// packaged worker from measuring different scheduler classes.
+pub const EMBEDDING_BUSY_RETRY_QUEUE_CLASS: &str = "query";
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingQualificationWorkerRequest {

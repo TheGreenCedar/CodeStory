@@ -307,14 +307,14 @@ pub use lexical_index::LEXICAL_INDEX_VERSION;
 pub use mode::RetrievalDegradedMode;
 pub use mode::derive_degraded_mode;
 pub use per_user_embedding::{
-    AwakeMonotonicClock, EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
-    EmbeddingCapacityPressureWire, EmbeddingClientBudgets, EmbeddingClientTransport,
-    EmbeddingCompatibility, EmbeddingConnectIntent, EmbeddingConnectOutcome,
-    EmbeddingEngineIdentity, EmbeddingEngineLeaseIdentity, EmbeddingExecutableIdentity,
-    EmbeddingOperation, EmbeddingProtocolError, EmbeddingProtocolRequest,
-    EmbeddingProtocolResponse, EmbeddingQualificationAttemptResult,
-    EmbeddingQualificationOperationResult, EmbeddingQualificationParameters,
-    EmbeddingQualificationRequest, EmbeddingQualificationResult,
+    AwakeMonotonicClock, EMBEDDING_BUSY_RETRY_QUEUE_CLASS,
+    EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, EmbeddingCapacityPressureWire,
+    EmbeddingClientBudgets, EmbeddingClientTransport, EmbeddingCompatibility,
+    EmbeddingConnectIntent, EmbeddingConnectOutcome, EmbeddingEngineIdentity,
+    EmbeddingEngineLeaseIdentity, EmbeddingExecutableIdentity, EmbeddingOperation,
+    EmbeddingProtocolError, EmbeddingProtocolRequest, EmbeddingProtocolResponse,
+    EmbeddingQualificationAttemptResult, EmbeddingQualificationOperationResult,
+    EmbeddingQualificationParameters, EmbeddingQualificationRequest, EmbeddingQualificationResult,
     EmbeddingQualificationWatchdogClock, EmbeddingQualificationWatchdogMarker,
     EmbeddingQualificationWorkerError, EmbeddingQualificationWorkerMeasurement,
     EmbeddingQualificationWorkerMeasurementSpan, EmbeddingQualificationWorkerOutput,

@@ -23,8 +23,9 @@ use super::owner_exit::{OwnerExitObservation, observe_owner_exit, wait_for_owner
 use super::queue::{QueueOperation, run_queue_operation};
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
-    AwakeMonotonicClock, EmbeddingCompatibility, EmbeddingEngineIdentity, EmbeddingOperation,
-    EmbeddingProtocolRequest, EmbeddingProtocolResponse, EmbeddingQualificationParameters,
+    AwakeMonotonicClock, EMBEDDING_BUSY_RETRY_QUEUE_CLASS, EmbeddingCompatibility,
+    EmbeddingEngineIdentity, EmbeddingOperation, EmbeddingProtocolRequest,
+    EmbeddingProtocolResponse, EmbeddingQualificationParameters,
     EmbeddingQualificationWorkerMeasurement as WorkerMeasurement,
     EmbeddingQualificationWorkerMeasurementSpan as WorkerMeasurementSpan,
     EmbeddingQualificationWorkerProtocolExchange as WorkerProtocolExchange, EmbeddingResult,
@@ -549,12 +550,12 @@ pub(in crate::embedding_qualification::worker) fn run_measure_true_idle(
 
 /// `busy_retry_usefulness`: the whole saturated-65th-retry experiment in one
 /// process, because the clock policy forbids cross-process timestamp
-/// subtraction. The driver holds the bulk and query classes before spawning
-/// this worker; the worker seeds one bulk, fills the query queue to capacity,
-/// validates the typed capacity retry for the 65th query, stamps
+/// subtraction. The driver holds the query class before spawning this worker;
+/// the worker seeds one query, fills the query queue to capacity, validates the
+/// typed capacity retry for the 65th query, stamps
 /// `typed_retry_emitted`, signals the driver through the retry marker, and
 /// stamps `named_retry_condition_became_true` when the first queued query
-/// completes after the driver releases the classes.
+/// completes after the driver releases the query class.
 pub(in crate::embedding_qualification::worker) fn run_measure_busy_retry(
     runtime: &SidecarRuntimeConfig,
     clock: Arc<dyn AwakeMonotonicClock>,
@@ -570,13 +571,16 @@ pub(in crate::embedding_qualification::worker) fn run_measure_busy_retry(
 
     let seed_runtime = runtime.clone();
     let seed_clock = Arc::clone(&clock);
+    // The seed completes inside the measured retry interval after the driver
+    // releases the class. Keep it on the declared query workload: a bulk seed
+    // charges unrelated backend first-use work to query-capacity recovery.
     let seed = std::thread::Builder::new()
         .name("codestory-measurement-busy-seed".into())
         .spawn(move || {
             run_raw_protocol_exchange(
                 &seed_runtime,
                 seed_clock.as_ref(),
-                "bulk",
+                EMBEDDING_BUSY_RETRY_QUEUE_CLASS,
                 ANTI_IDLE_PROTOCOL_DEADLINE_MS,
             )
         })?;
@@ -590,7 +594,7 @@ pub(in crate::embedding_qualification::worker) fn run_measure_busy_retry(
                 .scheduler
                 .active_request
                 .as_ref()
-                .is_some_and(|active| active.class == "bulk")
+                .is_some_and(|active| active.class == EMBEDDING_BUSY_RETRY_QUEUE_CLASS)
         },
     )?;
     if seed_active.scheduler.query_capacity != QUALIFICATION_QUEUE_CAPACITY {
@@ -611,7 +615,7 @@ pub(in crate::embedding_qualification::worker) fn run_measure_busy_retry(
             transport: transport.clone(),
             clock: Arc::clone(&clock),
             project_identity_sha256: project_identity.clone(),
-            class: "query",
+            class: EMBEDDING_BUSY_RETRY_QUEUE_CLASS,
             ordinal,
             correlation_id,
             input: Some(input),
@@ -649,7 +653,7 @@ pub(in crate::embedding_qualification::worker) fn run_measure_busy_retry(
     let overflow = run_raw_protocol_exchange_with_input(
         runtime,
         clock.as_ref(),
-        "query",
+        EMBEDDING_BUSY_RETRY_QUEUE_CLASS,
         ANTI_IDLE_PROTOCOL_DEADLINE_MS,
         Some(overflow_input.clone()),
     )?;
@@ -662,7 +666,7 @@ pub(in crate::embedding_qualification::worker) fn run_measure_busy_retry(
         .ok_or_else(|| anyhow::anyhow!("embedding_qualification_busy_retry_pressure_missing"))?;
     if overflow.terminal_transport_error.is_some()
         || pressure.reason != "queue_full"
-        || pressure.queue_class != "query"
+        || pressure.queue_class != EMBEDDING_BUSY_RETRY_QUEUE_CLASS
         || pressure.capacity != QUALIFICATION_QUEUE_CAPACITY
         || pressure.depth != pressure.capacity
         || pressure.retry_condition.trim().is_empty()
@@ -687,7 +691,7 @@ pub(in crate::embedding_qualification::worker) fn run_measure_busy_retry(
     let replay = run_raw_protocol_exchange_with_input(
         runtime,
         clock.as_ref(),
-        "query",
+        EMBEDDING_BUSY_RETRY_QUEUE_CLASS,
         ANTI_IDLE_PROTOCOL_DEADLINE_MS,
         Some(overflow_input),
     )?;
