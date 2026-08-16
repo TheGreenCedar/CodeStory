@@ -1693,7 +1693,14 @@ impl AppController {
         let source = self.read_file_text(codestory_contracts::api::ReadFileTextRequest {
             path: path.to_string(),
         })?;
-        Ok(brace_balanced_body_end_line(&source.text, start_line))
+        Ok(brace_balanced_body_end_line(
+            &source.text,
+            start_line,
+            Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("rs")),
+        ))
     }
 }
 
@@ -1756,7 +1763,11 @@ enum MultilineStringState {
     },
 }
 
-fn brace_balanced_body_end_line(source: &str, start_line: u32) -> Option<u32> {
+fn brace_balanced_body_end_line(
+    source: &str,
+    start_line: u32,
+    rust_literal_syntax: bool,
+) -> Option<u32> {
     let start_index = start_line.checked_sub(1)? as usize;
     let mut depth = 0usize;
     let mut saw_opening_brace = false;
@@ -1775,6 +1786,7 @@ fn brace_balanced_body_end_line(source: &str, start_line: u32) -> Option<u32> {
             &mut saw_opening_brace,
             &mut in_block_comment,
             &mut multiline_string,
+            rust_literal_syntax,
         );
         if saw_opening_brace && depth == 0 {
             return Some((offset + 1) as u32);
@@ -1802,6 +1814,7 @@ fn scan_braces_in_line(
     saw_opening_brace: &mut bool,
     in_block_comment: &mut bool,
     multiline_string: &mut MultilineStringState,
+    rust_literal_syntax: bool,
 ) {
     let chars: Vec<char> = line.chars().collect();
     let mut index = 0usize;
@@ -1875,6 +1888,12 @@ fn scan_braces_in_line(
             *multiline_string = MultilineStringState::RustRaw { hashes };
             continue;
         }
+        if ch == '\'' && rust_literal_syntax {
+            if let Some(end) = rust_char_literal_end(&chars, index - 1) {
+                index = end;
+            }
+            continue;
+        }
         if matches!(ch, '"' | '\'') {
             string_delimiter = Some(ch);
             continue;
@@ -1888,6 +1907,47 @@ fn scan_braces_in_line(
             *depth = depth.saturating_sub(1);
         }
     }
+}
+
+/// Return the byte-independent character index immediately after a Rust char
+/// literal that begins at `apostrophe_index`.
+///
+/// Rust lifetimes and labels use the same leading apostrophe but have no
+/// closing apostrophe. Treating them as strings can hide a function's opening
+/// brace when the lifetime and body share one line. A char literal is bounded:
+/// one scalar or one escape, followed immediately by its closing apostrophe.
+fn rust_char_literal_end(chars: &[char], apostrophe_index: usize) -> Option<usize> {
+    let mut index = apostrophe_index.checked_add(1)?;
+    match *chars.get(index)? {
+        '\\' => {
+            index += 1;
+            match *chars.get(index)? {
+                'u' if chars.get(index + 1) == Some(&'{') => {
+                    index += 2;
+                    while chars.get(index).is_some_and(|ch| *ch != '}') {
+                        index += 1;
+                    }
+                    if chars.get(index) != Some(&'}') {
+                        return None;
+                    }
+                    index += 1;
+                }
+                'x' => {
+                    if !chars
+                        .get(index + 1..index + 3)?
+                        .iter()
+                        .all(|ch| ch.is_ascii_hexdigit())
+                    {
+                        return None;
+                    }
+                    index += 3;
+                }
+                _ => index += 1,
+            }
+        }
+        _ => index += 1,
+    }
+    (chars.get(index) == Some(&'\'')).then_some(index + 1)
 }
 
 /// The `#` count of a Rust raw string literal opening at `index`, if one does.
@@ -1944,7 +2004,10 @@ mod tests {
             "  return markup;\n",
             "}\n",
         );
-        assert_eq!(brace_balanced_body_end_line(template_literal, 1), Some(6));
+        assert_eq!(
+            brace_balanced_body_end_line(template_literal, 1, false),
+            Some(6)
+        );
 
         let rust_raw_string = concat!(
             "fn render() -> String {\n",
@@ -1954,7 +2017,10 @@ mod tests {
             "    markup.to_string()\n",
             "}\n",
         );
-        assert_eq!(brace_balanced_body_end_line(rust_raw_string, 1), Some(6));
+        assert_eq!(
+            brace_balanced_body_end_line(rust_raw_string, 1, true),
+            Some(6)
+        );
 
         // Positive control: nothing about ordinary bodies moved, including the
         // single-line strings, char literals, and lifetimes that must stay
@@ -1968,7 +2034,23 @@ mod tests {
             "    rows.len().to_string()\n",
             "}\n",
         );
-        assert_eq!(brace_balanced_body_end_line(ordinary, 1), Some(7));
+        assert_eq!(brace_balanced_body_end_line(ordinary, 1, true), Some(7));
+    }
+
+    #[test]
+    fn brace_balanced_body_end_distinguishes_rust_lifetimes_labels_and_chars() {
+        let single_line = "pub fn shared_engine_probe() -> &'static str { \"warm\" }\n";
+        assert_eq!(brace_balanced_body_end_line(single_line, 1, true), Some(1));
+
+        let labeled = concat!(
+            "fn first<'a>(value: &'a str) -> char {\n",
+            "    'outer: loop { break 'outer '{'; }\n",
+            "}\n",
+        );
+        assert_eq!(brace_balanced_body_end_line(labeled, 1, true), Some(3));
+
+        let escaped = "fn escaped() -> char { '\\u{7d}' }\n";
+        assert_eq!(brace_balanced_body_end_line(escaped, 1, true), Some(1));
     }
 
     fn insert_file_node(
@@ -3369,6 +3451,58 @@ mod tests {
         assert!(snippet.snippet.contains("payload.create()"));
         assert!(!snippet.snippet.contains("fn before()"));
         assert!(!snippet.snippet.contains("fn after()"));
+    }
+
+    #[test]
+    fn function_body_snippet_keeps_single_line_rust_body() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let source_path = temp.path().join("lib.rs");
+        std::fs::write(
+            &source_path,
+            "pub fn shared_engine_probe() -> &'static str { \"warm\" }\n",
+        )
+        .expect("write source");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            insert_file_node(
+                &mut storage,
+                11,
+                &source_path,
+                Node {
+                    id: CoreNodeId(101),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "shared_engine_probe".to_string(),
+                    file_node_id: Some(CoreNodeId(11)),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("insert function");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+
+        let snippet = controller
+            .snippet_function_body_context(codestory_contracts::api::NodeId("101".to_string()), 0)
+            .expect("function body snippet");
+
+        assert_eq!(
+            snippet.scope,
+            codestory_contracts::api::SnippetScopeDto::FunctionBody
+        );
+        assert_eq!(
+            snippet.range_source.as_deref(),
+            Some("indexed_symbol_range")
+        );
+        assert!(snippet.snippet.contains("shared_engine_probe"));
+        assert!(snippet.snippet.contains("\"warm\""));
     }
 
     #[test]
