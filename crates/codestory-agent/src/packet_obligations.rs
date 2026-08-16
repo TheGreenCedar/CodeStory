@@ -9,7 +9,8 @@ use super::packet_flow_requirements::{
 };
 use super::packet_required_probes::{
     packet_named_schema_entity_queries, packet_named_schema_entity_symbol_queries,
-    packet_prompt_exact_symbol_probe_queries, packet_sufficiency_required_probe_queries_from_terms,
+    packet_prompt_exact_symbol_probe_queries, packet_prompt_explicit_source_path_queries,
+    packet_sufficiency_required_probe_queries_from_terms,
 };
 use super::packet_scoring::{normalize_identifier, packet_display_path};
 use super::packet_terms::{packet_probe_terms, packet_terms_indicate_sql_schema_flow};
@@ -144,6 +145,16 @@ pub fn build_packet_obligation_plan(
             push_query_obligation(
                 &mut query_obligations,
                 PacketQueryObligationKindDto::RequiredProbe,
+                &query,
+                true,
+            );
+        }
+    }
+    for query in packet_prompt_explicit_source_path_queries(question) {
+        if required_queries.insert(query.clone()) {
+            push_query_obligation(
+                &mut query_obligations,
+                PacketQueryObligationKindDto::RequiredPath,
                 &query,
                 true,
             );
@@ -3325,6 +3336,26 @@ mod tests {
     }
 
     #[test]
+    fn explicitly_named_source_files_are_material_query_obligations() {
+        let plan = build_packet_obligation_plan(
+            "Explain how `source/animate.css` imports _vars.css and connects classes to keyframes.",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+
+        for expected in ["source/animate.css", "_vars.css"] {
+            assert!(
+                plan.query_obligations.iter().any(|obligation| {
+                    obligation.query == expected
+                        && obligation.kind == PacketQueryObligationKindDto::RequiredPath
+                        && obligation.material
+                }),
+                "explicit file was not retained as material: {expected} {plan:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn recognized_flow_keeps_concrete_requested_claim_and_exact_probe_material() {
         let plan = build_packet_obligation_plan(
             "Explain the indexing runtime and MissingWidget.",
@@ -4890,7 +4921,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_source_paths_do_not_become_symbol_obligations() {
+    fn registered_source_paths_become_path_queries_but_not_symbol_obligations() {
         for extension in codestory_contracts::language_support::supported_extensions() {
             let path = format!("src/example.{extension}");
             let question = format!("Inspect {path}.");
@@ -4904,9 +4935,19 @@ mod tests {
                 "registered source path became a material symbol claim: {path}"
             );
             assert!(
-                plan.query_obligations
-                    .iter()
-                    .all(|obligation| { !(obligation.material && obligation.query == path) }),
+                plan.query_obligations.iter().any(|obligation| {
+                    obligation.material
+                        && obligation.kind == PacketQueryObligationKindDto::RequiredPath
+                        && obligation.query == path
+                }),
+                "registered source path was not retained as a path query: {path}"
+            );
+            assert!(
+                plan.query_obligations.iter().all(|obligation| {
+                    !(obligation.material
+                        && obligation.kind == PacketQueryObligationKindDto::RequiredProbe
+                        && obligation.query == path)
+                }),
                 "registered source path became a material symbol query: {path}"
             );
         }

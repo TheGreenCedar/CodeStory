@@ -815,6 +815,55 @@ pub fn packet_prompt_exact_symbol_probe_queries(
     queries
 }
 
+/// Extract source files and paths the user names explicitly.
+///
+/// Exact-symbol parsing deliberately excludes source paths because a file is not a typed symbol.
+/// Packet planning still needs to honor those paths as material retrieval targets rather than
+/// leaving them in the supplemental queue. This parser is bounded by the checked-in language
+/// support table, so dotted prose, URLs, and method names do not become file probes.
+pub fn packet_prompt_explicit_source_path_queries(question: &str) -> Vec<String> {
+    let mut queries = Vec::new();
+    for token in question.split_whitespace() {
+        let mut candidate = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+            )
+        });
+        if candidate.is_empty() || candidate.contains("://") {
+            continue;
+        }
+        if codestory_contracts::language_support::language_support_profile_for_path(Some(candidate))
+            .is_none()
+        {
+            candidate = candidate.trim_end_matches('.');
+        }
+        let candidate = packet_source_path_without_location_suffix(candidate);
+        if codestory_contracts::language_support::language_support_profile_for_path(Some(candidate))
+            .is_some()
+        {
+            push_unique_exact_symbol_term(&mut queries, candidate);
+        }
+    }
+    queries
+}
+
+fn packet_source_path_without_location_suffix(candidate: &str) -> &str {
+    if let Some((path, line)) = candidate.rsplit_once(':')
+        && !path.is_empty()
+        && line.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return path;
+    }
+    if let Some((path, line)) = candidate.rsplit_once("#L")
+        && !path.is_empty()
+        && line.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return path;
+    }
+    candidate
+}
+
 /// Extract table identities from the ordinary relational-schema phrasing "between A, B, and C".
 /// These are bounded source anchors, not benchmark labels: the same parser turns "customers,
 /// orders, and order items" into `customer`, `order`, and `order item` queries.
@@ -2289,6 +2338,19 @@ mod tests {
 
         assert!(queries.iter().any(|query| query == "AutoMapper"));
         assert!(!queries.iter().any(|query| query == "APIs"));
+    }
+
+    #[test]
+    fn prompt_source_path_queries_preserve_explicit_supported_files_only() {
+        let queries = packet_prompt_explicit_source_path_queries(
+            "Compare `animate.css`, src/http/client.dart:42, foo-bar.ts, \
+             Widget.run, example.com, and https://example.test/generated/main.rs.",
+        );
+
+        assert_eq!(
+            queries,
+            ["animate.css", "src/http/client.dart", "foo-bar.ts"]
+        );
     }
 
     #[test]

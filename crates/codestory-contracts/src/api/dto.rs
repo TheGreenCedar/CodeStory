@@ -2834,6 +2834,7 @@ pub enum PacketClaimObligationKindDto {
 pub enum PacketQueryObligationKindDto {
     RequiredFlow,
     RequiredProbe,
+    RequiredPath,
     Supplemental,
 }
 
