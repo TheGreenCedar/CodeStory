@@ -807,13 +807,20 @@ pub fn capture_packet_obligation_edge_proofs_before_budget(
         {
             continue;
         }
-        let carrier_node_id = obligation.carrier_node_ids.first().cloned().or_else(|| {
+        let primary_carrier_node_id = obligation.carrier_node_ids.first().cloned().or_else(|| {
             obligation
                 .carrier_edge_proofs
                 .first()
                 .map(|proof| proof.carrier_node_id.clone())
         });
-        if let Some(carrier_node_id) = carrier_node_id {
+        let Some(primary_carrier_node_id) = primary_carrier_node_id else {
+            continue;
+        };
+        let secondary_carrier_node_id =
+            first_context_connected_proven_carrier(answer, obligation, &primary_carrier_node_id);
+        for carrier_node_id in
+            std::iter::once(primary_carrier_node_id).chain(secondary_carrier_node_id)
+        {
             if protected_carrier_node_id_set.insert(carrier_node_id.clone()) {
                 protected_carrier_node_ids.push(carrier_node_id.clone());
             }
@@ -873,6 +880,53 @@ pub fn capture_packet_obligation_edge_proofs_before_budget(
         carriers,
         protected_carrier_node_ids,
         protected_edge_ids,
+    }
+}
+
+fn first_context_connected_proven_carrier(
+    answer: &AgentAnswerDto,
+    obligation: &PacketClaimObligationDto,
+    primary_carrier_node_id: &NodeId,
+) -> Option<NodeId> {
+    obligation
+        .carrier_node_ids
+        .iter()
+        .filter(|candidate_node_id| *candidate_node_id != primary_carrier_node_id)
+        .filter(|candidate_node_id| {
+            obligation
+                .carrier_edge_proofs
+                .iter()
+                .any(|proof| &proof.carrier_node_id == *candidate_node_id)
+        })
+        .find(|candidate_node_id| {
+            let candidate_node_id = *candidate_node_id;
+            answer.graphs.iter().any(|artifact| {
+                let GraphArtifactDto::Uml { graph, .. } = artifact else {
+                    return false;
+                };
+                graph.edges.iter().any(|edge| {
+                    packet_call_is_usable_selection_context(edge)
+                        && ((&edge.source == primary_carrier_node_id
+                            && &edge.target == candidate_node_id)
+                            || (&edge.target == primary_carrier_node_id
+                                && &edge.source == candidate_node_id))
+                })
+            })
+        })
+        .cloned()
+}
+
+fn packet_call_is_usable_selection_context(edge: &GraphEdgeDto) -> bool {
+    if edge.kind != EdgeKind::CALL || edge.source == edge.target {
+        return false;
+    }
+    match edge.certainty.as_deref() {
+        Some(certainty) if certainty.eq_ignore_ascii_case("certain") => true,
+        Some(certainty) if certainty.eq_ignore_ascii_case("probable") => true,
+        Some(_) => false,
+        None => edge.confidence.is_none_or(|confidence| {
+            confidence >= codestory_contracts::graph::ResolutionCertainty::CERTAIN_MIN
+        }),
     }
 }
 
@@ -5269,6 +5323,169 @@ mod tests {
             &truncated_budget,
         );
         assert!(plan.claim_obligations[0].carrier_edge_proofs.is_empty());
+    }
+
+    #[test]
+    fn probable_call_context_selects_only_a_secondary_carrier_with_its_own_proof() {
+        let question = "Trace how a command server initializes, enters the event loop, reads client input, and routes command execution.";
+        let primary_proof_id = EdgeId("primary-proof".to_string());
+        let secondary_proof_id = EdgeId("secondary-proof".to_string());
+        let uncertain_proof_id = EdgeId("uncertain-proof".to_string());
+        let context_edge_id = EdgeId("probable-wrapper-core".to_string());
+        let unproven_context_edge_id = EdgeId("probable-wrapper-unproven".to_string());
+        let uncertain_context_edge_id = EdgeId("uncertain-wrapper-core".to_string());
+        let mut primary = citation(
+            "executeCommandAndRecordMetrics",
+            "src/networking.c",
+            NodeKind::FUNCTION,
+        );
+        primary.evidence_edge_ids = vec![primary_proof_id.clone()];
+        let unproven = citation(
+            "executeCommandWithoutProof",
+            "src/server.c",
+            NodeKind::FUNCTION,
+        );
+        let mut uncertain = citation(
+            "executeCommandUncertain",
+            "src/server.c",
+            NodeKind::FUNCTION,
+        );
+        uncertain.evidence_edge_ids = vec![uncertain_proof_id.clone()];
+        let mut secondary = citation("executeCommand", "src/server.c", NodeKind::FUNCTION);
+        secondary.evidence_edge_ids = vec![secondary_proof_id.clone()];
+        let primary_target_id = NodeId("commandProcessed".to_string());
+        let secondary_target_id = NodeId("preprocessCommand".to_string());
+        let uncertain_target_id = NodeId("validateCommand".to_string());
+        let graph_node = |id: NodeId, label: &str, depth: u32| GraphNodeDto {
+            id,
+            label: label.to_string(),
+            kind: NodeKind::FUNCTION,
+            depth,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: Some("src/server.c".to_string()),
+            qualified_name: Some(label.to_string()),
+            member_access: None,
+        };
+        let mut answer = answer(vec![
+            primary.clone(),
+            unproven.clone(),
+            uncertain.clone(),
+            secondary.clone(),
+        ]);
+        answer.prompt = question.to_string();
+        answer.graphs.push(GraphArtifactDto::Uml {
+            id: "command-dispatch-context".to_string(),
+            title: "Command dispatch context".to_string(),
+            graph: GraphResponse {
+                center_id: primary.node_id.clone(),
+                nodes: vec![
+                    graph_node(primary.node_id.clone(), &primary.display_name, 0),
+                    graph_node(unproven.node_id.clone(), &unproven.display_name, 1),
+                    graph_node(uncertain.node_id.clone(), &uncertain.display_name, 1),
+                    graph_node(secondary.node_id.clone(), &secondary.display_name, 1),
+                    graph_node(primary_target_id.clone(), "commandProcessed", 1),
+                    graph_node(uncertain_target_id.clone(), "validateCommand", 2),
+                    graph_node(secondary_target_id.clone(), "preprocessCommand", 2),
+                ],
+                edges: vec![
+                    GraphEdgeDto {
+                        id: primary_proof_id.clone(),
+                        source: primary.node_id.clone(),
+                        target: primary_target_id,
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:primary-proof".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: unproven_context_edge_id.clone(),
+                        source: primary.node_id.clone(),
+                        target: unproven.node_id.clone(),
+                        kind: EdgeKind::CALL,
+                        confidence: Some(0.8),
+                        certainty: Some("probable".to_string()),
+                        callsite_identity: Some("test:unproven-selection-context".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: uncertain_context_edge_id.clone(),
+                        source: primary.node_id.clone(),
+                        target: uncertain.node_id.clone(),
+                        kind: EdgeKind::CALL,
+                        confidence: Some(0.5),
+                        certainty: Some("uncertain".to_string()),
+                        callsite_identity: Some("test:uncertain-selection-context".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: uncertain_proof_id.clone(),
+                        source: uncertain.node_id.clone(),
+                        target: uncertain_target_id,
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:uncertain-carrier-proof".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: context_edge_id.clone(),
+                        source: primary.node_id.clone(),
+                        target: secondary.node_id.clone(),
+                        kind: EdgeKind::CALL,
+                        confidence: Some(0.8),
+                        certainty: Some("probable".to_string()),
+                        callsite_identity: Some("test:selection-context".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: secondary_proof_id.clone(),
+                        source: secondary.node_id.clone(),
+                        target: secondary_target_id,
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:secondary-proof".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                ],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        });
+        let mut plan =
+            build_packet_obligation_plan(question, PacketTaskClassDto::RouteTracing, &[]);
+        plan.claim_obligations
+            .retain(|obligation| obligation.id == "command_dispatch");
+        plan.query_obligations.clear();
+
+        let snapshot = capture_packet_obligation_edge_proofs_before_budget(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &plan,
+            &answer,
+        );
+
+        assert_eq!(
+            protected_packet_obligation_carrier_node_ids(&snapshot),
+            &[primary.node_id, secondary.node_id]
+        );
+        assert_eq!(
+            protected_packet_obligation_edge_ids(&snapshot),
+            &[primary_proof_id, secondary_proof_id]
+        );
+        assert!(!protected_packet_obligation_edge_ids(&snapshot).contains(&context_edge_id));
+        assert!(
+            !protected_packet_obligation_edge_ids(&snapshot).contains(&unproven_context_edge_id)
+        );
+        assert!(
+            !protected_packet_obligation_edge_ids(&snapshot).contains(&uncertain_context_edge_id)
+        );
+        assert!(!protected_packet_obligation_edge_ids(&snapshot).contains(&uncertain_proof_id));
     }
 
     #[test]
