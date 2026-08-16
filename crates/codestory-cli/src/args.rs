@@ -511,7 +511,7 @@ pub(crate) struct PacketCommand {
         help = "Broad repository question or task to ground in one packet."
     )]
     pub(crate) question: String,
-    #[arg(long, value_enum, default_value_t = CliPacketBudget::Compact)]
+    #[arg(long, value_enum, default_value_t = CliPacketBudget::Standard)]
     pub(crate) budget: CliPacketBudget,
     #[arg(long, value_enum)]
     pub(crate) task_class: Option<CliPacketTaskClass>,
@@ -593,7 +593,7 @@ pub(crate) struct TaskBriefCommand {
         help = "Implementation task or issue brief to ground."
     )]
     pub(crate) prompt: String,
-    #[arg(long, value_enum, default_value_t = CliPacketBudget::Compact)]
+    #[arg(long, value_enum, default_value_t = CliPacketBudget::Standard)]
     pub(crate) budget: CliPacketBudget,
     #[arg(
         long = "probe",
@@ -3266,6 +3266,40 @@ mod tests {
         match cli.command {
             Command::Context(cmd) => assert_eq!(cmd.id.as_deref(), Some("-3816661223164617416")),
             _ => panic!("expected context command"),
+        }
+    }
+
+    #[test]
+    fn packet_and_task_brief_default_to_the_standard_evidence_budget() {
+        let packet = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--project",
+            "/tmp/project",
+            "--question",
+            "explain indexing",
+        ])
+        .expect("packet should parse with its default budget");
+        match packet.command {
+            Command::Packet(cmd) => assert_eq!(cmd.budget, CliPacketBudget::Standard),
+            _ => panic!("expected packet command"),
+        }
+
+        let brief = Cli::try_parse_from([
+            "codestory-cli",
+            "task",
+            "brief",
+            "--project",
+            "/tmp/project",
+            "--prompt",
+            "change indexing",
+        ])
+        .expect("task brief should parse with its default budget");
+        match brief.command {
+            Command::Task(TaskCommand {
+                action: TaskAction::Brief(cmd),
+            }) => assert_eq!(cmd.budget, CliPacketBudget::Standard),
+            _ => panic!("expected task brief command"),
         }
     }
 }

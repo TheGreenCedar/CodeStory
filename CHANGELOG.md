@@ -20,6 +20,7 @@ Cursor users can now install CodeStory from Customize as one plugin instead of c
 - The MCP `snippet` tool accepts the field names emitted by search and packet hits, so an agent can use a hit without translating its fields first.
 - Compact `context` output includes evidence and call or inheritance relations after the trust boundary, matching packet output.
 - Packets return compiled support plus one disposition: `supported`, `drill_once`, `not_established`, or `unavailable`. A drill is limited to one packet, and compact output shows the support before the disposition.
+- Broad packets and task briefs use the standard evidence budget by default, retaining more of the code and relationships needed to answer multi-step questions. The compact budget remains available when minimizing context matters more.
 - Task briefs expose that same typed disposition and optional one-round continuation instead of inventing `snippet` or `trail` recovery commands after a terminal packet.
 
 ### Fixed

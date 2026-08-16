@@ -371,7 +371,7 @@
         "description": "Build a broad task packet with compiled support units and a machine stop or one-round drill disposition.",
         "properties": {
           "budget": {
-            "default": "compact",
+            "default": "standard",
             "description": "Packet budget.",
             "enum": [
               "tiny",

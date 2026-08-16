@@ -28,7 +28,9 @@ generation pins). Do not send CLI flags such as `--file`, `mode`, or
 ## Notes
 
 - `packet` is for broad questions; `context` is for one concrete target.
-- Prefer a compact packet before manually opening source files for a broad explanation or plan.
+- Prefer the default standard packet before manually opening source files for a
+  broad explanation or plan. Select `compact` explicitly when minimizing
+  context is more important than retaining the fuller evidence set.
 - `probes` uses tagged objects with `kind` equal to `exact_path`, `symbol_id`,
   `file_symbol`, `free_query`, or `continuation`. For example,
   `{"kind":"exact_path","path":"assets/desk.svg"}` selects that exact

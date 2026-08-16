@@ -113,10 +113,11 @@ use codestory_contracts::api::{
     AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError, EdgeKind, GraphArtifactDto,
     GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, IndexFreshnessDto,
     IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
-    NodeOccurrencesRequest, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto,
-    PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketObligationPlanDto, PacketPlanDto,
-    PacketProbeDto, PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
-    SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, SourceCoverageObservationDto,
+    NodeOccurrencesRequest, PACKET_DRILL_MAX_BYTES, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS,
+    PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto, PacketEvidenceResolutionDto,
+    PacketEvidenceTierDto, PacketObligationPlanDto, PacketPlanDto, PacketProbeDto,
+    PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto, SearchHit,
+    SearchHitOrigin, SearchRepoTextMode, SearchRequest, SourceCoverageObservationDto,
     SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto, TrailConfigDto,
     TrailFilterOptionsDto,
 };
@@ -417,6 +418,7 @@ pub(crate) fn agent_packet(
             "packet option_ids require parent_packet_id for a generation-bound drill",
         ));
     }
+    let is_drill_continuation = req.parent_packet_id.is_some() || !req.option_ids.is_empty();
     let mut probes = normalize_packet_probe_request(&req.probes, &req.extra_probes);
     for option in drill_options_from_ids(&req.option_ids) {
         if let Some(path) = option.path {
@@ -445,9 +447,14 @@ pub(crate) fn agent_packet(
         task_class,
     );
     plan.probe_resolutions = probe_resolutions;
-    let limits = packet_budget_limits(req.budget);
+    let limits = packet_budget_limits_for_request(req.budget, is_drill_continuation);
     let packet_latency = PacketLatencyBudget::new(req.latency_budget_ms);
-    let retrieval_profile = packet_retrieval_profile(Some(plan.task_class), req.budget, &limits);
+    let retrieval_profile = packet_retrieval_profile(
+        Some(plan.task_class),
+        req.budget,
+        &limits,
+        is_drill_continuation,
+    );
     let retrieval_prompt = packet_retrieval_prompt(&question, &plan, req.budget);
     let (mut answer, initial_packet_hits) = agent_ask_with_packet_hits(
         controller,
@@ -704,6 +711,24 @@ pub(crate) fn agent_packet(
     apply_compiled_evidence(&mut packet, Some(&req));
 
     Ok(packet)
+}
+
+fn packet_budget_limits_for_request(
+    budget: PacketBudgetModeDto,
+    is_drill_continuation: bool,
+) -> PacketBudgetLimitsDto {
+    let mut limits = packet_budget_limits(budget);
+    if !is_drill_continuation {
+        return limits;
+    }
+    limits.max_anchors = limits.max_anchors.min(PACKET_DRILL_MAX_HITS);
+    limits.max_files = limits.max_files.min(PACKET_DRILL_MAX_HITS);
+    limits.max_snippets = limits.max_snippets.min(PACKET_DRILL_MAX_HITS);
+    limits.max_trail_edges = limits
+        .max_trail_edges
+        .min(PACKET_DRILL_MAX_HITS.saturating_mul(PACKET_DRILL_MAX_DEPTH));
+    limits.max_output_bytes = limits.max_output_bytes.min(PACKET_DRILL_MAX_BYTES);
+    limits
 }
 
 fn append_packet_non_trace_phase(answer: &mut AgentAnswerDto, label: &str, started_at: Instant) {
@@ -4496,6 +4521,7 @@ fn packet_retrieval_profile(
     task_class: Option<PacketTaskClassDto>,
     budget: PacketBudgetModeDto,
     limits: &PacketBudgetLimitsDto,
+    is_drill_continuation: bool,
 ) -> AgentRetrievalProfileSelectionDto {
     let preset = match task_class {
         Some(PacketTaskClassDto::BugLocalization) | Some(PacketTaskClassDto::EditPlanning) => {
@@ -4510,13 +4536,17 @@ fn packet_retrieval_profile(
         | None => AgentRetrievalPresetDto::Architecture,
     };
 
-    if matches!(
-        budget,
-        PacketBudgetModeDto::Tiny | PacketBudgetModeDto::Compact
-    ) {
+    if is_drill_continuation
+        || matches!(
+            budget,
+            PacketBudgetModeDto::Tiny | PacketBudgetModeDto::Compact
+        )
+    {
         return AgentRetrievalProfileSelectionDto::Custom {
             config: AgentCustomRetrievalConfigDto {
-                depth: if matches!(budget, PacketBudgetModeDto::Tiny) {
+                depth: if is_drill_continuation {
+                    PACKET_DRILL_MAX_DEPTH
+                } else if matches!(budget, PacketBudgetModeDto::Tiny) {
                     1
                 } else {
                     2
@@ -9554,6 +9584,42 @@ mod tests {
         assert_eq!(
             packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, budget, 8_000),
             3
+        );
+    }
+
+    #[test]
+    fn drill_continuation_uses_the_declared_bounded_packet_limits() {
+        let ordinary = packet_budget_limits_for_request(PacketBudgetModeDto::Standard, false);
+        let drill = packet_budget_limits_for_request(PacketBudgetModeDto::Standard, true);
+
+        let expected = packet_budget_limits(PacketBudgetModeDto::Standard);
+        assert_eq!(ordinary.max_anchors, expected.max_anchors);
+        assert_eq!(ordinary.max_files, expected.max_files);
+        assert_eq!(ordinary.max_snippets, expected.max_snippets);
+        assert_eq!(ordinary.max_trail_edges, expected.max_trail_edges);
+        assert_eq!(ordinary.max_output_bytes, expected.max_output_bytes);
+        assert_eq!(drill.max_anchors, PACKET_DRILL_MAX_HITS);
+        assert_eq!(drill.max_files, PACKET_DRILL_MAX_HITS);
+        assert_eq!(drill.max_snippets, PACKET_DRILL_MAX_HITS);
+        assert_eq!(
+            drill.max_trail_edges,
+            PACKET_DRILL_MAX_HITS * PACKET_DRILL_MAX_DEPTH
+        );
+        assert_eq!(drill.max_output_bytes, PACKET_DRILL_MAX_BYTES);
+
+        let profile = packet_retrieval_profile(
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Deep,
+            &drill,
+            true,
+        );
+        let AgentRetrievalProfileSelectionDto::Custom { config } = profile else {
+            panic!("a drill continuation must use a depth-bounded custom profile");
+        };
+        assert_eq!(config.depth, PACKET_DRILL_MAX_DEPTH);
+        assert_eq!(
+            config.max_nodes,
+            PACKET_DRILL_MAX_HITS * PACKET_DRILL_MAX_DEPTH
         );
     }
 

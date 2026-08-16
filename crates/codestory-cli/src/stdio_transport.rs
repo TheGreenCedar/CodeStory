@@ -4006,7 +4006,7 @@ fn stdio_packet_budget(request: &serde_json::Value) -> Result<PacketBudgetModeDt
     match request
         .pointer("/params/arguments/budget")
         .and_then(|value| value.as_str())
-        .unwrap_or("compact")
+        .unwrap_or("standard")
     {
         "tiny" => Ok(PacketBudgetModeDto::Tiny),
         "compact" => Ok(PacketBudgetModeDto::Compact),
@@ -6250,8 +6250,7 @@ fn stdio_status_recommended_next_calls(
             "tool": "packet",
             "arguments": {
                 "project": project,
-                "question": "<broad-task-question>",
-                "budget": "compact"
+                "question": "<broad-task-question>"
             }
         },
         {
@@ -8871,6 +8870,22 @@ version = "0.11.20"
             .expect("serialize caller-owned JSON-RPC frame")
             .len();
         assert!(jsonrpc_bytes > owned_bytes);
+    }
+
+    #[test]
+    fn stdio_packet_uses_the_catalog_default_when_budget_is_omitted() {
+        let request = json!({
+            "params": {
+                "arguments": {
+                    "question": "explain indexing"
+                }
+            }
+        });
+
+        assert_eq!(
+            stdio_packet_budget(&request).expect("omitted packet budget should use the default"),
+            PacketBudgetModeDto::Standard
+        );
     }
 
     #[test]

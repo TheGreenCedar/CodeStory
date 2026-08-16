@@ -2787,8 +2787,8 @@ pub struct AgentAnswerDto {
 #[serde(rename_all = "snake_case")]
 pub enum PacketBudgetModeDto {
     Tiny,
-    #[default]
     Compact,
+    #[default]
     Standard,
     Deep,
 }
@@ -3673,11 +3673,11 @@ mod packet_tests {
     }
 
     #[test]
-    fn packet_request_uses_compact_budget_by_default() {
+    fn packet_request_uses_standard_budget_by_default() {
         let request: AgentPacketRequestDto =
             serde_json::from_str(r#"{"question":"explain indexing"}"#).expect("deserialize");
 
-        assert_eq!(request.budget, PacketBudgetModeDto::Compact);
+        assert_eq!(request.budget, PacketBudgetModeDto::Standard);
         assert!(request.include_evidence);
     }
 

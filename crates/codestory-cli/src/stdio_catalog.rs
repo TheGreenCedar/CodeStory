@@ -2135,7 +2135,7 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         .with_min_length(1),
         SchemaProperty::string("budget", "Packet budget.")
             .with_enum(PACKET_BUDGETS)
-            .with_default(ValueLiteral::String("compact")),
+            .with_default(ValueLiteral::String("standard")),
         SchemaProperty::string("task_class", "Optional task class.")
             .with_enum(PACKET_TASK_CLASSES)
             .nullable(),

@@ -1930,7 +1930,7 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
     );
     assert_eq!(
         schema_property(packet, "budget").get("default"),
-        Some(&json!("compact")),
+        Some(&json!("standard")),
         "packet.budget should document the stdio default: {packet}"
     );
     assert_schema_enum_values(

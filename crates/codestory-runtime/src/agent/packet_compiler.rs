@@ -473,14 +473,12 @@ fn collect_drill_options(
         if let Some(edge_kind) = obligation.required_edge_kind
             && matches!(edge_kind, EdgeKind::CALL | EdgeKind::INHERITANCE)
             && obligation.carrier_edge_proofs.is_empty()
+            && let Some(target) = obligation.carrier_node_ids.first()
         {
-            let target = obligation
-                .carrier_node_ids
-                .first()
-                .map(|node| node.0.as_str())
-                .unwrap_or(obligation.id.as_str());
-            let option =
-                DrillOptionDto::omitted_symbol(format!("omitted-edge:{}", obligation.id), target);
+            let option = DrillOptionDto::omitted_symbol(
+                format!("omitted-edge:{}", obligation.id),
+                &target.0,
+            );
             if seen.insert(option.id.clone()) {
                 options.push(option);
             }
@@ -720,6 +718,32 @@ mod tests {
                 .iter()
                 .any(|option| { option.symbol_id.as_deref() == Some("Router.use") })
         );
+    }
+
+    #[test]
+    fn an_obligation_name_cannot_be_published_as_a_drill_symbol_id() {
+        let mut packet = test_packet("explain routing", 98_304);
+        packet.answer.freshness = Some(fresh_index_observation());
+        packet.answer.citations = vec![eligible_citation("Router.use", "src/router.rs")];
+        let mut obligation = claim_obligation(
+            PacketClaimObligationKindDto::Dispatch,
+            PacketObligationProofStatusDto::Unsupported,
+        );
+        obligation.id = "request_dispatch".to_string();
+        obligation.required_edge_kind = Some(EdgeKind::CALL);
+        packet.plan = empty_plan();
+        packet.plan.obligations.claim_obligations = vec![obligation];
+
+        let (_support, disposition) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            None,
+        );
+
+        assert_eq!(disposition.kind, PacketDispositionKindDto::NotEstablished);
+        assert!(disposition.drill.is_none());
     }
 
     #[test]

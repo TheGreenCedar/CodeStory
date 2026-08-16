@@ -42,9 +42,9 @@ const MANIFEST_REPO_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
 const MANIFEST_TASK_ID_PATTERN = /^[a-z0-9][a-z0-9.-]*$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const MAX_PACKET_MANIFEST_EXTRA_PROBES = 12;
-const PUBLIC_PACKET_MAX_ANCHORS = 13;
-const PUBLIC_PACKET_MAX_TRAIL_EDGES = 20;
-const PUBLIC_PACKET_MAX_OUTPUT_BYTES = 98_304;
+const PUBLIC_PACKET_MAX_ANCHORS = 16;
+const PUBLIC_PACKET_MAX_TRAIL_EDGES = 60;
+const PUBLIC_PACKET_MAX_OUTPUT_BYTES = 128 * 1024;
 const MAX_REUSED_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_BENCHMARK_MODEL = "gpt-5.6-sol";
 const REQUIRED_MANAGED_CODESTORY_VERSION = "0.17.0";
@@ -1620,9 +1620,9 @@ function packetFirstCommandForPrompt(taskPrompt, task = null, platform = process
     ? ` --task-class ${shellSingleQuoted(validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"), platform)}`
     : "";
   if (platform === "win32") {
-    return `& $env:CODESTORY_CLI packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget compact --format json`;
+    return `& $env:CODESTORY_CLI packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget standard --format json`;
   }
-  return `"$CODESTORY_CLI" packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget compact --format json`;
+  return `"$CODESTORY_CLI" packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget standard --format json`;
 }
 
 function packetPreludePromptBlock(prelude) {
@@ -2895,7 +2895,7 @@ function packetCommandArgs(repoConfig, task, opts = {}) {
     "--question",
     task?.prompt ?? repoConfig.prompt,
     "--budget",
-    "compact",
+    "standard",
     "--format",
     "json",
   ];
@@ -6365,7 +6365,7 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
             name: "packet",
             arguments: {
               question: task.prompt,
-              budget: "compact",
+              budget: "standard",
               task_class: task.task_class,
             },
           },
