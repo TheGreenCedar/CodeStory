@@ -1627,11 +1627,12 @@ impl AppController {
                             )),
                         })
                     }
-                    _ => Some(FunctionBodyRange {
+                    Some(_) => Some(FunctionBodyRange {
                         end_line,
                         range_source: "indexed_symbol_range",
                         fallback_reason: None,
                     }),
+                    None => None,
                 }
             }
             None => self
@@ -3489,6 +3490,61 @@ mod tests {
                 .is_some_and(|reason| reason.contains("fell back to line_context"))
         );
         assert!(snippet.snippet.contains("payload.create"));
+    }
+
+    #[test]
+    fn declaration_only_range_is_not_reported_as_a_function_body() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let source_path = temp.path().join("src").join("client.dart");
+        std::fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        std::fs::write(
+            &source_path,
+            "Future<Response> send(Request request) async {\n  final body = request.finalize();\n  return transport.send(body);\n}\n",
+        )
+        .expect("write source");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            insert_file_node(
+                &mut storage,
+                11,
+                &source_path,
+                Node {
+                    id: CoreNodeId(101),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "send".to_string(),
+                    file_node_id: Some(CoreNodeId(11)),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("insert function");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+
+        let snippet = controller
+            .snippet_function_body_context(codestory_contracts::api::NodeId("101".to_string()), 0)
+            .expect("declaration-only fallback");
+
+        assert_eq!(
+            snippet.scope,
+            codestory_contracts::api::SnippetScopeDto::LineContext
+        );
+        assert_eq!(snippet.range_source.as_deref(), Some("line_context"));
+        assert!(
+            snippet
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("fell back to line_context"))
+        );
+        assert!(!snippet.snippet.contains("request.finalize"));
     }
 
     #[test]

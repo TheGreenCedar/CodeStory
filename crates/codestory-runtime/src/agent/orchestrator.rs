@@ -117,9 +117,9 @@ use codestory_contracts::api::{
     PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto, PacketEvidenceResolutionDto,
     PacketEvidenceTierDto, PacketObligationPlanDto, PacketPlanDto, PacketProbeDto,
     PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto, SearchHit,
-    SearchHitOrigin, SearchRepoTextMode, SearchRequest, SourceCoverageObservationDto,
-    SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto, TrailConfigDto,
-    TrailFilterOptionsDto,
+    SearchHitOrigin, SearchRepoTextMode, SearchRequest, SnippetScopeDto,
+    SourceCoverageObservationDto, SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto,
+    TrailConfigDto, TrailFilterOptionsDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{
@@ -1208,12 +1208,19 @@ const CARRIER_SOURCE_FOCUS_CONTEXT_LINES: usize = 4;
 const CARRIER_SOURCE_FILE_FOCUS_CONTEXT_LINES: usize = 17;
 const CARRIER_SOURCE_MAX_FOCUSED_WINDOWS: usize = 2;
 const CARRIER_SOURCE_MAX_FOCUS_FILE_BYTES: u64 = 512 * 1_024;
+const CARRIER_SOURCE_DECLARATION_FALLBACK_LINES: u32 = 24;
 const SOURCE_RECEIPT_NOT_RETAINED: &str = "source_receipt_not_retained";
 
 struct CarrierSourceRange {
     path: String,
     start_line: u32,
     body: String,
+}
+
+fn carrier_source_line_context_end_line(scope: SnippetScopeDto, start_line: u32) -> Option<u32> {
+    (scope == SnippetScopeDto::LineContext).then(|| {
+        start_line.saturating_add(CARRIER_SOURCE_DECLARATION_FALLBACK_LINES.saturating_sub(1))
+    })
 }
 
 /// Truncate on a UTF-8 character boundary, never mid-codepoint.
@@ -1361,6 +1368,26 @@ fn append_packet_carrier_source_sections(
                 .snippet_function_body_context(citation.node_id.clone(), 0)
                 .ok()
                 .map(|snippet| {
+                    if let Some(end_line) =
+                        carrier_source_line_context_end_line(snippet.scope, snippet.line)
+                        && let Ok((path, bounded)) = controller.bounded_file_snippet_range(
+                            &snippet.path,
+                            crate::BoundedSnippetRangeOptions {
+                                focus_line: snippet.line,
+                                start_line: snippet.line,
+                                end_line,
+                                context_lines: 0,
+                                max_bytes: CARRIER_SOURCE_MAX_SNIPPET_BYTES,
+                                truncation_suffix: SOURCE_SNIPPET_TRUNCATION_SUFFIX,
+                            },
+                        )
+                    {
+                        return vec![CarrierSourceRange {
+                            path,
+                            start_line: snippet.line,
+                            body: bounded.markdown,
+                        }];
+                    }
                     if snippet.snippet_truncated
                         || snippet.snippet.len() > CARRIER_SOURCE_MAX_SNIPPET_BYTES
                     {
@@ -6356,6 +6383,22 @@ mod tests {
 
         citation.resolution_status = Some(PacketEvidenceResolutionDto::Unresolved);
         assert!(!citation_needs_bounded_source_read(&citation));
+    }
+
+    #[test]
+    fn declaration_only_behavioral_source_gets_a_bounded_forward_window() {
+        assert_eq!(
+            carrier_source_line_context_end_line(SnippetScopeDto::LineContext, 100),
+            Some(123)
+        );
+        assert_eq!(
+            carrier_source_line_context_end_line(SnippetScopeDto::FunctionBody, 100),
+            None
+        );
+        assert_eq!(
+            carrier_source_line_context_end_line(SnippetScopeDto::LineContext, u32::MAX - 3),
+            Some(u32::MAX)
+        );
     }
 
     #[test]
