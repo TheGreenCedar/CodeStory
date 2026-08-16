@@ -1178,13 +1178,20 @@ fn packet_relation_verb(kind: EdgeKind) -> &'static str {
 /// the whole packet and worth nothing to a reader who only ever sees the first few thousand
 /// characters, so they rank below the evidence and above the restatement. Ordering rather
 /// than dropping them costs a capped reader nothing and costs an uncapped reader nothing.
+///
+/// Resolved relations and carrier source lead the evidence itself. They state assertible
+/// connections and source text for the selected anchors. The retrieval appendix follows:
+/// its focused-symbol preamble and raw top matches are useful diagnostics, but can describe
+/// a neighboring symbol and must not evict the compiled relation/source evidence from a
+/// capped agent projection.
 fn packet_section_order_rank(id: &str) -> u8 {
     match id {
-        PACKET_RESOLVED_RELATIONS_SECTION_ID | "retrieval-evidence" => 0,
+        PACKET_RESOLVED_RELATIONS_SECTION_ID => 0,
         "packet-carrier-source" => 1,
-        "packet-flow-claims" => 3,
-        "packet-evidence-ledger" => 4,
-        _ => 2,
+        "retrieval-evidence" => 2,
+        "packet-flow-claims" => 4,
+        "packet-evidence-ledger" => 5,
+        _ => 3,
     }
 }
 
@@ -6079,6 +6086,40 @@ mod tests {
     };
     use crate::agent::planning::packet_plan_query_is_exact_symbol_identity;
     use crate::agent::profiles::ResolvedProfile;
+
+    #[test]
+    fn packet_sections_lead_with_relations_and_carrier_source() {
+        let section = |id: &str| AgentResponseSectionDto {
+            id: id.to_string(),
+            title: id.to_string(),
+            blocks: Vec::new(),
+        };
+        let mut sections = vec![
+            section("retrieval-evidence"),
+            section("packet-evidence-ledger"),
+            section("analysis"),
+            section("packet-carrier-source"),
+            section(PACKET_RESOLVED_RELATIONS_SECTION_ID),
+            section("packet-flow-claims"),
+        ];
+
+        order_packet_sections(&mut sections);
+
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                PACKET_RESOLVED_RELATIONS_SECTION_ID,
+                "packet-carrier-source",
+                "retrieval-evidence",
+                "analysis",
+                "packet-flow-claims",
+                "packet-evidence-ledger",
+            ]
+        );
+    }
 
     #[test]
     fn long_function_focus_covers_separate_question_actions() {
