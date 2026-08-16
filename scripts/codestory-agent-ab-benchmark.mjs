@@ -2504,9 +2504,12 @@ const CLAIM_STOPWORDS = new Set([
   "and",
   "are",
   "before",
+  "for",
   "from",
   "into",
+  "is",
   "later",
+  "or",
   "that",
   "the",
   "then",
@@ -2517,8 +2520,50 @@ const CLAIM_STOPWORDS = new Set([
 function claimTokens(value) {
   return normalizeSearchText(value)
     .split(/[^a-z0-9_:.]+/)
-    .map((token) => token.trim())
+    .map((token) => token.trim().replace(/^[.:]+|[.:]+$/g, ""))
     .filter((token) => token.length >= 3 && !CLAIM_STOPWORDS.has(token));
+}
+
+function positiveClaimTokenVariants(token) {
+  const variants = new Set([token]);
+  if (token.length >= 5 && token.endsWith("ies")) {
+    variants.add(`${token.slice(0, -3)}y`);
+  }
+  if (token.length >= 5 && token.endsWith("ing")) {
+    variants.add(token.slice(0, -3));
+    variants.add(`${token.slice(0, -3)}e`);
+  }
+  if (token.length >= 4 && token.endsWith("ed")) {
+    variants.add(token.slice(0, -2));
+    variants.add(token.slice(0, -1));
+  }
+  if (token.length >= 4 && token.endsWith("es")) {
+    variants.add(token.slice(0, -2));
+    variants.add(token.slice(0, -1));
+  }
+  if (token.length >= 4 && token.endsWith("s")) {
+    variants.add(token.slice(0, -1));
+  }
+  return variants;
+}
+
+function positiveClaimTokenMatched(token, haystackTokens) {
+  const expectedVariants = positiveClaimTokenVariants(token);
+  for (const candidate of haystackTokens) {
+    for (const expected of expectedVariants) {
+      for (const observed of positiveClaimTokenVariants(candidate)) {
+        if (
+          expected === observed ||
+          (expected.length >= 5 &&
+            observed.length >= 5 &&
+            (observed.includes(expected) || expected.includes(observed)))
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 function claimTokenMatched(token, haystackTokens) {
@@ -2542,9 +2587,15 @@ function claimMatched(haystack, claim) {
     return false;
   }
   const haystackTokens = new Set(claimTokens(haystack));
-  const matched = expectedTokens.filter((token) => claimTokenMatched(token, haystackTokens)).length;
+  const matched = expectedTokens.filter((token) =>
+    positiveClaimTokenMatched(token, haystackTokens),
+  ).length;
   const ratio = matched / expectedTokens.length;
-  return matched >= Math.min(4, expectedTokens.length) && ratio >= 0.65;
+  // Positive quality claims are short semantic summaries, not exact-string fixtures. Three
+  // independently matched content words plus 60% coverage accepts ordinary inflection and
+  // paraphrase while still rejecting a sentence that merely repeats one symbol name. Forbidden
+  // claims retain the stricter polarity-aware matcher below.
+  return matched >= Math.min(3, expectedTokens.length) && ratio >= 0.6;
 }
 
 const FORBIDDEN_POLARITY_TERMS = new Set([
@@ -5243,6 +5294,72 @@ async function writeJsonlRows(filePath, rows) {
   await writeFile(filePath, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "utf8");
 }
 
+function sameBenchmarkRowIdentity(left, right) {
+  return (
+    left?.repo === right?.repo &&
+    left?.task_id === right?.task_id &&
+    left?.arm === right?.arm &&
+    left?.repeat === right?.repeat
+  );
+}
+
+async function resolveReanalysisStdoutPath(result, runDir) {
+  let current = result;
+  let currentRunDir = runDir;
+  const visited = new Set();
+  for (let depth = 0; depth < 16; depth += 1) {
+    if (current.stdout_path) {
+      const candidate = path.isAbsolute(current.stdout_path)
+        ? current.stdout_path
+        : path.resolve(currentRunDir, current.stdout_path);
+      if (existsSync(candidate)) {
+        return candidate;
+      }
+    }
+
+    const reusedFrom = current.benchmark_contract?.reused_from;
+    if (!reusedFrom) {
+      return null;
+    }
+    const reusedRunDir = path.resolve(reusedFrom);
+    if (visited.has(reusedRunDir)) {
+      return null;
+    }
+    visited.add(reusedRunDir);
+    const reusedRunsPath = path.join(reusedRunDir, "runs.jsonl");
+    if (!existsSync(reusedRunsPath)) {
+      return null;
+    }
+    const reusedRows = (await readFile(reusedRunsPath, "utf8"))
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const reusedRow = reusedRows.find((candidate) =>
+      sameBenchmarkRowIdentity(candidate, result),
+    );
+    if (!reusedRow) {
+      return null;
+    }
+    current = reusedRow;
+    currentRunDir = reusedRunDir;
+  }
+  return null;
+}
+
+async function reanalysisPacketManifestQuality(result, runDir, task) {
+  const packetPath = result.codestory_harness_prelude?.stdout_path;
+  if (!packetPath || !task) {
+    return null;
+  }
+  const resolved = path.isAbsolute(packetPath) ? packetPath : path.resolve(runDir, packetPath);
+  if (!existsSync(resolved)) {
+    return null;
+  }
+  const packet = JSON.parse(await readFile(resolved, "utf8"));
+  return packetManifestQualitySummary(packet, task);
+}
+
 async function createDurableJsonlAppender(filePath) {
   await mkdir(path.dirname(filePath), { recursive: true });
   const handle = await open(filePath, "a");
@@ -5263,15 +5380,11 @@ async function createDurableJsonlAppender(filePath) {
 }
 
 async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
-  const stdoutPath = result.stdout_path
-    ? path.isAbsolute(result.stdout_path)
-      ? result.stdout_path
-      : path.resolve(runDir, result.stdout_path)
-    : null;
+  const stdoutPath = await resolveReanalysisStdoutPath(result, runDir);
   if (!stdoutPath || !existsSync(stdoutPath)) {
     return {
       ...result,
-      reanalysis_error: `missing stdout_path: ${result.stdout_path ?? ""}`,
+      reanalysis_error: `missing stdout artifact for ${result.repo}/${result.task_id}/${result.arm}/${result.repeat}`,
     };
   }
 
@@ -5281,6 +5394,7 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
     ...parsed,
   ];
   const task = await loadTaskForResult(result, opts, taskCache);
+  const packetManifestQuality = await reanalysisPacketManifestQuality(result, runDir, task);
   const repoConfig = ALL_REPOS[result.repo] ?? null;
   const usage = extractUsage(parsed);
   const analysis = analyzeTranscript(analysisEvents, result.repo_path ?? repoConfig?.path ?? runDir);
@@ -5296,8 +5410,16 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
         })
       : null
   );
+  const { reanalysis_error: _staleReanalysisError, ...sourceResult } = result;
   const output = {
-    ...result,
+    ...sourceResult,
+    codestory_harness_prelude: result.codestory_harness_prelude
+      ? {
+          ...result.codestory_harness_prelude,
+          packet_manifest_quality:
+            packetManifestQuality ?? result.codestory_harness_prelude.packet_manifest_quality,
+        }
+      : null,
     repo_provenance: result.repo_provenance ?? (repoConfig ? await repoProvenance(repoConfig) : null),
     codestory_cache_provenance: cacheProvenance,
     usage,
@@ -8165,6 +8287,48 @@ function runSelfTest() {
   assert.equal(quality.expected_symbols.recall, 1);
   assert.equal(quality.expected_claims.recall, 1);
   assert.equal(quality.citation_coverage.recall, 1);
+  assert.equal(
+    claimMatched(
+      "Build.process processes a Jekyll site before rendering pages and documents.",
+      "Build.process constructs or processes a Jekyll site.",
+    ),
+    true,
+  );
+  assert.equal(
+    claimMatched(
+      "Renderer handles rendering for pages and documents.",
+      "Renderer renders pages and documents.",
+    ),
+    true,
+  );
+  assert.equal(
+    claimMatched(
+      "Renderer selects an output directory.",
+      "Renderer renders pages and documents.",
+    ),
+    false,
+  );
+  assert.equal(
+    forbiddenClaimMatched(
+      "Jekyll does not write output before reading and rendering the site.",
+      "Jekyll writes output before reading and rendering the site.",
+    ),
+    false,
+  );
+  assert.equal(
+    sameBenchmarkRowIdentity(
+      { repo: "repo", task_id: "task", arm: "without_codestory", repeat: 1 },
+      { repo: "repo", task_id: "task", arm: "without_codestory", repeat: 1 },
+    ),
+    true,
+  );
+  assert.equal(
+    sameBenchmarkRowIdentity(
+      { repo: "repo", task_id: "task", arm: "without_codestory", repeat: 1 },
+      { repo: "repo", task_id: "task", arm: "with_codestory", repeat: 1 },
+    ),
+    false,
+  );
   const packetFixture = {
     budget: {
       used: { output_bytes: 123 },
