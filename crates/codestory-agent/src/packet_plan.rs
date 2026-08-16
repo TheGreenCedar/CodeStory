@@ -215,16 +215,22 @@ pub fn packet_owner_member_probe_queries(
         let Some(owner) = segments.get(segments.len().saturating_sub(2)) else {
             continue;
         };
-        let mut candidates = vec![(*owner).to_string()];
-        candidates.extend(packet_camel_identifier_words(owner));
-        for candidate in candidates {
-            let key = normalize_identifier(&candidate);
-            if key.len() < 3 || !prompt_term_keys.contains(&key) || !seen_owners.insert(key.clone())
-            {
-                continue;
-            }
-            let position = normalized_question.rfind(&key).unwrap_or_default();
-            owners.push((position, candidate));
+        let owner_key = normalize_identifier(owner);
+        if owner_key.len() < 3 || seen_owners.contains(&owner_key) {
+            continue;
+        }
+        let position = prompt_term_keys
+            .iter()
+            .filter(|term_key| packet_owner_identity_matches_prompt_term(&owner_key, term_key))
+            .filter_map(|term_key| normalized_question.rfind(term_key))
+            .max();
+        if let Some(position) = position
+            && seen_owners.insert(owner_key)
+        {
+            // A component word can establish that the typed owner is relevant, but it is never a
+            // replacement identity. Turning `Logger` into `Log` or `SourceObject` into `Source`
+            // fabricates owner/member probes that cannot resolve to the indexed symbol.
+            owners.push((position, (*owner).to_string()));
         }
     }
     owners.sort_by(|left, right| {
@@ -295,6 +301,14 @@ pub fn packet_owner_member_probe_queries(
         })
         .take(limit)
         .collect()
+}
+
+fn packet_owner_identity_matches_prompt_term(owner_key: &str, term_key: &str) -> bool {
+    if owner_key == term_key {
+        return true;
+    }
+    owner_key.len().abs_diff(term_key.len()) <= 4
+        && (owner_key.starts_with(term_key) || term_key.starts_with(owner_key))
 }
 
 fn packet_owner_member_term_is_noise(term: &str) -> bool {
@@ -1000,6 +1014,33 @@ mod owner_member_probe_tests {
         assert!(
             queries.is_empty(),
             "untyped citation authorized owner/member probes: {queries:?}"
+        );
+    }
+
+    #[test]
+    fn owner_member_probes_preserve_the_typed_owner_instead_of_prompt_fragments() {
+        let queries = packet_owner_member_probe_queries(
+            "Explain how Monolog turns a log call into a LogRecord and passes it through handlers.",
+            &symbols(&[
+                "Monolog.Logger.addRecord",
+                "SourceObject.map",
+                "ReplaceName.map",
+                "Monolog\\Handler.HandlerInterface.handle",
+            ]),
+            8,
+        );
+
+        assert!(
+            queries.iter().any(|query| query == "Logger.log"),
+            "typed Logger owner was not retained: {queries:?}"
+        );
+        assert!(
+            !queries.iter().any(|query| {
+                query.starts_with("Log.")
+                    || query.starts_with("Source.")
+                    || query.starts_with("Name.")
+            }),
+            "prompt fragments became fabricated owners: {queries:?}"
         );
     }
 }
