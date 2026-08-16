@@ -766,12 +766,7 @@ fn promote_retained_owner_member_probes(
     question: &str,
     answer: &mut AgentAnswerDto,
 ) -> Vec<String> {
-    let anchor_labels = answer
-        .citations
-        .iter()
-        .map(|citation| citation.display_name.clone())
-        .collect::<Vec<_>>();
-    let probes = packet_owner_member_probe_queries(question, &anchor_labels, 10)
+    let probes = packet_owner_member_probe_queries(question, &answer.citations, 10)
         .into_iter()
         .filter(|probe| {
             let probe = normalize_identifier(probe);
@@ -1338,10 +1333,12 @@ fn append_packet_carrier_source_sections(
             let (Some(path), Some(line)) = (citation.file_path.as_deref(), citation.line) else {
                 continue;
             };
-            let focused = (citation.kind == NodeKind::FILE
-                && citation_is_lexical_source_range(&citation))
-            .then(|| focused_file_source_ranges(controller, &file_focus_text, path))
-            .unwrap_or_default();
+            let focused =
+                if citation.kind == NodeKind::FILE && citation_is_lexical_source_range(&citation) {
+                    focused_file_source_ranges(controller, &file_focus_text, path)
+                } else {
+                    Vec::new()
+                };
             if focused.is_empty() {
                 controller
                     .bounded_file_snippet(

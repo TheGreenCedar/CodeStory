@@ -30,7 +30,8 @@ use crate::text::{
     query_mentions_non_primary_source,
 };
 use codestory_contracts::api::{
-    PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto, PacketTaskClassDto,
+    AgentCitationDto, NodeKind, PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto,
+    PacketTaskClassDto, SearchHitOrigin,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub fn build_packet_plan(
@@ -166,7 +167,7 @@ pub fn packet_rank_terms(question: &str) -> Vec<String> {
 /// retained owner with the task's verbs without adding repository-specific vocabulary.
 pub fn packet_owner_member_probe_queries(
     question: &str,
-    anchor_labels: &[String],
+    anchor_citations: &[AgentCitationDto],
     limit: usize,
 ) -> Vec<String> {
     if limit == 0 {
@@ -178,6 +179,15 @@ pub fn packet_owner_member_probe_queries(
         .iter()
         .map(|term| normalize_identifier(term))
         .collect::<std::collections::HashSet<_>>();
+    let anchor_labels = anchor_citations
+        .iter()
+        .filter(|citation| {
+            citation.origin == SearchHitOrigin::IndexedSymbol
+                && citation.resolvable
+                && !matches!(citation.kind, NodeKind::FILE | NodeKind::UNKNOWN)
+        })
+        .map(|citation| citation.display_name.as_str())
+        .collect::<Vec<_>>();
     let mut owners = Vec::<(usize, String)>::new();
     let mut seen_owners = std::collections::HashSet::<String>::new();
     let exact_owner_candidates = exact_symbol_query_terms(question);
@@ -238,7 +248,7 @@ pub fn packet_owner_member_probe_queries(
             .iter()
             .map(|owner| normalize_identifier(owner)),
     );
-    let mut candidates = Vec::<(bool, usize, usize, usize, String)>::new();
+    let mut candidates = Vec::<(bool, bool, usize, usize, usize, String)>::new();
     for (owner_index, (owner_position, owner)) in owners.iter().enumerate() {
         let owner_key = normalize_identifier(owner);
         for (term_index, term) in prompt_terms.iter().enumerate() {
@@ -258,6 +268,7 @@ pub fn packet_owner_member_probe_queries(
                 }
                 candidates.push((
                     !after_owner,
+                    member != term.to_ascii_lowercase(),
                     distance,
                     owner_index,
                     term_index,
@@ -273,11 +284,12 @@ pub fn packet_owner_member_probe_queries(
             .then_with(|| left.2.cmp(&right.2))
             .then_with(|| left.3.cmp(&right.3))
             .then_with(|| left.4.cmp(&right.4))
+            .then_with(|| left.5.cmp(&right.5))
     });
     let mut seen = std::collections::HashSet::<String>::new();
     candidates
         .into_iter()
-        .filter_map(|(_, _, _, _, query)| {
+        .filter_map(|(_, _, _, _, _, query)| {
             let key = normalize_identifier(&query);
             seen.insert(key).then_some(query)
         })
@@ -872,16 +884,55 @@ fn prompt_mentions_indexing_flow(lower: &str) -> bool {
 #[cfg(test)]
 mod owner_member_probe_tests {
     use super::packet_owner_member_probe_queries;
+    use codestory_contracts::api::{AgentCitationDto, NodeId, NodeKind, SearchHitOrigin};
+
+    fn citation(
+        display_name: &str,
+        kind: NodeKind,
+        origin: SearchHitOrigin,
+        resolvable: bool,
+    ) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(display_name.to_string()),
+            display_name: display_name.to_string(),
+            kind,
+            file_path: Some("src/example.rs".to_string()),
+            line: Some(1),
+            score: 1.0,
+            origin,
+            target: None,
+            resolvable,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+        }
+    }
+
+    fn symbols(display_names: &[&str]) -> Vec<AgentCitationDto> {
+        display_names
+            .iter()
+            .map(|display_name| {
+                citation(
+                    display_name,
+                    NodeKind::FUNCTION,
+                    SearchHitOrigin::IndexedSymbol,
+                    true,
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn exact_owner_members_cover_late_lifecycle_phases_without_task_specific_names() {
         let queries = packet_owner_member_probe_queries(
             "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases. Cite the source files and name the supporting symbols.",
-            &[
-                "Build.build".to_string(),
-                "Site.posts".to_string(),
-                "Command.process_site".to_string(),
-            ],
+            &symbols(&["Build.build", "Site.posts", "Command.process_site"]),
             10,
         );
 
@@ -904,5 +955,51 @@ mod owner_member_probe_tests {
 
         assert!(queries.iter().any(|query| query == "BaseRequest.finalize"));
         assert!(queries.iter().any(|query| query == "IOClient.send"));
+    }
+
+    #[test]
+    fn owner_member_probes_reject_untyped_retrieval_anchors() {
+        let citations = vec![
+            citation(
+                "examples/forms/validation.html",
+                NodeKind::FILE,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            citation(
+                "validation.html",
+                NodeKind::FILE,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            citation(
+                "validation.check",
+                NodeKind::FUNCTION,
+                SearchHitOrigin::TextMatch,
+                true,
+            ),
+            citation(
+                "validation.handle",
+                NodeKind::FUNCTION,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            citation(
+                "validation.unknown",
+                NodeKind::UNKNOWN,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+        ];
+        let queries = packet_owner_member_probe_queries(
+            "Explain how validation handles checks.",
+            &citations,
+            10,
+        );
+
+        assert!(
+            queries.is_empty(),
+            "untyped citation authorized owner/member probes: {queries:?}"
+        );
     }
 }

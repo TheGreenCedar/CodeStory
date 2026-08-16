@@ -425,31 +425,35 @@ fn packet_adaptive_material_queries(
         .collect::<Vec<_>>();
     let mut obligation_added_query = vec![false; missing_material.len()];
 
-    // Give every open material claim one semantic query before any claim can consume the
-    // remainder of the fixed batch with fallback paths.
-    for (index, obligation) in missing_material.iter().enumerate() {
+    let structural_schema_flow = missing_material
+        .iter()
+        .any(|obligation| obligation.id.starts_with("sql_"));
+    let owner_member_queries = if !missing_material.is_empty() && !structural_schema_flow {
+        packet_owner_member_probe_queries(
+            question,
+            &answer.citations,
+            limit.min(PACKET_OWNER_MEMBER_QUERY_LIMIT),
+        )
+    } else {
+        Vec::new()
+    };
+
+    // Reserve the bounded owner/member slice, then spread the rest across open claims before
+    // considering any claim's fallback paths.
+    let first_material_query_limit = limit.saturating_sub(owner_member_queries.len());
+    for (index, obligation) in missing_material
+        .iter()
+        .enumerate()
+        .take(first_material_query_limit)
+    {
         if let Some(query) = obligation.open_next_candidates.first() {
             obligation_added_query[index] |=
                 push(query, format!("material obligation {}", obligation.id));
         }
     }
 
-    let structural_schema_flow = missing_material
-        .iter()
-        .any(|obligation| obligation.id.starts_with("sql_"));
-    if !missing_material.is_empty() && !structural_schema_flow {
-        let anchor_labels = answer
-            .citations
-            .iter()
-            .map(|citation| citation.display_name.clone())
-            .collect::<Vec<_>>();
-        for query in packet_owner_member_probe_queries(
-            question,
-            &anchor_labels,
-            limit.min(PACKET_OWNER_MEMBER_QUERY_LIMIT),
-        ) {
-            let _ = push(&query, PACKET_OWNER_MEMBER_QUERY_PURPOSE.to_string());
-        }
+    for query in owner_member_queries {
+        let _ = push(&query, PACKET_OWNER_MEMBER_QUERY_PURPOSE.to_string());
     }
 
     for (index, obligation) in missing_material.iter().enumerate() {
