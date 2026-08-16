@@ -65,6 +65,17 @@ fn compile_support_units_with_source_ranges(
     let mut units = Vec::new();
     let mut seen = BTreeSet::new();
 
+    // Assertible relations lead the support projection. Compact MCP text retains only the
+    // first few support summaries, and agent JSON presents this array before answer sections;
+    // emitting location/range bookkeeping first hid the only units that state how symbols
+    // connect. The complete support set is unchanged.
+    for artifact in &answer.graphs {
+        let GraphArtifactDto::Uml { graph, .. } = artifact else {
+            continue;
+        };
+        units.extend(typed_edge_support_units(graph, &mut seen));
+    }
+
     for citation in answer
         .citations
         .iter()
@@ -108,13 +119,6 @@ fn compile_support_units_with_source_ranges(
                 units.push(source_range.clone());
             }
         }
-    }
-
-    for artifact in &answer.graphs {
-        let GraphArtifactDto::Uml { graph, .. } = artifact else {
-            continue;
-        };
-        units.extend(typed_edge_support_units(graph, &mut seen));
     }
 
     for diagnostic in &answer.retrieval_trace.packet_sidecar_diagnostics {
@@ -958,6 +962,64 @@ mod tests {
         assert_eq!(support[0].kind, SupportUnitKindDto::SymbolLocation);
         assert_eq!(support[1].kind, SupportUnitKindDto::SourceRange);
         assert_eq!(support[1].id, "source:retained");
+    }
+
+    #[test]
+    fn typed_relations_precede_location_and_source_bookkeeping() {
+        fn node(id: &str) -> codestory_contracts::api::GraphNodeDto {
+            codestory_contracts::api::GraphNodeDto {
+                id: NodeId(id.to_string()),
+                label: id.to_string(),
+                kind: NodeKind::FUNCTION,
+                depth: 1,
+                label_policy: None,
+                badge_visible_members: None,
+                badge_total_members: None,
+                merged_symbol_examples: Vec::new(),
+                file_path: Some("src/router.rs".to_string()),
+                qualified_name: None,
+                member_access: None,
+            }
+        }
+
+        let mut packet = test_packet("explain routing", 98_304);
+        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.rs")];
+        packet.answer.graphs = vec![GraphArtifactDto::Uml {
+            id: "routing".to_string(),
+            title: "Routing".to_string(),
+            graph: GraphResponse {
+                center_id: NodeId("Router.dispatch".to_string()),
+                nodes: vec![node("Router.dispatch"), node("Handler.call")],
+                edges: vec![codestory_contracts::api::GraphEdgeDto {
+                    id: codestory_contracts::api::EdgeId("dispatch-call".to_string()),
+                    source: NodeId("Router.dispatch".to_string()),
+                    target: NodeId("Handler.call".to_string()),
+                    kind: EdgeKind::CALL,
+                    confidence: None,
+                    certainty: None,
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        }];
+
+        let support = compile_support_units_with_source_ranges(
+            &packet.answer,
+            &[retained_source_range("Router.dispatch", "src/router.rs")],
+        );
+
+        assert_eq!(
+            support.iter().map(|unit| unit.kind).collect::<Vec<_>>(),
+            vec![
+                SupportUnitKindDto::TypedGraphEdge,
+                SupportUnitKindDto::SymbolLocation,
+                SupportUnitKindDto::SourceRange,
+            ]
+        );
+        assert_eq!(support[0].summary, "`Router.dispatch` CALL `Handler.call`");
     }
 
     #[test]
