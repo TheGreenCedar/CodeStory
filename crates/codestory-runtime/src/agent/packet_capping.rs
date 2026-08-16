@@ -86,11 +86,13 @@ fn cap_citations_with_priorities(
     let mut deferred = Vec::new();
 
     let mut candidates = answer.citations.drain(..).collect::<Vec<_>>();
+    let prefer_primary_sources = !query_mentions_non_primary_source(&answer.prompt);
     prioritize_protected_citations(&mut candidates, protected_citation_keys);
     order_citations_by_marginal_utility(
         &mut candidates,
         protected_citation_keys,
         obligation_value_keys,
+        prefer_primary_sources,
     );
     for citation in candidates {
         let file = citation.file_path.as_deref().map(packet_display_path);
@@ -272,6 +274,7 @@ fn order_citations_by_marginal_utility(
     citations: &mut Vec<AgentCitationDto>,
     protected_citation_keys: &HashSet<String>,
     obligation_value_keys: &HashSet<String>,
+    prefer_primary_sources: bool,
 ) {
     let mut protected = Vec::new();
     let mut remaining = Vec::new();
@@ -303,6 +306,7 @@ fn order_citations_by_marginal_utility(
                     &claim_keys,
                     &subsystems,
                     obligation_value_keys,
+                    prefer_primary_sources,
                 ),
             },
         )
@@ -318,6 +322,7 @@ fn order_citations_by_marginal_utility(
             &claim_keys,
             &subsystems,
             obligation_value_keys,
+            prefer_primary_sources,
         );
         if current_utility.to_bits() != entry.utility.to_bits() {
             heap.push(PacketUtilityHeapEntry {
@@ -345,6 +350,7 @@ fn packet_marginal_utility(
     claim_keys: &HashSet<String>,
     subsystems: &HashSet<String>,
     obligation_value_keys: &HashSet<String>,
+    prefer_primary_sources: bool,
 ) -> f32 {
     let role = packet_evidence_role(citation);
     let claim_key = role.map(|role| packet_claim_key_for_citation(role, citation));
@@ -359,6 +365,21 @@ fn packet_marginal_utility(
         + 0.15 * if new_coverage { 1.0 } else { 0.0 }
         + 0.10 * if subsystem_novelty { 1.0 } else { 0.0 }
         + 0.10 * if obligation_value { 1.0 } else { 0.0 }
+        - 0.65
+            * if prefer_primary_sources && packet_citation_is_non_primary(citation) {
+                1.0
+            } else {
+                0.0
+            }
+}
+
+fn packet_citation_is_non_primary(citation: &AgentCitationDto) -> bool {
+    packet_display_name_is_test_like(&citation.display_name)
+        || citation
+            .file_path
+            .as_deref()
+            .map(packet_display_path)
+            .is_some_and(|path| retrieval_file_role_from_path(&path).is_non_primary())
 }
 
 fn packet_citation_fused_score(citation: &AgentCitationDto) -> f32 {
@@ -1309,10 +1330,10 @@ fn packet_prefer_required_probe_match(
     focus_roots: &[PacketCommandFocusRoot],
 ) -> bool {
     if !query_mentions_non_primary_source(query) {
-        let candidate_test_like = packet_display_name_is_test_like(&candidate.display_name);
-        let existing_test_like = packet_display_name_is_test_like(&existing.display_name);
-        if candidate_test_like != existing_test_like {
-            return !candidate_test_like;
+        let candidate_non_primary = packet_citation_is_non_primary(candidate);
+        let existing_non_primary = packet_citation_is_non_primary(existing);
+        if candidate_non_primary != existing_non_primary {
+            return !candidate_non_primary;
         }
         if let Some(prefer_candidate) =
             packet_prefer_shared_source_set_citation(query, candidate, existing)
@@ -1630,6 +1651,72 @@ mod tests {
             provenance: vec!["lexical".to_string()],
         });
         citation
+    }
+
+    #[test]
+    fn marginal_utility_prefers_primary_source_unless_the_question_requests_tests() {
+        let primary = with_fused_score(citation("parseConfig", "src/core/config.rs", 0.2), 0.2);
+        let test = with_fused_score(citation("parseConfig", "tests/config.rs", 1.0), 1.0);
+        let roles = HashSet::new();
+        let claim_keys = HashSet::new();
+        let subsystems = HashSet::new();
+        let obligations = HashSet::new();
+
+        assert!(
+            packet_marginal_utility(
+                &primary,
+                &roles,
+                &claim_keys,
+                &subsystems,
+                &obligations,
+                true,
+            ) > packet_marginal_utility(
+                &test,
+                &roles,
+                &claim_keys,
+                &subsystems,
+                &obligations,
+                true,
+            )
+        );
+        assert!(
+            packet_marginal_utility(&test, &roles, &claim_keys, &subsystems, &obligations, false,)
+                > packet_marginal_utility(
+                    &primary,
+                    &roles,
+                    &claim_keys,
+                    &subsystems,
+                    &obligations,
+                    false,
+                )
+        );
+    }
+
+    #[test]
+    fn required_probe_prefers_primary_path_over_higher_ranked_test_namespace() {
+        let primary = citation("AutoMapper.Mapper.Map", "src/AutoMapper/Mapper.cs", 0.4);
+        let test = citation(
+            "AutoMapper.UnitTests.Mapping.Mapper.Map",
+            "src/UnitTests/Mapping.cs",
+            1.0,
+        );
+
+        assert!(packet_prefer_required_probe_match(
+            "Mapper.Map",
+            &primary,
+            4,
+            &test,
+            6,
+            &[],
+        ));
+        assert!(!packet_prefer_required_probe_match(
+            "mapping tests",
+            &primary,
+            4,
+            &test,
+            6,
+            &[],
+        ));
     }
 
     #[test]

@@ -320,6 +320,8 @@ pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
             "/test/data/",
             "/tests/",
             "/test/",
+            "/unittests/",
+            "/integrationtests/",
             "/spec/",
             "/fixtures/",
             "/fixture/",
@@ -501,6 +503,20 @@ mod tests {
             assert_eq!(
                 retrieval_file_role_from_path(path),
                 RetrievalFileRole::Source,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_compound_dotnet_test_directories() {
+        for path in [
+            "src/UnitTests/Mapping.cs",
+            "src/IntegrationTests/MappingFlow.cs",
+        ] {
+            assert_eq!(
+                retrieval_file_role_from_path(path),
+                RetrievalFileRole::Test,
                 "{path}"
             );
         }
