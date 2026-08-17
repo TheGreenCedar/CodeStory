@@ -26,9 +26,8 @@
 //!   compiled-rule cache key for every language at once.
 //!
 //! Ruby's marker is *not* emitted by the rule file: `rules/ruby.scm` carries no
-//! `call_syntax` attribute, so the registry row pairs `member_callsite_marker`
-//! and `graph_call_syntax` as `None`/`None` and the marker is applied by the
-//! pre-pass above.
+//! `call_syntax` attribute, so the registry row's `callsite_marker_families`
+//! table is empty and the marker is applied by the pre-pass above.
 //!
 //! This is a move, not a rewrite. The bodies below are the ones that used to
 //! sit in `lib.rs`, and `tests/language_extraction_snapshot.rs` pins the
@@ -67,11 +66,11 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     compiled_rules: &RULES,
     member_edge_specs: Some(member_edge_specs),
     receiver_call_specs: Some(receiver_call_specs),
+    type_usage_specs: None,
     // `rules/ruby.scm` emits no `call_syntax`, so there is no rule-file value
     // for the registry to map; `annotate_ruby_member_call_placeholders` stamps
     // `MEMBER_CALLSITE_MARKER` directly.
-    member_callsite_marker: None,
-    graph_call_syntax: None,
+    callsite_marker_families: &[],
     // A Ruby `method` inside a `class` is already projected as METHOD by the
     // rule file, so the FUNCTION -> METHOD promotion does not apply.
     promotes_type_member_functions_to_methods: false,
@@ -163,6 +162,10 @@ fn collect_ruby_precise_receiver_call_specs(
             method_col,
             line: Some(node.start_position().row as u32 + 1),
             allow_global_fallback: false,
+            binding_marker: None,
+            required_callsite_marker: None,
+            class_anchored: false,
+            owner_is_syntactic: false,
         });
     });
 }

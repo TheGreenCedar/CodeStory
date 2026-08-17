@@ -67,8 +67,8 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     compiled_rules: &RULES,
     member_edge_specs: None,
     receiver_call_specs: Some(receiver_call_specs),
-    member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
-    graph_call_syntax: Some("dart_member"),
+    type_usage_specs: None,
+    callsite_marker_families: &[("dart_member", MEMBER_CALLSITE_MARKER)],
     // Carried over verbatim from `lib.rs`'s `matches!(language_name, "swift" |
     // "dart")`. `rules/dart.scm` already labels class members METHOD, so the
     // promotion is a no-op on both snapshot fixtures — mutating this field
@@ -207,6 +207,10 @@ fn collect_dart_precise_receiver_call_specs(
                     method_col,
                     line: Some(node.start_position().row as u32 + 1),
                     allow_global_fallback: false,
+                    binding_marker: None,
+                    required_callsite_marker: None,
+                    class_anchored: false,
+                    owner_is_syntactic: false,
                 });
             }
             return;
@@ -235,6 +239,10 @@ fn collect_dart_precise_receiver_call_specs(
             method_col,
             line: Some(node.start_position().row as u32 + 1),
             allow_global_fallback: false,
+            binding_marker: None,
+            required_callsite_marker: None,
+            class_anchored: false,
+            owner_is_syntactic: false,
         });
     });
 }

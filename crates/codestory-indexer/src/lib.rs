@@ -66,6 +66,17 @@ use symbol_table::SymbolTable;
 
 pub(crate) const RECEIVER_OWNER_CALLSITE_PREFIX: &str = "receiver-owner:";
 pub(crate) const RECEIVER_MODULE_CALLSITE_PREFIX: &str = "receiver-module:";
+/// Prefix shared by all receiver-binding markers (e.g. the PHP foreach
+/// element marker `receiver-binding:loop-element@{start}-{end}`). Binding
+/// markers survive placeholder replacement: when an in-file resolution removes
+/// a generic placeholder edge, its binding markers move to the resolved edge.
+pub(crate) const RECEIVER_BINDING_CALLSITE_PREFIX: &str = "receiver-binding:";
+/// Canonical-id prefix of import-resolved TYPE_USAGE reference nodes (P2a).
+pub(crate) const TYPE_USAGE_REFERENCE_CANONICAL_PREFIX: &str = "type_reference:";
+/// Canonical-id prefix of PENDING same-root TYPE_USAGE reference nodes. The
+/// suffix is `{file}:{referencing_namespace}:{bare_name}`;
+/// `finalize_pending_type_usage_edges` reads the fact back from it.
+pub(crate) const TYPE_USAGE_PENDING_CANONICAL_PREFIX: &str = "type_ref_pending:";
 
 #[derive(Debug, Clone, Copy)]
 struct IndexFeatureFlags {
@@ -1864,6 +1875,11 @@ impl WorkspaceIndexer {
                 policy_exclusions,
             });
         }
+
+        // 3.4 Complete the pending same-root TYPE_USAGE channel now that all
+        // of the run's declarations are flushed (producer-side, not part of
+        // the resolution pipeline; see `finalize_pending_type_usage_edges`).
+        finalize_pending_type_usage_edges(storage)?;
 
         // 3.5 Resolve call/import edges post-pass
         let (resolution_scope_file_ids, expanded_resolution_scope_files) =
@@ -4425,6 +4441,72 @@ struct ManualReceiverCallSpec {
     method_col: Option<u32>,
     line: Option<u32>,
     allow_global_fallback: bool,
+    /// Marker proving how the receiver was bound (PHP foreach element specs
+    /// carry `receiver-binding:loop-element@{start}-{end}` with the exact
+    /// foreach statement line range). Landed on the callsite edge through both
+    /// engine branches, and appended even when an earlier spec already
+    /// annotated or resolved the same callsite.
+    binding_marker: Option<String>,
+    /// Per-spec override for the callsite marker the annotate path requires.
+    /// Construction specs require the language's `new` marker; member-call
+    /// specs leave this `None` and keep the language default. A spec carrying
+    /// an override is annotate-only: it never reaches the in-file
+    /// owner+method lookup and never appends a fallback placeholder edge.
+    required_callsite_marker: Option<&'static str>,
+    /// The spec's source anchor is the enclosing CLASS node rather than a
+    /// callable (P2: class anchoring is the written rule for constructor-body
+    /// facts — C# emits no constructor node, so the enclosing class is the
+    /// only stable anchor). Flagged specs resolve their source against CLASS
+    /// nodes; unflagged specs keep the FUNCTION|METHOD lookup untouched.
+    /// Flagged specs also never annotate the rule file's own placeholder:
+    /// a constructor-body self-placeholder is never attributed to a callable
+    /// and is dropped at post-processing, so owner markers must ride the
+    /// spec's own placeholder edge instead.
+    class_anchored: bool,
+    /// The owner name was read off the call syntax itself (a
+    /// `new X(args).Method()` chained call names X verbatim), not inferred
+    /// from a binding. Syntactic owners are trustworthy enough to annotate the
+    /// callsite with `receiver-owner:` even when no module is known, so the
+    /// resolution pass's same-root-namespace arm can finish the job
+    /// project-wide; inferred owners keep today's fail-closed behaviour.
+    owner_is_syntactic: bool,
+}
+
+/// One type-usage fact a language collector proved against its own binding
+/// tables (P2a).
+///
+/// A spec exists only when the collector resolved the type surface against
+/// the file's visible/imported binding tables — that emit gate is what the
+/// edge's `certainty = Some(Certain)` stamp asserts, because TYPE_USAGE has
+/// no resolution job (resolution/pipeline.rs runs CALL/IMPORT/OVERRIDE only)
+/// and emit-time is therefore the only place the certainty can come from.
+#[derive(Debug, Clone)]
+struct ManualTypeUsageSpec {
+    source_name: String,
+    source_span: GraphNodeSpan,
+    /// Source anchor is the enclosing CLASS node rather than a callable
+    /// (field declarations and constructor-context facts).
+    class_anchored: bool,
+    target_name: String,
+    /// Fully qualified path of the target type when it resolved through an
+    /// import table (`using` alias or single plain namespace import).
+    target_module: Option<String>,
+    /// Exact span of the same-file declaration node when the type is declared
+    /// in this file; `None` for import-resolved types, whose edge lands on a
+    /// reference node minted at the use site.
+    target_declaration_span: Option<GraphNodeSpan>,
+    /// Span of the type reference itself; places the reference node for
+    /// import-resolved types.
+    reference_span: GraphNodeSpan,
+    line: Option<u32>,
+    /// The referencing file's namespace, set when the type surface is a bare
+    /// name none of the per-file tables could resolve. Such a spec emits a
+    /// PENDING edge — certainty `None`, target a `type_ref_pending:` reference
+    /// node — which `finalize_pending_type_usage_edges` either upgrades
+    /// (exactly one project declaration with that name under the same root
+    /// namespace) or deletes, after every file of the run has been flushed.
+    /// `Some` here never coexists with a resolved target above.
+    pending_namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -4447,6 +4529,7 @@ struct ReceiverPlaceholderAnnotation<'a> {
     owner_name: &'a str,
     owner_module: Option<&'a str>,
     extra_callsite_marker: Option<&'a str>,
+    binding_marker: Option<&'a str>,
 }
 
 struct CallPlaceholderMarkerAnnotation<'a> {
@@ -8157,11 +8240,45 @@ fn append_manual_receiver_call_edges(
             .then_some(languages::python::CONTEXT_MANAGER_SELF_RETURN_REQUIRED_MARKER);
         let Some(source_id) =
             node_id_by_name_and_span(unique_nodes, &spec.source_name, spec.source_span, |kind| {
-                matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                if spec.class_anchored {
+                    // The type-anchor arm exists only for flagged specs, so
+                    // the FUNCTION|METHOD behaviour of every unflagged spec
+                    // is untouched by construction. STRUCT joins CLASS
+                    // because C# structs own constructors and primary
+                    // constructors too.
+                    matches!(kind, NodeKind::CLASS | NodeKind::STRUCT)
+                } else {
+                    matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                }
             })
         else {
             continue;
         };
+        let binding_marker = spec.binding_marker.as_deref();
+        if let Some(required_callsite_marker) = spec.required_callsite_marker {
+            // A marker-override spec (PHP construction) annotates the rule
+            // file's own placeholder and nothing else: no in-file owner+method
+            // lookup, no fallback placeholder edge. A `new` site whose
+            // placeholder is missing therefore stays unannotated and fails
+            // closed at resolution.
+            annotate_receiver_call_placeholder_owner(
+                unique_nodes,
+                result_edges,
+                edge_keys,
+                flags,
+                ReceiverPlaceholderAnnotation {
+                    line: spec.line,
+                    method_col: spec.method_col,
+                    method_name: &spec.method_name,
+                    owner_name: &spec.owner_name,
+                    owner_module: spec.owner_module.as_deref(),
+                    extra_callsite_marker,
+                    binding_marker,
+                },
+                Some(required_callsite_marker),
+            );
+            continue;
+        }
         if extra_callsite_marker.is_some() && spec.owner_module.is_none() {
             let annotated_index = annotate_receiver_call_placeholder_owner(
                 unique_nodes,
@@ -8175,6 +8292,7 @@ fn append_manual_receiver_call_edges(
                     owner_name: &spec.owner_name,
                     owner_module: None,
                     extra_callsite_marker,
+                    binding_marker,
                 },
                 receiver_annotation_required_callsite_marker(language_name),
             );
@@ -8193,28 +8311,65 @@ fn append_manual_receiver_call_edges(
                         owner_name: &spec.owner_name,
                         owner_module: None,
                         extra_callsite_marker,
+                        binding_marker,
                     },
                     callsite_ordinals,
                 );
             }
             continue;
         }
-        if let Some(owner_module) = spec.owner_module.as_deref() {
-            let annotated_index = annotate_receiver_call_placeholder_owner(
-                unique_nodes,
-                result_edges,
-                edge_keys,
-                flags,
-                ReceiverPlaceholderAnnotation {
-                    line: spec.line,
-                    method_col: spec.method_col,
-                    method_name: &spec.method_name,
-                    owner_name: &spec.owner_name,
-                    owner_module: Some(owner_module),
-                    extra_callsite_marker,
-                },
-                receiver_annotation_required_callsite_marker(language_name),
-            );
+        // Binding-marker specs (PHP foreach elements) join the imported-owner
+        // specs on the annotate-or-placeholder route even when their owner is
+        // file-local: the in-file owner+method lookup below stays unreachable
+        // for them, so a second spec for an already-claimed callsite can never
+        // mint a competing resolved edge — the marker lands on the existing
+        // edge instead and resolution stays with the resolution pass.
+        if binding_marker.is_some() || spec.owner_module.is_some() {
+            let owner_module = spec.owner_module.as_deref();
+            // A class-anchored spec's callsite lives in a constructor body,
+            // where the rule file's self-placeholder is never attributed to a
+            // callable and is dropped at post-processing; annotating it would
+            // strand the owner markers on a doomed edge. The spec appends its
+            // own placeholder (source = the class node) below instead.
+            let annotated_index = if spec.class_anchored {
+                None
+            } else {
+                annotate_receiver_call_placeholder_owner(
+                    unique_nodes,
+                    result_edges,
+                    edge_keys,
+                    flags,
+                    ReceiverPlaceholderAnnotation {
+                        line: spec.line,
+                        method_col: spec.method_col,
+                        method_name: &spec.method_name,
+                        owner_name: &spec.owner_name,
+                        owner_module,
+                        extra_callsite_marker,
+                        binding_marker,
+                    },
+                    receiver_annotation_required_callsite_marker(language_name),
+                )
+            };
+            // Order-independent binding-marker landing: when another spec
+            // already annotated or resolved this callsite, the annotate pass
+            // skips it, but a binding marker must still reach that edge
+            // instead of spawning a competing placeholder.
+            if annotated_index.is_none()
+                && let Some(marker) = binding_marker
+                && append_binding_marker_to_existing_callsite_edge(
+                    unique_nodes,
+                    result_edges,
+                    edge_keys,
+                    flags,
+                    spec.line,
+                    spec.method_col,
+                    &spec.method_name,
+                    marker,
+                )
+            {
+                continue;
+            }
             let should_append_manual = if language_name == "dart" {
                 if let Some(index) = annotated_index {
                     if let Some(edge) = result_edges.get(index) {
@@ -8239,8 +8394,9 @@ fn append_manual_receiver_call_edges(
                         method_col: spec.method_col,
                         method_name: &spec.method_name,
                         owner_name: &spec.owner_name,
-                        owner_module: Some(owner_module),
+                        owner_module,
                         extra_callsite_marker,
+                        binding_marker,
                     },
                     callsite_ordinals,
                 );
@@ -8268,6 +8424,7 @@ fn append_manual_receiver_call_edges(
                     owner_name: &spec.owner_name,
                     owner_module: None,
                     extra_callsite_marker,
+                    binding_marker,
                 },
                 receiver_annotation_required_callsite_marker(language_name),
             );
@@ -8289,8 +8446,38 @@ fn append_manual_receiver_call_edges(
                     spec.source_name.contains('.')
                         && (spec.receiver_name == "this" || spec.receiver_name.starts_with("this."))
                 }
+                // A chained `new X(args).Method()` names its owner verbatim;
+                // annotating `receiver-owner:X` without a module hands the
+                // callsite to the resolution pass's same-root-namespace arm.
+                // Inferred owners keep the fail-closed `false`.
+                "csharp" => spec.owner_is_syntactic,
                 _ => false,
             };
+            if should_annotate && spec.class_anchored {
+                // Constructor-body chained calls cannot annotate the rule
+                // file's self-placeholder (it is dropped unattributed at
+                // post-processing); they carry the owner marker on their own
+                // placeholder edge, exactly like the imported-owner route.
+                append_manual_receiver_call_placeholder_edge(
+                    unique_nodes,
+                    result_edges,
+                    edge_keys,
+                    flags,
+                    ManualReceiverCallPlaceholder {
+                        source_id,
+                        file_id,
+                        line: spec.line,
+                        method_col: spec.method_col,
+                        method_name: &spec.method_name,
+                        owner_name: &spec.owner_name,
+                        owner_module: None,
+                        extra_callsite_marker,
+                        binding_marker,
+                    },
+                    callsite_ordinals,
+                );
+                continue;
+            }
             if should_annotate {
                 let annotated_index = annotate_receiver_call_placeholder_owner(
                     unique_nodes,
@@ -8304,6 +8491,7 @@ fn append_manual_receiver_call_edges(
                         owner_name: &spec.owner_name,
                         owner_module: spec.owner_module.as_deref(),
                         extra_callsite_marker,
+                        binding_marker,
                     },
                     receiver_annotation_required_callsite_marker(language_name),
                 );
@@ -8328,6 +8516,7 @@ fn append_manual_receiver_call_edges(
                             owner_name: &spec.owner_name,
                             owner_module: None,
                             extra_callsite_marker,
+                            binding_marker,
                         },
                         callsite_ordinals,
                     );
@@ -8336,7 +8525,7 @@ fn append_manual_receiver_call_edges(
             continue;
         };
 
-        remove_generic_call_placeholders(
+        let removed_binding_markers = remove_generic_call_placeholders(
             unique_nodes,
             result_edges,
             edge_keys,
@@ -8367,12 +8556,342 @@ fn append_manual_receiver_call_edges(
         if let Some(marker) = extra_callsite_marker {
             append_callsite_part(&mut edge, marker);
         }
+        // Binding markers landed by earlier specs live on the placeholder this
+        // resolution just replaced; carry them over so marker landing stays
+        // independent of spec-pass ordering. (Specs carrying their own binding
+        // marker never reach this branch — the annotate-or-placeholder route
+        // above consumes them.)
+        for marker in &removed_binding_markers {
+            append_callsite_part(&mut edge, marker);
+        }
         if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
             continue;
         }
         edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
         result_edges.push(edge);
     }
+}
+
+fn language_type_usage_specs(
+    language_name: &str,
+    tree: &Tree,
+    source: &str,
+) -> Vec<ManualTypeUsageSpec> {
+    // Only languages with a manual type-usage collector carry one on their
+    // registry row (C# today); every other language has none.
+    languages::extraction_for_language(language_name)
+        .and_then(|extraction| extraction.type_usage_specs)
+        .map_or_else(Vec::new, |collect| collect(tree, source))
+}
+
+/// Canonical id for an import-resolved type-usage reference node.
+///
+/// The prefix is on the `preserved_canonical_id` list, so the node keeps this
+/// identity through canonicalization and the same-root finalize pass can
+/// exclude reference nodes from its declaration candidates. Two references to
+/// the same imported type in one file share the id and collapse to one node.
+fn type_usage_reference_canonical_id(file_name: &str, qualified_name: &str) -> String {
+    format!("{TYPE_USAGE_REFERENCE_CANONICAL_PREFIX}{file_name}:{qualified_name}")
+}
+
+/// Canonical id for a PENDING same-root type-usage reference node.
+///
+/// Encodes the referencing file's namespace and the bare type name so the
+/// finalize pass can recover the fact from storage alone: identifiers and
+/// namespaces never contain `:`, so parsing from the right is unambiguous
+/// even when the file name contains `:`.
+fn type_usage_pending_canonical_id(
+    file_name: &str,
+    referencing_namespace: &str,
+    target_name: &str,
+) -> String {
+    format!(
+        "{TYPE_USAGE_PENDING_CANONICAL_PREFIX}{file_name}:{referencing_namespace}:{target_name}"
+    )
+}
+
+/// Emit TYPE_USAGE edges for the specs a language collector proved against
+/// its binding tables (P2a).
+///
+/// The certainty is stamped `Some(Certain)` AT EMIT — the precedent is
+/// `push_type_usage_edge` (structural/common.rs), and the justification is
+/// the collector's emit gate: a spec exists only for a type that resolved
+/// against the file's visible/imported binding tables, and no TYPE_USAGE
+/// resolution job exists to stamp it later.
+///
+/// Source resolution accepts CLASS anchors for class-anchored specs and the
+/// usual FUNCTION|METHOD anchors otherwise. Same-file targets bind to the
+/// declaration node by exact name+span; import-resolved targets bind to a
+/// reference node minted at the use site (the INHERITANCE rule's parent
+/// nodes are the in-file precedent for reference nodes), carrying the
+/// import-resolved qualified name.
+#[allow(clippy::too_many_arguments)]
+fn append_manual_type_usage_edges(
+    language_name: &str,
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &mut HashMap<NodeId, Node>,
+    file_id: NodeId,
+    file_name: &str,
+    result_edges: &mut Vec<Edge>,
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+) {
+    for spec in language_type_usage_specs(language_name, tree, source) {
+        let Some(source_id) =
+            node_id_by_name_and_span(unique_nodes, &spec.source_name, spec.source_span, |kind| {
+                if spec.class_anchored {
+                    // Primary constructors put type anchors on structs too.
+                    matches!(kind, NodeKind::CLASS | NodeKind::STRUCT)
+                } else {
+                    matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                }
+            })
+        else {
+            continue;
+        };
+        // A pending spec's certainty is NOT yet established: the edge is
+        // emitted uncertain against a `type_ref_pending:` reference node, and
+        // the post-flush finalize pass either proves it (unique same-root
+        // declaration) and stamps `certain`, or deletes it.
+        let is_pending = spec.pending_namespace.is_some();
+        let target_id = match spec.target_declaration_span {
+            Some(declaration_span) => {
+                let Some(target_id) = node_id_by_name_and_span(
+                    unique_nodes,
+                    &spec.target_name,
+                    declaration_span,
+                    is_type_like_kind,
+                ) else {
+                    continue;
+                };
+                target_id
+            }
+            None => {
+                let canonical_id = match spec.pending_namespace.as_deref() {
+                    Some(referencing_namespace) => type_usage_pending_canonical_id(
+                        file_name,
+                        referencing_namespace,
+                        &spec.target_name,
+                    ),
+                    None => {
+                        let qualified_name = spec
+                            .target_module
+                            .as_deref()
+                            .unwrap_or(spec.target_name.as_str());
+                        type_usage_reference_canonical_id(file_name, qualified_name)
+                    }
+                };
+                let reference_id = NodeId(generate_id(&canonical_id));
+                unique_nodes.entry(reference_id).or_insert_with(|| Node {
+                    id: reference_id,
+                    kind: NodeKind::CLASS,
+                    serialized_name: spec.target_name.clone(),
+                    qualified_name: Some(
+                        spec.target_module
+                            .clone()
+                            .unwrap_or_else(|| spec.target_name.clone()),
+                    ),
+                    canonical_id: Some(canonical_id),
+                    start_line: Some(spec.reference_span.start_line),
+                    start_col: Some(spec.reference_span.start_col),
+                    end_line: Some(spec.reference_span.end_line),
+                    end_col: Some(spec.reference_span.end_col),
+                    ..Default::default()
+                });
+                reference_id
+            }
+        };
+        if source_id == target_id {
+            continue;
+        }
+
+        let mut edge = Edge {
+            id: EdgeId(0),
+            source: source_id,
+            target: target_id,
+            kind: EdgeKind::TYPE_USAGE,
+            file_node_id: Some(file_id),
+            line: spec.line,
+            certainty: (!is_pending).then_some(ResolutionCertainty::Certain),
+            ..Default::default()
+        };
+        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+            continue;
+        }
+        edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+        result_edges.push(edge);
+    }
+}
+
+/// Post-flush completion of the pending same-root TYPE_USAGE channel (P2a).
+///
+/// Extraction is per-file and cannot see other files' declarations, so a bare
+/// type name that no per-file table resolves is emitted as an UNCERTAIN edge
+/// against a `type_ref_pending:` reference node. After every file of the run
+/// has flushed, this pass — still the producer, still index-time; there is
+/// deliberately no TYPE_USAGE job in the resolution pipeline — checks each
+/// fact against the project's type declarations:
+///
+/// * exactly one declaration with that name under the SAME ROOT NAMESPACE as
+///   the referencing file (and distinct from the edge source) → the edge is
+///   resolved to it and stamped `certain`;
+/// * zero or several candidates, or only a self-candidate → the edge is
+///   deleted (fail closed), and pending reference nodes nothing uses any
+///   more are removed with their occurrences.
+///
+/// Reference nodes of either flavour never count as declarations (their
+/// canonical prefixes exclude them), and a declaration must be
+/// namespace-qualified to have a root at all — global-namespace types never
+/// participate. Idempotent: a resolved edge carries
+/// `resolved_target_node_id` and is never picked up again; a cancelled run
+/// leaves only uncertain pending edges, which can never discharge a
+/// certainty-gated check and are re-finalized (or removed with their file)
+/// by the next run.
+fn finalize_pending_type_usage_edges(storage: &mut Storage) -> Result<()> {
+    let conn = storage.get_connection();
+    let mut pending = Vec::new();
+    {
+        let mut statement = conn.prepare(
+            "SELECT e.id, e.source_node_id, n.canonical_id
+             FROM edge e
+             JOIN node n ON n.id = e.target_node_id
+             WHERE e.kind = ?1
+               AND e.resolved_target_node_id IS NULL
+               AND n.canonical_id LIKE ?2",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                EdgeKind::TYPE_USAGE as i32,
+                format!("{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%"),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            pending.push(row?);
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    // Declaration candidates by bare name (the last segment of the qualified
+    // name, so nested types match too).
+    let mut declarations_by_name: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    {
+        let mut statement = conn.prepare(
+            "SELECT id, qualified_name FROM node
+             WHERE kind IN (?1, ?2, ?3, ?4)
+               AND qualified_name LIKE '%.%'
+               AND (canonical_id IS NULL
+                    OR (canonical_id NOT LIKE ?5 AND canonical_id NOT LIKE ?6))",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                NodeKind::CLASS as i32,
+                NodeKind::STRUCT as i32,
+                NodeKind::INTERFACE as i32,
+                NodeKind::ENUM as i32,
+                format!("{TYPE_USAGE_REFERENCE_CANONICAL_PREFIX}%"),
+                format!("{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%"),
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+        for row in rows {
+            let (id, qualified) = row?;
+            let Some(qualified) = qualified else { continue };
+            let Some(name) = qualified.rsplit('.').next() else {
+                continue;
+            };
+            declarations_by_name
+                .entry(name.to_string())
+                .or_default()
+                .push((id, qualified.clone()));
+        }
+    }
+
+    let mut resolutions: Vec<(i64, i64)> = Vec::new();
+    let mut removals: Vec<i64> = Vec::new();
+    for (edge_id, source_node_id, canonical_id) in pending {
+        let Some(suffix) = canonical_id.strip_prefix(TYPE_USAGE_PENDING_CANONICAL_PREFIX) else {
+            continue;
+        };
+        // Suffix is `{file}:{referencing_namespace}:{bare_name}`; identifiers
+        // and namespaces never contain `:`, so parse from the right.
+        let mut parts = suffix.rsplitn(3, ':');
+        let (Some(target_name), Some(referencing_namespace)) = (parts.next(), parts.next()) else {
+            removals.push(edge_id);
+            continue;
+        };
+        let Some(referencing_root) = referencing_namespace
+            .split('.')
+            .next()
+            .filter(|root| !root.is_empty())
+        else {
+            removals.push(edge_id);
+            continue;
+        };
+        let mut candidates = declarations_by_name
+            .get(target_name)
+            .map(|declarations| {
+                declarations
+                    .iter()
+                    .filter(|(_, qualified)| qualified.split('.').next() == Some(referencing_root))
+                    .map(|(id, _)| *id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        candidates.sort_unstable();
+        candidates.dedup();
+        match candidates.as_slice() {
+            [declaration_id] if *declaration_id != source_node_id => {
+                resolutions.push((edge_id, *declaration_id));
+            }
+            _ => removals.push(edge_id),
+        }
+    }
+
+    {
+        let mut resolve = conn.prepare(
+            "UPDATE edge SET resolved_target_node_id = ?2, certainty = 'certain' WHERE id = ?1",
+        )?;
+        for (edge_id, declaration_id) in &resolutions {
+            resolve.execute(rusqlite::params![edge_id, declaration_id])?;
+        }
+        let mut remove = conn.prepare("DELETE FROM edge WHERE id = ?1")?;
+        for edge_id in &removals {
+            remove.execute(rusqlite::params![edge_id])?;
+        }
+    }
+
+    // Pending reference nodes nothing references any more (their edge failed
+    // closed) leave with their occurrences.
+    let orphan_filter = "canonical_id LIKE ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM edge e
+                   WHERE e.source_node_id = node.id
+                      OR e.target_node_id = node.id
+                      OR e.resolved_source_node_id = node.id
+                      OR e.resolved_target_node_id = node.id
+               )";
+    conn.execute(
+        &format!(
+            "DELETE FROM occurrence WHERE element_id IN
+             (SELECT id FROM node WHERE {orphan_filter})"
+        ),
+        rusqlite::params![format!("{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%")],
+    )?;
+    conn.execute(
+        &format!("DELETE FROM node WHERE {orphan_filter}"),
+        rusqlite::params![format!("{TYPE_USAGE_PENDING_CANONICAL_PREFIX}%")],
+    )?;
+    Ok(())
 }
 
 fn annotate_ruby_member_call_placeholders(
@@ -8499,8 +9018,70 @@ fn annotate_receiver_call_placeholder_owner(
     if let Some(marker) = annotation.extra_callsite_marker {
         append_callsite_part(edge, marker);
     }
+    if let Some(marker) = annotation.binding_marker {
+        append_callsite_part(edge, marker);
+    }
     edge_keys.insert(edge_dedup_key(edge, flags));
     Some(index)
+}
+
+/// Append a receiver-binding marker to the CALL edge already representing a
+/// callsite, whether that edge is a still-unresolved placeholder another spec
+/// annotated first or the resolved edge an earlier in-file lookup installed.
+///
+/// This is the order-independence half of binding-marker landing: the
+/// annotate pass deliberately skips annotated and resolved edges, so a spec
+/// that lost the annotation race lands its marker here instead of spawning a
+/// competing placeholder edge. Returns whether a matching edge was found.
+#[allow(clippy::too_many_arguments)]
+fn append_binding_marker_to_existing_callsite_edge(
+    nodes: &HashMap<NodeId, Node>,
+    edges: &mut [Edge],
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+    line: Option<u32>,
+    method_col: Option<u32>,
+    method_name: &str,
+    binding_marker: &str,
+) -> bool {
+    let mut fallback_index = None;
+    let mut exact_index = None;
+    for (index, edge) in edges.iter().enumerate() {
+        if edge.kind != EdgeKind::CALL || edge.line != line {
+            continue;
+        }
+        let target_matches = nodes
+            .get(&edge.target)
+            .is_some_and(|target| node_matches_name(target, method_name));
+        let resolved_matches = edge
+            .resolved_target
+            .and_then(|resolved_id| nodes.get(&resolved_id))
+            .is_some_and(|resolved| node_matches_name(resolved, method_name));
+        if !target_matches && !resolved_matches {
+            continue;
+        }
+
+        fallback_index.get_or_insert(index);
+        if method_col.is_none_or(|col| {
+            edge_callsite_col(edge) == Some(col)
+                || nodes.get(&edge.target).and_then(|target| target.start_col) == Some(col)
+        }) {
+            exact_index = Some(index);
+            break;
+        }
+    }
+
+    let Some(index) = exact_index.or(fallback_index) else {
+        return false;
+    };
+    let Some(edge) = edges.get_mut(index) else {
+        return false;
+    };
+    let old_key = edge_dedup_key(edge, flags);
+    edge_keys.remove(&old_key);
+    append_callsite_part(edge, binding_marker);
+    edge_keys.insert(edge_dedup_key(edge, flags));
+    true
 }
 
 struct ManualReceiverCallPlaceholder<'a> {
@@ -8512,6 +9093,7 @@ struct ManualReceiverCallPlaceholder<'a> {
     owner_name: &'a str,
     owner_module: Option<&'a str>,
     extra_callsite_marker: Option<&'a str>,
+    binding_marker: Option<&'a str>,
 }
 
 fn append_manual_receiver_call_placeholder_edge(
@@ -8567,6 +9149,9 @@ fn append_manual_receiver_call_placeholder_edge(
         );
     }
     if let Some(marker) = placeholder.extra_callsite_marker {
+        append_callsite_part(&mut edge, marker);
+    }
+    if let Some(marker) = placeholder.binding_marker {
         append_callsite_part(&mut edge, marker);
     }
     if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
@@ -8704,8 +9289,9 @@ fn remove_generic_call_placeholders(
     line: Option<u32>,
     method_col: Option<u32>,
     method_name: &str,
-) {
+) -> Vec<String> {
     let mut removed = Vec::new();
+    let mut removed_binding_markers = Vec::new();
     edges.retain(|edge| {
         let remove = edge.kind == EdgeKind::CALL
             && edge.line == line
@@ -8718,12 +9304,21 @@ fn remove_generic_call_placeholders(
                 .unwrap_or(false);
         if remove {
             removed.push(edge_dedup_key(edge, flags));
+            removed_binding_markers.extend(
+                edge.callsite_identity
+                    .as_deref()
+                    .into_iter()
+                    .flat_map(|identity| identity.split('|'))
+                    .filter(|part| part.starts_with(RECEIVER_BINDING_CALLSITE_PREFIX))
+                    .map(str::to_string),
+            );
         }
         !remove
     });
     for key in removed {
         edge_keys.remove(&key);
     }
+    removed_binding_markers
 }
 
 fn call_placeholder_matches_method(
@@ -8835,6 +9430,10 @@ fn collect_receiver_call_specs_in_callable(
             method_col,
             line: Some(node.start_position().row as u32 + 1),
             allow_global_fallback,
+            binding_marker: None,
+            required_callsite_marker: None,
+            class_anchored: false,
+            owner_is_syntactic: false,
         });
     });
 }
@@ -8870,6 +9469,19 @@ fn receiver_call_belongs_to_callable(node: TsNode<'_>, callable: TsNode<'_>) -> 
         "closure_expression",
         "class_definition",
         "class_declaration",
+        // Constructor bodies are walked by the C# collector with the
+        // constructor node as `callable` (P2b). The kind is a *more specific*
+        // boundary than the class that always encloses it, so adding it can
+        // only change the answer for constructor callables — every existing
+        // callable kind saw the same `false` for constructor-body calls
+        // before and after (the nearest boundary changes from the class to
+        // the constructor, and neither matches a method-like callable).
+        "constructor_declaration",
+        // C# structs bound scopes exactly like classes (fields, constructors,
+        // primary constructors); same neutrality argument — a more specific
+        // boundary can only change the answer for struct-shaped callables,
+        // and no other grammar names its structs `struct_declaration`.
+        "struct_declaration",
     ];
     const BODY_BOUNDARY_KINDS: &[&str] = &["function_body"];
 
@@ -9841,6 +10453,8 @@ fn preserved_canonical_id(node: &Node) -> Option<&str> {
             || value.starts_with("route_endpoint:")
             || value.starts_with("tauri:command:")
             || value.starts_with("payload:collection:")
+            || value.starts_with(TYPE_USAGE_REFERENCE_CANONICAL_PREFIX)
+            || value.starts_with(TYPE_USAGE_PENDING_CANONICAL_PREFIX)
     })
 }
 
@@ -14835,6 +15449,17 @@ pub fn index_file(
         &mut edge_keys,
         flags,
         &mut callsite_ordinals,
+    );
+    append_manual_type_usage_edges(
+        language_config.language_name,
+        &tree,
+        source,
+        &mut unique_nodes,
+        file_id,
+        &file_name,
+        &mut result_edges,
+        &mut edge_keys,
+        flags,
     );
     append_runtime_import_edges(
         &runtime_import_specs,

@@ -59,8 +59,8 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     // in `lib.rs::language_member_specs`.
     member_edge_specs: None,
     receiver_call_specs: Some(receiver_call_specs),
-    member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
-    graph_call_syntax: Some("kotlin_member"),
+    type_usage_specs: None,
+    callsite_marker_families: &[("kotlin_member", MEMBER_CALLSITE_MARKER)],
     // A `function_declaration` whose owner is type-like is a method in Kotlin;
     // the projection promotes FUNCTION to METHOD for exactly these languages.
     promotes_type_member_functions_to_methods: true,
@@ -186,6 +186,10 @@ fn collect_kotlin_precise_receiver_call_specs(
                     method_col,
                     line: Some(node.start_position().row as u32 + 1),
                     allow_global_fallback: false,
+                    binding_marker: None,
+                    required_callsite_marker: None,
+                    class_anchored: false,
+                    owner_is_syntactic: false,
                 });
             }
             return;
@@ -215,6 +219,10 @@ fn collect_kotlin_precise_receiver_call_specs(
             method_col,
             line: Some(node.start_position().row as u32 + 1),
             allow_global_fallback: false,
+            binding_marker: None,
+            required_callsite_marker: None,
+            class_anchored: false,
+            owner_is_syntactic: false,
         });
     });
 }

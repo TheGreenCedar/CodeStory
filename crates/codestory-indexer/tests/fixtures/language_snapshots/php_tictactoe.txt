@@ -21,6 +21,9 @@ node METHOD name=Player.turn qn=TicTacToe.Player.turn canonical=game.php:TicTacT
 node METHOD name=TicTacToe.run qn=TicTacToe.TicTacToe.run canonical=game.php:TicTacToe.TicTacToe.run#0 line=109 col=5 end=115:6 file=FILE:game.php@1
 node MODULE name=Random/Randomizer qn=Random/Randomizer canonical=game.php:Random/Randomizer#0 line=5 col=5 end=5:22 file=FILE:game.php@1
 node NAMESPACE name=TicTacToe qn=TicTacToe canonical=game.php:TicTacToe#0 line=3 col=1 end=3:21 file=FILE:game.php@1
+node UNKNOWN name=Field qn=Field canonical=game.php:Field#0 line=111 col=28 end=111:33 file=FILE:game.php@1
+node UNKNOWN name=Randomizer qn=Randomizer canonical=game.php:Randomizer#0 line=114 col=14 end=114:24 file=FILE:game.php@1
+node UNKNOWN name=TicTacToe qn=TicTacToe canonical=game.php:TicTacToe#1 line=118 col=6 end=118:15 file=FILE:game.php@1
 node UNKNOWN name=array_fill qn=array_fill canonical=game.php:array_fill#0 line=37 col=40 end=37:50 file=FILE:game.php@1
 node UNKNOWN name=makeMove qn=makeMove canonical=game.php:makeMove#0 line=84 col=24 end=84:32 file=FILE:game.php@1
 node UNKNOWN name=minMax qn=minMax canonical=game.php:minMax#0 line=95 col=23 end=95:29 file=FILE:game.php@1
@@ -35,9 +38,11 @@ edge CALL src=METHOD:Field.__construct@35 dst=UNKNOWN:array_fill@37 resolved_src
 edge CALL src=METHOD:Field.__construct@35 dst=UNKNOWN:array_fill@37 resolved_src=- resolved_dst=- line=37 confidence=- certainty=- callsite=h0:37:2:h2 candidates=[]
 edge CALL src=METHOD:Field.makeMove@63 dst=METHOD:Field.sameInRow@51 resolved_src=- resolved_dst=METHOD:Field.sameInRow@51 line=70 confidence=1.0000 certainty=Certain callsite=h0:70:1:h3 candidates=[]
 edge CALL src=METHOD:HumanPlayer.turn@82 dst=METHOD:Field.makeMove@63 resolved_src=- resolved_dst=METHOD:Field.makeMove@63 line=84 confidence=1.0000 certainty=Certain callsite=h0:84:1:h4 candidates=[]
-edge CALL src=METHOD:TicTacToe.run@109 dst=UNKNOWN:nextInt@114 resolved_src=- resolved_dst=- line=114 confidence=- certainty=- callsite=h0:114:1:h5|syntax:php-member-call|receiver-owner:Randomizer|receiver-module:Random.Randomizer candidates=[]
-edge CALL src=METHOD:TicTacToe.run@109 dst=UNKNOWN:numberIn@112 resolved_src=- resolved_dst=- line=112 confidence=- certainty=- callsite=h0:112:1:h6 candidates=[]
-edge CALL src=METHOD:TicTacToe.run@109 dst=UNKNOWN:stringOut@113 resolved_src=- resolved_dst=- line=113 confidence=- certainty=- callsite=h0:113:1:h7 candidates=[]
+edge CALL src=METHOD:TicTacToe.run@109 dst=UNKNOWN:Field@111 resolved_src=- resolved_dst=- line=111 confidence=- certainty=- callsite=h0:111:1:h5|syntax:php-new|receiver-owner:Field candidates=[]
+edge CALL src=METHOD:TicTacToe.run@109 dst=UNKNOWN:Randomizer@114 resolved_src=- resolved_dst=- line=114 confidence=- certainty=- callsite=h0:114:1:h6|syntax:php-new|receiver-owner:Randomizer|receiver-module:Random.Randomizer candidates=[]
+edge CALL src=METHOD:TicTacToe.run@109 dst=UNKNOWN:nextInt@114 resolved_src=- resolved_dst=- line=114 confidence=- certainty=- callsite=h0:114:1:h7|syntax:php-member-call|receiver-owner:Randomizer|receiver-module:Random.Randomizer candidates=[]
+edge CALL src=METHOD:TicTacToe.run@109 dst=UNKNOWN:numberIn@112 resolved_src=- resolved_dst=- line=112 confidence=- certainty=- callsite=h0:112:1:h8 candidates=[]
+edge CALL src=METHOD:TicTacToe.run@109 dst=UNKNOWN:stringOut@113 resolved_src=- resolved_dst=- line=113 confidence=- certainty=- callsite=h0:113:1:h9 candidates=[]
 edge IMPORT src=MODULE:Random/Randomizer@5 dst=MODULE:Random/Randomizer@5 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge INHERITANCE src=CLASS:Field@29 dst=CLASS:GameObject@29 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge INHERITANCE src=CLASS:TicTacToe@105 dst=CLASS:GameObject@29 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
@@ -81,6 +86,9 @@ occurrence element=METHOD:Player.turn@77 kind=DEFINITION span=77:5-77:58
 occurrence element=METHOD:TicTacToe.run@109 kind=DEFINITION span=109:5-115:6
 occurrence element=MODULE:Random/Randomizer@5 kind=DEFINITION span=5:5-5:22
 occurrence element=NAMESPACE:TicTacToe@3 kind=DEFINITION span=3:1-3:21
+occurrence element=UNKNOWN:Field@111 kind=DEFINITION span=111:28-111:33
+occurrence element=UNKNOWN:Randomizer@114 kind=DEFINITION span=114:14-114:24
+occurrence element=UNKNOWN:TicTacToe@118 kind=DEFINITION span=118:6-118:15
 occurrence element=UNKNOWN:array_fill@37 kind=DEFINITION span=37:40-37:50
 occurrence element=UNKNOWN:makeMove@84 kind=DEFINITION span=84:24-84:32
 occurrence element=UNKNOWN:minMax@100 kind=DEFINITION span=100:16-100:22
@@ -112,5 +120,5 @@ callable_state CallableProjectionState { file_id: -6460368281953754356, symbol_k
 callable_state CallableProjectionState { file_id: -6460368281953754356, symbol_key: "14:TicTacToe.GameObject.announce", node_id: NodeId(4993151564124375788), signature_hash: 8159730552014832428, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -3094451936880305499, start_line: 24, end_line: 26 }
 callable_state CallableProjectionState { file_id: -6460368281953754356, symbol_key: "14:TicTacToe.HumanPlayer.turn", node_id: NodeId(5735421101707362641), signature_hash: -4935815070297363741, normalized_signature: Some("shape:-1117341136637250039"), body_hash: 9161846392741600280, start_line: 82, end_line: 85 }
 callable_state CallableProjectionState { file_id: -6460368281953754356, symbol_key: "14:TicTacToe.Player.turn", node_id: NodeId(4153867858318907420), signature_hash: -918494154596152668, normalized_signature: Some("outline:-5083272169020481154"), body_hash: -4216802774850148624, start_line: 77, end_line: 77 }
-callable_state CallableProjectionState { file_id: -6460368281953754356, symbol_key: "14:TicTacToe.TicTacToe.run", node_id: NodeId(2419740236747960625), signature_hash: 2105959521563754291, normalized_signature: Some("shape:-6959750541430875846"), body_hash: -1084349564929774830, start_line: 109, end_line: 115 }
-callable_state CallableProjectionState { file_id: -6460368281953754356, symbol_key: "__file_structural__", node_id: NodeId(-6460368281953754356), signature_hash: -5828400723570993396, normalized_signature: None, body_hash: -4167641783090616645, start_line: 1, end_line: 118 }
+callable_state CallableProjectionState { file_id: -6460368281953754356, symbol_key: "14:TicTacToe.TicTacToe.run", node_id: NodeId(2419740236747960625), signature_hash: 2105959521563754291, normalized_signature: Some("shape:2096049349474418480"), body_hash: -3649202227902448721, start_line: 109, end_line: 115 }
+callable_state CallableProjectionState { file_id: -6460368281953754356, symbol_key: "__file_structural__", node_id: NodeId(-6460368281953754356), signature_hash: 5920002532170042634, normalized_signature: None, body_hash: 2374948577749112329, start_line: 1, end_line: 118 }

@@ -60,9 +60,9 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     // Shared with TypeScript; see the module doc.
     member_edge_specs: None,
     receiver_call_specs: Some(super::typescript::receiver_call_specs),
+    type_usage_specs: None,
     // `ts_member` is TypeScript's marker, not TSX's; see the module doc.
-    member_callsite_marker: None,
-    graph_call_syntax: None,
+    callsite_marker_families: &[],
     // A `method_definition` is already a METHOD in the TSX grammar, so the
     // FUNCTION-to-METHOD promotion never applied to TSX and must not start.
     promotes_type_member_functions_to_methods: false,

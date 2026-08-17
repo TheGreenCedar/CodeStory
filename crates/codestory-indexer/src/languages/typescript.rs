@@ -88,8 +88,8 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     compiled_rules: &RULES,
     member_edge_specs: None,
     receiver_call_specs: Some(receiver_call_specs),
-    member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
-    graph_call_syntax: Some("ts_member"),
+    type_usage_specs: None,
+    callsite_marker_families: &[("ts_member", MEMBER_CALLSITE_MARKER)],
     // TypeScript's rule file already projects class members as METHOD, so the
     // qualified-name traversal must not promote FUNCTION children on top of
     // it. `false` is the value the god file's match had.
@@ -249,6 +249,10 @@ fn collect_typescript_constructor_receiver_call_specs(
                 method_col,
                 line: Some(node.start_position().row as u32 + 1),
                 allow_global_fallback: false,
+                binding_marker: None,
+                required_callsite_marker: None,
+                class_anchored: false,
+                owner_is_syntactic: false,
             });
         }
     });

@@ -62,8 +62,8 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     // collector; see the module docs.
     member_edge_specs: None,
     receiver_call_specs: None,
-    member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
-    graph_call_syntax: Some("rust_method"),
+    type_usage_specs: None,
+    callsite_marker_families: &[("rust_method", MEMBER_CALLSITE_MARKER)],
     // Rust's rule file already emits METHOD for `impl` members, so the
     // FUNCTION-to-METHOD promotion must stay off; turning it on would reclassify
     // free functions declared inside a type-like owner.

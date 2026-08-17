@@ -14,16 +14,26 @@ node METHOD name=Workflow.decorate qn=App.Workflow.decorate canonical=<ROOT>/fid
 node METHOD name=Workflow.run qn=App.Workflow.run canonical=<ROOT>/fidelity.php:App.Workflow.run#0 line=43 col=5 end=48:6 file=FILE:<ROOT>/fidelity.php@1
 node MODULE name=Random/Randomizer qn=Random/Randomizer canonical=<ROOT>/fidelity.php:Random/Randomizer#0 line=5 col=5 end=5:22 file=FILE:<ROOT>/fidelity.php@1
 node NAMESPACE name=App qn=App canonical=<ROOT>/fidelity.php:App#0 line=3 col=1 end=3:15 file=FILE:<ROOT>/fidelity.php@1
+node UNKNOWN name=ConsoleNotifier qn=ConsoleNotifier canonical=<ROOT>/fidelity.php:ConsoleNotifier#0 line=58 col=34 end=58:49 file=FILE:<ROOT>/fidelity.php@1
+node UNKNOWN name=Event qn=Event canonical=<ROOT>/fidelity.php:Event#0 line=59 col=24 end=59:29 file=FILE:<ROOT>/fidelity.php@1
+node UNKNOWN name=Randomizer qn=Randomizer canonical=<ROOT>/fidelity.php:Randomizer#0 line=59 col=35 end=59:45 file=FILE:<ROOT>/fidelity.php@1
+node UNKNOWN name=Repository qn=Repository canonical=<ROOT>/fidelity.php:Repository#0 line=58 col=57 end=58:67 file=FILE:<ROOT>/fidelity.php@1
+node UNKNOWN name=Workflow qn=Workflow canonical=<ROOT>/fidelity.php:Workflow#0 line=58 col=21 end=58:29 file=FILE:<ROOT>/fidelity.php@1
 node UNKNOWN name=decorate qn=decorate canonical=<ROOT>/fidelity.php:decorate#0 line=47 col=16 end=47:24 file=FILE:<ROOT>/fidelity.php@1
 node UNKNOWN name=getBytes qn=getBytes canonical=<ROOT>/fidelity.php:getBytes#0 line=59 col=50 end=59:58 file=FILE:<ROOT>/fidelity.php@1
 node UNKNOWN name=notify qn=notify canonical=<ROOT>/fidelity.php:notify#0 line=45 col=26 end=45:32 file=FILE:<ROOT>/fidelity.php@1
 node UNKNOWN name=run qn=run canonical=<ROOT>/fidelity.php:run#0 line=59 col=16 end=59:19 file=FILE:<ROOT>/fidelity.php@1
 node UNKNOWN name=save qn=save canonical=<ROOT>/fidelity.php:save#0 line=46 col=28 end=46:32 file=FILE:<ROOT>/fidelity.php@1
 edge CALL src=FUNCTION:orchestrate_php@56 dst=METHOD:Workflow.run@43 resolved_src=FUNCTION:orchestrate_php@56 resolved_dst=METHOD:Workflow.run@43 line=59 confidence=1.0000 certainty=Certain callsite=h0:59:1:h1 candidates=[]
-edge CALL src=FUNCTION:orchestrate_php@56 dst=UNKNOWN:getBytes@59 resolved_src=FUNCTION:orchestrate_php@56 resolved_dst=- line=59 confidence=- certainty=- callsite=h0:59:1:h2|syntax:php-member-call|receiver-owner:Randomizer|receiver-module:Random.Randomizer candidates=[]
-edge CALL src=METHOD:Workflow.run@43 dst=METHOD:Notifier.notify@9 resolved_src=METHOD:Workflow.run@43 resolved_dst=METHOD:Notifier.notify@9 line=45 confidence=1.0000 certainty=Certain callsite=h0:45:1:h3 candidates=[]
-edge CALL src=METHOD:Workflow.run@43 dst=METHOD:Repository.save@22 resolved_src=METHOD:Workflow.run@43 resolved_dst=METHOD:Repository.save@22 line=46 confidence=1.0000 certainty=Certain callsite=h0:46:1:h4 candidates=[]
-edge CALL src=METHOD:Workflow.run@43 dst=METHOD:Workflow.decorate@50 resolved_src=METHOD:Workflow.run@43 resolved_dst=METHOD:Workflow.decorate@50 line=47 confidence=1.0000 certainty=Certain callsite=h0:47:1:h5 candidates=[]
+edge CALL src=FUNCTION:orchestrate_php@56 dst=UNKNOWN:ConsoleNotifier@58 resolved_src=FUNCTION:orchestrate_php@56 resolved_dst=- line=58 confidence=- certainty=- callsite=h0:58:1:h2|syntax:php-new|receiver-owner:ConsoleNotifier candidates=[]
+edge CALL src=FUNCTION:orchestrate_php@56 dst=UNKNOWN:Event@59 resolved_src=FUNCTION:orchestrate_php@56 resolved_dst=METHOD:Event.__construct@30 line=59 confidence=0.9500 certainty=Certain callsite=h0:59:1:h3|syntax:php-new|receiver-owner:Event candidates=[]
+edge CALL src=FUNCTION:orchestrate_php@56 dst=UNKNOWN:Randomizer@59 resolved_src=FUNCTION:orchestrate_php@56 resolved_dst=- line=59 confidence=- certainty=- callsite=h0:59:1:h4|syntax:php-new|receiver-owner:Randomizer|receiver-module:Random.Randomizer candidates=[]
+edge CALL src=FUNCTION:orchestrate_php@56 dst=UNKNOWN:Repository@58 resolved_src=FUNCTION:orchestrate_php@56 resolved_dst=- line=58 confidence=- certainty=- callsite=h0:58:1:h5|syntax:php-new|receiver-owner:Repository candidates=[]
+edge CALL src=FUNCTION:orchestrate_php@56 dst=UNKNOWN:Workflow@58 resolved_src=FUNCTION:orchestrate_php@56 resolved_dst=METHOD:Workflow.__construct@37 line=58 confidence=0.9500 certainty=Certain callsite=h0:58:1:h6|syntax:php-new|receiver-owner:Workflow candidates=[]
+edge CALL src=FUNCTION:orchestrate_php@56 dst=UNKNOWN:getBytes@59 resolved_src=FUNCTION:orchestrate_php@56 resolved_dst=- line=59 confidence=- certainty=- callsite=h0:59:1:h7|syntax:php-member-call|receiver-owner:Randomizer|receiver-module:Random.Randomizer candidates=[]
+edge CALL src=METHOD:Workflow.run@43 dst=METHOD:Notifier.notify@9 resolved_src=METHOD:Workflow.run@43 resolved_dst=METHOD:Notifier.notify@9 line=45 confidence=1.0000 certainty=Certain callsite=h0:45:1:h8 candidates=[]
+edge CALL src=METHOD:Workflow.run@43 dst=METHOD:Repository.save@22 resolved_src=METHOD:Workflow.run@43 resolved_dst=METHOD:Repository.save@22 line=46 confidence=1.0000 certainty=Certain callsite=h0:46:1:h9 candidates=[]
+edge CALL src=METHOD:Workflow.run@43 dst=METHOD:Workflow.decorate@50 resolved_src=METHOD:Workflow.run@43 resolved_dst=METHOD:Workflow.decorate@50 line=47 confidence=1.0000 certainty=Certain callsite=h0:47:1:h10 candidates=[]
 edge IMPORT src=MODULE:Random/Randomizer@5 dst=MODULE:Random/Randomizer@5 resolved_src=MODULE:Random/Randomizer@5 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:ConsoleNotifier@12 dst=METHOD:ConsoleNotifier.notify@14 resolved_src=- resolved_dst=- line=14 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:Event@28 dst=METHOD:Event.__construct@30 resolved_src=- resolved_dst=- line=30 confidence=- certainty=Certain callsite=- candidates=[]
