@@ -400,6 +400,62 @@ fn serve_embedding_connection_inner(
                 },
             )?;
         }
+        EmbeddingOperation::EmbedQueries {
+            scope_id,
+            deadline_ms,
+            retry_after_ms,
+            cancel_token,
+            inputs,
+        } => {
+            if inputs.is_empty()
+                || inputs.len() > super::super::protocol::PER_USER_EMBEDDING_QUERY_BATCH_MAX
+            {
+                return write_protocol_response(
+                    &mut *stream,
+                    failure_response(
+                        &request.request_id,
+                        protocol_error(
+                            "embedding_server_query_batch_invalid",
+                            "embedding query batch is empty or exceeds the bounded query batch limit",
+                        ),
+                    ),
+                    &[],
+                );
+            }
+            if let Err(error) = validate_raw_inputs(&inputs) {
+                return write_protocol_response(
+                    &mut *stream,
+                    failure_response(
+                        &request.request_id,
+                        protocol_error(
+                            "embedding_server_input_invalid",
+                            &format!("embedding query inputs were rejected: {error}"),
+                        ),
+                    ),
+                    &[],
+                );
+            }
+            let inputs = inputs
+                .into_iter()
+                .map(|input| format!("{CODERANK_QUERY_PREFIX}{input}"))
+                .collect();
+            serve_embedding_request(
+                &state,
+                &connection_id,
+                &mut *stream,
+                ServerEmbeddingRequest {
+                    request_id: &request.request_id,
+                    scope_id,
+                    request_class: EmbeddingRequestClass::Query,
+                    deadline_ms,
+                    retry_after_ms,
+                    cancel_token,
+                    client_pid: transport_peer_pid,
+                    client_process_start_id: &transport_peer_process_start_id,
+                    inputs,
+                },
+            )?;
+        }
         EmbeddingOperation::EmbedDocuments {
             scope_id,
             deadline_ms,

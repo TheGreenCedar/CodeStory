@@ -38,7 +38,7 @@
       "expected": {
         "files": [
           "crates/codestory-cli/src/output.rs",
-          "crates/codestory-runtime/src/agent/packet_evidence.rs"
+          "crates/codestory-agent/src/packet_evidence.rs"
         ],
         "symbols": [
           "append_search_evidence_packet",

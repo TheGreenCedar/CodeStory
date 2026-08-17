@@ -4,11 +4,6 @@ use crate::eval_probes::{
     eval_indexing_storage_flow_template_claims, eval_probes_enabled,
     eval_supporting_claim_flow_sentence,
 };
-use crate::packet_citations::packet_citation_source_text;
-use crate::packet_claim_profiles::{
-    packet_source_derived_claim_for_role, packet_source_derived_claims_for_citation_counted,
-};
-use crate::packet_command_profiles::packet_append_command_flow_template_claims;
 use crate::packet_evidence::{
     citation_sufficiency_eligible, evidence_resolution_for_citation, evidence_tier_for_citation,
 };
@@ -21,7 +16,6 @@ use crate::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_claim_carry_rank,
     packet_display_path, packet_query_stop_term, sort_by_cached_rank_desc,
 };
-use crate::packet_terms::{packet_probe_terms, packet_terms_indicate_sql_schema_flow};
 use crate::text::query_mentions_non_primary_source;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, PacketClaimDto, PacketEvidenceResolutionDto,
@@ -29,8 +23,6 @@ use codestory_contracts::api::{
 };
 use std::collections::HashSet;
 use std::fmt::Write as _;
-
-const PACKET_SOURCE_DEFINITION_CLAIM_LIMIT: usize = 6;
 
 pub fn packet_flow_claims_markdown(claims: &[PacketClaimDto]) -> String {
     let mut markdown = String::new();
@@ -156,20 +148,8 @@ pub fn append_flow_template_claims(
     let normalized_prompt = normalize_identifier(prompt);
 
     let phase = ClaimSourcePhase::start(claims);
-    packet_append_command_flow_template_claims(prompt, citations, claims, seen);
-    phase.finish(PacketClaimSource::CommandProfile, claims, telemetry);
-
-    let phase = ClaimSourcePhase::start(claims);
     packet_append_event_output_flow_template_claims(&normalized_prompt, citations, claims, seen);
     packet_append_indexing_pipeline_flow_template_claims(prompt, citations, claims, seen);
-    phase.finish(PacketClaimSource::FlowTemplate, claims, telemetry);
-
-    let phase = ClaimSourcePhase::start(claims);
-    packet_append_source_derived_flow_claims(prompt, citations, claims, seen, telemetry);
-    phase.finish(PacketClaimSource::SourceProfile, claims, telemetry);
-
-    let phase = ClaimSourcePhase::start(claims);
-    packet_append_sql_schema_file_claims(prompt, citations, claims, seen);
     phase.finish(PacketClaimSource::FlowTemplate, claims, telemetry);
 
     #[cfg(any(test, feature = "test-support"))]
@@ -218,7 +198,7 @@ fn packet_append_event_output_flow_template_claims(
 ) {
     if (normalized_prompt.contains("json") || normalized_prompt.contains("jsonl"))
         && (normalized_prompt.contains("event") || normalized_prompt.contains("output"))
-        && let Some(json_output_citation) = citations.iter().find(|citation| {
+        && let Some(event_output_citation) = citations.iter().find(|citation| {
             packet_evidence_role(citation) == Some(PacketEvidenceRole::EventOutputProcessing)
         })
     {
@@ -226,7 +206,7 @@ fn packet_append_event_output_flow_template_claims(
             claims,
             seen,
             "Event-output processing evidence describes how structured runtime events are serialized for JSON/JSONL output.",
-            Some(json_output_citation.clone()),
+            Some(event_output_citation.clone()),
         );
     }
 }
@@ -365,216 +345,6 @@ fn packet_symbol_extraction_witness_rank(citation: &AgentCitationDto) -> u8 {
     }
 }
 
-fn packet_append_source_derived_flow_claims(
-    prompt: &str,
-    citations: &[AgentCitationDto],
-    claims: &mut Vec<PacketClaimDto>,
-    seen: &mut HashSet<String>,
-    telemetry: &mut PacketClaimTelemetry,
-) {
-    for citation in citations.iter().take(24) {
-        let source = match packet_citation_source_text(citation) {
-            Some(source) if source.len() <= 800_000 => source,
-            _ => continue,
-        };
-        for claim in
-            packet_source_derived_claims_for_citation_counted(prompt, citation, &source, telemetry)
-        {
-            let claim_citation =
-                packet_preferred_source_derived_claim_citation(&claim, citation, citations);
-            // The pending source-derived profiles still return prose only, so they cannot declare
-            // which sibling flow obligation the prose asserts. Keep the evidence visible, but do
-            // not let a citation's broad role promote every phase-specific sentence it happened
-            // to emit. Contracted profiles must return explicit obligation bindings first.
-            packet_push_unbound_reported_claim(claims, seen, &claim, Some(claim_citation));
-            if claims.len() >= 18 {
-                return;
-            }
-        }
-    }
-}
-
-fn packet_preferred_source_derived_claim_citation(
-    claim: &str,
-    source_citation: &AgentCitationDto,
-    citations: &[AgentCitationDto],
-) -> AgentCitationDto {
-    if packet_claim_text_indicates_sql_relationship(claim)
-        && let Some(relationship_citation) =
-            packet_matching_sql_relationship_citation(source_citation, citations)
-    {
-        return relationship_citation;
-    }
-    source_citation.clone()
-}
-
-fn packet_matching_sql_relationship_citation(
-    source_citation: &AgentCitationDto,
-    citations: &[AgentCitationDto],
-) -> Option<AgentCitationDto> {
-    let source_path = source_citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .map(|path| normalize_identifier(&path));
-    citations
-        .iter()
-        .filter(|citation| {
-            packet_evidence_role(citation) == Some(PacketEvidenceRole::SqlRelationshipConstraint)
-        })
-        .find(|citation| {
-            source_path.as_deref().is_some_and(|source_path| {
-                citation
-                    .file_path
-                    .as_deref()
-                    .map(packet_display_path)
-                    .map(|path| normalize_identifier(&path) == source_path)
-                    .unwrap_or(false)
-            })
-        })
-        .or_else(|| {
-            citations.iter().find(|citation| {
-                packet_evidence_role(citation)
-                    == Some(PacketEvidenceRole::SqlRelationshipConstraint)
-            })
-        })
-        .cloned()
-}
-
-fn packet_claim_text_indicates_sql_relationship(claim: &str) -> bool {
-    let normalized = normalize_identifier(claim);
-    normalized.contains("rowsreference")
-        || normalized.contains("foreignkey")
-        || normalized.contains("references")
-        || ((normalized.contains("relationship")
-            || normalized.contains("relationships")
-            || normalized.contains("constraint")
-            || normalized.contains("constraints"))
-            && (normalized.contains("sql")
-                || normalized.contains("schema")
-                || normalized.contains("table")
-                || normalized.contains("rows")
-                || normalized.contains("foreign")
-                || normalized.contains("reference")
-                || normalized.contains("referential")))
-}
-
-fn packet_append_sql_schema_file_claims(
-    prompt: &str,
-    citations: &[AgentCitationDto],
-    claims: &mut Vec<PacketClaimDto>,
-    seen: &mut HashSet<String>,
-) {
-    let terms = packet_probe_terms(prompt);
-    if !packet_terms_indicate_sql_schema_flow(&terms) {
-        return;
-    }
-
-    let mut sql_schema_citations = Vec::new();
-    let mut seen_paths = HashSet::new();
-    let mut dialects = HashSet::new();
-    for citation in citations {
-        let Some(path) = citation.file_path.as_deref() else {
-            continue;
-        };
-        let display_path = packet_display_path(path);
-        if !display_path.to_ascii_lowercase().ends_with(".sql") {
-            continue;
-        }
-        let normalized_path = display_path.to_ascii_lowercase();
-        if !seen_paths.insert(normalized_path.clone()) {
-            continue;
-        }
-        let Ok(source) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        if !source.to_ascii_lowercase().contains("create table") {
-            continue;
-        }
-        if let Some(dialect) = packet_sql_dialect_key(&normalized_path) {
-            dialects.insert(dialect);
-        }
-        sql_schema_citations.push(citation.clone());
-    }
-
-    if sql_schema_citations.len() < 2 {
-        return;
-    }
-
-    let subject = packet_sql_schema_prompt_subject(prompt);
-    let claim = match (dialects.len() >= 2, subject.as_deref()) {
-        (true, Some(subject)) => {
-            format!(
-                "The repository carries multiple SQL dialect scripts for the same {subject} schema."
-            )
-        }
-        (true, None) => {
-            "The repository carries multiple SQL dialect scripts for the same schema.".to_string()
-        }
-        (false, Some(subject)) => {
-            format!(
-                "The repository carries multiple SQL schema scripts for the same {subject} schema."
-            )
-        }
-        (false, None) => {
-            "The repository carries multiple SQL schema scripts for the same schema.".to_string()
-        }
-    };
-    packet_push_flow_template_claim_with_citations(
-        claims,
-        seen,
-        &claim,
-        sql_schema_citations.into_iter().take(3).collect(),
-    );
-}
-
-fn packet_sql_dialect_key(normalized_path: &str) -> Option<&'static str> {
-    if normalized_path.contains("sqlite") {
-        Some("sqlite")
-    } else if normalized_path.contains("mysql") {
-        Some("mysql")
-    } else if normalized_path.contains("postgres") || normalized_path.contains("pgsql") {
-        Some("postgres")
-    } else if normalized_path.contains("sqlserver") || normalized_path.contains("mssql") {
-        Some("sqlserver")
-    } else if normalized_path.contains("db2") {
-        Some("db2")
-    } else if normalized_path.contains("oracle") {
-        Some("oracle")
-    } else {
-        None
-    }
-}
-
-fn packet_sql_schema_prompt_subject(prompt: &str) -> Option<String> {
-    let stop_words = [
-        "Explain",
-        "Trace",
-        "Cite",
-        "Name",
-        "SQL",
-        "Schema",
-        "Relationships",
-        "Relation",
-        "Tables",
-        "Table",
-    ];
-    prompt
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .map(str::trim)
-        .find(|token| {
-            token.len() >= 4
-                && token
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| ch.is_ascii_uppercase())
-                && !stop_words
-                    .iter()
-                    .any(|stop| stop.eq_ignore_ascii_case(token))
-        })
-        .map(str::to_string)
-}
-
 fn packet_push_flow_template_claim(
     claims: &mut Vec<PacketClaimDto>,
     seen: &mut HashSet<String>,
@@ -607,28 +377,6 @@ fn packet_push_flow_template_claim_with_citations(
         required_evidence_role: None,
         citations,
         coverage_role: Some("flow template".to_string()),
-        eligible_for_sufficiency: Some(false),
-    });
-}
-
-fn packet_push_unbound_reported_claim(
-    claims: &mut Vec<PacketClaimDto>,
-    seen: &mut HashSet<String>,
-    claim_text: &str,
-    citation: Option<AgentCitationDto>,
-) {
-    let key = normalize_identifier(claim_text);
-    if key.is_empty() || !seen.insert(key) {
-        return;
-    }
-    claims.push(PacketClaimDto {
-        claim: claim_text.to_string(),
-        required_obligation_ids: Vec::new(),
-        required_obligation_kinds: Vec::new(),
-        proof_status: None,
-        required_evidence_role: None,
-        citations: citation.into_iter().collect(),
-        coverage_role: Some("source-derived lead".to_string()),
         eligible_for_sufficiency: Some(false),
     });
 }
@@ -675,8 +423,8 @@ pub fn append_ranked_citation_claims(
                     continue;
                 }
             }
+            Some(PacketEvidenceRole::SourceEvidence) | None => continue,
             Some(role) => role,
-            None => PacketEvidenceRole::SourceEvidence,
         };
         let claim_key = packet_claim_key_for_citation(role, citation);
         if !seen_claims.insert(claim_key.clone()) {
@@ -690,14 +438,14 @@ pub fn append_ranked_citation_claims(
             required_evidence_role: None,
             citations: vec![citation.clone()],
             coverage_role: Some(role.as_str().to_string()),
-            eligible_for_sufficiency: Some(false),
+            eligible_for_sufficiency: Some(
+                role != PacketEvidenceRole::SourceEvidence
+                    && citation_sufficiency_eligible(citation),
+            ),
         });
         if claims.len() >= 18 {
             break;
         }
-    }
-    if claims.len() < 18 {
-        packet_append_source_definition_claims(&ordered_citations, rank_terms, claims, seen_claims);
     }
 }
 
@@ -709,9 +457,6 @@ pub fn packet_claim_for_role(
 ) -> String {
     if let Some(shaped) = packet_citation_shaped_claim(citation, prompt) {
         return shaped;
-    }
-    if let Some(source_derived) = packet_source_derived_claim_for_role(role, citation, prompt) {
-        return source_derived;
     }
     let symbol = citation.display_name.as_str();
     let path = citation
@@ -759,8 +504,8 @@ pub fn packet_claim_for_role(
         PacketEvidenceRole::WorkspaceDiscoveryAndPlanning => format!(
             "`{symbol}` handles workspace file selection, manifests, or execution-plan behavior."
         ),
-        PacketEvidenceRole::SourceGroupConfiguration => {
-            format!("`{symbol}` maps project settings into source-group-specific indexing inputs.")
+        PacketEvidenceRole::IndexInputConfiguration => {
+            format!("`{symbol}` maps project settings into indexing inputs.")
         }
         PacketEvidenceRole::IndexingWorkQueue => format!(
             "`{symbol}` turns build-index commands into parser handoff or source-file work items."
@@ -864,211 +609,6 @@ fn packet_citation_shaped_claim(citation: &AgentCitationDto, prompt: &str) -> Op
         let _ = (citation, prompt);
         None
     }
-}
-
-fn packet_append_source_definition_claims(
-    citations: &[AgentCitationDto],
-    rank_terms: &[String],
-    claims: &mut Vec<PacketClaimDto>,
-    seen_claims: &mut HashSet<String>,
-) {
-    let normalized_terms = rank_terms
-        .iter()
-        .map(|term| normalize_identifier(term))
-        .filter(|term| term.len() >= 6)
-        .collect::<Vec<_>>();
-    let rank_tokens = packet_definition_rank_tokens(rank_terms);
-    if normalized_terms.is_empty() && rank_tokens.is_empty() {
-        return;
-    }
-
-    let mut seen_definitions = HashSet::new();
-    let mut appended = 0;
-    for citation in citations.iter().take(24) {
-        let Some(source) = packet_citation_source_text(citation) else {
-            continue;
-        };
-        if source.len() > 400_000 {
-            continue;
-        }
-        for line in source.lines().take(4_000) {
-            let Some(definition) = packet_source_definition_name(line) else {
-                continue;
-            };
-            let normalized_definition = normalize_identifier(&definition);
-            if !packet_definition_matches_rank_terms(
-                &definition,
-                &normalized_definition,
-                &normalized_terms,
-                &rank_tokens,
-            ) {
-                continue;
-            }
-            let path = citation
-                .file_path
-                .as_deref()
-                .map(packet_display_path)
-                .unwrap_or_else(|| "<unknown path>".to_string());
-            let definition_key = format!("{normalized_definition}:{path}");
-            if !seen_definitions.insert(definition_key) {
-                continue;
-            }
-            packet_push_claim(
-                claims,
-                seen_claims,
-                &format!(
-                    "`{definition}` is defined in cited source `{path}` and should be treated as an exact source anchor for this flow."
-                ),
-                Some(citation.clone()),
-            );
-            appended += 1;
-            if claims.len() >= 18 {
-                return;
-            }
-            if appended >= PACKET_SOURCE_DEFINITION_CLAIM_LIMIT {
-                return;
-            }
-        }
-    }
-}
-
-fn packet_push_claim(
-    claims: &mut Vec<PacketClaimDto>,
-    seen_claims: &mut HashSet<String>,
-    claim_text: &str,
-    citation: Option<AgentCitationDto>,
-) {
-    let key = normalize_identifier(claim_text);
-    if key.is_empty() || !seen_claims.insert(key) {
-        return;
-    }
-    claims.push(PacketClaimDto {
-        claim: claim_text.to_string(),
-        required_obligation_ids: Vec::new(),
-        required_obligation_kinds: Vec::new(),
-        proof_status: None,
-        required_evidence_role: None,
-        citations: citation.map(|value| vec![value]).unwrap_or_default(),
-        coverage_role: Some("source definition".to_string()),
-        eligible_for_sufficiency: Some(false),
-    });
-}
-
-fn packet_source_definition_name(line: &str) -> Option<String> {
-    let trimmed = line.trim_start();
-    for prefix in [
-        "pub async fn ",
-        "pub(crate) async fn ",
-        "async fn ",
-        "pub fn ",
-        "pub(crate) fn ",
-        "fn ",
-        "pub struct ",
-        "pub(crate) struct ",
-        "struct ",
-        "pub enum ",
-        "pub(crate) enum ",
-        "enum ",
-        "pub trait ",
-        "pub(crate) trait ",
-        "trait ",
-        "export class ",
-        "class ",
-        "export interface ",
-        "interface ",
-        "export function ",
-        "function ",
-        "export const ",
-        "const ",
-        "export type ",
-        "type ",
-    ] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            return packet_take_definition_identifier(rest);
-        }
-    }
-    None
-}
-
-fn packet_take_definition_identifier(rest: &str) -> Option<String> {
-    let mut identifier = String::new();
-    for ch in rest.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
-            identifier.push(ch);
-        } else {
-            break;
-        }
-    }
-    (identifier.len() >= 3).then_some(identifier)
-}
-
-fn packet_definition_matches_rank_terms(
-    definition: &str,
-    normalized_definition: &str,
-    normalized_terms: &[String],
-    rank_tokens: &HashSet<String>,
-) -> bool {
-    if normalized_definition.len() < 6 {
-        return false;
-    }
-    if normalized_terms
-        .iter()
-        .any(|term| term == normalized_definition)
-    {
-        return true;
-    }
-    let definition_tokens = packet_identifier_tokens(definition);
-    let overlap = definition_tokens
-        .iter()
-        .filter(|token| rank_tokens.contains(token.as_str()))
-        .count();
-    overlap >= 2 || (definition_tokens.iter().any(|token| token == "exec") && overlap >= 1)
-}
-
-fn packet_definition_rank_tokens(rank_terms: &[String]) -> HashSet<String> {
-    rank_terms
-        .iter()
-        .flat_map(|term| packet_identifier_tokens(term))
-        .filter(|term| {
-            term.len() >= 3
-                && !matches!(
-                    term.as_str(),
-                    "the" | "and" | "for" | "with" | "from" | "into" | "flow" | "flows"
-                )
-        })
-        .collect()
-}
-
-fn packet_identifier_tokens(identifier: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut previous_lower_or_digit = false;
-    for ch in identifier.chars() {
-        if ch == '_' || ch == '-' || ch == '$' || ch.is_whitespace() {
-            if !current.is_empty() {
-                tokens.push(current.clone());
-                current.clear();
-            }
-            previous_lower_or_digit = false;
-            continue;
-        }
-        if ch.is_ascii_uppercase() && previous_lower_or_digit && !current.is_empty() {
-            tokens.push(current.clone());
-            current.clear();
-        }
-        if ch.is_ascii_alphanumeric() {
-            current.extend(ch.to_lowercase());
-            previous_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
-        } else if !current.is_empty() {
-            tokens.push(current.clone());
-            current.clear();
-            previous_lower_or_digit = false;
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
 }
 
 #[cfg(test)]
@@ -1230,49 +770,38 @@ mod tests {
         );
     }
 
-    fn write_sql_fixture(name: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "codestory-packet-claims-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create packet claims temp dir");
-        let path = root.join("schema.sql");
-        std::fs::write(
-            &path,
-            r#"
-            CREATE TABLE Child
-            (
-                ChildId INTEGER NOT NULL,
-                ParentId INTEGER NOT NULL,
-                FOREIGN KEY (ParentId) REFERENCES Parent (ParentId)
+    #[test]
+    fn production_source_evidence_does_not_emit_ties_boilerplate() {
+        let answer = test_answer(
+            "Explain how Logger.addRecord writes a record through handlers.",
+            vec![
+                test_citation("Logger.addRecord", "src/Logger.php", 0.9),
+                test_citation("AbstractProcessingHandler.handle", "src/Handler.php", 0.8),
+            ],
+        );
+        let claims = packet_supported_claims(&answer);
+        for claim in &claims {
+            assert!(
+                !claim.claim.contains("ties ") && !claim.claim.contains("adjacent ownership"),
+                "ranked source-evidence claims must omit navigation boilerplate: {claim:?}"
             );
-            CREATE TABLE Parent
-            (
-                ParentId INTEGER NOT NULL
-            );
-            "#,
-        )
-        .expect("write packet claims sql fixture");
-        path
+        }
     }
 
     #[test]
     fn sql_relationship_claims_attach_to_retained_foreign_key_citations() {
-        let path = write_sql_fixture("foreign-key");
-        let path_text = path.to_string_lossy().to_string();
         let answer = test_answer(
             "Explain SQL schema relationships between child and parent rows.",
             vec![
-                test_citation("CREATE TABLE Child", &path_text, 0.9),
-                test_citation("FOREIGN KEY", &path_text, 0.8),
+                test_citation("CREATE TABLE Child", "db/schema.sql", 0.9),
+                test_citation("FOREIGN KEY", "db/schema.sql", 0.8),
             ],
         );
 
         let claims = packet_supported_claims(&answer);
         let relationship_claim = claims
             .iter()
-            .find(|claim| claim.claim == "Child rows reference Parent rows through ParentId.")
+            .find(|claim| claim.coverage_role.as_deref() == Some("sql relationship constraint"))
             .unwrap_or_else(|| panic!("expected relationship claim in {claims:?}"));
         assert!(
             relationship_claim
@@ -1291,7 +820,7 @@ mod tests {
 
         let table_claim = claims
             .iter()
-            .find(|claim| claim.claim == "SQL schema defines tables Child and Parent.")
+            .find(|claim| claim.coverage_role.as_deref() == Some("sql table definition"))
             .unwrap_or_else(|| panic!("expected table claim in {claims:?}"));
         assert!(
             table_claim
@@ -1300,26 +829,22 @@ mod tests {
                 .any(|citation| citation.display_name == "CREATE TABLE Child"),
             "table claim should keep table-definition evidence: {table_claim:?}"
         );
-
-        let _ = std::fs::remove_dir_all(path.parent().expect("sql fixture parent"));
     }
 
     #[test]
     fn sql_relationship_claims_can_attach_to_retained_references_citations() {
-        let path = write_sql_fixture("references");
-        let path_text = path.to_string_lossy().to_string();
         let answer = test_answer(
             "Explain SQL schema relationships and references between child and parent rows.",
             vec![
-                test_citation("CREATE TABLE Child", &path_text, 0.9),
-                test_citation("REFERENCES", &path_text, 0.8),
+                test_citation("CREATE TABLE Child", "db/schema.sql", 0.9),
+                test_citation("REFERENCES", "db/schema.sql", 0.8),
             ],
         );
 
         let claims = packet_supported_claims(&answer);
         let relationship_claim = claims
             .iter()
-            .find(|claim| claim.claim == "Child rows reference Parent rows through ParentId.")
+            .find(|claim| claim.coverage_role.as_deref() == Some("sql relationship constraint"))
             .unwrap_or_else(|| panic!("expected relationship claim in {claims:?}"));
         assert!(
             relationship_claim
@@ -1328,7 +853,5 @@ mod tests {
                 .any(|citation| citation.display_name == "REFERENCES"),
             "relationship claim should cite retained REFERENCES evidence: {relationship_claim:?}"
         );
-
-        let _ = std::fs::remove_dir_all(path.parent().expect("sql fixture parent"));
     }
 }

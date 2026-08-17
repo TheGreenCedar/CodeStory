@@ -134,9 +134,7 @@ pub(in crate::per_user_embedding) fn serve_embedding_request(
         return Ok(());
     }
     let handle = match request_class {
-        EmbeddingRequestClass::Query => {
-            engine.submit_query_prepared(context.clone(), inputs[0].clone())
-        }
+        EmbeddingRequestClass::Query => engine.submit_queries_prepared(context.clone(), inputs),
         EmbeddingRequestClass::Bulk => engine.submit_documents_prepared(context.clone(), inputs),
     };
     let handle = match handle {

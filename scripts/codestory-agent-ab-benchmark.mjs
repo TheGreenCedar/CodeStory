@@ -2,11 +2,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
-import { copyFile, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { copyFile, mkdir, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { parseArgs as parseNodeArgs } from "node:util";
 
@@ -41,7 +42,18 @@ const MANIFEST_REPO_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
 const MANIFEST_TASK_ID_PATTERN = /^[a-z0-9][a-z0-9.-]*$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const MAX_PACKET_MANIFEST_EXTRA_PROBES = 12;
+const PUBLIC_PACKET_MAX_ANCHORS = 16;
+const PUBLIC_PACKET_MAX_TRAIL_EDGES = 60;
+const PUBLIC_PACKET_MAX_OUTPUT_BYTES = 128 * 1024;
 const MAX_REUSED_ARTIFACT_BYTES = 64 * 1024 * 1024;
+const DEFAULT_BENCHMARK_MODEL = "gpt-5.6-sol";
+const REQUIRED_MANAGED_CODESTORY_VERSION = "0.17.0";
+const PINNED_CODEX_RUNNER_CONFIG = [
+  'model_reasoning_effort="xhigh"',
+  'service_tier="default"',
+  'personality="pragmatic"',
+  'model_verbosity="low"',
+];
 const REUSABLE_BASELINE_ARTIFACT_NAME_PATTERN =
   /(?:\.stdout\.jsonl|\.stderr\.txt|\.baseline-context\.json|\.baseline-context\.stderr\.txt)$/;
 const PACKET_TASK_CLASSES = new Set([
@@ -52,6 +64,12 @@ const PACKET_TASK_CLASSES = new Set([
   "symbol_ownership",
   "data_flow",
   "edit_planning",
+]);
+const PACKET_DISPOSITIONS = new Set([
+  "supported",
+  "drill_once",
+  "not_established",
+  "unavailable",
 ]);
 const COMMAND_ACCOUNTING_CATEGORIES = [
   "codestory_cli",
@@ -130,7 +148,7 @@ const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
-    "Use CodeStory grounding first. CODESTORY_CLI is set to the executable for this run. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` commands for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Copy exact source identifiers, table names, declarations, and claim phrases from packet citations and sufficiency.covered_claims; do not compress exact anchors into comma shorthand that drops their repeated prefix, such as rewriting `CREATE TABLE A` and `CREATE TABLE B` as `CREATE TABLE A and B`. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening_paths, and any post-packet local source reads. Full retrieval is mandatory; if CodeStory is unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
+    "Use the CodeStory packet supplied by the harness as the only repository context. Judge its compiled support units directly. Supported, not_established, and unavailable are terminal. For supported, answer from support. For not_established, answer every directly established part and explicitly name the material gaps without inferring missing links. For unavailable, report the typed availability reason. Drill_once permits exactly one MCP packet continuation with the original question, parent_packet_id, listed option_ids, and the declared core_generation_id/retrieval_generation pins; after that result, apply the same terminal rules and stop. Do not use search, context, trail, snippet, shell, git, or direct source reads as packet recovery. Preserve exact source identifiers and paths from support and citations. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
 };
 
 function usage() {
@@ -139,7 +157,7 @@ function usage() {
   node scripts/codestory-agent-ab-benchmark.mjs --self-test
   node scripts/codestory-agent-ab-benchmark.mjs --reanalyze-dir target/agent-benchmark/<run-dir>
   node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite <suite> [--materialize-repos] [--repeats n]
-  node scripts/codestory-agent-ab-benchmark.mjs [--quick] [--repos names] [--arms names] [--task-suite name] [--task-ids ids] [--task-manifest path] [--include-local-repos] [--repeats n] [--runner codex] [--model model] [--sandbox mode] [--out-dir path] [--timeout-ms ms] [--prepare-codestory-cache] [--allow-failures] [--publishable]
+  node scripts/codestory-agent-ab-benchmark.mjs [--quick] [--repos names] [--arms names] [--task-suite name] [--task-ids ids] [--task-manifest path] [--include-local-repos] [--repeats n] [--runner codex] [--model model] [--sandbox mode] [--out-dir path] [--timeout-ms ms] [--prepare-codestory-cache] [--canary-task-id id] [--shard-count n --shard-index n] [--allow-failures] [--publishable]
 
 Options:
   --list          Print configured benchmark repositories or selected manifest tasks and exit.
@@ -166,7 +184,7 @@ Options:
                   Include local sibling repos in the default non-quick run.
   --repeats       Repeats per repo/arm. Default: 3, or 1 with --quick.
   --runner        Runner command family. Default: codex.
-  --model         Optional model passed to codex exec.
+  --model         Model passed to codex exec. Default: ${DEFAULT_BENCHMARK_MODEL}.
   --sandbox       Codex sandbox mode. Default: workspace-write.
   --out-dir       Output directory. Default: target/agent-benchmark/<timestamp>.
   --timeout-ms    Timeout per runner invocation. Default: 600000.
@@ -179,7 +197,17 @@ Options:
   --no-prepare-codestory-cache
                   Unsupported; retrieval preparation is mandatory.
   --prepare-codestory-jobs
-                  Parallel jobs for CodeStory cache preparation across independent repos. Default: 1.
+                  Parallel jobs for CodeStory cache preparation across independent repos. Default: 2.
+  --canary-task-id
+                  Task to prepare and run first as a real with-CodeStory repeat-1 row. A manifest can declare canary_task_id.
+  --shard-count   Number of deterministic whole-task shards. Default: 1.
+  --shard-index   Zero-based shard index. Default: 0.
+  --aggregate-shards
+                  Comma-separated completed shard directories to validate and aggregate without running agents.
+  --candidate-package-sha256
+                  SHA-256 of the exact installed candidate archive; required for publishable multi-host shards.
+  --collect-all-failures
+                  Diagnostic mode only. Continue after deterministic row failures; incompatible with --publishable.
   --prepare-codestory-timeout-ms
                   Timeout for each pre-run CodeStory index refresh. Default: 1800000.
   --max-source-reads-after-packet
@@ -240,6 +268,12 @@ function parseArgs(argv) {
       "no-prepare-codestory-cache": { type: "boolean" },
       "prepare-codestory-timeout-ms": { type: "string" },
       "prepare-codestory-jobs": { type: "string" },
+      "canary-task-id": { type: "string" },
+      "shard-count": { type: "string" },
+      "shard-index": { type: "string" },
+      "aggregate-shards": { type: "string" },
+      "candidate-package-sha256": { type: "string" },
+      "collect-all-failures": { type: "boolean" },
       "max-source-reads-after-packet": { type: "string" },
     },
   });
@@ -262,18 +296,25 @@ function parseArgs(argv) {
     includeLocalRepos: false,
     repeats: null,
     runner: "codex",
-    model: null,
+    model: DEFAULT_BENCHMARK_MODEL,
     sandbox: "workspace-write",
     outDir: null,
     timeoutMs: 600000,
     jobs: 1,
     reuseBaselineFrom: null,
     prepareCodestoryCache: null,
-    prepareCodestoryJobs: 1,
+    prepareCodestoryJobs: 2,
     prepareCodestoryTimeoutMs: 1_800_000,
     cachePreparationByRepo: null,
     maxSourceReadsAfterPacket: null,
     diagnosticExtraProbesFromManifest: false,
+    canaryTaskId: null,
+    manifestCanaryTaskId: null,
+    shardCount: 1,
+    shardIndex: 0,
+    aggregateShards: null,
+    candidatePackageSha256: null,
+    collectAllFailures: false,
     allowFailures: false,
     publishable: false,
   };
@@ -292,6 +333,14 @@ function parseArgs(argv) {
   opts.publishable = values.publishable === true;
   opts.allowFailures = values["allow-failures"] === true;
   opts.diagnosticExtraProbesFromManifest = values["diagnostic-extra-probes-from-manifest"] === true;
+  opts.canaryTaskId = values["canary-task-id"] ?? null;
+  opts.shardCount = values["shard-count"] == null ? 1 : Number.parseInt(values["shard-count"], 10);
+  opts.shardIndex = values["shard-index"] == null ? 0 : Number.parseInt(values["shard-index"], 10);
+  opts.aggregateShards = values["aggregate-shards"]
+    ? commaSeparatedList(values["aggregate-shards"]).map((entry) => path.resolve(entry))
+    : null;
+  opts.candidatePackageSha256 = values["candidate-package-sha256"] ?? null;
+  opts.collectAllFailures = values["collect-all-failures"] === true;
   opts.includeLocalRepos = values["include-local-repos"] === true;
   opts.materializeRepos = values["materialize-repos"] === true;
   opts.packetRuntime = values["packet-runtime"] === true;
@@ -368,6 +417,24 @@ function parseArgs(argv) {
   if (!Number.isInteger(opts.prepareCodestoryJobs) || opts.prepareCodestoryJobs < 1) {
     throw new Error("--prepare-codestory-jobs must be a positive integer");
   }
+  if (!Number.isInteger(opts.shardCount) || opts.shardCount < 1) {
+    throw new Error("--shard-count must be a positive integer");
+  }
+  if (!Number.isInteger(opts.shardIndex) || opts.shardIndex < 0 || opts.shardIndex >= opts.shardCount) {
+    throw new Error("--shard-index must be zero-based and smaller than --shard-count");
+  }
+  if (opts.publishable && opts.collectAllFailures) {
+    throw new Error("--collect-all-failures is diagnostic-only and cannot be combined with --publishable");
+  }
+  if (opts.candidatePackageSha256 != null) {
+    opts.candidatePackageSha256 = normalizeSha256(
+      opts.candidatePackageSha256,
+      "--candidate-package-sha256",
+    );
+  }
+  if (opts.publishable && opts.shardCount > 1 && !opts.candidatePackageSha256) {
+    throw new Error("publishable multi-host shards require --candidate-package-sha256");
+  }
   if (!["read-only", "workspace-write", "danger-full-access"].includes(opts.sandbox)) {
     throw new Error("--sandbox must be one of: read-only, workspace-write, danger-full-access");
   }
@@ -419,7 +486,7 @@ function selectedBenchmarkChildEnv(opts = {}) {
   return { ...(opts.packetRuntimeChildEnv ?? benchmarkChildEnv(process.env)) };
 }
 
-function runnerCommand(opts, repoPath, prompt) {
+function runnerCommand(opts, repoPath, prompt, arm = null) {
   if (opts.runner !== "codex") {
     return {
       command: opts.runner,
@@ -432,6 +499,10 @@ function runnerCommand(opts, repoPath, prompt) {
   const command = process.platform === "win32" ? "cmd.exe" : "codex";
   const codexArgs = [
     "exec",
+    ...(arm === "without_codestory" ? ["--ignore-user-config"] : []),
+    "--config",
+    'approval_policy="never"',
+    ...PINNED_CODEX_RUNNER_CONFIG.flatMap((value) => ["--config", value]),
     "--json",
     "--ephemeral",
     "--sandbox",
@@ -439,15 +510,53 @@ function runnerCommand(opts, repoPath, prompt) {
     "--cd",
     repoPath,
   ];
-  if (opts.model) {
-    codexArgs.push("--model", opts.model);
-  }
+  codexArgs.push("--model", opts.model ?? DEFAULT_BENCHMARK_MODEL);
   codexArgs.push("-");
   if (process.platform === "win32") {
     assertSafeWindowsCmdArgs(codexArgs);
   }
   const args = process.platform === "win32" ? ["/d", "/s", "/c", "codex.cmd", ...codexArgs] : codexArgs;
   return { command, args, stdin: prompt, killProcessTree: process.platform === "win32" };
+}
+
+function agentRunnerEnv(baseEnv = process.env, codexHome = null) {
+  const env = benchmarkChildEnv(baseEnv);
+  delete env.CODESTORY_CLI;
+  if (codexHome) {
+    env.CODEX_HOME = codexHome;
+  }
+  return env;
+}
+
+async function prepareAgentCodexIsolation(outDir, opts = {}) {
+  const sourceCodexHome = path.resolve(
+    process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex"),
+  );
+  const authPath = path.join(sourceCodexHome, "auth.json");
+  if (!existsSync(authPath)) {
+    throw new Error(`Codex benchmark isolation requires auth.json under ${sourceCodexHome}`);
+  }
+
+  const receipt = {
+    contract: "codestory.agent-benchmark-codex-isolation/v2",
+    codestory_surface: "managed_cli_packet_prelude",
+    with_codestory_config: "normal_user_config",
+    without_codestory_config: "ignore_user_config",
+    shared_auth: true,
+    output_settings_source: "explicit_runner_args",
+    model: opts.model ?? DEFAULT_BENCHMARK_MODEL,
+    runner_config: PINNED_CODEX_RUNNER_CONFIG,
+  };
+  await writeFile(
+    path.join(outDir, "codex-agent-isolation.json"),
+    `${JSON.stringify(receipt, null, 2)}\n`,
+    "utf8",
+  );
+  return {
+    root: null,
+    homes: null,
+    receipt,
+  };
 }
 
 function assertSafeWindowsCmdArgs(args) {
@@ -863,18 +972,38 @@ async function loadTasks(opts) {
   }
 
   const tasks = [];
+  let manifestCanaryTaskId = null;
   for (const filePath of await listManifestFiles(manifestPath)) {
     const raw = await loadJsonFile(filePath);
+    const declaredCanary = !Array.isArray(raw)
+      ? String(raw?.canary_task_id ?? raw?.canaryTaskId ?? "").trim()
+      : "";
     const rows = Array.isArray(raw.tasks) ? raw.tasks : Array.isArray(raw) ? raw : [raw];
+    let selectedRows = 0;
     for (const row of rows) {
       const task = normalizeManifestTask(filePath, row, opts);
       if (!opts.taskSuite || task.suite === opts.taskSuite || row.suite === opts.taskSuite) {
         tasks.push(task);
+        selectedRows += 1;
       }
+    }
+    if (declaredCanary && selectedRows > 0) {
+      validateManifestTaskId(filePath, declaredCanary);
+      if (manifestCanaryTaskId && manifestCanaryTaskId !== declaredCanary) {
+        throw new Error(
+          `Task manifests declare conflicting canary_task_id values: ${manifestCanaryTaskId}, ${declaredCanary}`,
+        );
+      }
+      manifestCanaryTaskId = declaredCanary;
     }
   }
   if (!tasks.length) {
     throw new Error(`Task manifest path contained no tasks: ${manifestPath}`);
+  }
+  opts.manifestCanaryTaskId = manifestCanaryTaskId;
+  opts.canaryTaskId ??= manifestCanaryTaskId;
+  if (opts.canaryTaskId && !tasks.some((task) => task.id === opts.canaryTaskId)) {
+    throw new Error(`Canary task '${opts.canaryTaskId}' was not found in the selected task manifest`);
   }
   if (opts.taskIds?.length) {
     const wanted = new Set(opts.taskIds);
@@ -887,6 +1016,18 @@ async function loadTasks(opts) {
     return filtered;
   }
   return tasks;
+}
+
+function taskShardIndex(taskId, shardCount) {
+  if (!Number.isInteger(shardCount) || shardCount < 1) {
+    throw new Error("shardCount must be a positive integer");
+  }
+  const prefix = createHash("sha256").update(String(taskId)).digest("hex").slice(0, 12);
+  return Number.parseInt(prefix, 16) % shardCount;
+}
+
+function tasksForShard(tasks, shardCount, shardIndex) {
+  return tasks.filter((task) => taskShardIndex(task.id, shardCount) === shardIndex);
 }
 
 function sortedUniqueStrings(values, label) {
@@ -1050,8 +1191,20 @@ function validatePublishableShape(opts, tasks) {
 }
 
 async function runProcess(command, args, options = {}) {
+  if (options.signal?.aborted) {
+    return {
+      status: "aborted",
+      exitCode: null,
+      signal: null,
+      stdout: "",
+      stderr: `${options.abortMessage ?? "Process aborted by benchmark fail-fast."}\n`,
+      error: null,
+      timedOut: false,
+      aborted: true,
+    };
+  }
   return await new Promise((resolve) => {
-    const child = spawn(command, args, {
+    const child = (options.spawnProcess ?? spawn)(command, args, {
       cwd: options.cwd,
       env: options.env ?? process.env,
       shell: false,
@@ -1061,20 +1214,41 @@ async function runProcess(command, args, options = {}) {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let aborted = false;
     let settled = false;
     let forceKillTimer = null;
+    const terminate = (signal, message = null) => {
+      if (message) {
+        stderr += `\n${message}\n`;
+      }
+      terminateProcess(child, signal, options);
+      const forceKillAfterMs = options.forceKillAfterMs ?? 5000;
+      if (forceKillAfterMs > 0 && signal !== "SIGKILL") {
+        forceKillTimer ??= setTimeout(
+          () => terminateProcess(child, "SIGKILL", options),
+          forceKillAfterMs,
+        );
+      }
+    };
+    const onAbort = () => {
+      if (settled || aborted || timedOut) {
+        return;
+      }
+      aborted = true;
+      terminate("SIGTERM", options.abortMessage ?? "Process aborted by benchmark fail-fast.");
+    };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) {
+      onAbort();
+    }
     const timeoutTimer = options.timeoutMs
       ? setTimeout(() => {
+          if (settled || aborted) {
+            return;
+          }
           timedOut = true;
           const message = options.timeoutMessage ?? `Process timed out after ${options.timeoutMs}ms.`;
-          stderr += `\n${message}\n`;
-          terminateProcess(child, "SIGTERM", options);
-          if (options.forceKillAfterMs) {
-            forceKillTimer = setTimeout(
-              () => terminateProcess(child, "SIGKILL", options),
-              options.forceKillAfterMs,
-            );
-          }
+          terminate("SIGTERM", message);
         }, options.timeoutMs)
       : null;
     function finish(payload) {
@@ -1088,7 +1262,8 @@ async function runProcess(command, args, options = {}) {
       if (forceKillTimer) {
         clearTimeout(forceKillTimer);
       }
-      resolve({ timedOut, ...payload });
+      options.signal?.removeEventListener("abort", onAbort);
+      resolve({ timedOut, aborted, ...payload });
     }
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
@@ -1101,7 +1276,7 @@ async function runProcess(command, args, options = {}) {
     }
     child.on("error", (error) => {
       finish({
-        status: timedOut ? "timeout" : "error",
+        status: timedOut ? "timeout" : aborted ? "aborted" : "error",
         exitCode: null,
         signal: null,
         stdout,
@@ -1111,7 +1286,7 @@ async function runProcess(command, args, options = {}) {
     });
     child.on("close", (exitCode, signal) => {
       finish({
-        status: timedOut ? "timeout" : exitCode === 0 ? "pass" : "fail",
+        status: timedOut ? "timeout" : aborted ? "aborted" : exitCode === 0 ? "pass" : "fail",
         exitCode,
         signal,
         stdout,
@@ -1139,6 +1314,43 @@ async function parallelMap(items, jobs, mapper) {
     }),
   );
   return results;
+}
+
+function createAsyncQueue() {
+  const values = [];
+  const waiters = [];
+  let closed = false;
+  return {
+    push(value) {
+      if (closed) {
+        throw new Error("cannot push to a closed queue");
+      }
+      const waiter = waiters.shift();
+      if (waiter) {
+        waiter(value);
+      } else {
+        values.push(value);
+      }
+    },
+    async shift() {
+      if (values.length) {
+        return values.shift();
+      }
+      if (closed) {
+        return null;
+      }
+      return await new Promise((resolve) => waiters.push(resolve));
+    },
+    close() {
+      closed = true;
+      while (waiters.length) {
+        waiters.shift()(null);
+      }
+    },
+    remaining() {
+      return [...values];
+    },
+  };
 }
 
 function terminateProcess(child, signal, options = {}) {
@@ -1201,12 +1413,19 @@ function assertManifestRepoMaterializationAllowed(tasks, opts = {}) {
   }
 }
 
-async function gitCheckedOutput(args, cwd, timeoutMs) {
-  const result = await runCheckedProcess("git", args, { cwd, timeoutMs });
+async function gitCheckedOutput(args, cwd, options = {}) {
+  const normalizedOptions = typeof options === "number"
+    ? { timeoutMs: options }
+    : options;
+  const result = await runCheckedProcess("git", args, {
+    ...normalizedOptions,
+    cwd,
+  });
   return result.stdout.trim();
 }
 
 async function installCodestoryProjectManifest(config, checkoutPath, opts) {
+  opts.signal?.throwIfAborted();
   const manifest = config.manifest_codestory_project_manifest ?? null;
   if (!manifest) {
     return null;
@@ -1224,7 +1443,11 @@ async function installCodestoryProjectManifest(config, checkoutPath, opts) {
   }
   const tracked = await runProcess("git", ["-C", checkoutPath, "ls-files", "--error-unmatch", "--", relativeDestination], {
     timeoutMs: opts.timeoutMs,
+    signal: opts.signal,
+    spawnProcess: opts.spawnProcess,
+    forceKillAfterMs: opts.forceKillAfterMs,
   });
+  opts.signal?.throwIfAborted();
   if (tracked.exitCode === 0) {
     throw new Error(`Refusing to replace upstream-tracked ${relativeDestination} in ${config.name}`);
   }
@@ -1247,8 +1470,14 @@ async function installCodestoryProjectManifest(config, checkoutPath, opts) {
   if (installedSha256 !== manifest.sha256) {
     throw new Error(`Installed CodeStory project manifest hash mismatch for ${config.name}`);
   }
-  await gitCheckedOutput(["-C", checkoutPath, "check-ignore", "-q", "--", relativeDestination], repoRoot, opts.timeoutMs);
-  const dirty = await gitCheckedOutput(["-C", checkoutPath, "status", "--porcelain"], repoRoot, opts.timeoutMs);
+  const gitOptions = {
+    timeoutMs: opts.timeoutMs,
+    signal: opts.signal,
+    spawnProcess: opts.spawnProcess,
+    forceKillAfterMs: opts.forceKillAfterMs,
+  };
+  await gitCheckedOutput(["-C", checkoutPath, "check-ignore", "-q", "--", relativeDestination], repoRoot, gitOptions);
+  const dirty = await gitCheckedOutput(["-C", checkoutPath, "status", "--porcelain"], repoRoot, gitOptions);
   if (dirty) {
     throw new Error(`Installing CodeStory project manifest dirtied ${config.name}: ${dirty}`);
   }
@@ -1262,21 +1491,27 @@ async function installCodestoryProjectManifest(config, checkoutPath, opts) {
 }
 
 async function scrubMaterializedCheckout(config, checkoutPath, opts) {
-  await runCheckedProcess("git", ["-C", checkoutPath, "reset", "--hard", config.ref], {
+  const processOptions = {
     timeoutMs: opts.timeoutMs,
+    signal: opts.signal,
+    spawnProcess: opts.spawnProcess,
+    forceKillAfterMs: opts.forceKillAfterMs,
+  };
+  await runCheckedProcess("git", ["-C", checkoutPath, "reset", "--hard", config.ref], {
+    ...processOptions,
   });
   await runCheckedProcess("git", ["-C", checkoutPath, "clean", "-ffdqx"], {
-    timeoutMs: opts.timeoutMs,
+    ...processOptions,
   });
-  const head = (await gitCheckedOutput(["-C", checkoutPath, "rev-parse", "HEAD"], repoRoot, opts.timeoutMs)).toLowerCase();
+  const head = (await gitCheckedOutput(["-C", checkoutPath, "rev-parse", "HEAD"], repoRoot, processOptions)).toLowerCase();
   if (head !== String(config.ref).toLowerCase()) {
     throw new Error(`Materialized repo ${config.name} HEAD ${head} does not match pinned ref ${config.ref}`);
   }
-  const dirty = await gitCheckedOutput(["-C", checkoutPath, "status", "--porcelain"], repoRoot, opts.timeoutMs);
+  const dirty = await gitCheckedOutput(["-C", checkoutPath, "status", "--porcelain"], repoRoot, processOptions);
   if (dirty) {
     throw new Error(`Materialized repo ${config.name} is dirty after scrub: ${dirty}`);
   }
-  const remaining = await gitCheckedOutput(["-C", checkoutPath, "clean", "-ffdqx", "-n"], repoRoot, opts.timeoutMs);
+  const remaining = await gitCheckedOutput(["-C", checkoutPath, "clean", "-ffdqx", "-n"], repoRoot, processOptions);
   if (remaining) {
     throw new Error(`Materialized repo ${config.name} retains untracked or ignored files after scrub: ${remaining}`);
   }
@@ -1290,6 +1525,13 @@ async function materializeRepos(tasks, opts) {
   }
   await mkdir(opts.repoCacheDir, { recursive: true });
   for (const [name, config] of repos) {
+    opts.signal?.throwIfAborted();
+    const processOptions = {
+      timeoutMs: opts.timeoutMs,
+      signal: opts.signal,
+      spawnProcess: opts.spawnProcess,
+      forceKillAfterMs: opts.forceKillAfterMs,
+    };
     const checkoutPath = path.resolve(config.checkout_path ?? path.join(opts.repoCacheDir, name));
     assertPathInside(opts.repoCacheDir, checkoutPath, "Materialized repo checkout path");
     assertPathInside(checkoutPath, config.path, `Materialized repo workspace path for ${name}`);
@@ -1297,11 +1539,11 @@ async function materializeRepos(tasks, opts) {
       await mkdir(path.dirname(checkoutPath), { recursive: true });
       console.log(`cloning ${name} ${redactUrlForDisplay(config.url)} -> ${checkoutPath}`);
       await runCheckedProcess("git", ["clone", "--filter=blob:none", "--no-checkout", config.url, checkoutPath], {
-        timeoutMs: opts.timeoutMs,
+        ...processOptions,
       });
     } else {
       const remote = await runCheckedProcess("git", ["-C", checkoutPath, "remote", "get-url", "origin"], {
-        timeoutMs: opts.timeoutMs,
+        ...processOptions,
       });
       if (remote.stdout.trim() !== config.url) {
         throw new Error(
@@ -1311,10 +1553,10 @@ async function materializeRepos(tasks, opts) {
     }
     console.log(`fetching ${name} ref ${config.ref}`);
     await runCheckedProcess("git", ["-C", checkoutPath, "fetch", "--depth=1", "origin", config.ref], {
-      timeoutMs: opts.timeoutMs,
+      ...processOptions,
     });
     await runCheckedProcess("git", ["-C", checkoutPath, "checkout", "--detach", "FETCH_HEAD"], {
-      timeoutMs: opts.timeoutMs,
+      ...processOptions,
     });
     await scrubMaterializedCheckout(config, checkoutPath, opts);
     if (!existsSync(config.path)) {
@@ -1334,7 +1576,7 @@ Task class: ${task.task_class ?? "unspecified"}`
     armName === "with_codestory"
       ? packetFirstCommandForPrompt(taskPrompt, task)
       : null;
-  const packetFirstBlock = packetFirstCommand
+  const packetFirstBlock = packetFirstCommand && !context.codestoryPrelude?.packet
     ? `
 Required first repository-context command:
 \`\`\`${packetFirstCommandFenceLanguage()}
@@ -1345,11 +1587,8 @@ Run that answer packet before any repository search, direct source read, git com
     : "";
   const stopContractBlock =
     armName === "with_codestory"
-      ? packetPreludeManifestComplete(context.codestoryPrelude?.public)
-        ? `
-The harness verified the CodeStory packet against this task manifest before starting you. Treat the packet as complete for this benchmark row even if its generic sufficiency status is partial. Do not run follow-up commands, ordinary source reads, \`rg\`, \`grep\`, \`git show\`, or file-open commands before answering.`
-        : `
-If the packet reports \`sufficiency.status: "sufficient"\` with no \`sufficiency.follow_up_commands\`, do not run ordinary source reads, \`rg\`, \`grep\`, \`git show\`, or file-open commands afterward. If the packet is partial or packet manifest quality is incomplete, close gaps with listed CodeStory follow-ups first; ordinary local source reads are allowed only after CodeStory attempts and count as post-packet overhead.`
+      ? `
+The packet's own \`disposition\` is the complete control contract. The benchmark's expected-answer manifest is never shown to you and does not authorize extra retrieval. Stop on \`supported\`, \`not_established\`, or \`unavailable\`. A \`not_established\` packet can still contain directly useful support: answer those established parts, identify the material gaps, and do not infer the missing links. On \`drill_once\`, execute exactly the declared one-shot packet continuation, apply the same terminal answer rule, and then stop regardless of its result.`
       : "";
   const harnessPacketBlock = packetPreludePromptBlock(context.codestoryPrelude);
   const baselineContextBlock = baselinePreludePromptBlock(context.baselinePrelude);
@@ -1381,38 +1620,25 @@ function packetFirstCommandForPrompt(taskPrompt, task = null, platform = process
     ? ` --task-class ${shellSingleQuoted(validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"), platform)}`
     : "";
   if (platform === "win32") {
-    return `& $env:CODESTORY_CLI packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget compact --format json`;
+    return `& $env:CODESTORY_CLI packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget standard --format json`;
   }
-  return `"$CODESTORY_CLI" packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget compact --format json`;
+  return `"$CODESTORY_CLI" packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget standard --format json`;
 }
 
 function packetPreludePromptBlock(prelude) {
   if (!prelude?.packet) {
     return "";
   }
-  const supportPaths = packetSupportPaths(prelude.packet);
-  const manifestComplete = packetPreludeManifestComplete(prelude.public);
-  const manifestBlock = manifestComplete
-    ? `
-Benchmark manifest coverage: complete. The harness matched this packet against the task's expected files, symbols, claims, and citations. Do not spend tokens trying follow-up commands for this row; answer from the packet.`
-    : prelude.public?.packet_manifest_quality
-      ? `
-Benchmark manifest coverage: incomplete. Packet manifest quality was ${JSON.stringify(prelude.public.packet_manifest_quality)}. Use the packet first, then close missing anchors with CodeStory follow-ups before any ordinary local source reads.`
-    : "";
-  const supportPathBlock = supportPaths.length
-    ? `
-CodeStory support paths extracted from the packet:
-${supportPaths.map((filePath) => `- ${filePath}`).join("\n")}`
-    : "";
   return `
 The benchmark harness already ran the required first repository-context command before starting you:
 \`\`\`${packetFirstCommandFenceLanguage()}
 ${prelude.public.command}
 \`\`\`
 
-Use this packet as the first CodeStory context source. If \`sufficiency.status\` is \`"sufficient"\` and \`sufficiency.follow_up_commands\` is empty, answer from this packet without ordinary source reads. Preserve exact source identifiers and covered-claim phrases from \`sufficiency.covered_claims\` and citation display names. Do not merge repeated exact anchors into shorthand that drops required prefixes; write each exact anchor independently when naming declarations, tables, symbols, or source-defined selectors. Include a compact \`Support files\` section with the packet citation and avoid-opening paths.
-${manifestBlock}
-${supportPathBlock}
+Use the compiled \`support\` units as evidence and obey only \`disposition\` for
+control flow. The task manifest is withheld and has no effect on whether you
+continue. Do not repeat the initial packet call. Preserve exact source
+identifiers and paths from support summaries and citations.
 
 CodeStory packet JSON excerpt:
 \`\`\`json
@@ -1425,21 +1651,15 @@ function packetForAgentPrompt(packet) {
     return packet;
   }
   return {
+    packet_id: packet.packet_id ?? null,
+    question: packet.question ?? null,
+    support: Array.isArray(packet.support) ? packet.support : [],
+    disposition: packet.disposition ?? null,
     answer: packet.answer
       ? {
           summary: packet.answer.summary ?? null,
           text: truncatePacketPromptText(packetAnswerText(packet), 4000),
           citations: (packet.answer.citations ?? []).map(leanPacketCitation),
-        }
-      : null,
-    sufficiency: packet.sufficiency
-      ? {
-          status: packet.sufficiency.status ?? null,
-          covered_claims: (packet.sufficiency.covered_claims ?? [])
-            .map((claim) => String(claim?.claim ?? "").trim())
-            .filter(Boolean),
-          avoid_opening: packetAvoidOpeningRawPaths(packet),
-          follow_up_commands: (packet.sufficiency.follow_up_commands ?? []).slice(0, 4),
         }
       : null,
   };
@@ -1450,15 +1670,10 @@ function packetPreludeManifestComplete(publicPrelude) {
   if (!quality?.pass) {
     return false;
   }
-  const sufficiency = publicPrelude?.packet_sufficiency;
-  const followUps = presentFiniteNumber(
-    sufficiency?.follow_up_commands_count ?? sufficiency?.follow_up_commands?.length,
-  );
-  if (
-    !sufficiency ||
-    sufficiency.status !== "sufficient" ||
-    followUps !== 0
-  ) {
+  if (publicPrelude?.packet_disposition_kind !== "supported") {
+    return false;
+  }
+  if ((presentFiniteNumber(publicPrelude?.packet_support_count) ?? 0) <= 0) {
     return false;
   }
   const composition = publicPrelude?.packet_composition;
@@ -1486,8 +1701,8 @@ function packetManifestQualitySummary(packet, task) {
     )
     .filter(Boolean)
     .join("\n");
-  const claimText = (packet.sufficiency?.covered_claims ?? [])
-    .map((claim) => String(claim?.claim ?? "").trim())
+  const claimText = (packet.support ?? [])
+    .map((support) => String(support?.summary ?? "").trim())
     .filter(Boolean)
     .join("\n");
   const text = [
@@ -1747,8 +1962,8 @@ function normalizePathLike(value) {
     .replace(/(?:['"])+$/, "")
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
-    .replace(/^\?\/(?=[A-Za-z]:\/)/, "")
-    .replace(/^\.?\//, "");
+    .replace(/^\/\?\/(?=[A-Za-z]:\/)/, "")
+    .replace(/^\.\//, "");
 }
 
 function pathMatchesLike(actual, expected) {
@@ -1902,9 +2117,61 @@ function isPathInsideProject(filePath, projectRoot) {
   return normalized === root || normalized.startsWith(`${root}/`);
 }
 
+function interactionTurnTelemetry(events) {
+  let modelMessages = 0;
+  let toolActions = 0;
+  let failedToolActions = 0;
+  let reasoningItemsExcluded = 0;
+  let errorItemsExcluded = 0;
+  for (const event of events) {
+    const eventType = String(event?.type ?? event?.event ?? "").toLowerCase();
+    if (!(eventType === "item.completed" || eventType.endsWith(".completed"))) {
+      continue;
+    }
+    const item = itemOf(event);
+    const itemType = String(item.type ?? "").toLowerCase();
+    if (itemType === "reasoning") {
+      reasoningItemsExcluded += 1;
+      continue;
+    }
+    if (itemType === "error") {
+      errorItemsExcluded += 1;
+      continue;
+    }
+    if (itemType === "agent_message") {
+      modelMessages += 1;
+      continue;
+    }
+    if (isToolType(itemType)) {
+      toolActions += 1;
+      if (
+        item.error != null ||
+        event.error != null ||
+        String(item.status ?? "completed").toLowerCase() === "failed"
+      ) {
+        failedToolActions += 1;
+      }
+    }
+  }
+  return {
+    total: modelMessages + toolActions,
+    model_messages: modelMessages,
+    tool_actions: toolActions,
+    failed_tool_actions: failedToolActions,
+    reasoning_items_excluded: reasoningItemsExcluded,
+    error_items_excluded: errorItemsExcluded,
+    taxonomy: "completed_agent_messages_plus_tool_actions_v1",
+  };
+}
+
 function analyzeTranscript(events, projectRoot = null) {
   const commands = extractCommandExecutions(events);
   const toolCategories = toolCallCategories(events);
+  const codestoryMcpToolCalls = events.filter(isCodeStoryMcpToolCallStartEvent);
+  const codestoryMcpCompletedCalls = events.filter(isSuccessfulCodeStoryMcpToolCallEvent);
+  const codestoryMcpRuntimeIdentities = codestoryMcpCompletedCalls
+    .map(codeStoryMcpRuntimeIdentity)
+    .filter(Boolean);
   const commandCategories = {};
   const outputCharsByCategory = {};
   const directFileReads = [];
@@ -1944,7 +2211,11 @@ function analyzeTranscript(events, projectRoot = null) {
       : sourceReads.filter((read) => (read.event_index ?? -1) > (first.completed_event_index ?? first.started_event_index ?? -1)).length;
 
   return {
+    interaction_turns: interactionTurnTelemetry(events),
     tool_categories: toolCategories,
+    codestory_mcp_tool_calls_observed: codestoryMcpToolCalls.length,
+    codestory_mcp_completed_calls_observed: codestoryMcpCompletedCalls.length,
+    codestory_mcp_runtime_identities: codestoryMcpRuntimeIdentities,
     external_context_tool_calls: toolCategories.web_search ?? 0,
     command_categories: commandCategories,
     command_count: commands.length,
@@ -1983,6 +2254,130 @@ function analyzeTranscript(events, projectRoot = null) {
     ordinary_source_reads_after_first_packet: afterIndex(firstSuccessfulPacket),
     final_answer_chars: extractFinalAnswer(events).length,
   };
+}
+
+function isCodeStoryMcpToolCallEvent(event) {
+  const item = itemOf(event);
+  return (
+    String(item.type ?? "").toLowerCase() === "mcp_tool_call" &&
+    String(item.server ?? event?.server ?? "").trim().toLowerCase() === "codestory"
+  );
+}
+
+function isCodeStoryMcpToolCallStartEvent(event) {
+  return isToolCallStartEvent(event) && isCodeStoryMcpToolCallEvent(event);
+}
+
+function isSuccessfulCodeStoryMcpToolCallEvent(event) {
+  if (!isCodeStoryMcpToolCallEvent(event)) {
+    return false;
+  }
+  const eventType = String(event.type ?? event.event ?? "").toLowerCase();
+  if (!(eventType === "item.completed" || eventType.endsWith(".completed"))) {
+    return false;
+  }
+  const item = itemOf(event);
+  const result = item.result ?? event.result ?? null;
+  return (
+    result != null &&
+    item.error == null &&
+    event.error == null &&
+    String(item.status ?? "completed").toLowerCase() !== "failed" &&
+    !(result && typeof result === "object" && result.isError === true)
+  );
+}
+
+function codeStoryMcpRuntimeIdentity(event) {
+  const item = itemOf(event);
+  const runtime = findCodeStoryRuntimeIdentity(item.result ?? event.result ?? null);
+  if (!runtime) {
+    return null;
+  }
+  return {
+    plugin_version: runtime.plugin_version ?? null,
+    plugin_cli_version: runtime.plugin_cli_version ?? null,
+    cli_version: runtime.cli_version ?? null,
+    cli_sha256: runtime.cli_sha256 ?? null,
+    cli_source: runtime.cli_source ?? null,
+    pinned_pair_matches: runtime.pinned_pair_matches ?? null,
+    known_override_skew_channel: runtime.known_override_skew_channel ?? null,
+  };
+}
+
+function codeStoryBinaryIdentity(preludeCliSha256, analysis) {
+  const preludeSha = String(preludeCliSha256 ?? "").trim().toLowerCase();
+  const completedCalls = analysis?.codestory_mcp_completed_calls_observed ?? 0;
+  const identities = analysis?.codestory_mcp_runtime_identities ?? [];
+  const declaredMcpShas = identities
+    .map((identity) => String(identity?.cli_sha256 ?? "").trim().toLowerCase())
+    .filter(Boolean);
+  const uniqueMcpShas = [...new Set(declaredMcpShas)].sort();
+  let status;
+  if (!SHA256_PATTERN.test(preludeSha)) {
+    status = "prelude_sha_missing_or_invalid";
+  } else if (completedCalls === 0) {
+    status = "prelude_only";
+  } else if (
+    declaredMcpShas.length < completedCalls ||
+    declaredMcpShas.some((sha) => !SHA256_PATTERN.test(sha))
+  ) {
+    status = "mcp_sha_missing_or_invalid";
+  } else if (uniqueMcpShas.length === 1 && uniqueMcpShas[0] === preludeSha) {
+    status = "exact_match";
+  } else {
+    status = "mismatch";
+  }
+  return {
+    status,
+    exact_match: status === "exact_match",
+    prelude_cli_sha256: SHA256_PATTERN.test(preludeSha) ? preludeSha : null,
+    completed_mcp_calls: completedCalls,
+    mcp_identities_observed: identities.length,
+    mcp_cli_sha256_values: uniqueMcpShas,
+  };
+}
+
+function findCodeStoryRuntimeIdentity(value, depth = 0) {
+  if (depth > 6 || value == null) {
+    return null;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!(trimmed.startsWith("{") || trimmed.startsWith("["))) {
+      return null;
+    }
+    try {
+      return findCodeStoryRuntimeIdentity(JSON.parse(trimmed), depth + 1);
+    } catch {
+      return null;
+    }
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const identity = findCodeStoryRuntimeIdentity(entry, depth + 1);
+      if (identity) {
+        return identity;
+      }
+    }
+    return null;
+  }
+  if (typeof value !== "object") {
+    return null;
+  }
+  const direct = value?._meta?.codestory_publication?.contract_runtime;
+  if (direct && typeof direct === "object") {
+    return direct;
+  }
+  for (const key of ["structuredContent", "structured_content", "content", "data", "output", "text"]) {
+    if (!(key in value)) {
+      continue;
+    }
+    const identity = findCodeStoryRuntimeIdentity(value[key], depth + 1);
+    if (identity) {
+      return identity;
+    }
+  }
+  return null;
 }
 
 function toolCallCategory(event) {
@@ -2109,9 +2504,12 @@ const CLAIM_STOPWORDS = new Set([
   "and",
   "are",
   "before",
+  "for",
   "from",
   "into",
+  "is",
   "later",
+  "or",
   "that",
   "the",
   "then",
@@ -2122,8 +2520,50 @@ const CLAIM_STOPWORDS = new Set([
 function claimTokens(value) {
   return normalizeSearchText(value)
     .split(/[^a-z0-9_:.]+/)
-    .map((token) => token.trim())
+    .map((token) => token.trim().replace(/^[.:]+|[.:]+$/g, ""))
     .filter((token) => token.length >= 3 && !CLAIM_STOPWORDS.has(token));
+}
+
+function positiveClaimTokenVariants(token) {
+  const variants = new Set([token]);
+  if (token.length >= 5 && token.endsWith("ies")) {
+    variants.add(`${token.slice(0, -3)}y`);
+  }
+  if (token.length >= 5 && token.endsWith("ing")) {
+    variants.add(token.slice(0, -3));
+    variants.add(`${token.slice(0, -3)}e`);
+  }
+  if (token.length >= 4 && token.endsWith("ed")) {
+    variants.add(token.slice(0, -2));
+    variants.add(token.slice(0, -1));
+  }
+  if (token.length >= 4 && token.endsWith("es")) {
+    variants.add(token.slice(0, -2));
+    variants.add(token.slice(0, -1));
+  }
+  if (token.length >= 4 && token.endsWith("s")) {
+    variants.add(token.slice(0, -1));
+  }
+  return variants;
+}
+
+function positiveClaimTokenMatched(token, haystackTokens) {
+  const expectedVariants = positiveClaimTokenVariants(token);
+  for (const candidate of haystackTokens) {
+    for (const expected of expectedVariants) {
+      for (const observed of positiveClaimTokenVariants(candidate)) {
+        if (
+          expected === observed ||
+          (expected.length >= 5 &&
+            observed.length >= 5 &&
+            (observed.includes(expected) || expected.includes(observed)))
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 function claimTokenMatched(token, haystackTokens) {
@@ -2147,9 +2587,15 @@ function claimMatched(haystack, claim) {
     return false;
   }
   const haystackTokens = new Set(claimTokens(haystack));
-  const matched = expectedTokens.filter((token) => claimTokenMatched(token, haystackTokens)).length;
+  const matched = expectedTokens.filter((token) =>
+    positiveClaimTokenMatched(token, haystackTokens),
+  ).length;
   const ratio = matched / expectedTokens.length;
-  return matched >= Math.min(4, expectedTokens.length) && ratio >= 0.65;
+  // Positive quality claims are short semantic summaries, not exact-string fixtures. Three
+  // independently matched content words plus 60% coverage accepts ordinary inflection and
+  // paraphrase while still rejecting a sentence that merely repeats one symbol name. Forbidden
+  // claims retain the stricter polarity-aware matcher below.
+  return matched >= Math.min(3, expectedTokens.length) && ratio >= 0.6;
 }
 
 const FORBIDDEN_POLARITY_TERMS = new Set([
@@ -2500,7 +2946,7 @@ function packetCommandArgs(repoConfig, task, opts = {}) {
     "--question",
     task?.prompt ?? repoConfig.prompt,
     "--budget",
-    "compact",
+    "standard",
     "--format",
     "json",
   ];
@@ -2544,13 +2990,16 @@ function preludePublicFields(prelude) {
     stdout_bytes: prelude.stdout_bytes,
     stderr_bytes: prelude.stderr_bytes,
     packet_parse_error: prelude.packet_parse_error,
-    packet_sufficiency_status: prelude.packet_sufficiency_status,
-    packet_sufficiency: prelude.packet_sufficiency ?? null,
+    packet_disposition_kind: prelude.packet_disposition_kind ?? null,
+    packet_disposition: prelude.packet_disposition ?? null,
+    packet_support_count: prelude.packet_support_count ?? null,
+    packet_support_kind_counts: prelude.packet_support_kind_counts ?? null,
     packet_citation_count: prelude.packet_citation_count,
     packet_avoid_opening_count: prelude.packet_avoid_opening_count,
     packet_latency: prelude.packet_latency,
     packet_composition: prelude.packet_composition,
     packet_manifest_quality: prelude.packet_manifest_quality,
+    packet_contract_runtime: prelude.packet_contract_runtime ?? null,
     packet_extra_probe_count: prelude.packet_extra_probe_count ?? null,
     packet_extra_probe_strategy: prelude.packet_extra_probe_strategy ?? null,
   };
@@ -2907,6 +3356,7 @@ async function runBaselinePrelude(opts, run, repoConfig, outDir, runId) {
   const result = await runProcess("rg", args, {
     cwd: repoConfig.path,
     env,
+    signal: opts.signal,
     timeoutMs: Math.min(opts.timeoutMs ?? 60_000, 60_000),
     timeoutMessage: "Baseline repository search timed out after 60000ms.",
   });
@@ -2977,7 +3427,353 @@ async function runBaselinePrelude(opts, run, repoConfig, outDir, runId) {
   };
 }
 
-async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, codestoryCli) {
+function packetGraphEdgeOccurrences(packet) {
+  return (packet?.answer?.graphs ?? []).reduce(
+    (count, artifact) => count + (Array.isArray(artifact?.graph?.edges) ? artifact.graph.edges.length : 0),
+    0,
+  );
+}
+
+function packetUniqueCitationFileCount(packet) {
+  return new Set(
+    (packet?.answer?.citations ?? [])
+      .filter((citation) => typeof citation?.file_path === "string")
+      .map((citation) => citation.file_path),
+  ).size;
+}
+
+function packetSourceReadSnippetCount(packet) {
+  return (packet?.answer?.retrieval_trace?.steps ?? []).filter(
+    (step) => step?.kind === "source_read" && step?.status === "ok",
+  ).length;
+}
+
+function packetFollowUpCount(packet) {
+  const invocations = packet?.sufficiency?.follow_up_invocations;
+  const commands = packet?.sufficiency?.follow_up_commands;
+  return Math.max(
+    Array.isArray(invocations) ? invocations.length : 0,
+    Array.isArray(commands) ? commands.length : 0,
+  );
+}
+
+function managedRuntimeIdentityBlockers(identity, label) {
+  const versionMatches = [
+    identity?.plugin_version,
+    identity?.plugin_cli_version,
+    identity?.cli_version,
+  ].every((version) => version === REQUIRED_MANAGED_CODESTORY_VERSION);
+  return versionMatches &&
+    identity?.pinned_pair_matches === true &&
+    identity?.cli_source === "managed" &&
+    identity?.known_override_skew_channel === false
+    ? []
+    : [`${label} runtime identity is not managed ${REQUIRED_MANAGED_CODESTORY_VERSION}: ${JSON.stringify(identity ?? null)}`];
+}
+
+function packetMaterialObligationBucket(obligation) {
+  if (String(obligation?.proof_status ?? "").trim().toLowerCase() === "proven") {
+    return "proven";
+  }
+  const reason = String(obligation?.reason ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!reason) {
+    return "missing_reason";
+  }
+  if (reason.startsWith("requested_claim_binding_limit_exceeded")) {
+    return "requested_claim_binding_limit_exceeded";
+  }
+  if ([
+    "packet_budget_truncated",
+    "carrier_not_sufficiency_eligible",
+    "carrier_does_not_satisfy_role_contract",
+    "required_evidence_edge_missing",
+  ].includes(reason)) {
+    return reason;
+  }
+  return `unclassified_reason:${reason}`;
+}
+
+function packetObligationAccounting(packet) {
+  const obligations = packet?.plan?.obligations?.claim_obligations;
+  if (!Array.isArray(obligations)) {
+    return null;
+  }
+  let material = 0;
+  let nonmaterial = 0;
+  const materialStatusBuckets = new Map();
+  for (const obligation of obligations) {
+    if (obligation?.material === true) {
+      material += 1;
+      const bucket = packetMaterialObligationBucket(obligation);
+      materialStatusBuckets.set(bucket, (materialStatusBuckets.get(bucket) ?? 0) + 1);
+    } else if (obligation?.material === false) {
+      nonmaterial += 1;
+    }
+  }
+  return {
+    total: obligations.length,
+    material,
+    nonmaterial,
+    material_status_buckets: Object.fromEntries(
+      [...materialStatusBuckets.entries()].sort(([left], [right]) =>
+        left < right ? -1 : left > right ? 1 : 0
+      ),
+    ),
+  };
+}
+
+function packetObligationAccountingError(accounting, label = "packet obligations") {
+  if (!accounting || typeof accounting !== "object" || Array.isArray(accounting)) {
+    return `${label} accounting is missing`;
+  }
+  if (["total", "material", "nonmaterial"].some(
+    (field) => !Number.isInteger(accounting[field]) || accounting[field] < 0
+  )) {
+    return `${label} counts are missing or invalid`;
+  }
+  const buckets = accounting.material_status_buckets;
+  if (!buckets || typeof buckets !== "object" || Array.isArray(buckets)) {
+    return `${label} material status buckets are missing or invalid`;
+  }
+  const bucketEntries = Object.entries(buckets);
+  if (bucketEntries.some(([status, count]) =>
+    !status || !Number.isInteger(count) || count < 0
+  )) {
+    return `${label} material status buckets are invalid`;
+  }
+  if (accounting.total !== accounting.material + accounting.nonmaterial) {
+    return `${label} total=${accounting.total} does not reconcile with material=${accounting.material} + nonmaterial=${accounting.nonmaterial}`;
+  }
+  const materialStatusTotal = bucketEntries.reduce((sum, [, count]) => sum + count, 0);
+  return accounting.material === materialStatusTotal
+    ? null
+    : `${label} material=${accounting.material} does not reconcile with material status buckets=${materialStatusTotal}`;
+}
+
+function resultPacketObligationAccounting(result) {
+  return result?.sufficiency?.obligation_accounting ??
+    result?.codestory_harness_prelude?.packet_sufficiency?.obligation_accounting ??
+    null;
+}
+
+function resultRequiresPacketObligationAccounting(result) {
+  if (result?.arm !== "with_codestory" && result?.mode == null) {
+    return false;
+  }
+  const prelude = result?.codestory_harness_prelude;
+  if (
+    result?.disposition != null ||
+    prelude?.packet_disposition != null ||
+    prelude?.packet_disposition_kind != null
+  ) {
+    return false;
+  }
+  const packetEvidencePresent =
+    result?.sufficiency != null ||
+    result?.packet_shape != null ||
+    result?.packet_latency != null ||
+    result?.packet_composition != null ||
+    prelude?.packet_sufficiency != null;
+  if (packetEvidencePresent) {
+    return true;
+  }
+  // Missing legacy status stays fail-closed because it cannot prove that no packet was emitted.
+  // Only an explicitly failed/cancelled row with no bounded packet evidence is exempt: fail-fast
+  // siblings can be stopped before their packet process begins and therefore own no accounting.
+  return result?.status == null || result.status === "pass";
+}
+
+function summarizePacketObligationAccounting(results, label) {
+  const aggregate = {
+    packets: 0,
+    total: 0,
+    material: 0,
+    nonmaterial: 0,
+    material_status_buckets: {},
+  };
+  for (const result of results) {
+    const accounting = resultPacketObligationAccounting(result);
+    if (!accounting) {
+      if (resultRequiresPacketObligationAccounting(result)) {
+        throw new Error(
+          `${label} ${result.repo ?? "unknown"}/${result.task_id ?? "unknown"}/${result.arm ?? result.mode ?? "unknown"}/repeat-${result.repeat ?? "unknown"} packet obligation accounting is missing`,
+        );
+      }
+      continue;
+    }
+    const rowLabel = `${label} ${result.repo ?? "unknown"}/${result.task_id ?? "unknown"}/${result.arm ?? result.mode ?? "unknown"}/repeat-${result.repeat ?? "unknown"}`;
+    const error = packetObligationAccountingError(accounting, rowLabel);
+    if (error) {
+      throw new Error(error);
+    }
+    aggregate.packets += 1;
+    aggregate.total += accounting.total;
+    aggregate.material += accounting.material;
+    aggregate.nonmaterial += accounting.nonmaterial;
+    for (const [status, count] of Object.entries(accounting.material_status_buckets)) {
+      aggregate.material_status_buckets[status] =
+        (aggregate.material_status_buckets[status] ?? 0) + count;
+    }
+  }
+  if (aggregate.packets === 0) {
+    return null;
+  }
+  aggregate.material_status_buckets = Object.fromEntries(
+    Object.entries(aggregate.material_status_buckets).sort(([left], [right]) =>
+      left < right ? -1 : left > right ? 1 : 0
+    ),
+  );
+  const error = packetObligationAccountingError(aggregate, label);
+  if (error) {
+    throw new Error(error);
+  }
+  return aggregate;
+}
+
+function packetPreludeContractBlockers(packet, stdout, options = {}) {
+  if (!packet || typeof packet !== "object") {
+    return ["packet JSON is missing"];
+  }
+  const blockers = [];
+  const limits = packet.budget?.limits ?? {};
+  const used = packet.budget?.used ?? {};
+  const actualStdoutBytes = Buffer.byteLength(String(stdout ?? ""), "utf8");
+  const citationCount = Array.isArray(packet.answer?.citations)
+    ? packet.answer.citations.length
+    : 0;
+  const fileCount = packetUniqueCitationFileCount(packet);
+  const snippetCount = packetSourceReadSnippetCount(packet);
+  const graphEdgeOccurrences = packetGraphEdgeOccurrences(packet);
+  const support = packet.support;
+  const disposition = packet.disposition;
+  const dispositionKind = disposition?.kind;
+  if (!Array.isArray(support)) {
+    blockers.push("packet support is missing or invalid");
+  }
+  if (!PACKET_DISPOSITIONS.has(dispositionKind)) {
+    blockers.push(`packet disposition=${dispositionKind ?? "missing"} is invalid`);
+  }
+  if (dispositionKind === "supported" && Array.isArray(support) && support.length === 0) {
+    blockers.push("supported packet has no support units");
+  }
+  if (dispositionKind === "drill_once") {
+    const drill = disposition?.drill;
+    if (!drill || typeof drill !== "object") {
+      blockers.push("drill_once packet has no drill plan");
+    } else {
+      if (drill.parent_packet_id !== packet.packet_id) {
+        blockers.push("drill_once parent_packet_id does not match packet_id");
+      }
+      if (!Array.isArray(drill.options) || drill.options.length === 0 || drill.options.length > 8) {
+        blockers.push(`drill_once option count=${drill.options?.length ?? "missing"}; expected 1..8`);
+      }
+      if (drill.remaining_rounds !== 1) {
+        blockers.push(`drill_once remaining_rounds=${drill.remaining_rounds ?? "missing"}; expected 1`);
+      }
+      if (!String(drill.core_generation_id ?? "").trim()) {
+        blockers.push("drill_once core_generation_id is missing");
+      }
+    }
+  } else if (disposition?.drill != null) {
+    blockers.push(`${dispositionKind ?? "unknown"} packet unexpectedly includes a drill plan`);
+  }
+  const boundedCounters = [
+    ["anchors", used.anchors, limits.max_anchors],
+    ["files", used.files, limits.max_files],
+    ["snippets", used.snippets, limits.max_snippets],
+    ["trail_edges", used.trail_edges, limits.max_trail_edges],
+    ["output_bytes", used.output_bytes, limits.max_output_bytes],
+  ];
+  for (const [name, observed, maximum] of boundedCounters) {
+    if (!Number.isInteger(observed) || observed < 0) {
+      blockers.push(`budget.used.${name} is missing or invalid`);
+    }
+    if (!Number.isInteger(maximum) || maximum < 0) {
+      blockers.push(`budget.limits.max_${name} is missing or invalid`);
+    }
+    if (Number.isInteger(observed) && Number.isInteger(maximum) && observed > maximum) {
+      blockers.push(`budget.used.${name}=${observed} exceeds ${maximum}`);
+    }
+  }
+  for (const [name, observed, declared, publicMaximum] of [
+    ["anchors", used.anchors, limits.max_anchors, PUBLIC_PACKET_MAX_ANCHORS],
+    ["trail_edges", used.trail_edges, limits.max_trail_edges, PUBLIC_PACKET_MAX_TRAIL_EDGES],
+    ["output_bytes", used.output_bytes, limits.max_output_bytes, PUBLIC_PACKET_MAX_OUTPUT_BYTES],
+  ]) {
+    if (Number.isInteger(declared) && declared !== publicMaximum) {
+      blockers.push(
+        `budget.limits.max_${name}=${declared} does not equal public cap=${publicMaximum}`,
+      );
+    }
+    if (Number.isInteger(observed) && observed > publicMaximum) {
+      blockers.push(`budget.used.${name}=${observed} exceeds public cap=${publicMaximum}`);
+    }
+  }
+  if (used.output_bytes !== actualStdoutBytes) {
+    blockers.push(
+      `budget.used.output_bytes=${used.output_bytes ?? "missing"} does not match CLI stdout bytes=${actualStdoutBytes}`,
+    );
+  }
+  if (used.anchors !== citationCount) {
+    blockers.push(
+      `budget.used.anchors=${used.anchors ?? "missing"} does not match citation count=${citationCount}`,
+    );
+  }
+  if (used.files !== fileCount) {
+    blockers.push(
+      `budget.used.files=${used.files ?? "missing"} does not match unique citation files=${fileCount}`,
+    );
+  }
+  if (used.snippets !== snippetCount) {
+    blockers.push(
+      `budget.used.snippets=${used.snippets ?? "missing"} does not match successful source reads=${snippetCount}`,
+    );
+  }
+  if (used.trail_edges !== graphEdgeOccurrences) {
+    blockers.push(
+      `budget.used.trail_edges=${used.trail_edges ?? "missing"} does not match serialized graph edges=${graphEdgeOccurrences}`,
+    );
+  }
+  if (options.requireSupported) {
+    if (dispositionKind !== "supported") {
+      blockers.push(`packet disposition=${dispositionKind ?? "missing"}; expected supported`);
+    }
+    const retrievalShadow = packetRetrievalShadow(packet);
+    if (!retrievalShadow) {
+      blockers.push("packet retrieval shadow is missing");
+    } else {
+      if (retrievalShadow.retrieval_mode !== "full") {
+        blockers.push(
+          `packet retrieval shadow mode=${retrievalShadow.retrieval_mode ?? "missing"}; expected full`,
+        );
+      }
+      for (const [field, value] of [
+        ["degraded_reason", retrievalShadow.degraded_reason],
+        ["error", retrievalShadow.error],
+        ["cancel_reason", retrievalShadow.cancel_reason],
+      ]) {
+        if (value) {
+          blockers.push(`packet retrieval shadow ${field}=${value}`);
+        }
+      }
+    }
+  }
+  if (options.requireManagedRuntime) {
+    blockers.push(
+      ...managedRuntimeIdentityBlockers(
+        packet?._meta?.codestory_publication?.contract_runtime,
+        "packet",
+      ),
+    );
+  }
+  return blockers;
+}
+
+async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, codestoryCli, env) {
   const args = packetCommandArgs(repoConfig, run.task, opts);
   const extraProbes = packetCommandExtraProbes(run.task, opts);
   const command = displayCommand(codestoryCli, args);
@@ -2986,7 +3782,8 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   const started = performance.now();
   const result = await runProcess(codestoryCli, args, {
     cwd: repoConfig.path,
-    env: benchmarkChildEnv(process.env),
+    env,
+    signal: opts.signal,
     timeoutMs: opts.timeoutMs,
     timeoutMessage: `CodeStory packet prelude timed out after ${opts.timeoutMs}ms.`,
   });
@@ -3004,22 +3801,31 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     }
   }
   const manifestQuality = packetManifestQualitySummary(packet, run.task);
+  const contractBlockers = parseError
+    ? [`packet JSON parse failed: ${parseError}`]
+    : packetPreludeContractBlockers(packet, result.stdout, {
+        requireSupported: opts.publishable,
+        requireManagedRuntime: opts.publishable,
+      });
+  const dispositionTelemetry = packetDispositionTelemetry(packet, manifestQuality);
   const publicPrelude = preludePublicFields({
     command,
     args,
-    status: result.status === "pass" && !parseError ? "pass" : "fail",
+    status: result.status === "pass" && !parseError && !contractBlockers.length ? "pass" : "fail",
     process_status: result.status,
     exit_code: result.exitCode,
     signal: result.signal,
-    error: result.error ?? parseError,
+    error: result.error ?? parseError ?? contractBlockers[0] ?? null,
     wall_ms: wallMs,
     stdout_path: stdoutPath,
     stderr_path: stderrPath,
     stdout_bytes: Buffer.byteLength(result.stdout, "utf8"),
     stderr_bytes: Buffer.byteLength(result.stderr, "utf8"),
     packet_parse_error: parseError,
-    packet_sufficiency_status: packet?.sufficiency?.status ?? null,
-    packet_sufficiency: packetSufficiencyTelemetry(packet, manifestQuality),
+    packet_disposition_kind: dispositionTelemetry?.kind ?? null,
+    packet_disposition: dispositionTelemetry,
+    packet_support_count: dispositionTelemetry?.support_count ?? null,
+    packet_support_kind_counts: dispositionTelemetry?.support_kind_counts ?? null,
     packet_citation_count: Array.isArray(packet?.answer?.citations)
       ? packet.answer.citations.length
       : null,
@@ -3027,8 +3833,10 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     packet_latency: packetLatencyTelemetry(packet, wallMs),
     packet_composition: packetComposition(packet, run.task),
     packet_manifest_quality: manifestQuality,
+    packet_contract_runtime: packet?._meta?.codestory_publication?.contract_runtime ?? null,
     packet_extra_probe_count: extraProbes.length,
     packet_extra_probe_strategy: packetExtraProbeStrategy(extraProbes),
+    packet_contract_blockers: contractBlockers,
   });
   return {
     public: publicPrelude,
@@ -3074,38 +3882,53 @@ async function runOne(opts, run, outDir) {
     run.arm,
     String(run.repeat).padStart(2, "0"),
   ]);
-  const env = run.arm === "with_codestory" ? benchmarkChildEnv(process.env) : { ...process.env };
-  if (run.arm === "with_codestory") {
-    const codestoryCli = resolveCodeStoryCli(opts);
-    env.CODESTORY_CLI = path.isAbsolute(codestoryCli) || /[\\/]/.test(codestoryCli)
-      ? path.resolve(codestoryCli)
-      : codestoryCli;
-  } else {
-    delete env.CODESTORY_CLI;
-  }
+  const resolvedCodeStoryCli = run.arm === "with_codestory" ? resolveCodeStoryCli(opts) : null;
+  const codestoryPreludeCli = resolvedCodeStoryCli
+    ? path.isAbsolute(resolvedCodeStoryCli) || /[\\/]/.test(resolvedCodeStoryCli)
+      ? path.resolve(resolvedCodeStoryCli)
+      : resolvedCodeStoryCli
+    : null;
+  const codestoryPreludeCliSha256 = codestoryPreludeCli && existsSync(codestoryPreludeCli)
+    ? sha256Bytes(await readFile(codestoryPreludeCli))
+    : null;
+  const env = agentRunnerEnv(process.env, opts.agentCodexHomes?.[run.arm] ?? null);
   const baselinePrelude =
     run.arm === "without_codestory"
       ? await runBaselinePrelude(opts, run, repoConfig, outDir, runId)
       : null;
   const codestoryPrelude =
     run.arm === "with_codestory"
-      ? await runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, env.CODESTORY_CLI)
+      ? await runCodeStoryPacketPrelude(
+          opts,
+          run,
+          repoConfig,
+          outDir,
+          runId,
+          codestoryPreludeCli,
+          env,
+        )
       : null;
   const prompt = composePrompt(run.repo, repoConfig, run.arm, run.task, {
     baselinePrelude,
     codestoryPrelude,
   });
-  const { command, args, stdin, killProcessTree } = runnerCommand(opts, repoConfig.path, prompt);
+  const { command, args, stdin, killProcessTree } = runnerCommand(
+    opts,
+    repoConfig.path,
+    prompt,
+    run.arm,
+  );
   const started = performance.now();
   const preludeFailure = [baselinePrelude, codestoryPrelude].find(
     (prelude) => prelude && !preludeAllowsAgentRun(prelude.public, opts),
   );
   const shouldRunAgent = preludeFailure == null;
   const result = shouldRunAgent
-    ? await runProcess(command, args, {
+      ? await runProcess(command, args, {
         cwd: repoConfig.path,
         env,
         stdin,
+        signal: opts.signal,
         timeoutMs: opts.timeoutMs,
         timeoutMessage: `Benchmark runner timed out after ${opts.timeoutMs}ms.`,
         forceKillAfterMs: 5000,
@@ -3139,19 +3962,29 @@ async function runOne(opts, run, outDir) {
   const codexToolCalls = parsed.filter(isToolCallStartEvent).length;
   const toolCalls = analysisEvents.filter(isToolCallStartEvent).length;
   const analysis = analyzeTranscript(analysisEvents, repoConfig.path);
-  const provenance = await repoProvenance(repoConfig);
+  const codestoryBinaryIdentity = run.arm === "with_codestory"
+    ? codeStoryBinaryIdentity(codestoryPreludeCliSha256, analysis)
+    : null;
+  const binaryIdentityFailed = codestoryBinaryIdentity != null && ![
+    "prelude_only",
+    "exact_match",
+  ].includes(codestoryBinaryIdentity.status);
+  const provenance = await repoProvenance(repoConfig, opts.signal);
   const packetFirstRequired = run.arm === "with_codestory";
   const packetFirstPass =
     !packetFirstRequired || Boolean(analysis.packet_was_first_context_command);
   const quality = scoreQuality(analysisEvents, run.task);
   const cacheProvenance = run.arm === "with_codestory"
-    ? await codestoryCacheProvenance(opts, repoConfig, {
-        codestory_index_commands_observed: analysis.codestory_index_commands_observed,
-        indexing_in_timed_run: analysis.codestory_index_commands_observed > 0,
-        cache_prepared: opts.cachePreparationByRepo?.has(run.repo) ?? false,
-        cache_preparation: opts.cachePreparationByRepo?.get(run.repo) ?? null,
-        transport_mode: "agent_runner",
-      })
+    ? await codestoryCacheProvenance(
+        opts,
+        repoConfig,
+        agentPacketPreludeCacheObservations(
+          opts,
+          run.repo,
+          codestoryPrelude?.packet ?? null,
+          analysis,
+        ),
+      )
     : null;
   const benchmarkContract = benchmarkContractForRun(opts, run, env);
 
@@ -3165,22 +3998,36 @@ async function runOne(opts, run, outDir) {
     task_manifest_snapshot: taskSnapshotForResult(run.task),
     arm: run.arm,
     repeat: run.repeat,
+    canary: run.canary === true,
+    preparation_overlap: run.preparation_overlap === true,
+    comparative_wall_time_eligible: run.comparative_wall_time_eligible !== false,
     runner: opts.runner,
     model: opts.model,
     sandbox: opts.sandbox,
     command,
     args,
     stdin: stdin == null ? null : "<prompt>",
-    codestory_cli_env: run.arm === "with_codestory" ? env.CODESTORY_CLI : null,
+    codestory_cli_env: null,
+    codestory_prelude_cli: run.arm === "with_codestory" ? codestoryPreludeCli : null,
+    codestory_prelude_cli_sha256: run.arm === "with_codestory"
+      ? codestoryPreludeCliSha256
+      : null,
+    codestory_binary_identity: codestoryBinaryIdentity,
     repo_path: repoConfig.path,
     repo_provenance: provenance,
     codestory_cache_provenance: cacheProvenance,
     benchmark_contract: benchmarkContract,
     promotion_eligible: benchmarkContract.promotion_eligible,
-    status: result.timedOut ? "timeout" : result.exitCode === 0 ? "pass" : "fail",
+    status: opts.signal?.aborted || result.status === "aborted"
+      ? "cancelled"
+      : binaryIdentityFailed
+        ? "fail"
+        : result.status,
     exit_code: result.exitCode,
     signal: result.signal,
-    error: result.error,
+    error: binaryIdentityFailed
+      ? `CodeStory binary identity ${codestoryBinaryIdentity.status}`
+      : result.error,
     wall_ms: wallMs,
     agent_runner_wall_ms: runnerWallMs,
     baseline_harness_prelude: baselinePrelude?.public ?? null,
@@ -3210,17 +4057,34 @@ function preludeAllowsAgentRun(publicPrelude, opts = {}) {
   return publicPrelude?.status === "pass" || (!opts.publishable && publicPrelude?.status === "pass_with_warnings");
 }
 
-async function gitOutput(args, cwd, timeoutMs = 10_000) {
-  const result = await runProcess("git", args, { cwd, timeoutMs });
+async function gitOutput(
+  args,
+  cwd,
+  timeoutMs = 10_000,
+  signal = null,
+  processOptions = {},
+) {
+  const result = await runProcess("git", args, {
+    ...processOptions,
+    cwd,
+    timeoutMs,
+    signal,
+  });
   if (result.exitCode !== 0) {
     return null;
   }
   return result.stdout.trim();
 }
 
-async function repoProvenance(config) {
+async function repoProvenance(config, signal = null, processOptions = {}) {
   const checkoutPath = path.resolve(config.checkout_path ?? config.path);
-  const statusShort = await gitOutput(["-C", checkoutPath, "status", "--short"], repoRoot);
+  const statusShort = await gitOutput(
+    ["-C", checkoutPath, "status", "--short"],
+    repoRoot,
+    10_000,
+    signal,
+    processOptions,
+  );
   return {
     resolved_path: config.path,
     checkout_path: checkoutPath,
@@ -3243,9 +4107,21 @@ async function repoProvenance(config) {
       languages: config.languages ?? [],
     },
     manifest_overridden_by_builtin: Boolean(config.manifest_overridden_by_builtin),
-    git_head: await gitOutput(["-C", checkoutPath, "rev-parse", "HEAD"], repoRoot),
+    git_head: await gitOutput(
+      ["-C", checkoutPath, "rev-parse", "HEAD"],
+      repoRoot,
+      10_000,
+      signal,
+      processOptions,
+    ),
     git_origin: redactUrlForDisplay(
-      await gitOutput(["-C", checkoutPath, "remote", "get-url", "origin"], repoRoot),
+      await gitOutput(
+        ["-C", checkoutPath, "remote", "get-url", "origin"],
+        repoRoot,
+        10_000,
+        signal,
+        processOptions,
+      ),
     ),
     git_dirty: statusShort == null ? null : statusShort.length > 0,
     git_status_short: statusShort,
@@ -3299,20 +4175,29 @@ function retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs) {
     manifest_embedding_backend: output?.manifest?.embedding_backend ?? null,
     manifest_embedding_dim: output?.manifest?.embedding_dim ?? null,
     semantic_generation: output?.manifest?.semantic_generation ?? null,
-    embedding_model_sha256: output?.embedding_model_sha256 ?? null,
-    embedding_ggml_build_identity: output?.embedding_ggml_build_identity ?? null,
-    embedding_backend: output?.embedding_backend ?? null,
-    embedding_adapter: output?.embedding_adapter ?? null,
-    embedding_policy: output?.embedding_policy ?? null,
-    embedding_engine_instance_id: output?.embedding_engine_instance_id ?? null,
-    embedding_model_load_count: output?.embedding_model_load_count ?? null,
-    embedding_smoke_ms: output?.embedding_smoke_ms ?? null,
-    embedding_initialization_ms: output?.embedding_initialization_ms ?? null,
-    embedding_materialized_reused: output?.embedding_materialized_reused ?? null,
-    embedding_accelerator_execution_verified: output?.embedding_accelerator_execution_verified ?? null,
-    local_only: true,
-    locality_kind: "same_user_local_ipc",
-    locality_evidence: "retrieval embeddings execute in the authenticated per-user CodeStory server",
+    embedding_device_policy: output?.embedding_device_policy ?? null,
+    embedding_device_state: output?.embedding_device_state ?? null,
+    embedding_device_observation_source: output?.embedding_device_observation_source ?? null,
+    embedding_detected_provider: output?.embedding_detected_provider ?? null,
+    embedding_detected_gpu: output?.embedding_detected_gpu ?? null,
+    embedding_accelerator_requested: output?.embedding_accelerator_requested ?? null,
+    embedding_accelerator_request_provider: output?.embedding_accelerator_request_provider ?? null,
+    embedding_accelerator_request_device: output?.embedding_accelerator_request_device ?? null,
+    embedding_cpu_allowed: output?.embedding_cpu_allowed ?? null,
+    embedding_model_sha256: null,
+    embedding_ggml_build_identity: null,
+    embedding_backend: null,
+    embedding_adapter: null,
+    embedding_policy: null,
+    embedding_engine_instance_id: null,
+    embedding_model_load_count: null,
+    embedding_smoke_ms: null,
+    embedding_initialization_ms: null,
+    embedding_materialized_reused: null,
+    embedding_accelerator_execution_verified: null,
+    local_only: null,
+    locality_kind: null,
+    locality_evidence: null,
     lexical_capabilities: output?.lexical?.capabilities ?? null,
     semantic_capabilities: output?.semantic?.capabilities ?? null,
     scip_capabilities: output?.scip?.capabilities ?? null,
@@ -3321,12 +4206,384 @@ function retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs) {
   };
 }
 
-async function codestoryDoctorSnapshot(codestoryCli, project, timeoutMs, env = benchmarkChildEnv(process.env)) {
+const RETRIEVAL_ENGINE_DIAGNOSTICS_URI = "codestory://diagnostics/retrieval-engine";
+const RETRIEVAL_ENGINE_IDENTITY_FIELDS = [
+  "embedding_model_sha256",
+  "embedding_ggml_build_identity",
+  "embedding_backend",
+  "embedding_adapter",
+  "embedding_adapter_description",
+  "embedding_policy",
+  "embedding_engine_instance_id",
+  "embedding_engine_residency",
+  "embedding_engine_load_generation",
+  "embedding_engine_load_error",
+  "embedding_model_load_count",
+  "embedding_smoke_ms",
+  "embedding_initialization_ms",
+  "embedding_materialized_reused",
+  "embedding_accelerator_execution_verified",
+  "embedding_execution_devices",
+  "embedding_execution_backends",
+  "embedding_execution_observation_source",
+  "embedding_encode_count",
+  "embedding_execution_node_count",
+  "embedding_resident_accelerator_tensor_count",
+  "embedding_resident_accelerator_tensor_bytes",
+  "embedding_model_layer_count",
+  "embedding_offloaded_layer_count",
+];
+
+function strictUriComponent(value) {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (character) =>
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+}
+
+function projectResourcePath(project, platform = process.platform) {
+  let value = String(project);
+  if (platform === "win32") {
+    value = value.replaceAll("\\", "/");
+    if (value.startsWith("//?/UNC/")) {
+      value = `//${value.slice("//?/UNC/".length)}`;
+    } else if (value.startsWith("//?/")) {
+      value = value.slice("//?/".length);
+    }
+  }
+  return value;
+}
+
+function projectResourceUri(baseUri, project, platform = process.platform) {
+  return `${baseUri}?project=${strictUriComponent(projectResourcePath(project, platform))}`;
+}
+
+function projectResourceUriParts(uri) {
+  const marker = "?project=";
+  const index = String(uri).indexOf(marker);
+  if (index <= 0 || String(uri).indexOf(marker, index + marker.length) >= 0) return null;
+  const baseUri = String(uri).slice(0, index);
+  const encodedProject = String(uri).slice(index + marker.length);
+  if (!encodedProject) return null;
+  try {
+    const project = decodeURIComponent(encodedProject);
+    if (strictUriComponent(project) !== encodedProject) return null;
+    return { baseUri, project };
+  } catch {
+    return null;
+  }
+}
+
+function resourceUriMatches(expectedUri, actualUri, platform = process.platform, sameFile = null) {
+  if (actualUri === expectedUri) return true;
+  const expected = projectResourceUriParts(expectedUri);
+  const actual = projectResourceUriParts(actualUri);
+  if (!expected || !actual || expected.baseUri !== actual.baseUri) return false;
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  if (!pathApi.isAbsolute(expected.project) || !pathApi.isAbsolute(actual.project)) return false;
+  const identityProbe = sameFile ?? ((left, right) => {
+    const leftStat = statSync(left, { bigint: true });
+    const rightStat = statSync(right, { bigint: true });
+    if (leftStat.ino !== 0n || rightStat.ino !== 0n) {
+      return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
+    }
+    const leftReal = realpathSync(left);
+    const rightReal = realpathSync(right);
+    return platform === "win32"
+      ? leftReal.toLowerCase() === rightReal.toLowerCase()
+      : leftReal === rightReal;
+  });
+  try {
+    return identityProbe(expected.project, actual.project) === true;
+  } catch {
+    return false;
+  }
+}
+
+function retrievalEngineDiagnosticsSnapshotFromOutput(
+  response,
+  expectedUri,
+  wallMs,
+) {
+  const snapshot = {
+    status: "fail",
+    error: null,
+    wall_ms: wallMs,
+    resource_uri: expectedUri,
+    retrieval_mode: null,
+    degraded_reason: null,
+    engine: null,
+    server: null,
+  };
+
+  try {
+    if (response.error) {
+      throw new Error(`retrieval-engine resource failed: ${JSON.stringify(response.error)}`);
+    }
+    const contents = response?.result?.contents;
+    if (!Array.isArray(contents)) {
+      throw new Error("retrieval-engine resource response lacks contents");
+    }
+    const matching = contents.filter((content) =>
+      typeof content?.uri === "string" && resourceUriMatches(expectedUri, content.uri),
+    );
+    if (matching.length !== 1 || contents.length !== 1) {
+      throw new Error(
+        `retrieval-engine resource content mismatch: matching=${matching.length} total=${contents.length}`,
+      );
+    }
+    if (matching[0].mimeType !== "application/json") {
+      throw new Error(`retrieval-engine resource MIME type=${matching[0].mimeType ?? "missing"}`);
+    }
+    const diagnostics = JSON.parse(matching[0].text);
+    if (!diagnostics || typeof diagnostics !== "object" || Array.isArray(diagnostics)) {
+      throw new Error("retrieval-engine resource text is not an object");
+    }
+    if (!diagnostics.engine || typeof diagnostics.engine !== "object" || Array.isArray(diagnostics.engine)) {
+      throw new Error("retrieval-engine resource lacks engine diagnostics");
+    }
+    snapshot.status = "pass";
+    snapshot.retrieval_mode = diagnostics.retrieval_mode ?? null;
+    snapshot.degraded_reason = diagnostics.degraded_reason ?? null;
+    snapshot.engine = Object.fromEntries(
+      RETRIEVAL_ENGINE_IDENTITY_FIELDS.map((field) => [
+        field,
+        field === "embedding_engine_load_error"
+          ? (diagnostics.engine[field] == null ? null : "present")
+          : diagnostics.engine[field] ?? null,
+      ]),
+    );
+    const server = diagnostics.embedding_server;
+    snapshot.server = server && typeof server === "object" && !Array.isArray(server)
+      ? {
+          lifecycle: server.lifecycle ?? null,
+          peer_verified: server.authority?.peer_verified ?? null,
+          server_instance_id: server.process?.server_instance_id ?? null,
+          executable_sha256: server.process?.executable_sha256 ?? null,
+          executable_version: server.process?.executable_version ?? null,
+          load_generation: server.engine?.load_generation ?? null,
+          model_load_count: server.engine?.model_load_count ?? null,
+          successful_encode_count: server.engine?.successful_encode_count ?? null,
+        }
+      : null;
+  } catch (error) {
+    snapshot.status = "fail";
+    snapshot.error = error instanceof Error ? error.message : String(error);
+  }
+  return snapshot;
+}
+
+function mergeRetrievalStatusWithEngineDiagnostics(retrievalStatus, diagnostics) {
+  const merged = {
+    ...retrievalStatus,
+    engine_diagnostics_status: diagnostics?.status ?? "missing",
+    engine_diagnostics_error: diagnostics?.error ?? null,
+    engine_diagnostics_wall_ms: diagnostics?.wall_ms ?? null,
+  };
+  if (diagnostics?.status !== "pass") {
+    return merged;
+  }
+  const publicMode = retrievalStatus?.retrieval_mode ?? null;
+  const diagnosticMode = diagnostics.retrieval_mode ?? null;
+  const publicDegraded = retrievalStatus?.degraded_reason ?? null;
+  const diagnosticDegraded = diagnostics.degraded_reason ?? null;
+  if (publicMode !== diagnosticMode || publicDegraded !== diagnosticDegraded) {
+    merged.engine_diagnostics_status = "fail";
+    merged.engine_diagnostics_error =
+      `retrieval status/engine diagnostics disagree: mode=${publicMode ?? "missing"}/${diagnosticMode ?? "missing"} `
+      + `degraded=${publicDegraded ?? "none"}/${diagnosticDegraded ?? "none"}`;
+    return merged;
+  }
+  for (const field of RETRIEVAL_ENGINE_IDENTITY_FIELDS) {
+    merged[field] = diagnostics.engine?.[field] ?? null;
+  }
+  merged.embedding_server_identity = diagnostics.server ?? null;
+  merged.local_only = diagnostics.server?.peer_verified === true;
+  merged.locality_kind = merged.local_only ? "same_user_local_ipc" : null;
+  merged.locality_evidence = merged.local_only
+    ? "retrieval embeddings execute in the peer-verified per-user CodeStory server"
+    : null;
+  return merged;
+}
+
+function createSequencedStdioSession(command, args, options) {
+  const child = (options.spawnProcess ?? spawn)(command, args, {
+    env: options.env,
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let stdoutBuffer = "";
+  let stdoutBytes = 0;
+  const stdoutDecoder = new StringDecoder("utf8");
+  let stderr = "";
+  let terminalError = null;
+  let exited = false;
+  let terminationStarted = false;
+  let forceKillTimer = null;
+  const queuedResponses = [];
+  const responseWaiters = [];
+  let exitResolve;
+  const exitPromise = new Promise((resolve) => {
+    exitResolve = resolve;
+  });
+
+  function rejectWaiters(error) {
+    while (responseWaiters.length) {
+      responseWaiters.shift().reject(error);
+    }
+  }
+  function terminate(signal) {
+    if (exited) return;
+    if (signal !== "SIGKILL" && terminationStarted) return;
+    if (signal !== "SIGKILL") terminationStarted = true;
+    terminateProcess(child, signal, options);
+    if (signal !== "SIGKILL" && (options.forceKillAfterMs ?? 5000) > 0) {
+      forceKillTimer ??= setTimeout(
+        () => terminateProcess(child, "SIGKILL", options),
+        options.forceKillAfterMs ?? 5000,
+      );
+    }
+  }
+  function fail(status, message) {
+    if (terminalError) return;
+    terminalError = Object.assign(new Error(message), { status });
+    rejectWaiters(terminalError);
+    terminate("SIGTERM");
+  }
+  function dispatchResponse(response) {
+    if (queuedResponses.length >= 4) {
+      fail("fail", "retrieval-engine stdio emitted too many unmatched responses");
+      return;
+    }
+    const waiter = responseWaiters.shift();
+    if (waiter) waiter.resolve(response);
+    else queuedResponses.push(response);
+  }
+
+  child.stdout.on("data", (chunk) => {
+    stdoutBytes += chunk.length;
+    if (stdoutBytes > 1_048_576) {
+      stdoutBuffer = trimTail(stdoutBuffer, 4096);
+      child.stdout.pause();
+      fail("fail", "retrieval-engine stdio response exceeded 1 MiB");
+      return;
+    }
+    stdoutBuffer += stdoutDecoder.write(chunk);
+    for (;;) {
+      const newline = stdoutBuffer.indexOf("\n");
+      if (newline < 0) break;
+      const line = stdoutBuffer.slice(0, newline).trim();
+      stdoutBuffer = stdoutBuffer.slice(newline + 1);
+      if (!line) continue;
+      try {
+        dispatchResponse(JSON.parse(line));
+      } catch (error) {
+        fail("fail", `retrieval-engine stdio emitted malformed JSON: ${error.message}`);
+      }
+    }
+  });
+  child.stdout.on("end", () => {
+    stdoutBuffer += stdoutDecoder.end();
+  });
+  child.stdout.on("error", (error) => {
+    fail("error", `retrieval-engine stdio stdout error: ${error.message}`);
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr = trimTail(stderr + chunk.toString(), 65_536);
+  });
+  child.stderr.on("error", (error) => {
+    fail("error", `retrieval-engine stdio stderr error: ${error.message}`);
+  });
+  child.stdin.on("error", (error) => {
+    fail("error", `retrieval-engine stdio stdin error: ${error.message}`);
+  });
+  child.on("error", (error) => {
+    fail("error", `retrieval-engine stdio process error: ${error.message}`);
+  });
+  child.on("close", (exitCode, signal) => {
+    exited = true;
+    if (forceKillTimer) clearTimeout(forceKillTimer);
+    exitResolve({ exitCode, signal });
+    if (!terminalError && (exitCode !== 0 || signal || responseWaiters.length)) {
+      terminalError = Object.assign(
+        new Error(
+          `retrieval-engine stdio exited before completing responses: code=${exitCode ?? ""} signal=${signal ?? ""} stderr=${trimTail(stderr)}`,
+        ),
+        { status: "fail" },
+      );
+      rejectWaiters(terminalError);
+    }
+  });
+
+  const onAbort = () => fail("aborted", "retrieval-engine stdio aborted by benchmark fail-fast");
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  if (options.signal?.aborted) onAbort();
+  const timeoutTimer = setTimeout(
+    () => fail("timeout", `retrieval-engine stdio timed out after ${options.timeoutMs}ms`),
+    options.timeoutMs,
+  );
+
+  async function nextResponse() {
+    if (terminalError) throw terminalError;
+    if (queuedResponses.length) return queuedResponses.shift();
+    if (exited) throw Object.assign(new Error("retrieval-engine stdio already exited"), { status: "fail" });
+    return await new Promise((resolve, reject) => responseWaiters.push({ resolve, reject }));
+  }
+  function send(payload) {
+    if (terminalError) throw terminalError;
+    if (exited) throw Object.assign(new Error("retrieval-engine stdio already exited"), { status: "fail" });
+    child.stdin.write(`${JSON.stringify(payload)}\n`);
+  }
+  async function request(payload) {
+    send(payload);
+    const response = await nextResponse();
+    const ownsResult = Object.prototype.hasOwnProperty.call(response ?? {}, "result");
+    const ownsError = Object.prototype.hasOwnProperty.call(response ?? {}, "error");
+    if (response?.jsonrpc !== "2.0" || response?.id !== payload.id || ownsResult === ownsError) {
+      fail(
+        "fail",
+        `retrieval-engine stdio response envelope mismatch for id=${JSON.stringify(payload.id)}`,
+      );
+      throw terminalError;
+    }
+    return response;
+  }
+  async function close() {
+    if (!terminalError) child.stdin.end();
+    else terminate("SIGTERM");
+    const exit = await exitPromise;
+    clearTimeout(timeoutTimer);
+    options.signal?.removeEventListener("abort", onAbort);
+    if (terminalError) throw terminalError;
+    if (stdoutBuffer.trim() || queuedResponses.length || responseWaiters.length) {
+      throw Object.assign(new Error("retrieval-engine stdio retained unmatched output"), { status: "fail" });
+    }
+    if (exit.exitCode !== 0 || exit.signal) {
+      throw Object.assign(new Error("retrieval-engine stdio did not exit cleanly"), { status: "fail" });
+    }
+  }
+  async function stop() {
+    if (!exited) terminate("SIGTERM");
+    await exitPromise;
+    clearTimeout(timeoutTimer);
+    options.signal?.removeEventListener("abort", onAbort);
+  }
+  return { request, send, close, stop, stderr: () => stderr };
+}
+
+async function codestoryDoctorSnapshot(
+  codestoryCli,
+  project,
+  timeoutMs,
+  env = benchmarkChildEnv(process.env),
+  signal = null,
+  processOptions = {},
+) {
   const started = performance.now();
   const result = await runProcess(
     codestoryCli,
     ["doctor", "--project", project, "--format", "json"],
-    { timeoutMs, env },
+    { ...processOptions, timeoutMs, env, signal },
   );
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
   let output = null;
@@ -3346,12 +4603,14 @@ async function codestoryRetrievalStatusSnapshot(
   project,
   timeoutMs,
   env = benchmarkChildEnv(process.env),
+  signal = null,
+  processOptions = {},
 ) {
   const started = performance.now();
   const result = await runProcess(
     codestoryCli,
     retrievalStatusCommandArgs(project),
-    { timeoutMs, env },
+    { ...processOptions, timeoutMs, env, signal },
   );
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
   let output = null;
@@ -3364,6 +4623,80 @@ async function codestoryRetrievalStatusSnapshot(
     }
   }
   return retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs);
+}
+
+async function codestoryRetrievalEngineDiagnosticsSnapshot(
+  codestoryCli,
+  project,
+  timeoutMs,
+  env = benchmarkChildEnv(process.env),
+  signal = null,
+  processOptions = {},
+) {
+  const uri = projectResourceUri(RETRIEVAL_ENGINE_DIAGNOSTICS_URI, project);
+  const started = performance.now();
+  const session = createSequencedStdioSession(
+    codestoryCli,
+    ["serve", "--stdio", "--multi-project", "--refresh", "none"],
+    {
+      ...processOptions,
+      timeoutMs,
+      env: {
+        ...env,
+        CODESTORY_RETRIEVAL_PROFILE: "agent",
+        CODESTORY_RETRIEVAL_RUN_ID: BENCHMARK_AGENT_RUN_ID,
+      },
+      signal,
+    },
+  );
+  try {
+    const initialize = await session.request({
+      jsonrpc: "2.0",
+      id: "benchmark-initialize",
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "codestory-benchmark", version: "1" },
+      },
+    });
+    if (initialize.error) {
+      throw new Error(`retrieval-engine stdio initialize failed: ${JSON.stringify(initialize.error)}`);
+    }
+    const negotiation = initialize?.result?._meta?.codestory_protocol;
+    if (
+      initialize?.result?.protocolVersion !== "2024-11-05"
+      || negotiation?.status !== "agreed"
+      || negotiation?.compatible !== true
+    ) {
+      throw new Error(
+        `retrieval-engine stdio protocol negotiation failed: ${JSON.stringify(negotiation ?? null)}`,
+      );
+    }
+    session.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const response = await session.request({
+      jsonrpc: "2.0",
+      id: "benchmark-retrieval-engine",
+      method: "resources/read",
+      params: { uri },
+    });
+    await session.close();
+    const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
+    return retrievalEngineDiagnosticsSnapshotFromOutput(response, uri, wallMs);
+  } catch (error) {
+    await session.stop();
+    return {
+      status: error?.status ?? "fail",
+      error: error instanceof Error ? error.message : String(error),
+      wall_ms: Math.round((performance.now() - started) * 1000) / 1000,
+      resource_uri: uri,
+      retrieval_mode: null,
+      degraded_reason: null,
+      engine: null,
+      server: null,
+      stderr_tail: trimTail(session.stderr()),
+    };
+  }
 }
 
 function cacheNeedsPreparation(snapshot) {
@@ -3413,6 +4746,218 @@ function compactCachePreparation(preparation) {
   };
 }
 
+function cachePreparationCanaryBlockers(preparation, env = process.env) {
+  const blockers = [];
+  if (!preparation) {
+    return ["canary cache preparation is missing"];
+  }
+  const retrieval = preparation.retrieval_status ?? {};
+  if (retrieval.status !== "pass") {
+    blockers.push(`retrieval status=${retrieval.status ?? "missing"}; expected pass`);
+  }
+  if (preparation.retrieval_index_status !== "pass") {
+    blockers.push(`retrieval preparation status=${preparation.retrieval_index_status ?? "missing"}`);
+  }
+  if (retrieval.retrieval_mode !== "full") {
+    blockers.push(`retrieval mode=${retrieval.retrieval_mode ?? "missing"}; expected full`);
+  }
+  if (!retrieval.semantic_generation) {
+    blockers.push("semantic generation identity is missing");
+  }
+  if (retrieval.degraded_reason != null) {
+    blockers.push(`retrieval is degraded: ${retrieval.degraded_reason}`);
+  }
+  if (retrieval.engine_diagnostics_status !== "pass") {
+    blockers.push(
+      `retrieval engine diagnostics=${retrieval.engine_diagnostics_status ?? "missing"}: ${retrieval.engine_diagnostics_error ?? "identity unavailable"}`,
+    );
+  } else if (retrieval.engine_diagnostics_error != null) {
+    blockers.push(`retrieval engine diagnostics retained an error: ${retrieval.engine_diagnostics_error}`);
+  }
+  if (retrieval.embedding_device_policy !== "accelerator_required") {
+    blockers.push(
+      `embedding device policy=${retrieval.embedding_device_policy ?? "missing"}; expected accelerator_required`,
+    );
+  }
+  if (retrieval.embedding_device_state !== "accelerated") {
+    blockers.push(
+      `embedding device state=${retrieval.embedding_device_state ?? "missing"}; expected accelerated`,
+    );
+  }
+  if (retrieval.embedding_cpu_allowed !== false) {
+    blockers.push("runtime did not prove CPU embeddings disabled");
+  }
+  if (retrieval.embedding_policy !== "accelerated") {
+    blockers.push(`embedding policy=${retrieval.embedding_policy ?? "missing"}; expected accelerated`);
+  }
+  if (retrieval.embedding_accelerator_execution_verified !== true) {
+    blockers.push("accelerator execution was not verified");
+  }
+  if (!retrieval.embedding_backend) {
+    blockers.push("accelerator backend identity is missing");
+  }
+  const modelSha = String(retrieval.embedding_model_sha256 ?? "");
+  if (!/^[0-9a-f]{64}$/i.test(modelSha)) {
+    blockers.push("embedding model digest is missing or malformed");
+  } else if (!String(retrieval.manifest_embedding_backend ?? "")
+    .startsWith(`per-user-server:coderank-embed:q8_0:sha256-${modelSha}:`)) {
+    blockers.push("live embedding model identity does not match the retrieval manifest");
+  }
+  if (!retrieval.embedding_ggml_build_identity) {
+    blockers.push("linked ggml build identity is missing");
+  }
+  const adapter = String(retrieval.embedding_adapter ?? "");
+  const adapterEvidence = `${retrieval.embedding_backend ?? ""} ${adapter} ${retrieval.embedding_adapter_description ?? ""}`;
+  if (!adapter) {
+    blockers.push("physical accelerator adapter identity is missing");
+  } else if (["llvmpipe", "lavapipe", "warp", "software rasterizer", "swiftshader", "microsoft basic render driver"]
+    .some((token) => adapterEvidence.toLowerCase().includes(token))) {
+    blockers.push(`software accelerator adapter is not eligible: ${adapter}`);
+  }
+  if (!retrieval.embedding_engine_instance_id) {
+    blockers.push("embedding engine instance identity is missing");
+  }
+  if (retrieval.embedding_engine_residency !== "resident") {
+    blockers.push(`embedding engine residency=${retrieval.embedding_engine_residency ?? "missing"}; expected resident`);
+  }
+  if (!Number.isInteger(retrieval.embedding_engine_load_generation)
+      || retrieval.embedding_engine_load_generation <= 0) {
+    blockers.push("embedding engine load generation is missing");
+  }
+  if (!Number.isInteger(retrieval.embedding_model_load_count)
+      || retrieval.embedding_model_load_count <= 0) {
+    blockers.push("embedding model load count is missing");
+  }
+  if (retrieval.embedding_engine_load_error != null) {
+    blockers.push(`embedding engine retained a load error: ${retrieval.embedding_engine_load_error}`);
+  }
+  if (typeof retrieval.embedding_materialized_reused !== "boolean") {
+    blockers.push("embedding model materialization reuse identity is missing");
+  }
+  for (const [field, label] of [
+    ["embedding_smoke_ms", "embedding smoke timing"],
+    ["embedding_initialization_ms", "embedding initialization timing"],
+  ]) {
+    if (!Number.isFinite(retrieval[field]) || retrieval[field] < 0) {
+      blockers.push(`${label} is missing`);
+    }
+  }
+  if (retrieval.embedding_execution_observation_source !== "ggml_eval_callback") {
+    blockers.push("accelerator execution observation is not backend-measured");
+  }
+  for (const [field, label] of [
+    ["embedding_execution_devices", "execution devices"],
+    ["embedding_execution_backends", "execution backends"],
+  ]) {
+    if (!Array.isArray(retrieval[field]) || retrieval[field].length === 0) {
+      blockers.push(`${label} are missing`);
+    }
+  }
+  for (const [field, label] of [
+    ["embedding_encode_count", "successful encode count"],
+    ["embedding_execution_node_count", "accelerator execution node count"],
+    ["embedding_resident_accelerator_tensor_count", "resident accelerator tensor count"],
+    ["embedding_resident_accelerator_tensor_bytes", "resident accelerator tensor bytes"],
+  ]) {
+    if (!Number.isInteger(retrieval[field]) || retrieval[field] <= 0) {
+      blockers.push(`${label} is missing`);
+    }
+  }
+  if (!Number.isInteger(retrieval.embedding_model_layer_count)
+      || retrieval.embedding_model_layer_count <= 0) {
+    blockers.push("embedding model layer count is missing");
+  } else if (retrieval.embedding_offloaded_layer_count !== retrieval.embedding_model_layer_count) {
+    blockers.push("not every embedding model layer was offloaded");
+  }
+  const server = retrieval.embedding_server_identity;
+  if (server?.peer_verified !== true) blockers.push("embedding server peer identity is not verified");
+  if (server?.lifecycle !== "resident") blockers.push("embedding server is not resident");
+  if (!/^[0-9a-f]{64}$/i.test(String(server?.executable_sha256 ?? ""))) {
+    blockers.push("embedding server executable digest is missing or malformed");
+  }
+  if (server?.executable_version !== REQUIRED_MANAGED_CODESTORY_VERSION) {
+    blockers.push(`embedding server version=${server?.executable_version ?? "missing"}; expected ${REQUIRED_MANAGED_CODESTORY_VERSION}`);
+  }
+  if (!server?.server_instance_id || server.server_instance_id !== retrieval.embedding_engine_instance_id) {
+    blockers.push("embedding server and engine instance identities disagree");
+  }
+  if (server?.load_generation !== retrieval.embedding_engine_load_generation
+      || server?.model_load_count !== retrieval.embedding_model_load_count) {
+    blockers.push("embedding server and engine load identities disagree");
+  }
+  if (!Number.isInteger(server?.successful_encode_count)
+      || server.successful_encode_count < retrieval.embedding_encode_count) {
+    blockers.push("embedding server successful encode count is missing");
+  }
+  if (retrieval.local_only !== true) {
+    blockers.push("same-user local embedding execution is not proven");
+  }
+  if (String(env.CODESTORY_EMBED_ALLOW_CPU ?? "0") !== "0") {
+    blockers.push("CPU embeddings are enabled");
+  }
+  return blockers;
+}
+
+function benchmarkHostClass(cachePreparations) {
+  const successful = (cachePreparations ?? []).filter((row) => row?.retrieval_status);
+  const reference = successful[0] ?? null;
+  if (reference) {
+    for (const preparation of successful.slice(1)) {
+      const blockers = cachePreparationIdentityBlockers(reference, preparation);
+      if (blockers.length) {
+        throw new Error(
+          `Benchmark preparations do not share one retrieval engine identity: ${blockers.join("; ")}`,
+        );
+      }
+    }
+  }
+  const retrieval = reference?.retrieval_status ?? {};
+  const cpus = os.cpus();
+  const cpuModel = String(cpus[0]?.model ?? "")
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s+/g, " ");
+  return {
+    platform: process.platform,
+    arch: process.arch,
+    cpu_model: cpuModel || null,
+    logical_cpu_count: cpus.length,
+    total_memory_bytes: os.totalmem(),
+    accelerator_backend: retrieval.embedding_backend ?? null,
+    accelerator_adapter: retrieval.embedding_adapter ?? null,
+    embedding_policy: retrieval.embedding_policy ?? null,
+    model_sha256: retrieval.embedding_model_sha256 ?? null,
+  };
+}
+
+const BENCHMARK_PREPARATION_IDENTITY_FIELDS = [
+  "embedding_model_sha256",
+  "embedding_backend",
+  "embedding_adapter",
+  "embedding_policy",
+  "embedding_engine_instance_id",
+];
+
+function cachePreparationIdentity(preparation) {
+  const retrieval = preparation?.retrieval_status ?? {};
+  return Object.fromEntries(
+    BENCHMARK_PREPARATION_IDENTITY_FIELDS.map((field) => [field, retrieval[field] ?? null]),
+  );
+}
+
+function cachePreparationIdentityBlockers(referencePreparation, preparation) {
+  const expected = cachePreparationIdentity(referencePreparation);
+  const observed = cachePreparationIdentity(preparation);
+  return BENCHMARK_PREPARATION_IDENTITY_FIELDS.flatMap((field) =>
+    observed[field] === expected[field]
+      ? []
+      : [
+          `retrieval preparation identity changed for ${field}: `
+          + `${observed[field] ?? "missing"}; expected ${expected[field] ?? "missing"}`,
+        ]
+  );
+}
+
 async function prepareCodeStoryCaches(opts, tasks) {
   if (!opts.arms.includes("with_codestory")) {
     return [];
@@ -3437,65 +4982,102 @@ async function prepareCodeStoryCaches(opts, tasks) {
     console.log(`preparing CodeStory cache for ${repo}`);
     const preparationStarted = performance.now();
     const childEnv = selectedBenchmarkChildEnv(opts);
-    const before = await codestoryDoctorSnapshot(codestoryCli, config.path, 60_000, childEnv);
     const preparation = {
       repo,
       project: config.path,
       codestory_cli: path.resolve(codestoryCli),
-      action: cachePreparationAction(before),
+      action: null,
       preparation_wall_ms: null,
-      before,
+      before: null,
       index_status: null,
       index_exit_code: null,
       index_wall_ms: 0,
       index_stdout_tail: null,
       index_stderr_tail: null,
       retrieval_status: null,
+      retrieval_engine_diagnostics: null,
       retrieval_index_stdout_tail: null,
       retrieval_index_stderr_tail: null,
-      after: before,
+      after: null,
     };
-
-    preparation.retrieval_contract = retrievalContractSummary(childEnv);
-    if (shouldPrepareRetrievalIndex(childEnv)) {
-      const retrievalStarted = performance.now();
-      const retrievalIndex = await runProcess(
-        codestoryCli,
-        retrievalIndexCommandArgs(config.path),
-        {
-          env: childEnv,
-          timeoutMs: opts.prepareCodestoryTimeoutMs,
-          timeoutMessage: `retrieval index timed out after ${opts.prepareCodestoryTimeoutMs}ms.`,
-        },
-      );
-      preparation.retrieval_index_status = retrievalIndex.status;
-      preparation.retrieval_index_exit_code = retrievalIndex.exitCode;
-      preparation.retrieval_index_wall_ms =
-        Math.round((performance.now() - retrievalStarted) * 1000) / 1000;
-      preparation.retrieval_index_stdout_tail = trimTail(retrievalIndex.stdout);
-      preparation.retrieval_index_stderr_tail = trimTail(retrievalIndex.stderr);
-      if (retrievalIndex.status !== "pass") {
-        throw new Error(
-          `mandatory retrieval index failed for ${repo}: ${trimTail(retrievalIndex.stderr || retrievalIndex.stdout)}`,
-        );
-      }
-      preparation.after = await codestoryDoctorSnapshot(codestoryCli, config.path, 60_000, childEnv);
-      preparation.retrieval_status = await codestoryRetrievalStatusSnapshot(
+    try {
+      const before = await codestoryDoctorSnapshot(
         codestoryCli,
         config.path,
         60_000,
         childEnv,
+        opts.signal,
       );
-      if (preparation.retrieval_status.retrieval_mode !== "full") {
-        throw new Error(
-          `mandatory retrieval index for ${repo} did not reach full mode: ${preparation.retrieval_status.retrieval_mode ?? "unknown"} ${preparation.retrieval_status.degraded_reason ?? ""}`.trim(),
+      preparation.before = before;
+      preparation.after = before;
+      preparation.action = cachePreparationAction(before);
+      preparation.retrieval_contract = retrievalContractSummary(childEnv);
+      if (shouldPrepareRetrievalIndex(childEnv)) {
+        const retrievalStarted = performance.now();
+        const retrievalIndex = await runProcess(
+          codestoryCli,
+          retrievalIndexCommandArgs(config.path),
+          {
+            env: childEnv,
+            signal: opts.signal,
+            timeoutMs: opts.prepareCodestoryTimeoutMs,
+            timeoutMessage: `retrieval index timed out after ${opts.prepareCodestoryTimeoutMs}ms.`,
+          },
         );
+        preparation.retrieval_index_status = retrievalIndex.status;
+        preparation.retrieval_index_exit_code = retrievalIndex.exitCode;
+        preparation.retrieval_index_wall_ms =
+          Math.round((performance.now() - retrievalStarted) * 1000) / 1000;
+        preparation.retrieval_index_stdout_tail = trimTail(retrievalIndex.stdout);
+        preparation.retrieval_index_stderr_tail = trimTail(retrievalIndex.stderr);
+        if (retrievalIndex.status !== "pass") {
+          throw new Error(
+            `mandatory retrieval index failed for ${repo}: ${trimTail(retrievalIndex.stderr || retrievalIndex.stdout)}`,
+          );
+        }
+        preparation.after = await codestoryDoctorSnapshot(
+          codestoryCli,
+          config.path,
+          60_000,
+          childEnv,
+          opts.signal,
+        );
+        const publicRetrievalStatus = await codestoryRetrievalStatusSnapshot(
+          codestoryCli,
+          config.path,
+          60_000,
+          childEnv,
+          opts.signal,
+        );
+        preparation.retrieval_engine_diagnostics =
+          await codestoryRetrievalEngineDiagnosticsSnapshot(
+            codestoryCli,
+            preparation.after?.project ?? config.path,
+            60_000,
+            childEnv,
+            opts.signal,
+          );
+        preparation.retrieval_status = mergeRetrievalStatusWithEngineDiagnostics(
+          publicRetrievalStatus,
+          preparation.retrieval_engine_diagnostics,
+        );
+        if (preparation.retrieval_status.retrieval_mode !== "full") {
+          throw new Error(
+            `mandatory retrieval index for ${repo} did not reach full mode: ${preparation.retrieval_status.retrieval_mode ?? "unknown"} ${preparation.retrieval_status.degraded_reason ?? ""}`.trim(),
+          );
+        }
       }
+      return preparation;
+    } catch (error) {
+      preparation.error = error instanceof Error ? error.message : String(error);
+      if (error && typeof error === "object") {
+        error.preparation = preparation;
+      }
+      throw error;
+    } finally {
+      preparation.preparation_wall_ms =
+        Math.round((performance.now() - preparationStarted) * 1000) / 1000;
     }
-
-    preparation.preparation_wall_ms =
-      Math.round((performance.now() - preparationStarted) * 1000) / 1000;
-    return preparation;
   });
 }
 
@@ -3554,6 +5136,24 @@ function packetRuntimeCacheObservations(opts, repoName, transportMode) {
     cache_preparation: cachePreparation,
     transport_mode: transportMode,
   };
+}
+
+function agentPacketPreludeCacheObservations(opts, repoName, packet, analysis) {
+  const observations = packetRuntimeCacheObservations(
+    opts,
+    repoName,
+    "agent_harness_prelude",
+  );
+  observations.codestory_index_commands_observed =
+    analysis?.codestory_index_commands_observed ?? 0;
+  observations.indexing_in_timed_run =
+    observations.codestory_index_commands_observed > 0;
+  observations.packet_embedding_execution = packetEmbeddingExecutionProof(
+    packet,
+    observations.cache_preparation,
+    observations.transport_mode,
+  );
+  return observations;
 }
 
 function packetEmbeddingExecutionProof(packet, cachePreparation, transportMode) {
@@ -3622,6 +5222,7 @@ async function codestoryCacheProvenance(opts, config, observations = {}) {
     config.path,
     Math.min(opts.timeoutMs ?? 600_000, 60_000),
     selectedBenchmarkChildEnv(opts),
+    opts.signal,
   );
   const retrievalStatus = observations.cache_preparation?.retrieval_status ??
     await codestoryRetrievalStatusSnapshot(
@@ -3629,6 +5230,7 @@ async function codestoryCacheProvenance(opts, config, observations = {}) {
       config.path,
       Math.min(opts.timeoutMs ?? 600_000, 60_000),
       selectedBenchmarkChildEnv(opts),
+      opts.signal,
     );
   return {
     codestory_cli: path.resolve(codestoryCli),
@@ -3692,16 +5294,97 @@ async function writeJsonlRows(filePath, rows) {
   await writeFile(filePath, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "utf8");
 }
 
+function sameBenchmarkRowIdentity(left, right) {
+  return (
+    left?.repo === right?.repo &&
+    left?.task_id === right?.task_id &&
+    left?.arm === right?.arm &&
+    left?.repeat === right?.repeat
+  );
+}
+
+async function resolveReanalysisStdoutPath(result, runDir) {
+  let current = result;
+  let currentRunDir = runDir;
+  const visited = new Set();
+  for (let depth = 0; depth < 16; depth += 1) {
+    if (current.stdout_path) {
+      const candidate = path.isAbsolute(current.stdout_path)
+        ? current.stdout_path
+        : path.resolve(currentRunDir, current.stdout_path);
+      if (existsSync(candidate)) {
+        return candidate;
+      }
+    }
+
+    const reusedFrom = current.benchmark_contract?.reused_from;
+    if (!reusedFrom) {
+      return null;
+    }
+    const reusedRunDir = path.resolve(reusedFrom);
+    if (visited.has(reusedRunDir)) {
+      return null;
+    }
+    visited.add(reusedRunDir);
+    const reusedRunsPath = path.join(reusedRunDir, "runs.jsonl");
+    if (!existsSync(reusedRunsPath)) {
+      return null;
+    }
+    const reusedRows = (await readFile(reusedRunsPath, "utf8"))
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const reusedRow = reusedRows.find((candidate) =>
+      sameBenchmarkRowIdentity(candidate, result),
+    );
+    if (!reusedRow) {
+      return null;
+    }
+    current = reusedRow;
+    currentRunDir = reusedRunDir;
+  }
+  return null;
+}
+
+async function reanalysisPacketManifestQuality(result, runDir, task) {
+  const packetPath = result.codestory_harness_prelude?.stdout_path;
+  if (!packetPath || !task) {
+    return null;
+  }
+  const resolved = path.isAbsolute(packetPath) ? packetPath : path.resolve(runDir, packetPath);
+  if (!existsSync(resolved)) {
+    return null;
+  }
+  const packet = JSON.parse(await readFile(resolved, "utf8"));
+  return packetManifestQualitySummary(packet, task);
+}
+
+async function createDurableJsonlAppender(filePath) {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const handle = await open(filePath, "a");
+  let pending = Promise.resolve();
+  return {
+    append(row) {
+      pending = pending.then(async () => {
+        await handle.write(`${JSON.stringify(row)}\n`, null, "utf8");
+        await handle.sync();
+      });
+      return pending;
+    },
+    async close() {
+      await pending;
+      await handle.close();
+    },
+  };
+}
+
 async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
-  const stdoutPath = result.stdout_path
-    ? path.isAbsolute(result.stdout_path)
-      ? result.stdout_path
-      : path.resolve(runDir, result.stdout_path)
-    : null;
+  const stdoutPath = await resolveReanalysisStdoutPath(result, runDir);
   if (!stdoutPath || !existsSync(stdoutPath)) {
     return {
       ...result,
-      reanalysis_error: `missing stdout_path: ${result.stdout_path ?? ""}`,
+      reanalysis_error: `missing stdout artifact for ${result.repo}/${result.task_id}/${result.arm}/${result.repeat}`,
     };
   }
 
@@ -3711,6 +5394,7 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
     ...parsed,
   ];
   const task = await loadTaskForResult(result, opts, taskCache);
+  const packetManifestQuality = await reanalysisPacketManifestQuality(result, runDir, task);
   const repoConfig = ALL_REPOS[result.repo] ?? null;
   const usage = extractUsage(parsed);
   const analysis = analyzeTranscript(analysisEvents, result.repo_path ?? repoConfig?.path ?? runDir);
@@ -3726,8 +5410,16 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
         })
       : null
   );
+  const { reanalysis_error: _staleReanalysisError, ...sourceResult } = result;
   const output = {
-    ...result,
+    ...sourceResult,
+    codestory_harness_prelude: result.codestory_harness_prelude
+      ? {
+          ...result.codestory_harness_prelude,
+          packet_manifest_quality:
+            packetManifestQuality ?? result.codestory_harness_prelude.packet_manifest_quality,
+        }
+      : null,
     repo_provenance: result.repo_provenance ?? (repoConfig ? await repoProvenance(repoConfig) : null),
     codestory_cache_provenance: cacheProvenance,
     usage,
@@ -3775,6 +5467,10 @@ async function reanalyzeAgentRunDirectory(opts) {
   }
 
   const summary = summarizeRuns(reanalyzed);
+  const obligationAccounting = summarizePacketObligationAccounting(
+    reanalyzed,
+    "reanalyzed benchmark report",
+  );
   const costAccounting = summarizeCostAccounting(reanalyzed);
   const summaryOpts = {
     ...opts,
@@ -3789,6 +5485,7 @@ async function reanalyzeAgentRunDirectory(opts) {
     publishable: Boolean(opts.publishable || originalSummary.publishable),
     max_source_reads_after_packet: opts.maxSourceReadsAfterPacket,
     output_dir: runDir,
+    packet_obligation_accounting: obligationAccounting,
     summary,
     cost_accounting: costAccounting,
   };
@@ -4136,6 +5833,39 @@ function packetDiagnosticIsDiagnosticOnly(value) {
   );
 }
 
+function packetCoverageQueryObligations(packet) {
+  const obligations = packet?.plan?.obligations?.query_obligations;
+  return Array.isArray(obligations) ? obligations : null;
+}
+
+function packetCoverageUnresolvedEntryBlocks(entry, queryObligations) {
+  if (packetDiagnosticIsDiagnosticOnly(entry)) {
+    return false;
+  }
+  if (!queryObligations) {
+    return true;
+  }
+  const query = String(
+    typeof entry === "string" ? entry : entry?.query ?? "",
+  ).trim();
+  if (!query) {
+    return true;
+  }
+  const matching = queryObligations.filter(
+    (obligation) => String(obligation?.query ?? "").trim() === query,
+  );
+  if (!matching.length) {
+    return true;
+  }
+  const material = matching.filter((obligation) => obligation?.material === true);
+  if (!material.length) {
+    return false;
+  }
+  return material.some(
+    (obligation) => String(obligation?.completion?.status ?? "") !== "completed",
+  );
+}
+
 function packetCoverageUnresolvedCounts(packet) {
   const unresolved =
     packet?.coverage_report?.unresolved ??
@@ -4143,9 +5873,12 @@ function packetCoverageUnresolvedCounts(packet) {
     packet?.sufficiency?.coverage_report?.unresolved ??
     null;
   if (Array.isArray(unresolved)) {
+    const queryObligations = packetCoverageQueryObligations(packet);
     return {
       total: unresolved.length,
-      blocking: unresolved.filter((entry) => !packetDiagnosticIsDiagnosticOnly(entry)).length,
+      blocking: unresolved.filter((entry) =>
+        packetCoverageUnresolvedEntryBlocks(entry, queryObligations)
+      ).length,
     };
   }
   const number = finiteNumber(unresolved);
@@ -4182,6 +5915,45 @@ function packetShape(packet) {
   };
 }
 
+function packetDispositionTelemetry(packet, quality) {
+  if (!packet || typeof packet !== "object") {
+    return null;
+  }
+  const support = Array.isArray(packet.support) ? packet.support : [];
+  const supportKindCounts = {};
+  for (const unit of support) {
+    const kind = String(unit?.kind ?? "unknown");
+    supportKindCounts[kind] = (supportKindCounts[kind] ?? 0) + 1;
+  }
+  const disposition = packet.disposition ?? null;
+  const drill = disposition?.drill ?? null;
+  const retrievalShadow = packetRetrievalShadow(packet);
+  return {
+    kind: disposition?.kind ?? null,
+    terminal: disposition?.kind != null && disposition.kind !== "drill_once",
+    reason: disposition?.reason ?? null,
+    support_count: support.length,
+    support_kind_counts: Object.fromEntries(
+      Object.entries(supportKindCounts).sort(([left], [right]) => left.localeCompare(right)),
+    ),
+    omission_receipts_count: Array.isArray(disposition?.omission_receipts)
+      ? disposition.omission_receipts.length
+      : 0,
+    drill_option_count: Array.isArray(drill?.options) ? drill.options.length : 0,
+    drill_option_ids: Array.isArray(drill?.options)
+      ? drill.options.map((option) => option?.id).filter(Boolean)
+      : [],
+    parent_packet_id: drill?.parent_packet_id ?? null,
+    core_generation_id: drill?.core_generation_id ?? null,
+    retrieval_generation: drill?.retrieval_generation ?? null,
+    remaining_rounds: presentFiniteNumber(drill?.remaining_rounds),
+    retrieval_mode: retrievalShadow?.retrieval_mode ?? null,
+    degraded_reason: retrievalShadow?.degraded_reason ?? null,
+    supported_quality_mismatch:
+      disposition?.kind === "supported" && quality?.pass === false,
+  };
+}
+
 function packetSufficiencyTelemetry(packet, quality) {
   if (!packet || typeof packet !== "object") {
     return null;
@@ -4209,6 +5981,7 @@ function packetSufficiencyTelemetry(packet, quality) {
     unresolved_candidate_diagnostic_only: packetDiagnosticIsDiagnosticOnly(retrievalShadow),
     coverage_unresolved_count: unresolvedCoverage.total,
     coverage_unresolved_blocking_count: unresolvedCoverage.blocking,
+    obligation_accounting: packetObligationAccounting(packet),
     sufficient_quality_mismatch: status === "sufficient" && qualityPass === false,
   };
 }
@@ -4458,7 +6231,7 @@ function packetLatencyTelemetry(packet, wallMs) {
 async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const repoConfig = ALL_REPOS[task.repo];
   const codestoryCli = resolveCodeStoryCli(opts);
-  const provenance = await repoProvenance(repoConfig);
+  const provenance = await repoProvenance(repoConfig, opts.signal);
   const args = packetCommandArgs(repoConfig, task, opts);
   const started = performance.now();
   const result = await runProcess(codestoryCli, args, {
@@ -4683,7 +6456,7 @@ function createStdioClient(command, args, opts) {
 async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
   const repoConfig = ALL_REPOS[repoName];
   const codestoryCli = resolveCodeStoryCli(opts);
-  const provenance = await repoProvenance(repoConfig);
+  const provenance = await repoProvenance(repoConfig, opts.signal);
   const cacheProvenance = await codestoryCacheProvenance(
     opts,
     repoConfig,
@@ -4714,7 +6487,7 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
             name: "packet",
             arguments: {
               question: task.prompt,
-              budget: "compact",
+              budget: "standard",
               task_class: task.task_class,
             },
           },
@@ -5231,6 +7004,24 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
 }
 
 function addPacketSufficiencyPublishableReasons(sufficiency, productReasons, harnessReasons, label) {
+  const obligationAccounting = sufficiency.obligation_accounting;
+  const accountingError = packetObligationAccountingError(
+    obligationAccounting,
+    `${label} obligations`,
+  );
+  if (accountingError) {
+    harnessReasons.push(accountingError);
+  }
+  const provenMaterial = obligationAccounting?.material_status_buckets?.proven ?? 0;
+  if (
+    Number.isInteger(obligationAccounting?.material) &&
+    Number.isInteger(provenMaterial) &&
+    provenMaterial !== obligationAccounting.material
+  ) {
+    productReasons.push(
+      `${label} material obligations proven=${provenMaterial}/${obligationAccounting.material}; expected all`,
+    );
+  }
   if (sufficiency.status !== "sufficient") {
     productReasons.push(`${label} sufficiency status=${sufficiency.status ?? "unknown"}; expected sufficient`);
   }
@@ -5281,6 +7072,15 @@ function groupTasksByRepo(tasks) {
     byRepo.get(task.repo).push(task);
   }
   return byRepo;
+}
+
+function groupPacketRuntimeColdJobs(tasks, repeats) {
+  return [...groupTasksByRepo(tasks)].map(([repo, repoTasks]) => ({
+    repo,
+    jobs: repoTasks.flatMap((task) =>
+      Array.from({ length: repeats }, (_, index) => ({ task, repeat: index + 1 })),
+    ),
+  }));
 }
 
 function packetCompositionPayload(results) {
@@ -5406,19 +7206,23 @@ async function runPacketRuntimeBenchmarkBody(opts, tasks) {
       : [opts.packetRuntimeMode];
   const results = [];
   if (modes.includes("cold-cli")) {
-    const coldJobs = [];
-    for (const task of tasks) {
-      for (let repeat = 1; repeat <= opts.repeats; repeat += 1) {
-        coldJobs.push({ task, repeat });
-      }
-    }
-    const coldResults = await parallelMap(coldJobs, opts.jobs, async ({ task, repeat }) => {
-      console.log(`packet-runtime cold-cli ${task.repo} ${task.id} repeat ${repeat}/${opts.repeats}`);
-      return await runColdPacketRuntime(opts, task, repeat, outDir);
-    });
-    for (const result of coldResults) {
-      if (result) {
-        results.push(result);
+    const coldResultGroups = await parallelMap(
+      groupPacketRuntimeColdJobs(tasks, opts.repeats),
+      opts.jobs,
+      async ({ jobs }) => {
+        const repoResults = [];
+        for (const { task, repeat } of jobs) {
+          console.log(`packet-runtime cold-cli ${task.repo} ${task.id} repeat ${repeat}/${opts.repeats}`);
+          repoResults.push(await runColdPacketRuntime(opts, task, repeat, outDir));
+        }
+        return repoResults;
+      },
+    );
+    for (const coldResults of coldResultGroups) {
+      for (const result of coldResults) {
+        if (result) {
+          results.push(result);
+        }
       }
     }
   }
@@ -5430,6 +7234,10 @@ async function runPacketRuntimeBenchmarkBody(opts, tasks) {
   }
   await writeJsonlRows(path.join(outDir, "packet-runtime-runs.jsonl"), results);
   const summary = summarizePacketRuntimeRuns(results);
+  const obligationAccounting = summarizePacketObligationAccounting(
+    results,
+    "packet runtime report",
+  );
   const blockers = packetRuntimePublishableBlockers(results, opts);
   const payload = {
     generated_at: new Date().toISOString(),
@@ -5452,6 +7260,7 @@ async function runPacketRuntimeBenchmarkBody(opts, tasks) {
       scorerPath: benchmarkScorerPath,
       cliIdentity: opts.codestoryCli ?? process.env.CODESTORY_CLI ?? null,
     }),
+    packet_obligation_accounting: obligationAccounting,
     ...(process.env.CODESTORY_RELEASE_EVIDENCE_COMMIT
       ? {
           release_evidence: {
@@ -5660,6 +7469,7 @@ function resourceAccountingForResult(result) {
       reasoning_tokens: usage.reasoning_tokens ?? null,
     },
     estimated_cost_usd: result.estimated_cost_usd ?? null,
+    interaction_turns: analysis.interaction_turns ?? null,
     tool_calls_observed: presentFiniteNumber(result.tool_calls_observed),
     codex_tool_calls_observed: presentFiniteNumber(result.codex_tool_calls_observed),
     tool_categories: analysis.tool_categories ?? {},
@@ -5676,6 +7486,9 @@ function resourceAccountingForResult(result) {
 
 function summarizeArmCostAccounting(rows) {
   const successful = rows.filter((row) => row.status === "pass");
+  const latencyEligible = successful.filter(
+    (row) => row.comparative_wall_time_eligible !== false,
+  );
   const wallMs = sumFinite(rows.map((row) => row.wall_ms));
   const agentRunnerWallMs = sumFinite(
     rows.map((row) => row.agent_runner_wall_ms ?? row.wall_ms),
@@ -5692,6 +7505,8 @@ function summarizeArmCostAccounting(rows) {
   return {
     runs: rows.length,
     successful_runs: successful.length,
+    comparative_wall_time_eligible_runs: latencyEligible.length,
+    comparative_wall_time_eligible: latencyEligible.length === successful.length,
     failed_runs: rows.filter((row) => row.status === "fail").length,
     timeout_runs: rows.filter((row) => row.status === "timeout").length,
     missing_token_usage_runs: rows.filter((row) => row.usage?.total_tokens == null).length,
@@ -5711,6 +7526,25 @@ function summarizeArmCostAccounting(rows) {
       reasoning_tokens: sumPresentFinite(rows.map((row) => row.usage?.reasoning_tokens)),
     },
     estimated_cost_usd: sumPresentFinite(rows.map((row) => row.estimated_cost_usd)),
+    interaction_turns: {
+      total: sumFinite(rows.map((row) => row.transcript_analysis?.interaction_turns?.total)),
+      model_messages: sumFinite(
+        rows.map((row) => row.transcript_analysis?.interaction_turns?.model_messages),
+      ),
+      tool_actions: sumFinite(
+        rows.map((row) => row.transcript_analysis?.interaction_turns?.tool_actions),
+      ),
+      failed_tool_actions: sumFinite(
+        rows.map((row) => row.transcript_analysis?.interaction_turns?.failed_tool_actions),
+      ),
+      reasoning_items_excluded: sumFinite(
+        rows.map((row) => row.transcript_analysis?.interaction_turns?.reasoning_items_excluded),
+      ),
+      error_items_excluded: sumFinite(
+        rows.map((row) => row.transcript_analysis?.interaction_turns?.error_items_excluded),
+      ),
+      taxonomy: "completed_agent_messages_plus_tool_actions_v1",
+    },
     tool_calls: {
       observed: sumFinite(rows.map((row) => row.tool_calls_observed)),
       codex_observed: sumFinite(rows.map((row) => row.codex_tool_calls_observed)),
@@ -5779,14 +7613,22 @@ function summarizeCostAccounting(results) {
   const withVsWithout =
     withCodeStory && withoutCodeStory
       ? {
-          runner_wall_ms: accountingComparison(
-            withCodeStory.time_spent_ms.runner_wall,
-            withoutCodeStory.time_spent_ms.runner_wall,
-          ),
-          all_in_wall_ms: accountingComparison(
-            withCodeStory.time_spent_ms.all_in,
-            withoutCodeStory.time_spent_ms.all_in,
-          ),
+          runner_wall_ms:
+            withCodeStory.comparative_wall_time_eligible &&
+            withoutCodeStory.comparative_wall_time_eligible
+              ? accountingComparison(
+                  withCodeStory.time_spent_ms.runner_wall,
+                  withoutCodeStory.time_spent_ms.runner_wall,
+                )
+              : null,
+          all_in_wall_ms:
+            withCodeStory.comparative_wall_time_eligible &&
+            withoutCodeStory.comparative_wall_time_eligible
+              ? accountingComparison(
+                  withCodeStory.time_spent_ms.all_in,
+                  withoutCodeStory.time_spent_ms.all_in,
+                )
+              : null,
           total_tokens: accountingComparison(
             withCodeStory.tokens_spent.total_tokens,
             withoutCodeStory.tokens_spent.total_tokens,
@@ -5806,6 +7648,10 @@ function summarizeCostAccounting(results) {
           commands: accountingComparison(
             withCodeStory.commands.observed,
             withoutCodeStory.commands.observed,
+          ),
+          interaction_turns: accountingComparison(
+            withCodeStory.interaction_turns.total,
+            withoutCodeStory.interaction_turns.total,
           ),
           estimated_cost_usd: accountingComparison(
             withCodeStory.estimated_cost_usd,
@@ -5838,11 +7684,28 @@ function summarizeRuns(results) {
   for (const [key, rows] of groups) {
     const [repo, taskId, arm] = key.split("\t");
     const successful = rows.filter((row) => row.status === "pass");
+    const latencyEligible = successful.filter(
+      (row) => row.comparative_wall_time_eligible !== false,
+    );
     const qualityRows = successful.filter((row) => row.quality);
     const packetFirstRows = successful.filter((row) => row.packet_first_required);
     const packetManifestRows = successful.filter(
       (row) => row.codestory_harness_prelude?.packet_manifest_quality,
     );
+    const packetDispositionCounts = {};
+    for (const row of successful) {
+      const kind = row.codestory_harness_prelude?.packet_disposition_kind;
+      if (kind) {
+        packetDispositionCounts[kind] = (packetDispositionCounts[kind] ?? 0) + 1;
+      }
+    }
+    const binaryIdentityStatusCounts = {};
+    for (const row of rows) {
+      const status = row.codestory_binary_identity?.status;
+      if (status) {
+        binaryIdentityStatusCounts[status] = (binaryIdentityStatusCounts[status] ?? 0) + 1;
+      }
+    }
     const categoryMedians = {};
     for (const category of COMMAND_ACCOUNTING_CATEGORIES) {
       categoryMedians[category] = median(
@@ -5867,15 +7730,20 @@ function summarizeRuns(results) {
       arm,
       runs: rows.length,
       successful_runs: successful.length,
+      comparative_wall_time_eligible_runs: latencyEligible.length,
       packet_first_pass_runs: packetFirstRows.filter((row) => row.packet_first_pass).length,
       packet_first_required_runs: packetFirstRows.length,
       packet_manifest_quality_pass_runs: packetManifestRows.filter(
         (row) => row.codestory_harness_prelude?.packet_manifest_quality?.pass,
       ).length,
       packet_manifest_quality_scored_runs: packetManifestRows.length,
-      packet_partial_runs: successful.filter(
-        (row) => row.codestory_harness_prelude?.packet_sufficiency_status === "partial",
-      ).length,
+      packet_disposition_counts: Object.fromEntries(
+        Object.entries(packetDispositionCounts).sort(([left], [right]) => left.localeCompare(right)),
+      ),
+      packet_drill_once_runs: packetDispositionCounts.drill_once ?? 0,
+      codestory_binary_identity_status_counts: Object.fromEntries(
+        Object.entries(binaryIdentityStatusCounts).sort(([left], [right]) => left.localeCompare(right)),
+      ),
       quality_scored_runs: qualityRows.length,
       quality_pass_runs: qualityRows.filter((row) => row.quality?.pass).length,
       total_wall_ms: totalWallMs,
@@ -5888,6 +7756,9 @@ function summarizeRuns(results) {
       total_estimated_cost_usd: sumPresentFinite(successful.map((row) => row.estimated_cost_usd)),
       total_tool_calls_observed: sumFinite(successful.map((row) => row.tool_calls_observed)),
       total_command_count: sumFinite(successful.map((row) => row.transcript_analysis?.command_count)),
+      total_interaction_turns: sumFinite(
+        successful.map((row) => row.transcript_analysis?.interaction_turns?.total),
+      ),
       total_web_search_tool_calls: sumFinite(
         successful.map((row) => row.transcript_analysis?.tool_categories?.web_search ?? 0),
       ),
@@ -5895,7 +7766,8 @@ function summarizeRuns(results) {
         successful.map((row) => row.transcript_analysis?.direct_source_reads_total),
       ),
       missing_token_usage_runs: successful.filter((row) => row.usage?.total_tokens == null).length,
-      median_wall_ms: median(successful.map((row) => row.wall_ms)),
+      median_wall_ms: median(latencyEligible.map((row) => row.wall_ms)),
+      observed_median_wall_ms: median(successful.map((row) => row.wall_ms)),
       median_codestory_cache_preparation_wall_ms: median(
         successful.map((row) => cachePreparationWallMs(row.codestory_cache_provenance?.cache_preparation)),
       ),
@@ -5907,6 +7779,9 @@ function summarizeRuns(results) {
       median_output_tokens: median(successful.map((row) => row.usage?.output_tokens)),
       median_estimated_cost_usd: median(successful.map((row) => row.estimated_cost_usd)),
       median_command_count: median(successful.map((row) => row.transcript_analysis?.command_count)),
+      median_interaction_turns: median(
+        successful.map((row) => row.transcript_analysis?.interaction_turns?.total),
+      ),
       median_tool_calls_observed: median(successful.map((row) => row.tool_calls_observed)),
       median_web_search_tool_calls: median(
         successful.map((row) => row.transcript_analysis?.tool_categories?.web_search ?? 0),
@@ -5989,6 +7864,40 @@ function usefulAnchorHitsPer10kContextChars(row) {
   return hits / Math.max(1, contextChars / 10_000);
 }
 
+function managedCodeStoryRuntimeIdentityBlockers(result) {
+  const reasons = [];
+  const analysis = result?.transcript_analysis;
+  const started = analysis?.codestory_mcp_tool_calls_observed ?? 0;
+  const completed = analysis?.codestory_mcp_completed_calls_observed ?? 0;
+  const identities = analysis?.codestory_mcp_runtime_identities ?? [];
+  if (started <= 0) {
+    const prelude = result?.codestory_harness_prelude;
+    if (prelude?.status !== "pass") {
+      reasons.push("with_codestory arm has no passing managed CodeStory packet prelude");
+      return reasons;
+    }
+    reasons.push(
+      ...managedRuntimeIdentityBlockers(
+        prelude.packet_contract_runtime,
+        "with_codestory packet prelude",
+      ),
+    );
+    return reasons;
+  }
+  if (identities.length <= 0) {
+    reasons.push("with_codestory arm has no managed CodeStory runtime identity");
+  }
+  if (identities.length < completed) {
+    reasons.push(
+      `with_codestory arm proved ${identities.length}/${completed} completed CodeStory MCP runtime identities`,
+    );
+  }
+  for (const identity of identities) {
+    reasons.push(...managedRuntimeIdentityBlockers(identity, "with_codestory arm"));
+  }
+  return reasons;
+}
+
 function agentPublishableBlockers(results, opts = {}) {
   const maxSourceReadsAfterPacket = opts.maxSourceReadsAfterPacket;
   const enforceRepoProvenance = Boolean(opts.publishable || opts.enforceRepoProvenance);
@@ -6014,9 +7923,27 @@ function agentPublishableBlockers(results, opts = {}) {
       }
       if (
         result.arm === "without_codestory" &&
-        (result.transcript_analysis?.command_categories?.codestory_cli ?? 0) > 0
+        ((result.transcript_analysis?.command_categories?.codestory_cli ?? 0) > 0 ||
+          (result.transcript_analysis?.codestory_mcp_tool_calls_observed ?? 0) > 0)
       ) {
         environmentReasons.push("without_codestory arm used CodeStory");
+      }
+      if (opts.publishable && result.arm === "with_codestory") {
+        environmentReasons.push(
+          ...managedCodeStoryRuntimeIdentityBlockers(result),
+        );
+        const obligationAccounting = resultPacketObligationAccounting(result);
+        if (obligationAccounting) {
+          const accountingError = packetObligationAccountingError(
+            obligationAccounting,
+            "codestory prelude packet obligations",
+          );
+          if (accountingError) {
+            harnessReasons.push(accountingError);
+          }
+        } else if (resultRequiresPacketObligationAccounting(result)) {
+          harnessReasons.push("codestory prelude packet obligation accounting is missing");
+        }
       }
       if (
         result.arm === "without_codestory" &&
@@ -6056,6 +7983,24 @@ function agentPublishableBlockers(results, opts = {}) {
         if (prelude.packet_manifest_quality && !prelude.packet_manifest_quality.pass) {
           productReasons.push(`${label} prelude packet manifest quality failed`);
         }
+        const preludeDisposition = prelude.packet_disposition;
+        if (preludeDisposition) {
+          if (!PACKET_DISPOSITIONS.has(preludeDisposition.kind)) {
+            harnessReasons.push(
+              `${label} prelude packet disposition=${preludeDisposition.kind ?? "missing"} is invalid`,
+            );
+          } else if (opts.publishable && preludeDisposition.kind !== "supported") {
+            productReasons.push(
+              `${label} prelude packet disposition=${preludeDisposition.kind}; expected supported`,
+            );
+          }
+          if (
+            preludeDisposition.kind === "supported" &&
+            (presentFiniteNumber(prelude.packet_support_count) ?? 0) <= 0
+          ) {
+            harnessReasons.push(`${label} prelude supported packet has no support units`);
+          }
+        }
         const preludeSufficiency =
           prelude.packet_sufficiency ??
           (prelude.packet_sufficiency_status
@@ -6080,6 +8025,7 @@ function agentPublishableBlockers(results, opts = {}) {
           }
         }
         const preludeRetrieval =
+          prelude.packet_disposition ??
           prelude.packet_sufficiency ??
           prelude.packet_latency?.retrieval_shadow ??
           null;
@@ -6179,6 +8125,10 @@ function markdownCostAccounting(costAccounting) {
       "| --- | ---: | ---: | ---: | ---: |",
     );
     for (const [label, values] of Object.entries(comparison)) {
+      if (values == null) {
+        lines.push(`| ${label} | ineligible | ineligible | ineligible | ineligible |`);
+        continue;
+      }
       lines.push(
         `| ${label} | ${formatValue(values.with_codestory)} | ${formatValue(values.without_codestory)} | ${formatValue(values.with_minus_without)} | ${formatValue(values.ratio)} |`,
       );
@@ -6293,6 +8243,10 @@ function runSelfTest() {
     commandEvent("cmd_3", "item.completed", "Get-Content crates/codestory-cli/src/main.rs", "fn run_index() {}"),
     commandEvent("cmd_4", "item.started", "Get-Content crates/codestory-cli/src/main.rs"),
     commandEvent("cmd_4", "item.completed", "Get-Content crates/codestory-cli/src/main.rs", "fn run_index() {}"),
+    commandEvent("cmd_5", "item.started", "sed -n '1,80p' /opt/codestory/SKILL.md"),
+    commandEvent("cmd_5", "item.completed", "sed -n '1,80p' /opt/codestory/SKILL.md", "# Instructions"),
+    commandEvent("cmd_6", "item.started", "/bin/zsh -lc \"sed -n '1,80p' /opt/codestory/references/packet.md\""),
+    commandEvent("cmd_6", "item.completed", "/bin/zsh -lc \"sed -n '1,80p' /opt/codestory/references/packet.md\"", "# Packet"),
     {
       type: "item.completed",
       item: {
@@ -6304,10 +8258,11 @@ function runSelfTest() {
     { type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 } },
   ];
 
-  const analysis = analyzeTranscript(fixtureEvents);
+  const analysis = analyzeTranscript(fixtureEvents, "/workspace/repository");
   assert.equal(analysis.command_categories.codestory_cli, 1);
   assert.equal(analysis.command_categories.shell_search, 1);
-  assert.equal(analysis.command_categories.direct_file_read, 2);
+  assert.equal(analysis.command_categories.direct_file_read, 4);
+  assert.equal(analysis.direct_file_reads_total, 4);
   assert.equal(analysis.direct_source_reads_total, 2);
   assert.equal(analysis.ordinary_source_reads_after_first_codestory, 2);
   assert.equal(analysis.ordinary_source_reads_after_first_packet, 2);
@@ -6332,6 +8287,48 @@ function runSelfTest() {
   assert.equal(quality.expected_symbols.recall, 1);
   assert.equal(quality.expected_claims.recall, 1);
   assert.equal(quality.citation_coverage.recall, 1);
+  assert.equal(
+    claimMatched(
+      "Build.process processes a Jekyll site before rendering pages and documents.",
+      "Build.process constructs or processes a Jekyll site.",
+    ),
+    true,
+  );
+  assert.equal(
+    claimMatched(
+      "Renderer handles rendering for pages and documents.",
+      "Renderer renders pages and documents.",
+    ),
+    true,
+  );
+  assert.equal(
+    claimMatched(
+      "Renderer selects an output directory.",
+      "Renderer renders pages and documents.",
+    ),
+    false,
+  );
+  assert.equal(
+    forbiddenClaimMatched(
+      "Jekyll does not write output before reading and rendering the site.",
+      "Jekyll writes output before reading and rendering the site.",
+    ),
+    false,
+  );
+  assert.equal(
+    sameBenchmarkRowIdentity(
+      { repo: "repo", task_id: "task", arm: "without_codestory", repeat: 1 },
+      { repo: "repo", task_id: "task", arm: "without_codestory", repeat: 1 },
+    ),
+    true,
+  );
+  assert.equal(
+    sameBenchmarkRowIdentity(
+      { repo: "repo", task_id: "task", arm: "without_codestory", repeat: 1 },
+      { repo: "repo", task_id: "task", arm: "with_codestory", repeat: 1 },
+    ),
+    false,
+  );
   const packetFixture = {
     budget: {
       used: { output_bytes: 123 },
@@ -6488,6 +8485,13 @@ function runSelfTest() {
           },
         },
       },
+      plan: {
+        obligations: {
+          claim_obligations: [
+            { material: true, proof_status: "proven" },
+          ],
+        },
+      },
     },
     { pass: true },
   );
@@ -6615,17 +8619,21 @@ function runSelfTest() {
     { status: "pass", exitCode: 0, timedOut: false },
     {
       retrieval_mode: "full",
-      embedding_backend: "Metal",
-      embedding_policy: "accelerated",
-      embedding_engine_instance_id: "engine-1",
+      degraded_reason: null,
+      embedding_device_policy: "accelerator_required",
+      embedding_device_state: "accelerated",
+      embedding_cpu_allowed: false,
     },
     null,
     1,
   );
-  assert.equal(engineStatus.locality_kind, "same_user_local_ipc");
-  assert.equal(engineStatus.embedding_backend, "Metal");
-  assert.equal(engineStatus.embedding_policy, "accelerated");
-  assert.equal(engineStatus.embedding_engine_instance_id, "engine-1");
+  assert.equal(engineStatus.embedding_device_policy, "accelerator_required");
+  assert.equal(engineStatus.embedding_device_state, "accelerated");
+  assert.equal(engineStatus.embedding_cpu_allowed, false);
+  assert.equal(engineStatus.locality_kind, null);
+  assert.equal(engineStatus.embedding_backend, null);
+  assert.equal(engineStatus.embedding_policy, null);
+  assert.equal(engineStatus.embedding_engine_instance_id, null);
   const packetRuntimePreparation = [
     {
       repo: "codestory",
@@ -6695,6 +8703,31 @@ function agentRunKey(run) {
   return [run.repo, taskId, run.arm, String(run.repeat)].join("\t");
 }
 
+function sortAgentResultsCanonical(results, tasks, arms) {
+  const taskOrder = new Map(tasks.map((task, index) => [task.id, index]));
+  const armOrder = new Map(arms.map((arm, index) => [arm, index]));
+  return [...results].sort((left, right) => {
+    const leftTask = taskOrder.get(left.task_id) ?? Number.MAX_SAFE_INTEGER;
+    const rightTask = taskOrder.get(right.task_id) ?? Number.MAX_SAFE_INTEGER;
+    return (
+      leftTask - rightTask ||
+      (armOrder.get(left.arm) ?? Number.MAX_SAFE_INTEGER) -
+        (armOrder.get(right.arm) ?? Number.MAX_SAFE_INTEGER) ||
+      left.repeat - right.repeat ||
+      String(left.repo).localeCompare(String(right.repo))
+    );
+  });
+}
+
+function withoutPooledLatency(summary) {
+  return summary.map((row) => Object.fromEntries(
+    Object.entries(row).map(([key, value]) => [
+      key,
+      key.includes("wall_ms") ? null : value,
+    ]),
+  ));
+}
+
 function agentRunIsolationGroupKey(run) {
   return run.repo;
 }
@@ -6726,6 +8759,103 @@ function benchmarkContractForRun(opts, run, env = process.env) {
     scorerPath: benchmarkScorerPath,
     cliIdentity: run.arm === "with_codestory" ? opts.codestoryCli ?? env.CODESTORY_CLI ?? null : null,
   });
+}
+
+function benchmarkContractEnvironment(contract) {
+  return {
+    contract_version: contract?.contract_version ?? null,
+    scorer_hash: contract?.scorer_hash ?? null,
+    harness_hash: contract?.harness_hash ?? null,
+    runner: contract?.runner ?? null,
+    model: contract?.model ?? null,
+    sandbox: contract?.sandbox ?? null,
+    retrieval_contract: contract?.retrieval_contract ?? null,
+    retrieval_env: contract?.retrieval_env ?? null,
+    packet_threshold_config: contract?.packet_threshold_config ?? null,
+  };
+}
+
+function benchmarkContractEnvironmentSha256(contract) {
+  return sha256Bytes(stableJsonForHash(benchmarkContractEnvironment(contract)));
+}
+
+function benchmarkContractProjection(contract, { pathNeutral = false } = {}) {
+  return Object.fromEntries([
+    "contract_version",
+    "task_id",
+    "task_manifest_hash",
+    "scorer_hash",
+    "harness_hash",
+    "runner",
+    "model",
+    "sandbox",
+    ...(!pathNeutral ? ["codestory_cli"] : []),
+    "retrieval_contract",
+    "retrieval_env",
+    "packet_threshold_config",
+  ].map((key) => [key, contract?.[key] ?? null]));
+}
+
+function benchmarkContractContentSha256(contract) {
+  return sha256Bytes(stableJsonForHash(benchmarkContractProjection(contract)));
+}
+
+function benchmarkShardContractSha256(contract) {
+  return sha256Bytes(stableJsonForHash(
+    benchmarkContractProjection(contract, { pathNeutral: true }),
+  ));
+}
+
+function benchmarkContractIntegrityError(contract, label) {
+  if (!contract || typeof contract !== "object" || Array.isArray(contract)) {
+    return `${label} benchmark contract is missing`;
+  }
+  const recomputed = benchmarkContractContentSha256(contract);
+  return contract.compatibility_fingerprint === recomputed
+    ? null
+    : `${label} benchmark contract compatibility fingerprint does not match its contents`;
+}
+
+function benchmarkContractFingerprints(results) {
+  return Object.fromEntries(
+    [...results]
+      .sort((left, right) => agentRunKey(left).localeCompare(agentRunKey(right)))
+      .map((row) => [agentRunKey(row), benchmarkShardContractSha256(row.benchmark_contract)]),
+  );
+}
+
+function benchmarkHostClassError(hostClass, label) {
+  if (!hostClass || typeof hostClass !== "object" || Array.isArray(hostClass)) {
+    return `${label} host class is missing`;
+  }
+  if (!String(hostClass.platform ?? "").trim() || !String(hostClass.arch ?? "").trim()) {
+    return `${label} host class must name platform and architecture`;
+  }
+  if (!String(hostClass.cpu_model ?? "").trim()) {
+    return `${label} host class must name the CPU model`;
+  }
+  if (!Number.isInteger(hostClass.logical_cpu_count) || hostClass.logical_cpu_count < 1) {
+    return `${label} host class has an invalid logical CPU count`;
+  }
+  if (!Number.isInteger(hostClass.total_memory_bytes) || hostClass.total_memory_bytes < 1) {
+    return `${label} host class has invalid total memory`;
+  }
+  const backend = String(hostClass.accelerator_backend ?? "").trim();
+  const adapter = String(hostClass.accelerator_adapter ?? "").trim();
+  if (!backend || !adapter) {
+    return `${label} host class must name the accelerator backend and adapter`;
+  }
+  if (["llvmpipe", "lavapipe", "warp", "software rasterizer", "swiftshader", "microsoft basic render driver"]
+    .some((token) => `${backend} ${adapter}`.toLowerCase().includes(token))) {
+    return `${label} host class names a software accelerator`;
+  }
+  if (hostClass.embedding_policy !== "accelerated") {
+    return `${label} host class embedding policy is not accelerated`;
+  }
+  if (!SHA256_PATTERN.test(String(hostClass.model_sha256 ?? ""))) {
+    return `${label} host class model digest is missing or malformed`;
+  }
+  return null;
 }
 
 function resolveRunArtifactPath(runDir, artifactPath) {
@@ -6874,29 +9004,942 @@ async function runPlannedAgentRun(opts, run, outDir, reusableBaselines) {
   return await runOne(opts, run, outDir);
 }
 
-async function runPlannedAgentRuns(opts, plannedRuns, reusableBaselines, outDir) {
-  const runsPath = path.join(outDir, "runs.jsonl");
-  if (opts.jobs <= 1 || plannedRuns.length <= 1) {
-    const results = [];
-    for (const run of plannedRuns) {
-      results.push(await runPlannedAgentRun(opts, run, outDir, reusableBaselines));
-      await writeJsonlRows(runsPath, results);
+function deterministicAgentRunFailure(result, opts) {
+  const blockers = opts.publishable
+    ? agentPublishableBlockers([result], opts)
+    : result.status === "pass"
+      ? []
+      : [{ result, category: "product", reasons: [`status=${result.status}`] }];
+  return blockers.length
+    ? {
+        benchmark_run_id: result.benchmark_run_id,
+        repo: result.repo,
+        task_id: result.task_id,
+        arm: result.arm,
+        repeat: result.repeat,
+        blockers: blockers.map(({ category, reasons }) => ({ category, reasons })),
+      }
+    : null;
+}
+
+function plannedAgentRunExceptionFailure(run, error) {
+  const reason = error instanceof Error ? error.message : String(error);
+  const taskId = run.task?.id ?? run.task_id ?? null;
+  return {
+    kind: "run_exception",
+    benchmark_run_id: benchmarkRunId([
+      run.repo,
+      ...(taskId ? [taskId] : []),
+      run.arm,
+      String(run.repeat).padStart(2, "0"),
+    ]),
+    repo: run.repo,
+    task_id: taskId,
+    arm: run.arm,
+    repeat: run.repeat,
+    error: reason,
+    blockers: [{
+      category: "harness-contract",
+      reasons: [`agent run raised an exception: ${reason}`],
+    }],
+  };
+}
+
+async function runPlannedAgentRuns(
+  opts,
+  plannedRuns,
+  reusableBaselines,
+  outDir,
+  options = {},
+) {
+  let stopScheduling = false;
+  let firstFailure = null;
+  const results = [];
+  const executeRun = options.runOne ?? runPlannedAgentRun;
+  const runOnePlanned = (run) => executeRun(
+    { ...opts, signal: options.signal },
+    options.decorateRun?.(run) ?? run,
+    outDir,
+    reusableBaselines,
+  );
+  const rememberFailure = async (failure, forceStop = false) => {
+    if (firstFailure) {
+      return;
     }
-    return results;
+    firstFailure = failure;
+    const shouldStop = forceStop || options.failFast;
+    if (shouldStop) {
+      stopScheduling = true;
+    }
+    try {
+      await options.onFirstFailure?.(failure);
+    } finally {
+      if (shouldStop) {
+        options.abortController?.abort(failure);
+      }
+    }
+  };
+  const record = async (result) => {
+    await options.onResult?.(result);
+    results.push(result);
+    const failure = deterministicAgentRunFailure(result, opts);
+    if (failure) {
+      await rememberFailure(failure);
+    }
+  };
+  const executeAndRecord = async (run) => {
+    try {
+      const result = await runOnePlanned(run);
+      await record(result);
+    } catch (error) {
+      await rememberFailure(plannedAgentRunExceptionFailure(run, error), true);
+    }
+  };
+  if (opts.jobs <= 1 || plannedRuns.length <= 1) {
+    for (const run of plannedRuns) {
+      if (stopScheduling || options.signal?.aborted || options.shouldSchedule?.(run) === false) {
+        break;
+      }
+      await executeAndRecord(run);
+    }
+    return { results, firstFailure };
   }
 
   const groups = groupPlannedAgentRuns(plannedRuns);
   console.log(`running ${plannedRuns.length} planned agent rows across ${groups.length} repo groups with --jobs ${opts.jobs}`);
-  const groupedResults = await parallelMap(groups, opts.jobs, async (group) => {
-    const rows = [];
+  await parallelMap(groups, opts.jobs, async (group) => {
     for (const run of group.runs) {
-      rows.push(await runPlannedAgentRun(opts, run, outDir, reusableBaselines));
+      if (stopScheduling || options.signal?.aborted || options.shouldSchedule?.(run) === false) {
+        break;
+      }
+      await executeAndRecord(run);
     }
-    return rows;
   });
-  const results = groupedResults.flat();
-  await writeJsonlRows(runsPath, results);
-  return results;
+  return { results, firstFailure };
+}
+
+function stableJsonForHash(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJsonForHash).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJsonForHash(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function benchmarkShardAttestation(
+  opts,
+  allTasks,
+  cachePreparation,
+  results = [],
+  dependencies = {},
+) {
+  const sourceCommit = dependencies.sourceCommit ??
+    await gitOutput(["-C", repoRoot, "rev-parse", "HEAD"], repoRoot);
+  const sourceTree = dependencies.sourceTree ??
+    await gitOutput(["-C", repoRoot, "rev-parse", "HEAD^{tree}"], repoRoot);
+  const trackedStatus = Object.hasOwn(dependencies, "trackedDirty")
+    ? null
+    : await gitOutput(
+      ["-C", repoRoot, "status", "--porcelain=v1", "--untracked-files=no"],
+      repoRoot,
+    );
+  if (!sourceCommit || !sourceTree || (!Object.hasOwn(dependencies, "trackedDirty") && trackedStatus == null)) {
+    throw new Error("Unable to attest the benchmark source checkout");
+  }
+  const trackedDirty = dependencies.trackedDirty ?? Boolean(trackedStatus);
+  if (trackedDirty) {
+    throw new Error("Benchmark shard attestation requires a clean tracked source checkout");
+  }
+  let cliSha256 = dependencies.cliSha256 ?? null;
+  if (!Object.hasOwn(dependencies, "cliSha256") && opts.arms.includes("with_codestory")) {
+    const cli = resolveCodeStoryCli(opts);
+    if (path.isAbsolute(cli) && existsSync(cli) && statSync(cli).isFile()) {
+      cliSha256 = sha256Bytes(await readFile(cli));
+    }
+  }
+  const manifestContract = allTasks.map((task) => {
+    const { manifest_path: _manifestPath, ...snapshot } = taskSnapshotForResult(task);
+    return snapshot;
+  });
+  const flags = {
+    arms: opts.arms,
+    repeats: opts.repeats,
+    runner: opts.runner,
+    model: opts.model,
+    sandbox: opts.sandbox,
+    jobs: opts.jobs,
+    timeout_ms: opts.timeoutMs,
+    task_suite: opts.taskSuite,
+    max_source_reads_after_packet: opts.maxSourceReadsAfterPacket,
+    publishable: opts.publishable,
+    prepare_codestory_cache: Boolean(opts.prepareCodestoryCache),
+    prepare_codestory_jobs: opts.prepareCodestoryJobs,
+    prepare_codestory_timeout_ms: opts.prepareCodestoryTimeoutMs,
+    packet_runtime: Boolean(opts.packetRuntime),
+    packet_runtime_mode: opts.packetRuntimeMode ?? null,
+    materialize_repos: Boolean(opts.materializeRepos),
+    canary_task_id: opts.canaryTaskId ?? opts.manifestCanaryTaskId ?? null,
+    diagnostic_extra_probes_from_manifest: Boolean(opts.diagnosticExtraProbesFromManifest),
+    collect_all_failures: Boolean(opts.collectAllFailures),
+    shard_count: opts.shardCount,
+  };
+  const rowContractEnvironmentDigests = new Set(
+    results.map((row) => benchmarkContractEnvironmentSha256(row.benchmark_contract)),
+  );
+  if (rowContractEnvironmentDigests.size > 1) {
+    throw new Error("Benchmark rows do not share one benchmark contract environment");
+  }
+  for (const row of results) {
+    const integrityError = benchmarkContractIntegrityError(
+      row.benchmark_contract,
+      `row ${agentRunKey(row)}`,
+    );
+    if (integrityError) {
+      throw new Error(integrityError);
+    }
+  }
+  const benchmarkContractEnvironmentDigest = rowContractEnvironmentDigests.values().next().value ??
+    benchmarkContractEnvironmentSha256(
+      benchmarkContractForRun(opts, planAgentRuns(opts, allTasks)[0] ?? { task: null, arm: null }),
+    );
+  const contractFingerprints = benchmarkContractFingerprints(results);
+  if (Object.values(contractFingerprints).some((fingerprint) => !fingerprint)) {
+    throw new Error("Benchmark row is missing its compatibility fingerprint");
+  }
+  if (opts.prepareCodestoryCache || opts.publishable) {
+    const ownedRepos = new Set(
+      tasksForShard(allTasks, opts.shardCount, opts.shardIndex).map((task) => task.repo),
+    );
+    const preparedRepos = cachePreparation.map((row) => row?.repo ?? null);
+    if (
+      preparedRepos.length !== ownedRepos.size
+      || new Set(preparedRepos).size !== preparedRepos.length
+      || preparedRepos.some((repo) => !ownedRepos.has(repo))
+      || [...ownedRepos].some((repo) => !preparedRepos.includes(repo))
+    ) {
+      throw new Error(
+        "Benchmark preparation rows do not match the repositories owned by this shard",
+      );
+    }
+  }
+  const hostClass = benchmarkHostClass(cachePreparation);
+  return {
+    contract: "codestory.agent-benchmark-shard/v2",
+    source_commit: sourceCommit,
+    source_tree: sourceTree,
+    tracked_dirty: false,
+    cli_sha256: cliSha256,
+    package_sha256: opts.candidatePackageSha256,
+    manifest_sha256: sha256Bytes(stableJsonForHash(manifestContract)),
+    flags_sha256: sha256Bytes(stableJsonForHash(flags)),
+    benchmark_contract_environment_sha256: benchmarkContractEnvironmentDigest,
+    benchmark_contract_fingerprints: contractFingerprints,
+    benchmark_contract_rows_sha256: sha256Bytes(stableJsonForHash(contractFingerprints)),
+    model_sha256: hostClass.model_sha256,
+    host_class: hostClass,
+  };
+}
+
+async function benchmarkShardAttestationForCloseout(
+  opts,
+  allTasks,
+  cachePreparation,
+  results,
+  firstFailure,
+  dependencies = {},
+) {
+  if (firstFailure) {
+    return null;
+  }
+  return await benchmarkShardAttestation(
+    opts,
+    allTasks,
+    cachePreparation,
+    results,
+    dependencies,
+  );
+}
+
+async function readJsonlRows(filePath) {
+  return (await readFile(filePath, "utf8"))
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+async function aggregateShardRuns(opts, allTasks) {
+  if (!opts.aggregateShards?.length) {
+    throw new Error("aggregateShardRuns requires at least one shard directory");
+  }
+  if (opts.publishable) {
+    validatePublishableShape(opts, allTasks);
+  }
+  const shards = [];
+  for (const directory of opts.aggregateShards) {
+    const summaryPath = path.join(directory, "summary.json");
+    const runsPath = path.join(directory, "runs.jsonl");
+    if (!existsSync(summaryPath) || !existsSync(runsPath)) {
+      throw new Error(`Shard is missing summary.json or runs.jsonl: ${directory}`);
+    }
+    shards.push({
+      directory,
+      summary: JSON.parse(await readFile(summaryPath, "utf8")),
+      rows: await readJsonlRows(runsPath),
+    });
+  }
+  const shardCount = shards[0].summary?.shard?.count;
+  if (!Number.isInteger(shardCount) || shardCount < 1 || shards.length !== shardCount) {
+    throw new Error(`Expected exactly ${shardCount ?? "unknown"} shard directories, found ${shards.length}`);
+  }
+  const indices = new Set();
+  const attestationReference = shards[0].summary?.shard?.attestation;
+  if (!attestationReference) {
+    throw new Error("Shard summary is missing its attestation");
+  }
+  if (attestationReference.tracked_dirty !== false) {
+    throw new Error("Shard attestation does not prove a clean tracked source checkout");
+  }
+  for (const field of [
+    "contract",
+    "source_commit",
+    "source_tree",
+    "cli_sha256",
+    "package_sha256",
+    "manifest_sha256",
+    "model_sha256",
+    "flags_sha256",
+    "benchmark_contract_environment_sha256",
+  ]) {
+    if (!attestationReference[field]) {
+      throw new Error(`Shard attestation is missing ${field}`);
+    }
+  }
+  const commonAttestation = ({
+    host_class: _hostClass,
+    cli_sha256: _cliSha256,
+    package_sha256: _packageSha256,
+    benchmark_contract_fingerprints: _contractFingerprints,
+    benchmark_contract_rows_sha256: _contractRowsSha256,
+    ...common
+  }) => common;
+  const artifactAttestationByHostClass = new Map();
+  for (const shard of shards) {
+    const index = shard.summary?.shard?.index;
+    if (
+      shard.summary?.shard?.count !== shardCount ||
+      !Number.isInteger(index) ||
+      index < 0 ||
+      index >= shardCount ||
+      indices.has(index)
+    ) {
+      throw new Error(`Invalid or duplicate shard index: ${index}`);
+    }
+    indices.add(index);
+    const attestation = shard.summary?.shard?.attestation;
+    if (attestation?.contract !== "codestory.agent-benchmark-shard/v2") {
+      throw new Error(`Shard ${index} attestation contract is not v2`);
+    }
+    if (attestation.tracked_dirty !== false) {
+      throw new Error(`Shard ${index} attestation does not prove a clean tracked source checkout`);
+    }
+    const hostClassError = benchmarkHostClassError(attestation?.host_class, `shard ${index}`);
+    if (hostClassError) {
+      throw new Error(hostClassError);
+    }
+    if (attestation.host_class.model_sha256 !== attestation.model_sha256) {
+      throw new Error(`Shard ${index} host-class model does not match its attested model`);
+    }
+    if (
+      stableJsonForHash(commonAttestation(attestation ?? {})) !==
+      stableJsonForHash(commonAttestation(attestationReference))
+    ) {
+      throw new Error(`Shard ${index} candidate or benchmark attestation does not match`);
+    }
+    const hostClassKey = stableJsonForHash(attestation.host_class);
+    const artifactAttestation = {
+      cli_sha256: attestation.cli_sha256 ?? null,
+      package_sha256: attestation.package_sha256 ?? null,
+    };
+    if (
+      artifactAttestationByHostClass.has(hostClassKey) &&
+      stableJsonForHash(artifactAttestationByHostClass.get(hostClassKey)) !==
+        stableJsonForHash(artifactAttestation)
+    ) {
+      throw new Error(`Shard ${index} platform artifacts do not match its host class`);
+    }
+    artifactAttestationByHostClass.set(hostClassKey, artifactAttestation);
+    if (opts.publishable && (
+      shard.summary?.publishable !== true ||
+      shard.summary?.first_failure != null ||
+      shard.summary?.comparative_failure != null ||
+      shard.summary?.comparative_publishable !== true ||
+      !Number.isInteger(shard.summary?.expected_rows) ||
+      shard.summary.expected_rows !== shard.summary?.completed_rows ||
+      shard.summary.completed_rows !== shard.rows.length
+    )) {
+      throw new Error(`Shard ${index} summary is not publishable and complete`);
+    }
+    if (shard.summary?.packet_obligation_accounting) {
+      const error = packetObligationAccountingError(
+        shard.summary.packet_obligation_accounting,
+        `shard ${index} summary packet obligations`,
+      );
+      if (error) {
+        throw new Error(error);
+      }
+    }
+    const attestedFingerprints = attestation.benchmark_contract_fingerprints;
+    if (
+      !attestedFingerprints ||
+      typeof attestedFingerprints !== "object" ||
+      Array.isArray(attestedFingerprints) ||
+      attestation.benchmark_contract_rows_sha256 !==
+        sha256Bytes(stableJsonForHash(attestedFingerprints))
+    ) {
+      throw new Error(`Shard ${index} benchmark contract fingerprint attestation is invalid`);
+    }
+    const expectedFingerprintKeys = new Set(shard.rows.map(agentRunKey));
+    if (
+      Object.keys(attestedFingerprints).length !== expectedFingerprintKeys.size ||
+      Object.keys(attestedFingerprints).some((key) => !expectedFingerprintKeys.has(key))
+    ) {
+      throw new Error(`Shard ${index} benchmark contract fingerprint rows do not match its ledger`);
+    }
+    for (const row of shard.rows) {
+      if (taskShardIndex(row.task_id, shardCount) !== index) {
+        throw new Error(`Row ${agentRunKey(row)} is recorded on the wrong shard`);
+      }
+      if (
+        benchmarkContractEnvironmentSha256(row.benchmark_contract) !==
+        attestation.benchmark_contract_environment_sha256
+      ) {
+        throw new Error(
+          `Row ${agentRunKey(row)} benchmark contract environment does not match shard ${index} attestation`,
+        );
+      }
+      const integrityError = benchmarkContractIntegrityError(
+        row.benchmark_contract,
+        `row ${agentRunKey(row)}`,
+      );
+      if (integrityError) {
+        throw new Error(integrityError);
+      }
+      if (
+        attestedFingerprints[agentRunKey(row)] !==
+          benchmarkShardContractSha256(row.benchmark_contract)
+      ) {
+        throw new Error(
+          `Row ${agentRunKey(row)} benchmark contract fingerprint does not match shard ${index} attestation`,
+        );
+      }
+    }
+  }
+  const rows = shards.flatMap((shard) =>
+    shard.rows.map((row) => ({
+      ...row,
+      host_class: shard.summary.shard.attestation.host_class,
+      shard_index: shard.summary.shard.index,
+    }))
+  );
+  const byKey = new Map();
+  for (const row of rows) {
+    const key = agentRunKey(row);
+    if (byKey.has(key)) {
+      throw new Error(`Duplicate benchmark row across shards: ${key}`);
+    }
+    byKey.set(key, row);
+  }
+  const expectedRuns = planAgentRuns(opts, allTasks);
+  const expectedByKey = new Map(expectedRuns.map((run) => [agentRunKey(run), run]));
+  for (const row of rows) {
+    const planned = expectedByKey.get(agentRunKey(row));
+    if (!planned) {
+      throw new Error(`Unexpected benchmark row across shards: ${agentRunKey(row)}`);
+    }
+    const expectedContractFingerprint = benchmarkShardContractSha256(
+      benchmarkContractForRun(opts, planned),
+    );
+    const observedContractFingerprint = benchmarkShardContractSha256(row.benchmark_contract);
+    if (expectedContractFingerprint !== observedContractFingerprint) {
+      throw new Error(
+        `Shard row ${agentRunKey(row)} benchmark contract is incompatible`,
+      );
+    }
+  }
+  const missing = expectedRuns.filter((run) => !byKey.has(agentRunKey(run)));
+  if (missing.length || rows.length !== expectedRuns.length) {
+    throw new Error(
+      `Shard aggregation is incomplete: expected ${expectedRuns.length}, found ${rows.length}, missing ${missing.length}`,
+    );
+  }
+  const declaredCanary = opts.canaryTaskId ?? opts.manifestCanaryTaskId ?? null;
+  if (
+    declaredCanary &&
+    opts.arms.includes("with_codestory") &&
+    allTasks.some((task) => task.id === declaredCanary)
+  ) {
+    const canaryRows = rows.filter((row) => row.canary === true);
+    const canaryRow = canaryRows[0] ?? null;
+    const ownerShard = taskShardIndex(declaredCanary, shardCount);
+    const effectiveCanarySummaries = shards.filter(
+      (shard) => shard.summary?.effective_canary_task_id === declaredCanary,
+    );
+    if (
+      canaryRows.length !== 1 ||
+      canaryRow?.task_id !== declaredCanary ||
+      canaryRow?.arm !== "with_codestory" ||
+      canaryRow?.repeat !== 1 ||
+      canaryRow?.shard_index !== ownerShard ||
+      effectiveCanarySummaries.length !== 1 ||
+      effectiveCanarySummaries[0]?.summary?.shard?.index !== ownerShard ||
+      shards.some((shard) => shard.summary?.canary_task_id !== declaredCanary) ||
+      shards.some((shard) =>
+        shard.summary?.shard?.index !== ownerShard &&
+        shard.summary?.effective_canary_task_id != null
+      )
+    ) {
+      throw new Error(
+        `Declared canary '${declaredCanary}' must appear exactly once across shard rows and summaries`,
+      );
+    }
+  }
+  const canonicalRows = sortAgentResultsCanonical(rows, allTasks, opts.arms);
+  if (opts.publishable) {
+    const blockers = agentPublishableBlockers(canonicalRows, opts);
+    if (blockers.length) {
+      throw new Error(
+        `Publishable shard rows failed: ${blockers.map(formatAgentPublishableBlocker).join(" | ")}`,
+      );
+    }
+  }
+  const pooledSummary = summarizeRuns(canonicalRows);
+  const obligationAccounting = summarizePacketObligationAccounting(
+    canonicalRows,
+    "shard aggregation",
+  );
+  const hostClasses = new Set(
+    shards.map((shard) => stableJsonForHash(shard.summary.shard.attestation.host_class)),
+  );
+  const latencySummariesByHostClass = [...hostClasses]
+    .sort()
+    .map((hostClassKey) => ({
+      host_class: JSON.parse(hostClassKey),
+      platform_artifacts: artifactAttestationByHostClass.get(hostClassKey),
+      summary: summarizeRuns(
+        canonicalRows.filter((row) => stableJsonForHash(row.host_class) === hostClassKey),
+      ),
+      cost_accounting: summarizeCostAccounting(
+        canonicalRows.filter((row) => stableJsonForHash(row.host_class) === hostClassKey),
+      ),
+    }));
+  const latencyPoolingEligible = hostClasses.size === 1;
+  const summary = latencyPoolingEligible
+    ? pooledSummary
+    : withoutPooledLatency(pooledSummary);
+  const outDir = path.resolve(
+    opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", `aggregate-${Date.now()}`),
+  );
+  await mkdir(outDir, { recursive: true });
+  await writeJsonlRows(path.join(outDir, "runs.jsonl"), canonicalRows);
+  await writeFile(
+    path.join(outDir, "summary.json"),
+    `${JSON.stringify(
+      {
+        generated_at: new Date().toISOString(),
+        aggregate: true,
+        shard_count: shardCount,
+        source_attestation: commonAttestation(attestationReference),
+        platform_artifacts_by_host_class: latencySummariesByHostClass.map((entry) => ({
+          host_class: entry.host_class,
+          platform_artifacts: entry.platform_artifacts,
+        })),
+        latency_pooling_eligible: latencyPoolingEligible,
+        latency_host_classes: latencySummariesByHostClass.map((entry) => entry.host_class),
+        latency_summaries_by_host_class: latencySummariesByHostClass,
+        pooled_latency_summary: latencyPoolingEligible ? pooledSummary : null,
+        expected_rows: expectedRuns.length,
+        completed_rows: canonicalRows.length,
+        packet_obligation_accounting: obligationAccounting,
+        summary,
+        cost_accounting: latencyPoolingEligible ? summarizeCostAccounting(canonicalRows) : null,
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  console.log(`wrote ${outDir}`);
+}
+
+function pipelineStageFailure(stage, group, error) {
+  const reason = error instanceof Error ? error.message : String(error);
+  return {
+    kind: `${stage}_failed`,
+    repo: group?.repo ?? null,
+    task_id: group?.tasks?.[0]?.id ?? null,
+    error: reason,
+    blockers: [{
+      category: stage === "preparation" ? "environment" : "harness-contract",
+      reasons: [reason],
+    }],
+  };
+}
+
+async function runAgentBenchmarkPipeline({
+  opts,
+  tasks,
+  plannedRuns,
+  executeRun = runPlannedAgentRun,
+  reusableBaselines = new Map(),
+  outDir = null,
+  materializeGroup = async () => {},
+  prepareGroup = async () => [],
+  prepareIsolation = async () => null,
+  recordResult = async () => {},
+  recordPreparation = async () => {},
+  recordPreparationState = async () => {},
+  recordFirstFailure = async () => {},
+  recordComparativeFailure = async () => {},
+}) {
+  const results = [];
+  const cachePreparation = [];
+  const abortController = new AbortController();
+  const comparativeAbortController = new AbortController();
+  opts.cachePreparationByRepo ??= new Map();
+  let firstFailure = null;
+  let comparativeFailure = null;
+  let agentCodexIsolation = null;
+  let preparationIdentityReference = null;
+  let stopScheduling = false;
+
+  const rememberFirstFailure = async (failure, abort = false) => {
+    if (firstFailure) {
+      return;
+    }
+    firstFailure = { recorded_at: new Date().toISOString(), ...failure };
+    if (abort) {
+      stopScheduling = true;
+      abortController.abort(firstFailure);
+    }
+    await recordFirstFailure(firstFailure);
+  };
+  const acceptPreparation = (row) => {
+    cachePreparation.push(row);
+    opts.cachePreparationByRepo.set(row.repo, row);
+  };
+  const rememberComparativeFailure = async (failure) => {
+    if (comparativeFailure) {
+      return;
+    }
+    comparativeFailure = {
+      recorded_at: new Date().toISOString(),
+      kind: "comparative_baseline_failure",
+      ...failure,
+    };
+    await recordComparativeFailure(comparativeFailure);
+    comparativeAbortController.abort(comparativeFailure);
+  };
+  const runBatch = async (batchOpts, runs, options = {}) => {
+    const batchSignal = options.comparativeOnly
+      ? AbortSignal.any([abortController.signal, comparativeAbortController.signal])
+      : abortController.signal;
+    if (!runs.length || stopScheduling || batchSignal.aborted) {
+      return { results: [], firstFailure: null };
+    }
+    return await runPlannedAgentRuns(
+      { ...batchOpts, signal: batchSignal },
+      runs,
+      reusableBaselines,
+      outDir,
+      {
+        ...options,
+        runOne: executeRun,
+        signal: batchSignal,
+        abortController: options.comparativeOnly
+          ? comparativeAbortController
+          : abortController,
+        onResult: async (result) => {
+          await recordResult(result);
+          await options.onResult?.(result);
+          results.push(result);
+        },
+        onFirstFailure: async (failure) => {
+          if (options.comparativeOnly && failure.kind !== "run_exception") {
+            await rememberComparativeFailure(failure);
+          } else {
+            await rememberFirstFailure(
+              failure,
+              !options.comparativeOnly && options.failFast === true,
+            );
+          }
+          await options.onFirstFailure?.(failure);
+        },
+      },
+    );
+  };
+  const prepareTaskGroup = async (group, canary = false) => {
+    if (!group || abortController.signal.aborted) {
+      return;
+    }
+    try {
+      await materializeGroup(group, abortController.signal);
+      await recordPreparationState({ kind: "materialized", repo: group.repo });
+      if (stopScheduling || abortController.signal.aborted) return;
+    } catch (error) {
+      await rememberFirstFailure(pipelineStageFailure("materialization", group, error), true);
+      await recordPreparationState({ kind: "materialization_failed", repo: group.repo });
+      return;
+    }
+    try {
+      const prepared = await prepareGroup(group, abortController.signal);
+      const requirePreparationRow = canary || opts.prepareCodestoryCache || opts.publishable;
+      const preparationContractInvalid = !Array.isArray(prepared)
+        || prepared.length > 1
+        || (prepared.length === 1 && prepared[0]?.repo !== group.repo)
+        || (requirePreparationRow && prepared.length !== 1);
+      if (preparationContractInvalid) {
+        const failure = {
+          kind: "preparation_contract_failed",
+          repo: group.repo,
+          task_id: group.tasks[0]?.id ?? null,
+          blockers: [{
+            category: "harness-contract",
+            reasons: [
+              `preparation must return exactly one row for ${group.repo}; received `
+              + `${Array.isArray(prepared) ? prepared.length : "non-array"}`,
+            ],
+          }],
+        };
+        for (const row of Array.isArray(prepared) ? prepared : []) {
+          await recordPreparation(row);
+        }
+        await rememberFirstFailure(failure, true);
+        await recordPreparationState({
+          kind: "preparation_contract_failed",
+          repo: group.repo,
+          returned_repos: Array.isArray(prepared)
+            ? prepared.map((row) => row?.repo ?? null)
+            : null,
+        });
+        return;
+      }
+      for (const row of prepared) {
+        await recordPreparation(row);
+        if (stopScheduling || firstFailure) return;
+        const eligibilityBlockers = cachePreparationCanaryBlockers(
+          row,
+          selectedBenchmarkChildEnv(opts),
+        );
+        const identityBlockers = preparationIdentityReference
+          ? cachePreparationIdentityBlockers(preparationIdentityReference, row)
+          : [];
+        const blockers = [...eligibilityBlockers, ...identityBlockers];
+        if (blockers.length) {
+          await rememberFirstFailure({
+            kind: identityBlockers.length
+              ? "preparation_identity_mismatch"
+              : (canary ? "canary_preparation" : "preparation_eligibility"),
+            repo: group.repo,
+            task_id: group.tasks[0]?.id ?? null,
+            blockers: [{ category: "environment", reasons: blockers }],
+          }, true);
+          await recordPreparationState({
+            kind: eligibilityBlockers.length
+              ? "preparation_eligibility_failed"
+              : "preparation_identity_failed",
+            repo: group.repo,
+            blockers,
+          });
+          return;
+        }
+        preparationIdentityReference ??= row;
+        acceptPreparation(row);
+      }
+      await recordPreparationState({ kind: "prepared", repo: group.repo });
+    } catch (error) {
+      if (error?.preparation) {
+        await recordPreparation(error.preparation);
+      }
+      await rememberFirstFailure(pipelineStageFailure("preparation", group, error), true);
+      await recordPreparationState({ kind: "preparation_failed", repo: group.repo });
+    }
+  };
+
+  const hasCodeStoryArm = opts.arms.includes("with_codestory");
+  const declaredCanary = opts.canaryTaskId ?? opts.manifestCanaryTaskId ?? null;
+  const canaryTask = hasCodeStoryArm && declaredCanary
+    ? tasks.find((task) => task.id === declaredCanary) ?? null
+    : null;
+  const taskGroups = [...groupTasksByRepo(tasks)].map(([repo, repoTasks]) => ({
+    repo,
+    tasks: repoTasks,
+  }));
+  const canaryGroup = canaryTask
+    ? taskGroups.find((group) => group.repo === canaryTask.repo) ?? null
+    : null;
+
+  if (canaryGroup) {
+    await prepareTaskGroup(canaryGroup, true);
+  }
+  if (!firstFailure && !stopScheduling) {
+    try {
+      agentCodexIsolation = await prepareIsolation();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      await rememberFirstFailure({
+        kind: "agent_isolation_failed",
+        repo: canaryGroup?.repo ?? null,
+        task_id: canaryTask?.id ?? null,
+        error: reason,
+        blockers: [{ category: "environment", reasons: [reason] }],
+      }, true);
+      await recordPreparationState({
+        kind: "agent_isolation_failed",
+        repo: canaryGroup?.repo ?? null,
+        error: reason,
+      });
+    }
+  }
+  if (!firstFailure && !stopScheduling && canaryTask) {
+    const canaryRun = plannedRuns.find(
+      (run) => run.task?.id === canaryTask.id &&
+        run.arm === "with_codestory" &&
+        run.repeat === 1,
+    );
+    if (!canaryRun) {
+      throw new Error(`Canary task '${canaryTask.id}' has no with_codestory repeat-1 row`);
+    }
+    await runBatch(
+      { ...opts, jobs: 1 },
+      [{ ...canaryRun, canary: true }],
+      { failFast: true },
+    );
+  }
+
+  if (!firstFailure && !stopScheduling) {
+    const completedKeys = new Set(results.map(agentRunKey));
+    const baselineRuns = plannedRuns.filter(
+      (run) => run.arm === "without_codestory" && !completedKeys.has(agentRunKey(run)),
+    );
+    const otherGroups = canaryGroup
+      ? taskGroups.filter((group) => group.repo !== canaryGroup.repo)
+      : taskGroups;
+    const readyBaselines = createAsyncQueue();
+    const preparationState = { drained: !otherGroups.length };
+    if (canaryGroup) {
+      const runs = baselineRuns.filter((run) => run.repo === canaryGroup.repo);
+      if (runs.length) {
+        readyBaselines.push({ repo: canaryGroup.repo, runs });
+      }
+    }
+    const baselineWorkers = Promise.all(
+      Array.from({ length: Math.min(4, Math.max(1, taskGroups.length)) }, async () => {
+        for (;;) {
+          const group = await readyBaselines.shift();
+          if (
+            !group ||
+            preparationState.drained ||
+            stopScheduling ||
+            abortController.signal.aborted ||
+            comparativeAbortController.signal.aborted
+          ) {
+            return;
+          }
+          await runBatch(
+            { ...opts, jobs: 1 },
+            group.runs,
+            {
+              failFast: true,
+              comparativeOnly: true,
+              shouldSchedule: () => !preparationState.drained,
+              decorateRun: (run) => ({
+                ...run,
+                preparation_overlap: true,
+                comparative_wall_time_eligible: false,
+              }),
+            },
+          );
+        }
+      }),
+    );
+
+    try {
+      await parallelMap(
+        otherGroups,
+        Math.min(2, Math.max(1, opts.prepareCodestoryJobs ?? 2)),
+        async (group) => {
+          if (stopScheduling || abortController.signal.aborted) {
+            return;
+          }
+          await prepareTaskGroup(group, false);
+          if (!stopScheduling && !abortController.signal.aborted && !comparativeAbortController.signal.aborted) {
+            const runs = baselineRuns.filter((run) => run.repo === group.repo);
+            if (runs.length) {
+              readyBaselines.push({ repo: group.repo, runs });
+            }
+          }
+        },
+      );
+    } finally {
+      preparationState.drained = true;
+      await recordPreparationState({ kind: "drained", repos: otherGroups.map((group) => group.repo) });
+      readyBaselines.close();
+      await baselineWorkers;
+    }
+
+    if (!stopScheduling && !abortController.signal.aborted) {
+      const completedAfterOverlap = new Set(results.map(agentRunKey));
+      const codeStoryRuns = plannedRuns.filter(
+        (run) => run.arm === "with_codestory" &&
+          !completedAfterOverlap.has(agentRunKey(run)),
+      );
+      const codeStoryOutcome = await runBatch(
+        { ...opts, jobs: Math.min(4, opts.jobs) },
+        codeStoryRuns,
+        { failFast: opts.publishable && !opts.collectAllFailures },
+      );
+      if (
+        !codeStoryOutcome.firstFailure &&
+        !abortController.signal.aborted &&
+        !comparativeFailure
+      ) {
+        const completedAfterCodeStory = new Set(results.map(agentRunKey));
+        const remainingBaselines = plannedRuns.filter(
+          (run) => run.arm === "without_codestory" &&
+            !completedAfterCodeStory.has(agentRunKey(run)),
+        );
+        await runBatch(
+          { ...opts, jobs: opts.jobs },
+          remainingBaselines,
+          {
+            failFast: true,
+            comparativeOnly: true,
+            decorateRun: (run) => ({
+              ...run,
+              preparation_overlap: false,
+              comparative_wall_time_eligible: true,
+            }),
+          },
+        );
+      }
+    }
+  }
+
+  return {
+    results,
+    firstFailure,
+    comparativeFailure,
+    comparativePublishable: comparativeFailure == null,
+    cachePreparation,
+    agentCodexIsolation,
+    aborted: abortController.signal.aborted,
+  };
 }
 
 async function main() {
@@ -6909,16 +9952,27 @@ async function main() {
     await reanalyzeAgentRunDirectory(opts);
     return;
   }
-  const tasks = await loadTasks(opts);
-  opts.releaseEvidenceCorpusContract = await loadReleaseEvidenceCorpusContract(tasks, opts);
-  if (opts.publishable) {
-    validatePublishableShape(opts, tasks);
+  const allTasks = await loadTasks(opts);
+  opts.releaseEvidenceCorpusContract = await loadReleaseEvidenceCorpusContract(allTasks, opts);
+  if (opts.aggregateShards) {
+    await aggregateShardRuns(opts, allTasks);
+    return;
   }
-  if (opts.materializeRepos) {
-    assertManifestRepoMaterializationAllowed(tasks, opts);
-    await materializeRepos(tasks, opts);
+  let tasks = allTasks;
+  if (tasks.length && opts.shardCount > 1) {
+    tasks = tasksForShard(tasks, opts.shardCount, opts.shardIndex);
+    if (!tasks.length) {
+      throw new Error(`Shard ${opts.shardIndex}/${opts.shardCount} owns no selected tasks`);
+    }
+  }
+  if (opts.publishable) {
+    validatePublishableShape(opts, allTasks);
   }
   if (opts.list) {
+    if (opts.materializeRepos) {
+      assertManifestRepoMaterializationAllowed(tasks, opts);
+      await materializeRepos(tasks, opts);
+    }
     if (tasks.length) {
       for (const task of tasks) {
         const config = ALL_REPOS[task.repo];
@@ -6936,6 +9990,10 @@ async function main() {
   }
 
   if (opts.packetRuntime) {
+    if (opts.materializeRepos) {
+      assertManifestRepoMaterializationAllowed(tasks, opts);
+      await materializeRepos(tasks, opts);
+    }
     await runPacketRuntimeBenchmark(opts, tasks);
     return;
   }
@@ -6953,11 +10011,81 @@ async function main() {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = path.resolve(opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", timestamp));
   await mkdir(outDir, { recursive: true });
+  const runsPath = path.join(outDir, "runs.jsonl");
+  if (existsSync(runsPath)) {
+    throw new Error(`Refusing to append a new benchmark to an existing ledger: ${runsPath}`);
+  }
+  const ledger = await createDurableJsonlAppender(runsPath);
+  const preparationLedger = await createDurableJsonlAppender(
+    path.join(outDir, "preparations.jsonl"),
+  );
   const reusableBaselines = await loadReusableBaselines(opts, plannedRuns, outDir);
-  const cachePreparation = opts.prepareCodestoryCache
-    ? await prepareCodeStoryCaches(opts, tasks)
-    : [];
-  opts.cachePreparationByRepo = new Map(cachePreparation.map((row) => [row.repo, row]));
+  opts.cachePreparationByRepo = new Map();
+  let agentCodexIsolation = null;
+  let pipeline = null;
+  try {
+    pipeline = await runAgentBenchmarkPipeline({
+      opts,
+      tasks,
+      plannedRuns,
+      reusableBaselines,
+      outDir,
+      materializeGroup: async (group, signal) => {
+        if (opts.materializeRepos) {
+          assertManifestRepoMaterializationAllowed(group.tasks, opts);
+          await materializeRepos(group.tasks, { ...opts, signal });
+        }
+      },
+      prepareGroup: async (group, signal) => opts.prepareCodestoryCache
+        ? await prepareCodeStoryCaches(
+          { ...opts, signal, prepareCodestoryJobs: 1 },
+          group.tasks,
+        )
+        : [],
+      prepareIsolation: async () => {
+        agentCodexIsolation =
+          opts.runner === "codex" ? await prepareAgentCodexIsolation(outDir, opts) : null;
+        opts.agentCodexHomes = agentCodexIsolation?.homes ?? null;
+        return agentCodexIsolation;
+      },
+      recordResult: (result) => ledger.append(result),
+      recordPreparation: (row) => preparationLedger.append({
+        kind: "preparation",
+        recorded_at: new Date().toISOString(),
+        ...row,
+      }),
+      recordPreparationState: (state) => preparationLedger.append({
+        recorded_at: new Date().toISOString(),
+        ...state,
+      }),
+      recordFirstFailure: (failure) => writeFile(
+        path.join(outDir, "first-failure.json"),
+        `${JSON.stringify(failure, null, 2)}\n`,
+        "utf8",
+      ),
+      recordComparativeFailure: (failure) => writeFile(
+        path.join(outDir, "comparative-failure.json"),
+        `${JSON.stringify(failure, null, 2)}\n`,
+        "utf8",
+      ),
+    });
+  } finally {
+    await ledger.close();
+    await preparationLedger.close();
+    if (agentCodexIsolation?.root) {
+      await rm(agentCodexIsolation.root, { recursive: true, force: true });
+    }
+  }
+
+  const {
+    results,
+    firstFailure,
+    comparativeFailure,
+    comparativePublishable,
+    cachePreparation,
+  } = pipeline;
+
+  const canonicalResults = sortAgentResultsCanonical(results, tasks, opts.arms);
   if (cachePreparation.length) {
     await writeFile(
       path.join(outDir, "codestory-cache-preparation.json"),
@@ -6966,10 +10094,19 @@ async function main() {
     );
   }
 
-  const results = await runPlannedAgentRuns(opts, plannedRuns, reusableBaselines, outDir);
-
-  const summary = summarizeRuns(results);
-  const costAccounting = summarizeCostAccounting(results);
+  const summary = summarizeRuns(canonicalResults);
+  const obligationAccounting = summarizePacketObligationAccounting(
+    canonicalResults,
+    "agent benchmark report",
+  );
+  const costAccounting = summarizeCostAccounting(canonicalResults);
+  const shardAttestation = await benchmarkShardAttestationForCloseout(
+    opts,
+    allTasks,
+    cachePreparation,
+    canonicalResults,
+    firstFailure,
+  );
   const summaryPayload = {
     generated_at: new Date().toISOString(),
     runner: opts.runner,
@@ -6979,6 +10116,14 @@ async function main() {
     task_suite: opts.taskSuite,
     task_ids: opts.taskIds,
     task_manifest: opts.taskManifest,
+    canary_task_id: opts.canaryTaskId ?? opts.manifestCanaryTaskId ?? null,
+    effective_canary_task_id:
+      canonicalResults.find((row) => row.canary === true)?.task_id ?? null,
+    shard: {
+      count: opts.shardCount,
+      index: opts.shardIndex,
+      attestation: shardAttestation,
+    },
     prepare_codestory_cache: opts.prepareCodestoryCache,
     cache_preparation: cachePreparation,
     tasks: tasks.map((task) => ({
@@ -6991,21 +10136,29 @@ async function main() {
     publishable: opts.publishable,
     max_source_reads_after_packet: opts.maxSourceReadsAfterPacket,
     reuse_baseline_from: opts.reuseBaselineFrom,
-    reused_baseline_runs: results.filter((row) => row.reused_from).length,
+    reused_baseline_runs: canonicalResults.filter((row) => row.reused_from).length,
     allow_failures: opts.allowFailures,
     timeout_ms: opts.timeoutMs,
     sandbox: opts.sandbox,
     output_dir: outDir,
     retrieval_env: retrievalEnv(),
     retrieval_contract: retrievalContractSummary(benchmarkChildEnv(process.env)),
+    codex_agent_isolation: agentCodexIsolation?.receipt ?? null,
+    host_class: benchmarkHostClass(cachePreparation),
+    expected_rows: plannedRuns.length,
+    completed_rows: canonicalResults.length,
+    first_failure: firstFailure,
+    comparative_failure: comparativeFailure,
+    comparative_publishable: comparativePublishable,
+    packet_obligation_accounting: obligationAccounting,
     summary,
     cost_accounting: costAccounting,
   };
   await writeFile(path.join(outDir, "summary.json"), `${JSON.stringify(summaryPayload, null, 2)}\n`, "utf8");
   await writeFile(path.join(outDir, "summary.md"), markdownSummary(summary, opts, costAccounting), "utf8");
 
-  const failedRuns = results.filter((result) => result.status !== "pass");
-  let exitCode = 0;
+  const failedRuns = canonicalResults.filter((result) => result.status !== "pass");
+  let exitCode = firstFailure ? 1 : 0;
   if (failedRuns.length && !opts.allowFailures) {
     console.error("benchmark failed: every run must pass unless --allow-failures is set.");
     for (const failed of failedRuns) {
@@ -7015,9 +10168,18 @@ async function main() {
   }
 
   if (opts.publishable) {
-    const blockers = agentPublishableBlockers(results, opts);
+    const blockers = agentPublishableBlockers(canonicalResults, opts);
+    const completedKeys = new Set(canonicalResults.map(agentRunKey));
+    const missingRuns = plannedRuns.filter((run) => !completedKeys.has(agentRunKey(run)));
+    if (missingRuns.length) {
+      blockers.push({
+        result: { repo: "benchmark", arm: "all", repeat: 0, task_id: null },
+        category: "harness-contract",
+        reasons: [`missing completed rows=${missingRuns.length}; expected ${plannedRuns.length}`],
+      });
+    }
     if (blockers.length) {
-      console.error("--publishable failed: every run must pass, report total token usage, pass preludes without warnings, pass manifest quality gates when present, run packet first when required, report sufficient packets with zero follow-ups or unresolved diagnostics, and stay within the post-packet source-read budget.");
+      console.error("--publishable failed: every run must pass, report total token usage, pass preludes without warnings, pass manifest quality gates when present, obey packet dispositions, prove exact runtime identity when MCP is used, and stay within the post-packet source-read budget.");
       for (const blocker of blockers) {
         console.error(formatAgentPublishableBlocker(blocker));
       }
@@ -7032,55 +10194,95 @@ async function main() {
 }
 
 export {
+  aggregateShardRuns,
+  agentRunnerEnv,
   analyzeTranscript,
   agentPublishableBlockers,
   assertSafeWindowsCmdArgs,
   benchmarkRunId,
+  benchmarkContractEnvironmentSha256,
+  benchmarkContractForRun,
+  benchmarkHostClass,
+  benchmarkShardAttestation,
+  benchmarkShardAttestationForCloseout,
   baselineSearchPreludeStatus,
   buildPacketQualityDeltas,
   buildQualityDebugPayload,
   copyResultArtifact,
   qualityFailureReasons,
   commandCategory,
+  codeStoryBinaryIdentity,
+  codestoryDoctorSnapshot,
+  codestoryRetrievalEngineDiagnosticsSnapshot,
+  codestoryRetrievalStatusSnapshot,
   extractCommandExecutions,
+  interactionTurnTelemetry,
   isPathInside,
   isTrustedPublishableRepoUrl,
   loadTaskForResult,
   loadReleaseEvidenceCorpusContract,
   loadTasks,
+  markdownCostAccounting,
   manifestRepoMaterializationBlockers,
   materializeRepos,
   parseArgs,
   parseJsonLines,
   cachePolicyForRun,
+  cachePreparationCanaryBlockers,
+  cachePreparationIdentityBlockers,
+  mergeRetrievalStatusWithEngineDiagnostics,
+  projectResourceUri,
+  retrievalEngineDiagnosticsSnapshotFromOutput,
+  resourceUriMatches,
+  createDurableJsonlAppender,
   benchmarkAgentScopeArgs,
   retrievalIndexCommandArgs,
+  retrievalStatusSnapshotFromOutput,
   retrievalStatusCommandArgs,
   packetComposition,
   packetCommandArgs,
   packetForAgentPrompt,
   packetManifestExtraProbes,
   packetManifestQualitySummary,
+  packetObligationAccounting,
+  packetDispositionTelemetry,
+  packetPreludeContractBlockers,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetRuntimeCacheObservations,
+  agentPacketPreludeCacheObservations,
   packetEmbeddingExecutionProof,
+  packetSufficiencyTelemetry,
+  groupPacketRuntimeColdJobs,
+  gitCheckedOutput,
+  gitOutput,
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
+  prepareAgentCodexIsolation,
   cacheProvenanceBlockers,
   PACKET_COMPOSITION_WEIGHTS,
   MAX_REUSED_ARTIFACT_BYTES,
   packetCompositionFileScore,
   packetFirstCommandForPrompt,
   publicCoreCorpusAudit,
+  planAgentRuns,
   repoProvenanceBlockers,
+  repoProvenance,
+  runnerCommand,
   resolveRunArtifactPath,
   repoConfigFromManifest,
   resolveCodeStoryCli,
   scoreQuality,
+  sortAgentResultsCanonical,
   summarizeCostAccounting,
+  summarizePacketObligationAccounting,
   summarizePacketRuntimeRuns,
   taskSnapshotForResult,
+  taskShardIndex,
+  tasksForShard,
+  runAgentBenchmarkPipeline,
+  runPlannedAgentRuns,
+  runProcess,
 };
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

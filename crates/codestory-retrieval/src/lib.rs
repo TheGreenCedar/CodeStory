@@ -37,6 +37,8 @@ mod retention;
 mod rollback;
 mod scip_client;
 mod scip_index;
+#[cfg(feature = "semantic-calibration-support")]
+pub mod semantic_calibration_support;
 mod sidecar;
 mod sidecar_search;
 
@@ -244,7 +246,10 @@ pub use cache_clean::{
     CacheCleanRefusal, CacheCleanRemoval, CacheCleanReport, CacheCleanRetained, apply_cache_clean,
     plan_cache_clean,
 };
-pub use candidate::{CandidateHit, CandidateSource, RankFeatures};
+pub use candidate::{
+    CandidateGraphDirection, CandidateGraphEvidence, CandidateHit, CandidateLane,
+    CandidateLaneEvidence, CandidateLaneScores, CandidateSource, RankFeatures,
+};
 pub use candidate::{is_phantom_sidecar_hit, phantom_sidecar_candidates_only};
 pub use capabilities::SidecarCapabilities;
 pub use codestory_llama_sys::{
@@ -302,14 +307,14 @@ pub use lexical_index::LEXICAL_INDEX_VERSION;
 pub use mode::RetrievalDegradedMode;
 pub use mode::derive_degraded_mode;
 pub use per_user_embedding::{
-    AwakeMonotonicClock, EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
-    EmbeddingCapacityPressureWire, EmbeddingClientBudgets, EmbeddingClientTransport,
-    EmbeddingCompatibility, EmbeddingConnectIntent, EmbeddingConnectOutcome,
-    EmbeddingEngineIdentity, EmbeddingEngineLeaseIdentity, EmbeddingExecutableIdentity,
-    EmbeddingOperation, EmbeddingProtocolError, EmbeddingProtocolRequest,
-    EmbeddingProtocolResponse, EmbeddingQualificationAttemptResult,
-    EmbeddingQualificationOperationResult, EmbeddingQualificationParameters,
-    EmbeddingQualificationRequest, EmbeddingQualificationResult,
+    AwakeMonotonicClock, EMBEDDING_BUSY_RETRY_QUEUE_CLASS,
+    EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, EmbeddingCapacityPressureWire,
+    EmbeddingClientBudgets, EmbeddingClientTransport, EmbeddingCompatibility,
+    EmbeddingConnectIntent, EmbeddingConnectOutcome, EmbeddingEngineIdentity,
+    EmbeddingEngineLeaseIdentity, EmbeddingExecutableIdentity, EmbeddingOperation,
+    EmbeddingProtocolError, EmbeddingProtocolRequest, EmbeddingProtocolResponse,
+    EmbeddingQualificationAttemptResult, EmbeddingQualificationOperationResult,
+    EmbeddingQualificationParameters, EmbeddingQualificationRequest, EmbeddingQualificationResult,
     EmbeddingQualificationWatchdogClock, EmbeddingQualificationWatchdogMarker,
     EmbeddingQualificationWorkerError, EmbeddingQualificationWorkerMeasurement,
     EmbeddingQualificationWorkerMeasurementSpan, EmbeddingQualificationWorkerOutput,
@@ -348,8 +353,11 @@ pub use query::{
     execute_strict_retrieval_query_batch_with_cache_for_runtime, is_retrieval_publication_changed,
     retrieval_publication_identity_from_storage,
 };
-pub use query_features::{QueryFeatures, QueryShape, classify_query};
-pub use ranker::rank_candidates;
+pub use query_features::{
+    QUERY_INTENT_POLICY_VERSION, QueryFeatures, QueryIntent, QueryLookupMode, QueryShape,
+    classify_query,
+};
+pub use ranker::{RANKING_POLICY_VERSION, rank_candidates};
 pub use retention::{
     GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport, GenerationRetentionLock,
     GenerationRetentionPlan, MarkerRetirement, ObservedRetentionLock, RETENTION_MARKER_SCHEMA_V1,

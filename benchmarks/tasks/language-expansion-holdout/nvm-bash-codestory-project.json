@@ -1,0 +1,21 @@
+{
+  "name": "nvm-language-expansion-holdout",
+  "version": 1,
+  "source_groups": [
+    {
+      "id": "90c385bb-71d4-5277-8546-276aa834abf2",
+      "language": "Bash",
+      "standard": "Default",
+      "source_paths": [
+        "."
+      ],
+      "exclude_patterns": [
+        "**/.git/**",
+        "test/**"
+      ],
+      "include_paths": [],
+      "defines": {},
+      "language_specific": "Other"
+    }
+  ]
+}

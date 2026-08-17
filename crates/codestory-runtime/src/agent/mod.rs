@@ -23,9 +23,8 @@
 //
 // Runtime-owned for reasons beside `AppController` reach:
 //
-// - `packet_budget`: composition site that closes the workspace path-identity
-//   seam (`RuntimeWorkspacePathIdentity`) and folds the runtime's step-trace
-//   summary into the budget verdict.
+// - `packet_budget`: folds the runtime's step-trace summary into the budget
+//   verdict.
 // - `packet_capping`: leans on `packet_batch` matching and the runtime's
 //   retrieval file-role classification; a confidence-pin contract names its
 //   runtime path as a gap-marker producer.
@@ -33,25 +32,18 @@
 //   and export what retrieval *executed* — wall-clock steps, shadow output,
 //   and the `CODESTORY_PACKET_STEP_TRACE_OUT` file write, which the planning
 //   crate is forbidden to spell (`fs::write` is contract-banned there).
-// - `path_identity`: the runtime half of the `WorkspacePathIdentity` seam,
-//   closing it over `codestory_workspace::same_workspace_path`.
-// - `packet_obligations_runtime_tests`, `packet_sufficiency_runtime_tests`:
-//   `cfg(test)` suites that exercise moved planning composed with runtime
-//   state the planning crate cannot construct.
 pub(crate) mod nucleo_policy;
 pub(crate) mod orchestrator;
 pub(crate) mod packet_batch;
 pub(crate) mod packet_budget;
+pub(crate) mod packet_candidate;
 pub(crate) mod packet_capping;
+pub(crate) mod packet_compiler;
+pub(crate) mod packet_follow_up;
 
-#[cfg(test)]
-mod packet_obligations_runtime_tests;
 pub(crate) mod packet_probe;
 pub(crate) mod packet_search;
-#[cfg(test)]
-mod packet_sufficiency_runtime_tests;
 pub(crate) mod packet_trace;
-pub(crate) mod path_identity;
 pub(crate) mod retrieval_primary;
 pub(crate) mod trace;
 pub(crate) mod trace_export;
@@ -64,13 +56,15 @@ pub(crate) use codestory_agent::eval_probes;
 #[allow(unused_imports)]
 pub(crate) use codestory_agent::{
     citation, packet_citations, packet_claim_profile_registry, packet_claim_profiles,
-    packet_claims, packet_command_profiles, packet_coverage, packet_degradation, packet_evidence,
-    packet_evidence_roles, packet_flow_requirements, packet_freshness, packet_obligations,
-    packet_plan, packet_profile_telemetry, packet_required_probes, packet_scoring,
-    packet_source_patterns, packet_sufficiency, packet_terms, planning, profiles,
+    packet_claims, packet_coverage, packet_degradation, packet_evidence, packet_evidence_roles,
+    packet_flow_requirements, packet_freshness, packet_obligations, packet_plan,
+    packet_profile_telemetry, packet_required_probes, packet_scoring, packet_terms, planning,
+    profiles,
 };
 
 pub(crate) use orchestrator::{agent_ask, agent_packet};
+pub use packet_budget::enforce_packet_output_budget_for_representation;
+pub use packet_follow_up::bind_packet_follow_up_program;
 pub use trace_export::packet_step_trace_json;
 
 /// Build the same bounded query plan used by `agent_packet` without executing retrieval.

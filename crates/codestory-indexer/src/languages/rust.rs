@@ -9,10 +9,10 @@
 //! dispatch in the crate reaches them through [`super::EXTRACTIONS`] rather
 //! than by naming the language.
 //!
-//! Rust carries no `member_callsite_marker`/`graph_call_syntax` pair: its rule
-//! file emits no `call_syntax` attribute, so the callsite-marker match has no
-//! Rust arm to move. Both fields are therefore `None`, which the registry's
-//! pairing invariant requires.
+//! Rust method-call placeholders carry a syntax marker even when the file-local
+//! receiver inference cannot prove an owner. That marker keeps an untyped
+//! `worker.execute()` call unresolved instead of letting the later name-only
+//! resolver attach it to an unrelated globally unique `execute` method.
 //!
 //! Several Rust surfaces are deliberately *not* here yet, and all of them are
 //! shared seams rather than registry rows:
@@ -45,6 +45,9 @@ const TAGS_QUERY: &str = include_str!("../../rules/rust.tags.scm");
 
 static RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 
+/// Callsite marker written onto edges produced from Rust method-call syntax.
+pub(crate) const MEMBER_CALLSITE_MARKER: &str = "syntax:rust-method-call";
+
 /// The single registry row for Rust.
 pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     dispatch_names: &["rust"],
@@ -59,8 +62,8 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     // collector; see the module docs.
     member_edge_specs: None,
     receiver_call_specs: None,
-    member_callsite_marker: None,
-    graph_call_syntax: None,
+    member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
+    graph_call_syntax: Some("rust_method"),
     // Rust's rule file already emits METHOD for `impl` members, so the
     // FUNCTION-to-METHOD promotion must stay off; turning it on would reclassify
     // free functions declared inside a type-like owner.

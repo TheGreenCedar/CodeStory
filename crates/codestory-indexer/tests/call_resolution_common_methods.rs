@@ -128,6 +128,7 @@ const RUST_RESOLVED: &[ResolvedCallExpectation] = &[
     ("run", "Notifier", "notify_event"),
     ("run", "Repository", "save"),
     ("run", "Workflow", "persist"),
+    ("run", "Workflow", "audit"),
 ];
 const RUST_RESOLVED_BY_NAME: &[ResolvedNameExpectation] = &[];
 const JAVASCRIPT_RESOLVED: &[ResolvedCallExpectation] = &[
@@ -829,7 +830,6 @@ impl RuntimeContext {
             describe_call_edges(&edges, &nodes)
         );
     }
-
     Ok(())
 }
 
@@ -1583,6 +1583,115 @@ def run():
 }
 
 #[test]
+fn test_python_annotated_factory_local_resolves_declared_interface_not_implementation()
+-> anyhow::Result<()> {
+    let adapters_source = r#"
+class BaseAdapter:
+    def send(self, request):
+        pass
+
+class HTTPAdapter(BaseAdapter):
+    def send(self, request):
+        pass
+"#;
+    let sessions_source = r#"
+from .adapters import BaseAdapter
+
+class Session:
+    def get_adapter(self, request) -> BaseAdapter:
+        raise NotImplementedError
+
+    def send(self, request):
+        adapter = self.get_adapter(request)
+        return adapter.send(request)
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("requests/adapters.py", adapters_source),
+        ("requests/sessions.py", sessions_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "python annotated factory interface receiver",
+        &nodes,
+        &edges,
+        "Session.send",
+        "BaseAdapter",
+        "send",
+        "requests/adapters.py",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "python annotated factory does not guess implementation",
+        &nodes,
+        &edges,
+        "Session.send",
+        "HTTPAdapter",
+        "send",
+        "requests/adapters.py",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_python_factory_receiver_without_one_precise_return_type_stays_unresolved()
+-> anyhow::Result<()> {
+    let source = r#"
+class BaseAdapter:
+    def send(self, request):
+        pass
+
+class HTTPAdapter(BaseAdapter):
+    def send(self, request):
+        pass
+
+class UnannotatedSession:
+    def get_adapter(self, request):
+        return BaseAdapter()
+
+    def send(self, request):
+        adapter = self.get_adapter(request)
+        return adapter.send(request)
+
+class UnionSession:
+    def get_adapter(self, request) -> BaseAdapter | HTTPAdapter:
+        return BaseAdapter()
+
+    def send(self, request):
+        adapter = self.get_adapter(request)
+        return adapter.send(request)
+
+class ReassignedSession:
+    def get_adapter(self, request) -> BaseAdapter:
+        return BaseAdapter()
+
+    def send(self, request, runtime_adapter):
+        adapter = self.get_adapter(request)
+        adapter = runtime_adapter
+        return adapter.send(request)
+"#;
+
+    let (nodes, edges) = index_single_file("requests/sessions.py", source)?;
+    for caller in [
+        "UnannotatedSession.send",
+        "UnionSession.send",
+        "ReassignedSession.send",
+    ] {
+        for owner in ["BaseAdapter", "HTTPAdapter"] {
+            assert_no_resolved_call_to_method_owner(
+                "python imprecise factory return",
+                &nodes,
+                &edges,
+                caller,
+                owner,
+                "send",
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_python_imported_constructor_local_receiver_resolves_to_imported_owner_method()
 -> anyhow::Result<()> {
     let workflow_source = r#"
@@ -1675,6 +1784,281 @@ def run():
         "Workflow",
         "run",
     );
+
+    Ok(())
+}
+
+#[test]
+fn test_python_with_item_constructor_receiver_resolves_to_exact_owner_method() -> anyhow::Result<()>
+{
+    let sessions_source = r#"
+class Session:
+    def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+"#;
+    let shadow_source = r#"
+class Session:
+    def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+"#;
+    let api_source = r#"
+from . import sessions
+
+def request(method, url):
+    """Send one outbound request."""
+    # Session owns request preparation and adapter selection.
+    # Closing the context releases session-owned resources.
+    with sessions.Session() as session:
+        return session.request(method=method, url=url)
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("src/requests/sessions.py", sessions_source),
+        ("src/shadow/sessions.py", shadow_source),
+        ("src/requests/api.py", api_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "python with-item imported module constructor",
+        &nodes,
+        &edges,
+        "request",
+        "Session",
+        "request",
+        "src/requests/sessions.py",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "python with-item imported module constructor",
+        &nodes,
+        &edges,
+        "request",
+        "Session",
+        "request",
+        "src/shadow/sessions.py",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_python_with_item_constructor_receiver_fails_closed_on_imprecise_bindings()
+-> anyhow::Result<()> {
+    let sessions_source = r#"
+class Session:
+    def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+
+class UnannotatedSession:
+    def request(self, method, url):
+        pass
+
+class OtherSession:
+    def request(self, method, url):
+        pass
+
+class WrongReturnSession:
+    def __enter__(self) -> OtherSession:
+        return OtherSession()
+
+    def request(self, method, url):
+        pass
+
+class StaticEnterSession:
+    @staticmethod
+    def __enter__() -> Self:
+        return StaticEnterSession()
+
+    def request(self, method, url):
+        pass
+
+class DuplicateEnterSession:
+    def __enter__(self) -> Self:
+        return self
+
+    def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+
+class AsyncEnterSession:
+    async def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+"#;
+    let api_source = r#"
+from . import sessions
+from .sessions import Session
+
+def unannotated_context(method, url):
+    with sessions.UnannotatedSession() as session:
+        return session.request(method, url)
+
+def wrong_return_context(method, url):
+    with sessions.WrongReturnSession() as session:
+        return session.request(method, url)
+
+def static_enter_context(method, url):
+    with sessions.StaticEnterSession() as session:
+        return session.request(method, url)
+
+def duplicate_enter_context(method, url):
+    with sessions.DuplicateEnterSession() as session:
+        return session.request(method, url)
+
+def parameter_shadowed_module(sessions, method, url):
+    with sessions.Session() as session:
+        return session.request(method, url)
+
+def parameter_shadowed_type(Session, method, url):
+    with Session() as session:
+        return session.request(method, url)
+
+def defaulted_parameter_shadowed_module(method, url, sessions=alternate):
+    with sessions.Session() as session:
+        return session.request(method, url)
+
+def defaulted_parameter_shadowed_type(method, url, Session=Other):
+    with Session() as session:
+        return session.request(method, url)
+
+def imported_bare_type_context(method, url):
+    with Session() as session:
+        return session.request(method, url)
+
+def constructor_argument_context(method, url):
+    with sessions.Session(option := make_option()) as session:
+        return session.request(method, url)
+
+def multi_with_item_context(method, url):
+    with sessions.Session() as session, sessions.Session() as other:
+        return session.request(method, url)
+
+async def async_with_context(method, url):
+    async with sessions.AsyncEnterSession() as session:
+        return session.request(method, url)
+
+def async_enter_context(method, url):
+    with sessions.AsyncEnterSession() as session:
+        return session.request(method, url)
+
+def except_alias_context(method, url):
+    with sessions.Session() as session:
+        try:
+            raise RuntimeError()
+        except RuntimeError as session:
+            return session.request(method, url)
+
+def walrus_branch_context(method, url):
+    with sessions.Session() as session:
+        if session := make_session():
+            return session.request(method, url)
+
+def comprehension_context(method, url):
+    with sessions.Session() as session:
+        return [session.request(method, url) for session in sessions]
+
+def enclosing_except_context(method, url):
+    try:
+        raise RuntimeError()
+    except RuntimeError:
+        with sessions.Session() as session:
+            return session.request(method, url)
+
+def untyped_factory(method, url):
+    with make_session() as session:
+        return session.request(method, url)
+
+def context_expression(method, url):
+    with sessions.open_session() as session:
+        return session.request(method, url)
+
+def subscript_alias(method, url):
+    with sessions.Session() as state["session"]:
+        return state["session"].request(method, url)
+
+def shadowed_alias(method, url):
+    with sessions.Session() as session:
+        session = make_session()
+        return session.request(method, url)
+
+def loop_shadow(method, url):
+    with sessions.Session() as session:
+        for session in pool:
+            return session.request(method, url)
+
+def nested_scope(method, url):
+    with sessions.Session() as session:
+        def inner():
+            return session.request(method, url)
+        return inner()
+
+def shadowed_module(method, url):
+    sessions = load_sessions()
+    with sessions.Session() as session:
+        return session.request(method, url)
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("src/requests/sessions.py", sessions_source),
+        ("src/requests/api.py", api_source),
+    ])?;
+    for caller in [
+        "unannotated_context",
+        "wrong_return_context",
+        "static_enter_context",
+        "duplicate_enter_context",
+        "parameter_shadowed_module",
+        "parameter_shadowed_type",
+        "defaulted_parameter_shadowed_module",
+        "defaulted_parameter_shadowed_type",
+        "imported_bare_type_context",
+        "constructor_argument_context",
+        "multi_with_item_context",
+        "async_with_context",
+        "async_enter_context",
+        "except_alias_context",
+        "walrus_branch_context",
+        "comprehension_context",
+        "enclosing_except_context",
+        "untyped_factory",
+        "context_expression",
+        "subscript_alias",
+        "shadowed_alias",
+        "loop_shadow",
+        "nested_scope",
+        "shadowed_module",
+    ] {
+        for owner in [
+            "Session",
+            "UnannotatedSession",
+            "OtherSession",
+            "WrongReturnSession",
+            "StaticEnterSession",
+            "DuplicateEnterSession",
+            "AsyncEnterSession",
+        ] {
+            assert_no_resolved_call_to_method_owner_in_file(
+                "python with-item fail-closed guard",
+                &nodes,
+                &edges,
+                caller,
+                owner,
+                "request",
+                "src/requests/sessions.py",
+            );
+        }
+    }
 
     Ok(())
 }
@@ -6876,6 +7260,692 @@ function scopedTwo(workflow) {
 }
 
 #[test]
+fn test_javascript_property_assigned_functions_preserve_receiver_and_import_boundaries()
+-> anyhow::Result<()> {
+    let source = r#"
+const send = require('wire-send');
+
+const app = {};
+app.handle = function handle(req, res) {
+    return [req].map(() => this.router.handle(req, res));
+};
+app.regular = function regular(req, res) {
+    return [req].map(function () {
+        return this.router.handle(req, res);
+    });
+};
+app.use = function use(path) {
+    var router = this.router;
+    return [path].map(function () {
+        return router.use(path);
+    });
+};
+app.arrowAlias = function arrowAlias(path) {
+    let router = this.router;
+    return [path].map(() => router.use(path));
+};
+app.reassigned = function reassigned(path, other) {
+    var router = this.router;
+    router = other;
+    return router.use(path);
+};
+app.blockReassigned = function blockReassigned(path, other) {
+    let router = this.router;
+    {
+        router = other;
+    }
+    return router.use(path);
+};
+app.closureReassigned = function closureReassigned(path, other) {
+    let router = this.router;
+    (() => { router = other; })();
+    return router.use(path);
+};
+app.dormantClosure = function dormantClosure(path, other) {
+    let router = this.router;
+    const mutate = () => { router = other; };
+    return router.use(path);
+};
+app.localShadowClosure = function localShadowClosure(path, other) {
+    let router = this.router;
+    (() => {
+        let router = other;
+        router = other;
+    })();
+    return router.use(path);
+};
+app.parameterShadowClosure = function parameterShadowClosure(path, other) {
+    let router = this.router;
+    ((router) => { router = other; })(other);
+    return router.use(path);
+};
+app.laterDirectWrite = function laterDirectWrite(path, other) {
+    let router = this.router;
+    const result = router.use(path);
+    router = other;
+    return result;
+};
+app.hoistedClosure = function hoistedClosure(path, other) {
+    let router = this.router;
+    mutate();
+    return router.use(path);
+    function mutate() { router = other; }
+};
+app.hoistedShadowClosure = function hoistedShadowClosure(path, other) {
+    let router = this.router;
+    mutate(other);
+    return router.use(path);
+    function mutate(router) { router = other; }
+};
+app.loopReassigned = function loopReassigned(path, other) {
+    let router = this.router;
+    for (let index = 0; index < 2; index++) {
+        if (index > 0) router.use(path);
+        router = other;
+    }
+};
+app.loneLoopLaterWrite = function loneLoopLaterWrite(path, other) {
+    let router = this.router;
+    const result = router.use(path);
+    for (let index = 0; index < 2; index++) {
+        router = other;
+    }
+    return result;
+};
+app.shadowed = function shadowed(path, other) {
+    var router = this.router;
+    return (function (router) {
+        return router.use(path);
+    })(other);
+};
+app.foreign = function foreign(path, other) {
+    var router = other.router;
+    return router.use(path);
+};
+
+const res = {};
+res.end = function end(body) {
+    return body;
+};
+res.send = function send(body) {
+    return this.end(body);
+};
+res.sendFile = function sendFile(path) {
+    return send(path);
+};
+"#;
+
+    let (nodes, edges) = index_single_file("server.js", source)?;
+    assert_resolved_call_to_method_owner(
+        "javascript property-assigned this receiver",
+        &nodes,
+        &edges,
+        "res.send",
+        "res",
+        "end",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "javascript imported bare call avoids same-name receiver method",
+        &nodes,
+        &edges,
+        "res.sendFile",
+        "res",
+        "send",
+    );
+
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let external_router_call = edges.iter().find(|edge| {
+        if edge.kind != EdgeKind::CALL {
+            return false;
+        }
+        let Some(source) = node_by_id.get(&edge.source) else {
+            return false;
+        };
+        let Some(target) = node_by_id.get(&edge.target) else {
+            return false;
+        };
+        is_matching_name(&source.serialized_name, "app.handle")
+            && is_matching_name(&target.serialized_name, "handle")
+    });
+    let external_router_call = external_router_call.unwrap_or_else(|| {
+        panic!(
+            "expected exact app.handle external callsite. Calls: {:?}",
+            describe_call_edges(&edges, &nodes)
+        )
+    });
+    assert_eq!(external_router_call.resolved_target, None);
+    assert!(
+        external_router_call
+            .callsite_identity
+            .as_deref()
+            .is_some_and(|identity| identity.contains("receiver-owner:app.router")),
+        "external callsite should retain its receiver provenance without a resolved target: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    let alias_edges = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge
+                    .callsite_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.contains("receiver-owner:app.router"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        alias_edges.len(),
+        8,
+        "only lexical `this.router` and its exact local alias may carry app.router provenance: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert!(
+        alias_edges.iter().all(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_none_or(|source| !is_matching_name(&source.serialized_name, "app.regular"))
+        }),
+        "a nested regular function owns its own `this` and must not inherit app.router provenance: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    let alias_use = alias_edges
+        .iter()
+        .find(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, "app.use"))
+                && node_by_id
+                    .get(&edge.target)
+                    .is_some_and(|target| is_matching_name(&target.serialized_name, "use"))
+        })
+        .expect("exact router alias call");
+    assert_eq!(alias_use.resolved_target, None);
+    assert!(
+        node_by_id
+            .get(&alias_use.source)
+            .is_some_and(|source| is_matching_name(&source.serialized_name, "app.use")),
+        "alias provenance should stay attached to the owning property-assigned callable: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert!(
+        alias_edges.iter().any(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, "app.arrowAlias"))
+        }),
+        "a nested arrow must retain the exact lexical router alias: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert!(
+        edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::CALL
+                    && node_by_id.get(&edge.source).is_some_and(|source| {
+                        is_matching_name(&source.serialized_name, "app.blockReassigned")
+                    })
+            })
+            .all(|edge| {
+                !edge
+                    .callsite_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.contains("receiver-owner:app.router"))
+                    && edge.resolved_target.is_none_or(|target| {
+                        node_by_id.get(&target).is_none_or(|resolved| {
+                            !is_matching_name(&resolved.serialized_name, "app.router.use")
+                        })
+                    })
+            }),
+        "an unconditional nested-block write must invalidate router alias provenance: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    for caller in [
+        "app.closureReassigned",
+        "app.dormantClosure",
+        "app.hoistedClosure",
+        "app.loopReassigned",
+    ] {
+        assert!(
+            edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::CALL
+                        && node_by_id
+                            .get(&edge.source)
+                            .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+                })
+                .all(|edge| !edge
+                    .callsite_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.contains("receiver-owner:app.router"))),
+            "a prior nested closure write to the captured outer alias must invalidate provenance even when invocation is unknown in `{caller}`: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+    for caller in [
+        "app.localShadowClosure",
+        "app.parameterShadowClosure",
+        "app.laterDirectWrite",
+        "app.hoistedShadowClosure",
+        "app.loneLoopLaterWrite",
+    ] {
+        assert!(
+            alias_edges.iter().any(|edge| {
+                node_by_id
+                    .get(&edge.source)
+                    .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+            }),
+            "a nested closure write to its own shadow must not invalidate the outer alias in `{caller}`: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_javascript_runtime_import_boundaries_follow_exact_binding_scope_and_alias()
+-> anyhow::Result<()> {
+    let source = r#"
+const direct = require('wire-direct');
+const { send: dispatch } = require('wire-dispatch');
+const relay = require('wire-relay').send;
+let assigned;
+assigned = require('wire-assigned');
+let reassigned;
+reassigned = require('wire-reassigned');
+reassigned = (value) => value;
+let dynamic;
+dynamic = require(moduleName);
+let destructured;
+({ destructured } = require('wire-destructured'));
+const holder = {};
+holder.member = require('wire-member');
+let parameterBound;
+const captured = require('wire-captured');
+const dormant = require('wire-dormant');
+const shadowLocal = require('wire-shadow-local');
+const shadowParameter = require('wire-shadow-parameter');
+let laterWrite = require('wire-later-write');
+let hoistedWrite = require('wire-hoisted-write');
+let hoistedShadow = require('wire-hoisted-shadow');
+let loopWrite = require('wire-loop-write');
+let loneLoopWrite = require('wire-lone-loop-write');
+
+function local(value) { return value; }
+(() => { captured = local; })();
+const mutateDormant = () => { dormant = local; };
+(() => {
+    let shadowLocal = local;
+    shadowLocal = local;
+})();
+((shadowParameter) => { shadowParameter = local; })(local);
+
+class Response {
+    direct(body) { return body; }
+    dispatch(body) { return body; }
+    relay(body) { return body; }
+    assigned(body) { return body; }
+    reassigned(body) { return body; }
+    dynamic(body) { return body; }
+    destructured(body) { return body; }
+}
+
+function externalCalls(body) {
+    direct(body);
+    dispatch(body);
+    relay(body);
+    assigned(body);
+    reassigned(body);
+    dynamic(body);
+    destructured(body);
+}
+
+function memberExternal(body) {
+    holder.member(body);
+}
+
+function parameterAssignment(parameterBound, body) {
+    parameterBound = require('wire-parameter');
+    parameterBound(body);
+}
+
+function shadowedLocal(body) {
+    const dispatch = (value) => value;
+    dispatch(body);
+}
+
+function shadowedDeclaration(body) {
+    function relay(value) { return value; }
+    relay(body);
+}
+
+const NamedClass = class dispatch {
+    static namedClassCall(body) { return dispatch(body); }
+};
+
+const AnonymousClass = class {
+    static anonymousClassCall(body) { return dispatch(body); }
+};
+
+function outerClassCall(body) {
+    return dispatch(body);
+}
+
+function capturedExternal(body) {
+    return captured(body);
+}
+
+function dormantExternal(body) {
+    return dormant(body);
+}
+
+function shadowLocalExternal(body) {
+    return shadowLocal(body);
+}
+
+function shadowParameterExternal(body) {
+    return shadowParameter(body);
+}
+
+function laterWriteExternal(body) {
+    return laterWrite(body);
+}
+
+laterWrite = local;
+
+function hoistedWriteExternal(body) {
+    return hoistedWrite(body);
+}
+
+mutateHoistedWrite();
+function mutateHoistedWrite() {
+    hoistedWrite = local;
+}
+
+function hoistedShadowExternal(body) {
+    return hoistedShadow(body);
+}
+
+mutateHoistedShadow(local);
+function mutateHoistedShadow(hoistedShadow) {
+    hoistedShadow = local;
+}
+
+function loopWriteExternal(body) {
+    for (let index = 0; index < 2; index++) {
+        if (index > 0) loopWrite(body);
+        loopWrite = local;
+    }
+}
+
+function loneLoopWriteExternal(body) {
+    const result = loneLoopWrite(body);
+    for (let index = 0; index < 2; index++) {
+        loneLoopWrite = local;
+    }
+    return result;
+}
+"#;
+    let (nodes, edges) = index_single_file("neutral.js", source)?;
+    for method in ["direct", "dispatch", "relay", "assigned"] {
+        assert_no_resolved_call_to_method_owner(
+            "exact CommonJS aliases stay external",
+            &nodes,
+            &edges,
+            "externalCalls",
+            "Response",
+            method,
+        );
+    }
+
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let mut external_markers = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && node_by_id.get(&edge.source).is_some_and(|source| {
+                    is_matching_name(&source.serialized_name, "externalCalls")
+                })
+                && edge
+                    .callsite_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call"))
+        })
+        .map(|edge| {
+            node_by_id
+                .get(&edge.target)
+                .expect("runtime import call target")
+                .serialized_name
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    external_markers.sort();
+    assert_eq!(
+        external_markers,
+        ["assigned", "direct", "dispatch", "relay"],
+        "declarator aliases and one simple assignment binding need exact external-boundary markers: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    for (caller, reason) in [
+        ("memberExternal", "member-assignment"),
+        ("parameterAssignment", "parameter-shadowed assignment"),
+    ] {
+        assert!(
+            edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::CALL
+                        && node_by_id
+                            .get(&edge.source)
+                            .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+                })
+                .all(|edge| !edge
+                    .callsite_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call"))),
+            "{reason} must not create a bare-binding marker: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+    for caller in ["shadowedLocal", "shadowedDeclaration"] {
+        let calls = edges.iter().filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && node_by_id
+                    .get(&edge.source)
+                    .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+        });
+        assert!(
+            calls.into_iter().all(|edge| !edge
+                .callsite_identity
+                .as_deref()
+                .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call"))),
+            "shadowed local binding in `{caller}` must not inherit the file import marker: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+    for (caller, method) in [
+        ("shadowedLocal", "dispatch"),
+        ("shadowedDeclaration", "relay"),
+    ] {
+        assert_no_resolved_call_to_method_owner(
+            "shadowed import name avoids unrelated receiver method",
+            &nodes,
+            &edges,
+            caller,
+            "Response",
+            method,
+        );
+    }
+    for caller in ["shadowedLocal", "shadowedDeclaration"] {
+        assert!(
+            edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::CALL)
+                .any(|edge| {
+                    node_by_id
+                        .get(&edge.source)
+                        .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+                        && edge.resolved_target.is_some_and(|target| {
+                            node_by_id.get(&target).is_some_and(|resolved| {
+                                resolved.kind == codestory_contracts::graph::NodeKind::FUNCTION
+                                    && matches!(
+                                        resolved.serialized_name.as_str(),
+                                        "dispatch" | "relay"
+                                    )
+                            })
+                        })
+                }),
+            "local callable shadow in `{caller}` should resolve locally: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+    for (caller, should_inherit_import) in [
+        ("namedClassCall", false),
+        ("anonymousClassCall", true),
+        ("outerClassCall", true),
+    ] {
+        let import_marked = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL)
+            .any(|edge| {
+                node_by_id
+                    .get(&edge.source)
+                    .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+                    && edge
+                        .callsite_identity
+                        .as_deref()
+                        .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call"))
+            });
+        assert_eq!(
+            import_marked,
+            should_inherit_import,
+            "named class expressions shadow only within their class; anonymous classes and outer calls retain the import: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+    for (caller, should_inherit_import) in [
+        ("capturedExternal", false),
+        ("dormantExternal", false),
+        ("shadowLocalExternal", true),
+        ("shadowParameterExternal", true),
+        ("laterWriteExternal", true),
+        ("hoistedWriteExternal", false),
+        ("hoistedShadowExternal", true),
+        ("loopWriteExternal", false),
+        ("loneLoopWriteExternal", true),
+    ] {
+        let import_marked = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL)
+            .any(|edge| {
+                node_by_id
+                    .get(&edge.source)
+                    .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+                    && edge
+                        .callsite_identity
+                        .as_deref()
+                        .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call"))
+            });
+        assert_eq!(
+            import_marked,
+            should_inherit_import,
+            "outer-binding closure writes invalidate runtime-import provenance conservatively, while local and parameter shadows do not in `{caller}`: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+    let import_binding_ids = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::IMPORT
+                && node_by_id
+                    .get(&edge.target)
+                    .is_some_and(|target| target.serialized_name.contains("wire-dispatch"))
+        })
+        .map(|edge| edge.source)
+        .collect::<HashSet<_>>();
+    assert!(
+        !import_binding_ids.is_empty(),
+        "expected the outer CommonJS import binding"
+    );
+    let named_class_calls = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && node_by_id.get(&edge.source).is_some_and(|source| {
+                    is_matching_name(&source.serialized_name, "namedClassCall")
+                })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !named_class_calls.is_empty()
+            && named_class_calls.iter().all(|edge| edge
+                .resolved_target
+                .is_none_or(|target| !import_binding_ids.contains(&target))),
+        "the named class binding must not resolve to the outer CommonJS import: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_typescript_family_member_calls_never_inherit_runtime_import_markers() -> anyhow::Result<()>
+{
+    for (filename, source) in [
+        (
+            "neutral.ts",
+            r#"
+const dispatch = require('wire-dispatch');
+class Response { dispatch(body: string) { return body; } }
+function invoke(response: Response, body: string) {
+    dispatch(body);
+    response.dispatch(body);
+}
+"#,
+        ),
+        (
+            "neutral.tsx",
+            r#"
+const dispatch = require('wire-dispatch');
+class Response { dispatch(body: string) { return body; } }
+function Widget({ response, body }: { response: Response; body: string }) {
+    dispatch(body);
+    response.dispatch(body);
+    return <span>{body}</span>;
+}
+"#,
+        ),
+    ] {
+        let (nodes, edges) = index_single_file(filename, source)?;
+        let marked = edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::CALL
+                    && edge
+                        .callsite_identity
+                        .as_deref()
+                        .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            marked.len(),
+            1,
+            "only the exact bare import call in `{filename}` should carry the marker: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+        let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+        assert_eq!(
+            node_by_id
+                .get(&marked[0].target)
+                .map(|target| target.serialized_name.as_str()),
+            Some("dispatch"),
+            "the member expression target must not inherit the bare import marker"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_javascript_imported_constructor_receiver_call_resolves_to_imported_owner_method()
 -> anyhow::Result<()> {
     let main_source = r#"
@@ -10544,6 +11614,18 @@ void run(Notifier notifier) {
   notifier.notifyEvent('ready');
 }
 "#;
+    let commented_import_source = r#"
+/*
+import './mail/notifier.dart';
+*/
+const importExample = """
+import './mail/notifier.dart';
+""";
+
+void run(Notifier notifier) {
+  notifier.notifyEvent('ready');
+}
+"#;
 
     let (nodes, edges) = index_files(&[
         ("lib/mail/notifier.dart", notifier_source),
@@ -10603,6 +11685,20 @@ void run(Notifier notifier) {
         "dart unimported receiver type stays unresolved",
         &no_import_nodes,
         &no_import_edges,
+        "run",
+        "Notifier",
+        "notifyEvent",
+        "lib/mail/notifier.dart",
+    );
+
+    let (commented_import_nodes, commented_import_edges) = index_files(&[
+        ("lib/mail/notifier.dart", notifier_source),
+        ("lib/workflow.dart", commented_import_source),
+    ])?;
+    assert_no_resolved_call_to_method_owner_in_file(
+        "dart comment and string text cannot prove an import",
+        &commented_import_nodes,
+        &commented_import_edges,
         "run",
         "Notifier",
         "notifyEvent",
@@ -13326,6 +14422,412 @@ class Bus {
         "run",
         "Audit",
         "forEach",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_rust_untyped_cross_file_method_stays_unresolved() -> anyhow::Result<()>
+{
+    let worker = r#"
+pub struct Worker;
+impl Worker {
+    pub fn execute(&mut self) {}
+}
+"#;
+    let factory = r#"
+pub struct Factory;
+impl Factory {
+    pub fn make(&self) -> Result<Worker, ()> { unimplemented!() }
+}
+"#;
+    let caller = r#"
+fn run(factory: &Factory) -> Result<(), ()> {
+    let mut worker = factory.make()?;
+    worker.execute();
+    Ok(())
+}
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("worker.rs", worker),
+        ("factory.rs", factory),
+        ("caller.rs", caller),
+    ])?;
+    assert_no_resolved_call_to_method_owner(
+        "rust cross-file return type remains fail-closed",
+        &nodes,
+        &edges,
+        "run",
+        "Worker",
+        "execute",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_rust_trait_default_self_calls_keep_trait_owner() -> anyhow::Result<()>
+{
+    let source = r#"
+trait Workflow {
+    fn persist(&self);
+    fn audit(&self) {}
+
+    fn run(&self) {
+        self.persist();
+        self.audit();
+    }
+}
+
+trait OtherWorkflow {
+    fn persist(&self);
+    fn audit(&self);
+}
+
+struct Other;
+impl Other {
+    fn inspect(&self) {}
+}
+
+trait ConstructorWorkflow {
+    fn new() -> Other;
+    fn inspect(&self) {}
+
+    fn run_constructor(&self) {
+        let value = Self::new();
+        value.inspect();
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("workflow.rs", source)?;
+    for method in ["persist", "audit"] {
+        assert_resolved_call_to_method_owner(
+            "rust trait default self call",
+            &nodes,
+            &edges,
+            "run",
+            "Workflow",
+            method,
+        );
+        assert_no_resolved_call_to_method_owner(
+            "rust trait default self call",
+            &nodes,
+            &edges,
+            "run",
+            "OtherWorkflow",
+            method,
+        );
+    }
+    assert_no_resolved_call_to_method_owner(
+        "rust trait constructor return remains fail closed",
+        &nodes,
+        &edges,
+        "run_constructor",
+        "ConstructorWorkflow",
+        "inspect",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_rust_local_generic_bound_requires_one_trait_method()
+-> anyhow::Result<()> {
+    let source = r#"
+trait Handler {
+    fn handle(&self);
+}
+
+trait Auditor {
+    fn handle(&self);
+}
+
+fn dispatch<T: Handler>(target: &T) {
+    target.handle();
+}
+
+fn ambiguous<T: Handler + Auditor>(target: &T) {
+    target.handle();
+}
+"#;
+
+    let (nodes, edges) = index_single_file("workflow.rs", source)?;
+    assert_resolved_call_to_method_owner(
+        "rust unique local generic trait bound",
+        &nodes,
+        &edges,
+        "dispatch",
+        "Handler",
+        "handle",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "rust ambiguous local generic trait bound",
+        &nodes,
+        &edges,
+        "ambiguous",
+        "Handler",
+        "handle",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "rust ambiguous local generic trait bound",
+        &nodes,
+        &edges,
+        "ambiguous",
+        "Auditor",
+        "handle",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_rust_local_unit_struct_constructor_keeps_owner() -> anyhow::Result<()>
+{
+    let source = r#"
+struct Runner;
+impl Runner {
+    fn execute(&self) {}
+}
+
+struct OtherRunner;
+impl OtherRunner {
+    fn execute(&self) {}
+}
+
+fn entrypoint() {
+    let runner = Runner;
+    runner.execute();
+}
+"#;
+
+    let (nodes, edges) = index_single_file("runner.rs", source)?;
+    assert_resolved_call_to_method_owner(
+        "rust local unit struct constructor",
+        &nodes,
+        &edges,
+        "entrypoint",
+        "Runner",
+        "execute",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "rust local unit struct constructor",
+        &nodes,
+        &edges,
+        "entrypoint",
+        "OtherRunner",
+        "execute",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_go_cross_file_typed_receivers_resolve_without_guessing()
+-> anyhow::Result<()> {
+    let types = r#"
+package router
+
+type node struct{}
+func (*node) addRoute() {}
+
+type Context struct{}
+func (*Context) Next() {}
+
+type other struct{}
+func (*other) addRoute() {}
+"#;
+    let callers = r#"
+package router
+
+func dispatch(c *Context) {
+    c.Next()
+}
+
+func build() {
+    var root *node
+    root = new(node)
+    root.addRoute()
+}
+
+func shadowed(new func(node) *other) {
+    root := new(node)
+    root.addRoute()
+}
+"#;
+
+    let (nodes, edges) = index_files(&[("types.go", types), ("callers.go", callers)])?;
+    assert_resolved_call_to_method_owner(
+        "go cross-file typed parameter",
+        &nodes,
+        &edges,
+        "dispatch",
+        "Context",
+        "Next",
+    );
+    assert_resolved_call_to_method_owner(
+        "go builtin new binding",
+        &nodes,
+        &edges,
+        "build",
+        "node",
+        "addRoute",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "go shadowed new remains fail-closed",
+        &nodes,
+        &edges,
+        "shadowed",
+        "node",
+        "addRoute",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_go_file_scope_new_shadow_stays_unresolved() -> anyhow::Result<()> {
+    let source = r#"
+package router
+
+type node struct{}
+func (*node) addRoute() {}
+
+type other struct{}
+func (*other) addRoute() {}
+
+var new = func(node) *other { return &other{} }
+
+func build() {
+    root := new(node)
+    root.addRoute()
+}
+"#;
+
+    let (nodes, edges) = index_files(&[("router.go", source)])?;
+    assert_no_resolved_call_to_method_owner(
+        "go file-scope new shadow remains fail-closed",
+        &nodes,
+        &edges,
+        "build",
+        "node",
+        "addRoute",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_dart_arrow_and_initializer_calls_are_typed() -> anyhow::Result<()> {
+    let request = r#"
+class BaseRequest {
+  void finalize() {}
+}
+"#;
+    let client = r#"
+class BaseClient {
+  Object get(Object url) => _sendUnstreamed(url);
+  Object _sendUnstreamed(Object url) => url;
+}
+"#;
+    let io_client = r#"
+import 'base_request.dart';
+
+class IOClient {
+  void send(BaseRequest request) {
+    var stream = request.finalize();
+  }
+
+  void untyped(dynamic request) {
+    var stream = request.finalize();
+  }
+}
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("lib/base_request.dart", request),
+        ("lib/base_client.dart", client),
+        ("lib/io_client.dart", io_client),
+    ])?;
+    assert_resolved_call_to_method_owner(
+        "dart arrow body direct call",
+        &nodes,
+        &edges,
+        "BaseClient.get",
+        "BaseClient",
+        "_sendUnstreamed",
+    );
+    assert_resolved_call_to_method_owner(
+        "dart typed initializer receiver",
+        &nodes,
+        &edges,
+        "IOClient.send",
+        "BaseRequest",
+        "finalize",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "dart untyped initializer remains fail-closed",
+        &nodes,
+        &edges,
+        "IOClient.untyped",
+        "BaseRequest",
+        "finalize",
+    );
+
+    let worker = r#"
+class Worker {
+  void run() {}
+}
+"#;
+    let unimported_entry = r#"
+void call(Worker worker) {
+  worker.run();
+}
+"#;
+    let (unimported_nodes, unimported_edges) = index_files(&[
+        ("lib/worker.dart", worker),
+        ("lib/entry.dart", unimported_entry),
+    ])?;
+    assert_no_resolved_call_to_method_owner(
+        "dart unimported typed parameter remains fail-closed",
+        &unimported_nodes,
+        &unimported_edges,
+        "call",
+        "Worker",
+        "run",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_dart_duplicate_local_owner_stays_unresolved() -> anyhow::Result<()> {
+    let first_request = r#"
+class Request {
+  void finish() {}
+}
+"#;
+    let second_request = r#"
+class Request {
+  void finish() {}
+}
+"#;
+    let caller = r#"
+import 'first_request.dart';
+
+class Client {
+  void send(Request request) {
+    request.finish();
+  }
+}
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("lib/first_request.dart", first_request),
+        ("lib/second_request.dart", second_request),
+        ("lib/client.dart", caller),
+    ])?;
+    assert_no_resolved_call_to_method_owner(
+        "dart duplicate same-directory owner remains fail-closed",
+        &nodes,
+        &edges,
+        "Client.send",
+        "Request",
+        "finish",
     );
     Ok(())
 }

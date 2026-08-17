@@ -1,7 +1,7 @@
 use crate::cache::RetrievalCache;
 #[cfg(test)]
 use crate::cache::RetrievalCacheKey;
-use crate::candidate::{CandidateHit, fused_candidate_identity_matches};
+use crate::candidate::{CandidateHit, CandidateLane, fused_candidate_identity_matches};
 use crate::health::{
     probe_sidecar_health, probe_sidecar_health_for_runtime,
     probe_sidecar_health_with_embedding_device,
@@ -9,8 +9,8 @@ use crate::health::{
 use crate::index::query_fingerprint;
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
 use crate::planner::{PlannedStage, RetrievalStageKind};
-use crate::query_features::{QueryFeatures, classify_query};
-use crate::ranker::rank_candidates;
+use crate::query_features::{QueryFeatures, QueryLookupMode, classify_query};
+use crate::ranker::{rank_candidates, retain_primary_candidates_for_query};
 use crate::sidecar_search::{SearchExecutionContext, SidecarSearch};
 use anyhow::{Result, bail};
 use codestory_store::RetrievalIndexManifest;
@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 const STAGE_WORKER_LIMIT: usize = 16;
 const STAGE_WAIT_POLL: Duration = Duration::from_millis(5);
-const MAX_RETRIEVAL_BUDGET_MS: u64 = 120_000;
+pub(crate) const MAX_RETRIEVAL_BUDGET_MS: u64 = 120_000;
 static STAGE_WORKER_POOL: OnceLock<StageWorkerPool> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,6 +429,7 @@ impl<'a> QueryExecutor<'a> {
     ) -> Result<Option<String>> {
         let mut low_gain_streak = 0u32;
         let mut cancel_reason = None;
+        let mut suppress_broad_lanes = false;
         for (index, stage) in stages.iter().enumerate() {
             if self.cancelled.load(Ordering::Relaxed) {
                 return Ok(Some("cancelled".into()));
@@ -437,13 +438,18 @@ impl<'a> QueryExecutor<'a> {
                 return Ok(Some(cancel_reason.unwrap_or_else(|| "deadline".into())));
             }
 
-            if should_skip_after_exact_symbol_anchor(stage, features, candidates) {
+            if suppress_broad_lanes
+                && matches!(
+                    stage.kind,
+                    RetrievalStageKind::Stage1bSemantic | RetrievalStageKind::Stage2ScipExpand
+                )
+            {
                 let mut trace = stage_trace(
                     stage,
                     0,
                     0,
                     0.0,
-                    Some("exact_symbol_anchor".into()),
+                    Some("unique_exact_definition".into()),
                     false,
                     None,
                 );
@@ -451,6 +457,7 @@ impl<'a> QueryExecutor<'a> {
                 stage_traces.push(trace);
                 continue;
             }
+
             if should_skip_zero_dense_stage(stage, self.manifest.as_ref()) {
                 let mut trace = stage_trace(
                     stage,
@@ -485,8 +492,11 @@ impl<'a> QueryExecutor<'a> {
 
             let stage_started = Instant::now();
             let before_score = candidate_mass(candidates);
+            let stage_anchors = (stage.kind == RetrievalStageKind::Stage2ScipExpand)
+                .then(|| fused_base_anchors_for_graph_expansion(features, candidates));
+            let anchors = stage_anchors.as_deref().unwrap_or(candidates.as_slice());
             let (mut stage_hits, admission_wait_ms, queue_wait_ms, execution_ms) =
-                match self.run_stage_bounded(&stage, features, candidates, deadline)? {
+                match self.run_stage_bounded(&stage, features, anchors, deadline)? {
                     StageRun::Completed {
                         hits,
                         admission_wait_ms,
@@ -518,9 +528,16 @@ impl<'a> QueryExecutor<'a> {
                         continue;
                     }
                 };
+            self.sidecars.enrich_candidates(&mut stage_hits)?;
+            enrich_candidates_with_file_roles(&mut stage_hits, &self.file_roles);
+            retain_primary_candidates_for_query(features, &mut stage_hits);
             annotate_stage_provenance(&stage, &mut stage_hits);
             let (stub_reason, stage_degraded) = stage_stub_metadata(&stage_hits);
             let added = merge_candidates(candidates, stage_hits);
+            if stage.kind == RetrievalStageKind::Stage0ScipAnchor {
+                suppress_broad_lanes =
+                    unique_exact_definition_suppresses_broad_lanes(features, candidates);
+            }
             let after_score = candidate_mass(candidates);
             let marginal_gain = if before_score <= 0.0 {
                 after_score
@@ -545,7 +562,14 @@ impl<'a> QueryExecutor<'a> {
             if let Some(threshold) = options.stop_marginal_gain_threshold {
                 if marginal_gain < threshold && !candidates.is_empty() {
                     low_gain_streak += 1;
-                    if low_gain_streak >= options.stop_after_low_gain_streak {
+                    let remaining_stages = &stages[index + 1..];
+                    let only_diagnostic_stages_remain = !remaining_stages.is_empty()
+                        && remaining_stages
+                            .iter()
+                            .all(|stage| stage.kind == RetrievalStageKind::Stage3RepoTextFallback);
+                    if low_gain_streak >= options.stop_after_low_gain_streak
+                        && only_diagnostic_stages_remain
+                    {
                         return Ok(Some(
                             cancel_reason.unwrap_or_else(|| "marginal_gain".into()),
                         ));
@@ -557,6 +581,53 @@ impl<'a> QueryExecutor<'a> {
         }
         Ok(cancel_reason)
     }
+}
+
+fn fused_base_anchors_for_graph_expansion(
+    features: &QueryFeatures,
+    candidates: &[CandidateHit],
+) -> Vec<CandidateHit> {
+    const FUSED_BASE_WINDOW: usize = 24;
+    let ranked = rank_candidates(features, candidates.to_vec());
+    let mut selected = ranked
+        .iter()
+        .filter(|candidate| candidate.provenance.iter().any(|label| label == "exact"))
+        .cloned()
+        .collect::<Vec<_>>();
+    for candidate in ranked {
+        if selected
+            .iter()
+            .any(|existing| fused_candidate_identity_matches(existing, &candidate))
+        {
+            continue;
+        }
+        selected.push(candidate);
+        if selected.len() == FUSED_BASE_WINDOW {
+            break;
+        }
+    }
+    selected.truncate(FUSED_BASE_WINDOW);
+    selected
+}
+
+fn unique_exact_definition_suppresses_broad_lanes(
+    features: &QueryFeatures,
+    candidates: &[CandidateHit],
+) -> bool {
+    if features.intent.lookup_mode != QueryLookupMode::Definition
+        || !features.intent.standalone_symbol
+        || features.intent.relationship
+    {
+        return false;
+    }
+    let mut node_ids = candidates
+        .iter()
+        .filter(|candidate| candidate.provenance.iter().any(|label| label == "exact"))
+        .filter_map(|candidate| candidate.node_id.as_deref())
+        .collect::<Vec<_>>();
+    node_ids.sort_unstable();
+    node_ids.dedup();
+    node_ids.len() == 1
 }
 
 fn query_completion_is_cacheable(cancel_reason: Option<&str>) -> bool {
@@ -834,28 +905,6 @@ fn stage_trace(
     }
 }
 
-fn should_skip_after_exact_symbol_anchor(
-    stage: &PlannedStage,
-    features: &QueryFeatures,
-    candidates: &[CandidateHit],
-) -> bool {
-    if !matches!(
-        features.shape,
-        crate::query_features::QueryShape::SymbolLike
-    ) {
-        return false;
-    }
-    if !matches!(
-        stage.kind,
-        RetrievalStageKind::Stage1bSemantic | RetrievalStageKind::Stage2ScipExpand
-    ) {
-        return false;
-    }
-    candidates
-        .iter()
-        .any(|candidate| candidate_is_exact_symbol_anchor(&features.raw_query, candidate))
-}
-
 fn should_skip_zero_dense_stage(
     stage: &PlannedStage,
     manifest: Option<&RetrievalIndexManifest>,
@@ -875,46 +924,27 @@ fn should_skip_zero_dense_stage(
 
 fn annotate_stage_provenance(stage: &PlannedStage, hits: &mut [CandidateHit]) {
     if let Some(label) = stage.kind.provenance_label() {
-        for hit in hits {
+        let lane = match stage.kind {
+            RetrievalStageKind::Stage0ScipAnchor | RetrievalStageKind::Stage2ScipExpand => {
+                CandidateLane::Graph
+            }
+            RetrievalStageKind::Stage1Lexical => CandidateLane::Lexical,
+            RetrievalStageKind::Stage1bSemantic => CandidateLane::Semantic,
+            RetrievalStageKind::Stage3RepoTextFallback => return,
+        };
+        for (index, hit) in hits.iter_mut().enumerate() {
+            let raw_score = hit.score;
             hit.add_provenance(label);
+            hit.record_lane(lane, raw_score, (index + 1) as u32, label);
         }
     }
 }
 
-fn candidate_is_exact_symbol_anchor(query: &str, candidate: &CandidateHit) -> bool {
-    if matches!(
-        candidate.source,
-        crate::candidate::CandidateSource::Semantic | crate::candidate::CandidateSource::Legacy
-    ) {
-        return false;
-    }
-    let Some(symbol) = candidate.symbol_name.as_deref() else {
-        return false;
-    };
-    let query_lower = query.trim().to_ascii_lowercase();
-    if query_lower.is_empty() {
-        return false;
-    }
-    let symbol_lower = symbol.trim().to_ascii_lowercase();
-    if symbol_lower == query_lower {
-        return true;
-    }
-    let symbol_tail = symbol_lower
-        .rsplit("::")
-        .next()
-        .unwrap_or(&symbol_lower)
-        .rsplit('.')
-        .next()
-        .unwrap_or(&symbol_lower);
-    query
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|token| token.len() >= 2)
-        .map(|token| token.to_ascii_lowercase())
-        .any(|token| token == symbol_tail)
-}
-
 fn candidate_mass(candidates: &[CandidateHit]) -> f32 {
-    candidates.iter().map(|hit| hit.score.max(0.01)).sum()
+    candidates
+        .iter()
+        .map(|hit| hit.lane_scores.evidence_count().max(1) as f32)
+        .sum()
 }
 
 fn stage_stub_metadata(hits: &[CandidateHit]) -> (Option<String>, bool) {
@@ -934,12 +964,19 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
             .iter_mut()
             .find(|existing| fused_candidate_identity_matches(existing, &hit));
         if let Some(existing) = duplicate {
-            existing.score = existing.score.max(hit.score);
+            let replace_graph_evidence = graph_evidence_should_replace(existing, &hit);
+            existing.merge_lane_scores(&hit.lane_scores);
             if existing.node_id.is_none() {
                 existing.node_id = hit.node_id.clone();
             }
             if existing.start_line.is_none() {
                 existing.start_line = hit.start_line;
+            }
+            if existing.qualified_name.is_none() {
+                existing.qualified_name = hit.qualified_name.clone();
+            }
+            if existing.structural_kind.is_none() {
+                existing.structural_kind = hit.structural_kind;
             }
             if existing.target.is_none() {
                 existing.target = hit.target.clone();
@@ -950,8 +987,12 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
             if existing.file_role.is_none() {
                 existing.file_role = hit.file_role;
             }
-            if existing.scip_hop_distance.is_none() {
-                existing.scip_hop_distance = hit.scip_hop_distance;
+            existing.scip_hop_distance = match (existing.scip_hop_distance, hit.scip_hop_distance) {
+                (Some(existing), Some(incoming)) => Some(existing.min(incoming)),
+                (existing, incoming) => existing.or(incoming),
+            };
+            if replace_graph_evidence {
+                existing.graph_evidence = hit.graph_evidence.clone();
             }
             for label in hit.provenance {
                 existing.add_provenance(label);
@@ -962,6 +1003,46 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
         added += 1;
     }
     added
+}
+
+fn graph_evidence_should_replace(existing: &CandidateHit, incoming: &CandidateHit) -> bool {
+    let existing_score = existing
+        .lane_scores
+        .graph
+        .as_ref()
+        .map(|evidence| evidence.raw_score)
+        .unwrap_or(f32::NEG_INFINITY);
+    let incoming_score = incoming
+        .lane_scores
+        .graph
+        .as_ref()
+        .map(|evidence| evidence.raw_score)
+        .unwrap_or(f32::NEG_INFINITY);
+    if incoming_score != existing_score {
+        return incoming_score > existing_score;
+    }
+    match (&existing.graph_evidence, &incoming.graph_evidence) {
+        (None, Some(_)) => true,
+        (Some(existing), Some(incoming)) => {
+            let direction_rank = |direction| match direction {
+                crate::candidate::CandidateGraphDirection::Anchor => 0,
+                crate::candidate::CandidateGraphDirection::Outgoing => 1,
+                crate::candidate::CandidateGraphDirection::Incoming => 2,
+            };
+            (
+                incoming.hop,
+                incoming.fanout,
+                incoming.edge_kind.map(|kind| kind as i32).unwrap_or(-1),
+                direction_rank(incoming.direction),
+            ) < (
+                existing.hop,
+                existing.fanout,
+                existing.edge_kind.map(|kind| kind as i32).unwrap_or(-1),
+                direction_rank(existing.direction),
+            )
+        }
+        _ => false,
+    }
 }
 
 pub fn cancellation_flag() -> Arc<AtomicBool> {
@@ -1155,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn executor_caches_successful_marginal_gain_stop() {
+    fn executor_caches_completed_low_gain_sequence() {
         let query = "explain startup request flow";
         let mock = Arc::new(MockSidecarSearch {
             lexical: Mutex::new(HashMap::from([(
@@ -1181,7 +1262,7 @@ mod tests {
             mode_override: Some(RetrievalDegradedMode::Full),
         };
         let first = executor.execute(query, Some(1_000)).expect("first query");
-        assert_eq!(first.trace.cancel_reason.as_deref(), Some("marginal_gain"));
+        assert_eq!(first.trace.cancel_reason, None);
         assert!(!first.trace.cache_hit);
 
         let cached = executor.execute(query, Some(1_000)).expect("cached query");
@@ -1190,17 +1271,81 @@ mod tests {
     }
 
     #[test]
-    fn executor_skips_semantic_and_expand_after_exact_symbol_anchor() {
+    fn executor_keeps_complementary_lanes_after_exact_symbol_anchor() {
+        let query = "how EventProcessor routes output";
+        let mut exact = CandidateHit::with_source(
+            "src/event_processor.rs",
+            Some("EventProcessor".into()),
+            0.95,
+            CandidateSource::Scip,
+        );
+        exact.node_id = Some("event-processor".into());
+        exact.add_provenance("exact");
         let mock = MockSidecarSearch {
-            scip_anchor: Mutex::new(HashMap::from([(
-                "EventProcessor".into(),
+            scip_anchor: Mutex::new(HashMap::from([(query.into(), vec![exact])])),
+            semantic: Mutex::new(HashMap::from([(
+                query.into(),
                 vec![CandidateHit::with_source(
-                    "src/event_processor.rs",
-                    Some("EventProcessor".into()),
-                    0.95,
-                    CandidateSource::Scip,
+                    "docs/event-output.md",
+                    Some("event output".into()),
+                    0.99,
+                    CandidateSource::Semantic,
                 )],
             )])),
+            scip_expand: Mutex::new(vec![CandidateHit::with_source(
+                "src/neighbor.rs",
+                Some("Neighbor".into()),
+                0.80,
+                CandidateSource::Scip,
+            )]),
+            ..Default::default()
+        };
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(mock),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        let result = executor.execute(query, Some(800)).expect("query succeeds");
+        assert_eq!(
+            result.hits.first().map(|hit| hit.file_path.as_str()),
+            Some("src/event_processor.rs")
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.file_path == "docs/event-output.md")
+        );
+        for kind in [
+            RetrievalStageKind::Stage1bSemantic,
+            RetrievalStageKind::Stage2ScipExpand,
+        ] {
+            let stage = result
+                .trace
+                .stages
+                .iter()
+                .find(|stage| stage.stage == kind)
+                .expect("complementary stage");
+            assert_eq!(stage.completion_status, StageCompletionStatus::Completed);
+        }
+    }
+
+    #[test]
+    fn executor_suppresses_broad_lanes_only_for_one_exact_definition() {
+        let mut exact = CandidateHit::with_source(
+            "src/event_processor.rs",
+            Some("EventProcessor".into()),
+            0.95,
+            CandidateSource::Scip,
+        );
+        exact.node_id = Some("41".into());
+        exact.add_provenance("exact");
+        let mock = MockSidecarSearch {
+            scip_anchor: Mutex::new(HashMap::from([("EventProcessor".into(), vec![exact])])),
             semantic: Mutex::new(HashMap::from([(
                 "EventProcessor".into(),
                 vec![CandidateHit::with_source(
@@ -1227,39 +1372,198 @@ mod tests {
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
+
         let result = executor
             .execute("EventProcessor", Some(800))
-            .expect("query succeeds");
-        assert_eq!(
-            result.hits.first().map(|hit| hit.file_path.as_str()),
-            Some("src/event_processor.rs")
+            .expect("query");
+
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].node_id.as_deref(), Some("41"));
+        for kind in [
+            RetrievalStageKind::Stage1bSemantic,
+            RetrievalStageKind::Stage2ScipExpand,
+        ] {
+            let stage = result
+                .trace
+                .stages
+                .iter()
+                .find(|stage| stage.stage == kind)
+                .expect("suppressed broad stage");
+            assert_eq!(stage.completion_status, StageCompletionStatus::Skipped);
+            assert_eq!(
+                stage.cancel_reason.as_deref(),
+                Some("unique_exact_definition")
+            );
+        }
+    }
+
+    #[test]
+    fn exact_definition_suppression_requires_explicit_definition_intent() {
+        let mut exact = CandidateHit::with_source(
+            "src/authentication.rs",
+            Some("authentication".into()),
+            0.95,
+            CandidateSource::Scip,
         );
+        exact.node_id = Some("authentication-definition".into());
+        exact.add_provenance("exact");
+        let candidates = vec![exact];
+
+        assert!(!unique_exact_definition_suppresses_broad_lanes(
+            &classify_query("authentication"),
+            &candidates,
+        ));
+        assert!(unique_exact_definition_suppresses_broad_lanes(
+            &classify_query("`authentication`"),
+            &candidates,
+        ));
+        assert!(!unique_exact_definition_suppresses_broad_lanes(
+            &classify_query("Authentication dispatch"),
+            &candidates,
+        ));
+    }
+
+    #[test]
+    fn fuzzy_scip_anchor_cannot_suppress_complementary_lanes_as_an_exact_definition() {
+        let fuzzy = CandidateHit::with_source(
+            "src/event_processor.rs",
+            Some("EventProcessor".into()),
+            0.90,
+            CandidateSource::Scip,
+        );
+        let mock = MockSidecarSearch {
+            scip_anchor: Mutex::new(HashMap::from([("EventProcess".into(), vec![fuzzy])])),
+            semantic: Mutex::new(HashMap::from([(
+                "EventProcess".into(),
+                vec![CandidateHit::with_source(
+                    "src/semantic_neighbor.rs",
+                    Some("SemanticNeighbor".into()),
+                    0.80,
+                    CandidateSource::Semantic,
+                )],
+            )])),
+            scip_expand: Mutex::new(vec![CandidateHit::with_source(
+                "src/graph_neighbor.rs",
+                Some("GraphNeighbor".into()),
+                0.75,
+                CandidateSource::Scip,
+            )]),
+            ..Default::default()
+        };
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(mock),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+
+        let result = executor.execute("EventProcess", Some(800)).expect("query");
+
+        let fuzzy = result
+            .hits
+            .iter()
+            .find(|hit| hit.symbol_name.as_deref() == Some("EventProcessor"))
+            .expect("fuzzy SCIP anchor");
+        assert!(!fuzzy.provenance.iter().any(|label| label == "exact"));
+        assert!(fuzzy.provenance.iter().any(|label| label == "scip_anchor"));
+        for (kind, expected_path) in [
+            (
+                RetrievalStageKind::Stage1bSemantic,
+                "src/semantic_neighbor.rs",
+            ),
+            (
+                RetrievalStageKind::Stage2ScipExpand,
+                "src/graph_neighbor.rs",
+            ),
+        ] {
+            let stage = result
+                .trace
+                .stages
+                .iter()
+                .find(|stage| stage.stage == kind)
+                .expect("complementary stage");
+            assert_eq!(stage.completion_status, StageCompletionStatus::Completed);
+            assert!(result.hits.iter().any(|hit| hit.file_path == expected_path));
+        }
+    }
+
+    #[test]
+    fn low_gain_stages_cannot_skip_graph_expansion_of_an_exact_anchor() {
+        let query = "explain how EventProcessor handles output";
+        let mock = MockSidecarSearch {
+            scip_anchor: Mutex::new(HashMap::from([(
+                query.into(),
+                vec![CandidateHit::with_source(
+                    "src/event_processor.rs",
+                    Some("EventProcessor".into()),
+                    0.95,
+                    CandidateSource::Scip,
+                )],
+            )])),
+            scip_expand: Mutex::new(vec![CandidateHit::with_source(
+                "src/event_sink.rs",
+                Some("EventSink".into()),
+                0.80,
+                CandidateSource::Scip,
+            )]),
+            ..Default::default()
+        };
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(mock),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+
+        let result = executor.execute(query, Some(800)).expect("query");
+
         assert!(
             result
                 .hits
                 .iter()
-                .all(|hit| hit.file_path != "docs/event-output.md")
+                .any(|hit| hit.file_path == "src/event_sink.rs")
         );
-        let skipped: Vec<_> = result
-            .trace
-            .stages
-            .iter()
-            .filter(|stage| stage.cancel_reason.as_deref() == Some("exact_symbol_anchor"))
-            .map(|stage| stage.stage)
-            .collect();
-        assert!(skipped.contains(&RetrievalStageKind::Stage1bSemantic));
-        assert!(skipped.contains(&RetrievalStageKind::Stage2ScipExpand));
-        let skipped_final = result
-            .trace
-            .stages
-            .iter()
-            .find(|stage| stage.stage == RetrievalStageKind::Stage1bSemantic)
-            .expect("skipped final stage");
-        assert_eq!(skipped_final.budget_ms, 120);
-        assert_eq!(
-            skipped_final.completion_status,
-            StageCompletionStatus::Skipped
+        assert!(result.trace.stages.iter().any(|stage| {
+            stage.stage == RetrievalStageKind::Stage2ScipExpand
+                && stage.completion_status == StageCompletionStatus::Completed
+        }));
+    }
+
+    #[test]
+    fn graph_expansion_window_keeps_exact_anchors_ahead_of_ranked_distractors() {
+        let features = classify_query("Explain how ExactTarget flows through dispatch");
+        let mut candidates = (0..30)
+            .map(|index| {
+                let mut hit = CandidateHit::with_source(
+                    format!("src/distractor_{index}.rs"),
+                    Some(format!("Distractor{index}")),
+                    1.0 - index as f32 / 100.0,
+                    CandidateSource::Semantic,
+                );
+                hit.node_id = Some(format!("distractor-{index}"));
+                hit
+            })
+            .collect::<Vec<_>>();
+        let mut exact = CandidateHit::with_source(
+            "src/exact.rs",
+            Some("ExactTarget".into()),
+            0.01,
+            CandidateSource::Scip,
         );
+        exact.node_id = Some("exact".into());
+        exact.add_provenance("exact");
+        candidates.push(exact);
+
+        let selected = fused_base_anchors_for_graph_expansion(&features, &candidates);
+
+        assert_eq!(selected.len(), 24);
+        assert_eq!(selected[0].node_id.as_deref(), Some("exact"));
     }
 
     #[test]
@@ -1813,8 +2117,8 @@ mod tests {
             fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
                 std::thread::sleep(Duration::from_millis(350));
                 Ok(vec![CandidateHit::with_source(
-                    "crates/codestory-cli/src/output.rs",
-                    Some("append_search_evidence_packet".into()),
+                    "src/delivery/output.rs",
+                    Some("append_ranked_findings".into()),
                     0.92,
                     CandidateSource::Lexical,
                 )])
@@ -1822,8 +2126,8 @@ mod tests {
 
             fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
                 Ok(vec![CandidateHit::with_source(
-                    "crates/codestory-contracts/src/api/dto.rs",
-                    Some("PacketRetrievalTraceSummaryDto".into()),
+                    "src/contracts/delivery.rs",
+                    Some("DeliveryTraceSummary".into()),
                     0.99,
                     CandidateSource::Semantic,
                 )])
@@ -1845,11 +2149,11 @@ mod tests {
         let mut cache = RetrievalCache::new();
         let mut roles = HashMap::new();
         roles.insert(
-            "crates/codestory-cli/src/output.rs".to_string(),
+            "src/delivery/output.rs".to_string(),
             codestory_store::FileRole::Source,
         );
         roles.insert(
-            "crates/codestory-contracts/src/api/dto.rs".to_string(),
+            "src/contracts/delivery.rs".to_string(),
             codestory_store::FileRole::Source,
         );
         let mut executor = QueryExecutor {
@@ -1862,7 +2166,7 @@ mod tests {
         };
         let result = executor
             .execute(
-                "packet search output evidence packet indexed symbol hits retrieval shadow",
+                "delivery adapter emits ranked findings with provenance",
                 Some(1_000),
             )
             .expect("query");
@@ -1879,7 +2183,7 @@ mod tests {
         );
         assert_eq!(
             result.hits.first().map(|hit| hit.file_path.as_str()),
-            Some("crates/codestory-cli/src/output.rs")
+            Some("src/delivery/output.rs")
         );
     }
 
@@ -2168,12 +2472,11 @@ mod tests {
         assert!(hit.provenance.iter().any(|label| label == "graph_neighbor"));
         assert!(hit.provenance.iter().any(|label| label == "dense_anchor"));
         let rank_features = hit.rank_features.as_ref().expect("rank features");
-        assert!(rank_features.lexical >= 0.85);
-        assert!(rank_features.semantic >= 0.85);
+        assert_eq!(rank_features.lexical, 0.70);
+        assert_eq!(rank_features.semantic, 0.85);
         assert_eq!(
-            rank_features.scip_distance, 0.5,
-            "a stage-2 candidate carries real reference adjacency, so the published graph \
-             feature is the hop-1 value rather than the non-graph floor: {hit:?}"
+            rank_features.scip_distance, 0.75,
+            "a stage-2 candidate must retain its own graph-lane score: {hit:?}"
         );
     }
 
@@ -2496,7 +2799,7 @@ mod tests {
     }
 
     #[test]
-    fn executor_enriches_file_role_before_ranking() {
+    fn executor_excludes_non_primary_file_roles_after_enrichment() {
         let mock = MockSidecarSearch {
             lexical: Mutex::new(HashMap::from([(
                 "startup".into(),
@@ -2540,10 +2843,7 @@ mod tests {
             role_by_path.get("src/main.rs").copied().flatten(),
             Some(codestory_store::FileRole::Entrypoint)
         );
-        assert_eq!(
-            role_by_path.get("src\\boot_test.rs").copied().flatten(),
-            Some(codestory_store::FileRole::Test)
-        );
+        assert!(!role_by_path.contains_key("src\\boot_test.rs"));
     }
 
     #[test]

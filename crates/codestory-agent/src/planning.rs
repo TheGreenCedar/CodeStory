@@ -5,6 +5,13 @@ use std::collections::HashSet;
 
 pub const PACKET_EXACT_SYMBOL_QUERY_PURPOSE: &str =
     "case-sensitive exact symbol identity from task wording";
+pub const PACKET_FLOW_ROLE_QUERY_PURPOSE: &str =
+    "flow-role symbol probe expanded from task wording";
+pub const PACKET_CONCRETE_FILE_QUERY_PURPOSE: &str =
+    "concrete file symbol probe expanded from task wording";
+pub const PACKET_ADJACENT_VARIANT_QUERY_PURPOSE: &str = "synthetic adjacent-term symbol variant";
+pub const PACKET_GENERIC_TERM_QUERY_PURPOSE: &str = "generic prompt-term symbol variant";
+pub const PACKET_OWNER_MEMBER_QUERY_PURPOSE: &str = "owner/member phase probe";
 
 pub fn packet_plan_query_is_exact_symbol_identity(query: &PacketPlanQueryDto) -> bool {
     query.purpose == PACKET_EXACT_SYMBOL_QUERY_PURPOSE

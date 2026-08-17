@@ -1,21 +1,29 @@
 //! AppController batch search paths for packet retrieval.
 
 use crate::AppController;
+use crate::agent::packet_candidate::PacketSearchHit;
 use crate::agent::retrieval_primary::{
     packet_batch_should_use_sidecar, search_sidecar_packet_batch,
     sidecar_retrieval_unavailable_error, sidecar_retrieval_unavailable_reason,
 };
-use codestory_contracts::api::{ApiError, PacketSidecarQueryDiagnosticDto, SearchHit};
+use codestory_contracts::api::{ApiError, PacketSidecarQueryDiagnosticDto};
 
 #[derive(Debug)]
 pub(crate) struct PacketFusedBatchOutcome {
-    pub results: Vec<(String, Vec<SearchHit>)>,
+    pub results: Vec<(String, Vec<PacketSearchHit>)>,
     pub retryable_queries: Vec<String>,
     pub sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
 }
 
 fn packet_batch_error(controller: &AppController, error: ApiError, context: &str) -> ApiError {
-    if matches!(error.code.as_str(), "publication_changed" | "cancelled") {
+    if matches!(
+        error.code.as_str(),
+        "embedding_capacity"
+            | "embedding_retryable"
+            | "cache_busy"
+            | "publication_changed"
+            | "cancelled"
+    ) {
         error
     } else {
         sidecar_retrieval_unavailable_error(
@@ -98,6 +106,49 @@ mod tests {
 
         assert_eq!(error.code, "cancelled");
         assert_eq!(error.message, "request cancelled");
+    }
+
+    #[test]
+    fn packet_batch_preserves_embedding_capacity_without_reindex_advice() {
+        let error = packet_batch_error(
+            &AppController::new(),
+            ApiError::embedding_capacity(
+                "embedding connection admission is full",
+                codestory_contracts::api::EmbeddingCapacityPressureDto {
+                    reason: "connection_limit".to_string(),
+                    queue_class: "packet".to_string(),
+                    capacity: 1,
+                    depth: 1,
+                    retry_after_ms: 25,
+                    retry_condition: "after_capacity_change".to_string(),
+                    owner_state: "busy".to_string(),
+                    active_scope_id: Some("project-a".to_string()),
+                    active_request_id: Some("packet-a".to_string()),
+                    active_request_class: Some("packet".to_string()),
+                },
+            ),
+            "packet batch",
+        );
+
+        assert_eq!(error.code, "embedding_capacity");
+        let details = error.details.expect("typed capacity details");
+        assert!(details.next_commands.is_empty());
+        assert!(details.minimum_next.is_empty());
+        assert!(details.full_repair.is_empty());
+        assert_eq!(
+            details
+                .embedding_retry
+                .as_ref()
+                .map(|retry| retry.retry_after_ms),
+            Some(25)
+        );
+        assert_eq!(
+            details
+                .embedding_capacity
+                .as_ref()
+                .map(|pressure| pressure.owner_state.as_str()),
+            Some("busy")
+        );
     }
 
     struct EnvVarGuard {

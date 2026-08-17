@@ -40,7 +40,7 @@ queries stay local by default.
 | Host | Start here |
 | --- | --- |
 | Codex | [Codex guide](docs/users/codex.md) — the recommended first install |
-| Cursor | [Cursor guide](docs/users/cursor.md) |
+| Cursor | [Cursor guide](docs/users/cursor.md) — install from Customize |
 | Claude Code | [Claude Code guide](docs/users/claude-code.md) |
 | GitHub Copilot | [Copilot guide](docs/users/copilot.md) |
 
@@ -147,29 +147,11 @@ Full routing: [docs/README.md](docs/README.md).
 
 ## Evaluation
 
-> **Scope:** The language-expansion holdout proves **token and wall-time reduction**
-> on 18 pinned public OSS tasks when agents use CodeStory instead of re-reading
-> the tree. It does **not** prove equal quality for every language, every repo
-> size, or your private checkout. For day-to-day limits, see
-> [What to expect](docs/users/what-to-expect.md).
+> **Scope:** The language-expansion holdout compares agents on 18 pinned public OSS tasks with and without CodeStory. A result is published only when both arms finish every repeat, pass the answer-quality checks, and stay within the declared source-read budget. For day-to-day limits, see [What to expect](docs/users/what-to-expect.md).
 
 ### Language expansion holdout (18 tasks)
 
-Broader public-repo evidence uses the
-[`language-support-ab`](benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json)
-manifest across 18 pinned OSS packages. Suite totals recorded **2026-06-17**,
-before 0.16 replaced the retrieval path, so these are a 0.15-era measurement and
-not a claim about the current release:
-
-| Metric | Without | With | Change |
-| --- | ---: | ---: | --- |
-| Context tokens | 9,692,559 | 5,514,580 | -43% |
-| Repeat-task wall time | 7,943s | 4,343s | -45% |
-| Tool calls | 475 | 60 | -87% |
-| Direct source reads | 417 | 0 | -100% |
-
-Per-task medians, ranges, reproduction commands, and boundary notes:
-[language-expansion holdout stats](docs/testing/language-expansion-holdout-stats.md).
+Broader public-repo evidence uses the [`language-support-ab`](benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json) manifest across 18 pinned OSS packages. We reran both arms from scratch against 0.17 on **2026-08-10**. All 108 agent runs completed, but the result did not meet the publication bar: only 34 of 54 answers in each arm passed the manifest quality checks, and the CodeStory arm still needed ordinary source reads after its packet. The old 0.15 totals are therefore no longer presented as a current performance claim. See the [language-expansion holdout evidence record](docs/testing/language-expansion-holdout-stats.md) for the exact run and rejection details.
 
 ## License
 

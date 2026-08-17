@@ -36,7 +36,7 @@ impl RetrievalStageKind {
 
     pub fn provenance_label(self) -> Option<&'static str> {
         match self {
-            RetrievalStageKind::Stage0ScipAnchor => Some("exact"),
+            RetrievalStageKind::Stage0ScipAnchor => Some("scip_anchor"),
             RetrievalStageKind::Stage1Lexical => Some("lexical_source"),
             RetrievalStageKind::Stage1bSemantic => Some("dense_anchor"),
             RetrievalStageKind::Stage2ScipExpand => Some("graph_neighbor"),
@@ -78,6 +78,8 @@ pub struct RetrievalPlan {
 const DEFAULT_TOTAL_BUDGET_MS: u64 = 1_000;
 const MARGINAL_GAIN_THRESHOLD: f32 = 0.05;
 const LOW_GAIN_STREAK: u32 = 2;
+pub(crate) const LEXICAL_FUSION_WINDOW: usize = 4_096;
+pub(crate) const SEMANTIC_CALIBRATION_WINDOW: usize = 64;
 
 /// Build the sidecar plan for a classified query and live retrieval mode.
 ///
@@ -96,12 +98,7 @@ pub fn plan_query(features: &QueryFeatures, mode: RetrievalDegradedMode) -> Retr
     let mut stages = Vec::new();
     let top_k = top_k_for_shape(features.shape);
 
-    if mode.runs_scip_stages()
-        && matches!(
-            features.shape,
-            QueryShape::SymbolLike | QueryShape::PathLike
-        )
-    {
+    if mode.runs_scip_stages() && (features.intent.symbol || features.intent.path) {
         stages.push(PlannedStage {
             kind: RetrievalStageKind::Stage0ScipAnchor,
             budget_ms: stage0_budget_ms(features.shape),
@@ -113,15 +110,19 @@ pub fn plan_query(features: &QueryFeatures, mode: RetrievalDegradedMode) -> Retr
         stages.push(PlannedStage {
             kind: RetrievalStageKind::Stage1Lexical,
             budget_ms: stage1_budget_ms(features.shape),
-            top_k,
+            // The lexical index already bounds and deduplicates the union of
+            // exact, path-BM25, content-BM25, and symbol-document matches.
+            // Preserve that recall set until lane fusion instead of applying
+            // the presentation-sized top-k before the other lanes can agree.
+            top_k: LEXICAL_FUSION_WINDOW,
         });
     }
 
-    let semantic_stage = if mode.runs_semantic_stage() && features.shape != QueryShape::PathLike {
-        let semantic_top_k = match features.shape {
-            QueryShape::NaturalLanguage | QueryShape::Mixed => top_k.saturating_mul(2).min(40),
-            _ => top_k,
-        };
+    let semantic_stage = if mode.runs_semantic_stage() && !features.intent.standalone_path {
+        // Calibration is selected over a fixed raw 64-candidate window. A
+        // smaller runtime scan would silently replace the calibrated
+        // absolute-plus-relative rule with an unrelated positional cutoff.
+        let semantic_top_k = SEMANTIC_CALIBRATION_WINDOW;
         Some(PlannedStage {
             kind: RetrievalStageKind::Stage1bSemantic,
             budget_ms: stage1b_budget_ms(features.shape),
@@ -145,10 +146,7 @@ pub fn plan_query(features: &QueryFeatures, mode: RetrievalDegradedMode) -> Retr
         None
     };
 
-    if matches!(
-        features.shape,
-        QueryShape::NaturalLanguage | QueryShape::Mixed
-    ) {
+    if features.intent.natural_language {
         stages.extend(semantic_stage);
         stages.extend(scip_expand_stage);
     } else {
@@ -182,7 +180,7 @@ fn top_k_for_shape(shape: QueryShape) -> usize {
 fn stage0_budget_ms(shape: QueryShape) -> u64 {
     match shape {
         QueryShape::SymbolLike | QueryShape::PathLike => 40,
-        _ => 30,
+        QueryShape::NaturalLanguage | QueryShape::Mixed => 120,
     }
 }
 
@@ -237,7 +235,11 @@ mod tests {
     #[test]
     fn stage_kind_metadata_matches_sidecar_stage_contract() {
         let cases = [
-            (RetrievalStageKind::Stage0ScipAnchor, Some("exact"), true),
+            (
+                RetrievalStageKind::Stage0ScipAnchor,
+                Some("scip_anchor"),
+                true,
+            ),
             (
                 RetrievalStageKind::Stage1Lexical,
                 Some("lexical_source"),
@@ -321,6 +323,20 @@ mod tests {
         assert!(!kinds.contains(&RetrievalStageKind::Stage0ScipAnchor));
         assert!(kinds.contains(&RetrievalStageKind::Stage2ScipExpand));
         assert!(kinds.contains(&RetrievalStageKind::Stage1bSemantic));
+        assert_eq!(
+            plan.stages
+                .iter()
+                .find(|stage| stage.kind == RetrievalStageKind::Stage1Lexical)
+                .map(|stage| stage.top_k),
+            Some(LEXICAL_FUSION_WINDOW)
+        );
+        assert_eq!(
+            plan.stages
+                .iter()
+                .find(|stage| stage.kind == RetrievalStageKind::Stage1bSemantic)
+                .map(|stage| stage.top_k),
+            Some(SEMANTIC_CALIBRATION_WINDOW)
+        );
         assert!(
             kinds
                 .iter()
@@ -336,7 +352,7 @@ mod tests {
         let features = classify_query("Explain how FooBar flows through request handling");
         let plan = plan_query(&features, RetrievalDegradedMode::Full);
         let kinds: Vec<_> = plan.stages.iter().map(|s| s.kind).collect();
-        assert!(!kinds.contains(&RetrievalStageKind::Stage0ScipAnchor));
+        assert!(kinds.contains(&RetrievalStageKind::Stage0ScipAnchor));
         assert!(kinds.contains(&RetrievalStageKind::Stage1Lexical));
         assert!(kinds.contains(&RetrievalStageKind::Stage2ScipExpand));
         assert!(kinds.contains(&RetrievalStageKind::Stage1bSemantic));
@@ -347,6 +363,17 @@ mod tests {
                 < kinds
                     .iter()
                     .position(|kind| *kind == RetrievalStageKind::Stage2ScipExpand)
+        );
+    }
+
+    #[test]
+    fn slash_separated_concepts_keep_semantic_recall() {
+        let features = classify_query("how does input/output validation work");
+        let plan = plan_query(&features, RetrievalDegradedMode::Full);
+        assert!(
+            plan.stages
+                .iter()
+                .any(|stage| stage.kind == RetrievalStageKind::Stage1bSemantic)
         );
     }
 }

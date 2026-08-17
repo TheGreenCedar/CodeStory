@@ -3,7 +3,7 @@ use super::{
     fs, graph_bridge_evidence_kind, orientation_query, same_search_file, search_plan_anchor_groups,
     search_plan_eligible, search_plan_path_is_test_or_bench, search_plan_rejected_hits,
     search_plan_runtime_call_is_speculative, search_plan_subqueries, search_plan_terms,
-    search_plan_test_hit, tempdir,
+    search_plan_test_hit, select_broad_search_result_breadth, tempdir,
 };
 use crate::root_rank::{CallDegrees, EntryEvidence, diversify_root_order};
 use crate::search_plan::search_orientation_report;
@@ -19,6 +19,58 @@ use codestory_contracts::api::{
     GroundingOrientationConfidenceDto, GroundingOrientationUncertaintyDto, SearchHit,
 };
 use codestory_contracts::graph::STRUCTURAL_COLLECTION_CANONICAL_ID_PREFIXES;
+
+#[test]
+fn broad_search_breadth_preserves_score_order_and_limits_ordinary_file_duplicates() {
+    let project_root = Path::new("/tmp/project");
+    let hits = vec![
+        search_plan_test_hit(
+            "a1",
+            "first",
+            Path::new("/tmp/project/src/a.rs"),
+            1,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        ),
+        search_plan_test_hit(
+            "a2",
+            "second",
+            Path::new("src/a.rs"),
+            2,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        ),
+        search_plan_test_hit(
+            "a3",
+            "third",
+            Path::new("src/a.rs"),
+            3,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        ),
+        search_plan_test_hit(
+            "b1",
+            "fourth",
+            Path::new("src/b.rs"),
+            1,
+            SearchHitOrigin::IndexedSymbol,
+            true,
+        ),
+    ];
+
+    let selected = select_broad_search_result_breadth(
+        project_root,
+        "explain the packet search evidence flow",
+        hits,
+    );
+    assert_eq!(
+        selected
+            .into_iter()
+            .map(|hit| hit.node_id.0)
+            .collect::<Vec<_>>(),
+        ["a1", "a2", "b1"]
+    );
+}
 
 #[test]
 fn broad_architecture_search_plan_terms_and_subqueries_are_bounded() {

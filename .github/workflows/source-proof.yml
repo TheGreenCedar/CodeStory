@@ -36,7 +36,7 @@ on:
         required: true
         type: string
       acceptance_only:
-        description: Execute only the hostile mutation and protected Windows native-probe freeze barrier.
+        description: Execute the exact phase barrier. Source stabilization also runs the authoritative source jobs.
         required: false
         default: false
         type: boolean
@@ -46,7 +46,7 @@ on:
         default: frozen_candidate
         type: choice
         options:
-          - calibration_source
+          - source_stabilization
           - frozen_candidate
       support_prs_json:
         description: JSON array of support PR numbers already merged into the release head.
@@ -177,6 +177,124 @@ jobs:
           )"
           echo "cancelled=$(jq -c '.cancelled' <<<"$result")" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve frozen calibration acceptance identity
+        id: frozen-calibration
+        if: ${{ inputs.acceptance_only && inputs.acceptance_phase == 'frozen_candidate' }}
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          python .github/scripts/check-calibration-release-lineage.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "$HEAD_SHA" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Authenticate frozen calibration producer
+        id: frozen-calibration-producer
+        if: ${{ inputs.acceptance_only && inputs.acceptance_phase == 'frozen_candidate' }}
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ steps.frozen-calibration.outputs.artifact_name }}
+          GH_TOKEN: ${{ github.token }}
+          PRODUCER_RUN_ATTEMPT: ${{ steps.frozen-calibration.outputs.producer_run_attempt }}
+          PRODUCER_RUN_ID: ${{ steps.frozen-calibration.outputs.producer_run_id }}
+          SOURCE_SHA: ${{ steps.frozen-calibration.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          producer_run="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$PRODUCER_RUN_ID/attempts/$PRODUCER_RUN_ATTEMPT"
+          )"
+          jq -e \
+            --arg attempt "$PRODUCER_RUN_ATTEMPT" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg run_id "$PRODUCER_RUN_ID" \
+            --arg source "$SOURCE_SHA" \
+            '.id == ($run_id | tonumber)
+             and .run_attempt == ($attempt | tonumber)
+             and .path == ".github/workflows/packaged-platform-pr.yml"
+             and .event == "workflow_dispatch"
+             and .status == "completed"
+             and .conclusion == "success"
+            and .head_sha == $source
+             and .head_repository.full_name == $repo' \
+            <<<"$producer_run" >/dev/null
+          attempt_started="$(jq -r '.run_started_at' <<<"$producer_run")"
+          attempt_finished="$(jq -r '.updated_at' <<<"$producer_run")"
+          artifacts="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$PRODUCER_RUN_ID/artifacts?per_page=100"
+          )"
+          matches="$(
+            jq -c \
+              --arg artifact "$ARTIFACT_NAME" \
+              --arg attempt_finished "$attempt_finished" \
+              --arg attempt_started "$attempt_started" \
+              --arg source "$SOURCE_SHA" \
+              --argjson run_id "$PRODUCER_RUN_ID" \
+              '[.artifacts[]
+                | select(
+                    .name == $artifact
+                    and .expired == false
+                    and .created_at >= $attempt_started
+                    and .created_at <= $attempt_finished
+                    and .workflow_run.id == $run_id
+                    and .workflow_run.head_sha == $source
+                  )]' \
+              <<<"$artifacts"
+          )"
+          test "$(jq 'length' <<<"$matches")" = 1 || {
+            echo "::error::Expected one unexpired $ARTIFACT_NAME artifact from calibration run $PRODUCER_RUN_ID."
+            exit 1
+          }
+          artifact_id="$(jq -r '.[0].id' <<<"$matches")"
+          container_digest="$(jq -r '.[0].digest // empty' <<<"$matches")"
+          printf '%s' "$artifact_id" | grep -Eq '^[1-9][0-9]*$'
+          printf '%s' "$container_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
+          echo "container_digest=$container_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Download frozen calibration bundle
+        if: ${{ inputs.acceptance_only && inputs.acceptance_phase == 'frozen_candidate' }}
+        shell: bash
+        env:
+          ARTIFACT_ID: ${{ steps.frozen-calibration-producer.outputs.artifact_id }}
+          CONTAINER_DIGEST: ${{ steps.frozen-calibration-producer.outputs.container_digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          destination="$RUNNER_TEMP/frozen-calibration-bundle"
+          archive="$RUNNER_TEMP/frozen-calibration-bundle.zip"
+          mkdir "$destination"
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
+            > "$archive"
+          actual_digest="sha256:$(sha256sum "$archive" | awk '{print $1}')"
+          test "$actual_digest" = "$CONTAINER_DIGEST"
+          unzip -q "$archive" -d "$destination"
+          test -f "$destination/calibration-bundle.json"
+          test -f "$destination/per-user-embedding-server-constant-set.json"
+
+      - name: Verify frozen calibration acceptance
+        if: ${{ inputs.acceptance_only && inputs.acceptance_phase == 'frozen_candidate' }}
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ steps.frozen-calibration.outputs.artifact_name }}
+          HEAD_SHA: ${{ steps.resolve.outputs.ref }}
+          PRODUCER_RUN_ATTEMPT: ${{ steps.frozen-calibration.outputs.producer_run_attempt }}
+          PRODUCER_RUN_ID: ${{ steps.frozen-calibration.outputs.producer_run_id }}
+        run: |
+          set -euo pipefail
+          python .github/scripts/check-calibration-release-lineage.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "$HEAD_SHA" \
+            --calibration-bundle "$RUNNER_TEMP/frozen-calibration-bundle/calibration-bundle.json" \
+            --artifact-constant-set "$RUNNER_TEMP/frozen-calibration-bundle/per-user-embedding-server-constant-set.json" \
+            --expected-producer-run-id "$PRODUCER_RUN_ID" \
+            --expected-producer-run-attempt "$PRODUCER_RUN_ATTEMPT" \
+            --expected-producer-artifact "$ARTIFACT_NAME"
+
       - name: Record executable release freeze
         id: receipt
         if: ${{ inputs.acceptance_only }}
@@ -283,7 +401,7 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --commit "$HEAD_SHA" \
             --tree "$tree" \
-            --phase frozen_candidate \
+            --phase source_stabilization \
             --receipt-digest "$FREEZE_RECEIPT_DIGEST"
 
   freeze-hostile-mutations:
@@ -323,6 +441,19 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.resolve.outputs.ref }}
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Run packaged proof self-test
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = "Stop"
+          python .github/scripts/check-packaged-agent-proof.py --self-test
+          if ($LASTEXITCODE -ne 0) {
+            throw "packaged proof self-test failed on the protected Windows runner"
+          }
 
       - name: Run exact-head Windows native probe
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
@@ -402,11 +533,22 @@ jobs:
       inputs.acceptance_only &&
       needs.resolve.result == 'success' &&
       needs.freeze-hostile-mutations.result == 'success' &&
-      needs.freeze-windows-native-probe.result == 'success'
+      needs.freeze-windows-native-probe.result == 'success' &&
+      (
+        inputs.acceptance_phase != 'source_stabilization' ||
+        (
+          needs.full-source-gate.result == 'success' &&
+          needs.retrieval-generalization.result == 'success' &&
+          needs.windows-native-contracts.result == 'success'
+        )
+      )
     needs:
       - resolve
       - freeze-hostile-mutations
       - freeze-windows-native-probe
+      - full-source-gate
+      - retrieval-generalization
+      - windows-native-contracts
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -455,11 +597,13 @@ jobs:
   full-source-gate:
     name: full-source-gate
     needs: resolve
-    # A completed gate for this exact head already proves this tree. Re-running it costs an hour
-    # and cannot reach a different answer, which is what made re-labelling a PR expensive. Release
-    # runs (workflow_call, which always supplies `ref`) never take this path: their chain requires
-    # the job to execute.
-    if: ${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}
+    # Source stabilization owns the one authoritative broad source gate. Frozen-candidate
+    # acceptance intentionally skips it because that head may differ only by generated constants.
+    if: >-
+      ${{
+        (!inputs.acceptance_only || inputs.acceptance_phase == 'source_stabilization') &&
+        needs.resolve.outputs.reuse != 'true'
+      }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -701,7 +845,7 @@ jobs:
       # seconds, and it means a future doctest can never silently stop being run.
       - name: Test the complete workspace once
         run: |
-          cargo nextest run --workspace --locked
+          cargo nextest run --workspace --locked --no-fail-fast
           cargo test --workspace --doc --locked
 
       - name: Emit authenticated source release cell
@@ -735,7 +879,11 @@ jobs:
   retrieval-generalization:
     name: retrieval-generalization
     needs: resolve
-    if: ${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}
+    if: >-
+      ${{
+        (!inputs.acceptance_only || inputs.acceptance_phase == 'source_stabilization') &&
+        needs.resolve.outputs.reuse != 'true'
+      }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -757,9 +905,13 @@ jobs:
   windows-native-contracts:
     name: windows-native-contracts
     needs: resolve
-    if: ${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}
+    if: >-
+      ${{
+        (!inputs.acceptance_only || inputs.acceptance_phase == 'source_stabilization') &&
+        needs.resolve.outputs.reuse != 'true'
+      }}
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       CMAKE_GENERATOR: Ninja
     steps:
@@ -832,3 +984,67 @@ jobs:
           }
           "- Windows path and native-staging source contracts: ${elapsed} ms" |
             Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Emit authenticated Windows-native source receipt
+        id: windows-native-source-proof
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.resolve.outputs.ref }}
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo metadata failed with exit code $LASTEXITCODE"
+          }
+          $cliPackages = @($metadata.packages | Where-Object { $_.name -eq "codestory-cli" })
+          if ($cliPackages.Count -ne 1) {
+            throw "expected exactly one codestory-cli package, found $($cliPackages.Count)"
+          }
+          $commit = (git rev-parse HEAD).Trim()
+          $sourceTree = (git rev-parse "HEAD^{tree}").Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "git identity resolution failed with exit code $LASTEXITCODE"
+          }
+          if ($commit -ne $env:EXPECTED_HEAD_SHA) {
+            throw "Windows-native source receipt head $commit differs from routed head $env:EXPECTED_HEAD_SHA"
+          }
+          $dirty = @(git status --porcelain=v1)
+          if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {
+            throw "Windows-native source receipt requires a clean exact-head checkout"
+          }
+          $receipt = [ordered]@{
+            schema = "codestory.windows-native-source-proof/v1"
+            status = "pass"
+            repository = $env:GITHUB_REPOSITORY
+            commit = $commit
+            source_tree = $sourceTree
+            version = $cliPackages[0].version
+            producer = [ordered]@{
+              workflow_path = ".github/workflows/source-proof.yml"
+              job = "windows-native-contracts"
+              run_id = [Int64]$env:GITHUB_RUN_ID
+              run_attempt = [Int64]$env:GITHUB_RUN_ATTEMPT
+            }
+            contracts = [ordered]@{
+              qualification_harness_self_test = $true
+              control_directory_inflight = $true
+              windows_path_identity = $true
+              native_staging = $true
+            }
+          }
+          New-Item -ItemType Directory -Force -Path target/windows-native-source-proof | Out-Null
+          $json = $receipt | ConvertTo-Json -Depth 4 -Compress
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::WriteAllText(
+            (Join-Path $env:GITHUB_WORKSPACE "target/windows-native-source-proof/windows-native-source-proof.json"),
+            "$json`n",
+            $utf8NoBom
+          )
+          "commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload authenticated Windows-native source receipt
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows-native-source-proof-${{ steps.windows-native-source-proof.outputs.commit }}-attempt-${{ github.run_attempt }}
+          path: target/windows-native-source-proof/windows-native-source-proof.json
+          if-no-files-found: error
+          retention-days: 30

@@ -136,6 +136,13 @@ def verify_flat_managed_layout(
         and HEX_SHA256.fullmatch(str(manifest.get("archive_sha256") or "")) is not None,
         "managed install manifest does not describe this staged version",
     )
+    archive_bytes = manifest.get("archive_bytes")
+    require(
+        isinstance(archive_bytes, int)
+        and not isinstance(archive_bytes, bool)
+        and 0 < archive_bytes <= 9_007_199_254_740_991,
+        "managed install manifest archive bytes are not a positive safe integer",
+    )
     launcher_name = managed_binary_name(asset_target)
     require(
         manifest.get("path") == launcher_name,

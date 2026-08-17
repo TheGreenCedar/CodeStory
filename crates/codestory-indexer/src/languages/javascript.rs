@@ -45,8 +45,8 @@ use crate::{
     CompiledLanguageRules, ImportedTypeBinding, LanguageRuleset, ManualReceiverCallSpec,
     ManualReceiverSource, OptionalReceiverOwnerBinding, ReceiverCallSiteKey, ReceiverOwnerBinding,
     collect_receiver_call_specs_in_callable, declaration_name, enclosing_node_with_kind,
-    js_like_callable_source_name, js_ts_local_binding_visible_at_call,
-    js_ts_visible_local_type_name, member_call_method_col,
+    javascript_binding_has_prior_write, js_like_callable_source_name,
+    js_ts_local_binding_visible_at_call, js_ts_visible_local_type_name, member_call_method_col,
     normalize_js_ts_private_receiver_surface, normalize_parameter_name,
     normalized_receiver_variable, receiver_call_belongs_to_callable, receiver_callsite_key,
     same_ts_span, trimmed_node_text, ts_node_graph_span, walk_tree_nodes,
@@ -55,6 +55,9 @@ use crate::{
 /// Callsite marker written onto edges produced from JavaScript member-call
 /// syntax.
 pub(crate) const MEMBER_CALLSITE_MARKER: &str = "syntax:js-member-call";
+
+/// Callsite marker for a bare call whose exact local name is also a runtime import binding.
+pub(crate) const RUNTIME_IMPORT_CALLSITE_MARKER: &str = "syntax:js-runtime-import-call";
 
 const GRAPH_QUERY: &str = include_str!("../../rules/javascript.scm");
 
@@ -102,7 +105,7 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
     walk_tree_nodes(tree.root_node(), &mut |callable| {
         if !matches!(
             callable.kind(),
-            "method_definition" | "function_declaration" | "arrow_function"
+            "method_definition" | "function_declaration" | "arrow_function" | "function_expression"
         ) {
             return;
         }
@@ -131,6 +134,28 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             && callable.kind() == "method_definition"
         {
             receiver_types.insert("this".to_string(), owner_name);
+        }
+        if let Some(owner_name) = javascript_property_assigned_function_owner(callable, source) {
+            collect_javascript_property_assigned_this_receiver_call_specs(
+                callable,
+                source,
+                ManualReceiverSource {
+                    name: call_source.name,
+                    span: call_source.span,
+                },
+                &owner_name,
+                &mut edges,
+            );
+            collect_javascript_property_assigned_alias_receiver_call_specs(
+                callable,
+                source,
+                ManualReceiverSource {
+                    name: call_source.name,
+                    span: call_source.span,
+                },
+                &owner_name,
+                &mut edges,
+            );
         }
         let property_receiver_types = collect_javascript_class_property_receiver_types(
             callable,
@@ -177,6 +202,272 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
         edges.extend(fallback_specs);
     });
     edges
+}
+
+fn javascript_property_assigned_function_owner(
+    callable: TsNode<'_>,
+    source: &str,
+) -> Option<String> {
+    if callable.kind() != "function_expression" {
+        return None;
+    }
+    let assignment = callable.parent().filter(|parent| {
+        parent.kind() == "assignment_expression"
+            && parent
+                .child_by_field_name("right")
+                .is_some_and(|right| same_ts_span(right, callable))
+    })?;
+    let left = assignment
+        .child_by_field_name("left")
+        .filter(|left| left.kind() == "member_expression")?;
+    left.child_by_field_name("property")
+        .filter(|property| property.kind() == "property_identifier")?;
+    let owner = left.child_by_field_name("object")?;
+    normalized_receiver_variable(owner, source)
+}
+
+fn collect_javascript_property_assigned_this_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    owner_name: &str,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |call| {
+        let Some((receiver_name, method_name)) = member_call(call, source) else {
+            return;
+        };
+        if !javascript_this_receiver_inherits_from_property_callable(call, callable) {
+            return;
+        }
+        let Some(suffix) = receiver_name.strip_prefix("this").map(str::to_string) else {
+            return;
+        };
+        if !suffix.is_empty() && !suffix.starts_with('.') {
+            return;
+        }
+        edges.push(ManualReceiverCallSpec {
+            source_name: call_source.name.to_string(),
+            source_span: call_source.span,
+            receiver_name,
+            owner_name: format!("{owner_name}{suffix}"),
+            owner_module: None,
+            method_name: method_name.clone(),
+            method_col: member_call_method_col(call, source, &method_name),
+            line: Some(call.start_position().row as u32 + 1),
+            allow_global_fallback: false,
+        });
+    });
+}
+
+fn javascript_this_receiver_inherits_from_property_callable(
+    call: TsNode<'_>,
+    callable: TsNode<'_>,
+) -> bool {
+    let mut current = call;
+    while let Some(parent) = current.parent() {
+        if same_ts_span(parent, callable) {
+            return true;
+        }
+        if javascript_callable_node(parent) && parent.kind() != "arrow_function" {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn collect_javascript_property_assigned_alias_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    owner_name: &str,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |call| {
+        let Some((receiver_name, method_name)) = member_call(call, source) else {
+            return;
+        };
+        if receiver_name.contains('.') {
+            return;
+        }
+        let Some(origin) =
+            javascript_visible_property_alias_origin(callable, call, &receiver_name, source)
+        else {
+            return;
+        };
+        let Some(property) = origin.strip_prefix("this.") else {
+            return;
+        };
+        edges.push(ManualReceiverCallSpec {
+            source_name: call_source.name.to_string(),
+            source_span: call_source.span,
+            receiver_name,
+            owner_name: format!("{owner_name}.{property}"),
+            owner_module: None,
+            method_name: method_name.clone(),
+            method_col: member_call_method_col(call, source, &method_name),
+            line: Some(call.start_position().row as u32 + 1),
+            allow_global_fallback: false,
+        });
+    });
+}
+
+fn javascript_visible_property_alias_origin(
+    callable: TsNode<'_>,
+    call: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+) -> Option<String> {
+    if javascript_enclosing_binding_shadows_alias(callable, call, receiver_name, source) {
+        return None;
+    }
+
+    let mut declarations = Vec::new();
+    walk_tree_nodes(callable, &mut |node| {
+        if node.kind() != "variable_declarator"
+            || !js_ts_local_binding_visible_at_call(node, call)
+            || node
+                .child_by_field_name("name")
+                .and_then(|name| trimmed_node_text(name, source))
+                .as_deref()
+                != Some(receiver_name)
+        {
+            return;
+        }
+        declarations.push(node);
+    });
+    let [declaration] = declarations.as_slice() else {
+        return None;
+    };
+    if declaration.end_byte() >= call.start_byte()
+        || !receiver_call_belongs_to_callable(*declaration, callable)
+    {
+        return None;
+    }
+    let origin = declaration
+        .child_by_field_name("value")
+        .and_then(|value| javascript_exact_this_property(value, source))?;
+
+    (!javascript_binding_has_prior_write(
+        callable,
+        source,
+        declaration
+            .child_by_field_name("name")
+            .expect("exact alias declaration name"),
+        declaration.end_byte(),
+        call,
+    ))
+    .then_some(origin)
+}
+
+fn javascript_exact_this_property(node: TsNode<'_>, source: &str) -> Option<String> {
+    if node.kind() != "member_expression"
+        || node
+            .child_by_field_name("object")
+            .is_none_or(|object| object.kind() != "this")
+        || node
+            .child_by_field_name("property")
+            .is_none_or(|property| property.kind() != "property_identifier")
+    {
+        return None;
+    }
+    normalized_receiver_variable(node, source).filter(|surface| {
+        surface
+            .strip_prefix("this.")
+            .is_some_and(|property| !property.is_empty() && !property.contains('.'))
+    })
+}
+
+fn javascript_enclosing_binding_shadows_alias(
+    callable: TsNode<'_>,
+    call: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+) -> bool {
+    let mut current = Some(call);
+    while let Some(node) = current {
+        if javascript_callable_node(node)
+            && javascript_callable_binds_name(node, receiver_name, source)
+        {
+            return true;
+        }
+        if node.kind() == "catch_clause"
+            && node
+                .child_by_field_name("parameter")
+                .is_some_and(|parameter| {
+                    javascript_binding_pattern_has_name(parameter, receiver_name, source)
+                })
+        {
+            return true;
+        }
+        if same_ts_span(node, callable) {
+            break;
+        }
+        current = node.parent();
+    }
+
+    let mut shadowed = false;
+    walk_tree_nodes(callable, &mut |node| {
+        if shadowed
+            || !matches!(node.kind(), "function_declaration" | "class_declaration")
+            || !js_ts_local_binding_visible_at_call(node, call)
+        {
+            return;
+        }
+        shadowed = node
+            .child_by_field_name("name")
+            .is_some_and(|name| javascript_simple_identifier_is(name, receiver_name, source));
+    });
+    shadowed
+}
+
+fn javascript_callable_node(node: TsNode<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_expression"
+            | "generator_function_declaration"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+    )
+}
+
+fn javascript_callable_binds_name(callable: TsNode<'_>, name: &str, source: &str) -> bool {
+    callable
+        .child_by_field_name("name")
+        .is_some_and(|binding| javascript_simple_identifier_is(binding, name, source))
+        || callable
+            .child_by_field_name("parameters")
+            .or_else(|| callable.child_by_field_name("parameter"))
+            .is_some_and(|parameters| javascript_binding_pattern_has_name(parameters, name, source))
+}
+
+fn javascript_binding_pattern_has_name(node: TsNode<'_>, name: &str, source: &str) -> bool {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            javascript_simple_identifier_is(node, name, source)
+        }
+        "pair_pattern" => node
+            .child_by_field_name("value")
+            .is_some_and(|value| javascript_binding_pattern_has_name(value, name, source)),
+        "assignment_pattern" => node
+            .child_by_field_name("left")
+            .is_some_and(|left| javascript_binding_pattern_has_name(left, name, source)),
+        "rest_pattern" => node
+            .child_by_field_name("argument")
+            .is_some_and(|argument| javascript_binding_pattern_has_name(argument, name, source)),
+        _ => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .any(|child| javascript_binding_pattern_has_name(child, name, source))
+        }
+    }
+}
+
+fn javascript_simple_identifier_is(node: TsNode<'_>, expected: &str, source: &str) -> bool {
+    node.kind() == "identifier" && trimmed_node_text(node, source).as_deref() == Some(expected)
 }
 
 fn collect_javascript_constructor_receiver_call_specs(

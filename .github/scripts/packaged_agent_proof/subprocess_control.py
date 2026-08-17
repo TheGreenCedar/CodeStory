@@ -20,6 +20,12 @@ from .foundation import (
 )
 
 
+def mcp_search_arguments(project: Path, query: str) -> dict[str, str]:
+    """Build the closed public MCP search argument shape."""
+
+    return {"project": str(project), "query": query}
+
+
 def run(command: list[str], *, env: dict[str, str], cwd: Path, timeout: int) -> dict:
     started = time.perf_counter()
     # A packaged worker can start the resident embedding server and then exit.

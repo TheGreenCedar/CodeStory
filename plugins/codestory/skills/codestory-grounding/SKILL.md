@@ -55,7 +55,7 @@ plugin result unless the user explicitly asks.
 | Find a symbol | `symbol`, then `definition` or `snippet`. |
 | Follow a call path | `callers`, `callees`, `trace`, or `trail`. |
 | Review change impact | `affected` with explicit Git-changed paths, then focused symbol or trace evidence. |
-| Broad structural question | `packet`; use `search` or `context` for bounded follow-up. |
+| Broad structural question | `packet`; stop on Supported, NotEstablished, or Unavailable. For DrillOnce, call `packet` again once with the exact original `question`, `parent_packet_id`, and the listed `option_ids`. Use `search` or `context` only for a user-named exact target, not as packet recovery. |
 
 ## Evidence Rules
 
@@ -65,12 +65,20 @@ plugin result unless the user explicitly asks.
   plugin unavailability.
 - Local repository-map output is navigation evidence. Broad packet/search
   output is stronger only when the response reports full retrieval readiness.
-- When `packet` reports `sufficient`, answer from the packet and cited anchors.
-  When it reports `partial`, run the named follow-up before making proof claims.
+- When `packet` reports `supported`, `not_established`, or `unavailable`, stop.
+  For `supported`, answer from the compiled support units. For
+  `not_established`, answer every claim those units directly establish, then
+  name the material links or claims that remain unproven; do not turn a partial
+  chain into a complete one. For `unavailable`, report the typed preparation
+  reason. Do not search to recover.
+- When `packet` reports `drill_once`, call `packet` once more with the exact
+  original `question`, `parent_packet_id`, and the listed `option_ids` (and the
+  pinned generation ids when present). Then answer. Do not start a free-form
+  `search` / `context` / `trail` / `snippet` loop from packet.
 - `affected` is planning evidence, not a guarantee that every runtime effect was
   found.
 - Tagged probes select exact or additional evidence work. They do not choose
-  route order or upgrade packet sufficiency.
+  route order or replace the packet disposition.
 - Do not paste empty grounding output as context. If a repository truly has no
   supported files, fall back to ordinary inspection or resolve the intended
   root when it is ambiguous.

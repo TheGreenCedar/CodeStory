@@ -26,17 +26,19 @@ admitted query costs, instead of by timeout after the whole proof budget.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from .event_producer_liveness import EventProducer, NativeProcessProducer
 from .foundation import ProofFailure, require
 from .publication_protocol import (
+    PUBLICATION_CRASH_EXIT_ALLOWANCE_SECS,
     control_timeout_secs,
     ensure_resident_qualification_server,
     read_jsonl,
+    server_producer_from_control_event,
     send_control_to_resident_server,
+    wait_for_accepted_crash_exit,
 )
 
 QUALIFICATION_DIRECTORY_ENV = "CODESTORY_EMBED_QUALIFICATION_DIR"
@@ -45,14 +47,6 @@ QUALIFICATION_DIRECTORY_ENV = "CODESTORY_EMBED_QUALIFICATION_DIR"
 # are written under -- so the failure is diagnosable from the message alone,
 # which `embedding_qualification_control_event_timeout:crash_server` never was.
 QUALIFICATION_DIRECTORY_MISMATCH = "embedding_qualification_control_directory_mismatch"
-_REPLACEMENT_POLL_SECS = 0.05
-# A settling window, never a bound on how long a server may take to exit: a
-# crashed server releases its endpoint immediately but may spend up to the
-# frozen native teardown grace actually leaving, and failing on that would
-# reject correct product conduct. Its only job is to keep the successor probe
-# from racing a server that accepted the crash microseconds earlier. Expiry is
-# therefore not a failure -- the identity comparison that follows is the check.
-_REPLACEMENT_SETTLE_SECS = 5
 
 
 @dataclass(frozen=True)
@@ -143,22 +137,6 @@ def _pinned_server(
     )
 
 
-def _settle_replaced_server(replaced: ResidentQualificationServer) -> bool:
-    """Let the accepted crash land, so the successor probe cannot see a ghost.
-
-    ``crash_server`` is answered before the server stops accepting work, so a
-    successor query issued in the same instant could still be served by the
-    process this step exists to remove, and an honest replacement would then
-    read as the surviving-server defect.
-    """
-    deadline = time.monotonic() + _REPLACEMENT_SETTLE_SECS
-    while time.monotonic() < deadline:
-        if replaced.producer.exited():
-            return True
-        time.sleep(_REPLACEMENT_POLL_SECS)
-    return False
-
-
 def rebind_qualification_directory(
     directory: Path,
     *,
@@ -170,6 +148,7 @@ def rebind_qualification_directory(
     timeout: int,
     server_cleanup_control: dict,
     label: str,
+    crash_exit_allowance_secs: float = PUBLICATION_CRASH_EXIT_ALLOWANCE_SECS,
 ) -> dict:
     """Move every control producer to ``directory``, replacing the server first.
 
@@ -211,7 +190,7 @@ def rebind_qualification_directory(
         established.append(producer)
         return producer
 
-    send_control_to_resident_server(
+    crash_event = send_control_to_resident_server(
         previous_directory,
         nonce,
         sequence=_next_control_sequence(previous_directory, nonce),
@@ -219,8 +198,20 @@ def rebind_qualification_directory(
         timeout=control_timeout_secs(timeout),
         establish=establish,
     )
-    replaced = _pinned_server(established[-1], previous, "to be replaced")
-    replaced_exited = _settle_replaced_server(replaced)
+    replaced = _pinned_server(
+        server_producer_from_control_event(
+            crash_event,
+            "exiting after accepting the directory-rebind crash control",
+        ),
+        previous,
+        "to be replaced",
+    )
+    wait_for_accepted_crash_exit(
+        replaced.producer,
+        None,
+        allowance_secs=crash_exit_allowance_secs,
+    )
+    replaced_exited = True
     bind_qualification_directory(
         env,
         directory,

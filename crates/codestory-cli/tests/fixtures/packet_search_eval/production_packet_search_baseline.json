@@ -37,7 +37,7 @@
   },
   "source_fixture_verdicts": {
     "sufficiency_counts": {
-      "partial": 2
+      "not_established": 2
     },
     "proof_status_counts": {
       "reported": 4

@@ -349,7 +349,7 @@ function reusedRunMetadata(groupId, { runId = 777, headSha = "b".repeat(40), con
       });
     }
   }
-  return { runId: String(runId), headSha, bindingValue: "t".repeat(64), artifacts, jobsByAttempt: jobs };
+  return { runId: String(runId), headSha, bindingValue: "d".repeat(40), artifacts, jobsByAttempt: jobs };
 }
 
 test("a reuse-bound group accepts binding-verified evidence from a prior run", () => {
@@ -372,12 +372,41 @@ test("a reuse-bound group accepts binding-verified evidence from a prior run", (
   });
   const row = map.producers.find(({ cell_id: cellId }) => cellId === "source_behavior");
   assert.equal(row.producer_run_id, "777");
-  assert.equal(row.reused_from.binding, "source_tree");
+  assert.equal(row.reused_from.binding, "calibration_source_lineage");
   assert.equal(row.reused_from.head_sha, "b".repeat(40));
   assert.equal(row.artifact.workflow_run_id, "777");
   // Non-reused cells stay bound to the current run.
   const packaged = map.producers.find(({ cell_id: cellId }) => cellId.startsWith("package_identity"));
   assert.equal(packaged.producer_run_id, "12345");
+});
+
+test("the cumulative 22-cell post-publish map retains the preflight source reuse", () => {
+  const metadata = actionsMetadata("post_publish");
+  metadata.jobsByAttempt["1"] = metadata.jobsByAttempt["1"].filter(
+    (job) => !job.name.endsWith("full-source-gate"),
+  );
+  metadata.artifacts = metadata.artifacts.filter(
+    ({ name }) => !name.startsWith("release-cell-prepublish-source"),
+  );
+  const map = buildTrustedProducerMap({
+    graph,
+    gitIdentity,
+    phase: "post_publish",
+    runId: "12345",
+    currentRunAttempt: "1",
+    ...metadata,
+    reuse: { source_behavior: reusedRunMetadata("source_behavior") },
+  });
+  assert.equal(map.producers.length, 22);
+  assert.equal(new Set(map.producers.map(({ cell_id: cellId }) => cellId)).size, 22);
+  const source = map.producers.find(({ cell_id: cellId }) => cellId === "source_behavior");
+  assert.equal(source.producer_run_id, "777");
+  assert.equal(source.reused_from.binding, "calibration_source_lineage");
+  assert.equal(source.artifact.workflow_run_id, "777");
+  assert.ok(map.artifacts.some(({ id }) => id === source.artifact.id));
+  assert.ok(map.producers
+    .filter(({ cell_id: cellId }) => cellId !== "source_behavior")
+    .every(({ producer_run_id: runId }) => runId === "12345"));
 });
 
 test("cross-run evidence is refused for groups without a reuse binding", () => {

@@ -26,7 +26,9 @@ const launcherTest = require(join(pluginRoot, "scripts", "codestory-mcp.cjs"))._
 const devCliContract = require(join(pluginRoot, "scripts", "codestory-dev-cli-contract.cjs"));
 const statusUri = launcherTest.projectBoundResourceUri("codestory://status", repoRoot);
 const {
+  confirmedCursorIdentity: confirmedCursorHookIdentity,
   dirtyMarkerPathForProject,
+  inferredCursorPluginDataDir: inferredCursorHookDataDir,
   writeDirtyMarker,
 } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
 
@@ -155,7 +157,7 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
   const snippet = catalog.tools.find(({ name }) => name === "snippet");
   assert.deepEqual(
     Object.keys(snippet.inputSchema.properties).sort(),
-    ["choose", "context", "function_body", "id", "lines", "project", "query", "scope"],
+    ["choose", "context", "end_line", "file_path", "function_body", "id", "line", "lines", "path", "paths", "project", "query", "scope", "start_line", "symbol_id"],
   );
 });
 
@@ -1095,7 +1097,7 @@ test("agent-facing guidance keeps embedding lifecycle internal", async () => {
   for (const file of [
     join(repoRoot, ".github", "copilot-instructions.md"),
     join(repoRoot, ".cursor", "rules", "codestory.mdc"),
-    join(pluginRoot, ".cursor", "rules", "codestory.mdc"),
+    join(pluginRoot, "rules", "codestory.mdc"),
   ]) {
     const text = await readFile(file, "utf8");
     assert.match(text, /Call the CodeStory tool that matches the task/u, file);
@@ -1111,12 +1113,14 @@ test("plugin package version tracks the codestory-cli release version", async ()
   );
   const workspaceVersion = readCargoVersion(cliManifest);
   const manifestPaths = [
+    join(pluginRoot, "plugin.json"),
     join(pluginRoot, ".codex-plugin", "plugin.json"),
+    join(pluginRoot, ".cursor-plugin", "plugin.json"),
     join(pluginRoot, ".claude-plugin", "plugin.json"),
     join(pluginRoot, ".github", "plugin", "plugin.json"),
   ];
 
-  // The three host manifests always agree with each other; that is the plugin's identity.
+  // The portable and host manifests agree on the plugin identity.
   const versions = [];
   for (const manifestPath of manifestPaths) {
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
@@ -1625,6 +1629,20 @@ test("candidate managed CLI metadata is accepted only for the exact proof archiv
       ).verified,
       true,
     );
+    delete manifest.archive_bytes;
+    await writeFile(
+      join(fixture.versionDir, "manifest.json"),
+      JSON.stringify(manifest),
+      "utf8",
+    );
+    const missingArchiveBytes = launcherTest.verifyPublishedManagedCli(
+      fixture.versionDir,
+      version,
+      target,
+      probe,
+    );
+    assert.equal(missingArchiveBytes.verified, false);
+    assert.equal(missingArchiveBytes.reason, "manifest_release_metadata_invalid");
   } finally {
     delete process.env.CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256;
     delete process.env.CODESTORY_EMBED_QUALIFICATION_DIR;
@@ -3690,9 +3708,11 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     const coldGroundTool = responses[2].result.tools.find((tool) => tool.name === "ground");
     assert.equal(coldGroundTool.safety.effect, "managed_activation");
     assert.equal(coldGroundTool.safety.requiresConfirmation, false);
+    // `ground` still reports managed_activation and openWorld (it can provision the
+    // embedding model); only readOnlyHint changes, because activation never writes the repo.
     assert.equal(coldGroundTool.safety.localOnly, false);
     assert.equal(coldGroundTool.safety.openWorld, true);
-    assert.equal(coldGroundTool.annotations.readOnlyHint, false);
+    assert.equal(coldGroundTool.annotations.readOnlyHint, true);
     assert.equal(coldGroundTool.annotations.openWorldHint, true);
     assert.equal(responses[3].result.isError, true);
     assert.equal(responses[3].result.structuredContent.code, "project_required");
@@ -3827,7 +3847,7 @@ test("mcp launcher owns initialize before handing off to the native runtime", as
 test("packaged initialize handshake carries the publication stamp the host reads", async () => {
   // The launcher answers `initialize` itself and suppresses the runtime's own
   // answer, so the runtime-side `initialize` stamp is invisible to a host wired
-  // through `plugins/codestory/.mcp.json`. This drives the packaged launcher as
+  // through the package MCP configs. This drives the packaged launcher as
   // a process — the only path the plugin configures — and pins the claim the
   // CHANGELOG and the shipped grounding skills make: the version is known at
   // handshake, before the first tool call.
@@ -3872,6 +3892,7 @@ test("packaged initialize handshake carries the publication stamp the host reads
         "else process.exit(2);",
       ].join("\n"),
     );
+    const cliSha256 = createHash("sha256").update(await readFile(cliPath)).digest("hex");
     const overrideResult = packagedInitializeResult({
       ...process.env,
       CODESTORY_CLI: cliPath,
@@ -3895,6 +3916,7 @@ test("packaged initialize handshake carries the publication stamp the host reads
         cli_version: version,
         plugin_version: version,
         plugin_cli_version: version,
+        cli_sha256: cliSha256,
         cli_source: "local_dev_override",
         pinned_pair_matches: true,
         known_override_skew_channel: true,
@@ -6617,6 +6639,9 @@ test("session-start hooks are thin and host manifests point at them", async () =
   const copilotHookConfig = JSON.parse(
     await readFile(join(pluginRoot, "hooks", "copilot-hooks.json"), "utf8"),
   );
+  const cursorHookConfig = JSON.parse(
+    await readFile(join(pluginRoot, "hooks", "cursor-hooks.json"), "utf8"),
+  );
   const hostManifest = join(pluginRoot, ".claude-plugin", "plugin.json");
   const hookCommands = Object.values(hookConfig.hooks)
     .flat()
@@ -6624,6 +6649,11 @@ test("session-start hooks are thin and host manifests point at them", async () =
   const hookScript = /hooks[\\/]([\w.-]+\.(?:js|mjs|cjs|ps1|sh))/u;
 
   assert.equal(copilotHookConfig.hooks.sessionStart.length, 1);
+  assert.equal(cursorHookConfig.version, 1);
+  assert.equal(cursorHookConfig.hooks.sessionStart.length, 1);
+  assert.match(cursorHookConfig.hooks.sessionStart[0].command, /codestory-activate\.cjs/u);
+  assert.match(cursorHookConfig.hooks.sessionStart[0].command, /\$\{CURSOR_PLUGIN_ROOT\}/u);
+  assert.doesNotMatch(cursorHookConfig.hooks.sessionStart[0].command, /\$\{PLUGIN_ROOT\}/u);
   assert.equal(Object.hasOwn(hookConfig.hooks, "UserPromptSubmit"), false);
 
   for (const hook of hookCommands) {
@@ -6641,6 +6671,10 @@ test("session-start hooks are thin and host manifests point at them", async () =
 
   const manifest = JSON.parse(await readFile(hostManifest, "utf8"));
   assert.equal(manifest.hooks, "./hooks/claude-codex-hooks.json");
+  const cursorManifest = JSON.parse(
+    await readFile(join(pluginRoot, ".cursor-plugin", "plugin.json"), "utf8"),
+  );
+  assert.equal(cursorManifest.hooks, "./hooks/cursor-hooks.json");
 });
 
 test("hook records Codex thread id in active project state", async () => {
@@ -6684,13 +6718,17 @@ test("hook manifest timeouts stay bounded for lightweight activation", async () 
   const copilotHookConfig = JSON.parse(
     await readFile(join(pluginRoot, "hooks", "copilot-hooks.json"), "utf8"),
   );
+  const cursorHookConfig = JSON.parse(
+    await readFile(join(pluginRoot, "hooks", "cursor-hooks.json"), "utf8"),
+  );
   const claudeTimeouts = Object.values(hookConfig.hooks)
     .flat()
     .flatMap((entry) => entry.hooks)
     .map((hook) => hook.timeout);
   const copilotTimeouts = copilotHookConfig.hooks.sessionStart.map((hook) => hook.timeoutSec);
+  const cursorTimeouts = cursorHookConfig.hooks.sessionStart.map((hook) => hook.timeout);
 
-  for (const timeoutSec of [...claudeTimeouts, ...copilotTimeouts]) {
+  for (const timeoutSec of [...claudeTimeouts, ...copilotTimeouts, ...cursorTimeouts]) {
     assert.equal(typeof timeoutSec, "number");
     assert.ok(timeoutSec >= 5, `hook timeout ${timeoutSec}s is too short for node startup`);
     assert.ok(timeoutSec <= 300, `hook timeout ${timeoutSec}s must stay bounded`);
@@ -6841,20 +6879,309 @@ test("hook script executes under Codex home module scope", async () => {
   }
 });
 
-test("portable agent adapters are present", async () => {
+test("portable plugin core and thin host adapters preserve their own contracts", async () => {
   const copilotManifest = JSON.parse(
     await readFile(join(pluginRoot, ".github", "plugin", "plugin.json"), "utf8"),
   );
   assert.equal(copilotManifest.hooks, "hooks/copilot-hooks.json");
   assert.equal(copilotManifest.skills, "skills/");
 
-  const cursorMcp = JSON.parse(
-    await readFile(join(pluginRoot, ".cursor", "mcp.json"), "utf8"),
+  const portableManifest = JSON.parse(
+    await readFile(join(pluginRoot, "plugin.json"), "utf8"),
   );
   assert.equal(
-    cursorMcp.mcpServers.codestory.env.CODESTORY_PLUGIN_DATA,
-    "/absolute/path/to/codestory-plugin-data",
+    portableManifest.$schema,
+    "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   );
+  assert.deepEqual(Object.keys(portableManifest).sort(), [
+    "$schema",
+    "author",
+    "description",
+    "homepage",
+    "keywords",
+    "license",
+    "name",
+    "repository",
+    "version",
+  ].sort());
+  assert.deepEqual(Object.keys(portableManifest.author).sort(), ["name", "url"]);
+
+  const cursorManifest = JSON.parse(
+    await readFile(join(pluginRoot, ".cursor-plugin", "plugin.json"), "utf8"),
+  );
+  assert.equal(cursorManifest.name, "codestory");
+  assert.equal(cursorManifest.hooks, "./hooks/cursor-hooks.json");
+  assert.equal(cursorManifest.keywords.includes("cursor"), true);
+  assert.deepEqual(cursorManifest.author, { name: "The Green Cedar" });
+  for (const discovered of ["skills", "rules", "mcpServers"]) {
+    assert.equal(Object.hasOwn(cursorManifest, discovered), false, discovered);
+  }
+
+  const portableMcpText = await readFile(join(pluginRoot, "mcp.json"), "utf8");
+  const portableMcp = JSON.parse(portableMcpText);
+  assert.equal(
+    portableMcp.$schema,
+    "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  );
+  assert.deepEqual(Object.keys(portableMcp).sort(), ["$schema", "mcpServers"]);
+  assert.deepEqual(portableMcp.mcpServers.codestory, {
+    type: "stdio",
+    command: "node",
+    args: ["./scripts/codestory-mcp.cjs"],
+    cwd: "${PLUGIN_ROOT}",
+    env: {},
+  });
+  assert.doesNotMatch(
+    portableMcpText,
+    /CODESTORY_PLUGIN_DATA|CODESTORY_CURSOR_DOGFOOD|absolute\/path|tool_timeout_sec/iu,
+  );
+
+  const codexManifest = JSON.parse(
+    await readFile(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"),
+  );
+  const claudeManifest = JSON.parse(
+    await readFile(join(pluginRoot, ".claude-plugin", "plugin.json"), "utf8"),
+  );
+  const legacyMcp = JSON.parse(await readFile(join(pluginRoot, ".mcp.json"), "utf8"));
+  assert.equal(codexManifest.mcpServers, "./.mcp.json");
+  assert.equal(Object.hasOwn(claudeManifest, "mcpServers"), false);
+  assert.deepEqual(legacyMcp.mcpServers.codestory, {
+    command: "node",
+    args: ["./scripts/codestory-mcp.cjs"],
+    cwd: ".",
+    env: {},
+    tool_timeout_sec: 300,
+  });
+
+  const dogfoodMcp = JSON.parse(
+    await readFile(join(repoRoot, ".cursor", "mcp.json"), "utf8"),
+  );
+  assert.deepEqual(dogfoodMcp.mcpServers.codestory.env, {
+    CODESTORY_CURSOR_DOGFOOD: "1",
+  });
+  assert.deepEqual(dogfoodMcp.mcpServers.codestory.args, [
+    "${workspaceFolder}/plugins/codestory/scripts/codestory-mcp.cjs",
+  ]);
+
+  const marketplace = JSON.parse(
+    await readFile(join(repoRoot, ".cursor-plugin", "marketplace.json"), "utf8"),
+  );
+  assert.equal(marketplace.name, "codestory");
+  assert.deepEqual(marketplace.plugins.map(({ source }) => source), ["plugins/codestory"]);
+  assert.equal(fs.existsSync(join(pluginRoot, ".mcp.json")), true);
+  assert.equal(fs.existsSync(join(pluginRoot, ".cursor", "mcp.json")), false);
+  assert.equal(fs.existsSync(join(pluginRoot, ".cursor", "rules", "codestory.mdc")), false);
+});
+
+test("Cursor rules share one grounding core and describe their host surfaces truthfully", async () => {
+  const pluginRule = await readFile(join(pluginRoot, "rules", "codestory.mdc"), "utf8");
+  const dogfoodRule = await readFile(join(repoRoot, ".cursor", "rules", "codestory.mdc"), "utf8");
+  const normalize = (text) => text
+    .replace(
+      /Cursor setup, MCP wiring, and host-specific notes: \[[^\n\]]+\]\([^\n)]+\)\./u,
+      "Cursor setup, MCP wiring, and host-specific notes: CURSOR_GUIDE.",
+    )
+    .replace(/(?:The \*\*codestory-grounding\*\*|This repository-managed setup)[^\n]+/u, "HOST SURFACE NOTE");
+  assert.equal(normalize(pluginRule), normalize(dogfoodRule));
+  assert.match(
+    pluginRule,
+    /\]\(https:\/\/github\.com\/TheGreenCedar\/CodeStory\/blob\/main\/docs\/users\/cursor\.md\)/u,
+  );
+  assert.doesNotMatch(pluginRule, /\]\(\.\.\//u);
+  assert.match(dogfoodRule, /\]\(\.\.\/\.\.\/docs\/users\/cursor\.md\)/u);
+  assert.match(pluginRule, /codestory-grounding.*loaded by the plugin/u);
+  assert.match(dogfoodRule, /provides the rule and MCP adapter only/u);
+  assert.doesNotMatch(dogfoodRule, /skill is loaded by the plugin/u);
+  assert.doesNotMatch(pluginRule, /plugins\/codestory\/skills/u);
+});
+
+test("Cursor plugin-data inference is identity-bound and local overrides use PLUGIN_DATA", async () => {
+  const home = await mkdtemp(join(tmpdir(), "codestory-cursor-data-"));
+  const cachedPlugin = join(
+    home,
+    ".cursor",
+    "plugins",
+    "cache",
+    "TheGreenCedar",
+    "codestory",
+    "0.17.0",
+  );
+  const dataDir = join(home, ".cursor", "plugins", "data", "codestory");
+  const genericEnv = {
+    CODESTORY_CURSOR_DOGFOOD: "",
+    CURSOR_PLUGIN_ROOT: "",
+    CURSOR_PROJECT_DIR: repoRoot,
+    CURSOR_VERSION: "ambient-terminal-value",
+  };
+  const claudeEnv = { ...genericEnv, CLAUDE_PLUGIN_ROOT: pluginRoot };
+  try {
+    await mkdir(cachedPlugin, { recursive: true });
+    await mkdir(dataDir, { recursive: true });
+    assert.equal(
+      launcherTest.inferredCursorPluginDataDir(cachedPlugin, home, { env: genericEnv }),
+      dataDir,
+    );
+    assert.equal(
+      inferredCursorHookDataDir(cachedPlugin, home, { env: genericEnv }),
+      dataDir,
+    );
+    for (const env of [genericEnv, claudeEnv]) {
+      assert.equal(launcherTest.confirmedCursorIdentity(env), false);
+      assert.equal(confirmedCursorHookIdentity(env), false);
+      assert.equal(
+        launcherTest.inferredCursorPluginDataDir(pluginRoot, home, { env }),
+        null,
+      );
+      assert.equal(inferredCursorHookDataDir(pluginRoot, home, { env }), null);
+    }
+
+    const dogfoodEnv = { [launcherTest.cursorDogfoodMarker]: "1" };
+    assert.equal(
+      launcherTest.inferredCursorPluginDataDir(pluginRoot, home, { env: dogfoodEnv }),
+      dataDir,
+    );
+    assert.equal(
+      inferredCursorHookDataDir(pluginRoot, home, { env: dogfoodEnv }),
+      dataDir,
+    );
+
+    const cliPath = join(home, "bin", process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli");
+    await writeFile(
+      join(dataDir, launcherTest.cursorLocalOverrideFileName),
+      `${JSON.stringify({ schema_version: 1, CODESTORY_CLI: cliPath })}\n`,
+      "utf8",
+    );
+    assert.deepEqual(
+      launcherTest.readCursorLocalOverrides(pluginRoot, {
+        env: genericEnv,
+        home,
+        pluginData: dataDir,
+      }),
+      { CODESTORY_CLI: cliPath },
+    );
+    assert.equal(
+      launcherTest.readCursorLocalOverrides(pluginRoot, {
+        env: genericEnv,
+        home,
+        pluginData: "",
+      }),
+      null,
+    );
+    assert.deepEqual(
+      launcherTest.readCursorLocalOverrides(pluginRoot, { env: dogfoodEnv, home }),
+      { CODESTORY_CLI: cliPath },
+    );
+
+    const probeLauncher = (env) => spawnSync(
+      process.execPath,
+      [
+        "-e",
+        `const test=require(${JSON.stringify(join(pluginRoot, "scripts", "codestory-mcp.cjs"))})._test;process.stdout.write(JSON.stringify({cli:process.env.CODESTORY_CLI,data:test.pluginDataDir()}));`,
+      ],
+      { env: { ...process.env, ...env }, encoding: "utf8" },
+    );
+    const launcherProbe = probeLauncher({
+      ...genericEnv,
+      CODESTORY_CLI: "",
+      CODESTORY_PLUGIN_DATA: "",
+      COPILOT_PLUGIN_DATA: "",
+      HOME: home,
+      PLUGIN_DATA: dataDir,
+      USERPROFILE: home,
+    });
+    assert.equal(launcherProbe.status, 0, launcherProbe.stderr);
+    assert.deepEqual(JSON.parse(launcherProbe.stdout), { cli: cliPath, data: dataDir });
+
+    for (const env of [genericEnv, claudeEnv]) {
+      const negativeLauncher = probeLauncher({
+        ...env,
+        CODESTORY_CLI: "",
+        CODESTORY_PLUGIN_DATA: "",
+        COPILOT_PLUGIN_DATA: "",
+        HOME: home,
+        PLUGIN_DATA: "",
+        USERPROFILE: home,
+      });
+      assert.equal(negativeLauncher.status, 0, negativeLauncher.stderr);
+      assert.deepEqual(JSON.parse(negativeLauncher.stdout), { cli: "", data: null });
+
+      const negativeDirtyHook = spawnSync(
+        process.execPath,
+        [join(pluginRoot, "hooks", "codestory-dirty-hook.cjs"), "mark", "--project", repoRoot],
+        {
+          env: {
+            ...process.env,
+            ...env,
+            CODESTORY_PLUGIN_DATA: "",
+            COPILOT_PLUGIN_DATA: "",
+            HOME: home,
+            PLUGIN_DATA: "",
+            USERPROFILE: home,
+          },
+          encoding: "utf8",
+        },
+      );
+      assert.equal(negativeDirtyHook.status, 0, negativeDirtyHook.stderr);
+      assert.equal(JSON.parse(negativeDirtyHook.stdout).status, "plugin_data_required");
+    }
+
+    const dirtyHook = spawnSync(
+      process.execPath,
+      [
+        join(pluginRoot, "hooks", "codestory-dirty-hook.cjs"),
+        "mark",
+        "--project",
+        repoRoot,
+        "--source",
+        "cursor-plugin-static",
+      ],
+      {
+        env: {
+          ...process.env,
+          CODESTORY_CURSOR_DOGFOOD: "1",
+          CODESTORY_PLUGIN_DATA: "",
+          COPILOT_PLUGIN_DATA: "",
+          HOME: home,
+          PLUGIN_DATA: "",
+          USERPROFILE: home,
+        },
+        encoding: "utf8",
+      },
+    );
+    assert.equal(dirtyHook.status, 0, dirtyHook.stderr);
+    assert.equal(JSON.parse(dirtyHook.stdout).path.startsWith(dataDir), true);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("Cursor sessionStart emits the Cursor additional_context contract", async () => {
+  const home = await mkdtemp(join(tmpdir(), "codestory-cursor-hook-"));
+  const dataDir = join(home, ".cursor", "plugins", "data", "codestory");
+  try {
+    await mkdir(dataDir, { recursive: true });
+    for (const event of ["sessionStart", "SessionStart"]) {
+      const output = runHookProcess(
+        join(pluginRoot, "hooks", "codestory-activate.cjs"),
+        { hook_event_name: event, cwd: repoRoot },
+        {
+          CODESTORY_PLUGIN_DATA: "",
+          CURSOR_PLUGIN_ROOT: pluginRoot,
+          CURSOR_PROJECT_DIR: "",
+          CURSOR_VERSION: "",
+          HOME: home,
+          PLUGIN_DATA: dataDir,
+          PATH: "",
+        },
+      );
+      assert.deepEqual(Object.keys(output), ["additional_context"]);
+      assert.match(output.additional_context, /CODESTORY GROUNDING AVAILABLE/u);
+    }
+    const state = JSON.parse(await readFile(join(dataDir, ".codestory-active"), "utf8"));
+    assert.equal(state.cwd, repoRoot);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test("default plugin prompts stay portable", async () => {

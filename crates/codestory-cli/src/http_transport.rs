@@ -555,6 +555,7 @@ fn write_http_json<T: serde::Serialize>(
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         _ => "OK",
     };
     write!(

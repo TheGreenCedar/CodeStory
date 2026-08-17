@@ -1,17 +1,18 @@
 use super::super::test_support::sample_task_brief_packet;
-use crate::app::resolution::quote_command_value;
 use crate::app::{build_task_brief_output, render_task_brief_markdown};
-use std::path::Path;
+use codestory_contracts::api::{
+    BoundedDrillPlanDto, DrillGapKindDto, DrillOptionDto, PacketDispositionDto,
+};
 
 #[test]
 fn task_brief_output_contract_maps_packet_evidence_to_owner_workflow() {
     let packet = sample_task_brief_packet();
-    let brief = build_task_brief_output(Path::new("C:/repo"), &packet);
+    let brief = build_task_brief_output(&packet);
 
-    assert_eq!(brief.task_brief_version, 1);
-    assert_eq!(brief.status, "needs_attention");
+    assert_eq!(brief.task_brief_version, 2);
+    assert_eq!(brief.status, "ready");
     assert_eq!(brief.source_packet_id, "packet-task-brief");
-    assert_eq!(brief.source_packet_sufficiency, "partial");
+    assert_eq!(brief.source_packet_disposition, "supported");
     assert_eq!(
         brief.first_files[0].path,
         "crates/codestory-cli/src/`main_$env:SECRET$('x').rs"
@@ -34,52 +35,8 @@ fn task_brief_output_contract_maps_packet_evidence_to_owner_workflow() {
             .risks_unknowns
             .contains(&"verify `changed` files after editing".to_string())
     );
-    for expected in [
-        "codestory-cli packet",
-        "codestory-cli snippet",
-        "codestory-cli trail",
-        "codestory-cli affected",
-    ] {
-        assert!(
-            brief
-                .follow_up_codestory_commands
-                .iter()
-                .any(|command| command.contains(expected)),
-            "brief should include {expected}: {brief:#?}"
-        );
-    }
+    assert_eq!(brief.packet_continuation, None);
     assert_eq!(brief.future_sections, ["scout", "where", "onboard"]);
-
-    let packet_command = brief
-        .follow_up_codestory_commands
-        .iter()
-        .find(|command| command.contains("codestory-cli packet"))
-        .expect("packet follow-up command");
-    assert!(
-        packet_command.contains(&format!(
-            "--question {}",
-            quote_command_value(&packet.question)
-        )),
-        "packet follow-up should quote prompt safely: {packet_command}"
-    );
-    let snippet_command = brief
-        .follow_up_codestory_commands
-        .iter()
-        .find(|command| command.contains("codestory-cli snippet"))
-        .expect("snippet follow-up command");
-    assert!(
-        snippet_command.contains(&quote_command_value(&brief.first_files[0].path)),
-        "snippet follow-up should quote path safely: {snippet_command}"
-    );
-    let trail_command = brief
-        .follow_up_codestory_commands
-        .iter()
-        .find(|command| command.contains("codestory-cli trail"))
-        .expect("trail follow-up command");
-    assert!(
-        trail_command.contains(&quote_command_value(&brief.relevant_symbols[0].name)),
-        "trail follow-up should quote symbol safely: {trail_command}"
-    );
 
     let json = serde_json::to_value(&brief).expect("brief should serialize");
     for key in [
@@ -91,7 +48,8 @@ fn task_brief_output_contract_maps_packet_evidence_to_owner_workflow() {
         "likely_tests",
         "impacted_surfaces",
         "risks_unknowns",
-        "follow_up_codestory_commands",
+        "source_packet_disposition",
+        "packet_continuation",
         "future_sections",
     ] {
         assert!(json.get(key).is_some(), "brief JSON should include {key}");
@@ -114,14 +72,9 @@ fn task_brief_output_contract_maps_packet_evidence_to_owner_workflow() {
         markdown.contains("- verify 'changed' files after editing"),
         "brief markdown should replace risk backticks in bullets: {markdown}"
     );
-    assert!(
-        markdown.contains("- command:\n    codestory-cli packet"),
-        "brief markdown should render commands as indented code blocks: {markdown}"
-    );
-    assert!(
-        !markdown.contains("- `codestory-cli"),
-        "brief markdown should not render follow-up commands as inline code: {markdown}"
-    );
+    assert!(markdown.contains("- none; source packet disposition is terminal"));
+    assert!(!markdown.contains("codestory-cli snippet"));
+    assert!(!markdown.contains("codestory-cli trail"));
     assert!(
         !markdown.contains("```"),
         "brief markdown should not use fences that embedded backticks can split: {markdown}"
@@ -133,7 +86,7 @@ fn task_brief_output_contract_maps_packet_evidence_to_owner_workflow() {
         "## Likely Tests",
         "## Impacted Surfaces",
         "## Risks And Unknowns",
-        "## Follow Up CodeStory Commands",
+        "## Packet Continuation",
         "## Future Sections",
     ] {
         assert!(
@@ -141,4 +94,51 @@ fn task_brief_output_contract_maps_packet_evidence_to_owner_workflow() {
             "brief markdown should include {heading}: {markdown}"
         );
     }
+}
+
+#[test]
+fn task_brief_exposes_only_the_typed_drill_once_continuation() {
+    let mut packet = sample_task_brief_packet();
+    packet.disposition = PacketDispositionDto::drill_once(
+        "one bounded source gap remains",
+        BoundedDrillPlanDto {
+            parent_packet_id: packet.packet_id.clone(),
+            core_generation_id: "core-generation-7".to_string(),
+            retrieval_generation: Some("retrieval-generation-4".to_string()),
+            gap_ids: vec!["gap-1".to_string()],
+            options: vec![DrillOptionDto {
+                id: "option-1".to_string(),
+                gap_id: "gap-1".to_string(),
+                kind: DrillGapKindDto::BoundedSourceRead,
+                path: Some("src/lib.rs".to_string()),
+                symbol_id: None,
+                query: None,
+            }],
+            max_bytes: 32 * 1024,
+            max_hits: 8,
+            max_depth: 2,
+            remaining_rounds: 1,
+        },
+    );
+
+    let brief = build_task_brief_output(&packet);
+    let continuation = brief
+        .packet_continuation
+        .as_ref()
+        .expect("drill_once task brief should retain the typed continuation");
+    assert_eq!(continuation.parent_packet_id, packet.packet_id);
+    assert_eq!(continuation.core_generation_id, "core-generation-7");
+    assert_eq!(
+        continuation.retrieval_generation.as_deref(),
+        Some("retrieval-generation-4")
+    );
+    assert_eq!(continuation.remaining_rounds, 1);
+    assert_eq!(continuation.options[0].id, "option-1");
+
+    let markdown = render_task_brief_markdown(&brief);
+    assert!(markdown.contains("parent_packet_id: `packet-task-brief`"));
+    assert!(markdown.contains("option_ids: `option-1`"));
+    assert!(!markdown.contains("codestory-cli packet"));
+    assert!(!markdown.contains("codestory-cli snippet"));
+    assert!(!markdown.contains("codestory-cli trail"));
 }

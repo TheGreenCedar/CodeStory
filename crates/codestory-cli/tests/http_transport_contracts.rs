@@ -472,25 +472,27 @@ fn a_dribbling_peer_cannot_hold_the_serial_http_loop_past_the_request_deadline()
             Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
             Err(error) => panic!("slow peer read: {error}"),
         }
-        if response_bytes
-            .windows(4)
-            .any(|window| window == b"\r\n\r\n")
-        {
-            break;
-        }
+        // Header and body may arrive in separate TCP reads. Keep reading until
+        // the server closes the connection so the typed JSON body is observed.
     }
     let elapsed = started.elapsed();
     let response = String::from_utf8_lossy(&response_bytes).to_string();
     let _ = dribbler.join();
 
     assert!(
-        response.starts_with("HTTP/1.1 408 "),
+        response.starts_with("HTTP/1.1 408 Request Timeout\r\n"),
         "slow peer should be ended with a typed request-deadline status after {elapsed:?}: \
          {response:?}"
     );
-    assert!(
-        response.contains("http_request_deadline_exceeded"),
-        "the 408 must carry its typed code: {response:?}"
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("the 408 must include headers and a body: {response:?}"));
+    let body: Value = serde_json::from_str(body.trim())
+        .unwrap_or_else(|error| panic!("the 408 body must be JSON: {error}: {body:?}"));
+    assert_eq!(
+        body.pointer("/error/code").and_then(Value::as_str),
+        Some("http_request_deadline_exceeded"),
+        "the 408 must carry its typed code: {body}"
     );
     assert!(
         elapsed < Duration::from_secs(20),

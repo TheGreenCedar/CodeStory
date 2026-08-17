@@ -15,7 +15,7 @@
     "answer_quality"
   ],
   "public_support": {
-    "release_line": "0.16",
+    "release_line": "0.17",
     "packages": [
       {
         "target": "macos-arm64",
@@ -118,6 +118,15 @@
         "source_tree": {
           "admits": "Evidence from a prior run is admissible when its producing commit resolves to the identical source tree and is an ancestor of the release commit on the promotion path.",
           "equates": []
+        },
+        "calibration_source_lineage": {
+          "admits": "Source-behavior evidence from the stabilized calibration source is admissible when the canonical calibration-lineage verifier proves that commit is the selected source and that the release differs only by the generated constant set plus an optional tree-preserving promotion commit.",
+          "equates": [
+            {
+              "identity": "source_tree",
+              "justification": "The canonical calibration-lineage proof binds the reused commit and tree as the exact source whose behavior was compiled, linted, tested, and checked on Windows before calibration. The generated constant-set child does not change source behavior, so the stabilized source tree is the one source_behavior evidence must continue to name."
+            }
+          ]
         },
         "native_fingerprint": {
           "admits": "Accelerator evidence from the previous published release is admissible when the reused commit is an ancestor of the release commit and the version-normalized native fingerprint (scripts/native-fingerprint.mjs) of both commits is identical: the built inputs differ only by the embedded version string. Packaging and signing always rerun; only accelerator behavior is inherited.",
@@ -615,7 +624,7 @@
           "producer_artifact": "release-cell-prepublish-source-attempt-{attempt}"
         },
         "archive_role": "none",
-        "reuse_binding": "source_tree"
+        "reuse_binding": "calibration_source_lineage"
       },
       {
         "id": "package_identity",
@@ -1116,7 +1125,7 @@
         "step": "Evidence, readiness, hooks, and workspace contract tests",
         "commands": [
           "cargo test --locked -p codestory-runtime --lib agent::packet_evidence::",
-          "cargo test --locked -p codestory-runtime --lib agent::packet_sufficiency::",
+          "cargo test --locked -p codestory-runtime --lib agent::packet_compiler::tests",
           "cargo test --locked -p codestory-runtime --lib agent::packet_batch::",
           "cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::",
           "cargo test --locked -p codestory-runtime --lib services::",
@@ -1239,8 +1248,8 @@
       "coordinator_workflow": "packaged-platform-pr.yml",
       "mode": "calibration",
       "assembly_job": "calibration-assemble",
-      "pre_collection_source_proof_required": false,
-      "source_proof_stage": "frozen_candidate_before_qualification",
+      "pre_collection_source_proof_required": true,
+      "source_proof_stage": "source_stabilization_before_calibration",
       "required_cells": [
         {
           "id": "protected_macos_arm64_metal",
@@ -1365,7 +1374,7 @@
         "archive_cache_contract": "candidate_archive_cache",
         "archive_transfer": "authenticated_miss_only",
         "evaluation_owner": "isolated_reusable_workflow",
-          "evaluation_owner_sha256": "b7a17c66c4cc4275b369f39fdc1fcdb375b334ba908d31577b910ea10e7eb54e",
+        "evaluation_owner_sha256": "5b97ee71393c5f72ef106d0d1e238cb1323e930204a06a4557f8e63725b0f8cd",
         "evaluation_contract": "publishable-three-repeat-packet/v1",
         "task_count": 1,
         "repeats_per_task": 3,
@@ -1666,18 +1675,17 @@
         "publisher_step": "Publish executable release freeze",
         "status_creator": "github-actions[bot]",
         "job_manifest": ".github/scripts/release-freeze-acceptance-jobs.json",
-        "job_manifest_sha256": "bb0a23ed7f74528fc3d4e4962c1b34f98758a628f48dd943b9d1356149e453c5",
+        "job_manifest_sha256": "b1ae13eabcbda9c99f7d0ba17cae97ca292d11fa4b010f87c534f9b7938843c7",
         "phases": {
-          "calibration_source": {
+          "source_stabilization": {
             "known_future_source_changes": [
               "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
             ],
             "planned_actions": [
-              "calibration-source-acceptance",
+              "source-stabilization",
               "calibration",
               "generated-constant-freeze",
               "frozen-candidate-acceptance",
-              "source-proof",
               "qualification",
               "release"
             ],
@@ -1687,7 +1695,6 @@
             "known_future_source_changes": [],
             "planned_actions": [
               "frozen-candidate-acceptance",
-              "source-proof",
               "qualification",
               "release"
             ],
@@ -1744,7 +1751,7 @@
         "file": "packaged-platform-pr.yml",
         "job": "route",
         "step": "Resolve trusted exact head",
-        "sha256": "14015fd938e7dc2bafd50bef2d85d6934ee4658bd86b5560729edb4be7c14679",
+        "sha256": "057bb7924c9ec281671defe683519debfb71359729d66fb0afb84513dc22bf5f",
         "reason": "The coordinator's trusted-head resolver authenticates the exact frozen-candidate head for every broad proof mode; its executable text must match the reviewed contract, not merely contain its tokens."
       },
       "marketplace_sync_dispatch_guard": {
@@ -1760,7 +1767,7 @@
         "file": "packaged-platform-pr.yml",
         "job": "closeout",
         "step": "Require one coherent accepted proof",
-        "sha256": "ce7a7f5aa99f5fcbc037d4c1f06de5d841e4a4d114208820592a84c41c797b1a",
+        "sha256": "998c75f00069e3b2a22bddd3be003b23b9dc34c31f14b06410ad53582e7e1097",
         "reason": "The closeout is a small shell control-flow program. Substring checks can be satisfied by parking the accepted qualification branch in dead code while the live branch blocks on optional Linux hardware, so its reviewed executable text is pinned as well as its reader-facing invariants."
       },
       "packaged_platform_proof_workflow": {
@@ -1772,13 +1779,13 @@
       "packaged_platform_pr_workflow": {
         "subject": "parsed_workflow_json",
         "file": "packaged-platform-pr.yml",
-        "sha256": "ca70707ba924b57848d92e8b7a3490e8e18623dce4d1afec393212a78bce110a",
+        "sha256": "a633fd7e6def5305940844aca96a6869fca77622050dc79f0c4682f5e0a9c1c3",
         "reason": "The frozen-candidate coordinator is a small release-control program, not a loose collection of independently safe fragments. Its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
       },
       "frozen_candidate_quality_workflow": {
         "subject": "parsed_workflow_json",
         "file": "frozen-candidate-quality.yml",
-        "sha256": "b7a17c66c4cc4275b369f39fdc1fcdb375b334ba908d31577b910ea10e7eb54e",
+        "sha256": "5b97ee71393c5f72ef106d0d1e238cb1323e930204a06a4557f8e63725b0f8cd",
         "reason": "The isolated evaluation owner runs optional quality evidence against the exact frozen candidate; pinning its complete parsed structure keeps the adjunct from acquiring authority or losing its isolation unreviewed. The qualification quality contract cites this same pin as evaluation_owner_sha256."
       },
       "macos_metal_proof_workflow": {
@@ -1803,7 +1810,7 @@
         "subject": "parsed_job_json",
         "file": "release.yml",
         "job": "source-proof",
-        "sha256": "91ee8bc1a6a055e9297e81747c37d167b123d0a2e5dc60d5c6e2bdcfbef9c351",
+        "sha256": "522027695f3fe82d01f7dc00514661d45483ef44e61e8f399955593444ec0d0d",
         "reason": "The release chain's source-proof job is a fail-closed placeholder that must refuse to run a second source proof; its complete parsed job body is pinned so the refusal cannot be disabled, made conditional, or made advisory."
       },
       "packaged_sccache_identity": {
@@ -2249,7 +2256,7 @@
         "job": "full-source-gate",
         "step": "Test the complete workspace once",
         "fragments": [
-          "cargo nextest run --workspace --locked",
+          "cargo nextest run --workspace --locked --no-fail-fast",
           "cargo test --workspace --doc --locked"
         ],
         "reason": "nextest owns unit and integration execution; the doc pass rides along so a future doctest can never silently stop being run, because nextest does not execute doctests. Both locked invocations are pinned."
@@ -3076,18 +3083,19 @@
         "job": "preflight",
         "step": "Resolve reusable prior evidence",
         "fragments": [
-          "release_tree=\"$(git rev-parse \"$GITHUB_SHA^{tree}\")\"",
-          "test \"$(git rev-parse \"$head_sha^{tree}\")\" = \"$release_tree\"",
-          "git merge-base --is-ancestor \"$head_sha\" \"$GITHUB_SHA\"",
+          "test \"$head_sha\" = \"$SOURCE_SHA\"",
           "full-source-gate",
+          "freeze-acceptance",
           ".path == \".github/workflows/source-proof.yml\"",
           ".event == \"workflow_dispatch\" and .conclusion == \"success\"",
-          "The release workflow will not start a broad proof",
+          "The calibrated source has no reusable source-stabilization proof",
           "artifact_name=\"release-cell-prepublish-source-attempt-$run_attempt\"",
-          ".expired == false",
-          "test \"$artifact_count\" = 1 || continue"
+          "release-freeze-receipt-attempt-$run_attempt",
+          "select(.name == $receipt and .expired == false)",
+          "select(.name == $source and .expired == false)",
+          "source_proof_reused=true"
         ],
-        "reason": "Prior source evidence is reusable only from a successful dispatched source-proof run whose head is an ancestor with this exact tree and whose unexpired attempt-qualified evidence artifact exists exactly once; each fragment pins one conjunct of that resolution."
+        "reason": "Prior source evidence is reusable only from the calibration lineage's selected source commit and a successful source-stabilization run carrying both the immutable freeze receipt and source release cell; each fragment pins one conjunct of that resolution."
       },
       "release_preflight_resolve_no_freeze_replay": {
         "kind": "forbid",
@@ -3107,7 +3115,7 @@
         "step": "Refuse a second source proof",
         "fragments": [
           "test \"$SOURCE_SHA\" = \"$GITHUB_SHA\"",
-          "Preflight did not resolve reusable exact-head source proof",
+          "Preflight did not resolve reusable source-stabilization proof",
           "exit 1"
         ],
         "reason": "The placeholder's only step must fail closed when preflight did not resolve reusable exact-head evidence, so the release chain can never quietly start a second broad source proof."
@@ -3256,6 +3264,37 @@
         ],
         "reason": "The version the catalog is pointed at reaches the push as a variable, so the command text no longer says which release it published; the flag spelling is pinned here and the env binding stays a code-owned check, as in the plugin lane."
       },
+      "post_publish_smoke_restart_survival": {
+        "kind": "require",
+        "file": "post-publish-release-smoke.yml",
+        "job": "smoke",
+        "step": "Prove the catalog-resolved published runtime",
+        "fragments": [
+          "common=(",
+          "python .github/scripts/check-packaged-agent-proof.py",
+          "--expected-backend \"$EXPECTED_BACKEND\"",
+          "\"${common[@]}\" --out-dir \"$proof_root/session-1\"",
+          "\"${common[@]}\" --out-dir \"$proof_root/session-2\"",
+          "time.time_ns() // 1_000_000",
+          "node .github/scripts/restart-survival-receipt.mjs",
+          "--session-1-summary \"$proof_root/session-1/summary.json\"",
+          "--session-2-summary \"$proof_root/session-2/summary.json\"",
+          "--install-attestation \"$INSTALLED_ATTESTATION\"",
+          "--catalog-delivery-state \"$CATALOG_DELIVERY_STATE\"",
+          "--expected-installer-identity \"$DELIVERED_INSTALLER\"",
+          "--expected-source-commit \"$source_sha\"",
+          "--expected-source-tree \"$source_tree\"",
+          "--expected-version \"$RELEASE_VERSION\"",
+          "--expected-archive-sha256 \"$archive_sha256\"",
+          "--expected-binary-sha256 \"$binary_sha256\"",
+          "--session-1-start-ms \"$session_1_started_ms\"",
+          "--session-1-finished-ms \"$session_1_finished_ms\"",
+          "--session-2-start-ms \"$session_2_started_ms\"",
+          "--session-2-finished-ms \"$session_2_finished_ms\"",
+          "--out \"$proof_root/restart-survival.json\""
+        ],
+        "reason": "Each post-publish target must reuse one catalog installation across two ordered fresh installed-runtime sessions, prove distinct runtime identities and full accelerated retrieval after restart, and retain a hashed restart-survival receipt before release cells are emitted."
+      },
       "release_post_publish_closeout_provenance": {
         "kind": "require",
         "file": "release.yml",
@@ -3264,23 +3303,23 @@
         "fragments": [
           "producer-map",
           "--phase post_publish",
-          "artifact_ids",
+          "--reuse \"$REUSE_SELECTION\"",
           "bash .github/scripts/collect-actions-job-evidence.sh",
           "--job-evidence target/release-closeout/job-evidence.json"
         ],
-        "reason": "The post-publish producer map must be collected by the closeout itself, scoped to its phase, and must publish the exact artifact ids the download step later consumes."
+        "reason": "The post-publish producer map must be collected by the closeout itself, scoped to its phase, and must consume the preflight-authenticated reuse selection so the cumulative ledger retains an earlier exact-tree source proof."
       },
       "release_post_publish_container_digests": {
         "kind": "require",
         "file": "release.yml",
         "job": "post-publish-closeout",
-        "step": "Verify selected post-publish artifact container digests",
+        "step": "Download and verify selected cumulative release cells",
         "fragments": [
           "/actions/artifacts/$artifact_id/zip",
           "sha256sum",
           "test \"$actual_digest\" = \"$expected_digest\""
         ],
-        "reason": "Each downloaded artifact container must be digest-verified against the provenance record before any cell inside it is trusted."
+        "reason": "Each same-run or reused artifact container selected by the cumulative producer map must be downloaded by authenticated artifact id and digest-verified against that provenance before any cell inside it is trusted."
       },
       "release_post_publish_closeout_evaluation": {
         "kind": "require",
@@ -3361,25 +3400,29 @@
           "release-freeze-barrier.mjs verify-status",
           "--commit \"$HEAD_SHA\"",
           "if [ \"$RESOLVED_MODE\" = calibration ]; then",
-          "freeze_phase=calibration_source",
+          "freeze_phase=source_stabilization",
           "freeze_phase=frozen_candidate",
           "--phase \"$freeze_phase\"",
           "--receipt-digest \"$FREEZE_RECEIPT_DIGEST\""
         ],
-        "reason": "Every broad proof mode must verify the executable freeze against the commit the API reports, selecting the calibration_source phase for calibration and frozen_candidate otherwise, with the receipt digest bound in; the fragments pin that phase selection and verification chain."
+        "reason": "Every broad proof mode must verify the executable freeze against the commit the API reports, selecting source_stabilization for calibration and frozen_candidate otherwise, with the receipt digest bound in; the fragments pin that phase selection and verification chain."
       },
       "packaged_platform_pr_route_exact_head_source_proof": {
         "kind": "require",
         "file": "packaged-platform-pr.yml",
         "job": "route",
-        "step": "Require successful exact-head source proof",
+        "step": "Require successful source-stabilization proof",
         "fragments": [
-          "actions/runs?head_sha=$HEAD_SHA",
+          "actions/runs?head_sha=$source_sha",
+          "freeze_record.selection_source_commit",
           ".path == \".github/workflows/source-proof.yml\"",
           ".event == \"workflow_dispatch\" and .conclusion == \"success\"",
-          ".name == \"full-source-gate\" and .conclusion == \"success\""
+          ".name == \"full-source-gate\" and .conclusion == \"success\"",
+          ".name == \"freeze-acceptance\" and .conclusion == \"success\"",
+          "release-freeze-receipt-attempt-$run_attempt",
+          "release-cell-prepublish-source-attempt-$run_attempt"
         ],
-        "reason": "A frozen-candidate proof may start only after a successful dispatched source proof of the exact head whose full-source-gate job succeeded; the fragments pin the head-scoped run lookup and both success conjuncts."
+        "reason": "A frozen-candidate proof may start only after the selected calibration source has a successful source-stabilization run, full-source gate, published receipt, and source cell; the fragments pin that lineage-scoped lookup and its proof artifacts."
       },
       "packaged_platform_pr_route_scope_selection": {
         "kind": "require",
@@ -3461,11 +3504,12 @@
           "WINDOWS_VULKAN_RESULT",
           "LINUX_VULKAN_RESULT",
           "if [ \"$MODE\" = qualification ]; then",
+          "if [ \"$QUALIFY_LINUX_VULKAN\" = true ]; then",
           "require_result \"$LINUX_VULKAN_RESULT\" skipped linux-vulkan-proof",
           "require_result \"$LINUX_VULKAN_RESULT\" success linux-vulkan-proof",
           "dev/codestory-next moved from proved head"
         ],
-        "reason": "Closeout must accept exactly one coherent proof shape per mode - package-only skips hardware, the no-op and Linux scopes bound the Vulkan set, and qualification accepts skipped optional Linux evidence - and must refuse a moved dev head; the fragments pin those mode branches and the moved-head refusal."
+        "reason": "Closeout must accept exactly one coherent proof shape per mode - package-only skips hardware, the no-op and Linux scopes bind the Vulkan set, and qualification requires Linux success exactly when its explicit lifecycle opt-in is true - and must refuse a moved dev head; the fragments pin those mode branches and the moved-head refusal."
       },
       "frozen_candidate_quality_candidate_cache_restore": {
         "kind": "require",
@@ -3591,10 +3635,10 @@
           "release-freeze-barrier.mjs verify-status",
           "--commit \"$HEAD_SHA\"",
           "--tree \"$tree\"",
-          "--phase frozen_candidate",
+          "--phase source_stabilization",
           "--receipt-digest \"$FREEZE_RECEIPT_DIGEST\""
         ],
-        "reason": "Broad source proof must verify the frozen_candidate freeze status for the exact commit and tree with the caller's receipt digest bound in; the fragments pin that verify-status invocation beside the source family's own wider pin so neither can drop alone."
+        "reason": "Broad source proof must verify the source_stabilization freeze status for the exact commit and tree with the caller's receipt digest bound in; the fragments pin that verify-status invocation beside the source family's own wider pin so neither can drop alone."
       },
       "source_proof_freeze_hostile_mutation_suites": {
         "kind": "require",
@@ -3675,24 +3719,25 @@
           "release-freeze-barrier.mjs verify-status",
           "--commit \"$HEAD_SHA\"",
           "if [ \"$RESOLVED_MODE\" = calibration ]; then",
-          "freeze_phase=calibration_source",
+          "freeze_phase=source_stabilization",
           "freeze_phase=frozen_candidate",
           "--phase \"$freeze_phase\"",
           "--receipt-digest \"$FREEZE_RECEIPT_DIGEST\""
         ],
-        "reason": "The freeze family independently pins the router's phase-selecting verify-status call so the packaged coordinator cannot drop calibration_source or frozen_candidate authentication while the coordinator family's wider pin survives; the fragments pin the invocation, the commit and phase bindings, and the receipt digest."
+        "reason": "The freeze family independently pins the router's phase-selecting verify-status call so the packaged coordinator cannot drop source_stabilization or frozen_candidate authentication while the coordinator family's wider pin survives; the fragments pin the invocation, the commit and phase bindings, and the receipt digest."
       },
       "freeze_barrier_packaged_route_source_proof": {
         "kind": "require",
         "file": "packaged-platform-pr.yml",
         "job": "route",
-        "step": "Require successful exact-head source proof",
+        "step": "Require successful source-stabilization proof",
         "fragments": [
-          "actions/runs?head_sha=$HEAD_SHA",
+          "actions/runs?head_sha=$source_sha",
           ".event == \"workflow_dispatch\" and .conclusion == \"success\"",
-          ".name == \"full-source-gate\" and .conclusion == \"success\""
+          ".name == \"full-source-gate\" and .conclusion == \"success\"",
+          ".name == \"freeze-acceptance\" and .conclusion == \"success\""
         ],
-        "reason": "The freeze family independently pins the head-scoped source-proof lookup and its dispatched-success and full-source-gate conjuncts, so packaged proof cannot start from an unproved head even if the coordinator family's wider pin changes."
+        "reason": "The freeze family independently pins the lineage-scoped source-stabilization lookup and its dispatched, full-source, and acceptance success conjuncts, so packaged proof cannot start from an unproved source even if the coordinator family's wider pin changes."
       },
       "freeze_barrier_release_reuse_resolution": {
         "kind": "require",
@@ -3700,16 +3745,15 @@
         "job": "preflight",
         "step": "Resolve reusable prior evidence",
         "fragments": [
-          "release_tree=\"$(git rev-parse \"$GITHUB_SHA^{tree}\")\"",
-          "test \"$(git rev-parse \"$head_sha^{tree}\")\" = \"$release_tree\"",
-          "git merge-base --is-ancestor \"$head_sha\" \"$GITHUB_SHA\"",
+          "test \"$head_sha\" = \"$SOURCE_SHA\"",
           "artifact_name=\"release-cell-prepublish-source-attempt-$run_attempt\"",
-          ".expired == false",
-          "test \"$artifact_count\" = 1 || continue",
-          "The release workflow will not start a broad proof",
+          "release-freeze-receipt-attempt-$run_attempt",
+          "select(.name == $receipt and .expired == false)",
+          "select(.name == $source and .expired == false)",
+          "The calibrated source has no reusable source-stabilization proof",
           "source_proof_reused=true"
         ],
-        "reason": "The freeze family independently pins the reuse resolver's exact-tree, ancestry, attempt-qualified artifact, and reuse-signal conjuncts, so release-time reuse cannot widen even if the release family's own pin changes; the fragments pin those conjuncts and the reuse output."
+        "reason": "The freeze family independently pins the reuse resolver's selected source commit, attempt-qualified receipt and source cell, and reuse signal, so release-time reuse cannot widen even if the release family's own pin changes."
       },
       "freeze_barrier_release_no_freeze_replay": {
         "kind": "forbid",

@@ -4446,6 +4446,7 @@ struct ReceiverPlaceholderAnnotation<'a> {
     method_name: &'a str,
     owner_name: &'a str,
     owner_module: Option<&'a str>,
+    extra_callsite_marker: Option<&'a str>,
 }
 
 struct CallPlaceholderMarkerAnnotation<'a> {
@@ -4895,6 +4896,7 @@ struct RuntimeImportSpec {
     suppress_line: u32,
     suppress_start_col: u32,
     suppress_callee_name: String,
+    exact_bare_call_target_spans: Vec<GraphNodeSpan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5278,11 +5280,14 @@ struct RustReceiverCallHint {
 type RustStructFieldTypes = HashMap<(String, String), String>;
 type RustMethodReturnTypes = HashMap<(String, String), String>;
 type RustTypeAliases = HashMap<String, String>;
+type RustTraitMethods = HashMap<String, HashSet<String>>;
 
 fn collect_rust_receiver_call_hints(tree: &Tree, source: &str) -> Vec<RustReceiverCallHint> {
     let aliases = collect_rust_type_aliases(tree, source);
     let field_types = collect_rust_struct_field_types(tree, source, &aliases);
     let method_return_types = collect_rust_method_return_types(tree, source, &aliases);
+    let local_trait_methods = collect_rust_trait_methods(tree, source, &aliases);
+    let local_unit_structs = collect_rust_unit_structs(tree, source, &aliases);
     let mut hints = Vec::new();
     let mut scopes: HashMap<usize, RustValueScope<'_>> = HashMap::new();
 
@@ -5309,6 +5314,7 @@ fn collect_rust_receiver_call_hints(tree: &Tree, source: &str) -> Vec<RustReceiv
             return;
         };
         let impl_owner = rust_enclosing_impl_owner(node, source, &aliases);
+        let self_owner = rust_enclosing_self_owner(node, source, &aliases);
         // One scope per enclosing function, advanced to this call rather than
         // rebuilt for it. `no_scope` covers a call outside any function, which
         // previously produced an empty map by finding no `function_item`.
@@ -5324,25 +5330,47 @@ fn collect_rust_receiver_call_hints(tree: &Tree, source: &str) -> Vec<RustReceiv
                     &aliases,
                     &field_types,
                     &method_return_types,
+                    &local_unit_structs,
                 );
                 &scope.value_types
             }
             None => &empty_value_types,
         };
-        let Some(owner_name) = infer_rust_receiver_owner(
-            receiver_node,
-            source,
-            impl_owner.as_deref(),
-            &field_types,
-            &method_return_types,
-            value_types,
-            &aliases,
-        )
-        .filter(|value| is_rust_type_like_name(value)) else {
+        let direct_self_owner = match receiver_node.kind() {
+            "self" => self_owner.clone(),
+            "identifier" if node_source_text(receiver_node, source).as_deref() == Some("Self") => {
+                self_owner.clone()
+            }
+            _ => None,
+        };
+        let Some(mut owner_name) = direct_self_owner
+            .or_else(|| {
+                infer_rust_receiver_owner(
+                    receiver_node,
+                    source,
+                    impl_owner.as_deref(),
+                    &field_types,
+                    &method_return_types,
+                    value_types,
+                    &aliases,
+                )
+            })
+            .filter(|value| is_rust_type_like_name(value))
+        else {
             return;
         };
         if rust_enclosing_generic_type_params(node, source).contains(&owner_name) {
-            return;
+            let Some(bound_owner) = rust_local_generic_bound_owner_for_method(
+                node,
+                &owner_name,
+                &method_name,
+                source,
+                &aliases,
+                &local_trait_methods,
+            ) else {
+                return;
+            };
+            owner_name = bound_owner;
         }
         let position = method_node.start_position();
         hints.push(RustReceiverCallHint {
@@ -5354,6 +5382,177 @@ fn collect_rust_receiver_call_hints(tree: &Tree, source: &str) -> Vec<RustReceiv
     });
 
     hints
+}
+
+fn collect_rust_unit_structs(
+    tree: &Tree,
+    source: &str,
+    aliases: &RustTypeAliases,
+) -> HashSet<String> {
+    let mut owners = HashSet::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "struct_item" || node.child_by_field_name("body").is_some() {
+            return;
+        }
+        if let Some(owner) = node
+            .child_by_field_name("name")
+            .and_then(|name| node_source_text(name, source))
+            .and_then(|name| normalize_rust_type_owner_name(&name, aliases))
+        {
+            owners.insert(owner);
+        }
+    });
+    owners
+}
+
+fn collect_rust_trait_methods(
+    tree: &Tree,
+    source: &str,
+    aliases: &RustTypeAliases,
+) -> RustTraitMethods {
+    let mut traits = RustTraitMethods::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "trait_item" {
+            return;
+        }
+        let Some(owner) = node
+            .child_by_field_name("name")
+            .and_then(|name| node_source_text(name, source))
+            .and_then(|name| normalize_rust_type_owner_name(&name, aliases))
+        else {
+            return;
+        };
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        let mut methods = HashSet::new();
+        let mut cursor = body.walk();
+        for item in body.named_children(&mut cursor) {
+            if !matches!(item.kind(), "function_signature_item" | "function_item") {
+                continue;
+            }
+            if let Some(method) = item
+                .child_by_field_name("name")
+                .and_then(|name| node_source_text(name, source))
+                .map(|name| name.trim().to_string())
+                .filter(|name| is_rust_identifier_like(name))
+            {
+                methods.insert(method);
+            }
+        }
+        traits.insert(owner, methods);
+    });
+    traits
+}
+
+fn rust_local_generic_bound_owner_for_method(
+    node: TsNode<'_>,
+    generic_name: &str,
+    method_name: &str,
+    source: &str,
+    aliases: &RustTypeAliases,
+    local_trait_methods: &RustTraitMethods,
+) -> Option<String> {
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        if matches!(
+            current.kind(),
+            "function_item" | "impl_item" | "struct_item" | "enum_item" | "trait_item"
+        ) {
+            let (declares_generic, owners) =
+                rust_generic_bound_owners(current, generic_name, source, aliases);
+            if declares_generic || !owners.is_empty() {
+                let mut candidates = owners
+                    .into_iter()
+                    .filter(|owner| {
+                        local_trait_methods
+                            .get(owner)
+                            .is_some_and(|methods| methods.contains(method_name))
+                    })
+                    .collect::<Vec<_>>();
+                candidates.sort();
+                candidates.dedup();
+                return match candidates.as_slice() {
+                    [owner] => Some(owner.clone()),
+                    _ => None,
+                };
+            }
+        }
+        cursor = current.parent();
+    }
+    None
+}
+
+fn rust_generic_bound_owners(
+    boundary: TsNode<'_>,
+    generic_name: &str,
+    source: &str,
+    aliases: &RustTypeAliases,
+) -> (bool, HashSet<String>) {
+    let mut declares_generic = false;
+    let mut owners = HashSet::new();
+    if let Some(parameters) = boundary.child_by_field_name("type_parameters") {
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            if parameter.kind() != "type_parameter"
+                || parameter
+                    .child_by_field_name("name")
+                    .and_then(|name| node_source_text(name, source))
+                    .as_deref()
+                    .map(str::trim)
+                    != Some(generic_name)
+            {
+                continue;
+            }
+            declares_generic = true;
+            if let Some(bounds) = parameter.child_by_field_name("bounds") {
+                collect_rust_bound_owners(bounds, source, aliases, &mut owners);
+            }
+        }
+    }
+
+    let mut boundary_cursor = boundary.walk();
+    for child in boundary.named_children(&mut boundary_cursor) {
+        if child.kind() != "where_clause" {
+            continue;
+        }
+        let mut where_cursor = child.walk();
+        for predicate in child.named_children(&mut where_cursor) {
+            if predicate.kind() != "where_predicate"
+                || predicate
+                    .child_by_field_name("left")
+                    .and_then(|left| node_source_text(left, source))
+                    .as_deref()
+                    .map(str::trim)
+                    != Some(generic_name)
+            {
+                continue;
+            }
+            if let Some(bounds) = predicate.child_by_field_name("bounds") {
+                collect_rust_bound_owners(bounds, source, aliases, &mut owners);
+            }
+        }
+    }
+    (declares_generic, owners)
+}
+
+fn collect_rust_bound_owners(
+    bounds: TsNode<'_>,
+    source: &str,
+    aliases: &RustTypeAliases,
+    owners: &mut HashSet<String>,
+) {
+    let mut cursor = bounds.walk();
+    for bound in bounds.named_children(&mut cursor) {
+        if bound.kind() == "lifetime" {
+            continue;
+        }
+        if let Some(owner) = node_source_text(bound, source)
+            .and_then(|surface| normalize_rust_type_owner_name(&surface, aliases))
+        {
+            owners.insert(owner);
+        }
+    }
 }
 
 fn apply_rust_receiver_call_hints(
@@ -5560,6 +5759,29 @@ fn rust_enclosing_impl_owner(
     None
 }
 
+fn rust_enclosing_self_owner(
+    node: TsNode<'_>,
+    source: &str,
+    aliases: &RustTypeAliases,
+) -> Option<String> {
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        let owner = match current.kind() {
+            "impl_item" => current.child_by_field_name("type"),
+            "trait_item" => current.child_by_field_name("name"),
+            _ => None,
+        };
+        if let Some(owner) = owner
+            .and_then(|owner| node_source_text(owner, source))
+            .and_then(|owner| normalize_rust_type_owner_name(&owner, aliases))
+        {
+            return Some(owner);
+        }
+        cursor = current.parent();
+    }
+    None
+}
+
 /// One function's value bindings, resolved as call sites are reached.
 ///
 /// The old shape rebuilt this map for *every* call by walking the enclosing
@@ -5610,6 +5832,7 @@ impl<'tree> RustValueScope<'tree> {
         aliases: &RustTypeAliases,
         field_types: &RustStructFieldTypes,
         method_return_types: &RustMethodReturnTypes,
+        local_unit_structs: &HashSet<String>,
     ) {
         while let Some(binding) = self.bindings.get(self.cursor) {
             if binding.start_byte() > call_start_byte {
@@ -5641,6 +5864,14 @@ impl<'tree> RustValueScope<'tree> {
                             &self.value_types,
                             aliases,
                         )
+                        .or_else(|| {
+                            rust_direct_local_unit_struct_owner(
+                                value,
+                                source,
+                                aliases,
+                                local_unit_structs,
+                            )
+                        })
                     })
                 });
             let Some(type_name) = type_name else {
@@ -5649,6 +5880,20 @@ impl<'tree> RustValueScope<'tree> {
             self.value_types.insert(value_name, type_name);
         }
     }
+}
+
+fn rust_direct_local_unit_struct_owner(
+    value: TsNode<'_>,
+    source: &str,
+    aliases: &RustTypeAliases,
+    local_unit_structs: &HashSet<String>,
+) -> Option<String> {
+    if !matches!(value.kind(), "identifier" | "scoped_identifier") {
+        return None;
+    }
+    let owner = node_source_text(value, source)
+        .and_then(|surface| normalize_rust_type_owner_name(&surface, aliases))?;
+    local_unit_structs.contains(&owner).then_some(owner)
 }
 
 fn rust_enclosing_function_item(call_node: TsNode<'_>) -> Option<TsNode<'_>> {
@@ -6326,6 +6571,17 @@ fn js_like_callable_source_name(node: TsNode<'_>, source: &str) -> Option<String
         "arrow_function" => node
             .parent()
             .and_then(|parent| tsx_callable_binding_name(parent, source)),
+        "function_expression" => node
+            .parent()
+            .filter(|parent| {
+                parent.kind() == "assignment_expression"
+                    && parent
+                        .child_by_field_name("right")
+                        .is_some_and(|right| same_ts_span(right, node))
+            })
+            .and_then(|assignment| assignment.child_by_field_name("left"))
+            .filter(|left| left.kind() == "member_expression")
+            .and_then(|left| normalized_receiver_variable(left, source)),
         _ => None,
     }
 }
@@ -6629,6 +6885,447 @@ fn runtime_import_binding_node_id(
     None
 }
 
+fn collect_javascript_binding_identifier_nodes<'tree>(
+    node: TsNode<'tree>,
+    bindings: &mut Vec<TsNode<'tree>>,
+) {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => bindings.push(node),
+        "pair_pattern" => {
+            if let Some(value) = node.child_by_field_name("value") {
+                collect_javascript_binding_identifier_nodes(value, bindings);
+            }
+        }
+        "assignment_pattern" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                collect_javascript_binding_identifier_nodes(left, bindings);
+            }
+        }
+        "rest_pattern" => {
+            if let Some(argument) = node.child_by_field_name("argument") {
+                collect_javascript_binding_identifier_nodes(argument, bindings);
+            }
+        }
+        "required_parameter" | "optional_parameter" => {
+            if let Some(pattern) = node
+                .child_by_field_name("pattern")
+                .or_else(|| node.child_by_field_name("name"))
+                .or_else(|| node.named_child(0))
+            {
+                collect_javascript_binding_identifier_nodes(pattern, bindings);
+            }
+        }
+        "object_pattern" | "array_pattern" | "formal_parameters" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_javascript_binding_identifier_nodes(child, bindings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn javascript_runtime_import_bindings<'tree>(
+    tree: &'tree Tree,
+    source: &str,
+    import_call: TsNode<'tree>,
+) -> Vec<JavaScriptRuntimeImportBinding<'tree>> {
+    let mut current = import_call;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "parenthesized_expression"
+            | "await_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "type_assertion"
+            | "non_null_expression" => current = parent,
+            "member_expression"
+                if parent
+                    .child_by_field_name("object")
+                    .is_some_and(|object| same_ts_span(object, current)) =>
+            {
+                current = parent;
+            }
+            "variable_declarator"
+                if parent
+                    .child_by_field_name("value")
+                    .is_some_and(|value| same_ts_span(value, current)) =>
+            {
+                let mut bindings = Vec::new();
+                if let Some(name) = parent.child_by_field_name("name") {
+                    collect_javascript_binding_identifier_nodes(name, &mut bindings);
+                }
+                let activation_end_byte = parent.parent().unwrap_or(parent).end_byte();
+                return bindings
+                    .into_iter()
+                    .map(|declaration_binding| JavaScriptRuntimeImportBinding {
+                        declaration_binding,
+                        activation_end_byte,
+                    })
+                    .collect();
+            }
+            "assignment_expression"
+                if parent
+                    .child_by_field_name("right")
+                    .is_some_and(|right| same_ts_span(right, current)) =>
+            {
+                let Some(left) = parent
+                    .child_by_field_name("left")
+                    .filter(|left| left.kind() == "identifier")
+                else {
+                    return Vec::new();
+                };
+                let Some(name) = trimmed_node_text(left, source) else {
+                    return Vec::new();
+                };
+                let mut declarations =
+                    collect_javascript_binding_occurrences(tree.root_node(), source, &name)
+                        .into_iter()
+                        .filter(|occurrence| ts_node_contains(occurrence.scope, parent))
+                        .collect::<Vec<_>>();
+                declarations.sort_by_key(|occurrence| {
+                    (
+                        occurrence.scope.start_byte(),
+                        occurrence.binding.start_byte(),
+                    )
+                });
+                let Some(declaration) = declarations.pop() else {
+                    return Vec::new();
+                };
+                if declarations
+                    .iter()
+                    .any(|other| same_ts_span(other.scope, declaration.scope))
+                {
+                    return Vec::new();
+                }
+                if declaration.binding.start_byte() >= parent.start_byte()
+                    || javascript_variable_declarator_for_binding(declaration.binding)
+                        .is_none_or(|declarator| declarator.child_by_field_name("value").is_some())
+                {
+                    return Vec::new();
+                }
+                return vec![JavaScriptRuntimeImportBinding {
+                    declaration_binding: declaration.binding,
+                    activation_end_byte: parent.end_byte(),
+                }];
+            }
+            _ => return Vec::new(),
+        }
+    }
+    Vec::new()
+}
+
+fn javascript_variable_declarator_for_binding(mut binding: TsNode<'_>) -> Option<TsNode<'_>> {
+    while let Some(parent) = binding.parent() {
+        if parent.kind() == "variable_declarator" {
+            return Some(parent);
+        }
+        if matches!(parent.kind(), "program" | "statement_block") {
+            return None;
+        }
+        binding = parent;
+    }
+    None
+}
+
+fn javascript_callable_scope(node: TsNode<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_expression"
+            | "generator_function_declaration"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+    )
+}
+
+fn javascript_nearest_scope<'tree>(
+    mut node: TsNode<'tree>,
+    lexical: bool,
+) -> Option<TsNode<'tree>> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "program"
+            || javascript_callable_scope(parent)
+            || (lexical
+                && matches!(
+                    parent.kind(),
+                    "statement_block" | "catch_clause" | "for_statement" | "for_in_statement"
+                ))
+        {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JavaScriptBindingOccurrence<'tree> {
+    binding: TsNode<'tree>,
+    scope: TsNode<'tree>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JavaScriptRuntimeImportBinding<'tree> {
+    declaration_binding: TsNode<'tree>,
+    activation_end_byte: usize,
+}
+
+fn collect_javascript_binding_occurrences<'tree>(
+    root: TsNode<'tree>,
+    source: &str,
+    name: &str,
+) -> Vec<JavaScriptBindingOccurrence<'tree>> {
+    let mut occurrences = Vec::new();
+    walk_tree_nodes(root, &mut |node| {
+        match node.kind() {
+            "variable_declarator" => {
+                let Some(pattern) = node.child_by_field_name("name") else {
+                    return;
+                };
+                let lexical = node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() != "variable_declaration");
+                let Some(scope) = javascript_nearest_scope(node, lexical) else {
+                    return;
+                };
+                let mut bindings = Vec::new();
+                collect_javascript_binding_identifier_nodes(pattern, &mut bindings);
+                occurrences.extend(bindings.into_iter().filter_map(|binding| {
+                    (trimmed_node_text(binding, source).as_deref() == Some(name))
+                        .then_some(JavaScriptBindingOccurrence { binding, scope })
+                }));
+            }
+            "function_declaration" | "generator_function_declaration" | "class_declaration" => {
+                if let Some(binding) = node.child_by_field_name("name")
+                    && trimmed_node_text(binding, source).as_deref() == Some(name)
+                    && let Some(scope) = javascript_nearest_scope(node, true)
+                {
+                    occurrences.push(JavaScriptBindingOccurrence { binding, scope });
+                }
+            }
+            "function_expression" | "generator_function" | "class" => {
+                if let Some(binding) = node.child_by_field_name("name")
+                    && trimmed_node_text(binding, source).as_deref() == Some(name)
+                {
+                    occurrences.push(JavaScriptBindingOccurrence {
+                        binding,
+                        scope: node,
+                    });
+                }
+            }
+            "catch_clause" => {
+                let Some(parameter) = node.child_by_field_name("parameter") else {
+                    return;
+                };
+                let mut bindings = Vec::new();
+                collect_javascript_binding_identifier_nodes(parameter, &mut bindings);
+                occurrences.extend(bindings.into_iter().filter_map(|binding| {
+                    (trimmed_node_text(binding, source).as_deref() == Some(name)).then_some(
+                        JavaScriptBindingOccurrence {
+                            binding,
+                            scope: node,
+                        },
+                    )
+                }));
+            }
+            _ => {}
+        }
+
+        if javascript_callable_scope(node) {
+            let parameters = node
+                .child_by_field_name("parameters")
+                .or_else(|| node.child_by_field_name("parameter"));
+            let Some(parameters) = parameters else {
+                return;
+            };
+            let mut bindings = Vec::new();
+            collect_javascript_binding_identifier_nodes(parameters, &mut bindings);
+            occurrences.extend(bindings.into_iter().filter_map(|binding| {
+                (trimmed_node_text(binding, source).as_deref() == Some(name)).then_some(
+                    JavaScriptBindingOccurrence {
+                        binding,
+                        scope: node,
+                    },
+                )
+            }));
+        }
+    });
+    occurrences
+}
+
+fn ts_node_contains(outer: TsNode<'_>, inner: TsNode<'_>) -> bool {
+    outer.start_byte() <= inner.start_byte() && outer.end_byte() >= inner.end_byte()
+}
+
+fn javascript_binding_has_prior_write(
+    root: TsNode<'_>,
+    source: &str,
+    declaration_binding: TsNode<'_>,
+    after_byte: usize,
+    proof_node: TsNode<'_>,
+) -> bool {
+    let Some(name) = trimmed_node_text(declaration_binding, source) else {
+        return true;
+    };
+    let occurrences = collect_javascript_binding_occurrences(root, source, &name);
+    let Some(declaration) = occurrences
+        .iter()
+        .find(|occurrence| same_ts_span(occurrence.binding, declaration_binding))
+    else {
+        return true;
+    };
+    let declaration_callable = javascript_enclosing_callable(declaration_binding);
+    let proof_callable = javascript_enclosing_callable(proof_node);
+
+    let mut written = false;
+    walk_tree_nodes(root, &mut |node| {
+        if written || !matches!(node.kind(), "assignment_expression" | "update_expression") {
+            return;
+        }
+        let target = if node.kind() == "assignment_expression" {
+            node.child_by_field_name("left")
+        } else {
+            node.named_child(0)
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let mut bindings = Vec::new();
+        collect_javascript_binding_identifier_nodes(target, &mut bindings);
+        if !bindings
+            .into_iter()
+            .any(|binding| trimmed_node_text(binding, source).as_deref() == Some(name.as_str()))
+        {
+            return;
+        }
+        let write_callable = javascript_enclosing_callable(node);
+        let unordered_nested_write = write_callable.is_some_and(|write_callable| {
+            !declaration_callable.is_some_and(|owner| same_ts_span(owner, write_callable))
+                && !proof_callable.is_some_and(|owner| same_ts_span(owner, write_callable))
+                && ts_node_contains(declaration.scope, write_callable)
+        });
+        let cyclic_write = javascript_nodes_share_enclosing_cycle(node, proof_node);
+        if !unordered_nested_write
+            && !cyclic_write
+            && (node.start_byte() < after_byte || node.end_byte() >= proof_node.start_byte())
+        {
+            return;
+        }
+        if !ts_node_contains(declaration.scope, node)
+            || occurrences.iter().any(|occurrence| {
+                !same_ts_span(occurrence.binding, declaration.binding)
+                    && ts_node_contains(declaration.scope, occurrence.scope)
+                    && ts_node_contains(occurrence.scope, node)
+            })
+        {
+            return;
+        }
+        written = true;
+    });
+    written
+}
+
+fn javascript_nodes_share_enclosing_cycle(left: TsNode<'_>, right: TsNode<'_>) -> bool {
+    let mut current = left;
+    while let Some(parent) = current.parent() {
+        if matches!(
+            parent.kind(),
+            "for_statement" | "for_in_statement" | "while_statement" | "do_statement"
+        ) && ts_node_contains(parent, right)
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn javascript_enclosing_callable(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
+    while let Some(parent) = node.parent() {
+        if javascript_callable_scope(parent) {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn javascript_runtime_import_binding_visible_at_call(
+    tree: &Tree,
+    source: &str,
+    import_binding: TsNode<'_>,
+    activation_end_byte: usize,
+    call_callee: TsNode<'_>,
+) -> bool {
+    let Some(name) = trimmed_node_text(import_binding, source) else {
+        return false;
+    };
+    if call_callee.start_byte() <= activation_end_byte {
+        return false;
+    }
+    let occurrences = collect_javascript_binding_occurrences(tree.root_node(), source, &name);
+    let Some(import_occurrence) = occurrences
+        .iter()
+        .find(|occurrence| same_ts_span(occurrence.binding, import_binding))
+    else {
+        return false;
+    };
+    if !ts_node_contains(import_occurrence.scope, call_callee) {
+        return false;
+    }
+    if occurrences.iter().any(|occurrence| {
+        !same_ts_span(occurrence.binding, import_binding)
+            && ts_node_contains(import_occurrence.scope, occurrence.scope)
+            && ts_node_contains(occurrence.scope, call_callee)
+    }) {
+        return false;
+    }
+
+    !javascript_binding_has_prior_write(
+        tree.root_node(),
+        source,
+        import_binding,
+        activation_end_byte,
+        call_callee,
+    )
+}
+
+fn javascript_runtime_import_bare_call_target_spans(
+    tree: &Tree,
+    source: &str,
+    import_binding: TsNode<'_>,
+    activation_end_byte: usize,
+) -> Vec<GraphNodeSpan> {
+    let Some(name) = trimmed_node_text(import_binding, source) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "call_expression" {
+            return;
+        }
+        let Some(callee) = node.child_by_field_name("function") else {
+            return;
+        };
+        if callee.kind() != "identifier"
+            || trimmed_node_text(callee, source).as_deref() != Some(name.as_str())
+            || !javascript_runtime_import_binding_visible_at_call(
+                tree,
+                source,
+                import_binding,
+                activation_end_byte,
+                callee,
+            )
+        {
+            return;
+        }
+        spans.push(ts_node_graph_span(callee));
+    });
+    spans
+}
+
 fn collect_runtime_import_specs(
     language_name: &str,
     file_name: &str,
@@ -6676,6 +7373,7 @@ fn collect_javascript_runtime_import_specs(
     symbol_table: Option<&Arc<SymbolTable>>,
 ) -> Vec<RuntimeImportSpec> {
     let mut specs = Vec::new();
+    let mut exact_bindings = Vec::new();
     walk_tree_nodes(tree.root_node(), &mut |node| {
         if node.kind() != "call_expression" {
             return;
@@ -6737,21 +7435,55 @@ fn collect_javascript_runtime_import_specs(
         if let Some(table) = symbol_table {
             table.insert(module_node_id.0, NodeKind::MODULE);
         }
-        specs.push(RuntimeImportSpec {
-            binding_node_id: runtime_import_binding_node_id(
-                node,
+        let bindings = javascript_runtime_import_bindings(tree, source, node);
+        if bindings.is_empty() {
+            specs.push(RuntimeImportSpec {
+                binding_node_id: runtime_import_binding_node_id(
+                    node,
+                    source,
+                    file_name,
+                    unique_nodes,
+                    symbol_table,
+                ),
+                module_node_id,
+                line,
+                suppress_line,
+                suppress_start_col,
+                suppress_callee_name: callee_name,
+                exact_bare_call_target_spans: Vec::new(),
+            });
+            return;
+        }
+        for binding in bindings {
+            let binding_node_id = runtime_import_binding_target_id(
+                binding.declaration_binding,
                 source,
                 file_name,
                 unique_nodes,
                 symbol_table,
-            ),
-            module_node_id,
-            line,
-            suppress_line,
-            suppress_start_col,
-            suppress_callee_name: callee_name,
-        });
+            );
+            let spec_index = specs.len();
+            specs.push(RuntimeImportSpec {
+                binding_node_id,
+                module_node_id,
+                line,
+                suppress_line,
+                suppress_start_col,
+                suppress_callee_name: callee_name.clone(),
+                exact_bare_call_target_spans: Vec::new(),
+            });
+            exact_bindings.push((spec_index, binding));
+        }
     });
+    for (spec_index, binding) in exact_bindings {
+        specs[spec_index].exact_bare_call_target_spans =
+            javascript_runtime_import_bare_call_target_spans(
+                tree,
+                source,
+                binding.declaration_binding,
+                binding.activation_end_byte,
+            );
+    }
     specs
 }
 
@@ -6827,6 +7559,7 @@ fn collect_ruby_runtime_import_specs(
             suppress_line,
             suppress_start_col,
             suppress_callee_name: callee_name,
+            exact_bare_call_target_spans: Vec::new(),
         });
     });
     specs
@@ -6899,6 +7632,7 @@ fn collect_bash_source_import_specs(
             suppress_line,
             suppress_start_col,
             suppress_callee_name: callee_name,
+            exact_bare_call_target_spans: Vec::new(),
         });
     });
     specs
@@ -7315,6 +8049,59 @@ fn append_manual_member_edges(
     }
 }
 
+fn annotate_python_context_manager_self_return_members(
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &HashMap<NodeId, Node>,
+    file_id: NodeId,
+    result_edges: &mut Vec<Edge>,
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+) {
+    for spec in languages::python::context_manager_self_return_member_specs(tree, source) {
+        let Some(source_id) = node_id_by_name_and_span(
+            unique_nodes,
+            &spec.source_name,
+            spec.source_span,
+            manual_member_source_kind,
+        ) else {
+            continue;
+        };
+        let Some(target_id) =
+            node_id_by_name_and_span(unique_nodes, &spec.target_name, spec.target_span, |kind| {
+                matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
+            })
+        else {
+            continue;
+        };
+        if let Some(edge) = result_edges.iter_mut().find(|edge| {
+            edge.kind == EdgeKind::MEMBER && edge.source == source_id && edge.target == target_id
+        }) {
+            edge.callsite_identity =
+                Some(languages::python::CONTEXT_MANAGER_SELF_RETURN_MEMBER_MARKER.to_string());
+            continue;
+        }
+
+        let mut edge = Edge {
+            id: EdgeId(0),
+            source: source_id,
+            target: target_id,
+            kind: EdgeKind::MEMBER,
+            file_node_id: Some(file_id),
+            line: spec.line,
+            certainty: parser_direct_structural_certainty(EdgeKind::MEMBER),
+            ..Default::default()
+        };
+        edge.callsite_identity =
+            Some(languages::python::CONTEXT_MANAGER_SELF_RETURN_MEMBER_MARKER.to_string());
+        if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+            continue;
+        }
+        edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+        result_edges.push(edge);
+    }
+}
+
 fn manual_member_source_kind(kind: NodeKind) -> bool {
     is_type_like_kind(kind) || matches!(kind, NodeKind::MODULE | NodeKind::NAMESPACE)
 }
@@ -7358,7 +8145,16 @@ fn append_manual_receiver_call_edges(
         );
     }
 
+    let context_manager_alias_callsites = if language_name == "python" {
+        languages::python::context_manager_alias_callsites(tree, source)
+    } else {
+        HashSet::new()
+    };
+
     for spec in language_receiver_call_specs(language_name, tree, source) {
+        let extra_callsite_marker = context_manager_alias_callsites
+            .contains(&receiver_callsite_key(&spec))
+            .then_some(languages::python::CONTEXT_MANAGER_SELF_RETURN_REQUIRED_MARKER);
         let Some(source_id) =
             node_id_by_name_and_span(unique_nodes, &spec.source_name, spec.source_span, |kind| {
                 matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
@@ -7366,6 +8162,43 @@ fn append_manual_receiver_call_edges(
         else {
             continue;
         };
+        if extra_callsite_marker.is_some() && spec.owner_module.is_none() {
+            let annotated_index = annotate_receiver_call_placeholder_owner(
+                unique_nodes,
+                result_edges,
+                edge_keys,
+                flags,
+                ReceiverPlaceholderAnnotation {
+                    line: spec.line,
+                    method_col: spec.method_col,
+                    method_name: &spec.method_name,
+                    owner_name: &spec.owner_name,
+                    owner_module: None,
+                    extra_callsite_marker,
+                },
+                receiver_annotation_required_callsite_marker(language_name),
+            );
+            if annotated_index.is_none() {
+                append_manual_receiver_call_placeholder_edge(
+                    unique_nodes,
+                    result_edges,
+                    edge_keys,
+                    flags,
+                    ManualReceiverCallPlaceholder {
+                        source_id,
+                        file_id,
+                        line: spec.line,
+                        method_col: spec.method_col,
+                        method_name: &spec.method_name,
+                        owner_name: &spec.owner_name,
+                        owner_module: None,
+                        extra_callsite_marker,
+                    },
+                    callsite_ordinals,
+                );
+            }
+            continue;
+        }
         if let Some(owner_module) = spec.owner_module.as_deref() {
             let annotated_index = annotate_receiver_call_placeholder_owner(
                 unique_nodes,
@@ -7378,6 +8211,7 @@ fn append_manual_receiver_call_edges(
                     method_name: &spec.method_name,
                     owner_name: &spec.owner_name,
                     owner_module: Some(owner_module),
+                    extra_callsite_marker,
                 },
                 receiver_annotation_required_callsite_marker(language_name),
             );
@@ -7405,11 +8239,38 @@ fn append_manual_receiver_call_edges(
                         method_col: spec.method_col,
                         method_name: &spec.method_name,
                         owner_name: &spec.owner_name,
-                        owner_module,
+                        owner_module: Some(owner_module),
+                        extra_callsite_marker,
                     },
                     callsite_ordinals,
                 );
             }
+            continue;
+        }
+
+        let javascript_property_alias_provenance_only = language_name == "javascript"
+            && !spec.receiver_name.starts_with("this")
+            && spec.source_name.rsplit_once('.').is_some_and(|(owner, _)| {
+                spec.owner_name
+                    .strip_prefix(owner)
+                    .is_some_and(|suffix| suffix.starts_with('.') && suffix.len() > 1)
+            });
+        if javascript_property_alias_provenance_only {
+            annotate_receiver_call_placeholder_owner(
+                unique_nodes,
+                result_edges,
+                edge_keys,
+                flags,
+                ReceiverPlaceholderAnnotation {
+                    line: spec.line,
+                    method_col: spec.method_col,
+                    method_name: &spec.method_name,
+                    owner_name: &spec.owner_name,
+                    owner_module: None,
+                    extra_callsite_marker,
+                },
+                receiver_annotation_required_callsite_marker(language_name),
+            );
             continue;
         }
 
@@ -7421,10 +8282,17 @@ fn append_manual_receiver_call_edges(
             file_id,
             spec.allow_global_fallback,
         ) else {
-            if language_name == "python"
-                && !languages::python::is_implicit_receiver(&spec.receiver_name)
-            {
-                annotate_receiver_call_placeholder_owner(
+            let should_annotate = match language_name {
+                "python" => !languages::python::is_implicit_receiver(&spec.receiver_name),
+                "go" | "dart" => true,
+                "javascript" => {
+                    spec.source_name.contains('.')
+                        && (spec.receiver_name == "this" || spec.receiver_name.starts_with("this."))
+                }
+                _ => false,
+            };
+            if should_annotate {
+                let annotated_index = annotate_receiver_call_placeholder_owner(
                     unique_nodes,
                     result_edges,
                     edge_keys,
@@ -7435,9 +8303,35 @@ fn append_manual_receiver_call_edges(
                         method_name: &spec.method_name,
                         owner_name: &spec.owner_name,
                         owner_module: spec.owner_module.as_deref(),
+                        extra_callsite_marker,
                     },
-                    Some(languages::python::MEMBER_CALLSITE_MARKER),
+                    receiver_annotation_required_callsite_marker(language_name),
                 );
+                if language_name == "dart" {
+                    if let Some(index) = annotated_index {
+                        if let Some(edge) = result_edges.get(index) {
+                            edge_keys.remove(&edge_dedup_key(edge, flags));
+                        }
+                        result_edges.remove(index);
+                    }
+                    append_manual_receiver_call_placeholder_edge(
+                        unique_nodes,
+                        result_edges,
+                        edge_keys,
+                        flags,
+                        ManualReceiverCallPlaceholder {
+                            source_id,
+                            file_id,
+                            line: spec.line,
+                            method_col: spec.method_col,
+                            method_name: &spec.method_name,
+                            owner_name: &spec.owner_name,
+                            owner_module: None,
+                            extra_callsite_marker,
+                        },
+                        callsite_ordinals,
+                    );
+                }
             }
             continue;
         };
@@ -7469,6 +8363,9 @@ fn append_manual_receiver_call_edges(
             let next = callsite_ordinals.entry(key).or_insert(0);
             *next = next.saturating_add(1);
             ensure_callsite_identity(&mut edge, Some(*next));
+        }
+        if let Some(marker) = extra_callsite_marker {
+            append_callsite_part(&mut edge, marker);
         }
         if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
             continue;
@@ -7599,6 +8496,9 @@ fn annotate_receiver_call_placeholder_owner(
     if let Some(marker) = module_marker.as_deref() {
         append_callsite_part(edge, marker);
     }
+    if let Some(marker) = annotation.extra_callsite_marker {
+        append_callsite_part(edge, marker);
+    }
     edge_keys.insert(edge_dedup_key(edge, flags));
     Some(index)
 }
@@ -7610,7 +8510,8 @@ struct ManualReceiverCallPlaceholder<'a> {
     method_col: Option<u32>,
     method_name: &'a str,
     owner_name: &'a str,
-    owner_module: &'a str,
+    owner_module: Option<&'a str>,
+    extra_callsite_marker: Option<&'a str>,
 }
 
 fn append_manual_receiver_call_placeholder_edge(
@@ -7622,9 +8523,10 @@ fn append_manual_receiver_call_placeholder_edge(
     callsite_ordinals: &mut HashMap<(NodeId, Option<u32>), u32>,
 ) {
     if placeholder.owner_name.contains('|')
-        || placeholder.owner_module.contains('|')
         || placeholder.owner_name.trim().is_empty()
-        || placeholder.owner_module.trim().is_empty()
+        || placeholder
+            .owner_module
+            .is_some_and(|module| module.contains('|') || module.trim().is_empty())
     {
         return;
     }
@@ -7658,13 +8560,15 @@ fn append_manual_receiver_call_placeholder_edge(
         &mut edge,
         &format!("{RECEIVER_OWNER_CALLSITE_PREFIX}{}", placeholder.owner_name),
     );
-    append_callsite_part(
-        &mut edge,
-        &format!(
-            "{RECEIVER_MODULE_CALLSITE_PREFIX}{}",
-            placeholder.owner_module
-        ),
-    );
+    if let Some(owner_module) = placeholder.owner_module {
+        append_callsite_part(
+            &mut edge,
+            &format!("{RECEIVER_MODULE_CALLSITE_PREFIX}{owner_module}"),
+        );
+    }
+    if let Some(marker) = placeholder.extra_callsite_marker {
+        append_callsite_part(&mut edge, marker);
+    }
     if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
         return;
     }
@@ -7961,6 +8865,7 @@ fn receiver_call_belongs_to_callable(node: TsNode<'_>, callable: TsNode<'_>) -> 
         "lambda",
         "lambda_expression",
         "arrow_function",
+        "function_expression",
         "anonymous_function",
         "closure_expression",
         "class_definition",
@@ -8414,6 +9319,45 @@ fn append_runtime_import_edges(
             continue;
         }
         result_edges.push(edge);
+    }
+}
+
+fn annotate_exact_runtime_import_bare_calls(
+    specs: &[RuntimeImportSpec],
+    unique_nodes: &HashMap<NodeId, Node>,
+    edges: &mut [Edge],
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+) {
+    let exact_target_spans = specs
+        .iter()
+        .flat_map(|spec| spec.exact_bare_call_target_spans.iter())
+        .map(|span| (span.start_line, span.start_col, span.end_line, span.end_col))
+        .collect::<HashSet<_>>();
+    if exact_target_spans.is_empty() {
+        return;
+    }
+
+    for edge in edges {
+        if edge.kind != EdgeKind::CALL
+            || !unique_nodes
+                .get(&edge.target)
+                .and_then(|target| {
+                    Some((
+                        target.start_line?,
+                        target.start_col?,
+                        target.end_line?,
+                        target.end_col?,
+                    ))
+                })
+                .is_some_and(|span| exact_target_spans.contains(&span))
+        {
+            continue;
+        }
+        edge_keys.remove(&edge_dedup_key(edge, flags));
+        append_callsite_marker(edge, languages::javascript::RUNTIME_IMPORT_CALLSITE_MARKER);
+        edge.id = EdgeId(generate_edge_id_for_edge(edge, flags));
+        edge_keys.insert(edge_dedup_key(edge, flags));
     }
 }
 
@@ -13870,6 +14814,17 @@ pub fn index_file(
         &mut result_edges,
         &mut edge_keys,
     );
+    if language_config.language_name == "python" {
+        annotate_python_context_manager_self_return_members(
+            &tree,
+            source,
+            &unique_nodes,
+            file_id,
+            &mut result_edges,
+            &mut edge_keys,
+            flags,
+        );
+    }
     append_manual_receiver_call_edges(
         language_config.language_name,
         &tree,
@@ -13885,6 +14840,13 @@ pub fn index_file(
         &runtime_import_specs,
         &unique_nodes,
         file_id,
+        &mut result_edges,
+        &mut edge_keys,
+        flags,
+    );
+    annotate_exact_runtime_import_bare_calls(
+        &runtime_import_specs,
+        &unique_nodes,
         &mut result_edges,
         &mut edge_keys,
         flags,

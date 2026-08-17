@@ -18,6 +18,7 @@ pub(super) fn compute_call_resolution(
     ) = row;
     let receiver_owner = receiver_owner_from_callsite(callsite_identity.as_deref());
     let receiver_module = receiver_module_from_callsite(callsite_identity.as_deref());
+    let dart_import_modules = receiver_module.and_then(dart_unprefixed_import_modules);
     let mut selected: Option<(i64, f32, ResolutionStrategy)> = None;
     let mut semantic_fallback = UnambiguousBestCandidate::default();
     let mut candidate_ids = OrderedCandidateIds::with_capacity(8);
@@ -34,6 +35,17 @@ pub(super) fn compute_call_resolution(
 
     if is_cpp_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    if is_rust_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+        && !target_name.contains("::")
     {
         let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
         return Ok(ComputedResolution {
@@ -149,6 +161,21 @@ pub(super) fn compute_call_resolution(
     let is_common_unqualified = is_common_unqualified_call_name(&prepared_name.original);
     let is_owner_qualified = is_owner_qualified_call_name(&prepared_name.original);
 
+    // The parser proved that this bare JavaScript-family call shares an exact local name with a
+    // runtime import binding. That proves a lexical external boundary, not the implementation
+    // behind it, so do not let semantic fallback redirect it to a same-named local method.
+    if callsite_identity.as_deref().is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::languages::javascript::RUNTIME_IMPORT_CALLSITE_MARKER)
+    }) {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
     for candidate in semantic_candidates {
         if pass.flags.store_candidates {
             candidate_ids.push(candidate.target_node_id);
@@ -164,7 +191,53 @@ pub(super) fn compute_call_resolution(
         }
     }
 
-    if let (Some(owner_name), Some(module_name)) = (receiver_owner, receiver_module) {
+    if let (Some(owner_name), Some(module_names)) = (receiver_owner, dart_import_modules.as_deref())
+    {
+        let mut imported_candidates = module_names
+            .iter()
+            .filter_map(|module_name| {
+                candidate_index.find_imported_owner_member_readonly(
+                    caller_file_path.as_deref(),
+                    module_name,
+                    owner_name,
+                    target_name,
+                )
+            })
+            .collect::<Vec<_>>();
+        imported_candidates.sort_unstable();
+        imported_candidates.dedup();
+        if pass.flags.store_candidates {
+            for candidate in &imported_candidates {
+                candidate_ids.push(*candidate);
+            }
+        }
+        if imported_candidates.len() != 1 {
+            let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+            return Ok(ComputedResolution {
+                update,
+                strategy: None,
+            });
+        }
+        let candidate = imported_candidates[0];
+        if candidate_index.find_global_unique_owner_member_readonly(owner_name, target_name)
+            != Some(candidate)
+        {
+            let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+            return Ok(ComputedResolution {
+                update,
+                strategy: None,
+            });
+        }
+        selected = Some((
+            candidate,
+            pass.policy.call_same_file,
+            ResolutionStrategy::CallGlobalUnique,
+        ));
+    }
+
+    if dart_import_modules.is_none()
+        && let (Some(owner_name), Some(module_name)) = (receiver_owner, receiver_module)
+    {
         let selected_imported_owner = candidate_index.find_imported_owner_member_readonly(
             caller_file_path.as_deref(),
             module_name,
@@ -242,6 +315,29 @@ pub(super) fn compute_call_resolution(
         }
     }
 
+    if selected.is_none()
+        && receiver_module.is_none()
+        && matches!(
+            semantic_language_bucket(caller_file_path.as_deref()),
+            Some("go" | "dart")
+        )
+        && let Some(owner_name) = receiver_owner
+        && let Some(candidate) = candidate_index.find_same_directory_owner_member_readonly(
+            caller_file_path.as_deref(),
+            owner_name,
+            target_name,
+        )
+    {
+        if pass.flags.store_candidates {
+            candidate_ids.push(candidate);
+        }
+        selected = Some((
+            candidate,
+            pass.policy.call_same_module,
+            ResolutionStrategy::CallSameModule,
+        ));
+    }
+
     if selected.is_none() && receiver_owner.is_some() && receiver_module.is_none() {
         let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
         return Ok(ComputedResolution {
@@ -309,6 +405,14 @@ pub(super) fn compute_call_resolution(
             confidence,
             callsite_identity.as_deref(),
         )
+    {
+        selected = None;
+    }
+
+    if requires_python_context_manager_self_return(callsite_identity.as_deref())
+        && selected.is_some_and(|(candidate, _, _)| {
+            !candidate_index.has_context_manager_self_return_contract(candidate)
+        })
     {
         selected = None;
     }

@@ -1312,42 +1312,90 @@ test("frozen-candidate quality stays optional, exact, and archive-authenticated"
     ["Windows qualification becomes server-behavior only", coordinatorFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].with.server_behavior_only = true;
     }, /qualification must run full Windows lifecycle and fault proof/u],
-    ["coordinator schedules Linux during qualification", coordinatorFile, workflow => {
+    ["coordinator schedules Linux during qualification without the opt-in", coordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].if
         = workflow.jobs["linux-vulkan-proof"].if.replace(
-          "needs.route.outputs.mode != 'qualification' &&",
-          "",
+          "(needs.route.outputs.mode != 'qualification' || inputs.qualify_linux_vulkan)",
+          "true",
         );
-    }, /qualification modes must skip coordinator Linux proof/u],
-    ["qualification closeout blocks on Linux", coordinatorFile, workflow => {
+    }, /qualification must schedule Linux proof only when the explicit lifecycle opt-in is true/u],
+    ["qualification closeout requires Linux without the opt-in", coordinatorFile, workflow => {
       const closeout = draftStep(
         workflow.jobs.closeout,
         "Require one coherent accepted proof",
       );
       closeout.run = closeout.run.replace(
-        `if [ "$MODE" = qualification ]; then
-      require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
-    else`,
-        `if [ "$MODE" = qualification ]; then
-      require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
-    else`,
+        'if [ "$QUALIFY_LINUX_VULKAN" = true ]; then',
+        "if true; then",
       );
-    }, /qualification closeout must accept skipped optional Linux proof without blocking/u],
+    }, /qualification closeout must require Linux success exactly when the explicit lifecycle opt-in is true/u],
+    ["opted-in Linux quality validation becomes advisory", coordinatorFile, workflow => {
+      draftStep(
+        workflow.jobs.closeout,
+        "Validate opted-in Linux quality evidence",
+      )["continue-on-error"] = true;
+    }, /Linux quality validation must fail closed on the routed frozen head/u],
+    ["opted-in Linux quality accepts a green wrapper without publishable rows", coordinatorFile, workflow => {
+      const validation = draftStep(
+        workflow.jobs.closeout,
+        "Validate opted-in Linux quality evidence",
+      );
+      validation.run = validation.run.replace(
+        "and .release_evidence.publishable_blockers == []",
+        "and true",
+      );
+    }, /authenticate and inspect every three-repeat publishable predicate/u],
+    ["opted-in Linux quality accepts an artifact from another head", coordinatorFile, workflow => {
+      const validation = draftStep(
+        workflow.jobs.closeout,
+        "Validate opted-in Linux quality evidence",
+      );
+      validation.run = validation.run.replace(
+        ".workflow_run.head_sha == $sha",
+        ".workflow_run.head_sha != $sha",
+      );
+    }, /authenticate and inspect every three-repeat publishable predicate/u],
+    ["opted-in Linux quality accepts an artifact from another attempt", coordinatorFile, workflow => {
+      const validation = draftStep(
+        workflow.jobs.closeout,
+        "Validate opted-in Linux quality evidence",
+      );
+      validation.run = validation.run.replace(
+        "-$GITHUB_RUN_ATTEMPT",
+        "-1",
+      );
+    }, /authenticate and inspect every three-repeat publishable predicate/u],
+    ["Linux quality publishes one reusable head-only artifact", qualityFile, workflow => {
+      draftStep(
+        workflow.jobs["linux-quality"],
+        "Upload optional Linux x64 Axios v2 quality evidence",
+      ).with.name = "frozen-candidate-linux-x64-quality-${{ inputs.ref }}";
+    }, /must run the same isolated Axios v2 smoke entrypoint/u],
+    ["opted-in Linux quality receipt is not retained", coordinatorFile, workflow => {
+      draftStep(
+        workflow.jobs.closeout,
+        "Upload opted-in Linux quality validation",
+      ).if = "false";
+    }, /must retain its exact-head receipt/u],
     ["qualification closeout hides the accepted Linux branch in dead code", coordinatorFile, workflow => {
       const closeout = draftStep(
         workflow.jobs.closeout,
         "Require one coherent accepted proof",
       );
       const accepted = `if [ "$MODE" = qualification ]; then
-      require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
+      if [ "$QUALIFY_LINUX_VULKAN" = true ]; then
+        require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
+      else
+        require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
+      fi
     else
       require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
     fi`;
       closeout.run = closeout.run.replace(
         accepted,
         accepted.replace(
-          'require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof',
-          'require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof',
+          'if [ "$QUALIFY_LINUX_VULKAN" = true ]; then',
+          "if true; then",
         ),
       );
       closeout.run += `\nif false; then\n${accepted}\nfi\n`;
@@ -1360,13 +1408,13 @@ test("frozen-candidate quality stays optional, exact, and archive-authenticated"
         workflow.jobs.closeout,
         "Require one coherent accepted proof",
       ).if = "${{ false }}";
-    }, /closeout must run one unconditional proof step under the reviewed Bash interpreter/u],
+    }, /closeout must retain one unconditional result proof plus the two opted-in Linux quality receipt steps/u],
     ["qualification closeout shell ignores the reviewed script", coordinatorFile, workflow => {
       draftStep(
         workflow.jobs.closeout,
         "Require one coherent accepted proof",
       ).shell = "bash -c 'true' {0}";
-    }, /closeout must run one unconditional proof step under the reviewed Bash interpreter/u],
+    }, /closeout must retain one unconditional result proof plus the two opted-in Linux quality receipt steps/u],
     ["qualification closeout mode is rebound away from the route", coordinatorFile, workflow => {
       draftStep(
         workflow.jobs.closeout,
@@ -3157,9 +3205,22 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
     ["protected Linux proof removed", packagedCoordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].uses = "./.github/workflows/packaged-platform-proof.yml";
     }, /Linux proof must use the protected Vulkan workflow/u],
+    ["Linux lifecycle qualification becomes implicit", packagedCoordinatorFile, workflow => {
+      workflow.on.workflow_dispatch.inputs.qualify_linux_vulkan.default = true;
+    }, /Linux lifecycle qualification must remain an explicit non-default dispatch opt-in/u],
+    ["Linux lifecycle qualification is admitted outside qualification mode", packagedCoordinatorFile, workflow => {
+      const resolver = packagedResolver(workflow);
+      resolver.run = resolver.run.replace(
+        'if [ "$qualify_linux_vulkan" = true ] && [ "$mode" != qualification ]; then',
+        'if [ "$qualify_linux_vulkan" = true ] && false; then',
+      );
+    }, /Linux lifecycle qualification opt-in must fail outside qualification mode/u],
     ["protected Linux candidate proof disabled", packagedCoordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].with.candidate_installed_proof = false;
-    }, /Linux proof must close Vulkan and candidate-installed claims/u],
+    }, /Linux proof must keep platform mode candidate-installed and run full lifecycle only in qualification/u],
+    ["protected Linux lifecycle proof loses calibration binding", packagedCoordinatorFile, workflow => {
+      delete workflow.jobs["linux-vulkan-proof"].with.calibration_bundle_artifact;
+    }, /full lifecycle only in qualification with the authenticated calibration bundle/u],
     ["Linux direct dispatch returns", linuxVulkanFile, workflow => {
       workflow.on.workflow_dispatch = { inputs: {} };
     }, /coordinator-only and not directly dispatchable/u],
@@ -3294,7 +3355,14 @@ test("source proof keeps retrieval generalization parallel on the resolved head"
     }, /hostile matrix must run its exact blocking Node command/u],
     ["full source reuse guard widened", workflow => {
       workflow.jobs["full-source-gate"].if = "always()";
-    }, /full source gate may skip only a completed exact-head proof/u],
+    }, /full source gate must run exactly once during source stabilization/u],
+    ["workspace test regains fail-fast", workflow => {
+      const step = draftStep(
+        workflow.jobs["full-source-gate"],
+        "Test the complete workspace once",
+      );
+      step.run = step.run.replace(" --no-fail-fast", "");
+    }, /complete workspace without fail-fast/u],
   ];
 
   for (const [name, mutate, expectedReason] of mutations) {
@@ -3332,13 +3400,13 @@ test("source proof reuse accepts only whole successful workflow runs", async (t)
     ["packaged prior proof lookup", workflows => {
       const step = draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       );
       step.run = step.run.replace(
         '.event == "workflow_dispatch" and .conclusion == "success"',
         '.event == "workflow_dispatch"',
       );
-    }, /packaged-platform-pr\.yml step Require successful exact-head source proof.*conclusion/u],
+    }, /packaged-platform-pr\.yml step Require successful source-stabilization proof.*conclusion/u],
   ];
 
   for (const [name, mutate, expectedReason] of mutations) {
@@ -3445,6 +3513,109 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       workflows.get("source-proof.yml").on.workflow_dispatch
         .inputs.acceptance_phase.options.push("pre_calibration_source_proof");
     }, /separate acceptance from broad proof/u],
+    ["frozen acceptance stops requiring a frozen record", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Resolve frozen calibration acceptance identity",
+      );
+      step.run = step.run.replace('--github-output "$GITHUB_OUTPUT"', "");
+    }, /resolve a frozen direct constant-only child/u],
+    ["frozen acceptance trusts the recorded source as its checkout", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Resolve frozen calibration acceptance identity",
+      );
+      step.env.HEAD_SHA = "${{ steps.frozen-calibration.outputs.source_commit }}";
+    }, /must bind HEAD_SHA/u],
+    ["frozen acceptance permits a later Rust or docs commit", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Resolve frozen calibration acceptance identity",
+      );
+      step.run += " \\\n  --allow-promotion-commit\n";
+    }, /canonical acceptance job manifest/u],
+    ["frozen acceptance authenticates the latest run attempt", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Authenticate frozen calibration producer",
+      );
+      step.run = step.run.replace(
+        "/attempts/$PRODUCER_RUN_ATTEMPT",
+        "",
+      );
+    }, /recorded calibration run, attempt, and artifact/u],
+    ["frozen acceptance trusts a different calibration workflow", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Authenticate frozen calibration producer",
+      );
+      step.run = step.run.replace(
+        ".github/workflows/packaged-platform-pr.yml",
+        ".github/workflows/source-proof.yml",
+      );
+    }, /recorded calibration run, attempt, and artifact/u],
+    ["frozen acceptance admits an artifact from another run", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Authenticate frozen calibration producer",
+      );
+      step.run = step.run.replace(".workflow_run.id == $run_id", "true");
+    }, /recorded calibration run, attempt, and artifact/u],
+    ["frozen acceptance admits an artifact from another attempt", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Authenticate frozen calibration producer",
+      );
+      step.run = step.run.replace(".created_at >= $attempt_started", "true");
+    }, /recorded calibration run, attempt, and artifact/u],
+    ["frozen acceptance downloads by mutable artifact name", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Download frozen calibration bundle",
+      );
+      step.run = step.run.replace(
+        "actions/artifacts/$ARTIFACT_ID/zip",
+        "actions/runs/$PRODUCER_RUN_ID/artifacts",
+      );
+    }, /exact authenticated calibration artifact container/u],
+    ["frozen acceptance skips the artifact container digest", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Download frozen calibration bundle",
+      );
+      step.run = step.run.replace(
+        'test "$actual_digest" = "$CONTAINER_DIGEST"',
+        "true",
+      );
+    }, /exact authenticated calibration artifact container/u],
+    ["frozen acceptance compares the checked-in constant to itself", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Verify frozen calibration acceptance",
+      );
+      step.run = step.run.replace(
+        "$RUNNER_TEMP/frozen-calibration-bundle/per-user-embedding-server-constant-set.json",
+        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+      );
+    }, /recompute the downloaded calibration and compare the checked-in freeze/u],
+    ["frozen acceptance verifies the wrong downloaded bundle", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Verify frozen calibration acceptance",
+      );
+      step.run = step.run.replace(
+        "$RUNNER_TEMP/frozen-calibration-bundle/calibration-bundle.json",
+        "$RUNNER_TEMP/frozen-calibration-bundle/assembly.json",
+      );
+    }, /recompute the downloaded calibration and compare the checked-in freeze/u],
+    ["frozen acceptance mints the receipt before recomputation", workflows => {
+      const job = workflows.get("source-proof.yml").jobs.resolve;
+      const verification = job.steps.splice(
+        job.steps.findIndex(({ name }) => name === "Verify frozen calibration acceptance"),
+        1,
+      )[0];
+      job.steps.push(verification);
+    }, /only after frozen calibration acceptance/u],
     ["acceptance adds an Ubuntu workspace test job", workflows => {
       workflows.get("source-proof.yml").jobs["acceptance-ubuntu-workspace"] = {
         if: "inputs.acceptance_only",
@@ -3594,6 +3765,19 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         "Execute exact-head hostile mutation matrix",
       )["continue-on-error"] = true;
     }, /exact blocking hostile mutation job/u],
+    ["Windows packaged proof self-test is recombined with the timed probe", workflows => {
+      const job = workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"];
+      const selfTest = draftStep(job, "Run packaged proof self-test");
+      const probe = draftStep(job, "Run exact-head Windows native probe");
+      probe.run = `${selfTest.run}\n${probe.run}`;
+      job.steps = job.steps.filter(step => step.name !== "Run packaged proof self-test");
+    }, /canonical acceptance job manifest/u],
+    ["Windows packaged proof self-test becomes advisory", workflows => {
+      draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],
+        "Run packaged proof self-test",
+      )["continue-on-error"] = true;
+    }, /canonical acceptance job manifest/u],
     ["Windows probe leaves the protected runner", workflows => {
       workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"]["runs-on"]
         = ["self-hosted", "Windows", "X64"];
@@ -3672,7 +3856,7 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
     ["acceptance publisher stops waiting for Windows", workflows => {
       workflows.get("source-proof.yml").jobs["freeze-acceptance"].needs
         = ["resolve", "freeze-hostile-mutations"];
-    }, /publisher must depend on both exact successful mutation jobs/u],
+    }, /publisher must require broad source success for source stabilization/u],
     ["acceptance publisher stops downloading the Actions receipt", workflows => {
       const job = workflows.get("source-proof.yml").jobs["freeze-acceptance"];
       job.steps = job.steps.filter(({ name }) =>
@@ -3702,16 +3886,16 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       );
       step.run = step.run.replace("verify-status", "verify-pending");
     }, /caller-authored pending status/u],
-    ["broad source proof accepts a calibration-source receipt", workflows => {
+    ["broad source proof accepts a frozen-candidate receipt", workflows => {
       const step = draftStep(
         workflows.get("source-proof.yml").jobs.resolve,
         "Require executable release freeze",
       );
       step.run = step.run.replace(
+        "--phase source_stabilization",
         "--phase frozen_candidate",
-        "--phase calibration_source",
       );
-    }, /Require executable release freeze.*frozen_candidate/u],
+    }, /Require executable release freeze.*source_stabilization/u],
     ["acceptance publisher loses Actions provenance", workflows => {
       const step = draftStep(
         workflows.get("source-proof.yml").jobs["freeze-acceptance"],
@@ -3738,46 +3922,56 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         "Require executable release freeze",
       ).if = "steps.resolve.outputs.mode != 'qualification'";
     }, /every packaged proof mode must authenticate the exact candidate head/u],
-    ["calibration regains a pre-freeze source proof", workflows => {
+    ["calibration repeats the stabilized source proof", workflows => {
       draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if = "steps.resolve.outputs.mode != 'integration'";
-    }, /calibration must precede the sole frozen-candidate source proof/u],
-    ["qualification loses the frozen-head source proof", workflows => {
+    }, /frozen candidates must reuse the pre-calibration source-stabilization proof/u],
+    ["qualification loses the stabilized source proof", workflows => {
       draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if
         = "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration' && steps.resolve.outputs.mode != 'qualification'";
-    }, /calibration must precede the sole frozen-candidate source proof/u],
-    ["release searches the calibration source instead of the frozen tree", workflows => {
+    }, /frozen candidates must reuse the pre-calibration source-stabilization proof/u],
+    ["release searches the frozen head instead of the selected source", workflows => {
       const step = draftStep(
         workflows.get("release.yml").jobs.preflight,
         "Resolve reusable prior evidence",
       );
-      step.run = step.run.replace(
-        'release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"',
-        'release_tree="$(git rev-parse "$SOURCE_SHA^{tree}")"',
-      );
-    }, /Resolve reusable prior evidence.*release_tree/u],
-    ["release restores post-calibration fallback", workflows => {
+      step.env.SOURCE_SHA = "${{ github.sha }}";
+    }, /SOURCE_SHA/u],
+    ["release restores a second source-proof fallback", workflows => {
       workflows.get("release.yml").jobs["source-proof"].if = "always()";
-    }, /post-calibration source-proof fallback unreachable/u],
+    }, /second source-proof fallback unreachable/u],
     ["source reuse accepts an expired cell", workflows => {
       const step = draftStep(
         workflows.get("source-proof.yml").jobs.resolve,
         "Reuse a completed gate for this exact head",
       );
-      step.run = step.run.replace(".expired == false", "true");
+      step.run = step.run.replaceAll(".expired == false", "true");
     }, /Reuse a completed gate.*expired/u],
+    ["release accepts an expired freeze receipt", workflows => {
+      const step = draftStep(
+        workflows.get("release.yml").jobs.preflight,
+        "Resolve reusable prior evidence",
+      );
+      step.run = step.run.replace(
+        "select(.name == $receipt and .expired == false)",
+        "select(.name == $receipt)",
+      );
+    }, /Resolve reusable prior evidence.*select\(\.name == \$receipt and \.expired == false\)/u],
     ["release accepts an expired source cell", workflows => {
       const step = draftStep(
         workflows.get("release.yml").jobs.preflight,
         "Resolve reusable prior evidence",
       );
-      step.run = step.run.replace(".expired == false", "true");
-    }, /Resolve reusable prior evidence.*expired/u],
+      step.run = step.run.replace(
+        "select(.name == $source and .expired == false)",
+        "select(.name == $source)",
+      );
+    }, /Resolve reusable prior evidence.*select\(\.name == \$source and \.expired == false\)/u],
     ["qualification trusts a bare success status", workflows => {
       const step = draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
@@ -4052,27 +4246,27 @@ test("release freeze policy authenticates the complete acceptance job manifest",
   }
 });
 
-test("calibration precedes the sole frozen-candidate source proof", async (t) => {
+test("frozen candidates reuse the pre-calibration source-stabilization proof", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
   const coordinatorFile = "packaged-platform-pr.yml";
   const mutations = [
-    ["calibration regains a pre-freeze source proof", workflow => {
+    ["calibration repeats the stabilized source proof", workflow => {
       draftStep(
         workflow.jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if = "steps.resolve.outputs.mode != 'integration'";
     }],
-    ["qualification loses the frozen-head source proof", workflow => {
+    ["qualification loses the stabilized source proof", workflow => {
       draftStep(
         workflow.jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if
         = "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration' && steps.resolve.outputs.mode != 'qualification'";
     }],
-    ["every mode loses the exact-head source proof", workflow => {
+    ["every mode loses the source-stabilization proof", workflow => {
       draftStep(
         workflow.jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if = "false";
     }],
   ];
@@ -4083,7 +4277,7 @@ test("calibration precedes the sole frozen-candidate source proof", async (t) =>
       mutate(workflows.get(coordinatorFile));
       assert.match(
         validateWorkflows(workflows).join("\n"),
-        /calibration must precede the sole frozen-candidate source proof/u,
+        /frozen candidates must reuse the pre-calibration source-stabilization proof/u,
       );
     });
   }
@@ -4202,6 +4396,9 @@ test("exact-head source proof owns Windows path and native-staging harnesses", a
     ["job becomes advisory", workflow => {
       workflow.jobs["windows-native-contracts"]["continue-on-error"] = true;
     }],
+    ["cold-build timeout is shortened", workflow => {
+      workflow.jobs["windows-native-contracts"]["timeout-minutes"] = 15;
+    }],
     ["checkout stops using the resolved head", workflow => {
       workflow.jobs["windows-native-contracts"].steps[0].with.ref = "dev/codestory-next";
     }],
@@ -4242,6 +4439,59 @@ test("exact-head source proof owns Windows path and native-staging harnesses", a
         validateWorkflows(workflows).join("\n"),
         /Windows native source contracts|Prove Windows path and native-staging source contracts|Windows path and native-staging contracts/u,
       );
+    });
+  }
+});
+
+test("Windows-native source receipt stays exact-head and contract-complete", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "source-proof.yml";
+  const receiptName = "Emit authenticated Windows-native source receipt";
+  const uploadName = "Upload authenticated Windows-native source receipt";
+  const receiptMutation = (workflow, from, to, label) => {
+    const step = draftStep(workflow.jobs["windows-native-contracts"], receiptName);
+    const before = step.run;
+    step.run = step.run.replace(from, to);
+    assert.notEqual(step.run, before, `${label} mutation did not apply`);
+  };
+  const mutations = [
+    ["dirty checkout is accepted", workflow => {
+      receiptMutation(workflow, "$dirty.Count -ne 0", "$dirty.Count -lt 0", "dirty checkout");
+    }, /Windows-native source receipt must bind the clean routed head and every proved contract/u],
+    ["routed-head mismatch is accepted", workflow => {
+      receiptMutation(
+        workflow,
+        "$commit -ne $env:EXPECTED_HEAD_SHA",
+        "$false",
+        "routed head",
+      );
+    }, /Windows-native source receipt must bind the clean routed head and every proved contract/u],
+    ["receipt schema is changed", workflow => {
+      receiptMutation(
+        workflow,
+        'schema = "codestory.windows-native-source-proof/v1"',
+        'schema = "codestory.windows-native-source-proof/v0"',
+        "schema",
+      );
+    }, /Windows-native source receipt must bind the clean routed head and every proved contract/u],
+    ["one proved contract is recorded false", workflow => {
+      receiptMutation(
+        workflow,
+        "native_staging = $true",
+        "native_staging = $false",
+        "contract boolean",
+      );
+    }, /Windows-native source receipt must bind the clean routed head and every proved contract/u],
+    ["artifact name drops the exact head", workflow => {
+      const step = draftStep(workflow.jobs["windows-native-contracts"], uploadName);
+      step.with.name = "windows-native-source-proof-attempt-${{ github.run_attempt }}";
+    }, /Windows-native source receipt upload must retain one exact-head attempt-qualified JSON artifact/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
     });
   }
 });
@@ -4550,7 +4800,7 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     ["package mode enables protected Linux proof", coordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].if = workflow.jobs["linux-vulkan-proof"].if
         .replace("needs.route.outputs.mode != 'package' &&", "");
-    }, /package-only and qualification modes must skip coordinator Linux proof/u],
+    }, /package mode must skip Linux proof/u],
     ["calibration mode restores hosted Linux CPU calibration", coordinatorFile, workflow => {
       workflow.jobs["calibration-linux"] = {
         if: "needs.route.outputs.mode == 'calibration'",
@@ -5727,6 +5977,91 @@ test("post-publish proof uses an immutable real Codex marketplace install", asyn
   }
 });
 
+test("post-publish installed runtime proof survives one real restart", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "post-publish-release-smoke.yml";
+  const proofName = "Prove the catalog-resolved published runtime";
+  const mutateRun = (workflow, from, to, label) => {
+    const step = draftStep(workflow.jobs.smoke, proofName);
+    const before = step.run;
+    step.run = step.run.replace(from, to);
+    assert.notEqual(step.run, before, `${label} mutation did not apply`);
+  };
+  const mutations = [
+    ["second installed-runtime session is omitted", workflow => {
+      mutateRun(
+        workflow,
+        '"${common[@]}" --out-dir "$proof_root/session-2"',
+        "true",
+        "second proof",
+      );
+    }, /must execute exactly two distinct sessions through the common invocation/u],
+    ["both installed-runtime sessions share one output directory", workflow => {
+      mutateRun(
+        workflow,
+        '"${common[@]}" --out-dir "$proof_root/session-2"',
+        '"${common[@]}" --out-dir "$proof_root/session-1"',
+        "session output",
+      );
+    }, /must execute exactly two distinct sessions through the common invocation/u],
+    ["restart receipt helper is omitted", workflow => {
+      mutateRun(
+        workflow,
+        "node .github/scripts/restart-survival-receipt.mjs",
+        "node --version",
+        "receipt helper",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt helper becomes advisory", workflow => {
+      mutateRun(
+        workflow,
+        '--out "$proof_root/restart-survival.json"',
+        '--out "$proof_root/restart-survival.json" || true',
+        "advisory receipt",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt omits catalog delivery state", workflow => {
+      mutateRun(
+        workflow,
+        '--catalog-delivery-state "$CATALOG_DELIVERY_STATE"',
+        '--catalog-delivery-state omitted',
+        "catalog state",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt omits delivered installer identity", workflow => {
+      mutateRun(
+        workflow,
+        '--expected-installer-identity "$DELIVERED_INSTALLER"',
+        '--expected-installer-identity omitted',
+        "installer identity",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt omits source-tree identity", workflow => {
+      mutateRun(
+        workflow,
+        '--expected-source-commit "$source_sha" \\\n  --expected-source-tree "$source_tree"',
+        '--expected-source-commit "$source_sha" \\\n  --expected-source-tree omitted',
+        "source identity",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt omits the final session timestamp", workflow => {
+      mutateRun(
+        workflow,
+        '--session-2-finished-ms "$session_2_finished_ms"',
+        '--session-2-finished-ms omitted',
+        "session timing",
+      );
+    }, /restart receipt must bind both sessions/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
 test("post-publish proof keeps every release asset on its protected accelerator", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 
@@ -6534,6 +6869,54 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
     const workflows = loadWorkflows();
     mutate(workflows);
     assert.notDeepEqual(validateWorkflows(workflows), [], label);
+  }
+});
+
+test("post-publish closeout authenticates cumulative reused release cells", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "release.yml";
+  const closeout = workflow => workflow.jobs["post-publish-closeout"];
+  const mutations = [
+    ["container digest comparison is omitted", workflow => {
+      const step = draftStep(
+        closeout(workflow),
+        "Download and verify selected cumulative release cells",
+      );
+      const before = step.run;
+      step.run = step.run.replace(
+        'test "$actual_digest" = "$expected_digest"',
+        'echo "$actual_digest $expected_digest"',
+      );
+      assert.notEqual(step.run, before, "digest mutation did not apply");
+    }, /must reject a selected artifact container digest mismatch/u],
+    ["selected containers are flattened during extraction", workflow => {
+      const step = draftStep(
+        closeout(workflow),
+        "Download and verify selected cumulative release cells",
+      );
+      const before = step.run;
+      step.run = step.run.replace(
+        'destination="target/release-cell-manifests/$artifact_name"',
+        'destination="target/release-cell-manifests"',
+      );
+      assert.notEqual(step.run, before, "flattening mutation did not apply");
+    }, /must create one exact artifact-name directory per selected container/u],
+    ["post-publish producer map omits the preflight reuse selection", workflow => {
+      const step = draftStep(
+        closeout(workflow),
+        "Authenticate post-publish Actions provenance",
+      );
+      const before = step.run;
+      step.run = step.run.replace('  --reuse "$REUSE_SELECTION" \\\n', "");
+      assert.notEqual(step.run, before, "reuse mutation did not apply");
+    }, /post-publish producer map must consume the preflight reuse selection/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
   }
 });
 

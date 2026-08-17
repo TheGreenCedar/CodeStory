@@ -1,6 +1,6 @@
 [package]
 name = "codestory-retrieval"
-version = "0.16.3"
+version = "0.17.0"
 edition = "2024"
 
 [features]
@@ -8,6 +8,10 @@ test-support = []
 # Measurement-only surface for the offline vector-backend bake-off. No product
 # binary enables this.
 benchmark-support = []
+# Development-only capture of the dense lane before abstention. This exists so
+# calibration can observe the full candidate window through the real embedding
+# and retrieval path; no product binary enables it.
+semantic-calibration-support = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -33,3 +37,7 @@ tempfile = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dev-dependencies]
+
+[[example]]
+name = "semantic_abstention_capture"
+required-features = ["semantic-calibration-support"]

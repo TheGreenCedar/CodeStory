@@ -1,0 +1,562 @@
+{
+  "schema_version": 1,
+  "capture": {
+    "source_commit": "56f6b97230fec643d68639da1bf714a6169576b4",
+    "capture_feature": "semantic-calibration-support",
+    "cli_sha256": "afab00abcae9b44895abf5801f33c18495d01a7459957e5dcec9799c355a7812",
+    "vector_generation_manifest_file": "vector-generation-manifest.json",
+    "vector_generation_manifest_sha256": "e3e4b130cb30669e0a09056f94104d8712e38d34c71a23c0bf1072c27c372fee",
+    "vector_database_file": "vectors.sqlite3",
+    "vector_database_sha256": "6b0a60e3a4af5e44cdae214b110c80c054afdf46f082754e4efc9a8684fdb826",
+    "capture_command": "cargo build --locked -p codestory-cli --features codestory-retrieval/semantic-calibration-support && cargo run --locked -p codestory-retrieval --features semantic-calibration-support --example semantic_abstention_capture -- target/debug/codestory-cli <output-dir> <source-commit>"
+  },
+  "fixture": {
+    "source_path": "crates/codestory-indexer/tests/fixtures/call_resolution_comprehensive/rust_workflow.rs",
+    "source_sha256": "afb4d70c9aa27943c68c7ee4b5161fcc049f5e0a11004f0f4540dfe156cb8c03",
+    "edge_contract_path": "crates/codestory-indexer/tests/call_resolution_common_methods.rs",
+    "edge_contract_sha256": "c741ba539dec194a55a82f25700c619c07416671e5433c1650ae344682f1b506",
+    "transformation_id": "rust-public-owner-anchors-v1",
+    "materialized_sha256": "32a6401044352f49756099694ddb2872075e83e5aee697c3020838bd9146a24a",
+    "disjointness_manifest_path": "benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json",
+    "disjointness_manifest_sha256": "0ab74fcbcc16e2bd4449b0a13146dd38b3bee7a4e63cd2c62d6bfa0ae047933b"
+  },
+  "selection_contract": {
+    "baseline_relative_percent": 50,
+    "absolute_floor_hundredths": [
+      10,
+      15,
+      20,
+      25,
+      30,
+      35,
+      40,
+      45,
+      50
+    ],
+    "additive_margin_hundredths": [
+      5,
+      10,
+      15,
+      20,
+      25,
+      30
+    ],
+    "max_retained_growth_percent": 25
+  },
+  "queries": [
+    {
+      "task_id": "dev-workflow-notification-flow",
+      "query": "how does workflow execution notify observers",
+      "query_sha256": "da5de3d72d242a9a2c7a5f1eb2fa2bd340f1a1eca3f85acde3eb11cec120ed8c",
+      "query_vector_sha256": "a625e9135d75eb4b4f1e3062283727d2e8868258893269b707d52c08d4b5126f",
+      "query_vector_f32_le_hex": "8308003d93a6343c775d78bc9da3c9392bea563d312469bd1cec783d6c27e13c5ab147bd226f973cde44873cf6fa8ebc626bab3c77ab013da28a6abdaa4d4bbce80f0fbd578e6e3ce2f552bb2af881bd727af9bccf0f883df1518fbb0ade713cd6ad703dd634943c9d54fa3b131396bc171cd4bb546009bd0deb5abb1a05373d44ea83bb44d5663c566855bc8b94fbbbfb49d23c5fdcd03b9c1a823c4eb494bca18c1bbde449283cf63b8c3dcac35bbd78648a3c66ecdfbc5e8ca83c9787cfbc4ed85d3da9991a3d72d14bbdac55d2bc4e180c3d2a8f663d90e2453d467f9a3d2fdbed3c4018483dfe6fb93c12af273a468d873b128fc2bd11d464bc5e1802be460202bd2d0e74bc025043bdcd4518bd5337033d4da98d3c900008bb993c2b3d57d42cbd37bb253d7f26da3c71a50a3de096a43cd261c6bbbdae9e391b429dbdbdc6023d688005bdaecf93bdccbbc9bcd2b8ff3cb00a9f3cf251bcbcf5f82c3d3202c03ce25ba43ca9d9bfbb208b4cbdc36bbabc351cc7bca6c689bbc76080bc2ebd1dbda4a77ebd058c533c1a9f3dbc480d4bbdcb306b3d0eb94fbd07709cbc6adf8a3d69c4ddbbb99bbebd430d0bbca3a867babf347e3c80e79f3cff7fdb3c3b732abd45b6453a44e8d23a28da2c3d7fb5cc3c47a739bd32b83bbd1517d03c519ead3ca0439a3b0a3ef2bc9545b7bc093357bde5fbdcbc8ac76d3d61e5d43cf7bfaebce313b7bc9141873d956cedbcd84c4cbd6c87e4bbd1d5c7bc200c2a3de52cdebc2b5224bd147d633d65ed94bd09f3913c6048823c231783bc6f6f87bca45b403ca4a38c3c32c129bcaaad87bc860f9dbc9f4fe8ba372f2bbdcb40243d98ac3dbdde628abd7346743d554cb2bcf05fe33b0cab65bca4180dbcc4f30e3ce51aa63c617e08bd7bb6d83c663f823cd6e15cbdb84037bdd730eebbbcff09bc9d95853d8ee4993cc655c1bcf01c3abd97b9123dd0e12c3c7ad6173dc221a03d52f4173cb112173c20e3a9bcc90f33bb5f48933ca0ee9cbde20ca3bcf8a332bd57e31a3dd55370bbf14489bc387857bc249f48bc7d589abca4e88ebc89ba9b3c1f71a9bcbd1b80bcddb06dbdd4f3ce3c302e61bc851eebbcbd23983979b497bc2ea09b3d8ee7393dd0dd9fbdb475613d08ef503ba3bf703cf14b253dadb12c3d9d0aa6bc7f167dbc0e6842bb7d94bb3c31980f3d27875e3c6d94963b6a92e93c690df0bc91b4253c6286933b1d3174bc0bc3bf3c878b72bde6d1f33c6d35b13c4b39d1bca200b3bc96192dbcaa2eb4bcc00680bce9baefbcca3c2ebd20d4d5bcb15d933ca7efdc3af9e5b3bc0188053de6d06b3db1a5b43b2ebb723c7a2ca63c837b933c15a3b63c30df04bd1240abbcc51301bdf7e9323dbd59113d3e3d933ae47a2e3ce39f10bdf8033fbc3ef2863c97935cbdbb768bbd1ce3013cef7e19bb96f6d2bcf514373b756cdcbc740b10bddd17253c287395bd130cb93c4ee515bd0919b73d7ef1633ce30a94bc92d31f3d8762943cc15938bd3a34ba3a67d720bc569a6abdf991bc3c33f021bdf1e09d3df97332bcfa6a3fbbf9b7a2bd4e57523c17c856bdec32d93ab9a860bdad01283d5e960c3ae0762aba52ff8d3c0504793bd137a4bc6278ecbce669dc3dfb67023c14ada9bc8bd3c33cd2e8543c117181bdab827c3dc6d5b43bd449423cc998f13d661b513daa3ff73ce490a0bc2904913c3e19cf3c8e4706bd127804bdeac1a73cabd08b3db76f60bc793a72bcd4bfc3bb947f0f3c303193bcf497153d06c71b3db1c987bd23d39a3d566098bcedb8dc3cc6686fbba742eb3c8b5324bd810b5c3b4d0da2bcd2d9223d24b986bc5ef5923c8dad983d2e7d39bcadfbe2bbfb5f33bd39a99d3d9090aa3cde50603d4817553c05c68fbdfca3483d3473b93cfd38883cc1e73f3c3ee8353bb262303d0afa33bd3418623c2fa332bc06df4c3c0b7f13bc80083dbd65405ebdf9300e3d260ecebc4311723c17082fbca378203d9bb7acbd668cad3cd4d020bd07798e3cb51f89bc2e91f0bd1b74ecbbd1ddadbd7a76d93dab405d3cf0b2953ca28b7c3c8ab3b8bc7dd7303c0f56d4bcce753e3da263403d273399bcaae07abdd88d94bc32d756bd600895bcc81e863d417ab7bcd1ce08bddfb1073dd080883cad4770bc1beb4cbd23a1713d25a194bc1a40093d3e66373a57a70d3c2ea9cbbc58dae9bcd49faabca9781bbde58fa9bcd59d573dbf5f51bcfc92243bdae5d03cf228263d905f20bcf7ad273dc5c26ebd8f19143dadd3d3bb285e6b3d796cb9bc8f742dbd4975243de252193de537bcbc1e997bbcf4c9a9b8117233bd448b7abda3a5853c7a1e023cfdbc013babbf1fbb81389ebd9791ae3c7e93c9bbf54b093de2478f3c38be8dbca1781dbd8cf89a3cd116a7bd34de88bcd3e784bc8ac12b3c17510d3df619293da02c413d322d2b3cc9e95abdacce08bce024d83c66dae23c936905bdaa47123d4c96443d1b980b3d475b47bdc80bca390121e8b9769d9c3d716e9e3c01c56b3b53401fbc04171d3ca661463c9526d53a930b343d58bb15bd79f6583c0753ad3c55d4413cbd97023d2349a3bdbedef03b590b89bd446f14bb4766113d581c20bdbf4cb73c0cc75f3dcb1780bd7f9f633b6f74613b72399e3c3232b9bc065ae5bc59db37bc8d1e45bb9f1005bd25cc303b23a56d3d30f2133cbadb963d99365f3d306f553c0b85cbbc6c7bbdbbd37ed93c623b8c3cf8a0a73bcde34d3d92cfa4bc5c241f3b8be1b63b315800bd829cfe3c0453bd3b20976c3dd92f9bbd34240c3dda25353de88613bd2e08373d748bc4bae960f0bda7f0303d9ebec8b994230f3de758603acee25f3d460e00bb6dfc8bbd372ab53c1552e1bc4d5151bc9f6c203dd61f24bb31a5653cc0791ebd55d2efbc0396033d24aa80bb94b643bdc98137bcc8a47f38686b2d3d727d253cd3b2ae3b1ea727bd5a7614bbd7d88abc913d8b3b93c72b3d999e223d90fa2dbd150a43bce58b81bc306cca3d18f0923c74e6453c3cb73a3d180f933d14fb683da72305bd99e325bd5e48d13c0a5f983c6db0923c43a72f3c49e788bca23b583cf996c0bb28c8d0bc71bd703c31ce9a3c4d06003d7236bd3b4f8d9e3c48cfb13d0853653d95396cbdbb0d77bcd7bf91bd076511bd085ad53c2cdf033d9bf97d3dd0238abcaba31a3d8bb70cbc16bfa13d39967dbca15382bd9b63a03c1a209b3ce05cd03cb3754bbd21353cbd5c6184bd1810b8bcdaa58dbc35f7c53cf8ef8dbd675a083c8e94bf3d459492bcffac743db72e08bcb42a503d46e4c9bccd36bbbc408d563d7696b33b4fb38cbc4333763c193e393caeb4d3bc330d073cdc141bbddb606d3c4ce6273c9a4f75bdbf6300bc4b34193d47593bbd83bf26bde6dd843d2385a6bdef6bc4bc7b051f3d947886bdfed6733ca3cf76bc861bad3d9c519cbc538d99bc3380693d7c3367bb2d621ebd9aee3d3d77f80a3d4e6c033d2cd44a3ca9779fbccdc824bd7b8822bd106d9f3c00d4ba3cb20cde3cdce5883d97ea8f3ba2e0b7bc7972b4bc81503c3db4cfcfba1941a03ddd9609bd44da66bcb70727bcb32a50bd4f486b3ca6a1063d886410bd67c4003b5cefbb3be24a3cbcf94beebcbe08d5bc1c66f7bc137f04bc40c39b3c93877f3df78877bc59e4283d80b58abc725aa5bc5fee553d4e87d73c0d18123dfea490bca440c33c28720cbd5115ebbc3fa9903c866b64bd7a69ff3b5ce4443cdbfb3c3b0b51403bf28be6bce3c9433d7041463d4cb51dbdcdf8a13cbdc9d23ba198dfbc4df516bcad11efbca81d833b5b6ad6bcb70cb33c9f1a5aba4c7d3dbd88cd613d581942bb8d4fc93b4754be3c3e0421bdf7d011bd53185ebc058d223c705026bd1fd8dcbc4fb921bc4e64f43b3d96333dd878af3ce7bd35bd9b89ecbcd919943d0e4af43b991e49bc0eb837bc7229c7bc2829193d6e2ef23b5fe77ebd103893bcd75121bd732d89bc1858a53b244001bd46fdab3c8d7cd4bb68fd44bd99cd6d3c90f790bc950c1d3b95dfa0bc3e170ebd0ce3ce3c24a2db3c3b26d53c4bea003dd0e79f3aa6281b3c949677bc978703bdd914363c3183e83bfcf5793cbff137bd080b71bc41a576bbb5d559396eb0453d31a79cbc3069aa3b7fac943a6d9265bcd65c36bbb66a8a3ca7a278bddbb9223c8176113de04801bd8bb7ad3c13170b3d21a1733b7c3becbc2af4863c6f903b3baf635c3d0c5b2fbca540acbc27c2823d8e1634bd205186bc1454abbc0a8dbdbc8976febbc40fc5bbb9e04ebbdd9ebebc4a3a22bc4fd0b63c7367cebc4382e0bc54bd913c60c8a23c6335893a99bd2f3c",
+      "expected_call": {
+        "caller": "run",
+        "caller_owner": "Workflow",
+        "callee_owner": "Notifier",
+        "callee": "notify_event"
+      },
+      "noise_nonce": null,
+      "candidates": [
+        {
+          "node_id": "4154321434010363626",
+          "document_hash": "3cdd8703e9d1e01b",
+          "display_name": "EmailNotifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1054846801,
+          "rank": 1
+        },
+        {
+          "node_id": "-7268165071706662718",
+          "document_hash": "6d7b4fe0499adf50",
+          "display_name": "Notifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1054409811,
+          "rank": 2
+        },
+        {
+          "node_id": "-6610728582579257779",
+          "document_hash": "add6f275e535c0a9",
+          "display_name": "Workflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1051787343,
+          "rank": 3
+        },
+        {
+          "node_id": "7843474940925757561",
+          "document_hash": "2d748912801084ed",
+          "display_name": "CheckoutWorkflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1051280507,
+          "rank": 4
+        },
+        {
+          "node_id": "2614172058490045527",
+          "document_hash": "bc329ad7a320a4e7",
+          "display_name": "MemoryRepository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1050916262,
+          "rank": 5
+        },
+        {
+          "node_id": "-4072284965942301196",
+          "document_hash": "ddee3c8cef428776",
+          "display_name": "codestory::component_report::dir:.",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1050116205,
+          "rank": 6
+        },
+        {
+          "node_id": "-6811065897980305788",
+          "document_hash": "f66bbbce9c36904b",
+          "display_name": "Repository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1048926716,
+          "rank": 7
+        }
+      ]
+    },
+    {
+      "task_id": "dev-workflow-notification-delegation",
+      "query": "where does a workflow delegate notifications",
+      "query_sha256": "ca06b6e207843a1cd585dc775c80ee5d91a133ea8a0609fad2878fa95accec7e",
+      "query_vector_sha256": "cbb1ad4f90e756ca84946fe370fae70dfb5f79f585e47cdbbd17be5abe9f3810",
+      "query_vector_f32_le_hex": "699e913d2e09fd3c6e34c6bc193a04bda5fcc53cbf8207bd9fd0813d86b43c3dead890bb6bf430bd2e390c3dcc09143d0770563d73cf0cb9769947bd642ab5bc5ab4b73cbcf28c3c4b69533df78b1bbd200da2bd9de2c83cd139a7bc86e8673b5709033d3a235a3c34f1533d11eb50bd34c12abd649794ba7a01b7bd08ad5e3dd7c4f03a54325c3cec7193bc470017bc2e9e1abc19be4f3d3e0d1d3d938f40bcbff234bce1a50ebc473b5d3d99ff40bd4a98153ddf8e46bd631150bcedcf49baf865b13b18067b3c2c3d12bcdd273abd6fb41cbc7126cb3dfeb66f3b0d15b93925d68c3bbb3bdc3b1453aa3bc51dbabcdec7263dbebeb23c6854b53c9f02febd373d5ebb1809a13d0551acbd6c5de5bc3b16adbb906b1c3c8e39b9ba50241e3d8dd30d3d8b160ebdcbabbfb96f4744392545953ce6638b3d19b031bbb24475bc3be7083ddee6acbc5f1c85bc4ec028bdf774393dfa356f3d9177523b934c313dd79e003d33e156bc66cb413b0c40d8bc967213bcffb291bdba2a253ca55f6b38218bc0bc3428c8bdcfd0363ccbd5dabbee6656bd6422cb3c1b25adbc1ae5663c1e246b3d704bddbc9693a5bd4543f83b90f8343d8bef0f3db0ad053d538407bd15b892bdcbcf30bc30bf843d0e77f93c2627ea3c57284fbd11af54bc217b9d3dfc48afba977711bb97e57cbda3bddbbc1c8e39bd0c681e3b3a7d55bdf9bc253d66c7133ce2ebc13c355b843da3633dbdff2822bd1bcffabb5ddbecbccffb893c5385d43cf98e5bbd541e19ba096f08bd3558c4bbdad802bd4d4ba8bc28696bbd7e78243c798e4abc91207e3df02766bcc956a4bca5b621bd2df6d6ba6381483a4a59d2bd4a871abd9b80813c3618813c22bf2ebbfc1ed23cc4c33bbc29c54c3d75268bbd50bde5bb5cffbf3ca67f023dbc09593d944342bd9d0db3bc0720253d5229be3b04fa793d4ec23a3c6c556fbce5f614bcf0cb0cbd0180b7ba638a7b3d3f600c3dddf798bb37c3083d86ba873c53451d3db270e93aa1d56fbc6b91ecbc968a583dabff083c3b5e6cbc61d18abcaaee3a3c20deb9bc5721913b3b1c603cac0bea3b96aadf3ce1bab0bdd7cad73ca212f43c7f836abd99c0c63c92b754bcea9b4e3df6cbeeba5889313bffc6303d00a3263cd388173dffa6993cd92a463cb633b23c4b056b3c4521cebc30dbcebb5c878abbaffb973b2e005a3966444e3b029934bd36c75a3d75b3273c514619bc207433bd13d390bcc4188b3d64ca1f3c86720abde2dc1ebda552bfbc83ea16bdd05b07bda9183a3dcda44ebdeeb742bdaeb7743d2590013db556e73c054f103d40299b3d28a6dcbc41ef1e3b1adea03c8bb762bc90d0a53c3aa897bda1fa803c1c45163c5391303d43b6febcef4eb9bce5ae57bc37338d3ca4f37fbdcce49a3cedac0bbddd374bbcad831e3da44a2ebc8b1c2fbd9f8831bd172205bddb5175bddf5cdfbc95af22bd2cd8543dc5d167bce4392a3d31c123bdcf07cd3c276684bc8578e93c3d1eedbc296e183ddeba1e3d4a5d2dbde771e9bba15397bcc08fbe3d93822e3c00de923c8a5cbbbd8e9d803d6234db3c59645f3d4d8b70bc900018bc2471cd3ae6016bbcad96bf3cd7af5e3d595bbc3c35f6b23beb2acb3d5a4f703cc9e9c4b8bdce463d08e7103d02fc2cba12a0413da8ce72bb2162c0bb7f78783df9343ebc300a103d230e523bd09a1f3ddc68b13c665a3cbd33f6c4bc3d60093c66ed143daf0898bcf413cbbcc76f8c3cff43643d6154c9bb5fcaa83c1cb832bd1716c0bc5f3baf3c9e1817bd5af5e03cd6d4393d8add303dd2500bbcb4c902bde784df3b1e279c3dd97885bc279986ba956b353da4419dbb8c4f93bb4d152dbd524e783dcd1cd2bc93a2413d49b5dfbce2ea23bde0388d3d60e40f3d5417fd3cbac78ebc2d0156bc11392c3ddff135bc0ce6fc3c4d10613c391937bda36c153d261926bd6aad37bcf91e3abd3dc60bbd4b3b16bdfcb2afbcd4e9433b3ce6d9bde3c580bcadef5abdacd9073c4e6207bcf74e3ebd8ac61f3dbe4897bd0575c73c107a87bc2d5ccd3c5cd14c3cac5803bdf17a213d9d4416bc9e1a78bc5ac9b63cb3776fbcd261a43c2353cabc673b6bbc4d1fb6bd09d6b93de0464cbdb81f083ca754023d2209c83c333e293bd3152abdc2b7913d826e90bdf5a6933bd766483c32661e3d859930bc49cbcfbc4593a83add4730bd6e248fbc19e18f3c874405bdb8e3c53c87389e3d5e3a193c541c713de4d48d3c8ec246bcac73853c09f459bbceef84bba5c5ad3c4600753c7938b53cfa68e43cb4826dbc42b0023d6c6d5a3c7f9c77bd6b68e2bc9e98be3ce2d595bcc770b7bc255a0bbc84a81abd1ba49b3c99e2b83c4c18333db48d6c3c6656ad3ccfe1b4b9fe338aba6013cbbcf54d20bc83045f3b875b883ce8b9f3bc1a14523c5f945fbc3214f13ab86551bb5484bebbeb0a45bdf64867bc490b16bddae5463ddfe7053c5ddaf9bc3c4268bcb16684bcb91e2ebcc19bb03a1edcac3c7083bc3c93dc183da24678bcf2ce003d7a8f313d0af5b7bc1ef42bbdb26e8a3dfd03dfbc43004d3d27879a3c306cf0bdeddf28bc03b56ebd3bb6e13ce4a9313cc51330bb2ab988bc76ae113d17e5cabcdfa3673bd22b2bbdceb9e43c81197e3c505424bcc0a101bdb17b95bb49040bbd237ead3c85244e3d06d538bdf4f48cbb16932d3d485fd2bb2dfbc53a1ac36e3c25311b3d0040a73cc5c50d3d6b67333d9fe05ebd6d3b423d9f4a8eb9fea191bccb87cebc62df63bdd9cd0c3d049e77bda03c95bbfd9659bd1b3091bb8f4b873d8342d3bcefe5b2bde651013d872b1f3a88f7d33c167c383d11768a3d002bcb3c9cca08bd130411bdb57c19bcf7b09bbc369b993ce75d22bdec05b53a8075d2bbab9878bc805f783a7d3dae3c7c5f81bdbe59823ce00a07bd3e52553ba297c03ba53e0abc853e44bcf79f66bbf3df093dcde0133cd3c6c33c8742bcbb71590cbdc390993b8649583cd145a83dc899f9bc9882193d951b833ca15a363d03d29a3a2a0ce6bcadda2bbc8d480cbd3694cd3c545e3bbd5c8b86bda7bbd43ca45ed73ca39688bc29ab6dbd59ecbcbc2b7f6a3dcdc0c23ccdcb90bb9499b53c003c6c3d4790973c403ec5bcc614caba141fb4bae56c723c1c14abbbb0054a3d71ee99bc8c4783bcf987ed3c8935ce3a8b04183d1d7f283c579e493c007d0b3d7a6850bdf267c1bbbbe5b0bd709980bcec9c39bd94a113bd4c8d633b1f91633c3d835ebcd79a293d7923c23d6a04433da72a823d200e48bda7a4ea399719e63ca73269ba10cfd73c944ab2bb126f363c3ec71b3dd88005bdb8575c3d6a10e93bdc7d59bd2fc0153d6c1f983ce68e60bd8fe607b90fef5a3c2041b9bc5cf3dfbcd804283da2ea80bd3c037f3c8376173d0d618abd51c85bbd069ba9bb04ed903df761993c8b9243bde00a483d36309ebc6e2438bcdca5453d4d1134bd2e54cebc66639cbd3c3f44bb156ea63c981a41bd64acb33c3e520d3db8ae2c3d523d6a3de4c06bbd9369ecbc26c9c8bce6f89e3d895ba3bb227a233d7a6aa43c9d08a0bcd87133bd5177b0bd9f833e3dd3c4a3bc3069cfbcd7f56e3c60031abd5ed0c6bcc9ba83bb39949b3cc245023c4a045b3da013843cd5ea203dd3139e3b46185b3d5ab1263cd5bfb73c28cb1f3d97e3c83caab2c33b14d10dbd3945553c9064a6bc42232aba4005d73c434a03bdc5400d3d4621abbc8e66d23c433561bc35a496bcd1f4563dcf1ab23c18065ebdd9e138bc82be033d1d2a34bdafa266bd0b72fd3b6e53d0bc5be5debc3feb773d5c36863b949318bb1625b4bcdb5d1a3d64eb7e3ca2c5ccbb30b890bd04103dbda50a88bd88f6013d2a1507bd383e35bd993151bc0be528bc89b597bab4d0493c8c3f5ebd929e013b27c3cc3d86ef783dff49233dd27003bddef376bda809813ce6200c3c1fb82dbd8039a1bc16ab37bc456ee4bc47acc1bc1e5e19bc68fa0e3d17084aba6d7716bcfe77083db6e38339907fd13c24e9dc3b649d003d03f974bc97b48dbc97ba973dd970ae3c3906e43c529ed4ba968e0b3d43e204bd6e79cfbbedec49bc8357af3c2b80cdbc518d27bcca47863c1b9350bd8330c63c079ada3cbd2a67bd825051bd495b68bd6b960a3cc2a90dbb0fcb66bd7b91f53c5e191abca10ea0bdd051d93b5910113dd0802b3bd527a23a449e2f3b78664bbd9a39bfbbcbe34bbcb6cb9fbcf94ba33ae941f7bb316cdabc7bf9adbc1d5f3ebbad48f63ce4e5bd3ce1cc45bdb3f7d1bc3d611cbc247d43bd8de9b43b332d583c422fd03afe718a3da94f923b8a061bbd",
+      "expected_call": {
+        "caller": "run",
+        "caller_owner": "Workflow",
+        "callee_owner": "Notifier",
+        "callee": "notify_event"
+      },
+      "noise_nonce": null,
+      "candidates": [
+        {
+          "node_id": "-7268165071706662718",
+          "document_hash": "6d7b4fe0499adf50",
+          "display_name": "Notifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1053722782,
+          "rank": 1
+        },
+        {
+          "node_id": "4154321434010363626",
+          "document_hash": "3cdd8703e9d1e01b",
+          "display_name": "EmailNotifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1052859687,
+          "rank": 2
+        },
+        {
+          "node_id": "-6610728582579257779",
+          "document_hash": "add6f275e535c0a9",
+          "display_name": "Workflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1050829523,
+          "rank": 3
+        },
+        {
+          "node_id": "-4072284965942301196",
+          "document_hash": "ddee3c8cef428776",
+          "display_name": "codestory::component_report::dir:.",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1050185286,
+          "rank": 4
+        },
+        {
+          "node_id": "-6811065897980305788",
+          "document_hash": "f66bbbce9c36904b",
+          "display_name": "Repository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1049935432,
+          "rank": 5
+        },
+        {
+          "node_id": "2614172058490045527",
+          "document_hash": "bc329ad7a320a4e7",
+          "display_name": "MemoryRepository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1049108889,
+          "rank": 6
+        },
+        {
+          "node_id": "7843474940925757561",
+          "document_hash": "2d748912801084ed",
+          "display_name": "CheckoutWorkflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1047617675,
+          "rank": 7
+        }
+      ]
+    },
+    {
+      "task_id": "dev-workflow-repository-save",
+      "query": "how does workflow execution save repository values",
+      "query_sha256": "13f755f65f4f7af027bb2dde875b3feb5095975ad6a02ed9c190b29c400d9dc9",
+      "query_vector_sha256": "f617f17b9db9529dcdd25a34403390cd59fb199318e0da80e8dc630552fd3aa8",
+      "query_vector_f32_le_hex": "789ac8bb8e21ab3cf8ddb1bcf22ba0bc3f04963d6ac268bd7f287f3b53adf93c1af424bdc8a3f13ca72ca3bcad090ebd8e6db9b9bc34673c317a12bbf6a3f33c72f0003d338b033ca84dfd3b8fd1fdbb28bc69bdc066ac3c677a25bbf759413d3ea5983d645495bba3e4cf3c0a9239b8741e51bded5601bb6ee788bc5b2a403d5f73413c5fd58e3cfc57afbc91c9d2bbf90bca3c660fb43aec319a3dee8d19bdbe88b4bc4c8ec4bc7909673d96d99ebc1e14c9ba9e882bbc92680e3d3ce85cbd172aa23c2960593ddd8b3bbd48048abddfa032bd592f143d39b4603decfc67bc38236a3a9138b53c4512893cdf483dbc85e8703dbb5548bdcfaf2fbc035292bd1ffa19bac167d33cf657d73c0dccc13c70140e3d600e3c3d89c8a1bb8ece633d380f4a3cba3375bcb7f6243d2483733c402eac3c2297d33cc86ce1bcd1d8a7bc27f1c83c30cdcebbfea9bfbc2ffadb3c247e8e3d5985883d30ee42bd236d9f3c8dcbb7bcc0fd853d685b92bbf2c82cbd9f4bd1bcada880bcf56882bbae371d3d9066763c7f85b93c3c5b8fbbea8d19bcddee7cbd9700553c570f20bdc9ebb2bc7566ad3cb6fa3a3d7c9722bd1fb6233dec3f023ba8b80f3d70c3863cc96fd63c8ab6e8bcb0904c3dee9b583de698953d6396263dd195853a72cf0bbd71ef1b3d3804703c40400d3db8c888bc97dd3ebdde4e4ebd54cf56bd405f8b3cb8ff483cc5f87d3c65d4133dab665bbab0d4ddbc6f4dadbc0d7a733b3bd49fbb1947f5bcb53058bdc8c45f3b51122e3d41ee1dbde1312b3dbd153d3dba32c5bc883f23bbd197d3bc9e3de4bc1bfe36bd9539d73c054650bda4dbcd3c4fe5d0bb2769de3bcf626dbd142da03cb482493c6126c2bbae46eabb2aaf943c1c80d9bc2ffda83c9d2aa13d138220bc4e891b3de9a38b3da2cd6b3b51cf41bd66abb3bc7f9130bdd55fd03cb059fb3ce6b4453c9c1da4bb80da7e3c2e69933cda22773c71a1033d82e35c3cf824a63c53d2433ccd33aebc19f9323d1fe12f3c2458b6bc6508d5393d113a3daeee04bcb64c0e3c75c0503da0a4b6bce4ce00bd2c75253c3c9dd43bbd18e1bc81d8d2bc6405a7bcc89749bd643bb03bf684243db28b3aba575e4dbdb895ce3da90e9b3db1a323bd646b383d54a1ad3ce483eebcbb8040bd8f81e93c521184bb82fdd4bc7c9a67bc4a591e3dd0bd953d1a4adf3c36c0913c7773433b1e8a1c3baf59523d7d5f873d4cc070bd3c569b3dba9dfabdd7cd723d0d85b43c36d810bd442b54bd3222c03ca084b2bb587e4cbc4de051bd1e075bbd2ae0cabcff78f8bc9f53b8bb46472a3dd66e8a3dde7b43bc2416b8bc992645bd33dab33cbccc0a3d4292ac3cddb308bd5de9a0bcbe899bbc87ec5b3d5f06023d3f9f9f3abaf1d8bbe00404bd330e0b3d5e410cbd0b0f56bd74b7bcbdae61b03c270a9d3b9a55c0bcb23c9dbc9168663dccf2b1bd5628933c783763bd7f5e3c3cc996df3cf95a523d2821e73a7b5a11bd6e5b8bbc79d836bdc2249b3b85d3e23cd5bf45bd338970bda8bdbe3cb45734bd2e47543dc2127a3c8e8cb93cb7d639bd6fa434bb0e34d7bd715b9dbd2db926bdd124c9babf161cbd5bb1e53c4e38c03c6f601ebc3da60c3c8b87233de5c9813da31c113df9bbebbce48c88bdf63cc53c98d312bc3795123c87c192bc63bf033d81e7433da1c566bce7bce53b2527073d2d308bbb4ba144bc147d13bd069408bd49aaf83ceb74c33cd32832bd18831b3d31ac4e3cbd67c13ca8eb0dbdea8619bdc3eef0bc870c18bd7e84a6bc69e9123d2a021bbcaf9c8d3cbea97d3c5a92343deb80a4bb214484bc0826163d9d9175bdb0a804bb6c5c963cb0ef8abb04f2d43ca66b9cbc70b8743d1737063c88bc25bccebf53bcead9d3bc254afb3bbc0b553d42982a3c288ff5ba34bc9fbdeae0323c8e40a0bc4e1e9c3a858facbce2d3b53d386b073ce07141bcf2c8d33b72684fbb16e78cbd19da263c0652a7bda37a57bdad7966bdba0bffbbb143913c0916773cd45c083c603099bdaa39cfbc5a0c9abdf8f3d53c050c543c38ec093d2e21a23c9bd8b0bc928236bca107f0bcccc5ef3c597f8b3d91d142bd6cda99bb8c58c5bcd7aa5abdac639ebd0e1ecd3c64e6f2bcda506f3cbff4bc3d6712edbb08b8e93c283b6bbd09dee23c1735ce3c8bd8233b1ff95f3d5f58a23cb74900bd54f60dbda374e13b8c4d9ebd3145aabc3fc0e13b4ad7063d1c8885bd36d4573adca3553db9844a3a66fc00bc8b58bebce697103dd73a8e3c28d6933ca3cad13a9219c23a6521a03cda2a823d037794bcdea4443dcd0580bc4867eebc5683aebc5ec12ebcf630bf3b9ac5d63b7b60a7bc926907bd40c006bd3b38983db6f7faba0694a33c946a013d7f432a3ca8eb79bd9a70bdbd769ba93cb728b73cf23a8ebc702a4c3d5ed4453c75d1523ddde7f23c75a4fcbbac38193dbe32813b294d10bc603a70bd092caabcfd691fbb34d9763c26fb40bdd100d63cd3395abd464e0b3d28cc0dbcebe4ba3bf0e8033d969c0e392c3ca5bbcf9bad3cf61cea3bf820863c32c43b3dc2d3a33c32e6c2bc9524bdbc18287e3b38acfabc1dc80bbd6dac88bd00a30b3d33ae28bd62130f3d28c196bd17404ebd587d5dbb7458e03cdef7da3c251c003d5e8e30bd8ca61e3b812d48bdeaa934bc200c93bbedce533d9553ddbbe80e953d98fec5bc021f49bd195c773cad02fbbc538488bcb6a58fbdf3710f3d8352e33cad6718bdf68a943c4337313c6c93ebbc5c2e6b3d6d219f3d39eec73b26e248bcac8dbfbca1685abced4cb33c8f34d9bc25e2cdbb79db32bdb8ca9abcea8c1abd40b3a03c808ee93c285ea13d324cf0bbce6b823c8ccb05bdad67c4bdb2ab2b3c9a130b3db20fa43d2f578ebc6c9a173b38ec7d3c1813893c4fdc643cca2da4bd9b4c053d30212b3bd25f1a3d4b8ea53c1daa44bd38ad05bdde5a12bbbac0873c5df5883cd209343dd1499d3cfd9666bc47e9293db1c3393c3588a23d848958bd4e4187bd5b0974bc21304bbbdb06293d7d8b9abd279557bc7929e03c6ff3b63a5087ab3c416e2cbc9d18b53cd28f663cb335d9bcb76638bd3a81ebbcfeb40cbd2a1eba3b95db29bc2bf6e83a01b8093deb0dab3cd06285bb5a6bd5bc2cc963bd9c1cc83cdd9f82bc4c7a013d9e2aac3cfb3c89ba79e8723df3975d3c86a59f3db8afc4bc018b383a89a61b3c91e3c43cefbf1b3d5ef481bdbd8eabbb46026fbdffbdabbc718891bdcfbaabbc2d2f58bd6d18763c70d48e3dc661d0bda770443d8cf2aebb17f7a8baa54e913c2029c93cfa1af9bbbffa44bd4c497ebdc58a02bd0aead93cf7c8cbbbbd02613d9e3e193c7165673def345bbc5fa48ebd47793cbdb304a0bc2c8305bee99f8dbce14e163d5b9171bd3aa388bc946d0fbdf357cdbd947aae3bf99dadbcab96883dce5b89bda4db053d0cab04bd846e483c94bb2abd92f53b3dd3697e3df5d507bddc587abc7589183d14e53abdf8cc2bbd9107d7bb7629c1bab2a7113df7d3843ced303ebd19f9373acefd80bc0f5a3b3d143d7fb99f14653d4db3bcbb0a1bc23c131e53bc8f12f8bc3897dd3cdb710a3d1b61263b43b38d3c657b15bdebb0113dd43e193dd815023d27fb11bd65540dbc7e6de5bb4f463a3cdf19343dd484f53b6e2f90bc220ca73b1117d13c2719933a91ca5b3dec9e0e3c0d94a2bcde33643c324a67bcf82f14bdf7dd993cf7fecc3c320a893c9a8b31bcf86ec33ca373c03c2939a13cfac98d3cea8bf4bc24aab43bc60c96bd0b1ff4bc9523853bd44d963a4822b53cc116a83be86a003d0a1592bb80c626bced068b3df4874d3b47e5213de865de3c4d2defbc05d43bbddb3a6fbcccb192bc7153c83cc9f354bdcc971d3db1af2e3d21049b3ce2d3bc3cc4146abb1c4f8dbc62f01dbb4c37c53a325113bd858086bcee46133cb56be83da9d559bde7b018bc5ba881ba2191b9bca9b832bdbcb356bce0cfe33bc006483b922db0bbd25bad3c194cd83c0bab813c77adbdbb78d1253dd8ce4cbce52395bb3da8dbbacb11683d8c7a923c365a093db1f1193dcc7492bc9a9201bd638303bdb8a087bcfee5e23bacf163bd2ac3e33b9381ba3c696fe6393206f8ba8e0e2ebbff1dc23c011fbb3c5e41f13caacdebbcefb3013dc2411dbda6d69cbcb40623bb60a886bd9da2cd3ce5d79f3df70f24bcf054c73c56f32bbc316a1c3d03a499bc333667bc26b5ae3c66da133d4caccfbc34d4fbbc1d3035bcca7f46bdf6f85dbc61e66abc9067fc3c935b113d6a9207bd7f38df3cf449c63c314719bdceeff43c4e3a213cb72e7abc621da7bb",
+      "expected_call": {
+        "caller": "run",
+        "caller_owner": "Workflow",
+        "callee_owner": "Repository",
+        "callee": "save"
+      },
+      "noise_nonce": null,
+      "candidates": [
+        {
+          "node_id": "2614172058490045527",
+          "document_hash": "bc329ad7a320a4e7",
+          "display_name": "MemoryRepository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1057417078,
+          "rank": 1
+        },
+        {
+          "node_id": "-6811065897980305788",
+          "document_hash": "f66bbbce9c36904b",
+          "display_name": "Repository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1056225239,
+          "rank": 2
+        },
+        {
+          "node_id": "7843474940925757561",
+          "document_hash": "2d748912801084ed",
+          "display_name": "CheckoutWorkflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1055505159,
+          "rank": 3
+        },
+        {
+          "node_id": "-6610728582579257779",
+          "document_hash": "add6f275e535c0a9",
+          "display_name": "Workflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1055103387,
+          "rank": 4
+        },
+        {
+          "node_id": "-4072284965942301196",
+          "document_hash": "ddee3c8cef428776",
+          "display_name": "codestory::component_report::dir:.",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1051802308,
+          "rank": 5
+        },
+        {
+          "node_id": "4154321434010363626",
+          "document_hash": "3cdd8703e9d1e01b",
+          "display_name": "EmailNotifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1049280117,
+          "rank": 6
+        },
+        {
+          "node_id": "-7268165071706662718",
+          "document_hash": "6d7b4fe0499adf50",
+          "display_name": "Notifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1046317536,
+          "rank": 7
+        }
+      ]
+    },
+    {
+      "task_id": "dev-workflow-repository-delegation",
+      "query": "where does a workflow delegate repository persistence",
+      "query_sha256": "3e0bd293cde6eb239f5ba6dd57d84c896097630aa2263cdb8ce8f16cc80f179f",
+      "query_vector_sha256": "7e338e285f43c0c15ff80facb96ebd77feadbd0e1d5d575fe4b247f4f9fb5186",
+      "query_vector_f32_le_hex": "04a24a3d2e8bec3cd75f79bcb97fb4bc310e523de9dcfcbc16f32d3d45d83c3d6887c33c62a546bde0b9103d9159ffbbfcd04a3b2a83c3bc3ad5f0bc671f61bb7198223be8acb03c6919803d964da0bc97b7e2bd283c1d3b2e848f3c26ad0a3d1c77193d4d4dbd3cb1df203d5f56e6bc89a2f3bcc6d4b03cde4e10bd5280823d7a7d8b3ce07204bd711ab93bba314fbc7913de3c5560083d5d99923df45ed3bc1fdeb83ca2efb2bc6710113d883fa1bdc38d293d28fc85bcacd498bb9ba270bc3b981abc5faff43ad024d23b7c378fbd152a37bd4c401b3d88c0a13c795a71bc571b54babd9887bcf3f121bd1a5f1dbd077e4b3d9d51863cfda1df3cbaffd8bd9973bdbc946e8f3d6a94e3bc9ab852b941bbc5bc547cacbc1db52fba83db2d3d2a39053db5910abd6f02113ddae6c0bbeb6ba73c3cd4953d716ddfbc88a2803b62342e3ddeed913cdaf78bbc204778bc187beb3c17f5a63dfac6383aff4cc63c555d443b7c89303a3c602d3c3677f4bb49ff953a39346abda95a22bc7de6ad3c74684b3b8be792bd7bab8cbbb50c893c5ef73dbd3062873c56423ebd7f10ce3cb059cf39d603593c250897bd98980a3df7d7ce3ca67ce93ca48f2f3da09500bd2b3d04bdf871103d52497d3d69ae373d041975bb933868bd2920c6bc45e79e3d372c21bb19770f3d906ffcbc4bc338bc9cd70bbdde6fbabba2178bbd78c8473d0730f43c6490723dddc8193dced4b4bcd3525ebda435aebc4793a4baf2e9b7bc3c5909bc712c173c4f8249bcc0138a3cc01a183d4bd948bc7f9a55bdd7693fbc038a86bc4fc4d7bcca89923d2a4b803ca14990bd2cf8c43c6600c2b9d53cfdbc9eb503be2aa7bdbcbeb21f3da5410e3d942886bcb820593d918277b98d8f9d3de7353cbcf781263bfd73743cf5d56b3de4ffa43cfe0686bdc097cbbc939e87bc852f21bd3f9b8a3de370113df2498e3a9f403dbc8a4b2f3bb960af3b30c6283d1deb8b3c5446a8bc3e45bd3c06a080bcd118163d3d81833b63b163bcb5c4443cb32c213d3f670a38231e633c0bd1f13ba2258bbbcf778bbd7097513c2ce7f33c56f553bc2b78c03c03ee43bdf65031bcd08f363dcc5b94bcb316443d22a104bd8934783d2c1fc73c45c32c3c8c96233de017cb3c10b6ebbcb86d87bbba56c13c80d6bebbffb6a23ce1bc0cbcafb3cf3cd9327e3c026a183b9ee19dba9e2b7fbc3b1fb43b7388523d581fa23c5f133fbdf8a1c43cc8b5a5bc0da5023d9ea5223d7b0de4bca3aea9bc6220ddbca2aa6ebcbaec7dbc886c663dd81485bda808c4bd1be1a73cd521f73c6d9c743d0f4a8a3d89a7033d2c5b46bdb83620bdc421b53c3b343fbc4f44433c767568bdc9f8c0bb7a464b3d3b12813c58f304bdef5ab03c44b7c4bb2e850e3d6d7782bb257c99bbb7302dbd631a60bd5061373dc15c93bc00b1e4bb98f91cbd2ebda03c6c09dcbdfaa9153dd0744dbcac5a533dc013a23c5afb153dfcf689bc8601c8bcc2bf3cbaaad09a3c87a4f1bc1e33213db57bc23ce18b4bbd945313bd9293c4bca662b73d8dbc563c1707b1bbd5c9b5bd98e1d23c7437a73ca140863be4df09bd988ee6bc0e88ddbc09e88f3cf49894395fd0f63c8e27913ca12c513d2d0ad53d1363cf3c7d6577bdbcf77f3ca870a73c7f59513bf6470ebca21a1bbdd5fd0bbb5747263de501ecbc0cd7563d3c87583d81cda83cbfacca3c407d5cbd3585333c321ad13c6defde3c88908dbc5ea02f3d8f08513d3499283d9fa293bcf3c524bd6a4d3dbd5f78a7bc37c424bd6d0b03baea4cea3cf7f38d3d68bd9d3c5f59583daf7902bdd9cb023d2613a73d8bd115bd501235bbb2f5113de8f0153c36d3d9398fd250bd1a20833db08009bdb8f15abce9680ebcb1123cbdd7f4883d8da8693d63716ebb98af0fbd786d2dbd5d50603d5c72683c69c1da3cfbaf5a3be251d63a8a50243db9b3cfbcba904d3d29fc4ebdfbe358bd143dd6bc99dc96bd941e7fbd61f776bd6acf4abd8088afbcc4c1b13b743110bb38b040bd5fd1d93ab0e532bd5f1f6cbb839814bd2baa0b3ab0e98b3c218fcebc22f9c43cc52e1f3d2eab54bc3d718c3c507153bceba0383d07fdf1bc19e72bbda680e4bde7fccd3db405b0bcc2eb1b3d312ba43d4ee6fe3bd0371d393a6ce2bcc604853d6f1734bdc63e69bb909e493d0f30253d1bacd9bc7ba1cfbc0ced32bcbbbfacbdf5a4edbc66f35f3c39756c3c1264fdbb3a838f3dcb2f243d54a7a73b95748e3b8275a93cb068313dfa7aaf3c8d92f13c227380ba14d9033da46eaf3c8ea4f53cb406b6bc0e7c943da2ce423d7935a8bdb41ab7bc783e9fbc7ecc96bc23e9c3bc1c88f1bbf7c393bbb470833cb1ffe53cdc6d8c3cd5f5453bb3c6953d478c6a3c6a4914bd8bd9dcbd3ef601bcc5881f3d46bfa7bc425844bdd6122ebc4f20603cfe4fa93c33aab43ca93a21bc33fc1cbc3ffef3baa91e87bd83ee09bb2ed892bc05b512bbc2b46f3cad356a3cb80f94bd9890d93b0c03b2ba464e7d3b39d5833d7ae138bbbaa9143d95ac743c663116bcc8b81c3c53ec163d655710bdc460db3bd18f05bcf3763abd41c21bbd248536bdcc91a3bcd2e2373a2424dabc97d7fdba75238dbc7a2110bd1cfc64bc756552bd97708e3cc30a2e3d11f236bc38c6403c5a91dfbce1d0543ba533c3bccec12f3d071879bd73bbc13be7b2963c774d41bdb3dc463b3717bbbba30133bcb90c2bbdb1e2073dac982e3cead664bdadde363dede90c3df9e022bce101d73ca25b75bc7d86bc3cd33c96bcffc3fdbcbebb42bde364413d2987a73c5d060cbd7c72f8bc3283903c3b24a6bae924863cf192eebb5fda843dc1bb4d3d2884ca3cc6bc33bd5ce4b3bdd4f287b830ee283d6bf7a7bca0459b3b5cdce33c937f44bcfa30323c022da9bc0d649cbdccdd823c633c1bbdbb42883b6776803cb98b4abd81ab1cbdc71825bb78f9ec3c48b40bbcf52b963b78cce33b0604af3c93712cbba89efc3c406a923d357aaebdc8d4d73a80cb1b3b68c0383cb5d314bb923476bd435e7cbc6498e63b333d083d8ff1abbce99078bd7156cd3c99abc03cc519e9bba67d4fbdc2f382bd7946f83c156b5e3c975288bc40fd633cecca3f3c4661433bf68ad6bc2d84cf3b41f90abd5c392f3cbf5f383c53ad0f3d131f3abd460207bde58a153dd5f6183a5dd5103d09aea13c463c2c3d418e0a3d52467dbc2fa15a3b0ed6bebd557fe63bd893e1bbef8e88bc764848bdeb6beebb26ddc2bc4a0c453d2192643da9c4a9bccda58f3da8af09ba4c54edbccc4d1f3d2969083d91280b3a4559f8bcf41297bc1a1b463b3329a0bc13f3663d11e7773b83e19bbcfdee953d5c064fbc15228fbd1952b4bcbd736a3b3c599ebdb101cabcade3013d83c746bdacbd953cc0964cbc2e27a2bd3206ecbc746dd1bc4747883dfeba2bbca2f4153dd58010bc50c148bcd42a00bd756c093d80b01bbded903bbd671eb2bdffdd653d0cbcb2bbd66e20bb6b08b4bc3d2f0e3cfd05b83ce5dee8b8250c4abd7ae023bdad9763bc86237f3d4eb8143d4eb6423c95a6493d15de7d3becce1fbb1c7482bdbb7c2b3dfeb0493c41bed1bbf057093d3a324abddc67253cf894433d72f0253d846813bc36d70a3d31b2573c9034a2bb9119963b7828933c4076e43cd350933c6b58383de04311bc7d957b3b07fad3bc8573e8bc4e605cbc15683a3cf4fe263aed7b09bc24cd153df5a0bdba75b3a93c45ef1cbdb7f9003cb1f2203d18ef7fbceb6e9fbceacdba3cb82229bdd97645bdc4c61fbdc6a5f43b19a223bd9d86afbc8676e23c893c83bb0bd7433d43dab8bc68ca573cd117c73c4d54b23b92bd8fbd06231dbde9ba25bd6024ee3ca0f284bc3e3953bdc867e23bafac2f3ce3fc3b3c4e1eef3cbaf4e2bc0276ebbc3a01223db1339c3dbc6b2dbc9174bcbccd6abfbce07b4b3d0b0262bc417f7bbcb458183ca31f053c5e6587bdeb190cbdc057ecbc2e972b3b61bcd6bce448bb3cd767da3cbf43de3c67e2c73c660fb73c2d8610bd82e404bd8e70f5bc2e6c6f3dcfb7063c7a94893dc11fc63cb9c7413ce19d1abd76279bbcb3c72abd5d6b2a3d4d3adbbce7c9613ceb6a243c91e746bdfdcebb3c7b47173da85161bc300a16bd364507bcf88b04bd65990c3dd0550bbd2995c83c98e825bde19dd4bdd97c263c7db9a33d8c679f3c6f93093d74f7083ce09abcbc6ac1a03ba1750f3b823f503bbe8f7fbaca62243b41f72ebda79e89bc41950abdf2d1c93b40dc89b922fff0bc2112753ccea0bebc01e9f1bcda09523dea15ba3ce6ca5c3c9d89353ddbc394bccd0cb4bc",
+      "expected_call": {
+        "caller": "run",
+        "caller_owner": "Workflow",
+        "callee_owner": "Repository",
+        "callee": "save"
+      },
+      "noise_nonce": null,
+      "candidates": [
+        {
+          "node_id": "-6811065897980305788",
+          "document_hash": "f66bbbce9c36904b",
+          "display_name": "Repository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1056033690,
+          "rank": 1
+        },
+        {
+          "node_id": "2614172058490045527",
+          "document_hash": "bc329ad7a320a4e7",
+          "display_name": "MemoryRepository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1055661336,
+          "rank": 2
+        },
+        {
+          "node_id": "-6610728582579257779",
+          "document_hash": "add6f275e535c0a9",
+          "display_name": "Workflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1054776717,
+          "rank": 3
+        },
+        {
+          "node_id": "7843474940925757561",
+          "document_hash": "2d748912801084ed",
+          "display_name": "CheckoutWorkflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1053154624,
+          "rank": 4
+        },
+        {
+          "node_id": "-4072284965942301196",
+          "document_hash": "ddee3c8cef428776",
+          "display_name": "codestory::component_report::dir:.",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1051500655,
+          "rank": 5
+        },
+        {
+          "node_id": "-7268165071706662718",
+          "document_hash": "6d7b4fe0499adf50",
+          "display_name": "Notifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1049203931,
+          "rank": 6
+        },
+        {
+          "node_id": "4154321434010363626",
+          "document_hash": "3cdd8703e9d1e01b",
+          "display_name": "EmailNotifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1048311009,
+          "rank": 7
+        }
+      ]
+    },
+    {
+      "task_id": "dev-workflow-persist-flow",
+      "query": "how does a workflow persist a value",
+      "query_sha256": "da8974096ce07cc39e6376ece439e9f4ba33d3ce1dddc0cac2a8ffd1c5311504",
+      "query_vector_sha256": "7993f6f8a3e1a3c815c5fef609a2e0bc0afc1a28ede2054fde5865d78bd97722",
+      "query_vector_f32_le_hex": "2aeca33cb3082a3d0b29a9bcdb2ec1bc965f883d9f4dd8bc8aa9573cc49ce73bb07e8f3c8f56e5bbb6e48bbc14ef4bbc95216e3aefa9c83bc7f63fbcda8e843b856bde3c7f9508bd3e7a7d3df4f4e2ba5bdba1bd230851ba4a0b303cea14333d22e10b3dd483c73c4b9e693c396ed23bf90a15bdf3c4d2bc18ac9cbaa4ed273def0664bc9acf04bd19b40dbd376e57bc01119f3abfeae13b4af58d3d9ec5733b3db95cbc65f0cabcca03583d3eba5ebb0fa6ce3b7671a33abef8e8bb02f903bd388c1ebd863dfc3c02f82c3beb76d3bdaccb2dbcdf7b513d8778bb3d6ec5c0ba5ee85e3d8d54e43cf807d0bc04a5ca3bdbc7563d95c01bbdd976a33d74934bbd8b52c5ba01cbb63c819e11bd92cc9f3ce48ec8bc1f39233d6c3d103d7179d83c9790973c73e359bc0158ac3cad42463c440aa43b8261fb3c0df1183dc83322bcd53b0d3d93a020bdedb1abbc1d2828bc84a7a73df8f4213d84c3c5bc963dd23cd33215bdff1bc73c4fac2abc398903bd913639bcbb39753bdcbe68bcf067ecbc1cf5c3bbdd8b0ebd8f70a5bca06ca23ca66381bd8f1a003cebe31bbdd5d054bc014aa23aefe9a13c963cb3bda377fc3cfc13b23c93f9723b89c1593c4e5685bb087aaabcd176833d84ff0fbc5bc09c3d3008c83c84e99dbba02d2bbd95206c3c67d795bc5068593cdb8e36bd5677ab3c209912bd5af76f3cb1e724bc73996a3b343692bcd77b103d9b5a103c9d8293bc5cacf8bc090fa03c42b296bb9232b2bcb9a9f1bc70bbcd3b5004d2bb91c00cba10d3483c360df43b3f6812bd327a43bc55470cbd3de10abc2e7fdebbdee5063c6e129cbdcfe8d6bc4565453db87b383c26708ebde4720f3b0bc2513d397514bc5c12c13c60888e3c73bcf23bbd83913d3602603dacab0bbdacf55f3d2996d13c80a404bc635734bd98d1ed3cda03edbc1b1dd93c6d133f3caac6543c9bd7acbb6333083d08abca3c30aada3b1c31063cbc75b03c7e0d30bcc5d51d3c651a4abcb99ebb3c54c1bc3b717342bb7ae0bfbc5e468fbbdb4c30bc4eb1503d795e383d7f8b41bdfa9972bd297e7cbde5f4a7bc03c21fbb166dd63c531088bc2f6496bc527f3a3dcb1691bcddde953cff1e723b57f8483dec50733d052c16bd66ed743d4a4f34bc4c1f2dbd8fd403bd1917eeba165611bdbdcb40bda99c2ebb207cc73c04e2233ddf8f7dbccd63d33c5b0836bc4e86593c97761f3d2254123d4d1659bde940683d7f2086bd83340c3d7ad1763d25136fbdee8b35bdd764513cffc2debc464f56bdf085873c782e70bd60d802bce4af22bb7235bd3cfe882f3d15d4da3c79d367bc2ef20cbdc71220bdb74869bcec0de63c1b7916bba84399bbcba505ba9ea0a33cbb7cc93d448912bd101863bb10dd98bc5dbd013c0c1ac1bcb776b0bd45f3babc2bb1a3bd88cdfb3b2656cebc5a0e7bbcb0bfa7bb47c4143c2eb7b2bd5531183c03a1e4bc6b5b6c3c4d22603ce40aee3c794338bd0e0a2abd3e78b1bc1eab0cbd3d120abc89c06c3d10bf30bda4695fbdeac9c4bca79744bd1f34603d03d411bce31372bc7d001abd328e12bd6791d6bd9cb4d5bc75fc9cbd028808bccc5d2abdeffbdf3c3f7fa53cccb9973c37596b3c4f1d693dd03b9f3d7115423ddd60c9bccc0fb53a1096723de585aebba1d90e3d99dc1fbdfc50963bb94d503d93a4e3bc67d6a4bce4934e3c935da1bcac17823ce8451fbdf08c13bd046f113d189ecd3c2a621ebb7cf25b3baf97e23c8c3d0ebc103948bd89e065bd8cffbc3ca397b73b1f0a16bd60e03d3dd615cc3b5021fd3c570fa9bc7b459d3dc131633c4ae2043baf55143db475a1bdcda4c53c2d04673cacfe0f3c6f746d3c092965bd9038563d11a409bde6f9923cbb28b63bd5219ebda1256d3c28313e3cb8dd583d8be25d3cf1c0a8bd499d053dcaca3ebda7fff23b6cc004bd9857113d48511fbdd664debcdf852d3d4d7c13bdde4bb1bd1375debc0bf21ebd9ac2c2bb66668ebd91bd98bc4e39123c1067e03c6f06febc52a696bdc4cf21bc183778bc2c971f3c490c0f3c256b783c27a0023d52674a3de2cfb2bb3f9ebc3c32743dbc1c5a783dc49730bd6575003c0d581cbd73b37bbd74d79bbdd39a9e3d87c7e8bcb161aebb01cd433d2d9b763c20f3b13de06ddabc3092d13c1996cdbbccc39dbbc47f023d094c553d4f824b3c9f12e4bcdfa3153d9502c6bdfdeaafbcf88d1f3cb2466b3dd01788bd422ac63c3869c83c81c7ac3b0d13363de88ad3bb22e30c3dca790b3d201f623d4124be3c97c5be3cc892403ca5eaed3cc4d503bdad23533d52e8efbc284e3fbd1aae89bdff8bf6bc182dd83cfdf1413d075d0dbd263e1dbccfc3383c33788c3d1953223d26a1603c8267b13bd547113d4a1ea4bd6abaf2bd3b64083db921e2bbb0f83abcc11027bc5224593d526a8d3d1e3facbc1dae103d3842c93bbe1a71bc9fd28e3c2c7c90bd42ccb33cdc61233d33a94f3b34671a3c676a733d98ada5bc915e5a3cc3b5d5bc40090c3d6422893d53a0f2ba9eca1ebdf6c2a03cfebbf6ba5d8d5abce20ff63cfc7f09bdfbc4f33c3b06debbc1e343bcf113cabc6d0d5cbd919d40bd5da3c03c823bc6bc54dfa53c8f8378bd2cc21abd5fca15bc83eaa1ba4385563d8aac9f3c8cf34bbdae9dae3c909a5ebcba44213c9794b9bc77ae343df8158dbc7eae753d5ad466bce76d54bde35ff03c14cd70bc1ae85a3c2882e3bca50e5f3d2d65bfbc64120ebd09df503cc2cca9bc0ba8483c15a5563d8f3ab43d573593bb0eca14bddbd785bdc82ae9bc4e9d8ebb662c0cbc2fe4cdbcdb3dcdbda0c5ef3a5a5fdcbb117aa93b40bb113d1813993d69abdb3bc1ac6e3cd43c07bd1c9f3cbdd95b88bcafc34d3d3449b03c4c61dabc3991a53bc34729bd8cf21e3c19138a3c131156bd606bde3c0e620dbcfa0c003d822fadbb7f23d9bcdbfd53bd62f8903ce884453b5819c7bc4ef4153da073a83c72bd203c5610293d667eb53b72cd3d3dc98f9cbc24b98bbc0160953b0fa8043d85a0a43c3d5fcabc930322bdc2f4b43c22f9efbc1fafb53bf704343d8940db3a08d51d3c54df923c5a90d0bbe7b7e8bce643e4bbc117b5bc5e7d97bc6540103d0f2e853d5b2e2bbc5c4002bd7dfff1bcc34f3bbd8f0c313bd8f0b03c5d99673ddd81603cb7cf36bd03215b3da96113bd6aa3973d665e23bc4c1cc03b5f5a193daf26f93bca43223d9aed4ebcc2a61fbd34c53abd62b354bd184dafbde505debc325a6fbd4fd090bbfbe6863d0b8451bdbcecb23ded0243bca8e5cd3c3296193c3e0f053c1100c3bc925356bd530771bbd544ab3c7ac1773c6eddc63ccb3da53c87f565bb697f603da02c29bc3a9ef4bda1b11a3b436f64bdf4137ebd462b9abb84df8c3deedd1abdc2d17b3beae8673c2c0d0dbd4477223d90c0c1bc1d868a3d210591bd32391f3dab5c7cbc931666bce91d0fbd1a107e3df020433d78ea5cbc10697a3bbd6a593d2b2bd0bdff8d17bd88b1a63cc4aa793c3c20b13dd093223c396012bd92a1dcbb6619eabcbf5e813d7d4a71bce7b7fd3cad601d3d5392263df3fc29bcd0e0b1bca759883b66e3f73cafc2b23bce91393d3fdf84bd6d6d3d3d75f65dba5295d73c88f35cbb4baa103dbc30febc9e4e5d3cefdaac3be8cbc43b26e42239afa4523d65c98abbdebe063dc2267f3cae6240bd33f3a0bc00ba58bcf7bbd5baab65783c8e50293d2e26463dca42573d0118b73b19badf3c337eb33da7221e3db544b9bcd39079bb44e0933c1d0537bd67e190bb8fe2053d2aa9723bc01fe6bcdce0fbbcdb6d67bb69b8913b0d6474bcb89fb23b2ec6b93c0c553d3dfcfe733d89568ebd3bfb54bdc25629bbae911abdd6731e3dc2c76bbd281b173dddc6b43c040db93ca46d653d50a5d9bb85fbd2bc7a88ff3c91603f3d9eff52bc19de3fbd0e6d453d17f4b03da2ecb7bce13b91bbfe4f68bb83c8d83ca817edbc7f9b04bd061b46bd477881bc82bb2abd5118453c2098c33c73b0bc3cd41edfbc6b952c3d272309bd4dd862bc01bfe3bc2f61163de2cece3c44abb43be623353d580992bcd6f8d9bc93ae363c571ce5bc4c28ebbcc7dd9d3bc5e178bc7ea7f63cba6e26bc6e96fe3c49aa183db720ffbbbc7e353c31d0443c7e6e9e3ce1b2313dca5b41bd9b19553aa13ce03cd51e85bd362d223dfb7e133d6c69c4bcbe0b393c274f63bc89381cbb7aad8ebc3f3c2ebdac7701bce0f69bbb714dc9bc37a7e0bc2a065abcbb8b6bbc80caa1bc7d7d6d3c288b95bc81b0b3bc528092bcdf47933cbe0ca2bcdc59563cfc6fe43c555fad3b6ff80abd523edbba",
+      "expected_call": {
+        "caller": "run",
+        "caller_owner": "Workflow",
+        "callee_owner": "Workflow",
+        "callee": "persist"
+      },
+      "noise_nonce": null,
+      "candidates": [
+        {
+          "node_id": "2614172058490045527",
+          "document_hash": "bc329ad7a320a4e7",
+          "display_name": "MemoryRepository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1055440612,
+          "rank": 1
+        },
+        {
+          "node_id": "-6610728582579257779",
+          "document_hash": "add6f275e535c0a9",
+          "display_name": "Workflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1055318197,
+          "rank": 2
+        },
+        {
+          "node_id": "-6811065897980305788",
+          "document_hash": "f66bbbce9c36904b",
+          "display_name": "Repository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1054587592,
+          "rank": 3
+        },
+        {
+          "node_id": "7843474940925757561",
+          "document_hash": "2d748912801084ed",
+          "display_name": "CheckoutWorkflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1054478308,
+          "rank": 4
+        },
+        {
+          "node_id": "-4072284965942301196",
+          "document_hash": "ddee3c8cef428776",
+          "display_name": "codestory::component_report::dir:.",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1053057469,
+          "rank": 5
+        },
+        {
+          "node_id": "4154321434010363626",
+          "document_hash": "3cdd8703e9d1e01b",
+          "display_name": "EmailNotifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1049922907,
+          "rank": 6
+        },
+        {
+          "node_id": "-7268165071706662718",
+          "document_hash": "6d7b4fe0499adf50",
+          "display_name": "Notifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1049883744,
+          "rank": 7
+        }
+      ]
+    },
+    {
+      "task_id": "dev-noise-quartz",
+      "query": "calibrationabsentquartz",
+      "query_sha256": "f288b94015cc4e351d28c13a0a6e191f78c679162ab2488a102bb8184dcd45af",
+      "query_vector_sha256": "95eaf6c39ca4eb5c19652af772db83e9cab1eb01d0f6b9aafd870d2966e17586",
+      "query_vector_f32_le_hex": "8f9dc63c6ccb76bd0a8db8bc0362303c412685bd85efa13dccaadc3c332365bd002dfe3c31533b3c630ad9bb580272bc270956bdd7a3143dc2af623dcdfbbd3d7b0fd9ba44f5683dc649d43c54e3ebbcb3fbdc3c76a914bcc7cf0dbd078688bd5bdd473dab4311bd6b3d59bd7e5c463d8e5cc2bcc0ce93bc58668fbbd70190bd0ba905bd37c540bcb933dd3b3a79b4bc5da89d3d83d6053d1450093c752bf4bb64822bbd8a217cbd3f54843c6ae2af3c85a62f3cf774a5bc41376abb3da6133db9b4e93bd0ef3d3d392aabbb8352503dbc7d943d7dce053c11850c3da2bb763c814df43c28afc7bcc327e23c2c35b23bbcc9aabd3be42ebd196b363be6f904bd37a1dc3c40608a3bc6b744bcdcd813bd117430bd3733073a63e6863cc77bcfbc01d490bdfa2b9c3ddeb9debc1a5cfb3ca5131bbda8bc95bdbe1fba3bdf9fe03aa8c13cba2de3653d394cf7b9931a3b3c9eecee3cb94661bb11f326b9ef85e43a39cf0c3d6097fcbc9323c53b7c5cbd3d9d4c3dbc79b0fb3b0a720a3db1fe1bbc759e3e3d41d53a3d93848fbdf054c43c15b7473d9162793c34a500bc6d333b3d2ba783bc700f5fbd939ea6bcc8bd3cbc86a0ff3ccffd9e3dc572203c5efc883dd277823c73869dbc4ec452bc88bc05bdd13f8dbc5d6ddebc81924bbb26e3aebb7d23823c6594d63c90400f3dca4007bd0af46bbbbb844ebd669afbbcf018783c00a0c3bbe6c54d3cddb68cbce6a86eba312c18bc175f063cea9c9bbdbdb93dbdccdb083ac17c9a3ad9d422bd4f89403ba02c283d98c491bc100a883c86bc93bc9ac14a3d81993b3d303e64bddfe99e3b32068bbd2e3761bd102bbcbc55d9aebc92c6383d5d4e0abbfc46373db97dc2394f6d9cbc3e540fbbf308283dadcc1d3d2d0c37bcabf058bd492872bc23f848bd1bb993bcf187b83c95e183bcfa394b3b4e82333d7648103d0cdf8fbb4afb2fbccb9a4bbceaa449bdaf4a903cd3ad963cb865873b0c36243d6104f53c1919153c320e523d7bca7f3d8ff871bc2cf88b3c11fad4bc26af8a3ccac78f3b5d41d03c23b7413c77d884bb2ad48c3d5dd871bd757c12bdc92ee6bbf34121bd3a31a53c7520513dddfbba3cae28a4bce8d53f3dcd27c43c7c6ea83ca2c9dc3c0f10a5bc66698d3d3d39bcbb31b5b6bd562208bd7f6388bd9f9543bd724ab23c93ca663da14eae3cc78d473d01a603bc763cf23b36bb983d6675453de34cf5bca3b6783da8a813bcfe314ebafdf67a3b3ba8e53c96aa68bb585773ba99dd17bd174972bdb8b51ebdf4ff63bdbab510bc01801dbd5adb97bb4841583d82a685bc2da1b3bc966cb63ce438bdbccfc2db3cddf130bd092f1b3cef40803dea9296bcd4083cbc57a66d3c902b003d4d3f50ba5de9323d4ba04fbc99c32fbc088d5e3daa9576bdd048c8bce1b1cfbde779c43c25759c3c90f8353b7d52babdcf7e06bd473104bdba13c33ccb1ff33c5b9cf53cf9d1c03b55dd12bdcd05833d012e283c0973e83ba5ce1dbd87b03fbd0ac6bebcdd08023c3bcc14bd74ffb33c5ef2bb3ce0f6b93ccacf34bc6c6ea03b101331bdc94d98bbf12faabb673782bcc8c6dbbc04c8303d627c17bcea64aa3c19aeb0bc6cda5a3d7fd51fb9080f03bda20623bd46472dbd738ffdbb8078bbbcb38f7b3b0a7c40bd77024abd82fc81bc1dab17bd7b8d553c381b89bc23698b3ce8aac8bcbf2943bdecb660bdeef9e73b7c7a3cbdec569c3c8aa5353d6deed93ce0b9b9bc90c15a3db3d5c33c6749a6bd0fc9023bde207f3c5c2af6bb0f7f38bd9845903c954021bb40ec04bdf108a93c98d877bc9127febc8cc5433d8de79f3c5dd3ab3c1e029abcf7c9af3dd9280cbd73571b3c83ee03bc1c4b8cbbc6d421bc14fbbabc79ee9cbd336a5a3b5dfc513c7f0f433c597fdc3ccfe8b0bbcf79e1bc738a22bbaa56e4ba7b699abb6151493d5577a73c2282f73b618a26bde55c823d1eeea93de10ea33c219b833c44e7a43c198c85bd1cfb933dd537773de11714bd3719d0bc196b04bb7379adb934a1f83c26bf17bc4c384d3dde6092bbee96023c70d0e9bc4377e3bc467b65bd8c64f93bbe34babbd242e3bcfd8526bd544eab3c8d5a013d7f7f57bc58014a3d927f473da56d0ebdaf896abd4249853c442a123d54c2eb3c41f626bdc9f3463d9fe3a03c60b5b2bcd29b6c3b80b79abd3a07b63c18abd63c90f71ebcdf5487bb839dc53bb1cabfbd91feb1bc75836c3c26a7573d1cb3583d4026283d33d6ecbc055730bc00276cbd7c7ce7bc3fc5223de0eb8c3bd3e61dbdb23830bd7b347a3d87b1023bf256c3bca9b40e3cec89203da638c7bbf3b9833d4be529bb4be544bdcc7238bd6aa2adbcbab2eebc07ff123cba72003da109903c6eddaebc258f4b3d9bc344bc2aa0d4bca713413da822283d1451613b2e5bcdba42b630bb261eb3bcd6d0073c053baa3cd609763d79f07ebc98699fbb17a1753c8246ca3cf093a8bc20fb97bcffa0f43b3c170cbd011036bd23639bbc137ca1bc7ed511bd5e0f9fbc45db963cb80a673d85c10abd0134caba5e3f613d98227dbd64e7983c77c1c43c05915c3cd236833c7ba4363d85f28abca70cdf3c42ac82bccd154a3cb210903b3d530ebd078d21bd4d5a03bdb2b21ebd66950b3baeef583c5a93223d8220adbc188c243c026a25bdaee5fd3c5550713d73f81f3dffe2133cb69a53bc2556cabce779203db3d12a3d5866763d010717bb1d55913d9b73423c95fe6fbce781893b0ffef2bc4a851d3cf73323bd502346bc510da5bb83957abd95ac5a3d5a76873b8c18983c47aa963dd548b0bc50a9d23c49543cba43ca8dbc95a3363df82824bdece5283d32a5473dc936853b884d13bc73af873dd2882c3cf5efd93c5d64bb3de0c980bc556373bb5397a93b793a4c3c931ed73c0e1b4dbb6c1890bd2c9105bb66897cbc0d4230bd2d1dbdbcff1d4fbccdc1cabb06dd83bb41f73dba68bba3bc599381bd9d1c0dbdbb58813deb03563cfeb4b0bb4f24c13c661f3c3c10a8c33cea0c92bd90e86dbc80072bbd414e22bd82dfa6bb4d0b543d408a0d3de4a6b8badd21013da1991f3da44b683d752a08ba1fd8b83c83906fbc2d71503c793bbdbc1b3f3a3d1336ad390147873dd14a96bdcdc249bd7c23ba3a1e1667bd0456b23cabb905bc99f60d3d2b86483baff8143a024bb2bc1e6de33c5a7f96bbd98fa53c78d0c2bc7cf9473ddd822b3cde7d82bc2b23733dd687a43c90068f3de9db14bc64f9bd3cbc982d3cb0ce993d80d473bdb10ca03d56381b3c6b9be0bc2239443d1cd5c4bc71e861bccbcb383c06ad91bc3745c63c2e2839bc212159bd2b302bba945f54bcb22f8f3c2fa611bb3380ec3c9346e3bdaa8a9bbc51ce3a3da7faafbc2358b03b18bc903d3f601c3c29aab33bc4cddd3c9714a43d736f2dbcee3318bdfb9ab53c96fde93ca5b6f83c7f82c93c9e8e1c3d6d49653de59c533c010454bca97435bc7db49dbad6cb99bd3a21c23b977fadbcdd14ed3c0c2da1bcd1b50ebd0d7ae0bc63f3483ce661d73c05df32bda045c83cea94823dc661f63cfcc9693df554fbbce894cfbc1167ba3d234d413dea9903bced40503d0c1053bc7404853c7dd9293d926ebf3c218faebd3edbb5bded87d73c570076bd3387003d900856bb14e39c3d5f11df3b9d4bf8bc5d9da93cc25613bc3baf703c2473403db61d40bda96efbbaf05e183ca4be26bd109e3d3c13f9c1bc817b293c5e5b3ebdd93e59bb33838c3cb71cb23ba0671ebccb8db8bb9d358ebadbb91ebd626c4cbb26e21bbc39df9fbd647c41bd3296ebbb8806b33b9fe3b5ba718b213c841b8f3c7cec163dc0bd1d3df9287fbc0cf2ad3c7077ed3b701601bd8e2002bb1c401dbc99620a3da83f913dfafef9bafa010dbb7eb59bbad79317bdee7b6e3dc42264bc7371a63d8c70703b1b9a923bbb15febcf9948e3d2e7ec3bc5d15673a48b0783c80a2443ca6c0993c5414103dd7772fbc86f0ae3b601c1cbdc8749dbce0a88ebc738f88bc7e8598bcd8078a3cf879723cda777fbdf1a41b3c505621bc681b5ebd8cadfabcc2f740bd5562d9bc891122bdaf74203cb647a9bd3f1fdabc373262bd7eb0a0bcab1f24bd759255bd8105ff3d47a6f0bc0df4063d041b5f3c2b49dcbcfef2b5bd4148e2bca4e85bbc9ce10d3d4e6c45bc24dd193df91d83bc80c9f0bcfd534d3b6938403b440e0dbcec3a59bdde743bbcd8b183bd11a2c4bb6a0b64bd5c655f3cac4a98bcf2789fbb0fca2abdebcc1cbdd82e9fbc8115dabcebcaaebdf5f461bd7af452bdaa538d3ca451b7b991bcb8bcb431493c777be7bc4190f33b",
+      "expected_call": null,
+      "noise_nonce": "calibrationabsentquartz",
+      "candidates": [
+        {
+          "node_id": "-4072284965942301196",
+          "document_hash": "ddee3c8cef428776",
+          "display_name": "codestory::component_report::dir:.",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1025416334,
+          "rank": 1
+        },
+        {
+          "node_id": "-6811065897980305788",
+          "document_hash": "f66bbbce9c36904b",
+          "display_name": "Repository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1016670566,
+          "rank": 2
+        },
+        {
+          "node_id": "-7268165071706662718",
+          "document_hash": "6d7b4fe0499adf50",
+          "display_name": "Notifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1016270077,
+          "rank": 3
+        },
+        {
+          "node_id": "-6610728582579257779",
+          "document_hash": "add6f275e535c0a9",
+          "display_name": "Workflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1014540108,
+          "rank": 4
+        },
+        {
+          "node_id": "2614172058490045527",
+          "document_hash": "bc329ad7a320a4e7",
+          "display_name": "MemoryRepository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1011036167,
+          "rank": 5
+        },
+        {
+          "node_id": "7843474940925757561",
+          "document_hash": "2d748912801084ed",
+          "display_name": "CheckoutWorkflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 965740368,
+          "rank": 6
+        },
+        {
+          "node_id": "4154321434010363626",
+          "document_hash": "3cdd8703e9d1e01b",
+          "display_name": "EmailNotifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 3163732464,
+          "rank": 7
+        }
+      ]
+    },
+    {
+      "task_id": "dev-noise-zephyr",
+      "query": "calibrationabsentzephyr",
+      "query_sha256": "50431de2380b46f77e7168a734818610d0bef0b9043e6e2d127056950701b257",
+      "query_vector_sha256": "73b261d1ac00556f99838561df42c0551601193cdfaf27a4cff10a9f365a818b",
+      "query_vector_f32_le_hex": "6986883c5037debc3d57b2bcf59b563db72f98bd6890993d84a53c3d0891e4bcc40d15bc8d5b8e3d8417003c913240bcf39dffbcb4706b3d4a599b3deb36803d395bf63c6350d2bae8b34bba5e9237bdf6397d3b31fcec3c02704dbd8e916cbda38e783dac3026bdb3f330bd42ad123dd4f16bbd09438d3b61b4eabb3a5635bd7da1323b652a35bda7e0a23b0c4212bc0243c13d0d8e393de817b13c625544baee9325b9dc93dbbb7907d23b7560083d7a2f033ddc8e1c3c3bf69cbc8aa4e93cc93ea03c3f97a13c36a08fbd2a5396bc5dba683dc942ca3c88b9473d0c151e3bc2baff3c92e2acbc9867cf3b60aaf23c15489abd4d9206bd1f2dc4bb639e70bd4bf476bc2f539fbcb64610bd24c3b3bc2eac893a65f226bd9115653d1a0d69bcfa13c0bde05b2a3d250c95bcb23bb3bc45084bbda30cbbbdacb7883d4f144a3c778f573cb78b2d3d82a3463b260af43c503e46bcb1d7dcbbe842e3bbf872e63c040298bc58dee6bc104faabcb5968e3d343c58bcd03114bdadb0643d82d414bdd884743d1f1a1ebbaa9925bdd2608fbce8546b3d9edd623dae6806bd78cb493dd92c213d3dfac1bc7a6c293c784edbbdb6ad0fbba265b83d315011bcfff5823cb9c4073dbd843cbd23d81a3c92c09d3c45f6c5bc7e3c31bc152a363d69a6efbc2f67133d97bda33c670a933c872af1bb7d191cbdd72de3bc0bfd17bd0f63d8bbf05cb4bbc69c56bc0ce975bc674b883b4e17dabc2510383c8004a3bd3bd72bbd0cdda4bc200fab3cfd84f43ad3b7a83c1c31523db71101bda428ad3aa72b0f3ddec2e8bc5b52db3c92e2abbd7ee5373a86cf70bcf11e223bcd96bfbce8b80abd0399793cf0ceab3c85df413d8a9073bd5c10c1bc2963493bca92283d5850803c070c99bb07bc86bd3815853c712c26bd2b56d1ba55640d3c4e9c1bbd73b949bc2c04893cc8a5d33be516c7bbb27f78bc32a82a3db54fb2bd1ecc0cbd81ad2b3c2cdf313d3445a33c06bb39bcff98cfb902046f3bd5cc763dc373833b1a6916bcabdbfebba908323b4021063d21d00cbc2f689bbccb5744bca7eeae3d39b84a3ae9f016bbd00edbbb303c5abdae11083b0314c03b15c156ba468fcfbb4141973c3cb68ebc51febe3c04c013bd473a1fbd1f45c03c6d1fa6bc1163afbd968ac0bca5e31bbd88d43ebdfbbc56ba9e42973c645e2a3dd49bbb3d050ea8bcfe710bbdec5d563d219f333d63d232bc459c083d546e143d85c628bc61d5143d5082153d4621d43b5ebeea3c319cb7bbc2fe34bc0b4c55bd000e42bdc61e11bdcf5e31bd4bb87d3d7dcc323d78a495bc3c8254bc5817babb717d51bd89e50bbb743cf9bc16c69c3c128a053d38499fbc13c1743c4551103c7c46553d847e01bbe187883c9f4104bda433a9bc5e9465bbd99b35bd32f486bc3f389bbd8fcc1abc5cdeca3cdb313cbd42cdb1bd7c73b1bc9794e33cb494fe3c01b68c3c4090f53c4b77d63c3c645abd9482643d8238783ce48703bd2a9d573b1c7e81bd833ea4bc83ce0abd5e1532bdc7798b3d3e0ebcbc3b3cab3d7d43c73c4b5e48bc012f22bcdfb5bf3c9109d1bb77564d3ca23f42bd47810e3d2ed195bc40fcac3c367163bbd916b73d64ee6bbcad339fbb86b480bcd66d3dbdde4328bc20a79dbbe3f094bb2f2ffbbc53036fbc2a0d12bcd8c625bd2f9cda3cf1cb3c3c48501a3d6381efbc5e0901bbc43c34bd8824c63ce9ee87bd2472973910d0013dd306223d25dfb7bcf41a2dbc09c62fbda80d70bd417d733c0819283d4ff58a3bf92e3bbcbfc59f3c474795bcf5310cbc0789553d7d2241bc00c9e0ba51d2ff3c7f7cf0bc027d433b13a52abd155d7f3df21a80bd4876c0ba5b000cbcd05ea5bc80e269bc2693ecbc0dfd02bd2472203ada657b3dad327abc2ad6493c5818143cec804a3a0da5cbbc70ac693c3229de3c97c4d93c6a4644bcc667d6bce049a4bc4792433d363d993dae5f3c3d7e280ebc5167e83aac1019bd5a6d953ce132ce3c25e926bd647880bc5b9f7abc4e78fcbbed09b53ccbe63f3bc0a0733dbc510ebdbcc8913ce5462ebce4aee3bcbe6b83bdfb43a6bcdc151bbde295713c36f7ffbbd250313de19c7f3b71fa21bcca8baf3d6bfd153d83970abd4fc939bb9f25d7bb349cbe3c5d84543ae6aeacbc0269cd3d541afbbc27dc3fbb0a2e083dbad880bd19c1bc3d1a38553d80a96b3c58beac3b1f641a3d69c687bcf37995bc9611193d0079423d010be9bcccd5cd3c11b1e53c9a0a5cbaa62330bd8c0622bdc505f13c3abca33b553749bdbe2278b997f6863c88fccc3c9509a33c2cf24d3c1aad183d233addbc4ac6543d5f9ed83bb874c5bc750f83bc94f3e43ce3f55a3db08152bc711c1e3d9e88c63cb1ff37bdf563c93c3043aa3c43d144bd3f738f3c3fea183b33ff18bc1aa60cbde9281cbc54eae3bc31b732bd8e2fa03dc1491b3d4891183d206ef2bc1e5b97bc7257913dd62052bb0440a1bcb278cf3cbce0153b6eb053bd334353bd5580bfbcb11f83bda1bc8c3c51a0763d286b0b3df5c03bbd06cf863c43804c3d8f446abdd82566bc1ccdb7bb2238a93ca08fb7bcf7ce7f3d66e02b3de36a5b3c5f8c1bbd46d8a5bc29b1cb3c7c5a75bdd1f249bde4c43ebd2073f0bb8a95acbc25db0a3c22fda33d3bf010bdf03a2ebc14480cbdb845b3bc32af303dbb331d3d18a083bc0028103d8984adbc6292023c6a6dec3c749a3f3d493bae3c7b990d3d88a5c23c71bcd43cfac84ebdf339cebc717b8ebc179e9ebbc7abce3c57de0b3d46eba5bd64f61a3dae12073d8214913d7bb85f3dea2d94bcccfbde3b38a3053c46ae4cbced837e3c30daa7bc2518313c8e08b73d5fe12f3c4b898bbc4de4483dbb14343ccc166bbb862abd3d6d211c3ccf4eba3a61c44bbd6f98ccbc5dd7a53c89eb8f3c0ec26dbda228b83ccb494bbbdb2e89bcb9cd41bd9d780cbd42e840bc395b3a3d224acd3c53403ebd79758cbd13b4113ccb3a823c35b0443d78f1c63baf19873dcee738bd90853b3d0cc21abdcedae5bc7adb68bd74e83fbdc590493c128c5f3cfd45633d2bac413ca4e6313d5251fd3c30dfb23dc8fe6a3c0169053ce5009b3c2271163d3e23c13bde1a413d6db9c4bcd78f143d539e86bd6e3e5fbd3debd23cd2fffebcacc3243d957fe03bb5a3e43cec6e4a3c07ac173dcdd7953c759f16bc4c4502bcef333f3cf8f04ebdc7de393dc69191bc3184ca3a8d0ff13cef9e92bc52d23b3d6f765a3ccbc7863ddf0e53bc45e6cf3cd1c3bbbcbd99553ccd90943ca425b3bcad02753d1620b3bd019029bdb0e70cbda6afa2bccc46a63c0d8ba0bc62c42ebde537823d76d2173cf3d22a3cca23023d65e6e53ccd21dfbdb0a69dbc3943bc3c073eeebbe443153de5f39f3d5a1e9bbc3b9a2ebc264d1f3cad920e3d92b47bbcc66149bd06ae82bc95c9113d7a9a713c9552d83c759e0c3b1b9b963b9f0b72bbc9b4b43c96ee143da61eb33bf0e3e0bcdc198c38d48a8cbcbd4ffc3ce00d87bc9cd237bd26e707bd96be50bcd262153cd6f49abdd8327b3aee54b43d67f82b3c12880fbde231d5bc4614abbc4d602e3d610c013d9837553c9435743cfc09efbcfa7e94b9955f9f3c1a091abc6d7a9cbded814fbd50cdf13cfb9ec3bd2dfe033da93b043dee5c233dfe87ff3cd987bcbbcb21dc3b9867be3c14e1793d96f9163df44382bd0a20a1ba4c8a26bcbdaf54bc18a1fbb99f371bbde987173d8bb6b0bcd134eabacfcc9b3c290f923cf423c9bc07691b3c206fb039a5fe213c3ff7293c11428ebcaf18bbbdaa2ba8bd166cd73c3a82203d48d714bd9fa947bc5da7d13b988b803b391e2f3d5f03043ccfac0c3d5a84efbc952761bd3a7a0f3cf2ecdd381555613c15cac83c4b22d43c80a0f7bbfa65283d133e42bd2c88e03caca8acbc1f1a213d59f4e3bb1ef012bd09d440bc8721053d559433bd0dcd963c4d1e113d30c224bc58a31b3dd2d1dfbbe8a0a3bb3ffe863ca52181bd4d8be7bc3f56033ca250983c59398abcdefc28bcdd720f3d9df50dbdf48b87bc75198b3bdff2013da3d955bdfe181cbccb05bd3b41a91ebd99c37f3d207d08bdda8aa4bb8f92a3bd94a058baceb3603b5cff83bdb0969a3d74493abdd68f303d22f5273c7274093c446052bd387d42bd50ef95bc5977c83c5a25f63a2b53d73ca14f16bd3311d1bc65b268bc2080063d4e90a1bc129984bb630794bc639f9ebcc6f992bd558fd63ba0ccb23b5503323c792f513c709682bdc05a643bd27025bd41f160bd1e5d3abdbab070bc3f338cbda9ceb53c14cc823cf20c573c3edfa83b651bd63b5b338e3b",
+      "expected_call": null,
+      "noise_nonce": "calibrationabsentzephyr",
+      "candidates": [
+        {
+          "node_id": "-4072284965942301196",
+          "document_hash": "ddee3c8cef428776",
+          "display_name": "codestory::component_report::dir:.",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1034282971,
+          "rank": 1
+        },
+        {
+          "node_id": "-7268165071706662718",
+          "document_hash": "6d7b4fe0499adf50",
+          "display_name": "Notifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1033130294,
+          "rank": 2
+        },
+        {
+          "node_id": "-6811065897980305788",
+          "document_hash": "f66bbbce9c36904b",
+          "display_name": "Repository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1032394915,
+          "rank": 3
+        },
+        {
+          "node_id": "2614172058490045527",
+          "document_hash": "bc329ad7a320a4e7",
+          "display_name": "MemoryRepository",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1031254996,
+          "rank": 4
+        },
+        {
+          "node_id": "4154321434010363626",
+          "document_hash": "3cdd8703e9d1e01b",
+          "display_name": "EmailNotifier",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1029420882,
+          "rank": 5
+        },
+        {
+          "node_id": "-6610728582579257779",
+          "document_hash": "add6f275e535c0a9",
+          "display_name": "Workflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1027571530,
+          "rank": 6
+        },
+        {
+          "node_id": "7843474940925757561",
+          "document_hash": "2d748912801084ed",
+          "display_name": "CheckoutWorkflow",
+          "file_path": "workflow.rs",
+          "raw_score_bits": 1024995630,
+          "rank": 7
+        }
+      ]
+    }
+  ],
+  "selection": {
+    "baseline": {
+      "mrr_at_10_scaled_2520": 8820,
+      "relevant_at_10": 9,
+      "relevant_total": 9,
+      "noisy_query_false_positives": 7,
+      "retained_candidates": 41
+    },
+    "policy": {
+      "absolute_floor_hundredths": 30,
+      "additive_margin_hundredths": 10
+    },
+    "metrics": {
+      "mrr_at_10_scaled_2520": 8820,
+      "relevant_at_10": 9,
+      "relevant_total": 9,
+      "noisy_query_false_positives": 0,
+      "retained_candidates": 19
+    }
+  }
+}

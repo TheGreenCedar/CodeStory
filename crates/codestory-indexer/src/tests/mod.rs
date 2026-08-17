@@ -4336,6 +4336,7 @@ fn test_runtime_import_call_suppression_uses_callsite_column() {
         suppress_line: 42,
         suppress_start_col: 1,
         suppress_callee_name: "require".to_string(),
+        exact_bare_call_target_spans: Vec::new(),
     }];
 
     suppress_runtime_import_call_edges(&nodes, &mut edges, &specs);
@@ -4689,6 +4690,46 @@ void calls(Worker worker) {
                 .unwrap_or_default(),
             0,
             "{shape} member call must not also emit a direct placeholder"
+        );
+    }
+
+    let complex_receivers = execute_raw_graph_contract(
+        Path::new("complex_receivers.dart"),
+        r#"
+class Worker {
+  int run() => 1;
+  int save() => 2;
+}
+
+void calls(Worker worker) {
+  final values = [worker.run(), worker.save()];
+  final matched = worker.run() == worker.save();
+  final selected = true ? worker.run() : worker.save();
+}
+"#,
+        &config,
+    )?;
+    assert!(
+        !complex_receivers.has_parse_error,
+        "complex receiver fixture must parse cleanly"
+    );
+    for target in ["run", "save"] {
+        assert_eq!(
+            complex_receivers
+                .call_counts
+                .get(&(target.to_string(), Some("dart_member".to_string())))
+                .copied(),
+            Some(3),
+            "multiple member calls inside one expression must bind distinct graph nodes"
+        );
+        assert_eq!(
+            complex_receivers
+                .call_counts
+                .get(&(target.to_string(), None))
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "complex member calls must not also emit direct placeholders"
         );
     }
 

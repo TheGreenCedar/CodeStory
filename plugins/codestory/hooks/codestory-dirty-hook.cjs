@@ -4,7 +4,11 @@ const fs = require('fs');
 const path = require('path');
 const { createHash } = require('crypto');
 const { spawnSync } = require('child_process');
-const { writeDirtyMarker } = require('./codestory-runtime.cjs');
+const {
+  inferredCodexPluginDataDir,
+  inferredCursorPluginDataDir,
+  writeDirtyMarker,
+} = require('./codestory-runtime.cjs');
 
 const MAX_RUNTIME_RECEIPT_BYTES = 256 * 1024;
 const MAX_CLI_OUTPUT_BYTES = 4 * 1024 * 1024;
@@ -132,7 +136,9 @@ function main() {
   const pluginDataDir = argValue(args, '--plugin-data')
     || process.env.PLUGIN_DATA
     || process.env.COPILOT_PLUGIN_DATA
-    || process.env.CODESTORY_PLUGIN_DATA;
+    || process.env.CODESTORY_PLUGIN_DATA
+    || inferredCodexPluginDataDir()
+    || inferredCursorPluginDataDir();
   if (!['install', 'uninstall', 'status', 'mark'].includes(action)) {
     console.error(usage());
     process.exit(2);

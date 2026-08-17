@@ -3,14 +3,14 @@ use super::super::lifecycle::{OpenedAgentSurface, open_agent_surface};
 use crate::args;
 use crate::args::PacketCommand;
 use crate::output::{
-    REPO_CONTENT_BOUNDARY_LINE, RenderedPublicOutput, emit_public_operation, render_agent_citation,
-    render_context_markdown,
+    REPO_CONTENT_BOUNDARY_LINE, RenderedPublicOutput, emit_public_operation,
+    render_context_markdown, render_public_operation_json_content,
 };
 use crate::runtime;
 use crate::runtime::map_api_error;
 use anyhow::Result;
 use codestory_contracts::api::{
-    AgentPacketDto, AgentPacketRequestDto, PacketBudgetModeDto, PacketSufficiencyStatusDto,
+    AgentPacketDto, AgentPacketRequestDto, PacketBudgetModeDto, PacketDispositionKindDto,
     PacketTaskClassDto,
 };
 use std::fmt::Write as _;
@@ -28,8 +28,8 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
         "packet",
     )?;
 
-    let operation = runtime.run_public_operation("packet", || {
-        let packet = runtime
+    let mut operation = runtime.run_public_operation("packet", || {
+        runtime
             .browser
             .packet(AgentPacketRequestDto {
                 question: cmd.question.clone(),
@@ -39,25 +39,74 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
                 extra_probes: cmd.extra_probes.clone(),
                 include_evidence: !cmd.no_evidence,
                 latency_budget_ms: cmd.latency_budget_ms,
+                parent_packet_id: None,
+                option_ids: Vec::new(),
+                core_generation_id: None,
+                retrieval_generation: None,
             })
-            .map_err(map_api_error)?;
-        let step_trace = if cmd.step_trace_out.is_some() {
-            let trace = codestory_runtime::packet_step_trace_json(&packet.answer);
-            Some(serde_json::to_string_pretty(&trace)?)
-        } else {
-            None
-        };
-        let markdown = render_packet_markdown(&runtime.project_root, &packet);
-        Ok((
-            RenderedPublicOutput::structured(&packet, markdown)?,
-            step_trace,
-        ))
+            .map_err(map_api_error)
     })?;
-    if let (Some(path), Some(trace)) = (&cmd.step_trace_out, &operation.value.1) {
+    let executable = std::env::current_exe()?;
+
+    let step_trace = if cmd.step_trace_out.is_some() {
+        let trace = codestory_runtime::packet_step_trace_json(&operation.value.answer);
+        Some(serde_json::to_string_pretty(&trace)?)
+    } else {
+        None
+    };
+    if cmd.format == args::OutputFormat::Json {
+        enforce_packet_cli_json_output_budget(&runtime.project_root, &mut operation, &executable)?;
+    } else {
+        codestory_runtime::bind_packet_follow_up_program(
+            &runtime.project_root,
+            &mut operation.value,
+            &executable,
+        );
+    }
+    if let (Some(path), Some(trace)) = (&cmd.step_trace_out, step_trace) {
         std::fs::write(path, trace)?;
     }
-    let operation = runtime::map_public_operation(operation, |(rendered, _)| rendered);
+    let markdown = render_packet_markdown(&runtime.project_root, &operation.value);
+    let rendered = RenderedPublicOutput::structured(&operation.value, markdown)?;
+    let operation = runtime::map_public_operation(operation, |_| rendered);
     emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
+}
+
+pub(in crate::app) fn enforce_packet_cli_json_output_budget(
+    project_root: &std::path::Path,
+    operation: &mut codestory_runtime::PublicOperation<AgentPacketDto>,
+    executable: &std::path::Path,
+) -> Result<()> {
+    let envelope = codestory_runtime::PublicOperation {
+        value: (),
+        core_publication: operation.core_publication.clone(),
+        retrieval_publication: operation.retrieval_publication.clone(),
+        operation_id: operation.operation_id.clone(),
+        attempt: operation.attempt,
+    };
+    let _ = render_public_operation_json_content(&envelope, &operation.value)?;
+    codestory_runtime::enforce_packet_output_budget_for_representation(
+        project_root,
+        &mut operation.value,
+        |packet| {
+            let mut public_packet = packet.clone();
+            codestory_runtime::bind_packet_follow_up_program(
+                project_root,
+                &mut public_packet,
+                executable,
+            );
+            render_public_operation_json_content(&envelope, &public_packet)
+                .expect("packet public JSON rendering was validated before budget enforcement")
+                .len()
+        },
+    )
+    .map_err(map_api_error)?;
+    codestory_runtime::bind_packet_follow_up_program(
+        project_root,
+        &mut operation.value,
+        executable,
+    );
+    Ok(())
 }
 
 pub(in crate::app) fn render_packet_markdown(
@@ -66,12 +115,31 @@ pub(in crate::app) fn render_packet_markdown(
 ) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Packet");
-    append_packet_operator_header(&mut markdown, packet);
     let _ = writeln!(
         markdown,
         "question: `{}`",
         packet.question.replace('\n', " ")
     );
+    if !packet.support.is_empty() {
+        let _ = writeln!(markdown, "\n## Support");
+        let _ = writeln!(markdown, "{REPO_CONTENT_BOUNDARY_LINE}");
+        for unit in &packet.support {
+            let _ = writeln!(markdown, "- {}", unit.summary);
+        }
+    }
+    let _ = writeln!(
+        markdown,
+        "\ndisposition: `{}`",
+        packet_disposition_label(packet.disposition.kind)
+    );
+    if let Some(reason) = packet.disposition.reason.as_deref() {
+        let _ = writeln!(markdown, "- {}", reason);
+        if let Some(drill) = &packet.disposition.drill {
+            for option in &drill.options {
+                let _ = writeln!(markdown, "- drill `{}`", option.id);
+            }
+        }
+    }
     let _ = writeln!(
         markdown,
         "budget: `{}`",
@@ -82,11 +150,6 @@ pub(in crate::app) fn render_packet_markdown(
         "task_class: `{}`",
         packet_task_class_label(packet.plan.task_class)
     );
-    let _ = writeln!(
-        markdown,
-        "sufficiency: `{}`",
-        packet_sufficiency_label(packet.sufficiency.status)
-    );
     if packet.budget.truncated {
         let _ = writeln!(
             markdown,
@@ -95,49 +158,7 @@ pub(in crate::app) fn render_packet_markdown(
             packet.budget.omitted_sections.join(", ")
         );
     }
-
-    if !packet.plan.queries.is_empty() {
-        let _ = writeln!(markdown, "\n## Plan");
-        for query in &packet.plan.queries {
-            let _ = writeln!(markdown, "- `{}` - {}", query.query, query.purpose);
-        }
-    }
-
-    if !packet.sufficiency.covered_claims.is_empty() {
-        let _ = writeln!(markdown, "\n## Covered Claims");
-        let _ = writeln!(markdown, "{REPO_CONTENT_BOUNDARY_LINE}");
-        for claim in &packet.sufficiency.covered_claims {
-            let _ = writeln!(markdown, "- {}", claim.claim);
-            for citation in claim.citations.iter().take(3) {
-                let _ = writeln!(
-                    markdown,
-                    "  - {}",
-                    render_agent_citation(project_root, citation, true)
-                );
-            }
-        }
-    }
-
-    if !packet.sufficiency.gaps.is_empty() {
-        let _ = writeln!(markdown, "\n## Gaps");
-        for gap in &packet.sufficiency.gaps {
-            let _ = writeln!(markdown, "- {gap}");
-        }
-    }
-
-    if !packet.sufficiency.follow_up_commands.is_empty() {
-        let _ = writeln!(markdown, "\n## Follow Up");
-        for command in &packet.sufficiency.follow_up_commands {
-            let _ = writeln!(markdown, "- `{command}`");
-        }
-    }
-
-    if !packet.sufficiency.avoid_opening.is_empty() {
-        let _ = writeln!(markdown, "\n## Avoid Opening");
-        for item in &packet.sufficiency.avoid_opening {
-            let _ = writeln!(markdown, "- {item}");
-        }
-    }
+    append_packet_operator_header(&mut markdown, packet);
 
     markdown.push('\n');
     markdown.push_str(&render_context_markdown(project_root, &packet.answer));
@@ -149,13 +170,13 @@ fn append_packet_operator_header(markdown: &mut String, packet: &AgentPacketDto)
     let _ = writeln!(
         markdown,
         "status: {}",
-        packet_operator_status(packet.sufficiency.status)
+        packet_operator_status(packet.disposition.kind)
     );
     let _ = writeln!(markdown, "## Trust");
     let _ = writeln!(
         markdown,
-        "trust: sufficiency={} budget_truncated={} omitted_sections={}",
-        packet_sufficiency_label(packet.sufficiency.status),
+        "trust: disposition={} budget_truncated={} omitted_sections={}",
+        packet_disposition_label(packet.disposition.kind),
         packet.budget.truncated,
         packet_budget_omitted_sections(packet)
     );
@@ -169,11 +190,13 @@ fn append_packet_operator_header(markdown: &mut String, packet: &AgentPacketDto)
     let _ = writeln!(markdown, "proof_tier: packet_evidence");
 }
 
-pub(super) fn packet_operator_status(status: PacketSufficiencyStatusDto) -> &'static str {
-    match status {
-        PacketSufficiencyStatusDto::Sufficient => "ready",
-        PacketSufficiencyStatusDto::Partial => "needs_attention",
-        PacketSufficiencyStatusDto::Insufficient => "blocked",
+pub(super) fn packet_operator_status(kind: PacketDispositionKindDto) -> &'static str {
+    match kind {
+        PacketDispositionKindDto::Supported => "ready",
+        PacketDispositionKindDto::DrillOnce => "needs_attention",
+        PacketDispositionKindDto::NotEstablished | PacketDispositionKindDto::Unavailable => {
+            "blocked"
+        }
     }
 }
 
@@ -185,13 +208,25 @@ pub(super) fn packet_budget_omitted_sections(packet: &AgentPacketDto) -> String 
     }
 }
 
-fn packet_operator_next_action(packet: &AgentPacketDto) -> &str {
-    packet
-        .sufficiency
-        .follow_up_commands
-        .first()
-        .map(String::as_str)
-        .unwrap_or("Inspect cited source before relying on claims not covered by packet citations.")
+fn packet_operator_next_action(packet: &AgentPacketDto) -> String {
+    match packet.disposition.kind {
+        PacketDispositionKindDto::Supported | PacketDispositionKindDto::NotEstablished => {
+            "Answer from compiled support units, or say the repository does not establish the claim."
+                .to_string()
+        }
+        PacketDispositionKindDto::Unavailable => packet
+            .disposition
+            .reason
+            .clone()
+            .unwrap_or_else(|| "Typed preparation is required before another packet.".to_string()),
+        PacketDispositionKindDto::DrillOnce => packet
+            .disposition
+            .drill
+            .as_ref()
+            .and_then(|drill| drill.options.first())
+            .map(|option| format!("Execute drill option `{}` once.", option.id))
+            .unwrap_or_else(|| "Execute the listed drill option ids once.".to_string()),
+    }
 }
 
 pub(in crate::app) fn packet_budget_mode_label(mode: PacketBudgetModeDto) -> &'static str {
@@ -215,10 +250,15 @@ pub(in crate::app) fn packet_task_class_label(task_class: PacketTaskClassDto) ->
     }
 }
 
-pub(crate) fn packet_sufficiency_label(status: PacketSufficiencyStatusDto) -> &'static str {
-    match status {
-        PacketSufficiencyStatusDto::Sufficient => "sufficient",
-        PacketSufficiencyStatusDto::Partial => "partial",
-        PacketSufficiencyStatusDto::Insufficient => "blocked",
+pub(crate) fn packet_disposition_label(kind: PacketDispositionKindDto) -> &'static str {
+    match kind {
+        PacketDispositionKindDto::Supported => "supported",
+        PacketDispositionKindDto::DrillOnce => "drill_once",
+        PacketDispositionKindDto::NotEstablished => "not_established",
+        PacketDispositionKindDto::Unavailable => "unavailable",
     }
+}
+
+pub(crate) fn packet_sufficiency_label(kind: PacketDispositionKindDto) -> &'static str {
+    packet_disposition_label(kind)
 }

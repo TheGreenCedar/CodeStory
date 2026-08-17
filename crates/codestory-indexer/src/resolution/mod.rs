@@ -59,7 +59,7 @@ type SameModuleCacheKey = (String, String, String);
 type NameCacheKey = (String, String);
 type RelativeImportCacheKey = (String, String, String, String);
 /// Version for cached resolution-support snapshots.
-pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 4;
+pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SemanticResolutionRequestKey {
@@ -110,6 +110,7 @@ struct CandidateIndex {
     nodes: Vec<CandidateNode>,
     relative_import_nodes: Vec<CandidateNode>,
     import_binding_node_ids: HashSet<i64>,
+    context_manager_self_returning_method_ids: HashSet<i64>,
     node_offset_by_id: HashMap<i64, usize>,
     exact_map: HashMap<String, Vec<usize>>,
     suffix_map_ascii_lower: HashMap<String, Vec<usize>>,
@@ -186,6 +187,8 @@ struct ResolutionSupportSnapshot {
     call_candidates: Vec<CandidateNodeSnapshot>,
     #[serde(default)]
     call_import_binding_node_ids: Vec<i64>,
+    #[serde(default)]
+    call_context_manager_self_returning_method_ids: Vec<i64>,
     import_candidates: Vec<CandidateNodeSnapshot>,
     #[serde(default)]
     relative_import_candidates: Vec<CandidateNodeSnapshot>,
@@ -1325,6 +1328,18 @@ fn is_cpp_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option
     })
 }
 
+fn is_rust_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::languages::rust::MEMBER_CALLSITE_MARKER)
+    })
+}
+
 fn is_js_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
     if edge_kind != EdgeKind::CALL {
         return false;
@@ -1474,6 +1489,31 @@ fn receiver_module_from_callsite(callsite_identity: Option<&str>) -> Option<&str
         })
 }
 
+fn requires_python_context_manager_self_return(callsite_identity: Option<&str>) -> bool {
+    callsite_identity.is_some_and(|identity| {
+        identity.split('|').any(|part| {
+            part == crate::languages::python::CONTEXT_MANAGER_SELF_RETURN_REQUIRED_MARKER
+        })
+    })
+}
+
+fn dart_unprefixed_import_modules(module_marker: &str) -> Option<Vec<&str>> {
+    let mut encoded =
+        module_marker.strip_prefix(crate::languages::dart::UNPREFIXED_IMPORT_SET_PREFIX)?;
+    let mut modules = Vec::new();
+    while !encoded.is_empty() {
+        let (length, remainder) = encoded.split_once(':')?;
+        let length = length.parse::<usize>().ok()?;
+        if length == 0 || remainder.len() < length || !remainder.is_char_boundary(length) {
+            return None;
+        }
+        let (module, rest) = remainder.split_at(length);
+        modules.push(module);
+        encoded = rest;
+    }
+    (!modules.is_empty()).then_some(modules)
+}
+
 pub(super) fn semantic_candidate_kinds(edge_kind: EdgeKind) -> &'static [i32] {
     match edge_kind {
         EdgeKind::CALL => &[NodeKind::FUNCTION as i32, NodeKind::METHOD as i32],
@@ -1619,6 +1659,7 @@ impl PreparedResolutionState {
             call_candidate_index: CandidateIndex::from_snapshot_nodes_with_import_bindings(
                 snapshot.call_candidates,
                 snapshot.call_import_binding_node_ids,
+                snapshot.call_context_manager_self_returning_method_ids,
             ),
             import_candidate_index: CandidateIndex::from_snapshot_nodes_with_relative(
                 snapshot.import_candidates,
@@ -1643,6 +1684,9 @@ impl PreparedResolutionState {
             enable_semantic: flags.enable_semantic,
             call_candidates: self.call_candidate_index.snapshot_nodes(),
             call_import_binding_node_ids: self.call_candidate_index.import_binding_node_ids(),
+            call_context_manager_self_returning_method_ids: self
+                .call_candidate_index
+                .context_manager_self_returning_method_ids(),
             import_candidates: self.import_candidate_index.snapshot_nodes(),
             relative_import_candidates: self
                 .import_candidate_index
@@ -1666,11 +1710,14 @@ impl CandidateIndex {
     fn load_with_import_bindings(conn: &rusqlite::Connection, kinds: &[i32]) -> Result<Self> {
         let nodes = Self::load_nodes(conn, kinds)?;
         let import_binding_node_ids = Self::load_import_binding_node_ids(conn)?;
-        Ok(Self::from_primary_relative_and_import_bindings(
+        let mut index = Self::from_primary_relative_and_import_bindings(
             nodes,
             Vec::new(),
             import_binding_node_ids,
-        ))
+        );
+        index.context_manager_self_returning_method_ids =
+            Self::load_context_manager_self_returning_method_ids(conn)?;
+        Ok(index)
     }
 
     fn load_with_relative_import_kinds(
@@ -1697,6 +1744,29 @@ impl CandidateIndex {
              WHERE kind = ?1",
         )?;
         let rows = stmt.query_map(params![EdgeKind::IMPORT as i32], |row| row.get::<_, i64>(0))?;
+        Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
+    }
+
+    fn load_context_manager_self_returning_method_ids(
+        conn: &rusqlite::Connection,
+    ) -> Result<HashSet<i64>> {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT member.target_node_id
+             FROM edge AS contract
+             JOIN node AS enter_method ON enter_method.id = contract.target_node_id
+             JOIN edge AS member ON member.source_node_id = contract.source_node_id
+             WHERE contract.kind = ?1
+               AND contract.callsite_identity = ?2
+               AND member.kind = ?1
+               AND member.target_node_id != contract.target_node_id",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                EdgeKind::MEMBER as i32,
+                crate::languages::python::CONTEXT_MANAGER_SELF_RETURN_MEMBER_MARKER,
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
         Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
     }
 
@@ -1736,12 +1806,17 @@ impl CandidateIndex {
     fn from_snapshot_nodes_with_import_bindings(
         nodes: Vec<CandidateNodeSnapshot>,
         import_binding_node_ids: Vec<i64>,
+        context_manager_self_returning_method_ids: Vec<i64>,
     ) -> Self {
-        Self::from_primary_relative_and_import_bindings(
+        let mut index = Self::from_primary_relative_and_import_bindings(
             Self::candidate_nodes_from_snapshots(nodes),
             Vec::new(),
             import_binding_node_ids.into_iter().collect(),
-        )
+        );
+        index.context_manager_self_returning_method_ids = context_manager_self_returning_method_ids
+            .into_iter()
+            .collect();
+        index
     }
 
     fn from_snapshot_nodes_with_relative(
@@ -1778,6 +1853,21 @@ impl CandidateIndex {
                 qualified_name: node.qualified_name.clone(),
             })
             .collect()
+    }
+
+    fn context_manager_self_returning_method_ids(&self) -> Vec<i64> {
+        let mut ids = self
+            .context_manager_self_returning_method_ids
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn has_context_manager_self_return_contract(&self, candidate_id: i64) -> bool {
+        self.context_manager_self_returning_method_ids
+            .contains(&candidate_id)
     }
 
     fn candidate_nodes_from_snapshots(nodes: Vec<CandidateNodeSnapshot>) -> Vec<CandidateNode> {
@@ -2013,6 +2103,54 @@ impl CandidateIndex {
                 owner_name,
                 method_name,
             ),
+            _ => None,
+        }
+    }
+
+    fn find_same_directory_owner_member_readonly(
+        &self,
+        caller_file_path: Option<&str>,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let caller_file_path = normalize_resolution_path(caller_file_path?)?;
+        let caller_directory = resolution_path_directory(&caller_file_path);
+        let mut matches = self
+            .owner_member_candidate_offsets(owner_name, method_name)
+            .into_iter()
+            .filter_map(|offset| self.nodes.get(offset))
+            .filter(|node| owner_member_candidate_matches(node, owner_name, method_name))
+            .filter(|node| {
+                node.normalized_file_path
+                    .as_deref()
+                    .is_some_and(|path| resolution_path_directory(path) == caller_directory)
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        match matches.as_slice() {
+            [candidate] => Some(*candidate),
+            _ => None,
+        }
+    }
+
+    fn find_global_unique_owner_member_readonly(
+        &self,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let mut matches = self
+            .owner_member_candidate_offsets(owner_name, method_name)
+            .into_iter()
+            .filter_map(|offset| self.nodes.get(offset))
+            .filter(|node| owner_member_candidate_matches(node, owner_name, method_name))
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        match matches.as_slice() {
+            [candidate] => Some(*candidate),
             _ => None,
         }
     }
@@ -2650,6 +2788,12 @@ fn normalize_resolution_path(path: &str) -> Option<String> {
     out.push_str(&parts.join("/"));
     let out = out.trim_end_matches('/').to_ascii_lowercase();
     (!out.is_empty()).then_some(out)
+}
+
+fn resolution_path_directory(path: &str) -> &str {
+    path.rsplit_once('/')
+        .map(|(directory, _)| directory)
+        .unwrap_or_default()
 }
 
 fn relative_import_path_candidates(caller_file_path: &str, module_name: &str) -> Vec<String> {
@@ -3443,6 +3587,7 @@ mod tests {
             enable_semantic: false,
             call_candidates: Vec::new(),
             call_import_binding_node_ids: Vec::new(),
+            call_context_manager_self_returning_method_ids: Vec::new(),
             import_candidates: Vec::new(),
             relative_import_candidates: Vec::new(),
             call_semantic_nodes: Vec::new(),

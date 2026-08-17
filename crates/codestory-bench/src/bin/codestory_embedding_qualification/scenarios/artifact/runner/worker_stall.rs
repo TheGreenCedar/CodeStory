@@ -2,7 +2,8 @@ use super::super::{NORMAL_WORKER_TIMEOUT, SNAPSHOT_TIMEOUT, btree};
 use super::ScenarioRunner;
 use super::analysis::{consume_watchdog_marker, same_server_authority, scheduler_values};
 use super::process::{
-    require_worker_success, stall_worker_timeout, validate_replay_attempts, wait_for_process_exit,
+    require_worker_success, stall_worker_timeout, validate_replay_attempts,
+    wait_for_exact_process_exit,
 };
 use crate::qualification::diagnostic_worker_stall_enabled;
 use crate::qualification::output::write_atomic_json;
@@ -76,7 +77,12 @@ impl<'a> ScenarioRunner<'a> {
         // Observation: a direct OS start-identity probe on the owner the
         // watchdog already fail-stopped; it spawns no worker and waits on no
         // client ramp.
-        wait_for_process_exit(&self.clock, before.process.pid, SNAPSHOT_TIMEOUT)?;
+        wait_for_exact_process_exit(
+            &self.clock,
+            before.process.pid,
+            &before.process.process_start_id,
+            SNAPSHOT_TIMEOUT,
+        )?;
         let (watchdog_marker, watchdog_marker_sha256) = consume_watchdog_marker(
             self.context.output_directory,
             self.context.nonce_sha256,

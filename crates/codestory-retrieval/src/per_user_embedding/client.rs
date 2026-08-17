@@ -300,6 +300,47 @@ impl PerUserEmbeddingClient {
         Ok((vector, attempts))
     }
 
+    pub fn embed_queries_with_control(
+        &self,
+        texts: &[String],
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if texts.len() > super::protocol::PER_USER_EMBEDDING_QUERY_BATCH_MAX {
+            bail!(
+                "embedding_query_batch_too_large: maximum={} observed={}",
+                super::protocol::PER_USER_EMBEDDING_QUERY_BATCH_MAX,
+                texts.len()
+            );
+        }
+        validate_raw_inputs(texts)?;
+        let budgets = self.transport.budgets();
+        let (result, _) = self.call_pure_with_replay_controlled_and_attempts(
+            budgets.query_request,
+            maximum_timeout,
+            cancelled,
+            |deadline_ms, token| EmbeddingOperation::EmbedQueries {
+                scope_id: self.scope_id.clone(),
+                deadline_ms,
+                retry_after_ms: duration_ms(budgets.retry_after),
+                cancel_token: Some(token),
+                inputs: texts.to_vec(),
+            },
+        )?;
+        let (rows, columns, identity, payload) = vectors_result(result)?;
+        if rows as usize != texts.len() {
+            bail!(
+                "embedding_vector_row_count_mismatch: expected={} observed={rows}",
+                texts.len()
+            );
+        }
+        validate_engine_identity(&identity, &self.compatibility)?;
+        normalize_and_validate_vectors(decode_vectors(rows, columns, &payload)?)
+    }
+
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         self.embed_documents_with_control(texts, None, &|| false)
     }

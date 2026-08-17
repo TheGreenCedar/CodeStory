@@ -148,6 +148,14 @@ pub(crate) fn emit_public_operation(
     emit_rendered_public_operation(format, &operation, &operation.value, output_file)
 }
 
+pub(crate) fn render_public_operation_json_content<T, V: Serialize>(
+    operation: &codestory_runtime::PublicOperation<T>,
+    response: &V,
+) -> Result<String> {
+    let json = crate::runtime::public_operation_json_value(operation, response)?;
+    render_output_content(OutputFormat::Json, &json, "")
+}
+
 pub(crate) fn emit_rendered_public_operation<T>(
     format: OutputFormat,
     operation: &codestory_runtime::PublicOperation<T>,
@@ -157,8 +165,8 @@ pub(crate) fn emit_rendered_public_operation<T>(
     match rendered {
         RenderedPublicOutput::Structured { json, markdown } => match format {
             OutputFormat::Json => {
-                let json = crate::runtime::public_operation_json_value(operation, json)?;
-                emit(format, &json, markdown.clone(), output_file)
+                let content = render_public_operation_json_content(operation, json)?;
+                emit_content(&content, output_file)
             }
             OutputFormat::Markdown => emit(format, json, markdown.clone(), output_file),
             OutputFormat::Dot => bail!("--format dot is only supported by `trail`"),
@@ -3117,30 +3125,24 @@ fn append_evidence_packet(markdown: &mut String, output: &DrillOutput) {
         markdown,
         "evidence_packet: id={} sufficiency={} citations={}",
         packet.packet_id,
-        crate::packet_sufficiency_label(packet.sufficiency.status),
+        crate::packet_sufficiency_label(packet.disposition.kind),
         packet.answer.citations.len()
     );
     let _ = writeln!(markdown, "- question: {}", packet.question);
-    if !packet.sufficiency.covered_claims.is_empty() {
-        let _ = writeln!(markdown, "- covered_claims:");
-        for claim in packet
-            .sufficiency
-            .covered_claims
+    if !packet.support.is_empty() {
+        let _ = writeln!(markdown, "- support:");
+        for unit in packet.support.iter().take(EVIDENCE_PREVIEW_LIMIT) {
+            let _ = writeln!(markdown, "  - {}", unit.summary);
+        }
+    }
+    if !packet.disposition.omission_receipts.is_empty() {
+        let _ = writeln!(markdown, "- gaps:");
+        for gap in packet
+            .disposition
+            .omission_receipts
             .iter()
             .take(EVIDENCE_PREVIEW_LIMIT)
         {
-            let _ = writeln!(
-                markdown,
-                "  - {} citations={} proof={:?}",
-                claim.claim,
-                claim.citations.len(),
-                claim.proof_status
-            );
-        }
-    }
-    if !packet.sufficiency.gaps.is_empty() {
-        let _ = writeln!(markdown, "- gaps:");
-        for gap in packet.sufficiency.gaps.iter().take(EVIDENCE_PREVIEW_LIMIT) {
             let _ = writeln!(markdown, "  - {gap}");
         }
     }

@@ -23,36 +23,36 @@ node STRUCT name=MemoryRepository qn=MemoryRepository canonical=<ROOT>/fidelity.
 node STRUCT name=Workflow qn=Workflow canonical=<ROOT>/fidelity.rs:Workflow line=39 col=8 end=39:16 file=FILE:<ROOT>/fidelity.rs@1
 node UNKNOWN name=ConsoleNotifier::write_log qn=ConsoleNotifier::write_log canonical=<ROOT>/fidelity.rs:ConsoleNotifier::write_log#1 line=16 col=14 end=16:23 file=FILE:<ROOT>/fidelity.rs@1
 node UNKNOWN name=MemoryRepository::track qn=MemoryRepository::track canonical=<ROOT>/fidelity.rs:MemoryRepository::track#0 line=33 col=14 end=33:19 file=FILE:<ROOT>/fidelity.rs@1
+node UNKNOWN name=Notifier::notify qn=Notifier::notify canonical=<ROOT>/fidelity.rs:Notifier::notify#1 line=55 col=18 end=55:24 file=FILE:<ROOT>/fidelity.rs@1
+node UNKNOWN name=Repository::save qn=Repository::save canonical=<ROOT>/fidelity.rs:Repository::save#1 line=56 col=20 end=56:24 file=FILE:<ROOT>/fidelity.rs@1
 node UNKNOWN name=String::len qn=String::len canonical=<ROOT>/fidelity.rs:String::len#0 line=70 col=20 end=70:23 file=FILE:<ROOT>/fidelity.rs@1
 node UNKNOWN name=VecDeque::pop_front qn=VecDeque::pop_front canonical=<ROOT>/fidelity.rs:VecDeque::pop_front#0 line=81 col=32 end=81:41 file=FILE:<ROOT>/fidelity.rs@1
 node UNKNOWN name=Workflow::decorate qn=Workflow::decorate canonical=<ROOT>/fidelity.rs:Workflow::decorate#0 line=57 col=14 end=57:22 file=FILE:<ROOT>/fidelity.rs@1
 node UNKNOWN name=Workflow::identity qn=Workflow::identity canonical=<ROOT>/fidelity.rs:Workflow::identity#1 line=54 col=27 end=54:35 file=FILE:<ROOT>/fidelity.rs@1
 node UNKNOWN name=Workflow::run qn=Workflow::run canonical=<ROOT>/fidelity.rs:Workflow::run#1 line=65 col=14 end=65:17 file=FILE:<ROOT>/fidelity.rs@1
+node UNKNOWN name=Workflow::run qn=Workflow::run canonical=<ROOT>/fidelity.rs:Workflow::run#2 line=82 col=18 end=82:21 file=FILE:<ROOT>/fidelity.rs@1
 node UNKNOWN name=from qn=from canonical=<ROOT>/fidelity.rs:from#0 line=75 col=28 end=75:32 file=FILE:<ROOT>/fidelity.rs@1
 node UNKNOWN name=mapper qn=mapper canonical=<ROOT>/fidelity.rs:mapper#0 line=46 col=9 end=46:15 file=FILE:<ROOT>/fidelity.rs@1
-node UNKNOWN name=notify qn=notify canonical=<ROOT>/fidelity.rs:notify#0 line=55 col=18 end=55:24 file=FILE:<ROOT>/fidelity.rs@1
 node UNKNOWN name=ready qn=ready canonical=<ROOT>/fidelity.rs:ready#0 line=66 col=9 end=66:14 file=FILE:<ROOT>/fidelity.rs@1
-node UNKNOWN name=run qn=run canonical=<ROOT>/fidelity.rs:run#0 line=82 col=18 end=82:21 file=FILE:<ROOT>/fidelity.rs@1
-node UNKNOWN name=save qn=save canonical=<ROOT>/fidelity.rs:save#0 line=56 col=20 end=56:24 file=FILE:<ROOT>/fidelity.rs@1
 node UNKNOWN name=to_string qn=to_string canonical=<ROOT>/fidelity.rs:to_string#0 line=76 col=26 end=76:35 file=FILE:<ROOT>/fidelity.rs@1
 node VARIABLE name=mapped qn=mapped canonical=<ROOT>/fidelity.rs:mapped#0 line=54 col=13 end=54:19 file=FILE:<ROOT>/fidelity.rs@1
 node VARIABLE name=notifier qn=notifier canonical=<ROOT>/fidelity.rs:notifier#0 line=79 col=9 end=79:17 file=FILE:<ROOT>/fidelity.rs@1
 node VARIABLE name=queue qn=queue canonical=<ROOT>/fidelity.rs:queue#0 line=75 col=13 end=75:18 file=FILE:<ROOT>/fidelity.rs@1
 node VARIABLE name=repository qn=repository canonical=<ROOT>/fidelity.rs:repository#0 line=80 col=9 end=80:19 file=FILE:<ROOT>/fidelity.rs@1
 node VARIABLE name=workflow qn=workflow canonical=<ROOT>/fidelity.rs:workflow#0 line=78 col=9 end=78:17 file=FILE:<ROOT>/fidelity.rs@1
-edge CALL src=FUNCTION:orchestrate_rust@74 dst=UNKNOWN:VecDeque::pop_front@81 resolved_src=FUNCTION:orchestrate_rust@74 resolved_dst=- line=81 confidence=- certainty=- callsite=h0:81:1:h1 candidates=[]
-edge CALL src=FUNCTION:orchestrate_rust@74 dst=UNKNOWN:from@75 resolved_src=FUNCTION:orchestrate_rust@74 resolved_dst=- line=75 confidence=- certainty=- callsite=h0:75:1:h2 candidates=[]
-edge CALL src=FUNCTION:orchestrate_rust@74 dst=UNKNOWN:run@82 resolved_src=FUNCTION:orchestrate_rust@74 resolved_dst=METHOD:Workflow::run@49 line=82 confidence=0.9500 certainty=Certain callsite=h0:82:1:h3 candidates=[]
-edge CALL src=FUNCTION:orchestrate_rust@74 dst=UNKNOWN:to_string@76 resolved_src=FUNCTION:orchestrate_rust@74 resolved_dst=- line=76 confidence=- certainty=- callsite=h0:76:1:h4 candidates=[]
-edge CALL src=METHOD:ConsoleNotifier::notify@15 dst=UNKNOWN:ConsoleNotifier::write_log@16 resolved_src=METHOD:ConsoleNotifier::notify@15 resolved_dst=METHOD:ConsoleNotifier::write_log@11 line=16 confidence=0.9500 certainty=Certain callsite=h0:16:1:h5 candidates=[]
-edge CALL src=METHOD:MemoryRepository::save@32 dst=UNKNOWN:MemoryRepository::track@33 resolved_src=METHOD:MemoryRepository::save@32 resolved_dst=METHOD:MemoryRepository::track@36 line=33 confidence=0.9500 certainty=Certain callsite=h0:33:1:h6 candidates=[]
-edge CALL src=METHOD:Workflow::decorate@69 dst=UNKNOWN:String::len@70 resolved_src=METHOD:Workflow::decorate@69 resolved_dst=- line=70 confidence=- certainty=- callsite=h0:70:1:h7 candidates=[]
+edge CALL src=FUNCTION:orchestrate_rust@74 dst=UNKNOWN:VecDeque::pop_front@81 resolved_src=FUNCTION:orchestrate_rust@74 resolved_dst=- line=81 confidence=- certainty=- callsite=h0:81:1:h1|syntax:rust-method-call candidates=[]
+edge CALL src=FUNCTION:orchestrate_rust@74 dst=UNKNOWN:Workflow::run@82 resolved_src=FUNCTION:orchestrate_rust@74 resolved_dst=METHOD:Workflow::run@49 line=82 confidence=0.9500 certainty=Certain callsite=h0:82:1:h2|syntax:rust-method-call candidates=[]
+edge CALL src=FUNCTION:orchestrate_rust@74 dst=UNKNOWN:from@75 resolved_src=FUNCTION:orchestrate_rust@74 resolved_dst=- line=75 confidence=- certainty=- callsite=h0:75:1:h3 candidates=[]
+edge CALL src=FUNCTION:orchestrate_rust@74 dst=UNKNOWN:to_string@76 resolved_src=FUNCTION:orchestrate_rust@74 resolved_dst=- line=76 confidence=- certainty=- callsite=h0:76:1:h4|syntax:rust-method-call candidates=[]
+edge CALL src=METHOD:ConsoleNotifier::notify@15 dst=UNKNOWN:ConsoleNotifier::write_log@16 resolved_src=METHOD:ConsoleNotifier::notify@15 resolved_dst=METHOD:ConsoleNotifier::write_log@11 line=16 confidence=0.9500 certainty=Certain callsite=h0:16:1:h5|syntax:rust-method-call candidates=[]
+edge CALL src=METHOD:MemoryRepository::save@32 dst=UNKNOWN:MemoryRepository::track@33 resolved_src=METHOD:MemoryRepository::save@32 resolved_dst=METHOD:MemoryRepository::track@36 line=33 confidence=0.9500 certainty=Certain callsite=h0:33:1:h6|syntax:rust-method-call candidates=[]
+edge CALL src=METHOD:Workflow::decorate@69 dst=UNKNOWN:String::len@70 resolved_src=METHOD:Workflow::decorate@69 resolved_dst=- line=70 confidence=- certainty=- callsite=h0:70:1:h7|syntax:rust-method-call candidates=[]
 edge CALL src=METHOD:Workflow::identity@42 dst=UNKNOWN:mapper@46 resolved_src=METHOD:Workflow::identity@42 resolved_dst=- line=46 confidence=- certainty=- callsite=h0:46:1:h8 candidates=[]
-edge CALL src=METHOD:Workflow::run@49 dst=UNKNOWN:Workflow::decorate@57 resolved_src=METHOD:Workflow::run@49 resolved_dst=METHOD:Workflow::decorate@69 line=57 confidence=0.9500 certainty=Certain callsite=h0:57:1:h9 candidates=[]
-edge CALL src=METHOD:Workflow::run@49 dst=UNKNOWN:Workflow::identity@54 resolved_src=METHOD:Workflow::run@49 resolved_dst=METHOD:Workflow::identity@42 line=54 confidence=0.9500 certainty=Certain callsite=h0:54:1:h10 candidates=[]
-edge CALL src=METHOD:Workflow::run@49 dst=UNKNOWN:notify@55 resolved_src=METHOD:Workflow::run@49 resolved_dst=FUNCTION:Notifier::notify@5 line=55 confidence=0.9500 certainty=Certain callsite=h0:55:1:h11 candidates=[]
-edge CALL src=METHOD:Workflow::run@49 dst=UNKNOWN:save@56 resolved_src=METHOD:Workflow::run@49 resolved_dst=FUNCTION:Repository::save@25 line=56 confidence=0.9500 certainty=Certain callsite=h0:56:1:h12 candidates=[]
-edge CALL src=METHOD:Workflow::run_async@60 dst=UNKNOWN:Workflow::run@65 resolved_src=METHOD:Workflow::run_async@60 resolved_dst=METHOD:Workflow::run@49 line=65 confidence=0.9500 certainty=Certain callsite=h0:65:1:h13 candidates=[]
+edge CALL src=METHOD:Workflow::run@49 dst=UNKNOWN:Notifier::notify@55 resolved_src=METHOD:Workflow::run@49 resolved_dst=FUNCTION:Notifier::notify@5 line=55 confidence=0.9500 certainty=Certain callsite=h0:55:1:h9|syntax:rust-method-call candidates=[]
+edge CALL src=METHOD:Workflow::run@49 dst=UNKNOWN:Repository::save@56 resolved_src=METHOD:Workflow::run@49 resolved_dst=FUNCTION:Repository::save@25 line=56 confidence=0.9500 certainty=Certain callsite=h0:56:1:h10|syntax:rust-method-call candidates=[]
+edge CALL src=METHOD:Workflow::run@49 dst=UNKNOWN:Workflow::decorate@57 resolved_src=METHOD:Workflow::run@49 resolved_dst=METHOD:Workflow::decorate@69 line=57 confidence=0.9500 certainty=Certain callsite=h0:57:1:h11|syntax:rust-method-call candidates=[]
+edge CALL src=METHOD:Workflow::run@49 dst=UNKNOWN:Workflow::identity@54 resolved_src=METHOD:Workflow::run@49 resolved_dst=METHOD:Workflow::identity@42 line=54 confidence=0.9500 certainty=Certain callsite=h0:54:1:h12|syntax:rust-method-call candidates=[]
+edge CALL src=METHOD:Workflow::run_async@60 dst=UNKNOWN:Workflow::run@65 resolved_src=METHOD:Workflow::run_async@60 resolved_dst=METHOD:Workflow::run@49 line=65 confidence=0.9500 certainty=Certain callsite=h0:65:1:h13|syntax:rust-method-call candidates=[]
 edge CALL src=METHOD:Workflow::run_async@60 dst=UNKNOWN:ready@66 resolved_src=METHOD:Workflow::run_async@60 resolved_dst=- line=66 confidence=- certainty=- callsite=h0:66:1:h14 candidates=[]
 edge IMPORT src=MODULE:Queue@1 dst=MODULE:std::collections::VecDeque@1 resolved_src=MODULE:Queue@1 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge IMPORT src=MODULE:std::future::ready@2 dst=MODULE:std::future::ready@2 resolved_src=MODULE:std::future::ready@2 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]

@@ -24,14 +24,13 @@ const ACTIVE_RUN_STATES = new Set([
 const CONSTANT_SET_PATH =
   "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
 const PHASE_CONTRACTS = Object.freeze({
-  calibration_source: Object.freeze({
+  source_stabilization: Object.freeze({
     knownFutureSourceChanges: Object.freeze([CONSTANT_SET_PATH]),
     plannedProofActions: Object.freeze([
-      "calibration-source-acceptance",
+      "source-stabilization",
       "calibration",
       "generated-constant-freeze",
       "frozen-candidate-acceptance",
-      "source-proof",
       "qualification",
       "release",
     ]),
@@ -41,7 +40,6 @@ const PHASE_CONTRACTS = Object.freeze({
     knownFutureSourceChanges: Object.freeze([]),
     plannedProofActions: Object.freeze([
       "frozen-candidate-acceptance",
-      "source-proof",
       "qualification",
       "release",
     ]),
@@ -59,6 +57,7 @@ const CANCEL_POLL_MS = Number.parseInt(
   process.env.CODESTORY_FREEZE_CANCEL_POLL_MS ?? "1000",
   10,
 );
+const COMMAND_OUTPUT_MAX_BYTES = 64 * 1024 * 1024;
 
 function fail(message) {
   throw new Error(message);
@@ -67,7 +66,7 @@ function fail(message) {
 function phaseContract(phase) {
   const contract = PHASE_CONTRACTS[phase];
   if (!contract) {
-    fail("freeze phase must be calibration_source or frozen_candidate");
+    fail("freeze phase must be source_stabilization or frozen_candidate");
   }
   return contract;
 }
@@ -76,6 +75,7 @@ function run(command, args, options = {}) {
   return execFileSync(command, args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: COMMAND_OUTPUT_MAX_BYTES,
     ...options,
   }).trim();
 }

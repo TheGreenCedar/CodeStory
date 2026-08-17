@@ -607,7 +607,10 @@ mod tests {
                     "task_class": null,
                     "probes": [{"kind": "free_query", "query": "router"}],
                     "extra_probes": ["router"],
-                    "latency_budget_ms": 5000
+                    "latency_budget_ms": 5000,
+                    "parent_packet_id": "packet-1",
+                    "option_ids": ["bounded_source_read:src%2Funread.rs"],
+                    "core_generation_id": "core-1"
                 }),
             ),
             (
@@ -632,6 +635,29 @@ mod tests {
                 validate_tool_arguments(tool, Some(&arguments)),
                 Ok(()),
                 "{tool} rejected its own advertised argument shape"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_schema_rejects_undocumented_cli_flags() {
+        for (flag, value) in [
+            ("file", json!("src/lib.rs")),
+            ("mode", json!("compact")),
+            ("max_snippet_bytes", json!(2048)),
+        ] {
+            let mut arguments = json!({
+                "project": "/repo",
+                "question": "how does routing work"
+            });
+            arguments
+                .as_object_mut()
+                .expect("object")
+                .insert(flag.to_string(), value);
+            assert_eq!(
+                codes("packet", arguments),
+                vec!["unknown_property"],
+                "packet must reject undocumented CLI flag {flag}"
             );
         }
     }
@@ -824,5 +850,229 @@ mod tests {
             validate_tool_arguments("not_a_tool", Some(&json!({"anything": true}))),
             Ok(())
         );
+    }
+}
+
+/// Argument names that mean the same thing, one group per concept.
+///
+/// A tool's *output* calls a stable node identifier `node_id`; several tools' *input*
+/// schemas call it `id`. An agent that reads `node_id` from a search result and hands it
+/// straight back is doing the obvious thing, and the server rejected it as an undeclared
+/// property. Across a 54-row benchmark that single mismatch produced 98 `unknown_property`
+/// rejections, and the agent -- given an error that named the pointer but not the accepted
+/// spelling -- retried the same shape rather than renaming the field.
+///
+/// `depth` and `max_depth` are the same story between `trail` and `shortest_path`.
+///
+/// Reconciling here rather than in each schema keeps one published name per concept, so
+/// the catalog stays unambiguous while the server accepts its own output vocabulary.
+const ARGUMENT_SYNONYMS: &[&[&str]] = &[
+    // A hit's identifier. Emitted 1,978 times across a 54-row census as `node_id`.
+    &["id", "node_id"],
+    // A hit's name. `display_name` appears 2,177 times, `qualified_name` 771, `label` 837 --
+    // and every consumer tool declares only `query`, so piping a result into the next call
+    // meant renaming the field by hand every time.
+    &["query", "display_name", "qualified_name", "label"],
+    // A hit's file. `file_path` appears 2,903 times; `snippet` range entries call it `path`.
+    &["path", "file_path"],
+    &["depth", "max_depth"],
+];
+
+/// Rewrite supplied argument names to the spelling this tool's schema declares.
+///
+/// Only ever renames when exactly one member of a synonym group is declared and the caller
+/// used a different member that the schema does not declare; an argument the schema already
+/// accepts is never touched, and a collision between two spellings is left alone so
+/// validation still reports it.
+pub(crate) fn reconcile_argument_synonyms(tool: &str, arguments: &mut Value) {
+    let Some(schema) = crate::stdio_catalog::tool_input_schema(tool) else {
+        return;
+    };
+    let Some(declared) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(supplied) = arguments.as_object_mut() else {
+        return;
+    };
+    for group in ARGUMENT_SYNONYMS {
+        let mut accepted = group.iter().filter(|name| declared.contains_key(**name));
+        let (Some(canonical), None) = (accepted.next(), accepted.next()) else {
+            continue;
+        };
+        if supplied.contains_key(*canonical) {
+            continue;
+        }
+        let Some(alias) = group
+            .iter()
+            .find(|name| *name != canonical && supplied.contains_key(**name))
+        else {
+            continue;
+        };
+        if let Some(value) = supplied.remove(*alias) {
+            supplied.insert((*canonical).to_string(), value);
+        }
+    }
+}
+
+#[cfg(test)]
+mod synonym_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The server's search results name a stable identifier `node_id`; `symbol` declares
+    /// `id`. Handing a result field straight back must work.
+    #[test]
+    fn node_id_is_accepted_where_the_schema_declares_id() {
+        let mut arguments = json!({"project": "/tmp/repo", "node_id": "12345"});
+        assert!(
+            validate_tool_arguments("symbol", Some(&arguments)).is_err(),
+            "precondition: the published schema does not declare node_id"
+        );
+        reconcile_argument_synonyms("symbol", &mut arguments);
+        assert_eq!(arguments["id"], json!("12345"));
+        assert!(arguments.get("node_id").is_none());
+        assert_eq!(validate_tool_arguments("symbol", Some(&arguments)), Ok(()));
+    }
+
+    /// `trail` declares `depth`; `shortest_path` declares `max_depth`. An agent moving
+    /// between them should not have to remember which is which.
+    #[test]
+    fn max_depth_is_accepted_where_the_schema_declares_depth() {
+        let mut arguments = json!({"project": "/tmp/repo", "query": "Session", "max_depth": 2});
+        reconcile_argument_synonyms("trail", &mut arguments);
+        assert_eq!(arguments["depth"], json!(2));
+        assert_eq!(validate_tool_arguments("trail", Some(&arguments)), Ok(()));
+    }
+
+    /// A spelling the schema already declares is never rewritten.
+    #[test]
+    fn declared_names_are_left_alone() {
+        let mut arguments = json!({"project": "/tmp/repo", "id": "keep-me"});
+        reconcile_argument_synonyms("symbol", &mut arguments);
+        assert_eq!(arguments["id"], json!("keep-me"));
+    }
+
+    /// Supplying both spellings is a real ambiguity; leave it for validation to report
+    /// rather than silently picking one.
+    #[test]
+    fn colliding_spellings_are_not_silently_merged() {
+        let mut arguments = json!({"project": "/tmp/repo", "id": "a", "node_id": "b"});
+        reconcile_argument_synonyms("symbol", &mut arguments);
+        assert_eq!(arguments["id"], json!("a"));
+        assert_eq!(arguments["node_id"], json!("b"));
+        assert!(validate_tool_arguments("symbol", Some(&arguments)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod source_range_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Reading by path is a declared target, so schema validation must accept it.
+    #[test]
+    fn snippet_accepts_batched_file_ranges() {
+        let arguments = json!({
+            "project": "/tmp/repo",
+            "paths": [
+                {"path": "src/a.rs", "start_line": 10, "end_line": 40},
+                {"path": "src/b.rs", "start_line": 1, "end_line": 12}
+            ]
+        });
+        assert_eq!(validate_tool_arguments("snippet", Some(&arguments)), Ok(()));
+    }
+
+    /// A hit reports `file_path` and a single `line`. Pasting exactly that must work, because
+    /// requiring callers to invent an `end_line` is why the batch went unused: 8 of 507
+    /// snippet events mentioned `paths` at all.
+    #[test]
+    fn snippet_accepts_the_line_field_hits_actually_emit() {
+        let arguments = json!({
+            "project": "/tmp/repo",
+            "paths": [{"path": "ChinookDatabase/DataSources/Chinook.sql", "line": 34}]
+        });
+        assert_eq!(validate_tool_arguments("snippet", Some(&arguments)), Ok(()));
+    }
+
+    #[test]
+    fn snippet_accepts_top_level_path_and_line_from_a_hit() {
+        let arguments = json!({
+            "project": "/tmp/repo",
+            "path": "src/app.ts",
+            "line": 12
+        });
+        assert_eq!(validate_tool_arguments("snippet", Some(&arguments)), Ok(()));
+    }
+
+    #[test]
+    fn snippet_accepts_symbol_id_as_an_id_alias() {
+        let arguments = json!({
+            "project": "/tmp/repo",
+            "symbol_id": "42"
+        });
+        assert_eq!(validate_tool_arguments("snippet", Some(&arguments)), Ok(()));
+    }
+
+    #[test]
+    fn snippet_accepts_file_path_inside_a_paths_entry() {
+        let arguments = json!({
+            "project": "/tmp/repo",
+            "paths": [{"file_path": "src/app.ts", "line": 12}]
+        });
+        assert_eq!(validate_tool_arguments("snippet", Some(&arguments)), Ok(()));
+    }
+
+    /// A range entry still has to name a file.
+    #[test]
+    fn snippet_range_entries_require_a_path() {
+        let arguments = json!({"project": "/tmp/repo", "paths": [{"line": 10}]});
+        assert!(validate_tool_arguments("snippet", Some(&arguments)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod emitted_vocabulary_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Every field a hit reports should be pasteable into the tool that consumes it.
+    /// Measured over a 54-row census, the consumers accepted none of them: `file_path`
+    /// (2,903 occurrences), `display_name` (2,177), `line` (2,110), `node_id` (1,978) and
+    /// `qualified_name` (771) were all undeclared, so piping one call into the next meant
+    /// renaming fields by hand on every hop.
+    #[test]
+    fn a_hit_display_name_can_be_pasted_as_a_query() {
+        for tool in ["symbol", "trail", "context"] {
+            let mut arguments = json!({"project": "/tmp/repo", "display_name": "Session.request"});
+            assert!(
+                validate_tool_arguments(tool, Some(&arguments)).is_err(),
+                "precondition: {tool} does not declare display_name"
+            );
+            reconcile_argument_synonyms(tool, &mut arguments);
+            assert_eq!(arguments["query"], json!("Session.request"), "{tool}");
+            assert_eq!(
+                validate_tool_arguments(tool, Some(&arguments)),
+                Ok(()),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hit_qualified_name_resolves_to_the_query_selector() {
+        let mut arguments =
+            json!({"project": "/tmp/repo", "qualified_name": "requests.Session.send"});
+        reconcile_argument_synonyms("symbol", &mut arguments);
+        assert_eq!(arguments["query"], json!("requests.Session.send"));
+        assert_eq!(validate_tool_arguments("symbol", Some(&arguments)), Ok(()));
+    }
+
+    /// An explicit `query` still wins; aliases never overwrite a declared name.
+    #[test]
+    fn an_explicit_query_is_not_overwritten_by_an_alias() {
+        let mut arguments =
+            json!({"project": "/tmp/repo", "query": "keep", "display_name": "other"});
+        reconcile_argument_synonyms("symbol", &mut arguments);
+        assert_eq!(arguments["query"], json!("keep"));
     }
 }

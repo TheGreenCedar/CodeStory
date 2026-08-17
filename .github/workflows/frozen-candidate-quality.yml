@@ -585,7 +585,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: frozen-candidate-linux-x64-quality-${{ inputs.ref }}
+          name: frozen-candidate-linux-x64-quality-${{ inputs.ref }}-attempt-${{ github.run_attempt }}
           path: target/frozen-candidate-linux-quality/evidence
           if-no-files-found: error
           retention-days: 30

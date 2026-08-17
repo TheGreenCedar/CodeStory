@@ -60,8 +60,8 @@ integration head
 | State | Entry condition | Exit condition |
 | --- | --- | --- |
 | Integrated | Every release blocker is merged to `dev/codestory-next`; focused checks are green; no source or workflow change remains planned | Record the exact dev commit and tree, reconcile the control plane and proof hosts, and begin the merge moratorium |
-| Calibration source | One open same-repository release PR into dev contains the approved version bump and current dev ancestry | Exact-head review, hostile-mutation acceptance, and required native microprobes pass on the bumped head |
-| Frozen candidate | Exactly three fresh protected Apple-Silicon Metal calibration runs are assembled, and the direct child of the calibration source changes only `crates/codestory-llama-sys/per-user-embedding-server-constant-set.json` | Reaccept the exact generated head, run the broad source proof once, and complete required package, platform, and qualification evidence |
+| Stabilized calibration source | One open same-repository release PR into dev contains the approved version bump and current dev ancestry | Exact-head review, hostile mutations, generalization checks, full Linux workspace compile/lint/test, and Windows source contracts pass in one source-stabilization run |
+| Frozen candidate | Exactly three fresh protected Apple-Silicon Metal calibration runs are assembled, and the direct child of the stabilized source changes only `crates/codestory-llama-sys/per-user-embedding-server-constant-set.json` | Reaccept the exact generated head through lineage, hostile mutations, calibration-specific checks, and native probes, then complete required package, platform, and qualification evidence without repeating the workspace suite |
 | Promotion ready | The reviewed release PR can fast-forward dev to the exact frozen candidate | Fast-forward dev to the frozen head without an intervening merge commit, accept the graph-declared pre-publish ledger from that live dev head, record the combined approval, then create the sole tree-preserving dev-to-main promotion commit with the frozen head as a direct parent |
 | Published | The automatic main release creates the tag, release, archives, checksums, notes, and closeout summary | The graph-declared post-publish ledger accepts current downloads, installed runtimes, and live behavior |
 | Closed | Publication and catalog-delivery state are known | Dev exists and matches main, retained evidence is linked, cleanup is complete, and every release child has its acceptance evidence |
@@ -99,11 +99,13 @@ Do not edit version surfaces by hand.
 
 ## Freeze and qualification
 
-Run the calibration-source acceptance on the bumped release-PR head before
-calibration. It receives focused hostile mutations and native microprobes, not
-the broad workspace source proof. The canonical dispatch uses
+Run source stabilization on the bumped release-PR head before calibration. It
+owns the one broad source proof and runs the hostile mutations, retrieval
+generalization, Linux all-target/all-feature lint plus the complete workspace
+test, and Windows source contracts concurrently. The canonical dispatch uses
 `source-proof.yml` with `acceptance_only=true` and
-`acceptance_phase=calibration_source`, bound to exact commit `C`.
+`acceptance_phase=source_stabilization`, bound to exact commit `C`. Calibration
+cannot start until that run publishes its authenticated receipt.
 
 Collect exactly three fresh protected Apple-Silicon Metal calibration runs with
 CPU fallback disabled. Assemble their authenticated bundle, then commit only
@@ -112,10 +114,11 @@ of the accepted calibration source.
 
 Treat that generated head as a new candidate. Record its commit, tree, and
 freeze receipt. Re-run exact-head acceptance with
-`acceptance_phase=frozen_candidate`, bound to exact commit `F`, then run the
-full workspace source proof exactly once on this unchanged frozen candidate.
-Run package, protected hardware, installed-candidate, and qualification lanes
-from artifacts built from that same head. Qualification is a program gate; the
+`acceptance_phase=frozen_candidate`, bound to exact commit `F`. This acceptance
+proves the constant-only lineage and reruns hostile mutations plus native
+probes; it must not repeat the workspace source proof. Run package, protected
+hardware, installed-candidate, and qualification lanes from artifacts built
+from that same head. Qualification is a program gate; the
 live release workflow does not yet authenticate an earlier qualification run,
 so record its complete run identity in the release-driver receipt rather than
 implying the workflow already carries it:
@@ -145,8 +148,8 @@ node .github/scripts/release-driver-receipt.mjs show \
 ```
 
 The field-group names are `calibration-source`, `pull-requests`,
-`calibration-source-acceptance`, `calibration`, `frozen-candidate`,
-`frozen-candidate-acceptance`, `source-proof`, `package`, `hardware`,
+`source-stabilization`, `source-proof`, `calibration`, `frozen-candidate`,
+`frozen-candidate-acceptance`, `package`, `hardware`,
 `installed-candidate`, `qualification`, `pre-publish-ledger`, `evidence`,
 `promotion`, `publication`, `native-release-manifest`,
 `post-publish-ledger`, `catalog-delivery`, and `next-action`. Run evidence uses
@@ -160,10 +163,9 @@ The record must carry:
 - calibration-source commit and tree;
 - frozen-candidate commit and tree;
 - release PR and integrated support PRs;
-- calibration-source acceptance run, attempt, artifact, and digest for `C`;
+- source-stabilization receipt and source-proof run, attempt, artifacts, and digests for `C`;
 - frozen-candidate acceptance run, attempt, artifact, and digest for `F`;
 - calibration run IDs, artifact name, and digest;
-- source-proof run, attempt, artifact, and digest;
 - package, hardware, installed-candidate, and qualification run identities;
 - accepted pre-publish ledger artifact and digest;
 - reusable and invalidated evidence with reasons;
@@ -192,8 +194,8 @@ node .github/scripts/release-driver-receipt.mjs validate \
 
 ## Invalidation
 
-Any unplanned commit after calibration-source acceptance invalidates that
-acceptance. The generated constant-set commit is the sole planned transition.
+Any unplanned commit after source stabilization invalidates that proof. The
+generated constant-set commit is the sole planned transition.
 
 Any commit after frozen-candidate acceptance invalidates the freeze, including
 documentation or workflow changes. A changed PR head, advanced dev base,
@@ -326,7 +328,8 @@ After publication:
   summary; verify the release manifest only after W8.11 has landed and the
   machine policy declares it;
 - run the graph-declared post-publish proof against downloaded bytes and fresh
-  installed runtimes;
+  installed runtimes, including two ordered fresh runtime sessions that reuse
+  one catalog installation and retain the restart-survival receipt;
 - record the catalog-delivery state without upgrading `deferred` or `restored`
   to `published`;
 - fast-forward `dev/codestory-next` from `F` to the published promotion `P`, or

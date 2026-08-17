@@ -540,14 +540,13 @@ fn indexer_crate_stays_decoupled_from_runtime_and_cli() {
 /// `agent_module_allowlist_stays_in_sync_with_the_agent_source_tree` enforces
 /// that, so adding a module to the crate without extending this list fails
 /// loudly instead of silently escaping every contract built on it.
-const AGENT_PLANNING_MODULES: [&str; 30] = [
+const AGENT_PLANNING_MODULES: [&str; 26] = [
     "citation.rs",
     "packet_citations.rs",
     "packet_claim_profile_registry.rs",
     "packet_claim_profiles.rs",
     "packet_claims.rs",
     "packet_command.rs",
-    "packet_command_profiles.rs",
     "packet_coverage.rs",
     "packet_degradation.rs",
     "packet_evidence.rs",
@@ -562,15 +561,12 @@ const AGENT_PLANNING_MODULES: [&str; 30] = [
     "packet_profile_telemetry.rs",
     "packet_required_probes.rs",
     "packet_scoring.rs",
-    "packet_source_patterns.rs",
-    "packet_sufficiency.rs",
     "packet_terms.rs",
     "pinned_reader.rs",
     "planning.rs",
     "profiles.rs",
     "text.rs",
     "trail.rs",
-    "workspace_path_identity.rs",
 ];
 
 /// Agent-crate source files that are deliberately not planning modules.
@@ -818,14 +814,14 @@ fn agent_planning_import_graph_stays_acyclic() {
         graph.insert(module, imports);
     }
 
-    // Scanner self-check: packet_sufficiency imports packet_claims in release
+    // Scanner self-check: packet_obligations imports packet_required_probes in release
     // code today. If the reference extraction regresses to matching nothing,
     // the acyclicity assertion below would pass vacuously; fail here instead.
     assert!(
         graph
-            .get("packet_sufficiency")
-            .is_some_and(|imports| imports.contains("packet_claims")),
-        "planning import scan lost the known packet_sufficiency -> packet_claims edge; \
+            .get("packet_obligations")
+            .is_some_and(|imports| imports.contains("packet_required_probes")),
+        "planning import scan lost the known packet_obligations -> packet_required_probes edge; \
          the DAG guard is no longer reading real imports"
     );
 
@@ -836,51 +832,6 @@ fn agent_planning_import_graph_stays_acyclic() {
              this is the boundary S4-10a's seam breaks established (#1673, M2 on #1865).",
             cycle.join(" -> ")
         );
-    }
-}
-
-/// The `WorkspacePathIdentity` seam is threaded into packet sufficiency as a
-/// REQUIRED argument, and the requirement only holds while nothing can stand
-/// in for it. A defaulted seam is exactly the LanguageExtraction defect: a
-/// sibling construction site compiles against the default and silently runs
-/// without the real dependency. Neither the trait's home in `codestory-agent`
-/// nor the runtime adapter that closes it over
-/// `codestory_workspace::same_workspace_path` may ever spell a `Default`, so
-/// every new construction site stays a compile error until it threads the
-/// seam explicitly.
-#[test]
-fn workspace_path_identity_seam_never_grows_a_default() {
-    let seam = read("crates/codestory-agent/src/workspace_path_identity.rs");
-    assert!(
-        seam.contains("pub trait WorkspacePathIdentity"),
-        "the WorkspacePathIdentity seam trait must live in codestory-agent"
-    );
-    let adapter = read("crates/codestory-runtime/src/agent/path_identity.rs");
-    assert!(
-        adapter.contains("impl WorkspacePathIdentity for RuntimeWorkspacePathIdentity"),
-        "the runtime must close the WorkspacePathIdentity seam over same_workspace_path"
-    );
-
-    for (path, source) in [
-        (
-            "crates/codestory-agent/src/workspace_path_identity.rs",
-            &seam,
-        ),
-        (
-            "crates/codestory-runtime/src/agent/path_identity.rs",
-            &adapter,
-        ),
-    ] {
-        for line in source.lines() {
-            let spells_default = line.contains("impl Default")
-                || (line.contains("derive") && line.contains("Default"));
-            assert!(
-                !spells_default,
-                "{path} must not give the path identity seam a Default; keep it a required \
-                 argument so sibling construction sites fail to compile without it \
-                 (offending line: {line:?})"
-            );
-        }
     }
 }
 
@@ -2334,10 +2285,10 @@ fn owned_artifact_identities_are_declared_only_in_the_registry() {
 }
 
 #[test]
-fn packet_claim_profile_contracts_are_enforced_at_runtime_not_only_in_debug_builds() {
-    // ARCH-005 shipped the claim-profile contract behind `debug_assert!`, so a release
-    // binary answered from a profile whose calibration no longer held. Validation has to
-    // run in the shipped build and skip the profile it rejects.
+fn retired_packet_claim_profile_registry_stays_empty_versioned_and_fail_closed() {
+    // Source-text claim profiles are retired. The empty versioned registry remains in the
+    // shipped telemetry path, and its loader must keep rejecting malformed or incompatible
+    // documents rather than letting a heuristic profile re-enter production.
     let profiles = read("crates/codestory-agent/src/packet_claim_profiles.rs");
     let production = production_source_prefix(&profiles);
     let registry = read("crates/codestory-agent/src/packet_claim_profile_registry.rs");
@@ -2349,19 +2300,19 @@ fn packet_claim_profile_contracts_are_enforced_at_runtime_not_only_in_debug_buil
         );
     }
     for required in [
-        "telemetry.record_profile_skipped(profile_id, violation.code());",
         // The registry is versioned data now, and the loader is the only way in.
         "include_str!(\"data/claim_profiles.v2.json\")",
+        "load_claim_profile_registry(CLAIM_PROFILE_DOCUMENT, &[])",
     ] {
         assert!(
             production.contains(required),
-            "packet claim-profile registry must keep runtime validate-or-skip: missing {required}"
+            "retired packet claim-profile registry must stay empty and versioned: missing {required}"
         );
     }
     for required in [
         "-> Result<(), ClaimProfileContractViolation>",
         "enum ClaimProfileContractViolation",
-        "const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize",
+        "const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize = 0",
         // Every load failure removes profiles; none may add one.
         "ClaimProfileRegistry::refused(ClaimProfileDocumentRejection::Malformed)",
         "ClaimProfileRegistry::refused(ClaimProfileDocumentRejection::SchemaVersionMismatch)",
@@ -2807,12 +2758,11 @@ const PRODUCTION_GAP_ANNOTATION_PRODUCERS: &[(&str, &[&str])] = &[
         "crates/codestory-runtime/src/agent/packet_batch.rs",
         &[
             "\"packet_subqueries skipped budget=tiny\"",
+            "format!(\"packet_material_queries skipped reason=latency_budget_exhausted count={}\", pending.len())",
             "format!(\"packet_fused_subquery_batch_failed error={error:?}\")",
             "format!(\"packet_fused_blocking_cancel_retry skipped reason=latency_budget_exhausted count={}\", retry_pending.len())",
             "format!(\"packet_fused_blocking_cancel_retry_failed error={error:?}\")",
             "format!(\"packet_fused_blocking_cancel_retry exhausted count={}\", retry_outcome.retryable_queries.len())",
-            "format!(\"packet_anchor_probes skipped reason={reason}\")",
-            "format!(\"packet_anchor_probe_failed query=`{}` error={}\", query.replace('`', \"'\"), message)",
         ],
     ),
     ("crates/codestory-runtime/src/agent/trace.rs", &["message"]),
@@ -2963,5 +2913,31 @@ fn every_production_gap_annotation_producer_is_pinned_to_the_gap_kind() {
         discovered, pinned,
         "a production file emits Gap-kind annotations without being pinned in \
          PRODUCTION_GAP_ANNOTATION_PRODUCERS"
+    );
+}
+
+/// Repo-text search must not be disabled by a constant on any search path.
+///
+/// The sidecar path -- the one the MCP tool surface and the packet both use -- once built
+/// its results with `let repo_text_hits = Vec::new();` and `repo_text_enabled: false`,
+/// while still honouring the caller's `repo_text` argument everywhere else. The tool
+/// accepted the request, returned nothing, and advised running an index refresh to restore
+/// a mode the caller was already in. It went unnoticed because nothing asserted the field:
+/// across a 54-row benchmark, agents asked for repo text on 582 of 582 searches and every
+/// one of the 569 that completed reported a zero count.
+///
+/// A literal `false` here is indistinguishable from "this path does not support repo text",
+/// which is why the regression was invisible. The flag has to follow the requested mode.
+#[test]
+fn search_paths_do_not_hardcode_repo_text_disabled() {
+    let source = read("crates/codestory-runtime/src/search_plan.rs");
+    assert!(
+        !source.contains("repo_text_enabled: false"),
+        "search_plan.rs disables repo text with a constant; it must follow the requested \
+         SearchRepoTextMode so a caller that asks for literal matches receives them"
+    );
+    assert!(
+        source.contains("let repo_text_enabled = repo_text_mode != SearchRepoTextMode::Off;"),
+        "the sidecar search path must derive repo_text_enabled from the requested mode"
     );
 }

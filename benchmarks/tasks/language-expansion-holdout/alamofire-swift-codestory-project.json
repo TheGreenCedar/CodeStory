@@ -1,0 +1,20 @@
+{
+  "name": "alamofire-language-expansion-holdout",
+  "version": 1,
+  "source_groups": [
+    {
+      "id": "c6576eac-a9f1-5b0f-ad99-ebf3acac2a9e",
+      "language": "Swift",
+      "standard": "Default",
+      "source_paths": [
+        "Source"
+      ],
+      "exclude_patterns": [
+        "**/.git/**"
+      ],
+      "include_paths": [],
+      "defines": {},
+      "language_specific": "Other"
+    }
+  ]
+}

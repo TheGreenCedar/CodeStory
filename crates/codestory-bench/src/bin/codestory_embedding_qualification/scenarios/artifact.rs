@@ -198,6 +198,7 @@ pub(in crate::qualification) struct MeasurementArtifact {
     contracts: QualificationContracts,
     external_metrics: Vec<String>,
     metrics: BTreeMap<String, RawMetric>,
+    windows_warm_connect_probe_elapsed_wall_ns: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]

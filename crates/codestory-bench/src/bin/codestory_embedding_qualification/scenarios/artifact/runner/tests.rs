@@ -14,12 +14,22 @@ use super::process::{
 use super::{ScenarioEvidence, WorkerOutput, opaque_measurement_sample_id};
 use crate::qualification::request::{QualificationContracts, REQUIRED_METRICS, REQUIRED_SCENARIOS};
 use codestory_retrieval::{
-    EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, EmbeddingClientBudgets,
-    EmbeddingQualificationWorkerMeasurementSpan, EmbeddingServerClockSnapshot,
-    PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS, PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
+    EMBEDDING_BUSY_RETRY_QUEUE_CLASS, EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
+    EmbeddingClientBudgets, EmbeddingQualificationWorkerMeasurementSpan,
+    EmbeddingServerClockSnapshot, PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS,
+    PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
 };
 use std::collections::BTreeSet;
 use std::time::Duration;
+
+#[test]
+fn busy_retry_driver_and_worker_share_the_declared_query_class() {
+    assert_eq!(EMBEDDING_BUSY_RETRY_QUEUE_CLASS, "query");
+    assert_eq!(
+        declared_workload_id("busy_retry_usefulness").expect("busy-retry workload"),
+        "saturated_query_65th_retry_v1"
+    );
+}
 
 #[test]
 fn measurement_worker_budgets_dominate_the_deadlines_workers_honor() {

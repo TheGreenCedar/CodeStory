@@ -1,23 +1,35 @@
 //! Generic packet flow requirements shared by planning, probes, and sufficiency.
 
 use crate::packet_evidence_carriers::{
+    SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS, SEARCH_EVIDENCE_OUTPUT_ACTIONS,
     citation_owns_buffer_read_write, citation_owns_buffer_storage,
+    citation_owns_client_adapter_selection, citation_owns_client_public_facade_helper,
+    citation_owns_client_request_dispatch, citation_owns_client_request_entrypoint,
     citation_owns_client_request_finalization, citation_owns_client_request_method,
-    citation_owns_client_response_materialization, citation_owns_css_animation_entrypoint,
-    citation_owns_css_animation_structure, citation_owns_css_structure,
-    citation_owns_form_custom_validation, citation_owns_form_native_constraint,
-    citation_owns_form_submit_guard, citation_owns_format_arguments,
-    citation_owns_formatter_fallback, citation_owns_hook_cache_helper,
-    citation_owns_hook_key_serialization, citation_owns_hook_mutation_flow,
-    citation_owns_hook_public_export, citation_owns_html_app_shell,
-    citation_owns_log_handler_processing, citation_owns_log_record_creation,
-    citation_owns_mapper_configuration, citation_owns_mapper_execution,
+    citation_owns_client_response_materialization, citation_owns_client_transport_send,
+    citation_owns_css_animation_entrypoint, citation_owns_css_animation_structure,
+    citation_owns_css_structure, citation_owns_form_custom_validation,
+    citation_owns_form_native_constraint, citation_owns_form_submit_guard,
+    citation_owns_format_arguments, citation_owns_formatter_fallback,
+    citation_owns_hook_cache_helper, citation_owns_hook_key_serialization,
+    citation_owns_hook_mutation_flow, citation_owns_hook_public_export,
+    citation_owns_html_app_shell, citation_owns_log_handler_processing,
+    citation_owns_log_record_creation, citation_owns_mapper_configuration,
+    citation_owns_mapper_execution, citation_owns_search_evidence_classification,
+    citation_owns_search_evidence_output, citation_owns_server_request_dispatch,
+    citation_owns_server_request_entrypoint, citation_owns_server_response_terminal,
     citation_owns_shell_completion, citation_owns_shell_function_dispatch,
     citation_owns_shell_installer_bootstrap, citation_owns_site_lifecycle,
-    citation_owns_site_terminal, flow_belongs_to_client_request, flow_belongs_to_command_dispatch,
+    citation_owns_site_terminal, citation_owns_string_blank_predicate,
+    citation_owns_string_empty_predicate, citation_owns_string_region_handoff,
+    client_public_facade_successor_call_target, client_request_dispatch_predecessor_call_source,
+    client_request_dispatch_successor_call_target, client_request_entrypoint_call_target,
+    flow_belongs_to_client_request, flow_belongs_to_command_dispatch,
     flow_belongs_to_command_server, flow_belongs_to_event_loop, flow_belongs_to_indexing,
     flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
     flow_belongs_to_server_request, flow_belongs_to_sql_schema, flow_belongs_to_url_session,
+    server_request_dispatch_call_target, server_request_entrypoint_call_target,
+    server_response_terminal_call_target,
 };
 use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
@@ -28,17 +40,22 @@ use crate::packet_terms::{
     packet_terms_indicate_command_event_loop_flow,
     packet_terms_indicate_command_server_bootstrap_flow,
     packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_form_validation_flow,
-    packet_terms_indicate_hook_cache_flow, packet_terms_indicate_html_css_template_structure_flow,
-    packet_terms_indicate_indexing_flow, packet_terms_indicate_log_record_handler_flow,
+    packet_terms_indicate_full_outbound_request_flow, packet_terms_indicate_hook_cache_flow,
+    packet_terms_indicate_html_css_template_structure_flow, packet_terms_indicate_indexing_flow,
+    packet_terms_indicate_log_record_handler_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_network_command_input_flow, packet_terms_indicate_request_dispatch_flow,
     packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
     packet_terms_indicate_server_request_dispatch_flow,
+    packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
-    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
-    packet_terms_indicate_url_session_request_flow,
+    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_string_predicate_flow,
+    packet_terms_indicate_stylesheet_animation_flow,
+    packet_terms_indicate_url_session_request_flow, prompt_search_terms,
 };
-use codestory_contracts::api::{AgentCitationDto, NodeKind, PacketTaskClassDto};
+use codestory_contracts::api::{
+    AgentCitationDto, EdgeKind, GraphEdgeDto, NodeKind, PacketTaskClassDto,
+};
 
 const CALLABLE_NODE_KINDS: &[NodeKind] = &[NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::MACRO];
 const BEHAVIORAL_OWNER_NODE_KINDS: &[NodeKind] = &[
@@ -48,7 +65,10 @@ const BEHAVIORAL_OWNER_NODE_KINDS: &[NodeKind] = &[
     NodeKind::STRUCT,
     NodeKind::CLASS,
 ];
-const SQL_SCHEMA_NODE_KINDS: &[NodeKind] = &[NodeKind::FILE, NodeKind::ANNOTATION];
+const SQL_SCHEMA_NODE_KINDS: &[NodeKind] = &[NodeKind::FILE, NodeKind::ANNOTATION, NodeKind::CLASS];
+
+type SymbolPredicate = fn(&str) -> bool;
+type OrderedCallBoundary = (SymbolPredicate, SymbolPredicate);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FlowRole {
@@ -120,6 +140,25 @@ pub enum EvidencePredicate {
         subsystem: fn(&AgentCitationDto) -> bool,
         roles: &'static [PacketEvidenceRole],
     },
+    /// Preserve an established role-backed surface while admitting a structural carrier only when
+    /// its cited CALL reaches the next action at this exact flow boundary. A boundary without a
+    /// target predicate accepts either an incoming predecessor CALL or an outgoing successor CALL.
+    CitedRolesOrCallBoundary {
+        subsystem: fn(&AgentCitationDto) -> bool,
+        roles: &'static [PacketEvidenceRole],
+        carrier: fn(&AgentCitationDto) -> bool,
+        call_target: Option<SymbolPredicate>,
+    },
+    /// Covered by a lawful ordered-stage carrier with an exact CALL either from the preceding
+    /// stage or to the following stage. This keeps an unrelated incident CALL from proving the
+    /// stage merely because the carrier itself has the right name.
+    CitedRolesOrOrderedCallBoundary {
+        subsystem: fn(&AgentCitationDto) -> bool,
+        roles: &'static [PacketEvidenceRole],
+        carrier: fn(&AgentCitationDto) -> bool,
+        incoming_source: SymbolPredicate,
+        outgoing_target: SymbolPredicate,
+    },
     /// Covered by a citation that passes a structural ownership check, used where the evidence
     /// role is too coarse to separate a requirement from its siblings. The carriers carry their own
     /// subsystem factor.
@@ -130,10 +169,20 @@ impl EvidencePredicate {
     pub fn citation_proves(self, citation: &AgentCitationDto) -> bool {
         match self {
             Self::CitedRoles { subsystem, roles } => {
-                subsystem(citation)
-                    && packet_evidence_role(citation).is_some_and(|role| roles.contains(&role))
-                    && role_survives_without_its_path(citation, roles)
+                citation_has_named_role(citation, subsystem, roles)
             }
+            Self::CitedRolesOrCallBoundary {
+                subsystem,
+                roles,
+                carrier,
+                ..
+            }
+            | Self::CitedRolesOrOrderedCallBoundary {
+                subsystem,
+                roles,
+                carrier,
+                ..
+            } => citation_has_named_role(citation, subsystem, roles) || carrier(citation),
             Self::CitedCarrier(carrier) => carrier(citation),
         }
     }
@@ -141,8 +190,11 @@ impl EvidencePredicate {
     /// Secondary node-kind policy for role-based predicates. Carrier predicates already encode
     /// their own structural contract and return an empty list to mean "predicate-owned".
     pub fn allowed_node_kinds(self) -> &'static [NodeKind] {
-        let Self::CitedRoles { roles, .. } = self else {
-            return &[];
+        let roles = match self {
+            Self::CitedRoles { roles, .. }
+            | Self::CitedRolesOrCallBoundary { roles, .. }
+            | Self::CitedRolesOrOrderedCallBoundary { roles, .. } => roles,
+            Self::CitedCarrier(_) => return &[],
         };
         if roles.iter().any(|role| {
             matches!(
@@ -164,6 +216,164 @@ impl EvidencePredicate {
             CALLABLE_NODE_KINDS
         }
     }
+
+    /// Role-only evidence can be evaluated without the predicate's exact target. A citation that
+    /// also satisfies a call-boundary carrier is only proof after packet finalization validates
+    /// that declared boundary, even when its evidence role would otherwise be sufficient.
+    pub fn citation_proves_without_call_boundary(self, citation: &AgentCitationDto) -> bool {
+        match self {
+            Self::CitedRoles { subsystem, roles }
+            | Self::CitedRolesOrOrderedCallBoundary {
+                subsystem, roles, ..
+            } => citation_has_named_role(citation, subsystem, roles),
+            Self::CitedRolesOrCallBoundary {
+                subsystem,
+                roles,
+                carrier,
+                ..
+            } => citation_has_named_role(citation, subsystem, roles) && !carrier(citation),
+            Self::CitedCarrier(carrier) => carrier(citation),
+        }
+    }
+
+    pub fn call_boundary_target(self, citation: &AgentCitationDto) -> Option<SymbolPredicate> {
+        let Self::CitedRolesOrCallBoundary {
+            carrier,
+            call_target,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        carrier(citation).then_some(call_target).flatten()
+    }
+
+    pub fn ordered_call_boundary(self, citation: &AgentCitationDto) -> Option<OrderedCallBoundary> {
+        let Self::CitedRolesOrOrderedCallBoundary {
+            subsystem,
+            roles,
+            carrier,
+            incoming_source,
+            outgoing_target,
+        } = self
+        else {
+            return None;
+        };
+        (citation_has_named_role(citation, subsystem, roles) || carrier(citation))
+            .then_some((incoming_source, outgoing_target))
+    }
+}
+
+/// Validate one cited CALL as a proof receipt for a flow requirement after the caller resolves the
+/// incident neighbor. This is deliberately stricter than general graph context: explicit
+/// uncertainty never proves a material boundary, and an unresolved syntax-only target needs both
+/// parser CALL provenance and a receiver/action pair that satisfies the declared target predicate.
+///
+/// Callers still own citation-edge identity and graph-neighbor lookup. Keeping the receipt rule in
+/// the agent contract lets prebudget reservation, finalization, and runtime candidate filtering use
+/// one definition without moving product orchestration into this crate.
+pub fn ordinary_incident_call_receipt_is_valid(
+    citation: &AgentCitationDto,
+    edge: &GraphEdgeDto,
+    neighbor_kind: NodeKind,
+) -> bool {
+    edge.kind == EdgeKind::CALL
+        && (edge.source == citation.node_id || edge.target == citation.node_id)
+        && edge.source != edge.target
+        && neighbor_kind != NodeKind::UNKNOWN
+        && match edge.certainty.as_deref() {
+            Some(certainty) => certainty.eq_ignore_ascii_case("certain"),
+            None => true,
+        }
+}
+
+pub fn flow_requirement_call_receipt_is_valid(
+    requirement: &FlowRequirement,
+    citation: &AgentCitationDto,
+    edge: &GraphEdgeDto,
+    neighbor_label: &str,
+    neighbor_kind: NodeKind,
+) -> bool {
+    if edge.kind != EdgeKind::CALL || edge.source == edge.target {
+        return false;
+    }
+    let target_predicate = if let Some((incoming_source, outgoing_target)) =
+        requirement.evidence.ordered_call_boundary(citation)
+    {
+        if edge.target == citation.node_id {
+            Some(incoming_source)
+        } else if edge.source == citation.node_id {
+            Some(outgoing_target)
+        } else {
+            return false;
+        }
+    } else if let Some(outgoing_target) = requirement.evidence.call_boundary_target(citation) {
+        if edge.source != citation.node_id {
+            return false;
+        }
+        Some(outgoing_target)
+    } else {
+        if !requirement
+            .evidence
+            .citation_proves_without_call_boundary(citation)
+        {
+            return false;
+        }
+        return ordinary_incident_call_receipt_is_valid(citation, edge, neighbor_kind);
+    };
+
+    match edge.certainty.as_deref() {
+        Some(certainty) if !certainty.eq_ignore_ascii_case("certain") => return false,
+        Some(_) if neighbor_kind != NodeKind::UNKNOWN => {
+            return target_predicate.is_none_or(|predicate| predicate(neighbor_label));
+        }
+        Some(_) => return false,
+        None if neighbor_kind != NodeKind::UNKNOWN => {
+            return target_predicate.is_none_or(|predicate| predicate(neighbor_label));
+        }
+        None => {}
+    }
+
+    let Some(target_predicate) = target_predicate else {
+        return false;
+    };
+    if edge.confidence.is_some() || edge.source != citation.node_id {
+        return false;
+    }
+    let Some(receiver_owner) = parser_call_receiver_owner(edge.callsite_identity.as_deref()) else {
+        return false;
+    };
+    let target = neighbor_label
+        .rsplit(['.', ':', '#'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(neighbor_label);
+    target_predicate(&format!("{receiver_owner}.{target}"))
+}
+
+fn parser_call_receiver_owner(callsite_identity: Option<&str>) -> Option<&str> {
+    let identity = callsite_identity?;
+    let parser_proven = identity
+        .split('|')
+        .any(|segment| segment.starts_with("syntax:") && segment.ends_with("-call"));
+    if !parser_proven {
+        return None;
+    }
+    identity.split('|').find_map(|segment| {
+        segment
+            .strip_prefix("receiver-owner:")
+            .map(str::trim)
+            .filter(|owner| !owner.is_empty())
+    })
+}
+
+fn citation_has_named_role(
+    citation: &AgentCitationDto,
+    subsystem: fn(&AgentCitationDto) -> bool,
+    roles: &[PacketEvidenceRole],
+) -> bool {
+    subsystem(citation)
+        && packet_evidence_role(citation).is_some_and(|role| roles.contains(&role))
+        && role_survives_without_its_path(citation, roles)
 }
 
 /// Whether the citation still earns one of `roles` once its path is taken away.
@@ -242,16 +452,32 @@ pub fn packet_flow_requirements_for_terms(
         requirements.extend_from_slice(INDEXING_FLOW);
     }
     let server_request_dispatch = packet_terms_indicate_server_request_dispatch_flow(terms);
+    let server_route_dispatch = packet_terms_indicate_server_route_dispatch_flow(terms);
     let client_request_dispatch = packet_terms_indicate_request_dispatch_flow(terms);
+    let full_outbound_request = packet_terms_indicate_full_outbound_request_flow(terms);
     if server_request_dispatch {
         requirements.extend_from_slice(SERVER_REQUEST_DISPATCH_FLOW);
+    } else if server_route_dispatch {
+        let response_terminal_requested = packet_terms_have_any(terms, &["response", "responses"]);
+        requirements.extend(
+            SERVER_REQUEST_DISPATCH_FLOW
+                .iter()
+                .copied()
+                .filter(|requirement| {
+                    requirement.role != FlowRole::TerminalBoundary || response_terminal_requested
+                }),
+        );
     } else if client_request_dispatch {
-        requirements.extend_from_slice(CLIENT_REQUEST_DISPATCH_FLOW);
+        if full_outbound_request {
+            push_full_client_outbound_request_flow(terms, &mut requirements);
+        } else {
+            requirements.extend_from_slice(CLIENT_REQUEST_DISPATCH_FLOW);
+        }
         if packet_terms_have_any(terms, &["interceptor", "interceptors"]) {
             requirements.push(REQUEST_INTERCEPTOR_REQUIREMENT);
         }
     }
-    if packet_terms_indicate_client_send_flow(terms) {
+    if packet_terms_indicate_client_send_flow(terms) && !full_outbound_request {
         push_client_send_requirements_for_terms(terms, &mut requirements);
     }
     if packet_terms_indicate_hook_cache_flow(terms) {
@@ -293,8 +519,30 @@ pub fn packet_flow_requirements_for_terms(
     if packet_terms_indicate_runtime_formatting_flow(terms) {
         requirements.extend_from_slice(RUNTIME_FORMATTING_FLOW);
     }
+    if packet_terms_indicate_string_predicate_flow(terms) {
+        push_string_predicate_requirements_for_terms(terms, &mut requirements);
+    }
     if packet_terms_indicate_search_execution_flow(terms) {
         requirements.extend_from_slice(SEARCH_EXECUTION_FLOW);
+    }
+    let search_evidence_requested = packet_terms_have_any(terms, &["search", "searches"])
+        && packet_terms_have_any(terms, &["evidence", "proof", "provenance"]);
+    if search_evidence_requested {
+        let output_requested = packet_terms_have_any(terms, SEARCH_EVIDENCE_OUTPUT_ACTIONS)
+            || packet_terms_have_any(terms, &["surface", "handoff", "packet"]);
+        let classification_requested =
+            packet_terms_have_any(terms, SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS)
+                || (output_requested
+                    && packet_terms_have_any(
+                        terms,
+                        &["result", "results", "hit", "hits", "citation", "citations"],
+                    ));
+        if classification_requested {
+            requirements.push(SEARCH_EVIDENCE_FLOW[0]);
+        }
+        if output_requested {
+            requirements.push(SEARCH_EVIDENCE_FLOW[1]);
+        }
     }
     dedupe_requirements(requirements)
 }
@@ -319,6 +567,133 @@ pub fn packet_flow_requirement_queries_for_terms(
         }
     }
     queries
+}
+
+/// Preserve the action phrasing next to each required flow step instead of replacing it with only
+/// the generic role seed. A prompt such as "reads client input" carries substantially more symbol
+/// identity than the seed "network input", while the seed still tells us which obligation owns
+/// that clause. The query stays repository-neutral: it is assembled entirely from the prompt and
+/// the declared requirement vocabulary.
+pub fn packet_flow_requirement_context_queries_for_prompt(
+    question: &str,
+    terms: &[String],
+    task_class: PacketTaskClassDto,
+) -> Vec<(&'static str, String)> {
+    let clauses = packet_prompt_flow_clauses(question);
+    let mut queries = Vec::new();
+    for requirement in packet_flow_requirements_for_terms(terms, task_class) {
+        let seed_terms = requirement
+            .query_seeds
+            .iter()
+            .map(|seed| prompt_search_terms(seed))
+            .filter(|seed| !seed.is_empty())
+            .collect::<Vec<_>>();
+        let best = clauses
+            .iter()
+            .filter_map(|clause| {
+                let clause_terms = prompt_search_terms(clause)
+                    .into_iter()
+                    .filter(|term| !packet_flow_context_scaffolding(term))
+                    .collect::<Vec<_>>();
+                if clause_terms.len() < 2 {
+                    return None;
+                }
+                let best_seed_match = seed_terms
+                    .iter()
+                    .map(|seed| {
+                        let matched = seed
+                            .iter()
+                            .filter(|seed_term| clause_terms.iter().any(|term| term == *seed_term))
+                            .count();
+                        (matched, seed.len())
+                    })
+                    .filter(|(matched, _)| *matched > 0)
+                    .max_by(|left, right| {
+                        (left.0 * right.1)
+                            .cmp(&(right.0 * left.1))
+                            .then_with(|| left.0.cmp(&right.0))
+                    })?;
+                let query_terms = packet_bounded_flow_context_terms(&clause_terms, &seed_terms);
+                let query = query_terms.join(" ");
+                let duplicates_seed = requirement.query_seeds.iter().any(|seed| {
+                    prompt_search_terms(seed)
+                        .join(" ")
+                        .eq_ignore_ascii_case(&query)
+                });
+                (!duplicates_seed && !query.is_empty()).then_some((
+                    best_seed_match.0,
+                    best_seed_match.1,
+                    query_terms.len(),
+                    query,
+                ))
+            })
+            .max_by(|left, right| {
+                (left.0 * right.1)
+                    .cmp(&(right.0 * left.1))
+                    .then_with(|| left.0.cmp(&right.0))
+                    .then_with(|| right.2.cmp(&left.2))
+            });
+        if let Some((_, _, _, query)) = best {
+            queries.push((requirement.id, query));
+        }
+    }
+    queries
+}
+
+fn packet_prompt_flow_clauses(question: &str) -> Vec<&str> {
+    question
+        .split([',', ';', '.', '?', '!', '\n', '\r'])
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .collect()
+}
+
+fn packet_flow_context_scaffolding(term: &str) -> bool {
+    matches!(
+        term,
+        "answer"
+            | "cite"
+            | "cites"
+            | "describe"
+            | "explain"
+            | "file"
+            | "files"
+            | "name"
+            | "names"
+            | "source"
+            | "sources"
+            | "supporting"
+            | "symbol"
+            | "symbols"
+            | "trace"
+    )
+}
+
+fn packet_bounded_flow_context_terms(
+    clause_terms: &[String],
+    seed_terms: &[Vec<String>],
+) -> Vec<String> {
+    const CONTEXT_TERM_LIMIT: usize = 6;
+    if clause_terms.len() <= CONTEXT_TERM_LIMIT {
+        return clause_terms.to_vec();
+    }
+    let seed_term_set = seed_terms
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let matching_positions = clause_terms
+        .iter()
+        .enumerate()
+        .filter_map(|(index, term)| seed_term_set.contains(term.as_str()).then_some(index))
+        .collect::<Vec<_>>();
+    let Some(center) = matching_positions.first().copied() else {
+        return clause_terms[..CONTEXT_TERM_LIMIT].to_vec();
+    };
+    let start = center
+        .saturating_sub(2)
+        .min(clause_terms.len().saturating_sub(CONTEXT_TERM_LIMIT));
+    clause_terms[start..start + CONTEXT_TERM_LIMIT].to_vec()
 }
 
 fn dedupe_requirements(requirements: Vec<FlowRequirement>) -> Vec<FlowRequirement> {
@@ -388,7 +763,7 @@ fn push_client_send_requirements_for_terms(
     ]) {
         requirements.push(CLIENT_REQUEST_FINALIZATION_REQUIREMENT);
     }
-    if has_any(&["send", "sending", "sent"])
+    if has_any(&["send"])
         || (has_any(&["transport", "transports"]) && has_any(&["implementation", "implements"]))
     {
         requirements.push(CLIENT_TRANSPORT_SEND_REQUIREMENT);
@@ -409,6 +784,42 @@ fn push_client_send_requirements_for_terms(
         .all(|requirement| !requirement.id.starts_with("client_"))
     {
         requirements.push(CLIENT_TRANSPORT_SEND_REQUIREMENT);
+    }
+}
+
+fn push_full_client_outbound_request_flow(
+    terms: &[String],
+    requirements: &mut Vec<FlowRequirement>,
+) {
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+    requirements.push(CLIENT_PUBLIC_FACADE_REQUIREMENT);
+    if has_any(&[
+        "convenience",
+        "conveniences",
+        "method",
+        "methods",
+        "interface",
+        "interfaces",
+        "helper",
+        "helpers",
+    ]) {
+        requirements.push(CLIENT_INTERFACE_HELPERS_REQUIREMENT);
+    }
+    requirements.push(CLIENT_REQUEST_DISPATCH_FLOW[0]);
+    requirements.push(CLIENT_REQUEST_FINALIZATION_REQUIREMENT);
+    requirements.push(CLIENT_REQUEST_DISPATCH_FLOW[1]);
+    requirements.push(CLIENT_REQUEST_DISPATCH_FLOW[2]);
+    requirements.push(CLIENT_TRANSPORT_SEND_REQUIREMENT);
+    if has_any(&[
+        "response",
+        "responses",
+        "materialize",
+        "materializes",
+        "materialization",
+        "stream",
+        "boundary",
+    ]) {
+        requirements.push(CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT);
     }
 }
 
@@ -466,42 +877,48 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "request_entrypoint",
         role: FlowRole::Registration,
-        query_seeds: &["request entrypoint", "route registration"],
+        query_seeds: &["application use", "route registration"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles {
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_server_request,
             roles: &[
                 PacketEvidenceRole::RouteHandling,
                 PacketEvidenceRole::AppServerRequestProtocol,
             ],
+            carrier: citation_owns_server_request_entrypoint,
+            call_target: Some(server_request_entrypoint_call_target),
         },
     },
     FlowRequirement {
         id: "request_dispatch",
         role: FlowRole::Dispatch,
-        query_seeds: &["request dispatch", "handler dispatch", "transport adapter"],
+        query_seeds: &["application handle", "request dispatch"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles {
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_server_request,
             roles: &[
                 PacketEvidenceRole::RequestDispatch,
                 PacketEvidenceRole::CommandDispatch,
                 PacketEvidenceRole::RuntimeOrchestration,
             ],
+            carrier: citation_owns_server_request_dispatch,
+            call_target: Some(server_request_dispatch_call_target),
         },
     },
     FlowRequirement {
         id: "request_terminal",
         role: FlowRole::TerminalBoundary,
-        query_seeds: &["response finalization", "transport send"],
-        coverage_mode: CoverageMode::AllowsSourceRange,
-        evidence: EvidencePredicate::CitedRoles {
+        query_seeds: &["response send", "response finalization"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_request_terminal,
             roles: &[
                 PacketEvidenceRole::TransportAdapter,
                 PacketEvidenceRole::EventOutputProcessing,
                 PacketEvidenceRole::BufferedIo,
             ],
+            carrier: citation_owns_server_response_terminal,
+            call_target: Some(server_response_terminal_call_target),
         },
     },
 ];
@@ -512,12 +929,14 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["default instance", "request method", "request entrypoint"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles {
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_client_request,
             roles: &[
                 PacketEvidenceRole::ClientFactory,
                 PacketEvidenceRole::CommandEntrypoint,
             ],
+            carrier: citation_owns_client_request_entrypoint,
+            call_target: Some(client_request_entrypoint_call_target),
         },
     },
     FlowRequirement {
@@ -525,20 +944,20 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Dispatch,
         query_seeds: &["request dispatch", "adapters", "transport adapter"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles {
+        evidence: EvidencePredicate::CitedRolesOrOrderedCallBoundary {
             subsystem: flow_belongs_to_client_request,
             roles: &[PacketEvidenceRole::RequestDispatch],
+            carrier: citation_owns_client_request_dispatch,
+            incoming_source: client_request_dispatch_predecessor_call_source,
+            outgoing_target: client_request_dispatch_successor_call_target,
         },
     },
     FlowRequirement {
         id: "request_terminal",
-        role: FlowRole::TerminalBoundary,
-        query_seeds: &["response finalization", "transport send"],
-        coverage_mode: CoverageMode::AllowsSourceRange,
-        evidence: EvidencePredicate::CitedRoles {
-            subsystem: flow_belongs_to_request_terminal,
-            roles: &[PacketEvidenceRole::TransportAdapter],
-        },
+        role: FlowRole::Dispatch,
+        query_seeds: &["session adapter selection", "get adapter"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_client_adapter_selection),
     },
 ];
 
@@ -552,7 +971,7 @@ const REQUEST_INTERCEPTOR_REQUIREMENT: FlowRequirement = FlowRequirement {
 
 const URL_SESSION_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
-        id: "session_request",
+        id: "client_request_entry",
         role: FlowRole::Entrypoint,
         query_seeds: &["session request creation", "request task resume"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
@@ -585,13 +1004,27 @@ const URL_SESSION_FLOW: &[FlowRequirement] = &[
 const CLIENT_PUBLIC_FACADE_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "client_public_facade",
     role: FlowRole::Entrypoint,
-    query_seeds: &["http top level helper", "public client facade"],
+    query_seeds: &["http public get request", "public client facade"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-    evidence: EvidencePredicate::CitedRoles {
-        subsystem: flow_belongs_to_client_request,
+    evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+        subsystem: flow_belongs_to_public_client_factory,
         roles: &[PacketEvidenceRole::ClientFactory],
+        carrier: citation_owns_client_public_facade_helper,
+        call_target: Some(client_public_facade_successor_call_target),
     },
 };
+
+fn flow_belongs_to_public_client_factory(citation: &AgentCitationDto) -> bool {
+    if citation.kind != NodeKind::FUNCTION || !flow_belongs_to_client_request(citation) {
+        return false;
+    }
+    let terminal = citation
+        .display_name
+        .rsplit(['.', ':', '#'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(citation.display_name.as_str());
+    !terminal.starts_with('_')
+}
 
 const CLIENT_INTERFACE_HELPERS_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "client_interface_helpers",
@@ -611,16 +1044,10 @@ const CLIENT_REQUEST_FINALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement
 
 const CLIENT_TRANSPORT_SEND_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "client_transport_send",
-    role: FlowRole::Dispatch,
+    role: FlowRole::TerminalBoundary,
     query_seeds: &["transport send", "client send implementation"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-    evidence: EvidencePredicate::CitedRoles {
-        subsystem: flow_belongs_to_client_request,
-        roles: &[
-            PacketEvidenceRole::TransportAdapter,
-            PacketEvidenceRole::RequestDispatch,
-        ],
-    },
+    evidence: EvidencePredicate::CitedCarrier(citation_owns_client_transport_send),
 };
 
 const CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -727,7 +1154,7 @@ const SQL_SCHEMA_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "sql_relationships",
         role: FlowRole::Configuration,
-        query_seeds: &["foreign key relationships", "schema constraints"],
+        query_seeds: &["referential relationships", "schema constraints"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_sql_schema,
@@ -891,7 +1318,7 @@ const MAPPER_PLAN_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Configuration,
         query_seeds: &[
             "mapper runtime api",
-            "mapper configuration",
+            "mapping configuration",
             "type map plan",
         ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
@@ -915,13 +1342,67 @@ const RUNTIME_FORMATTING_FLOW: &[FlowRequirement] = &[
         evidence: EvidencePredicate::CitedCarrier(citation_owns_format_arguments),
     },
     FlowRequirement {
-        id: "format_errors",
+        id: "formatter_fallback",
         role: FlowRole::ErrorOrFallback,
-        query_seeds: &["format error", "error formatting"],
+        query_seeds: &["formatting failure", "formatter fallback"],
         coverage_mode: CoverageMode::AllowsSourceRange,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_formatter_fallback),
     },
 ];
+
+const STRING_PREDICATE_FLOW: &[FlowRequirement] = &[
+    FlowRequirement {
+        id: "string_blank_predicate",
+        role: FlowRole::TransformOrValidate,
+        query_seeds: &["string blank predicate", "whitespace predicate"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_string_blank_predicate),
+    },
+    FlowRequirement {
+        id: "string_empty_predicate",
+        role: FlowRole::TransformOrValidate,
+        query_seeds: &["string empty predicate"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_string_empty_predicate),
+    },
+    FlowRequirement {
+        id: "string_region_handoff",
+        role: FlowRole::Dispatch,
+        query_seeds: &["string region match", "case-sensitive string comparison"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_string_region_handoff),
+    },
+];
+
+fn push_string_predicate_requirements_for_terms(
+    terms: &[String],
+    requirements: &mut Vec<FlowRequirement>,
+) {
+    let generic = packet_terms_have_any(terms, &["predicate", "predicates"]);
+    if generic || packet_terms_have_any(terms, &["blank", "whitespace", "trim", "trims"]) {
+        requirements.push(STRING_PREDICATE_FLOW[0]);
+    }
+    if generic || packet_terms_have_any(terms, &["empty"]) {
+        requirements.push(STRING_PREDICATE_FLOW[1]);
+    }
+    if generic
+        || packet_terms_have_any(
+            terms,
+            &[
+                "case",
+                "cases",
+                "sensitive",
+                "region",
+                "regions",
+                "match",
+                "matches",
+                "matching",
+            ],
+        )
+    {
+        requirements.push(STRING_PREDICATE_FLOW[2]);
+    }
+}
 
 const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
@@ -954,6 +1435,23 @@ const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
                 PacketEvidenceRole::CandidateFileConstruction,
             ],
         },
+    },
+];
+
+const SEARCH_EVIDENCE_FLOW: &[FlowRequirement] = &[
+    FlowRequirement {
+        id: "search_evidence_classification",
+        role: FlowRole::TransformOrValidate,
+        query_seeds: &["search result evidence classification", "evidence tier"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_evidence_classification),
+    },
+    FlowRequirement {
+        id: "search_evidence_output",
+        role: FlowRole::TerminalBoundary,
+        query_seeds: &["search result evidence output", "packet evidence handoff"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_evidence_output),
     },
 ];
 
@@ -1010,7 +1508,9 @@ pub fn all_flow_requirement_groups() -> Vec<(&'static str, Vec<FlowRequirement>)
         ("site_build", SITE_BUILD_FLOW.to_vec()),
         ("mapper_plan", MAPPER_PLAN_FLOW.to_vec()),
         ("runtime_formatting", RUNTIME_FORMATTING_FLOW.to_vec()),
+        ("string_predicates", STRING_PREDICATE_FLOW.to_vec()),
         ("search_execution", SEARCH_EXECUTION_FLOW.to_vec()),
+        ("search_evidence", SEARCH_EVIDENCE_FLOW.to_vec()),
     ]
 }
 
@@ -1025,8 +1525,9 @@ pub fn all_flow_requirements() -> Vec<FlowRequirement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packet_evidence_carriers::carrier_taxonomy_vocabulary;
     use crate::packet_terms::packet_probe_terms;
-    use codestory_contracts::api::{NodeId, NodeKind, SearchHitOrigin};
+    use codestory_contracts::api::{EdgeId, NodeId, NodeKind, SearchHitOrigin};
     use std::collections::BTreeMap;
 
     fn client_requirement_ids(prompt: &str) -> Vec<&'static str> {
@@ -1042,6 +1543,36 @@ mod tests {
                 .then_some(requirement.id)
         })
         .collect()
+    }
+
+    #[test]
+    fn flow_queries_preserve_prompt_actions_near_each_required_step() {
+        let prompt = "Trace how Redis initializes the server, enters the event loop, reads client input, and routes a command for execution. Cite the source files and name the supporting symbols.";
+        let terms = packet_probe_terms(prompt);
+        let queries = packet_flow_requirement_context_queries_for_prompt(
+            prompt,
+            &terms,
+            PacketTaskClassDto::RouteTracing,
+        )
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            queries.get("command_server_bootstrap").map(String::as_str),
+            Some("redis initializes server")
+        );
+        assert_eq!(
+            queries.get("command_event_loop").map(String::as_str),
+            Some("enters event loop")
+        );
+        assert_eq!(
+            queries.get("command_network_input").map(String::as_str),
+            Some("reads client input")
+        );
+        assert_eq!(
+            queries.get("command_dispatch").map(String::as_str),
+            Some("routes command execution")
+        );
     }
 
     #[test]
@@ -1061,6 +1592,44 @@ mod tests {
     }
 
     #[test]
+    fn inflected_outbound_request_plans_one_ordered_six_stage_lifecycle() {
+        for action in ["send", "sends", "sending", "sent"] {
+            let prompt = format!(
+                "Explain how a top-level request call becomes a prepared request and {action} it through a session adapter."
+            );
+            let terms = packet_probe_terms(&prompt);
+            let requirements =
+                packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::DataFlow);
+            assert_eq!(
+                requirements
+                    .iter()
+                    .map(|requirement| requirement.id)
+                    .collect::<Vec<_>>(),
+                [
+                    "client_public_facade",
+                    "request_entrypoint",
+                    "client_request_finalization",
+                    "request_dispatch",
+                    "request_terminal",
+                    "client_transport_send",
+                ],
+                "{action}: {terms:?}"
+            );
+
+            let queries =
+                packet_flow_requirement_queries_for_terms(&terms, PacketTaskClassDto::DataFlow);
+            assert_eq!(
+                queries
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                queries.len(),
+                "the lifecycle must not dispatch duplicate queries: {queries:?}"
+            );
+        }
+    }
+
+    #[test]
     fn focused_client_finalization_prompt_does_not_require_full_lifecycle() {
         assert_eq!(
             client_requirement_ids(
@@ -1076,6 +1645,77 @@ mod tests {
             client_requirement_ids("Explain how an HTTP client performs transport send."),
             vec!["client_transport_send"]
         );
+    }
+
+    #[test]
+    fn search_evidence_handoff_adds_classification_and_output_obligations() {
+        let full_flow = packet_flow_requirements_for_terms(
+            &packet_probe_terms(
+                "Explain how search results are ranked and turned into the final evidence packet.",
+            ),
+            PacketTaskClassDto::DataFlow,
+        );
+        let full_flow_ids = full_flow
+            .iter()
+            .map(|requirement| requirement.id)
+            .collect::<Vec<_>>();
+
+        assert!(full_flow_ids.contains(&"search_entrypoint"));
+        assert!(full_flow_ids.contains(&"search_dispatch"));
+        assert!(full_flow_ids.contains(&"search_evidence_classification"));
+        assert!(full_flow_ids.contains(&"search_evidence_output"));
+
+        let focused = packet_flow_requirements_for_terms(
+            &packet_probe_terms("Explain search result evidence classification and output."),
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        let focused_ids = focused
+            .iter()
+            .map(|requirement| requirement.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            focused_ids,
+            ["search_evidence_classification", "search_evidence_output"]
+        );
+
+        let verb_ids = packet_flow_requirements_for_terms(
+            &packet_probe_terms("How does search classify evidence and emit it?"),
+            PacketTaskClassDto::DataFlow,
+        )
+        .into_iter()
+        .map(|requirement| requirement.id)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            verb_ids,
+            ["search_evidence_classification", "search_evidence_output"]
+        );
+
+        let classification_only = packet_flow_requirements_for_terms(
+            &packet_probe_terms("How is the search evidence tier assigned?"),
+            PacketTaskClassDto::ArchitectureExplanation,
+        )
+        .into_iter()
+        .map(|requirement| requirement.id)
+        .collect::<Vec<_>>();
+        assert_eq!(classification_only, ["search_evidence_classification"]);
+
+        let output_only = packet_flow_requirements_for_terms(
+            &packet_probe_terms("How does search emit evidence?"),
+            PacketTaskClassDto::ArchitectureExplanation,
+        )
+        .into_iter()
+        .map(|requirement| requirement.id)
+        .collect::<Vec<_>>();
+        assert_eq!(output_only, ["search_evidence_output"]);
+
+        let surface_output = packet_flow_requirements_for_terms(
+            &packet_probe_terms("How does search surface evidence?"),
+            PacketTaskClassDto::ArchitectureExplanation,
+        )
+        .into_iter()
+        .map(|requirement| requirement.id)
+        .collect::<Vec<_>>();
+        assert_eq!(surface_output, ["search_evidence_output"]);
     }
 
     #[test]
@@ -1107,7 +1747,11 @@ mod tests {
                 "client request flow should probe {expected}"
             );
         }
-        for server_only in ["route registration", "handler dispatch"] {
+        for server_only in [
+            "application use",
+            "application handle",
+            "route registration",
+        ] {
             assert!(
                 !queries.contains(&server_only),
                 "client request flow should not probe {server_only}"
@@ -1116,7 +1760,7 @@ mod tests {
     }
 
     #[test]
-    fn server_request_flow_retains_route_registration_and_handler_dispatch() {
+    fn server_request_flow_leads_with_carrier_aligned_symbols() {
         let requirements = packet_flow_requirements_for_terms(
             &packet_probe_terms(
                 "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.",
@@ -1133,7 +1777,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(entrypoint.role, FlowRole::Registration);
-        for expected in ["route registration", "handler dispatch"] {
+        for expected in [
+            "application use",
+            "route registration",
+            "application handle",
+            "request dispatch",
+            "response send",
+            "response finalization",
+        ] {
             assert!(
                 queries.contains(&expected),
                 "server request flow should probe {expected}"
@@ -1144,10 +1795,82 @@ mod tests {
             "request method",
             "interceptor handlers",
             "adapters",
+            "transport adapter",
         ] {
             assert!(
                 !queries.contains(&client_only),
                 "server request flow should not probe {client_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_route_flow_requires_registration_and_dispatch_without_response_terminal() {
+        let requirements = packet_flow_requirements_for_terms(
+            &packet_probe_terms(
+                "Trace how an Express application registers middleware and routes, then dispatches an incoming request through router layers to a route handler.",
+            ),
+            PacketTaskClassDto::RouteTracing,
+        );
+        let ids = requirements
+            .iter()
+            .map(|requirement| requirement.id)
+            .collect::<Vec<_>>();
+        let queries = requirements
+            .iter()
+            .flat_map(|requirement| requirement.query_seeds.iter().copied())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, ["request_entrypoint", "request_dispatch"]);
+        for expected in [
+            "application use",
+            "route registration",
+            "application handle",
+            "request dispatch",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "server route flow should probe {expected}"
+            );
+        }
+        for out_of_scope in [
+            "response send",
+            "response finalization",
+            "transport send",
+            "transport adapter",
+        ] {
+            assert!(
+                !queries.contains(&out_of_scope),
+                "route-to-handler prompt should not require {out_of_scope}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_route_flow_includes_response_terminal_when_explicitly_requested() {
+        let requirements = packet_flow_requirements_for_terms(
+            &packet_probe_terms(
+                "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.",
+            ),
+            PacketTaskClassDto::RouteTracing,
+        );
+        let ids = requirements
+            .iter()
+            .map(|requirement| requirement.id)
+            .collect::<Vec<_>>();
+        let queries = requirements
+            .iter()
+            .flat_map(|requirement| requirement.query_seeds.iter().copied())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            ["request_entrypoint", "request_dispatch", "request_terminal"]
+        );
+        for expected in ["response send", "response finalization"] {
+            assert!(
+                queries.contains(&expected),
+                "response-helper route flow should probe {expected}"
             );
         }
     }
@@ -1166,7 +1889,7 @@ mod tests {
         "client_public_facade | entrypoint | RequiresResolvedSourceOrGraph",
         "client_request_finalization | transform_or_validate | RequiresResolvedSourceOrGraph",
         "client_response_materialization | terminal_boundary | RequiresResolvedSourceOrGraph",
-        "client_transport_send | dispatch | RequiresResolvedSourceOrGraph",
+        "client_transport_send | terminal_boundary | RequiresResolvedSourceOrGraph",
         "command_dispatch | dispatch | RequiresResolvedSourceOrGraph",
         "command_event_loop | dispatch | RequiresResolvedSourceOrGraph",
         "command_network_input | dispatch | RequiresResolvedSourceOrGraph",
@@ -1178,7 +1901,7 @@ mod tests {
         "form_native_constraints | transform_or_validate | AllowsLexicalSource",
         "form_submit_guard | terminal_boundary | AllowsLexicalSource",
         "format_arguments | transform_or_validate | RequiresResolvedSourceOrGraph",
-        "format_errors | error_or_fallback | AllowsSourceRange",
+        "formatter_fallback | error_or_fallback | AllowsSourceRange",
         "handler_processing | dispatch | RequiresResolvedSourceOrGraph",
         "hook_cache_helper | state_or_storage | AllowsSourceRange",
         "hook_key_serialization | transform_or_validate | AllowsSourceRange",
@@ -1194,11 +1917,14 @@ mod tests {
         "request_entrypoint | entrypoint | RequiresResolvedSourceOrGraph",
         "request_entrypoint | registration | RequiresResolvedSourceOrGraph",
         "request_interceptor_management | dispatch | RequiresResolvedSourceOrGraph",
-        "request_terminal | terminal_boundary | AllowsSourceRange",
+        "request_terminal | dispatch | RequiresResolvedSourceOrGraph",
+        "request_terminal | terminal_boundary | RequiresResolvedSourceOrGraph",
         "search_dispatch | dispatch | RequiresResolvedSourceOrGraph",
+        "search_evidence_classification | transform_or_validate | RequiresResolvedSourceOrGraph",
+        "search_evidence_output | terminal_boundary | RequiresResolvedSourceOrGraph",
         "search_entrypoint | entrypoint | RequiresResolvedSourceOrGraph",
         "session_callbacks | dispatch | AllowsSourceRange",
-        "session_request | entrypoint | RequiresResolvedSourceOrGraph",
+        "client_request_entry | entrypoint | RequiresResolvedSourceOrGraph",
         "shell_completion | terminal_boundary | DiagnosticOnly",
         "shell_function_dispatch | dispatch | AllowsLexicalSource",
         "shell_installer_bootstrap | entrypoint | AllowsLexicalSource",
@@ -1206,6 +1932,9 @@ mod tests {
         "site_terminal | terminal_boundary | AllowsSourceRange",
         "sql_relationships | configuration | AllowsLexicalSource",
         "sql_tables | state_or_storage | AllowsLexicalSource",
+        "string_blank_predicate | transform_or_validate | RequiresResolvedSourceOrGraph",
+        "string_empty_predicate | transform_or_validate | RequiresResolvedSourceOrGraph",
+        "string_region_handoff | dispatch | RequiresResolvedSourceOrGraph",
     ];
 
     fn requirement_inventory_entry(requirement: &FlowRequirement) -> String {
@@ -1294,6 +2023,14 @@ mod tests {
                 ),
             ),
             (
+                ("request_terminal", "dispatch"),
+                witness(
+                    "Session.get_adapter",
+                    "src/requests/sessions.py",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
                 ("request_interceptor_management", "dispatch"),
                 witness(
                     "InterceptorManager",
@@ -1302,7 +2039,7 @@ mod tests {
                 ),
             ),
             (
-                ("session_request", "entrypoint"),
+                ("client_request_entry", "entrypoint"),
                 witness(
                     "createClientInstance",
                     "Source/Session.swift",
@@ -1334,10 +2071,10 @@ mod tests {
                 ),
             ),
             (
-                ("client_transport_send", "dispatch"),
+                ("client_transport_send", "terminal_boundary"),
                 witness(
-                    "IOClient.sendAdapter",
-                    "lib/io_client.dart",
+                    "BaseAdapter.send",
+                    "src/requests/adapters.py",
                     NodeKind::METHOD,
                 ),
             ),
@@ -1447,7 +2184,7 @@ mod tests {
             ),
             (
                 ("shell_function_dispatch", "dispatch"),
-                witness("nvm_command", "nvm.sh", NodeKind::FUNCTION),
+                witness("nvm_command_dispatch", "nvm.sh", NodeKind::FUNCTION),
             ),
             (
                 ("shell_completion", "terminal_boundary"),
@@ -1512,7 +2249,7 @@ mod tests {
                 witness("basic_format_args", "include/fmt/base.h", NodeKind::CLASS),
             ),
             (
-                ("format_errors", "error_or_fallback"),
+                ("formatter_fallback", "error_or_fallback"),
                 witness(
                     "throw_format_error",
                     "include/fmt/format.h",
@@ -1525,7 +2262,47 @@ mod tests {
             ),
             (
                 ("search_dispatch", "dispatch"),
-                witness("SearchWorker", "crates/core/search.rs", NodeKind::STRUCT),
+                witness(
+                    "SearchWorker::execute_search",
+                    "crates/core/search.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_evidence_classification", "transform_or_validate"),
+                witness(
+                    "SearchHitEvidence::tier",
+                    "crates/core/evidence.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_evidence_output", "terminal_boundary"),
+                witness(
+                    "append_search_evidence_packet",
+                    "crates/core/output.rs",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("string_blank_predicate", "transform_or_validate"),
+                witness(
+                    "StringUtils.isBlank",
+                    "src/text/StringUtils.java",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("string_empty_predicate", "transform_or_validate"),
+                witness("Strings.isEmpty", "src/text/Strings.java", NodeKind::METHOD),
+            ),
+            (
+                ("string_region_handoff", "dispatch"),
+                witness(
+                    "CharSequenceUtils.regionMatches",
+                    "src/text/CharSequenceUtils.java",
+                    NodeKind::METHOD,
+                ),
             ),
         ]
     }
@@ -1577,6 +2354,288 @@ mod tests {
                 witness.display_name
             );
         }
+    }
+
+    #[test]
+    fn client_public_facade_helper_requires_its_exact_outgoing_request_boundary() {
+        let requirement = CLIENT_PUBLIC_FACADE_REQUIREMENT;
+        let established_factory = witness("createClient", "lib/client.dart", NodeKind::FUNCTION);
+        assert!(
+            requirement
+                .evidence
+                .citation_proves_without_call_boundary(&established_factory)
+        );
+        assert!(
+            requirement
+                .evidence
+                .call_boundary_target(&established_factory)
+                .is_none()
+        );
+        for internal_factory in [
+            witness(
+                "CronetClient._createProfile",
+                "lib/src/cronet_client.dart",
+                NodeKind::METHOD,
+            ),
+            witness("_createClient", "lib/client.dart", NodeKind::FUNCTION),
+            witness("createClient", "lib/client.dart", NodeKind::METHOD),
+        ] {
+            assert!(
+                !requirement.evidence.citation_proves(&internal_factory),
+                "an internal helper is not the package's public facade: {internal_factory:?}"
+            );
+        }
+
+        let helper = witness("request", "src/requests/api.py", NodeKind::FUNCTION);
+        assert!(requirement.evidence.citation_proves(&helper));
+        assert!(
+            !requirement
+                .evidence
+                .citation_proves_without_call_boundary(&helper)
+        );
+        let target = requirement
+            .evidence
+            .call_boundary_target(&helper)
+            .expect("the public helper needs an outgoing CALL boundary");
+        assert!(target("Session.request"));
+
+        let other_package_helper =
+            witness("request", "lib/transportkit/api.py", NodeKind::FUNCTION);
+        assert!(requirement.evidence.citation_proves(&other_package_helper));
+        assert!(
+            requirement
+                .evidence
+                .call_boundary_target(&other_package_helper)
+                .is_some_and(|target| target("HttpClient.request"))
+        );
+        let library_entry_helper = witness("get", "pkgs/http/lib/http.dart", NodeKind::FUNCTION);
+        assert!(requirement.evidence.citation_proves(&library_entry_helper));
+        assert!(
+            requirement
+                .evidence
+                .call_boundary_target(&library_entry_helper)
+                .is_some_and(|target| target("_withClient"))
+        );
+        for negative in [
+            "request",
+            "requests.api.request",
+            "Cache.request",
+            "CacheClient.request",
+            "Database.request",
+            "DatabaseClient.request",
+            "TelemetryClient.request",
+            "MonitoringClient.request",
+            "dispatch_hook",
+        ] {
+            assert!(
+                !target(negative),
+                "{negative} is not the next request stage"
+            );
+        }
+
+        for wrong_carrier in [
+            witness("request", "src/cache.py", NodeKind::FUNCTION),
+            witness("request", "src/database/api.py", NodeKind::FUNCTION),
+            witness("request", "src/telemetry/api.py", NodeKind::FUNCTION),
+            witness("request", "src/monitoring/api.py", NodeKind::FUNCTION),
+            witness("FrameKind.request", "src/requests/api.py", NodeKind::METHOD),
+            witness("dispatch_hook", "src/requests/api.py", NodeKind::FUNCTION),
+            witness("get", "pkgs/http/lib/src/http.dart", NodeKind::FUNCTION),
+        ] {
+            assert!(!requirement.evidence.citation_proves(&wrong_carrier));
+            assert!(
+                requirement
+                    .evidence
+                    .call_boundary_target(&wrong_carrier)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_role_carriers_keep_their_declared_call_boundary() {
+        let cases = [
+            (
+                "server request entrypoint",
+                SERVER_REQUEST_DISPATCH_FLOW[0],
+                witness("Router.use", "src/router.js", NodeKind::METHOD),
+                witness("Router.map", "src/router.js", NodeKind::METHOD),
+                "Router.route",
+            ),
+            (
+                "server request dispatch",
+                SERVER_REQUEST_DISPATCH_FLOW[1],
+                witness("Router.dispatch", "src/router.js", NodeKind::METHOD),
+                witness(
+                    "RequestDispatcher.execute",
+                    "src/dispatcher.js",
+                    NodeKind::METHOD,
+                ),
+                "finalhandler",
+            ),
+            (
+                "server response terminal",
+                SERVER_REQUEST_DISPATCH_FLOW[2],
+                witness("Response.writeBuffer", "src/response.js", NodeKind::METHOD),
+                witness("ResponseBuffer.read", "src/response.js", NodeKind::METHOD),
+                "Socket.end",
+            ),
+            (
+                "client request entrypoint",
+                CLIENT_REQUEST_DISPATCH_FLOW[0],
+                witness(
+                    "HttpClientFactory.request",
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                ),
+                witness("createClient", "src/client.rs", NodeKind::FUNCTION),
+                "PreparedRequest.build",
+            ),
+            (
+                "client public facade",
+                CLIENT_PUBLIC_FACADE_REQUIREMENT,
+                witness(
+                    "createClient.request",
+                    "src/requests/api.py",
+                    NodeKind::FUNCTION,
+                ),
+                witness("createClient", "src/requests/api.py", NodeKind::FUNCTION),
+                "Session.request",
+            ),
+        ];
+
+        for (label, requirement, hybrid, role_only, lawful_target) in cases {
+            assert!(
+                requirement.evidence.citation_proves(&hybrid),
+                "{label}: fixture must satisfy the hybrid predicate"
+            );
+            assert!(
+                !requirement
+                    .evidence
+                    .citation_proves_without_call_boundary(&hybrid),
+                "{label}: a named role must not bypass carrier boundary proof"
+            );
+            let target = requirement
+                .evidence
+                .call_boundary_target(&hybrid)
+                .unwrap_or_else(|| panic!("{label}: hybrid carrier lost its declared target"));
+            assert!(target(lawful_target), "{label}: lawful target rejected");
+            assert!(
+                !target("Metrics.record"),
+                "{label}: unrelated target admitted"
+            );
+
+            assert!(
+                requirement.evidence.citation_proves(&role_only),
+                "{label}: role-only fixture must retain the established role surface"
+            );
+            assert!(
+                requirement
+                    .evidence
+                    .citation_proves_without_call_boundary(&role_only),
+                "{label}: role-only evidence should keep the ordinary CALL contract"
+            );
+            assert!(
+                requirement
+                    .evidence
+                    .call_boundary_target(&role_only)
+                    .is_none(),
+                "{label}: role-only evidence must not invent an exact target"
+            );
+        }
+
+        let ordered = CLIENT_REQUEST_DISPATCH_FLOW[1];
+        let ordered_hybrid = witness("HttpClient.dispatchSend", "src/client.rs", NodeKind::METHOD);
+        assert!(ordered.evidence.citation_proves(&ordered_hybrid));
+        assert!(
+            ordered
+                .evidence
+                .citation_proves_without_call_boundary(&ordered_hybrid),
+            "the ordered-boundary predicate keeps its established role behavior"
+        );
+        assert!(
+            ordered
+                .evidence
+                .ordered_call_boundary(&ordered_hybrid)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn request_entrypoint_receipts_reject_self_loops_and_storage_clients() {
+        let requirement = CLIENT_REQUEST_DISPATCH_FLOW[0];
+        let carrier = witness(
+            "Session.request",
+            "src/requests/sessions.py",
+            NodeKind::METHOD,
+        );
+        let receipt = |id: &str, source: NodeId, target: NodeId| GraphEdgeDto {
+            id: EdgeId(id.to_string()),
+            source,
+            target,
+            kind: EdgeKind::CALL,
+            confidence: Some(1.0),
+            certainty: Some("certain".to_string()),
+            callsite_identity: Some("src/requests/sessions.py:1".to_string()),
+            candidate_targets: Vec::new(),
+        };
+
+        for target in [
+            "Session.prepare_request",
+            "PreparedRequest.build",
+            "Session.send",
+            "Client.send",
+        ] {
+            let lawful = receipt(target, carrier.node_id.clone(), NodeId(target.to_string()));
+            assert!(
+                flow_requirement_call_receipt_is_valid(
+                    &requirement,
+                    &carrier,
+                    &lawful,
+                    target,
+                    NodeKind::METHOD,
+                ),
+                "{target}"
+            );
+        }
+
+        for target in [
+            "CacheClient.send",
+            "CacheClient.prepareRequest",
+            "DatabaseClient.send",
+            "HookClient.send",
+            "HookClient.prepareRequest",
+        ] {
+            let unlawful = receipt(target, carrier.node_id.clone(), NodeId(target.to_string()));
+            assert!(
+                !flow_requirement_call_receipt_is_valid(
+                    &requirement,
+                    &carrier,
+                    &unlawful,
+                    target,
+                    NodeKind::METHOD,
+                ),
+                "{target}"
+            );
+        }
+
+        let self_loop = receipt(
+            "self-loop",
+            carrier.node_id.clone(),
+            carrier.node_id.clone(),
+        );
+        assert!(!flow_requirement_call_receipt_is_valid(
+            &requirement,
+            &carrier,
+            &self_loop,
+            "PreparedRequest.build",
+            NodeKind::METHOD,
+        ));
+        assert!(!ordinary_incident_call_receipt_is_valid(
+            &carrier,
+            &self_loop,
+            NodeKind::METHOD,
+        ));
     }
 
     #[test]
@@ -2014,7 +3073,6 @@ mod tests {
         "css_animation_entrypoint | forward",
         "css_animation_entrypoint | import",
         "css_animation_entrypoint | use",
-        "css_animation_structure | animated",
         "css_animation_structure | animation",
         "css_animation_structure | delay",
         "css_animation_structure | duration",
@@ -2052,17 +3110,6 @@ mod tests {
         "shell_completion | compgen",
         "shell_completion | complete",
         "shell_completion | completion",
-        "shell_function_dispatch | case",
-        "shell_function_dispatch | command",
-        "shell_function_dispatch | commands",
-        "shell_function_dispatch | dispatch",
-        "shell_function_dispatch | dispatcher",
-        "shell_function_dispatch | exec",
-        "shell_function_dispatch | execut",
-        "shell_function_dispatch | execute",
-        "shell_function_dispatch | execution",
-        "shell_function_dispatch | run",
-        "shell_function_dispatch | use",
         "shell_installer_bootstrap | bootstrap",
         "shell_installer_bootstrap | download",
         "shell_installer_bootstrap | install",
@@ -2074,8 +3121,8 @@ mod tests {
     /// Every word any predicate in this crate reads, so the sweep below covers the whole vocabulary
     /// the tables are written in rather than a sample of it. Held to the carriers' own source by
     /// `the_one_word_sweep_covers_every_word_the_carriers_match_on`, so it cannot fall behind them.
-    fn evidence_vocabulary() -> Vec<&'static str> {
-        vec![
+    fn evidence_vocabulary() -> Vec<String> {
+        let mut vocabulary = vec![
             "request",
             "requests",
             "route",
@@ -2142,6 +3189,7 @@ mod tests {
             "loop",
             "poll",
             "select",
+            "choose",
             "epoll",
             "reactor",
             "tick",
@@ -2235,6 +3283,7 @@ mod tests {
             "download",
             "completion",
             "prepare",
+            "prepared",
             "finalize",
             "materialize",
             "interceptor",
@@ -2284,12 +3333,29 @@ mod tests {
             "forward",
             "keyframes",
             "animation",
-            "animated",
             "transition",
             "duration",
             "delay",
             "iteration",
             "fillmode",
+            "string",
+            "strings",
+            "text",
+            "char",
+            "sequence",
+            "sequences",
+            "charsequence",
+            "charsequences",
+            "blank",
+            "whitespace",
+            "empty",
+            "region",
+            "regions",
+            "matches",
+            "matching",
+            "compare",
+            "equal",
+            "equals",
             "forms",
             "fieldset",
             "validation",
@@ -2328,8 +3394,17 @@ mod tests {
             "logs",
             "loggers",
             "handle",
+            "finalhandler",
             "add",
             "create",
+            "initialize",
+            "new",
+            "application",
+            "invoke",
+            "end",
+            "finish",
+            "res",
+            "reply",
             "push",
             "pop",
             "remove",
@@ -2447,7 +3522,27 @@ mod tests {
             // removal widens it, and the sweep is what would notice.
             "sitemap",
             "sitemaps",
+            // Public-facade carrier scope and its exact close negatives.
+            "api",
+            "hook",
+            "hooks",
+            "database",
+            "db",
+            "metrics",
+            "telemetry",
+            "monitoring",
+            "observability",
+            // Exact public-facade successor `_withClient` is the bounded wrapper that owns the
+            // client lifetime before delegating to `Client`.
+            "with",
         ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        vocabulary.extend(carrier_taxonomy_vocabulary());
+        vocabulary.sort();
+        vocabulary.dedup();
+        vocabulary
     }
 
     /// The sweep is only as wide as the vocabulary it sweeps, so the vocabulary is checked against
@@ -2477,7 +3572,7 @@ mod tests {
                     || !literal
                         .chars()
                         .all(|character| character.is_ascii_lowercase())
-                    || vocabulary.contains(&literal)
+                    || vocabulary.iter().any(|word| word.as_str() == literal)
                     || missing.iter().any(|word| word == literal)
                 {
                     continue;
@@ -2674,7 +3769,6 @@ mod tests {
         "css_animation_entrypoint | forward",
         "css_animation_entrypoint | import",
         "css_animation_entrypoint | use",
-        "css_animation_structure | animated",
         "css_animation_structure | animation",
         "css_animation_structure | delay",
         "css_animation_structure | duration",
@@ -2720,17 +3814,6 @@ mod tests {
         "shell_completion | compgen",
         "shell_completion | complete",
         "shell_completion | completion",
-        "shell_function_dispatch | case",
-        "shell_function_dispatch | command",
-        "shell_function_dispatch | commands",
-        "shell_function_dispatch | dispatch",
-        "shell_function_dispatch | dispatcher",
-        "shell_function_dispatch | exec",
-        "shell_function_dispatch | execut",
-        "shell_function_dispatch | execute",
-        "shell_function_dispatch | execution",
-        "shell_function_dispatch | run",
-        "shell_function_dispatch | use",
         "shell_installer_bootstrap | bootstrap",
         "shell_installer_bootstrap | download",
         "shell_installer_bootstrap | install",
@@ -2834,7 +3917,7 @@ mod tests {
         let mut names_swept = 0_usize;
         let mut closes_every_name: BTreeMap<String, usize> = BTreeMap::new();
         for word in evidence_vocabulary() {
-            for name in compound_shapes_for(word) {
+            for name in compound_shapes_for(&word) {
                 for surface in sweep_surfaces() {
                     names_swept += 1;
                     let mut closed_here: Vec<&str> = Vec::new();
@@ -2933,11 +4016,12 @@ mod tests {
                 // for, crossed with one file per surface class. It used to be `.rs` and `.ts` under
                 // a comment claiming `.ts` stood for every script surface; that claim is now a
                 // test rather than a comment, and it was false while `.vue` took the markup branch.
-                // `STRUCT` is treated identically to `CLASS` by every predicate in the crate, and
-                // the non-behavior kinds are crossed against the corpus above.
+                // These callable/owner shapes exercise the lexical predicates only. Narrower kind
+                // policies belong to explicit carrier contracts rather than an assumed global
+                // equivalence between every `NodeKind`.
                 for file in sweep_surface_files() {
                     for kind in [NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::CLASS] {
-                        let citation = witness(word, &format!("{directory}{file}"), kind);
+                        let citation = witness(&word, &format!("{directory}{file}"), kind);
                         for requirement in &requirements {
                             if !requirement.evidence.citation_proves(&citation) {
                                 continue;
@@ -3485,10 +4569,12 @@ mod tests {
     /// generic web nouns stood in for one specific one. Both are two-word-plus-verb shapes, and the
     /// one-vocabulary-word sweeps are structurally blind to them.
     ///
-    /// `NodeKind::METHOD` alone, and provably so: every requirement in these six flows is a
-    /// `CitedCarrier`, and every carrier's kind test is either `owns_behavior` — which accepts
-    /// `FUNCTION`, `METHOD`, `CLASS` and `STRUCT` alike — or `FUNCTION | METHOD`. No carrier can
-    /// accept a kind it rejects for a method, so widening the axis could only cost time.
+    /// `NodeKind::METHOD` is the callable representative for this lexical cross-product, not a
+    /// global kind-policy assertion. Carrier-specific extractor boundaries are covered beside the
+    /// carrier itself; for example, shell dispatch explicitly crosses callable `FUNCTION` /
+    /// `METHOD` anchors with non-callable `VARIABLE`, `FIELD` and `TYPEDEF` anchors. Keeping kind
+    /// policy out of this already-large sweep lets it answer one question: whether off-subject
+    /// words can satisfy a carrier's two lexical factors.
     #[test]
     fn no_carrier_flow_closes_on_evidence_that_never_names_it() {
         let vocabulary = evidence_vocabulary();
@@ -3509,8 +4595,8 @@ mod tests {
             for requirement in &requirements {
                 assert!(
                     matches!(requirement.evidence, EvidencePredicate::CitedCarrier(_)),
-                    "{} is not carrier-backed, so the METHOD-only kind axis below is no longer \
-                     sound for the {} flow",
+                    "{} is not carrier-backed, so the lexical carrier sweep no longer applies to \
+                     the {} flow",
                     requirement.id,
                     flow.flow
                 );
@@ -3518,7 +4604,7 @@ mod tests {
 
             let off_subject = vocabulary
                 .iter()
-                .filter(|word| !flow.subject_words.contains(*word))
+                .filter(|word| !flow.subject_words.contains(&word.as_str()))
                 .collect::<Vec<_>>();
             let mut closable: Vec<String> = Vec::new();
             for object in &off_subject {

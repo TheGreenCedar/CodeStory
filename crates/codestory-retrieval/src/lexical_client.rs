@@ -1,6 +1,10 @@
 use crate::config::SidecarLayout;
-use crate::lexical_index::{search_lexical_index_with_cancel, shard_dir_for};
+use crate::lexical_index::{
+    LexicalHit, search_lexical_index_batch_with_cancel, search_lexical_index_with_cancel,
+    shard_dir_for,
+};
 use anyhow::Result;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
 pub struct LexicalClient;
@@ -35,7 +39,6 @@ impl LexicalClient {
     where
         F: Fn() -> bool + Send + Sync + 'static,
     {
-        use super::candidate::{CandidateHit, CandidateSource};
         search_lexical_index_with_cancel(
             &shard_dir_for(&layout.lexical_data_dir, generation),
             sidecar_input_hash,
@@ -44,20 +47,42 @@ impl LexicalClient {
             cancelled,
         )?
         .into_iter()
-        .map(|hit| {
-            let mut candidate = CandidateHit::with_source(
-                hit.path,
-                hit.symbol_name,
-                hit.score,
-                CandidateSource::Lexical,
-            );
-            candidate.node_id = hit.node_id;
-            candidate.start_line = hit.start_line;
-            candidate.target = hit.target;
-            candidate.source_excerpt = hit.source_excerpt;
-            candidate.add_provenance(hit.source.provenance_label());
-            Ok(candidate)
-        })
+        .map(lexical_hit_to_candidate)
         .collect()
     }
+
+    pub fn search_batch_with_cancel(
+        &self,
+        layout: &SidecarLayout,
+        generation: &str,
+        sidecar_input_hash: &str,
+        queries: &[(String, usize)],
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Vec<Vec<super::CandidateHit>>> {
+        search_lexical_index_batch_with_cancel(
+            &shard_dir_for(&layout.lexical_data_dir, generation),
+            sidecar_input_hash,
+            queries,
+            cancelled,
+        )?
+        .into_iter()
+        .map(|hits| hits.into_iter().map(lexical_hit_to_candidate).collect())
+        .collect()
+    }
+}
+
+fn lexical_hit_to_candidate(hit: LexicalHit) -> Result<super::CandidateHit> {
+    use super::candidate::{CandidateHit, CandidateSource};
+    let mut candidate = CandidateHit::with_source(
+        hit.path,
+        hit.symbol_name,
+        hit.score,
+        CandidateSource::Lexical,
+    );
+    candidate.node_id = hit.node_id;
+    candidate.start_line = hit.start_line;
+    candidate.target = hit.target;
+    candidate.source_excerpt = hit.source_excerpt;
+    candidate.add_provenance(hit.source.provenance_label());
+    Ok(candidate)
 }

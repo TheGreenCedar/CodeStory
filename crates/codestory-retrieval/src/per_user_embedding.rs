@@ -26,10 +26,11 @@ pub use qualification_control::{
     run_per_user_embedding_qualification,
 };
 pub use qualification_worker::{
-    EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, EmbeddingQualificationWorkerError,
-    EmbeddingQualificationWorkerMeasurement, EmbeddingQualificationWorkerMeasurementSpan,
-    EmbeddingQualificationWorkerOutput, EmbeddingQualificationWorkerProtocolExchange,
-    EmbeddingQualificationWorkerQueueOperation, EmbeddingQualificationWorkerRequest,
+    EMBEDDING_BUSY_RETRY_QUEUE_CLASS, EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
+    EmbeddingQualificationWorkerError, EmbeddingQualificationWorkerMeasurement,
+    EmbeddingQualificationWorkerMeasurementSpan, EmbeddingQualificationWorkerOutput,
+    EmbeddingQualificationWorkerProtocolExchange, EmbeddingQualificationWorkerQueueOperation,
+    EmbeddingQualificationWorkerRequest,
 };
 pub use server::{
     EmbeddingServerBudgets, PerUserEmbeddingServerConfig, run_per_user_embedding_server,
@@ -68,10 +69,11 @@ pub use protocol::{
     PER_USER_EMBEDDING_MAX_INPUT_BYTES, PER_USER_EMBEDDING_MAX_METADATA_BYTES,
     PER_USER_EMBEDDING_MAX_PAYLOAD_BYTES, PER_USER_EMBEDDING_MEASUREMENT_PROTOCOL_SHA256,
     PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION, PER_USER_EMBEDDING_PROTOCOL_SHA256,
-    PER_USER_EMBEDDING_PROTOCOL_V1, PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
-    PER_USER_EMBEDDING_SERVER_PROOF_MARKER, PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION,
-    PerUserEmbeddingError, embedding_capacity_pressure,
-    embedding_qualification_watchdog_marker_filename, embedding_retry_state,
+    PER_USER_EMBEDDING_PROTOCOL_V1, PER_USER_EMBEDDING_QUERY_BATCH_MAX,
+    PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS, PER_USER_EMBEDDING_SERVER_PROOF_MARKER,
+    PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION, PerUserEmbeddingError,
+    embedding_capacity_pressure, embedding_qualification_watchdog_marker_filename,
+    embedding_retry_state,
 };
 use qualification_control::ServerQualificationControl;
 #[cfg(all(test, windows))]

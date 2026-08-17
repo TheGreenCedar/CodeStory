@@ -386,7 +386,7 @@ fn grounding_root_subsystem_key(
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct GroundingRootSortKey {
-    import_like: bool,
+    architecture_band: u8,
     entry: Reverse<EntryEvidence>,
     file_role_rank: u8,
     helper_like: bool,
@@ -412,11 +412,18 @@ impl GroundingRootSortKey {
         let role = grounding_root_file_role(record, file_roles);
         let relative = grounding_root_relative_path(root, record);
         let call_degrees = degrees.get(&record.node.id).copied().unwrap_or_default();
+        let entry = grounding_entry_evidence(record, file_roles, call_degrees);
         Self {
-            import_like: is_import_like_symbol(&record.node),
-            // Role stays the band frame; directed graph evidence refines within
-            // the band; structure only breaks ties.
-            entry: Reverse(grounding_entry_evidence(record, file_roles, call_degrees)),
+            // Repository structure is the band frame. Directed graph evidence
+            // refines within a band, so a topological tool script cannot crowd
+            // a shallow production ownership boundary out of compact output.
+            architecture_band: grounding_root_architecture_band(
+                record,
+                role,
+                relative.as_deref(),
+                entry,
+            ),
+            entry: Reverse(entry),
             file_role_rank: grounding_root_file_role_rank(role),
             helper_like: helper_like_name_or_path(&record.display_name, relative.as_deref()),
             reference_tier: Reverse(degree_tier(call_degrees.production_in_calls)),
@@ -432,6 +439,43 @@ impl GroundingRootSortKey {
     }
 }
 
+fn grounding_root_architecture_band(
+    record: &GroundingNodeRecord,
+    role: Option<FileRole>,
+    relative_path: Option<&str>,
+    entry: EntryEvidence,
+) -> u8 {
+    if is_import_like_symbol(&record.node) {
+        return 5;
+    }
+    if role == Some(FileRole::Entrypoint) && entry != EntryEvidence::None {
+        return 0;
+    }
+    match role {
+        Some(FileRole::Entrypoint | FileRole::Source) => {
+            if grounding_root_tooling_path(relative_path) {
+                return 3;
+            }
+            match structural_path_rank(role, relative_path) {
+                0 | 1 => 1,
+                2 => 2,
+                _ => 3,
+            }
+        }
+        _ => 4,
+    }
+}
+
+fn grounding_root_tooling_path(relative_path: Option<&str>) -> bool {
+    let Some(path) = relative_path else {
+        return false;
+    };
+    let normalized = format!("/{}", path.replace('\\', "/").to_ascii_lowercase());
+    ["/scripts/", "/tools/", "/tooling/", "/build/", "/ci/"]
+        .iter()
+        .any(|segment| normalized.contains(segment))
+}
+
 fn diversify_grounding_root_records(
     mut records: Vec<GroundingNodeRecord>,
     root: &Path,
@@ -443,31 +487,79 @@ fn diversify_grounding_root_records(
     records.sort_by_cached_key(|record| {
         GroundingRootSortKey::new(record, root, file_roles, degrees, member_counts)
     });
-    let (production, secondary): (Vec<_>, Vec<_>) = records
-        .into_iter()
-        .partition(|record| is_production_file_role(grounding_root_file_role(record, file_roles)));
-
-    // Spend the compact budget on distinct production language/subsystem
-    // surfaces, then distinct names, before compatibility-only candidates.
-    // Every budget truncates this one stable order.
+    // Spend the compact budget on one best root from every production
+    // subsystem before repeating any subsystem. Name diversity alone cannot do
+    // this: a new subsystem may expose the same conventional symbol name as an
+    // already represented one. Keep the strongest entrypoint first, then pin
+    // one representative per remaining subsystem. After breadth is secured,
+    // the shared diversification pass retains its existing stable name order
+    // over the leftovers. Tooling, secondary roles, and imports remain later
+    // tiers, and every budget truncates this one deterministic order.
     let surface_key = |record: &GroundingNodeRecord| {
         (
             grounding_root_subsystem_key(root, record, file_languages),
             grounding_root_terminal_name(record),
         )
     };
-    // One diversity state across both tiers: a secondary candidate whose name a
-    // production root already spent must not consume a novel-name slot of its
-    // own, which is the duplicate-name diversity #1338 requires stay intact.
     let mut state = RootDiversityState::default();
-    let mut diversified =
-        diversify_root_order_within(production, |_| false, surface_key, &mut state);
-    diversified.extend(diversify_root_order_within(
-        secondary,
-        |_| false,
+    let mut bands = std::array::from_fn::<_, 6, _>(|_| Vec::new());
+    for record in records {
+        let role = grounding_root_file_role(&record, file_roles);
+        let relative = grounding_root_relative_path(root, &record);
+        let call_degrees = degrees.get(&record.node.id).copied().unwrap_or_default();
+        let entry = grounding_entry_evidence(&record, file_roles, call_degrees);
+        let band =
+            grounding_root_architecture_band(&record, role, relative.as_deref(), entry) as usize;
+        bands[band].push(record);
+    }
+    let mut production_architecture = Vec::new();
+    for band in bands.iter_mut().take(3) {
+        production_architecture.append(band);
+    }
+
+    let highest_ranked_entrypoint = production_architecture.iter().position(|record| {
+        grounding_entry_evidence(
+            record,
+            file_roles,
+            degrees.get(&record.node.id).copied().unwrap_or_default(),
+        ) != EntryEvidence::None
+    });
+    let mut representatives = Vec::new();
+    let mut represented_subsystems = HashSet::new();
+    let mut representative_ids = HashSet::new();
+    if let Some(index) = highest_ranked_entrypoint {
+        let record = production_architecture.remove(index);
+        represented_subsystems.insert(grounding_root_subsystem_key(root, &record, file_languages));
+        representative_ids.insert(record.node.id);
+        representatives.push(record);
+    }
+
+    let mut leftovers = Vec::new();
+    for record in production_architecture {
+        let subsystem = grounding_root_subsystem_key(root, &record, file_languages);
+        if represented_subsystems.insert(subsystem) {
+            representative_ids.insert(record.node.id);
+            representatives.push(record);
+        } else {
+            leftovers.push(record);
+        }
+    }
+    representatives.extend(leftovers);
+
+    let mut diversified = diversify_root_order_within(
+        representatives,
+        |record| representative_ids.contains(&record.node.id),
         surface_key,
         &mut state,
-    ));
+    );
+    for tier in bands.into_iter().skip(3) {
+        diversified.extend(diversify_root_order_within(
+            tier,
+            |_| false,
+            surface_key,
+            &mut state,
+        ));
+    }
     diversified
 }
 
@@ -572,6 +664,29 @@ fn grounding_root_candidate_files(
         .filter(|file_id| seen.insert(*file_id))
         .take(ARCHITECTURE_ROOT_FILE_LIMIT)
         .collect()
+}
+
+/// Resolve file-role evidence against the selected project rather than its
+/// checkout ancestors.
+///
+/// The stored role is classified when the file is indexed. An otherwise
+/// ordinary project copied below a directory such as `target` or `build` can
+/// therefore inherit that ancestor's generated role and lose every production
+/// candidate. Grounding already owns the explicit project root, so use the
+/// same role classifier on the project-relative path and retain stored evidence
+/// only for records that are not beneath that root.
+fn grounding_file_role_for_project(
+    root: &Path,
+    summary: &codestory_store::GroundingFileSummary,
+) -> Option<FileRole> {
+    let stored_role = summary.file_role?;
+    summary
+        .file
+        .path
+        .strip_prefix(root)
+        .ok()
+        .map(FileRole::classify_path)
+        .or(Some(stored_role))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1019,7 +1134,9 @@ impl AppController {
             .collect::<HashMap<_, _>>();
         let file_roles = file_summaries
             .iter()
-            .filter_map(|summary| summary.file_role.map(|role| (summary.file.id, role)))
+            .filter_map(|summary| {
+                grounding_file_role_for_project(&root, summary).map(|role| (summary.file.id, role))
+            })
             .collect::<HashMap<_, _>>();
         let architecture_root_file_ids =
             grounding_root_candidate_files(&root, &file_summaries, &file_roles, &file_languages);
@@ -1510,11 +1627,12 @@ impl AppController {
                             )),
                         })
                     }
-                    _ => Some(FunctionBodyRange {
+                    Some(_) => Some(FunctionBodyRange {
                         end_line,
                         range_source: "indexed_symbol_range",
                         fallback_reason: None,
                     }),
+                    None => None,
                 }
             }
             None => self
@@ -1575,7 +1693,14 @@ impl AppController {
         let source = self.read_file_text(codestory_contracts::api::ReadFileTextRequest {
             path: path.to_string(),
         })?;
-        Ok(brace_balanced_body_end_line(&source.text, start_line))
+        Ok(brace_balanced_body_end_line(
+            &source.text,
+            start_line,
+            Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("rs")),
+        ))
     }
 }
 
@@ -1638,7 +1763,11 @@ enum MultilineStringState {
     },
 }
 
-fn brace_balanced_body_end_line(source: &str, start_line: u32) -> Option<u32> {
+fn brace_balanced_body_end_line(
+    source: &str,
+    start_line: u32,
+    rust_literal_syntax: bool,
+) -> Option<u32> {
     let start_index = start_line.checked_sub(1)? as usize;
     let mut depth = 0usize;
     let mut saw_opening_brace = false;
@@ -1657,6 +1786,7 @@ fn brace_balanced_body_end_line(source: &str, start_line: u32) -> Option<u32> {
             &mut saw_opening_brace,
             &mut in_block_comment,
             &mut multiline_string,
+            rust_literal_syntax,
         );
         if saw_opening_brace && depth == 0 {
             return Some((offset + 1) as u32);
@@ -1684,6 +1814,7 @@ fn scan_braces_in_line(
     saw_opening_brace: &mut bool,
     in_block_comment: &mut bool,
     multiline_string: &mut MultilineStringState,
+    rust_literal_syntax: bool,
 ) {
     let chars: Vec<char> = line.chars().collect();
     let mut index = 0usize;
@@ -1757,6 +1888,12 @@ fn scan_braces_in_line(
             *multiline_string = MultilineStringState::RustRaw { hashes };
             continue;
         }
+        if ch == '\'' && rust_literal_syntax {
+            if let Some(end) = rust_char_literal_end(&chars, index - 1) {
+                index = end;
+            }
+            continue;
+        }
         if matches!(ch, '"' | '\'') {
             string_delimiter = Some(ch);
             continue;
@@ -1770,6 +1907,47 @@ fn scan_braces_in_line(
             *depth = depth.saturating_sub(1);
         }
     }
+}
+
+/// Return the byte-independent character index immediately after a Rust char
+/// literal that begins at `apostrophe_index`.
+///
+/// Rust lifetimes and labels use the same leading apostrophe but have no
+/// closing apostrophe. Treating them as strings can hide a function's opening
+/// brace when the lifetime and body share one line. A char literal is bounded:
+/// one scalar or one escape, followed immediately by its closing apostrophe.
+fn rust_char_literal_end(chars: &[char], apostrophe_index: usize) -> Option<usize> {
+    let mut index = apostrophe_index.checked_add(1)?;
+    match *chars.get(index)? {
+        '\\' => {
+            index += 1;
+            match *chars.get(index)? {
+                'u' if chars.get(index + 1) == Some(&'{') => {
+                    index += 2;
+                    while chars.get(index).is_some_and(|ch| *ch != '}') {
+                        index += 1;
+                    }
+                    if chars.get(index) != Some(&'}') {
+                        return None;
+                    }
+                    index += 1;
+                }
+                'x' => {
+                    if !chars
+                        .get(index + 1..index + 3)?
+                        .iter()
+                        .all(|ch| ch.is_ascii_hexdigit())
+                    {
+                        return None;
+                    }
+                    index += 3;
+                }
+                _ => index += 1,
+            }
+        }
+        _ => index += 1,
+    }
+    (chars.get(index) == Some(&'\'')).then_some(index + 1)
 }
 
 /// The `#` count of a Rust raw string literal opening at `index`, if one does.
@@ -1826,7 +2004,10 @@ mod tests {
             "  return markup;\n",
             "}\n",
         );
-        assert_eq!(brace_balanced_body_end_line(template_literal, 1), Some(6));
+        assert_eq!(
+            brace_balanced_body_end_line(template_literal, 1, false),
+            Some(6)
+        );
 
         let rust_raw_string = concat!(
             "fn render() -> String {\n",
@@ -1836,7 +2017,10 @@ mod tests {
             "    markup.to_string()\n",
             "}\n",
         );
-        assert_eq!(brace_balanced_body_end_line(rust_raw_string, 1), Some(6));
+        assert_eq!(
+            brace_balanced_body_end_line(rust_raw_string, 1, true),
+            Some(6)
+        );
 
         // Positive control: nothing about ordinary bodies moved, including the
         // single-line strings, char literals, and lifetimes that must stay
@@ -1850,7 +2034,23 @@ mod tests {
             "    rows.len().to_string()\n",
             "}\n",
         );
-        assert_eq!(brace_balanced_body_end_line(ordinary, 1), Some(7));
+        assert_eq!(brace_balanced_body_end_line(ordinary, 1, true), Some(7));
+    }
+
+    #[test]
+    fn brace_balanced_body_end_distinguishes_rust_lifetimes_labels_and_chars() {
+        let single_line = "pub fn shared_engine_probe() -> &'static str { \"warm\" }\n";
+        assert_eq!(brace_balanced_body_end_line(single_line, 1, true), Some(1));
+
+        let labeled = concat!(
+            "fn first<'a>(value: &'a str) -> char {\n",
+            "    'outer: loop { break 'outer '{'; }\n",
+            "}\n",
+        );
+        assert_eq!(brace_balanced_body_end_line(labeled, 1, true), Some(3));
+
+        let escaped = "fn escaped() -> char { '\\u{7d}' }\n";
+        assert_eq!(brace_balanced_body_end_line(escaped, 1, true), Some(1));
     }
 
     fn insert_file_node(
@@ -1903,7 +2103,7 @@ mod tests {
     }
 
     #[test]
-    fn grounding_root_diversity_does_not_consume_duplicate_name_subsystems() {
+    fn grounding_root_breadth_keeps_subsystems_with_duplicate_root_names() {
         let root = Path::new("/repo");
         let record = |node_id, file_id, name: &str, path: &str| GroundingNodeRecord {
             node: Node {
@@ -1965,7 +2165,7 @@ mod tests {
                     "typescript:packages/a/src".to_string()
                 ),
                 (
-                    "uniqueb".to_string(),
+                    "sharedroot".to_string(),
                     "typescript:packages/b/src".to_string()
                 ),
                 (
@@ -1973,6 +2173,98 @@ mod tests {
                     "typescript:packages/c/src".to_string()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn production_architecture_breadth_does_not_require_a_novel_symbol_name() {
+        let root = Path::new("/repo");
+        let record = |node_id, file_id, name: String, path: &str, kind| GroundingNodeRecord {
+            node: Node {
+                id: CoreNodeId(node_id),
+                kind,
+                serialized_name: name.clone(),
+                file_node_id: Some(CoreNodeId(file_id)),
+                start_line: Some(node_id as u32),
+                ..Default::default()
+            },
+            display_name: name,
+            file_path: Some(root.join(path)),
+        };
+        let mut records = (0..8_i64)
+            .map(|index| {
+                record(
+                    100 + index,
+                    10,
+                    if index == 0 {
+                        "Common".to_string()
+                    } else {
+                        format!("A{index}")
+                    },
+                    "apps/alpha/src/main.ts",
+                    NodeKind::FUNCTION,
+                )
+            })
+            .collect::<Vec<_>>();
+        records.push(record(
+            200,
+            20,
+            "Common".to_string(),
+            "crates/beta/src/lib.rs",
+            NodeKind::STRUCT,
+        ));
+        let file_roles = [(10, FileRole::Entrypoint), (20, FileRole::Source)]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let file_languages = [(10, "typescript"), (20, "rust")]
+            .into_iter()
+            .map(|(id, language)| (id, language.to_string()))
+            .collect::<HashMap<_, _>>();
+        let degrees = (0..8_i64)
+            .map(|index| {
+                (
+                    CoreNodeId(100 + index),
+                    CallDegrees {
+                        production_in_calls: 0,
+                        out_calls: 3,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let ordered = diversify_grounding_root_records(
+            records,
+            root,
+            &file_roles,
+            &file_languages,
+            &degrees,
+            &HashMap::new(),
+        );
+        let first_two = ordered
+            .iter()
+            .take(2)
+            .map(|candidate| {
+                (
+                    candidate.display_name.as_str(),
+                    grounding_root_subsystem_key(root, candidate, &file_languages),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_two[0].0, "Common");
+        assert_eq!(first_two[1].0, "Common");
+        assert_ne!(first_two[0].1, first_two[1].1);
+        assert_eq!(ordered[0].node.id, CoreNodeId(100));
+        assert_eq!(ordered[1].node.id, CoreNodeId(200));
+        assert_eq!(
+            ordered
+                .iter()
+                .take(8)
+                .map(|candidate| { grounding_root_subsystem_key(root, candidate, &file_languages) })
+                .collect::<HashSet<_>>()
+                .len(),
+            2,
+            "strict grounding must represent both subsystems before repeating alpha"
         );
     }
 
@@ -2084,6 +2376,136 @@ mod tests {
                 .map(|record| record.display_name.as_str())
                 .collect::<Vec<_>>(),
             ["aaSubsystemRoot", "zzHelperAlias"]
+        );
+    }
+
+    #[test]
+    fn topological_tool_scripts_do_not_crowd_out_production_architecture_bands() {
+        let root = Path::new("/repo");
+        let record = |node_id, file_id, name: &str, path: &str, kind| GroundingNodeRecord {
+            node: Node {
+                id: CoreNodeId(node_id),
+                kind,
+                serialized_name: name.to_string(),
+                file_node_id: Some(CoreNodeId(file_id)),
+                start_line: Some(1),
+                ..Default::default()
+            },
+            display_name: name.to_string(),
+            file_path: Some(root.join(path)),
+        };
+        let records = vec![
+            record(
+                101,
+                10,
+                "ApplicationMain",
+                "src/main.ts",
+                NodeKind::FUNCTION,
+            ),
+            record(
+                201,
+                20,
+                "CoreLibrary",
+                "src/lib/bridge.ts",
+                NodeKind::STRUCT,
+            ),
+            record(
+                301,
+                30,
+                "HostBoundary",
+                "src-tauri/src/runtime.rs",
+                NodeKind::STRUCT,
+            ),
+            record(
+                401,
+                40,
+                "RubyPackaging",
+                "tools/release/src/main.rb",
+                NodeKind::FUNCTION,
+            ),
+            record(
+                501,
+                50,
+                "PythonSigning",
+                "scripts/sign.py",
+                NodeKind::FUNCTION,
+            ),
+            record(
+                601,
+                60,
+                "ShellInstaller",
+                "scripts/install.sh",
+                NodeKind::FUNCTION,
+            ),
+            record(
+                701,
+                70,
+                "JavascriptRelease",
+                "scripts/release.js",
+                NodeKind::FUNCTION,
+            ),
+        ];
+        let file_roles = [
+            (10, FileRole::Entrypoint),
+            (20, FileRole::Source),
+            (30, FileRole::Source),
+            (40, FileRole::Source),
+            (50, FileRole::Source),
+            (60, FileRole::Source),
+            (70, FileRole::Source),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let file_languages = [
+            (10, "typescript"),
+            (20, "typescript"),
+            (30, "rust"),
+            (40, "ruby"),
+            (50, "python"),
+            (60, "shell"),
+            (70, "javascript"),
+        ]
+        .into_iter()
+        .map(|(id, language)| (id, language.to_string()))
+        .collect::<HashMap<_, _>>();
+        let degrees = [401, 501, 601, 701]
+            .into_iter()
+            .map(|id| {
+                (
+                    CoreNodeId(id),
+                    CallDegrees {
+                        production_in_calls: 0,
+                        out_calls: 6,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let ordered = diversify_grounding_root_records(
+            records,
+            root,
+            &file_roles,
+            &file_languages,
+            &degrees,
+            &HashMap::new(),
+        );
+        let names = ordered
+            .iter()
+            .map(|record| record.display_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names[0], "ApplicationMain");
+        assert!(names[..3].contains(&"CoreLibrary"), "{names:?}");
+        assert!(names[..3].contains(&"HostBoundary"), "{names:?}");
+        assert_eq!(
+            names[3..].iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([
+                "RubyPackaging",
+                "PythonSigning",
+                "ShellInstaller",
+                "JavascriptRelease",
+            ]),
+            "tool scripts must remain behind production architecture: {names:?}"
         );
     }
 
@@ -2217,6 +2639,387 @@ mod tests {
             );
         }
         assert!(universe.len() <= ARCHITECTURE_ROOT_FILE_LIMIT);
+    }
+
+    #[test]
+    fn large_member_rich_mixed_project_diversifies_entrypoints_into_architecture_breadth() {
+        let temp = tempdir().expect("temp dir");
+        let project_root = temp.path().join("target/acceptance/project");
+        let db_path = temp.path().join("cache/codestory.db");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+
+            // More type roots than the global 224-candidate window can hold.
+            // Each is member-rich and test-owned relative to the project, but
+            // its absolute path is contaminated by the generated-path prefix.
+            for index in 0..225_i64 {
+                let file_id = 10_000 + index;
+                let root_id = 100_000 + index * 10;
+                let path = project_root.join(format!("tests/corpus/decoy_{index}.rs"));
+                let persisted_role = FileRole::classify_path(&path);
+                assert_eq!(persisted_role, FileRole::Generated);
+                insert_file_node_with_role_and_language(
+                    &mut storage,
+                    file_id,
+                    &path,
+                    persisted_role,
+                    "rust",
+                    Node {
+                        id: CoreNodeId(root_id),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: format!("DecoyType{index:03}"),
+                        file_node_id: Some(CoreNodeId(file_id)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .expect("insert decoy root");
+
+                let members = (1..=4_i64)
+                    .map(|offset| Node {
+                        id: CoreNodeId(root_id + offset),
+                        kind: NodeKind::METHOD,
+                        serialized_name: format!("member_{offset}"),
+                        file_node_id: Some(CoreNodeId(file_id)),
+                        start_line: Some(offset as u32 + 1),
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>();
+                storage
+                    .insert_nodes_batch(&members)
+                    .expect("insert decoy members");
+                storage
+                    .insert_edges_batch(
+                        &(1..=4_i64)
+                            .map(|offset| Edge {
+                                id: EdgeId(200_000 + index * 10 + offset),
+                                source: CoreNodeId(root_id),
+                                target: CoreNodeId(root_id + offset),
+                                kind: EdgeKind::MEMBER,
+                                file_node_id: Some(CoreNodeId(file_id)),
+                                line: Some(offset as u32 + 1),
+                                resolved_source: None,
+                                resolved_target: None,
+                                confidence: None,
+                                certainty: None,
+                                callsite_identity: None,
+                                candidate_targets: Vec::new(),
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .expect("insert decoy membership");
+            }
+
+            let architecture = [
+                (
+                    101,
+                    1_001,
+                    "src/main.ts",
+                    "typescript",
+                    "LaunchWorkspace",
+                    NodeKind::FUNCTION,
+                ),
+                (
+                    201,
+                    2_001,
+                    "apps/desktop/ui/src/App.svelte",
+                    "svelte",
+                    "ApplicationShell",
+                    NodeKind::STRUCT,
+                ),
+                (
+                    301,
+                    3_001,
+                    "apps/desktop/src-tauri/src/lib.rs",
+                    "rust",
+                    "HostRuntime",
+                    NodeKind::STRUCT,
+                ),
+                (
+                    401,
+                    4_001,
+                    "apps/desktop/ui/src/lib/runtimeBridge.ts",
+                    "typescript",
+                    "UiLibraryBoundary",
+                    NodeKind::STRUCT,
+                ),
+                (
+                    501,
+                    5_001,
+                    "packages/shared/src/lib.rs",
+                    "rust",
+                    "SharedLibrary",
+                    NodeKind::STRUCT,
+                ),
+                (
+                    601,
+                    6_001,
+                    "services/api/src/service.go",
+                    "go",
+                    "ApiBoundary",
+                    NodeKind::STRUCT,
+                ),
+                (
+                    701,
+                    7_001,
+                    "crates/state/src/lib.rs",
+                    "rust",
+                    "StateBoundary",
+                    NodeKind::STRUCT,
+                ),
+                (
+                    801,
+                    8_001,
+                    "crates/query/src/lib.rs",
+                    "rust",
+                    "QueryBoundary",
+                    NodeKind::STRUCT,
+                ),
+            ];
+            for (file_id, node_id, relative, language, name, kind) in architecture {
+                let path = project_root.join(relative);
+                let persisted_role = FileRole::classify_path(&path);
+                assert_eq!(persisted_role, FileRole::Generated);
+                insert_file_node_with_role_and_language(
+                    &mut storage,
+                    file_id,
+                    &path,
+                    persisted_role,
+                    language,
+                    Node {
+                        id: CoreNodeId(node_id),
+                        kind,
+                        serialized_name: name.to_string(),
+                        file_node_id: Some(CoreNodeId(file_id)),
+                        start_line: Some(500),
+                        ..Default::default()
+                    },
+                )
+                .expect("insert architecture root");
+
+                if kind == NodeKind::STRUCT {
+                    let members = (1..=4_i64)
+                        .map(|offset| Node {
+                            id: CoreNodeId(node_id + offset),
+                            kind: NodeKind::METHOD,
+                            serialized_name: format!("{name}Member{offset}"),
+                            file_node_id: Some(CoreNodeId(file_id)),
+                            start_line: Some(500 + offset as u32),
+                            ..Default::default()
+                        })
+                        .collect::<Vec<_>>();
+                    storage
+                        .insert_nodes_batch(&members)
+                        .expect("insert architecture members");
+                    storage
+                        .insert_edges_batch(
+                            &(1..=4_i64)
+                                .map(|offset| Edge {
+                                    id: EdgeId(60_000 + node_id + offset),
+                                    source: CoreNodeId(node_id),
+                                    target: CoreNodeId(node_id + offset),
+                                    kind: EdgeKind::MEMBER,
+                                    file_node_id: Some(CoreNodeId(file_id)),
+                                    line: Some(500 + offset as u32),
+                                    resolved_source: None,
+                                    resolved_target: None,
+                                    confidence: None,
+                                    certainty: None,
+                                    callsite_identity: None,
+                                    candidate_targets: Vec::new(),
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .expect("insert architecture membership");
+                }
+            }
+
+            // Real applications often expose several host commands and
+            // bootstrap functions from the same entry files. They all carry
+            // valid topology, but they must not consume the whole strict map
+            // before distinct production ownership boundaries are shown.
+            let clustered_entry_roots = (0..6_i64)
+                .map(|index| {
+                    (
+                        50_000 + index,
+                        101,
+                        format!("BootstrapCommand{index}"),
+                        520 + index as u32,
+                        [CoreNodeId(2_001), CoreNodeId(4_001)],
+                    )
+                })
+                .chain((0..6_i64).map(|index| {
+                    (
+                        50_100 + index,
+                        301,
+                        format!("HostCommand{index}"),
+                        620 + index as u32,
+                        [CoreNodeId(2_001), CoreNodeId(5_001)],
+                    )
+                }))
+                .collect::<Vec<_>>();
+            storage
+                .insert_nodes_batch(
+                    &clustered_entry_roots
+                        .iter()
+                        .map(|(node_id, file_id, name, line, _)| Node {
+                            id: CoreNodeId(*node_id),
+                            kind: NodeKind::FUNCTION,
+                            serialized_name: name.clone(),
+                            file_node_id: Some(CoreNodeId(*file_id)),
+                            start_line: Some(*line),
+                            ..Default::default()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .expect("insert clustered entry roots");
+            storage
+                .insert_edges_batch(
+                    &clustered_entry_roots
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(index, (source, file_id, _, line, targets))| {
+                            targets
+                                .iter()
+                                .enumerate()
+                                .map(move |(target_index, target)| Edge {
+                                    id: EdgeId(90_000 + index as i64 * 2 + target_index as i64),
+                                    source: CoreNodeId(*source),
+                                    target: *target,
+                                    kind: EdgeKind::CALL,
+                                    file_node_id: Some(CoreNodeId(*file_id)),
+                                    line: Some(*line + target_index as u32),
+                                    resolved_source: None,
+                                    resolved_target: None,
+                                    confidence: None,
+                                    certainty: None,
+                                    callsite_identity: None,
+                                    candidate_targets: Vec::new(),
+                                })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .expect("insert clustered entry topology");
+            storage
+                .insert_edges_batch(&[
+                    Edge {
+                        id: EdgeId(9_001),
+                        source: CoreNodeId(1_001),
+                        target: CoreNodeId(2_001),
+                        kind: EdgeKind::CALL,
+                        file_node_id: Some(CoreNodeId(101)),
+                        line: Some(501),
+                        resolved_source: None,
+                        resolved_target: None,
+                        confidence: None,
+                        certainty: None,
+                        callsite_identity: None,
+                        candidate_targets: Vec::new(),
+                    },
+                    Edge {
+                        id: EdgeId(9_002),
+                        source: CoreNodeId(1_001),
+                        target: CoreNodeId(3_001),
+                        kind: EdgeKind::CALL,
+                        file_node_id: Some(CoreNodeId(101)),
+                        line: Some(502),
+                        resolved_source: None,
+                        resolved_target: None,
+                        confidence: None,
+                        certainty: None,
+                        callsite_identity: None,
+                        candidate_targets: Vec::new(),
+                    },
+                ])
+                .expect("insert entrypoint topology");
+
+            storage
+                .snapshots()
+                .refresh_summary()
+                .expect("refresh summary snapshot");
+            storage
+                .snapshots()
+                .refresh_detail()
+                .expect("refresh detail snapshot");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(project_root, db_path)
+            .expect("open project");
+        let strict = controller
+            .grounding_snapshot(GroundingBudgetDto::Strict)
+            .expect("strict snapshot");
+        let balanced = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("balanced snapshot");
+        let max = controller
+            .grounding_snapshot(GroundingBudgetDto::Max)
+            .expect("max snapshot");
+        let strict_again = controller
+            .grounding_snapshot(GroundingBudgetDto::Strict)
+            .expect("repeat strict snapshot");
+
+        let names = strict
+            .root_symbols
+            .iter()
+            .map(grounding_symbol_name)
+            .collect::<Vec<_>>();
+        assert_eq!(names.first().map(String::as_str), Some("LaunchWorkspace"));
+        for boundary in [
+            "ApplicationShell",
+            "UiLibraryBoundary",
+            "SharedLibrary",
+            "ApiBoundary",
+            "StateBoundary",
+            "QueryBoundary",
+        ] {
+            assert!(
+                names.iter().any(|name| name == boundary),
+                "strict grounding omitted {boundary}: {names:?}"
+            );
+        }
+        assert!(strict.orientation.evaluated_root_candidates > 224);
+        assert!(strict.orientation.selected_entrypoint_roots >= 1);
+        assert!(strict.orientation.candidate_subsystems >= 8);
+        assert_eq!(strict.orientation.selected_subsystems, 8);
+        let selected_paths = strict
+            .root_symbols
+            .iter()
+            .filter_map(grounding_symbol_path)
+            .collect::<Vec<_>>();
+        assert!(
+            selected_paths
+                .iter()
+                .any(|path| path.starts_with("apps/desktop/src-tauri/")),
+            "strict grounding omitted the host boundary: {selected_paths:?}"
+        );
+        assert!(
+            selected_paths
+                .iter()
+                .any(|path| path.starts_with("apps/desktop/ui/src/lib/")),
+            "strict grounding omitted the UI library boundary: {selected_paths:?}"
+        );
+
+        let root_refs = |snapshot: &GroundingSnapshotDto| {
+            snapshot
+                .root_symbols
+                .iter()
+                .map(|symbol| symbol.node_ref.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(root_refs(&strict), root_refs(&strict_again));
+        assert_eq!(
+            root_refs(&strict),
+            root_refs(&balanced)[..strict.root_symbols.len()]
+        );
+        assert_eq!(
+            root_refs(&balanced),
+            root_refs(&max)[..balanced.root_symbols.len()]
+        );
     }
 
     #[test]
@@ -2651,6 +3454,58 @@ mod tests {
     }
 
     #[test]
+    fn function_body_snippet_keeps_single_line_rust_body() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let source_path = temp.path().join("lib.rs");
+        std::fs::write(
+            &source_path,
+            "pub fn shared_engine_probe() -> &'static str { \"warm\" }\n",
+        )
+        .expect("write source");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            insert_file_node(
+                &mut storage,
+                11,
+                &source_path,
+                Node {
+                    id: CoreNodeId(101),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "shared_engine_probe".to_string(),
+                    file_node_id: Some(CoreNodeId(11)),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("insert function");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+
+        let snippet = controller
+            .snippet_function_body_context(codestory_contracts::api::NodeId("101".to_string()), 0)
+            .expect("function body snippet");
+
+        assert_eq!(
+            snippet.scope,
+            codestory_contracts::api::SnippetScopeDto::FunctionBody
+        );
+        assert_eq!(
+            snippet.range_source.as_deref(),
+            Some("indexed_symbol_range")
+        );
+        assert!(snippet.snippet.contains("shared_engine_probe"));
+        assert!(snippet.snippet.contains("\"warm\""));
+    }
+
+    #[test]
     fn function_body_snippet_uses_brace_balanced_fallback_when_range_is_missing() {
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
@@ -2769,6 +3624,61 @@ mod tests {
                 .is_some_and(|reason| reason.contains("fell back to line_context"))
         );
         assert!(snippet.snippet.contains("payload.create"));
+    }
+
+    #[test]
+    fn declaration_only_range_is_not_reported_as_a_function_body() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let source_path = temp.path().join("src").join("client.dart");
+        std::fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        std::fs::write(
+            &source_path,
+            "Future<Response> send(Request request) async {\n  final body = request.finalize();\n  return transport.send(body);\n}\n",
+        )
+        .expect("write source");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            insert_file_node(
+                &mut storage,
+                11,
+                &source_path,
+                Node {
+                    id: CoreNodeId(101),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "send".to_string(),
+                    file_node_id: Some(CoreNodeId(11)),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("insert function");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+
+        let snippet = controller
+            .snippet_function_body_context(codestory_contracts::api::NodeId("101".to_string()), 0)
+            .expect("declaration-only fallback");
+
+        assert_eq!(
+            snippet.scope,
+            codestory_contracts::api::SnippetScopeDto::LineContext
+        );
+        assert_eq!(snippet.range_source.as_deref(), Some("line_context"));
+        assert!(
+            snippet
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("fell back to line_context"))
+        );
+        assert!(!snippet.snippet.contains("request.finalize"));
     }
 
     #[test]

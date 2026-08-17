@@ -57,8 +57,13 @@ function preFreezeReceipt() {
   });
   receipt = record(
     receipt,
-    "calibration-source-acceptance",
-    runEvidence("calibration-source-acceptance", 100, 1, "success", C, C_TREE),
+    "source-stabilization",
+    runEvidence("source-stabilization", 100, 1, "success", C, C_TREE),
+  );
+  receipt = record(
+    receipt,
+    "source-proof",
+    runEvidence("source-proof", 105, 1, "success", C, C_TREE),
   );
   receipt = record(receipt, "evidence", {
     reusable: [{
@@ -95,7 +100,6 @@ function frozenReceipt() {
     "frozen-candidate-acceptance",
     runEvidence("frozen-candidate-acceptance", 104),
   );
-  receipt = record(receipt, "source-proof", runEvidence("source-proof", 105));
   receipt = record(receipt, "package", runEvidence("package", 106));
   receipt = record(receipt, "hardware", runEvidence("hardware", 107));
   receipt = record(
@@ -193,7 +197,7 @@ test("post-calibration and post-freeze commits cascade invalidation", () => {
     changedPaths: [".github/workflows/release.yml"],
   });
   assert.equal(
-    afterCalibrationChange.groups["calibration-source-acceptance"].status,
+    afterCalibrationChange.groups["source-stabilization"].status,
     "invalidated",
   );
   assert.equal(afterCalibrationChange.groups.qualification.status, "invalidated");
@@ -212,6 +216,8 @@ test("post-calibration and post-freeze commits cascade invalidation", () => {
     changedPaths: [CONSTANT_SET_PATH],
   });
   assert.equal(constantOnly.groups.calibration.status, "active");
+  assert.equal(constantOnly.groups["source-stabilization"].status, "active");
+  assert.equal(constantOnly.groups["source-proof"].status, "active");
   assert.equal(constantOnly.groups["frozen-candidate"].status, "invalidated");
   assert.equal(
     constantOnly.groups["frozen-candidate-acceptance"].status,
@@ -228,7 +234,7 @@ test("post-calibration and post-freeze commits cascade invalidation", () => {
   });
   assert.equal(sourceChange.groups.calibration.status, "invalidated");
   assert.equal(
-    sourceChange.groups["calibration-source-acceptance"].status,
+    sourceChange.groups["source-stabilization"].status,
     "invalidated",
   );
   assert.equal(sourceChange.invalidations[0].recalibration_required, true);

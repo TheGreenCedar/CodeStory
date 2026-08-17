@@ -188,18 +188,17 @@ test("versioned claim graph has one deterministic digest and all declared contro
       status_creator: "github-actions[bot]",
       job_manifest: ".github/scripts/release-freeze-acceptance-jobs.json",
       job_manifest_sha256:
-        "bb0a23ed7f74528fc3d4e4962c1b34f98758a628f48dd943b9d1356149e453c5",
+        "b1ae13eabcbda9c99f7d0ba17cae97ca292d11fa4b010f87c534f9b7938843c7",
       phases: {
-        calibration_source: {
+        source_stabilization: {
           known_future_source_changes: [
             "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
           ],
           planned_actions: [
-            "calibration-source-acceptance",
+            "source-stabilization",
             "calibration",
             "generated-constant-freeze",
             "frozen-candidate-acceptance",
-            "source-proof",
             "qualification",
             "release",
           ],
@@ -210,7 +209,6 @@ test("versioned claim graph has one deterministic digest and all declared contro
           known_future_source_changes: [],
           planned_actions: [
             "frozen-candidate-acceptance",
-            "source-proof",
             "qualification",
             "release",
           ],
@@ -460,10 +458,10 @@ test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => 
   assert.equal(calibration.optional_cells[0].feeds_constant_selection, false);
   assert.equal(calibration.runs_per_required_cell, 3);
   assert.equal(calibration.samples_per_metric_per_run, 1);
-  assert.equal(calibration.pre_collection_source_proof_required, false);
+  assert.equal(calibration.pre_collection_source_proof_required, true);
   assert.equal(
     calibration.source_proof_stage,
-    "frozen_candidate_before_qualification",
+    "source_stabilization_before_calibration",
   );
   assert.deepEqual(calibration.forbidden_environment, [
     "CODESTORY_EMBED_ALLOW_CPU=1",
@@ -489,11 +487,11 @@ test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => 
       draft.workflow_policy.calibration.samples_per_metric_per_run = 3;
     }, /exactly one sample per metric per run/u],
     [draft => {
-      draft.workflow_policy.calibration.pre_collection_source_proof_required = true;
-    }, /sole frozen-candidate source proof/u],
+      draft.workflow_policy.calibration.pre_collection_source_proof_required = false;
+    }, /require source stabilization/u],
     [draft => {
       draft.workflow_policy.calibration.source_proof_stage = "before_calibration";
-    }, /sole frozen-candidate source proof/u],
+    }, /require source stabilization/u],
     [draft => {
       draft.workflow_policy.calibration.forbidden_environment = [
         "CODESTORY_EMBED_ALLOW_CPU=0",
@@ -567,7 +565,7 @@ test("claim graph freezes one GPU-only qualification run per available platform"
     archive_transfer: "authenticated_miss_only",
     evaluation_owner: "isolated_reusable_workflow",
     evaluation_owner_sha256:
-      "b7a17c66c4cc4275b369f39fdc1fcdb375b334ba908d31577b910ea10e7eb54e",
+      "5b97ee71393c5f72ef106d0d1e238cb1323e930204a06a4557f8e63725b0f8cd",
     evaluation_contract: "publishable-three-repeat-packet/v1",
     task_count: 1,
     repeats_per_task: 3,
@@ -715,12 +713,36 @@ test("pinned programs are an exact fail-closed membership with graph-owned diges
 
 test("step fragments are an exact fail-closed membership with graph-owned rule data", () => {
   const rules = graph.workflow_policy.step_fragments;
-  assert.equal(Object.keys(rules).length, 132);
+  assert.equal(Object.keys(rules).length, 133);
   for (const row of Object.values(rules)) {
     assert.ok(row.kind === "require" || row.kind === "forbid");
     assert.ok(row.fragments.length > 0);
   }
   assert.equal(rules.marketplace_sync_dispatch_guard_line_tests.kind, "forbid");
+  assert.deepEqual(rules.release_post_publish_closeout_provenance.fragments, [
+    "producer-map",
+    "--phase post_publish",
+    "--reuse \"$REUSE_SELECTION\"",
+    "bash .github/scripts/collect-actions-job-evidence.sh",
+    "--job-evidence target/release-closeout/job-evidence.json",
+  ]);
+  assert.equal(
+    rules.release_post_publish_container_digests.step,
+    "Download and verify selected cumulative release cells",
+  );
+  assert.deepEqual(rules.release_post_publish_container_digests.fragments, [
+    "/actions/artifacts/$artifact_id/zip",
+    "sha256sum",
+    "test \"$actual_digest\" = \"$expected_digest\"",
+  ]);
+  assert.ok(!JSON.stringify([
+    rules.release_post_publish_closeout_provenance,
+    rules.release_post_publish_container_digests,
+  ]).includes("artifact_ids"));
+  assert.notEqual(
+    rules.release_post_publish_container_digests.step,
+    "Verify selected post-publish artifact container digests",
+  );
   const mutations = [
     [draft => {
       delete draft.workflow_policy.step_fragments.close_dev_issues;
@@ -1205,19 +1227,19 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
     /release_freeze_barrier\.acceptance/u,
   );
 
-  const preCalibrationSourceProof = structuredClone(graph);
-  preCalibrationSourceProof.workflow_policy.release_freeze_barrier
-    .acceptance.phases.calibration_source.planned_actions = [
-      "calibration-source-acceptance",
-      "source-proof",
+  const sourceProofAfterCalibration = structuredClone(graph);
+  sourceProofAfterCalibration.workflow_policy.release_freeze_barrier
+    .acceptance.phases.source_stabilization.planned_actions = [
+      "source-stabilization",
       "calibration",
       "generated-constant-freeze",
+      "source-proof",
       "qualification",
       "release",
     ];
   assert.throws(
-    () => validateReleaseClaimGraph(preCalibrationSourceProof),
-    /calibration_source.*calibration.*generated constant-set freeze before source proof/u,
+    () => validateReleaseClaimGraph(sourceProofAfterCalibration),
+    /source_stabilization.*finish source proof before/u,
   );
 
   const mutableFrozenCandidate = structuredClone(graph);
@@ -1890,6 +1912,41 @@ test("reuse bindings verify tree identity and fingerprint equality against real 
     reusedCommit: releaseTag,
   });
   assert.match(tree, /^[0-9a-f]{40}$/u);
+  const lineageRepository = mkdtempSync(path.join(os.tmpdir(), "codestory-calibration-lineage-"));
+  try {
+    gitIn(lineageRepository, ["init", "--quiet", "--initial-branch", "main"]);
+    gitIn(lineageRepository, ["config", "user.name", "CodeStory Test"]);
+    gitIn(lineageRepository, ["config", "user.email", "codestory-test@example.invalid"]);
+    const constantPath = path.join(
+      lineageRepository,
+      "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+    );
+    mkdirSync(path.dirname(constantPath), { recursive: true });
+    writeFileSync(constantPath, `${JSON.stringify({ status: "unfrozen", freeze_record: null })}\n`);
+    gitIn(lineageRepository, ["add", "."]);
+    gitIn(lineageRepository, ["commit", "--quiet", "-m", "source"]);
+    const sourceCommit = gitIn(lineageRepository, ["rev-parse", "HEAD"]);
+    const sourceTree = gitIn(lineageRepository, ["rev-parse", "HEAD^{tree}"]);
+    writeFileSync(constantPath, `${JSON.stringify({
+      status: "frozen",
+      freeze_record: {
+        selection_source_commit: sourceCommit,
+        selection_source_tree: sourceTree,
+      },
+    })}\n`);
+    gitIn(lineageRepository, ["add", "."]);
+    gitIn(lineageRepository, ["commit", "--quiet", "-m", "freeze constants"]);
+    const frozenCommit = gitIn(lineageRepository, ["rev-parse", "HEAD"]);
+    const calibratedSourceTree = verifyReuseBinding({
+      binding: "calibration_source_lineage",
+      repository: lineageRepository,
+      releaseCommit: frozenCommit,
+      reusedCommit: sourceCommit,
+    });
+    assert.equal(calibratedSourceTree, sourceTree);
+  } finally {
+    rmSync(lineageRepository, { recursive: true, force: true });
+  }
   // A binding name the claim graph never declared proves nothing.
   assert.throws(
     () => verifyReuseBinding({
@@ -1942,7 +1999,9 @@ function versionSurfaceRepository(ref) {
     UNSTAMPED_NATIVE_CONTROL,
     "crates/codestory-llama-sys/model-contract.json",
     "plugins/codestory/cli-version.json",
+    "plugins/codestory/plugin.json",
     "plugins/codestory/.codex-plugin/plugin.json",
+    "plugins/codestory/.cursor-plugin/plugin.json",
     "plugins/codestory/.claude-plugin/plugin.json",
     "plugins/codestory/.github/plugin/plugin.json",
     ...workspaceMemberManifests(show("Cargo.toml")),
@@ -1992,6 +2051,15 @@ function runBump(repository, args) {
   );
 }
 
+function nextPatchVersion(repository) {
+  const currentVersion = JSON.parse(readFileSync(
+    path.join(repository, "plugins/codestory/cli-version.json"),
+    "utf8",
+  )).cli_version;
+  const [major, minor, patch] = currentVersion.split(".").map(Number);
+  return `${major}.${minor}.${patch + 1}`;
+}
+
 test("a version-only release bump leaves the native fingerprint unchanged", () => {
   // release-claims.json binds `native_fingerprint` admissibility to this equality, and
   // `evidence_policy.native_reuse = "version_only_delta"` is the whole justification for
@@ -2001,6 +2069,7 @@ test("a version-only release bump leaves the native fingerprint unchanged", () =
   // pull requests run (#1673).
   const repository = versionSurfaceRepository("HEAD");
   try {
+    const nextVersion = nextPatchVersion(repository);
     const members = workspaceMemberManifests(
       readFileSync(path.join(repository, "Cargo.toml"), "utf8"),
     );
@@ -2013,16 +2082,16 @@ test("a version-only release bump leaves the native fingerprint unchanged", () =
     // cannot run against a manifest-only checkout. Cargo's own effect on the lock -- the recorded
     // version of each workspace crate -- is applied here in its place, and the owner's own
     // `--check` then certifies that the result is a complete release bump and nothing more.
-    runBump(repository, ["--version", "0.17.0"]);
+    runBump(repository, ["--version", nextVersion]);
     const lockPath = path.join(repository, "Cargo.lock");
     writeFileSync(
       lockPath,
       readFileSync(lockPath, "utf8").replace(
         /(name = "codestory-[a-z-]+"\nversion = ")[^"]+(")/gu,
-        "$10.17.0$2",
+        `$1${nextVersion}$2`,
       ),
     );
-    const certified = runBump(repository, ["--version", "0.17.0", "--check"]);
+    const certified = runBump(repository, ["--version", nextVersion, "--check"]);
     assert.equal(
       certified.status,
       0,
@@ -2056,12 +2125,16 @@ test("every workspace crate is version-normalized and content-bound by the finge
     const basePrint = nativeFingerprint(repository, base);
     const probe = (relative, edit, message) => {
       const absolute = path.join(repository, relative);
-      writeFileSync(absolute, edit(readFileSync(absolute, "utf8")));
+      const before = readFileSync(absolute, "utf8");
+      const after = edit(before);
+      assert.notEqual(after, before, `${message} must change the probe input`);
+      writeFileSync(absolute, after);
       const commit = commitEverything(repository, message);
       const print = nativeFingerprint(repository, commit);
       gitIn(repository, ["reset", "--hard", "--quiet", base]);
       return print;
     };
+    const nextVersion = nextPatchVersion(repository);
     const members = workspaceMemberManifests(
       readFileSync(path.join(repository, "Cargo.toml"), "utf8"),
     );
@@ -2071,7 +2144,10 @@ test("every workspace crate is version-normalized and content-bound by the finge
         probe(
           manifest,
           (source) =>
-            source.replace(/(^\[package\][\s\S]*?^version\s*=\s*")[^"]+(")/mu, "$10.17.0$2"),
+            source.replace(
+              /(^\[package\][\s\S]*?^version\s*=\s*")[^"]+(")/mu,
+              `$1${nextVersion}$2`,
+            ),
           `bump ${manifest}`,
         ),
         basePrint,
@@ -2105,8 +2181,16 @@ test("a reuse binding may equate only identities its own construction determines
   // graph, with a reason -- never per cell group, and never by narrowing a group's
   // required_identity, which would drop the check for fresh evidence too (#1567).
   const declared = graph.evidence_policy.reuse.bindings;
-  assert.deepEqual(Object.keys(declared).sort(), ["native_fingerprint", "source_tree"]);
+  assert.deepEqual(Object.keys(declared).sort(), [
+    "calibration_source_lineage",
+    "native_fingerprint",
+    "source_tree",
+  ]);
   assert.deepEqual(declared.source_tree.equates, []);
+  assert.deepEqual(
+    declared.calibration_source_lineage.equates.map(({ identity }) => identity),
+    ["source_tree"],
+  );
   assert.deepEqual(declared.native_fingerprint.equates.map(({ identity }) => identity), ["source_tree"]);
   assert.ok(declared.native_fingerprint.equates[0].justification.length > 0);
 
@@ -2157,7 +2241,7 @@ test("a reuse binding may equate only identities its own construction determines
   delete undeclaredBinding.evidence_policy.reuse.bindings.native_fingerprint;
   assert.throws(
     () => validateReleaseClaimGraph(undeclaredBinding),
-    /reuse bindings must declare exactly native_fingerprint, source_tree/u,
+    /reuse bindings must declare exactly calibration_source_lineage, native_fingerprint, source_tree/u,
   );
 
   // And a cell group admits cross-run evidence only under a binding the policy declares.

@@ -65,9 +65,12 @@ Impact hints are not test results.
 Only trust output when `retrieval status` reports `retrieval_mode: "full"`.
 
 ```sh
-codestory-cli packet --project <repo> --question "<broad task question>" --budget compact
+codestory-cli packet --project <repo> --question "<broad task question>"
 codestory-cli search --project <repo> --query "<symbol or behavior>" --why
 ```
+
+Packets use the standard evidence budget by default. Pass `--budget compact`
+when minimizing context matters more than keeping the fuller evidence set.
 
 Degraded retrieval is navigation help only. See [Glossary](../glossary.md#retrieval-mode).
 

@@ -105,9 +105,9 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
-      "description": "Answer broad structural questions with repository evidence, sufficiency, truncation, and follow-up commands before source snippets. CodeStory prepares managed retrieval automatically.",
+      "description": "Answer broad structural questions with compiled support units and a machine stop or one-round drill. Supported, NotEstablished, and Unavailable are terminal. DrillOnce means call packet again once with the exact original question, parent_packet_id, and the listed option_ids. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
       "inputSchema": {
         "additionalProperties": false,
         "allOf": [
@@ -368,10 +368,10 @@
             }
           }
         ],
-        "description": "Build a broad task packet with budget and sufficiency metadata.",
+        "description": "Build a broad task packet with compiled support units and a machine stop or one-round drill disposition.",
         "properties": {
           "budget": {
-            "default": "compact",
+            "default": "standard",
             "description": "Packet budget.",
             "enum": [
               "tiny",
@@ -379,6 +379,10 @@
               "standard",
               "deep"
             ],
+            "type": "string"
+          },
+          "core_generation_id": {
+            "description": "Pinned core publication generation for a DrillOnce continuation.",
             "type": "string"
           },
           "extra_probes": {
@@ -405,6 +409,20 @@
               "integer",
               "null"
             ]
+          },
+          "option_ids": {
+            "description": "Drill option ids from the parent packet disposition. Execute them once; do not invent a second search.",
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "type": "array"
+          },
+          "parent_packet_id": {
+            "description": "Parent packet id for a generation-bound DrillOnce continuation; repeat the original question unchanged.",
+            "type": "string"
           },
           "probes": {
             "description": "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
@@ -588,8 +606,12 @@
             "type": "string"
           },
           "question": {
-            "description": "Broad repository question or task.",
+            "description": "Broad repository question or task. Repeat it unchanged for a DrillOnce continuation.",
             "minLength": 1,
+            "type": "string"
+          },
+          "retrieval_generation": {
+            "description": "Pinned retrieval generation for a DrillOnce continuation.",
             "type": "string"
           },
           "task_class": {
@@ -618,7 +640,7 @@
       "name": "packet",
       "outputSchema": {
         "additionalProperties": false,
-        "description": "CodeStory broad task packet DTO with graph/sidecar evidence, budget truncation, unsafe-to-claim gaps, and follow-up commands.",
+        "description": "CodeStory broad task packet DTO with compiled support units and a machine stop or one-round drill disposition.",
         "properties": {
           "answer": {
             "description": "Underlying DB-first answer packet.",
@@ -626,6 +648,10 @@
           },
           "budget": {
             "description": "Budget limits, usage, and truncation metadata.",
+            "type": "object"
+          },
+          "disposition": {
+            "description": "Machine stop or one-round drill decision: supported, drill_once, not_established, or unavailable.",
             "type": "object"
           },
           "packet_id": {
@@ -644,8 +670,8 @@
             "description": "Compact retrieval trace telemetry summary.",
             "type": "object"
           },
-          "sufficiency": {
-            "description": "Covered claims, gaps, and follow-up contract.",
+          "support": {
+            "description": "Compiled evidence atoms: symbol locations, source ranges, typed graph edges, and complete-query negatives.",
             "type": "object"
           },
           "task_class": {
@@ -671,7 +697,8 @@
           "plan",
           "answer",
           "budget",
-          "sufficiency",
+          "support",
+          "disposition",
           "retrieval_trace_summary"
         ],
         "type": "object"
@@ -683,7 +710,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -694,7 +721,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Discover candidate symbols and retrieval hits; for broad structural questions call packet before snippet/source reads. CodeStory prepares managed retrieval automatically.",
       "inputSchema": {
@@ -988,7 +1015,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -999,7 +1026,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Return a compact repository map for orientation before packet/search; equivalent to codestory://grounding. The first call may refresh the local map and begin managed retrieval preparation.",
       "inputSchema": {
@@ -1190,7 +1217,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -1201,7 +1228,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "List indexed files and coverage from a locally fresh index; refreshes the repository map before dispatch and does not wait for broad search.",
       "inputSchema": {
@@ -1449,7 +1476,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -1460,7 +1487,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Analyze one explicit path source against the last complete local index while preserving bounded stale and error evidence. Cold or partial state may trigger managed indexing before dispatch. Prefer paths, use changed_paths for compatibility or change_records for status-rich input. Never discovers git changes and does not wait for broad search.",
       "inputSchema": {
@@ -2089,7 +2116,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -2100,7 +2127,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Resolve a symbol id or query and return details.",
       "inputSchema": {
@@ -2387,7 +2414,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -2398,7 +2425,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Return a graph trail around a symbol.",
       "inputSchema": {
@@ -2507,7 +2534,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -2518,7 +2545,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Return a bounded incoming caller graph around a symbol.",
       "inputSchema": {
@@ -2653,7 +2680,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -2664,7 +2691,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Return a bounded outgoing callee graph around a symbol.",
       "inputSchema": {
@@ -2799,7 +2826,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -2810,7 +2837,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Return a readable trace around a symbol.",
       "inputSchema": {
@@ -2919,7 +2946,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -2930,7 +2957,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Return one stable graph node with file refs before requesting a packet.",
       "inputSchema": {
@@ -3051,7 +3078,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -3062,7 +3089,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Return a bounded graph neighborhood around one node.",
       "inputSchema": {
@@ -3207,7 +3234,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -3218,7 +3245,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Return a bounded forward path graph between two node ids.",
       "inputSchema": {
@@ -3337,7 +3364,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -3348,7 +3375,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Return a bounded subgraph around one resolved node; packet remains the broad task tool.",
       "inputSchema": {
@@ -3493,7 +3520,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -3504,7 +3531,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Return definition metadata for a symbol id or query.",
       "inputSchema": {
@@ -3609,7 +3636,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -3620,7 +3647,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Return incoming references for a symbol id or query.",
       "inputSchema": {
@@ -3700,7 +3727,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -3711,7 +3738,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Browse root symbols or children for a parent id.",
       "inputSchema": {
@@ -3815,7 +3842,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -3826,12 +3853,12 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
-      "description": "Return a focused source snippet after packet, search, or graph evidence selects a concrete target.",
+      "description": "Return line-numbered source after packet, search, or graph evidence selects targets: one symbol, or many file ranges in a single call via `paths` rather than one file at a time.",
       "inputSchema": {
         "additionalProperties": false,
-        "description": "Resolve a symbol and return bounded line or function-body source context.",
+        "description": "Return bounded source: either resolve one symbol, or read line ranges from files named by earlier evidence.",
         "oneOf": [
           {
             "required": [
@@ -3841,6 +3868,26 @@
           {
             "required": [
               "id"
+            ]
+          },
+          {
+            "required": [
+              "paths"
+            ]
+          },
+          {
+            "required": [
+              "path"
+            ]
+          },
+          {
+            "required": [
+              "file_path"
+            ]
+          },
+          {
+            "required": [
+              "symbol_id"
             ]
           }
         ],
@@ -3858,6 +3905,17 @@
             "minimum": 0,
             "type": "integer"
           },
+          "end_line": {
+            "description": "Last line to return with top-level `path`. Defaults to a bounded window after the start.",
+            "maximum": 1000000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "file_path": {
+            "description": "Alias for `path`. Hits report this field name.",
+            "minLength": 1,
+            "type": "string"
+          },
           "function_body": {
             "description": "CLI-compatible scope selector; true requests `function_body`, false requests `line_context`.",
             "type": "boolean"
@@ -3867,11 +3925,74 @@
             "minLength": 1,
             "type": "string"
           },
+          "line": {
+            "description": "1-based line from a search, trail, or packet hit. Used with `path`.",
+            "maximum": 1000000,
+            "minimum": 1,
+            "type": "integer"
+          },
           "lines": {
             "description": "Agent-friendly compatibility alias for `context`.",
             "maximum": 200,
             "minimum": 0,
             "type": "integer"
+          },
+          "path": {
+            "description": "Single-file alias for `paths`: repository-relative path as returned in `file_path`. Combine with `line`.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "paths": {
+            "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+            "items": {
+              "additionalProperties": false,
+              "description": "One file range to read. Paste `file_path` and `line` straight from a search, trail, or packet hit.",
+              "oneOf": [
+                {
+                  "required": [
+                    "path"
+                  ]
+                },
+                {
+                  "required": [
+                    "file_path"
+                  ]
+                }
+              ],
+              "properties": {
+                "end_line": {
+                  "description": "Last line to return, 1-based. Defaults to a bounded window after the start.",
+                  "maximum": 1000000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "file_path": {
+                  "description": "Alias for `path`. Hits report this field name.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "line": {
+                  "description": "Line of interest, 1-based, as returned in `line`. A window is returned around it.",
+                  "maximum": 1000000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "path": {
+                  "description": "Repository-relative file path, as returned in `file_path`.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "start_line": {
+                  "description": "First line to return, 1-based. Alternative to `line`.",
+                  "maximum": 1000000,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
           },
           "project": {
             "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
@@ -3890,6 +4011,17 @@
               "line_context",
               "function_body"
             ],
+            "type": "string"
+          },
+          "start_line": {
+            "description": "First line to return with top-level `path`. Alternative to `line`.",
+            "maximum": 1000000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "symbol_id": {
+            "description": "Alias for `id`. Hits report this field name.",
+            "minLength": 1,
             "type": "string"
           }
         },
@@ -3973,7 +4105,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false
@@ -3984,7 +4116,7 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": true,
-        "readOnlyHint": false
+        "readOnlyHint": true
       },
       "description": "Build proof-bearing source/graph evidence for one concrete target; not broad question answering.",
       "inputSchema": {
@@ -4283,7 +4415,7 @@
         "idempotent": true,
         "localOnly": false,
         "openWorld": true,
-        "readOnly": false,
+        "readOnly": true,
         "requiresConfirmation": false,
         "sideEffects": true,
         "writesRepository": false

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -27,10 +29,41 @@ from .foundation import (
     ProofFailure,
     require,
 )
+from .process_identity import ExactProcessExitWaiter
 from .subprocess_control import json_command, run
 
 SERVER_PRODUCER_LABEL = "the per-user embedding qualification server"
 _WORKER_LABEL = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+_COMMAND_UNLINK_TIMEOUT_SECS = 2.0
+_CRASH_EXIT_POLL_SECS = 0.05
+# A harness allowance for an already-accepted abort to become an observable
+# native process exit. This is deliberately independent of the proof timeout,
+# product idle/teardown constants, and calibration. It stays below the
+# qualification lane's 90-second native-microprobe ceiling so a process that
+# never exits fails by name before any replacement query can race it.
+PUBLICATION_CRASH_EXIT_ALLOWANCE_SECS = 75.0
+PUBLICATION_CRASH_EXIT_TIMEOUT = (
+    "embedding_qualification_crashed_server_exit_timeout"
+)
+PUBLICATION_CRASH_IDENTITY_MISSING = (
+    "embedding_qualification_crashed_server_identity_missing"
+)
+PUBLICATION_CRASH_NOT_ACCEPTED = (
+    "embedding_qualification_crash_server_not_accepted"
+)
+
+
+def _unlink_control_command(path: Path) -> None:
+    """Remove a consumed command after a bounded Windows sharing retry."""
+    deadline = time.monotonic() + _COMMAND_UNLINK_TIMEOUT_SECS
+    while True:
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
 
 
 def control_timeout_secs(timeout: int) -> int:
@@ -220,7 +253,7 @@ def send_server_qualification_control(
         )
         return event
     finally:
-        command_path.unlink(missing_ok=True)
+        _unlink_control_command(command_path)
 
 
 def server_observation_from_control_event(event: dict, phase: str) -> dict:
@@ -480,15 +513,41 @@ def run_publication_replacement_worker(
     private_root: Path,
     nonce: str,
     *,
+    crash_event: dict,
+    candidate_producer: EventProducer,
     executable_sha256: str,
     timeout: int,
+    crash_exit_allowance_secs: float = PUBLICATION_CRASH_EXIT_ALLOWANCE_SECS,
 ) -> None:
     """Start the server that replaces the one sequence 2 crashed on purpose.
 
-    Same primitive as establishing residency -- one admitted query -- under the
-    name the post-crash step calls it by, and with its own request and output
-    files so the two never read each other's evidence.
+    The crash event is the durable acceptance receipt and names the exact
+    process that accepted it. A new admitted query may start only after that
+    pinned PID plus process-start identity is proven gone. Otherwise the query
+    can race the still-live authority and report an owner-unresponsive product
+    failure that the harness created. The paused publication candidate is the
+    other irreplaceable producer, so its exit aborts this wait immediately.
+
+    Once the predecessor is gone, use the same one-query residency primitive as
+    the rest of the harness, under the name the post-crash step calls it by and
+    with its own immutable request/output files.
     """
+    require(
+        isinstance(crash_event, dict)
+        and crash_event.get("action") == "crash_server"
+        and crash_event.get("status") == "accepted",
+        f"{PUBLICATION_CRASH_NOT_ACCEPTED}: replacement requires the durable"
+        " accepted crash_server event",
+    )
+    predecessor = server_producer_from_control_event(
+        crash_event,
+        "exiting after durably accepting the publication crash control",
+    )
+    wait_for_accepted_crash_exit(
+        predecessor,
+        candidate_producer,
+        allowance_secs=crash_exit_allowance_secs,
+    )
     run_embedding_qualification_query_worker(
         cli,
         env,
@@ -499,6 +558,119 @@ def run_publication_replacement_worker(
         timeout=timeout,
         label="replacement",
     )
+
+
+def wait_for_accepted_crash_exit(
+    predecessor: EventProducer,
+    candidate: EventProducer | None,
+    *,
+    allowance_secs: float = PUBLICATION_CRASH_EXIT_ALLOWANCE_SECS,
+) -> dict:
+    """Prove the accepted-crash predecessor gone before any fresh query.
+
+    ``ExactProcessExitWaiter`` is the identity fence: on Windows it holds a
+    synchronization handle to the exact process object; on Unix it requires
+    either absence, a terminated state, or PID reuse with a different start
+    identity. Inspection failures are not exit evidence. A non-native producer
+    cannot support the claim and therefore fails closed rather than treating an
+    unobservable server as absent.
+    """
+    if (
+        not isinstance(predecessor, NativeProcessProducer)
+        or not isinstance(predecessor.pid, int)
+        or isinstance(predecessor.pid, bool)
+        or predecessor.pid <= 0
+        or not isinstance(predecessor.process_start_id, str)
+        or not predecessor.process_start_id
+    ):
+        raise ProofFailure(
+            f"{PUBLICATION_CRASH_IDENTITY_MISSING}: the accepted crash_server"
+            " event did not pin a positive PID and nonempty process-start"
+            f" identity ({predecessor.describe()})"
+        )
+    require(
+        isinstance(allowance_secs, (int, float))
+        and not isinstance(allowance_secs, bool)
+        and 0 < allowance_secs < 90,
+        "publication crash-exit allowance must be positive and below 90 seconds",
+    )
+    started = time.monotonic()
+    deadline = started + allowance_secs
+    target_os = (
+        "windows"
+        if os.name == "nt"
+        else ("macos" if sys.platform == "darwin" else "linux")
+    )
+    waiter = ExactProcessExitWaiter(
+        predecessor.pid,
+        predecessor.process_start_id,
+        target_os,
+        allow_already_exited=True,
+    )
+    try:
+        first_probe = True
+        while True:
+            # The candidate is irreplaceable and must remain paused throughout
+            # the crash fence. Check it first so simultaneous process loss is
+            # never misreported as permission to start a replacement.
+            if candidate is not None and candidate.exited():
+                raise ProofFailure(
+                    f"{candidate.label} ({candidate.activity})"
+                    f" {candidate.termination()} while waiting for crashed server"
+                    f" pid {predecessor.pid} (start identity"
+                    f" {predecessor.process_start_id}) to exit; no replacement"
+                    " worker was invoked"
+                )
+            now = time.monotonic()
+            # Always admit one immediate probe. The native waiter may need a
+            # little construction time to open and inspect its held Windows
+            # handle, and an already-gone predecessor must not become a timeout
+            # solely because that setup crossed the allowance. Every later
+            # poll is gated before probing, so an overslept/late exit cannot be
+            # accepted after the named bound.
+            if not first_probe and now >= deadline:
+                if candidate is not None and candidate.exited():
+                    raise ProofFailure(
+                        f"{candidate.label} ({candidate.activity})"
+                        f" {candidate.termination()} while waiting for crashed"
+                        f" server pid {predecessor.pid} (start identity"
+                        f" {predecessor.process_start_id}) to exit; no replacement"
+                        " worker was invoked"
+                    )
+                raise ProofFailure(
+                    f"{PUBLICATION_CRASH_EXIT_TIMEOUT}: pid {predecessor.pid}"
+                    f" (start identity {predecessor.process_start_id}) remained"
+                    f" live for {int((now - started) * 1000)}ms after accepting"
+                    " crash_server; no replacement worker was invoked"
+                )
+            exited = waiter.exited()
+            if candidate is not None and candidate.exited():
+                raise ProofFailure(
+                    f"{candidate.label} ({candidate.activity})"
+                    f" {candidate.termination()} while waiting for crashed"
+                    f" server pid {predecessor.pid} (start identity"
+                    f" {predecessor.process_start_id}) to exit; no replacement"
+                    " worker was invoked"
+                )
+            observed_at = time.monotonic()
+            if exited and (first_probe or observed_at < deadline):
+                return {
+                    "pid": predecessor.pid,
+                    "process_start_id": predecessor.process_start_id,
+                    "waited_ms": int((observed_at - started) * 1000),
+                }
+            if observed_at >= deadline:
+                raise ProofFailure(
+                    f"{PUBLICATION_CRASH_EXIT_TIMEOUT}: pid {predecessor.pid}"
+                    f" (start identity {predecessor.process_start_id}) remained"
+                    f" live for {int((observed_at - started) * 1000)}ms after"
+                    " accepting crash_server; no replacement worker was invoked"
+                )
+            first_probe = False
+            now = observed_at
+            time.sleep(min(_CRASH_EXIT_POLL_SECS, deadline - now))
+    finally:
+        waiter.close()
 
 
 def ensure_resident_qualification_server(

@@ -205,7 +205,6 @@ def _single_project_mode_tests() -> None:
                 {
                     "project": str(project),
                     "query": "single_project_probe",
-                    "why": True,
                 },
                 "server-readiness-search",
             ),

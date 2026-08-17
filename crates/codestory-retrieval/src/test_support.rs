@@ -261,6 +261,7 @@ pub fn publish_zero_dense_pinned_query_fixture(
         target_symbol: None,
         node_id: symbol.node_id.clone(),
         target_node_id: None,
+        edge_kind: None,
     };
     let index = crate::scip_index::ScipSymbolsIndex {
         generation: generation.to_string(),

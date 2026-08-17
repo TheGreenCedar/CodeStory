@@ -1,11 +1,11 @@
 {
   "schema": "codestory.release-freeze-acceptance-jobs/v2",
   "workflow": ".github/workflows/source-proof.yml",
-  "workflow_context_sha256": "c4fc041ddabf8ac44f4966e13e0c351b4f0d70bf3a94878490aff7030f912f66",
+  "workflow_context_sha256": "81c20037a04bf19fb5a0ac043cea491186613ae55335c88b86150011191254a4",
   "jobs": {
-    "resolve": "da6c955c944644cd714728bf67d43aabd4ad049d5fde943ce7b1739f3d7cd8e5",
+    "resolve": "16e028133665257ebd2260770752587cb339dc58dbf87004065ac1a9f754fa65",
     "freeze-hostile-mutations": "ebc27d28a1c087f848be090d2a2a458acee0177f06048c4d357e0724cf38be1a",
-    "freeze-windows-native-probe": "03fc4c0ae9758564ea2d8588d6661c393e88939cf3a7b229448bbfcfc5e11457",
-    "freeze-acceptance": "544688894a77c9f95ef5799e3070ec3bea4e199b5ed650f9aa62d35a54e83ca4"
+    "freeze-windows-native-probe": "e4570bb9d0ae34da43965d49c02b34276b43ad6b6e2a492435dedb1f254e454a",
+    "freeze-acceptance": "19e8ad21de3c35d03b4630c44f6b88d1d3d813d48c28aa9176cb4b75bb596371"
   }
 }

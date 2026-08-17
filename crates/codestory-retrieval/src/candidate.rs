@@ -1,15 +1,85 @@
 use codestory_contracts::api::SearchTargetDto;
+use codestory_contracts::graph::{EdgeKind, NodeKind};
 use codestory_store::FileRole;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RankFeatures {
+    pub ranking_policy: String,
     pub lexical: f32,
     pub semantic: f32,
     pub scip_distance: f32,
     pub file_role_prior: f32,
     pub definition_quality: f32,
     pub token_overlap: f32,
+    pub text_quality: f32,
+    pub requested_role_agreement: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateGraphDirection {
+    Anchor,
+    Outgoing,
+    Incoming,
+}
+
+/// Typed graph evidence retained independently from the fused score.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateGraphEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_kind: Option<EdgeKind>,
+    pub direction: CandidateGraphDirection,
+    pub hop: u32,
+    pub fanout: u32,
+    pub edge_weight: f32,
+    pub direction_weight: f32,
+}
+
+/// Lane-local evidence retained until reciprocal-rank fusion.
+///
+/// `raw_score` is meaningful only inside the producing lane. `rank` is the
+/// one-based order assigned by that lane before candidates are merged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateLaneEvidence {
+    pub raw_score: f32,
+    pub rank: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
+}
+
+/// Independent retrieval-lane evidence for a candidate.
+///
+/// This is the candidate-v2 seam: lane scores never borrow the fused total or
+/// another lane's score. The legacy scalar `CandidateHit::score` remains the
+/// final public ranking score for compatibility.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CandidateLaneScores {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical: Option<CandidateLaneEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<CandidateLaneEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<CandidateLaneEvidence>,
+}
+
+impl CandidateLaneScores {
+    pub fn is_empty(&self) -> bool {
+        self.lexical.is_none() && self.semantic.is_none() && self.graph.is_none()
+    }
+
+    pub fn evidence_count(&self) -> usize {
+        usize::from(self.lexical.is_some())
+            + usize::from(self.semantic.is_some())
+            + usize::from(self.graph.is_some())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateLane {
+    Lexical,
+    Semantic,
+    Graph,
 }
 
 /// Unified retrieval candidate from any sidecar lane.
@@ -23,12 +93,18 @@ pub struct CandidateHit {
     pub node_id: Option<String>,
     pub file_path: String,
     pub symbol_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualified_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_kind: Option<NodeKind>,
     pub start_line: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<SearchTargetDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_excerpt: Option<String>,
     pub score: f32,
+    #[serde(default, skip_serializing)]
+    pub lane_scores: CandidateLaneScores,
     pub source: CandidateSource,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<String>,
@@ -37,6 +113,8 @@ pub struct CandidateHit {
     /// SCIP graph hops from anchor (lower is better).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scip_hop_distance: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_evidence: Option<CandidateGraphEvidence>,
     /// Populated by the feature ranker after fusion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rank_features: Option<RankFeatures>,
@@ -89,14 +167,25 @@ impl CandidateHit {
             node_id: None,
             file_path: file_path.into(),
             symbol_name: None,
+            qualified_name: None,
+            structural_kind: None,
             start_line: None,
             target: None,
             source_excerpt: None,
             score,
+            lane_scores: CandidateLaneScores {
+                lexical: Some(CandidateLaneEvidence {
+                    raw_score: score,
+                    rank: 0,
+                    provenance: vec!["lexical_source".into()],
+                }),
+                ..CandidateLaneScores::default()
+            },
             source: CandidateSource::Lexical,
             provenance: vec!["lexical_source".into()],
             file_role: None,
             scip_hop_distance: None,
+            graph_evidence: None,
             rank_features: None,
         }
     }
@@ -107,26 +196,125 @@ impl CandidateHit {
         score: f32,
         source: CandidateSource,
     ) -> Self {
-        Self {
+        let mut hit = Self {
             node_id: None,
             file_path: file_path.into(),
             symbol_name,
+            qualified_name: None,
+            structural_kind: None,
             start_line: None,
             target: None,
             source_excerpt: None,
             score,
+            lane_scores: CandidateLaneScores::default(),
             source,
             provenance: Vec::new(),
             file_role: None,
             scip_hop_distance: None,
+            graph_evidence: None,
             rank_features: None,
-        }
+        };
+        hit.record_lane(source.lane(), score, 0, source.default_provenance());
+        hit
     }
 
     pub fn add_provenance(&mut self, label: impl Into<String>) {
         let label = label.into();
         if !self.provenance.iter().any(|existing| existing == &label) {
             self.provenance.push(label);
+        }
+    }
+
+    pub fn record_lane(
+        &mut self,
+        lane: CandidateLane,
+        raw_score: f32,
+        rank: u32,
+        provenance: impl Into<String>,
+    ) {
+        let provenance = provenance.into();
+        let slot = match lane {
+            CandidateLane::Lexical => &mut self.lane_scores.lexical,
+            CandidateLane::Semantic => &mut self.lane_scores.semantic,
+            CandidateLane::Graph => &mut self.lane_scores.graph,
+        };
+        match slot {
+            Some(evidence) => {
+                if raw_score > evidence.raw_score {
+                    evidence.raw_score = raw_score;
+                }
+                if rank > 0 && (evidence.rank == 0 || rank < evidence.rank) {
+                    evidence.rank = rank;
+                }
+                if !provenance.is_empty()
+                    && !evidence
+                        .provenance
+                        .iter()
+                        .any(|existing| existing == &provenance)
+                {
+                    evidence.provenance.push(provenance);
+                }
+            }
+            None => {
+                *slot = Some(CandidateLaneEvidence {
+                    raw_score,
+                    rank,
+                    provenance: if provenance.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![provenance]
+                    },
+                });
+            }
+        }
+    }
+
+    pub fn merge_lane_scores(&mut self, incoming: &CandidateLaneScores) {
+        for (lane, evidence) in [
+            (CandidateLane::Lexical, incoming.lexical.as_ref()),
+            (CandidateLane::Semantic, incoming.semantic.as_ref()),
+            (CandidateLane::Graph, incoming.graph.as_ref()),
+        ] {
+            let Some(evidence) = evidence else {
+                continue;
+            };
+            if evidence.provenance.is_empty() {
+                self.record_lane(lane, evidence.raw_score, evidence.rank, "");
+            } else {
+                for provenance in &evidence.provenance {
+                    self.record_lane(lane, evidence.raw_score, evidence.rank, provenance);
+                }
+            }
+        }
+    }
+
+    pub fn ensure_source_lane(&mut self) {
+        let lane = self.source.lane();
+        let missing = match lane {
+            CandidateLane::Lexical => self.lane_scores.lexical.is_none(),
+            CandidateLane::Semantic => self.lane_scores.semantic.is_none(),
+            CandidateLane::Graph => self.lane_scores.graph.is_none(),
+        };
+        if missing {
+            self.record_lane(lane, self.score, 0, self.source.default_provenance());
+        }
+    }
+}
+
+impl CandidateSource {
+    pub fn lane(self) -> CandidateLane {
+        match self {
+            Self::Lexical | Self::Legacy => CandidateLane::Lexical,
+            Self::Semantic => CandidateLane::Semantic,
+            Self::Scip => CandidateLane::Graph,
+        }
+    }
+
+    fn default_provenance(self) -> &'static str {
+        match self {
+            Self::Lexical | Self::Legacy => "lexical_source",
+            Self::Semantic => "dense_anchor",
+            Self::Scip => "graph_neighbor",
         }
     }
 }
@@ -178,5 +366,42 @@ mod tests {
 
         assert!(fused_candidate_identity_matches(&anchored, &same_site));
         assert!(!fused_candidate_identity_matches(&anchored, &other_site));
+    }
+
+    #[test]
+    fn merging_lanes_never_relabels_one_raw_score_as_another() {
+        let mut fused = CandidateHit::with_source(
+            "src/search.rs",
+            Some("search".into()),
+            0.42,
+            CandidateSource::Lexical,
+        );
+        let semantic = CandidateHit::with_source(
+            "src/search.rs",
+            Some("search".into()),
+            0.87,
+            CandidateSource::Semantic,
+        );
+
+        fused.merge_lane_scores(&semantic.lane_scores);
+
+        assert_eq!(
+            fused
+                .lane_scores
+                .lexical
+                .as_ref()
+                .expect("lexical")
+                .raw_score,
+            0.42
+        );
+        assert_eq!(
+            fused
+                .lane_scores
+                .semantic
+                .as_ref()
+                .expect("semantic")
+                .raw_score,
+            0.87
+        );
     }
 }

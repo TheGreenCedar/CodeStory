@@ -17,6 +17,7 @@ pub use codestory_contracts::workspace::{
     RefreshMode, RefreshPlan, SourceIndexPolicy, StoredFileRecord, StoredFileState,
     WorkspaceInventory,
 };
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
@@ -24,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 pub mod atomic_file;
@@ -192,6 +194,8 @@ pub struct WorkspaceManifest {
     discovery_owned_storage_paths: Vec<PathBuf>,
     #[cfg(test)]
     discovery_exclusion_observation_count: Cell<usize>,
+    #[cfg(test)]
+    discovery_walk_count: Cell<usize>,
 }
 
 fn default_source_exclude_patterns() -> Vec<String> {
@@ -369,6 +373,29 @@ struct DiscoveryPathFilter<'a> {
     discovery_exclusions: &'a ObservedDiscoveryExclusions,
 }
 
+#[derive(Debug, Clone)]
+struct DiscoveryRoute {
+    path: PathBuf,
+    source_root: PathBuf,
+    filter_by_language: bool,
+    language: Language,
+    exclude_patterns: Vec<CompiledExcludePattern>,
+}
+
+#[derive(Debug)]
+struct CoalescedDiscoveryWalk {
+    path: PathBuf,
+    routes: Vec<DiscoveryRoute>,
+}
+
+struct ObservedDiscoveryPath {
+    normalized: PathBuf,
+    canonical: Option<PathBuf>,
+    exclusion_lexical: WorkspacePathLexicalIdentity,
+    exclusion_canonical: Option<WorkspacePathLexicalIdentity>,
+    is_dir: bool,
+}
+
 #[derive(Debug)]
 struct DiscoveryExclusionObservationError {
     path: PathBuf,
@@ -392,6 +419,8 @@ impl WorkspaceManifest {
             discovery_owned_storage_paths: Vec::new(),
             #[cfg(test)]
             discovery_exclusion_observation_count: Cell::new(0),
+            #[cfg(test)]
+            discovery_walk_count: Cell::new(0),
         }
     }
 
@@ -410,6 +439,8 @@ impl WorkspaceManifest {
             discovery_owned_storage_paths: Vec::new(),
             #[cfg(test)]
             discovery_exclusion_observation_count: Cell::new(0),
+            #[cfg(test)]
+            discovery_walk_count: Cell::new(0),
         })
     }
 
@@ -441,6 +472,8 @@ impl WorkspaceManifest {
             discovery_owned_storage_paths: Vec::new(),
             #[cfg(test)]
             discovery_exclusion_observation_count: Cell::new(0),
+            #[cfg(test)]
+            discovery_walk_count: Cell::new(0),
         }
     }
 
@@ -555,6 +588,11 @@ impl WorkspaceManifest {
     #[cfg(test)]
     fn discovery_exclusion_observation_count(&self) -> usize {
         self.discovery_exclusion_observation_count.get()
+    }
+
+    #[cfg(test)]
+    fn discovery_walk_count(&self) -> usize {
+        self.discovery_walk_count.get()
     }
 
     /// Return the manifest path that defines the workspace root.
@@ -989,6 +1027,8 @@ impl WorkspaceDiscovery {
         let mut issues = repository_metadata_issues;
         let mut warnings: Vec<WorkspaceInventoryIssue> = Vec::new();
         let mut inspected_source_roots = 0usize;
+        #[cfg(test)]
+        manifest.discovery_walk_count.set(0);
         let discovery_exclusions = match observe_discovery_exclusions(manifest) {
             Ok(exclusions) => exclusions,
             Err(error) => {
@@ -1006,6 +1046,7 @@ impl WorkspaceDiscovery {
                 });
             }
         };
+        let mut directory_routes = Vec::new();
 
         for group in &manifest.settings.source_groups {
             let exclude_patterns = compile_exclude_patterns(&group.exclude_patterns)?;
@@ -1081,134 +1122,138 @@ impl WorkspaceDiscovery {
                     }
                     continue;
                 }
-                if metadata.is_dir() {
-                    let mut builder = ignore::WalkBuilder::new(&full_path);
-                    builder.follow_links(true);
-                    builder.require_git(false);
-                    builder.parents(false);
-                    builder.git_global(false);
-                    // Hidden source trees such as .github are product input. The
-                    // manifest's explicit excludes still prune repository metadata.
-                    builder.hidden(false);
-                    let workspace_root_for_filter = workspace_root.clone();
-                    let source_root_for_filter = source_root.clone();
-                    let exclude_patterns_for_filter = exclude_patterns.clone();
-                    let filter_discovery_exclusions = discovery_exclusions.clone();
-                    let language = group.language.clone();
-                    builder.filter_entry(move |entry| {
-                        let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-                        let path_filter = DiscoveryPathFilter {
-                            workspace_root: &workspace_root_for_filter,
-                            source_root: &source_root_for_filter,
-                            filter_by_language,
-                            language: &language,
-                            exclude_patterns: &exclude_patterns_for_filter,
-                            discovery_exclusions: &filter_discovery_exclusions,
-                        };
-                        should_include_discovered_path(entry.path(), is_dir, &path_filter)
+                directory_routes.push(DiscoveryRoute {
+                    path: full_path,
+                    source_root,
+                    filter_by_language,
+                    language: group.language.clone(),
+                    exclude_patterns: exclude_patterns.clone(),
+                });
+            }
+        }
+
+        for walk in coalesce_discovery_walks(directory_routes) {
+            let mut builder = ignore::WalkBuilder::new(&walk.path);
+            builder.follow_links(true);
+            builder.require_git(false);
+            builder.parents(false);
+            builder.git_global(false);
+            // Hidden source trees such as .github are product input. The
+            // manifest's explicit excludes still prune repository metadata.
+            builder.hidden(false);
+            let workspace_root_for_filter = workspace_root.clone();
+            let routes_for_filter = walk.routes.clone();
+            let filter_discovery_exclusions = discovery_exclusions.clone();
+            builder.filter_entry(move |entry| {
+                let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+                should_include_discovered_path_for_routes(
+                    entry.path(),
+                    is_dir,
+                    &workspace_root_for_filter,
+                    &routes_for_filter,
+                    &filter_discovery_exclusions,
+                )
+            });
+            let issue_count_before_walk = issues.len();
+            #[cfg(test)]
+            manifest
+                .discovery_walk_count
+                .set(manifest.discovery_walk_count.get() + 1);
+            for entry in builder.build() {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        record_walk_error(&mut issues, &walk.path, &error);
+                        continue;
+                    }
+                };
+                if let Some(error) = entry.error() {
+                    record_walk_error(&mut issues, entry.path(), error);
+                }
+                if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    continue;
+                }
+                match discovery_exclusions.file_is_excluded(entry.path()) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        issues.push(WorkspaceInventoryIssue {
+                            path: entry.path().to_path_buf(),
+                            message: format!(
+                                "failed to observe source identity against caller-owned exclusions: {error}"
+                            ),
+                        });
+                        continue;
+                    }
+                }
+                if !push_discovered_file_within_limit(
+                    &mut all_files,
+                    &mut seen,
+                    entry.into_path(),
+                    &workspace_root,
+                    max_files,
+                ) {
+                    all_files.sort();
+                    return Ok(WorkspaceFileInventory {
+                        files: all_files,
+                        outcome: WorkspaceInventoryOutcome::Bounded,
+                        issues,
+                        warnings,
                     });
-                    let issue_count_before_walk = issues.len();
-                    for entry in builder.build() {
-                        let entry = match entry {
-                            Ok(entry) => entry,
-                            Err(error) => {
-                                record_walk_error(&mut issues, &full_path, &error);
-                                continue;
-                            }
-                        };
-                        if let Some(error) = entry.error() {
-                            record_walk_error(&mut issues, entry.path(), error);
-                        }
-                        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-                            continue;
-                        }
-                        match discovery_exclusions.file_is_excluded(entry.path()) {
-                            Ok(true) => continue,
-                            Ok(false) => {}
-                            Err(error) => {
-                                issues.push(WorkspaceInventoryIssue {
-                                    path: entry.path().to_path_buf(),
-                                    message: format!(
-                                        "failed to observe source identity against caller-owned exclusions: {error}"
-                                    ),
-                                });
-                                continue;
-                            }
-                        }
-                        if !push_discovered_file_within_limit(
-                            &mut all_files,
-                            &mut seen,
-                            entry.into_path(),
-                            &workspace_root,
-                            max_files,
-                        ) {
-                            all_files.sort();
-                            return Ok(WorkspaceFileInventory {
-                                files: all_files,
-                                outcome: WorkspaceInventoryOutcome::Bounded,
-                                issues,
-                                warnings,
-                            });
-                        }
+                }
+            }
+            let walk_had_errors = issues.len() != issue_count_before_walk;
+            for tracked_path in &repository_tracked_paths {
+                if seen.contains(&normalized_compare_key(&workspace_root, tracked_path))
+                    || !fs::metadata(tracked_path).is_ok_and(|metadata| metadata.is_file())
+                    || !should_include_discovered_path_for_routes(
+                        tracked_path,
+                        false,
+                        &workspace_root,
+                        &walk.routes,
+                        &discovery_exclusions,
+                    )
+                {
+                    continue;
+                }
+                match discovery_exclusions.file_is_excluded(tracked_path) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        issues.push(WorkspaceInventoryIssue {
+                            path: tracked_path.clone(),
+                            message: format!(
+                                "failed to observe tracked source identity against caller-owned exclusions: {error}"
+                            ),
+                        });
+                        continue;
                     }
-                    let walk_had_errors = issues.len() != issue_count_before_walk;
-                    let path_filter = DiscoveryPathFilter {
-                        workspace_root: &workspace_root,
-                        source_root: &source_root,
-                        filter_by_language,
-                        language: &group.language,
-                        exclude_patterns: &exclude_patterns,
-                        discovery_exclusions: &discovery_exclusions,
-                    };
-                    for tracked_path in &repository_tracked_paths {
-                        if seen.contains(&normalized_compare_key(&workspace_root, tracked_path))
-                            || !fs::metadata(tracked_path).is_ok_and(|metadata| metadata.is_file())
-                            || !should_include_discovered_path(tracked_path, false, &path_filter)
-                        {
-                            continue;
-                        }
-                        match discovery_exclusions.file_is_excluded(tracked_path) {
-                            Ok(true) => continue,
-                            Ok(false) => {}
-                            Err(error) => {
-                                issues.push(WorkspaceInventoryIssue {
-                                    path: tracked_path.clone(),
-                                    message: format!(
-                                        "failed to observe tracked source identity against caller-owned exclusions: {error}"
-                                    ),
-                                });
-                                continue;
-                            }
-                        }
-                        if !push_discovered_file_within_limit(
-                            &mut all_files,
-                            &mut seen,
-                            tracked_path.clone(),
-                            &workspace_root,
-                            max_files,
-                        ) {
-                            all_files.sort();
-                            return Ok(WorkspaceFileInventory {
-                                files: all_files,
-                                outcome: WorkspaceInventoryOutcome::Bounded,
-                                issues,
-                                warnings,
-                            });
-                        }
-                        if !walk_had_errors {
-                            // The file is present and indexed; only its
-                            // discovery route was degraded. Recording this as a
-                            // warning keeps the inventory complete (a tracked
-                            // input that could NOT be restored still pushes an
-                            // issue and demotes the outcome) while leaving the
-                            // degradation visible to every inventory consumer.
-                            warnings.push(WorkspaceInventoryIssue {
-                                path: tracked_path.clone(),
-                                message: "repository ignore rules excluded a tracked source; the repository index restored it"
-                                    .to_string(),
-                            });
-                        }
-                    }
+                }
+                if !push_discovered_file_within_limit(
+                    &mut all_files,
+                    &mut seen,
+                    tracked_path.clone(),
+                    &workspace_root,
+                    max_files,
+                ) {
+                    all_files.sort();
+                    return Ok(WorkspaceFileInventory {
+                        files: all_files,
+                        outcome: WorkspaceInventoryOutcome::Bounded,
+                        issues,
+                        warnings,
+                    });
+                }
+                if !walk_had_errors {
+                    // The file is present and indexed; only its discovery
+                    // route was degraded. Recording this as a warning keeps
+                    // the inventory complete while leaving the degradation
+                    // visible to every inventory consumer.
+                    warnings.push(WorkspaceInventoryIssue {
+                        path: tracked_path.clone(),
+                        message: "repository ignore rules excluded a tracked source; the repository index restored it"
+                            .to_string(),
+                    });
                 }
             }
         }
@@ -1460,20 +1505,32 @@ fn build_refresh_outcome_from_inventory(
     let mut files_to_remove = Vec::new();
     let mut existing_file_ids = HashMap::new();
     let mut current_file_keys = HashSet::with_capacity(current_files.len());
+    let mut stored_files = Vec::with_capacity(current_files.len());
 
-    for path in current_files {
-        let normalized_key = normalized_compare_key(&workspace_root, &path);
+    for path in &current_files {
+        let normalized_key = normalized_compare_key(&workspace_root, path);
         current_file_keys.insert(normalized_key.clone());
-        let needs_index = match normalized_stored_map.get(&normalized_key) {
-            Some(file) => {
-                existing_file_ids.insert(path.clone(), file.id);
-                stored_file_needs_index(&path, file)
-            }
-            None => true,
-        };
+        let stored = normalized_stored_map.get(&normalized_key);
+        if let Some(file) = stored {
+            existing_file_ids.insert(path.clone(), file.id);
+        }
+        stored_files.push(stored);
+    }
 
-        if needs_index {
-            files_to_index.push(path);
+    if let Some(decisions) = parallel_stored_file_decisions(&current_files, &stored_files) {
+        for (path, decision) in current_files.iter().zip(decisions) {
+            if decision.needs_index {
+                files_to_index.push(path.clone());
+            }
+        }
+    } else {
+        for (path, stored) in current_files.iter().zip(stored_files) {
+            let needs_index = stored
+                .map(|file| stored_file_needs_index(path, file))
+                .unwrap_or(true);
+            if needs_index {
+                files_to_index.push(path.clone());
+            }
         }
     }
 
@@ -1497,6 +1554,117 @@ fn build_refresh_outcome_from_inventory(
         inventory_outcome,
         inventory_issues,
         inventory_warnings,
+    })
+}
+
+const PARALLEL_STORED_FILE_MINIMUM: usize = 16;
+const PARALLEL_STORED_FILE_MAX_THREADS: usize = 8;
+
+#[derive(Debug, Clone, Copy)]
+struct StoredFileDecision {
+    needs_index: bool,
+    content_hash_read: bool,
+    memo_reused: bool,
+    memo_record: Option<StoredFileMemoRecord>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StoredFileMemoRecord {
+    modified_ms: i64,
+    len: u64,
+}
+
+fn freshness_hash_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .min(PARALLEL_STORED_FILE_MAX_THREADS);
+        (threads > 1)
+            .then(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .ok()
+            })
+            .flatten()
+    })
+    .as_ref()
+}
+
+fn parallel_stored_file_decisions(
+    paths: &[PathBuf],
+    stored_files: &[Option<&StoredFileState>],
+) -> Option<Vec<StoredFileDecision>> {
+    if paths.len() < PARALLEL_STORED_FILE_MINIMUM || paths.len() != stored_files.len() {
+        return None;
+    }
+    let pool = freshness_hash_pool()?;
+    let batch = source_freshness::source_freshness_batch();
+    let decisions = stored_file_decisions_in_pool(pool, paths, stored_files, batch.as_ref());
+    account_parallel_stored_file_decisions(paths, stored_files, &decisions, batch.as_ref());
+    Some(decisions)
+}
+
+fn account_parallel_stored_file_decisions(
+    paths: &[PathBuf],
+    stored_files: &[Option<&StoredFileState>],
+    decisions: &[StoredFileDecision],
+    batch: Option<&source_freshness::SourceFreshnessBatch>,
+) {
+    for decision in decisions {
+        if decision.content_hash_read {
+            // Worker threads deliberately never enter the caller's thread-local
+            // scope. Account for completed reads here so telemetry remains
+            // deterministic and attached to the public operation.
+            source_freshness::record_content_hash_read();
+        }
+        if decision.memo_reused {
+            source_freshness::record_verdict_reuse();
+        }
+    }
+    if let Some(batch) = batch {
+        source_freshness::record_batch_verdicts(
+            batch,
+            paths.iter().zip(stored_files).zip(decisions).filter_map(
+                |((path, stored), decision)| {
+                    let record = decision.memo_record?;
+                    let expected_hash = stored.as_ref()?.content_hash.as_deref()?;
+                    Some((
+                        path.as_path(),
+                        record.modified_ms,
+                        record.len,
+                        expected_hash,
+                        decision.needs_index,
+                    ))
+                },
+            ),
+        );
+    }
+}
+
+fn stored_file_decisions_in_pool(
+    pool: &rayon::ThreadPool,
+    paths: &[PathBuf],
+    stored_files: &[Option<&StoredFileState>],
+    batch: Option<&source_freshness::SourceFreshnessBatch>,
+) -> Vec<StoredFileDecision> {
+    pool.install(|| {
+        paths
+            .par_iter()
+            .zip(stored_files.par_iter())
+            .map(|(path, stored)| {
+                stored
+                    .map(|file| stored_file_needs_index_direct(path, file, batch))
+                    .unwrap_or(StoredFileDecision {
+                        needs_index: true,
+                        content_hash_read: false,
+                        memo_reused: false,
+                        memo_record: None,
+                    })
+            })
+            .collect()
     })
 }
 
@@ -1694,6 +1862,7 @@ fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
     let Some(expected_hash) = file.content_hash.as_deref() else {
         return false;
     };
+    let batch = source_freshness::source_freshness_batch();
     // The hash below is the verification, never a redundant double-check: an
     // mtime mismatch already short-circuited, so this is the only mechanism
     // that sees same-mtime drift. The memo caches that verdict for one armed
@@ -1714,16 +1883,109 @@ fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
     // Only a torn-read-clean observation whose metadata still agrees with the
     // metadata the key was built from may be memoized. Anything that raced a
     // writer is recomputed next time.
-    if identity.modified_ms == observed.modified_ms && identity.len == observed.len {
-        source_freshness::record_verdict(
+    if identity.modified_ms == observed.modified_ms
+        && identity.len == observed.len
+        && let Some(batch) = batch.as_ref()
+    {
+        source_freshness::record_batch_verdicts(
+            batch,
+            [(
+                path,
+                observed.modified_ms,
+                observed.len,
+                expected_hash,
+                verdict,
+            )],
+        );
+    }
+    verdict
+}
+
+/// The parallel planner's exact predicate.
+///
+/// Unlike [`stored_file_needs_index`], this never consults or publishes the
+/// operation-scoped memo: worker-thread TLS must not create a second cache
+/// lifetime. Every same-mtime file is read directly, with the same before/read/
+/// after torn-read guard, and the caller records the returned work counters in
+/// deterministic input order.
+fn stored_file_needs_index_direct(
+    path: &Path,
+    file: &StoredFileState,
+    batch: Option<&source_freshness::SourceFreshnessBatch>,
+) -> StoredFileDecision {
+    if !file.indexed || file.retry_required {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: false,
+            memo_reused: false,
+            memo_record: None,
+        };
+    }
+    let Ok(observed) = observed_file_metadata(path) else {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: false,
+            memo_reused: false,
+            memo_record: None,
+        };
+    };
+    if observed.modified_ms != file.modification_time {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: false,
+            memo_reused: false,
+            memo_record: None,
+        };
+    }
+    let Some(expected_hash) = file.content_hash.as_deref() else {
+        return StoredFileDecision {
+            needs_index: false,
+            content_hash_read: false,
+            memo_reused: false,
+            memo_record: None,
+        };
+    };
+    if let Some(verdict) = batch.and_then(|batch| {
+        source_freshness::batch_memoized_verdict(
+            batch,
             path,
             observed.modified_ms,
             observed.len,
             expected_hash,
-            verdict,
-        );
+        )
+    }) {
+        return StoredFileDecision {
+            needs_index: verdict,
+            content_hash_read: false,
+            memo_reused: true,
+            memo_record: None,
+        };
     }
-    verdict
+    let Ok(identity) = read_content_identity(path) else {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: true,
+            memo_reused: false,
+            memo_record: None,
+        };
+    };
+    if identity.modified_ms != observed.modified_ms || identity.len != observed.len {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: true,
+            memo_reused: false,
+            memo_record: None,
+        };
+    }
+    StoredFileDecision {
+        needs_index: identity.content_hash != expected_hash,
+        content_hash_read: true,
+        memo_reused: false,
+        memo_record: Some(StoredFileMemoRecord {
+            modified_ms: observed.modified_ms,
+            len: observed.len,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1769,26 +2031,26 @@ fn read_content_identity(path: &Path) -> Result<ContentIdentity> {
 }
 
 #[cfg(test)]
-thread_local! {
-    static TORN_READ_MUTATION: std::cell::RefCell<Option<(PathBuf, Vec<u8>)>> =
-        const { std::cell::RefCell::new(None) };
+fn torn_read_mutations_for_test() -> &'static std::sync::Mutex<HashMap<PathBuf, Vec<u8>>> {
+    static MUTATIONS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Vec<u8>>>> = OnceLock::new();
+    MUTATIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 #[cfg(test)]
 fn arm_torn_read_mutation_for_test(path: PathBuf, contents: Vec<u8>) {
-    TORN_READ_MUTATION.with(|mutation| mutation.replace(Some((path, contents))));
+    torn_read_mutations_for_test()
+        .lock()
+        .expect("torn-read mutation hook poisoned")
+        .insert(path, contents);
 }
 
 #[cfg(test)]
 fn run_torn_read_mutation_for_test(path: &Path) -> Result<()> {
-    TORN_READ_MUTATION.with(|mutation| {
-        let Some((target, contents)) = mutation.borrow_mut().take() else {
-            return Ok(());
-        };
-        if target != path {
-            mutation.replace(Some((target, contents)));
-            return Ok(());
-        }
+    let contents = torn_read_mutations_for_test()
+        .lock()
+        .expect("torn-read mutation hook poisoned")
+        .remove(path);
+    contents.map_or(Ok(()), |contents| {
         fs::write(path, contents).map_err(Into::into)
     })
 }
@@ -1958,6 +2220,21 @@ fn observe_discovery_exclusions(
     Ok(observed)
 }
 
+fn coalesce_discovery_walks(routes: Vec<DiscoveryRoute>) -> Vec<CoalescedDiscoveryWalk> {
+    let mut walks: Vec<CoalescedDiscoveryWalk> = Vec::new();
+    for route in routes {
+        if let Some(walk) = walks.iter_mut().find(|walk| walk.path == route.path) {
+            walk.routes.push(route);
+        } else {
+            walks.push(CoalescedDiscoveryWalk {
+                path: route.path.clone(),
+                routes: vec![route],
+            });
+        }
+    }
+    walks
+}
+
 impl ObservedDiscoveryExclusions {
     fn file_is_excluded(&self, path: &Path) -> std::io::Result<bool> {
         if self.file_identities.is_empty() {
@@ -2000,45 +2277,111 @@ impl ObservedDiscoveryExclusions {
     }
 }
 
-fn should_include_discovered_path(
-    path: &Path,
-    is_dir: bool,
+impl ObservedDiscoveryPath {
+    fn observe(path: &Path, is_dir: bool) -> Option<Self> {
+        let normalized = normalize_lexical_path(path);
+        let canonical = normalized.canonicalize().ok();
+        let exclusion_lexical = workspace_path_lexical_identity(&normalized).ok()?;
+        let exclusion_canonical = canonical
+            .as_deref()
+            .and_then(|path| workspace_path_lexical_identity(path).ok());
+        Some(Self {
+            normalized,
+            canonical,
+            exclusion_lexical,
+            exclusion_canonical,
+            is_dir,
+        })
+    }
+}
+
+fn should_include_observed_discovery_path_globally(
+    observed: &ObservedDiscoveryPath,
+    workspace_root: &Path,
+    discovery_exclusions: &ObservedDiscoveryExclusions,
+) -> bool {
+    if discovery_exclusions.directory_contains_observed(
+        &observed.exclusion_lexical,
+        observed.exclusion_canonical.as_ref(),
+    ) {
+        return false;
+    }
+    observed.is_dir
+        || workspace_structural_source_exclusion(workspace_root, &observed.normalized).is_none()
+}
+
+fn should_include_observed_discovery_path(
+    observed: &ObservedDiscoveryPath,
     filter: &DiscoveryPathFilter<'_>,
 ) -> bool {
-    let normalized = normalize_lexical_path(path);
-    let canonical = normalized.canonicalize().ok();
-    let Ok(exclusion_lexical) = workspace_path_lexical_identity(&normalized) else {
-        return false;
-    };
-    let exclusion_canonical = canonical
+    if observed
+        .canonical
         .as_deref()
-        .and_then(|path| workspace_path_lexical_identity(path).ok());
-    if filter
-        .discovery_exclusions
-        .directory_contains_observed(&exclusion_lexical, exclusion_canonical.as_ref())
+        .is_some_and(|path| !path.starts_with(filter.source_root))
     {
-        return false;
-    }
-    if !is_dir
-        && workspace_structural_source_exclusion(filter.workspace_root, &normalized).is_some()
-    {
-        return false;
-    }
-    if canonical.is_some_and(|canonical| !canonical.starts_with(filter.source_root)) {
         return false;
     }
     if is_excluded_path(
-        &normalized,
+        &observed.normalized,
         filter.workspace_root,
         filter.source_root,
         filter.exclude_patterns,
     ) {
         return false;
     }
-    if is_dir {
-        return true;
+    observed.is_dir
+        || !filter.filter_by_language
+        || matches_source_group_language(&observed.normalized, filter.language)
+}
+
+fn should_include_discovered_path_for_routes(
+    path: &Path,
+    is_dir: bool,
+    workspace_root: &Path,
+    routes: &[DiscoveryRoute],
+    discovery_exclusions: &ObservedDiscoveryExclusions,
+) -> bool {
+    let Some(observed) = ObservedDiscoveryPath::observe(path, is_dir) else {
+        return false;
+    };
+    if !should_include_observed_discovery_path_globally(
+        &observed,
+        workspace_root,
+        discovery_exclusions,
+    ) {
+        return false;
     }
-    !filter.filter_by_language || matches_source_group_language(&normalized, filter.language)
+    routes.iter().any(|route| {
+        should_include_observed_discovery_path(
+            &observed,
+            &DiscoveryPathFilter {
+                workspace_root,
+                source_root: &route.source_root,
+                filter_by_language: route.filter_by_language,
+                language: &route.language,
+                exclude_patterns: &route.exclude_patterns,
+                discovery_exclusions,
+            },
+        )
+    })
+}
+
+fn should_include_discovered_path(
+    path: &Path,
+    is_dir: bool,
+    filter: &DiscoveryPathFilter<'_>,
+) -> bool {
+    let Some(observed) = ObservedDiscoveryPath::observe(path, is_dir) else {
+        return false;
+    };
+    if !should_include_observed_discovery_path_globally(
+        &observed,
+        filter.workspace_root,
+        filter.discovery_exclusions,
+    ) {
+        return false;
+    }
+    should_include_observed_discovery_path(&observed, filter)
 }
 
 fn workspace_structural_source_exclusion(
@@ -2395,6 +2738,58 @@ mod tests {
     use std::path::Path;
     use tempfile::tempdir;
 
+    fn test_source_group(
+        language: Language,
+        source_path: PathBuf,
+        exclude_patterns: &[&str],
+    ) -> SourceGroupSettings {
+        SourceGroupSettings {
+            id: Uuid::new_v4(),
+            language,
+            standard: LanguageStandard::Default,
+            source_paths: vec![source_path],
+            exclude_patterns: exclude_patterns
+                .iter()
+                .map(|pattern| (*pattern).to_string())
+                .collect(),
+            include_paths: Vec::new(),
+            defines: HashMap::new(),
+            language_specific: LanguageSpecificSettings::Other,
+        }
+    }
+
+    fn every_source_group_language() -> Vec<Language> {
+        vec![
+            Language::Cxx,
+            Language::Java,
+            Language::Python,
+            Language::Rust,
+            Language::JavaScript,
+            Language::TypeScript,
+            Language::Go,
+            Language::Ruby,
+            Language::Php,
+            Language::CSharp,
+            Language::Kotlin,
+            Language::Swift,
+            Language::Dart,
+            Language::Lua,
+            Language::Sql,
+            Language::Html,
+            Language::Css,
+            Language::Bash,
+            Language::Shell,
+            Language::PowerShell,
+            Language::Markdown,
+            Language::Yaml,
+            Language::Toml,
+            Language::Json,
+            Language::Svelte,
+            Language::Vue,
+            Language::Astro,
+        ]
+    }
+
     #[test]
     fn exact_project_path_resolution_distinguishes_existing_missing_and_outside() -> Result<()> {
         let project = tempdir()?;
@@ -2622,6 +3017,92 @@ mod tests {
         );
         assert!(outcome.plan.files_to_index.is_empty());
         assert_eq!(outcome.plan.files_to_remove, vec![44]);
+        assert!(outcome.plan.existing_file_ids.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_negative_structural_fixtures_are_omitted_without_hiding_real_sources()
+    -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let controlled_fixture = root
+            .join(".github")
+            .join("scripts")
+            .join("fixtures")
+            .join("actionlint-invalid.yml");
+        let valid_fixture = root.join("tests/fixtures/valid.yml");
+        let parser_fixture = root.join("tests/fixtures/actionlint-invalid.rs");
+        let production_structural = root.join("src/actionlint-invalid.yml");
+        let workflow = root.join(".github/workflows/ci.yml");
+        for path in [
+            &controlled_fixture,
+            &valid_fixture,
+            &parser_fixture,
+            &production_structural,
+            &workflow,
+        ] {
+            fs::create_dir_all(path.parent().expect("source parent"))?;
+        }
+        fs::write(&controlled_fixture, "jobs: [\n")?;
+        fs::write(&valid_fixture, "enabled: true\n")?;
+        fs::write(&parser_fixture, "pub fn fixture() {}\n")?;
+        fs::write(&production_structural, "enabled: true\n")?;
+        fs::write(
+            &workflow,
+            "name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n",
+        )?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(!inventory.files.contains(&controlled_fixture));
+        for admitted in [
+            valid_fixture,
+            parser_fixture,
+            production_structural,
+            workflow,
+        ] {
+            assert!(inventory.files.contains(&admitted), "{admitted:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_negative_fixture_schedules_pre_policy_row_removal() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let excluded = root.join("tests/fixtures/schema.malformed.json");
+        fs::create_dir_all(excluded.parent().expect("excluded parent"))?;
+        fs::write(&excluded, "{\"legacy\":")?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let outcome = WorkspaceDiscovery.build_refresh_outcome(
+            &manifest,
+            &RefreshInputs {
+                stored_files: Vec::new(),
+                policy_exclusions: Vec::new(),
+                inventory: WorkspaceInventory::from_records([(
+                    excluded,
+                    IndexedFileRecord {
+                        file_id: 45,
+                        modification_time: 0,
+                        content_hash: Some("b".repeat(64)),
+                        indexed: true,
+                        complete: false,
+                        retry_required: true,
+                    },
+                )]),
+            },
+        )?;
+
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert_eq!(outcome.plan.mode, RefreshMode::Incremental);
+        assert!(outcome.plan.files_to_index.is_empty());
+        assert_eq!(outcome.plan.files_to_remove, vec![45]);
         assert!(outcome.plan.existing_file_ids.is_empty());
         Ok(())
     }
@@ -3010,6 +3491,134 @@ mod tests {
             policy_exclusions: Vec::new(),
             inventory: WorkspaceInventory::default(),
         })
+    }
+
+    fn parallel_refresh_fixture(
+        root: &Path,
+        count: usize,
+    ) -> Result<(Vec<PathBuf>, RefreshInputs)> {
+        let mut files = Vec::with_capacity(count);
+        for index in 0..count {
+            let path = root.join(format!("file_{index:02}.rs"));
+            fs::write(&path, format!("fn file_{index:02}() {{}}\n"))?;
+            files.push(path);
+        }
+        let inputs = indexed_inputs_for(&files)?;
+        Ok((files, inputs))
+    }
+
+    #[test]
+    fn parallel_stored_file_decisions_are_exact_ordered_and_memo_aware() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let (mut files, mut inputs) = parallel_refresh_fixture(&root, 20)?;
+
+        let same_mtime = fs::metadata(&files[3])?.modified()?;
+        let mut same_length_drift = fs::read(&files[3])?;
+        same_length_drift[3] ^= 1;
+        fs::write(&files[3], same_length_drift)?;
+        fs::File::open(&files[3])?.set_modified(same_mtime)?;
+
+        let changed_mtime = fs::metadata(&files[7])?
+            .modified()?
+            .checked_add(std::time::Duration::from_secs(2))
+            .expect("fixture timestamp can advance");
+        fs::File::open(&files[7])?.set_modified(changed_mtime)?;
+        fs::remove_file(&files[11])?;
+        inputs.stored_files[15].retry_required = true;
+
+        let new_file = root.join("new_file.rs");
+        fs::write(&new_file, "fn newly_discovered() {}\n")?;
+        files.push(new_file);
+        let mut stored_files = inputs.stored_files.iter().map(Some).collect::<Vec<_>>();
+        stored_files.push(None);
+
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+        let _scope = SourceFreshnessScope::enter();
+        let batch = source_freshness::source_freshness_batch();
+        let decisions = stored_file_decisions_in_pool(&pool, &files, &stored_files, batch.as_ref());
+        account_parallel_stored_file_decisions(&files, &stored_files, &decisions, batch.as_ref());
+        let repeated_batch = source_freshness::source_freshness_batch();
+        let repeated =
+            stored_file_decisions_in_pool(&pool, &files, &stored_files, repeated_batch.as_ref());
+        account_parallel_stored_file_decisions(
+            &files,
+            &stored_files,
+            &repeated,
+            repeated_batch.as_ref(),
+        );
+        assert_eq!(
+            decisions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, decision)| decision.needs_index.then_some(index))
+                .collect::<Vec<_>>(),
+            vec![3, 7, 11, 15, 20]
+        );
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|decision| decision.needs_index)
+                .collect::<Vec<_>>(),
+            repeated
+                .iter()
+                .map(|decision| decision.needs_index)
+                .collect::<Vec<_>>(),
+            "indexed parallel collection must preserve deterministic input order"
+        );
+        assert_eq!(
+            source_freshness_counts().expect("armed scope"),
+            SourceFreshnessCounts {
+                content_hash_reads: 17,
+                verdict_reuses: 17,
+                readiness_fingerprint_passes: 0,
+            },
+            "the first batch must hash each eligible file once and the second must reuse it"
+        );
+
+        source_freshness::reverify_from_content();
+        let torn_target = files[5].clone();
+        arm_torn_read_mutation_for_test(
+            torn_target,
+            b"fn file_05() { let write_raced_the_reader = true; }\n".to_vec(),
+        );
+        let torn_batch = source_freshness::source_freshness_batch();
+        let torn = stored_file_decisions_in_pool(&pool, &files, &stored_files, torn_batch.as_ref());
+        account_parallel_stored_file_decisions(&files, &stored_files, &torn, torn_batch.as_ref());
+        assert!(torn[5].needs_index, "a torn content read must fail closed");
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_refresh_plan_preserves_stale_and_removal_order() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let (files, inputs) = parallel_refresh_fixture(&root, 20)?;
+        let same_mtime = fs::metadata(&files[3])?.modified()?;
+        let mut same_length_drift = fs::read(&files[3])?;
+        same_length_drift[3] ^= 1;
+        fs::write(&files[3], same_length_drift)?;
+        fs::File::open(&files[3])?.set_modified(same_mtime)?;
+        let changed_mtime = fs::metadata(&files[7])?
+            .modified()?
+            .checked_add(std::time::Duration::from_secs(2))
+            .expect("fixture timestamp can advance");
+        fs::File::open(&files[7])?.set_modified(changed_mtime)?;
+        fs::remove_file(&files[11])?;
+        let new_file = root.join("file_21.rs");
+        fs::write(&new_file, "fn file_21() {}\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let plan = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert_eq!(
+            plan.files_to_index,
+            vec![files[3].clone(), files[7].clone(), new_file],
+            "parallel decisions must be assembled in discovery order"
+        );
+        assert_eq!(plan.files_to_remove, vec![12]);
+        Ok(())
     }
 
     /// One public operation derives source freshness several times (before and
@@ -3943,6 +4552,177 @@ mod tests {
         assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
         assert!(inventory.files.contains(&workflow));
         assert!(!inventory.files.contains(&git_source));
+        Ok(())
+    }
+
+    #[test]
+    fn identical_language_roots_share_one_walk_and_preserve_group_union() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("excluded"))?;
+        fs::create_dir_all(root.join("ui"))?;
+        for (relative, contents) in [
+            ("main.rs", "pub fn main_source() {}\n"),
+            ("app.ts", "export const app = true;\n"),
+            ("ui/App.svelte", "<script>export let app;</script>\n"),
+            ("README.md", "# repository\n"),
+            ("config.yaml", "enabled: true\n"),
+            ("excluded/skip.rs", "pub fn excluded() {}\n"),
+        ] {
+            fs::write(root.join(relative), contents)?;
+        }
+
+        let groups = every_source_group_language()
+            .into_iter()
+            .map(|language| {
+                let excludes = if language == Language::Rust {
+                    vec!["**/excluded/**"]
+                } else if language == Language::Svelte {
+                    vec!["**/ui/**"]
+                } else {
+                    Vec::new()
+                };
+                test_source_group(language, root.clone(), &excludes)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(groups.len(), 27);
+
+        let manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "coalesced".to_string(),
+                version: 1,
+                source_groups: groups.clone(),
+            },
+            root.join("codestory_project.json"),
+        );
+        let inventory = manifest.source_inventory()?;
+
+        let mut reference_files = Vec::new();
+        for group in groups {
+            let reference = WorkspaceManifest::from_parts(
+                WorkspaceSettings {
+                    name: "reference".to_string(),
+                    version: 1,
+                    source_groups: vec![group],
+                },
+                root.join("codestory_project.json"),
+            )
+            .source_inventory()?;
+            assert_eq!(reference.outcome, WorkspaceInventoryOutcome::Complete);
+            reference_files.extend(reference.files);
+        }
+        reference_files.sort();
+        reference_files.dedup();
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert_eq!(inventory.files, reference_files);
+        assert_eq!(manifest.discovery_walk_count(), 1);
+        assert!(inventory.files.contains(&root.join("ui/App.svelte")));
+        assert!(!inventory.files.contains(&root.join("excluded/skip.rs")));
+
+        let changed = root.join("main.rs");
+        let indexed_hash = current_content_hash(&changed)?;
+        fs::write(&changed, "pub fn next_source() {}\n")?;
+        let outcome = manifest.build_execution_outcome(&RefreshInputs {
+            stored_files: vec![StoredFileState {
+                id: 7,
+                path: changed.clone(),
+                modification_time: modification_time_millis(&changed)?,
+                content_hash: Some(indexed_hash),
+                indexed: true,
+                complete: true,
+                retry_required: false,
+            }],
+            policy_exclusions: Vec::new(),
+            inventory: WorkspaceInventory::default(),
+        })?;
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert_eq!(manifest.discovery_walk_count(), 1);
+        assert!(outcome.plan.files_to_index.contains(&changed));
+        assert!(outcome.plan.files_to_remove.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_overlapping_roots_preserve_root_specific_ignore_contexts() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested)?;
+        let outer = root.join("outer.rs");
+        let nested_source = nested.join("lib.rs");
+        fs::write(root.join(".ignore"), "nested/\n")?;
+        fs::write(&outer, "pub fn outer() {}\n")?;
+        fs::write(&nested_source, "pub fn nested() {}\n")?;
+
+        let manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "overlapping".to_string(),
+                version: 1,
+                source_groups: vec![
+                    test_source_group(Language::Rust, root.clone(), &[]),
+                    test_source_group(Language::Rust, nested, &[]),
+                ],
+            },
+            root.join("codestory_project.json"),
+        );
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert_eq!(manifest.discovery_walk_count(), 2);
+        assert!(inventory.files.contains(&outer));
+        assert!(inventory.files.contains(&nested_source));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_alias_roots_preserve_route_lexical_excludes() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let actual = root.join("actual");
+        let alias_a = root.join("alias-a");
+        let alias_b = root.join("alias-b");
+        fs::create_dir_all(&actual)?;
+        symlink(&actual, &alias_a)?;
+        symlink(&actual, &alias_b)?;
+        let actual_source = actual.join("lib.rs");
+        let alias_a_source = alias_a.join("lib.rs");
+        let alias_b_source = alias_b.join("lib.rs");
+        fs::write(&actual_source, "pub fn through_alias() {}\n")?;
+        let alias_a_absolute_exclude = alias_a_source.to_string_lossy().into_owned();
+
+        let manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "aliases".to_string(),
+                version: 1,
+                source_groups: vec![
+                    test_source_group(Language::TypeScript, alias_a, &[]),
+                    test_source_group(
+                        Language::Rust,
+                        alias_b,
+                        &[alias_a_absolute_exclude.as_str()],
+                    ),
+                ],
+            },
+            root.join("codestory_project.json"),
+        );
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert_eq!(manifest.discovery_walk_count(), 2);
+        assert!(inventory.files.contains(&alias_b_source));
+        assert!(
+            inventory
+                .files
+                .iter()
+                .any(|path| same_workspace_path(path, &actual_source))
+        );
         Ok(())
     }
 

@@ -127,6 +127,7 @@ Rollout and diagnostic switches. They are not product configuration and may chan
 | `CODESTORY_RESOLUTION_STORE_CANDIDATES` | boolean | `crates/codestory-indexer/src/resolution/mod.rs` | Persists unresolved resolution candidates for inspection. |
 | `CODESTORY_RETRIEVAL` | boolean | `crates/codestory-runtime/src/agent/retrieval_primary.rs` | `1` requires published retrieval for packet and search; `0` is unsupported and fails closed. |
 | `CODESTORY_RETRIEVAL_SHADOW` | boolean | `crates/codestory-runtime/src/agent/retrieval_primary.rs` | Runs published retrieval beside the incumbent path for comparison. |
+| `CODESTORY_SEMANTIC_CALIBRATION_QUERY_VECTOR_DIR` | path | `crates/codestory-retrieval/src/semantic_calibration_support.rs` | Directory where the development calibration harness captures query vectors. |
 | `CODESTORY_SYMBOL_FULL_TEXT_INDEX` | boolean | `crates/codestory-runtime/src/search/engine.rs` | Builds the symbol full-text index (default on). |
 
 ### Test-harness environment variables

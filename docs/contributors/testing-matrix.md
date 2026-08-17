@@ -35,17 +35,17 @@ cargo test --locked -p codestory-indexer --test tictactoe_language_coverage
 That lane has its own exact-key Cargo cache, derives the key from the Rust host
 and manifests plus `Cargo.lock`, and saves only after all three commands pass.
 It does not emit artifacts or turn unrelated crate changes into durability
-work. Run broad source proof once on the frozen candidate rather than using
-this focused durability lane as a second source-proof coordinator.
+work. Run source stabilization once on the final pre-calibration source head
+rather than using this focused durability lane as a second proof coordinator.
 
 The same universal `linux-contracts` job also runs the merged proof suites as
-a blocking per-PR lane, so evidence classification, packet sufficiency,
+a blocking per-PR lane, so evidence classification, packet compilation,
 readiness leases, hook installation, and the confined workspace reader cannot
 regress between dispatch-gated workspace proofs:
 
 ```bash
 cargo test --locked -p codestory-runtime --lib agent::packet_evidence::
-cargo test --locked -p codestory-runtime --lib agent::packet_sufficiency::
+cargo test --locked -p codestory-runtime --lib agent::packet_compiler::tests
 cargo test --locked -p codestory-runtime --lib agent::packet_batch::
 cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::
 cargo test --locked -p codestory-runtime --lib services::
@@ -98,15 +98,20 @@ their error-only file outcomes must use the fallback replacement path without
 discarding the previous projection. Journal/checkpoint policy and
 multiple-writer changes remain separate lanes.
 
-## Exact-head source gate
+## Source stabilization gate
 
-After independent review finds no blocker, run once on the unchanged head:
+After every implementation, plugin, documentation, and workflow change is
+integrated and independent review finds no blocker, run once on the unchanged
+pre-calibration source head. The coordinator runs the generalization lane,
+Windows source contracts, and the Linux compile/lint/test lane concurrently.
+The Linux lane uses:
 
 ```sh
 cargo fmt --all -- --check
 cargo check --workspace --locked
-cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo nextest run --workspace --locked --no-fail-fast
+cargo test --workspace --doc --locked
 ```
 
 Run the two indexer acceptance binaries in full when parser, extraction,
@@ -116,6 +121,11 @@ resolution, language coverage, or retrieval document production changed:
 cargo test --locked -p codestory-indexer --test fidelity_regression
 cargo test --locked -p codestory-indexer --test tictactoe_language_coverage
 ```
+
+The resulting `source_stabilization` receipt is required before calibration.
+The generated constant-set-only child reuses this source-behavior evidence
+through calibration lineage and must not repeat the full workspace suite. Any
+other source change invalidates the receipt.
 
 The repo-scale stats lane runs once on the final merge-ready head only when
 default indexing, symbol/dense persistence, embedding reuse, or cold-start
@@ -228,10 +238,11 @@ it does not feed or block the frozen calibration bundle.
 
 Frozen-candidate qualification is a separate one-run-per-platform lane.
 Metal and Windows Vulkan each run the full lifecycle, fault, true-idle, memory,
-and accelerator suite once. Protected Linux Vulkan may run that same
-qualification through a standalone dispatch when its GPU runner is online; it
-is not a coordinator closeout dependency and cannot block qualification when
-that runner is absent.
+and accelerator suite once. A full coordinator dispatch with
+`qualify_linux_vulkan=true` runs the same qualification on the protected Linux
+Vulkan host and requires that job to pass before closeout. The default remains
+false, so the standard release can still qualify Metal and Windows without
+turning an unavailable Linux runner into a new claim or release gate.
 
 Answer quality is a separate, optional frozen-candidate adjunct. After the
 protected Metal package proof, it runs the checksum-bound Axios JavaScript and
@@ -240,6 +251,11 @@ macOS archive. Its failure or absence cannot block Metal, Windows, Linux, or
 closeout, and the standard release makes no answer-quality claim. Promotion and
 release decisions consume the coordinator's `closeout` job result directly;
 they do not wait for this optional job or for workflow-wide completion.
+The explicit Linux qualification opt-in is stricter: it also requires the
+current run attempt's exact-head Linux Axios artifact to contain three
+publishable cold-CLI rows with no blockers, gaps, degraded retrieval, or missed
+SLA. That receipt closes the issue-specific acceptance contract; it does not
+broaden the standard release's public answer-quality or performance claims.
 
 ### Packaged proof
 
@@ -549,6 +565,15 @@ hosts must match the OS and architecture derived from the package matrix's Rust
 target. Do not use `matrix`, `mixed`, or another
 aggregate placeholder for a host, runner, backend, installer, or native-engine
 identity.
+
+Each post-publish target performs one catalog installation and then launches
+two ordered fresh installed-runtime proof sessions against that same install.
+The retained restart-survival receipt hashes both summaries and the install
+attestation, requires stable package and managed-runtime identity, distinct
+server/process/engine identities, project-bound ground and search in both
+sessions, and full backend-observed accelerated retrieval in the second. This
+proves visibility after a fresh host/runtime launch; it does not claim the
+server persists after every client exits.
 
 Production producers use `scripts/codestory-release-cell-manifest.mjs`. They
 emit cells only after their job succeeds and bind workflow, job, run, attempt

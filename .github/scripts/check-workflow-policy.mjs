@@ -2526,10 +2526,12 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     // to resolve) are rule instances and live in release-claims.json under
     // workflow_policy.structural_pins; structuralPinViolations evaluates them.
     const full = object(object(source.jobs)["full-source-gate"]);
+    const sourceStabilizationCondition = "${{ (!inputs.acceptance_only || inputs.acceptance_phase == 'source_stabilization') && needs.resolve.outputs.reuse != 'true' }}";
+    const workflowExpression = value => String(value ?? "").replace(/\s+/gu, " ").trim();
     add(
       violations,
-      full.if === "${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}",
-      `${sourceFile} full source gate may skip only a completed exact-head proof`,
+      workflowExpression(full.if) === sourceStabilizationCondition,
+      `${sourceFile} full source gate must run exactly once during source stabilization`,
     );
     // The retrieval generalization job's structural pin (job existence) is a
     // rule instance and lives in release-claims.json under
@@ -2551,8 +2553,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       violations,
       generalization.name === "retrieval-generalization"
         && sameMembers(needs(generalization), ["resolve"])
-        && generalization.if
-          === "${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}"
+        && workflowExpression(generalization.if) === sourceStabilizationCondition
         && generalization["runs-on"] === "ubuntu-latest"
         && generalization["timeout-minutes"] === 5
         && generalization["continue-on-error"] === undefined,
@@ -2616,10 +2617,9 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       ])
         && windowsNative.name === "windows-native-contracts"
         && sameMembers(needs(windowsNative), ["resolve"])
-        && windowsNative.if
-          === "${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}"
+        && workflowExpression(windowsNative.if) === sourceStabilizationCondition
         && windowsNative["runs-on"] === "windows-latest"
-        && windowsNative["timeout-minutes"] === 15
+        && windowsNative["timeout-minutes"] === 25
         && object(windowsNative.env).CMAKE_GENERATOR === "Ninja"
         && windowsNative["continue-on-error"] === undefined,
       `${sourceFile} Windows native source contracts must run in parallel on the resolved exact head`,
@@ -2627,11 +2627,11 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     const windowsNativeSteps = list(windowsNative.steps).map(object);
     add(
       violations,
-      windowsNativeSteps.length === 7
+      windowsNativeSteps.length === 9
         && windowsNativeSteps[0]?.uses === "actions/checkout@v5"
         && object(windowsNativeSteps[0]?.with).ref === "${{ needs.resolve.outputs.ref }}"
         && windowsNativeSteps.every(step => step?.["continue-on-error"] === undefined),
-      `${sourceFile} Windows native source contracts must keep the exact blocking seven-step shape`,
+      `${sourceFile} Windows native source contracts must keep the exact blocking nine-step shape`,
     );
     // The qualification harness regression runs before the toolchain steps: it
     // needs no build, and a Windows-native reproduction of the control
@@ -2658,6 +2658,74 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && jobShellInvocationsContaining(windowsNative, "cargo build").length === 0
         && jobShellInvocationsContaining(windowsNative, "cargo check").length === 0,
       `${sourceFile} Windows path and native-staging contracts must share one source-only Cargo invocation`,
+    );
+    const windowsNativeReceiptName = "Emit authenticated Windows-native source receipt";
+    const windowsNativeReceipt = namedStep(windowsNative, windowsNativeReceiptName);
+    const windowsNativeReceiptRun = executableRunText(
+      stepRun(windowsNative, windowsNativeReceiptName),
+    );
+    add(
+      violations,
+      windowsNativeSteps[7]?.name === windowsNativeReceiptName
+        && windowsNativeReceipt?.id === "windows-native-source-proof"
+        && windowsNativeReceipt?.shell === "pwsh"
+        && windowsNativeReceipt?.["continue-on-error"] === undefined
+        && hasExactKeys(windowsNativeReceipt, ["name", "id", "shell", "env", "run"]),
+      `${sourceFile} Windows-native source receipt must be the blocking terminal evidence producer`,
+    );
+    requireStepEnv(
+      violations,
+      sourceFile,
+      windowsNative,
+      windowsNativeReceiptName,
+      { EXPECTED_HEAD_SHA: "${{ needs.resolve.outputs.ref }}" },
+    );
+    add(
+      violations,
+      [
+        "$commit = (git rev-parse HEAD).Trim()",
+        '$sourceTree = (git rev-parse "HEAD^{tree}").Trim()',
+        "if ($commit -ne $env:EXPECTED_HEAD_SHA) {",
+        "git status --porcelain=v1",
+        "if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {",
+        'schema = "codestory.windows-native-source-proof/v1"',
+        'status = "pass"',
+        "repository = $env:GITHUB_REPOSITORY",
+        "commit = $commit",
+        "source_tree = $sourceTree",
+        'workflow_path = ".github/workflows/source-proof.yml"',
+        'job = "windows-native-contracts"',
+        "run_id = [Int64]$env:GITHUB_RUN_ID",
+        "run_attempt = [Int64]$env:GITHUB_RUN_ATTEMPT",
+        "qualification_harness_self_test = $true",
+        "control_directory_inflight = $true",
+        "windows_path_identity = $true",
+        "native_staging = $true",
+        '"commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT',
+      ].every(fragment => windowsNativeReceiptRun.includes(fragment)),
+      `${sourceFile} Windows-native source receipt must bind the clean routed head and every proved contract`,
+    );
+    const windowsNativeUploadName = "Upload authenticated Windows-native source receipt";
+    const windowsNativeUpload = namedStep(windowsNative, windowsNativeUploadName);
+    add(
+      violations,
+      windowsNativeSteps[8]?.name === windowsNativeUploadName
+        && windowsNativeUpload?.uses === "actions/upload-artifact@v7.0.1"
+        && windowsNativeUpload?.["continue-on-error"] === undefined
+        && hasExactKeys(windowsNativeUpload, ["name", "uses", "with"])
+        && hasExactKeys(object(windowsNativeUpload?.with), [
+          "name",
+          "path",
+          "if-no-files-found",
+          "retention-days",
+        ])
+        && object(windowsNativeUpload?.with).name
+          === "windows-native-source-proof-${{ steps.windows-native-source-proof.outputs.commit }}-attempt-${{ github.run_attempt }}"
+        && object(windowsNativeUpload?.with).path
+          === "target/windows-native-source-proof/windows-native-source-proof.json"
+        && object(windowsNativeUpload?.with)["if-no-files-found"] === "error"
+        && object(windowsNativeUpload?.with)["retention-days"] === 30,
+      `${sourceFile} Windows-native source receipt upload must retain one exact-head attempt-qualified JSON artifact`,
     );
     add(
       violations,
@@ -3514,13 +3582,78 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && !String(postCloseout.if ?? "").includes(`needs.${catalogDelivery.publish_job}`),
     `${releaseFile} post-publish closeout must not gate on ${catalogDelivery.publish_job} succeeding`,
   );
-  const postDownload = namedStep(postCloseout, "Download selected release cells without flattening");
+  const postProvenanceName = "Authenticate post-publish Actions provenance";
+  const postProvenanceRun = executableRunText(stepRun(postCloseout, postProvenanceName));
+  requireStepEnv(violations, releaseFile, postCloseout, postProvenanceName, {
+    GH_TOKEN: "${{ github.token }}",
+    REUSE_SELECTION: "${{ needs.preflight.outputs.reuse }}",
+  });
+  requireFlagOnInvocation(
+    violations,
+    `${releaseFile} post-publish producer map must consume the preflight reuse selection`,
+    postProvenanceRun,
+    "codestory-release-cell-manifest.mjs producer-map",
+    '--reuse "$REUSE_SELECTION"',
+  );
+  const postDownloadName = "Download and verify selected cumulative release cells";
+  const postDownload = namedStep(postCloseout, postDownloadName);
+  const postDownloadRun = executableRunText(stepRun(postCloseout, postDownloadName));
+  const postDigestCheck = 'test "$actual_digest" = "$expected_digest"';
+  const postDestinationCreate = 'mkdir "$destination"';
+  const postContainerExtract = 'unzip -q "$archive" -d "$destination"';
+  const postDirectoryCheck = 'test -d "target/release-cell-manifests/$artifact_name"';
   add(
     violations,
-    postDownload?.uses === "actions/download-artifact@v8.0.1"
-      && object(postDownload.with)["artifact-ids"] === "${{ steps.post-publish-provenance.outputs.artifact_ids }}"
-      && object(postDownload.with)["merge-multiple"] === false,
-    `${releaseFile} post-publish closeout must download selected Actions artifact ids without flattening`,
+    postDownload?.uses === undefined
+      && postDownload?.shell === "bash"
+      && postDownload?.["continue-on-error"] === undefined
+      && object(postDownload?.env).GH_TOKEN === "${{ github.token }}",
+    `${releaseFile} post-publish closeout must materialize cumulative release cells in blocking Bash`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(
+      ".artifacts[] | [.id, .name, .digest] | @tsv",
+    ),
+    `${releaseFile} post-publish closeout must iterate every selected artifact id, name, and digest`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(
+      "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip",
+    ),
+    `${releaseFile} post-publish closeout must fetch every selected artifact by authenticated artifact id`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes('sha256sum "$archive"')
+      && postDownloadRun.includes(postDigestCheck),
+    `${releaseFile} post-publish closeout must reject a selected artifact container digest mismatch`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(
+      'destination="target/release-cell-manifests/$artifact_name"',
+    )
+      && postDownloadRun.includes(postDestinationCreate),
+    `${releaseFile} post-publish closeout must create one exact artifact-name directory per selected container`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(postContainerExtract)
+      && postDownloadRun.indexOf(postDigestCheck)
+        < postDownloadRun.indexOf(postDestinationCreate)
+      && postDownloadRun.indexOf(postDestinationCreate)
+        < postDownloadRun.indexOf(postContainerExtract),
+    `${releaseFile} post-publish closeout must extract each verified container into its exact artifact-name directory`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(".artifacts[].name")
+      && postDownloadRun.includes(postDirectoryCheck)
+      && postDownloadRun.indexOf(postContainerExtract)
+        < postDownloadRun.indexOf(postDirectoryCheck),
+    `${releaseFile} post-publish closeout must verify every selected artifact-name directory exists`,
   );
   requireStepEnv(violations, releaseFile, postCloseout, "Evaluate authenticated post-publish closeout", {
     RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
@@ -5171,6 +5304,7 @@ function validatePostPublish(workflows, violations, graph) {
   add(
     violations,
     installed?.if === undefined
+      && installed?.shell === "bash"
       && installed?.["continue-on-error"] === undefined,
     `${file} installed runtime proof must be unconditional and fail closed`,
   );
@@ -5185,7 +5319,7 @@ function validatePostPublish(workflows, violations, graph) {
     '--archive "$ASSET_ARCHIVE"',
     "--plugin-handoff",
     "--engine-policy accelerated",
-    '--expected-backend "${{ matrix.backend }}"',
+    '--expected-backend "$EXPECTED_BACKEND"',
     "--proof-tier installed_runtime",
     "--server-behavior-only",
     "--installed-plugin-attestation",
@@ -5208,7 +5342,124 @@ function validatePostPublish(workflows, violations, graph) {
     INSTALLED_PLUGIN_ROOT: "${{ steps.installed.outputs.plugin_root }}",
     INSTALLED_ATTESTATION: "${{ steps.installed.outputs.attestation }}",
     INSTALLED_PLUGIN_DATA: "${{ steps.installed.outputs.plugin_data }}",
+    CATALOG_DELIVERY_STATE: "${{ steps.delivery.outputs.state }}",
+    DELIVERED_INSTALLER: "${{ steps.delivery.outputs.installer }}",
+    EXPECTED_BACKEND: "${{ matrix.backend }}",
   });
+  add(
+    violations,
+    hasExactKeys(object(installed?.env), [
+      "ASSET_ARCHIVE",
+      "ASSET_CHECKSUM",
+      "CATALOG_DELIVERY_STATE",
+      "CODESTORY_EMBED_ALLOW_CPU",
+      "DELIVERED_INSTALLER",
+      "EXPECTED_BACKEND",
+      "INSTALLED_ATTESTATION",
+      "INSTALLED_PLUGIN_DATA",
+      "INSTALLED_PLUGIN_ROOT",
+      "RELEASE_VERSION",
+    ]),
+    `${file} installed runtime restart proof must bind only the reviewed package, install, delivery, and backend identities`,
+  );
+  const commonStart = installedRun.indexOf("common=(");
+  const commonEnd = commonStart < 0 ? -1 : installedRun.indexOf("\n)", commonStart);
+  const installedCommon = commonStart >= 0 && commonEnd > commonStart
+    ? installedRun.slice(commonStart, commonEnd + 2)
+    : "";
+  const commonExpansion = '"${common[@]}"';
+  add(
+    violations,
+    occurrenceCount(installedRun, "common=(") === 1
+      && occurrenceCount(installedCommon, "python .github/scripts/check-packaged-agent-proof.py") === 1
+      && [
+        '--archive "$ASSET_ARCHIVE"',
+        '--checksum-file "$ASSET_CHECKSUM"',
+        '--expected-version "$RELEASE_VERSION"',
+        '--plugin-root "$INSTALLED_PLUGIN_ROOT"',
+        '--installed-plugin-attestation "$INSTALLED_ATTESTATION"',
+        '--installed-plugin-data "$INSTALLED_PLUGIN_DATA"',
+        '--expected-source-sha "$source_sha"',
+        '--expected-source-tree "$source_tree"',
+        '--expected-backend "$EXPECTED_BACKEND"',
+      ].every(fragment => installedCommon.includes(fragment)),
+    `${file} installed runtime restart proof must define one common exact-package and installed-runtime invocation`,
+  );
+  const session1Proof = `${commonExpansion} --out-dir "$proof_root/session-1"`;
+  const session2Proof = `${commonExpansion} --out-dir "$proof_root/session-2"`;
+  add(
+    violations,
+    occurrenceCount(installedRun, commonExpansion) === 2
+      && occurrenceCount(installedRun, session1Proof) === 1
+      && occurrenceCount(installedRun, session2Proof) === 1,
+    `${file} installed runtime restart proof must execute exactly two distinct sessions through the common invocation`,
+  );
+  const timingAndSessionOrder = [
+    'session_1_started_ms="$(now_ms)"',
+    session1Proof,
+    'session_1_finished_ms="$(now_ms)"',
+    'session_2_started_ms="$(now_ms)"',
+    session2Proof,
+    'session_2_finished_ms="$(now_ms)"',
+  ].map(fragment => installedRun.indexOf(fragment));
+  add(
+    violations,
+    installedRun.includes("time.time_ns() // 1_000_000")
+      && timingAndSessionOrder.every(index => index >= 0)
+      && timingAndSessionOrder.every(
+        (index, position) => position === 0 || timingAndSessionOrder[position - 1] < index,
+      ),
+    `${file} installed runtime restart proof must record two monotonically ordered session intervals`,
+  );
+  add(
+    violations,
+    installedRun.includes('hashlib.file_digest(source, "sha256").hexdigest()')
+      && installedRun.includes(
+        'binary_sha256="$(jq -er \'.package_contract.manifest.binary.sha256\' "$proof_root/session-1/summary.json")"',
+      ),
+    `${file} installed runtime restart proof must derive the actual archive and packaged binary hashes`,
+  );
+  const restartInvocations = shellInvocationsContaining(
+    installedRun,
+    "node .github/scripts/restart-survival-receipt.mjs",
+  );
+  const restartInvocation = restartInvocations.length === 1 ? restartInvocations[0] : "";
+  add(
+    violations,
+    restartInvocations.length === 1
+      && [
+        '--session-1-summary "$proof_root/session-1/summary.json"',
+        '--session-2-summary "$proof_root/session-2/summary.json"',
+        '--install-attestation "$INSTALLED_ATTESTATION"',
+        '--catalog-delivery-state "$CATALOG_DELIVERY_STATE"',
+        '--expected-installer-identity "$DELIVERED_INSTALLER"',
+        '--expected-source-commit "$source_sha"',
+        '--expected-source-tree "$source_tree"',
+        '--expected-version "$RELEASE_VERSION"',
+        '--expected-archive-sha256 "$archive_sha256"',
+        '--expected-binary-sha256 "$binary_sha256"',
+        '--expected-backend "$EXPECTED_BACKEND"',
+        '--session-1-start-ms "$session_1_started_ms"',
+        '--session-1-finished-ms "$session_1_finished_ms"',
+        '--session-2-start-ms "$session_2_started_ms"',
+        '--session-2-finished-ms "$session_2_finished_ms"',
+        '--out "$proof_root/restart-survival.json"',
+      ].every(fragment => restartInvocation.includes(fragment))
+      && !restartInvocation.includes("|| true"),
+    `${file} installed runtime restart receipt must bind both sessions, one install, delivery, release, package, backend, and timing identities`,
+  );
+  const proofUpload = namedStep(job, "Upload post-publish proof artifacts");
+  add(
+    violations,
+    proofUpload?.if === "always()"
+      && proofUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && String(object(proofUpload?.with).path).split(/\r?\n/u)
+        .map(value => value.trim())
+        .filter(Boolean)
+        .includes("target/post-publish-installed-proof")
+      && object(proofUpload?.with)["if-no-files-found"] === "error",
+    `${file} post-publish proof artifact must retain the complete installed-runtime restart root`,
+  );
   for (const fragment of ["--engine-policy cpu_explicit", "--expected-backend CPU", "--ground-only"]) {
     add(
       violations,
@@ -5306,6 +5557,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     calibrationPolicy.coordinator_workflow === file
       && calibrationPolicy.mode === "calibration"
       && calibrationPolicy.assembly_job === "calibration-assemble"
+      && calibrationPolicy.pre_collection_source_proof_required === true
+      && calibrationPolicy.source_proof_stage === "source_stabilization_before_calibration"
       && calibrationPolicy.runs_per_required_cell === 3
       && calibrationPolicy.samples_per_metric_per_run === 1
       && list(calibrationPolicy.required_cells).length === 1
@@ -5442,6 +5695,16 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     ),
     `${file} dispatch scopes changed`,
   );
+  const linuxQualificationInput = object(
+    at(workflow, "on", "workflow_dispatch", "inputs", "qualify_linux_vulkan"),
+  );
+  add(
+    violations,
+    linuxQualificationInput.required === false
+      && linuxQualificationInput.default === false
+      && linuxQualificationInput.type === "boolean",
+    `${file} Linux lifecycle qualification must remain an explicit non-default dispatch opt-in`,
+  );
   add(violations, trigger(workflow, "pull_request_target") === undefined, `${file} must not use pull_request_target`);
   // The workflow-scoped permission grants (actions write for superseded-run
   // cancellation, read-only contents) are rule instances and live in
@@ -5464,7 +5727,15 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   requireStepEnv(violations, file, route, "Resolve trusted exact head", {
     INPUT_CALIBRATION_ARTIFACT: "${{ inputs.calibration_bundle_artifact }}",
     INPUT_CALIBRATION_RUN_ID: "${{ inputs.calibration_bundle_run_id }}",
+    INPUT_QUALIFY_LINUX_VULKAN: "${{ inputs.qualify_linux_vulkan }}",
   });
+  add(
+    violations,
+    stepRun(route, "Resolve trusted exact head").includes(
+      'if [ "$qualify_linux_vulkan" = true ] && [ "$mode" != qualification ]; then',
+    ),
+    `${file} Linux lifecycle qualification opt-in must fail outside qualification mode`,
+  );
   add(
     violations,
     namedStep(route, "Require executable release freeze")?.if === undefined,
@@ -5475,12 +5746,12 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   requireStepEnv(violations, file, route, "Require executable release freeze", {
     RESOLVED_MODE: "${{ steps.resolve.outputs.mode }}",
   });
-  const exactHeadSourceProof = namedStep(route, "Require successful exact-head source proof");
+  const exactHeadSourceProof = namedStep(route, "Require successful source-stabilization proof");
   add(
     violations,
     exactHeadSourceProof?.if
       === "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'",
-    `${file} calibration must precede the sole frozen-candidate source proof`,
+    `${file} frozen candidates must reuse the pre-calibration source-stabilization proof`,
   );
   // The mode the scope selector branches on now arrives as a variable, so the branch text alone no
   // longer says which mode it read. This binds the variable back to the resolver's own output.
@@ -6018,6 +6289,10 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   const linuxQualitySteps = list(linuxQuality.steps).map(object);
   const linuxQualityProducer = linuxQualitySteps.find(step => step.id === "linux-quality");
   const linuxQualityRun = shellLiteralNormalizedText(String(linuxQualityProducer?.run ?? ""));
+  const optionalLinuxQualityUpload = namedStep(
+    linuxQuality,
+    "Upload optional Linux x64 Axios v2 quality evidence",
+  );
   add(
     violations,
     linuxQuality.name === "Optional frozen-candidate Linux x64 Axios v2 quality"
@@ -6044,7 +6319,12 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && linuxQualityRun.includes("--repeats 3")
       && linuxQualityRun.includes("--publishable")
       && !linuxQualityRun.includes("--task-suite")
-      && !linuxQualityRun.includes("--task-ids"),
+      && !linuxQualityRun.includes("--task-ids")
+      && optionalLinuxQualityUpload?.if === "steps.linux-quality.outcome == 'success'"
+      && optionalLinuxQualityUpload?.["continue-on-error"] === true
+      && object(optionalLinuxQualityUpload?.with).name
+        === "frozen-candidate-linux-x64-quality-${{ inputs.ref }}-attempt-${{ github.run_attempt }}"
+      && object(optionalLinuxQualityUpload?.with).overwrite === true,
     `${qualityFile} optional Linux x64 quality must run the same isolated Axios v2 smoke entrypoint`,
   );
   // The windows-vulkan-proof job's structural pin (job existence) and its
@@ -6085,9 +6365,9 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations,
     String(linuxVulkan.if ?? "").includes("needs.route.outputs.mode != 'package'")
       && String(linuxVulkan.if ?? "").includes(
-        "needs.route.outputs.mode != 'qualification'",
+        "needs.route.outputs.mode != 'qualification' || inputs.qualify_linux_vulkan",
       ),
-    `${file} package-only and qualification modes must skip coordinator Linux proof`,
+    `${file} package mode must skip Linux proof; qualification must schedule Linux proof only when the explicit lifecycle opt-in is true`,
   );
   add(
     violations,
@@ -6096,11 +6376,17 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    object(linuxVulkan.with).candidate_installed_proof === true
-      && object(linuxVulkan.with).server_behavior_only === true
+    object(linuxVulkan.with).calibration_bundle_artifact
+        === "${{ inputs.calibration_bundle_artifact || '' }}"
+      && object(linuxVulkan.with).calibration_bundle_run_id
+        === "${{ inputs.calibration_bundle_run_id || '' }}"
+      && object(linuxVulkan.with).candidate_installed_proof
+        === "${{ needs.route.outputs.mode != 'qualification' }}"
+      && object(linuxVulkan.with).server_behavior_only
+        === "${{ needs.route.outputs.mode != 'qualification' }}"
       && object(linuxVulkan.with).candidate_producer_workflow_path
         === ".github/workflows/packaged-platform-pr.yml",
-    `${file} Linux proof must close Vulkan and candidate-installed claims without optional evaluation`,
+    `${file} Linux proof must keep platform mode candidate-installed and run full lifecycle only in qualification with the authenticated calibration bundle`,
   );
   // The closeout job's structural pin (job existence) and its needs edge are
   // rule instances and live in release-claims.json under
@@ -6114,7 +6400,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     closeout.if
       === "always() && needs.route.result != 'skipped' && needs.route.outputs.mode != 'calibration'"
       && closeout["runs-on"] === "ubuntu-latest"
-      && closeout["timeout-minutes"] === 20
+      && closeout["timeout-minutes"] === 65
       && closeout["continue-on-error"] === undefined,
     `${file} closeout job must retain its reviewed unconditional result-checking activation`,
   );
@@ -6132,17 +6418,18 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   const closeoutRun = executableRunText(stepRun(closeout, closeoutProofName));
   add(
     violations,
-    list(closeout.steps).length === 1
+    list(closeout.steps).length === 3
       && closeoutProof?.if === undefined
       && closeoutProof?.["continue-on-error"] === undefined
       && closeoutProof?.shell === "bash"
       && closeoutProof?.["working-directory"] === undefined,
-    `${file} closeout must run one unconditional proof step under the reviewed Bash interpreter`,
+    `${file} closeout must retain one unconditional result proof plus the two opted-in Linux quality receipt steps`,
   );
   const expectedCloseoutEnv = {
     GH_TOKEN: "${{ github.token }}",
     HEAD_SHA: "${{ needs.route.outputs.head_sha }}",
     MODE: "${{ needs.route.outputs.mode }}",
+    QUALIFY_LINUX_VULKAN: "${{ inputs.qualify_linux_vulkan }}",
     SCOPE: "${{ needs.route.outputs.scope }}",
     ROUTE_RESULT: "${{ needs.route.result }}",
     SOURCE_RESULT: "${{ needs.source-proof.result }}",
@@ -6162,9 +6449,69 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    /if\s+\[\s*"\$MODE"\s*=\s*qualification\s*\];\s*then\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+skipped\s+linux-vulkan-proof\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+fi/um
+    /if\s+\[\s*"\$MODE"\s*=\s*qualification\s*\];\s*then\s+if\s+\[\s*"\$QUALIFY_LINUX_VULKAN"\s*=\s*true\s*\];\s*then\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+skipped\s+linux-vulkan-proof\s+fi\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+fi/um
       .test(closeoutRun),
-    `${file} qualification closeout must accept skipped optional Linux proof without blocking`,
+    `${file} qualification closeout must require Linux success exactly when the explicit lifecycle opt-in is true`,
+  );
+  const linuxQualityProofName = "Validate opted-in Linux quality evidence";
+  const linuxQualityProof = namedStep(closeout, linuxQualityProofName);
+  const strictLinuxQualityRun = executableRunText(stepRun(closeout, linuxQualityProofName));
+  add(
+    violations,
+    linuxQualityProof?.if === "inputs.qualify_linux_vulkan"
+      && linuxQualityProof?.shell === "bash"
+      && linuxQualityProof?.["continue-on-error"] === undefined
+      && hasExactKeys(object(linuxQualityProof?.env), ["GH_TOKEN", "HEAD_SHA"])
+      && object(linuxQualityProof?.env).GH_TOKEN === "${{ github.token }}"
+      && object(linuxQualityProof?.env).HEAD_SHA === "${{ needs.route.outputs.head_sha }}",
+    `${file} opted-in Linux quality validation must fail closed on the routed frozen head`,
+  );
+  add(
+    violations,
+    [
+      "frozen-candidate-linux-x64-quality-$HEAD_SHA-attempt-$GITHUB_RUN_ATTEMPT",
+      "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100",
+      ".workflow_run.id == $run_id",
+      ".workflow_run.head_sha == $sha",
+      "gh run download \"$GITHUB_RUN_ID\"",
+      "packet-runtime-summary.json",
+      "packet-runtime-runs.jsonl",
+      "publishable-three-repeat-packet/v1",
+      "optional-linux-x64-quality",
+      "codestory-release-corpus-v0.16-axios-js-ts-v2",
+      'and .release_evidence.quality_gate_status == "pass"',
+      "and .release_evidence.publishable_blockers == []",
+      "and (.release_evidence.rows | length) == 3",
+      'and .task_id == "axios-request-dispatch-v2"',
+      'and .sufficiency.status == "sufficient"',
+      'and .sufficiency.retrieval_mode == "full"',
+      "and .packet_latency.sla_missed == false",
+      'and .packet_latency.retrieval_shadow.retrieval_mode == "full"',
+      "and .repo_provenance.git_dirty == false",
+      "and .codestory_cache_provenance.local_only == true",
+      "cmp \"$evidence_root/summary-rows.json\" \"$evidence_root/raw-rows.json\"",
+      "codestory.strict-linux-quality-validation/v1",
+    ].every(fragment => strictLinuxQualityRun.includes(fragment)),
+    `${file} opted-in Linux quality validation must authenticate and inspect every three-repeat publishable predicate`,
+  );
+  const linuxQualityUpload = namedStep(closeout, "Upload opted-in Linux quality validation");
+  add(
+    violations,
+    linuxQualityUpload?.if === "inputs.qualify_linux_vulkan"
+      && linuxQualityUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && hasExactKeys(object(linuxQualityUpload?.with), [
+        "name",
+        "path",
+        "if-no-files-found",
+        "retention-days",
+      ])
+      && object(linuxQualityUpload?.with).name
+        === "strict-linux-quality-validation-${{ needs.route.outputs.head_sha }}-attempt-${{ github.run_attempt }}"
+      && object(linuxQualityUpload?.with).path
+        === "target/strict-linux-quality/receipt.json"
+      && object(linuxQualityUpload?.with)["if-no-files-found"] === "error"
+      && object(linuxQualityUpload?.with)["retention-days"] === 30,
+    `${file} opted-in Linux quality validation must retain its exact-head receipt`,
   );
   add(violations, !scalarStrings(workflow).some(value => value === "./.github/workflows/release.yml"), `${file} must not publish releases`);
 }
@@ -8080,7 +8427,7 @@ export function releaseFreezeBarrierWorkflowViolations(
   const freeze = object(graph.workflow_policy.release_freeze_barrier);
   const acceptance = object(freeze.acceptance);
   const acceptancePhases = object(acceptance.phases);
-  const calibrationSourcePhase = object(acceptancePhases.calibration_source);
+  const sourceStabilizationPhase = object(acceptancePhases.source_stabilization);
   const frozenCandidatePhase = object(acceptancePhases.frozen_candidate);
   let acceptanceManifest = {};
   try {
@@ -8136,24 +8483,22 @@ export function releaseFreezeBarrierWorkflowViolations(
         === ".github/scripts/release-freeze-acceptance-jobs.json"
       && /^[0-9a-f]{64}$/u.test(String(acceptance.job_manifest_sha256 ?? ""))
       && acceptance.job_manifest_sha256 === acceptanceManifestDigest
-      && sameMembers(list(calibrationSourcePhase.known_future_source_changes), [
+      && sameMembers(list(sourceStabilizationPhase.known_future_source_changes), [
         "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
       ])
-      && JSON.stringify(list(calibrationSourcePhase.planned_actions)) === JSON.stringify([
-        "calibration-source-acceptance",
+      && JSON.stringify(list(sourceStabilizationPhase.planned_actions)) === JSON.stringify([
+        "source-stabilization",
         "calibration",
         "generated-constant-freeze",
         "frozen-candidate-acceptance",
-        "source-proof",
         "qualification",
         "release",
       ])
-      && calibrationSourcePhase.next_permitted_mutation
+      && sourceStabilizationPhase.next_permitted_mutation
         === "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
       && list(frozenCandidatePhase.known_future_source_changes).length === 0
       && JSON.stringify(list(frozenCandidatePhase.planned_actions)) === JSON.stringify([
         "frozen-candidate-acceptance",
-        "source-proof",
         "qualification",
         "release",
       ])
@@ -8360,7 +8705,7 @@ export function releaseFreezeBarrierWorkflowViolations(
           && acceptancePhaseInput.type === "choice"
           && acceptancePhaseInput.default === "frozen_candidate"
           && JSON.stringify(list(acceptancePhaseInput.options))
-            === JSON.stringify(["calibration_source", "frozen_candidate"])
+            === JSON.stringify(["source_stabilization", "frozen_candidate"])
           && at(workflow, "on", "workflow_dispatch", "inputs", "emit_release_cells")
             === undefined
           && at(workflow, "on", "workflow_call", "inputs", "emit_release_cells")
@@ -8401,6 +8746,31 @@ export function releaseFreezeBarrierWorkflowViolations(
     sameMembers(Object.keys(object(sourceWorkflow.jobs)), sourceJobNames),
     "[freeze_barrier] source-proof.yml must use the closed source and acceptance job contract",
   );
+  for (const jobName of [
+    "full-source-gate",
+    "retrieval-generalization",
+    "windows-native-contracts",
+  ]) {
+    const condition = String(at(sourceWorkflow, "jobs", jobName, "if") ?? "");
+    add(
+      violations,
+      condition.includes("!inputs.acceptance_only")
+        && condition.includes("inputs.acceptance_phase == 'source_stabilization'")
+        && condition.includes("needs.resolve.outputs.reuse != 'true'"),
+      `[freeze_barrier] source-proof.yml ${jobName} must run during source stabilization and skip frozen acceptance`,
+    );
+  }
+  const fullSourceTest = namedStep(
+    object(at(sourceWorkflow, "jobs", "full-source-gate")),
+    "Test the complete workspace once",
+  );
+  add(
+    violations,
+    executableRunText(String(fullSourceTest?.run ?? "")).includes(
+      "cargo nextest run --workspace --locked --no-fail-fast",
+    ),
+    "[freeze_barrier] source stabilization must run the complete workspace without fail-fast",
+  );
   const actualWorkflowContextDigest = createHash("sha256")
     .update(canonicalJson(workflowExecutionContext(sourceWorkflow)))
     .digest("hex");
@@ -8436,11 +8806,164 @@ export function releaseFreezeBarrierWorkflowViolations(
       && object(acceptedCheckout.with)["fetch-depth"] === 0,
     "[freeze_barrier] Actions receipt generation must have complete history for support PR ancestry",
   );
+  const frozenAcceptanceCondition
+    = "${{ inputs.acceptance_only && inputs.acceptance_phase == 'frozen_candidate' }}";
+  const frozenIdentity = namedStep(
+    sourceResolve,
+    "Resolve frozen calibration acceptance identity",
+  );
+  const frozenIdentityRun = executableRunText(String(frozenIdentity?.run ?? ""));
+  add(
+    violations,
+    frozenIdentity?.id === "frozen-calibration"
+      && frozenIdentity?.if === frozenAcceptanceCondition
+      && frozenIdentity?.shell === "bash"
+      && frozenIdentity?.["continue-on-error"] === undefined
+      && [
+        "python .github/scripts/check-calibration-release-lineage.py",
+        '--repo "$GITHUB_WORKSPACE"',
+        '--expected-sha "$HEAD_SHA"',
+        '--github-output "$GITHUB_OUTPUT"',
+      ].every(fragment => frozenIdentityRun.includes(fragment)),
+    "[freeze_barrier] frozen acceptance must resolve a frozen direct constant-only child before receipt generation",
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Resolve frozen calibration acceptance identity",
+    { HEAD_SHA: "${{ steps.resolve.outputs.ref }}" },
+  );
+
+  const frozenProducer = namedStep(
+    sourceResolve,
+    "Authenticate frozen calibration producer",
+  );
+  const frozenProducerRun = executableRunText(String(frozenProducer?.run ?? ""));
+  add(
+    violations,
+    frozenProducer?.id === "frozen-calibration-producer"
+      && frozenProducer?.if === frozenAcceptanceCondition
+      && frozenProducer?.shell === "bash"
+      && frozenProducer?.["continue-on-error"] === undefined
+      && [
+        "actions/runs/$PRODUCER_RUN_ID/attempts/$PRODUCER_RUN_ATTEMPT",
+        '.path == ".github/workflows/packaged-platform-pr.yml"',
+        '.event == "workflow_dispatch"',
+        '.status == "completed"',
+        '.conclusion == "success"',
+        ".head_sha == $source",
+        ".head_repository.full_name == $repo",
+        "actions/runs/$PRODUCER_RUN_ID/artifacts?per_page=100",
+        ".name == $artifact",
+        ".expired == false",
+        ".created_at >= $attempt_started",
+        ".created_at <= $attempt_finished",
+        ".workflow_run.id == $run_id",
+        ".workflow_run.head_sha == $source",
+        "test \"$(jq 'length' <<<\"$matches\")\" = 1",
+        "^sha256:[0-9a-f]{64}$",
+      ].every(fragment => frozenProducerRun.includes(fragment)),
+    "[freeze_barrier] frozen acceptance must authenticate the recorded calibration run, attempt, and artifact",
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Authenticate frozen calibration producer",
+    {
+      ARTIFACT_NAME: "${{ steps.frozen-calibration.outputs.artifact_name }}",
+      GH_TOKEN: "${{ github.token }}",
+      PRODUCER_RUN_ATTEMPT:
+        "${{ steps.frozen-calibration.outputs.producer_run_attempt }}",
+      PRODUCER_RUN_ID: "${{ steps.frozen-calibration.outputs.producer_run_id }}",
+      SOURCE_SHA: "${{ steps.frozen-calibration.outputs.source_commit }}",
+    },
+  );
+
+  const frozenDownload = namedStep(
+    sourceResolve,
+    "Download frozen calibration bundle",
+  );
+  const frozenDownloadRun = executableRunText(String(frozenDownload?.run ?? ""));
+  add(
+    violations,
+    frozenDownload?.if === frozenAcceptanceCondition
+      && frozenDownload?.shell === "bash"
+      && frozenDownload?.["continue-on-error"] === undefined
+      && [
+        "actions/artifacts/$ARTIFACT_ID/zip",
+        'actual_digest="sha256:$(sha256sum "$archive"',
+        'test "$actual_digest" = "$CONTAINER_DIGEST"',
+        'unzip -q "$archive" -d "$destination"',
+        'test -f "$destination/calibration-bundle.json"',
+        'test -f "$destination/per-user-embedding-server-constant-set.json"',
+      ].every(fragment => frozenDownloadRun.includes(fragment)),
+    "[freeze_barrier] frozen acceptance must download the exact authenticated calibration artifact container",
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Download frozen calibration bundle",
+    {
+      ARTIFACT_ID: "${{ steps.frozen-calibration-producer.outputs.artifact_id }}",
+      CONTAINER_DIGEST:
+        "${{ steps.frozen-calibration-producer.outputs.container_digest }}",
+      GH_TOKEN: "${{ github.token }}",
+    },
+  );
+
+  const frozenVerification = namedStep(
+    sourceResolve,
+    "Verify frozen calibration acceptance",
+  );
+  const frozenVerificationRun = executableRunText(
+    String(frozenVerification?.run ?? ""),
+  );
+  add(
+    violations,
+    frozenVerification?.if === frozenAcceptanceCondition
+      && frozenVerification?.shell === "bash"
+      && frozenVerification?.["continue-on-error"] === undefined
+      && [
+        "python .github/scripts/check-calibration-release-lineage.py",
+        '--repo "$GITHUB_WORKSPACE"',
+        '--expected-sha "$HEAD_SHA"',
+        '--calibration-bundle "$RUNNER_TEMP/frozen-calibration-bundle/calibration-bundle.json"',
+        '--artifact-constant-set "$RUNNER_TEMP/frozen-calibration-bundle/per-user-embedding-server-constant-set.json"',
+        '--expected-producer-run-id "$PRODUCER_RUN_ID"',
+        '--expected-producer-run-attempt "$PRODUCER_RUN_ATTEMPT"',
+        '--expected-producer-artifact "$ARTIFACT_NAME"',
+      ].every(fragment => frozenVerificationRun.includes(fragment)),
+    "[freeze_barrier] frozen acceptance must recompute the downloaded calibration and compare the checked-in freeze",
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Verify frozen calibration acceptance",
+    {
+      ARTIFACT_NAME: "${{ steps.frozen-calibration.outputs.artifact_name }}",
+      HEAD_SHA: "${{ steps.resolve.outputs.ref }}",
+      PRODUCER_RUN_ATTEMPT:
+        "${{ steps.frozen-calibration.outputs.producer_run_attempt }}",
+      PRODUCER_RUN_ID: "${{ steps.frozen-calibration.outputs.producer_run_id }}",
+    },
+  );
   const recordReceipt = namedStep(sourceResolve, "Record executable release freeze");
   add(
     violations,
-    recordReceipt?.if === "${{ inputs.acceptance_only }}",
-    "[freeze_barrier] Actions may generate a release freeze receipt only in acceptance mode",
+    recordReceipt?.if === "${{ inputs.acceptance_only }}"
+      && stepIndex(sourceResolve, "Resolve frozen calibration acceptance identity")
+        < stepIndex(sourceResolve, "Authenticate frozen calibration producer")
+      && stepIndex(sourceResolve, "Authenticate frozen calibration producer")
+        < stepIndex(sourceResolve, "Download frozen calibration bundle")
+      && stepIndex(sourceResolve, "Download frozen calibration bundle")
+        < stepIndex(sourceResolve, "Verify frozen calibration acceptance")
+      && stepIndex(sourceResolve, "Verify frozen calibration acceptance")
+        < stepIndex(sourceResolve, "Record executable release freeze"),
+    "[freeze_barrier] Actions may generate a release freeze receipt only after frozen calibration acceptance",
   );
   // The receipt-recording step fragments are rule instances and live in
   // release-claims.json under workflow_policy.step_fragments;
@@ -8560,6 +9083,9 @@ export function releaseFreezeBarrierWorkflowViolations(
       "resolve",
       acceptance.hostile_job,
       acceptance.windows_job,
+      "full-source-gate",
+      "retrieval-generalization",
+      "windows-native-contracts",
     ])
       && publisherJob["runs-on"] === "ubuntu-latest"
       && publisherJob["timeout-minutes"] === 5
@@ -8568,8 +9094,12 @@ export function releaseFreezeBarrierWorkflowViolations(
           "inputs.acceptance_only",
           `needs.${acceptance.hostile_job}.result == 'success'`,
           `needs.${acceptance.windows_job}.result == 'success'`,
+          "inputs.acceptance_phase != 'source_stabilization'",
+          "needs.full-source-gate.result == 'success'",
+          "needs.retrieval-generalization.result == 'success'",
+          "needs.windows-native-contracts.result == 'success'",
         ].every(fragment => String(publisherJob.if ?? "").includes(fragment)),
-    "[freeze_barrier] acceptance publisher must depend on both exact successful mutation jobs",
+    "[freeze_barrier] acceptance publisher must require broad source success for source stabilization",
   );
   const receiptDownload = namedStep(
     publisherJob,
@@ -8635,12 +9165,12 @@ export function releaseFreezeBarrierWorkflowViolations(
       RESOLVED_MODE: "${{ steps.resolve.outputs.mode }}",
     },
   );
-  const packagedSourceProof = namedStep(route, "Require successful exact-head source proof");
+  const packagedSourceProof = namedStep(route, "Require successful source-stabilization proof");
   add(
     violations,
     packagedSourceProof?.if
       === "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'",
-    "[freeze_barrier] calibration must precede the sole frozen-candidate source proof",
+    "[freeze_barrier] frozen candidates must reuse the pre-calibration source-stabilization proof",
   );
   // The coordinator source-proof job's structural pin (job existence) is a
   // rule instance and lives in release-claims.json under
@@ -8680,6 +9210,15 @@ export function releaseFreezeBarrierWorkflowViolations(
   // pins; stepFragmentViolations evaluates them all.
   const preflight = requireJob(violations, "release.yml", release, "preflight");
   const sourceJob = requireJob(violations, "release.yml", release, "source-proof");
+  requireStepEnv(
+    violations,
+    "release.yml",
+    preflight,
+    "Resolve reusable prior evidence",
+    {
+      SOURCE_SHA: "${{ steps.lineage.outputs.selection_commit }}",
+    },
+  );
   add(
     violations,
     sourceJob.if === "needs.preflight.outputs.source_proof_reused != 'true'"
@@ -8688,7 +9227,7 @@ export function releaseFreezeBarrierWorkflowViolations(
       && sourceJob.uses === undefined
       && sourceJob.with === undefined
       && namedStep(sourceJob, "Refuse a second source proof") !== undefined,
-    "[freeze_barrier] release must make the post-calibration source-proof fallback unreachable",
+    "[freeze_barrier] release must make a second source-proof fallback unreachable",
   );
 
   const lineageSource = fs.readFileSync(

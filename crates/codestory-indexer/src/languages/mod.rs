@@ -422,9 +422,12 @@ mod tests {
         // Rust resolves through `semantic::RustSemanticResolver`, not the shared
         // name-only resolver; the generic flag must stay off.
         assert!(!rust.uses_generic_semantic_resolver);
-        // Rust's rule file emits no `call_syntax`, so it has no callsite marker.
-        assert!(rust.member_callsite_marker.is_none());
-        assert!(rust.graph_call_syntax.is_none());
+        assert_eq!(rust.member_callsite_marker, Some("syntax:rust-method-call"));
+        assert_eq!(rust.graph_call_syntax, Some("rust_method"));
+        assert_eq!(
+            member_callsite_marker_for_call_syntax("rust_method"),
+            Some("syntax:rust-method-call")
+        );
         // Rust's receiver-call inference is not a `language_receiver_call_specs`
         // collector; see `languages::rust`'s module docs.
         assert!(rust.receiver_call_specs.is_none());

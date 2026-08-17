@@ -14,10 +14,11 @@ function packet() {
       trace: ["explicit_extra_probes=1 source=request"],
     },
     answer: { citations: [citation] },
-    sufficiency: {
-      status: "partial",
-      covered_claims: [{ claim: "indexing feeds search", citations: [citation] }],
-      follow_up_commands: ["codestory-cli snippet --query WorkspaceIndexer --project ."],
+    disposition: {
+      kind: "drill_once",
+      drill: {
+        options: [{ id: "bounded_source_read:src%2Flib.rs" }],
+      },
     },
   };
 }
@@ -46,7 +47,7 @@ function proof() {
       anchors: [{ commands: [] }],
       bridges: [{ command: { command: "packet" } }],
       execution_boundaries: [{ command: "packet" }],
-      next_commands: pairedPacket.sufficiency.follow_up_commands,
+      next_commands: (pairedPacket.disposition.drill?.options ?? []).map((option) => option.id),
     },
     summary: { full_report_json: "drill-report.json", full_report_markdown: "drill-report.md" },
     markdown: "# Drill\nevidence_packet: packet\n",
@@ -66,10 +67,10 @@ test("paired packet and drill proof accepts one matching packet execution", () =
       schema_version: 3,
       graph_hash: "graph",
     },
-    sufficiency: "partial",
+    sufficiency: "drill_once",
     citation_count: 1,
     explicit_probes: ["WorkspaceIndexer"],
-    follow_up_commands: ["codestory-cli snippet --query WorkspaceIndexer --project ."],
+    follow_up_commands: ["bounded_source_read:src%2Flib.rs"],
     packet_execution_count: 1,
     artifacts: ["drill-report.json", "drill-report.md", "drill-summary.json"],
   });

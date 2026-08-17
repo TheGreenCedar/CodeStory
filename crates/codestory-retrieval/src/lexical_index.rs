@@ -4,12 +4,14 @@ use anyhow::{Context, Result, bail};
 use codestory_contracts::api::SearchTargetDto;
 use codestory_contracts::owned_artifacts::sqlite_file_with_sidecars;
 use codestory_contracts::validation_receipts::SealedReceiptCache;
-use codestory_store::{FileRole, SourcePolicyExclusionPolicyIdentity, Store, SymbolSearchDoc};
+#[cfg(test)]
+use codestory_store::FileRole;
+use codestory_store::{SourcePolicyExclusionPolicyIdentity, Store, SymbolSearchDoc};
 use codestory_workspace::paths::sqlite_open_path;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -436,6 +438,82 @@ fn search_lexical_index_with_cancel_inner(
         None,
         cancelled.as_ref(),
     )?;
+    let document_count: usize = connection.query_row(
+        "SELECT file_count FROM lexical_metadata WHERE id = 1",
+        [],
+        |row| row.get::<_, u32>(0).map(|count| count as usize),
+    )?;
+    search_lexical_index_on_connection(
+        &connection,
+        query,
+        limit,
+        document_count,
+        &mut HashMap::new(),
+        cancelled.as_ref(),
+    )
+}
+
+pub(crate) fn search_lexical_index_batch_with_cancel(
+    shard_dir: &Path,
+    expected_sidecar_input_hash: &str,
+    queries: &[(String, usize)],
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<Vec<Vec<LexicalHit>>> {
+    if queries.is_empty() {
+        return Ok(Vec::new());
+    }
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
+    let Some(project_id) = shard_dir.file_name().and_then(|name| name.to_str()) else {
+        bail!("lexical shard path has no generation directory");
+    };
+    let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
+    let connection = open_read_only(&index_path)?;
+    let progress_cancelled = Arc::clone(&cancelled);
+    connection.progress_handler(1_000, Some(move || progress_cancelled()))?;
+    let _metadata = validate_open_database_metadata(
+        &connection,
+        project_id,
+        expected_sidecar_input_hash,
+        None,
+        cancelled.as_ref(),
+    )?;
+    let document_count: usize = connection.query_row(
+        "SELECT file_count FROM lexical_metadata WHERE id = 1",
+        [],
+        |row| row.get::<_, u32>(0).map(|count| count as usize),
+    )?;
+    let mut token_frequencies = HashMap::new();
+    queries
+        .iter()
+        .map(|(query, limit)| {
+            search_lexical_index_on_connection(
+                &connection,
+                query,
+                *limit,
+                document_count,
+                &mut token_frequencies,
+                cancelled.as_ref(),
+            )
+        })
+        .collect()
+}
+
+fn search_lexical_index_on_connection(
+    connection: &Connection,
+    query: &str,
+    limit: usize,
+    document_count: usize,
+    frequency_cache: &mut HashMap<String, usize>,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<Vec<LexicalHit>> {
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let tokens = lexical_query_tokens(query);
     if tokens.is_empty() {
         return Ok(Vec::new());
@@ -447,74 +525,110 @@ fn search_lexical_index_with_cancel_inner(
         .join(" OR ");
     let candidate_limit = limit.saturating_mul(64).clamp(256, MAX_CANDIDATES);
 
-    let command_tokens = command_query_tokens(query);
-    let document_count: usize = connection.query_row(
-        "SELECT file_count FROM lexical_metadata WHERE id = 1",
-        [],
-        |row| row.get::<_, u32>(0).map(|count| count as usize),
-    )?;
+    let mandatory_tokens = quoted_query_tokens(query);
     let mut token_frequencies = Vec::with_capacity(tokens.len());
     for token in &tokens {
         if cancelled() {
             bail!("lexical search cancelled");
         }
-        token_frequencies.push(fts_document_frequency(&connection, token)?);
+        let frequency = match frequency_cache.get(token) {
+            Some(frequency) => *frequency,
+            None => {
+                let frequency = fts_document_frequency(connection, token)?;
+                frequency_cache.insert(token.clone(), frequency);
+                frequency
+            }
+        };
+        token_frequencies.push(frequency);
     }
     let token_weights = token_frequencies
         .iter()
         .zip(tokens.iter())
         .map(|(frequency, token)| {
             let mut weight = lexical_token_weight(*frequency, document_count);
-            if command_tokens.iter().any(|command| command == token) {
+            if mandatory_tokens.iter().any(|mandatory| mandatory == token) {
                 weight *= 2.0;
             }
             weight
         })
         .collect::<Vec<_>>();
-    let total_weight = token_weights.iter().sum::<f32>();
-    let required_weight = required_lexical_match_weight(tokens.len(), total_weight);
+    // Coverage is a count of distinct query terms. Rarity weights order
+    // candidates within lexical lanes; an unmatched rare term must not veto
+    // the documented two-of-three or forty-percent admission contracts.
+    let required_match_count = required_lexical_match_count(tokens.len());
 
-    let mut statement = connection.prepare(
-        "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
-                d.source, d.node_id, d.symbol_name, d.start_line
-         FROM lexical_fts
-         JOIN lexical_documents d ON d.id = lexical_fts.rowid
-         WHERE lexical_fts MATCH ?1
-         ORDER BY bm25(lexical_fts, 8.0, 1.0)
-         LIMIT ?2",
+    let exact_candidates = query_exact_candidates(connection, query, candidate_limit)?;
+    let path_candidates = query_fts_candidates(
+        connection,
+        &fts_query,
+        candidate_limit,
+        LexicalCandidateOrder::Path,
     )?;
-    let rows = statement.query_map(params![fts_query, candidate_limit as i64], |row| {
-        let document = LexicalDocument {
-            path: row.get(0)?,
-            content: row.get(1)?,
-            source: LexicalDocumentSource::parse(&row.get::<_, String>(4)?).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    4,
-                    rusqlite::types::Type::Text,
-                    error.into(),
-                )
-            })?,
-            node_id: row.get(5)?,
-            symbol_name: row.get(6)?,
-            start_line: row.get(7)?,
-        };
-        Ok((document, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
-    })?;
+    let content_candidates = query_fts_candidates(
+        connection,
+        &fts_query,
+        candidate_limit,
+        LexicalCandidateOrder::Content,
+    )?;
+    let mut symbol_candidates = query_fts_candidates(
+        connection,
+        &fts_query,
+        candidate_limit,
+        LexicalCandidateOrder::SymbolDocument,
+    )?;
+    rank_symbol_candidates_by_identifier_overlap(&mut symbol_candidates, &tokens, &token_weights);
+
+    // Exact, path-BM25, content-BM25, and focused symbol documents are
+    // independent lexical recall lanes. Preserve every deterministic rank a
+    // document earned and fuse those ranks instead of comparing incompatible
+    // raw BM25 scores or collapsing them to one best lane. The coverage rule
+    // below remains the admission threshold.
+    let query_shape = crate::query_features::classify_query(query).shape;
+    let mut best_sublane_ranks = HashMap::new();
+    for (lane, candidates) in [
+        (LexicalSublane::Exact, exact_candidates.as_slice()),
+        (LexicalSublane::Path, path_candidates.as_slice()),
+        (LexicalSublane::Content, content_candidates.as_slice()),
+        (LexicalSublane::SymbolDocument, symbol_candidates.as_slice()),
+    ] {
+        record_lexical_sublane_ranks(&mut best_sublane_ranks, candidates, lane);
+    }
+
+    let mut candidates = exact_candidates;
+    candidates.extend(interleave_candidate_lanes(vec![
+        path_candidates,
+        content_candidates,
+        symbol_candidates,
+    ]));
 
     let mut hits = Vec::new();
-    for (index, row) in rows.enumerate() {
+    let mut seen = HashSet::new();
+    for (index, (document, normalized_path, normalized_content)) in
+        candidates.into_iter().enumerate()
+    {
         if index % 64 == 0 && cancelled() {
             bail!("lexical search cancelled");
         }
-        let (document, normalized_path, normalized_content) = row?;
+        let identity = lexical_candidate_identity(&document);
+        let sublane_ranks = best_sublane_ranks
+            .get(&identity)
+            .copied()
+            .unwrap_or_default();
+        if seen.contains(&identity) {
+            continue;
+        }
+        if seen.len() == MAX_CANDIDATES {
+            break;
+        }
+        seen.insert(identity);
         let token_match = lexical_token_match(
             &tokens,
             &token_weights,
             &normalized_path,
             &normalized_content,
         );
-        if token_match.matched_weight >= required_weight
-            && broad_query_path_gate(tokens.len(), &token_match)
+        if token_match.matched_count >= required_match_count
+            && mandatory_tokens_match(&mandatory_tokens, &normalized_path, &normalized_content)
         {
             let (target, matched_line, source_excerpt) =
                 if document.source == LexicalDocumentSource::LexicalSource {
@@ -528,7 +642,7 @@ fn search_lexical_index_with_cancel_inner(
                     (None, None, None)
                 };
             hits.push(LexicalHit {
-                score: score_lexical_match(&document.path, document.source, &token_match),
+                score: lexical_sublane_score(sublane_ranks, query_shape),
                 path: document.path,
                 source: document.source,
                 node_id: document.node_id,
@@ -548,9 +662,293 @@ fn search_lexical_index_with_cancel_inner(
             .partial_cmp(&left.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| lexical_source_rank(left.source).cmp(&lexical_source_rank(right.source)))
+            .then_with(|| left.node_id.cmp(&right.node_id))
+            .then_with(|| left.symbol_name.cmp(&right.symbol_name))
+            .then_with(|| left.start_line.cmp(&right.start_line))
     });
     hits.truncate(limit);
     Ok(hits)
+}
+
+fn lexical_source_rank(source: LexicalDocumentSource) -> u8 {
+    match source {
+        LexicalDocumentSource::SymbolDoc => 0,
+        LexicalDocumentSource::LexicalSource => 1,
+        LexicalDocumentSource::ComponentReport => 2,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LexicalCandidateOrder {
+    Path,
+    Content,
+    SymbolDocument,
+}
+
+type LexicalCandidate = (LexicalDocument, String, String);
+
+fn query_fts_candidates(
+    connection: &Connection,
+    fts_query: &str,
+    candidate_limit: usize,
+    order: LexicalCandidateOrder,
+) -> Result<Vec<LexicalCandidate>> {
+    let scoped_query = match order {
+        LexicalCandidateOrder::Path => format!("path : ({fts_query})"),
+        LexicalCandidateOrder::Content | LexicalCandidateOrder::SymbolDocument => {
+            format!("content : ({fts_query})")
+        }
+    };
+    let sql = match order {
+        LexicalCandidateOrder::Path => {
+            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1
+             ORDER BY bm25(lexical_fts, 8.0, 1.0), d.path, d.id
+             LIMIT ?2"
+        }
+        LexicalCandidateOrder::Content => {
+            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1
+             ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
+             LIMIT ?2"
+        }
+        LexicalCandidateOrder::SymbolDocument => {
+            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1 AND d.source = 'symbol_doc'
+             ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
+             LIMIT ?2"
+        }
+    };
+    let mut statement = connection.prepare_cached(sql)?;
+    let rows = statement.query_map(params![scoped_query, candidate_limit as i64], |row| {
+        let document = LexicalDocument {
+            path: row.get(0)?,
+            content: row.get(1)?,
+            source: LexicalDocumentSource::parse(&row.get::<_, String>(4)?).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })?,
+            node_id: row.get(5)?,
+            symbol_name: row.get(6)?,
+            start_line: row.get(7)?,
+        };
+        Ok((document, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn query_exact_candidates(
+    connection: &Connection,
+    query: &str,
+    candidate_limit: usize,
+) -> Result<Vec<LexicalCandidate>> {
+    let mut needles = quoted_query_tokens(query);
+    let intent = crate::query_features::classify_query(query).intent;
+    needles.extend(
+        intent
+            .exact_symbols
+            .into_iter()
+            .chain(intent.paths)
+            .map(|needle| needle.to_ascii_lowercase()),
+    );
+    needles.sort();
+    needles.dedup();
+
+    let mut candidates = Vec::new();
+    let mut statement = connection.prepare_cached(
+        "SELECT d.path, d.content, lower(lexical_fts.path), lower(lexical_fts.content),
+                d.source, d.node_id, d.symbol_name, d.start_line
+         FROM lexical_documents d
+         JOIN lexical_fts ON lexical_fts.rowid = d.id
+         WHERE lower(d.path) = ?1
+            OR lower(d.symbol_name) = ?1
+            OR lower(d.symbol_name) LIKE '%::' || ?1
+            OR lower(d.symbol_name) LIKE '%.' || ?1
+         ORDER BY d.path, d.source, d.node_id, d.symbol_name, d.start_line, d.id
+         LIMIT ?2",
+    )?;
+    for needle in needles {
+        let rows = statement.query_map(params![needle, candidate_limit as i64], |row| {
+            let document = LexicalDocument {
+                path: row.get(0)?,
+                content: row.get(1)?,
+                source: LexicalDocumentSource::parse(&row.get::<_, String>(4)?).map_err(
+                    |error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            error.into(),
+                        )
+                    },
+                )?,
+                node_id: row.get(5)?,
+                symbol_name: row.get(6)?,
+                start_line: row.get(7)?,
+            };
+            Ok((document, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+        })?;
+        candidates.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+        if candidates.len() >= candidate_limit {
+            break;
+        }
+    }
+    candidates.truncate(candidate_limit);
+    Ok(candidates)
+}
+
+fn interleave_candidate_lanes(lanes: Vec<Vec<LexicalCandidate>>) -> Vec<LexicalCandidate> {
+    let mut lanes = lanes.into_iter().map(Vec::into_iter).collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    loop {
+        let mut added = false;
+        for lane in &mut lanes {
+            if let Some(candidate) = lane.next() {
+                candidates.push(candidate);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    candidates
+}
+
+type LexicalCandidateIdentity = (String, u8, Option<String>, Option<String>, Option<u32>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexicalSublane {
+    Exact,
+    Path,
+    Content,
+    SymbolDocument,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LexicalSublaneRanks {
+    exact: Option<u32>,
+    path: Option<u32>,
+    content: Option<u32>,
+    symbol_document: Option<u32>,
+}
+
+impl LexicalSublaneRanks {
+    fn record(&mut self, lane: LexicalSublane, rank: u32) {
+        let slot = match lane {
+            LexicalSublane::Exact => &mut self.exact,
+            LexicalSublane::Path => &mut self.path,
+            LexicalSublane::Content => &mut self.content,
+            LexicalSublane::SymbolDocument => &mut self.symbol_document,
+        };
+        *slot = Some(slot.map_or(rank, |current| current.min(rank)));
+    }
+}
+
+fn record_lexical_sublane_ranks(
+    ranks: &mut HashMap<LexicalCandidateIdentity, LexicalSublaneRanks>,
+    candidates: &[LexicalCandidate],
+    lane: LexicalSublane,
+) {
+    for (index, (document, _, _)) in candidates.iter().enumerate() {
+        let candidate_rank = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        ranks
+            .entry(lexical_candidate_identity(document))
+            .or_default()
+            .record(lane, candidate_rank);
+    }
+}
+
+fn rank_symbol_candidates_by_identifier_overlap(
+    candidates: &mut [LexicalCandidate],
+    tokens: &[String],
+    token_weights: &[f32],
+) {
+    let original_order = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, (document, _, _))| (lexical_candidate_identity(document), index))
+        .collect::<HashMap<_, _>>();
+    candidates.sort_by(|left, right| {
+        symbol_identifier_overlap(&right.0, tokens, token_weights)
+            .partial_cmp(&symbol_identifier_overlap(&left.0, tokens, token_weights))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                original_order[&lexical_candidate_identity(&left.0)]
+                    .cmp(&original_order[&lexical_candidate_identity(&right.0)])
+            })
+    });
+}
+
+fn symbol_identifier_overlap(
+    document: &LexicalDocument,
+    tokens: &[String],
+    token_weights: &[f32],
+) -> f32 {
+    let Some(symbol_name) = document.symbol_name.as_deref() else {
+        return 0.0;
+    };
+    let normalized = normalize_lexical_text(symbol_name);
+    let symbol_tokens = normalized.split_whitespace().collect::<HashSet<_>>();
+    tokens
+        .iter()
+        .zip(token_weights.iter().copied())
+        .filter_map(|(token, weight)| symbol_tokens.contains(token.as_str()).then_some(weight))
+        .sum()
+}
+
+fn lexical_sublane_score(
+    ranks: LexicalSublaneRanks,
+    shape: crate::query_features::QueryShape,
+) -> f32 {
+    // Fuse only deterministic ranks. BM25 values from different FTS column
+    // weightings are not comparable, and aggregate file coverage must not
+    // erase a focused symbol-document signal. k=20 matches the outer hybrid
+    // ranker; the denominator normalizes a candidate ranked first in every
+    // lexical sublane to 1.0.
+    const RRF_K: f32 = 20.0;
+    let (exact_weight, path_weight, content_weight, symbol_weight) = match shape {
+        crate::query_features::QueryShape::PathLike => (2.0, 1.25, 1.0, 1.0),
+        crate::query_features::QueryShape::SymbolLike => (2.0, 0.75, 1.0, 1.5),
+        crate::query_features::QueryShape::NaturalLanguage
+        | crate::query_features::QueryShape::Mixed => (2.0, 1.0, 1.0, 1.25),
+    };
+    let weighted_rank =
+        |rank: Option<u32>, weight: f32| rank.map_or(0.0, |rank| weight / (RRF_K + rank as f32));
+    let score = weighted_rank(ranks.exact, exact_weight)
+        + weighted_rank(ranks.path, path_weight)
+        + weighted_rank(ranks.content, content_weight)
+        + weighted_rank(ranks.symbol_document, symbol_weight);
+    let maximum = (exact_weight + path_weight + content_weight + symbol_weight) / (RRF_K + 1.0);
+    (score / maximum).clamp(0.0, 1.0)
+}
+
+fn lexical_candidate_identity(document: &LexicalDocument) -> LexicalCandidateIdentity {
+    let source = match document.source {
+        LexicalDocumentSource::LexicalSource => 0,
+        LexicalDocumentSource::SymbolDoc => 1,
+        LexicalDocumentSource::ComponentReport => 2,
+    };
+    (
+        document.path.clone(),
+        source,
+        document.node_id.clone(),
+        document.symbol_name.clone(),
+        document.start_line,
+    )
 }
 
 pub fn shard_dir_for(lexical_data_dir: &Path, project_id: &str) -> PathBuf {
@@ -1376,11 +1774,10 @@ fn lexical_source_target(
 fn fts_document_frequency(connection: &Connection, token: &str) -> Result<usize> {
     let query = format!("\"{}\"*", token.replace('"', "\"\""));
     connection
-        .query_row(
-            "SELECT count(*) FROM lexical_fts WHERE lexical_fts MATCH ?1",
-            [query],
-            |row| row.get::<_, u32>(0).map(|count| count as usize),
-        )
+        .prepare_cached("SELECT count(*) FROM lexical_fts WHERE lexical_fts MATCH ?1")?
+        .query_row([query], |row| {
+            row.get::<_, u32>(0).map(|count| count as usize)
+        })
         .map_err(Into::into)
 }
 
@@ -1399,13 +1796,13 @@ fn lexical_query_tokens(query: &str) -> Vec<String> {
     tokens
 }
 
-fn command_query_tokens(query: &str) -> Vec<String> {
+fn quoted_query_tokens(query: &str) -> Vec<String> {
     let mut tokens = Vec::new();
-    let mut in_backticks = false;
+    let mut delimiter = None;
     let mut current = String::new();
     for character in query.chars() {
-        if character == '`' {
-            if in_backticks {
+        if delimiter == Some(character) {
+            if !current.is_empty() {
                 for token in lexical_query_tokens(&current) {
                     if !tokens.iter().any(|existing| existing == &token) {
                         tokens.push(token);
@@ -1413,8 +1810,10 @@ fn command_query_tokens(query: &str) -> Vec<String> {
                 }
                 current.clear();
             }
-            in_backticks = !in_backticks;
-        } else if in_backticks {
+            delimiter = None;
+        } else if delimiter.is_none() && matches!(character, '`' | '"') {
+            delimiter = Some(character);
+        } else if delimiter.is_some() {
             current.push(character);
         }
     }
@@ -1432,21 +1831,22 @@ fn lexical_token_weight(document_frequency: usize, document_count: usize) -> f32
     (1.0 + rarity).clamp(0.25, 5.0)
 }
 
-fn required_lexical_match_weight(token_count: usize, total_weight: f32) -> f32 {
-    if token_count <= 3 {
-        total_weight
-    } else {
-        (total_weight * 0.28).max(2.5)
+fn required_lexical_match_count(token_count: usize) -> usize {
+    match token_count {
+        0 => 0,
+        1 => 1,
+        2 | 3 => 2,
+        _ => token_count.saturating_mul(2).saturating_add(4) / 5,
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct LexicalTokenMatch {
+    matched_count: usize,
     matched_weight: f32,
     path_weight: f32,
     content_weight: f32,
     total_weight: f32,
-    meaningful_path_weight: f32,
 }
 
 fn lexical_token_match(
@@ -1456,34 +1856,28 @@ fn lexical_token_match(
     content_lower: &str,
 ) -> LexicalTokenMatch {
     let mut result = LexicalTokenMatch {
+        matched_count: 0,
         matched_weight: 0.0,
         path_weight: 0.0,
         content_weight: 0.0,
         total_weight: 0.0,
-        meaningful_path_weight: 0.0,
     };
     for (token, weight) in tokens.iter().zip(token_weights.iter().copied()) {
         result.total_weight += weight;
         let path_factor = path_match_factor(path_lower, token);
         let content_match = content_lower.contains(token.as_str());
         if path_factor > 0.0 || content_match {
+            result.matched_count += 1;
             result.matched_weight += weight;
         }
         if path_factor > 0.0 {
             result.path_weight += weight * path_factor;
-            if path_factor >= 1.0 && weight >= 1.5 {
-                result.meaningful_path_weight += weight;
-            }
         }
         if content_match {
             result.content_weight += weight;
         }
     }
     result
-}
-
-fn broad_query_path_gate(token_count: usize, token_match: &LexicalTokenMatch) -> bool {
-    token_count < 8 || token_match.meaningful_path_weight > 0.0
 }
 
 fn path_match_factor(normalized_path: &str, token: &str) -> f32 {
@@ -1496,6 +1890,17 @@ fn path_match_factor(normalized_path: &str, token: &str) -> f32 {
     }
 }
 
+fn mandatory_tokens_match(
+    mandatory_tokens: &[String],
+    normalized_path: &str,
+    normalized_content: &str,
+) -> bool {
+    mandatory_tokens.iter().all(|token| {
+        normalized_path.contains(token.as_str()) || normalized_content.contains(token.as_str())
+    })
+}
+
+#[cfg(test)]
 fn score_lexical_match(
     path: &str,
     source: LexicalDocumentSource,
@@ -1506,28 +1911,55 @@ fn score_lexical_match(
     } else {
         token_match.matched_weight / token_match.total_weight
     };
-    let mut score = 0.20_f32
-        + coverage * 0.25
-        + token_match.path_weight * 0.09
-        + token_match.content_weight * 0.035;
-    let path_lower = path.replace('\\', "/").to_ascii_lowercase();
-    if path_lower.contains("/src/") || path_lower.starts_with("src/") {
-        score += 0.04;
-    }
-    if source == LexicalDocumentSource::ComponentReport {
-        score += 0.08;
+    let path_coverage = if token_match.total_weight <= 0.0 {
+        0.0
     } else {
-        score *= match FileRole::classify_path(Path::new(path)) {
-            FileRole::Entrypoint => 1.08,
-            FileRole::Source => 1.0,
-            FileRole::Test => 0.68,
-            FileRole::Docs => 0.72,
-            FileRole::Benchmark => 0.64,
-            FileRole::Generated => 0.55,
-            FileRole::Vendor => 0.45,
-        };
+        token_match.path_weight / token_match.total_weight
+    };
+    let content_coverage = if token_match.total_weight <= 0.0 {
+        0.0
+    } else {
+        token_match.content_weight / token_match.total_weight
+    };
+    let role_prior = match lexical_file_role(path) {
+        FileRole::Entrypoint => 1.0,
+        FileRole::Source => 0.9,
+        FileRole::Test => 0.55,
+        FileRole::Docs => 0.50,
+        FileRole::Benchmark => 0.45,
+        FileRole::Generated => 0.35,
+        FileRole::Vendor => 0.25,
+    };
+    let source_quality = match source {
+        LexicalDocumentSource::SymbolDoc => 1.0,
+        LexicalDocumentSource::LexicalSource => 0.9,
+        LexicalDocumentSource::ComponentReport => 0.8,
+    };
+    (0.55 * coverage
+        + 0.20 * content_coverage.clamp(0.0, 1.0)
+        + 0.15 * path_coverage.clamp(0.0, 1.0)
+        + 0.05 * role_prior
+        + 0.05 * source_quality)
+        .clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+fn lexical_file_role(path: &str) -> FileRole {
+    let path = Path::new(path);
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "md" | "mdx" | "rst"
+            )
+        })
+    {
+        FileRole::Docs
+    } else {
+        FileRole::classify_path(path)
     }
-    score.min(0.99)
 }
 
 #[cfg(test)]
@@ -1666,6 +2098,257 @@ mod tests {
                 .is_empty()
         );
         assert!(search_lexical_index(&shard_a, "wrong-input", "handler", 8).is_err());
+    }
+
+    #[test]
+    fn lexical_batch_is_serial_equivalent() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("src/alpha_handler.rs"),
+            "fn alpha_handler() { beta_router(); }",
+        )
+        .expect("alpha");
+        std::fs::write(
+            project.path().join("src/beta_router.rs"),
+            "fn beta_router() {}",
+        )
+        .expect("beta");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "batch", "input");
+        let requests = vec![
+            ("alpha handler".to_string(), 4),
+            ("beta router".to_string(), 2),
+        ];
+
+        let batched =
+            search_lexical_index_batch_with_cancel(&shard, "input", &requests, Arc::new(|| false))
+                .expect("batch search");
+        let serial = requests
+            .iter()
+            .map(|(query, limit)| search_lexical_index(&shard, "input", query, *limit))
+            .collect::<Result<Vec<_>>>()
+            .expect("serial searches");
+        let identity = |hits: &[LexicalHit]| {
+            hits.iter()
+                .map(|hit| {
+                    (
+                        hit.path.clone(),
+                        hit.node_id.clone(),
+                        hit.symbol_name.clone(),
+                        hit.start_line,
+                        hit.score.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            batched
+                .iter()
+                .map(|hits| identity(hits))
+                .collect::<Vec<_>>(),
+            serial.iter().map(|hits| identity(hits)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn lexical_union_retains_an_independent_content_candidate() {
+        let project = TempDir::new().expect("project");
+        let path_matches = project.path().join("needle");
+        std::fs::create_dir_all(&path_matches).expect("path matches");
+        for index in 0..300 {
+            std::fs::write(
+                path_matches.join(format!("path_match_{index:03}.rs")),
+                "fn unrelated() {}",
+            )
+            .expect("path candidate");
+        }
+        let content_match = project.path().join("src/content_match.rs");
+        std::fs::create_dir_all(content_match.parent().expect("parent")).expect("src");
+        std::fs::write(&content_match, "fn content_match() { /* needle */ }")
+            .expect("content candidate");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "union", "input");
+
+        let hits = search_lexical_index(&shard, "input", "needle", 8).expect("search");
+
+        assert!(
+            hits.iter().any(|hit| hit.path == "src/content_match.rs"),
+            "the content lane must survive a large independent path lane: {hits:#?}"
+        );
+    }
+
+    #[test]
+    fn focused_symbol_lane_beats_scattered_whole_file_term_coverage() {
+        let root = TempDir::new().expect("root");
+        let generation = "focused-symbol";
+        let shard = shard_dir_for(root.path(), generation);
+        std::fs::create_dir_all(&shard).expect("shard");
+        let documents = vec![
+            LexicalDocument {
+                path: "src/broad.rs".to_string(),
+                content: "request dispatch output evidence indexed symbol hits retrieval shadow"
+                    .to_string(),
+                source: LexicalDocumentSource::LexicalSource,
+                node_id: None,
+                symbol_name: None,
+                start_line: None,
+            },
+            LexicalDocument {
+                path: "src/primary.rs".to_string(),
+                content:
+                    "fn request_dispatch_output_evidence_indexed_symbol_hits_retrieval_shadow()"
+                        .to_string(),
+                source: LexicalDocumentSource::SymbolDoc,
+                node_id: Some("symbol:primary-request-dispatch".to_string()),
+                symbol_name: Some(
+                    "request_dispatch_output_evidence_indexed_symbol_hits_retrieval_shadow"
+                        .to_string(),
+                ),
+                start_line: Some(4),
+            },
+            LexicalDocument {
+                path: "src/output.rs".to_string(),
+                content: "fn append_request_evidence_symbol() // indexed output dispatch result"
+                    .to_string(),
+                source: LexicalDocumentSource::SymbolDoc,
+                node_id: Some("symbol:append-request-evidence".to_string()),
+                symbol_name: Some("append_request_evidence_symbol".to_string()),
+                start_line: Some(12),
+            },
+        ];
+        let coverage = LexicalCoverage {
+            discovered_files: 3,
+            indexed_files: 3,
+            ..Default::default()
+        };
+        let fingerprint = LexicalInputFingerprint {
+            file_count: documents.len() as u32,
+            hash: lexical_documents_hash(&documents, &coverage),
+            coverage: coverage.clone(),
+        };
+        write_lexical_database(
+            &shard.join(LEXICAL_INDEX_FILE),
+            generation,
+            "focused-symbol-input",
+            &fingerprint,
+            |visit| {
+                for document in &documents {
+                    visit(document)?;
+                }
+                Ok(coverage.clone())
+            },
+        )
+        .expect("write focused lexical shard");
+
+        let hits = search_lexical_index(
+            &shard,
+            "focused-symbol-input",
+            "request dispatch output evidence indexed symbol hits retrieval shadow",
+            3,
+        )
+        .expect("search");
+
+        let focused_position = hits
+            .iter()
+            .position(|hit| hit.symbol_name.as_deref() == Some("append_request_evidence_symbol"))
+            .expect("second-ranked focused symbol is retained");
+        let broad_position = hits
+            .iter()
+            .position(|hit| hit.path == "src/broad.rs")
+            .expect("broad source candidate is retained");
+        assert!(
+            focused_position < broad_position,
+            "a focused symbol-document rank must survive independent sublane fusion"
+        );
+    }
+
+    #[test]
+    fn lexical_sublane_fusion_does_not_collapse_to_the_minimum_rank() {
+        let broad_file = LexicalSublaneRanks {
+            content: Some(1),
+            ..Default::default()
+        };
+        let focused_symbol = LexicalSublaneRanks {
+            symbol_document: Some(2),
+            ..Default::default()
+        };
+
+        assert!(
+            lexical_sublane_score(focused_symbol, crate::query_features::QueryShape::Mixed)
+                > lexical_sublane_score(broad_file, crate::query_features::QueryShape::Mixed)
+        );
+    }
+
+    #[test]
+    fn lexical_recall_requires_quoted_entities_without_a_long_query_path_gate() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("src/flow.rs"),
+            "packet search dispatch builds ranked results through semantic graph retrieval",
+        )
+        .expect("complete source");
+        std::fs::write(
+            project.path().join("src/distractor.rs"),
+            "packet search dispatch builds ranked results through semantic graph",
+        )
+        .expect("missing quoted entity");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "quoted", "input");
+
+        let hits = search_lexical_index(
+            &shard,
+            "input",
+            "explain packet search dispatch builds ranked results through semantic graph `retrieval`",
+            8,
+        )
+        .expect("search");
+
+        assert_eq!(
+            hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/flow.rs"]
+        );
+    }
+
+    #[test]
+    fn lexical_admission_counts_terms_and_keeps_quoted_terms_mandatory() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("src/text_checks.rs"),
+            "fn isEmpty() -> bool { true }",
+        )
+        .expect("two-term source");
+        std::fs::write(
+            project.path().join("src/cache_state.rs"),
+            "fn isEmpty() -> bool { false }",
+        )
+        .expect("one-term source");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "term-count", "input");
+
+        let hits = search_lexical_index(&shard, "input", "text empty predicate", 8)
+            .expect("unquoted search");
+        assert_eq!(
+            hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/text_checks.rs"],
+            "two of three non-stopwords qualify while one of three does not"
+        );
+
+        let quoted = search_lexical_index(&shard, "input", "text empty `predicate`", 8)
+            .expect("quoted search");
+        assert!(
+            quoted.is_empty(),
+            "count-based admission must not weaken quoted-term requirements"
+        );
+
+        assert_eq!(required_lexical_match_count(1), 1);
+        assert_eq!(required_lexical_match_count(2), 2);
+        assert_eq!(required_lexical_match_count(3), 2);
+        assert_eq!(required_lexical_match_count(4), 2);
+        assert_eq!(required_lexical_match_count(12), 5);
     }
 
     #[test]
@@ -2100,7 +2783,7 @@ mod tests {
         assert_eq!(rebuilt, before);
         let shard = shard_dir_for(data.path(), "owned-exclusions");
         assert!(
-            search_lexical_index(&shard, "input", "generation_owned_json", 8)
+            search_lexical_index(&shard, "input", "`generation_owned_json`", 8)
                 .expect("search owned token")
                 .is_empty()
         );
@@ -2442,7 +3125,7 @@ mod tests {
             .iter()
             .map(|frequency| lexical_token_weight(*frequency, documents.len()))
             .collect::<Vec<_>>();
-        let required = required_lexical_match_weight(tokens.len(), weights.iter().sum());
+        let required = required_lexical_match_count(tokens.len());
         let mut hits = documents
             .iter()
             .filter_map(|document| {
@@ -2452,7 +3135,7 @@ mod tests {
                     &document.path.to_ascii_lowercase(),
                     &document.content.to_ascii_lowercase(),
                 );
-                (token_match.matched_weight >= required).then(|| {
+                (token_match.matched_count >= required).then(|| {
                     let (target, matched_line, source_excerpt) =
                         if document.source == LexicalDocumentSource::LexicalSource {
                             lexical_source_target(

@@ -42,7 +42,7 @@ from .foundation import (
     ProofFailure,
     require,
 )
-from .publication_protocol import read_jsonl
+from .publication_protocol import PUBLICATION_CRASH_EXIT_TIMEOUT, read_jsonl
 from .qualification_directory_binding import (
     QUALIFICATION_DIRECTORY_ENV,
     QUALIFICATION_DIRECTORY_MISMATCH,
@@ -97,6 +97,15 @@ while time.monotonic() < deadline:
         time.sleep(0.01)
         continue
     answered.add(sequence)
+    snapshot = None
+    if action == "crash_server":
+        recorded = json.loads(state.read_text(encoding="utf-8"))
+        snapshot = {
+            "process": {
+                "pid": os.getpid(),
+                "process_start_id": recorded["process_start_id"],
+            }
+        }
     with open(events_path, "a", encoding="utf-8") as handle:
         handle.write(
             json.dumps(
@@ -105,7 +114,7 @@ while time.monotonic() < deadline:
                     "sequence": sequence,
                     "action": action,
                     "status": "accepted" if action == "crash_server" else "completed",
-                    "snapshot": None,
+                    "snapshot": snapshot,
                 },
                 sort_keys=True,
             )
@@ -315,6 +324,7 @@ class _Fixture:
             timeout=_PROOF_BUDGET_SECS,
             server_cleanup_control=self.control,
             label=_LABEL,
+            crash_exit_allowance_secs=0.25,
         )
 
     def parent_events(self) -> list[dict]:
@@ -412,7 +422,7 @@ def _a_replaced_server_lets_every_producer_move_together() -> None:
 
 
 def _a_surviving_parent_directory_server_fails_by_name() -> None:
-    """The restored defect: it must be named, not waited out.
+    """The restored defect: exact exit must precede every successor query.
 
     This is proof run 30600248269 in miniature. The parent-directory server
     outlives the crash control, so it is still the server every later control
@@ -432,14 +442,20 @@ def _a_surviving_parent_directory_server_fails_by_name() -> None:
                 f" budget ({elapsed:.1f}s) instead of failing by name",
             )
             require(
-                QUALIFICATION_DIRECTORY_MISMATCH in message,
-                f"the directory mismatch was not named: {message}",
+                message.startswith(PUBLICATION_CRASH_EXIT_TIMEOUT + ":")
+                and "pid " in message
+                and "start identity" in message,
+                f"the surviving exact predecessor was not named: {message}",
             )
             require(
-                str(fixture.private_root.resolve()) in message
-                and str(fixture.artifact_root.resolve()) in message,
-                "the directory mismatch did not name the directory the server"
-                f" is bound to and the one the controls move to: {message}",
+                bound_qualification_directory(fixture.env)
+                == str(fixture.private_root.resolve())
+                and not (
+                    fixture.artifact_root
+                    / f"publication-{_LABEL}-successor-worker-output.json"
+                ).exists(),
+                "a surviving predecessor let the directory move or successor"
+                " worker run before exact exit",
             )
             require(
                 "timed out after" not in message,

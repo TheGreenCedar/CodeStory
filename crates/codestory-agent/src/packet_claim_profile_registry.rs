@@ -40,7 +40,7 @@ pub const PACKET_CLAIM_PROFILE_SCHEMA_VERSION: u32 = 2;
 ///
 /// The ratchet only ever falls: a new profile has to arrive contracted, and migrating a pending
 /// profile has to lower this number and the document's `pending_ratchet` in the same diff.
-pub const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize = 13;
+pub const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize = 0;
 
 /// Typed reasons a contracted profile is not runtime-valid.
 ///
@@ -377,13 +377,25 @@ pub fn load_claim_profile_registry(
     document: &str,
     known_ids: &[&'static str],
 ) -> ClaimProfileRegistry {
+    load_claim_profile_registry_with_ceiling(
+        document,
+        known_ids,
+        PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET,
+    )
+}
+
+fn load_claim_profile_registry_with_ceiling(
+    document: &str,
+    known_ids: &[&'static str],
+    pending_ceiling: usize,
+) -> ClaimProfileRegistry {
     let Ok(parsed) = serde_json::from_str::<ClaimProfileDocument>(document) else {
         return ClaimProfileRegistry::refused(ClaimProfileDocumentRejection::Malformed);
     };
     if parsed.schema_version != PACKET_CLAIM_PROFILE_SCHEMA_VERSION {
         return ClaimProfileRegistry::refused(ClaimProfileDocumentRejection::SchemaVersionMismatch);
     }
-    if parsed.pending_ratchet > PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET {
+    if parsed.pending_ratchet > pending_ceiling {
         return ClaimProfileRegistry::refused(ClaimProfileDocumentRejection::RatchetAboveCeiling);
     }
 
@@ -542,9 +554,13 @@ mod tests {
         )
     }
 
+    fn load_parser_fixture(document: &str, known_ids: &[&'static str]) -> ClaimProfileRegistry {
+        load_claim_profile_registry_with_ceiling(document, known_ids, usize::MAX)
+    }
+
     #[test]
     fn a_well_formed_document_loads_both_statuses() {
-        let registry = load_claim_profile_registry(
+        let registry = load_parser_fixture(
             &document(
                 1,
                 &[
@@ -566,7 +582,7 @@ mod tests {
 
     #[test]
     fn a_malformed_document_serves_no_profiles_at_all() {
-        let registry = load_claim_profile_registry("{ not json", KNOWN);
+        let registry = load_parser_fixture("{ not json", KNOWN);
         assert_eq!(
             registry.document_rejection(),
             Some(ClaimProfileDocumentRejection::Malformed)
@@ -580,7 +596,7 @@ mod tests {
             &format!("\"schema_version\": {PACKET_CLAIM_PROFILE_SCHEMA_VERSION}"),
             "\"schema_version\": 99",
         );
-        let registry = load_claim_profile_registry(&raw, KNOWN);
+        let registry = load_parser_fixture(&raw, KNOWN);
         assert_eq!(
             registry.document_rejection(),
             Some(ClaimProfileDocumentRejection::SchemaVersionMismatch)
@@ -705,7 +721,7 @@ mod tests {
         for (row, expected) in cases {
             // The ratchet is slack here on purpose: a rejection that stops rejecting has to
             // surface as an accepted row, not as a ratchet overflow that hides which case broke.
-            let registry = load_claim_profile_registry(&document(2, &[good.clone(), row]), KNOWN);
+            let registry = load_parser_fixture(&document(2, &[good.clone(), row]), KNOWN);
             assert_eq!(registry.document_rejection(), None);
             assert_eq!(
                 registry.profiles().len(),
@@ -730,7 +746,7 @@ mod tests {
             "\"status\": \"pending_migration\"",
             "\"status\": \"pending_migration\", \"waiver\": true",
         );
-        let registry = load_claim_profile_registry(&document(1, &[raw]), KNOWN);
+        let registry = load_parser_fixture(&document(1, &[raw]), KNOWN);
         assert_eq!(
             registry.document_rejection(),
             Some(ClaimProfileDocumentRejection::Malformed)
@@ -740,7 +756,7 @@ mod tests {
 
     #[test]
     fn a_duplicated_identity_keeps_the_first_row_and_refuses_the_second() {
-        let registry = load_claim_profile_registry(
+        let registry = load_parser_fixture(
             &document(
                 1,
                 &[pending_row("sql-schema"), contracted_row("sql-schema")],

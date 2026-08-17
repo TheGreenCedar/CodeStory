@@ -20,7 +20,7 @@ from .process_identity import process_start_identity
 from .runtime_bootstrap_types import ColdProof, ContinuityProof, HostPair, RuntimeSetup
 from .server_engine_identity import engine_identity
 from .server_identity import server_snapshot
-from .subprocess_control import McpProcess
+from .subprocess_control import McpProcess, mcp_search_arguments
 
 
 def _managed_runtime(
@@ -109,7 +109,7 @@ def _live_retrieval(
             "packet-a",
         )
     live_tasks["search-b-live"] = lambda: hosts.host_b.search_until_ready(
-        {"project": str(setup.project_b), "query": setup.query_b, "why": True},
+        mcp_search_arguments(setup.project_b, setup.query_b),
         "search-b-live",
     )
     run_parallel(live_tasks)
@@ -155,7 +155,7 @@ def _continuity_proof(
 ) -> ContinuityProof:
     hosts.host_a.kill()
     hosts.host_b.search_until_ready(
-        {"project": str(setup.project_b), "query": setup.query_b, "why": True},
+        mcp_search_arguments(setup.project_b, setup.query_b),
         "survivor-search",
     )
     survivor = server_snapshot(
@@ -194,7 +194,7 @@ def _continuity_proof(
         )
         host_c.initialize()
         host_c.search_until_ready(
-            {"project": str(rejoin_project), "query": rejoin_query, "why": True},
+            mcp_search_arguments(rejoin_project, rejoin_query),
             "rejoin-search",
         )
         diagnostics = host_c.engine_diagnostics(rejoin_project, "rejoin-diagnostics")

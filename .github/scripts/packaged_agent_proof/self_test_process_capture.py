@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from .foundation import ProofFailure, require
+from .process_identity import ExactProcessExitWaiter, process_start_identity
 from .subprocess_control import run
 
 _DIRECT_STDOUT = "direct-child-stdout\n"
@@ -44,6 +45,7 @@ def _run_inherited_descendant_leg() -> None:
         _write_script(
             descendant_path,
             """
+import os
 import sys
 import time
 from pathlib import Path
@@ -51,7 +53,7 @@ from pathlib import Path
 ready = Path(sys.argv[1])
 release = Path(sys.argv[2])
 stopped = Path(sys.argv[3])
-ready.write_text("ready\\n", encoding="utf-8")
+ready.write_text(f"{os.getpid()}\\n", encoding="utf-8")
 deadline = time.monotonic() + 2.5
 while not release.exists() and time.monotonic() < deadline:
     time.sleep(0.01)
@@ -87,21 +89,36 @@ sys.stderr.flush()
             str(release_path),
             str(stopped_path),
         ]
-        started = time.perf_counter()
         result = run(
             command,
             env=os.environ.copy(),
             cwd=root,
             timeout=10,
         )
-        elapsed = time.perf_counter() - started
-        release_path.write_text("release\n", encoding="utf-8")
-        _wait_for_path(stopped_path, 2)
         require(
-            elapsed < 1.5,
+            not stopped_path.exists(),
             "synchronous capture waited for an inheriting descendant instead "
-            f"of only the direct child ({elapsed:.3f}s)",
+            "of only the direct child",
         )
+        descendant_pid = int(ready_path.read_text(encoding="utf-8").strip())
+        target_os = (
+            "windows"
+            if os.name == "nt"
+            else ("macos" if sys.platform == "darwin" else "linux")
+        )
+        descendant_waiter = ExactProcessExitWaiter(
+            descendant_pid,
+            process_start_identity(descendant_pid),
+            target_os,
+        )
+        try:
+            release_path.write_text("release\n", encoding="utf-8")
+            _wait_for_path(stopped_path, 2)
+        finally:
+            try:
+                descendant_waiter.wait(3_000)
+            finally:
+                descendant_waiter.close()
         require(
             result["stdout"] == _DIRECT_STDOUT
             and result["stderr"] == _DIRECT_STDERR,

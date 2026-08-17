@@ -318,6 +318,9 @@ impl ScriptStream {
                 response
             }
             EmbeddingOperation::EmbedQuery { .. } => self.query_response(&request_id),
+            EmbeddingOperation::EmbedQueries { inputs, .. } => {
+                self.documents_response(&request_id, inputs.len())
+            }
             EmbeddingOperation::EmbedDocuments { inputs, .. } => {
                 self.documents_response(&request_id, inputs.len())
             }

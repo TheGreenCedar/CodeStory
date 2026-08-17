@@ -114,7 +114,6 @@ def _run_live_retrieval_case(
                 {
                     "project": str(_PROJECT_B),
                     "query": _QUERY_B,
-                    "why": True,
                 },
                 "search-b-live",
             ),
@@ -257,7 +256,6 @@ def _run_continuity_case(proof_tier: str, expected_project: Path) -> None:
                 {
                     "project": str(_PROJECT_B),
                     "query": _QUERY_B,
-                    "why": True,
                 },
                 "survivor-search",
             ),
@@ -280,7 +278,6 @@ def _run_continuity_case(proof_tier: str, expected_project: Path) -> None:
                 {
                     "project": str(expected_project),
                     "query": _QUERY_B if expected_project == _PROJECT_B else _QUERY_A,
-                    "why": True,
                 },
                 "rejoin-search",
             ),

@@ -18,28 +18,26 @@ const RUN_ID = 77;
 const RUN_ATTEMPT = 2;
 const NEXT_PERMITTED_MUTATION =
   "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
-const CALIBRATION_SOURCE_ACTIONS = [
-  "calibration-source-acceptance",
+const SOURCE_STABILIZATION_ACTIONS = [
+  "source-stabilization",
   "calibration",
   "generated-constant-freeze",
   "frozen-candidate-acceptance",
-  "source-proof",
   "qualification",
   "release",
 ];
 const FROZEN_CANDIDATE_ACTIONS = [
   "frozen-candidate-acceptance",
-  "source-proof",
   "qualification",
   "release",
 ];
 
 function receipt(overrides = {}) {
-  const phase = overrides.phase ?? "calibration_source";
+  const phase = overrides.phase ?? "source_stabilization";
   const frozen = phase === "frozen_candidate";
   const plannedActions = frozen
     ? FROZEN_CANDIDATE_ACTIONS
-    : CALIBRATION_SOURCE_ACTIONS;
+    : SOURCE_STABILIZATION_ACTIONS;
   const candidate = {
     schema: 3,
     authority: "github_actions",
@@ -85,10 +83,10 @@ const RECEIPT_CONTEXT = {
   tree: TREE,
   runId: String(RUN_ID),
   runAttempt: String(RUN_ATTEMPT),
-  phase: "calibration_source",
+  phase: "source_stabilization",
 };
 
-test("an exact clean pushed calibration-source Actions receipt passes", () => {
+test("an exact clean pushed source-stabilization Actions receipt passes", () => {
   validateReceipt(receipt(), RECEIPT_CONTEXT);
 });
 
@@ -102,14 +100,14 @@ test("a frozen-candidate receipt carries no future mutation and passes", () => {
   assert.equal(frozen.next_permitted_mutation, null);
 });
 
-test("calibration-source acceptance orders calibration before the sole source proof", () => {
+test("source stabilization finishes before calibration and has no later source proof", () => {
   const actions = receipt().planned_proof_actions;
+  assert.ok(actions.indexOf("source-stabilization") < actions.indexOf("calibration"));
   assert.ok(actions.indexOf("calibration") < actions.indexOf("generated-constant-freeze"));
-  assert.ok(actions.indexOf("generated-constant-freeze") < actions.indexOf("source-proof"));
-  assert.equal(actions.filter(action => action === "source-proof").length, 1);
+  assert.equal(actions.includes("source-proof"), false);
 });
 
-test("receipts cannot cross the calibration-source and frozen-candidate phases", () => {
+test("receipts cannot cross the source-stabilization and frozen-candidate phases", () => {
   assert.throws(
     () => validateReceipt(receipt(), {
       ...RECEIPT_CONTEXT,
@@ -169,20 +167,20 @@ for (const [name, mutate, pattern] of [
   }, /bind the open release PR/u],
   ["undeclared source change", (value) => {
     value.known_future_source_changes.push(".github/workflows/release.yml");
-  }, /future changes do not match calibration_source/u],
+  }, /future changes do not match source_stabilization/u],
   ["caller-selected proof actions", (value) => {
     value.planned_proof_actions = ["source-proof"];
-  }, /exact calibration_source actions/u],
+  }, /exact source_stabilization actions/u],
   ["proof-triggering label", (value) => {
     value.proof_triggering_labels = ["source-proof"];
-  }, /exact calibration_source actions/u],
+  }, /exact source_stabilization actions/u],
   ["cross-attempt receipt", (value) => {
     value.acceptance_run.attempt = RUN_ATTEMPT + 1;
   }, /exact Actions run and attempt/u],
   ["missing handoff field", (value) => { delete value.running_workflows; }, /running_workflows/u],
   ["missing next mutation", (value) => {
     value.next_permitted_mutation = "";
-  }, /next mutation does not match calibration_source/u],
+  }, /next mutation does not match source_stabilization/u],
   ["tampered receipt", (value) => {
     value.reusable_evidence.push("unauthenticated evidence");
   }, /digest/u],
@@ -258,7 +256,7 @@ function acceptanceProvenance() {
     commit: COMMIT,
     tree: TREE,
     digest,
-    phase: "calibration_source",
+    phase: "source_stabilization",
   };
 }
 
@@ -334,7 +332,7 @@ test("verify-file is executable and rejects a later commit", () => {
       "--run-attempt",
       String(RUN_ATTEMPT),
       "--phase",
-      "calibration_source",
+      "source_stabilization",
     ],
     { encoding: "utf8" },
   );
@@ -359,7 +357,7 @@ test("verify-file is executable and rejects a later commit", () => {
       "--run-attempt",
       String(RUN_ATTEMPT),
       "--phase",
-      "calibration_source",
+      "source_stabilization",
     ],
     { encoding: "utf8" },
   );
@@ -394,7 +392,7 @@ test("record-actions-receipt refuses to mint authority outside GitHub Actions", 
       "--run-attempt",
       String(RUN_ATTEMPT),
       "--phase",
-      "calibration_source",
+      "source_stabilization",
       "--support-prs-json",
       "[]",
       "--broad-workflow",
@@ -487,7 +485,7 @@ exit 9
       "--run-attempt",
       String(RUN_ATTEMPT),
       "--phase",
-      "calibration_source",
+      "source_stabilization",
       "--support-prs-json",
       "[]",
       "--reusable-evidence-json",

@@ -261,6 +261,7 @@ pub(in crate::per_user_embedding) fn poll_server_qualification_command(
                 "crash_server" => {
                     crash = true;
                     status = "accepted";
+                    snapshot = Some(state.snapshot());
                     Ok(())
                 }
                 "stall_native" => {

@@ -11,10 +11,7 @@ const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = path.resolve(path.dirname(scriptPath), "..");
 
 function citationKeys(packet) {
-  const citations = [
-    ...(packet.answer?.citations ?? []),
-    ...(packet.sufficiency?.covered_claims ?? []).flatMap((claim) => claim.citations ?? []),
-  ];
+  const citations = packet.answer?.citations ?? [];
   return [...new Set(citations.map((citation) => JSON.stringify([
     citation.node_id,
     citation.file_path ?? null,
@@ -58,12 +55,12 @@ export function verifyDrillPacketParity({ packet, report, summary, markdown, anc
   assert.deepEqual(generation(afterStatus), generation(beforeStatus), "retrieval generation changed during proof");
 
   const drillPacket = report.evidence_packet;
-  assert.deepEqual(drillPacket.sufficiency, packet.sufficiency, "sufficiency differs");
+  assert.deepEqual(drillPacket.disposition, packet.disposition, "disposition differs");
   assert.deepEqual(citationKeys(drillPacket), citationKeys(packet), "citations differ");
   assert.deepEqual(requestedProbes(drillPacket, anchors, "drill packet"), [...anchors].sort());
   assert.deepEqual(requestedProbes(packet, anchors, "paired packet"), [...anchors].sort());
-  assert.deepEqual(drillPacket.sufficiency.follow_up_commands, packet.sufficiency.follow_up_commands, "follow-ups differ");
-  assert.deepEqual(report.next_commands, packet.sufficiency.follow_up_commands, "drill report follow-ups differ");
+  const optionIds = (packet.disposition?.drill?.options ?? []).map((option) => option.id);
+  assert.deepEqual(report.next_commands, optionIds, "drill report option ids differ");
 
   assert.equal(report.question_search?.command, "packet", "drill did not report packet execution");
   assert.deepEqual(report.question_supplemental_searches ?? [], [], "drill ran supplemental searches");
@@ -78,10 +75,10 @@ export function verifyDrillPacketParity({ packet, report, summary, markdown, anc
   assert.match(markdown, /evidence_packet:/);
   return {
     generation: generation(beforeStatus),
-    sufficiency: packet.sufficiency.status,
+    sufficiency: packet.disposition?.kind,
     citation_count: citationKeys(packet).length,
     explicit_probes: requestedProbes(packet, anchors, "paired packet"),
-    follow_up_commands: packet.sufficiency.follow_up_commands,
+    follow_up_commands: optionIds,
     packet_execution_count: 1,
     artifacts: [...artifacts].sort(),
   };

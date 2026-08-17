@@ -61,8 +61,8 @@ def _preservation_unit_tests() -> None:
             encoding="utf-8",
         )
         (root / "qualification").mkdir()
-        (root / "qualification" / "gate.json").write_text(
-            '{"state": "open"}\n', encoding="utf-8"
+        (root / "qualification" / "gate.json").write_bytes(
+            b'{"state": "open"}\n'
         )
         symlink_supported = True
         try:
@@ -158,8 +158,8 @@ def _scripted_driver_failure_tests(fixture: FullStackFixture) -> None:
             ),
             encoding="utf-8",
         )
-        (artifact_root / "measurement-samples.partial.jsonl").write_text(
-            '{"sample_index": 0}\n', encoding="utf-8"
+        (artifact_root / "measurement-samples.partial.jsonl").write_bytes(
+            b'{"sample_index": 0}\n'
         )
         raise ProofFailure(_SCRIPTED_FAILURE)
 

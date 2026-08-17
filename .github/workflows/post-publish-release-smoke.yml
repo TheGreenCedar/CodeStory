@@ -619,12 +619,19 @@ jobs:
           INSTALLED_PLUGIN_ROOT: ${{ steps.installed.outputs.plugin_root }}
           INSTALLED_ATTESTATION: ${{ steps.installed.outputs.attestation }}
           INSTALLED_PLUGIN_DATA: ${{ steps.installed.outputs.plugin_data }}
+          CATALOG_DELIVERY_STATE: ${{ steps.delivery.outputs.state }}
+          DELIVERED_INSTALLER: ${{ steps.delivery.outputs.installer }}
+          EXPECTED_BACKEND: ${{ matrix.backend }}
         shell: bash
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
-          python .github/scripts/check-packaged-agent-proof.py \
+          proof_root=target/post-publish-installed-proof
+          rm -rf "$proof_root"
+          mkdir -p "$proof_root"
+          common=(
+            python .github/scripts/check-packaged-agent-proof.py
             --archive "$ASSET_ARCHIVE" \
             --checksum-file "$ASSET_CHECKSUM" \
             --expected-version "$RELEASE_VERSION" \
@@ -632,15 +639,49 @@ jobs:
             --plugin-root "$INSTALLED_PLUGIN_ROOT" \
             --plugin-handoff \
             --engine-policy accelerated \
-            --expected-backend "${{ matrix.backend }}" \
+            --expected-backend "$EXPECTED_BACKEND" \
             --proof-tier installed_runtime \
             --server-behavior-only \
             --installed-plugin-attestation "$INSTALLED_ATTESTATION" \
             --installed-plugin-data "$INSTALLED_PLUGIN_DATA" \
             --expected-source-sha "$source_sha" \
             --expected-source-tree "$source_tree" \
-            --timeout-secs 3600 \
-            --out-dir target/post-publish-installed-proof
+            --timeout-secs 3600
+          )
+          now_ms() {
+            python -c 'import time; print(time.time_ns() // 1_000_000)'
+          }
+          session_1_started_ms="$(now_ms)"
+          "${common[@]}" --out-dir "$proof_root/session-1"
+          session_1_finished_ms="$(now_ms)"
+          session_2_started_ms="$(now_ms)"
+          "${common[@]}" --out-dir "$proof_root/session-2"
+          session_2_finished_ms="$(now_ms)"
+          archive_sha256="$(python - "$ASSET_ARCHIVE" <<'PY'
+          import hashlib
+          import sys
+          with open(sys.argv[1], "rb") as source:
+              print(hashlib.file_digest(source, "sha256").hexdigest())
+          PY
+          )"
+          binary_sha256="$(jq -er '.package_contract.manifest.binary.sha256' "$proof_root/session-1/summary.json")"
+          node .github/scripts/restart-survival-receipt.mjs \
+            --session-1-summary "$proof_root/session-1/summary.json" \
+            --session-2-summary "$proof_root/session-2/summary.json" \
+            --install-attestation "$INSTALLED_ATTESTATION" \
+            --catalog-delivery-state "$CATALOG_DELIVERY_STATE" \
+            --expected-installer-identity "$DELIVERED_INSTALLER" \
+            --expected-source-commit "$source_sha" \
+            --expected-source-tree "$source_tree" \
+            --expected-version "$RELEASE_VERSION" \
+            --expected-archive-sha256 "$archive_sha256" \
+            --expected-binary-sha256 "$binary_sha256" \
+            --expected-backend "$EXPECTED_BACKEND" \
+            --session-1-start-ms "$session_1_started_ms" \
+            --session-1-finished-ms "$session_1_finished_ms" \
+            --session-2-start-ms "$session_2_started_ms" \
+            --session-2-finished-ms "$session_2_finished_ms" \
+            --out "$proof_root/restart-survival.json"
 
       - name: Emit authenticated post-publish release cells
         if: inputs.emit_release_cells

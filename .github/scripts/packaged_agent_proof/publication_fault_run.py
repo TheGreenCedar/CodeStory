@@ -181,7 +181,7 @@ def _run_fault(
         # 2's whole purpose is to end that server, so its exit proves nothing
         # about this wait. Only the candidate process -- which nothing replaces
         # -- can fail it.
-        send_server_qualification_control(
+        crash_event = send_server_qualification_control(
             private_root,
             nonce,
             sequence=2,
@@ -204,6 +204,8 @@ def _run_fault(
             fixture.project,
             private_root,
             nonce,
+            crash_event=crash_event,
+            candidate_producer=candidate_producer,
             executable_sha256=executable_sha256,
             timeout=timeout,
         )

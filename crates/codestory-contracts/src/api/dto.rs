@@ -2787,8 +2787,8 @@ pub struct AgentAnswerDto {
 #[serde(rename_all = "snake_case")]
 pub enum PacketBudgetModeDto {
     Tiny,
-    #[default]
     Compact,
+    #[default]
     Standard,
     Deep,
 }
@@ -2863,6 +2863,13 @@ pub enum PacketObligationProofStatusDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketObligationCarrierEdgeProofDto {
+    pub carrier_node_id: NodeId,
+    pub edge_id: EdgeId,
+    pub edge_kind: EdgeKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct PacketClaimObligationDto {
     pub id: String,
     pub kind: PacketClaimObligationKindDto,
@@ -2887,6 +2894,11 @@ pub struct PacketClaimObligationDto {
     pub carrier_node_ids: Vec<NodeId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carrier_paths: Vec<String>,
+    /// Exact typed edge receipts that remain serialized with the carrier in the final packet.
+    /// Trimming the corresponding trail edge removes its receipt and demotes only that obligation;
+    /// a global omission marker never substitutes for the missing typed edge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carrier_edge_proofs: Vec<PacketObligationCarrierEdgeProofDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_next_candidates: Vec<String>,
 }
@@ -3100,6 +3112,16 @@ pub struct AgentPacketRequestDto {
     pub include_evidence: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_budget_ms: Option<u32>,
+    /// Parent packet identity for a generation-bound DrillOnce continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_packet_id: Option<String>,
+    /// Option ids from that parent's `disposition.drill.options`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub option_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_generation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_generation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -3131,13 +3153,246 @@ pub struct PacketBudgetDto {
     pub next_deeper_command: Option<String>,
 }
 
+/// Compiled evidence atom the agent judges. Compact text projects these first.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum PacketSufficiencyStatusDto {
-    Sufficient,
-    Partial,
-    #[serde(rename = "blocked", alias = "insufficient")]
-    Insufficient,
+pub enum SupportUnitKindDto {
+    SymbolLocation,
+    SourceRange,
+    TypedGraphEdge,
+    CompleteQueryNegative,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct SupportUnitDto {
+    pub id: String,
+    pub kind: SupportUnitKindDto,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+}
+
+/// Machine stop/drill classification. Runtime compile owns this; adapters must not
+/// re-run a budget fixpoint that can change it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketDispositionKindDto {
+    Supported,
+    DrillOnce,
+    NotEstablished,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DrillGapKindDto {
+    DeadlineLostCandidate,
+    OmittedMandatorySupport,
+    BoundedSourceRead,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct DrillOptionDto {
+    pub id: String,
+    pub gap_id: String,
+    pub kind: DrillGapKindDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+}
+
+pub const PACKET_DRILL_MAX_OPTIONS: usize = 8;
+pub const PACKET_DRILL_MAX_BYTES: u32 = 32 * 1024;
+pub const PACKET_DRILL_MAX_HITS: u32 = 8;
+pub const PACKET_DRILL_MAX_DEPTH: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct BoundedDrillPlanDto {
+    pub parent_packet_id: String,
+    pub core_generation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_generation: Option<String>,
+    #[serde(default)]
+    pub gap_ids: Vec<String>,
+    #[serde(default)]
+    pub options: Vec<DrillOptionDto>,
+    pub max_bytes: u32,
+    pub max_hits: u32,
+    pub max_depth: u32,
+    /// `1` when DrillOnce is first emitted; `0` after that drill executes. Merge
+    /// cannot emit another drill.
+    pub remaining_rounds: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketDispositionDto {
+    pub kind: PacketDispositionKindDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drill: Option<BoundedDrillPlanDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omission_receipts: Vec<String>,
+}
+
+impl PacketDispositionDto {
+    pub fn supported() -> Self {
+        Self {
+            kind: PacketDispositionKindDto::Supported,
+            reason: None,
+            drill: None,
+            omission_receipts: Vec::new(),
+        }
+    }
+
+    pub fn not_established(reason: impl Into<String>) -> Self {
+        Self {
+            kind: PacketDispositionKindDto::NotEstablished,
+            reason: Some(reason.into()),
+            drill: None,
+            omission_receipts: Vec::new(),
+        }
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            kind: PacketDispositionKindDto::Unavailable,
+            reason: Some(reason.into()),
+            drill: None,
+            omission_receipts: Vec::new(),
+        }
+    }
+
+    pub fn drill_once(reason: impl Into<String>, drill: BoundedDrillPlanDto) -> Self {
+        Self {
+            kind: PacketDispositionKindDto::DrillOnce,
+            reason: Some(reason.into()),
+            drill: Some(drill),
+            omission_receipts: Vec::new(),
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self.kind, PacketDispositionKindDto::DrillOnce)
+    }
+}
+
+impl DrillOptionDto {
+    pub fn bounded_source_read(gap_id: impl Into<String>, path: impl Into<String>) -> Self {
+        let path = path.into();
+        let gap_id = gap_id.into();
+        Self {
+            id: encode_drill_option_id(DrillGapKindDto::BoundedSourceRead, &path),
+            gap_id,
+            kind: DrillGapKindDto::BoundedSourceRead,
+            path: Some(path),
+            symbol_id: None,
+            query: None,
+        }
+    }
+
+    pub fn omitted_symbol(gap_id: impl Into<String>, symbol_id: impl Into<String>) -> Self {
+        let symbol_id = symbol_id.into();
+        let gap_id = gap_id.into();
+        Self {
+            id: encode_drill_option_id(
+                DrillGapKindDto::OmittedMandatorySupport,
+                &format!("symbol:{symbol_id}"),
+            ),
+            gap_id,
+            kind: DrillGapKindDto::OmittedMandatorySupport,
+            path: None,
+            symbol_id: Some(symbol_id),
+            query: None,
+        }
+    }
+
+    pub fn deadline_lost_query(gap_id: impl Into<String>, query: impl Into<String>) -> Self {
+        let query = query.into();
+        let gap_id = gap_id.into();
+        Self {
+            id: encode_drill_option_id(DrillGapKindDto::DeadlineLostCandidate, &query),
+            gap_id,
+            kind: DrillGapKindDto::DeadlineLostCandidate,
+            path: None,
+            symbol_id: None,
+            query: Some(query),
+        }
+    }
+}
+
+pub fn encode_drill_option_id(kind: DrillGapKindDto, target: &str) -> String {
+    let kind = match kind {
+        DrillGapKindDto::DeadlineLostCandidate => "deadline_lost_candidate",
+        DrillGapKindDto::OmittedMandatorySupport => "omitted_mandatory_support",
+        DrillGapKindDto::BoundedSourceRead => "bounded_source_read",
+    };
+    format!("{kind}:{}", percent_encode_drill_target(target))
+}
+
+pub fn decode_drill_option_id(id: &str) -> Option<(DrillGapKindDto, String)> {
+    let (kind, encoded) = id.split_once(':')?;
+    let kind = match kind {
+        "deadline_lost_candidate" => DrillGapKindDto::DeadlineLostCandidate,
+        "omitted_mandatory_support" => DrillGapKindDto::OmittedMandatorySupport,
+        "bounded_source_read" => DrillGapKindDto::BoundedSourceRead,
+        _ => return None,
+    };
+    Some((kind, percent_decode_drill_target(encoded)))
+}
+
+fn percent_encode_drill_target(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn percent_decode_drill_target(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""),
+                16,
+            )
+        {
+            decoded.push(byte);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -3203,32 +3458,6 @@ pub struct PacketFollowUpInvocationDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct PacketSufficiencyDto {
-    pub status: PacketSufficiencyStatusDto,
-    #[serde(default)]
-    pub covered_claims: Vec<PacketClaimDto>,
-    #[serde(default)]
-    pub open_next: Vec<String>,
-    #[serde(default)]
-    pub avoid_opening: Vec<String>,
-    #[serde(default)]
-    pub avoid_opening_paths: Vec<String>,
-    #[serde(default)]
-    pub gaps: Vec<String>,
-    #[serde(default)]
-    pub follow_up_commands: Vec<String>,
-    /// The same follow-ups as executable invocations.
-    ///
-    /// `follow_up_commands` is the shell rendering of these entries. A caller
-    /// that runs a follow-up spawns the invocation directly instead of parsing
-    /// the display string back apart.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub follow_up_invocations: Vec<PacketFollowUpInvocationDto>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coverage_report: Option<PacketCoverageReportDto>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct PacketRetrievalTraceSummaryDto {
     pub retrieval_trace: AgentRetrievalTraceDto,
     pub source_read_steps: u32,
@@ -3238,9 +3467,8 @@ pub struct PacketRetrievalTraceSummaryDto {
 
 /// Packet response for source-grounded answer workflows.
 ///
-/// This is a compatibility surface for budget, sufficiency, answer, and
-/// retrieval-trace semantics. `sufficiency.status` is the primary readiness
-/// decision; budget truncation or diagnostic traces should not override it.
+/// `support` is the agent-facing evidence. `disposition` is the machine stop or
+/// one-round drill decision compiled by runtime from retained evidence.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentPacketDto {
     pub packet_id: String,
@@ -3249,8 +3477,10 @@ pub struct AgentPacketDto {
     pub task_class: Option<PacketTaskClassDto>,
     pub plan: PacketPlanDto,
     pub answer: AgentAnswerDto,
+    #[serde(default)]
+    pub support: Vec<SupportUnitDto>,
+    pub disposition: PacketDispositionDto,
     pub budget: PacketBudgetDto,
-    pub sufficiency: PacketSufficiencyDto,
     #[serde(alias = "benchmark_trace")]
     pub retrieval_trace_summary: PacketRetrievalTraceSummaryDto,
 }
@@ -3443,11 +3673,11 @@ mod packet_tests {
     }
 
     #[test]
-    fn packet_request_uses_compact_budget_by_default() {
+    fn packet_request_uses_standard_budget_by_default() {
         let request: AgentPacketRequestDto =
             serde_json::from_str(r#"{"question":"explain indexing"}"#).expect("deserialize");
 
-        assert_eq!(request.budget, PacketBudgetModeDto::Compact);
+        assert_eq!(request.budget, PacketBudgetModeDto::Standard);
         assert!(request.include_evidence);
     }
 
@@ -3920,55 +4150,102 @@ mod packet_tests {
     }
 
     #[test]
-    fn packet_sufficiency_serializes_status_as_snake_case() {
-        let partial = serde_json::to_value(PacketSufficiencyDto {
-            status: PacketSufficiencyStatusDto::Partial,
-            covered_claims: Vec::new(),
-            open_next: vec!["codestory-cli search --query runtime".to_string()],
-            avoid_opening: Vec::new(),
-            avoid_opening_paths: Vec::new(),
-            gaps: vec!["No focused symbol selected.".to_string()],
-            follow_up_commands: Vec::new(),
-            follow_up_invocations: Vec::new(),
-            coverage_report: None,
-        })
-        .expect("serialize");
-
-        assert_eq!(partial["status"], "partial");
-
-        let blocked = serde_json::to_value(PacketSufficiencyDto {
-            status: PacketSufficiencyStatusDto::Insufficient,
-            covered_claims: Vec::new(),
-            open_next: Vec::new(),
-            avoid_opening: Vec::new(),
-            avoid_opening_paths: vec!["crates/codestory-cli/src/main.rs".to_string()],
-            gaps: vec!["Sidecar readiness is not full.".to_string()],
-            follow_up_commands: Vec::new(),
-            follow_up_invocations: Vec::new(),
-            coverage_report: None,
-        })
-        .expect("serialize");
-
-        assert_eq!(blocked["status"], "blocked");
-        assert_eq!(
-            blocked["avoid_opening_paths"],
-            serde_json::json!(["crates/codestory-cli/src/main.rs"])
+    fn packet_disposition_and_support_units_round_trip() {
+        let support = SupportUnitDto {
+            id: "sym-1".to_string(),
+            kind: SupportUnitKindDto::SymbolLocation,
+            summary: "AgentPacketDto at dto.rs:3251".to_string(),
+            path: Some("crates/codestory-contracts/src/api/dto.rs".to_string()),
+            symbol_id: Some("42".to_string()),
+            start_line: Some(3251),
+            end_line: None,
+            snippet: None,
+            edge_kind: None,
+            from_symbol: None,
+            to_symbol: None,
+            query: None,
+        };
+        let drill = BoundedDrillPlanDto {
+            parent_packet_id: "packet-1".to_string(),
+            core_generation_id: "core-1".to_string(),
+            retrieval_generation: Some("retrieval-1".to_string()),
+            gap_ids: vec!["named-path:src/main.rs".to_string()],
+            options: vec![DrillOptionDto::bounded_source_read(
+                "named-path:src/main.rs",
+                "src/main.rs",
+            )],
+            max_bytes: PACKET_DRILL_MAX_BYTES,
+            max_hits: PACKET_DRILL_MAX_HITS,
+            max_depth: PACKET_DRILL_MAX_DEPTH,
+            remaining_rounds: 1,
+        };
+        let disposition = PacketDispositionDto::drill_once(
+            "mandatory named path was not retained",
+            drill.clone(),
         );
-        let legacy: PacketSufficiencyDto = serde_json::from_str(
-            r#"{
-                "status": "partial",
-                "covered_claims": [],
-                "open_next": [],
-                "avoid_opening": ["crates/codestory-cli/src/main.rs because cited"],
-                "gaps": [],
-                "follow_up_commands": []
-            }"#,
-        )
-        .expect("deserialize legacy sufficiency without raw paths");
-        assert!(legacy.avoid_opening_paths.is_empty());
-        let legacy: PacketSufficiencyStatusDto =
-            serde_json::from_str("\"insufficient\"").expect("deserialize legacy status");
-        assert_eq!(legacy, PacketSufficiencyStatusDto::Insufficient);
+
+        let support_json = serde_json::to_value(&support).expect("serialize support");
+        assert_eq!(support_json["kind"], "symbol_location");
+        let decoded_support: SupportUnitDto =
+            serde_json::from_value(support_json).expect("deserialize support");
+        assert_eq!(decoded_support, support);
+
+        let disposition_json = serde_json::to_value(&disposition).expect("serialize disposition");
+        assert_eq!(disposition_json["kind"], "drill_once");
+        assert_eq!(disposition_json["drill"]["remaining_rounds"], 1);
+        assert!(disposition_json.get("status").is_none());
+        assert!(disposition_json.get("follow_up_commands").is_none());
+        assert!(disposition_json.get("unsafe_to_claim").is_none());
+        assert!(disposition_json.get("covered_claims").is_none());
+        let decoded: PacketDispositionDto =
+            serde_json::from_value(disposition_json).expect("deserialize disposition");
+        assert_eq!(decoded.kind, PacketDispositionKindDto::DrillOnce);
+        assert_eq!(
+            decoded.drill.as_ref().map(|plan| plan.remaining_rounds),
+            Some(1)
+        );
+        assert!(!decoded.is_terminal());
+
+        let after = PacketDispositionDto::supported();
+        assert!(after.is_terminal());
+        assert_eq!(
+            serde_json::to_value(PacketDispositionKindDto::NotEstablished).expect("kind"),
+            serde_json::json!("not_established")
+        );
+        assert_eq!(
+            serde_json::to_value(PacketDispositionKindDto::Unavailable).expect("kind"),
+            serde_json::json!("unavailable")
+        );
+
+        let option = drill.options.first().expect("option");
+        let (kind, target) = decode_drill_option_id(&option.id).expect("decode option id");
+        assert_eq!(kind, DrillGapKindDto::BoundedSourceRead);
+        assert_eq!(target, "src/main.rs");
+    }
+
+    #[test]
+    fn agent_packet_request_serializes_drill_continuation_fields() {
+        let request = AgentPacketRequestDto {
+            question: "How does packet compile support?".to_string(),
+            budget: PacketBudgetModeDto::Compact,
+            task_class: None,
+            probes: Vec::new(),
+            extra_probes: Vec::new(),
+            include_evidence: true,
+            latency_budget_ms: None,
+            parent_packet_id: Some("packet-1".to_string()),
+            option_ids: vec!["bounded_source_read:src%2Fmain.rs".to_string()],
+            core_generation_id: Some("core-1".to_string()),
+            retrieval_generation: Some("retrieval-1".to_string()),
+        };
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(value["parent_packet_id"], "packet-1");
+        assert_eq!(value["option_ids"][0], "bounded_source_read:src%2Fmain.rs");
+        assert_eq!(value["core_generation_id"], "core-1");
+        let decoded: AgentPacketRequestDto =
+            serde_json::from_value(value).expect("deserialize request");
+        assert_eq!(decoded.parent_packet_id.as_deref(), Some("packet-1"));
+        assert_eq!(decoded.option_ids.len(), 1);
     }
 
     #[test]

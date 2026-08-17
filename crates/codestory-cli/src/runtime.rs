@@ -556,6 +556,7 @@ pub(crate) fn codestory_publication_contract_runtime_meta() -> serde_json::Value
         active_cli_version,
         host.plugin_version,
         host.plugin_cli_version,
+        host.cli_sha256,
         cli_source,
         override_configured,
     )
@@ -565,6 +566,7 @@ pub(crate) fn codestory_publication_contract_runtime_meta_from(
     active_cli_version: &str,
     plugin_version: Option<String>,
     plugin_cli_version: Option<String>,
+    cli_sha256: Option<String>,
     cli_source: String,
     override_configured: bool,
 ) -> serde_json::Value {
@@ -575,6 +577,7 @@ pub(crate) fn codestory_publication_contract_runtime_meta_from(
         "cli_version": active_cli_version,
         "plugin_version": plugin_version,
         "plugin_cli_version": plugin_cli_version,
+        "cli_sha256": cli_sha256,
         "cli_source": cli_source,
         "pinned_pair_matches": pinned_pair_matches,
         "known_override_skew_channel": override_configured,

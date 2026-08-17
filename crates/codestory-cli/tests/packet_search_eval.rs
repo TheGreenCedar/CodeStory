@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 const FIXTURE_FILE: &str = "production_packet_search_fixtures.json";
 const BASELINE_FILE: &str = "production_packet_search_baseline.json";
 const LIVE_EVAL_RUN_ID: &str = "packet-search-eval";
+const LIVE_EVAL_PROJECT_ENV: &str = "CODESTORY_PACKET_SEARCH_EVAL_PROJECT";
 const LIVE_EVAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 const LIVE_EVAL_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -130,6 +131,13 @@ fn fixture_dir() -> PathBuf {
 }
 
 fn repo_root() -> PathBuf {
+    repo_root_from(std::env::var_os(LIVE_EVAL_PROJECT_ENV))
+}
+
+fn repo_root_from(explicit: Option<OsString>) -> PathBuf {
+    if let Some(project) = explicit.filter(|path| !path.is_empty()) {
+        return PathBuf::from(project);
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -180,19 +188,19 @@ fn score_runs(fixtures: &[EvalFixture], runs: &[EvalRun], baseline: &Baseline) -
             .add(&row);
         if row.full_mode {
             match run.sufficiency_status.as_str() {
-                "sufficient" => assert!(
+                "supported" => assert!(
                     run.verdict_causes.is_empty(),
-                    "sufficient fixture {} must not report blocking verdict causes: {:?}",
+                    "supported fixture {} must not report blocking verdict causes: {:?}",
                     fixture.id,
                     run.verdict_causes
                 ),
-                "partial" | "blocked" => assert!(
+                "drill_once" | "not_established" | "unavailable" => assert!(
                     !run.verdict_causes.is_empty(),
-                    "non-sufficient fixture {} must report at least one typed verdict cause",
+                    "non-supported fixture {} must report at least one typed verdict cause",
                     fixture.id
                 ),
                 status => panic!(
-                    "full-mode fixture {} emitted unsupported sufficiency status {status:?}",
+                    "full-mode fixture {} emitted unsupported disposition kind {status:?}",
                     fixture.id
                 ),
             }
@@ -516,7 +524,7 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
     let fixtures = load_fixture_set();
     let baseline = load_baseline();
     let readiness_verdict = packet_verdict_evidence(&serde_json::json!({
-        "sufficiency": { "status": "partial" },
+        "disposition": { "kind": "not_established" },
         "plan": { "obligations": { "claim_obligations": [
             {
                 "material": true,
@@ -527,7 +535,7 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
         ] } }
     }));
     let placement_verdict = packet_verdict_evidence(&serde_json::json!({
-        "sufficiency": { "status": "partial" },
+        "disposition": { "kind": "not_established" },
         "plan": { "obligations": { "claim_obligations": [
             {
                 "material": true,
@@ -566,7 +574,7 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
             retrieval_mode: "full".to_string(),
             ranked_files: vec![
                 "crates/codestory-cli/src/output.rs".to_string(),
-                "crates/codestory-runtime/src/agent/packet_evidence.rs".to_string(),
+                "crates/codestory-agent/src/packet_evidence.rs".to_string(),
             ],
             ranked_symbols: vec![
                 "append_search_evidence_packet".to_string(),
@@ -609,7 +617,7 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
 #[test]
 fn packet_search_eval_extracts_schema_v2_obligation_counts_and_causes() {
     let packet = serde_json::json!({
-        "sufficiency": { "status": "partial" },
+        "disposition": { "kind": "not_established" },
         "plan": {
             "obligations": {
                 "claim_obligations": [
@@ -638,7 +646,7 @@ fn packet_search_eval_extracts_schema_v2_obligation_counts_and_causes() {
     });
 
     let (status, proof_statuses, causes) = packet_verdict_evidence(&packet);
-    assert_eq!(status, "partial");
+    assert_eq!(status, "not_established");
     assert_eq!(proof_statuses, ["proven", "reported"]);
     assert_eq!(causes, ["required_evidence_edge_missing", "stage_deadline"]);
 }
@@ -646,9 +654,9 @@ fn packet_search_eval_extracts_schema_v2_obligation_counts_and_causes() {
 #[test]
 fn packet_search_eval_causes_follow_only_final_sufficiency_blockers() {
     let sufficient = serde_json::json!({
-        "sufficiency": {
-            "status": "sufficient",
-            "gaps": ["obligation guard_dispatch is reported: diagnostic lead"]
+        "disposition": {
+            "kind": "supported",
+            "omission_receipts": ["obligation guard_dispatch is reported: diagnostic lead"]
         },
         "budget": { "truncated": true },
         "plan": { "obligations": {
@@ -671,9 +679,9 @@ fn packet_search_eval_causes_follow_only_final_sufficiency_blockers() {
     assert!(packet_verdict_evidence(&sufficient).2.is_empty());
 
     let material_claim = serde_json::json!({
-        "sufficiency": {
-            "status": "partial",
-            "gaps": [
+        "disposition": {
+            "kind": "not_established",
+            "omission_receipts": [
                 "obligation requested_claim:0 is reported: exact member missing",
                 "obligation guard_dispatch is reported: diagnostic lead"
             ]
@@ -697,7 +705,7 @@ fn packet_search_eval_causes_follow_only_final_sufficiency_blockers() {
     );
 
     let material_query = serde_json::json!({
-        "sufficiency": { "status": "partial" },
+        "disposition": { "kind": "not_established" },
         "plan": { "obligations": { "query_obligations": [
             {
                 "material": true,
@@ -715,18 +723,18 @@ fn packet_search_eval_causes_follow_only_final_sufficiency_blockers() {
     );
 
     let budget_and_gap = serde_json::json!({
-        "sufficiency": {
-            "status": "blocked",
-            "coverage_report": { "budget_omitted": ["citations"] },
-            "gaps": ["minimum claim-family coverage not met"]
+        "disposition": {
+            "kind": "unavailable",
+            "omission_receipts": ["minimum claim-family coverage not met"]
         },
+        "budget": { "omitted_sections": ["citations"] },
         "plan": { "obligations": {} }
     });
     assert_eq!(
         packet_verdict_evidence(&budget_and_gap).2,
         [
             "budget_omitted:citations",
-            "sufficiency_gap:minimum claim-family coverage not met"
+            "disposition_gap:minimum claim-family coverage not met"
         ]
     );
 }
@@ -752,7 +760,7 @@ fn packet_search_eval_does_not_count_non_full_retrieval_as_full() {
                 .enumerate()
                 .map(|(index, anchor)| (anchor.clone(), index))
                 .collect(),
-            sufficiency_status: "partial".to_string(),
+            sufficiency_status: "not_established".to_string(),
             proof_statuses: vec!["reported".to_string()],
             verdict_causes: vec!["non_full_mode".to_string()],
         })
@@ -781,6 +789,37 @@ fn packet_search_eval_readiness_mode_uses_verdict_status_not_sidecar_mode() {
     });
 
     assert_eq!(readiness_mode(&readiness), "repair_index");
+}
+
+#[test]
+fn packet_search_live_eval_readiness_uses_full_accelerated_status() {
+    let ready = serde_json::json!({
+        "retrieval_mode": "full",
+        "embedding_device_state": "accelerated",
+        "embedding_device_observation_source": "per_user_server",
+        "embedding_cpu_allowed": false,
+        "embedding_accelerator_requested": true
+    });
+    assert_eq!(live_eval_readiness_mode(&ready), "ready");
+
+    for (field, value) in [
+        ("retrieval_mode", serde_json::json!("unavailable")),
+        ("embedding_device_state", serde_json::json!("cpu")),
+        (
+            "embedding_device_observation_source",
+            serde_json::json!("test_support"),
+        ),
+        ("embedding_cpu_allowed", serde_json::json!(true)),
+        ("embedding_accelerator_requested", serde_json::json!(false)),
+    ] {
+        let mut unavailable = ready.clone();
+        unavailable[field] = value;
+        assert_eq!(
+            live_eval_readiness_mode(&unavailable),
+            "unavailable",
+            "{field} must fail closed"
+        );
+    }
 }
 
 #[test]
@@ -827,7 +866,7 @@ fn packet_search_live_eval_uses_fixed_run_id() {
         ]
     );
     assert_eq!(
-        live_eval_ready_args(),
+        live_eval_index_args(),
         [
             "retrieval",
             "index",
@@ -939,21 +978,29 @@ fn packet_search_live_eval_honors_explicit_cli_path() {
 }
 
 #[test]
-#[ignore = "live production packet/search eval; requires retrieval_mode=full sidecars for this checkout"]
+fn packet_search_live_eval_honors_explicit_project_path() {
+    let explicit = PathBuf::from("C:/projects/codestory-eval");
+    assert_eq!(
+        repo_root_from(Some(explicit.clone().into_os_string())),
+        explicit
+    );
+    assert_eq!(repo_root_from(None), repo_root());
+}
+
+#[test]
+#[ignore = "live production packet/search eval; requires CODESTORY_CLI to name a production binary with an embedded model"]
 fn packet_search_eval_live_runs_production_cli_path() {
     let fixtures = load_fixture_set();
     let baseline = load_baseline();
     let project = repo_root();
     let eval_started = Instant::now();
-    let readiness = live_eval_run_cli(&project, &live_eval_ready_args());
+    let index = live_eval_run_cli(&project, &live_eval_index_args());
     assert!(
-        readiness.status.success(),
-        "agent readiness failed: {}",
-        String::from_utf8_lossy(&readiness.stderr)
+        index.status.success(),
+        "retrieval index failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&index.stdout),
+        String::from_utf8_lossy(&index.stderr)
     );
-    let readiness_json: Value =
-        serde_json::from_slice(&readiness.stdout).expect("parse readiness json");
-    let readiness_mode = readiness_mode(&readiness_json);
 
     let status = live_eval_run_cli(&project, &live_eval_status_args());
     assert!(
@@ -966,9 +1013,11 @@ fn packet_search_eval_live_runs_production_cli_path() {
         .as_str()
         .unwrap_or("unavailable")
         .to_string();
+    assert_live_eval_status_binding(&status_json, &project);
+    assert_live_eval_device_truth(&status_json);
+    let readiness_mode = live_eval_readiness_mode(&status_json);
     assert_eq!(readiness_mode, baseline.required_full_modes.readiness_mode);
     assert_eq!(retrieval_mode, baseline.required_full_modes.retrieval_mode);
-    assert_live_eval_device_truth(&status_json);
 
     let mut runs = Vec::new();
     for (index, fixture) in fixtures.fixtures.iter().enumerate() {
@@ -1139,8 +1188,8 @@ fn assert_live_verdict_calibration(
 
 fn packet_verdict_evidence(packet: &Value) -> (String, Vec<String>, Vec<String>) {
     let packet = packet.get("result").unwrap_or(packet);
-    let sufficiency_status = packet
-        .pointer("/sufficiency/status")
+    let disposition_kind = packet
+        .pointer("/disposition/kind")
         .and_then(Value::as_str)
         .unwrap_or("missing")
         .to_string();
@@ -1154,8 +1203,8 @@ fn packet_verdict_evidence(packet: &Value) -> (String, Vec<String>, Vec<String>)
         .filter_map(|obligation| obligation.get("proof_status").and_then(Value::as_str))
         .map(str::to_string)
         .collect::<Vec<_>>();
-    if sufficiency_status == "sufficient" {
-        return (sufficiency_status, proof_statuses, Vec::new());
+    if disposition_kind == "supported" {
+        return (disposition_kind, proof_statuses, Vec::new());
     }
 
     let mut causes = BTreeSet::new();
@@ -1196,7 +1245,7 @@ fn packet_verdict_evidence(packet: &Value) -> (String, Vec<String>, Vec<String>)
         }
     }
     if let Some(sections) = packet
-        .pointer("/sufficiency/coverage_report/budget_omitted")
+        .pointer("/budget/omitted_sections")
         .and_then(Value::as_array)
     {
         for section in sections.iter().filter_map(Value::as_str) {
@@ -1204,24 +1253,24 @@ fn packet_verdict_evidence(packet: &Value) -> (String, Vec<String>, Vec<String>)
         }
     }
     if let Some(gaps) = packet
-        .pointer("/sufficiency/gaps")
+        .pointer("/disposition/omission_receipts")
         .and_then(Value::as_array)
     {
         for gap in gaps.iter().filter_map(Value::as_str) {
             if gap.starts_with("obligation ") || gap.starts_with("query obligation ") {
                 continue;
             }
-            causes.insert(format!("sufficiency_gap:{gap}"));
+            causes.insert(format!("disposition_gap:{gap}"));
         }
     }
     (
-        sufficiency_status,
+        disposition_kind,
         proof_statuses,
         causes.into_iter().collect(),
     )
 }
 
-fn live_eval_ready_args() -> [&'static str; 10] {
+fn live_eval_index_args() -> [&'static str; 10] {
     [
         "retrieval",
         "index",
@@ -1375,35 +1424,81 @@ fn join_pipe(handle: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
 }
 
 fn assert_live_eval_device_truth(status: &Value) {
-    assert_json_path_str(status, &["ownership", "profile"], "agent");
-    assert_json_path_suffix(
-        status,
-        &["ownership", "namespace"],
-        &format!("-{LIVE_EVAL_RUN_ID}"),
-    );
-    assert_json_path_contains(status, &["ownership", "state_file"], LIVE_EVAL_RUN_ID);
-    assert_json_path_contains(
-        status,
-        &["ownership", "cleanup_command"],
-        "--profile agent --run-id packet-search-eval",
-    );
     assert_json_path_str(status, &["embedding_device_policy"], "accelerator_required");
     assert_json_path_str(status, &["embedding_device_state"], "accelerated");
     assert_json_path_str(
         status,
         &["embedding_device_observation_source"],
-        "native_log",
+        "per_user_server",
     );
     assert_json_path_bool(status, &["embedding_cpu_allowed"], false);
     assert_json_path_bool(status, &["embedding_accelerator_requested"], true);
-    assert_json_path_str(
-        status,
-        &["embedding_accelerator_request_provider"],
-        "vulkan",
+    let detected_provider = json_path(status, &["embedding_detected_provider"])
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .expect("live eval status must report a detected accelerator provider");
+    let detected_gpu = json_path(status, &["embedding_detected_gpu"])
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .expect("live eval status must report a detected accelerator device");
+    assert_eq!(
+        json_path(status, &["embedding_accelerator_request_provider"]).and_then(Value::as_str),
+        Some(detected_provider),
+        "the requested and observed accelerator providers must agree: {status:#}"
     );
-    assert_json_path_str(status, &["embedding_accelerator_request_device"], "Vulkan0");
-    assert_json_path_str(status, &["embedding_detected_provider"], "amd");
+    assert_eq!(
+        json_path(status, &["embedding_accelerator_request_device"]).and_then(Value::as_str),
+        Some(detected_gpu),
+        "the requested and observed accelerator devices must agree: {status:#}"
+    );
+    assert!(
+        !matches!(
+            detected_provider.to_ascii_lowercase().as_str(),
+            "cpu" | "test-accelerator"
+        ),
+        "the live production eval cannot use a CPU or test accelerator: {status:#}"
+    );
     assert_json_path_non_empty(status, &["embedding_detected_gpu"]);
+}
+
+fn assert_live_eval_status_binding(status: &Value, project: &Path) {
+    assert_eq!(
+        json_path(status, &["manifest_contract", "source_root"]).and_then(Value::as_str),
+        project.to_str(),
+        "live eval status must bind the indexed source root: {status:#}"
+    );
+    assert_json_path_contains(status, &["scip", "detail"], LIVE_EVAL_RUN_ID);
+}
+
+#[test]
+fn packet_search_live_eval_accepts_a_real_accelerator_identity() {
+    assert_live_eval_device_truth(&serde_json::json!({
+        "embedding_device_policy": "accelerator_required",
+        "embedding_device_state": "accelerated",
+        "embedding_device_observation_source": "per_user_server",
+        "embedding_cpu_allowed": false,
+        "embedding_accelerator_requested": true,
+        "embedding_accelerator_request_provider": "Metal",
+        "embedding_accelerator_request_device": "Apple GPU",
+        "embedding_detected_provider": "Metal",
+        "embedding_detected_gpu": "Apple GPU"
+    }));
+}
+
+#[test]
+#[should_panic(expected = "per_user_server")]
+fn packet_search_live_eval_rejects_test_support_accelerator_identity() {
+    assert_live_eval_device_truth(&serde_json::json!({
+        "embedding_device_policy": "accelerator_required",
+        "embedding_device_state": "accelerated",
+        "embedding_device_observation_source": "test_support",
+        "embedding_cpu_allowed": false,
+        "embedding_accelerator_requested": true,
+        "embedding_accelerator_request_provider": "test-accelerator",
+        "embedding_accelerator_request_device": "test-accelerator",
+        "embedding_detected_provider": "test-accelerator",
+        "embedding_detected_gpu": "test-accelerator"
+    }));
 }
 
 fn assert_json_path_str(status: &Value, path: &[&str], expected: &str) {
@@ -1444,16 +1539,6 @@ fn assert_json_path_contains(status: &Value, path: &[&str], expected: &str) {
     );
 }
 
-fn assert_json_path_suffix(status: &Value, path: &[&str], expected: &str) {
-    assert!(
-        json_path(status, path)
-            .and_then(Value::as_str)
-            .is_some_and(|value| value.ends_with(expected)),
-        "live eval status must report {} ending with {expected}: {status:#}",
-        path.join(".")
-    );
-}
-
 fn json_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     path.iter()
         .try_fold(value, |current, field| current.get(*field))
@@ -1471,6 +1556,15 @@ fn readiness_mode(json: &Value) -> String {
         })
         .unwrap_or("unavailable")
         .to_string()
+}
+
+fn live_eval_readiness_mode(status: &Value) -> String {
+    let ready = status["retrieval_mode"].as_str() == Some("full")
+        && status["embedding_device_state"].as_str() == Some("accelerated")
+        && status["embedding_device_observation_source"].as_str() == Some("per_user_server")
+        && status["embedding_cpu_allowed"].as_bool() == Some(false)
+        && status["embedding_accelerator_requested"].as_bool() == Some(true);
+    if ready { "ready" } else { "unavailable" }.to_string()
 }
 
 fn ranked_files(json: &Value) -> Vec<String> {

@@ -1,31 +1,48 @@
-//! Packet batch retrieval orchestration: anchor expansion and planned subqueries.
+//! Packet batch retrieval orchestration for missing material proof.
 #![allow(clippy::items_after_test_module)]
 
-use super::citation::to_citation_from_hit;
+use super::packet_candidate::PacketSearchHit;
+#[cfg(test)]
+use super::packet_candidate::merge_packet_candidate_graph;
 use super::packet_required_probes::packet_sufficiency_required_probe_queries_from_terms;
 use super::packet_scoring::{
-    normalize_identifier, packet_citation_key, packet_citation_rank,
-    packet_stage_citation_carry_limit, packet_subquery_hit_limit, sort_by_cached_rank_desc,
+    normalize_identifier, packet_stage_citation_carry_limit, packet_subquery_hit_limit,
 };
+#[cfg(test)]
+use super::packet_scoring::{packet_citation_key, packet_citation_rank, sort_by_cached_rank_desc};
 use super::packet_terms::packet_probe_terms;
+use super::packet_trace::merge_packet_fused_subquery_batch;
+#[cfg(test)]
 use super::packet_trace::{
-    append_packet_query_timing_fields, merge_packet_fused_subquery_batch, packet_query_diagnostic,
-    packet_query_duration_ms,
+    append_packet_query_timing_fields, packet_query_diagnostic, packet_query_duration_ms,
 };
+#[cfg(test)]
 use super::trace::field;
-use crate::{AppController, clamp_u128_to_u32, query_has_symbol_or_literal_signal};
+use crate::{AppController, clamp_u128_to_u32};
+use codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms;
+use codestory_agent::packet_obligations::preview_packet_obligation_plan_before_budget;
+use codestory_agent::packet_plan::packet_owner_member_probe_queries;
 pub(crate) use codestory_agent::packet_scoring::packet_file_stem_matches_query;
+use codestory_agent::planning::{
+    PACKET_ADJACENT_VARIANT_QUERY_PURPOSE, PACKET_CONCRETE_FILE_QUERY_PURPOSE,
+    PACKET_FLOW_ROLE_QUERY_PURPOSE, PACKET_GENERIC_TERM_QUERY_PURPOSE,
+    PACKET_OWNER_MEMBER_QUERY_PURPOSE, packet_plan_query_is_exact_symbol_identity,
+};
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
-    ApiError, NodeKind, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketPlanDto,
-    PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, PacketTaskClassDto,
-    RetrievalAnnotationDto, SearchHit, SearchHitOrigin, SearchMatchQualityDto,
+    AgentAnswerDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError,
+    PacketBudgetLimitsDto, PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto,
+    PacketSidecarQueryDiagnosticDto, PacketTaskClassDto, RetrievalAnnotationDto,
+};
+#[cfg(test)]
+use codestory_contracts::api::{
+    AgentRetrievalStepDto, NodeKind, SearchHit, SearchHitOrigin, SearchMatchQualityDto,
 };
 use std::collections::HashSet;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Instant;
 
 const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
+const PACKET_OWNER_MEMBER_QUERY_LIMIT: usize = 4;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PacketLatencyBudget {
     pub(crate) started_at: Instant,
@@ -54,6 +71,7 @@ impl PacketLatencyBudget {
         clamp_u128_to_u32(self.target_ms.saturating_sub(self.elapsed_ms()).max(1_000))
     }
 
+    #[cfg(test)]
     pub(crate) fn budget_usage_percent(&self, consumed_trace_ms: u32) -> u128 {
         (consumed_trace_ms as u128)
             .saturating_mul(100)
@@ -72,6 +90,7 @@ impl PacketLatencyBudget {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_packet_planned_subqueries(
     controller: &AppController,
+    question: &str,
     plan: &PacketPlanDto,
     budget: PacketBudgetModeDto,
     limits: &PacketBudgetLimitsDto,
@@ -92,8 +111,24 @@ pub(crate) fn run_packet_planned_subqueries(
         return Ok(());
     }
 
-    let pending = packet_planned_subqueries(plan, budget, limit);
+    let adaptive_queries = packet_adaptive_material_queries(question, plan, answer, limit);
+    let pending = adaptive_queries
+        .iter()
+        .enumerate()
+        .map(|(index, query)| (plan.queries.len().saturating_add(index), query))
+        .collect::<Vec<_>>();
     if pending.is_empty() {
+        return Ok(());
+    }
+    if packet_latency.exhausted() {
+        answer.retrieval_trace.sla_missed = true;
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::gap(format!(
+                "packet_material_queries skipped reason=latency_budget_exhausted count={}",
+                pending.len()
+            )));
         return Ok(());
     }
 
@@ -107,7 +142,7 @@ pub(crate) fn run_packet_planned_subqueries(
         .retrieval_trace
         .annotations
         .push(RetrievalAnnotationDto::observation(format!(
-            "packet_subqueries fused_batch={} total={}",
+            "packet_material_queries fused_batch={} total={}",
             batch.len(),
             pending.len()
         )));
@@ -229,6 +264,7 @@ pub(crate) fn run_packet_planned_subqueries(
         include_evidence,
         rank_terms,
         stage_carry_limit,
+        &packet_flow_requirements_for_terms(&packet_probe_terms(question), plan.task_class),
     );
     packet_latency.apply_to_trace(answer);
     Ok(())
@@ -255,8 +291,8 @@ fn packet_fused_retry_is_live() -> bool {
 }
 
 fn replace_packet_fused_results(
-    results: &mut [(String, Vec<SearchHit>)],
-    retry_results: Vec<(String, Vec<SearchHit>)>,
+    results: &mut [(String, Vec<PacketSearchHit>)],
+    retry_results: Vec<(String, Vec<PacketSearchHit>)>,
 ) {
     for (retry_query, retry_hits) in retry_results {
         if let Some((_, hits)) = results.iter_mut().find(|(query, _)| *query == retry_query) {
@@ -310,6 +346,7 @@ fn annotate_packet_batch_timing(
         .push(RetrievalAnnotationDto::observation(annotation));
 }
 
+#[cfg(test)]
 fn packet_anchor_timing_annotation(diagnostic: Option<&PacketSidecarQueryDiagnosticDto>) -> String {
     let Some(diagnostic) = diagnostic else {
         return String::new();
@@ -339,44 +376,144 @@ fn packet_anchor_timing_annotation(diagnostic: Option<&PacketSidecarQueryDiagnos
 fn packet_subquery_limit(budget: PacketBudgetModeDto) -> usize {
     match budget {
         PacketBudgetModeDto::Tiny => 0,
-        PacketBudgetModeDto::Compact => 3,
-        PacketBudgetModeDto::Standard => 4,
-        PacketBudgetModeDto::Deep => 6,
+        PacketBudgetModeDto::Compact
+        | PacketBudgetModeDto::Standard
+        | PacketBudgetModeDto::Deep => 16,
     }
 }
 
-fn packet_planned_subqueries(
+fn packet_adaptive_material_queries(
+    question: &str,
     plan: &PacketPlanDto,
-    budget: PacketBudgetModeDto,
+    answer: &AgentAnswerDto,
     limit: usize,
-) -> Vec<(usize, &PacketPlanQueryDto)> {
-    plan.queries
+) -> Vec<PacketPlanQueryDto> {
+    let preview = preview_packet_obligation_plan_before_budget(
+        question,
+        plan.task_class,
+        &plan.obligations,
+        answer,
+    );
+    let mut queries = Vec::new();
+    let mut seen = HashSet::<String>::new();
+
+    let mut push = |query: &str, purpose: String| {
+        let query = query.trim();
+        let key = normalize_identifier(query);
+        if query.is_empty()
+            || packet_query_completed(answer, query)
+            || (!key.is_empty() && !seen.insert(key))
+            || queries.len() >= limit
+        {
+            return false;
+        }
+        queries.push(PacketPlanQueryDto {
+            query: query.to_string(),
+            purpose,
+        });
+        true
+    };
+
+    let missing_material = preview
+        .claim_obligations
+        .iter()
+        .filter(|obligation| {
+            obligation.material
+                && obligation.proof_status
+                    != codestory_contracts::api::PacketObligationProofStatusDto::Proven
+        })
+        .collect::<Vec<_>>();
+    let mut obligation_added_query = vec![false; missing_material.len()];
+
+    let structural_schema_flow = missing_material
+        .iter()
+        .any(|obligation| obligation.id.starts_with("sql_"));
+    let owner_member_queries = if !missing_material.is_empty() && !structural_schema_flow {
+        packet_owner_member_probe_queries(
+            question,
+            &answer.citations,
+            limit.min(PACKET_OWNER_MEMBER_QUERY_LIMIT),
+        )
+    } else {
+        Vec::new()
+    };
+
+    // Reserve the bounded owner/member slice, then spread the rest across open claims before
+    // considering any claim's fallback paths.
+    let first_material_query_limit = limit.saturating_sub(owner_member_queries.len());
+    for (index, obligation) in missing_material
         .iter()
         .enumerate()
-        .skip(1)
-        .take(limit)
-        .filter(|(_, query)| packet_planned_subquery_should_run(budget, query))
-        .collect()
+        .take(first_material_query_limit)
+    {
+        if let Some(query) = obligation.open_next_candidates.first() {
+            obligation_added_query[index] |=
+                push(query, format!("material obligation {}", obligation.id));
+        }
+    }
+
+    for query in owner_member_queries {
+        let _ = push(&query, PACKET_OWNER_MEMBER_QUERY_PURPOSE.to_string());
+    }
+
+    for (index, obligation) in missing_material.iter().enumerate() {
+        for query in obligation.open_next_candidates.iter().skip(1) {
+            obligation_added_query[index] |=
+                push(query, format!("material obligation {}", obligation.id));
+        }
+    }
+
+    for obligation in plan
+        .obligations
+        .query_obligations
+        .iter()
+        .filter(|obligation| obligation.material)
+    {
+        let _ = push(
+            &obligation.query,
+            format!("material query obligation {}", obligation.id),
+        );
+    }
+
+    for (index, obligation) in missing_material.iter().enumerate() {
+        for query in &obligation.carrier_paths {
+            obligation_added_query[index] |=
+                push(query, format!("material obligation {}", obligation.id));
+        }
+    }
+
+    let missing_material_without_query = obligation_added_query.iter().any(|added| !added);
+    if missing_material_without_query {
+        for query in packet_anchor_probe_queries(plan) {
+            let _ = push(&query, "unresolved material behavior anchor".to_string());
+        }
+    }
+
+    queries
 }
 
-fn packet_planned_subquery_should_run(
-    budget: PacketBudgetModeDto,
-    query: &PacketPlanQueryDto,
-) -> bool {
-    if !matches!(
-        budget,
-        PacketBudgetModeDto::Compact | PacketBudgetModeDto::Standard
-    ) || !query
-        .purpose
-        .contains("concrete symbol, file, route, or code term")
-    {
-        return true;
-    }
-    let trimmed = query.query.trim();
-    query_has_symbol_or_literal_signal(trimmed) || is_packet_code_like_term(trimmed)
+fn packet_query_completed(answer: &AgentAnswerDto, query: &str) -> bool {
+    answer
+        .retrieval_trace
+        .packet_sidecar_diagnostics
+        .iter()
+        .rev()
+        .find(|diagnostic| diagnostic.query == query)
+        .is_some_and(|diagnostic| {
+            diagnostic.completion == codestory_contracts::api::PacketQueryCompletionDto::Completed
+        })
+        || answer.retrieval_trace.steps.iter().rev().any(|step| {
+            step.kind == AgentRetrievalStepKindDto::Search
+                && step.status == AgentRetrievalStepStatusDto::Ok
+                && step
+                    .input
+                    .iter()
+                    .any(|field| field.key == "query" && field.value == query)
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn run_packet_anchor_expansion(
     controller: &AppController,
     plan: &PacketPlanDto,
@@ -473,12 +610,15 @@ pub(crate) fn run_packet_anchor_expansion(
                 let mut citations = hits
                     .iter()
                     .filter(|hit| packet_anchor_hit_is_relevant(&query, hit))
-                    .map(|hit| to_citation_from_hit(hit, None, None, include_evidence))
+                    .map(|hit| (hit.citation(include_evidence), hit))
                     .collect::<Vec<_>>();
-                sort_by_cached_rank_desc(&mut citations, |citation| {
+                sort_by_cached_rank_desc(&mut citations, |(citation, _)| {
                     packet_citation_rank(citation, rank_terms, true)
                 });
-                for citation in citations.into_iter().take(stage_carry_limit) {
+                for (citation, hit) in citations.into_iter().take(stage_carry_limit) {
+                    if include_evidence {
+                        merge_packet_candidate_graph(answer, hit);
+                    }
                     if citation_keys.insert(packet_citation_key(&citation)) {
                         answer.citations.push(citation);
                         added = added.saturating_add(1);
@@ -540,6 +680,7 @@ pub(crate) fn run_packet_anchor_expansion(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn packet_anchor_probe_limit(budget: PacketBudgetModeDto) -> usize {
     match budget {
         PacketBudgetModeDto::Tiny => 0,
@@ -549,6 +690,7 @@ pub(crate) fn packet_anchor_probe_limit(budget: PacketBudgetModeDto) -> usize {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn packet_anchor_probe_limit_for_budget(
     budget: PacketBudgetModeDto,
     packet_latency: PacketLatencyBudget,
@@ -571,6 +713,7 @@ pub(crate) fn packet_anchor_probe_limit_for_budget(
     }
 }
 
+#[cfg(test)]
 fn packet_anchor_per_query_limit(
     limits: &PacketBudgetLimitsDto,
     packet_latency: PacketLatencyBudget,
@@ -596,10 +739,11 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
         .enumerate()
         .filter(|query| {
             let query = query.1;
-            query.purpose.contains("symbol probe")
-                || packet_task_seed_anchor_probe(&query.query)
-                || query.purpose.contains("concrete symbol")
-                || is_packet_code_like_term(&query.query)
+            !packet_anchor_probe_is_instruction_noise(query)
+                && (query.purpose.contains("symbol probe")
+                    || packet_task_seed_anchor_probe(&query.query)
+                    || query.purpose.contains("concrete symbol")
+                    || is_packet_code_like_term(&query.query))
         })
         .collect::<Vec<_>>();
     ranked.sort_by_key(|(index, query)| {
@@ -659,15 +803,55 @@ fn packet_anchor_required_probe_keys(plan: &PacketPlanDto) -> HashSet<String> {
 }
 
 fn packet_anchor_probe_priority(query: &PacketPlanQueryDto) -> u8 {
-    if query.purpose.contains("symbol probe") {
+    if packet_plan_query_is_exact_symbol_identity(query) {
         0
-    } else if packet_task_seed_anchor_probe(&query.query) {
+    } else if matches!(
+        query.purpose.as_str(),
+        PACKET_FLOW_ROLE_QUERY_PURPOSE | PACKET_CONCRETE_FILE_QUERY_PURPOSE
+    ) || (packet_anchor_probe_has_strong_code_shape(&query.query)
+        && !matches!(
+            query.purpose.as_str(),
+            PACKET_ADJACENT_VARIANT_QUERY_PURPOSE | PACKET_GENERIC_TERM_QUERY_PURPOSE
+        ))
+    {
         1
-    } else if packet_anchor_probe_has_strong_code_shape(&query.query) {
+    } else if query.purpose.contains("concrete symbol") {
         2
-    } else {
+    } else if packet_task_seed_anchor_probe(&query.query) {
         3
+    } else if matches!(
+        query.purpose.as_str(),
+        PACKET_ADJACENT_VARIANT_QUERY_PURPOSE | PACKET_GENERIC_TERM_QUERY_PURPOSE
+    ) {
+        5
+    } else {
+        4
     }
+}
+
+fn packet_anchor_probe_is_instruction_noise(query: &PacketPlanQueryDto) -> bool {
+    if packet_plan_query_is_exact_symbol_identity(query)
+        || packet_anchor_probe_has_strong_code_shape(&query.query)
+    {
+        return false;
+    }
+    matches!(
+        normalize_identifier(&query.query).as_str(),
+        "answer"
+            | "cite"
+            | "cites"
+            | "explain"
+            | "file"
+            | "files"
+            | "name"
+            | "names"
+            | "source"
+            | "sources"
+            | "supporting"
+            | "symbol"
+            | "symbols"
+            | "trace"
+    )
 }
 
 fn packet_task_seed_anchor_probe(query: &str) -> bool {
@@ -689,6 +873,7 @@ fn packet_anchor_probe_has_strong_code_shape(query: &str) -> bool {
             && trimmed.chars().skip(1).any(|ch| ch.is_ascii_uppercase()))
 }
 
+#[cfg(test)]
 pub(crate) fn packet_anchor_hit_is_relevant(query: &str, hit: &SearchHit) -> bool {
     if hit.origin != SearchHitOrigin::IndexedSymbol || !hit.resolvable {
         return false;
@@ -719,7 +904,6 @@ fn is_packet_path_like_query(query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::packet_plan::build_packet_plan;
     use codestory_contracts::api::{
         AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto,
         PacketPlanDto, PacketPlanQueryDto, PacketTaskClassDto, RetrievalAnnotationKindDto,
@@ -763,6 +947,31 @@ mod tests {
         }
     }
 
+    fn anchor_citation(display_name: &str) -> codestory_contracts::api::AgentCitationDto {
+        codestory_contracts::api::AgentCitationDto {
+            node_id: codestory_contracts::api::NodeId(display_name.to_string()),
+            display_name: display_name.to_string(),
+            kind: codestory_contracts::api::NodeKind::FUNCTION,
+            file_path: Some("src/site.rb".to_string()),
+            line: Some(1),
+            score: 1.0,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
+        }
+    }
+
     fn ev6c_limits() -> PacketBudgetLimitsDto {
         PacketBudgetLimitsDto {
             max_anchors: 8,
@@ -774,26 +983,31 @@ mod tests {
     }
 
     fn ev6c_plan() -> PacketPlanDto {
+        let question = "Trace how StringUtils normalizes request routes";
+        let task_class = PacketTaskClassDto::RouteTracing;
+        let queries = vec![
+            PacketPlanQueryDto {
+                query: question.to_string(),
+                purpose: "original task phrasing for sidecar-primary source-backed retrieval"
+                    .to_string(),
+            },
+            PacketPlanQueryDto {
+                query: "StringUtils".to_string(),
+                purpose: "concrete symbol, file, route, or code term".to_string(),
+            },
+            PacketPlanQueryDto {
+                query: "CharSequenceUtils".to_string(),
+                purpose: "concrete symbol, file, route, or code term".to_string(),
+            },
+        ];
         PacketPlanDto {
-            task_class: PacketTaskClassDto::RouteTracing,
+            task_class,
             inferred_task_class: false,
-            queries: vec![
-                PacketPlanQueryDto {
-                    query: "Trace how StringUtils normalizes request routes".to_string(),
-                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
-                        .to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "StringUtils".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "CharSequenceUtils".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-            ],
+            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
+                question, task_class, &queries,
+            ),
+            queries,
             probe_resolutions: Vec::new(),
-            obligations: Default::default(),
             trace: Vec::new(),
         }
     }
@@ -833,6 +1047,7 @@ mod tests {
         let mut answer = empty_answer();
         run_packet_planned_subqueries(
             &AppController::new(),
+            "Trace how StringUtils normalizes request routes",
             &ev6c_plan(),
             PacketBudgetModeDto::Tiny,
             &ev6c_limits(),
@@ -854,6 +1069,39 @@ mod tests {
     }
 
     #[test]
+    fn material_queries_dropped_for_latency_are_published_as_an_evidence_gap() {
+        // The material queries were planned but never dispatched, so the packet must report
+        // missing evidence and the missed SLA instead of retaining clean confidence.
+        let mut answer = empty_answer();
+        let packet_latency = PacketLatencyBudget {
+            started_at: Instant::now() - std::time::Duration::from_secs(2),
+            target_ms: 1_000,
+        };
+        run_packet_planned_subqueries(
+            &AppController::new(),
+            "Trace how StringUtils normalizes request routes",
+            &ev6c_plan(),
+            PacketBudgetModeDto::Compact,
+            &ev6c_limits(),
+            false,
+            packet_latency,
+            &[],
+            &mut answer,
+        )
+        .expect("dropping material queries for latency is not an execution error");
+
+        assert_eq!(
+            kind_of(
+                &answer,
+                "packet_material_queries skipped reason=latency_budget_exhausted count="
+            ),
+            RetrievalAnnotationKindDto::Gap,
+            "an SLA-driven material-query drop must publish an evidence gap"
+        );
+        assert!(answer.retrieval_trace.sla_missed);
+    }
+
+    #[test]
     fn failed_fused_subquery_batch_is_published_as_an_evidence_gap() {
         // EV-6c (#1775). The fused batch failing means none of the planned subqueries returned
         // evidence. The sibling `packet_subqueries fused_batch=` note on the same path is
@@ -861,6 +1109,7 @@ mod tests {
         let mut answer = empty_answer();
         let error = run_packet_planned_subqueries(
             &AppController::new(),
+            "Trace how StringUtils normalizes request routes",
             &ev6c_plan(),
             PacketBudgetModeDto::Compact,
             &ev6c_limits(),
@@ -882,7 +1131,7 @@ mod tests {
             classified(&answer)
         );
         assert_eq!(
-            kind_of(&answer, "packet_subqueries fused_batch="),
+            kind_of(&answer, "packet_material_queries fused_batch="),
             RetrievalAnnotationKindDto::Observation,
             "batch sizing is routine telemetry: {:?}",
             classified(&answer)
@@ -1027,79 +1276,200 @@ mod tests {
     }
 
     #[test]
-    fn packet_planned_subqueries_skip_low_signal_lexical_concrete_terms() {
+    fn adaptive_queries_follow_missing_material_obligations_and_skip_completed_work() {
+        let question = "Explain the indexing runtime, persistence, and snapshot flow.";
+        let task_class = PacketTaskClassDto::ArchitectureExplanation;
+        let original = PacketPlanQueryDto {
+            query: question.to_string(),
+            purpose: "original task phrasing".to_string(),
+        };
         let plan = PacketPlanDto {
-            task_class: PacketTaskClassDto::RouteTracing,
+            task_class,
             inferred_task_class: false,
-            queries: vec![
-                PacketPlanQueryDto {
-                    query: "Trace how Redis initializes command routing".to_string(),
-                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
-                        .to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "Trace".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "Redis".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "initializes".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-            ],
+            queries: vec![original.clone()],
             probe_resolutions: Vec::new(),
-            obligations: Default::default(),
+            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
+                question,
+                task_class,
+                &[original],
+            ),
             trace: Vec::new(),
         };
+        let mut answer = empty_answer();
 
-        let pending = packet_planned_subqueries(&plan, PacketBudgetModeDto::Compact, 3);
+        let queries = packet_adaptive_material_queries(question, &plan, &answer, 16)
+            .into_iter()
+            .map(|query| query.query)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            queries.first().map(String::as_str),
+            Some("indexing runtime")
+        );
+        for expected in [
+            "indexing entrypoint",
+            "file discovery",
+            "symbol extraction",
+            "storage persistence",
+        ] {
+            assert!(queries.iter().any(|query| query == expected), "{queries:?}");
+        }
 
-        assert!(pending.is_empty());
+        answer
+            .retrieval_trace
+            .packet_sidecar_diagnostics
+            .push(PacketSidecarQueryDiagnosticDto {
+                query: "indexing entrypoint".to_string(),
+                completion: codestory_contracts::api::PacketQueryCompletionDto::Completed,
+                retrieval_mode: "full".to_string(),
+                sidecar_query_ms: Some(1),
+                candidate_resolution_ms: Some(0),
+                total_elapsed_ms: Some(1),
+                sidecar_stage_count: 1,
+                sidecar_stage_total_ms: Some(1),
+                batch_query_wall_ms: Some(1),
+                candidate_count: 1,
+                resolved_hit_count: 1,
+                unresolved_candidate_count: 0,
+                blocking_unresolved_candidate_count: 0,
+                semantic_stage_timeout_zero_hits: false,
+                semantic_abstained: false,
+                diagnostic: None,
+            });
+        let queries = packet_adaptive_material_queries(question, &plan, &answer, 16)
+            .into_iter()
+            .map(|query| query.query)
+            .collect::<Vec<_>>();
+        assert!(!queries.contains(&"indexing entrypoint".to_string()));
+        assert_eq!(
+            queries.first().map(String::as_str),
+            Some("indexing runtime")
+        );
     }
 
     #[test]
-    fn packet_planned_subqueries_keep_code_like_terms_and_deep_semantic_terms() {
+    fn adaptive_queries_use_retrieved_owners_for_missing_lifecycle_members() {
+        let question = "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases. Cite the source files and name the supporting symbols.";
+        let task_class = PacketTaskClassDto::RouteTracing;
+        let original = PacketPlanQueryDto {
+            query: question.to_string(),
+            purpose: "original task phrasing".to_string(),
+        };
         let plan = PacketPlanDto {
-            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            task_class,
             inferred_task_class: false,
-            queries: vec![
-                PacketPlanQueryDto {
-                    query: "Explain string predicate helpers".to_string(),
-                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
-                        .to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "StringUtils".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "CharSequenceUtils".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-                PacketPlanQueryDto {
-                    query: "Commons".to_string(),
-                    purpose: "concrete symbol, file, route, or code term".to_string(),
-                },
-            ],
+            queries: vec![original.clone()],
             probe_resolutions: Vec::new(),
-            obligations: Default::default(),
+            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
+                question,
+                task_class,
+                &[original],
+            ),
+            trace: Vec::new(),
+        };
+        let mut answer = empty_answer();
+        answer.citations.push(anchor_citation("Jekyll::Site.posts"));
+
+        let queries = packet_adaptive_material_queries(question, &plan, &answer, 16)
+            .into_iter()
+            .map(|query| query.query)
+            .collect::<Vec<_>>();
+
+        for expected in ["Site.read", "Site.generate", "Site.render", "Site.write"] {
+            assert!(
+                queries.iter().any(|query| query == expected),
+                "missing {expected} from {queries:?}"
+            );
+        }
+        assert!(queries.len() <= 16);
+    }
+
+    #[test]
+    fn adaptive_queries_reserve_batch_space_for_explicit_owner_members() {
+        let question = "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.";
+        let task_class = PacketTaskClassDto::DataFlow;
+        let original = PacketPlanQueryDto {
+            query: question.to_string(),
+            purpose: "original task phrasing".to_string(),
+        };
+        let plan = PacketPlanDto {
+            task_class,
+            inferred_task_class: false,
+            queries: vec![original.clone()],
+            probe_resolutions: Vec::new(),
+            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
+                question,
+                task_class,
+                &[original],
+            ),
             trace: Vec::new(),
         };
 
-        let compact = packet_planned_subqueries(&plan, PacketBudgetModeDto::Compact, 3)
-            .into_iter()
-            .map(|(_, query)| query.query.as_str())
+        let queries = packet_adaptive_material_queries(question, &plan, &empty_answer(), 16);
+
+        for expected in ["BaseRequest.finalize", "IOClient.send"] {
+            assert!(
+                queries.iter().any(|query| query.query == expected),
+                "missing {expected} from {queries:?}"
+            );
+        }
+        let owner_probe_indexes = queries
+            .iter()
+            .enumerate()
+            .filter(|(_, query)| query.purpose == PACKET_OWNER_MEMBER_QUERY_PURPOSE)
+            .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        let deep = packet_planned_subqueries(&plan, PacketBudgetModeDto::Deep, 3)
+        assert_eq!(owner_probe_indexes.len(), PACKET_OWNER_MEMBER_QUERY_LIMIT);
+        let last_owner_probe = *owner_probe_indexes.last().expect("owner probes");
+        assert!(
+            queries.iter().skip(last_owner_probe + 1).any(|query| {
+                query.purpose.starts_with("material obligation ")
+                    || query.purpose.starts_with("material query obligation ")
+            }),
+            "owner probes starved the remaining material queries: {queries:?}"
+        );
+        assert!(queries.len() <= 16);
+    }
+
+    #[test]
+    fn adaptive_sql_queries_reserve_the_named_schema_entities() {
+        let question = "Explain schema relationships between artists, albums, tracks, invoices, and invoice lines across the SQL scripts.";
+        let task_class = PacketTaskClassDto::DataFlow;
+        let original = PacketPlanQueryDto {
+            query: question.to_string(),
+            purpose: "original task phrasing".to_string(),
+        };
+        let plan = PacketPlanDto {
+            task_class,
+            inferred_task_class: false,
+            queries: vec![original.clone()],
+            probe_resolutions: Vec::new(),
+            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
+                question,
+                task_class,
+                &[original],
+            ),
+            trace: Vec::new(),
+        };
+
+        let queries = packet_adaptive_material_queries(question, &plan, &empty_answer(), 16)
             .into_iter()
-            .map(|(_, query)| query.query.as_str())
+            .map(|query| query.query)
             .collect::<Vec<_>>();
 
-        assert_eq!(compact, ["StringUtils", "CharSequenceUtils"]);
-        assert_eq!(deep, ["StringUtils", "CharSequenceUtils", "Commons"]);
+        for expected in [
+            "public.artist",
+            "public.album",
+            "public.track",
+            "public.invoice",
+            "public.invoiceline",
+        ] {
+            assert!(
+                queries.iter().any(|query| query == expected),
+                "missing {expected} from {queries:?}"
+            );
+        }
+        assert!(!queries.iter().any(|query| query.starts_with("Chinook.")));
+        assert!(queries.len() <= 16);
     }
 
     #[test]
@@ -1301,24 +1671,77 @@ mod tests {
     }
 
     #[test]
-    fn compact_search_flow_reserves_main_anchor_query() {
-        let plan = build_packet_plan(
-            "Explain how a search command parses CLI flags, walks candidate inputs, and executes sequential or parallel searches through matcher, searcher, and printer components.",
-            Some(PacketTaskClassDto::ArchitectureExplanation),
-            PacketBudgetModeDto::Compact,
-        );
+    fn packet_anchor_probe_queries_keep_distinct_late_phases_ahead_of_synthetic_variants() {
+        let plan = PacketPlanDto {
+            task_class: PacketTaskClassDto::RouteTracing,
+            inferred_task_class: false,
+            queries: vec![
+                PacketPlanQueryDto {
+                    query: "Trace how Jekyll builds a site through reading, rendering, and writing"
+                        .to_string(),
+                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
+                        .to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "Trace".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "Jekyll".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "build".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "reading".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "rendering".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "writing".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "build_site".to_string(),
+                    purpose: PACKET_ADJACENT_VARIANT_QUERY_PURPOSE.to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "reading_rendering".to_string(),
+                    purpose: PACKET_ADJACENT_VARIANT_QUERY_PURPOSE.to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "cite".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+            ],
+            probe_resolutions: Vec::new(),
+            obligations: Default::default(),
+            trace: Vec::new(),
+        };
+
+        let queries = packet_anchor_probe_queries(&plan);
 
         assert_eq!(
-            plan.queries.len(),
-            32,
-            "fixture should exercise the plan cap"
+            &queries[..5],
+            &[
+                "Jekyll".to_string(),
+                "build".to_string(),
+                "reading".to_string(),
+                "rendering".to_string(),
+                "writing".to_string(),
+            ]
         );
-        let selected = packet_anchor_probe_queries(&plan)
-            .into_iter()
-            .take(packet_anchor_probe_limit(PacketBudgetModeDto::Compact))
-            .collect::<Vec<_>>();
-
-        assert!(selected.iter().any(|query| query == "main"));
+        assert!(!queries.contains(&"Trace".to_string()));
+        assert!(!queries.contains(&"cite".to_string()));
+        assert!(
+            queries.iter().position(|query| query == "writing")
+                < queries.iter().position(|query| query == "build_site")
+        );
     }
 
     #[test]
@@ -1335,7 +1758,7 @@ mod tests {
         ] {
             queries.push(PacketPlanQueryDto {
                 query: query.to_string(),
-                purpose: "symbol probe expanded from task wording".to_string(),
+                purpose: PACKET_FLOW_ROLE_QUERY_PURPOSE.to_string(),
             });
         }
         for index in 0..15 {

@@ -40,8 +40,6 @@ pub fn prompt_search_terms(prompt: &str) -> Vec<String> {
         "risk",
         "risks",
         "study",
-        "surface",
-        "surfaces",
         "the",
         "this",
         "to",
@@ -189,8 +187,23 @@ fn title_case_brand_token_term(token: &str) -> Option<String> {
 pub fn packet_terms_have(terms: &[String], needle: &str) -> bool {
     let normalized_needle = normalize_identifier(needle);
     terms.iter().any(|value| {
-        value.eq_ignore_ascii_case(needle) || normalize_identifier(value) == normalized_needle
+        let normalized_value = normalize_identifier(value);
+        value.eq_ignore_ascii_case(needle)
+            || normalized_value == normalized_needle
+            || bounded_action_lemma(&normalized_value) == bounded_action_lemma(&normalized_needle)
     })
+}
+
+/// Collapse only the finite action forms packet planning explicitly understands.
+///
+/// This deliberately is not stemming or prefix matching: `sender`, `sending_hook`, and
+/// `dispatch_hook` remain unrelated tokens while the grammatical forms of `send` share one
+/// intent.
+fn bounded_action_lemma(term: &str) -> &str {
+    match term {
+        "send" | "sends" | "sending" | "sent" => "send",
+        _ => term,
+    }
 }
 
 pub fn packet_terms_have_any(terms: &[String], needles: &[&str]) -> bool {
@@ -226,6 +239,11 @@ pub fn packet_terms_indicate_indexing_flow(terms: &[String]) -> bool {
 pub fn packet_terms_indicate_request_dispatch_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+    if packet_terms_indicate_process_transport_flow(terms)
+        && !packet_terms_have_explicit_client_http_intent(terms)
+    {
+        return false;
+    }
     let explicit_client_transport = has_any(&[
         "adapter",
         "adapters",
@@ -311,15 +329,7 @@ pub fn packet_terms_indicate_route_tree_dispatch_flow(terms: &[String]) -> bool 
         && packet_terms_have_any(
             terms,
             &[
-                "engine",
-                "engines",
-                "group",
-                "groups",
-                "method",
-                "methods",
-                "tree",
-                "trees",
-                "routergroup",
+                "engine", "engines", "group", "groups", "method", "methods", "tree", "trees",
             ],
         )
 }
@@ -385,13 +395,8 @@ pub fn packet_terms_indicate_mapper_configuration_plan_flow(terms: &[String]) ->
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let mapper_intent = has_any(&["mapper", "mappers", "mapping", "map", "maps"]);
-    let configuration_intent = has_any(&[
-        "configuration",
-        "config",
-        "profile",
-        "profiles",
-        "mappingconfiguration",
-    ]);
+    let configuration_intent =
+        has_any(&["configuration", "config", "profile", "profiles", "mapping"]);
     let runtime_api_intent = has_any(&[
         "runtime",
         "api",
@@ -410,8 +415,6 @@ pub fn packet_terms_indicate_mapper_configuration_plan_flow(terms: &[String]) ->
         "execution",
         "expression",
         "lambda",
-        "typemap",
-        "typemaps",
         "type",
         "types",
     ]);
@@ -436,11 +439,21 @@ pub fn packet_terms_indicate_search_execution_flow(terms: &[String]) -> bool {
     has("search")
         && has_any(&[
             "candidate",
+            "execution",
             "flags",
+            "flow",
             "haystack",
+            "handoff",
             "matcher",
+            "packet",
+            "path",
             "printer",
+            "ranked",
+            "results",
+            "retrieval",
             "searcher",
+            "sidecar",
+            "sidecars",
             "walk",
             "walks",
         ])
@@ -450,7 +463,6 @@ pub fn packet_terms_indicate_stylesheet_animation_flow(terms: &[String]) -> bool
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let css_signal = has("css")
-        || has("animatecss")
         || has_any(&[
             "stylesheet",
             "stylesheets",
@@ -461,7 +473,6 @@ pub fn packet_terms_indicate_stylesheet_animation_flow(terms: &[String]) -> bool
         ]);
     let animation_signal = has_any(&[
         "animate",
-        "animated",
         "animation",
         "animations",
         "keyframe",
@@ -551,18 +562,50 @@ pub fn packet_terms_indicate_hook_cache_flow(terms: &[String]) -> bool {
 }
 
 pub fn packet_terms_indicate_client_send_flow(terms: &[String]) -> bool {
-    let explicit_client_or_http_intent =
-        packet_terms_have_any(terms, &["client", "clients", "http", "httpclient"]);
-    let request_intent = packet_terms_have_any(terms, &["request", "requests"]);
-    let send_or_transport_intent = packet_terms_have_any(
+    if packet_terms_indicate_process_transport_flow(terms)
+        && !packet_terms_have_explicit_client_http_intent(terms)
+    {
+        return false;
+    }
+    let explicit_client_owner = packet_terms_have_any(
         terms,
-        &["send", "sending", "sent", "transport", "transports"],
+        &["client", "clients", "httpclient", "session", "sessions"],
     );
+    if (packet_terms_indicate_server_route_dispatch_flow(terms)
+        || packet_terms_indicate_server_request_dispatch_flow(terms))
+        && !explicit_client_owner
+    {
+        return false;
+    }
+    let explicit_client_or_http_intent = explicit_client_owner || packet_terms_have(terms, "http");
+    let send_or_transport_intent =
+        packet_terms_have_any(terms, &["send", "transport", "transports"]);
     let convenience_or_helper_intent =
         packet_terms_have_any(terms, &["convenience", "helper", "helpers"]);
 
-    (explicit_client_or_http_intent && (send_or_transport_intent || convenience_or_helper_intent))
-        || (request_intent && send_or_transport_intent)
+    explicit_client_or_http_intent && (send_or_transport_intent || convenience_or_helper_intent)
+}
+
+pub fn packet_terms_indicate_full_outbound_request_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["request", "requests"])
+        && packet_terms_have(terms, "send")
+        && packet_terms_have_any(terms, &["adapter", "adapters", "transport", "transports"])
+        && packet_terms_have_any(
+            terms,
+            &["client", "clients", "http", "httpclient", "session"],
+        )
+}
+
+fn packet_terms_indicate_process_transport_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["stdio", "stdin", "stdout", "ipc"])
+        && packet_terms_have_any(
+            terms,
+            &["plugin", "process", "runtime", "server", "transport"],
+        )
+}
+
+fn packet_terms_have_explicit_client_http_intent(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["client", "clients", "http", "httpclient"])
 }
 
 pub fn packet_terms_indicate_form_validation_flow(terms: &[String]) -> bool {
@@ -714,27 +757,33 @@ pub fn packet_terms_indicate_string_predicate_flow(terms: &[String]) -> bool {
             "trims",
             "predicate",
             "predicates",
+            "case",
+            "cases",
+            "sensitive",
+            "region",
+            "regions",
+            "match",
+            "matches",
+            "matching",
         ],
     )
 }
 
 pub fn packet_terms_indicate_runtime_formatting_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(
-        terms,
-        &["format", "formats", "formatting", "vformat", "format_to"],
-    ) && packet_terms_have_any(
-        terms,
-        &[
-            "arg",
-            "args",
-            "argument",
-            "arguments",
-            "runtime",
-            "type",
-            "erased",
-            "output",
-        ],
-    )
+    packet_terms_have_any(terms, &["format", "formats", "formatting", "vformat"])
+        && packet_terms_have_any(
+            terms,
+            &[
+                "arg",
+                "args",
+                "argument",
+                "arguments",
+                "runtime",
+                "type",
+                "erased",
+                "output",
+            ],
+        )
 }
 
 #[cfg(test)]
@@ -783,6 +832,46 @@ mod tests {
             "Trace how Express creates an application, registers middleware routes, and handles an incoming request through the router and response helpers.",
         );
         assert!(!packet_terms_indicate_client_send_flow(&route_terms));
+
+        let response_terms = packet_probe_terms(
+            "Trace how an HTTP server dispatches an incoming request to a handler and sends the response.",
+        );
+        assert!(!packet_terms_indicate_client_send_flow(&response_terms));
+    }
+
+    #[test]
+    fn bounded_send_morphology_is_exact_and_shared() {
+        for action in ["send", "sends", "sending", "sent"] {
+            let terms = packet_probe_terms(&format!(
+                "Explain how a session {action} a request through an adapter."
+            ));
+            assert!(packet_terms_have(&terms, "send"), "{action}: {terms:?}");
+            assert!(packet_terms_indicate_client_send_flow(&terms));
+            assert!(packet_terms_indicate_full_outbound_request_flow(&terms));
+        }
+
+        for unrelated in ["sender", "sending_hook", "dispatch_hook"] {
+            let terms =
+                packet_probe_terms(&format!("Explain the session request adapter {unrelated}."));
+            assert!(!packet_terms_have(&terms, "send"), "{unrelated}: {terms:?}");
+            assert!(!packet_terms_indicate_full_outbound_request_flow(&terms));
+        }
+    }
+
+    #[test]
+    fn process_transport_prompts_do_not_activate_http_client_flows() {
+        let terms = packet_probe_terms(
+            "Explain the plugin request through stdio transport and runtime orchestration.",
+        );
+
+        assert!(!packet_terms_indicate_request_dispatch_flow(&terms));
+        assert!(!packet_terms_indicate_client_send_flow(&terms));
+
+        let adapter_terms = packet_probe_terms(
+            "Explain the plugin request through the stdio process transport adapter.",
+        );
+        assert!(!packet_terms_indicate_request_dispatch_flow(&adapter_terms));
+        assert!(!packet_terms_indicate_client_send_flow(&adapter_terms));
     }
 
     #[test]

@@ -7,11 +7,31 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   deriveProductRepositoryNames,
+  maskDeclarativeCoverageMetadata,
   parseBenchmarkPromptLiterals,
   pendingClaimProfileProblem,
   pendingInventoryTotalsProblem,
   runRetrievalGeneralizationLint,
 } from "../lib/retrieval-generalization-lint.mjs";
+
+test("declarative route coverage names do not become retrieval steering", () => {
+  const source = [
+    "FrameworkRouteCoverageEntry {",
+    '    framework: "example_framework",',
+    '    known_gaps: &["example_framework dispatch remains partial"],',
+    "}",
+    'if framework == "example_framework" { route(); }',
+  ].join("\n");
+  const masked = maskDeclarativeCoverageMetadata("route_coverage.rs", source);
+
+  assert.match(masked, /framework: "",/);
+  assert.match(masked, /known_gaps:.*example_framework/);
+  assert.match(masked, /framework == "example_framework"/);
+  assert.equal(
+    maskDeclarativeCoverageMetadata("packet_plan.rs", source),
+    source,
+  );
+});
 
 const repositoryRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),

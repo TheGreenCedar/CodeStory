@@ -89,6 +89,13 @@ fn owns_behavior(citation: &AgentCitationDto) -> bool {
     )
 }
 
+fn owns_callable_behavior(citation: &AgentCitationDto) -> bool {
+    matches!(
+        citation.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    )
+}
+
 fn path_has_any_extension(citation: &AgentCitationDto, extensions: &[&str]) -> bool {
     let path = path(citation);
     extensions.iter().any(|extension| path.ends_with(extension))
@@ -182,6 +189,72 @@ fn names_token_prefix(citation: &AgentCitationDto, prefixes: &[&str]) -> bool {
     any_token_starts_with(&name_tokens(citation), prefixes)
 }
 
+/// Match a callable whose terminal segment names an action and whose owner, or the remainder of
+/// that same compound terminal, independently names the subsystem. An owner-qualified send
+/// method and `sendRequest` have two factors; a bare `send` or `dispatch_hook` does not.
+fn callable_owns_terminal_action_for_subject(
+    citation: &AgentCitationDto,
+    actions: &[&str],
+    subjects: &[&str],
+) -> bool {
+    if !owns_callable_behavior(citation) {
+        return false;
+    }
+    let terminal_tokens = identifier_tokens(terminal_segment_raw(&citation.display_name));
+    if !has_token(&terminal_tokens, actions) {
+        return false;
+    }
+    let tokens = name_tokens(citation);
+    let owner_token_count = tokens.len().saturating_sub(terminal_tokens.len());
+    has_token(&tokens[..owner_token_count], subjects)
+        || terminal_tokens.iter().any(|token| {
+            subjects.iter().any(|subject| token == subject)
+                && !actions.iter().any(|action| token == action)
+        })
+}
+
+fn callable_has_exact_owner_and_terminal_action(
+    citation: &AgentCitationDto,
+    owners: &[&str],
+    actions: &[&str],
+) -> bool {
+    if !owns_callable_behavior(citation) {
+        return false;
+    }
+    let mut segments = citation
+        .display_name
+        .rsplit(['.', ':', '#', '/', '\\'])
+        .filter(|segment| !segment.is_empty());
+    let Some(terminal) = segments.next() else {
+        return false;
+    };
+    let Some(owner) = segments.next() else {
+        return false;
+    };
+    owners
+        .iter()
+        .any(|expected| normalize_identifier(owner) == *expected)
+        && has_token(&identifier_tokens(terminal), actions)
+}
+
+fn callable_owns_terminal_action_for_two_subjects(
+    citation: &AgentCitationDto,
+    actions: &[&str],
+    primary_subjects: &[&str],
+    boundary_subjects: &[&str],
+) -> bool {
+    if !owns_callable_behavior(citation)
+        || !has_token(
+            &identifier_tokens(terminal_segment_raw(&citation.display_name)),
+            actions,
+        )
+    {
+        return false;
+    }
+    let tokens = name_tokens(citation);
+    has_token(&tokens, primary_subjects) && has_token(&tokens, boundary_subjects)
+}
+
 // ---------------------------------------------------------------------------
 // HTTP client lifecycle
 // ---------------------------------------------------------------------------
@@ -205,6 +278,301 @@ pub fn citation_owns_client_request_method(citation: &AgentCitationDto) -> bool 
         && matches!(
             terminal(citation).as_str(),
             "request" | "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
+        )
+}
+
+/// The package-level HTTP helper that opens the outbound-request lifecycle. A bare `request`
+/// citation is lawful here only on the public API module; the exact outgoing CALL to the following
+/// client/session request stage remains mandatory and is checked by the flow requirement.
+pub fn citation_owns_client_public_facade_helper(citation: &AgentCitationDto) -> bool {
+    if citation.kind != NodeKind::FUNCTION
+        || !matches!(
+            terminal(citation).as_str(),
+            "request" | "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
+        )
+    {
+        return false;
+    }
+    let path_tokens = path_tokens(citation);
+    let public_api_surface = has_token(&path_tokens, &["api"])
+        || path(citation)
+            .rsplit_once("/lib/")
+            .is_some_and(|(_, relative)| {
+                !relative.contains('/')
+                    && has_token(
+                        &path_tokens,
+                        &["http", "https", "request", "requests", "client"],
+                    )
+            });
+    public_api_surface
+        && !names_or_path_token(
+            citation,
+            &[
+                "hook",
+                "hooks",
+                "cache",
+                "caches",
+                "database",
+                "db",
+                "telemetry",
+                "monitoring",
+                "observability",
+                "metrics",
+            ],
+        )
+}
+
+/// A public outbound-request entrypoint. Unlike the broader request-method ranking predicate, a
+/// bare `request` is insufficient here: the symbol must independently name a client/session
+/// subject so `FrameKind.request` cannot become a material packet carrier.
+pub fn citation_owns_client_request_entrypoint(citation: &AgentCitationDto) -> bool {
+    (callable_has_exact_owner_and_terminal_action(citation, &["session"], &["request"])
+        && has_token(
+            &path_tokens(citation),
+            &["http", "https", "request", "requests", "client"],
+        ))
+        || callable_owns_terminal_action_for_two_subjects(
+            citation,
+            &[
+                "request", "get", "post", "put", "patch", "delete", "head", "options",
+            ],
+            &["client", "session"],
+            &["http", "https", "requests", "fetch"],
+        )
+}
+
+/// The callable that hands an assembled outbound request to the selected transport. Adapters and
+/// transports are deliberately excluded: they are the terminal boundary, while this carrier is
+/// the session/client dispatch immediately before it.
+pub fn citation_owns_client_request_dispatch(citation: &AgentCitationDto) -> bool {
+    ((callable_has_exact_owner_and_terminal_action(citation, &["session"], &["send"])
+        && has_token(
+            &path_tokens(citation),
+            &["http", "https", "request", "requests", "client"],
+        ))
+        || callable_owns_terminal_action_for_two_subjects(
+            citation,
+            &["send"],
+            &["client", "session"],
+            &["http", "https", "requests", "fetch"],
+        ))
+        && !names_token(
+            citation,
+            &["adapter", "adapters", "transport", "transports"],
+        )
+}
+
+/// The session/client step that chooses the transport interface used for an outbound request.
+/// Both the client/session owner and the adapter/transport subject must be present in the symbol;
+/// a generic hook or a directory name cannot satisfy this boundary.
+pub fn citation_owns_client_adapter_selection(citation: &AgentCitationDto) -> bool {
+    callable_owns_terminal_action_for_two_subjects(
+        citation,
+        &["get", "select", "choose", "resolve"],
+        &["client", "session"],
+        &["adapter", "adapters", "transport", "transports"],
+    )
+}
+
+/// The declared adapter/transport send boundary. This excludes the session's own `send` method,
+/// which is the preceding dispatch stage.
+pub fn citation_owns_client_transport_send(citation: &AgentCitationDto) -> bool {
+    callable_owns_terminal_action_for_subject(
+        citation,
+        &["send"],
+        &["adapter", "adapters", "transport", "transports"],
+    )
+}
+
+/// Registration of an inbound server request surface.
+pub fn citation_owns_server_request_entrypoint(citation: &AgentCitationDto) -> bool {
+    callable_has_exact_owner_and_terminal_action(citation, &["app"], &["route", "use", "listen"])
+        || callable_owns_terminal_action_for_subject(
+            citation,
+            &["route", "use", "listen"],
+            &["router", "middleware", "wsgi", "asgi", "servlet"],
+        )
+}
+
+/// The callable that selects or invokes an inbound request handler.
+pub fn citation_owns_server_request_dispatch(citation: &AgentCitationDto) -> bool {
+    callable_has_exact_owner_and_terminal_action(citation, &["app"], &["handle"])
+        || callable_owns_terminal_action_for_subject(
+            citation,
+            &["dispatch", "handle", "invoke"],
+            &[
+                "router",
+                "controller",
+                "middleware",
+                "wsgi",
+                "asgi",
+                "servlet",
+            ],
+        )
+}
+
+/// The response-side callable that leaves a server handler for its writer or transport.
+pub fn citation_owns_server_response_terminal(citation: &AgentCitationDto) -> bool {
+    callable_has_exact_owner_and_terminal_action(
+        citation,
+        &["res", "response", "reply"],
+        &["send", "end", "write", "flush", "finish"],
+    ) || callable_owns_terminal_action_for_two_subjects(
+        citation,
+        &["send", "end", "write", "flush", "finish"],
+        &["response", "responses", "reply"],
+        &[
+            "writer",
+            "sender",
+            "transport",
+            "socket",
+            "stream",
+            "output",
+        ],
+    )
+}
+
+/// Typed CALL targets that advance an outbound public request into preparation or dispatch.
+pub fn client_request_entrypoint_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    if has_token(
+        &tokens,
+        &[
+            "cache",
+            "database",
+            "db",
+            "hook",
+            "metrics",
+            "telemetry",
+            "monitoring",
+            "observability",
+        ],
+    ) {
+        return false;
+    }
+    let terminal = identifier_tokens(terminal_segment_raw(display_name));
+    let owns_client_lifecycle = has_token(&tokens, &["client", "session"]);
+    let owns_prepared_artifact =
+        has_token(&tokens, &["prepared"]) && has_token(&tokens, &["request", "requests"]);
+    let prepares_request =
+        has_token(&terminal, &["prepare"]) && has_token(&terminal, &["request", "requests"]);
+    let dispatches_request = has_token(&terminal, &["request", "send"]);
+    let builds_prepared_artifact = has_token(&terminal, &["build"]);
+    (owns_client_lifecycle && (prepares_request || dispatches_request))
+        || (owns_prepared_artifact && builds_prepared_artifact)
+}
+
+/// Typed CALL targets that advance a top-level package helper into the session/client request
+/// entrypoint. The final adjacent owner/action pair keeps another package helper, a request-shaped
+/// metrics symbol, or a similarly named hook from satisfying the boundary.
+pub fn client_public_facade_successor_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    !has_token(
+        &tokens,
+        &[
+            "cache",
+            "database",
+            "db",
+            "hook",
+            "metrics",
+            "telemetry",
+            "monitoring",
+            "observability",
+        ],
+    ) && (tokens.windows(2).last().is_some_and(|tail| {
+        tail[1] == "request" && matches!(tail[0].as_str(), "client" | "session")
+    }) || tokens
+        .windows(2)
+        .last()
+        .is_some_and(|tail| tail == ["with", "client"]))
+}
+
+/// Typed CALL sources that precede the client/session dispatch stage.
+pub fn client_request_dispatch_predecessor_call_source(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    tokens.windows(2).last().is_some_and(|tail| {
+        tail[1] == "request" && matches!(tail[0].as_str(), "client" | "session" | "requests")
+    })
+}
+
+/// Typed CALL targets that advance client/session dispatch into adapter selection.
+pub fn client_request_dispatch_successor_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    tokens.windows(2).last().is_some_and(|tail| {
+        matches!(tail[0].as_str(), "get" | "select" | "choose" | "resolve")
+            && matches!(
+                tail[1].as_str(),
+                "adapter" | "adapters" | "transport" | "transports"
+            )
+    })
+}
+
+/// Typed CALL targets that implement route or middleware registration.
+pub fn server_request_entrypoint_call_target(display_name: &str) -> bool {
+    display_terminal_owner_action_matches(
+        display_name,
+        &["router"],
+        &["route", "routes", "use", "listen"],
+    ) || display_terminal_owner_action_matches(display_name, &["server"], &["listen"])
+}
+
+/// Typed CALL targets that select or invoke the inbound handler.
+pub fn server_request_dispatch_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    tokens.as_slice() == ["finalhandler"]
+        || display_terminal_owner_action_matches(
+            display_name,
+            &[
+                "app",
+                "router",
+                "controller",
+                "middleware",
+                "wsgi",
+                "asgi",
+                "servlet",
+            ],
+            &["dispatch", "handle", "invoke"],
+        )
+}
+
+/// Typed CALL targets that perform the response write or flush.
+pub fn server_response_terminal_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    display_terminal_owner_action_matches(
+        display_name,
+        &[
+            "res",
+            "response",
+            "reply",
+            "writer",
+            "transport",
+            "socket",
+            "stream",
+        ],
+        &["end", "write", "flush", "finish"],
+    ) || tokens.windows(3).last().is_some_and(|tail| {
+        matches!(tail[0].as_str(), "response" | "reply")
+            && tail[1] == "sender"
+            && matches!(tail[2].as_str(), "end" | "write" | "flush" | "finish")
+    }) || (tokens.len() == 2
+        && tokens[0] == "output"
+        && matches!(tokens[1].as_str(), "end" | "write" | "flush" | "finish"))
+}
+
+fn display_terminal_owner_action_matches(
+    display_name: &str,
+    owners: &[&str],
+    actions: &[&str],
+) -> bool {
+    let tokens = identifier_tokens(display_name);
+    let Some(tail) = tokens.windows(2).last() else {
+        return false;
+    };
+    owners.contains(&tail[0].as_str())
+        && actions.contains(&tail[1].as_str())
+        && !has_token(
+            &tokens[..tokens.len().saturating_sub(2)],
+            &["metrics", "telemetry", "monitoring", "observability"],
         )
 }
 
@@ -389,7 +757,6 @@ pub fn citation_owns_css_animation_structure(citation: &AgentCitationDto) -> boo
             &[
                 "keyframes",
                 "animation",
-                "animated",
                 "transition",
                 "duration",
                 "delay",
@@ -523,10 +890,16 @@ pub fn citation_owns_shell_installer_bootstrap(citation: &AgentCitationDto) -> b
         )
 }
 
+const SHELL_FUNCTION_SUBJECT_TOKENS: &[&str] = &["shell", "function", "command"];
+const SHELL_FUNCTION_ACTION_TOKENS: &[&str] =
+    &["use", "run", "exec", "execute", "case", "dispatch"];
+
 pub fn citation_owns_shell_function_dispatch(citation: &AgentCitationDto) -> bool {
-    is_shell_script(citation)
-        && (names_token(citation, &["use", "run", "exec", "case"])
-            || names_token_prefix(citation, &["dispatch", "command", "exec"]))
+    let tokens = name_tokens(citation);
+    matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        && is_shell_script(citation)
+        && taxonomy_has_token(&tokens, SHELL_FUNCTION_SUBJECT_TOKENS)
+        && taxonomy_has_token(&tokens, SHELL_FUNCTION_ACTION_TOKENS)
 }
 
 pub fn citation_owns_shell_completion(citation: &AgentCitationDto) -> bool {
@@ -819,6 +1192,39 @@ pub fn citation_owns_mapper_execution(citation: &AgentCitationDto) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// String predicates
+// ---------------------------------------------------------------------------
+
+fn belongs_to_string_predicates(citation: &AgentCitationDto) -> bool {
+    matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        && (names_token(citation, &["string", "strings", "text"])
+            || (names_token(citation, &["char"])
+                && names_token(citation, &["sequence", "sequences"])))
+}
+
+/// A string helper's blank-or-whitespace predicate. The string subject is deliberately read from
+/// the symbol, not its package path, so an unrelated record predicate filed beside text helpers
+/// cannot close the requirement.
+pub fn citation_owns_string_blank_predicate(citation: &AgentCitationDto) -> bool {
+    belongs_to_string_predicates(citation) && names_token(citation, &["blank", "whitespace"])
+}
+
+/// The empty-string predicate remains distinct from blank/trim behavior.
+pub fn citation_owns_string_empty_predicate(citation: &AgentCitationDto) -> bool {
+    belongs_to_string_predicates(citation) && names_token(citation, &["empty"])
+}
+
+/// The helper that hands a case-sensitive comparison to a region matcher.
+pub fn citation_owns_string_region_handoff(citation: &AgentCitationDto) -> bool {
+    belongs_to_string_predicates(citation)
+        && names_token(citation, &["region"])
+        && names_token(
+            citation,
+            &["match", "matches", "matching", "compare", "equal", "equals"],
+        )
+}
+
+// ---------------------------------------------------------------------------
 // Runtime formatting
 // ---------------------------------------------------------------------------
 
@@ -894,6 +1300,176 @@ pub fn citation_owns_formatter_fallback(citation: &AgentCitationDto) -> bool {
 // a symbol was filed, never what it does, and letting a directory supply the subsystem is precisely
 // what lets an off-subject symbol inside a flow's own folder close that flow's requirement.
 // ---------------------------------------------------------------------------
+
+/// A callable that starts or schedules indexing work.
+///
+/// Both factors come from identifier tokens. A path under `indexer/` cannot promote an unrelated
+/// `run`, and querying an index is not an indexing entrypoint. Explicit construction and write
+/// methods remain eligible even when their owner is named `SearchIndex`; generic lifecycle verbs
+/// are rejected when the owner or method instead names read/query/search/lookup execution.
+const INDEXING_SUBJECT_TOKENS: &[&str] = &["index", "indexer", "indexing", "reindex"];
+const INDEXING_MUTATION_ACTIONS: &[&str] = &[
+    "index",
+    "reindex",
+    "build",
+    "rebuild",
+    "create",
+    "construct",
+    "generate",
+    "write",
+    "persist",
+    "store",
+    "save",
+    "update",
+    "insert",
+    "upsert",
+    "ingest",
+    "populate",
+    "materialize",
+];
+const INDEXING_OBSERVATION_ACTIONS: &[&str] = &[
+    "read", "query", "search", "lookup", "execute", "scan", "fetch", "get", "list", "inspect",
+    "load", "open", "find", "check", "describe",
+];
+const INDEXING_OBSERVATION_OWNER_NOUNS: &[&str] = &[
+    "reader",
+    "querier",
+    "searcher",
+    "executor",
+    "scanner",
+    "fetcher",
+    "getter",
+    "lister",
+    "inspector",
+    "loader",
+    "opener",
+    "finder",
+    "checker",
+    "describer",
+];
+const INDEXING_LIFECYCLE_ACTIONS: &[&str] =
+    &["run", "start", "schedule", "queue", "enqueue", "dispatch"];
+const INDEXING_DIRECT_OBJECT_TOKENS: &[&str] = &[
+    "document",
+    "file",
+    "source",
+    "record",
+    "repository",
+    "project",
+    "workspace",
+];
+const TAXONOMY_PLURAL_ES_BYTES: &[u8] = &[101, 115];
+const TAXONOMY_PLURAL_IES_BYTES: &[u8] = &[105, 101, 115];
+const TAXONOMY_SPLIT_RE_BYTES: &[u8] = &[114, 101];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndexingActionDirection {
+    Mutation,
+    Observation,
+    Lifecycle,
+    Unknown,
+}
+
+fn taxonomy_token_matches(token: &str, family: &str) -> bool {
+    if token == family
+        || token
+            .strip_suffix('s')
+            .is_some_and(|singular| singular == family)
+    {
+        return true;
+    }
+    let token_bytes = token.as_bytes();
+    let family_bytes = family.as_bytes();
+    (token_bytes.ends_with(TAXONOMY_PLURAL_ES_BYTES)
+        && token_bytes.get(..token_bytes.len() - 2) == Some(family_bytes))
+        || (token_bytes.ends_with(TAXONOMY_PLURAL_IES_BYTES)
+            && family_bytes.ends_with(b"y")
+            && token_bytes.get(..token_bytes.len() - 3)
+                == family_bytes.get(..family_bytes.len() - 1))
+}
+
+fn taxonomy_has_token(tokens: &[String], family: &[&str]) -> bool {
+    tokens.iter().any(|token| {
+        family
+            .iter()
+            .any(|candidate| taxonomy_token_matches(token, candidate))
+    })
+}
+
+fn indexing_action_direction(terminal_tokens: &[String]) -> IndexingActionDirection {
+    let Some(action) = terminal_tokens.first().map(String::as_str) else {
+        return IndexingActionDirection::Unknown;
+    };
+    if INDEXING_MUTATION_ACTIONS
+        .iter()
+        .any(|candidate| taxonomy_token_matches(action, candidate))
+        || (action.as_bytes() == TAXONOMY_SPLIT_RE_BYTES
+            && terminal_tokens.get(1).is_some_and(|token| token == "index"))
+    {
+        IndexingActionDirection::Mutation
+    } else if INDEXING_OBSERVATION_ACTIONS
+        .iter()
+        .any(|candidate| taxonomy_token_matches(action, candidate))
+    {
+        IndexingActionDirection::Observation
+    } else if INDEXING_LIFECYCLE_ACTIONS
+        .iter()
+        .any(|candidate| taxonomy_token_matches(action, candidate))
+    {
+        IndexingActionDirection::Lifecycle
+    } else {
+        IndexingActionDirection::Unknown
+    }
+}
+
+fn is_intrinsic_indexing_action(terminal_tokens: &[String]) -> bool {
+    terminal_tokens.first().is_some_and(|action| {
+        taxonomy_token_matches(action, "index") || taxonomy_token_matches(action, "reindex")
+    }) || (terminal_tokens
+        .first()
+        .is_some_and(|action| action.as_bytes() == TAXONOMY_SPLIT_RE_BYTES)
+        && terminal_tokens.get(1).is_some_and(|token| token == "index"))
+}
+
+pub fn citation_owns_indexing_entrypoint(citation: &AgentCitationDto) -> bool {
+    if !matches!(
+        citation.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    ) {
+        return false;
+    }
+
+    let tokens = name_tokens(citation);
+    let terminal_tokens = identifier_tokens(terminal_segment_raw(&citation.display_name));
+    let action_width = if terminal_tokens
+        .first()
+        .is_some_and(|token| token.as_bytes() == TAXONOMY_SPLIT_RE_BYTES)
+        && terminal_tokens.get(1).is_some_and(|token| token == "index")
+    {
+        2
+    } else {
+        1
+    };
+    let terminal_subject_tokens = terminal_tokens.get(action_width..).unwrap_or_default();
+    let owner_token_count = tokens.len().saturating_sub(terminal_tokens.len());
+    let owner_tokens = &tokens[..owner_token_count];
+    let has_distinct_subject = taxonomy_has_token(owner_tokens, INDEXING_SUBJECT_TOKENS)
+        || taxonomy_has_token(terminal_subject_tokens, INDEXING_SUBJECT_TOKENS);
+
+    match indexing_action_direction(&terminal_tokens) {
+        IndexingActionDirection::Mutation => {
+            let indexes_explicit_object = is_intrinsic_indexing_action(&terminal_tokens)
+                && taxonomy_has_token(terminal_subject_tokens, INDEXING_DIRECT_OBJECT_TOKENS);
+            has_distinct_subject || indexes_explicit_object
+        }
+        IndexingActionDirection::Observation | IndexingActionDirection::Unknown => false,
+        IndexingActionDirection::Lifecycle => {
+            has_distinct_subject
+                && !taxonomy_has_token(&tokens, INDEXING_OBSERVATION_ACTIONS)
+                && !taxonomy_has_token(&tokens, INDEXING_OBSERVATION_OWNER_NOUNS)
+        }
+    }
+}
 
 /// Indexing: discovering files, extracting symbols, and persisting them.
 pub fn flow_belongs_to_indexing(citation: &AgentCitationDto) -> bool {
@@ -1125,10 +1701,102 @@ pub fn flow_belongs_to_search(citation: &AgentCitationDto) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Search evidence handoff
+//
+// A search implementation has two proof-bearing boundaries after execution: deciding what kind
+// of evidence a result carries, and writing that evidence into the returned surface. Neither is
+// interchangeable with generic search execution. Keeping the two factors in the citation's own
+// callable name prevents a helper filed under `search/` from inheriting either obligation.
+// ---------------------------------------------------------------------------
+
+const SEARCH_EVIDENCE_CONTEXT_TOKENS: &[&str] = &["search", "result", "hit", "citation"];
+pub(crate) const SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS: &[&str] = &[
+    "classify",
+    "classification",
+    "tier",
+    "provenance",
+    "resolve",
+    "resolution",
+    "eligibility",
+];
+pub(crate) const SEARCH_EVIDENCE_OUTPUT_ACTIONS: &[&str] = &[
+    "append",
+    "decorate",
+    "emit",
+    "render",
+    "serialize",
+    "write",
+    "output",
+];
+
+fn owns_search_evidence_subject(citation: &AgentCitationDto) -> bool {
+    let tokens = name_tokens(citation);
+    taxonomy_has_token(&tokens, &["evidence"])
+        && taxonomy_has_token(&tokens, SEARCH_EVIDENCE_CONTEXT_TOKENS)
+}
+
+pub fn citation_owns_search_evidence_classification(citation: &AgentCitationDto) -> bool {
+    owns_callable_behavior(citation)
+        && owns_search_evidence_subject(citation)
+        && taxonomy_has_token(
+            &name_tokens(citation),
+            SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS,
+        )
+}
+
+pub fn citation_owns_search_evidence_output(citation: &AgentCitationDto) -> bool {
+    owns_callable_behavior(citation)
+        && owns_search_evidence_subject(citation)
+        && taxonomy_has_token(&name_tokens(citation), SEARCH_EVIDENCE_OUTPUT_ACTIONS)
+}
+
 /// A schema requirement is proved by the schema file, so here the file *is* the subsystem: a `.sql`
 /// anchor has no identifier of its own to scope by.
 pub fn flow_belongs_to_sql_schema(citation: &AgentCitationDto) -> bool {
     path_has_any_extension(citation, &[".sql"])
+}
+
+#[cfg(test)]
+fn taxonomy_plural(term: &str) -> String {
+    let bytes = term.as_bytes();
+    let last = bytes.last().copied();
+    let penultimate = bytes.get(bytes.len().saturating_sub(2)).copied();
+    if last == Some(b'y')
+        && bytes
+            .get(bytes.len().saturating_sub(2))
+            .is_some_and(|previous| !matches!(previous, b'a' | b'e' | b'i' | b'o' | b'u'))
+    {
+        format!("{}ies", &term[..term.len() - 1])
+    } else if matches!(last, Some(b's' | b'x' | b'z'))
+        || matches!((penultimate, last), (Some(b'c' | b's'), Some(b'h')))
+    {
+        format!("{term}es")
+    } else {
+        format!("{term}s")
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn carrier_taxonomy_vocabulary() -> Vec<String> {
+    let mut vocabulary = INDEXING_SUBJECT_TOKENS
+        .iter()
+        .chain(INDEXING_MUTATION_ACTIONS)
+        .chain(INDEXING_OBSERVATION_ACTIONS)
+        .chain(INDEXING_OBSERVATION_OWNER_NOUNS)
+        .chain(INDEXING_LIFECYCLE_ACTIONS)
+        .chain(INDEXING_DIRECT_OBJECT_TOKENS)
+        .chain(SHELL_FUNCTION_SUBJECT_TOKENS)
+        .chain(SHELL_FUNCTION_ACTION_TOKENS)
+        .chain(SEARCH_EVIDENCE_CONTEXT_TOKENS)
+        .chain(SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS)
+        .chain(SEARCH_EVIDENCE_OUTPUT_ACTIONS)
+        .chain(["evidence"].iter())
+        .flat_map(|term| [(*term).to_string(), taxonomy_plural(term)])
+        .collect::<Vec<_>>();
+    vocabulary.sort();
+    vocabulary.dedup();
+    vocabulary
 }
 
 #[cfg(test)]
@@ -1168,6 +1836,271 @@ mod tests {
         assert!(!citation_owns_buffer_read_write(&container));
         assert!(citation_owns_buffer_read_write(&operation));
         assert!(!citation_owns_buffer_storage(&operation));
+    }
+
+    #[test]
+    fn shell_function_dispatch_requires_distinct_subject_and_action_families() {
+        for name in [
+            "command_dispatch",
+            "commands_dispatches",
+            "shell_execute",
+            "shells_executes",
+            "function_run",
+            "functions_run",
+        ] {
+            assert!(
+                citation_owns_shell_function_dispatch(&citation(
+                    name,
+                    "src/runtime.sh",
+                    NodeKind::FUNCTION,
+                )),
+                "{name} names both the shell-function subject and dispatch action",
+            );
+        }
+        for name in [
+            "dispatch",
+            "dispatches",
+            "execute",
+            "executes",
+            "executor",
+            "executors",
+            "command",
+            "commands",
+        ] {
+            assert!(
+                !citation_owns_shell_function_dispatch(&citation(
+                    name,
+                    "src/runtime.sh",
+                    NodeKind::FUNCTION,
+                )),
+                "{name} supplies only one carrier factor",
+            );
+        }
+    }
+
+    #[test]
+    fn shell_function_dispatch_requires_a_callable_anchor() {
+        for (name, kind) in [
+            ("nvm_command_dispatch", NodeKind::FUNCTION),
+            ("ShellCommand::dispatch", NodeKind::METHOD),
+        ] {
+            assert!(
+                citation_owns_shell_function_dispatch(&citation(name, "src/runtime.sh", kind)),
+                "{name} is a callable shell dispatch anchor",
+            );
+        }
+
+        for kind in [NodeKind::VARIABLE, NodeKind::FIELD, NodeKind::TYPEDEF] {
+            assert!(
+                !citation_owns_shell_function_dispatch(&citation(
+                    "command_dispatch",
+                    "src/runtime.sh",
+                    kind,
+                )),
+                "a {kind:?} named like a shell dispatcher is not callable evidence",
+            );
+        }
+    }
+
+    #[test]
+    fn search_evidence_carriers_require_subject_action_and_callable_shape() {
+        for (name, kind) in [
+            ("SearchHitEvidence::tier", NodeKind::METHOD),
+            ("classify_result_evidence", NodeKind::FUNCTION),
+        ] {
+            assert!(
+                citation_owns_search_evidence_classification(&citation(
+                    name,
+                    "src/retrieval/evidence.rs",
+                    kind,
+                )),
+                "{name} classifies search-result evidence",
+            );
+        }
+        for (name, kind) in [
+            ("append_search_evidence_packet", NodeKind::FUNCTION),
+            ("SearchEvidence::render_output", NodeKind::METHOD),
+        ] {
+            assert!(
+                citation_owns_search_evidence_output(&citation(
+                    name,
+                    "src/runtime/output.rs",
+                    kind,
+                )),
+                "{name} writes search evidence to an output surface",
+            );
+        }
+
+        let wrong_action = citation(
+            "SearchHitEvidence::rank",
+            "src/retrieval/ranker.rs",
+            NodeKind::METHOD,
+        );
+        assert!(!citation_owns_search_evidence_classification(&wrong_action));
+        assert!(!citation_owns_search_evidence_output(&wrong_action));
+
+        let non_callable = citation(
+            "SearchHitEvidenceTier",
+            "src/retrieval/evidence.rs",
+            NodeKind::STRUCT,
+        );
+        assert!(!citation_owns_search_evidence_classification(&non_callable));
+    }
+
+    #[test]
+    fn indexing_entrypoint_action_taxonomy_is_directional_and_table_driven() {
+        let mutation_actions = [
+            "index",
+            "reindex",
+            "build",
+            "rebuild",
+            "create",
+            "construct",
+            "generate",
+            "write",
+            "persist",
+            "store",
+            "save",
+            "update",
+            "insert",
+            "upsert",
+            "ingest",
+            "populate",
+            "materialize",
+        ];
+        let observation_actions = [
+            "read", "query", "search", "lookup", "execute", "scan", "fetch", "get", "list",
+            "inspect", "load", "open", "find", "check", "describe",
+        ];
+
+        for action in mutation_actions {
+            for (name, kind) in [
+                (format!("{action}_index"), NodeKind::FUNCTION),
+                (format!("SearchIndex::{action}"), NodeKind::METHOD),
+            ] {
+                assert!(
+                    citation_owns_indexing_entrypoint(&citation(&name, "src/services.rs", kind,)),
+                    "{name} must claim mutation/construction ownership",
+                );
+            }
+        }
+
+        for action in observation_actions {
+            for (name, kind) in [
+                (format!("{action}_index"), NodeKind::FUNCTION),
+                (format!("IndexService::{action}"), NodeKind::METHOD),
+            ] {
+                assert!(
+                    !citation_owns_indexing_entrypoint(&citation(&name, "src/search.rs", kind,)),
+                    "{name} must remain observational",
+                );
+            }
+        }
+
+        for owner_family in INDEXING_OBSERVATION_ACTIONS
+            .iter()
+            .chain(INDEXING_OBSERVATION_OWNER_NOUNS)
+        {
+            for owner in [(*owner_family).to_string(), taxonomy_plural(owner_family)] {
+                let name = format!("Index_{owner}::run");
+                assert!(
+                    !citation_owns_indexing_entrypoint(&citation(
+                        &name,
+                        "src/search.rs",
+                        NodeKind::METHOD,
+                    )),
+                    "singular/plural observation owner {name} must veto lifecycle ownership",
+                );
+            }
+        }
+
+        for action in INDEXING_LIFECYCLE_ACTIONS {
+            for (name, kind) in [
+                (format!("{action}_index"), NodeKind::FUNCTION),
+                (format!("IndexingWorkQueue::{action}"), NodeKind::METHOD),
+            ] {
+                assert!(
+                    citation_owns_indexing_entrypoint(&citation(&name, "src/services.rs", kind,)),
+                    "{name} must claim indexing lifecycle ownership",
+                );
+            }
+        }
+
+        for (name, kind, expected) in [
+            ("run_index", NodeKind::FUNCTION, true),
+            (
+                "IndexService::run_indexing_blocking_without_runtime_refresh",
+                NodeKind::METHOD,
+                true,
+            ),
+            ("BuildIndex::run", NodeKind::METHOD, true),
+            ("index_file", NodeKind::FUNCTION, true),
+            ("reindex_files", NodeKind::FUNCTION, true),
+            ("re_index_files", NodeKind::FUNCTION, true),
+            ("SearchIndex::build", NodeKind::METHOD, true),
+            ("SearchIndex::execute_query", NodeKind::METHOD, false),
+            ("IndexReader::read_index", NodeKind::METHOD, false),
+            ("IndexReader::run", NodeKind::METHOD, false),
+            ("IndexLookup::run", NodeKind::METHOD, false),
+            ("run_indexed_query", NodeKind::FUNCTION, false),
+            ("index", NodeKind::FUNCTION, false),
+            ("cache_index", NodeKind::FUNCTION, false),
+            ("build_files", NodeKind::FUNCTION, false),
+            ("create_files", NodeKind::FUNCTION, false),
+            ("run_index", NodeKind::VARIABLE, false),
+            ("run", NodeKind::FUNCTION, false),
+        ] {
+            assert_eq!(
+                citation_owns_indexing_entrypoint(&citation(name, "src/services.rs", kind,)),
+                expected,
+                "exact carrier {name}",
+            );
+        }
+    }
+
+    #[test]
+    fn string_predicate_carriers_require_both_string_subject_and_distinct_behavior() {
+        for name in ["StringUtils.isBlank", "TextPredicates::whitespaceOnly"] {
+            assert!(
+                citation_owns_string_blank_predicate(&citation(
+                    name,
+                    "src/text/predicates.rs",
+                    NodeKind::METHOD,
+                )),
+                "{name} is a string blank predicate",
+            );
+        }
+        for name in ["Strings.isEmpty", "CharSequencePredicates::empty"] {
+            assert!(
+                citation_owns_string_empty_predicate(&citation(
+                    name,
+                    "src/text/predicates.rs",
+                    NodeKind::METHOD,
+                )),
+                "{name} is a string empty predicate",
+            );
+        }
+        for name in ["Strings.regionMatches", "CharSequenceUtils::compareRegion"] {
+            assert!(
+                citation_owns_string_region_handoff(&citation(
+                    name,
+                    "src/text/compare.rs",
+                    NodeKind::METHOD,
+                )),
+                "{name} is a string region handoff",
+            );
+        }
+
+        for name in [
+            "DatabaseRecord.isBlank",
+            "Queue.isEmpty",
+            "MemoryRegion.compare",
+        ] {
+            let unrelated = citation(name, "src/storage/state.rs", NodeKind::METHOD);
+            assert!(!citation_owns_string_blank_predicate(&unrelated));
+            assert!(!citation_owns_string_empty_predicate(&unrelated));
+            assert!(!citation_owns_string_region_handoff(&unrelated));
+        }
     }
 
     #[test]
@@ -1237,6 +2170,291 @@ mod tests {
 
         assert!(!citation_owns_client_request_method(&factory));
         assert!(citation_owns_client_request_method(&request));
+    }
+
+    #[test]
+    fn request_flow_carriers_require_independent_subject_and_action_tokens() {
+        for (name, path) in [
+            ("request", "src/requests/api.py"),
+            ("get", "lib/transportkit/api.py"),
+            ("get", "pkgs/http/lib/http.dart"),
+        ] {
+            assert!(citation_owns_client_public_facade_helper(&citation(
+                name,
+                path,
+                NodeKind::FUNCTION,
+            )));
+        }
+        for (name, path, kind) in [
+            ("request", "src/client.py", NodeKind::FUNCTION),
+            ("request", "src/database/api.py", NodeKind::FUNCTION),
+            ("get", "src/cache/api.py", NodeKind::FUNCTION),
+            ("request", "src/telemetry/api.py", NodeKind::FUNCTION),
+            ("get", "src/monitoring/api.py", NodeKind::FUNCTION),
+            ("request", "src/requests/api.py", NodeKind::METHOD),
+            ("FrameKind.request", "src/requests/api.py", NodeKind::METHOD),
+            ("Session.request", "src/requests/api.py", NodeKind::METHOD),
+            ("Cache.request", "src/requests/api.py", NodeKind::METHOD),
+            ("dispatch_hook", "src/requests/api.py", NodeKind::FUNCTION),
+            ("get", "pkgs/http/lib/src/http.dart", NodeKind::FUNCTION),
+        ] {
+            assert!(!citation_owns_client_public_facade_helper(&citation(
+                name, path, kind,
+            )));
+        }
+
+        for positive in ["Session.request", "HttpClient.get"] {
+            assert!(citation_owns_client_request_entrypoint(&citation(
+                positive,
+                "src/client.rs",
+                NodeKind::METHOD,
+            )));
+        }
+        for negative in [
+            "FrameKind.request",
+            "Session.get",
+            "ClientCache.get",
+            "HttpCache.get",
+        ] {
+            assert!(!citation_owns_client_request_entrypoint(&citation(
+                negative,
+                "src/client.rs",
+                NodeKind::METHOD,
+            )));
+        }
+        assert!(!citation_owns_client_request_entrypoint(&citation(
+            "Session.request",
+            "src/storage.rs",
+            NodeKind::METHOD,
+        )));
+
+        for positive in ["Session.send", "HttpClient.send"] {
+            assert!(citation_owns_client_request_dispatch(&citation(
+                positive,
+                "src/client.rs",
+                NodeKind::METHOD,
+            )));
+        }
+        for negative in [
+            "dispatch_hook",
+            "HttpTransportAdapter.send",
+            "Connection.execute",
+            "RequestRouter.dispatch",
+            "HttpCache.send",
+        ] {
+            assert!(!citation_owns_client_request_dispatch(&citation(
+                negative,
+                "src/client.rs",
+                NodeKind::FUNCTION,
+            )));
+        }
+
+        for positive in ["Session.get_adapter", "HttpClient.selectTransport"] {
+            assert!(citation_owns_client_adapter_selection(&citation(
+                positive,
+                "src/client.rs",
+                NodeKind::METHOD,
+            )));
+        }
+        for negative in [
+            "dispatch_hook",
+            "Session.send",
+            "BaseAdapter.send",
+            "AdapterRegistry.get",
+        ] {
+            assert!(!citation_owns_client_adapter_selection(&citation(
+                negative,
+                "src/client.rs",
+                NodeKind::METHOD,
+            )));
+        }
+
+        for positive in ["BaseAdapter.send", "HttpTransport.send"] {
+            assert!(citation_owns_client_transport_send(&citation(
+                positive,
+                "src/client.rs",
+                NodeKind::METHOD,
+            )));
+        }
+        for negative in ["dispatch_hook", "Session.send", "HttpCache.send"] {
+            assert!(!citation_owns_client_transport_send(&citation(
+                negative,
+                "src/client.rs",
+                NodeKind::METHOD,
+            )));
+        }
+
+        for positive in ["app.route", "RequestRouter.route"] {
+            assert!(citation_owns_server_request_entrypoint(&citation(
+                positive,
+                "lib/application.js",
+                NodeKind::FUNCTION,
+            )));
+        }
+        for negative in [
+            "WidgetFactory.create",
+            "ApplicationFactory.create",
+            "HttpClient.new",
+            "ServerPluginRegistry.registerPlugin",
+        ] {
+            assert!(!citation_owns_server_request_entrypoint(&citation(
+                negative,
+                "lib/application.js",
+                NodeKind::FUNCTION,
+            )));
+        }
+
+        for positive in ["app.handle", "RequestRouter.dispatch"] {
+            assert!(citation_owns_server_request_dispatch(&citation(
+                positive,
+                "lib/application.js",
+                NodeKind::FUNCTION,
+            )));
+        }
+        for negative in [
+            "EventProcessor.handle",
+            "EventHandler.handle",
+            "HttpClient.dispatch",
+        ] {
+            assert!(!citation_owns_server_request_dispatch(&citation(
+                negative,
+                "lib/application.js",
+                NodeKind::FUNCTION,
+            )));
+        }
+
+        for positive in ["res.send", "ResponseWriter.flush"] {
+            assert!(citation_owns_server_response_terminal(&citation(
+                positive,
+                "lib/response.js",
+                NodeKind::FUNCTION,
+            )));
+        }
+        for negative in [
+            "EmailSender.send",
+            "StreamWriter.write",
+            "ResponseParser.finish",
+        ] {
+            assert!(!citation_owns_server_response_terminal(&citation(
+                negative,
+                "lib/response.js",
+                NodeKind::FUNCTION,
+            )));
+        }
+
+        for target in [
+            "Session.prepare_request",
+            "PreparedRequest.build",
+            "Session.send",
+            "Client.send",
+        ] {
+            assert!(client_request_entrypoint_call_target(target), "{target}");
+        }
+        for target in [
+            "Telemetry.prepareRequest",
+            "CacheBuilder.build",
+            "Telemetry.send",
+            "CacheClient.send",
+            "CacheClient.prepareRequest",
+            "DatabaseClient.send",
+            "HookClient.send",
+            "HookClient.prepareRequest",
+        ] {
+            assert!(!client_request_entrypoint_call_target(target), "{target}");
+        }
+        for positive in [
+            "Session.request",
+            "HttpClient.request",
+            "requests.sessions.Session.request",
+        ] {
+            assert!(client_public_facade_successor_call_target(positive));
+        }
+        for negative in [
+            "request",
+            "requests.api.request",
+            "FrameKind.request",
+            "ClientRequestMetrics.request",
+            "CacheClient.request",
+            "DatabaseClient.request",
+            "TelemetryClient.request",
+            "MonitoringClient.request",
+            "Session.prepare_request",
+            "Session.send",
+            "dispatch_hook",
+        ] {
+            assert!(!client_public_facade_successor_call_target(negative));
+        }
+        assert!(client_request_dispatch_predecessor_call_source(
+            "Session.request"
+        ));
+        assert!(!client_request_dispatch_predecessor_call_source(
+            "Logger.record"
+        ));
+        assert!(!client_request_dispatch_predecessor_call_source(
+            "ClientRequestMetrics.record"
+        ));
+        assert!(client_request_dispatch_successor_call_target(
+            "Session.get_adapter"
+        ));
+        assert!(!client_request_dispatch_successor_call_target(
+            "Logger.record"
+        ));
+        assert!(!client_request_dispatch_successor_call_target(
+            "AdapterResolveMetrics.record"
+        ));
+        assert!(server_request_entrypoint_call_target("Router.route"));
+        assert!(server_request_entrypoint_call_target("Router.use"));
+        assert!(server_request_entrypoint_call_target("Router.listen"));
+        assert!(server_request_entrypoint_call_target("Server.listen"));
+        assert!(!server_request_entrypoint_call_target("Server.route"));
+        assert!(!server_request_entrypoint_call_target("Server.use"));
+        assert!(server_request_dispatch_call_target("finalhandler"));
+        for target in [
+            "app.handle",
+            "Router.dispatch",
+            "Controller.handle",
+            "Middleware.invoke",
+            "Wsgi.handle",
+            "Asgi.dispatch",
+            "Servlet.invoke",
+        ] {
+            assert!(server_request_dispatch_call_target(target), "{target}");
+        }
+        assert!(server_response_terminal_call_target("ServerResponse.end"));
+        for target in [
+            "response.write",
+            "ResponseSender.finish",
+            "reply.flush",
+            "writer.finish",
+            "transport.write",
+            "socket.end",
+            "stream.flush",
+            "output.finish",
+        ] {
+            assert!(server_response_terminal_call_target(target), "{target}");
+        }
+        assert!(!server_request_entrypoint_call_target(
+            "PluginRegistry.registerPlugin"
+        ));
+        assert!(!server_request_entrypoint_call_target("Metrics.use"));
+        assert!(!server_request_entrypoint_call_target("MetricsRouter.use"));
+        assert!(!server_request_dispatch_call_target("HttpClient.dispatch"));
+        assert!(!server_request_dispatch_call_target("Telemetry.handle"));
+        assert!(!server_request_dispatch_call_target(
+            "TelemetryRouter.handle"
+        ));
+        assert!(!server_response_terminal_call_target(
+            "ResponseParser.parse"
+        ));
+        assert!(!server_response_terminal_call_target("Telemetry.end"));
+        assert!(!server_response_terminal_call_target("Cache.write"));
+        assert!(!server_response_terminal_call_target("EmailSender.finish"));
+        assert!(!server_response_terminal_call_target(
+            "TelemetryOutput.finish"
+        ));
+        assert!(!server_response_terminal_call_target(
+            "MetricsOutput.finish"
+        ));
     }
 
     #[test]

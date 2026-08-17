@@ -1102,6 +1102,14 @@ impl EmbeddingEngine {
         self.submit(context, vec![input], RequestPriority::Query)
     }
 
+    pub fn submit_queries_prepared(
+        &self,
+        context: EmbeddingRequestContext,
+        inputs: Vec<String>,
+    ) -> Result<EmbeddingRequestHandle, EngineError> {
+        self.submit(context, inputs, RequestPriority::Query)
+    }
+
     pub fn submit_documents_prepared(
         &self,
         context: EmbeddingRequestContext,

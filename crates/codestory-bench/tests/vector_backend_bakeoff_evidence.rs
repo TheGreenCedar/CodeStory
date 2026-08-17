@@ -157,7 +157,8 @@ fn abstention_corpus() -> Vec<BenchmarkVector> {
             node_id: "aligned".to_string(),
             vector: unit([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         },
-        // cosine 0.707 — above the lane's half-of-best floor
+        // cosine 0.707 — above the absolute floor but outside the calibrated
+        // additive margin from the best hit
         BenchmarkVector {
             node_id: "near".to_string(),
             vector: unit([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
@@ -184,8 +185,9 @@ fn abstention_corpus() -> Vec<BenchmarkVector> {
 fn the_benchmark_scan_is_the_product_scan_including_its_abstention_rule() {
     // Five neighbours are published and a window of five is asked for, so a
     // scan that merely sorted would return all five. The shipped lane keeps
-    // only neighbours at or above half its own best similarity, and that is
-    // what the harness must be measuring.
+    // only neighbours that meet both its calibrated absolute floor and its
+    // additive margin from the best hit, and that is what the harness must be
+    // measuring.
     let root = tempfile::tempdir().expect("bake-off root");
     let corpus = abstention_corpus();
     let published = publish_vector_generation(
@@ -205,7 +207,7 @@ fn the_benchmark_scan_is_the_product_scan_including_its_abstention_rule() {
         .iter()
         .map(|(node_id, _)| node_id.clone())
         .collect::<Vec<_>>();
-    assert_eq!(served, vec!["aligned".to_string(), "near".to_string()]);
+    assert_eq!(served, vec!["aligned".to_string()]);
 }
 
 #[test]

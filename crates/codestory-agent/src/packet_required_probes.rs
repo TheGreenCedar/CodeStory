@@ -1,8 +1,7 @@
+#[cfg(test)]
+use crate::eval_probes::push_eval_required_probe_queries;
 #[cfg(any(test, feature = "test-support"))]
-use crate::eval_probes::{
-    eval_probes_enabled, push_eval_required_probe_queries,
-    push_prompt_concept_derived_symbol_probes,
-};
+use crate::eval_probes::{eval_probes_enabled, push_prompt_concept_derived_symbol_probes};
 use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management,
     packet_citation_owns_request_pipeline, packet_citation_owns_transport_adapter,
@@ -14,15 +13,19 @@ use crate::packet_scoring::{
     packet_query_stop_term,
 };
 use crate::packet_terms::{
-    packet_probe_terms, packet_terms_have, packet_terms_have_any,
-    packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
-    packet_terms_indicate_command_dispatch_flow, packet_terms_indicate_command_event_loop_flow,
+    packet_probe_terms, packet_terms_indicate_command_dispatch_flow,
+    packet_terms_indicate_command_event_loop_flow,
     packet_terms_indicate_command_server_bootstrap_flow,
-    packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_form_validation_flow,
+    packet_terms_indicate_network_command_input_flow,
+};
+#[cfg(test)]
+use crate::packet_terms::{
+    packet_terms_have, packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
+    packet_terms_indicate_client_send_flow, packet_terms_indicate_event_loop_command_flow,
+    packet_terms_indicate_form_validation_flow,
     packet_terms_indicate_html_css_template_structure_flow, packet_terms_indicate_indexing_flow,
     packet_terms_indicate_log_record_handler_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
-    packet_terms_indicate_network_command_input_flow,
     packet_terms_indicate_prepared_session_adapter_flow,
     packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_route_tree_dispatch_flow,
     packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
@@ -54,16 +57,12 @@ pub fn packet_missing_sufficiency_probe_queries_with_extra(
 fn packet_probe_query_is_covered(
     query: &str,
     answer: &AgentAnswerDto,
-    supported_claims: &[PacketClaimDto],
+    _supported_claims: &[PacketClaimDto],
 ) -> bool {
-    if packet_required_probe_requires_citation(query) {
-        return packet_probe_query_is_cited(query, answer);
-    }
     packet_probe_query_is_cited(query, answer)
-        || packet_css_custom_property_probe_is_covered(query, answer, supported_claims)
-        || packet_probe_query_is_claimed(query, supported_claims)
 }
 
+#[cfg(test)]
 pub fn packet_probe_query_is_claimed(query: &str, supported_claims: &[PacketClaimDto]) -> bool {
     if let Some(parts) = packet_file_scoped_symbol_probe_parts(query) {
         return supported_claims
@@ -90,6 +89,7 @@ pub fn packet_probe_query_is_claimed(query: &str, supported_claims: &[PacketClai
     })
 }
 
+#[cfg(test)]
 fn packet_probe_query_requires_concept_match(normalized_query: &str) -> bool {
     matches!(
         normalized_query,
@@ -97,6 +97,7 @@ fn packet_probe_query_requires_concept_match(normalized_query: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn packet_claim_covers_concept_probe(normalized_query: &str, normalized_claim: &str) -> bool {
     match normalized_query {
         "recordcreation" => {
@@ -248,6 +249,7 @@ fn packet_claim_covers_concept_probe(normalized_query: &str, normalized_claim: &
     }
 }
 
+#[cfg(test)]
 fn packet_claim_covers_file_scoped_probe(
     parts: &PacketFileScopedSymbolProbe,
     claim: &PacketClaimDto,
@@ -275,52 +277,7 @@ fn packet_claim_covers_file_scoped_probe(
         .all(|symbol| normalized_claim.contains(symbol))
 }
 
-fn packet_css_custom_property_probe_is_covered(
-    query: &str,
-    answer: &AgentAnswerDto,
-    supported_claims: &[PacketClaimDto],
-) -> bool {
-    let Some(parts) = packet_file_scoped_symbol_probe_parts(query) else {
-        return false;
-    };
-    if !parts.file_name.eq_ignore_ascii_case("_vars.css") {
-        return false;
-    }
-    if parts.symbols.is_empty()
-        || !parts
-            .symbols
-            .iter()
-            .all(|symbol| symbol.starts_with("animate"))
-    {
-        return false;
-    }
-    let cites_variables_file = answer.citations.iter().any(|citation| {
-        citation
-            .file_path
-            .as_deref()
-            .map(packet_display_path)
-            .map(|path| {
-                path.rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or(path.as_str())
-                    .eq_ignore_ascii_case("_vars.css")
-            })
-            .unwrap_or(false)
-    });
-    if !cites_variables_file {
-        return false;
-    }
-
-    supported_claims.iter().any(|claim| {
-        let normalized_claim = normalize_identifier(&claim.claim);
-        normalized_claim.contains("csscustomproperties")
-            && parts
-                .symbols
-                .iter()
-                .all(|symbol| normalized_claim.contains(symbol))
-    })
-}
-
+#[cfg(test)]
 fn packet_probe_query_allows_claim_coverage(query: &str) -> bool {
     let trimmed = query.trim();
     packet_concept_probe_allows_claim_coverage(&normalize_identifier(trimmed))
@@ -330,6 +287,7 @@ fn packet_probe_query_allows_claim_coverage(query: &str) -> bool {
             && !trimmed.chars().any(char::is_whitespace)
 }
 
+#[cfg(test)]
 fn claim_has_sql_relationship_reference(normalized_claim: &str) -> bool {
     normalized_claim.contains("rowsreference")
         || (normalized_claim.contains("references")
@@ -339,6 +297,7 @@ fn claim_has_sql_relationship_reference(normalized_claim: &str) -> bool {
                 || normalized_claim.contains("rows")))
 }
 
+#[cfg(test)]
 fn packet_concept_probe_allows_claim_coverage(normalized_query: &str) -> bool {
     matches!(
         normalized_query,
@@ -367,13 +326,6 @@ fn packet_concept_probe_allows_claim_coverage(normalized_query: &str) -> bool {
     )
 }
 
-fn packet_required_probe_requires_citation(query: &str) -> bool {
-    matches!(
-        normalize_identifier(query).as_str(),
-        "routetreeaddroute" | "sourcereadbuffer" | "sinkwritebuffer"
-    )
-}
-
 #[cfg(any(test, feature = "test-support"))]
 pub fn packet_sufficiency_required_probe_queries(
     question: &str,
@@ -398,6 +350,25 @@ pub fn packet_sufficiency_required_probe_queries_with_extra(
 }
 
 pub fn packet_sufficiency_required_probe_queries_from_terms(
+    terms: &[String],
+    task_class: PacketTaskClassDto,
+) -> Vec<String> {
+    if !matches!(
+        task_class,
+        PacketTaskClassDto::ArchitectureExplanation
+            | PacketTaskClassDto::DataFlow
+            | PacketTaskClassDto::ChangeImpact
+            | PacketTaskClassDto::RouteTracing
+            | PacketTaskClassDto::EditPlanning
+    ) {
+        return Vec::new();
+    }
+    packet_flow_requirement_queries_for_terms(terms, task_class)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn legacy_packet_sufficiency_required_probe_queries_from_terms(
     terms: &[String],
     task_class: PacketTaskClassDto,
 ) -> Vec<String> {
@@ -559,6 +530,7 @@ pub fn packet_sufficiency_required_probe_queries_from_terms(
     queries
 }
 
+#[cfg(test)]
 fn push_prompt_concept_role_probe_queries(terms: &[String], queries: &mut Vec<String>) {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
@@ -843,6 +815,85 @@ pub fn packet_prompt_exact_symbol_probe_queries(
     queries
 }
 
+/// Extract table identities from the ordinary relational-schema phrasing "between A, B, and C".
+/// These are bounded source anchors, not benchmark labels: the same parser turns "customers,
+/// orders, and order items" into `customer`, `order`, and `order item` queries.
+pub fn packet_named_schema_entity_queries(question: &str) -> Vec<String> {
+    let lower = question.to_ascii_lowercase();
+    let Some(start) = [" between ", " among "]
+        .into_iter()
+        .filter_map(|marker| lower.find(marker).map(|index| index + marker.len()))
+        .min()
+    else {
+        return Vec::new();
+    };
+    let tail = &lower[start..];
+    let end = [" across ", " within ", " using ", " from ", "."]
+        .into_iter()
+        .filter_map(|marker| tail.find(marker))
+        .min()
+        .unwrap_or(tail.len());
+    let segment = tail[..end].replace(" and ", ",");
+    let mut queries = Vec::new();
+    for phrase in segment.split(',') {
+        let words = phrase
+            .split_whitespace()
+            .map(|word| word.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')))
+            .filter(|word| !word.is_empty() && !matches!(*word, "a" | "an" | "the"))
+            .collect::<Vec<_>>();
+        if words.is_empty()
+            || words.len() > 3
+            || words.iter().any(|word| {
+                matches!(
+                    *word,
+                    "database"
+                        | "relation"
+                        | "relations"
+                        | "relationship"
+                        | "relationships"
+                        | "schema"
+                        | "sql"
+                        | "table"
+                        | "tables"
+                )
+            })
+        {
+            continue;
+        }
+        let mut normalized = words
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect::<Vec<_>>();
+        if let Some(last) = normalized.last_mut() {
+            if let Some(stem) = last.strip_suffix("ies") {
+                *last = format!("{stem}y");
+            } else if let Some(stem) = last.strip_suffix("sses") {
+                *last = format!("{stem}ss");
+            } else if last.ends_with('s') && !last.ends_with("ss") {
+                last.pop();
+            }
+        }
+        let query = normalized.join(" ");
+        if query.len() >= 3 && !queries.iter().any(|existing| existing == &query) {
+            queries.push(query);
+        }
+        if queries.len() == 8 {
+            break;
+        }
+    }
+    queries
+}
+
+/// Query the SQL collector's canonical default-schema identity for each named entity. The
+/// collector deliberately assigns unqualified tables to `public`, so this asks for its exact
+/// durable symbol instead of hoping a broad noun query outranks every seed file containing it.
+pub fn packet_named_schema_entity_symbol_queries(question: &str) -> Vec<String> {
+    packet_named_schema_entity_queries(question)
+        .into_iter()
+        .map(|entity| format!("public.{}", entity.replace(' ', "")))
+        .collect()
+}
+
 fn push_unique_exact_symbol_term(terms: &mut Vec<String>, value: &str) {
     let value = value.trim();
     if value.len() >= 3 && !terms.iter().any(|term| term == value) {
@@ -862,7 +913,14 @@ fn packet_prompt_exact_symbol_term_is_probe(term: &str) -> bool {
         .chars()
         .filter(|ch| ch.is_ascii_alphabetic())
         .collect::<Vec<_>>();
-    !letters.is_empty() && !letters.iter().all(|ch| ch.is_ascii_uppercase())
+    if letters.is_empty() || letters.iter().all(|ch| ch.is_ascii_uppercase()) {
+        return false;
+    }
+    let plural_acronym = letters.last() == Some(&'s')
+        && letters[..letters.len() - 1]
+            .iter()
+            .all(|ch| ch.is_ascii_uppercase());
+    !plural_acronym
 }
 
 fn packet_prompt_exact_symbol_term_is_source_path(term: &str) -> bool {
@@ -1006,7 +1064,6 @@ fn packet_required_probe_needs_full_token_coverage(query: &str) -> bool {
             | "storagepersistence"
             | "searchprojection"
             | "snapshotrefresh"
-            | "routetreeaddroute"
             | "sourcereadbuffer"
             | "sinkwritebuffer"
     )
@@ -1294,27 +1351,16 @@ fn packet_citation_matches_route_registration_probe(
         return false;
     }
 
-    let normalized_display = normalize_identifier(&citation.display_name);
-    let display_tail = citation
-        .display_name
-        .rsplit(['.', ':', '#'])
-        .next()
-        .map(normalize_identifier)
-        .unwrap_or_default();
-    let route_context = normalized_display.contains("route")
-        || normalized_display.contains("router")
-        || path.contains("route")
-        || path.contains("router")
-        || path.contains("application");
-    let registration_shape = normalized_display.contains("addroute")
-        || normalized_display.contains("registerroute")
-        || display_tail == "route"
-        || ((display_tail == "use" || normalized_display.ends_with("use"))
-            && path.contains("application"))
-        || ((display_tail == "handle" || normalized_display.ends_with("handle"))
-            && (normalized_display.contains("routergroup") || path.contains("routergroup")));
-
-    route_context && registration_shape
+    if packet_evidence_role(citation) != Some(PacketEvidenceRole::RouteHandling) {
+        return false;
+    }
+    let tokens = crate::text::symbol_query_tokens(&citation.display_name);
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "register" | "registration" | "add" | "mount" | "use" | "route"
+        )
+    })
 }
 
 fn packet_citation_matches_route_engine_constructor_probe(
@@ -1685,8 +1731,10 @@ fn packet_file_scoped_symbol_probe_matches(
         return Some(normalized_display == expected || normalized_display.ends_with(&expected));
     }
     if parts.symbols.len() >= 2 && parts.symbols[0] == "foreign" && parts.symbols[1] == "key" {
+        let tokens = crate::text::symbol_query_tokens(&citation.display_name);
         return Some(
-            normalized_display == "foreignkey" || normalized_display.ends_with("foreignkey"),
+            tokens.iter().any(|token| token == "foreign")
+                && tokens.iter().any(|token| token == "key"),
         );
     }
     Some(parts.symbols.iter().any(|symbol| {
@@ -1847,6 +1895,7 @@ fn push_unique_owned_terms(terms: &mut Vec<String>, values: &[String]) {
     }
 }
 
+#[cfg(test)]
 fn push_runtime_formatting_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -1869,6 +1918,7 @@ fn push_runtime_formatting_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_log_record_handler_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -1883,6 +1933,7 @@ fn push_log_record_handler_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_site_build_phase_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -1899,6 +1950,7 @@ fn push_site_build_phase_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_mapper_configuration_plan_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -1914,6 +1966,7 @@ fn push_mapper_configuration_plan_source_probe_queries(queries: &mut Vec<String>
     );
 }
 
+#[cfg(test)]
 fn push_client_send_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -1953,6 +2006,7 @@ pub fn push_command_loop_source_probe_queries_for_terms(
     }
 }
 
+#[cfg(test)]
 fn push_server_request_dispatch_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -1968,6 +2022,7 @@ fn push_server_request_dispatch_source_probe_queries(queries: &mut Vec<String>) 
     );
 }
 
+#[cfg(test)]
 fn push_url_session_request_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -1982,6 +2037,7 @@ fn push_url_session_request_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_form_validation_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -1997,6 +2053,7 @@ fn push_form_validation_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_stylesheet_animation_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -2015,6 +2072,7 @@ fn push_stylesheet_animation_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+#[cfg(test)]
 fn push_html_css_template_structure_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -2037,7 +2095,7 @@ pub fn push_sql_schema_required_probe_queries(terms: &[String], queries: &mut Ve
         queries,
         &[
             "CREATE TABLE",
-            "FOREIGN KEY",
+            "referential constraint",
             "REFERENCES",
             "sql schema scripts",
         ],
@@ -2222,6 +2280,40 @@ mod tests {
     }
 
     #[test]
+    fn prompt_exact_symbol_queries_reject_plural_acronyms() {
+        let queries = packet_prompt_exact_symbol_probe_queries(
+            "Explain how the AutoMapper APIs build and execute a mapping plan",
+            &[],
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+
+        assert!(queries.iter().any(|query| query == "AutoMapper"));
+        assert!(!queries.iter().any(|query| query == "APIs"));
+    }
+
+    #[test]
+    fn named_schema_entities_are_bounded_and_singularized() {
+        assert_eq!(
+            packet_named_schema_entity_queries(
+                "Explain relationships between customers, orders, and order items across SQL scripts."
+            ),
+            ["customer", "order", "order item"]
+        );
+        assert_eq!(
+            packet_named_schema_entity_queries(
+                "Explain relationships between artists, albums, tracks, invoices, and invoice lines across the seed scripts."
+            ),
+            ["artist", "album", "track", "invoice", "invoice line"]
+        );
+        assert_eq!(
+            packet_named_schema_entity_symbol_queries(
+                "Explain relationships between artists, albums, and invoice lines across the seed scripts."
+            ),
+            ["public.artist", "public.album", "public.invoiceline"]
+        );
+    }
+
+    #[test]
     fn packet_probe_match_rank_uses_multi_token_path_coverage() {
         let mut citation = test_packet_citation(
             "std::collections::HashMap",
@@ -2356,9 +2448,16 @@ mod tests {
         );
         assert_role_match(
             "search execution unit",
-            "SearchExecutor",
+            "SearchExecutor::execute_search",
             "src/search/executor.rs",
-            NodeKind::STRUCT,
+            NodeKind::METHOD,
+        );
+        let mut search_type = test_packet_citation("SearchExecutor", "src/search/executor.rs", 0.7);
+        search_type.kind = NodeKind::STRUCT;
+        assert_ne!(
+            packet_citation_probe_match_rank("search execution unit", &search_type),
+            Some(6),
+            "a named type is not behavioral execution evidence"
         );
         assert_role_match(
             "flag parsing",
@@ -2468,7 +2567,7 @@ mod tests {
             "Explain how the public hook serializes keys, connects cache helpers, and composes middleware.",
             PacketTaskClassDto::ArchitectureExplanation,
         );
-        for expected in ["serialize", "cache helper", "middleware"] {
+        for expected in ["public hook export", "key serialization", "cache helper"] {
             assert!(
                 hook_queries.iter().any(|query| query == expected),
                 "expected {expected:?} in {hook_queries:?}"
@@ -2484,26 +2583,16 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
         );
         for expected in [
-            "form validation",
+            "native form constraints",
             "constraint validation",
-            "html constraint",
-            "pattern",
-            "javascript validation",
-            "custom validation flow",
-            "validity state",
-            "handler processing",
-            "mapper configuration",
-            "type map",
-            "mapping plan",
-            "buffered source",
-            "buffered sink",
-            "source sink buffer",
+            "custom validation",
+            "submit prevent default",
+            "mapper runtime api",
+            "mapping execution plan",
             "buffer storage",
-            "buffered wrapper",
+            "source sink buffer",
             "source read buffer",
             "sink write buffer",
-            "source buffer",
-            "sink buffer",
         ] {
             assert!(
                 flow_queries.iter().any(|query| query == expected),
@@ -2516,18 +2605,10 @@ mod tests {
             PacketTaskClassDto::RouteTracing,
         );
         for expected in [
-            "handler dispatch",
+            "application use",
             "route registration",
-            "router group",
-            "route tree",
-            "route tree add route",
-            "router group handle route",
-            "request handler",
-            "engine request handler",
-            "context next handler chain",
-            "handler chain",
-            "engine creation",
-            "engine creation router state",
+            "application handle",
+            "request dispatch",
         ] {
             assert!(
                 route_queries.iter().any(|query| query == expected),
@@ -2606,10 +2687,13 @@ mod tests {
             "route registration",
             &test_packet_citation("app.route", "lib/application.js", 0.9)
         ));
-        assert!(packet_citation_satisfies_required_probe(
-            "route registration",
-            &test_packet_citation("app.use", "lib/application.js", 0.9)
-        ));
+        assert!(
+            !packet_citation_satisfies_required_probe(
+                "route registration",
+                &test_packet_citation("app.use", "lib/application.js", 0.9)
+            ),
+            "middleware installation is not route registration"
+        );
         assert!(packet_citation_satisfies_required_probe(
             "request handler",
             &test_packet_citation("app.handle", "lib/application.js", 0.9)
@@ -2859,9 +2943,9 @@ mod tests {
     }
 
     #[test]
-    fn sql_schema_required_probes_derive_prompt_table_symbols() {
+    fn sql_schema_required_probes_are_compositional() {
         let terms = packet_probe_terms(
-            "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across SQL seed scripts. Cite the source files.",
+            "Explain SQL table definitions and referential relationships across schema seed scripts.",
         );
         let queries = packet_sufficiency_required_probe_queries_from_terms(
             &terms,
@@ -2869,28 +2953,17 @@ mod tests {
         );
 
         for expected in [
+            "sql table definitions",
             "CREATE TABLE",
-            "FOREIGN KEY",
-            "REFERENCES",
-            "CREATE TABLE Artist",
-            "CREATE TABLE Album",
-            "CREATE TABLE Track",
-            "CREATE TABLE Invoice",
-            "CREATE TABLE InvoiceLine",
+            "referential relationships",
+            "schema constraints",
         ] {
             assert!(
                 queries.iter().any(|query| query == expected),
                 "expected SQL schema probe `{expected}` in {queries:?}"
             );
         }
-        assert!(
-            !queries.iter().any(|query| query == "CREATE TABLE Line"),
-            "standalone compound suffixes should not become table probes: {queries:?}"
-        );
-        assert!(
-            !queries.iter().any(|query| query == "CREATE TABLE File"),
-            "documentation words should not become table probes: {queries:?}"
-        );
+        assert_eq!(queries.len(), 4, "the flow emits only typed general probes");
     }
 
     #[test]
