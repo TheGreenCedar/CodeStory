@@ -32,7 +32,9 @@ use crate::agent::packet_claims::packet_claim_for_role as build_packet_claim_for
 #[cfg(test)]
 use crate::agent::packet_claims::packet_supported_claims;
 use crate::agent::packet_claims::packet_supported_claims_with_telemetry;
-use crate::agent::packet_compiler::{apply_compiled_evidence, drill_options_from_ids};
+use crate::agent::packet_compiler::{
+    apply_compiled_evidence_with_proof_reconciliation, drill_options_from_ids,
+};
 use crate::agent::packet_degradation::apply_packet_semantic_degradation_counters;
 use crate::agent::packet_evidence::decorate_citation_from_hit;
 use crate::agent::packet_evidence_roles::{
@@ -650,6 +652,10 @@ pub(crate) fn agent_packet(
         &mut plan.obligations,
         &answer,
         &budget,
+        // The post-cap receipts view: the reread source support plus the live
+        // `answer.graphs`, built by the same shared view function the budget
+        // rebuild site uses.
+        &source_support,
     );
     append_packet_evidence_sections(
         &mut answer,
@@ -699,7 +705,9 @@ pub(crate) fn agent_packet(
     append_packet_non_trace_phase(&mut packet.answer, "packet_dto", phase_started);
     enforce_packet_output_budget(&project_root, &mut packet);
 
-    if let Some(diagnostic) = trace_export::write_packet_step_trace_from_env(&packet.answer) {
+    if let Some(diagnostic) =
+        trace_export::write_packet_step_trace_from_env(&packet.answer, &packet.plan.obligations)
+    {
         // Failing to export the developer step-trace artifact says nothing about packet evidence.
         packet
             .answer
@@ -708,7 +716,7 @@ pub(crate) fn agent_packet(
             .push(RetrievalAnnotationDto::observation(diagnostic));
         enforce_packet_output_budget(&project_root, &mut packet);
     }
-    apply_compiled_evidence(&mut packet, Some(&req));
+    apply_compiled_evidence_with_proof_reconciliation(&mut packet, Some(&req));
 
     Ok(packet)
 }

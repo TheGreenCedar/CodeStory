@@ -3,8 +3,8 @@
 
 use codestory_contracts::api::{
     AgentAnswerDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
-    AgentRetrievalTraceDto, PacketRetrievalTraceSummaryDto, RetrievalAnnotationDto,
-    RetrievalAnnotationKindDto,
+    AgentRetrievalTraceDto, PacketObligationPlanDto, PacketRetrievalTraceSummaryDto,
+    RetrievalAnnotationDto, RetrievalAnnotationKindDto,
 };
 use serde_json::{Value, json};
 
@@ -617,9 +617,20 @@ pub(crate) fn packet_retrieval_trace_summary(
     }
 }
 
-pub(crate) fn write_packet_step_trace_from_env(answer: &AgentAnswerDto) -> Option<String> {
+/// Env-gated developer step-trace artifact. Obligation proof verdicts ride
+/// here — and NEVER in `retrieval_trace` annotations, which are
+/// budget-visible — so shadow observability of the typed-proof matcher stays
+/// out of the public payload. The recorded reason keeps a matcher abort
+/// (`flow_proof_atoms_aborted`) distinguishable from an ordinary unproven
+/// verdict.
+pub(crate) fn write_packet_step_trace_from_env(
+    answer: &AgentAnswerDto,
+    obligations: &PacketObligationPlanDto,
+) -> Option<String> {
     let trace_path = std::env::var("CODESTORY_PACKET_STEP_TRACE_OUT").ok()?;
-    let payload = match serde_json::to_string_pretty(&packet_step_trace_json(answer)) {
+    let mut trace = packet_step_trace_json(answer);
+    trace["obligation_proof_verdicts"] = obligation_proof_verdicts_json(obligations);
+    let payload = match serde_json::to_string_pretty(&trace) {
         Ok(payload) => payload,
         Err(error) => {
             return Some(format!(
@@ -635,6 +646,25 @@ pub(crate) fn write_packet_step_trace_from_env(answer: &AgentAnswerDto) -> Optio
             trace_path
         )),
     }
+}
+
+/// One row per claim obligation: id, finalize-time proof status, and the
+/// recorded reason. Formula-bearing obligations carry the matcher verdict in
+/// `reason` (`flow_proof_atoms_unproven` vs `flow_proof_atoms_aborted`).
+fn obligation_proof_verdicts_json(obligations: &PacketObligationPlanDto) -> Value {
+    Value::Array(
+        obligations
+            .claim_obligations
+            .iter()
+            .map(|obligation| {
+                json!({
+                    "id": obligation.id,
+                    "proof_status": format!("{:?}", obligation.proof_status),
+                    "reason": obligation.reason,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn attributable_step_rows(rows: &[PacketStepTraceRow]) -> Vec<&PacketStepTraceRow> {
@@ -1119,8 +1149,9 @@ mod tests {
         }
 
         let answer = sample_answer(Vec::new());
-        let diagnostic = write_packet_step_trace_from_env(&answer)
-            .expect("missing parent should produce a write diagnostic");
+        let diagnostic =
+            write_packet_step_trace_from_env(&answer, &PacketObligationPlanDto::default())
+                .expect("missing parent should produce a write diagnostic");
         assert!(
             diagnostic.starts_with("packet_step_trace_out error=write "),
             "diagnostic should report the write error: {diagnostic}"

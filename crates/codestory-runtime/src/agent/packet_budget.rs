@@ -758,6 +758,11 @@ fn rebuild_packet_budget_dependents(
         &mut packet.plan.obligations,
         &packet.answer,
         &packet.budget,
+        // The receipts view at the rebuild site is the SAME shared function of
+        // (support units, answer) the orchestrator finalize uses — here fed
+        // with the survivors at rebuild time, so identical state yields
+        // identical proof_status at both sites.
+        &packet.support,
     );
     refresh_packet_claim_markdown(packet);
     let trim_trace_summary = packet
@@ -2022,6 +2027,7 @@ pub(super) mod tests {
             &mut packet.plan.obligations,
             &packet.answer,
             &packet.budget,
+            &[],
         );
         let supported_claims_with_telemetry =
             packet_supported_claims_with_telemetry(&packet.answer);
@@ -2062,6 +2068,7 @@ pub(super) mod tests {
             &mut packet.plan.obligations,
             &packet.answer,
             &packet.budget,
+            &[],
         );
 
         refresh_packet_claim_markdown(&mut packet);
@@ -3334,5 +3341,183 @@ pub(super) mod tests {
 
     fn test_project_root() -> &'static Path {
         Path::new("C:/workspace/project root")
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 2: byte-budget rebuild agreement for typed-proof obligations
+    // -----------------------------------------------------------------------
+
+    pub(in crate::agent) const MAPPER_PROOF_QUESTION: &str =
+        "How does the mapper build its configuration and execution plan?";
+
+    fn eligible_proof_citation(name: &str, path: &str, kind: NodeKind) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(name.to_string()),
+            display_name: name.to_string(),
+            kind,
+            file_path: Some(path.to_string()),
+            line: Some(10),
+            score: 0.9,
+            origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: Some(PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(PacketEvidenceResolutionDto::Resolved),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
+        }
+    }
+
+    fn mapper_proof_graph_node(citation: &AgentCitationDto) -> GraphNodeDto {
+        GraphNodeDto {
+            id: citation.node_id.clone(),
+            label: citation.display_name.clone(),
+            kind: citation.kind,
+            depth: 1,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: citation.file_path.clone(),
+            qualified_name: None,
+            member_access: None,
+        }
+    }
+
+    /// A packet whose live state proves `mapper_config` through the atom
+    /// matcher: a certain TYPE_USAGE receipt (A1) in `answer.graphs` plus a
+    /// reread source range for the configuration type (A2) in
+    /// `packet.support`, owned by a retained sufficiency-eligible citation.
+    pub(in crate::agent) fn mapper_proof_packet() -> AgentPacketDto {
+        let builder =
+            eligible_proof_citation("PlanBuilder", "src/plan_builder.cs", NodeKind::CLASS);
+        let config = eligible_proof_citation(
+            "MapperConfiguration",
+            "src/mapper_configuration.cs",
+            NodeKind::CLASS,
+        );
+        let mut packet = test_packet(MAPPER_PROOF_QUESTION, 98_304);
+        packet.task_class = Some(PacketTaskClassDto::ArchitectureExplanation);
+        packet.plan.task_class = PacketTaskClassDto::ArchitectureExplanation;
+        packet.plan.obligations = build_packet_obligation_plan(
+            MAPPER_PROOF_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        packet.answer.citations = vec![builder.clone(), config.clone()];
+        packet.answer.graphs = vec![GraphArtifactDto::Uml {
+            id: "mapper-plan".to_string(),
+            title: "Mapper plan".to_string(),
+            graph: GraphResponse {
+                center_id: builder.node_id.clone(),
+                nodes: vec![
+                    mapper_proof_graph_node(&builder),
+                    mapper_proof_graph_node(&config),
+                ],
+                edges: vec![GraphEdgeDto {
+                    id: EdgeId("builder-uses-config".to_string()),
+                    source: builder.node_id.clone(),
+                    target: config.node_id.clone(),
+                    kind: EdgeKind::TYPE_USAGE,
+                    confidence: Some(1.0),
+                    certainty: Some("certain".to_string()),
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        }];
+        packet.support = mapper_proof_raw_source_support();
+        packet
+    }
+
+    /// The reread source units exactly as the orchestrator holds them in its
+    /// `source_support` local — constructed independently of any packet, so
+    /// the agreement test below exercises the production asymmetry (raw units
+    /// at site A, `packet.support` at site B), not one vector compared with
+    /// itself.
+    fn mapper_proof_raw_source_support() -> Vec<codestory_contracts::api::SupportUnitDto> {
+        vec![codestory_contracts::api::SupportUnitDto {
+            id: "range:MapperConfiguration".to_string(),
+            kind: codestory_contracts::api::SupportUnitKindDto::SourceRange,
+            summary: "MapperConfiguration source".to_string(),
+            path: Some("src/mapper_configuration.cs".to_string()),
+            symbol_id: Some("MapperConfiguration".to_string()),
+            start_line: Some(10),
+            end_line: Some(30),
+            snippet: Some("public class MapperConfiguration {}".to_string()),
+            edge_kind: None,
+            from_symbol: None,
+            to_symbol: None,
+            query: None,
+        }]
+    }
+
+    /// The round-1 review's central hazard: the orchestrator finalize and the
+    /// byte-budget rebuild finalize see different budgets, and finalize is
+    /// destructive. Given identical state the two sites must produce identical
+    /// `proof_status` on every claim obligation, because both build the
+    /// receipts view through the same shared function of (support, answer).
+    ///
+    /// The two sites' support inputs are genuinely different expressions in
+    /// production: the orchestrator feeds its raw `source_support` local
+    /// (which only later becomes `packet.support` — the move happens before
+    /// compile rewrites it), while the rebuild feeds the current
+    /// `packet.support`. Site A therefore gets independently constructed raw
+    /// units here, not `packet.support` itself.
+    #[test]
+    fn orchestrator_and_budget_rebuild_finalize_agree_on_proof_status() {
+        let packet = mapper_proof_packet();
+        let raw_source_support = mapper_proof_raw_source_support();
+        assert_eq!(
+            raw_source_support, packet.support,
+            "fixture invariant: the packet carries exactly the raw reread units"
+        );
+
+        // Site A: the orchestrator-style finalize over the raw units.
+        let mut orchestrator_plan = packet.plan.obligations.clone();
+        finalize_packet_obligation_plan(
+            &packet.question,
+            packet.plan.task_class,
+            &mut orchestrator_plan,
+            &packet.answer,
+            &packet.budget,
+            &raw_source_support,
+        );
+
+        // Site B: the byte-budget rebuild finalize inside the dependents pass.
+        let mut rebuilt = packet.clone();
+        rebuild_packet_budget_dependents(test_project_root(), &mut rebuilt, &[]);
+
+        let statuses = |plan: &codestory_contracts::api::PacketObligationPlanDto| {
+            plan.claim_obligations
+                .iter()
+                .map(|obligation| (obligation.id.clone(), obligation.proof_status))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            statuses(&orchestrator_plan),
+            statuses(&rebuilt.plan.obligations),
+            "the two finalize sites disagreed on proof_status for identical state"
+        );
+        // The agreement must bite on a formula-proven obligation, not only on
+        // trivially unproven ones.
+        let proven = orchestrator_plan
+            .claim_obligations
+            .iter()
+            .find(|obligation| obligation.id == "mapper_config")
+            .expect("mapper_config obligation");
+        assert_eq!(
+            proven.proof_status,
+            PacketObligationProofStatusDto::Proven,
+            "fixture must prove mapper_config through receipts: {proven:?}"
+        );
     }
 }

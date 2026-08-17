@@ -1283,7 +1283,14 @@ mod golden_tests {
             &snapshot,
             limits.max_anchors as usize,
         );
-        finalize_packet_obligation_plan(prompt, task_class, &mut obligation_plan, &answer, &budget);
+        finalize_packet_obligation_plan(
+            prompt,
+            task_class,
+            &mut obligation_plan,
+            &answer,
+            &budget,
+            &[],
+        );
         let obligation = obligation_plan
             .claim_obligations
             .iter()
@@ -1483,6 +1490,7 @@ mod golden_tests {
             &mut obligation_plan,
             &answer,
             &complete_packet_budget(&answer),
+            &[],
         );
         for requirement_id in ["request_entrypoint", "request_dispatch", "request_terminal"] {
             let obligation = obligation_plan
@@ -1619,6 +1627,7 @@ mod golden_tests {
             &mut obligation_plan,
             &answer,
             &complete_packet_budget(&answer),
+            &[],
         );
         for requirement_id in ["request_entrypoint", "request_dispatch", "request_terminal"] {
             let obligation = obligation_plan
@@ -1692,6 +1701,7 @@ mod golden_tests {
                 &mut plan,
                 &answer,
                 &budget,
+                &[],
             );
             let obligation = plan
                 .claim_obligations
@@ -1856,6 +1866,7 @@ mod golden_tests {
                 &mut plan,
                 &answer,
                 &complete_packet_budget(&answer),
+                &[],
             );
             let obligation = plan
                 .claim_obligations
@@ -1907,6 +1918,7 @@ mod golden_tests {
                 &mut plan,
                 &answer,
                 &complete_packet_budget(&answer),
+                &[],
             );
             let obligation = plan
                 .claim_obligations

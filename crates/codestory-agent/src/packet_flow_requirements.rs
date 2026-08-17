@@ -34,6 +34,9 @@ use crate::packet_evidence_carriers::{
 use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
 };
+use crate::packet_proof_atoms::{
+    CSS_ANIMATION_FLOW_PROOF, FlowProofSpec, LOG_HANDLER_FLOW_PROOF, MAPPER_PLAN_FLOW_PROOF,
+};
 use crate::packet_terms::{
     packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
     packet_terms_indicate_client_send_flow, packet_terms_indicate_command_dispatch_flow,
@@ -422,6 +425,12 @@ pub struct FlowRequirement {
     pub role: FlowRole,
     pub query_seeds: &'static [&'static str],
     pub coverage_mode: CoverageMode,
+    /// The proof authority this requirement carries. `Legacy` preserves
+    /// today's evidence-predicate discharge path exactly; `Atoms` routes
+    /// `proof_status` exclusively through the stage-1 proof-atom matcher
+    /// (contract R1(a)) — only the six shard requirement ids reference the
+    /// const formula groups.
+    pub proof: FlowProofSpec,
     pub evidence: EvidencePredicate,
 }
 
@@ -846,6 +855,7 @@ const INDEXING_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["indexing entrypoint"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_indexing,
             roles: &[
@@ -860,6 +870,7 @@ const INDEXING_FLOW: &[FlowRequirement] = &[
         role: FlowRole::StateOrStorage,
         query_seeds: &["file discovery", "symbol extraction", "storage persistence"],
         coverage_mode: CoverageMode::AllowsSourceRange,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_indexing,
             roles: &[
@@ -879,6 +890,7 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Registration,
         query_seeds: &["application use", "route registration"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_server_request,
             roles: &[
@@ -894,6 +906,7 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Dispatch,
         query_seeds: &["application handle", "request dispatch"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_server_request,
             roles: &[
@@ -910,6 +923,7 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::TerminalBoundary,
         query_seeds: &["response send", "response finalization"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_request_terminal,
             roles: &[
@@ -929,6 +943,7 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["default instance", "request method", "request entrypoint"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRolesOrCallBoundary {
             subsystem: flow_belongs_to_client_request,
             roles: &[
@@ -944,6 +959,7 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Dispatch,
         query_seeds: &["request dispatch", "adapters", "transport adapter"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRolesOrOrderedCallBoundary {
             subsystem: flow_belongs_to_client_request,
             roles: &[PacketEvidenceRole::RequestDispatch],
@@ -957,6 +973,7 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Dispatch,
         query_seeds: &["session adapter selection", "get adapter"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_client_adapter_selection),
     },
 ];
@@ -966,6 +983,7 @@ const REQUEST_INTERCEPTOR_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["interceptor handlers", "request interceptor"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(packet_citation_owns_interceptor_management),
 };
 
@@ -975,6 +993,7 @@ const URL_SESSION_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["session request creation", "request task resume"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_url_session,
             roles: &[
@@ -989,6 +1008,7 @@ const URL_SESSION_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Dispatch,
         query_seeds: &["session delegate callbacks", "data request validation"],
         coverage_mode: CoverageMode::AllowsSourceRange,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_url_session,
             roles: &[
@@ -1006,6 +1026,7 @@ const CLIENT_PUBLIC_FACADE_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Entrypoint,
     query_seeds: &["http public get request", "public client facade"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedRolesOrCallBoundary {
         subsystem: flow_belongs_to_public_client_factory,
         roles: &[PacketEvidenceRole::ClientFactory],
@@ -1031,6 +1052,7 @@ const CLIENT_INTERFACE_HELPERS_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Entrypoint,
     query_seeds: &["client convenience method", "client interface helper"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(citation_owns_client_request_method),
 };
 
@@ -1039,6 +1061,7 @@ const CLIENT_REQUEST_FINALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement
     role: FlowRole::TransformOrValidate,
     query_seeds: &["request finalization", "transport-ready request object"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(citation_owns_client_request_finalization),
 };
 
@@ -1047,6 +1070,7 @@ const CLIENT_TRANSPORT_SEND_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::TerminalBoundary,
     query_seeds: &["transport send", "client send implementation"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(citation_owns_client_transport_send),
 };
 
@@ -1055,6 +1079,7 @@ const CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT: FlowRequirement = FlowRequire
     role: FlowRole::TerminalBoundary,
     query_seeds: &["request response", "response stream boundary"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(citation_owns_client_response_materialization),
 };
 
@@ -1063,6 +1088,7 @@ const HOOK_PUBLIC_EXPORT_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Entrypoint,
     query_seeds: &["public hook export", "hook argument wrapper"],
     coverage_mode: CoverageMode::AllowsSourceRange,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(citation_owns_hook_public_export),
 };
 
@@ -1071,6 +1097,7 @@ const HOOK_KEY_SERIALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::TransformOrValidate,
     query_seeds: &["key serialization", "serialize hook key"],
     coverage_mode: CoverageMode::AllowsSourceRange,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(citation_owns_hook_key_serialization),
 };
 
@@ -1079,6 +1106,7 @@ const HOOK_CACHE_HELPER_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::StateOrStorage,
     query_seeds: &["cache helper", "cache state helper"],
     coverage_mode: CoverageMode::AllowsSourceRange,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(citation_owns_hook_cache_helper),
 };
 
@@ -1087,6 +1115,7 @@ const HOOK_MUTATION_FLOW_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["mutation helper", "mutate dispatch"],
     coverage_mode: CoverageMode::AllowsSourceRange,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(citation_owns_hook_mutation_flow),
 };
 
@@ -1095,6 +1124,7 @@ const COMMAND_SERVER_BOOTSTRAP_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Entrypoint,
     query_seeds: &["server bootstrap", "command server entrypoint"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedRoles {
         subsystem: flow_belongs_to_command_server,
         roles: &[
@@ -1109,6 +1139,7 @@ const COMMAND_EVENT_LOOP_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["event loop", "event loop source"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedRoles {
         subsystem: flow_belongs_to_event_loop,
         roles: &[PacketEvidenceRole::EventLoop],
@@ -1120,6 +1151,7 @@ const COMMAND_NETWORK_INPUT_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["network input", "network command input"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedRoles {
         subsystem: flow_belongs_to_network_input,
         roles: &[PacketEvidenceRole::NetworkCommandInput],
@@ -1131,6 +1163,7 @@ const COMMAND_DISPATCH_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["command dispatch", "command table dispatch"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedRoles {
         subsystem: flow_belongs_to_command_dispatch,
         roles: &[
@@ -1146,6 +1179,7 @@ const SQL_SCHEMA_FLOW: &[FlowRequirement] = &[
         role: FlowRole::StateOrStorage,
         query_seeds: &["sql table definitions", "CREATE TABLE"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_sql_schema,
             roles: &[PacketEvidenceRole::SqlTableDefinition],
@@ -1156,6 +1190,7 @@ const SQL_SCHEMA_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Configuration,
         query_seeds: &["referential relationships", "schema constraints"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_sql_schema,
             roles: &[PacketEvidenceRole::SqlRelationshipConstraint],
@@ -1169,6 +1204,7 @@ const HTML_CSS_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["html app shell", "module script entry"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_html_app_shell),
     },
     FlowRequirement {
@@ -1180,6 +1216,7 @@ const HTML_CSS_FLOW: &[FlowRequirement] = &[
             "interactive element styles",
         ],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_css_structure),
     },
 ];
@@ -1190,6 +1227,7 @@ const CSS_ANIMATION_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["animation stylesheet entrypoint", "css animation imports"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        proof: FlowProofSpec::Atoms(&CSS_ANIMATION_FLOW_PROOF),
         evidence: EvidencePredicate::CitedCarrier(citation_owns_css_animation_entrypoint),
     },
     FlowRequirement {
@@ -1201,6 +1239,7 @@ const CSS_ANIMATION_FLOW: &[FlowRequirement] = &[
             "css animation keyframes",
         ],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        proof: FlowProofSpec::Atoms(&CSS_ANIMATION_FLOW_PROOF),
         evidence: EvidencePredicate::CitedCarrier(citation_owns_css_animation_structure),
     },
 ];
@@ -1215,6 +1254,7 @@ const FORM_VALIDATION_FLOW: &[FlowRequirement] = &[
             "validity state",
         ],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_form_native_constraint),
     },
     FlowRequirement {
@@ -1222,6 +1262,7 @@ const FORM_VALIDATION_FLOW: &[FlowRequirement] = &[
         role: FlowRole::TransformOrValidate,
         query_seeds: &["custom validation", "custom error rendering"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_form_custom_validation),
     },
     FlowRequirement {
@@ -1229,6 +1270,7 @@ const FORM_VALIDATION_FLOW: &[FlowRequirement] = &[
         role: FlowRole::TerminalBoundary,
         query_seeds: &["submit prevent default", "submit invalid guard"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_form_submit_guard),
     },
 ];
@@ -1239,6 +1281,7 @@ const SHELL_INSTALL_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["shell installer bootstrap", "install download helpers"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_shell_installer_bootstrap),
     },
     FlowRequirement {
@@ -1246,6 +1289,7 @@ const SHELL_INSTALL_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Dispatch,
         query_seeds: &["shell function dispatch", "conditional version use"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_shell_function_dispatch),
     },
     FlowRequirement {
@@ -1253,6 +1297,7 @@ const SHELL_INSTALL_FLOW: &[FlowRequirement] = &[
         role: FlowRole::TerminalBoundary,
         query_seeds: &["shell completion"],
         coverage_mode: CoverageMode::DiagnosticOnly,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_shell_completion),
     },
 ];
@@ -1263,6 +1308,7 @@ const BUFFERED_IO_FLOW: &[FlowRequirement] = &[
         role: FlowRole::StateOrStorage,
         query_seeds: &["buffer storage", "source sink buffer"],
         coverage_mode: CoverageMode::AllowsSourceRange,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_buffer_storage),
     },
     FlowRequirement {
@@ -1270,6 +1316,7 @@ const BUFFERED_IO_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Dispatch,
         query_seeds: &["source read buffer", "sink write buffer"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_buffer_read_write),
     },
 ];
@@ -1280,6 +1327,7 @@ const LOG_HANDLER_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["logger record", "record creation"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Atoms(&LOG_HANDLER_FLOW_PROOF),
         evidence: EvidencePredicate::CitedCarrier(citation_owns_log_record_creation),
     },
     FlowRequirement {
@@ -1291,6 +1339,7 @@ const LOG_HANDLER_FLOW: &[FlowRequirement] = &[
             "handler interface",
         ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Atoms(&LOG_HANDLER_FLOW_PROOF),
         evidence: EvidencePredicate::CitedCarrier(citation_owns_log_handler_processing),
     },
 ];
@@ -1301,6 +1350,7 @@ const SITE_BUILD_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["site build lifecycle", "site process phases"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_site_lifecycle),
     },
     FlowRequirement {
@@ -1308,6 +1358,7 @@ const SITE_BUILD_FLOW: &[FlowRequirement] = &[
         role: FlowRole::TerminalBoundary,
         query_seeds: &["read generate render write", "renderer render"],
         coverage_mode: CoverageMode::AllowsSourceRange,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_site_terminal),
     },
 ];
@@ -1322,6 +1373,7 @@ const MAPPER_PLAN_FLOW: &[FlowRequirement] = &[
             "type map plan",
         ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Atoms(&MAPPER_PLAN_FLOW_PROOF),
         evidence: EvidencePredicate::CitedCarrier(citation_owns_mapper_configuration),
     },
     FlowRequirement {
@@ -1329,6 +1381,7 @@ const MAPPER_PLAN_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Dispatch,
         query_seeds: &["mapping execution plan", "source destination mapping"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Atoms(&MAPPER_PLAN_FLOW_PROOF),
         evidence: EvidencePredicate::CitedCarrier(citation_owns_mapper_execution),
     },
 ];
@@ -1339,6 +1392,7 @@ const RUNTIME_FORMATTING_FLOW: &[FlowRequirement] = &[
         role: FlowRole::TransformOrValidate,
         query_seeds: &["format arguments", "format output"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_format_arguments),
     },
     FlowRequirement {
@@ -1346,6 +1400,7 @@ const RUNTIME_FORMATTING_FLOW: &[FlowRequirement] = &[
         role: FlowRole::ErrorOrFallback,
         query_seeds: &["formatting failure", "formatter fallback"],
         coverage_mode: CoverageMode::AllowsSourceRange,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_formatter_fallback),
     },
 ];
@@ -1356,6 +1411,7 @@ const STRING_PREDICATE_FLOW: &[FlowRequirement] = &[
         role: FlowRole::TransformOrValidate,
         query_seeds: &["string blank predicate", "whitespace predicate"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_string_blank_predicate),
     },
     FlowRequirement {
@@ -1363,6 +1419,7 @@ const STRING_PREDICATE_FLOW: &[FlowRequirement] = &[
         role: FlowRole::TransformOrValidate,
         query_seeds: &["string empty predicate"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_string_empty_predicate),
     },
     FlowRequirement {
@@ -1370,6 +1427,7 @@ const STRING_PREDICATE_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Dispatch,
         query_seeds: &["string region match", "case-sensitive string comparison"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_string_region_handoff),
     },
 ];
@@ -1410,6 +1468,7 @@ const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["search entrypoint", "argument planning"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_search,
             roles: &[
@@ -1428,6 +1487,7 @@ const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
             "search execution unit",
         ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_search,
             roles: &[
@@ -1444,6 +1504,7 @@ const SEARCH_EVIDENCE_FLOW: &[FlowRequirement] = &[
         role: FlowRole::TransformOrValidate,
         query_seeds: &["search result evidence classification", "evidence tier"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_search_evidence_classification),
     },
     FlowRequirement {
@@ -1451,6 +1512,7 @@ const SEARCH_EVIDENCE_FLOW: &[FlowRequirement] = &[
         role: FlowRole::TerminalBoundary,
         query_seeds: &["search result evidence output", "packet evidence handoff"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_search_evidence_output),
     },
 ];
@@ -1526,9 +1588,87 @@ pub fn all_flow_requirements() -> Vec<FlowRequirement> {
 mod tests {
     use super::*;
     use crate::packet_evidence_carriers::carrier_taxonomy_vocabulary;
+    use crate::packet_proof_atoms::FlowProofFormula;
     use crate::packet_terms::packet_probe_terms;
     use codestory_contracts::api::{EdgeId, NodeId, NodeKind, SearchHitOrigin};
     use std::collections::BTreeMap;
+
+    /// Contract rev 5 scope table: exactly six requirement ids carry real
+    /// proof formulas, each referencing its stage-1 const formula group;
+    /// everything else — both `SITE_BUILD_FLOW` ids explicitly included — is
+    /// `FlowProofSpec::Legacy`.
+    #[test]
+    fn only_the_six_shard_requirements_carry_atom_proof_formulas() {
+        let expected: BTreeMap<&str, &'static FlowProofFormula> = [
+            ("logger_event", &LOG_HANDLER_FLOW_PROOF),
+            ("handler_processing", &LOG_HANDLER_FLOW_PROOF),
+            ("mapper_config", &MAPPER_PLAN_FLOW_PROOF),
+            ("mapper_execution", &MAPPER_PLAN_FLOW_PROOF),
+            ("css_animation_entrypoint", &CSS_ANIMATION_FLOW_PROOF),
+            ("css_animation_structure", &CSS_ANIMATION_FLOW_PROOF),
+        ]
+        .into_iter()
+        .collect();
+        let mut formula_bearing_ids = std::collections::BTreeSet::new();
+        for requirement in all_flow_requirements() {
+            match requirement.proof.formula() {
+                Some(formula) => {
+                    formula_bearing_ids.insert(requirement.id);
+                    let expected_formula = expected.get(requirement.id).unwrap_or_else(|| {
+                        panic!(
+                            "requirement `{}` carries a proof formula but is not one of the six \
+                             shard ids the contract scope table names",
+                            requirement.id
+                        )
+                    });
+                    // `&CONST` promotion does not guarantee one address per
+                    // const, so identity is compared structurally: atom ids
+                    // are unique across the three formula groups.
+                    assert_eq!(
+                        formula.requirements(),
+                        expected_formula.requirements(),
+                        "requirement `{}` references the wrong const formula group",
+                        requirement.id
+                    );
+                    assert_eq!(
+                        formula.atoms_for(requirement.id),
+                        expected_formula.atoms_for(requirement.id),
+                        "requirement `{}` references the wrong const formula group",
+                        requirement.id
+                    );
+                    assert!(
+                        formula.requirements().contains(&requirement.id),
+                        "requirement `{}` references a formula that names no atom for it",
+                        requirement.id
+                    );
+                    assert!(
+                        !formula.atoms_for(requirement.id).is_empty(),
+                        "requirement `{}` has no materially required atoms in its formula",
+                        requirement.id
+                    );
+                }
+                None => {
+                    assert!(
+                        !expected.contains_key(requirement.id),
+                        "shard requirement `{}` lost its proof formula",
+                        requirement.id
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            formula_bearing_ids.iter().copied().collect::<Vec<_>>(),
+            expected.keys().copied().collect::<Vec<_>>(),
+            "the formula-bearing requirement ids must be exactly the contract's six"
+        );
+        for requirement in SITE_BUILD_FLOW {
+            assert!(
+                requirement.proof.formula().is_none(),
+                "SITE_BUILD_FLOW id `{}` must stay FlowProofSpec::Legacy (contract scope table)",
+                requirement.id
+            );
+        }
+    }
 
     fn client_requirement_ids(prompt: &str) -> Vec<&'static str> {
         packet_flow_requirements_for_terms(
