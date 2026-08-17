@@ -540,7 +540,7 @@ fn indexer_crate_stays_decoupled_from_runtime_and_cli() {
 /// `agent_module_allowlist_stays_in_sync_with_the_agent_source_tree` enforces
 /// that, so adding a module to the crate without extending this list fails
 /// loudly instead of silently escaping every contract built on it.
-const AGENT_PLANNING_MODULES: [&str; 26] = [
+const AGENT_PLANNING_MODULES: [&str; 27] = [
     "citation.rs",
     "packet_citations.rs",
     "packet_claim_profile_registry.rs",
@@ -559,6 +559,7 @@ const AGENT_PLANNING_MODULES: [&str; 26] = [
     "packet_plan.rs",
     "packet_probes.rs",
     "packet_profile_telemetry.rs",
+    "packet_proof_atoms.rs",
     "packet_required_probes.rs",
     "packet_scoring.rs",
     "packet_terms.rs",
@@ -823,6 +824,18 @@ fn agent_planning_import_graph_stays_acyclic() {
             .is_some_and(|imports| imports.contains("packet_required_probes")),
         "planning import scan lost the known packet_obligations -> packet_required_probes edge; \
          the DAG guard is no longer reading real imports"
+    );
+
+    // packet_proof_atoms is the stage-1 typed-proof leaf: its matcher consumes
+    // codestory_contracts types only, so its release-code planning-import set
+    // must stay empty. A sibling import added there must fail here by name,
+    // not only as an eventual cycle somewhere else in the DAG.
+    assert_eq!(
+        graph.get("packet_proof_atoms").map(BTreeSet::len),
+        Some(0),
+        "packet_proof_atoms must stay a leaf planning module: it may import contracts types \
+         only, never a crate::/super:: planning sibling; found imports: {:?}",
+        graph.get("packet_proof_atoms")
     );
 
     if let Some(cycle) = find_planning_import_cycle(&graph) {
