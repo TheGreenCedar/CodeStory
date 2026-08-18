@@ -7,9 +7,9 @@
     },
     "connect_timeout_ms": 2000,
     "election_backoff_policy": {
-      "initial_backoff_ms": 9,
+      "initial_backoff_ms": 8,
       "jitter": "sha256(process_start_id||attempt) modulo inclusive [initial_backoff_ms,maximum_backoff_ms]",
-      "maximum_backoff_ms": 109
+      "maximum_backoff_ms": 111
     },
     "hard_native_no_progress_ms": 385431,
     "request_deadlines_ms": {
@@ -44,20 +44,20 @@
     "true_idle_observation_grace_ms": 2500
   },
   "freeze_record": {
-    "calibration_bundle_sha256": "83d11c141ac50e1c32a2f88d4b28b9d737d2062097aae70cca9038229b914ac2",
-    "calibration_freeze_digest": "83b0d0ecc5ab3af116d5f778e996508ce43bbeb9722e1a49c18777d6554ad3ca",
-    "input_constant_set_sha256": "0913f81b16fa04679957950766796119fc6e465aae6a68fae4818fd2f6ea7f59",
+    "calibration_bundle_sha256": "9159479f2dd9e7d8056388f4dc4aeef8273722b6d095dc1124af92f8132e6786",
+    "calibration_freeze_digest": "f933390d12cf61e4fe377bcd24a159d5c8f753667ec4715991b97517d6b7e612",
+    "input_constant_set_sha256": "2c4157ce273fd8b6bd3cf7764c53b51baec66874217f07868c6350e3072aa0ab",
     "measurement_protocol_sha256": "9eb303b6204ca6218e97ae299356370b16921a485350146fe85203a298e59269",
     "protocol_sha256": "25373a136cc1da119ed6829769b90aab075084406b0489f9f7698b370f5ee447",
     "run_artifact_sha256s": [
-      "2cbea72b807a8c81964f8f560e8b0ab4559d2045c3af710fc219f4a8f3b5e8b1",
-      "bb1c67161785d8acad4a3a9c2dc43bcea1715ec8edfee5a01cdd621c63b07777",
-      "e1385ab4b4b225d4f2c3b71e224c6d0e26ba1a507a491be70dfae94ae289dfc4"
+      "57047430fda464b338472f0315307d9be1a7430717e225b4c02c2c9acb0a1e03",
+      "7aada4bb0df6fc2f2b330e188374ddf770bfe4e515d949b25100437f05794b6c",
+      "a3c0c08725fcdffcc3579ae50462c4974673b2e7bfe0476e7454da612d268d01"
     ],
-    "selected_at": "github-actions-run:31930568418:1",
+    "selected_at": "github-actions-run:32152267828:1",
     "selection_rule": "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
-    "selection_source_commit": "0955e8da7ef0940c441ae45cba66930849c6b8ce",
-    "selection_source_tree": "cec0c3d2f5a0cf8a060d36270fcdb391242ef735"
+    "selection_source_commit": "6d5b4a74c1cea6151151b55c3c990d19055e8d0f",
+    "selection_source_tree": "5071dc56673e8d61de30e9d1fd56050bd506d249"
   },
   "qualification_threshold_overrides": {
     "protected_windows_x64_vulkan": {
