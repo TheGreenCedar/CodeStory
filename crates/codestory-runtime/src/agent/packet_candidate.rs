@@ -2479,14 +2479,17 @@ mod tests {
         let member_anim_kf = typed_edge("m-kf", "anim", "kf", EdgeKind::MEMBER, None, None);
         let member_anim_sa = typed_edge("m-sa", "anim", "sa", EdgeKind::MEMBER, None, None);
         let usage_sa_kf = typed_edge("u-kf", "sa", "kf", EdgeKind::USAGE, None, None);
-        let c_cases: Vec<(
+        // (atom, fact index under test, scaffold edges, anchored receipts,
+        // edge under test, optional node-kind override for its target)
+        type MirrorParityCase<'a> = (
             ProofAtomId,
             usize,
-            Vec<&GraphEdgeDto>,
+            Vec<&'a GraphEdgeDto>,
             Vec<VerifiedSourceAspectReceipt>,
             GraphEdgeDto,
-            Option<(&str, NodeKind)>,
-        )> = vec![
+            Option<(&'a str, NodeKind)>,
+        );
+        let c_cases: Vec<MirrorParityCase<'_>> = vec![
             // C2 IMPORT pattern: FILE target passes (uncertain is exempt —
             // the structural certainty pin), a VARIABLE target fails.
             (
