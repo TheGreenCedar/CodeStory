@@ -1143,12 +1143,24 @@ fn build_sidecar_packet_batch_outcome(
         ));
         let packet_hits = resolution.packet_hits;
         let resolved_hits = resolution.resolved_hits;
+        // Bound before the rejection branch below can consume `packet_hits`.
         if let Some(reason) = sidecar_packet_batch_rejection_reason(&query_result, &resolved_hits) {
             if let Some("deadline" | "stage_deadline") =
                 sidecar_blocking_cancel_reason(&query_result)
             {
                 retryable_queries.push(query.clone());
-                results.push((query.clone(), Vec::new()));
+                // A deadline-cancelled batch query used to contribute
+                // NOTHING: every candidate it had already resolved was
+                // discarded here, before any scoring, ranking or carry could
+                // see it. The single-query path
+                // (`sidecar_primary_result_rejection_reason`) already SERVES
+                // resolved hits from a cancelled query; that asymmetry was a
+                // plain defect with nothing to do with atoms, discarding real
+                // retrieval work on every deadline-pressured packet. The
+                // batch path now matches those semantics — see
+                // [`retained_cancelled_packet_hits`] — and the query is still
+                // marked retryable, so the retry runs exactly as before.
+                results.push((query.clone(), retained_cancelled_packet_hits(packet_hits)));
                 continue;
             }
             let diagnostic =
@@ -1168,6 +1180,50 @@ fn build_sidecar_packet_batch_outcome(
         retryable_queries,
         diagnostics,
     })
+}
+
+/// The resolved hits a DEADLINE-CANCELLED batch query still contributes.
+///
+/// A cancelled batch query used to contribute NOTHING: every candidate it had
+/// already resolved was discarded before scoring, ranking or carry could see
+/// it. Gate 9 measured what that costs on a slow shard — all 32 queries
+/// cancelled, 327 resolved hits thrown away, and the classes the formulas
+/// needed among them. The single-query path already decided this question the
+/// other way: `sidecar_primary_result_rejection_reason` SERVES resolved hits
+/// from a cancelled query rather than dropping them. That asymmetry was a
+/// plain defect, unrelated to atoms — it silently discarded real retrieval
+/// work on every deadline-pressured packet — so the batch path now matches
+/// the single-query semantics.
+///
+/// Retention is NOT atom-gated: every resolved hit is kept, subject to every
+/// existing downstream limit, and the query is still marked retryable so the
+/// retry runs exactly as before. The atom signal only ORDERS the result —
+/// resolution rank first, need-first as a tiebreak among equal ranks, then
+/// the original resolution order — so that when a downstream limit binds it
+/// binds on the identities that occupy the most role positions of the
+/// requirement group rather than on whichever tied hit came first. No slot is
+/// added anywhere, and nothing here marks a hit as proven (contract rule 4:
+/// atom need is a selection input, never a proof input).
+fn retained_cancelled_packet_hits(hits: Vec<PacketSearchHit>) -> Vec<PacketSearchHit> {
+    let session = crate::agent::packet_candidate::active_packet_proof_session()
+        .filter(|session| session.has_atom_needed_identities());
+    let need_rank = |hit: &PacketSearchHit| {
+        session
+            .as_ref()
+            .and_then(|session| session.citation_atom_priority(&hit.hit.node_id))
+            .map_or(0, |priority| priority + 1)
+    };
+    let mut retained = hits.into_iter().enumerate().collect::<Vec<_>>();
+    retained.sort_by(|(left_rank, left), (right_rank, right)| {
+        right
+            .hit
+            .score
+            .partial_cmp(&left.hit.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| need_rank(right).cmp(&need_rank(left)))
+            .then(left_rank.cmp(right_rank))
+    });
+    retained.into_iter().map(|(_, hit)| hit).collect()
 }
 
 fn clamp_elapsed_ms(started_at: Instant) -> u32 {
@@ -2499,13 +2555,49 @@ fn hydrate_packet_atom_trails_in_storage(
     let mut seen_roots: HashSet<i64> = HashSet::new();
     let mut cost_spent = 0usize;
     let mut new_artifacts: Vec<(String, GraphResponse, Vec<PacketCandidateTrailScan>)> = Vec::new();
-    for citation in &answer.citations {
+
+    // NEED-ORDERED, SKIP-BOUNDED (gate 8). The traversal used to walk plain
+    // citation/rank order and `break` the moment a root did not fit the cost
+    // budget. Both halves were wrong for exactly the roots this machinery
+    // exists to serve: R6 promotion changes WHICH candidates are admitted,
+    // never their rank, so rescued roots sit at the TAIL of citation order
+    // and a rank-ordered hard break systematically never reached them —
+    // structurally the same pathology R6 itself replaced one layer up, which
+    // is why nothing changed above it could move the outcome. Their
+    // MEMBER/TYPE_USAGE receipts therefore never entered `packet.support`,
+    // could not be proven on, could not be protected as atom carriers, and
+    // the citation cap dropped them.
+    //
+    // So: roots are ordered by ATOM NEED first — the session's own
+    // multiplicity priority, which is exactly "how many role positions of
+    // the active formulas this identity occupies" — and citation order
+    // breaks ties, keeping priority-0 roots in their existing relative
+    // order behind the needed ones. Nothing outside the session's need-set
+    // enters the key: no vocabulary, no rank, no path.
+    //
+    // And the budget SKIPS rather than breaks: a root whose cost does not
+    // fit is passed over and cheaper roots behind it may still be hydrated.
+    // The total budget is unchanged, so the cost bound is identical; what
+    // changes is that one expensive early root can no longer starve every
+    // cheap one behind it.
+    let mut ordered_roots: Vec<(i64, usize)> = Vec::new();
+    for (citation_index, citation) in answer.citations.iter().enumerate() {
         let Ok(core_id) = citation.node_id.0.parse::<i64>() else {
             continue;
         };
         if !seen_roots.insert(core_id) {
             continue;
         }
+        ordered_roots.push((core_id, citation_index));
+    }
+    ordered_roots.sort_by_key(|(core_id, citation_index)| {
+        (
+            std::cmp::Reverse(session.promotion_priority(*core_id)),
+            *citation_index,
+        )
+    });
+
+    for (core_id, _) in ordered_roots {
         let root_id = CoreNodeId(core_id);
         let artifact_id = format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}{core_id}");
         if live_artifact_ids.contains(&artifact_id) {
@@ -2550,7 +2642,9 @@ fn hydrate_packet_atom_trails_in_storage(
             .sum::<usize>()
             .saturating_mul(directions.len());
         if cost_spent.saturating_add(root_cost) > PACKET_ATOM_POST_PASS_COST_BUDGET {
-            break;
+            // Skip, never break: this root does not fit, but a cheaper root
+            // behind it still may. The total budget is unchanged.
+            continue;
         }
         cost_spent += root_cost;
 
@@ -7526,6 +7620,102 @@ mod tests {
         );
     }
 
+    /// Gate 9 item 2 — the fourth selection. A deadline-cancelled batch query
+    /// used to contribute NOTHING: every candidate it had already resolved
+    /// was discarded before scoring, ranking or carry could see it. The
+    /// AutoMapper shard measured 32 of 32 queries cancelled and 327 resolved
+    /// hits thrown away, while the single-query path was already serving such
+    /// hits — a plain asymmetry, unrelated to atoms.
+    ///
+    /// Retention is therefore NOT atom-gated: every resolved hit survives,
+    /// ordered by resolution rank, with the atom signal breaking ties among
+    /// equal ranks only.
+    #[test]
+    fn deadline_cancelled_queries_retain_resolved_hits_ordered_by_rank() {
+        let hit_with = |id: i64, score: f32| {
+            let mut hit = PacketSearchHit::without_graph(SearchHit {
+                node_id: NodeId(id.to_string()),
+                display_name: format!("symbol_{id}"),
+                kind: ApiNodeKind::CLASS,
+                file_path: Some(format!("src/f{id}.rs")),
+                line: Some(1),
+                score,
+                origin: SearchHitOrigin::IndexedSymbol,
+                target: None,
+                resolvable: true,
+                match_quality: None,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: Some(true),
+                source_excerpt: None,
+                verification_targets: Vec::new(),
+                score_breakdown: None,
+            });
+            hit.hit.score = score;
+            hit
+        };
+        // Ranks 0.9 / 0.5 / 0.5 / 0.2: one clear leader, one tied pair, one
+        // trailer.
+        let hits = || {
+            vec![
+                hit_with(1, 0.9),
+                hit_with(2, 0.5),
+                hit_with(3, 0.5),
+                hit_with(4, 0.2),
+            ]
+        };
+        let order = |hits: Vec<PacketSearchHit>| {
+            retained_cancelled_packet_hits(hits)
+                .into_iter()
+                .map(|hit| hit.hit.node_id.0.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            order(hits()),
+            ["1", "2", "3", "4"],
+            "with no session every resolved hit is retained in rank order — \
+             the single-query path's semantics"
+        );
+
+        let legacy_requirements =
+            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
+                &codestory_agent::packet_terms::packet_probe_terms(
+                    "Trace how a server application registers middleware, handles a request, and sends the response.",
+                ),
+                codestory_contracts::api::PacketTaskClassDto::RouteTracing,
+            );
+        let legacy = Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
+            crate::agent::packet_candidate::packet_atom_hydration_spec(&legacy_requirements),
+        ));
+        {
+            let _guard =
+                crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&legacy));
+            assert_eq!(
+                order(hits()),
+                ["1", "2", "3", "4"],
+                "an all-Legacy packet has no need-set, so the order is pure rank"
+            );
+        }
+
+        // Node 3 is atom-needed and TIED with node 2 at 0.5: the atom signal
+        // breaks that tie and nothing else moves. The clear leader keeps its
+        // place and the trailer keeps its place — need never overtakes rank.
+        let session = session_needing("3", "9");
+        let _guard =
+            crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
+        assert!(session.identity_is_atom_needed(3));
+        assert_eq!(
+            order(hits()),
+            ["1", "3", "2", "4"],
+            "need-first applies only among equal ranks"
+        );
+        assert_eq!(order(hits()), order(hits()), "and it is deterministic");
+    }
+
     /// A C-family session with the R6 trace armed, so the per-query
     /// promotion SLOT accounting is observable in assertions.
     fn traced_file_structural_session() -> Rc<crate::agent::packet_candidate::PacketProofSession> {
@@ -8313,6 +8503,227 @@ mod tests {
             c_hits,
             ["2"],
             "with nothing retired the need-gate still promotes the entrypoint"
+        );
+    }
+
+    /// `file_count` stylesheets, each owning one selector — enough FILE and
+    /// structural roots to make the post-pass cost budget bind.
+    fn post_pass_budget_storage(file_count: i64) -> Store {
+        use codestory_store::{FileInfo, FileRole};
+
+        let mut storage = Store::new_in_memory().expect("storage");
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for index in 1..=file_count {
+            let path = format!("styles/f{index:02}.css");
+            storage
+                .insert_file(&FileInfo {
+                    id: index,
+                    path: PathBuf::from(&path),
+                    language: "css".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 20,
+                    file_role: FileRole::Source,
+                })
+                .expect("insert file");
+            nodes.push(codestory_contracts::graph::Node {
+                id: CoreNodeId(index),
+                kind: NodeKind::FILE,
+                serialized_name: path,
+                file_node_id: Some(CoreNodeId(index)),
+                start_line: Some(1),
+                ..Default::default()
+            });
+            nodes.push(codestory_contracts::graph::Node {
+                id: CoreNodeId(1_000 + index),
+                kind: NodeKind::CONSTANT,
+                serialized_name: format!(".sel{index:02}"),
+                file_node_id: Some(CoreNodeId(index)),
+                start_line: Some(3),
+                ..Default::default()
+            });
+            edges.push(codestory_contracts::graph::Edge {
+                id: codestory_contracts::graph::EdgeId(5_000 + index),
+                source: CoreNodeId(index),
+                target: CoreNodeId(1_000 + index),
+                kind: EdgeKind::MEMBER,
+                file_node_id: Some(CoreNodeId(index)),
+                ..Default::default()
+            });
+        }
+        storage.insert_nodes_batch(&nodes).expect("insert nodes");
+        storage.insert_edges_batch(&edges).expect("insert edges");
+        storage
+    }
+
+    fn answer_citing_nodes(node_ids: &[i64]) -> AgentAnswerDto {
+        let mut answer = sidecar_answer_with_citation_node("0");
+        answer.citations.clear();
+        for node_id in node_ids {
+            let citation = sidecar_answer_with_citation_node(&node_id.to_string())
+                .citations
+                .remove(0);
+            answer.citations.push(citation);
+        }
+        answer
+    }
+
+    fn post_pass_artifact_ids(answer: &AgentAnswerDto) -> Vec<String> {
+        answer
+            .graphs
+            .iter()
+            .filter_map(|artifact| match artifact {
+                GraphArtifactDto::Uml { id, .. }
+                    if id.starts_with(PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX) =>
+                {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A C-family session with two identities already in the promotion
+    /// need-set — the shape R6 works to rescue.
+    fn session_needing(
+        source: &str,
+        target: &str,
+    ) -> Rc<crate::agent::packet_candidate::PacketProofSession> {
+        let session = file_structural_session();
+        let node = |id: &str| codestory_contracts::api::GraphNodeDto {
+            id: NodeId(id.into()),
+            label: id.into(),
+            kind: ApiNodeKind::FILE,
+            depth: 1,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: None,
+            qualified_name: None,
+            member_access: None,
+        };
+        session.record_atom_needed_identities(&GraphResponse {
+            center_id: NodeId(source.into()),
+            nodes: vec![node(source), node(target)],
+            edges: vec![codestory_contracts::api::GraphEdgeDto {
+                id: codestory_contracts::api::EdgeId("import-1".into()),
+                source: NodeId(source.into()),
+                target: NodeId(target.into()),
+                kind: codestory_contracts::api::EdgeKind::IMPORT,
+                certainty: None,
+                confidence: None,
+                callsite_identity: None,
+                candidate_targets: Vec::new(),
+            }],
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: None,
+        });
+        session
+    }
+
+    /// Gate 8 — the post-pass is NEED-ORDERED, not rank-ordered. R6 promotion
+    /// changes which candidates are admitted, never their rank, so rescued
+    /// roots land at the TAIL of citation order; under the old rank-ordered
+    /// walk with a hard budget `break` they were systematically the roots the
+    /// traversal never reached, and their receipts never entered the support.
+    /// Here the two atom-needed roots sit LAST among 18 citations while the
+    /// budget only affords 16 — and they are hydrated while priority-0 roots
+    /// ahead of them are the ones dropped.
+    #[test]
+    fn post_pass_hydrates_atom_needed_roots_before_rank_order() {
+        let storage = post_pass_budget_storage(18);
+        let session = session_needing("18", "17");
+        assert!(session.promotion_priority(18) > 0 && session.promotion_priority(17) > 0);
+        assert_eq!(session.promotion_priority(1), 0);
+
+        // 18 FILE roots at 12 units each = 216 against a 192-unit budget.
+        let citations = (1..=18).collect::<Vec<_>>();
+        let mut answer = answer_citing_nodes(&citations);
+        hydrate_packet_atom_trails_in_storage(&storage, &HashMap::new(), &session, &mut answer);
+        let artifacts = post_pass_artifact_ids(&answer);
+        assert_eq!(
+            artifacts.len(),
+            16,
+            "the cost budget still affords exactly 16 FILE roots: {artifacts:?}"
+        );
+        for needed in [17, 18] {
+            assert!(
+                artifacts.contains(&format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}{needed}")),
+                "the atom-needed root at the tail of citation order must be hydrated: {needed}"
+            );
+        }
+        for dropped in [15, 16] {
+            assert!(
+                !artifacts.contains(&format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}{dropped}")),
+                "a priority-0 root is what the budget drops now: {dropped}"
+            );
+        }
+        assert_eq!(
+            artifacts[0],
+            format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}17"),
+            "need-ordered roots come first, and citation order breaks their tie"
+        );
+        assert_eq!(
+            artifacts[1],
+            format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}18")
+        );
+    }
+
+    /// Gate 8 — determinism of the need-ordered traversal: identical inputs
+    /// produce an identical artifact set in an identical order.
+    #[test]
+    fn post_pass_need_ordering_is_deterministic() {
+        let storage = post_pass_budget_storage(18);
+        let citations = (1..=18).collect::<Vec<_>>();
+        let run = || {
+            let session = session_needing("18", "17");
+            let mut answer = answer_citing_nodes(&citations);
+            hydrate_packet_atom_trails_in_storage(&storage, &HashMap::new(), &session, &mut answer);
+            post_pass_artifact_ids(&answer)
+        };
+        let first = run();
+        let second = run();
+        assert_eq!(first, second, "the traversal order must be reproducible");
+        assert_eq!(first.len(), 16);
+    }
+
+    /// Gate 8 — SKIP, never BREAK. A root whose cost does not fit is passed
+    /// over and cheaper roots behind it are still hydrated; the total budget
+    /// is unchanged, so this only stops one expensive root from starving
+    /// everything behind it.
+    #[test]
+    fn post_pass_skips_an_unaffordable_root_and_keeps_hydrating_cheaper_ones() {
+        let storage = post_pass_budget_storage(17);
+        let session = file_structural_session();
+
+        // 15 FILE roots (12 each = 180) + one structural root (4) = 184 of
+        // 192. The next FILE root costs 12 and cannot fit; the structural
+        // root behind it costs 4 and still can.
+        let mut citations = (1..=15).collect::<Vec<_>>();
+        citations.push(1_001); // CONSTANT root, 4 units
+        citations.push(16); // FILE root, 12 units — must be SKIPPED
+        citations.push(1_002); // CONSTANT root, 4 units — must still hydrate
+        let mut answer = answer_citing_nodes(&citations);
+        hydrate_packet_atom_trails_in_storage(&storage, &HashMap::new(), &session, &mut answer);
+        let artifacts = post_pass_artifact_ids(&answer);
+
+        assert!(
+            !artifacts.contains(&format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}16")),
+            "the unaffordable FILE root is skipped: {artifacts:?}"
+        );
+        assert!(
+            artifacts.contains(&format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}1002")),
+            "a cheaper root behind it must still be hydrated — the old hard \
+             break would have ended the traversal here: {artifacts:?}"
+        );
+        assert_eq!(
+            artifacts.len(),
+            17,
+            "15 file roots plus both structural roots: {artifacts:?}"
         );
     }
 

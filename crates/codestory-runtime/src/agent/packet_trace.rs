@@ -236,6 +236,61 @@ fn select_packet_candidate_indices(
             return selected;
         }
     }
+
+    // ATOM-NEED TIER (gate 9). Atom-needed evidence has to survive three
+    // successive bounded selections — the resolution window, this
+    // resolved-hit → citation carry, and the graph cap — and R6 only made
+    // the first of them atom-aware. TypeMap and TypeMapPlanBuilder were
+    // admitted and resolved (one of them through an R6 promotion) and then
+    // dropped HERE, by pure rank order, while five of the packet's sixteen
+    // citation slots went unused: nothing downstream could recover them,
+    // because the post-pass roots at citations and the obligations prove on
+    // support built from citations.
+    //
+    // The principle this encodes, and the reason it is admissible at all
+    // (contract rule 4): atom need is a SELECTION input at every bounded
+    // stage and never a PROOF input. Provenance decides which receipts get
+    // produced and retained; receipts alone decide what discharges. Nothing
+    // here marks a citation as proven, and no name, path, or query token
+    // participates — only node identities the active formulas' typed
+    // patterns put in the need-set.
+    //
+    // Ordering: need first (highest atom-role multiplicity), then the
+    // existing rank (candidates arrive rank-sorted, so the index IS that
+    // rank), then the stable node identity. Slots are never added: needed
+    // candidates fill the carry ahead of the plain rank fill below and only
+    // displace lower-ranked non-needed candidates when the limit binds.
+    // With no active formula-bearing requirement the need-set is empty, the
+    // tier selects nothing, and this function is bit-identical to before.
+    if let Some(session) = crate::agent::packet_candidate::active_packet_proof_session()
+        && session.has_atom_needed_identities()
+    {
+        let mut atom_needed = candidates
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !selected_set.contains(index))
+            .filter_map(|(index, (citation, _))| {
+                let priority = session.citation_atom_priority(&citation.node_id)?;
+                Some((index, priority, citation.node_id.0.clone()))
+            })
+            .collect::<Vec<_>>();
+        atom_needed.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then(left.0.cmp(&right.0))
+                .then(left.2.cmp(&right.2))
+        });
+        for (index, _, _) in atom_needed {
+            if selected.len() >= limit {
+                return selected;
+            }
+            if selected_set.insert(index) {
+                selected.push(index);
+            }
+        }
+    }
+
     for index in 0..candidates.len() {
         if selected.len() >= limit {
             break;
@@ -1309,6 +1364,199 @@ mod golden_tests {
             proof.edge_id == EdgeId("2489411124501892282".into())
                 && proof.carrier_node_id == NodeId("5296498989960597280".into())
         }));
+    }
+
+    /// A plain candidate at a known rank position with a numeric node id, so
+    /// the atom-need tier can key on it.
+    fn carry_candidate(node_id: i64, score: f32) -> PacketSearchHit {
+        let mut hit = call_boundary_hit(
+            &node_id.to_string(),
+            &format!("Owner{node_id}.method"),
+            &format!("{}", node_id + 500_000),
+            &format!("Target{node_id}.method"),
+            &format!("edge-{node_id}"),
+            &format!("src/f{node_id}.rs"),
+        );
+        hit.hit.score = score;
+        hit
+    }
+
+    /// A C-family session whose need-set carries `needed`, installed for the
+    /// duration of the returned guard.
+    fn carry_session_needing(
+        needed: &[i64],
+    ) -> std::rc::Rc<crate::agent::packet_candidate::PacketProofSession> {
+        let requirements = packet_flow_requirements_for_terms(
+            &packet_probe_terms(
+                "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
+            ),
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        let session = std::rc::Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
+            crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
+        ));
+        let node = |id: i64| GraphNodeDto {
+            id: NodeId(id.to_string()),
+            label: id.to_string(),
+            kind: NodeKind::FILE,
+            depth: 1,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: None,
+            qualified_name: None,
+            member_access: None,
+        };
+        // One IMPORT edge per needed identity, each pairing it with a
+        // throwaway partner, so the C IMPORT patterns put it in the need-set.
+        for (index, identity) in needed.iter().enumerate() {
+            let partner = 900_000 + index as i64;
+            session.record_atom_needed_identities(&GraphResponse {
+                center_id: NodeId(identity.to_string()),
+                nodes: vec![node(*identity), node(partner)],
+                edges: vec![GraphEdgeDto {
+                    id: EdgeId(format!("import-{identity}")),
+                    source: NodeId(partner.to_string()),
+                    target: NodeId(identity.to_string()),
+                    kind: EdgeKind::IMPORT,
+                    certainty: None,
+                    confidence: None,
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            });
+            assert!(session.identity_is_atom_needed(*identity));
+        }
+        session
+    }
+
+    fn carry_selection(
+        hits: &[PacketSearchHit],
+        limit: usize,
+        flow_requirements: &[codestory_agent::packet_flow_requirements::FlowRequirement],
+    ) -> Vec<i64> {
+        let candidates = hits
+            .iter()
+            .map(|hit| (hit.citation_for_requirements(true, flow_requirements), hit))
+            .collect::<Vec<_>>();
+        select_packet_candidate_indices(&candidates, flow_requirements, limit, None)
+            .into_iter()
+            .map(|index| candidates[index].0.node_id.0.parse::<i64>().expect("id"))
+            .collect()
+    }
+
+    /// FIX A non-regression, asserted FIRST because it is the highest risk in
+    /// the change: a packet with no formula-bearing requirement has an empty
+    /// need-set, so the atom-need tier selects nothing and the carry is
+    /// BIT-IDENTICAL to no session at all. This is what keeps the M shard and
+    /// all-Legacy packets — the two that currently pass — from moving.
+    #[test]
+    fn atom_need_carry_is_bit_identical_without_active_formulas() {
+        let hits = (1..=5)
+            .map(|id| carry_candidate(id, 0.9 - id as f32 * 0.1))
+            .collect::<Vec<_>>();
+        let baseline = carry_selection(&hits, 3, &[]);
+
+        for (label, probe, class) in [
+            (
+                "all-Legacy",
+                "Trace how a server application registers middleware, handles a request, and sends the response.",
+                PacketTaskClassDto::RouteTracing,
+            ),
+            (
+                "M shard",
+                "Trace how the logger creates a log record and dispatches it to each handler for processing.",
+                PacketTaskClassDto::ArchitectureExplanation,
+            ),
+        ] {
+            let requirements =
+                packet_flow_requirements_for_terms(&packet_probe_terms(probe), class);
+            let session =
+                std::rc::Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
+                    crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
+                ));
+            let _guard = crate::agent::packet_candidate::install_packet_proof_session(
+                std::rc::Rc::clone(&session),
+            );
+            assert!(
+                !session.has_atom_needed_identities(),
+                "{label} can never populate a need-set"
+            );
+            assert_eq!(
+                carry_selection(&hits, 3, &[]),
+                baseline,
+                "{label} carry must be bit-identical to no session"
+            );
+        }
+    }
+
+    /// FIX A: an atom-needed candidate below the rank cutoff is carried into
+    /// citations while slots remain. Gate 8 measured the failure this
+    /// repairs — TypeMap and TypeMapPlanBuilder were admitted and resolved,
+    /// then dropped here by pure rank order with five of sixteen citation
+    /// slots unused.
+    #[test]
+    fn atom_needed_candidate_below_the_cutoff_is_carried_while_slots_remain() {
+        let hits = (1..=5)
+            .map(|id| carry_candidate(id, 0.9 - id as f32 * 0.1))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            carry_selection(&hits, 3, &[]),
+            vec![1, 2, 3],
+            "without a session the carry is the rank prefix"
+        );
+
+        let session = carry_session_needing(&[5]);
+        let _guard = crate::agent::packet_candidate::install_packet_proof_session(
+            std::rc::Rc::clone(&session),
+        );
+        assert_eq!(
+            carry_selection(&hits, 3, &[]),
+            vec![5, 1, 2],
+            "the atom-needed candidate is carried; the displaced slot is the \
+             LOWEST-ranked one the limit would have reached"
+        );
+    }
+
+    /// FIX A: the atom tier never displaces a HIGHER-ranked candidate — it
+    /// spends the slots the plain rank fill would have spent on lower-ranked
+    /// ones, and it never adds a slot.
+    #[test]
+    fn atom_need_never_displaces_a_higher_ranked_candidate_or_adds_a_slot() {
+        let hits = (1..=6)
+            .map(|id| carry_candidate(id, 0.9 - id as f32 * 0.1))
+            .collect::<Vec<_>>();
+        let session = carry_session_needing(&[6]);
+        let _guard = crate::agent::packet_candidate::install_packet_proof_session(
+            std::rc::Rc::clone(&session),
+        );
+
+        let bound = carry_selection(&hits, 2, &[]);
+        assert_eq!(bound.len(), 2, "the carry limit is never exceeded");
+        assert!(
+            bound.contains(&1),
+            "the top-ranked candidate survives: {bound:?}"
+        );
+        assert!(bound.contains(&6), "the atom-needed candidate is carried");
+        assert!(
+            !bound.contains(&2),
+            "only a lower-ranked non-needed candidate is displaced: {bound:?}"
+        );
+
+        // With room for everyone nothing is dropped — only the order moves.
+        let unbound = carry_selection(&hits, 6, &[]);
+        assert_eq!(unbound.len(), 6);
+        assert_eq!(unbound[0], 6, "need-ordered first");
+        let mut sorted = unbound.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![1, 2, 3, 4, 5, 6], "membership is unchanged");
+
+        // Deterministic across runs.
+        assert_eq!(carry_selection(&hits, 2, &[]), bound);
     }
 
     #[test]

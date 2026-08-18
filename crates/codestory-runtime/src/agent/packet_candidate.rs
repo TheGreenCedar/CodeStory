@@ -805,6 +805,27 @@ impl PacketProofSession {
             .min()
     }
 
+    /// The carry priority of one citation-shaped node id, or `None` when no
+    /// atom needs it (gate 9).
+    ///
+    /// This is the single predicate every BOUNDED SELECTION downstream of
+    /// admission consults — the resolved-hit → citation carry and the graph
+    /// cap both read it — so "which evidence a bounded stage keeps" has one
+    /// definition instead of one per stage. It is a SELECTION input and
+    /// never a PROOF input (contract rule 4): provenance decides which
+    /// receipts get produced and retained, receipts alone decide what
+    /// discharges. Returns `None` for every id when no formula-bearing
+    /// requirement is active, which is what keeps M-shard and all-Legacy
+    /// packets bit-identical.
+    pub(crate) fn citation_atom_priority(
+        &self,
+        node_id: &codestory_contracts::api::NodeId,
+    ) -> Option<usize> {
+        let identity = node_id.0.parse::<i64>().ok()?;
+        self.identity_is_atom_needed(identity)
+            .then(|| self.promotion_priority(identity))
+    }
+
     /// NEED-SET PRIORITY BY ATOM-ROLE MULTIPLICITY (gate 6): the number of
     /// distinct un-retired (requirement, role) positions this identity
     /// occupies in the active formulas.
