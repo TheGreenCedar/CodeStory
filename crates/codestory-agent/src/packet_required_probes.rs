@@ -2983,16 +2983,8 @@ mod tests {
             &create_playlist_track
         ));
 
-        let catalog_track = test_packet_citation(
-            "public.Track",
-            "db/schema.sql",
-            0.9,
-        );
-        let catalog_playlist = test_packet_citation(
-            "public.PlaylistTrack",
-            "db/schema.sql",
-            0.9,
-        );
+        let catalog_track = test_packet_citation("public.Track", "db/schema.sql", 0.9);
+        let catalog_playlist = test_packet_citation("public.PlaylistTrack", "db/schema.sql", 0.9);
         assert!(packet_citation_satisfies_required_probe(
             "CREATE TABLE Track",
             &catalog_track

@@ -361,10 +361,8 @@ pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
             "/docs-source/",
             "/docs_source/",
         ],
-    ) || matches!(
-        file_name,
-        "readme.md" | "changelog.md" | "contributing.md"
-    ) {
+    ) || matches!(file_name, "readme.md" | "changelog.md" | "contributing.md")
+    {
         return RetrievalFileRole::Docs;
     }
 

@@ -262,11 +262,10 @@ const HTTP_HANDLE_EXCLUDED_SUBJECTS: &[&str] = &[
     "sessions",
 ];
 
-/// A callable whose terminal names both the handle step and an HTTP request, such as
-/// `handleHTTPRequest`. Owner `app` and subject `router` remain the primary dispatch
-/// carriers; this admits engines that put HTTP on the method rather than the type.
-/// The owner segment is required so a bare `handleHTTP` identifier cannot close the
-/// step without naming a receiver.
+/// A callable whose terminal names both the handle step and HTTP. Owner `app` and subject
+/// `router` remain the primary dispatch carriers; this admits engines that put HTTP on the
+/// method rather than the type. The owner segment is required so a bare handle-plus-HTTP
+/// identifier cannot close the step without naming a receiver.
 fn citation_owns_http_request_handle(citation: &AgentCitationDto) -> bool {
     if !owns_callable_behavior(citation) {
         return false;
@@ -1272,9 +1271,7 @@ pub fn citation_owns_mapper_execution(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && belongs_to_object_mapper(citation)
         && !names_mapper_configuration(citation)
-        && (names_token_prefix(citation, &["plan", "execut", "pipeline"])
-            || (names_token(citation, &["lambda"])
-                && names_token(citation, &["map", "maps", "mapper", "mapping"])))
+        && names_token_prefix(citation, &["plan", "execut", "pipeline"])
 }
 
 // ---------------------------------------------------------------------------
