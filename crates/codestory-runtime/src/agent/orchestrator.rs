@@ -902,7 +902,13 @@ fn promote_retained_schema_entity_probes(question: &str, answer: &mut AgentAnswe
                         display == catalog_key || sql_catalog_table_key(&display) == table_key
                     }
             })
-            .max_by(|(_, left), (_, right)| left.score.total_cmp(&right.score))
+            .max_by(|(_, left), (_, right)| {
+                sql_schema_dialect_rank(left.file_path.as_deref().unwrap_or_default())
+                    .total_cmp(&sql_schema_dialect_rank(
+                        right.file_path.as_deref().unwrap_or_default(),
+                    ))
+                    .then_with(|| left.score.total_cmp(&right.score))
+            })
             .map(|(index, _)| index);
         let Some(index) = best else {
             continue;
@@ -952,11 +958,51 @@ fn promote_retained_schema_entity_probes(question: &str, answer: &mut AgentAnswe
             evidence_producer: Some("packet_sql_schema_ddl_alias".to_string()),
             resolution_status: source.resolution_status,
             loss_reason: None,
-            coverage_role: Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string()),
+            coverage_role: None,
             eligible_for_sufficiency: Some(false),
         });
     }
     answer.citations.extend(aliases);
+    promote_sql_schema_dialect_files(answer);
+}
+
+fn sql_schema_dialect_rank(path: &str) -> f32 {
+    let lower = packet_display_path(path).to_ascii_lowercase();
+    if lower.contains("sqlite") {
+        4.0
+    } else if lower.contains("mysql") {
+        3.0
+    } else if lower.contains("postgres") || lower.contains("postgresql") {
+        3.0
+    } else if lower.contains("sqlserver") {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn promote_sql_schema_dialect_files(answer: &mut AgentAnswerDto) {
+    for marker in ["sqlite", "mysql", "postgres"] {
+        let best = answer
+            .citations
+            .iter()
+            .enumerate()
+            .filter(|(_, citation)| {
+                citation.file_path.as_deref().is_some_and(|path| {
+                    let display = packet_display_path(path).to_ascii_lowercase();
+                    display.ends_with(".sql") && display.contains(marker)
+                })
+            })
+            .max_by(|(_, left), (_, right)| left.score.total_cmp(&right.score))
+            .map(|(index, _)| index);
+        let Some(index) = best else {
+            continue;
+        };
+        if answer.citations[index].coverage_role.is_none() {
+            answer.citations[index].coverage_role =
+                Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
+        }
+    }
 }
 
 fn sql_catalog_table_key(normalized_display: &str) -> String {
@@ -9582,6 +9628,60 @@ mod tests {
         assert!(alias_names.contains(&"CREATE TABLE Artist"));
         assert!(alias_names.contains(&"CREATE TABLE InvoiceLine"));
         assert!(!alias_names.contains(&"CREATE TABLE Customer"));
+    }
+
+    #[test]
+    fn schema_entity_promotion_keeps_common_sql_dialect_scripts() {
+        let question = "Explain schema relationships between artists, albums, and invoice lines across SQL scripts.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("public.Artist", "db/Chinook_Db2.sql", 0.95),
+                test_packet_citation("public.Artist", "db/Chinook_Sqlite.sql", 0.4),
+                test_packet_citation("seed", "db/Chinook_MySql.sql", 0.3),
+                test_packet_citation("seed", "db/Chinook_PostgreSql.sql", 0.2),
+            ],
+        );
+        for citation in &mut answer.citations {
+            citation.evidence_producer = Some("structural_sql_collector".to_string());
+            citation.origin = SearchHitOrigin::IndexedSymbol;
+        }
+        answer.citations[2].origin = SearchHitOrigin::TextMatch;
+        answer.citations[3].origin = SearchHitOrigin::TextMatch;
+
+        promote_retained_schema_entity_probes(question, &mut answer);
+
+        let protected_paths = answer
+            .citations
+            .iter()
+            .filter(|citation| citation.coverage_role.as_deref() == Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE))
+            .filter_map(|citation| citation.file_path.as_deref())
+            .map(packet_display_path)
+            .collect::<Vec<_>>();
+        assert!(
+            protected_paths.iter().any(|path| path.contains("Sqlite")),
+            "sqlite dialect should be retained: {protected_paths:?}"
+        );
+        assert!(
+            protected_paths.iter().any(|path| path.contains("MySql")),
+            "mysql dialect should be retained: {protected_paths:?}"
+        );
+        assert!(
+            protected_paths.iter().any(|path| path.contains("PostgreSql")),
+            "postgres dialect should be retained: {protected_paths:?}"
+        );
+        assert!(
+            answer
+                .citations
+                .iter()
+                .any(|citation| citation.display_name == "CREATE TABLE Artist"
+                    && citation
+                        .file_path
+                        .as_deref()
+                        .is_some_and(|path| packet_display_path(path).contains("Sqlite"))),
+            "CREATE TABLE alias should follow the preferred dialect file: {:?}",
+            answer.citations
+        );
     }
 
     #[test]

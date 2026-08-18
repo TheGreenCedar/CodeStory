@@ -685,7 +685,7 @@ fn packet_form_validation_rank_bonus(normalized_display: &str, path: &str) -> f3
         bonus -= 10.0;
     }
     if !path.ends_with(".html") {
-        bonus -= 10.0;
+        bonus -= 24.0;
     }
     bonus
 }
@@ -712,7 +712,7 @@ fn packet_sql_schema_rank_bonus(normalized_display: &str, path: &str, terms: &[S
         || display_or_path.contains("postgresql")
         || display_or_path.contains("sqlserver")
     {
-        bonus += 3.0;
+        bonus += 8.0;
     }
     if path.contains("/test/")
         || path.contains("/tests/")
@@ -1363,6 +1363,15 @@ mod tests {
             ) > packet_form_validation_rank_bonus(
                 "beans",
                 "html/forms/native-form-widgets/advanced-examples.html"
+            )
+        );
+        assert!(
+            packet_form_validation_rank_bonus(
+                "pattern",
+                "html/forms/form-validation/min-max.html"
+            ) > packet_form_validation_rank_bonus(
+                "validate",
+                "javascript/building-blocks/events/preventdefault-validation.js"
             )
         );
     }
