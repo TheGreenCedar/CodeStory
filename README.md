@@ -153,6 +153,30 @@ Full routing: [docs/README.md](docs/README.md).
 
 Broader public-repo evidence uses the [`language-support-ab`](benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json) manifest across 18 pinned OSS packages. We reran both arms from scratch against 0.17 on **2026-08-10**. All 108 agent runs completed, but the result did not meet the publication bar: only 34 of 54 answers in each arm passed the manifest quality checks, and the CodeStory arm still needed ordinary source reads after its packet. The old 0.15 totals are therefore no longer presented as a current performance claim. See the [language-expansion holdout evidence record](docs/testing/language-expansion-holdout-stats.md) for the exact run and rejection details.
 
+### Packet-backed answers vs. reading the repository (4 tasks, 2026-08-18)
+
+A scoped rerun of four holdout tasks against 0.17, one repeat each, `gpt-5.6-sol` driven by
+`codex`, CLI `552245c6`. The no-CodeStory arm is reused unchanged from the pinned 2026-08-16
+baseline, so both arms answer the same prompts on the same pinned checkouts.
+
+| Task | Answer quality | Tokens | Wall time | Tool calls |
+| --- | --- | --- | --- | --- |
+| Monolog record flow | passes in both arms | 191,759 → 31,053 (−84%) | 75s → 35s | 18 → 1 |
+| Jekyll site build | passes in both arms | 257,094 → 35,763 (−86%) | 88s → 26s | 35 → 1 |
+| AutoMapper map flow | passes without, **fails with** | 333,210 → 285,182 (−14%) | 118s → 80s | 28 → 3 |
+| animate.css keyframes | passes without, **fails with** | 154,735 → 393,818 (+155%) | 54s → 84s | 13 → 5 |
+
+Two of the four CodeStory answers did not pass the manifest quality checks, so this run does not
+meet the publication bar above and is not an answer-quality or performance claim for the release.
+
+What it does show is the shape of the trade. On the two tasks whose packet proved the flow the
+question asked about — disposition `supported` — the agent reached the same verified answer with
+about 85% fewer tokens and a single tool call instead of 18 or 35. On the other two the packet
+returned `drill_once` rather than a confident answer it could not support, and an agent that still
+has to read the repository itself is worse off than one that started reading immediately. The
+limit is visible in the packet rather than hidden in the answer, which is the behaviour the
+grounding contract is built for; closing those two flows is ongoing work.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
