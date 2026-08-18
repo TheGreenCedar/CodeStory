@@ -777,10 +777,10 @@ pub fn packet_proof_source_range_owner<'a>(
     if unit.kind != SupportUnitKindDto::SourceRange {
         return None;
     }
-    if !unit
+    if unit
         .snippet
         .as_deref()
-        .is_some_and(|snippet| !snippet.trim().is_empty())
+        .is_none_or(|snippet| snippet.trim().is_empty())
     {
         return None;
     }

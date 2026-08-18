@@ -3195,10 +3195,10 @@ fn import_name_candidates(target_name: &str, legacy_mode: bool) -> Vec<String> {
 /// for a namespace to exist; a member caller (`Ns.Sub.Class.Method`) needs
 /// at least three. Global-namespace callers yield `None`, so the same-root
 /// arm never runs for them.
-fn csharp_caller_root_namespace<'a>(
-    caller_qualified: Option<&'a str>,
+fn csharp_caller_root_namespace(
+    caller_qualified: Option<&str>,
     caller_kind: Option<i64>,
-) -> Option<&'a str> {
+) -> Option<&str> {
     let qualified = caller_qualified?;
     let caller_is_type_like = matches!(
         caller_kind,

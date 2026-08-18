@@ -404,10 +404,10 @@ impl RequirementConstraintStrength {
 /// [`ProofEndpointPattern::Role`] ever binds — `AnyOfRoles` requires an
 /// already-bound role and `Any` constrains nothing.
 fn note_bound_role(roles: &mut Vec<ProofRole>, endpoint: ProofEndpointPattern) {
-    if let ProofEndpointPattern::Role(role) = endpoint {
-        if !roles.contains(&role) {
-            roles.push(role);
-        }
+    if let ProofEndpointPattern::Role(role) = endpoint
+        && !roles.contains(&role)
+    {
+        roles.push(role);
     }
 }
 
@@ -523,10 +523,10 @@ impl VerifiedSourceAspectReceipt {
         if unit.kind != SupportUnitKindDto::SourceRange {
             return None;
         }
-        if !unit
+        if unit
             .snippet
             .as_deref()
-            .is_some_and(|snippet| !snippet.trim().is_empty())
+            .is_none_or(|snippet| snippet.trim().is_empty())
         {
             return None;
         }
