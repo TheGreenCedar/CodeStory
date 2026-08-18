@@ -2,6 +2,13 @@
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::eval_probes::eval_citation_rank_adjustment;
+use crate::packet_terms::{
+    packet_terms_indicate_client_send_flow, packet_terms_indicate_form_validation_flow,
+    packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_sql_schema_flow,
+    packet_terms_indicate_stylesheet_animation_flow,
+    packet_terms_indicate_url_session_request_flow,
+};
 use crate::text::retrieval_file_role_from_path;
 use codestory_contracts::api::{
     AgentCitationDto, NodeKind, PacketBudgetLimitsDto, SearchHitOrigin,
@@ -168,6 +175,14 @@ pub fn packet_citation_rank(
         score -= 8.0;
     }
 
+    score += packet_flow_shape_rank_bonus(
+        citation,
+        &display,
+        &normalized_display,
+        &path,
+        terms,
+    );
+
     score
 }
 
@@ -256,6 +271,7 @@ pub fn packet_display_name_is_test_like(display: &str) -> bool {
         || local_name.contains("test.")
         || local_name.ends_with("_test")
         || local_name.ends_with("_tests")
+        || local_name.ends_with("tests")
         || local_name.ends_with("test")
         || local_name.contains("_test_")
         || local_name.contains("_tests_")
@@ -354,7 +370,6 @@ fn packet_application_router_response_source_anchor(
         && packet_request_dispatch_method_tail(normalized_display)
 }
 
-#[cfg(test)]
 fn packet_display_owner_and_method(display: &str) -> Option<(String, String)> {
     let trimmed = display.trim();
     for separator in ['.', '#', ':'] {
@@ -419,12 +434,125 @@ fn packet_buffered_io_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     bonus
 }
 
-#[cfg(test)]
+fn packet_flow_shape_rank_bonus(
+    citation: &AgentCitationDto,
+    display: &str,
+    normalized_display: &str,
+    path: &str,
+    terms: &[String],
+) -> f32 {
+    let mut bonus = 0.0;
+    if packet_terms_indicate_mapper_configuration_plan_flow(terms) {
+        bonus += packet_mapper_configuration_plan_rank_bonus(normalized_display, path);
+    }
+    if packet_terms_indicate_stylesheet_animation_flow(terms) {
+        bonus += packet_stylesheet_animation_rank_bonus(display, normalized_display, path);
+    }
+    if packet_terms_indicate_form_validation_flow(terms) {
+        bonus += packet_form_validation_rank_bonus(normalized_display, path);
+    }
+    if packet_terms_indicate_sql_schema_flow(terms) {
+        bonus += packet_sql_schema_rank_bonus(normalized_display, path, terms);
+    }
+    if packet_terms_indicate_url_session_request_flow(terms) {
+        bonus += packet_url_session_request_rank_bonus(display, normalized_display, path);
+    }
+    if packet_terms_indicate_client_send_flow(terms) {
+        bonus += packet_client_send_rank_bonus(normalized_display, path, terms);
+    }
+    if packet_terms_indicate_runtime_formatting_flow(terms) {
+        bonus += packet_runtime_formatting_rank_bonus(normalized_display, path);
+    }
+    if let Some(role) = citation.coverage_role.as_deref() {
+        bonus += packet_coverage_role_rank_bonus(role);
+    }
+    bonus
+}
+
+fn packet_coverage_role_rank_bonus(role: &str) -> f32 {
+    match role {
+        "mapping execution plan" | "css keyframes" | "css animation selector" => 18.0,
+        "css animation variables" | "css animation import" | "sql schema anchor" => 14.0,
+        "form_native_constraints"
+        | "form_pattern_constraint"
+        | "request_resume_dispatch"
+        | "request_validation_pipeline" => 12.0,
+        "material schema entity" => 16.0,
+        _ => 0.0,
+    }
+}
+
+fn packet_stylesheet_animation_rank_bonus(
+    display: &str,
+    normalized_display: &str,
+    path: &str,
+) -> f32 {
+    let mut bonus = 0.0;
+    if path.ends_with(".css") {
+        if path.contains('/') {
+            bonus += 4.0;
+        } else {
+            bonus -= 8.0;
+        }
+    }
+    if display.contains("@keyframes")
+        || normalized_display.contains("keyframes")
+        || path.contains("/keyframes")
+    {
+        bonus += 10.0;
+    }
+    if display.starts_with("--")
+        && (normalized_display.contains("animat")
+            || normalized_display.contains("duration")
+            || normalized_display.contains("delay")
+            || normalized_display.contains("repeat"))
+    {
+        bonus += 8.0;
+    }
+    if display.starts_with('.') && normalized_display.contains("animat") {
+        bonus += 3.0;
+    }
+    bonus
+}
+
+fn packet_url_session_request_rank_bonus(
+    display: &str,
+    normalized_display: &str,
+    path: &str,
+) -> f32 {
+    let mut bonus = 0.0;
+    let path_stem = packet_path_file_stem(path);
+    if let Some((owner, method)) = packet_display_owner_and_method(display) {
+        if matches!(owner.as_str(), "session" | "request" | "datarequest")
+            && matches!(method.as_str(), "request" | "resume" | "validate")
+        {
+            bonus += 10.0;
+        }
+        if owner == "session" && method == "request" {
+            bonus += 4.0;
+        }
+        if owner == "datarequest" && method == "validate" {
+            bonus += 4.0;
+        }
+    }
+    if path_stem == "session" || path_stem == "request" || path_stem == "datarequest" {
+        bonus += 3.0;
+    }
+    if normalized_display == "sendable"
+        || normalized_display.contains("eventmonitor")
+        || path.contains("/features/")
+        || path.contains("httpheaders")
+    {
+        bonus -= 8.0;
+    }
+    bonus
+}
+
 fn packet_mapper_configuration_plan_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
     let path_stem = packet_path_file_stem(path);
-    if path.ends_with("mapper.cs") {
+    if path_stem.contains("mapper") && path.ends_with(".cs") {
         bonus += 5.0;
     }
     if normalized_display.contains("imapper") || normalized_display.contains("mappermap") {
@@ -433,7 +561,7 @@ fn packet_mapper_configuration_plan_rank_bonus(normalized_display: &str, path: &
     if display_or_path.contains("mapper") && display_or_path.contains("configuration") {
         bonus += 6.0;
     }
-    if path.ends_with("typemap.cs") || normalized_display.contains("typemap") {
+    if path_stem.contains("typemap") || normalized_display.contains("typemap") {
         bonus += 6.0;
     }
     if (path_stem.contains("plan") && path_stem.ends_with("builder"))
@@ -458,7 +586,6 @@ fn packet_mapper_configuration_plan_rank_bonus(normalized_display: &str, path: &
     bonus
 }
 
-#[cfg(test)]
 fn packet_client_send_rank_bonus(normalized_display: &str, path: &str, terms: &[String]) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -467,30 +594,33 @@ fn packet_client_send_rank_bonus(normalized_display: &str, path: &str, terms: &[
     } else if path.contains("/pkgs/") || path.contains("/packages/") {
         bonus -= 5.0;
     }
-    if path.ends_with("http.dart") && !path.contains("/src/") {
+    let path_stem = packet_path_file_stem(path);
+    if path_stem == "http" && !path.contains("/src/") {
         bonus += 7.0;
     }
-    if path.ends_with("client.dart") && normalized_display.contains("client") {
+    if path_stem == "client" && normalized_display.contains("client") {
         bonus += 7.0;
     }
-    if packet_path_file_stem(path) == "base_client"
+    if path_stem == "base_client"
         || (normalized_display.contains("base")
             && normalized_display.contains("client")
             && normalized_display.contains("send"))
     {
         bonus += 6.0;
     }
-    if packet_path_file_stem(path) == "base_request"
+    if path_stem == "base_request"
         || (normalized_display.contains("base")
             && normalized_display.contains("request")
             && normalized_display.contains("finalize"))
     {
         bonus += 6.0;
     }
-    if path.ends_with("io_client.dart") || normalized_display.contains("ioclientsend") {
+    if (path_stem.contains("io") && path_stem.contains("client"))
+        || normalized_display.contains("ioclientsend")
+    {
         bonus += 7.0;
     }
-    if path.ends_with("response.dart") || normalized_display.contains("responsefromstream") {
+    if path_stem == "response" || normalized_display.contains("responsefromstream") {
         bonus += 4.0;
     }
     if normalized_display.contains("native") || display_or_path.contains("bindings") {
@@ -499,7 +629,6 @@ fn packet_client_send_rank_bonus(normalized_display: &str, path: &str, terms: &[
     bonus
 }
 
-#[cfg(test)]
 fn packet_path_has_prompt_package_segment(path: &str, terms: &[String]) -> bool {
     let segments = path
         .split(['/', '\\'])
@@ -512,7 +641,6 @@ fn packet_path_has_prompt_package_segment(path: &str, terms: &[String]) -> bool 
     })
 }
 
-#[cfg(test)]
 fn packet_path_file_stem(path: &str) -> String {
     let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path).trim();
     let stem = file_name
@@ -522,10 +650,8 @@ fn packet_path_file_stem(path: &str) -> String {
     normalize_identifier(stem)
 }
 
-#[cfg(test)]
 fn packet_form_validation_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
-    let display_or_path = format!("{normalized_display}{path}");
     let normalized_path = normalize_identifier(path);
     let is_html = path.ends_with(".html");
     if normalized_path.contains("form") && normalized_path.contains("validation") {
@@ -555,18 +681,15 @@ fn packet_form_validation_rank_bonus(normalized_display: &str, path: &str) -> f3
     {
         bonus += 6.0;
     }
-    if path.contains("/accessibility/")
-        || path.contains("/native-form-widgets/")
-        || path.contains("/sending-form-data/")
-        || display_or_path.contains("modernizr")
-        || display_or_path.contains("three.min")
-    {
+    if path.contains("/accessibility/") {
+        bonus -= 10.0;
+    }
+    if !path.ends_with(".html") {
         bonus -= 10.0;
     }
     bonus
 }
 
-#[cfg(test)]
 fn packet_sql_schema_rank_bonus(normalized_display: &str, path: &str, terms: &[String]) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -620,7 +743,6 @@ fn packet_sql_schema_rank_bonus(normalized_display: &str, path: &str, terms: &[S
     bonus
 }
 
-#[cfg(test)]
 fn packet_runtime_formatting_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -715,6 +837,8 @@ fn packet_path_is_test_segment(path: &str) -> bool {
         || path.starts_with("tests/")
         || path.contains("/test/")
         || path.contains("/tests/")
+        || path.contains(".tests/")
+        || path.contains(".test/")
         || path.contains("-test-")
         || path.contains("_test.")
         || path.starts_with("test\\")
@@ -1002,7 +1126,90 @@ mod tests {
         ));
         assert!(packet_display_name_is_test_like("pkg::tests::case"));
         assert!(packet_display_name_is_test_like("handler_test"));
+        assert!(packet_display_name_is_test_like("ServiceLifetimeTests"));
         assert!(!packet_display_name_is_test_like("TestingStrategy"));
+    }
+
+    #[test]
+    fn citation_rank_demotes_docs_source_and_generated_stylesheets() {
+        let terms = vec![
+            "css".to_string(),
+            "animation".to_string(),
+            "keyframes".to_string(),
+            "variables".to_string(),
+        ];
+        let source = test_rank_citation("@keyframes bounce", "styles/motion/bounce.css", 1.0);
+        let docs = test_rank_citation("Usage", "docsSource/sections/usage.md", 1.0);
+        let generated = test_rank_citation("bundle", "bundle.min.css", 1.0);
+
+        assert!(
+            packet_citation_rank(&source, &terms, true)
+                > packet_citation_rank(&docs, &terms, true)
+        );
+        assert!(
+            packet_citation_rank(&source, &terms, true)
+                > packet_citation_rank(&generated, &terms, true)
+        );
+    }
+
+    #[test]
+    fn citation_rank_prefers_mapper_execution_plan_over_annotation_attributes() {
+        let terms = vec![
+            "mapper".to_string(),
+            "configuration".to_string(),
+            "runtime".to_string(),
+            "source".to_string(),
+            "destination".to_string(),
+            "lambda".to_string(),
+            "plans".to_string(),
+        ];
+        let execution = test_rank_citation(
+            "TypeMap.CreateMapperLambda",
+            "src/ObjectMapping/TypeMap.cs",
+            1.0,
+        );
+        let annotation = test_rank_citation(
+            "MapAtRuntimeAttribute.ApplyConfiguration",
+            "src/ObjectMapping/Configuration/Annotations/MapAtRuntimeAttribute.cs",
+            1.0,
+        );
+
+        assert!(
+            packet_citation_rank(&execution, &terms, true)
+                > packet_citation_rank(&annotation, &terms, true)
+        );
+    }
+
+    #[test]
+    fn citation_rank_prefers_url_session_request_methods_over_delegate_noise() {
+        let terms = vec![
+            "session".to_string(),
+            "creates".to_string(),
+            "requests".to_string(),
+            "resumes".to_string(),
+            "tasks".to_string(),
+            "validates".to_string(),
+            "data".to_string(),
+            "urlsession".to_string(),
+            "callbacks".to_string(),
+        ];
+        let request = test_rank_citation("Session.request", "Source/Core/Session.swift", 0.8);
+        let resume = test_rank_citation("Request.resume", "Source/Core/Request.swift", 0.8);
+        let validate =
+            test_rank_citation("DataRequest.validate", "Source/Core/DataRequest.swift", 0.8);
+        let delegate = test_rank_citation("urlSession", "Source/Core/SessionDelegate.swift", 0.8);
+        let sendable = test_rank_citation("Sendable", "Source/Core/DataRequest.swift", 0.8);
+
+        let request_rank = packet_citation_rank(&request, &terms, true);
+        assert!(request_rank > packet_citation_rank(&delegate, &terms, true));
+        assert!(
+            packet_citation_rank(&resume, &terms, true)
+                > packet_citation_rank(&delegate, &terms, true)
+        );
+        assert!(
+            packet_citation_rank(&validate, &terms, true)
+                > packet_citation_rank(&sendable, &terms, true)
+        );
     }
 
     #[test]

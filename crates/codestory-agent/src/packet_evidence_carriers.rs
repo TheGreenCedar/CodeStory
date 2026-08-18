@@ -1188,7 +1188,9 @@ pub fn citation_owns_mapper_execution(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && belongs_to_object_mapper(citation)
         && !names_mapper_configuration(citation)
-        && names_token_prefix(citation, &["plan", "execut", "pipeline"])
+        && (names_token_prefix(citation, &["plan", "execut", "pipeline"])
+            || (names_token(citation, &["lambda"])
+                && names_token(citation, &["map", "maps", "mapper", "mapping"])))
 }
 
 // ---------------------------------------------------------------------------

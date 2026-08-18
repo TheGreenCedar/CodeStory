@@ -1047,6 +1047,9 @@ pub fn packet_citation_satisfies_required_probe(query: &str, citation: &AgentCit
     {
         return matches_file_scoped_symbol;
     }
+    if packet_citation_matches_create_table_probe(query, citation) {
+        return true;
+    }
     if packet_citation_matches_route_registration_probe(query, citation) {
         return true;
     }
@@ -1159,7 +1162,8 @@ pub fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto
         } else {
             None
         }
-    } else if packet_citation_matches_route_registration_probe(query, citation)
+    } else if packet_citation_matches_create_table_probe(query, citation)
+        || packet_citation_matches_route_registration_probe(query, citation)
         || packet_citation_matches_route_engine_constructor_probe(query, citation)
         || packet_citation_matches_route_dispatch_probe(query, citation)
         || packet_citation_matches_argument_planning_probe(query, citation)
@@ -1365,6 +1369,54 @@ fn packet_citation_matches_sql_schema_scripts_probe(
             || path.contains("oracle")
             || path.contains("db2")
             || normalize_identifier(&citation.display_name).contains("sqlschema"))
+}
+
+fn packet_citation_matches_create_table_probe(query: &str, citation: &AgentCitationDto) -> bool {
+    let Some(expected_table) = packet_create_table_probe_table(query) else {
+        return false;
+    };
+    let Some(cited_table) = packet_sql_table_identity(&citation.display_name) else {
+        return false;
+    };
+    expected_table == cited_table
+}
+
+fn packet_create_table_probe_table(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    let remainder = trimmed
+        .strip_prefix("CREATE TABLE")
+        .or_else(|| {
+            let lower = trimmed.to_ascii_lowercase();
+            let index = lower.find("create table")?;
+            Some(&trimmed[index + "create table".len()..])
+        })?
+        .trim();
+    if remainder.is_empty() {
+        return None;
+    }
+    packet_sql_table_identity(remainder)
+}
+
+fn packet_sql_table_identity(display: &str) -> Option<String> {
+    let trimmed = display.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_create = trimmed
+        .strip_prefix("CREATE TABLE")
+        .or_else(|| {
+            let lower = trimmed.to_ascii_lowercase();
+            let index = lower.find("create table")?;
+            Some(&trimmed[index + "create table".len()..])
+        })
+        .unwrap_or(trimmed)
+        .trim();
+    let token = without_create
+        .rsplit(['.', ' ', '/', '\\'])
+        .next()?
+        .trim_matches(|ch: char| matches!(ch, '[' | ']' | '"' | '\'' | '`' | '(' | ')' | ';'));
+    let normalized = normalize_identifier(token);
+    (normalized.len() >= 4).then_some(normalized)
 }
 
 fn packet_citation_matches_route_registration_probe(
@@ -2929,6 +2981,25 @@ mod tests {
         assert!(!packet_citation_satisfies_required_probe(
             "SampleDatabase/DataSources/Sample_Sqlite.sql CREATE TABLE Track",
             &create_playlist_track
+        ));
+
+        let catalog_track = test_packet_citation(
+            "public.Track",
+            "db/schema.sql",
+            0.9,
+        );
+        let catalog_playlist = test_packet_citation(
+            "public.PlaylistTrack",
+            "db/schema.sql",
+            0.9,
+        );
+        assert!(packet_citation_satisfies_required_probe(
+            "CREATE TABLE Track",
+            &catalog_track
+        ));
+        assert!(!packet_citation_satisfies_required_probe(
+            "CREATE TABLE Track",
+            &catalog_playlist
         ));
 
         let log_record = test_packet_citation("LogRecord", "src/Monolog/LogRecord.php", 0.9);

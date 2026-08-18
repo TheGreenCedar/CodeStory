@@ -299,6 +299,9 @@ pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
         || marked.contains(".generated.")
         || file_name.contains("generated")
         || file_name.ends_with(".g.cs")
+        || file_name.ends_with(".min.css")
+        || file_name.ends_with(".compat.css")
+        || file_name.contains(".min.")
     {
         return RetrievalFileRole::Generated;
     }
@@ -332,7 +335,8 @@ pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
             "-test-client/",
             "_test_client/",
         ],
-    ) || file_name.contains(".test.")
+    ) || path_has_dotted_test_directory(&marked)
+        || file_name.contains(".test.")
         || file_name.contains(".spec.")
         || file_name.ends_with("_test.rs")
         || file_name.ends_with("_tests.rs")
@@ -348,9 +352,19 @@ pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
         return RetrievalFileRole::Test;
     }
 
-    if path_contains_any(&marked, &["/docs/", "/doc/"])
-        || matches!(file_name, "readme.md" | "changelog.md")
-    {
+    if path_contains_any(
+        &marked,
+        &[
+            "/docs/",
+            "/doc/",
+            "/docssource/",
+            "/docs-source/",
+            "/docs_source/",
+        ],
+    ) || matches!(
+        file_name,
+        "readme.md" | "changelog.md" | "contributing.md"
+    ) {
         return RetrievalFileRole::Docs;
     }
 
@@ -388,6 +402,11 @@ fn strip_materialized_repo_cache_prefix(path: &str) -> &str {
 
 fn path_contains_any(path: &str, markers: &[&str]) -> bool {
     markers.iter().any(|marker| path.contains(marker))
+}
+
+fn path_has_dotted_test_directory(path: &str) -> bool {
+    path.split('/')
+        .any(|segment| segment.ends_with(".tests") || segment.ends_with(".test"))
 }
 
 fn benchmark_file_name(file_name: &str) -> bool {
@@ -513,6 +532,8 @@ mod tests {
         for path in [
             "src/UnitTests/Mapping.cs",
             "src/IntegrationTests/MappingFlow.cs",
+            "src/ObjectMapping.Tests/MappingFlow.cs",
+            "src/ObjectMapping.DI.Tests/Registration.cs",
         ] {
             assert_eq!(
                 retrieval_file_role_from_path(path),
@@ -520,5 +541,36 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn classifies_docs_source_trees_and_contributor_guides_as_docs() {
+        for path in [
+            "docsSource/sections/usage.md",
+            "docs-source/guide.md",
+            "CONTRIBUTING.md",
+            "docs/CONTRIBUTING.md",
+        ] {
+            assert_eq!(
+                retrieval_file_role_from_path(path),
+                RetrievalFileRole::Docs,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_minified_and_compat_stylesheets_as_generated() {
+        for path in ["bundle.min.css", "dist/app.min.css", "theme.compat.css"] {
+            assert_eq!(
+                retrieval_file_role_from_path(path),
+                RetrievalFileRole::Generated,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            retrieval_file_role_from_path("styles/_tokens.css"),
+            RetrievalFileRole::Source
+        );
     }
 }

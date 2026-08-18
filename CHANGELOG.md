@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Packets keep cited stylesheet imports that define keyframes or custom properties, surface SQL `CREATE TABLE` names for retained catalog tables, and rank mapper, session, and form-validation evidence ahead of docs, generated bundles, and test assemblies.
+
 ## 0.17.0
 
 CodeStory 0.17 changes what an answer packet carries, and when it stops instead of answering. Questions can now combine names, files, concepts, relationships, and ordered flows, and search keeps exact, semantic, and graph evidence in separate lanes while ranking them together. Exact definitions stay easy to find, related callers and routes stay attached to the result, and a semantic lane with no close match abstains rather than filling its window with unrelated vectors.

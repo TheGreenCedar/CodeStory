@@ -3176,6 +3176,18 @@ mod tests {
                 .citation_proves(&real),
             "a type map's plan builder is still the mapper's execution step"
         );
+
+        let lambda = witness(
+            "TypeMap.CreateMapperLambda",
+            "src/ObjectMapping/TypeMap.cs",
+            NodeKind::METHOD,
+        );
+        assert!(
+            requirement_named("mapper_execution")
+                .evidence
+                .citation_proves(&lambda),
+            "a type-map lambda plan method is a mapper execution step"
+        );
     }
 
     /// The complete set of *bare, one-word* symbol names that close a requirement, as
