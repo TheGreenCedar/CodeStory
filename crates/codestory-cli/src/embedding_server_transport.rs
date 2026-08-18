@@ -5,6 +5,10 @@
 //! that prove one local OS user is talking to one lifetime authority.
 
 use anyhow::{Context, Result, bail};
+use codestory_contracts::config_registry::{
+    EMBED_QUALIFICATION_DIR_ENV as QUALIFICATION_DIR_ENV,
+    EMBED_QUALIFICATION_NONCE_ENV as QUALIFICATION_NONCE_ENV,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -20,8 +24,6 @@ use std::time::Duration;
 const INTERNAL_SERVER_COMMAND: &str = "internal-embedding-server";
 const EXPECTED_EXECUTABLE_SHA256_ENV: &str =
     "CODESTORY_INTERNAL_EMBEDDING_SERVER_EXECUTABLE_SHA256";
-const QUALIFICATION_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
-const QUALIFICATION_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
 const ENDPOINT_NAMESPACE: &str = "codestory-per-user-embedding-v1";
 const CHILD_STDERR_TAIL_BYTES: usize = 8 * 1024;
 const EXECUTABLE_ATTESTATION_SCHEMA_VERSION: u32 = 1;
@@ -112,6 +114,7 @@ impl ExactExecutable {
         let attested_sha256 = matches!(mode, ClientTransportMode::ObserveOnly)
             .then(|| store.and_then(|store| read_matching_attestation(store, &before)))
             .flatten();
+        let reused_attestation = attested_sha256.is_some();
         let sha256 = match attested_sha256 {
             Some(sha256) => sha256,
             None => digest(&file, &path)?,
@@ -123,12 +126,23 @@ impl ExactExecutable {
                 "embedding_executable_changed: current executable changed while it was being verified"
             );
         }
-        Ok(Self {
+        let executable = Self {
             path,
             sha256,
             file_identity: before,
             version: env!("CARGO_PKG_VERSION"),
-        })
+        };
+        if matches!(mode, ClientTransportMode::ObserveOnly)
+            && !reused_attestation
+            && let Some(store) = store
+        {
+            // A read-only command may establish reusable digest evidence after it has
+            // performed the same exact hash and before/after identity check as a fresh
+            // capture. This never authorizes spawning: the transport mode remains
+            // ObserveOnly, and spawn_exact_current_exe rejects it unconditionally.
+            let _ = publish_attestation(store, &executable);
+        }
+        Ok(executable)
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -676,9 +690,11 @@ impl codestory_retrieval::EmbeddingServerTransport for NativeEmbeddingServerTran
     }
 }
 
-fn fail_stop_process(_reason_code: &str) -> ! {
+fn fail_stop_process(reason_code: &str) -> ! {
     // A spawned server can outlive the process that owns its stderr reader.
-    // Fail-stop must not perform fallible I/O before terminating the process.
+    // The marker is best-effort, but the attempt is unconditional and abort is
+    // never contingent on a live stderr reader or a successful filesystem write.
+    crate::diagnostics::record_fail_stop(reason_code);
     std::process::abort()
 }
 
@@ -854,13 +870,25 @@ enum RetainedWindowsAuthorityState {
 }
 
 #[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsDataPipeOpenState {
+    NoOwner,
+    RetryLiveAuthority,
+}
+
+#[cfg(any(windows, test))]
 fn classify_windows_data_pipe_open_error(
     error_code: u32,
     authority: RetainedWindowsAuthorityState,
-) -> Option<NativeConnectOutcome> {
-    (error_code == WINDOWS_ERROR_FILE_NOT_FOUND_CODE).then(|| match authority {
-        RetainedWindowsAuthorityState::Absent => NativeConnectOutcome::NoOwner,
-        RetainedWindowsAuthorityState::Live => NativeConnectOutcome::OwnerUnresponsive,
+) -> Option<WindowsDataPipeOpenState> {
+    (error_code == WINDOWS_ERROR_FILE_NOT_FOUND_CODE).then_some(match authority {
+        RetainedWindowsAuthorityState::Absent => WindowsDataPipeOpenState::NoOwner,
+        // The listener creates the next Windows data-pipe instance after it
+        // hands the accepted instance to a connection handler. During that
+        // bounded handoff CreateFileW can report FILE_NOT_FOUND even though
+        // the retained authority proves the owner is live. Let the caller
+        // keep the existing connect deadline in charge of that transient gap.
+        RetainedWindowsAuthorityState::Live => WindowsDataPipeOpenState::RetryLiveAuthority,
     })
 }
 
@@ -1897,10 +1925,8 @@ mod platform {
     }
 
     fn runtime_paths() -> Result<RuntimePaths> {
-        match (
-            std::env::var_os(QUALIFICATION_DIR_ENV),
-            std::env::var_os(QUALIFICATION_NONCE_ENV),
-        ) {
+        let gate = codestory_retrieval::qualification_gate_environment();
+        match (gate.directory, gate.nonce) {
             (None, None) => platform_runtime_paths(),
             (Some(dir), Some(nonce)) => qualification_runtime_paths(
                 PathBuf::from(dir),
@@ -3117,7 +3143,8 @@ mod platform {
     use super::{
         ENDPOINT_NAMESPACE, ExecutableAttestationStore, NativeConnectOutcome,
         QUALIFICATION_DIR_ENV, QUALIFICATION_NONCE_ENV, RetainedWindowsAuthorityState,
-        TransportIdentity, awake_deadline_ns, classify_windows_data_pipe_open_error, sha256_fields,
+        TransportIdentity, WindowsDataPipeOpenState, awake_deadline_ns,
+        classify_windows_data_pipe_open_error, remaining_awake_budget, sha256_fields,
         windows_pipe_read_failure_is_pollable, windows_pipe_write_failure_is_pollable,
     };
     use anyhow::{Context, Result, bail};
@@ -3569,11 +3596,21 @@ mod platform {
             let error = std::io::Error::last_os_error();
             match error.raw_os_error().map(|code| code as u32) {
                 Some(ERROR_FILE_NOT_FOUND) => {
-                    return Ok(classify_windows_data_pipe_open_error(
+                    match classify_windows_data_pipe_open_error(
                         ERROR_FILE_NOT_FOUND,
                         probe_retained_authority(&authority_pipe_name)?,
                     )
-                    .expect("ERROR_FILE_NOT_FOUND is classified"));
+                    .expect("ERROR_FILE_NOT_FOUND is classified")
+                    {
+                        WindowsDataPipeOpenState::NoOwner => {
+                            return Ok(NativeConnectOutcome::NoOwner);
+                        }
+                        WindowsDataPipeOpenState::RetryLiveAuthority => {
+                            if !wait_for_live_data_pipe(started, budget) {
+                                return Ok(NativeConnectOutcome::OwnerUnresponsive);
+                            }
+                        }
+                    }
                 }
                 Some(ERROR_PIPE_BUSY) => {
                     let elapsed = Duration::from_nanos(awake_now_ns().saturating_sub(started));
@@ -3603,11 +3640,22 @@ mod platform {
                         if wait_error.raw_os_error().map(|code| code as u32)
                             == Some(ERROR_FILE_NOT_FOUND)
                         {
-                            return Ok(classify_windows_data_pipe_open_error(
+                            match classify_windows_data_pipe_open_error(
                                 ERROR_FILE_NOT_FOUND,
                                 probe_retained_authority(&authority_pipe_name)?,
                             )
-                            .expect("ERROR_FILE_NOT_FOUND is classified"));
+                            .expect("ERROR_FILE_NOT_FOUND is classified")
+                            {
+                                WindowsDataPipeOpenState::NoOwner => {
+                                    return Ok(NativeConnectOutcome::NoOwner);
+                                }
+                                WindowsDataPipeOpenState::RetryLiveAuthority => {
+                                    if !wait_for_live_data_pipe(started, budget) {
+                                        return Ok(NativeConnectOutcome::OwnerUnresponsive);
+                                    }
+                                    continue;
+                                }
+                            }
                         }
                         return Err(wait_error).context("wait for embedding named pipe");
                     }
@@ -3618,6 +3666,14 @@ mod platform {
                 _ => return Err(error).context("connect to embedding named pipe"),
             }
         }
+    }
+
+    fn wait_for_live_data_pipe(started_ns: u64, budget: Duration) -> bool {
+        let Some(remaining) = remaining_awake_budget(started_ns, awake_now_ns(), budget) else {
+            return false;
+        };
+        std::thread::sleep(remaining.min(PIPE_CONNECT_POLL));
+        true
     }
 
     pub(super) fn bind() -> Result<BindOutcome> {
@@ -3861,10 +3917,8 @@ mod platform {
     }
 
     fn qualification_namespace_salt() -> Result<String> {
-        match (
-            std::env::var_os(QUALIFICATION_DIR_ENV),
-            std::env::var_os(QUALIFICATION_NONCE_ENV),
-        ) {
+        let gate = codestory_retrieval::qualification_gate_environment();
+        match (gate.directory, gate.nonce) {
             (None, None) => Ok("production".into()),
             (Some(dir), Some(nonce)) => {
                 let dir = PathBuf::from(dir);
@@ -4727,6 +4781,47 @@ mod tests {
     }
 
     #[test]
+    fn observe_capture_writes_through_a_fresh_exact_digest() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let executable_path = directory.path().join("codestory-cli");
+        std::fs::write(&executable_path, b"exact candidate bytes")?;
+        let store = TestAttestationStore::new("normal-authority");
+
+        let mut first_calls = 0;
+        let first = capture_test_file(
+            &executable_path,
+            ClientTransportMode::ObserveOnly,
+            Some(&store),
+            &mut first_calls,
+        )?;
+        assert_eq!(first_calls, 1, "the cache miss must fresh-hash once");
+        assert!(store.read()?.is_some(), "the exact digest must be cached");
+
+        let mut second_calls = 0;
+        let second = capture_test_file(
+            &executable_path,
+            ClientTransportMode::ObserveOnly,
+            Some(&store),
+            &mut second_calls,
+        )?;
+        assert_eq!(second_calls, 0, "the next process may reuse the digest");
+        assert_eq!(second.sha256(), first.sha256());
+
+        let mut spawn_calls = 0;
+        capture_test_file(
+            &executable_path,
+            ClientTransportMode::SpawnCapable,
+            Some(&store),
+            &mut spawn_calls,
+        )?;
+        assert_eq!(
+            spawn_calls, 1,
+            "observe-only evidence must not widen spawn-capable capture"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn observe_capture_invalidates_attestation_after_file_identity_change() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let executable_path = directory.path().join("codestory-cli");
@@ -4946,20 +5041,20 @@ mod tests {
     }
 
     #[test]
-    fn missing_windows_data_pipe_with_live_authority_is_owner_unresponsive() {
-        let outcome = classify_windows_data_pipe_open_error(
+    fn missing_windows_data_pipe_retries_only_while_authority_is_live() {
+        let state = classify_windows_data_pipe_open_error(
             WINDOWS_ERROR_FILE_NOT_FOUND_CODE,
             RetainedWindowsAuthorityState::Live,
         )
         .expect("missing data pipe is classified");
-        assert!(matches!(outcome, NativeConnectOutcome::OwnerUnresponsive));
+        assert_eq!(state, WindowsDataPipeOpenState::RetryLiveAuthority);
 
-        let outcome = classify_windows_data_pipe_open_error(
+        let state = classify_windows_data_pipe_open_error(
             WINDOWS_ERROR_FILE_NOT_FOUND_CODE,
             RetainedWindowsAuthorityState::Absent,
         )
         .expect("missing data pipe is classified");
-        assert!(matches!(outcome, NativeConnectOutcome::NoOwner));
+        assert_eq!(state, WindowsDataPipeOpenState::NoOwner);
     }
 
     #[test]

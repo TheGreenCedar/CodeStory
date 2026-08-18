@@ -2,95 +2,50 @@
 
 ## Unreleased
 
+## 0.17.0
+
+CodeStory 0.17 changes what an answer packet carries, and when it stops instead of answering. Questions can now combine names, files, concepts, relationships, and ordered flows, and search keeps exact, semantic, and graph evidence in separate lanes while ranking them together. Exact definitions stay easy to find, related callers and routes stay attached to the result, and a semantic lane with no close match abstains rather than filling its window with unrelated vectors.
+
+Packets are built around the parts of the question that need support. CodeStory reserves a citation and the relevant code relationship for each required step before adding background context, keeps exact-file questions tied to those files, and checks the complete CLI or MCP response against its size limit. Support arrives as typed units — a symbol location, a source range, a typed graph edge, or a proven negative from a complete query — rather than as prose an agent has to take on trust, and a required step that no unit discharges fails closed as unproven instead of being counted. Each packet now tells the agent to answer from the compiled support, make one bounded follow-up packet, decline an unsupported claim, or report that the project is unavailable. It no longer sends agents into an open-ended recovery loop.
+
+Indexing and semantic search now preserve more of the structure that explains how code works: entry points, symbol roles, incoming and outgoing calls, routes, SQL relationships, and receiver calls in Go and Dart. Ambiguous calls remain gaps instead of guessed links. Refreshes reuse unchanged semantic documents, while the accelerated embedding runtime remains warm across projects for the same user.
+
+The installed experience is more predictable under load and across upgrades. One failed or cancelled request no longer takes down unrelated project work, bookmarks survive index rebuilds and unambiguous symbol moves, and CodeStory refuses to combine a plugin with an incompatible CLI. Bookmarks and other user annotations now live in a sidecar file beside the index instead of inside it, and schema migrations are forward-only, so 0.16.3 pointed at a cache 0.17 has written fails closed with `Unsupported database schema version` rather than risk writing incompatible data. There is no bookmark export or import command, and `index --refresh full` fails closed on that cache too. The recovery is `cache reset --derived-only`, which quarantines the derived cache into a timestamped directory in the same cache root, deletes nothing, and leaves the annotation sidecar holding your bookmarks in place; `index --refresh full` then rebuilds what it moved. That command ships in 0.17 and does not exist in 0.16.3, so it has to be run from a 0.17 binary.
+
+Cursor users can now install CodeStory from Customize as one plugin instead of copying a rule and MCP configuration by hand. The package includes the grounding rule and skill, session-start hook, and managed runtime launcher; after installation, Cursor still requires its MCP server to be enabled once and the window reloaded. The portable plugin core follows Agent Plugins v1, so CodeStory can share the same package structure across supported agent hosts without pretending their setup steps are identical.
+
+### Grounding details
+
+- Packets keep cited calls and inheritance relations through the compact graph cap instead of replacing them with bookkeeping text.
+- The MCP `snippet` tool accepts the field names emitted by search and packet hits, so an agent can use a hit without translating its fields first.
+- Compact `context` output includes evidence and call or inheritance relations after the trust boundary, matching packet output.
+- Packets return compiled support plus one disposition: `supported`, `drill_once`, `not_established`, or `unavailable`. A drill is limited to one packet, and compact output shows the support before the disposition.
+- Broad packets and task briefs default to the `standard` evidence budget instead of `compact`, which keeps more cited source ranges and code relations in the response. The `compact` budget remains available when minimizing context matters more.
+- When an index can locate a function but only records its declaration line, packets include a bounded source window from that exact declaration instead of handing the agent a signature with no behavior.
+- Task briefs expose that same typed disposition and optional one-round continuation instead of inventing `snippet` or `trail` recovery commands after a terminal packet.
+- A required step is discharged only by evidence CodeStory re-read or authenticated for that step: a source range the runtime opened and kept, or a typed relationship the index resolved with certainty. A symbol whose name reads like the question no longer closes a step on its own, and a step nothing discharges is reported unproven rather than assumed.
+- More of what a flow is made of is now recorded while indexing, so those steps have something to be proven from. PHP records the element type a `foreach` iterates and the call it dispatches inside the loop, plus the constructor a `new` expression runs. C# records type usage from fields, parameters, primary constructors, and object creations, including a call chained directly onto a construction, resolving names through `using` aliases and same-root namespaces. CSS resolves `@import` to the file it actually names, records `@keyframes` and custom-property declarations, and links a selector to the keyframes and variables it uses across the imported sheets.
+
+### Recovery commands
+
+Three repair commands are new in 0.17. None of them exists in 0.16.3, so each has to be run from a 0.17 binary.
+
+- `cache reset --project <repo> --derived-only` is the recovery after rolling CodeStory back onto a cache a newer release wrote. It moves the core database, its SQLite siblings, the rollback backup, promotion journals, the search trees, and local-refresh state into a timestamped quarantine directory in the same cache root, preserves user-authored annotations in place, and never opens the database — so a cache whose schema is too new to read is still reachable. It requires exactly one of `--dry-run` or `--confirm`, deletes nothing, and prints the reindex step to run next.
+- `cache clean` reports, and with `--apply` reclaims, cache state no live workspace or model can still claim: the cache directory of a worktree that is provably gone, and the model tree of a revision this executable was not built with. Everything else is reported as retained with a typed reason, and a cache holding authored annotations is never reclaimed.
+- `retrieval activate-rollback --project <repo>` validates the one retained previous retrieval generation and makes it current, for when broad retrieval stops being live-ready but the retained generation still proves out. `--dry-run` runs every validation and changes nothing; activation re-proves the generation against live state and refuses with a typed code rather than serving something the publication fence would have rejected.
+
 ### Fixed
 
-- A packet no longer reports a step of a flow as covered because a different
-  step was. Coverage was decided by the kind of position a step occupies —
-  entrypoint, dispatch, terminal boundary — so when a question asked about two
-  steps of the same kind, evidence for one closed both, and an answer that only
-  used the right words could close either. Each step now has to be backed by
-  evidence for that step. Asking about an HTTP client that runs interceptors
-  before dispatching a request, for instance, no longer counts as answered when
-  the interceptor owner was never found.
-- A packet only repeats back the claims it proved. Claims the same packet
-  reported as unproven — an unsupported sentence, evidence it had already ruled
-  diagnostic, or prose that points at a file without explaining it — were still
-  published as covered, and the files behind them were listed as not worth
-  opening. Both lists now come from proven claims; the coverage report still
-  names every dropped claim and why.
-- Naming an exact file in a question holds the answer to that file. Only
-  architecture questions did; every other kind could answer around a requested
-  path and still report itself complete. Each unproven path is now reported on
-  its own, with its own follow-up, for every kind of question.
-- Evidence for a step now has to come from the part of the codebase that step is
-  about. A step was matched by looking for a word anywhere inside a symbol's
-  name, so a symbol could close a step it had nothing to do with whenever its
-  letters happened to line up — a command-line parser error standing in for a
-  formatter's failure path, or a page-layout helper standing in for a form's
-  input constraints, because "adminPanel" contains "min". Words are now matched
-  whole, and a step also checks that the symbol belongs to the subsystem in
-  question, so unrelated results no longer make a packet look complete.
-- The file a result sits in no longer decides which step it proves. Half of the
-  steps were matched by asking what kind of result something was, and that
-  question is largely answered by the file's path — so everything under a folder
-  called `views`, `runtime`, `store` or `flags` proved whichever step named that
-  kind, whatever the result actually was. A chart renderer stood in for a web
-  server's entrypoint and a cache deletion stood in for an indexer storing
-  symbols. A result now has to say what it is by its own name. The path is used
-  only to take a step away, never to hand one out — with one stated exception,
-  below.
-- The exception is a file that *is* the evidence: a stylesheet, an HTML
-  document, and a `.sql` schema. Their anchors are selectors, attributes and
-  statements with no symbol name to read, so there the file still says what the
-  result is about. It is one exception and it covers those three file kinds —
-  `.html`, `.htm` and `.xhtml` for the document — and nothing else.
-- A single-file component is read as a script, not as a document. `.vue` and
-  `.svelte` files were treated as markup, but CodeStory only ever reads their
-  `<script>` block, so every result from one is an ordinary function with a name
-  of its own. While they counted as markup, the folder they sat in answered the
-  question the name should have: three unrelated helpers in one component under
-  a `forms/` directory reported a form's constraints, its custom validation and
-  its submit guard as all proved, and none of the three mentions a form.
-- Within an HTML document, only the step whose evidence really is markup takes
-  the file's word for it. A form's native constraints are attributes written in
-  the document; its custom validation and its submit guard are code. While all
-  three took the document's word, any three text matches in one HTML file under
-  a `forms/` directory reported the whole flow as proved.
-- A static-site build step has to name the site. The folder was allowed to say
-  it instead, so a build pipeline and a layout renderer filed under `lib/site/`
-  reported a site's build lifecycle and its output boundary as proved, while the
-  identical two symbols one directory over proved nothing. Two ordinary web
-  words were allowed to stand in for the site as well, so an asset collection
-  and a page template did the same thing from a `src/ui/` folder. Both are now
-  results that say "site" in their own name. The cost is stated: a helper class
-  named only `Renderer` or `Reader` no longer closes a step on its own, which
-  makes an unproven step easier to report than a proven one — the safe
-  direction.
-- A result also has to be about the step in more than one word. A name like
-  `FrameBuffer`, `sourceMapOptions`, `PaymentHandler.process` or `Layout.render`
-  reads as two signals until you notice both come from the same word, or from a
-  word every codebase uses for something else. Those four each closed a step of
-  a flow they have nothing to do with, and between them they closed five whole
-  flows — a graphics buffer and a segment tree proving a byte-IO pipeline, a
-  build config and a route planner proving an object mapper. The words that can
-  still decide a step on their own are recorded in the codebase and checked on
-  every build, so the list cannot grow unnoticed.
-- That check now covers the two places it could not see, which is where the
-  remaining false reports were. It reads every kind of file the coverage rules
-  branch on — scripts, single-file components, HTML, stylesheets, shell scripts
-  and schemas — rather than two source extensions with a comment claiming the
-  rest behave the same; that claim is now itself a test, and it was untrue for
-  `.vue`. And it builds names that carry a subject *and* an action, not one word
-  each, because that is the shape that was slipping through: `ChartPipeline`
-  proved nothing while `ChartPipeline.run` proved a static-site build, and only
-  the second is a counter-example. Every step of every flow is now checked
-  against every such name the vocabulary can spell without the flow's own
-  subject in it, and at least one step of each flow has to survive — so a
-  question can no longer be reported as fully answered by results that never
-  mention what it asked about.
-- When a question names more files than fit in the follow-up list, the missing
-  parts of the flow are no longer pushed out of it. Follow-ups for requested
-  files and for unproven steps now alternate, so both survive the limit.
+- MCP tools work again in hosts running without a person at the keyboard. Every CodeStory tool now reports `readOnlyHint: true`, which is what that field asks: none of them writes to the repository, and managed activation writes only to a per-user cache outside the checkout. Reporting it as false made 19 of the 20 tools request an approval elicitation, and a non-interactive host — `codex exec`, CI, a scripted agent — auto-cancels that request, so those calls were silently cancelled instead of answered. Managed activation is still disclosed, through the `effect`, `sideEffects`, and `activatesProject` fields each tool carries.
+- A packet no longer reports one step of a flow as covered because a different step was. Coverage was decided by the kind of position a step occupies, so evidence for one step closed every step of the same kind and wording alone could close either. Each step is now discharged by evidence for that step, and a required step nothing discharges is reported as unproven.
+- A packet only counts the claims it proved. Claims the same packet had already classified as unsupported, diagnostic, or an unverified lead still counted toward its verdict; only proven claims do now, and the coverage report still names every claim it dropped.
+- Evidence for a step has to come from the part of the codebase the step is about. A step was matched by looking for a word anywhere inside a symbol's name, so a layout helper named `determineFieldOrder` stood in for a form's native input constraints because the letters of `min` fall inside `determine`. Words are now matched whole, and a candidate also has to name the subsystem in question rather than merely sit near it.
+- The directory a result sits in no longer decides what it proves. A path says where a symbol was filed, not what it does, so `clampMin` in `src/forms/layout.ts` closed a form's native-constraint step while the identical `clampMin` in `src/render/layout.ts` closed nothing, and two ordinary web nouns in `AssetCollection.process` and `PageTemplate.render`, filed under `src/ui/`, proved a static-site build in a repository with no static site in it. A result now has to say what it is in its own name, and a path can only rule a candidate out, never hand it a step. The stated exception is the surface where the file really is the evidence — stylesheets, `.html`/`.htm`/`.xhtml` documents, and `.sql` schemas, whose indexed anchors are selectors, attributes, and statements with no identifier to read. Single-file components are not in it: CodeStory blanks an SFC's template before parsing, so a `.vue` or `.svelte` result is an ordinary named `<script>` export.
+- Naming an exact file in a question holds the answer to that file, for every kind of question rather than only architecture questions, and each unproven path is reported on its own with its own follow-up.
+- The rule that no flow may be closed by results that never name it is now checked by generating the counter-examples rather than listing a few. For each flow the check builds every subject-plus-step name the evidence vocabulary can spell without that flow's own subject in it, files each one on every file kind the coverage rules branch on — scripts, single-file components, HTML, stylesheets, shell scripts, and schemas — and requires at least one step of the flow to survive. The vocabulary that can decide a step therefore cannot grow unnoticed.
+- Search results are no longer thrown away when a query stage runs out of time. A batched query that hit its deadline discarded every result it had already resolved, while the single-query path kept them; on a large repository that silently dropped hundreds of resolved results before ranking ever saw them. The batched path now keeps what it resolved and stays retryable.
+- Evidence a packet needs survives the size limits. Choosing which citations to carry, which relationships fit under the graph cap, and which single edge to drop when trimming to the byte ceiling all used to fall back on incidental ordering, so a relationship a step depended on could be cut while unrelated ones stayed. Those choices now prefer the evidence a required step needs, inside the same limits, and the byte ceiling still holds.
+- On Windows, a request no longer mistakes a live embedding runtime for a dead owner when its data pipe is briefly between listeners during a handoff.
 
 ## 0.16.3
 

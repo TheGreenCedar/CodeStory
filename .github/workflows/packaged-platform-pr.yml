@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Build exact packages, prove platforms, run one frozen-candidate qualification, collect calibration, run release evidence, or prove current dev.
+        description: Build exact packages, prove platforms, run one frozen-candidate qualification, collect calibration, or prove current dev.
         required: true
         default: platform
         type: choice
-        options: [package, platform, qualification, calibration, release-evidence, integration]
+        options: [package, platform, qualification, calibration, integration]
       pr_number:
         description: Same-repository pull request. Dispatch PR modes with --ref <same-repository PR head branch>.
         required: false
@@ -23,10 +23,6 @@ on:
         default: auto
         type: choice
         options: [auto, none, linux, windows, macos, full]
-      source_run_id:
-        description: Optional prior rejected release-evidence run to re-evaluate.
-        required: false
-        type: string
       calibration_bundle_artifact:
         description: Frozen calibration bundle artifact name.
         required: false
@@ -39,6 +35,11 @@ on:
         description: Active executable-freeze receipt digest for this exact proof head.
         required: true
         type: string
+      qualify_linux_vulkan:
+        description: Extend frozen-candidate qualification with the protected Linux x64 Vulkan lifecycle proof.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: write
@@ -70,15 +71,21 @@ jobs:
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
           INPUT_HEAD_SHA: ${{ inputs.expected_head_sha }}
           INPUT_MODE: ${{ inputs.mode }}
+          INPUT_QUALIFY_LINUX_VULKAN: ${{ inputs.qualify_linux_vulkan }}
           EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          INPUT_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           INPUT_CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
           INPUT_CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
         run: |
           set -euo pipefail
           mode="${INPUT_MODE:-platform}"
+          qualify_linux_vulkan="${INPUT_QUALIFY_LINUX_VULKAN:-false}"
+          test "$qualify_linux_vulkan" = false || test "$qualify_linux_vulkan" = true
+          if [ "$qualify_linux_vulkan" = true ] && [ "$mode" != qualification ]; then
+            echo "::error::Linux Vulkan lifecycle qualification is valid only in qualification mode."
+            exit 1
+          fi
           if [ "$mode" = "integration" ]; then
             test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
             test -n "$INPUT_HEAD_SHA"
@@ -103,7 +110,7 @@ jobs:
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          test "$mode" = "package" || test "$mode" = "platform" || test "$mode" = "qualification" || test "$mode" = "calibration" || test "$mode" = "release-evidence"
+          test "$mode" = "package" || test "$mode" = "platform" || test "$mode" = "qualification" || test "$mode" = "calibration"
           pr_number="${EVENT_PR_NUMBER:-$INPUT_PR_NUMBER}"
           test -n "$pr_number"
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number")"
@@ -137,7 +144,7 @@ jobs:
               exit 1
             }
           fi
-          if [ "$mode" = "release-evidence" ] || [ "$mode" = "calibration" ] || [ "$mode" = "qualification" ]; then
+          if [ "$mode" = "calibration" ] || [ "$mode" = "qualification" ]; then
             test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
             test "$base_ref" = "dev/codestory-next" || {
               echo "::error::$mode requires a PR into dev/codestory-next, not $base_ref."
@@ -149,14 +156,12 @@ jobs:
             }
           fi
           if [ "$mode" = "calibration" ]; then
-            if [ -n "$INPUT_SOURCE_RUN_ID" ] \
-              || [ -n "$INPUT_CALIBRATION_ARTIFACT" ] \
+            if [ -n "$INPUT_CALIBRATION_ARTIFACT" ] \
               || [ -n "$INPUT_CALIBRATION_RUN_ID" ]; then
               echo "::error::Calibration collection does not consume prior proof artifacts."
               exit 1
             fi
           elif [ "$mode" = "qualification" ]; then
-            test -z "$INPUT_SOURCE_RUN_ID"
             test -n "$INPUT_CALIBRATION_ARTIFACT"
             test -n "$INPUT_CALIBRATION_RUN_ID"
           fi
@@ -211,6 +216,7 @@ jobs:
                 '[.artifacts[] | select(.name == $name and .expired == false)] | length'
           )"
           test "$artifact_count" = 1
+          echo "source_sha=$producer_sha" >> "$GITHUB_OUTPUT"
 
       - name: Require executable release freeze
         shell: bash
@@ -223,7 +229,7 @@ jobs:
           set -euo pipefail
           printf '%s' "$FREEZE_RECEIPT_DIGEST" | grep -Eq '^[0-9a-f]{64}$'
           if [ "$RESOLVED_MODE" = calibration ]; then
-            freeze_phase=calibration_source
+            freeze_phase=source_stabilization
           else
             freeze_phase=frozen_candidate
           fi
@@ -237,32 +243,60 @@ jobs:
             --phase "$freeze_phase" \
             --receipt-digest "$FREEZE_RECEIPT_DIGEST"
 
-      - name: Require successful exact-head source proof
+      - name: Require successful source-stabilization proof
         if: steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'
         shell: bash
         env:
+          CALIBRATION_SOURCE_SHA: ${{ steps.calibration.outputs.source_sha }}
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
         run: |
           set -euo pipefail
+          source_sha="$CALIBRATION_SOURCE_SHA"
+          if [ -z "$source_sha" ]; then
+            source_sha="$(
+              jq -r '.freeze_record.selection_source_commit // empty' \
+                crates/codestory-llama-sys/per-user-embedding-server-constant-set.json
+            )"
+          fi
+          printf '%s' "$source_sha" | grep -Eq '^[0-9a-f]{40}$' || {
+            echo "::error::The frozen candidate does not name its source-stabilization commit."
+            exit 1
+          }
+          git merge-base --is-ancestor "$source_sha" "$HEAD_SHA" || {
+            echo "::error::Source-stabilization commit $source_sha is not an ancestor of candidate $HEAD_SHA."
+            exit 1
+          }
           accepted=false
           while IFS= read -r run_id; do
-            if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
-              --jq '.jobs[] | select(.name == "full-source-gate" and .conclusion == "success") | .id' \
-              | grep -q .
-            then
-              accepted=true
-              echo "Accepted exact-head source proof run $run_id for $HEAD_SHA."
-              break
-            fi
+            jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100")"
+            jq -e '
+              any(.jobs[]; .name == "full-source-gate" and .conclusion == "success")
+              and any(.jobs[]; .name == "freeze-acceptance" and .conclusion == "success")
+            ' <<<"$jobs" >/dev/null || continue
+            run_attempt="$(
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.run_attempt'
+            )"
+            artifacts="$(
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100"
+            )"
+            jq -e \
+              --arg receipt "release-freeze-receipt-attempt-$run_attempt" \
+              --arg source "release-cell-prepublish-source-attempt-$run_attempt" \
+              '([.artifacts[] | select(.name == $receipt and .expired == false)] | length) == 1
+               and ([.artifacts[] | select(.name == $source and .expired == false)] | length) == 1' \
+              <<<"$artifacts" >/dev/null || continue
+            accepted=true
+            echo "Accepted source-stabilization run $run_id for $source_sha."
+            break
           done < <(
             gh api --paginate \
-              "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$HEAD_SHA&status=completed&per_page=100" \
+              "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$source_sha&status=completed&per_page=100" \
               | jq -r --arg repo "$GITHUB_REPOSITORY" \
                 '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .event == "workflow_dispatch" and .conclusion == "success") | .id'
           )
           test "$accepted" = true || {
-            echo "::error::No successful full-source-gate job exists for exact head $HEAD_SHA."
+            echo "::error::No successful source-stabilization full-source-gate exists for $source_sha."
             exit 1
           }
 
@@ -294,8 +328,6 @@ jobs:
             scope=full
           elif [ "$RESOLVED_MODE" = "calibration" ]; then
             scope=none
-          elif [ "$RESOLVED_MODE" = "release-evidence" ]; then
-            scope=none
           else
             scope="$(git diff --name-only "$BASE_SHA...$HEAD_SHA" | node .github/scripts/route-ci-proof.mjs --stdin --requested "$REQUESTED_SCOPE")"
           fi
@@ -303,7 +335,6 @@ jobs:
           echo "Selected $scope platform proof."
 
       - name: Verify package version surfaces
-        if: steps.resolve.outputs.mode != 'release-evidence'
         id: version
         shell: bash
         run: |
@@ -405,17 +436,6 @@ jobs:
           path: target/calibration-freeze
           if-no-files-found: error
           retention-days: 30
-
-  release-evidence:
-    if: needs.route.outputs.mode == 'release-evidence'
-    needs: route
-    uses: ./.github/workflows/release-candidate-evidence.yml
-    with:
-      ref: ${{ needs.route.outputs.head_sha }}
-      proof_key: ${{ needs.route.outputs.proof_key }}
-      profile: codestory-release-evidence-linux-arm64-v2
-      drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
-      source_run_id: ${{ inputs.source_run_id }}
 
   source-proof:
     if: needs.route.outputs.mode == 'integration'
@@ -524,7 +544,7 @@ jobs:
       needs.route.result == 'success' &&
       needs.packaged-proof.result == 'success' &&
       needs.route.outputs.mode != 'package' &&
-      needs.route.outputs.mode != 'qualification' &&
+      (needs.route.outputs.mode != 'qualification' || inputs.qualify_linux_vulkan) &&
       (needs.route.outputs.scope == 'linux' || needs.route.outputs.scope == 'full')
     needs:
       - route
@@ -534,15 +554,16 @@ jobs:
       version: ${{ needs.route.outputs.version }}
       ref: ${{ needs.route.outputs.head_sha }}
       proof_key: ${{ needs.route.outputs.proof_key }}
-      candidate_installed_proof: true
+      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
+      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
+      candidate_installed_proof: ${{ needs.route.outputs.mode != 'qualification' }}
       candidate_producer_workflow_path: .github/workflows/packaged-platform-pr.yml
-      server_behavior_only: true
+      server_behavior_only: ${{ needs.route.outputs.mode != 'qualification' }}
 
   closeout:
     if: >-
       always() &&
       needs.route.result != 'skipped' &&
-      needs.route.outputs.mode != 'release-evidence' &&
       needs.route.outputs.mode != 'calibration'
     needs:
       - route
@@ -552,7 +573,7 @@ jobs:
       - windows-vulkan-proof
       - linux-vulkan-proof
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 65
     steps:
       - name: Require one coherent accepted proof
         shell: bash
@@ -560,6 +581,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ needs.route.outputs.head_sha }}
           MODE: ${{ needs.route.outputs.mode }}
+          QUALIFY_LINUX_VULKAN: ${{ inputs.qualify_linux_vulkan }}
           SCOPE: ${{ needs.route.outputs.scope }}
           ROUTE_RESULT: ${{ needs.route.result }}
           SOURCE_RESULT: ${{ needs.source-proof.result }}
@@ -609,7 +631,11 @@ jobs:
               require_result "$METAL_RESULT" success macos-metal-proof
               require_result "$WINDOWS_VULKAN_RESULT" success windows-vulkan-proof
               if [ "$MODE" = qualification ]; then
-                require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
+                if [ "$QUALIFY_LINUX_VULKAN" = true ]; then
+                  require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
+                else
+                  require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
+                fi
               else
                 require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
               fi
@@ -622,3 +648,129 @@ jobs:
               exit 1
             }
           fi
+
+      - name: Validate opted-in Linux quality evidence
+        if: inputs.qualify_linux_vulkan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.route.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          artifact_name="frozen-candidate-linux-x64-quality-$HEAD_SHA-attempt-$GITHUB_RUN_ATTEMPT"
+          evidence_root=target/strict-linux-quality
+          rm -rf "$evidence_root"
+          mkdir -p "$evidence_root"
+
+          artifact=""
+          for _ in $(seq 1 300); do
+            artifacts="$({ gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100"; } 2>/dev/null || true)"
+            if [ -z "$artifacts" ]; then artifacts='{"artifacts":[]}'; fi
+            artifact="$(jq -c \
+              --arg name "$artifact_name" \
+              --arg sha "$HEAD_SHA" \
+              --argjson run_id "$GITHUB_RUN_ID" \
+              '[.artifacts[]? | select(
+                .name == $name
+                and .expired == false
+                and .workflow_run.id == $run_id
+                and .workflow_run.head_sha == $sha
+              )] | if length == 1 then .[0] else empty end' \
+              <<<"$artifacts")"
+            if [ -n "$artifact" ]; then break; fi
+            sleep 10
+          done
+          test -n "$artifact" || {
+            echo "::error::Exact Linux quality artifact $artifact_name was not retained."
+            exit 1
+          }
+          artifact_id="$(jq -r .id <<<"$artifact")"
+          artifact_digest="$(jq -r .digest <<<"$artifact")"
+          [[ "$artifact_id" =~ ^[0-9]+$ ]]
+          [[ "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$artifact_name" \
+            --dir "$evidence_root/artifact"
+
+          summary="$(find "$evidence_root/artifact" -type f -name packet-runtime-summary.json -print)"
+          runs="$(find "$evidence_root/artifact" -type f -name packet-runtime-runs.jsonl -print)"
+          test "$(printf '%s\n' "$summary" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          test "$(printf '%s\n' "$runs" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          source_tree="$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA" --jq .tree.sha)"
+          jq -e \
+            --arg commit "$HEAD_SHA" \
+            --arg tree "$source_tree" \
+            '.modes == ["cold-cli"]
+              and .repeats == 3
+              and .release_evidence.commit == $commit
+              and .release_evidence.source_tree == $tree
+              and .release_evidence.evaluation_contract == "publishable-three-repeat-packet/v1"
+              and .release_evidence.profile == "optional-linux-x64-quality"
+              and .release_evidence.evidence_identity.corpus_id == "codestory-release-corpus-v0.16-axios-js-ts-v2"
+              and .release_evidence.evidence_identity.cache_id == "frozen-candidate-linux-x64-axios-js-ts-v2"
+              and (.release_evidence.evidence_identity.machine_fingerprint | test("^[0-9a-f]{64}$"))
+              and .release_evidence.publishable == true
+              and .release_evidence.repeats == 3
+              and .release_evidence.quality_gate_status == "pass"
+              and .release_evidence.publishable_blockers == []
+              and (.release_evidence.rows | length) == 3' \
+            "$summary" >/dev/null
+          jq -s -e '
+            length == 3
+            and ([.[].repeat] | sort) == [1, 2, 3]
+            and all(.[];
+              .repo == "axios"
+              and .task_id == "axios-request-dispatch-v2"
+              and .mode == "cold_cli_packet"
+              and .status == "pass"
+              and .quality.pass == true
+              and .sufficiency.status == "sufficient"
+              and .sufficiency.gaps_count == 0
+              and .sufficiency.open_next_count == 0
+              and .sufficiency.follow_up_commands_count == 0
+              and (.sufficiency.coverage_unresolved_blocking_count // .sufficiency.coverage_unresolved_count // 0) == 0
+              and ((.sufficiency.unresolved_candidate_count // 0) == 0 or .sufficiency.unresolved_candidate_diagnostic_only == true)
+              and .sufficiency.retrieval_mode == "full"
+              and .sufficiency.degraded_reason == null
+              and .packet_latency.sla_missed == false
+              and .packet_latency.retrieval_shadow.retrieval_mode == "full"
+              and .packet_extra_probe_strategy == null
+              and .repo_provenance.git_dirty == false
+              and .codestory_cache_provenance.local_only == true
+            )' "$runs" >/dev/null
+          jq -S '.release_evidence.rows' "$summary" > "$evidence_root/summary-rows.json"
+          jq -sS '.' "$runs" > "$evidence_root/raw-rows.json"
+          cmp "$evidence_root/summary-rows.json" "$evidence_root/raw-rows.json"
+          summary_sha256="$(sha256sum "$summary" | awk '{print $1}')"
+          runs_sha256="$(sha256sum "$runs" | awk '{print $1}')"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg commit "$HEAD_SHA" \
+            --arg source_tree "$source_tree" \
+            --argjson producer_run_id "$GITHUB_RUN_ID" \
+            --argjson producer_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --argjson source_artifact_id "$artifact_id" \
+            --arg source_artifact "$artifact_name" \
+            --arg source_artifact_digest "$artifact_digest" \
+            --arg summary_sha256 "$summary_sha256" \
+            --arg runs_sha256 "$runs_sha256" \
+            '{schema:"codestory.strict-linux-quality-validation/v1", status:"pass",
+              repository:$repository, commit:$commit, source_tree:$source_tree,
+              producer_run_id:$producer_run_id, producer_run_attempt:$producer_run_attempt,
+              source_artifact_id:$source_artifact_id, source_artifact:$source_artifact,
+              source_artifact_digest:$source_artifact_digest,
+              evaluation_contract:"publishable-three-repeat-packet/v1",
+              corpus_id:"codestory-release-corpus-v0.16-axios-js-ts-v2",
+              repeats:3, rows:3, summary_sha256:$summary_sha256, runs_sha256:$runs_sha256}' \
+            > "$evidence_root/receipt.json"
+
+      - name: Upload opted-in Linux quality validation
+        if: inputs.qualify_linux_vulkan
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: strict-linux-quality-validation-${{ needs.route.outputs.head_sha }}-attempt-${{ github.run_attempt }}
+          path: target/strict-linux-quality/receipt.json
+          if-no-files-found: error
+          retention-days: 30

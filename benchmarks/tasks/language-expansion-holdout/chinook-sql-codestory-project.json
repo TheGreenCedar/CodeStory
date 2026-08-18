@@ -1,0 +1,20 @@
+{
+  "name": "chinook-language-expansion-holdout",
+  "version": 1,
+  "source_groups": [
+    {
+      "id": "6bf905c6-2e24-5c6d-87ec-f9a54e40f36d",
+      "language": "Sql",
+      "standard": "Default",
+      "source_paths": [
+        "ChinookDatabase/DataSources"
+      ],
+      "exclude_patterns": [
+        "**/.git/**"
+      ],
+      "include_paths": [],
+      "defines": {},
+      "language_specific": "Other"
+    }
+  ]
+}

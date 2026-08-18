@@ -8,8 +8,14 @@ from .self_test_installation import run_installation_self_tests
 from .self_test_managed_layout import run_managed_layout_self_tests
 from .self_test_marketplace_delivery import run_marketplace_delivery_self_tests
 from .self_test_process import run_process_self_tests
+from .self_test_publication_crash_exit import (
+    run_publication_crash_exit_self_tests,
+)
 from .self_test_producer_liveness import run_producer_liveness_self_tests
 from .self_test_qualification import run_qualification_self_tests
+from .self_test_qualification_directory import (
+    run_qualification_directory_self_tests,
+)
 from .self_test_server_idle import run_idle_boundary_self_tests
 
 
@@ -19,8 +25,10 @@ def self_test() -> None:
     run_contract_self_tests()
     run_process_self_tests()
     run_producer_liveness_self_tests()
+    run_publication_crash_exit_self_tests()
     run_idle_boundary_self_tests()
     run_qualification_self_tests()
+    run_qualification_directory_self_tests()
     run_installation_self_tests()
     run_marketplace_delivery_self_tests()
     run_managed_layout_self_tests()

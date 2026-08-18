@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from . import publication_protocol
+from .event_producer_liveness import EventProducer, NativeProcessProducer
 from .foundation import (
     EMBEDDING_QUALIFICATION_WORKER_CONTRACT_SOURCE,
     EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
@@ -96,13 +97,56 @@ def _drive_replacement_worker(output_document) -> dict:
             )
             return {"exit_code": 0, "stdout": "", "stderr": ""}
 
-        with patch.object(publication_protocol, "run", fake_run):
+        predecessor = NativeProcessProducer(
+            4242,
+            (
+                "windows:1"
+                if publication_protocol.os.name == "nt"
+                else (
+                    "macos-proc:1:1"
+                    if publication_protocol.sys.platform == "darwin"
+                    else "linux:1"
+                )
+            ),
+            "the self-test predecessor",
+            "exiting after a self-test crash",
+        )
+        candidate = EventProducer(
+            "the self-test candidate",
+            "remaining paused during replacement",
+        )
+        class ExitedWaiter:
+            def exited(self):
+                return True
+
+            def close(self):
+                return None
+
+        with (
+            patch.object(publication_protocol, "run", fake_run),
+            patch.object(
+                publication_protocol,
+                "ExactProcessExitWaiter",
+                return_value=ExitedWaiter(),
+            ),
+        ):
             publication_protocol.run_publication_replacement_worker(
                 Path(root) / "codestory-cli",
                 {},
                 project,
                 private_root,
                 "self-test-nonce",
+                crash_event={
+                    "action": "crash_server",
+                    "status": "accepted",
+                    "snapshot": {
+                        "process": {
+                            "pid": predecessor.pid,
+                            "process_start_id": predecessor.process_start_id,
+                        }
+                    },
+                },
+                candidate_producer=candidate,
                 executable_sha256=executable_sha256,
                 timeout=5,
             )

@@ -1,0 +1,22 @@
+{
+  "name": "swr-language-expansion-holdout",
+  "version": 1,
+  "source_groups": [
+    {
+      "id": "96d92330-a7c8-56bc-9a54-235f69b8f2e8",
+      "language": "TypeScript",
+      "standard": "Default",
+      "source_paths": [
+        "."
+      ],
+      "exclude_patterns": [
+        "**/.git/**",
+        "**/node_modules/**",
+        "e2e/test/tsconfig.json"
+      ],
+      "include_paths": [],
+      "defines": {},
+      "language_specific": "Other"
+    }
+  ]
+}

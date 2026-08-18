@@ -413,6 +413,7 @@ pub(super) fn refresh_caches(
             state.node_names.clear();
             clear_search_engine(&mut state);
             controller.sidecar_query_cache.lock().clear();
+            controller.canonical_symbol_names.lock().clear();
             state.is_indexing = false;
             Err(error)
         }
@@ -428,6 +429,7 @@ pub(super) fn publish_prepared_search_state(
     state.node_names = result.node_names;
     publish_search_engine(&mut state, result.engine, result.publication);
     controller.sidecar_query_cache.lock().clear();
+    controller.canonical_symbol_names.lock().clear();
     state.is_indexing = false;
     CacheRefreshStats {
         search_stats: result.search_stats,

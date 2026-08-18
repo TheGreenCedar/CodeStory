@@ -34,18 +34,25 @@ pub struct StyleBlockRange {
 #[derive(Debug, Clone)]
 pub struct TemplatePrepareResult {
     pub blanked: String,
+    /// Retained executable regions, used to decide whether the parser-backed
+    /// portion of the template is complete.
+    pub completeness_blanked: String,
     /// `javascript` or `typescript` — selects tree-sitter ruleset.
     pub script_language: &'static str,
     pub style_blocks: Vec<StyleBlockRange>,
 }
 
+/// Surface language of a template file, from the companion-extension registry.
+///
+/// The extension list used to be repeated here and at three other call sites
+/// (ARCH-012). `codestory_contracts::language_support` owns it now.
+pub fn template_surface_language(path: &Path) -> Option<&'static str> {
+    let ext = path.extension().and_then(|value| value.to_str())?;
+    codestory_contracts::language_support::companion_surface_language(ext)
+}
+
 pub fn template_kind_for_path(path: &Path) -> Option<TemplateKind> {
-    let ext = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match ext.as_str() {
+    match template_surface_language(path)? {
         "vue" => Some(TemplateKind::Vue),
         "svelte" => Some(TemplateKind::Svelte),
         "astro" => Some(TemplateKind::Astro),
@@ -53,16 +60,9 @@ pub fn template_kind_for_path(path: &Path) -> Option<TemplateKind> {
     }
 }
 
-pub fn template_surface_language(path: &Path) -> Option<&'static str> {
-    template_kind_for_path(path).map(|kind| match kind {
-        TemplateKind::Vue => "vue",
-        TemplateKind::Svelte => "svelte",
-        TemplateKind::Astro => "astro",
-    })
-}
-
 pub fn prepare_template_source(kind: TemplateKind, source: &str) -> TemplatePrepareResult {
     let mut keep_ranges = Vec::new();
+    let mut svelte_inline_ranges = Vec::new();
     let mut style_blocks = Vec::new();
     let mut script_language = "javascript";
 
@@ -73,17 +73,44 @@ pub fn prepare_template_source(kind: TemplateKind, source: &str) -> TemplatePrep
         collect_astro_frontmatter(source, &mut keep_ranges, &mut script_language);
     }
     if matches!(kind, TemplateKind::Svelte) {
-        let script_ranges = keep_ranges.clone();
-        collect_svelte_inline_expressions(source, &script_ranges, &mut keep_ranges);
+        let mut excluded_ranges = keep_ranges.clone();
+        excluded_ranges.extend(style_blocks.iter().map(|block| block.range));
+        collect_svelte_inline_expressions(source, &excluded_ranges, &mut svelte_inline_ranges);
+        keep_ranges.extend(svelte_inline_ranges.iter().copied());
     }
 
     keep_ranges.sort_by_key(|range| range.start);
     keep_ranges = merge_ranges(keep_ranges);
 
     let blanked = blank_source(source, &keep_ranges);
+    let mut completeness_blanked = blank_source(source, &keep_ranges).into_bytes();
+    // A Svelte object-literal expression is spelled `{{ ... }}`. As a raw JS
+    // program that becomes a labelled block and can report a false syntax
+    // error. Group only that form; ordinary braces must remain because Svelte
+    // also admits declaration forms such as `{let value = ...}`.
+    for range in svelte_inline_ranges {
+        if source[range.start + 1..range.end - 1]
+            .trim_start()
+            .starts_with('{')
+        {
+            completeness_blanked[range.start] = b'(';
+            completeness_blanked[range.end - 1] = b')';
+            if let Some((separator, b' ')) = completeness_blanked[range.end..]
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, byte)| *byte != b'\n' && *byte != b'\r')
+            {
+                completeness_blanked[range.end + separator] = b';';
+            }
+        }
+    }
+    let completeness_blanked =
+        String::from_utf8(completeness_blanked).expect("blanking preserves UTF-8");
 
     TemplatePrepareResult {
         blanked,
+        completeness_blanked,
         script_language,
         style_blocks,
     }
@@ -119,10 +146,14 @@ fn collect_script_blocks(
 
     while let Some(rel) = lower[search_from..].find("<script") {
         let start = search_from + rel;
-        let Some(open_end) = lower[start..].find('>') else {
+        let after_name = start + "<script".len();
+        if !is_tag_name_boundary(bytes.get(after_name).copied()) {
+            search_from = after_name;
+            continue;
+        }
+        let Some(open_end) = find_opening_tag_end(source, after_name) else {
             break;
         };
-        let open_end = start + open_end + 1;
         let Some(close_rel) = lower[open_end..].find("</script>") else {
             break;
         };
@@ -140,15 +171,20 @@ fn collect_script_blocks(
 }
 
 fn collect_style_blocks(source: &str, style_blocks: &mut Vec<StyleBlockRange>) {
+    let bytes = source.as_bytes();
     let lower = source.to_ascii_lowercase();
     let mut search_from = 0usize;
 
     while let Some(rel) = lower[search_from..].find("<style") {
         let start = search_from + rel;
-        let Some(open_end) = lower[start..].find('>') else {
+        let after_name = start + "<style".len();
+        if !is_tag_name_boundary(bytes.get(after_name).copied()) {
+            search_from = after_name;
+            continue;
+        }
+        let Some(open_end) = find_opening_tag_end(source, after_name) else {
             break;
         };
-        let open_end = start + open_end + 1;
         let Some(close_rel) = lower[open_end..].find("</style>") else {
             break;
         };
@@ -189,11 +225,9 @@ fn collect_astro_frontmatter(
         start: content_start,
         end: close_line_start,
     });
-    if source[content_start..close_line_start].contains("lang=\"ts\"")
-        || source[content_start..close_line_start].contains("lang='ts'")
-    {
-        *script_language = "typescript";
-    }
+    // Astro frontmatter is TypeScript by convention; there is no script tag
+    // whose `lang` attribute could select the grammar.
+    *script_language = "typescript";
 }
 
 fn collect_svelte_inline_expressions(
@@ -213,12 +247,43 @@ fn collect_svelte_inline_expressions(
             continue;
         }
         if let Some(end) = find_brace_expression_end(source, index) {
-            keep_ranges.push(ByteRange { start: index, end });
+            if !matches!(bytes.get(index + 1), Some(b'#' | b':' | b'/' | b'@'))
+                && bytes.get(index + 1..index + 4) != Some(b"...")
+            {
+                keep_ranges.push(ByteRange { start: index, end });
+            }
             index = end;
         } else {
             index += 1;
         }
     }
+}
+
+fn is_tag_name_boundary(byte: Option<u8>) -> bool {
+    byte.is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'>' | b'/'))
+}
+
+/// Return the byte immediately after the opening tag's `>`, ignoring `>`
+/// characters inside quoted attributes.
+fn find_opening_tag_end(source: &str, mut index: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut quote = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active_quote) = quote {
+            if byte == active_quote {
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'>' => return Some(index + 1),
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    None
 }
 
 fn find_brace_expression_end(source: &str, open_index: usize) -> Option<usize> {
@@ -324,6 +389,42 @@ mod tests {
     use super::*;
     use crate::{get_language_for_ext, index_file};
     use std::path::Path;
+
+    /// Template routing must stay the exact three-dialect set it was before it
+    /// started reading the companion-extension registry.
+    ///
+    /// Widening it would send new file types through script blanking, and
+    /// `semantic::detect_language` reports whatever `template_surface_language`
+    /// returns, so a stray row here would attribute files to a language with no
+    /// parser behind it.
+    #[test]
+    fn template_routing_covers_exactly_the_blanked_component_dialects() {
+        for (path, kind, surface) in [
+            ("app/Widget.vue", Some(TemplateKind::Vue), Some("vue")),
+            ("app/Widget.VUE", Some(TemplateKind::Vue), Some("vue")),
+            (
+                "app/Widget.svelte",
+                Some(TemplateKind::Svelte),
+                Some("svelte"),
+            ),
+            ("app/Page.astro", Some(TemplateKind::Astro), Some("astro")),
+            ("app/Page.cshtml", None, None),
+            ("styles/app.scss", None, None),
+            ("styles/app.sass", None, None),
+            ("styles/app.less", None, None),
+            ("scripts/tool.lua", None, None),
+            ("app/Main.kt", None, None),
+            ("app/main.js", None, None),
+            ("Makefile", None, None),
+        ] {
+            assert_eq!(template_kind_for_path(Path::new(path)), kind, "{path}");
+            assert_eq!(
+                template_surface_language(Path::new(path)),
+                surface,
+                "{path}"
+            );
+        }
+    }
 
     fn symbol_line_col(result: &crate::IndexResult, name: &str) -> Option<(u32, u32)> {
         result
@@ -445,7 +546,12 @@ const site = 'codestory'
 </html>
 "#;
         let prepared = prepare_template_source(TemplateKind::Astro, source);
-        let language_config = get_language_for_ext("ts").expect("typescript config");
+        assert_eq!(prepared.script_language, "typescript");
+        let language_config = get_language_for_ext(match prepared.script_language {
+            "typescript" => "ts",
+            _ => "js",
+        })
+        .expect("template script config");
         let result = index_file(
             Path::new("src/pages/index.astro"),
             &prepared.blanked,
@@ -455,6 +561,7 @@ const site = 'codestory'
         )?;
 
         assert_symbol_on_original_source_line(source, &result, "buildTitle");
+        assert!(result.files[0].complete);
         Ok(())
     }
 
@@ -463,5 +570,74 @@ const site = 'codestory'
         let source = r#"<script lang="ts">export const x = 1</script>"#;
         let prepared = prepare_template_source(TemplateKind::Vue, source);
         assert_eq!(prepared.script_language, "typescript");
+    }
+
+    #[test]
+    fn opening_tag_scan_ignores_greater_than_inside_quoted_attributes() -> anyhow::Result<()> {
+        let source = r#"<script lang="ts" generic="T extends Item<K>">
+interface Props<T> { item: T }
+export const props: Props<string> = { item: "ok" }
+</script>
+"#;
+        let prepared = prepare_template_source(TemplateKind::Vue, source);
+
+        assert_eq!(prepared.script_language, "typescript");
+        assert!(prepared.blanked.contains("interface Props<T>"));
+        let storage =
+            crate::index_template_file(Path::new("Component.vue"), TemplateKind::Vue, source)?;
+        assert!(storage.files[0].complete);
+        Ok(())
+    }
+
+    #[test]
+    fn svelte_completeness_uses_script_regions_not_template_directives_or_styles()
+    -> anyhow::Result<()> {
+        let source = r#"<script>
+export let visible = true
+</script>
+{#if visible}
+  <div {...restProps} use:action={{ visible, nested: { enabled: true } }}>{visible}</div>
+{:else}
+  <span>hidden</span>
+{/if}
+<style>
+  div { font-weight: var(--weight); }
+</style>
+"#;
+
+        let storage = crate::index_template_file(
+            Path::new("Component.svelte"),
+            TemplateKind::Svelte,
+            source,
+        )?;
+
+        assert!(
+            storage.files[0].complete,
+            "{}",
+            prepare_template_source(TemplateKind::Svelte, source).completeness_blanked
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_svelte_script_remains_incomplete() -> anyhow::Result<()> {
+        let source = "<script>export function broken( {</script>\n<h1>Broken</h1>\n";
+
+        let storage =
+            crate::index_template_file(Path::new("Broken.svelte"), TemplateKind::Svelte, source)?;
+
+        assert!(!storage.files[0].complete);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_kept_svelte_inline_expression_remains_incomplete() -> anyhow::Result<()> {
+        let source = "<script>export let value = 1</script>\n<p>{broken(}</p>\n";
+
+        let storage =
+            crate::index_template_file(Path::new("Broken.svelte"), TemplateKind::Svelte, source)?;
+
+        assert!(!storage.files[0].complete);
+        Ok(())
     }
 }

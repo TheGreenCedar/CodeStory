@@ -2,7 +2,8 @@ use super::test_support::{sample_retrieval, sample_task_brief_citation, sample_t
 use crate::app::drill::{
     drill_packet_anchors, drill_packet_bridges, drill_packet_citation_is_typed_resolvable,
     drill_packet_citations, drill_packet_claim_readiness, drill_packet_verification_targets,
-    drill_search_hit_from_packet_citation, execute_drill_packet, write_drill_outputs,
+    drill_search_hit_from_packet_citation, execute_drill_packet, packet_drill_option_ids,
+    write_drill_outputs,
 };
 use crate::args::{
     self, DrillCommandStatusOutput, DrillExecutionBoundaryOutput, DrillMechanicalOutput,
@@ -41,12 +42,12 @@ fn drill_packet_adapter_reuses_packet_citations_and_sufficiency() {
     assert_eq!(bridges[0].evidence.strategy, "packet_claim");
     assert_eq!(bridges[0].evidence.status, "source_truth_only");
     assert_eq!(
-        drill_packet_claim_readiness(packet.sufficiency.status),
-        ClaimReadinessDto::Partial
+        drill_packet_claim_readiness(packet.disposition.kind),
+        ClaimReadinessDto::Supported
     );
     assert_eq!(
         bridges[0].evidence.next_commands,
-        packet.sufficiency.follow_up_commands
+        packet_drill_option_ids(&packet)
     );
 }
 
@@ -62,6 +63,10 @@ fn drill_executes_one_packet_with_explicit_anchor_probes() {
         extra_probes: vec!["WorkspaceIndexer".to_string()],
         include_evidence: true,
         latency_budget_ms: None,
+        parent_packet_id: None,
+        option_ids: Vec::new(),
+        core_generation_id: None,
+        retrieval_generation: None,
     };
 
     let result = execute_drill_packet(request, |request| {
@@ -88,9 +93,6 @@ fn drill_retained_fields_match_pre_adapter_fixture() {
         query: "WorkspaceIndexer".to_string(),
         purpose: "explicit symbol probe from packet request".to_string(),
     }];
-    packet.sufficiency.covered_claims[0].citations = vec![source, search];
-    packet.sufficiency.follow_up_commands =
-        vec!["codestory-cli snippet --query WorkspaceIndexer --project .".to_string()];
 
     let citations = drill_packet_citations(&packet);
     let anchors = drill_packet_anchors(
@@ -124,7 +126,7 @@ fn drill_retained_fields_match_pre_adapter_fixture() {
         },
         question_search: Some(DrillCommandStatusOutput {
             command: "packet".to_string(),
-            status: "partial".to_string(),
+            status: "supported".to_string(),
             duration_ms: 1,
             artifact: None,
             error: None,
@@ -138,7 +140,7 @@ fn drill_retained_fields_match_pre_adapter_fixture() {
             source_files: vec!["crates/codestory-runtime/src/agent/orchestrator.rs".to_string()],
         }],
         verification_targets,
-        next_commands: packet.sufficiency.follow_up_commands.clone(),
+        next_commands: packet_drill_option_ids(&packet),
         evidence_packet: packet,
     };
     let output_dir = tempdir().expect("output dir");
@@ -310,7 +312,7 @@ fn drill_packet_keeps_structural_source_ranges_navigable_but_not_typed() {
     assert!(drill_packet_verification_targets(project_root, &[structural.clone()]).is_empty());
 
     let mut packet = sample_task_brief_packet();
-    packet.sufficiency.covered_claims[0].citations = vec![
+    packet.answer.citations = vec![
         structural,
         sample_task_brief_citation("SearchService", NodeKind::STRUCT, "src/search.rs", 24),
     ];
@@ -328,21 +330,19 @@ fn drill_packet_keeps_structural_source_ranges_navigable_but_not_typed() {
 #[test]
 fn drill_packet_bridge_requires_shared_concrete_edge_evidence() {
     let mut packet = sample_task_brief_packet();
-    packet.sufficiency.covered_claims[0].citations[0].subgraph_id = Some("only-from".to_string());
+    packet.answer.citations[0].subgraph_id = Some("only-from".to_string());
     let bridges = drill_packet_bridges(Path::new("C:/repo"), &packet);
     assert_eq!(bridges[0].evidence.status, "source_truth_only");
 
-    packet.sufficiency.covered_claims[0].citations[0].subgraph_id = Some("shared".to_string());
-    packet.sufficiency.covered_claims[0].citations[1].subgraph_id = Some("shared".to_string());
+    packet.answer.citations[0].subgraph_id = Some("shared".to_string());
+    packet.answer.citations[1].subgraph_id = Some("shared".to_string());
     let bridges = drill_packet_bridges(Path::new("C:/repo"), &packet);
     assert_eq!(bridges[0].evidence.status, "source_truth_only");
 
-    packet.sufficiency.covered_claims[0].citations[0].subgraph_id = None;
-    packet.sufficiency.covered_claims[0].citations[1].subgraph_id = None;
-    packet.sufficiency.covered_claims[0].citations[0].evidence_edge_ids =
-        vec![EdgeId("shared-edge".to_string())];
-    packet.sufficiency.covered_claims[0].citations[1].evidence_edge_ids =
-        vec![EdgeId("shared-edge".to_string())];
+    packet.answer.citations[0].subgraph_id = None;
+    packet.answer.citations[1].subgraph_id = None;
+    packet.answer.citations[0].evidence_edge_ids = vec![EdgeId("shared-edge".to_string())];
+    packet.answer.citations[1].evidence_edge_ids = vec![EdgeId("shared-edge".to_string())];
     let bridges = drill_packet_bridges(Path::new("C:/repo"), &packet);
     assert_eq!(bridges[0].evidence.status, "graph_path");
 }

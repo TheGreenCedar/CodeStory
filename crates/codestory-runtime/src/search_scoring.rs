@@ -1,9 +1,8 @@
 use super::{
     AgentHybridWeightsDto, ApiError, AppController, ExpandedSymbolMatches, HashMap, HashSet,
     NodeId, NodeKind, RetrievalStateDto, SearchHit, SearchPlanSubqueryDto, SearchRequest, Storage,
-    aggregate_symbol_matches, decorate_search_hit_evidence, extract_symbol_search_terms,
-    node_display_name, preferred_occurrence, route_endpoint_adjusted_search_score,
-    symbol_name_match_rank,
+    aggregate_symbol_matches, extract_symbol_search_terms, node_display_name, preferred_occurrence,
+    route_endpoint_adjusted_search_score, symbol_name_match_rank,
 };
 #[cfg(test)]
 use super::{
@@ -13,6 +12,10 @@ use super::{
     looks_like_standalone_symbol_query, mixed_natural_language_query, normalized_hybrid_weights,
     query_mentions_non_primary_source,
 };
+use crate::agent::packet_evidence::decorate_lexical_search_hit_evidence;
+#[cfg(test)]
+use crate::agent::packet_evidence::decorate_search_hit_evidence;
+use crate::controller_symbols::node_names_for_ids;
 #[cfg(test)]
 use crate::search_publication::{
     retrieval_state_from_engine, retrieval_state_from_engine_with_storage_contract,
@@ -30,6 +33,19 @@ pub(crate) struct HybridSearchScoredHit {
     pub semantic_score: f32,
     pub graph_score: f32,
     pub total_score: f32,
+}
+
+impl HybridSearchScoredHit {
+    pub(crate) fn from_search_hit(hit: SearchHit) -> Self {
+        let breakdown = hit.score_breakdown.as_ref();
+        Self {
+            lexical_score: breakdown.map(|scores| scores.lexical).unwrap_or(0.0),
+            semantic_score: breakdown.map(|scores| scores.semantic).unwrap_or(0.0),
+            graph_score: breakdown.map(|scores| scores.graph).unwrap_or(0.0),
+            total_score: breakdown.map(|scores| scores.total).unwrap_or(hit.score),
+            hit,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -354,7 +370,7 @@ impl AppController {
             ))
         })?;
 
-        let mut hit = SearchHit {
+        let hit = SearchHit {
             node_id: NodeId::from(id),
             display_name,
             kind: NodeKind::from(node.kind),
@@ -362,38 +378,30 @@ impl AppController {
             line,
             score: route_endpoint_adjusted_search_score(score, node.canonical_id.as_deref()),
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
-            evidence_tier: Some(if structural_unit.is_some() {
-                codestory_contracts::api::PacketEvidenceTierDto::StructuralText
-            } else if openapi_endpoint {
-                codestory_contracts::api::PacketEvidenceTierDto::ExactSource
-            } else {
-                codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph
-            }),
-            evidence_producer: Some(if let Some(unit) = structural_unit.as_ref() {
-                unit.producer.clone()
-            } else {
-                if openapi_endpoint {
-                    "openapi_endpoint_schema"
-                } else {
-                    "route_endpoint"
-                }
-                .to_string()
-            }),
-            resolution_status: Some(if structural_unit.is_some() || openapi_endpoint {
-                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly
-            } else {
-                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved
-            }),
+            evidence_tier: structural_unit
+                .as_ref()
+                .map(|_| codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+                .or_else(|| {
+                    openapi_endpoint
+                        .then_some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource)
+                }),
+            evidence_producer: structural_unit
+                .as_ref()
+                .map(|unit| unit.producer.clone())
+                .or_else(|| openapi_endpoint.then(|| "openapi_endpoint_schema".to_string())),
+            resolution_status: (structural_unit.is_some() || openapi_endpoint)
+                .then_some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly),
             loss_reason: None,
             coverage_role: None,
-            eligible_for_sufficiency: Some(structural_unit.is_none() && !openapi_endpoint),
+            eligible_for_sufficiency: (structural_unit.is_some() || openapi_endpoint)
+                .then_some(false),
             source_excerpt: None,
             verification_targets: Vec::new(),
             score_breakdown: None,
         };
-        decorate_search_hit_evidence(&mut hit);
         Ok(Some(hit))
     }
 
@@ -426,6 +434,10 @@ impl AppController {
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
+            .map(|mut hit| {
+                decorate_lexical_search_hit_evidence(&mut hit);
+                hit
+            })
             .collect())
     }
 
@@ -451,10 +463,9 @@ impl AppController {
             }
         }
 
-        Ok(Some((
-            aggregate_symbol_matches(direct_matches, expanded),
-            s.node_names.clone(),
-        )))
+        let matches = aggregate_symbol_matches(direct_matches, expanded);
+        let node_names = node_names_for_ids(&s.node_names, matches.iter().map(|(id, _)| *id));
+        Ok(Some((matches, node_names)))
     }
 
     fn search_hybrid_results(
@@ -501,25 +512,7 @@ impl AppController {
             self.search_hybrid_results(req, focus_node_id, max_results, request_weights)?;
         Ok(hits
             .into_iter()
-            .map(|hit| HybridSearchScoredHit {
-                lexical_score: hit.score,
-                semantic_score: hit
-                    .score_breakdown
-                    .as_ref()
-                    .map(|scores| scores.semantic)
-                    .unwrap_or(0.0),
-                graph_score: hit
-                    .score_breakdown
-                    .as_ref()
-                    .map(|scores| scores.graph)
-                    .unwrap_or(0.0),
-                total_score: hit
-                    .score_breakdown
-                    .as_ref()
-                    .map(|scores| scores.total)
-                    .unwrap_or(hit.score),
-                hit,
-            })
+            .map(HybridSearchScoredHit::from_search_hit)
             .collect())
     }
 
@@ -652,7 +645,8 @@ impl AppController {
                 "hybrid_search_instrumentation"
             );
 
-            (hits, s.node_names.clone(), retrieval)
+            let node_names = node_names_for_ids(&s.node_names, hits.iter().map(|hit| hit.node_id));
+            (hits, node_names, retrieval)
         };
 
         let mut out = Vec::with_capacity(hybrid.len());
@@ -671,6 +665,7 @@ impl AppController {
                     final_rank_reason: None,
                     provenance: Vec::new(),
                 });
+                decorate_search_hit_evidence(&mut hit);
                 out.push(HybridSearchScoredHit {
                     hit,
                     lexical_score: scored.lexical_score,

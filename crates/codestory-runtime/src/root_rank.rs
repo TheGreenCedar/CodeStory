@@ -277,6 +277,7 @@ pub(crate) struct RootDiversityState {
 /// Taking no limit is what makes every budget's prefix monotone: one order is
 /// produced, and each budget truncates that same order. The output is a
 /// permutation of the input and relative order is preserved inside each pass.
+#[cfg(test)]
 pub(crate) fn diversify_root_order<T>(
     items: Vec<T>,
     pinned: impl Fn(&T) -> bool,

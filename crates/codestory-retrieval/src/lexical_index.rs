@@ -1,11 +1,18 @@
 //! Project-local SQLite FTS lexical index.
 
 use anyhow::{Context, Result, bail};
-use codestory_store::{FileRole, Store, SymbolSearchDoc};
+use codestory_contracts::api::SearchTargetDto;
+use codestory_contracts::owned_artifacts::sqlite_file_with_sidecars;
+use codestory_contracts::validation_receipts::SealedReceiptCache;
+#[cfg(test)]
+use codestory_store::FileRole;
+use codestory_store::{SourcePolicyExclusionPolicyIdentity, Store, SymbolSearchDoc};
 use codestory_workspace::paths::sqlite_open_path;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,9 +21,33 @@ pub const LEXICAL_INDEX_FILE: &str = "lexical-index.sqlite3";
 const LEGACY_INDEX_FILE: &str = "lexical-index.jsonl";
 const LEGACY_META_FILE: &str = "shard-meta.json";
 const LEGACY_STUB_MARKER: &str = ".zoekt-stub";
-const MAX_FILE_BYTES: u64 = 1_000_000;
+/// Default lexical source-file cap for scans without a pinned core publication.
+/// Product scans use the active cap recorded with that publication.
+pub(crate) const MAX_FILE_BYTES: u64 = codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP;
 const MAX_CANDIDATES: usize = 4_096;
 const COVERAGE_PATH_SAMPLE: usize = 32;
+
+/// How many published lexical generations may hold a sealed health receipt at
+/// once.
+///
+/// A runtime works on one project generation at a time and keeps at most the
+/// outgoing one alive beside it, so the live cardinality is a handful; the
+/// bound exists to make the memory ceiling hard, not to force turnover. A
+/// receipt is one metadata row, so the whole cache at capacity is tens of
+/// kilobytes. Reaching the bound clears the cache, which costs a re-scan and
+/// never changes a verdict.
+const LEXICAL_SHARD_RECEIPT_CAPACITY: usize = 256;
+
+/// Sealed deep-verification receipts for immutable lexical shards.
+///
+/// The receipt records what a shard *is* — its self-consistent metadata row —
+/// after a full integrity pass. It never records whether that shard satisfies
+/// a particular caller's expectations; those comparisons are cheap and re-run
+/// on every probe. The seal covers the shard database and every SQLite sidecar
+/// identity the registry owns, so an in-place rewrite, a replacement, or a
+/// stray write-ahead log invalidates the receipt instead of hiding behind it.
+static LEXICAL_SHARD_RECEIPTS: SealedReceiptCache<PathBuf, LexicalShardMetadata> =
+    SealedReceiptCache::new(LEXICAL_SHARD_RECEIPT_CAPACITY);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LexicalCoverage {
@@ -121,6 +152,8 @@ pub struct LexicalHit {
     pub node_id: Option<String>,
     pub symbol_name: Option<String>,
     pub start_line: Option<u32>,
+    pub target: Option<SearchTargetDto>,
+    pub source_excerpt: Option<String>,
     pub score: f32,
 }
 
@@ -209,12 +242,14 @@ pub fn build_lexical_shard(
             expected,
             |visit| scan_lexical_documents(project_root, storage_path, storage_path, visit),
         )?;
-        validate_lexical_database(
-            &temp_path,
+        // The staged file is about to be renamed away, so its verdict is not
+        // receiptable: seal the published identity, never the temporary one.
+        let staged = verify_lexical_database_contents(&temp_path)?;
+        match_lexical_shard_expectations(
+            &staged,
             project_id,
             sidecar_input_hash,
             Some((expected.file_count, expected.hash.as_str())),
-            true,
         )?;
         publish_immutable_lexical_database(&temp_path, &index_path)?;
         Ok(rebuilt)
@@ -295,7 +330,6 @@ pub fn shard_has_lexical_index(shard_dir: &Path, expected_sidecar_input_hash: &s
         project_id,
         expected_sidecar_input_hash,
         None,
-        false,
     )
     .is_ok()
 }
@@ -312,7 +346,6 @@ pub fn shard_matches_lexical_input(
         sidecar_generation,
         expected_sidecar_input_hash,
         Some((expected_file_count, expected_hash)),
-        true,
     )
     .is_ok()
 }
@@ -327,9 +360,19 @@ pub fn lexical_shard_coverage(
         sidecar_generation,
         expected_sidecar_input_hash,
         None,
-        false,
     )?
     .coverage)
+}
+
+/// Sealed-receipt accounting for one shard, for tests that must prove the deep
+/// verification ran exactly as often as the seal allowed.
+#[cfg(test)]
+pub(crate) fn lexical_shard_receipt_stats(
+    lexical_data_dir: &Path,
+    sidecar_generation: &str,
+) -> Option<codestory_contracts::validation_receipts::ReceiptStats> {
+    LEXICAL_SHARD_RECEIPTS
+        .stats(&shard_dir_for(lexical_data_dir, sidecar_generation).join(LEXICAL_INDEX_FILE))
 }
 
 #[cfg(test)]
@@ -395,6 +438,82 @@ fn search_lexical_index_with_cancel_inner(
         None,
         cancelled.as_ref(),
     )?;
+    let document_count: usize = connection.query_row(
+        "SELECT file_count FROM lexical_metadata WHERE id = 1",
+        [],
+        |row| row.get::<_, u32>(0).map(|count| count as usize),
+    )?;
+    search_lexical_index_on_connection(
+        &connection,
+        query,
+        limit,
+        document_count,
+        &mut HashMap::new(),
+        cancelled.as_ref(),
+    )
+}
+
+pub(crate) fn search_lexical_index_batch_with_cancel(
+    shard_dir: &Path,
+    expected_sidecar_input_hash: &str,
+    queries: &[(String, usize)],
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<Vec<Vec<LexicalHit>>> {
+    if queries.is_empty() {
+        return Ok(Vec::new());
+    }
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
+    let Some(project_id) = shard_dir.file_name().and_then(|name| name.to_str()) else {
+        bail!("lexical shard path has no generation directory");
+    };
+    let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
+    let connection = open_read_only(&index_path)?;
+    let progress_cancelled = Arc::clone(&cancelled);
+    connection.progress_handler(1_000, Some(move || progress_cancelled()))?;
+    let _metadata = validate_open_database_metadata(
+        &connection,
+        project_id,
+        expected_sidecar_input_hash,
+        None,
+        cancelled.as_ref(),
+    )?;
+    let document_count: usize = connection.query_row(
+        "SELECT file_count FROM lexical_metadata WHERE id = 1",
+        [],
+        |row| row.get::<_, u32>(0).map(|count| count as usize),
+    )?;
+    let mut token_frequencies = HashMap::new();
+    queries
+        .iter()
+        .map(|(query, limit)| {
+            search_lexical_index_on_connection(
+                &connection,
+                query,
+                *limit,
+                document_count,
+                &mut token_frequencies,
+                cancelled.as_ref(),
+            )
+        })
+        .collect()
+}
+
+fn search_lexical_index_on_connection(
+    connection: &Connection,
+    query: &str,
+    limit: usize,
+    document_count: usize,
+    frequency_cache: &mut HashMap<String, usize>,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<Vec<LexicalHit>> {
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let tokens = lexical_query_tokens(query);
     if tokens.is_empty() {
         return Ok(Vec::new());
@@ -406,43 +525,212 @@ fn search_lexical_index_with_cancel_inner(
         .join(" OR ");
     let candidate_limit = limit.saturating_mul(64).clamp(256, MAX_CANDIDATES);
 
-    let command_tokens = command_query_tokens(query);
-    let document_count: usize = connection.query_row(
-        "SELECT file_count FROM lexical_metadata WHERE id = 1",
-        [],
-        |row| row.get::<_, u32>(0).map(|count| count as usize),
-    )?;
+    let mandatory_tokens = quoted_query_tokens(query);
     let mut token_frequencies = Vec::with_capacity(tokens.len());
     for token in &tokens {
         if cancelled() {
             bail!("lexical search cancelled");
         }
-        token_frequencies.push(fts_document_frequency(&connection, token)?);
+        let frequency = match frequency_cache.get(token) {
+            Some(frequency) => *frequency,
+            None => {
+                let frequency = fts_document_frequency(connection, token)?;
+                frequency_cache.insert(token.clone(), frequency);
+                frequency
+            }
+        };
+        token_frequencies.push(frequency);
     }
     let token_weights = token_frequencies
         .iter()
         .zip(tokens.iter())
         .map(|(frequency, token)| {
             let mut weight = lexical_token_weight(*frequency, document_count);
-            if command_tokens.iter().any(|command| command == token) {
+            if mandatory_tokens.iter().any(|mandatory| mandatory == token) {
                 weight *= 2.0;
             }
             weight
         })
         .collect::<Vec<_>>();
-    let total_weight = token_weights.iter().sum::<f32>();
-    let required_weight = required_lexical_match_weight(tokens.len(), total_weight);
+    // Coverage is a count of distinct query terms. Rarity weights order
+    // candidates within lexical lanes; an unmatched rare term must not veto
+    // the documented two-of-three or forty-percent admission contracts.
+    let required_match_count = required_lexical_match_count(tokens.len());
 
-    let mut statement = connection.prepare(
-        "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
-                d.source, d.node_id, d.symbol_name, d.start_line
-         FROM lexical_fts
-         JOIN lexical_documents d ON d.id = lexical_fts.rowid
-         WHERE lexical_fts MATCH ?1
-         ORDER BY bm25(lexical_fts, 8.0, 1.0)
-         LIMIT ?2",
+    let exact_candidates = query_exact_candidates(connection, query, candidate_limit)?;
+    let path_candidates = query_fts_candidates(
+        connection,
+        &fts_query,
+        candidate_limit,
+        LexicalCandidateOrder::Path,
     )?;
-    let rows = statement.query_map(params![fts_query, candidate_limit as i64], |row| {
+    let content_candidates = query_fts_candidates(
+        connection,
+        &fts_query,
+        candidate_limit,
+        LexicalCandidateOrder::Content,
+    )?;
+    let mut symbol_candidates = query_fts_candidates(
+        connection,
+        &fts_query,
+        candidate_limit,
+        LexicalCandidateOrder::SymbolDocument,
+    )?;
+    rank_symbol_candidates_by_identifier_overlap(&mut symbol_candidates, &tokens, &token_weights);
+
+    // Exact, path-BM25, content-BM25, and focused symbol documents are
+    // independent lexical recall lanes. Preserve every deterministic rank a
+    // document earned and fuse those ranks instead of comparing incompatible
+    // raw BM25 scores or collapsing them to one best lane. The coverage rule
+    // below remains the admission threshold.
+    let query_shape = crate::query_features::classify_query(query).shape;
+    let mut best_sublane_ranks = HashMap::new();
+    for (lane, candidates) in [
+        (LexicalSublane::Exact, exact_candidates.as_slice()),
+        (LexicalSublane::Path, path_candidates.as_slice()),
+        (LexicalSublane::Content, content_candidates.as_slice()),
+        (LexicalSublane::SymbolDocument, symbol_candidates.as_slice()),
+    ] {
+        record_lexical_sublane_ranks(&mut best_sublane_ranks, candidates, lane);
+    }
+
+    let mut candidates = exact_candidates;
+    candidates.extend(interleave_candidate_lanes(vec![
+        path_candidates,
+        content_candidates,
+        symbol_candidates,
+    ]));
+
+    let mut hits = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, (document, normalized_path, normalized_content)) in
+        candidates.into_iter().enumerate()
+    {
+        if index % 64 == 0 && cancelled() {
+            bail!("lexical search cancelled");
+        }
+        let identity = lexical_candidate_identity(&document);
+        let sublane_ranks = best_sublane_ranks
+            .get(&identity)
+            .copied()
+            .unwrap_or_default();
+        if seen.contains(&identity) {
+            continue;
+        }
+        if seen.len() == MAX_CANDIDATES {
+            break;
+        }
+        seen.insert(identity);
+        let token_match = lexical_token_match(
+            &tokens,
+            &token_weights,
+            &normalized_path,
+            &normalized_content,
+        );
+        if token_match.matched_count >= required_match_count
+            && mandatory_tokens_match(&mandatory_tokens, &normalized_path, &normalized_content)
+        {
+            let (target, matched_line, source_excerpt) =
+                if document.source == LexicalDocumentSource::LexicalSource {
+                    lexical_source_target(
+                        &document.path,
+                        &document.content,
+                        &tokens,
+                        token_match.content_weight > 0.0,
+                    )
+                } else {
+                    (None, None, None)
+                };
+            hits.push(LexicalHit {
+                score: lexical_sublane_score(sublane_ranks, query_shape),
+                path: document.path,
+                source: document.source,
+                node_id: document.node_id,
+                symbol_name: document.symbol_name,
+                start_line: document.start_line.or(matched_line),
+                target,
+                source_excerpt,
+            });
+        }
+    }
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| lexical_source_rank(left.source).cmp(&lexical_source_rank(right.source)))
+            .then_with(|| left.node_id.cmp(&right.node_id))
+            .then_with(|| left.symbol_name.cmp(&right.symbol_name))
+            .then_with(|| left.start_line.cmp(&right.start_line))
+    });
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+fn lexical_source_rank(source: LexicalDocumentSource) -> u8 {
+    match source {
+        LexicalDocumentSource::SymbolDoc => 0,
+        LexicalDocumentSource::LexicalSource => 1,
+        LexicalDocumentSource::ComponentReport => 2,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LexicalCandidateOrder {
+    Path,
+    Content,
+    SymbolDocument,
+}
+
+type LexicalCandidate = (LexicalDocument, String, String);
+
+fn query_fts_candidates(
+    connection: &Connection,
+    fts_query: &str,
+    candidate_limit: usize,
+    order: LexicalCandidateOrder,
+) -> Result<Vec<LexicalCandidate>> {
+    let scoped_query = match order {
+        LexicalCandidateOrder::Path => format!("path : ({fts_query})"),
+        LexicalCandidateOrder::Content | LexicalCandidateOrder::SymbolDocument => {
+            format!("content : ({fts_query})")
+        }
+    };
+    let sql = match order {
+        LexicalCandidateOrder::Path => {
+            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1
+             ORDER BY bm25(lexical_fts, 8.0, 1.0), d.path, d.id
+             LIMIT ?2"
+        }
+        LexicalCandidateOrder::Content => {
+            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1
+             ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
+             LIMIT ?2"
+        }
+        LexicalCandidateOrder::SymbolDocument => {
+            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1 AND d.source = 'symbol_doc'
+             ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
+             LIMIT ?2"
+        }
+    };
+    let mut statement = connection.prepare_cached(sql)?;
+    let rows = statement.query_map(params![scoped_query, candidate_limit as i64], |row| {
         let document = LexicalDocument {
             path: row.get(0)?,
             content: row.get(1)?,
@@ -459,44 +747,208 @@ fn search_lexical_index_with_cancel_inner(
         };
         Ok((document, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
     })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
 
-    let mut hits = Vec::new();
-    for (index, row) in rows.enumerate() {
-        if index % 64 == 0 && cancelled() {
-            bail!("lexical search cancelled");
-        }
-        let (document, normalized_path, normalized_content) = row?;
-        let token_match = lexical_token_match(
-            &tokens,
-            &token_weights,
-            &normalized_path,
-            &normalized_content,
-        );
-        if token_match.matched_weight >= required_weight
-            && broad_query_path_gate(tokens.len(), &token_match)
-        {
-            hits.push(LexicalHit {
-                score: score_lexical_match(&document.path, document.source, &token_match),
-                path: document.path,
-                source: document.source,
-                node_id: document.node_id,
-                symbol_name: document.symbol_name,
-                start_line: document.start_line,
-            });
+fn query_exact_candidates(
+    connection: &Connection,
+    query: &str,
+    candidate_limit: usize,
+) -> Result<Vec<LexicalCandidate>> {
+    let mut needles = quoted_query_tokens(query);
+    let intent = crate::query_features::classify_query(query).intent;
+    needles.extend(
+        intent
+            .exact_symbols
+            .into_iter()
+            .chain(intent.paths)
+            .map(|needle| needle.to_ascii_lowercase()),
+    );
+    needles.sort();
+    needles.dedup();
+
+    let mut candidates = Vec::new();
+    let mut statement = connection.prepare_cached(
+        "SELECT d.path, d.content, lower(lexical_fts.path), lower(lexical_fts.content),
+                d.source, d.node_id, d.symbol_name, d.start_line
+         FROM lexical_documents d
+         JOIN lexical_fts ON lexical_fts.rowid = d.id
+         WHERE lower(d.path) = ?1
+            OR lower(d.symbol_name) = ?1
+            OR lower(d.symbol_name) LIKE '%::' || ?1
+            OR lower(d.symbol_name) LIKE '%.' || ?1
+         ORDER BY d.path, d.source, d.node_id, d.symbol_name, d.start_line, d.id
+         LIMIT ?2",
+    )?;
+    for needle in needles {
+        let rows = statement.query_map(params![needle, candidate_limit as i64], |row| {
+            let document = LexicalDocument {
+                path: row.get(0)?,
+                content: row.get(1)?,
+                source: LexicalDocumentSource::parse(&row.get::<_, String>(4)?).map_err(
+                    |error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            error.into(),
+                        )
+                    },
+                )?,
+                node_id: row.get(5)?,
+                symbol_name: row.get(6)?,
+                start_line: row.get(7)?,
+            };
+            Ok((document, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+        })?;
+        candidates.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+        if candidates.len() >= candidate_limit {
+            break;
         }
     }
-    if cancelled() {
-        bail!("lexical search cancelled");
+    candidates.truncate(candidate_limit);
+    Ok(candidates)
+}
+
+fn interleave_candidate_lanes(lanes: Vec<Vec<LexicalCandidate>>) -> Vec<LexicalCandidate> {
+    let mut lanes = lanes.into_iter().map(Vec::into_iter).collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    loop {
+        let mut added = false;
+        for lane in &mut lanes {
+            if let Some(candidate) = lane.next() {
+                candidates.push(candidate);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
     }
-    hits.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
+    candidates
+}
+
+type LexicalCandidateIdentity = (String, u8, Option<String>, Option<String>, Option<u32>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexicalSublane {
+    Exact,
+    Path,
+    Content,
+    SymbolDocument,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LexicalSublaneRanks {
+    exact: Option<u32>,
+    path: Option<u32>,
+    content: Option<u32>,
+    symbol_document: Option<u32>,
+}
+
+impl LexicalSublaneRanks {
+    fn record(&mut self, lane: LexicalSublane, rank: u32) {
+        let slot = match lane {
+            LexicalSublane::Exact => &mut self.exact,
+            LexicalSublane::Path => &mut self.path,
+            LexicalSublane::Content => &mut self.content,
+            LexicalSublane::SymbolDocument => &mut self.symbol_document,
+        };
+        *slot = Some(slot.map_or(rank, |current| current.min(rank)));
+    }
+}
+
+fn record_lexical_sublane_ranks(
+    ranks: &mut HashMap<LexicalCandidateIdentity, LexicalSublaneRanks>,
+    candidates: &[LexicalCandidate],
+    lane: LexicalSublane,
+) {
+    for (index, (document, _, _)) in candidates.iter().enumerate() {
+        let candidate_rank = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        ranks
+            .entry(lexical_candidate_identity(document))
+            .or_default()
+            .record(lane, candidate_rank);
+    }
+}
+
+fn rank_symbol_candidates_by_identifier_overlap(
+    candidates: &mut [LexicalCandidate],
+    tokens: &[String],
+    token_weights: &[f32],
+) {
+    let original_order = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, (document, _, _))| (lexical_candidate_identity(document), index))
+        .collect::<HashMap<_, _>>();
+    candidates.sort_by(|left, right| {
+        symbol_identifier_overlap(&right.0, tokens, token_weights)
+            .partial_cmp(&symbol_identifier_overlap(&left.0, tokens, token_weights))
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| {
+                original_order[&lexical_candidate_identity(&left.0)]
+                    .cmp(&original_order[&lexical_candidate_identity(&right.0)])
+            })
     });
-    hits.truncate(limit);
-    Ok(hits)
+}
+
+fn symbol_identifier_overlap(
+    document: &LexicalDocument,
+    tokens: &[String],
+    token_weights: &[f32],
+) -> f32 {
+    let Some(symbol_name) = document.symbol_name.as_deref() else {
+        return 0.0;
+    };
+    let normalized = normalize_lexical_text(symbol_name);
+    let symbol_tokens = normalized.split_whitespace().collect::<HashSet<_>>();
+    tokens
+        .iter()
+        .zip(token_weights.iter().copied())
+        .filter_map(|(token, weight)| symbol_tokens.contains(token.as_str()).then_some(weight))
+        .sum()
+}
+
+fn lexical_sublane_score(
+    ranks: LexicalSublaneRanks,
+    shape: crate::query_features::QueryShape,
+) -> f32 {
+    // Fuse only deterministic ranks. BM25 values from different FTS column
+    // weightings are not comparable, and aggregate file coverage must not
+    // erase a focused symbol-document signal. k=20 matches the outer hybrid
+    // ranker; the denominator normalizes a candidate ranked first in every
+    // lexical sublane to 1.0.
+    const RRF_K: f32 = 20.0;
+    let (exact_weight, path_weight, content_weight, symbol_weight) = match shape {
+        crate::query_features::QueryShape::PathLike => (2.0, 1.25, 1.0, 1.0),
+        crate::query_features::QueryShape::SymbolLike => (2.0, 0.75, 1.0, 1.5),
+        crate::query_features::QueryShape::NaturalLanguage
+        | crate::query_features::QueryShape::Mixed => (2.0, 1.0, 1.0, 1.25),
+    };
+    let weighted_rank =
+        |rank: Option<u32>, weight: f32| rank.map_or(0.0, |rank| weight / (RRF_K + rank as f32));
+    let score = weighted_rank(ranks.exact, exact_weight)
+        + weighted_rank(ranks.path, path_weight)
+        + weighted_rank(ranks.content, content_weight)
+        + weighted_rank(ranks.symbol_document, symbol_weight);
+    let maximum = (exact_weight + path_weight + content_weight + symbol_weight) / (RRF_K + 1.0);
+    (score / maximum).clamp(0.0, 1.0)
+}
+
+fn lexical_candidate_identity(document: &LexicalDocument) -> LexicalCandidateIdentity {
+    let source = match document.source {
+        LexicalDocumentSource::LexicalSource => 0,
+        LexicalDocumentSource::SymbolDoc => 1,
+        LexicalDocumentSource::ComponentReport => 2,
+    };
+    (
+        document.path.clone(),
+        source,
+        document.node_id.clone(),
+        document.symbol_name.clone(),
+        document.start_line,
+    )
 }
 
 pub fn shard_dir_for(lexical_data_dir: &Path, project_id: &str) -> PathBuf {
@@ -640,47 +1092,56 @@ where
     Ok(actual)
 }
 
+/// Deep-verify one immutable lexical shard, reusing a sealed receipt when the
+/// shard's native identity is unchanged, then check the caller's expectations
+/// against the receipted metadata.
+///
+/// The two halves are deliberately separate. The deep half scans the whole FTS
+/// mirror and is a fact about the artifact, so it is receiptable. The
+/// expectation half is three string comparisons that depend on the caller, so
+/// it runs every time and can never be answered from a receipt.
 fn validate_lexical_database(
     path: &Path,
     expected_project_id: &str,
     expected_sidecar_input_hash: &str,
     expected_lexical: Option<(u32, &str)>,
-    quick_check: bool,
 ) -> Result<LexicalShardMetadata> {
+    let metadata = LEXICAL_SHARD_RECEIPTS.validate_sealed(
+        path.to_path_buf(),
+        &sqlite_file_with_sidecars(path),
+        || verify_lexical_database_contents(path),
+    )?;
+    match_lexical_shard_expectations(
+        &metadata,
+        expected_project_id,
+        expected_sidecar_input_hash,
+        expected_lexical,
+    )?;
+    Ok(metadata)
+}
+
+/// The receiptable half: everything that depends only on the shard's own bytes.
+///
+/// `quick_check` is unconditional here. It used to be opt-in so that the cheap
+/// callers could skip it, but with the verdict sealed to native identity the
+/// page-level check is paid once per generation, and the strongest verdict is
+/// the only one worth sealing.
+fn verify_lexical_database_contents(path: &Path) -> Result<LexicalShardMetadata> {
     if !path.is_file() {
         bail!("lexical SQLite shard is missing");
     }
     let connection = open_read_only(path)?;
-    validate_open_database(
-        &connection,
-        expected_project_id,
-        expected_sidecar_input_hash,
-        expected_lexical,
-        quick_check,
-        &|| false,
-    )
+    verify_open_database_contents(&connection, &|| false)
 }
 
-fn validate_open_database(
+fn verify_open_database_contents(
     connection: &Connection,
-    expected_project_id: &str,
-    expected_sidecar_input_hash: &str,
-    expected_lexical: Option<(u32, &str)>,
-    quick_check: bool,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<LexicalShardMetadata> {
-    let metadata = validate_open_database_metadata(
-        connection,
-        expected_project_id,
-        expected_sidecar_input_hash,
-        expected_lexical,
-        cancelled,
-    )?;
-    if quick_check {
-        let check: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
-        if check != "ok" {
-            bail!("lexical SQLite shard failed quick_check: {check}");
-        }
+    let metadata = read_open_database_metadata(connection, cancelled)?;
+    let check: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if check != "ok" {
+        bail!("lexical SQLite shard failed quick_check: {check}");
     }
     let actual_count: u32 =
         connection.query_row("SELECT count(*) FROM lexical_documents", [], |row| {
@@ -735,6 +1196,24 @@ fn validate_open_database_metadata(
     expected_lexical: Option<(u32, &str)>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<LexicalShardMetadata> {
+    let metadata = read_open_database_metadata(connection, cancelled)?;
+    match_lexical_shard_expectations(
+        &metadata,
+        expected_project_id,
+        expected_sidecar_input_hash,
+        expected_lexical,
+    )?;
+    Ok(metadata)
+}
+
+/// Read the shard's own metadata row and check it is internally consistent.
+///
+/// Nothing here depends on the caller, which is what makes the verdict
+/// receiptable.
+fn read_open_database_metadata(
+    connection: &Connection,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<LexicalShardMetadata> {
     if cancelled() {
         bail!("lexical search cancelled");
     }
@@ -787,12 +1266,6 @@ fn validate_open_database_metadata(
     if version != LEXICAL_INDEX_VERSION {
         bail!("lexical SQLite shard version is not current");
     }
-    if metadata.project_id != expected_project_id {
-        bail!("lexical SQLite shard project id does not match its generation directory");
-    }
-    if metadata.sidecar_input_hash != expected_sidecar_input_hash {
-        bail!("lexical SQLite shard does not match the sidecar input hash");
-    }
     if metadata.binding_sha256
         != metadata_binding(
             &metadata.project_id,
@@ -804,12 +1277,28 @@ fn validate_open_database_metadata(
     {
         bail!("lexical SQLite shard metadata binding is invalid");
     }
+    Ok(metadata)
+}
+
+/// The caller-dependent half: never receipted, always re-checked.
+fn match_lexical_shard_expectations(
+    metadata: &LexicalShardMetadata,
+    expected_project_id: &str,
+    expected_sidecar_input_hash: &str,
+    expected_lexical: Option<(u32, &str)>,
+) -> Result<()> {
+    if metadata.project_id != expected_project_id {
+        bail!("lexical SQLite shard project id does not match its generation directory");
+    }
+    if metadata.sidecar_input_hash != expected_sidecar_input_hash {
+        bail!("lexical SQLite shard does not match the sidecar input hash");
+    }
     if let Some((file_count, lexical_hash)) = expected_lexical
         && (metadata.file_count != file_count || metadata.lexical_hash != lexical_hash)
     {
         bail!("lexical SQLite shard does not match current lexical input");
     }
-    Ok(metadata)
+    Ok(())
 }
 
 fn open_read_only(path: &Path) -> Result<Connection> {
@@ -850,6 +1339,7 @@ fn scan_lexical_documents(
     symbol_storage_path: Option<&Path>,
     visit: &mut dyn FnMut(&LexicalDocument) -> Result<()>,
 ) -> Result<LexicalCoverage> {
+    let source_policy = lexical_source_policy(project_root, source_storage_path)?;
     let workspace = match source_storage_path {
         Some(storage_path) => {
             codestory_workspace::WorkspaceManifest::open_with_storage_owned_exclusions(
@@ -863,12 +1353,13 @@ fn scan_lexical_documents(
     let discovered = workspace
         .source_files()
         .context("discover canonical workspace files for lexical index")?;
-    let mut coverage = LexicalCoverage {
-        discovered_files: discovered.len().min(u32::MAX as usize) as u32,
-        ..Default::default()
-    };
+    let mut coverage = LexicalCoverage::default();
     for path in discovered {
         let relative = lexical_relative_path(project_root, &path);
+        if source_policy.excluded_paths.contains(&relative) {
+            continue;
+        }
+        coverage.discovered_files = coverage.discovered_files.saturating_add(1);
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(_) => {
@@ -877,13 +1368,18 @@ fn scan_lexical_documents(
                 continue;
             }
         };
-        if metadata.len() > MAX_FILE_BYTES {
+        if metadata.len() > source_policy.max_file_bytes {
             coverage.omitted_oversized = coverage.omitted_oversized.saturating_add(1);
             push_coverage_sample(&mut coverage.omitted_path_sample, relative);
             continue;
         }
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
+        let content = match read_lexical_file_text_limited(&path, source_policy.max_file_bytes) {
+            Ok(Some(content)) => content,
+            Ok(None) => {
+                coverage.omitted_oversized = coverage.omitted_oversized.saturating_add(1);
+                push_coverage_sample(&mut coverage.omitted_path_sample, relative);
+                continue;
+            }
             Err(_) => {
                 coverage.unreadable_files = coverage.unreadable_files.saturating_add(1);
                 push_coverage_sample(&mut coverage.unreadable_path_sample, relative);
@@ -902,6 +1398,96 @@ fn scan_lexical_documents(
     }
     scan_symbol_documents(project_root, symbol_storage_path, visit)?;
     Ok(coverage)
+}
+
+fn read_lexical_file_text_limited(path: &Path, max_bytes: u64) -> std::io::Result<Option<String>> {
+    let file = std::fs::File::open(path)?;
+    read_lexical_text_limited(file, max_bytes)
+}
+
+fn read_lexical_text_limited(reader: impl Read, max_bytes: u64) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let mut reader = reader.take(max_bytes.saturating_add(1));
+    reader.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Ok(None);
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+struct LexicalSourcePolicy {
+    max_file_bytes: u64,
+    excluded_paths: HashSet<String>,
+}
+
+fn lexical_source_policy(
+    project_root: &Path,
+    source_storage_path: Option<&Path>,
+) -> Result<LexicalSourcePolicy> {
+    let Some(storage_path) = source_storage_path else {
+        return Ok(LexicalSourcePolicy {
+            max_file_bytes: MAX_FILE_BYTES,
+            excluded_paths: HashSet::new(),
+        });
+    };
+    if !storage_path.is_file() {
+        bail!(
+            "pinned core storage for lexical source policy is missing: {}",
+            storage_path.display()
+        );
+    }
+    let storage =
+        Store::open_read_only(storage_path).context("open storage for lexical source policy")?;
+    let publication = storage
+        .get_complete_index_publication()
+        .context("load complete core publication for lexical source policy")?
+        .context("complete core publication for lexical source policy is missing")?;
+    let manifest = storage
+        .get_source_policy_exclusion_manifest()
+        .context("load lexical source policy manifest")?
+        .context("lexical source policy manifest is missing")?;
+    let records = storage
+        .get_source_policy_exclusions()
+        .context("load lexical source policy exclusions")?;
+    let project_identity = codestory_workspace::project_identity_v3(project_root);
+    let validated = storage
+        .validate_source_policy_exclusion_publication(
+            &publication,
+            &project_identity.project_id,
+            &project_identity.workspace_id,
+            SourcePolicyExclusionPolicyIdentity::new(
+                &manifest.policy_version,
+                manifest.byte_cap,
+                manifest.structural_unit_cap,
+            ),
+        )
+        .context("validate lexical source policy publication")?;
+    let confirmed_publication = storage
+        .get_complete_index_publication()
+        .context("confirm complete core publication for lexical source policy")?;
+    let confirmed_manifest = storage
+        .get_source_policy_exclusion_manifest()
+        .context("confirm lexical source policy manifest")?;
+    let confirmed_records = storage
+        .get_source_policy_exclusions()
+        .context("confirm lexical source policy exclusions")?;
+    if validated != manifest
+        || confirmed_publication.as_ref() != Some(&publication)
+        || confirmed_manifest.as_ref() != Some(&manifest)
+        || confirmed_records != records
+    {
+        bail!("lexical source policy publication changed while it was being pinned");
+    }
+
+    Ok(LexicalSourcePolicy {
+        max_file_bytes: validated.byte_cap,
+        excluded_paths: records
+            .into_iter()
+            .map(|record| record.normalized_path)
+            .collect(),
+    })
 }
 
 fn scan_symbol_documents(
@@ -1025,7 +1611,7 @@ fn lexical_documents_hash(documents: &[LexicalDocument], coverage: &LexicalCover
 fn normalize_lexical_text(value: &str) -> String {
     let mut normalized = String::with_capacity(value.len() + value.len() / 8);
     let mut characters = value.chars().peekable();
-    let mut previous = None;
+    let mut previous: Option<char> = None;
     while let Some(character) = characters.next() {
         let next = characters.peek().copied();
         if character.is_uppercase()
@@ -1046,14 +1632,152 @@ fn normalize_lexical_text(value: &str) -> String {
     normalized
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LexicalSourceToken {
+    normalized: String,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+fn lexical_source_match(value: &str, query_tokens: &[String]) -> Option<LexicalSourceToken> {
+    let mut characters = value.char_indices().peekable();
+    let mut current = String::new();
+    let mut start_byte = None;
+    let mut previous: Option<char> = None;
+
+    while let Some((byte_index, character)) = characters.next() {
+        let next = characters.peek().map(|(_, character)| *character);
+        let camel_boundary = character.is_uppercase()
+            && previous.is_some_and(|value| value.is_lowercase() || value.is_numeric())
+            || character.is_uppercase()
+                && previous.is_some_and(|value| value.is_uppercase())
+                && next.is_some_and(|value| value.is_lowercase());
+        if camel_boundary && !current.is_empty() {
+            let token = LexicalSourceToken {
+                normalized: std::mem::take(&mut current),
+                start_byte: start_byte.take().expect("non-empty token has a start"),
+                end_byte: byte_index,
+            };
+            if query_tokens
+                .iter()
+                .any(|query| token.normalized.starts_with(query))
+            {
+                return Some(token);
+            }
+        }
+        if character.is_alphanumeric() {
+            start_byte.get_or_insert(byte_index);
+            current.extend(character.to_lowercase());
+        } else if !current.is_empty() {
+            let token = LexicalSourceToken {
+                normalized: std::mem::take(&mut current),
+                start_byte: start_byte.take().expect("non-empty token has a start"),
+                end_byte: byte_index,
+            };
+            if query_tokens
+                .iter()
+                .any(|query| token.normalized.starts_with(query))
+            {
+                return Some(token);
+            }
+        }
+        previous = Some(character);
+    }
+    if !current.is_empty() {
+        let token = LexicalSourceToken {
+            normalized: current,
+            start_byte: start_byte.expect("non-empty token has a start"),
+            end_byte: value.len(),
+        };
+        if query_tokens
+            .iter()
+            .any(|query| token.normalized.starts_with(query))
+        {
+            return Some(token);
+        }
+    }
+    None
+}
+
+fn lexical_source_target(
+    file_path: &str,
+    content: &str,
+    query_tokens: &[String],
+    content_matched: bool,
+) -> (Option<SearchTargetDto>, Option<u32>, Option<String>) {
+    if content_matched && let Some(matched) = lexical_source_match(content, query_tokens) {
+        let start_line = content[..matched.start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            .saturating_add(1) as u32;
+        let line_start = content[..matched.start_byte]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let line_end = content[matched.end_byte..]
+            .find('\n')
+            .map_or(content.len(), |index| matched.end_byte + index);
+        let excerpt_prefix = content[line_start..matched.start_byte]
+            .chars()
+            .rev()
+            .take(192)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        let excerpt_match = content[matched.start_byte..matched.end_byte]
+            .chars()
+            .take(128)
+            .collect::<String>();
+        let excerpt_suffix = content[matched.end_byte..line_end]
+            .chars()
+            .take(192)
+            .collect::<String>();
+        let Ok(start_byte) = u32::try_from(matched.start_byte) else {
+            return (
+                Some(SearchTargetDto::File {
+                    file_path: file_path.to_string(),
+                }),
+                None,
+                None,
+            );
+        };
+        let Ok(end_byte) = u32::try_from(matched.end_byte) else {
+            return (
+                Some(SearchTargetDto::File {
+                    file_path: file_path.to_string(),
+                }),
+                None,
+                None,
+            );
+        };
+        return (
+            Some(SearchTargetDto::FileRange {
+                file_path: file_path.to_string(),
+                start_byte,
+                end_byte,
+            }),
+            Some(start_line),
+            Some(format!("{excerpt_prefix}{excerpt_match}{excerpt_suffix}")),
+        );
+    }
+
+    (
+        Some(SearchTargetDto::File {
+            file_path: file_path.to_string(),
+        }),
+        None,
+        None,
+    )
+}
+
 fn fts_document_frequency(connection: &Connection, token: &str) -> Result<usize> {
     let query = format!("\"{}\"*", token.replace('"', "\"\""));
     connection
-        .query_row(
-            "SELECT count(*) FROM lexical_fts WHERE lexical_fts MATCH ?1",
-            [query],
-            |row| row.get::<_, u32>(0).map(|count| count as usize),
-        )
+        .prepare_cached("SELECT count(*) FROM lexical_fts WHERE lexical_fts MATCH ?1")?
+        .query_row([query], |row| {
+            row.get::<_, u32>(0).map(|count| count as usize)
+        })
         .map_err(Into::into)
 }
 
@@ -1072,13 +1796,13 @@ fn lexical_query_tokens(query: &str) -> Vec<String> {
     tokens
 }
 
-fn command_query_tokens(query: &str) -> Vec<String> {
+fn quoted_query_tokens(query: &str) -> Vec<String> {
     let mut tokens = Vec::new();
-    let mut in_backticks = false;
+    let mut delimiter = None;
     let mut current = String::new();
     for character in query.chars() {
-        if character == '`' {
-            if in_backticks {
+        if delimiter == Some(character) {
+            if !current.is_empty() {
                 for token in lexical_query_tokens(&current) {
                     if !tokens.iter().any(|existing| existing == &token) {
                         tokens.push(token);
@@ -1086,8 +1810,10 @@ fn command_query_tokens(query: &str) -> Vec<String> {
                 }
                 current.clear();
             }
-            in_backticks = !in_backticks;
-        } else if in_backticks {
+            delimiter = None;
+        } else if delimiter.is_none() && matches!(character, '`' | '"') {
+            delimiter = Some(character);
+        } else if delimiter.is_some() {
             current.push(character);
         }
     }
@@ -1105,21 +1831,22 @@ fn lexical_token_weight(document_frequency: usize, document_count: usize) -> f32
     (1.0 + rarity).clamp(0.25, 5.0)
 }
 
-fn required_lexical_match_weight(token_count: usize, total_weight: f32) -> f32 {
-    if token_count <= 3 {
-        total_weight
-    } else {
-        (total_weight * 0.28).max(2.5)
+fn required_lexical_match_count(token_count: usize) -> usize {
+    match token_count {
+        0 => 0,
+        1 => 1,
+        2 | 3 => 2,
+        _ => token_count.saturating_mul(2).saturating_add(4) / 5,
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct LexicalTokenMatch {
+    matched_count: usize,
     matched_weight: f32,
     path_weight: f32,
     content_weight: f32,
     total_weight: f32,
-    meaningful_path_weight: f32,
 }
 
 fn lexical_token_match(
@@ -1129,34 +1856,28 @@ fn lexical_token_match(
     content_lower: &str,
 ) -> LexicalTokenMatch {
     let mut result = LexicalTokenMatch {
+        matched_count: 0,
         matched_weight: 0.0,
         path_weight: 0.0,
         content_weight: 0.0,
         total_weight: 0.0,
-        meaningful_path_weight: 0.0,
     };
     for (token, weight) in tokens.iter().zip(token_weights.iter().copied()) {
         result.total_weight += weight;
         let path_factor = path_match_factor(path_lower, token);
         let content_match = content_lower.contains(token.as_str());
         if path_factor > 0.0 || content_match {
+            result.matched_count += 1;
             result.matched_weight += weight;
         }
         if path_factor > 0.0 {
             result.path_weight += weight * path_factor;
-            if path_factor >= 1.0 && weight >= 1.5 {
-                result.meaningful_path_weight += weight;
-            }
         }
         if content_match {
             result.content_weight += weight;
         }
     }
     result
-}
-
-fn broad_query_path_gate(token_count: usize, token_match: &LexicalTokenMatch) -> bool {
-    token_count < 8 || token_match.meaningful_path_weight > 0.0
 }
 
 fn path_match_factor(normalized_path: &str, token: &str) -> f32 {
@@ -1169,6 +1890,17 @@ fn path_match_factor(normalized_path: &str, token: &str) -> f32 {
     }
 }
 
+fn mandatory_tokens_match(
+    mandatory_tokens: &[String],
+    normalized_path: &str,
+    normalized_content: &str,
+) -> bool {
+    mandatory_tokens.iter().all(|token| {
+        normalized_path.contains(token.as_str()) || normalized_content.contains(token.as_str())
+    })
+}
+
+#[cfg(test)]
 fn score_lexical_match(
     path: &str,
     source: LexicalDocumentSource,
@@ -1179,28 +1911,55 @@ fn score_lexical_match(
     } else {
         token_match.matched_weight / token_match.total_weight
     };
-    let mut score = 0.20_f32
-        + coverage * 0.25
-        + token_match.path_weight * 0.09
-        + token_match.content_weight * 0.035;
-    let path_lower = path.replace('\\', "/").to_ascii_lowercase();
-    if path_lower.contains("/src/") || path_lower.starts_with("src/") {
-        score += 0.04;
-    }
-    if source == LexicalDocumentSource::ComponentReport {
-        score += 0.08;
+    let path_coverage = if token_match.total_weight <= 0.0 {
+        0.0
     } else {
-        score *= match FileRole::classify_path(Path::new(path)) {
-            FileRole::Entrypoint => 1.08,
-            FileRole::Source => 1.0,
-            FileRole::Test => 0.68,
-            FileRole::Docs => 0.72,
-            FileRole::Benchmark => 0.64,
-            FileRole::Generated => 0.55,
-            FileRole::Vendor => 0.45,
-        };
+        token_match.path_weight / token_match.total_weight
+    };
+    let content_coverage = if token_match.total_weight <= 0.0 {
+        0.0
+    } else {
+        token_match.content_weight / token_match.total_weight
+    };
+    let role_prior = match lexical_file_role(path) {
+        FileRole::Entrypoint => 1.0,
+        FileRole::Source => 0.9,
+        FileRole::Test => 0.55,
+        FileRole::Docs => 0.50,
+        FileRole::Benchmark => 0.45,
+        FileRole::Generated => 0.35,
+        FileRole::Vendor => 0.25,
+    };
+    let source_quality = match source {
+        LexicalDocumentSource::SymbolDoc => 1.0,
+        LexicalDocumentSource::LexicalSource => 0.9,
+        LexicalDocumentSource::ComponentReport => 0.8,
+    };
+    (0.55 * coverage
+        + 0.20 * content_coverage.clamp(0.0, 1.0)
+        + 0.15 * path_coverage.clamp(0.0, 1.0)
+        + 0.05 * role_prior
+        + 0.05 * source_quality)
+        .clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+fn lexical_file_role(path: &str) -> FileRole {
+    let path = Path::new(path);
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "md" | "mdx" | "rst"
+            )
+        })
+    {
+        FileRole::Docs
+    } else {
+        FileRole::classify_path(path)
     }
-    score.min(0.99)
 }
 
 #[cfg(test)]
@@ -1219,17 +1978,86 @@ pub(crate) fn make_test_file_writable(path: &Path) {
     std::fs::set_permissions(path, permissions).expect("make test file writable");
 }
 
+/// Keep the fallback aligned if the default source policy changes. Product
+/// scans resolve the active cap from the pinned core publication instead.
+const _: () = assert!(
+    MAX_FILE_BYTES >= codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
+    "the lexical lane must admit every file the indexer does"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    struct CountingReader {
+        remaining: usize,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = buffer.len().min(self.remaining);
+            buffer[..count].fill(b'x');
+            self.remaining -= count;
+            self.bytes_read.fetch_add(count, Ordering::SeqCst);
+            Ok(count)
+        }
+    }
 
     fn build(project: &Path, data: &Path, generation: &str, input: &str) -> PathBuf {
         let fingerprint = lexical_input_fingerprint(project, None).expect("fingerprint");
         build_lexical_shard(project, None, data, generation, &fingerprint, input)
             .expect("build lexical shard");
         shard_dir_for(data, generation)
+    }
+
+    fn publish_test_source_policy(
+        storage: &mut Store,
+        project_root: &Path,
+        byte_cap: u64,
+        candidates: &[codestory_workspace::OversizedSourceExclusionCandidate],
+    ) {
+        let publication = codestory_store::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "test-generation".to_string(),
+            run_id: "test-run".to_string(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        storage
+            .put_index_publication(&publication)
+            .expect("publish test core identity");
+        let identity = codestory_workspace::project_identity_v3(project_root);
+        storage
+            .publish_source_policy_exclusion_generation(
+                &publication,
+                &identity.project_id,
+                &identity.workspace_id,
+                SourcePolicyExclusionPolicyIdentity::new(
+                    codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION,
+                    byte_cap,
+                    codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+                ),
+                candidates,
+            )
+            .expect("publish test source policy");
+    }
+
+    #[test]
+    fn lexical_text_reader_stops_after_cap_overflow_sentinel() {
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let reader = CountingReader {
+            remaining: 4_096,
+            bytes_read: Arc::clone(&bytes_read),
+        };
+
+        let contents = read_lexical_text_limited(reader, 64).expect("bounded read");
+
+        assert!(contents.is_none());
+        assert_eq!(bytes_read.load(Ordering::SeqCst), 65);
     }
 
     #[test]
@@ -1251,12 +2079,301 @@ mod tests {
 
         let hits = search_lexical_index(&shard_a, "input-a", "handler", 1).expect("search");
         assert_eq!(hits[0].path, "src/z_strong_handler.rs");
+        assert_eq!(hits[0].start_line, Some(1));
+        assert_eq!(
+            hits[0].source_excerpt.as_deref(),
+            Some("handler handler handler")
+        );
+        assert_eq!(
+            hits[0].target,
+            Some(SearchTargetDto::FileRange {
+                file_path: "src/z_strong_handler.rs".to_string(),
+                start_byte: 0,
+                end_byte: 7,
+            })
+        );
         assert!(
             search_lexical_index(&shard_a, "input-a", "project_b_handler", 8)
                 .expect("isolated search")
                 .is_empty()
         );
         assert!(search_lexical_index(&shard_a, "wrong-input", "handler", 8).is_err());
+    }
+
+    #[test]
+    fn lexical_batch_is_serial_equivalent() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("src/alpha_handler.rs"),
+            "fn alpha_handler() { beta_router(); }",
+        )
+        .expect("alpha");
+        std::fs::write(
+            project.path().join("src/beta_router.rs"),
+            "fn beta_router() {}",
+        )
+        .expect("beta");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "batch", "input");
+        let requests = vec![
+            ("alpha handler".to_string(), 4),
+            ("beta router".to_string(), 2),
+        ];
+
+        let batched =
+            search_lexical_index_batch_with_cancel(&shard, "input", &requests, Arc::new(|| false))
+                .expect("batch search");
+        let serial = requests
+            .iter()
+            .map(|(query, limit)| search_lexical_index(&shard, "input", query, *limit))
+            .collect::<Result<Vec<_>>>()
+            .expect("serial searches");
+        let identity = |hits: &[LexicalHit]| {
+            hits.iter()
+                .map(|hit| {
+                    (
+                        hit.path.clone(),
+                        hit.node_id.clone(),
+                        hit.symbol_name.clone(),
+                        hit.start_line,
+                        hit.score.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            batched
+                .iter()
+                .map(|hits| identity(hits))
+                .collect::<Vec<_>>(),
+            serial.iter().map(|hits| identity(hits)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn lexical_union_retains_an_independent_content_candidate() {
+        let project = TempDir::new().expect("project");
+        let path_matches = project.path().join("needle");
+        std::fs::create_dir_all(&path_matches).expect("path matches");
+        for index in 0..300 {
+            std::fs::write(
+                path_matches.join(format!("path_match_{index:03}.rs")),
+                "fn unrelated() {}",
+            )
+            .expect("path candidate");
+        }
+        let content_match = project.path().join("src/content_match.rs");
+        std::fs::create_dir_all(content_match.parent().expect("parent")).expect("src");
+        std::fs::write(&content_match, "fn content_match() { /* needle */ }")
+            .expect("content candidate");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "union", "input");
+
+        let hits = search_lexical_index(&shard, "input", "needle", 8).expect("search");
+
+        assert!(
+            hits.iter().any(|hit| hit.path == "src/content_match.rs"),
+            "the content lane must survive a large independent path lane: {hits:#?}"
+        );
+    }
+
+    #[test]
+    fn focused_symbol_lane_beats_scattered_whole_file_term_coverage() {
+        let root = TempDir::new().expect("root");
+        let generation = "focused-symbol";
+        let shard = shard_dir_for(root.path(), generation);
+        std::fs::create_dir_all(&shard).expect("shard");
+        let documents = vec![
+            LexicalDocument {
+                path: "src/broad.rs".to_string(),
+                content: "request dispatch output evidence indexed symbol hits retrieval shadow"
+                    .to_string(),
+                source: LexicalDocumentSource::LexicalSource,
+                node_id: None,
+                symbol_name: None,
+                start_line: None,
+            },
+            LexicalDocument {
+                path: "src/primary.rs".to_string(),
+                content:
+                    "fn request_dispatch_output_evidence_indexed_symbol_hits_retrieval_shadow()"
+                        .to_string(),
+                source: LexicalDocumentSource::SymbolDoc,
+                node_id: Some("symbol:primary-request-dispatch".to_string()),
+                symbol_name: Some(
+                    "request_dispatch_output_evidence_indexed_symbol_hits_retrieval_shadow"
+                        .to_string(),
+                ),
+                start_line: Some(4),
+            },
+            LexicalDocument {
+                path: "src/output.rs".to_string(),
+                content: "fn append_request_evidence_symbol() // indexed output dispatch result"
+                    .to_string(),
+                source: LexicalDocumentSource::SymbolDoc,
+                node_id: Some("symbol:append-request-evidence".to_string()),
+                symbol_name: Some("append_request_evidence_symbol".to_string()),
+                start_line: Some(12),
+            },
+        ];
+        let coverage = LexicalCoverage {
+            discovered_files: 3,
+            indexed_files: 3,
+            ..Default::default()
+        };
+        let fingerprint = LexicalInputFingerprint {
+            file_count: documents.len() as u32,
+            hash: lexical_documents_hash(&documents, &coverage),
+            coverage: coverage.clone(),
+        };
+        write_lexical_database(
+            &shard.join(LEXICAL_INDEX_FILE),
+            generation,
+            "focused-symbol-input",
+            &fingerprint,
+            |visit| {
+                for document in &documents {
+                    visit(document)?;
+                }
+                Ok(coverage.clone())
+            },
+        )
+        .expect("write focused lexical shard");
+
+        let hits = search_lexical_index(
+            &shard,
+            "focused-symbol-input",
+            "request dispatch output evidence indexed symbol hits retrieval shadow",
+            3,
+        )
+        .expect("search");
+
+        let focused_position = hits
+            .iter()
+            .position(|hit| hit.symbol_name.as_deref() == Some("append_request_evidence_symbol"))
+            .expect("second-ranked focused symbol is retained");
+        let broad_position = hits
+            .iter()
+            .position(|hit| hit.path == "src/broad.rs")
+            .expect("broad source candidate is retained");
+        assert!(
+            focused_position < broad_position,
+            "a focused symbol-document rank must survive independent sublane fusion"
+        );
+    }
+
+    #[test]
+    fn lexical_sublane_fusion_does_not_collapse_to_the_minimum_rank() {
+        let broad_file = LexicalSublaneRanks {
+            content: Some(1),
+            ..Default::default()
+        };
+        let focused_symbol = LexicalSublaneRanks {
+            symbol_document: Some(2),
+            ..Default::default()
+        };
+
+        assert!(
+            lexical_sublane_score(focused_symbol, crate::query_features::QueryShape::Mixed)
+                > lexical_sublane_score(broad_file, crate::query_features::QueryShape::Mixed)
+        );
+    }
+
+    #[test]
+    fn lexical_recall_requires_quoted_entities_without_a_long_query_path_gate() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("src/flow.rs"),
+            "packet search dispatch builds ranked results through semantic graph retrieval",
+        )
+        .expect("complete source");
+        std::fs::write(
+            project.path().join("src/distractor.rs"),
+            "packet search dispatch builds ranked results through semantic graph",
+        )
+        .expect("missing quoted entity");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "quoted", "input");
+
+        let hits = search_lexical_index(
+            &shard,
+            "input",
+            "explain packet search dispatch builds ranked results through semantic graph `retrieval`",
+            8,
+        )
+        .expect("search");
+
+        assert_eq!(
+            hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/flow.rs"]
+        );
+    }
+
+    #[test]
+    fn lexical_admission_counts_terms_and_keeps_quoted_terms_mandatory() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("src/text_checks.rs"),
+            "fn isEmpty() -> bool { true }",
+        )
+        .expect("two-term source");
+        std::fs::write(
+            project.path().join("src/cache_state.rs"),
+            "fn isEmpty() -> bool { false }",
+        )
+        .expect("one-term source");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "term-count", "input");
+
+        let hits = search_lexical_index(&shard, "input", "text empty predicate", 8)
+            .expect("unquoted search");
+        assert_eq!(
+            hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/text_checks.rs"],
+            "two of three non-stopwords qualify while one of three does not"
+        );
+
+        let quoted = search_lexical_index(&shard, "input", "text empty `predicate`", 8)
+            .expect("quoted search");
+        assert!(
+            quoted.is_empty(),
+            "count-based admission must not weaken quoted-term requirements"
+        );
+
+        assert_eq!(required_lexical_match_count(1), 1);
+        assert_eq!(required_lexical_match_count(2), 2);
+        assert_eq!(required_lexical_match_count(3), 2);
+        assert_eq!(required_lexical_match_count(4), 2);
+        assert_eq!(required_lexical_match_count(12), 5);
+    }
+
+    #[test]
+    fn whole_file_path_only_match_has_an_explicit_file_target() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("src/request_handler.rs"),
+            "fn run() {}\n",
+        )
+        .expect("source");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "path-target", "input");
+
+        let hits = search_lexical_index(&shard, "input", "request_handler", 1).expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].start_line, None);
+        assert_eq!(hits[0].source_excerpt, None);
+        assert_eq!(
+            hits[0].target,
+            Some(SearchTargetDto::File {
+                file_path: "src/request_handler.rs".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -1615,7 +2732,9 @@ mod tests {
         let storage_path = project.path().join("cache").join("custom-core.db");
         std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
             .expect("storage parent");
-        let _storage = Store::open(&storage_path).expect("custom in-worktree store");
+        let mut storage = Store::open(&storage_path).expect("custom in-worktree store");
+        publish_test_source_policy(&mut storage, project.path(), MAX_FILE_BYTES, &[]);
+        drop(storage);
         let sibling = project
             .path()
             .join("cache")
@@ -1664,7 +2783,7 @@ mod tests {
         assert_eq!(rebuilt, before);
         let shard = shard_dir_for(data.path(), "owned-exclusions");
         assert!(
-            search_lexical_index(&shard, "input", "generation_owned_json", 8)
+            search_lexical_index(&shard, "input", "`generation_owned_json`", 8)
                 .expect("search owned token")
                 .is_empty()
         );
@@ -1675,6 +2794,136 @@ mod tests {
                 .map(|hit| hit.path.as_str()),
             Some("cache/custom-core.search-generations-user/user-config.json")
         );
+    }
+
+    #[test]
+    fn pinned_policy_exclusions_filter_structural_files_without_narrowing_parser_recall() {
+        let project = TempDir::new().expect("project");
+        let src = project.path().join("src");
+        let data = project.path().join("data");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::create_dir_all(&data).expect("data");
+
+        let widened_cap = MAX_FILE_BYTES + 1_024;
+        let parser_path = src.join("widened.rs");
+        let mut parser_source = b"fn widened_parser_token() {}\n".to_vec();
+        parser_source.resize(MAX_FILE_BYTES as usize + 1, b' ');
+        std::fs::write(&parser_path, &parser_source).expect("widened parser source");
+
+        let json_path = data.join("config.json");
+        let mut json_source = br#"{"excluded_structural_token":"x"}"#.to_vec();
+        json_source.resize(
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP as usize + 1,
+            b' ',
+        );
+        std::fs::write(&json_path, &json_source).expect("excluded structural source");
+
+        let storage_root = TempDir::new().expect("storage root");
+        let storage_path = storage_root.path().join("core.db");
+        let mut storage = Store::open(&storage_path).expect("core storage");
+        publish_test_source_policy(
+            &mut storage,
+            project.path(),
+            widened_cap,
+            &[codestory_workspace::OversizedSourceExclusionCandidate {
+                normalized_path: "data/config.json".to_string(),
+                content_hash: format!("{:x}", Sha256::digest(&json_source)),
+                observed_size: json_source.len() as u64,
+                observed_unit_count: 0,
+                policy_version: codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION
+                    .to_string(),
+                byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
+                structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            }],
+        );
+        drop(storage);
+
+        let mut source_paths = std::collections::BTreeSet::new();
+        let coverage =
+            scan_lexical_documents(project.path(), Some(&storage_path), None, &mut |document| {
+                if document.source == LexicalDocumentSource::LexicalSource {
+                    source_paths.insert(document.path.clone());
+                }
+                Ok(())
+            })
+            .expect("scan pinned lexical sources");
+
+        assert_eq!(
+            source_paths,
+            std::collections::BTreeSet::from(["src/widened.rs".to_string()])
+        );
+        assert_eq!(coverage.discovered_files, 1);
+        assert_eq!(coverage.indexed_files, 1);
+        assert!(coverage.complete());
+    }
+
+    #[test]
+    fn pinned_lexical_scan_fails_closed_without_source_policy_publication() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "fn source() {}\n").expect("source");
+        let storage_root = TempDir::new().expect("storage root");
+        let storage_path = storage_root.path().join("core.db");
+        drop(Store::open(&storage_path).expect("bare core storage"));
+
+        let error = lexical_input_fingerprint(project.path(), Some(&storage_path))
+            .expect_err("missing publication must fail closed");
+
+        assert!(
+            format!("{error:#}")
+                .contains("complete core publication for lexical source policy is missing")
+        );
+    }
+
+    #[test]
+    fn pinned_lexical_scan_rejects_a_foreign_project_policy() {
+        let project_a = TempDir::new().expect("project a");
+        let project_b = TempDir::new().expect("project b");
+        std::fs::create_dir_all(project_a.path().join("data")).expect("project a data");
+        std::fs::create_dir_all(project_b.path().join("data")).expect("project b data");
+        std::fs::write(
+            project_a.path().join("data/config.json"),
+            br#"{"selected_project_token":"a"}"#,
+        )
+        .expect("project a source");
+
+        let mut excluded_source = br#"{"foreign_project_token":"b"}"#.to_vec();
+        excluded_source.resize(
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP as usize + 1,
+            b' ',
+        );
+        std::fs::write(project_b.path().join("data/config.json"), &excluded_source)
+            .expect("project b source");
+
+        let identity_a = codestory_workspace::project_identity_v3(project_a.path());
+        let identity_b = codestory_workspace::project_identity_v3(project_b.path());
+        assert_ne!(identity_a.workspace_id, identity_b.workspace_id);
+
+        let storage_root = TempDir::new().expect("foreign storage root");
+        let storage_path = storage_root.path().join("core.db");
+        let mut storage = Store::open(&storage_path).expect("foreign core storage");
+        publish_test_source_policy(
+            &mut storage,
+            project_b.path(),
+            MAX_FILE_BYTES,
+            &[codestory_workspace::OversizedSourceExclusionCandidate {
+                normalized_path: "data/config.json".to_string(),
+                content_hash: format!("{:x}", Sha256::digest(&excluded_source)),
+                observed_size: excluded_source.len() as u64,
+                observed_unit_count: 0,
+                policy_version: codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION
+                    .to_string(),
+                byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
+                structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            }],
+        );
+        drop(storage);
+
+        let error = lexical_input_fingerprint(project_a.path(), Some(&storage_path))
+            .expect_err("foreign core policy must fail closed");
+
+        assert!(format!("{error:#}").contains(
+            "source policy exclusion manifest does not match the complete core publication"
+        ));
     }
 
     #[test]
@@ -1798,14 +3047,18 @@ mod tests {
             let mut deep_validation_micros = Vec::new();
             for _ in 0..7 {
                 let started = std::time::Instant::now();
-                validate_lexical_database(
-                    &index_path,
+                // Measure the uncached scan on purpose: the sealed receipt
+                // would answer every repeat and report the cost of a HashMap
+                // lookup instead of the corpus pass this fixture reports.
+                let metadata =
+                    verify_lexical_database_contents(&index_path).expect("deep validation");
+                match_lexical_shard_expectations(
+                    &metadata,
                     &generation,
                     "benchmark-input",
                     Some((fingerprint.file_count, fingerprint.hash.as_str())),
-                    true,
                 )
-                .expect("deep validation");
+                .expect("deep validation expectations");
                 deep_validation_micros.push(started.elapsed().as_micros() as u64);
             }
 
@@ -1872,7 +3125,7 @@ mod tests {
             .iter()
             .map(|frequency| lexical_token_weight(*frequency, documents.len()))
             .collect::<Vec<_>>();
-        let required = required_lexical_match_weight(tokens.len(), weights.iter().sum());
+        let required = required_lexical_match_count(tokens.len());
         let mut hits = documents
             .iter()
             .filter_map(|document| {
@@ -1882,13 +3135,28 @@ mod tests {
                     &document.path.to_ascii_lowercase(),
                     &document.content.to_ascii_lowercase(),
                 );
-                (token_match.matched_weight >= required).then(|| LexicalHit {
-                    path: document.path.clone(),
-                    source: document.source,
-                    node_id: document.node_id.clone(),
-                    symbol_name: document.symbol_name.clone(),
-                    start_line: document.start_line,
-                    score: score_lexical_match(&document.path, document.source, &token_match),
+                (token_match.matched_count >= required).then(|| {
+                    let (target, matched_line, source_excerpt) =
+                        if document.source == LexicalDocumentSource::LexicalSource {
+                            lexical_source_target(
+                                &document.path,
+                                &document.content,
+                                &tokens,
+                                token_match.content_weight > 0.0,
+                            )
+                        } else {
+                            (None, None, None)
+                        };
+                    LexicalHit {
+                        path: document.path.clone(),
+                        source: document.source,
+                        node_id: document.node_id.clone(),
+                        symbol_name: document.symbol_name.clone(),
+                        start_line: document.start_line.or(matched_line),
+                        target,
+                        source_excerpt,
+                        score: score_lexical_match(&document.path, document.source, &token_match),
+                    }
                 })
             })
             .collect::<Vec<_>>();
@@ -1901,5 +3169,157 @@ mod tests {
         });
         hits.truncate(limit);
         hits
+    }
+
+    fn shard_modified_nanos(index: &Path) -> u64 {
+        std::fs::metadata(index)
+            .expect("shard metadata")
+            .modified()
+            .expect("shard mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("shard mtime after epoch")
+            .as_nanos() as u64
+    }
+
+    fn restore_shard_modified_nanos(index: &Path, nanos: u64) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(index)
+            .expect("open shard to restore times");
+        let restored = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos);
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(restored)
+                .set_accessed(restored),
+        )
+        .expect("restore shard times");
+    }
+
+    #[test]
+    fn repeated_probes_of_one_generation_deep_scan_the_shard_once() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "pub fn handler() {}").expect("source");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "receipt-reuse", "input");
+        let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
+        assert_eq!(
+            lexical_shard_receipt_stats(data.path(), "receipt-reuse"),
+            None,
+            "publishing a shard must not seal a receipt; only a read path may"
+        );
+
+        // Exactly the pair a single health probe performs, then the finalize
+        // fence's stricter check over the same generation.
+        assert!(shard_has_lexical_index(&shard, "input"));
+        lexical_shard_coverage(data.path(), "receipt-reuse", "input").expect("coverage");
+        assert!(shard_matches_lexical_input(
+            data.path(),
+            "receipt-reuse",
+            fingerprint.file_count,
+            &fingerprint.hash,
+            "input",
+        ));
+
+        let stats = lexical_shard_receipt_stats(data.path(), "receipt-reuse")
+            .expect("a successful deep verification seals a receipt");
+        assert_eq!(
+            (stats.validations, stats.reuses, stats.invalidations),
+            (1, 2, 0),
+            "three probes of one unchanged generation must scan the FTS mirror once"
+        );
+    }
+
+    #[test]
+    fn a_sealed_receipt_cannot_hide_in_place_corruption_of_its_shard() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "fn handler() {}").expect("source");
+        std::fs::write(project.path().join("other.rs"), "fn unrelated() {}").expect("source");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "receipt-seal", "input");
+        let index = shard.join(LEXICAL_INDEX_FILE);
+
+        lexical_shard_coverage(data.path(), "receipt-seal", "input")
+            .expect("healthy generation verifies");
+        assert!(
+            lexical_shard_receipt_stats(data.path(), "receipt-seal").is_some(),
+            "the healthy verdict must be sealed, or corruption below proves nothing"
+        );
+
+        // Rewrite the shard where it lies, keeping the forged text the same
+        // length as the document it shadows, then put the modification time
+        // back: exactly what a restore-in-place or a torn write leaves behind,
+        // and invisible to a length-and-mtime check.
+        let published = std::fs::metadata(&index).expect("shard metadata");
+        let modified = shard_modified_nanos(&index);
+        let length = published.len();
+        let permissions = published.permissions();
+        make_test_file_writable(&index);
+        let connection = Connection::open(&index).expect("open writable");
+        connection
+            .execute(
+                "UPDATE lexical_fts SET content = 'fn unrelated() {;'
+                 WHERE rowid = (SELECT id FROM lexical_documents WHERE path = 'other.rs')",
+                [],
+            )
+            .expect("forge FTS row");
+        drop(connection);
+        restore_shard_modified_nanos(&index, modified);
+        std::fs::set_permissions(&index, permissions.clone()).expect("restore shard permissions");
+        let corrupted = std::fs::metadata(&index).expect("shard metadata");
+        assert_eq!(
+            shard_modified_nanos(&index),
+            modified,
+            "the corruption must be invisible to a modification-time check"
+        );
+        assert_eq!(
+            corrupted.len(),
+            length,
+            "the corruption must be invisible to a file-length check"
+        );
+        assert_eq!(
+            corrupted.permissions().readonly(),
+            permissions.readonly(),
+            "the corruption must be invisible to a permission check"
+        );
+
+        let after = lexical_shard_coverage(data.path(), "receipt-seal", "input");
+
+        assert!(
+            after.is_err(),
+            "the sealed receipt answered for bytes that no longer exist: {after:?}"
+        );
+        assert!(
+            format!("{:#}", after.expect_err("corrupt shard"))
+                .contains("FTS rows do not match immutable documents"),
+            "the re-run deep scan must report the corruption it found"
+        );
+        assert!(!shard_has_lexical_index(&shard, "input"));
+        assert_eq!(
+            lexical_shard_receipt_stats(data.path(), "receipt-seal"),
+            None,
+            "a failed verification must leave no receipt behind"
+        );
+    }
+
+    #[test]
+    fn rebuilding_a_damaged_generation_in_place_reseals_it_as_healthy() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "fn handler() {}").expect("source");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "receipt-repair", "input");
+        let index = shard.join(LEXICAL_INDEX_FILE);
+        lexical_shard_coverage(data.path(), "receipt-repair", "input").expect("healthy");
+
+        make_test_file_writable(&index);
+        std::fs::write(&index, b"not sqlite").expect("corrupt shard");
+        assert!(lexical_shard_coverage(data.path(), "receipt-repair", "input").is_err());
+
+        // The same generation id rebuilt in place: this is the self-repair the
+        // finalize fall-through reaches.
+        let _repaired = build(project.path(), data.path(), "receipt-repair", "input");
+
+        lexical_shard_coverage(data.path(), "receipt-repair", "input")
+            .expect("the repaired generation verifies again");
+        assert!(shard_has_lexical_index(&shard, "input"));
     }
 }

@@ -474,7 +474,7 @@ Semantic sync does these pieces of work:
 
 - build deterministic generated text for durable AST symbols and store it in `symbol_search_doc`
 - build deterministic component/community report docs with extracted provenance
-- classify each symbol under `graph_first_v2`
+- classify each symbol under `graph_first_v3`
 - reuse unchanged dense-anchor input metadata when generated text hash, selection reason, and policy version still match
 - publish selected anchor text, source provenance, source range, content hash, policy, and exact core generation/run identity without loading the embedding engine
 - prune stale symbol docs or dense inputs that no longer correspond to the refreshed graph and policy
@@ -498,7 +498,7 @@ Incremental refresh scopes symbol-doc and dense-anchor invalidation to changed o
 
 The default symbol-doc scope is durable symbols: classes, structs, interfaces, annotations, unions, enums, typedefs, functions, methods, macros, global variables, constants, and enum constants. Lower-signal module, namespace, package, field, local variable, and type-parameter docs stay out of dense retrieval by default while remaining present in graph and lexical search. Set `CODESTORY_SEMANTIC_DOC_SCOPE=all` only for investigations.
 
-The dense-anchor policy version is `graph_first_v2`. Dense reasons are `public_api`, `entrypoint`, `documented_nontrivial`, `central_graph_node`, `component_report`, and `unstructured_doc`. Centrality uses complete bounded graph relationship counts, while generated symbol documents retain their six-item member and related-symbol presentation caps. Private trivial helpers, generated/vendor code, and test-only implementation details are skipped for dense embedding unless they are structurally central; they remain discoverable through exact lookup, `symbol_search_doc`, source lexical search, and graph expansion.
+The dense-anchor policy version is `graph_first_v3`. Dense reasons are `public_api`, `entrypoint`, `documented_nontrivial`, `central_graph_node`, `flow_neighbor`, `component_report`, and `unstructured_doc`. Centrality uses complete bounded graph relationship counts, and each existing seed can admit up to eight primary-source callable neighbors through typed call or route evidence. Generated symbol documents retain bounded member and related-symbol context. Private trivial helpers, generated/vendor code, and test-only implementation details are skipped for dense embedding unless they are structurally central or a selected flow neighbor; they remain discoverable through exact lookup, `symbol_search_doc`, source lexical search, and graph expansion.
 
 The default semantic text alias policy is `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant`. It keeps compact language, terminal-name, owner-name, and symbol-role hints, but leaves out the noisier full name-alias and path-alias lists from the earlier `current_alias` research variant. Use `no_alias` for baseline research rows and `current_alias` only when reproducing older alias-enriched runs.
 
@@ -559,6 +559,87 @@ refresh discards the stage; incremental refresh discards its clone; promotion
 and rollback validate the recorded structural identity before installing either
 database.
 
+### Why whole-database staging still owns core publication
+
+One incremental publication moves the whole database three times: it clones
+live into the stage, copies live into the rollback backup, and restores the
+stage over live. A staged delta or attached-database apply would remove all
+three, so the wall those three report is the ceiling on what such a design
+could save. That ceiling was measured rather than assumed, by
+`incremental_publication_whole_database_movement_measurement` in
+`crates/codestory-runtime/tests/integration.rs`.
+
+Five consecutive one-file edits against a 0.52-0.56 GB core index of this
+repository, on an optimized dev build, Apple-silicon laptop, APFS:
+
+| round | refresh wall | publication | whole-database movement | movement share |
+| ----- | -----------: | ----------: | ----------------------: | -------------: |
+| 1     |    19,789 ms |    8,646 ms |                4,706 ms |          23.8% |
+| 2     |    29,613 ms |   19,879 ms |               11,253 ms |          38.0% |
+| 3     |    34,968 ms |   17,423 ms |               13,557 ms |          38.8% |
+| 4     |    20,252 ms |   10,007 ms |                5,562 ms |          27.5% |
+| 5     |    19,912 ms |   11,088 ms |                5,640 ms |          28.3% |
+
+Publication is 43.7-67.1% of an incremental refresh at this size, and moving
+whole databases is 23.8-38.8% of it. The two validation phases that carry the
+whole-file digests add a further 4,887-8,247 ms — the candidate is digested on
+each side of its own validation and the published file once more — though those
+phases also do cheap indexed identity reads, so that figure bounds the digest
+cost rather than isolating it. Every plan in the table scheduled 29 files,
+so a genuinely single-file edit would spend *less* time parsing and the same
+time moving bytes — the movement share would rise, not fall. The headroom is
+real and material, and it is not the reason the swap is declined.
+
+Read these as one machine's ratios, not a portable budget. The run shared the
+host with other compilation, which is most of why the per-round walls spread as
+widely as they do; rerun the measurement before quoting an absolute number.
+The ordering it establishes is what the decision below rests on, and it held in
+every round: publication is about half the refresh, and moving whole databases
+is the largest single part of publication.
+
+The swap is declined because of the four properties it has to preserve, two of
+which it cannot:
+
+- **Pinned readers** and **old-or-new publication** would survive. A single
+  WAL write transaction commits atomically and a reader holding a snapshot sees
+  the old generation until it ends, exactly as the restore-based promotion
+  already gives it.
+- **Post-restore identity** does not. The current fence proves the published
+  file is byte-identical to the candidate whose validation already passed, and
+  reports `core_promotion.promoted_validation=reused_candidate_receipt`; every
+  publication in the table did. An apply assembles the live image in place and
+  keeps no separate validated candidate file, so the receipt has no second file
+  to match. The strongest claim it can make is `revalidated`, which is a
+  strictly weaker post-restore identity than the one being replaced.
+- **Crash recovery** does not survive independently of that. Rollback returns
+  the live path to the whole-database backup image. An apply that drops the
+  backup has to validate before it commits instead — and a pre-commit
+  validation cannot digest a file that does not exist yet. Dropping the backup
+  and dropping the identity receipt are one change, not two.
+
+There is also no delta to apply. The incremental indexer mutates a full clone
+with ordinary SQL across the whole schema and nothing captures a changeset;
+SQLite's session extension is the standard mechanism for that and is not
+compiled in, because the workspace pins rusqlite with `backup`, `bundled`,
+`hooks`, and `limits` only. The remaining shape — writing straight into the
+published database inside one transaction — would hold a write transaction
+against live for the whole refresh, which the table above measures at
+19.8-35.0 seconds.
+
+So the promotion fence is unchanged and this is a recorded non-change, not a
+deferral for lack of evidence. Two things would reopen it, and both are
+measurable from telemetry already emitted:
+
+1. a post-restore fence that binds the published database to a validation
+   without requiring two files, stated and proved before any apply is written;
+2. the refresh collapsing to a single write transaction. The projection flush
+   already commits once per incremental refresh
+   (`projection_batch_transactions=1` in every round above), so the distance to
+   that shape is a measurement worth repeating rather than a guess.
+
+Redesigning marketplace generated packages is recorded here as an option only.
+Nothing in this measurement evaluates it, and no claim is made about it.
+
 ### How symbol docs and dense anchors are kept fast
 
 Symbol docs are deterministic graph artifacts persisted in SQLite with generated-text metadata and extracted provenance. Dense anchors are persisted separately as embedding-free inputs. Core reuse is keyed by generated text hash, selection reason, and semantic policy version; the stored source identity still changes to the exact candidate core generation/run before publication. Core publishes the complete anchor count, content digest, policy, migration state, and source identity as one manifest with the graph generation. On full refresh, runtime copies prior retrieval artifact nodes, symbol docs, and dense inputs forward into the staged database before checking them. On incremental refresh, runtime rebuilds inputs for changed and removed files plus files connected to them through the previous or refreshed graph, then rebinds the complete carried-forward set before publication.
@@ -603,9 +684,10 @@ The index summary reports graph and semantic work separately:
 - `semantic_docs.embedded`: always zero for core indexing; vector production is retrieval-owned
 - `semantic_docs.pending`: changed dense-anchor inputs that require the next retrieval-generation decision
 - `semantic_docs.stale`: persisted dense-anchor inputs pruned because they no longer match the refreshed symbol set
-- `semantic_dense_docs_skipped` and `semantic_dense_*`: policy skip and dense-reason counters for `graph_first_v2`
+- `semantic_dense_docs_skipped` and `semantic_dense_*`: policy skip and dense-reason counters for `graph_first_v3`
 - `staged_snapshot_copy`: successful incremental live-to-staged SQLite backup-call wall and logical source/target database bytes (`page_count * page_size`); this clone happens before incremental indexing, is outside `publish_ms`, and is absent for full refresh
 - `core_promotion`: successful nested promotion wall, validation/copy/journal/restore/cleanup subphases, logical candidate/prior/rollback database bytes, and its saturating residual; rollback backup fields are absent for a first publication
+- `core_promotion.promoted_validation`: which post-restore identity fence the promotion satisfied. `reused_candidate_receipt` means the published file was proven byte-identical to the candidate whose validation already passed; `revalidated` means it could not be proven identical and the deep identity checks were re-derived from the published file. An absent value reads as `revalidated`, because that is the weaker claim
 
 Only the sibling fields inside `full_refresh_wall_ms` are additive. Indexer
 children, semantic diagnostics, search stream/commit/reload timings, snapshot

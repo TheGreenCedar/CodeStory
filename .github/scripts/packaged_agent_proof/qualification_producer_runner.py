@@ -13,6 +13,7 @@ from .contract_primitives import (
 )
 from .foundation import REQUIRED_SERVER_SCENARIOS, ProofFailure, require
 from .measurement_samples import selected_qualification_matrix_cell
+from .qualification_directory_binding import rebind_qualification_directory
 from .qualification_production_types import (
     QualificationProducerContext,
     QualificationRunnerEvidence,
@@ -149,9 +150,21 @@ def run_qualification_producer(
         matrix_cell_id=matrix_cell_id,
         matrix_cell=matrix_cell,
     )
-    artifact_root = str(context.artifact_root.resolve())
-    context.qualification_env["CODESTORY_EMBED_QUALIFICATION_DIR"] = artifact_root
-    context.server_cleanup_control["qualification_directory"] = artifact_root
+    # The publication-fault phase runs against the parent directory and leaves a
+    # server resident on it. That server polls the directory it was started
+    # with, so it can never answer a control the scenario runner writes under
+    # this child directory: it is replaced here, before anything moves.
+    rebind_qualification_directory(
+        context.artifact_root,
+        cli=context.qualification_cli,
+        env=context.qualification_env,
+        project=Path(context.projects[0]),
+        nonce=context.nonce,
+        executable_sha256=context.package["executable_sha256"],
+        timeout=context.args.timeout_secs,
+        server_cleanup_control=context.server_cleanup_control,
+        label="measurement-rebind",
+    )
     request_path = context.artifact_root / "request.json"
     output_path = context.artifact_root / "output.json"
     write_private_json(request_path, request)

@@ -23,8 +23,13 @@ const SHIPPING_BINARIES = [
     targetName: "codestory-cli-runtime",
   },
 ];
+// Every crate feature that swaps product behavior for test behavior, and so must be absent from
+// the graph the shipped binaries are built from. A crate that grows such a feature has to be
+// added here: the gate proves the feature is off, and it also proves the crate is in the shipping
+// graph at all, so an omission here is an unproved crate rather than a passing one.
 const FORBIDDEN_SHIPPING_FEATURES = new Map([
-  ["codestory-retrieval", new Set(["test-support"])],
+  ["codestory-agent", new Set(["test-support"])],
+  ["codestory-retrieval", new Set(["benchmark-support", "test-support"])],
   ["codestory-runtime", new Set(["benchmark-support", "test-support"])],
 ]);
 const ARTIFACT_CONTRACT = {

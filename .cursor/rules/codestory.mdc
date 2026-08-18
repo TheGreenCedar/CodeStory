@@ -17,4 +17,4 @@ Before making source claims, planning edits, choosing tests, or reviewing change
 
 Cursor setup, MCP wiring, and host-specific notes: [docs/users/cursor.md](../../docs/users/cursor.md).
 
-Skill details and the status field glossary live in `plugins/codestory/skills/codestory-grounding/` and `references/status-contract.md`.
+This repository-managed setup provides the rule and MCP adapter only. Install the Cursor plugin to load the **codestory-grounding** skill and session hook.

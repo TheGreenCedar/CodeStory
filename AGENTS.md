@@ -39,6 +39,11 @@ pages, runbooks, and workflows own detailed mechanics.
   publication.
 - `codestory-retrieval`: lexical, semantic, and SCIP artifacts; immutable
   sidecar generations; manifests; health; and fail-closed query execution.
+- `codestory-agent`: packet planning only -- prompt terms, flow requirements,
+  evidence roles and carriers, citation scoring, and the query plan. It depends
+  on `codestory-contracts` alone and reads pinned runtime state only through the
+  `PinnedReader` trait, so it can never activate, store, execute retrieval,
+  retry a publication, or move readiness.
 - `codestory-runtime`: the only product orchestration layer. Indexing,
   grounding, search, packet construction, and agent flows belong here.
 - `codestory-cli`: command and transport parsing, output rendering, process
@@ -205,18 +210,19 @@ adapter to compensate for incorrect upstream state.
   support PRs are integrated into the release lane. Broad proof belongs to the
   final integration head, not every independently mergeable PR.
 - Release order is: merge all blockers, run focused checks, run actual-host
-  microprobes, execute hostile mutation acceptance, push and declare the source
-  head frozen for calibration, calibrate, apply the sole generated constant-set
-  change, accept and freeze that generated head, run one broad source proof on
-  it, then qualify. If another source or workflow change becomes necessary,
-  immediately invalidate the candidate and cancel every queued or running
-  proof for it.
-- Run the full workspace source proof exactly once per release candidate, on
-  the generated constant-only frozen head after calibration. The calibration
-  source receives focused hostile-mutation and native-probe acceptance, not a
-  broad source proof. Use deterministic selection validation, direct
-  constant-only lineage verification, and frozen-candidate qualification;
-  never run both a pre-calibration and post-calibration workspace proof.
+  microprobes, run source stabilization on the pushed final source head, then
+  calibrate, apply the sole generated constant-set change, accept and freeze
+  that generated head, and qualify. Source stabilization runs the hostile
+  mutations, generalization checks, all-target/all-feature lint, complete
+  workspace test, and Windows source contracts concurrently. If another source
+  or workflow change becomes necessary, immediately invalidate the candidate
+  and cancel every queued or running proof for it.
+- Run the full workspace source proof exactly once per release candidate, as
+  part of source stabilization before calibration. Calibration cannot start
+  without that exact-head receipt. The generated constant-only head receives
+  lineage validation, calibration-specific checks, hostile mutations, and
+  native probes, but never repeats the workspace source proof. Any nonconstant
+  change invalidates stabilization and returns the release to the source phase.
 - Cancel a run whose head is no longer the intended release candidate. Never
   let an expensive obsolete run finish for information. Before dispatching,
   inspect both in-flight runs and whether any known source change will
@@ -257,9 +263,18 @@ adapter to compensate for incorrect upstream state.
   persisted vectors, so bumping it discards every user's dense sidecars. Move it
   only when the embeddings themselves change -- model, llama.cpp commit,
   pooling, normalization, dimension, prefixes, or vector schema.)
+  - `plugins/codestory/plugin.json`
   - `plugins/codestory/.codex-plugin/plugin.json`
+  - `plugins/codestory/.cursor-plugin/plugin.json`
   - `plugins/codestory/.claude-plugin/plugin.json`
   - `plugins/codestory/.github/plugin/plugin.json`
+- For a plugin-only release, use
+  `node scripts/bump-version.mjs --version <plugin-version> --lane plugin`.
+  That lane leaves native and model versions unchanged, fetches the pinned
+  CLI release's published checksum file, and writes all three archive digests
+  into `plugins/codestory/cli-version.json`.
+  `--archive-checksums <path-or-https-url>` is the explicit offline/test source;
+  never type those digests by hand.
 - Release ordering is **bump-then-calibrate**. Bump the version first,
   calibrate the per-user embedding server on the bumped tree, land the
   constant-set freeze commit, then package and release. The frozen-candidate

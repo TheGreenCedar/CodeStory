@@ -15,9 +15,11 @@ pub(super) fn compute_call_resolution(
         target_node_id,
         caller_file_path,
         callsite_identity,
+        caller_kind,
     ) = row;
     let receiver_owner = receiver_owner_from_callsite(callsite_identity.as_deref());
     let receiver_module = receiver_module_from_callsite(callsite_identity.as_deref());
+    let dart_import_modules = receiver_module.and_then(dart_unprefixed_import_modules);
     let mut selected: Option<(i64, f32, ResolutionStrategy)> = None;
     let mut semantic_fallback = UnambiguousBestCandidate::default();
     let mut candidate_ids = OrderedCandidateIds::with_capacity(8);
@@ -34,6 +36,17 @@ pub(super) fn compute_call_resolution(
 
     if is_cpp_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    if is_rust_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+        && !target_name.contains("::")
     {
         let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
         return Ok(ComputedResolution {
@@ -142,12 +155,75 @@ pub(super) fn compute_call_resolution(
         });
     }
 
+    // Construction-aware arm (P1b): a `syntax:php-new`-marked CALL resolves
+    // only to its annotated receiver owner's `__construct` method — through
+    // the imported-owner index when the annotation carries a module, and
+    // through the same-file index otherwise. Everything else about the edge
+    // (no annotation, no such constructor) fails closed; the generic
+    // name-based machinery below never sees a construction placeholder.
+    if is_php_new_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref()) {
+        const PHP_CONSTRUCTOR_METHOD_NAME: &str = "__construct";
+        let (selected_constructor, strategy) = match (receiver_owner, receiver_module) {
+            (Some(owner_name), Some(module_name)) => (
+                candidate_index.find_imported_owner_member_readonly(
+                    caller_file_path.as_deref(),
+                    module_name,
+                    owner_name,
+                    PHP_CONSTRUCTOR_METHOD_NAME,
+                ),
+                ResolutionStrategy::CallGlobalUnique,
+            ),
+            (Some(owner_name), None) => {
+                let constructor_name =
+                    PreparedName::new(format!("{owner_name}.{PHP_CONSTRUCTOR_METHOD_NAME}"));
+                (
+                    candidate_index.find_same_file_readonly(
+                        *file_id,
+                        &constructor_name.original,
+                        &constructor_name.ascii_lower,
+                    ),
+                    ResolutionStrategy::CallSameFile,
+                )
+            }
+            (None, _) => (None, ResolutionStrategy::CallSameFile),
+        };
+        if pass.flags.store_candidates
+            && let Some(candidate) = selected_constructor
+        {
+            candidate_ids.push(candidate);
+        }
+        let update = build_resolved_edge_update(
+            *edge_id,
+            selected_constructor.map(|candidate| (candidate, pass.policy.call_same_file)),
+            candidate_ids.as_slice(),
+        )?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: selected_constructor.map(|_| strategy),
+        });
+    }
+
     let lookup_target_name = receiver_owner
         .map(|owner| format!("{owner}.{target_name}"))
         .unwrap_or_else(|| target_name.clone());
     let prepared_name = PreparedName::new(lookup_target_name);
     let is_common_unqualified = is_common_unqualified_call_name(&prepared_name.original);
     let is_owner_qualified = is_owner_qualified_call_name(&prepared_name.original);
+
+    // The parser proved that this bare JavaScript-family call shares an exact local name with a
+    // runtime import binding. That proves a lexical external boundary, not the implementation
+    // behind it, so do not let semantic fallback redirect it to a same-named local method.
+    if callsite_identity.as_deref().is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::languages::javascript::RUNTIME_IMPORT_CALLSITE_MARKER)
+    }) {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
 
     for candidate in semantic_candidates {
         if pass.flags.store_candidates {
@@ -164,7 +240,53 @@ pub(super) fn compute_call_resolution(
         }
     }
 
-    if let (Some(owner_name), Some(module_name)) = (receiver_owner, receiver_module) {
+    if let (Some(owner_name), Some(module_names)) = (receiver_owner, dart_import_modules.as_deref())
+    {
+        let mut imported_candidates = module_names
+            .iter()
+            .filter_map(|module_name| {
+                candidate_index.find_imported_owner_member_readonly(
+                    caller_file_path.as_deref(),
+                    module_name,
+                    owner_name,
+                    target_name,
+                )
+            })
+            .collect::<Vec<_>>();
+        imported_candidates.sort_unstable();
+        imported_candidates.dedup();
+        if pass.flags.store_candidates {
+            for candidate in &imported_candidates {
+                candidate_ids.push(*candidate);
+            }
+        }
+        if imported_candidates.len() != 1 {
+            let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+            return Ok(ComputedResolution {
+                update,
+                strategy: None,
+            });
+        }
+        let candidate = imported_candidates[0];
+        if candidate_index.find_global_unique_owner_member_readonly(owner_name, target_name)
+            != Some(candidate)
+        {
+            let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+            return Ok(ComputedResolution {
+                update,
+                strategy: None,
+            });
+        }
+        selected = Some((
+            candidate,
+            pass.policy.call_same_file,
+            ResolutionStrategy::CallGlobalUnique,
+        ));
+    }
+
+    if dart_import_modules.is_none()
+        && let (Some(owner_name), Some(module_name)) = (receiver_owner, receiver_module)
+    {
         let selected_imported_owner = candidate_index.find_imported_owner_member_readonly(
             caller_file_path.as_deref(),
             module_name,
@@ -242,6 +364,58 @@ pub(super) fn compute_call_resolution(
         }
     }
 
+    if selected.is_none()
+        && receiver_module.is_none()
+        && matches!(
+            semantic_language_bucket(caller_file_path.as_deref()),
+            Some("go" | "dart")
+        )
+        && let Some(owner_name) = receiver_owner
+        && let Some(candidate) = candidate_index.find_same_directory_owner_member_readonly(
+            caller_file_path.as_deref(),
+            owner_name,
+            target_name,
+        )
+    {
+        if pass.flags.store_candidates {
+            candidate_ids.push(candidate);
+        }
+        selected = Some((
+            candidate,
+            pass.policy.call_same_module,
+            ResolutionStrategy::CallSameModule,
+        ));
+    }
+
+    // C# same-root-namespace arm: a receiver-owner-annotated callsite whose
+    // owner carries no module (parent-namespace visibility, csproj-level
+    // global usings — no per-file using table can see either) resolves iff
+    // exactly one project declaration of `Owner.Method` lives under the
+    // caller's root namespace. Ambiguity, foreign roots, and
+    // global-namespace callers all fall through to the fail-closed gate
+    // right below.
+    if selected.is_none()
+        && receiver_module.is_none()
+        && semantic_language_bucket(caller_file_path.as_deref()) == Some("csharp")
+        && let Some(owner_name) = receiver_owner
+        && let Some(caller_root) =
+            csharp_caller_root_namespace(caller_qualified.as_deref(), *caller_kind)
+        && let Some(candidate) = candidate_index.find_same_root_owner_member_readonly(
+            caller_root,
+            owner_name,
+            target_name,
+        )
+    {
+        if pass.flags.store_candidates {
+            candidate_ids.push(candidate);
+        }
+        selected = Some((
+            candidate,
+            pass.policy.call_same_file,
+            ResolutionStrategy::CallGlobalUnique,
+        ));
+    }
+
     if selected.is_none() && receiver_owner.is_some() && receiver_module.is_none() {
         let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
         return Ok(ComputedResolution {
@@ -313,6 +487,14 @@ pub(super) fn compute_call_resolution(
         selected = None;
     }
 
+    if requires_python_context_manager_self_return(callsite_identity.as_deref())
+        && selected.is_some_and(|(candidate, _, _)| {
+            !candidate_index.has_context_manager_self_return_contract(candidate)
+        })
+    {
+        selected = None;
+    }
+
     let strategy = selected.map(|(_, _, strategy)| strategy);
     let selected_pair = selected.map(|(candidate, confidence, _)| (candidate, confidence));
     let update = build_resolved_edge_update(*edge_id, selected_pair, candidate_ids.as_slice())?;
@@ -353,6 +535,7 @@ pub(super) fn compute_import_resolution(
         _target_node_id,
         caller_file_path,
         _callsite_identity,
+        _caller_kind,
     ) = row;
     let has_alias = import_alias_mismatch(source_name, target_name);
     let has_relative_import_binding =
@@ -621,6 +804,7 @@ mod tests {
             0,
             Some("src/main.ts".to_string()),
             callsite_identity.map(str::to_string),
+            None,
         )
     }
 
@@ -685,6 +869,7 @@ mod tests {
             77_i64,
             Some("src/main.ts".to_string()),
             Some("1:1:1:1".to_string()),
+            None,
         );
         let mut index = CandidateIndex::default();
         index.import_binding_node_ids.insert(77);

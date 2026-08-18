@@ -5,6 +5,7 @@ use super::filesystem::{
     NativeFileIdentity, native_file_identity, native_path_identity,
     validate_private_qualification_directory_metadata,
 };
+use crate::per_user_embedding::qualification_control::qualification_gate_environment;
 use anyhow::{Context, Result, bail};
 use std::fs;
 #[cfg(unix)]
@@ -23,10 +24,9 @@ pub(in crate::per_user_embedding) struct PinnedQualificationDirectory {
 
 pub(in crate::per_user_embedding) fn server_qualification_control_from_env()
 -> Result<Option<ServerQualificationControl>> {
-    server_qualification_control_from_values(
-        std::env::var_os("CODESTORY_EMBED_QUALIFICATION_DIR"),
-        std::env::var("CODESTORY_EMBED_QUALIFICATION_NONCE").ok(),
-    )
+    let gate = qualification_gate_environment();
+    let nonce = gate.nonce_string();
+    server_qualification_control_from_values(gate.directory, nonce)
 }
 
 pub(in crate::per_user_embedding) fn server_qualification_control_from_values(

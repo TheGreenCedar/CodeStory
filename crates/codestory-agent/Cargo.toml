@@ -1,0 +1,17 @@
+[package]
+name = "codestory-agent"
+version = "0.17.0"
+edition = "2024"
+
+[features]
+# Compiles the eval/holdout probe hooks for downstream unit tests. No product
+# build enables it.
+test-support = []
+
+[dependencies]
+codestory-contracts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

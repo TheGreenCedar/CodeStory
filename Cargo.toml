@@ -7,6 +7,7 @@ members = [
     "crates/codestory-store",
     "crates/codestory-indexer",
     "crates/codestory-retrieval",
+    "crates/codestory-agent",
     "crates/codestory-runtime",
     "crates/codestory-cli",
     "crates/codestory-bench",
@@ -21,9 +22,9 @@ codestory-workspace = { path = "crates/codestory-workspace" }
 codestory-store = { path = "crates/codestory-store" }
 codestory-indexer = { path = "crates/codestory-indexer" }
 codestory-retrieval = { path = "crates/codestory-retrieval" }
+codestory-agent = { path = "crates/codestory-agent" }
 codestory-runtime = { path = "crates/codestory-runtime" }
 codestory-cli = { path = "crates/codestory-cli" }
-codestory-bench = { path = "crates/codestory-bench" }
 
 # Parsing (tree-sitter)
 tree-sitter = "0.26.11"
@@ -78,21 +79,20 @@ ratatui = "0.30"
 fs_at = "0.2.1"
 libc = "0.2"
 remove_dir_all = "1.0.0"
-uuid = { version = "1.0", features = ["v4", "serde"] }
+uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6.0.0"
 glob = "0.3"
+gix = { version = "=0.86.0", default-features = false, features = ["parallel", "sha1", "sha256", "status"] }
 tempfile = "3.10"
 toml = "0.8"
 sha2 = "0.10"
-ring = "0.17.14"
 ureq = "2.12"
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 llama-cpp-2 = { version = "=0.1.151", default-features = false }
 llama-cpp-sys-2 = { version = "=0.1.151", default-features = false }
 
 criterion = "0.8.2"
-proptest = "1.5"
 
 [profile.dev]
 opt-level = 0 # keep your own code fast-to-compile

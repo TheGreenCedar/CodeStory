@@ -1,0 +1,506 @@
+node CLASS name=ArtificialPlayer qn=ArtificialPlayer canonical=game.py:ArtificialPlayer line=182 col=7 end=182:23 file=FILE:game.py@1
+node CLASS name=Enum qn=Enum canonical=game.py:Enum line=22 col=14 end=22:18 file=FILE:game.py@1
+node CLASS name=Field qn=Field canonical=game.py:Field line=21 col=7 end=21:12 file=FILE:game.py@1
+node CLASS name=GameObject qn=GameObject canonical=game.py:GameObject line=17 col=7 end=17:17 file=FILE:game.py@1
+node CLASS name=HumanPlayer qn=HumanPlayer canonical=game.py:HumanPlayer line=147 col=7 end=147:18 file=FILE:game.py@1
+node CLASS name=Move qn=Move canonical=game.py:Move line=36 col=8 end=36:12 file=FILE:game.py@1
+node CLASS name=Node qn=Node canonical=game.py:Node line=183 col=8 end=183:12 file=FILE:game.py@1
+node CLASS name=Player qn=Player canonical=game.py:Player line=137 col=7 end=137:13 file=FILE:game.py@1
+node CLASS name=TicTacToe qn=TicTacToe canonical=game.py:TicTacToe line=243 col=7 end=243:16 file=FILE:game.py@1
+node CLASS name=Token qn=Token canonical=game.py:Token line=22 col=8 end=22:13 file=FILE:game.py@1
+node CONSTANT name=TOKEN_NONE qn=TOKEN_NONE canonical=game.py:TOKEN_NONE#0 line=23 col=3 end=23:13 file=FILE:game.py@1
+node CONSTANT name=TOKEN_PLAYER_A qn=TOKEN_PLAYER_A canonical=game.py:TOKEN_PLAYER_A#0 line=24 col=3 end=24:17 file=FILE:game.py@1
+node CONSTANT name=TOKEN_PLAYER_B qn=TOKEN_PLAYER_B canonical=game.py:TOKEN_PLAYER_B#0 line=25 col=3 end=25:17 file=FILE:game.py@1
+node FILE name=game.py qn=game.py canonical=game.py:game.py:1 line=1 col=1 end=308:0 file=FILE:game.py@1
+node FUNCTION name=ArtificialPlayer.__init__ qn=ArtificialPlayer.__init__ canonical=game.py:ArtificialPlayer.__init__#0 line=189 col=2 end=190:37 file=FILE:game.py@1
+node FUNCTION name=ArtificialPlayer._evaluate qn=ArtificialPlayer._evaluate canonical=game.py:ArtificialPlayer._evaluate#0 line=233 col=2 end=240:11 file=FILE:game.py@1
+node FUNCTION name=ArtificialPlayer._minMax qn=ArtificialPlayer._minMax canonical=game.py:ArtificialPlayer._minMax#0 line=199 col=2 end=230:14 file=FILE:game.py@1
+node FUNCTION name=ArtificialPlayer.turn qn=ArtificialPlayer.turn canonical=game.py:ArtificialPlayer.turn#0 line=193 col=2 end=196:19 file=FILE:game.py@1
+node FUNCTION name=Field.__init__ qn=Field.__init__ canonical=game.py:Field.__init__#0 line=42 col=2 end=49:17 file=FILE:game.py@1
+node FUNCTION name=Field.clear qn=Field.clear canonical=game.py:Field.clear#0 line=61 col=2 end=65:17 file=FILE:game.py@1
+node FUNCTION name=Field.clearMove qn=Field.clearMove canonical=game.py:Field.clearMove#0 line=126 col=2 end=134:18 file=FILE:game.py@1
+node FUNCTION name=Field.clone qn=Field.clone canonical=game.py:Field.clone#0 line=52 col=2 end=58:15 file=FILE:game.py@1
+node FUNCTION name=Field.inRange qn=Field.inRange canonical=game.py:Field.inRange#0 line=101 col=2 end=102:75 file=FILE:game.py@1
+node FUNCTION name=Field.isEmpty qn=Field.isEmpty canonical=game.py:Field.isEmpty#0 line=105 col=2 end=106:66 file=FILE:game.py@1
+node FUNCTION name=Field.isFull qn=Field.isFull canonical=game.py:Field.isFull#0 line=109 col=2 end=110:25 file=FILE:game.py@1
+node FUNCTION name=Field.makeMove qn=Field.makeMove canonical=game.py:Field.makeMove#0 line=113 col=2 end=123:18 file=FILE:game.py@1
+node FUNCTION name=Field.opponent qn=Field.opponent canonical=game.py:Field.opponent#0 line=28 col=2 end=33:32 file=FILE:game.py@1
+node FUNCTION name=Field.sameInRow qn=Field.sameInRow canonical=game.py:Field.sameInRow#0 line=87 col=2 end=98:15 file=FILE:game.py@1
+node FUNCTION name=Field.show qn=Field.show canonical=game.py:Field.show#0 line=68 col=2 end=84:20 file=FILE:game.py@1
+node FUNCTION name=HumanPlayer.__init__ qn=HumanPlayer.__init__ canonical=game.py:HumanPlayer.__init__#0 line=148 col=2 end=149:37 file=FILE:game.py@1
+node FUNCTION name=HumanPlayer._check qn=HumanPlayer._check canonical=game.py:HumanPlayer._check#0 line=172 col=2 end=179:14 file=FILE:game.py@1
+node FUNCTION name=HumanPlayer._input qn=HumanPlayer._input canonical=game.py:HumanPlayer._input#0 line=162 col=2 end=169:14 file=FILE:game.py@1
+node FUNCTION name=HumanPlayer.turn qn=HumanPlayer.turn canonical=game.py:HumanPlayer.turn#0 line=152 col=2 end=159:14 file=FILE:game.py@1
+node FUNCTION name=Move.__init__ qn=Move.__init__ canonical=game.py:Move.__init__#0 line=37 col=3 end=39:19 file=FILE:game.py@1
+node FUNCTION name=Node.__init__ qn=Node.__init__ canonical=game.py:Node.__init__#0 line=184 col=3 end=186:18 file=FILE:game.py@1
+node FUNCTION name=Player.__init__ qn=Player.__init__ canonical=game.py:Player.__init__#0 line=138 col=2 end=140:19 file=FILE:game.py@1
+node FUNCTION name=Player.turn qn=Player.turn canonical=game.py:Player.turn#0 line=143 col=2 end=144:28 file=FILE:game.py@1
+node FUNCTION name=TicTacToe.__init__ qn=TicTacToe.__init__ canonical=game.py:TicTacToe.__init__#0 line=244 col=2 end=246:31 file=FILE:game.py@1
+node FUNCTION name=TicTacToe._reset qn=TicTacToe._reset canonical=game.py:TicTacToe._reset#0 line=280 col=2 end=283:22 file=FILE:game.py@1
+node FUNCTION name=TicTacToe._selectPlayer qn=TicTacToe._selectPlayer canonical=game.py:TicTacToe._selectPlayer#0 line=286 col=2 end=298:31 file=FILE:game.py@1
+node FUNCTION name=TicTacToe.run qn=TicTacToe.run canonical=game.py:TicTacToe.run#0 line=265 col=2 end=277:38 file=FILE:game.py@1
+node FUNCTION name=TicTacToe.start qn=TicTacToe.start canonical=game.py:TicTacToe.start#0 line=249 col=2 end=262:14 file=FILE:game.py@1
+node FUNCTION name=main qn=main canonical=game.py:main#0 line=301 col=1 end=304:18 file=FILE:game.py@1
+node FUNCTION name=numberIn qn=numberIn canonical=game.py:numberIn#0 line=5 col=1 end=6:21 file=FILE:game.py@1
+node FUNCTION name=numberOut qn=numberOut canonical=game.py:numberOut#0 line=9 col=1 end=10:25 file=FILE:game.py@1
+node FUNCTION name=stringOut qn=stringOut canonical=game.py:stringOut#0 line=13 col=1 end=14:20 file=FILE:game.py@1
+node MODULE name=enum qn=enum canonical=game.py:enum#0 line=1 col=6 end=1:10 file=FILE:game.py@1
+node MODULE name=random qn=random canonical=game.py:random#0 line=2 col=6 end=2:12 file=FILE:game.py@1
+node UNKNOWN name=ArtificialPlayer qn=ArtificialPlayer canonical=game.py:ArtificialPlayer#0 line=295 col=12 end=295:28 file=FILE:game.py@1
+node UNKNOWN name=Enum qn=Enum canonical=game.py:Enum#0 line=1 col=18 end=1:22 file=FILE:game.py@1
+node UNKNOWN name=Field qn=Field canonical=game.py:Field#0 line=53 col=11 end=53:16 file=FILE:game.py@1
+node UNKNOWN name=Field qn=Field canonical=game.py:Field#1 line=245 col=17 end=245:22 file=FILE:game.py@1
+node UNKNOWN name=HumanPlayer qn=HumanPlayer canonical=game.py:HumanPlayer#0 line=293 col=12 end=293:23 file=FILE:game.py@1
+node UNKNOWN name=Move qn=Move canonical=game.py:Move#0 line=163 col=16 end=163:20 file=FILE:game.py@1
+node UNKNOWN name=Move qn=Move canonical=game.py:Move#1 line=203 col=16 end=203:20 file=FILE:game.py@1
+node UNKNOWN name=Node qn=Node canonical=game.py:Node#0 line=200 col=27 end=200:31 file=FILE:game.py@1
+node UNKNOWN name=TicTacToe qn=TicTacToe canonical=game.py:TicTacToe#0 line=302 col=14 end=302:23 file=FILE:game.py@1
+node UNKNOWN name=__init__ qn=__init__ canonical=game.py:__init__#0 line=149 col=10 end=149:18 file=FILE:game.py@1
+node UNKNOWN name=__init__ qn=__init__ canonical=game.py:__init__#1 line=190 col=10 end=190:18 file=FILE:game.py@1
+node UNKNOWN name=_check qn=_check canonical=game.py:_check#0 line=157 col=12 end=157:18 file=FILE:game.py@1
+node UNKNOWN name=_evaluate qn=_evaluate canonical=game.py:_evaluate#0 line=216 col=22 end=216:31 file=FILE:game.py@1
+node UNKNOWN name=_input qn=_input canonical=game.py:_input#0 line=156 col=16 end=156:22 file=FILE:game.py@1
+node UNKNOWN name=_minMax qn=_minMax canonical=game.py:_minMax#0 line=195 col=15 end=195:22 file=FILE:game.py@1
+node UNKNOWN name=_minMax qn=_minMax canonical=game.py:_minMax#1 line=218 col=24 end=218:31 file=FILE:game.py@1
+node UNKNOWN name=_reset qn=_reset canonical=game.py:_reset#0 line=250 col=8 end=250:14 file=FILE:game.py@1
+node UNKNOWN name=_selectPlayer qn=_selectPlayer canonical=game.py:_selectPlayer#0 line=253 col=27 end=253:40 file=FILE:game.py@1
+node UNKNOWN name=_selectPlayer qn=_selectPlayer canonical=game.py:_selectPlayer#1 line=257 col=27 end=257:40 file=FILE:game.py@1
+node UNKNOWN name=append qn=append canonical=game.py:append#0 line=47 col=9 end=47:15 file=FILE:game.py@1
+node UNKNOWN name=append qn=append canonical=game.py:append#1 line=48 col=15 end=48:21 file=FILE:game.py@1
+node UNKNOWN name=clear qn=clear canonical=game.py:clear#0 line=283 col=15 end=283:20 file=FILE:game.py@1
+node UNKNOWN name=clearMove qn=clearMove canonical=game.py:clearMove#0 line=220 col=11 end=220:20 file=FILE:game.py@1
+node UNKNOWN name=clone qn=clone canonical=game.py:clone#0 line=194 col=21 end=194:26 file=FILE:game.py@1
+node UNKNOWN name=inRange qn=inRange canonical=game.py:inRange#0 line=114 col=15 end=114:22 file=FILE:game.py@1
+node UNKNOWN name=inRange qn=inRange canonical=game.py:inRange#1 line=127 col=15 end=127:22 file=FILE:game.py@1
+node UNKNOWN name=inRange qn=inRange canonical=game.py:inRange#2 line=173 col=16 end=173:23 file=FILE:game.py@1
+node UNKNOWN name=input qn=input canonical=game.py:input#0 line=6 col=13 end=6:18 file=FILE:game.py@1
+node UNKNOWN name=int qn=int canonical=game.py:int#0 line=6 col=9 end=6:12 file=FILE:game.py@1
+node UNKNOWN name=isEmpty qn=isEmpty canonical=game.py:isEmpty#0 line=116 col=15 end=116:22 file=FILE:game.py@1
+node UNKNOWN name=isEmpty qn=isEmpty canonical=game.py:isEmpty#1 line=129 col=11 end=129:18 file=FILE:game.py@1
+node UNKNOWN name=isEmpty qn=isEmpty canonical=game.py:isEmpty#2 line=176 col=18 end=176:25 file=FILE:game.py@1
+node UNKNOWN name=isEmpty qn=isEmpty canonical=game.py:isEmpty#3 line=211 col=18 end=211:25 file=FILE:game.py@1
+node UNKNOWN name=isFull qn=isFull canonical=game.py:isFull#0 line=120 col=11 end=120:17 file=FILE:game.py@1
+node UNKNOWN name=isFull qn=isFull canonical=game.py:isFull#1 line=217 col=37 end=217:43 file=FILE:game.py@1
+node UNKNOWN name=main qn=main canonical=game.py:main#1 line=308 col=2 end=308:6 file=FILE:game.py@1
+node UNKNOWN name=makeMove qn=makeMove canonical=game.py:makeMove#0 line=214 col=11 end=214:19 file=FILE:game.py@1
+node UNKNOWN name=makeMove qn=makeMove canonical=game.py:makeMove#1 line=270 col=16 end=270:24 file=FILE:game.py@1
+node UNKNOWN name=numberIn qn=numberIn canonical=game.py:numberIn#1 line=165 col=14 end=165:22 file=FILE:game.py@1
+node UNKNOWN name=numberIn qn=numberIn canonical=game.py:numberIn#2 line=167 col=14 end=167:22 file=FILE:game.py@1
+node UNKNOWN name=numberIn qn=numberIn canonical=game.py:numberIn#3 line=291 col=16 end=291:24 file=FILE:game.py@1
+node UNKNOWN name=numberOut qn=numberOut canonical=game.py:numberOut#1 line=71 col=4 end=71:13 file=FILE:game.py@1
+node UNKNOWN name=opponent qn=opponent canonical=game.py:opponent#0 line=218 col=45 end=218:53 file=FILE:game.py@1
+node UNKNOWN name=opponent qn=opponent canonical=game.py:opponent#1 line=236 col=30 end=236:38 file=FILE:game.py@1
+node UNKNOWN name=print qn=print canonical=game.py:print#0 line=10 col=2 end=10:7 file=FILE:game.py@1
+node UNKNOWN name=print qn=print canonical=game.py:print#1 line=14 col=2 end=14:7 file=FILE:game.py@1
+node UNKNOWN name=randint qn=randint canonical=game.py:randint#0 line=2 col=20 end=2:27 file=FILE:game.py@1
+node UNKNOWN name=randint qn=randint canonical=game.py:randint#1 line=228 col=9 end=228:16 file=FILE:game.py@1
+node UNKNOWN name=range qn=range canonical=game.py:range#0 line=44 col=12 end=44:17 file=FILE:game.py@1
+node UNKNOWN name=range qn=range canonical=game.py:range#1 line=46 col=13 end=46:18 file=FILE:game.py@1
+node UNKNOWN name=range qn=range canonical=game.py:range#10 line=268 col=12 end=268:17 file=FILE:game.py@1
+node UNKNOWN name=range qn=range canonical=game.py:range#11 line=281 col=12 end=281:17 file=FILE:game.py@1
+node UNKNOWN name=range qn=range canonical=game.py:range#2 line=54 col=12 end=54:17 file=FILE:game.py@1
+node UNKNOWN name=range qn=range canonical=game.py:range#3 line=55 col=13 end=55:18 file=FILE:game.py@1
+node UNKNOWN name=range qn=range canonical=game.py:range#4 line=62 col=12 end=62:17 file=FILE:game.py@1
+node UNKNOWN name=range qn=range canonical=game.py:range#5 line=63 col=13 end=63:18 file=FILE:game.py@1
+node UNKNOWN name=range qn=range canonical=game.py:range#6 line=70 col=14 end=70:19 file=FILE:game.py@1
+node UNKNOWN name=range qn=range canonical=game.py:range#7 line=73 col=15 end=73:20 file=FILE:game.py@1
+node UNKNOWN name=range qn=range canonical=game.py:range#8 line=206 col=12 end=206:17 file=FILE:game.py@1
+node UNKNOWN name=range qn=range canonical=game.py:range#9 line=208 col=13 end=208:18 file=FILE:game.py@1
+node UNKNOWN name=run qn=run canonical=game.py:run#0 line=304 col=13 end=304:16 file=FILE:game.py@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=game.py:sameInRow#0 line=234 col=12 end=234:21 file=FILE:game.py@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=game.py:sameInRow#1 line=236 col=14 end=236:23 file=FILE:game.py@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=game.py:sameInRow#2 line=238 col=14 end=238:23 file=FILE:game.py@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=game.py:sameInRow#3 line=272 col=19 end=272:28 file=FILE:game.py@1
+node UNKNOWN name=show qn=show canonical=game.py:show#0 line=266 col=15 end=266:19 file=FILE:game.py@1
+node UNKNOWN name=show qn=show canonical=game.py:show#1 line=271 col=16 end=271:20 file=FILE:game.py@1
+node UNKNOWN name=start qn=start canonical=game.py:start#0 line=303 col=18 end=303:23 file=FILE:game.py@1
+node UNKNOWN name=str qn=str canonical=game.py:str#0 line=10 col=8 end=10:11 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#1 line=69 col=3 end=69:12 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#10 line=154 col=3 end=154:12 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#11 line=164 col=3 end=164:12 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#12 line=166 col=3 end=166:12 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#13 line=168 col=3 end=168:12 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#14 line=174 col=4 end=174:13 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#15 line=177 col=4 end=177:13 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#16 line=251 col=3 end=251:12 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#17 line=261 col=3 end=261:12 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#18 line=273 col=5 end=273:14 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#19 line=274 col=5 end=274:14 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#2 line=72 col=4 end=72:13 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#20 line=277 col=3 end=277:12 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#21 line=288 col=4 end=288:13 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#22 line=289 col=4 end=289:13 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#23 line=290 col=4 end=290:13 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#24 line=298 col=4 end=298:13 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#3 line=75 col=6 end=75:15 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#4 line=77 col=6 end=77:15 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#5 line=79 col=6 end=79:15 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#6 line=81 col=6 end=81:15 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#7 line=83 col=5 end=83:14 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#8 line=84 col=3 end=84:12 file=FILE:game.py@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.py:stringOut#9 line=153 col=3 end=153:12 file=FILE:game.py@1
+node UNKNOWN name=turn qn=turn canonical=game.py:turn#0 line=270 col=32 end=270:36 file=FILE:game.py@1
+node VARIABLE name=count qn=count canonical=game.py:count#0 line=89 col=3 end=89:8 file=FILE:game.py@1
+node VARIABLE name=field qn=field canonical=game.py:field#0 line=53 col=3 end=53:8 file=FILE:game.py@1
+node VARIABLE name=move qn=move canonical=game.py:move#0 line=156 col=4 end=156:8 file=FILE:game.py@1
+node VARIABLE name=move qn=move canonical=game.py:move#1 line=163 col=3 end=163:7 file=FILE:game.py@1
+node VARIABLE name=move qn=move canonical=game.py:move#2 line=203 col=3 end=203:7 file=FILE:game.py@1
+node VARIABLE name=node qn=node canonical=game.py:node#0 line=195 col=3 end=195:7 file=FILE:game.py@1
+node VARIABLE name=node qn=node canonical=game.py:node#1 line=200 col=3 end=200:7 file=FILE:game.py@1
+node VARIABLE name=player qn=player canonical=game.py:player#0 line=269 col=4 end=269:10 file=FILE:game.py@1
+node VARIABLE name=playerIndex qn=playerIndex canonical=game.py:playerIndex#0 line=267 col=3 end=267:14 file=FILE:game.py@1
+node VARIABLE name=playerIndex qn=playerIndex canonical=game.py:playerIndex#1 line=276 col=4 end=276:15 file=FILE:game.py@1
+node VARIABLE name=row qn=row canonical=game.py:row#0 line=45 col=4 end=45:7 file=FILE:game.py@1
+node VARIABLE name=sameMove qn=sameMove canonical=game.py:sameMove#0 line=204 col=3 end=204:11 file=FILE:game.py@1
+node VARIABLE name=sameMove qn=sameMove canonical=game.py:sameMove#1 line=225 col=6 end=225:14 file=FILE:game.py@1
+node VARIABLE name=selection qn=selection canonical=game.py:selection#0 line=291 col=4 end=291:13 file=FILE:game.py@1
+node VARIABLE name=tempField qn=tempField canonical=game.py:tempField#0 line=194 col=3 end=194:12 file=FILE:game.py@1
+node VARIABLE name=tictactoe qn=tictactoe canonical=game.py:tictactoe#0 line=302 col=2 end=302:11 file=FILE:game.py@1
+node VARIABLE name=total qn=total canonical=game.py:total#0 line=88 col=3 end=88:8 file=FILE:game.py@1
+node VARIABLE name=turnValue qn=turnValue canonical=game.py:turnValue#0 line=216 col=5 end=216:14 file=FILE:game.py@1
+node VARIABLE name=turnValue qn=turnValue canonical=game.py:turnValue#1 line=218 col=6 end=218:15 file=FILE:game.py@1
+edge CALL src=FUNCTION:ArtificialPlayer.__init__@189 dst=UNKNOWN:__init__@190 resolved_src=- resolved_dst=- line=190 confidence=- certainty=- callsite=h0:190:10:h1|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._evaluate@233 dst=UNKNOWN:opponent@236 resolved_src=- resolved_dst=- line=236 confidence=- certainty=- callsite=h0:236:30:h2|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._evaluate@233 dst=UNKNOWN:sameInRow@234 resolved_src=- resolved_dst=- line=234 confidence=- certainty=- callsite=h0:234:12:h3|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._evaluate@233 dst=UNKNOWN:sameInRow@236 resolved_src=- resolved_dst=- line=236 confidence=- certainty=- callsite=h0:236:14:h4|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._evaluate@233 dst=UNKNOWN:sameInRow@238 resolved_src=- resolved_dst=- line=238 confidence=- certainty=- callsite=h0:238:14:h5|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._minMax@199 dst=FUNCTION:ArtificialPlayer._evaluate@233 resolved_src=- resolved_dst=FUNCTION:ArtificialPlayer._evaluate@233 line=216 confidence=1.0000 certainty=Certain callsite=h0:216:1:h6 candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._minMax@199 dst=UNKNOWN:Move@203 resolved_src=- resolved_dst=- line=203 confidence=- certainty=- callsite=h0:203:16:h7|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._minMax@199 dst=UNKNOWN:Node@200 resolved_src=- resolved_dst=- line=200 confidence=- certainty=- callsite=h0:200:27:h8|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._minMax@199 dst=UNKNOWN:clearMove@220 resolved_src=- resolved_dst=- line=220 confidence=- certainty=- callsite=h0:220:11:h9|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._minMax@199 dst=UNKNOWN:isEmpty@211 resolved_src=- resolved_dst=- line=211 confidence=- certainty=- callsite=h0:211:18:h10|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._minMax@199 dst=UNKNOWN:isFull@217 resolved_src=- resolved_dst=- line=217 confidence=- certainty=- callsite=h0:217:37:h11|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._minMax@199 dst=UNKNOWN:makeMove@214 resolved_src=- resolved_dst=- line=214 confidence=- certainty=- callsite=h0:214:11:h12|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._minMax@199 dst=UNKNOWN:opponent@218 resolved_src=- resolved_dst=- line=218 confidence=- certainty=- callsite=h0:218:45:h13|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._minMax@199 dst=UNKNOWN:randint@228 resolved_src=- resolved_dst=- line=228 confidence=- certainty=- callsite=h0:228:9:h14 candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._minMax@199 dst=UNKNOWN:range@206 resolved_src=- resolved_dst=- line=206 confidence=- certainty=- callsite=h0:206:12:h15 candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer._minMax@199 dst=UNKNOWN:range@208 resolved_src=- resolved_dst=- line=208 confidence=- certainty=- callsite=h0:208:13:h16 candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer.turn@193 dst=FUNCTION:ArtificialPlayer._minMax@199 resolved_src=- resolved_dst=FUNCTION:ArtificialPlayer._minMax@199 line=195 confidence=1.0000 certainty=Certain callsite=h0:195:1:h17 candidates=[]
+edge CALL src=FUNCTION:ArtificialPlayer.turn@193 dst=UNKNOWN:clone@194 resolved_src=- resolved_dst=- line=194 confidence=- certainty=- callsite=h0:194:21:h18|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:Field.__init__@42 dst=UNKNOWN:append@47 resolved_src=- resolved_dst=- line=47 confidence=- certainty=- callsite=h0:47:9:h19|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:Field.__init__@42 dst=UNKNOWN:append@48 resolved_src=- resolved_dst=- line=48 confidence=- certainty=- callsite=h0:48:15:h20|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:Field.__init__@42 dst=UNKNOWN:range@44 resolved_src=- resolved_dst=- line=44 confidence=- certainty=- callsite=h0:44:12:h21 candidates=[]
+edge CALL src=FUNCTION:Field.__init__@42 dst=UNKNOWN:range@46 resolved_src=- resolved_dst=- line=46 confidence=- certainty=- callsite=h0:46:13:h22 candidates=[]
+edge CALL src=FUNCTION:Field.clear@61 dst=UNKNOWN:range@62 resolved_src=- resolved_dst=- line=62 confidence=- certainty=- callsite=h0:62:12:h23 candidates=[]
+edge CALL src=FUNCTION:Field.clear@61 dst=UNKNOWN:range@63 resolved_src=- resolved_dst=- line=63 confidence=- certainty=- callsite=h0:63:13:h24 candidates=[]
+edge CALL src=FUNCTION:Field.clearMove@126 dst=FUNCTION:Field.inRange@101 resolved_src=- resolved_dst=FUNCTION:Field.inRange@101 line=127 confidence=1.0000 certainty=Certain callsite=h0:127:1:h25 candidates=[]
+edge CALL src=FUNCTION:Field.clearMove@126 dst=FUNCTION:Field.isEmpty@105 resolved_src=- resolved_dst=FUNCTION:Field.isEmpty@105 line=129 confidence=1.0000 certainty=Certain callsite=h0:129:1:h26 candidates=[]
+edge CALL src=FUNCTION:Field.clone@52 dst=UNKNOWN:Field@53 resolved_src=- resolved_dst=- line=53 confidence=- certainty=- callsite=h0:53:11:h27 candidates=[]
+edge CALL src=FUNCTION:Field.clone@52 dst=UNKNOWN:range@54 resolved_src=- resolved_dst=- line=54 confidence=- certainty=- callsite=h0:54:12:h28 candidates=[]
+edge CALL src=FUNCTION:Field.clone@52 dst=UNKNOWN:range@55 resolved_src=- resolved_dst=- line=55 confidence=- certainty=- callsite=h0:55:13:h29 candidates=[]
+edge CALL src=FUNCTION:Field.makeMove@113 dst=FUNCTION:Field.inRange@101 resolved_src=- resolved_dst=FUNCTION:Field.inRange@101 line=114 confidence=1.0000 certainty=Certain callsite=h0:114:1:h25 candidates=[]
+edge CALL src=FUNCTION:Field.makeMove@113 dst=FUNCTION:Field.isEmpty@105 resolved_src=- resolved_dst=FUNCTION:Field.isEmpty@105 line=116 confidence=1.0000 certainty=Certain callsite=h0:116:1:h26 candidates=[]
+edge CALL src=FUNCTION:Field.makeMove@113 dst=FUNCTION:Field.isFull@109 resolved_src=- resolved_dst=FUNCTION:Field.isFull@109 line=120 confidence=1.0000 certainty=Certain callsite=h0:120:1:h30 candidates=[]
+edge CALL src=FUNCTION:Field.show@68 dst=UNKNOWN:numberOut@71 resolved_src=- resolved_dst=- line=71 confidence=- certainty=- callsite=h0:71:4:h31 candidates=[]
+edge CALL src=FUNCTION:Field.show@68 dst=UNKNOWN:range@70 resolved_src=- resolved_dst=- line=70 confidence=- certainty=- callsite=h0:70:14:h32 candidates=[]
+edge CALL src=FUNCTION:Field.show@68 dst=UNKNOWN:range@73 resolved_src=- resolved_dst=- line=73 confidence=- certainty=- callsite=h0:73:15:h33 candidates=[]
+edge CALL src=FUNCTION:Field.show@68 dst=UNKNOWN:stringOut@69 resolved_src=- resolved_dst=- line=69 confidence=- certainty=- callsite=h0:69:3:h34 candidates=[]
+edge CALL src=FUNCTION:Field.show@68 dst=UNKNOWN:stringOut@72 resolved_src=- resolved_dst=- line=72 confidence=- certainty=- callsite=h0:72:4:h35 candidates=[]
+edge CALL src=FUNCTION:Field.show@68 dst=UNKNOWN:stringOut@75 resolved_src=- resolved_dst=- line=75 confidence=- certainty=- callsite=h0:75:6:h36 candidates=[]
+edge CALL src=FUNCTION:Field.show@68 dst=UNKNOWN:stringOut@77 resolved_src=- resolved_dst=- line=77 confidence=- certainty=- callsite=h0:77:6:h37 candidates=[]
+edge CALL src=FUNCTION:Field.show@68 dst=UNKNOWN:stringOut@79 resolved_src=- resolved_dst=- line=79 confidence=- certainty=- callsite=h0:79:6:h38 candidates=[]
+edge CALL src=FUNCTION:Field.show@68 dst=UNKNOWN:stringOut@81 resolved_src=- resolved_dst=- line=81 confidence=- certainty=- callsite=h0:81:6:h39 candidates=[]
+edge CALL src=FUNCTION:Field.show@68 dst=UNKNOWN:stringOut@83 resolved_src=- resolved_dst=- line=83 confidence=- certainty=- callsite=h0:83:5:h40 candidates=[]
+edge CALL src=FUNCTION:Field.show@68 dst=UNKNOWN:stringOut@84 resolved_src=- resolved_dst=- line=84 confidence=- certainty=- callsite=h0:84:3:h41 candidates=[]
+edge CALL src=FUNCTION:HumanPlayer.__init__@148 dst=UNKNOWN:__init__@149 resolved_src=- resolved_dst=- line=149 confidence=- certainty=- callsite=h0:149:10:h42|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:HumanPlayer._check@172 dst=UNKNOWN:inRange@173 resolved_src=- resolved_dst=- line=173 confidence=- certainty=- callsite=h0:173:16:h43|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:HumanPlayer._check@172 dst=UNKNOWN:isEmpty@176 resolved_src=- resolved_dst=- line=176 confidence=- certainty=- callsite=h0:176:18:h44|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:HumanPlayer._check@172 dst=UNKNOWN:stringOut@174 resolved_src=- resolved_dst=- line=174 confidence=- certainty=- callsite=h0:174:4:h45 candidates=[]
+edge CALL src=FUNCTION:HumanPlayer._check@172 dst=UNKNOWN:stringOut@177 resolved_src=- resolved_dst=- line=177 confidence=- certainty=- callsite=h0:177:4:h46 candidates=[]
+edge CALL src=FUNCTION:HumanPlayer._input@162 dst=UNKNOWN:Move@163 resolved_src=- resolved_dst=- line=163 confidence=- certainty=- callsite=h0:163:16:h47|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:HumanPlayer._input@162 dst=UNKNOWN:numberIn@165 resolved_src=- resolved_dst=- line=165 confidence=- certainty=- callsite=h0:165:14:h48 candidates=[]
+edge CALL src=FUNCTION:HumanPlayer._input@162 dst=UNKNOWN:numberIn@167 resolved_src=- resolved_dst=- line=167 confidence=- certainty=- callsite=h0:167:14:h49 candidates=[]
+edge CALL src=FUNCTION:HumanPlayer._input@162 dst=UNKNOWN:stringOut@164 resolved_src=- resolved_dst=- line=164 confidence=- certainty=- callsite=h0:164:3:h50 candidates=[]
+edge CALL src=FUNCTION:HumanPlayer._input@162 dst=UNKNOWN:stringOut@166 resolved_src=- resolved_dst=- line=166 confidence=- certainty=- callsite=h0:166:3:h51 candidates=[]
+edge CALL src=FUNCTION:HumanPlayer._input@162 dst=UNKNOWN:stringOut@168 resolved_src=- resolved_dst=- line=168 confidence=- certainty=- callsite=h0:168:3:h52 candidates=[]
+edge CALL src=FUNCTION:HumanPlayer.turn@152 dst=FUNCTION:HumanPlayer._check@172 resolved_src=- resolved_dst=FUNCTION:HumanPlayer._check@172 line=157 confidence=1.0000 certainty=Certain callsite=h0:157:1:h53 candidates=[]
+edge CALL src=FUNCTION:HumanPlayer.turn@152 dst=FUNCTION:HumanPlayer._input@162 resolved_src=- resolved_dst=FUNCTION:HumanPlayer._input@162 line=156 confidence=1.0000 certainty=Certain callsite=h0:156:1:h54 candidates=[]
+edge CALL src=FUNCTION:HumanPlayer.turn@152 dst=UNKNOWN:stringOut@153 resolved_src=- resolved_dst=- line=153 confidence=- certainty=- callsite=h0:153:3:h55 candidates=[]
+edge CALL src=FUNCTION:HumanPlayer.turn@152 dst=UNKNOWN:stringOut@154 resolved_src=- resolved_dst=- line=154 confidence=- certainty=- callsite=h0:154:3:h56 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.__init__@244 dst=UNKNOWN:Field@245 resolved_src=- resolved_dst=- line=245 confidence=- certainty=- callsite=h0:245:17:h57 candidates=[]
+edge CALL src=FUNCTION:TicTacToe._reset@280 dst=FUNCTION:Field.clear@61 resolved_src=- resolved_dst=FUNCTION:Field.clear@61 line=283 confidence=1.0000 certainty=Certain callsite=h0:283:1:h58 candidates=[]
+edge CALL src=FUNCTION:TicTacToe._reset@280 dst=UNKNOWN:range@281 resolved_src=- resolved_dst=- line=281 confidence=- certainty=- callsite=h0:281:12:h59 candidates=[]
+edge CALL src=FUNCTION:TicTacToe._selectPlayer@286 dst=UNKNOWN:ArtificialPlayer@295 resolved_src=- resolved_dst=- line=295 confidence=- certainty=- callsite=h0:295:12:h60 candidates=[]
+edge CALL src=FUNCTION:TicTacToe._selectPlayer@286 dst=UNKNOWN:HumanPlayer@293 resolved_src=- resolved_dst=- line=293 confidence=- certainty=- callsite=h0:293:12:h61 candidates=[]
+edge CALL src=FUNCTION:TicTacToe._selectPlayer@286 dst=UNKNOWN:numberIn@291 resolved_src=- resolved_dst=- line=291 confidence=- certainty=- callsite=h0:291:16:h62 candidates=[]
+edge CALL src=FUNCTION:TicTacToe._selectPlayer@286 dst=UNKNOWN:stringOut@288 resolved_src=- resolved_dst=- line=288 confidence=- certainty=- callsite=h0:288:4:h63 candidates=[]
+edge CALL src=FUNCTION:TicTacToe._selectPlayer@286 dst=UNKNOWN:stringOut@289 resolved_src=- resolved_dst=- line=289 confidence=- certainty=- callsite=h0:289:4:h64 candidates=[]
+edge CALL src=FUNCTION:TicTacToe._selectPlayer@286 dst=UNKNOWN:stringOut@290 resolved_src=- resolved_dst=- line=290 confidence=- certainty=- callsite=h0:290:4:h65 candidates=[]
+edge CALL src=FUNCTION:TicTacToe._selectPlayer@286 dst=UNKNOWN:stringOut@298 resolved_src=- resolved_dst=- line=298 confidence=- certainty=- callsite=h0:298:4:h66 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.run@265 dst=FUNCTION:Field.makeMove@113 resolved_src=- resolved_dst=FUNCTION:Field.makeMove@113 line=270 confidence=1.0000 certainty=Certain callsite=h0:270:1:h67 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.run@265 dst=FUNCTION:Field.sameInRow@87 resolved_src=- resolved_dst=FUNCTION:Field.sameInRow@87 line=272 confidence=1.0000 certainty=Certain callsite=h0:272:1:h68 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.run@265 dst=FUNCTION:Field.show@68 resolved_src=- resolved_dst=FUNCTION:Field.show@68 line=266 confidence=1.0000 certainty=Certain callsite=h0:266:1:h69 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.run@265 dst=FUNCTION:Field.show@68 resolved_src=- resolved_dst=FUNCTION:Field.show@68 line=271 confidence=1.0000 certainty=Certain callsite=h0:271:1:h69 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.run@265 dst=UNKNOWN:range@268 resolved_src=- resolved_dst=- line=268 confidence=- certainty=- callsite=h0:268:12:h70 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.run@265 dst=UNKNOWN:stringOut@273 resolved_src=- resolved_dst=- line=273 confidence=- certainty=- callsite=h0:273:5:h71 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.run@265 dst=UNKNOWN:stringOut@274 resolved_src=- resolved_dst=- line=274 confidence=- certainty=- callsite=h0:274:5:h72 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.run@265 dst=UNKNOWN:stringOut@277 resolved_src=- resolved_dst=- line=277 confidence=- certainty=- callsite=h0:277:3:h73 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.run@265 dst=UNKNOWN:turn@270 resolved_src=- resolved_dst=- line=270 confidence=- certainty=- callsite=h0:270:32:h74|syntax:python-attribute-call candidates=[]
+edge CALL src=FUNCTION:TicTacToe.start@249 dst=FUNCTION:TicTacToe._reset@280 resolved_src=- resolved_dst=FUNCTION:TicTacToe._reset@280 line=250 confidence=1.0000 certainty=Certain callsite=h0:250:1:h75 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.start@249 dst=FUNCTION:TicTacToe._selectPlayer@286 resolved_src=- resolved_dst=FUNCTION:TicTacToe._selectPlayer@286 line=253 confidence=1.0000 certainty=Certain callsite=h0:253:1:h76 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.start@249 dst=FUNCTION:TicTacToe._selectPlayer@286 resolved_src=- resolved_dst=FUNCTION:TicTacToe._selectPlayer@286 line=257 confidence=1.0000 certainty=Certain callsite=h0:257:1:h76 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.start@249 dst=UNKNOWN:stringOut@251 resolved_src=- resolved_dst=- line=251 confidence=- certainty=- callsite=h0:251:3:h77 candidates=[]
+edge CALL src=FUNCTION:TicTacToe.start@249 dst=UNKNOWN:stringOut@261 resolved_src=- resolved_dst=- line=261 confidence=- certainty=- callsite=h0:261:3:h78 candidates=[]
+edge CALL src=FUNCTION:main@301 dst=FUNCTION:TicTacToe.run@265 resolved_src=- resolved_dst=FUNCTION:TicTacToe.run@265 line=304 confidence=1.0000 certainty=Certain callsite=h0:304:1:h79 candidates=[]
+edge CALL src=FUNCTION:main@301 dst=FUNCTION:TicTacToe.start@249 resolved_src=- resolved_dst=FUNCTION:TicTacToe.start@249 line=303 confidence=1.0000 certainty=Certain callsite=h0:303:1:h80 candidates=[]
+edge CALL src=FUNCTION:main@301 dst=UNKNOWN:TicTacToe@302 resolved_src=- resolved_dst=- line=302 confidence=- certainty=- callsite=h0:302:14:h81 candidates=[]
+edge CALL src=FUNCTION:numberIn@5 dst=UNKNOWN:input@6 resolved_src=- resolved_dst=- line=6 confidence=- certainty=- callsite=h0:6:13:h82 candidates=[]
+edge CALL src=FUNCTION:numberIn@5 dst=UNKNOWN:int@6 resolved_src=- resolved_dst=- line=6 confidence=- certainty=- callsite=h0:6:9:h83 candidates=[]
+edge CALL src=FUNCTION:numberOut@9 dst=UNKNOWN:print@10 resolved_src=- resolved_dst=- line=10 confidence=- certainty=- callsite=h0:10:2:h84 candidates=[]
+edge CALL src=FUNCTION:numberOut@9 dst=UNKNOWN:str@10 resolved_src=- resolved_dst=- line=10 confidence=- certainty=- callsite=h0:10:8:h85 candidates=[]
+edge CALL src=FUNCTION:stringOut@13 dst=UNKNOWN:print@14 resolved_src=- resolved_dst=- line=14 confidence=- certainty=- callsite=h0:14:2:h86 candidates=[]
+edge IMPORT src=UNKNOWN:Enum@1 dst=MODULE:enum@1 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge IMPORT src=UNKNOWN:randint@2 dst=MODULE:random@2 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:ArtificialPlayer@182 dst=CLASS:Player@137 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:Field@21 dst=CLASS:GameObject@17 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:HumanPlayer@147 dst=CLASS:Player@137 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:Player@137 dst=CLASS:GameObject@17 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:Token@22 dst=CLASS:Enum@22 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ArtificialPlayer@182 dst=FUNCTION:ArtificialPlayer.__init__@189 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ArtificialPlayer@182 dst=FUNCTION:ArtificialPlayer._evaluate@233 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ArtificialPlayer@182 dst=FUNCTION:ArtificialPlayer._minMax@199 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ArtificialPlayer@182 dst=FUNCTION:ArtificialPlayer.turn@193 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@21 dst=FUNCTION:Field.__init__@42 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@21 dst=FUNCTION:Field.clear@61 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@21 dst=FUNCTION:Field.clearMove@126 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@21 dst=FUNCTION:Field.clone@52 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@21 dst=FUNCTION:Field.inRange@101 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@21 dst=FUNCTION:Field.isEmpty@105 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@21 dst=FUNCTION:Field.isFull@109 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@21 dst=FUNCTION:Field.makeMove@113 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@21 dst=FUNCTION:Field.opponent@28 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@21 dst=FUNCTION:Field.sameInRow@87 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@21 dst=FUNCTION:Field.show@68 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:HumanPlayer@147 dst=FUNCTION:HumanPlayer.__init__@148 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:HumanPlayer@147 dst=FUNCTION:HumanPlayer._check@172 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:HumanPlayer@147 dst=FUNCTION:HumanPlayer._input@162 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:HumanPlayer@147 dst=FUNCTION:HumanPlayer.turn@152 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Move@36 dst=FUNCTION:Move.__init__@37 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Node@183 dst=FUNCTION:Node.__init__@184 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Player@137 dst=FUNCTION:Player.__init__@138 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Player@137 dst=FUNCTION:Player.turn@143 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:TicTacToe@243 dst=FUNCTION:TicTacToe.__init__@244 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:TicTacToe@243 dst=FUNCTION:TicTacToe._reset@280 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:TicTacToe@243 dst=FUNCTION:TicTacToe._selectPlayer@286 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:TicTacToe@243 dst=FUNCTION:TicTacToe.run@265 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:TicTacToe@243 dst=FUNCTION:TicTacToe.start@249 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+file path=game.py language=python lines=308 complete=true role=Source
+occurrence element=CLASS:ArtificialPlayer@182 kind=DEFINITION span=182:7-182:23
+occurrence element=CLASS:Enum@22 kind=DEFINITION span=22:14-22:18
+occurrence element=CLASS:Field@21 kind=DEFINITION span=21:7-21:12
+occurrence element=CLASS:GameObject@17 kind=DEFINITION span=137:14-137:24
+occurrence element=CLASS:GameObject@17 kind=DEFINITION span=17:7-17:17
+occurrence element=CLASS:GameObject@17 kind=DEFINITION span=21:13-21:23
+occurrence element=CLASS:HumanPlayer@147 kind=DEFINITION span=147:7-147:18
+occurrence element=CLASS:Move@36 kind=DEFINITION span=36:8-36:12
+occurrence element=CLASS:Node@183 kind=DEFINITION span=183:8-183:12
+occurrence element=CLASS:Player@137 kind=DEFINITION span=137:7-137:13
+occurrence element=CLASS:Player@137 kind=DEFINITION span=147:19-147:25
+occurrence element=CLASS:Player@137 kind=DEFINITION span=182:24-182:30
+occurrence element=CLASS:TicTacToe@243 kind=DEFINITION span=243:7-243:16
+occurrence element=CLASS:Token@22 kind=DEFINITION span=22:8-22:13
+occurrence element=CONSTANT:TOKEN_NONE@23 kind=DEFINITION span=23:3-23:13
+occurrence element=CONSTANT:TOKEN_PLAYER_A@24 kind=DEFINITION span=24:3-24:17
+occurrence element=CONSTANT:TOKEN_PLAYER_B@25 kind=DEFINITION span=25:3-25:17
+occurrence element=FUNCTION:ArtificialPlayer.__init__@189 kind=DEFINITION span=189:2-190:37
+occurrence element=FUNCTION:ArtificialPlayer._evaluate@233 kind=DEFINITION span=233:2-240:11
+occurrence element=FUNCTION:ArtificialPlayer._minMax@199 kind=DEFINITION span=199:2-230:14
+occurrence element=FUNCTION:ArtificialPlayer.turn@193 kind=DEFINITION span=193:2-196:19
+occurrence element=FUNCTION:Field.__init__@42 kind=DEFINITION span=42:2-49:17
+occurrence element=FUNCTION:Field.clear@61 kind=DEFINITION span=61:2-65:17
+occurrence element=FUNCTION:Field.clearMove@126 kind=DEFINITION span=126:2-134:18
+occurrence element=FUNCTION:Field.clone@52 kind=DEFINITION span=52:2-58:15
+occurrence element=FUNCTION:Field.inRange@101 kind=DEFINITION span=101:2-102:75
+occurrence element=FUNCTION:Field.isEmpty@105 kind=DEFINITION span=105:2-106:66
+occurrence element=FUNCTION:Field.isFull@109 kind=DEFINITION span=109:2-110:25
+occurrence element=FUNCTION:Field.makeMove@113 kind=DEFINITION span=113:2-123:18
+occurrence element=FUNCTION:Field.opponent@28 kind=DEFINITION span=28:2-33:32
+occurrence element=FUNCTION:Field.sameInRow@87 kind=DEFINITION span=87:2-98:15
+occurrence element=FUNCTION:Field.show@68 kind=DEFINITION span=68:2-84:20
+occurrence element=FUNCTION:HumanPlayer.__init__@148 kind=DEFINITION span=148:2-149:37
+occurrence element=FUNCTION:HumanPlayer._check@172 kind=DEFINITION span=172:2-179:14
+occurrence element=FUNCTION:HumanPlayer._input@162 kind=DEFINITION span=162:2-169:14
+occurrence element=FUNCTION:HumanPlayer.turn@152 kind=DEFINITION span=152:2-159:14
+occurrence element=FUNCTION:Move.__init__@37 kind=DEFINITION span=37:3-39:19
+occurrence element=FUNCTION:Node.__init__@184 kind=DEFINITION span=184:3-186:18
+occurrence element=FUNCTION:Player.__init__@138 kind=DEFINITION span=138:2-140:19
+occurrence element=FUNCTION:Player.turn@143 kind=DEFINITION span=143:2-144:28
+occurrence element=FUNCTION:TicTacToe.__init__@244 kind=DEFINITION span=244:2-246:31
+occurrence element=FUNCTION:TicTacToe._reset@280 kind=DEFINITION span=280:2-283:22
+occurrence element=FUNCTION:TicTacToe._selectPlayer@286 kind=DEFINITION span=286:2-298:31
+occurrence element=FUNCTION:TicTacToe.run@265 kind=DEFINITION span=265:2-277:38
+occurrence element=FUNCTION:TicTacToe.start@249 kind=DEFINITION span=249:2-262:14
+occurrence element=FUNCTION:main@301 kind=DEFINITION span=301:1-304:18
+occurrence element=FUNCTION:numberIn@5 kind=DEFINITION span=5:1-6:21
+occurrence element=FUNCTION:numberOut@9 kind=DEFINITION span=9:1-10:25
+occurrence element=FUNCTION:stringOut@13 kind=DEFINITION span=13:1-14:20
+occurrence element=MODULE:enum@1 kind=DEFINITION span=1:6-1:10
+occurrence element=MODULE:random@2 kind=DEFINITION span=2:6-2:12
+occurrence element=UNKNOWN:ArtificialPlayer@295 kind=DEFINITION span=295:12-295:28
+occurrence element=UNKNOWN:Enum@1 kind=DEFINITION span=1:18-1:22
+occurrence element=UNKNOWN:Field@245 kind=DEFINITION span=245:17-245:22
+occurrence element=UNKNOWN:Field@53 kind=DEFINITION span=53:11-53:16
+occurrence element=UNKNOWN:HumanPlayer@293 kind=DEFINITION span=293:12-293:23
+occurrence element=UNKNOWN:Move@163 kind=DEFINITION span=163:16-163:20
+occurrence element=UNKNOWN:Move@203 kind=DEFINITION span=203:16-203:20
+occurrence element=UNKNOWN:Node@200 kind=DEFINITION span=200:27-200:31
+occurrence element=UNKNOWN:TicTacToe@302 kind=DEFINITION span=302:14-302:23
+occurrence element=UNKNOWN:__init__@149 kind=DEFINITION span=149:10-149:18
+occurrence element=UNKNOWN:__init__@190 kind=DEFINITION span=190:10-190:18
+occurrence element=UNKNOWN:_check@157 kind=DEFINITION span=157:12-157:18
+occurrence element=UNKNOWN:_evaluate@216 kind=DEFINITION span=216:22-216:31
+occurrence element=UNKNOWN:_input@156 kind=DEFINITION span=156:16-156:22
+occurrence element=UNKNOWN:_minMax@195 kind=DEFINITION span=195:15-195:22
+occurrence element=UNKNOWN:_minMax@218 kind=DEFINITION span=218:24-218:31
+occurrence element=UNKNOWN:_reset@250 kind=DEFINITION span=250:8-250:14
+occurrence element=UNKNOWN:_selectPlayer@253 kind=DEFINITION span=253:27-253:40
+occurrence element=UNKNOWN:_selectPlayer@257 kind=DEFINITION span=257:27-257:40
+occurrence element=UNKNOWN:append@47 kind=DEFINITION span=47:9-47:15
+occurrence element=UNKNOWN:append@48 kind=DEFINITION span=48:15-48:21
+occurrence element=UNKNOWN:clear@283 kind=DEFINITION span=283:15-283:20
+occurrence element=UNKNOWN:clearMove@220 kind=DEFINITION span=220:11-220:20
+occurrence element=UNKNOWN:clone@194 kind=DEFINITION span=194:21-194:26
+occurrence element=UNKNOWN:inRange@114 kind=DEFINITION span=114:15-114:22
+occurrence element=UNKNOWN:inRange@127 kind=DEFINITION span=127:15-127:22
+occurrence element=UNKNOWN:inRange@173 kind=DEFINITION span=173:16-173:23
+occurrence element=UNKNOWN:input@6 kind=DEFINITION span=6:13-6:18
+occurrence element=UNKNOWN:int@6 kind=DEFINITION span=6:9-6:12
+occurrence element=UNKNOWN:isEmpty@116 kind=DEFINITION span=116:15-116:22
+occurrence element=UNKNOWN:isEmpty@129 kind=DEFINITION span=129:11-129:18
+occurrence element=UNKNOWN:isEmpty@176 kind=DEFINITION span=176:18-176:25
+occurrence element=UNKNOWN:isEmpty@211 kind=DEFINITION span=211:18-211:25
+occurrence element=UNKNOWN:isFull@120 kind=DEFINITION span=120:11-120:17
+occurrence element=UNKNOWN:isFull@217 kind=DEFINITION span=217:37-217:43
+occurrence element=UNKNOWN:main@308 kind=DEFINITION span=308:2-308:6
+occurrence element=UNKNOWN:makeMove@214 kind=DEFINITION span=214:11-214:19
+occurrence element=UNKNOWN:makeMove@270 kind=DEFINITION span=270:16-270:24
+occurrence element=UNKNOWN:numberIn@165 kind=DEFINITION span=165:14-165:22
+occurrence element=UNKNOWN:numberIn@167 kind=DEFINITION span=167:14-167:22
+occurrence element=UNKNOWN:numberIn@291 kind=DEFINITION span=291:16-291:24
+occurrence element=UNKNOWN:numberOut@71 kind=DEFINITION span=71:4-71:13
+occurrence element=UNKNOWN:opponent@218 kind=DEFINITION span=218:45-218:53
+occurrence element=UNKNOWN:opponent@236 kind=DEFINITION span=236:30-236:38
+occurrence element=UNKNOWN:print@10 kind=DEFINITION span=10:2-10:7
+occurrence element=UNKNOWN:print@14 kind=DEFINITION span=14:2-14:7
+occurrence element=UNKNOWN:randint@2 kind=DEFINITION span=2:20-2:27
+occurrence element=UNKNOWN:randint@228 kind=DEFINITION span=228:9-228:16
+occurrence element=UNKNOWN:range@206 kind=DEFINITION span=206:12-206:17
+occurrence element=UNKNOWN:range@208 kind=DEFINITION span=208:13-208:18
+occurrence element=UNKNOWN:range@268 kind=DEFINITION span=268:12-268:17
+occurrence element=UNKNOWN:range@281 kind=DEFINITION span=281:12-281:17
+occurrence element=UNKNOWN:range@44 kind=DEFINITION span=44:12-44:17
+occurrence element=UNKNOWN:range@46 kind=DEFINITION span=46:13-46:18
+occurrence element=UNKNOWN:range@54 kind=DEFINITION span=54:12-54:17
+occurrence element=UNKNOWN:range@55 kind=DEFINITION span=55:13-55:18
+occurrence element=UNKNOWN:range@62 kind=DEFINITION span=62:12-62:17
+occurrence element=UNKNOWN:range@63 kind=DEFINITION span=63:13-63:18
+occurrence element=UNKNOWN:range@70 kind=DEFINITION span=70:14-70:19
+occurrence element=UNKNOWN:range@73 kind=DEFINITION span=73:15-73:20
+occurrence element=UNKNOWN:run@304 kind=DEFINITION span=304:13-304:16
+occurrence element=UNKNOWN:sameInRow@234 kind=DEFINITION span=234:12-234:21
+occurrence element=UNKNOWN:sameInRow@236 kind=DEFINITION span=236:14-236:23
+occurrence element=UNKNOWN:sameInRow@238 kind=DEFINITION span=238:14-238:23
+occurrence element=UNKNOWN:sameInRow@272 kind=DEFINITION span=272:19-272:28
+occurrence element=UNKNOWN:show@266 kind=DEFINITION span=266:15-266:19
+occurrence element=UNKNOWN:show@271 kind=DEFINITION span=271:16-271:20
+occurrence element=UNKNOWN:start@303 kind=DEFINITION span=303:18-303:23
+occurrence element=UNKNOWN:str@10 kind=DEFINITION span=10:8-10:11
+occurrence element=UNKNOWN:stringOut@153 kind=DEFINITION span=153:3-153:12
+occurrence element=UNKNOWN:stringOut@154 kind=DEFINITION span=154:3-154:12
+occurrence element=UNKNOWN:stringOut@164 kind=DEFINITION span=164:3-164:12
+occurrence element=UNKNOWN:stringOut@166 kind=DEFINITION span=166:3-166:12
+occurrence element=UNKNOWN:stringOut@168 kind=DEFINITION span=168:3-168:12
+occurrence element=UNKNOWN:stringOut@174 kind=DEFINITION span=174:4-174:13
+occurrence element=UNKNOWN:stringOut@177 kind=DEFINITION span=177:4-177:13
+occurrence element=UNKNOWN:stringOut@251 kind=DEFINITION span=251:3-251:12
+occurrence element=UNKNOWN:stringOut@261 kind=DEFINITION span=261:3-261:12
+occurrence element=UNKNOWN:stringOut@273 kind=DEFINITION span=273:5-273:14
+occurrence element=UNKNOWN:stringOut@274 kind=DEFINITION span=274:5-274:14
+occurrence element=UNKNOWN:stringOut@277 kind=DEFINITION span=277:3-277:12
+occurrence element=UNKNOWN:stringOut@288 kind=DEFINITION span=288:4-288:13
+occurrence element=UNKNOWN:stringOut@289 kind=DEFINITION span=289:4-289:13
+occurrence element=UNKNOWN:stringOut@290 kind=DEFINITION span=290:4-290:13
+occurrence element=UNKNOWN:stringOut@298 kind=DEFINITION span=298:4-298:13
+occurrence element=UNKNOWN:stringOut@69 kind=DEFINITION span=69:3-69:12
+occurrence element=UNKNOWN:stringOut@72 kind=DEFINITION span=72:4-72:13
+occurrence element=UNKNOWN:stringOut@75 kind=DEFINITION span=75:6-75:15
+occurrence element=UNKNOWN:stringOut@77 kind=DEFINITION span=77:6-77:15
+occurrence element=UNKNOWN:stringOut@79 kind=DEFINITION span=79:6-79:15
+occurrence element=UNKNOWN:stringOut@81 kind=DEFINITION span=81:6-81:15
+occurrence element=UNKNOWN:stringOut@83 kind=DEFINITION span=83:5-83:14
+occurrence element=UNKNOWN:stringOut@84 kind=DEFINITION span=84:3-84:12
+occurrence element=UNKNOWN:turn@270 kind=DEFINITION span=270:32-270:36
+occurrence element=VARIABLE:count@89 kind=DEFINITION span=89:3-89:8
+occurrence element=VARIABLE:field@53 kind=DEFINITION span=53:3-53:8
+occurrence element=VARIABLE:move@156 kind=DEFINITION span=156:4-156:8
+occurrence element=VARIABLE:move@163 kind=DEFINITION span=163:3-163:7
+occurrence element=VARIABLE:move@203 kind=DEFINITION span=203:3-203:7
+occurrence element=VARIABLE:node@195 kind=DEFINITION span=195:3-195:7
+occurrence element=VARIABLE:node@200 kind=DEFINITION span=200:3-200:7
+occurrence element=VARIABLE:player@269 kind=DEFINITION span=269:4-269:10
+occurrence element=VARIABLE:playerIndex@267 kind=DEFINITION span=267:3-267:14
+occurrence element=VARIABLE:playerIndex@276 kind=DEFINITION span=276:4-276:15
+occurrence element=VARIABLE:row@45 kind=DEFINITION span=45:4-45:7
+occurrence element=VARIABLE:sameMove@204 kind=DEFINITION span=204:3-204:11
+occurrence element=VARIABLE:sameMove@225 kind=DEFINITION span=225:6-225:14
+occurrence element=VARIABLE:selection@291 kind=DEFINITION span=291:4-291:13
+occurrence element=VARIABLE:tempField@194 kind=DEFINITION span=194:3-194:12
+occurrence element=VARIABLE:tictactoe@302 kind=DEFINITION span=302:2-302:11
+occurrence element=VARIABLE:total@88 kind=DEFINITION span=88:3-88:8
+occurrence element=VARIABLE:turnValue@216 kind=DEFINITION span=216:5-216:14
+occurrence element=VARIABLE:turnValue@218 kind=DEFINITION span=218:6-218:15
+access node=CONSTANT:TOKEN_NONE@23 kind=Public
+access node=CONSTANT:TOKEN_PLAYER_A@24 kind=Public
+access node=CONSTANT:TOKEN_PLAYER_B@25 kind=Public
+access node=VARIABLE:count@89 kind=Public
+access node=VARIABLE:field@53 kind=Public
+access node=VARIABLE:move@156 kind=Public
+access node=VARIABLE:move@163 kind=Public
+access node=VARIABLE:move@203 kind=Public
+access node=VARIABLE:node@195 kind=Public
+access node=VARIABLE:node@200 kind=Public
+access node=VARIABLE:player@269 kind=Public
+access node=VARIABLE:playerIndex@267 kind=Public
+access node=VARIABLE:playerIndex@276 kind=Public
+access node=VARIABLE:row@45 kind=Public
+access node=VARIABLE:sameMove@204 kind=Public
+access node=VARIABLE:sameMove@225 kind=Public
+access node=VARIABLE:selection@291 kind=Public
+access node=VARIABLE:tempField@194 kind=Public
+access node=VARIABLE:tictactoe@302 kind=Public
+access node=VARIABLE:total@88 kind=Public
+access node=VARIABLE:turnValue@216 kind=Public
+access node=VARIABLE:turnValue@218 kind=Public
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:ArtificialPlayer.__init__", node_id: NodeId(5989378751334661710), signature_hash: 1755476741879730270, normalized_signature: Some("shape:3866101950015543316"), body_hash: 6386031208097564258, start_line: 189, end_line: 190 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:ArtificialPlayer._evaluate", node_id: NodeId(-2961465523989852172), signature_hash: -8349635676682364848, normalized_signature: Some("shape:-5808747585328297118"), body_hash: -8398272015669385772, start_line: 233, end_line: 240 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:ArtificialPlayer._minMax", node_id: NodeId(4277291887458799085), signature_hash: 2418964870271381011, normalized_signature: Some("shape:-35501155718880390"), body_hash: -7032342299762495036, start_line: 199, end_line: 230 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:ArtificialPlayer.turn", node_id: NodeId(4165849448595149059), signature_hash: -1169764551011815891, normalized_signature: Some("shape:-7355955248722865667"), body_hash: -7032459764732231503, start_line: 193, end_line: 196 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Field.__init__", node_id: NodeId(2608793095535553549), signature_hash: -5575150427984782109, normalized_signature: Some("shape:-5472095419973164130"), body_hash: -1876883133129826800, start_line: 42, end_line: 49 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Field.clear", node_id: NodeId(7003162059303496426), signature_hash: -6169274095310701782, normalized_signature: Some("shape:-2624939224003736862"), body_hash: 908476727114895809, start_line: 61, end_line: 65 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Field.clearMove", node_id: NodeId(2608317473481884691), signature_hash: -9048124430405793411, normalized_signature: Some("shape:-8858423963534275558"), body_hash: 6123819446525943392, start_line: 126, end_line: 134 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Field.clone", node_id: NodeId(2411219944413668106), signature_hash: 1378355590425012202, normalized_signature: Some("shape:-1444109967516730316"), body_hash: 4081137360906492718, start_line: 52, end_line: 58 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Field.inRange", node_id: NodeId(3929423940423021163), signature_hash: 6370111462321436821, normalized_signature: Some("outline:-1792392611245487894"), body_hash: -3881089500508782279, start_line: 101, end_line: 102 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Field.isEmpty", node_id: NodeId(8085543292579253070), signature_hash: 1497344284946948862, normalized_signature: Some("outline:-1792392611245487894"), body_hash: 474654353539328972, start_line: 105, end_line: 106 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Field.isFull", node_id: NodeId(-9122721243812861278), signature_hash: 6260677086336585810, normalized_signature: Some("outline:-1792392611245487894"), body_hash: 4724751421930111428, start_line: 109, end_line: 110 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Field.makeMove", node_id: NodeId(2036697598788759048), signature_hash: 4333676292522098868, normalized_signature: Some("shape:5636139822989682067"), body_hash: 8790910928787061859, start_line: 113, end_line: 123 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Field.opponent", node_id: NodeId(-7374923262064213286), signature_hash: 396845555584238298, normalized_signature: Some("outline:-1788451961570736570"), body_hash: -8317798079304444793, start_line: 28, end_line: 33 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Field.sameInRow", node_id: NodeId(-503403200566016048), signature_hash: 5931070487030413932, normalized_signature: Some("shape:-7212304814644848492"), body_hash: -1726395781560375072, start_line: 87, end_line: 98 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Field.show", node_id: NodeId(-4691435348074014098), signature_hash: 6545884105094088190, normalized_signature: Some("shape:-4913784757335701208"), body_hash: 6913586263552348062, start_line: 68, end_line: 84 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:HumanPlayer.__init__", node_id: NodeId(-2929626825153398959), signature_hash: 6565865036368802503, normalized_signature: Some("shape:7351140673194461088"), body_hash: -2834321968593391181, start_line: 148, end_line: 149 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:HumanPlayer._check", node_id: NodeId(987095681779573124), signature_hash: 5194962015948308960, normalized_signature: Some("shape:-8445830967205959128"), body_hash: 2839570124550177389, start_line: 172, end_line: 179 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:HumanPlayer._input", node_id: NodeId(4648841601402798328), signature_hash: -6907293988443763388, normalized_signature: Some("shape:8763965824551667739"), body_hash: 7553101411172641673, start_line: 162, end_line: 169 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:HumanPlayer.turn", node_id: NodeId(5581724472880576372), signature_hash: -7215589493974656048, normalized_signature: Some("shape:9163240756385270039"), body_hash: 1870951159174135186, start_line: 152, end_line: 159 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Move.__init__", node_id: NodeId(832642991965325378), signature_hash: 1015947852990068354, normalized_signature: Some("outline:-1795207361013140379"), body_hash: 8243943182077432973, start_line: 37, end_line: 39 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Node.__init__", node_id: NodeId(-1598687336164433347), signature_hash: -2849779087175510493, normalized_signature: Some("outline:-1795207361013140379"), body_hash: -8427981612631534571, start_line: 184, end_line: 186 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Player.__init__", node_id: NodeId(-4727475047681808898), signature_hash: 2323012146506699470, normalized_signature: Some("outline:-1795207361013140379"), body_hash: 7415511865380373646, start_line: 138, end_line: 140 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:Player.turn", node_id: NodeId(1168914400897689075), signature_hash: -6236141171673811747, normalized_signature: Some("outline:-1792392611245487894"), body_hash: 980230644416580105, start_line: 143, end_line: 144 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:TicTacToe.__init__", node_id: NodeId(-6549864785023178987), signature_hash: 8118541719181814827, normalized_signature: Some("shape:959675877598862817"), body_hash: -8282644452411426388, start_line: 244, end_line: 246 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:TicTacToe._reset", node_id: NodeId(-3486612097034760113), signature_hash: 3655216159136547257, normalized_signature: Some("shape:125358581695886382"), body_hash: 1062078011439877800, start_line: 280, end_line: 283 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:TicTacToe._selectPlayer", node_id: NodeId(-2265567783195135033), signature_hash: 8095590326225479217, normalized_signature: Some("shape:8400806291373403838"), body_hash: -498213367202910865, start_line: 286, end_line: 298 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:TicTacToe.run", node_id: NodeId(-7637538619124929910), signature_hash: 415849543742481066, normalized_signature: Some("shape:8105026971534037408"), body_hash: -1236957507326693843, start_line: 265, end_line: 277 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:TicTacToe.start", node_id: NodeId(7393767884582127243), signature_hash: -2173138682723514523, normalized_signature: Some("shape:-163612864639532168"), body_hash: 6687092593975261804, start_line: 249, end_line: 262 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:main", node_id: NodeId(-1437938411531175156), signature_hash: -4671339478033693080, normalized_signature: Some("shape:-1515120247180913178"), body_hash: -3211263890253540770, start_line: 301, end_line: 304 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:numberIn", node_id: NodeId(7935436492154356219), signature_hash: 2477812878330356949, normalized_signature: Some("shape:-3459214452230704719"), body_hash: -7092376848787408438, start_line: 5, end_line: 6 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:numberOut", node_id: NodeId(770247654827272598), signature_hash: -1579019679195996938, normalized_signature: Some("shape:-8785239976009734509"), body_hash: -4913445228260769170, start_line: 9, end_line: 10 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "13:stringOut", node_id: NodeId(-7519405162588533286), signature_hash: -5818630870471287222, normalized_signature: Some("shape:7342203676796833973"), body_hash: 3475513809850346643, start_line: 13, end_line: 14 }
+callable_state CallableProjectionState { file_id: 4297592266589437056, symbol_key: "__file_structural__", node_id: NodeId(4297592266589437056), signature_hash: -7785555724303284565, normalized_signature: None, body_hash: -1540130469466338248, start_line: 1, end_line: 308 }

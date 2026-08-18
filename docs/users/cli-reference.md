@@ -65,9 +65,12 @@ Impact hints are not test results.
 Only trust output when `retrieval status` reports `retrieval_mode: "full"`.
 
 ```sh
-codestory-cli packet --project <repo> --question "<broad task question>" --budget compact
+codestory-cli packet --project <repo> --question "<broad task question>"
 codestory-cli search --project <repo> --query "<symbol or behavior>" --why
 ```
+
+Packets use the standard evidence budget by default. Pass `--budget compact`
+when minimizing context matters more than keeping the fuller evidence set.
 
 Degraded retrieval is navigation help only. See [Glossary](../glossary.md#retrieval-mode).
 
@@ -90,6 +93,63 @@ recovery after status or `doctor` identifies that exact cache and coordinated
 refresh cannot converge. Verify the path is under the active CodeStory cache
 root, preserve the old directory until the replacement is healthy, and never
 clean a user cache merely to make tests pass.
+
+## Roll a retrieval generation back
+
+CodeStory retains one deeply verified previous retrieval generation beside the
+current one. When broad retrieval stops being live-ready but the retained
+generation still proves out, activate it instead of rebuilding:
+
+```sh
+codestory-cli retrieval activate-rollback --project <repo> --dry-run
+codestory-cli retrieval activate-rollback --project <repo>
+```
+
+`--dry-run` runs every validation and changes nothing. Activation re-proves the
+retained generation against the live core publication and the artifacts on disk
+before it moves the pointer, so it can only ever refuse — with a typed code such
+as `rollback_evidence_invalid` or `rollback_not_live_ready` — never serve
+something the normal publication fence would have rejected. Activation consumes
+the retained pointer: the generation you stepped away from is not re-armed as a
+rollback target.
+
+`doctor` reports the retained generation and recommends this command when
+retrieval is not live-ready. `doctor` never activates anything itself.
+
+## Downgrade to an older CodeStory
+
+Schema migrations are forward-only. An older CodeStory pointed at a cache a
+newer release wrote fails closed with `Unsupported database schema version`, and
+`--refresh full` fails closed on it too. That is deliberate: the alternative is
+destroying a newer database. The executable recovery is to quarantine the
+derived cache and rebuild it.
+
+```sh
+codestory-cli cache reset --project <repo> --derived-only --dry-run
+codestory-cli cache reset --project <repo> --derived-only --confirm
+codestory-cli index --project <repo> --refresh full
+codestory-cli retrieval index --project <repo> --refresh full
+codestory-cli doctor --project <repo> --format markdown
+```
+
+`cache reset` requires `--derived-only` and exactly one of `--dry-run` or
+`--confirm`. It moves derived state — the core database and its SQLite
+siblings, the rollback backup, promotion journals, the search trees, and
+local-refresh state — into a timestamped `derived-reset-quarantine/` directory
+inside the same cache root. Nothing is deleted, so a mistaken reset is
+recoverable by moving the quarantined files back. It never opens the database,
+which is what makes it usable against a schema it cannot read.
+
+User-authored annotations live in a sidecar beside the cache and are preserved
+in place; the command reports exactly what it moved and what it preserved.
+The reset holds this project's index-writer and promotion locks for the whole
+move, so a concurrent indexing run or publication either finishes first or is
+refused with `cache_busy`; if neither releases within the wait budget the reset
+itself refuses and moves nothing.
+
+Retrieval generations are reclaimed separately by
+`codestory-cli retrieval inventory --project <repo> --apply` once the rebuild
+has published a new generation.
 
 ## Index and ground
 
@@ -117,9 +177,16 @@ Environment variables win over files.
 Configuration is resolved independently for each project and retained for the
 life of that project runtime. Multi-project stdio captures the user home,
 project-network opt-in, cache root, and runtime environment once; it neither
-rewrites nor re-reads them when requests switch repositories. Trusted project files
-may also set `embedding_query_prefix` and `embedding_document_prefix` as part of
-their per-project embedding contract.
+rewrites nor re-reads them when requests switch repositories.
+
+[Configuration reference](configuration-reference.md) lists every honoured
+`.codestory.toml` key and environment variable; it is generated from the one
+registry the code reads, so a key that is absent there does nothing. Embedding
+query and document prefixes are compile-time constants of the pinned model and
+are not configurable. A file may declare `schema_version`: version 1 (the
+default when the key is absent) warns about unknown keys by name and ignores
+them, version 2 rejects them, and a higher version fails with
+`unsupported_config_schema`.
 
 Project `.codestory.toml` cannot choose cache roots. It also cannot choose
 network egress settings by default. A trusted operator may set
@@ -138,6 +205,8 @@ Embedding never uses a network endpoint. Put `cache_dir` in user home `.codestor
 | Change impact | `affected` with `--stdin` from `git diff` | Pick focused tests; not a test run |
 | Readiness | `agent preflight --format json` | `codestory://status{?project}` when MCP is live |
 | Broad evidence | `retrieval status --format json` | `packet` or `search` only after `full` mode |
+| Broad retrieval broke and a rollback is retained | `retrieval activate-rollback --project <repo> --dry-run` | Rerun without `--dry-run` once validation passes |
+| Rolled back CodeStory onto a newer cache | `cache reset --project <repo> --derived-only --dry-run` | `--confirm`, then `index --refresh full` |
 
 ## Managed search internals
 

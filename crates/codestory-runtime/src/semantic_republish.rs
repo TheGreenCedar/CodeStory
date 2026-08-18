@@ -263,7 +263,13 @@ fn stage_semantic_projection_publication(
         .map(|record| {
             let mut candidate = source_policy_exclusion_candidate(record);
             candidate.policy_version = source_index_policy.policy_version.clone();
-            candidate.byte_cap = source_index_policy.byte_cap;
+            // Rebind to the cap that governs *this path*, not the parser
+            // headroom. Stamping the headroom on a structural row makes the
+            // row stop qualifying — `observed_size > byte_cap` becomes false
+            // once the cap doubles — and publication then refuses it on every
+            // attempt, with no re-index able to clear it. This was a no-op
+            // while every row carried the headroom.
+            candidate.byte_cap = source_index_policy.effective_byte_cap(&candidate.normalized_path);
             candidate.structural_unit_cap = source_index_policy.structural_unit_cap;
             candidate
         })
@@ -496,6 +502,7 @@ pub(super) fn semantic_projection_republish_for_runtime(
                 #[cfg(test)]
                 publication: publication.clone(),
                 prepared_search_state: Some(prepared_search_state),
+                unchanged_publication: false,
             },
             publication,
             prepared.stats.symbol_search_docs_written,

@@ -57,6 +57,8 @@ pub struct RepoReportHandoff {
     pub top_risk: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_command: Option<String>,
+    #[serde(flatten)]
+    pub ready_lease: crate::ReadyLeaseEvidence,
 }
 
 #[derive(Debug, Clone, Serialize)]

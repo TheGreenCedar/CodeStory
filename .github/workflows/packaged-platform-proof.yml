@@ -433,12 +433,19 @@ jobs:
             linker_log="$timing_dir/msvc-link-time.log"
             build_started_ms="$(node -p 'Date.now()')"
             export RUSTFLAGS="-C link-arg=/TIME"
+            # The captured linker trace is read as timing evidence as soon as
+            # this boundary closes, so stderr goes to a file the shell has
+            # already closed rather than to an unwaited process substitution
+            # that can still be writing when the trace is selected.
+            build_status=0
             build_package_graph \
               --message-format=json-render-diagnostics \
               --timings \
-              2> >(tee "$linker_log" >&2) \
-              | tee "$cargo_json"
+              2> "$linker_log" \
+              | tee "$cargo_json" || build_status=$?
             build_ended_ms="$(node -p 'Date.now()')"
+            cat "$linker_log" >&2
+            test "$build_status" -eq 0
             build_elapsed_ms=$((build_ended_ms - build_started_ms))
             test "$build_elapsed_ms" -ge 0
 
@@ -474,11 +481,15 @@ jobs:
                 fs.cpSync(source, destination, { recursive: true });
               }
             '
-            linker_rows="$(grep -Eic '(^|[[:space:]])time([[:space:](:]|$)' "$linker_log" || true)"
-            {
-              echo "- Exact release graph build: ${build_elapsed_ms} ms"
-              echo "- MSVC /TIME linker rows retained: ${linker_rows}"
-            } >> "$GITHUB_STEP_SUMMARY"
+            echo "- Exact release graph build (cargo_graph): ${build_elapsed_ms} ms" \
+              >> "$GITHUB_STEP_SUMMARY"
+            # msvc_link is its own reported interval, selected from the explicit
+            # link /TIME boundaries inside the trace above. Unusable timing is
+            # observational: the selector records `unavailable` and exits 0.
+            node .github/scripts/windows-link-timing.mjs select \
+              --input "$linker_log" \
+              --out "$timing_dir/windows-link-timing.json" \
+              --build-elapsed-ms "$build_elapsed_ms"
           else
             timing_dir="target/package-build-contract/${{ matrix.asset_target }}"
             mkdir -p "$timing_dir"

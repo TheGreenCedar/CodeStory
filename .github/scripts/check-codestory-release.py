@@ -14,9 +14,12 @@ SEMVER_RE = re.compile(
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
+STABLE_RELEASE_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 
 PLUGIN_MANIFESTS = (
+    Path("plugins/codestory/plugin.json"),
     Path("plugins/codestory/.codex-plugin/plugin.json"),
+    Path("plugins/codestory/.cursor-plugin/plugin.json"),
     Path("plugins/codestory/.claude-plugin/plugin.json"),
     Path("plugins/codestory/.github/plugin/plugin.json"),
 )
@@ -107,6 +110,15 @@ def validate_model_producer(root: Path, expected: str) -> None:
 def fail(message: str) -> None:
     print(f"error: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def stable_release_version(value: str) -> str:
+    expected = value.removeprefix("v")
+    if not STABLE_RELEASE_RE.fullmatch(expected):
+        raise ValueError(
+            f"version must be a stable release version like 0.17.0, got {value!r}"
+        )
+    return expected
 
 
 def compare_semver_core(left: str, right: str) -> int:
@@ -221,15 +233,21 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    expected = args.version.removeprefix("v")
-    if not SEMVER_RE.fullmatch(expected):
-        fail(f"version must be strict semver like 0.7.0, got {args.version!r}")
+    try:
+        expected = stable_release_version(args.version)
+    except ValueError as exc:
+        fail(str(exc))
 
     root = Path(args.project_root).resolve()
     cli_manifest = root / "crates" / "codestory-cli" / "Cargo.toml"
     cli_name, cli_version = package_info(cli_manifest)
     if cli_name != "codestory-cli":
         fail(f"{cli_manifest} package.name is {cli_name!r}, expected 'codestory-cli'")
+    if not STABLE_RELEASE_RE.fullmatch(cli_version):
+        fail(
+            f"codestory-cli version surface must be a stable release version like 0.17.0, "
+            f"got {cli_version!r}"
+        )
 
     if args.lane == "plugin":
         try:

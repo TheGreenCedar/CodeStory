@@ -22,13 +22,15 @@ pub use client::{
 pub use qualification_control::{
     EmbeddingQualificationAttemptResult, EmbeddingQualificationOperationResult,
     EmbeddingQualificationParameters, EmbeddingQualificationRequest, EmbeddingQualificationResult,
+    QualificationGateEnvironment, qualification_gate_environment,
     run_per_user_embedding_qualification,
 };
 pub use qualification_worker::{
-    EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, EmbeddingQualificationWorkerError,
-    EmbeddingQualificationWorkerMeasurement, EmbeddingQualificationWorkerMeasurementSpan,
-    EmbeddingQualificationWorkerOutput, EmbeddingQualificationWorkerProtocolExchange,
-    EmbeddingQualificationWorkerQueueOperation, EmbeddingQualificationWorkerRequest,
+    EMBEDDING_BUSY_RETRY_QUEUE_CLASS, EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
+    EmbeddingQualificationWorkerError, EmbeddingQualificationWorkerMeasurement,
+    EmbeddingQualificationWorkerMeasurementSpan, EmbeddingQualificationWorkerOutput,
+    EmbeddingQualificationWorkerProtocolExchange, EmbeddingQualificationWorkerQueueOperation,
+    EmbeddingQualificationWorkerRequest,
 };
 pub use server::{
     EmbeddingServerBudgets, PerUserEmbeddingServerConfig, run_per_user_embedding_server,
@@ -41,7 +43,7 @@ pub use transport::{
 };
 
 use exchange::{
-    configure_exchange_timeout, decode_vectors, duration_ms, elapsed_since, embedding_scope_id,
+    arm_exchange_deadline, decode_vectors, duration_ms, elapsed_since, embedding_scope_id,
     encode_vectors, exchange, hello, is_server_loss, is_sha256, positive_duration_ms, read_frame,
     request, response_result, validate_engine_identity, validate_engine_server_identity,
     validate_lease_server_identity, validate_same_server, validate_server_snapshot, vectors_result,
@@ -67,10 +69,11 @@ pub use protocol::{
     PER_USER_EMBEDDING_MAX_INPUT_BYTES, PER_USER_EMBEDDING_MAX_METADATA_BYTES,
     PER_USER_EMBEDDING_MAX_PAYLOAD_BYTES, PER_USER_EMBEDDING_MEASUREMENT_PROTOCOL_SHA256,
     PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION, PER_USER_EMBEDDING_PROTOCOL_SHA256,
-    PER_USER_EMBEDDING_PROTOCOL_V1, PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
-    PER_USER_EMBEDDING_SERVER_PROOF_MARKER, PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION,
-    PerUserEmbeddingError, embedding_capacity_pressure,
-    embedding_qualification_watchdog_marker_filename, embedding_retry_state,
+    PER_USER_EMBEDDING_PROTOCOL_V1, PER_USER_EMBEDDING_QUERY_BATCH_MAX,
+    PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS, PER_USER_EMBEDDING_SERVER_PROOF_MARKER,
+    PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION, PerUserEmbeddingError,
+    embedding_capacity_pressure, embedding_qualification_watchdog_marker_filename,
+    embedding_retry_state,
 };
 use qualification_control::ServerQualificationControl;
 #[cfg(all(test, windows))]

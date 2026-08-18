@@ -1,23 +1,89 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { createHash } = require('crypto');
 
-const isCopilot = Boolean(process.env.COPILOT_PLUGIN_DATA);
-const isCodex = !isCopilot && Boolean(process.env.PLUGIN_DATA);
+const pluginRoot = path.dirname(__dirname);
+const cursorDogfoodMarker = 'CODESTORY_CURSOR_DOGFOOD';
+const isCursor = confirmedCursorIdentity();
+const isCopilot = !isCursor && Boolean(process.env.COPILOT_PLUGIN_DATA);
+const isCodex = !isCursor && !isCopilot && Boolean(process.env.PLUGIN_DATA);
 
 const STATE_FILE = '.codestory-active';
 const THREAD_STATE_PREFIX = '.codestory-active-thread-';
 const DIRTY_MARKER_SCHEMA_VERSION = 1;
 const DIRTY_MARKER_SAMPLE_LIMIT = 20;
-const DIRTY_HOOK_NAMES = ['post-checkout', 'post-merge', 'post-rewrite'];
-const DIRTY_HOOK_START = '# >>> codestory dirty marker >>>';
-const DIRTY_HOOK_END = '# <<< codestory dirty marker <<<';
+
+function usablePluginDataDir(dataDir) {
+  try {
+    if (fs.existsSync(dataDir)) return fs.statSync(dataDir).isDirectory();
+    const dataRoot = path.dirname(dataDir);
+    if (fs.existsSync(dataRoot)) return fs.statSync(dataRoot).isDirectory();
+    fs.accessSync(path.dirname(dataRoot), fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function inferredCodexPluginDataDir(root = pluginRoot) {
+  const parts = path.resolve(root).split(/[\\/]+/u);
+  for (let index = 0; index <= parts.length - 6; index += 1) {
+    if (
+      parts[index].toLowerCase() !== '.codex'
+      || parts[index + 1] !== 'plugins'
+      || parts[index + 2] !== 'cache'
+      || parts[index + 4] !== 'codestory'
+    ) {
+      continue;
+    }
+    const codexRoot = parts.slice(0, index + 1).join(path.sep);
+    const dataDir = path.join(codexRoot, 'plugins', 'data', `codestory-${parts[index + 3]}`);
+    if (usablePluginDataDir(dataDir)) return dataDir;
+  }
+  return null;
+}
+
+function inferredCursorPluginDataDir(
+  root = pluginRoot,
+  home = process.env.HOME || process.env.USERPROFILE || os.homedir(),
+  options = {},
+) {
+  const parts = path.resolve(root).split(/[\\/]+/u);
+  for (let index = 0; index <= parts.length - 5; index += 1) {
+    if (
+      parts[index].toLowerCase() !== '.cursor'
+      || parts[index + 1] !== 'plugins'
+      || parts[index + 2] !== 'cache'
+    ) {
+      continue;
+    }
+    const packageIndex = parts.findIndex(
+      (part, candidateIndex) => candidateIndex >= index + 3 && part.toLowerCase() === 'codestory',
+    );
+    if (packageIndex === -1 || packageIndex === parts.length - 1) continue;
+    const cursorRoot = parts.slice(0, index + 1).join(path.sep);
+    const dataDir = path.join(cursorRoot, 'plugins', 'data', 'codestory');
+    if (usablePluginDataDir(dataDir)) return dataDir;
+  }
+  if (!confirmedCursorIdentity(options.env || process.env)) return null;
+  const fallback = path.join(home, '.cursor', 'plugins', 'data', 'codestory');
+  return usablePluginDataDir(fallback) ? fallback : null;
+}
+
+function confirmedCursorIdentity(env = process.env) {
+  return Boolean(
+    env.CURSOR_PLUGIN_ROOT
+    || env[cursorDogfoodMarker] === '1'
+  );
+}
 
 function pluginDataDir() {
-  if (process.env.PLUGIN_DATA) return process.env.PLUGIN_DATA;
-  if (process.env.COPILOT_PLUGIN_DATA) return process.env.COPILOT_PLUGIN_DATA;
-  if (process.env.CODESTORY_PLUGIN_DATA) return process.env.CODESTORY_PLUGIN_DATA;
-  return null;
+  return process.env.PLUGIN_DATA
+    || process.env.COPILOT_PLUGIN_DATA
+    || process.env.CODESTORY_PLUGIN_DATA
+    || inferredCodexPluginDataDir()
+    || inferredCursorPluginDataDir();
 }
 
 function stateFilePath() {
@@ -128,175 +194,12 @@ function writeDirtyMarker(projectRoot, options = {}) {
   }
 }
 
-function shellQuote(value) {
-  return `'${String(value).replace(/\\/g, '/').replace(/'/g, `'\\''`)}'`;
-}
-
-function gitDirForProject(projectRoot) {
-  const dotGit = path.join(normalizeProjectRoot(projectRoot), '.git');
-  try {
-    const stat = fs.statSync(dotGit);
-    if (stat.isDirectory()) return dotGit;
-    if (stat.isFile()) {
-      const text = fs.readFileSync(dotGit, 'utf8').trim();
-      const match = text.match(/^gitdir:\s*(.+)$/iu);
-      if (!match) return null;
-      return path.resolve(path.dirname(dotGit), match[1]);
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
-function hookManagerPaths(projectRoot, options = {}) {
-  const dataDir = options.pluginDataDir || pluginDataDir();
-  const gitDir = gitDirForProject(projectRoot);
-  const scriptPath = path.join(__dirname, 'codestory-dirty-hook.cjs');
-  return {
-    dataDir,
-    gitDir,
-    hooksDir: gitDir ? path.join(gitDir, 'hooks') : null,
-    nodePath: process.execPath,
-    projectRoot: normalizeProjectRoot(projectRoot),
-    scriptPath,
-  };
-}
-
-function dirtyHookBlock(paths, hookName) {
-  const command = [
-    shellQuote(paths.nodePath),
-    shellQuote(paths.scriptPath),
-    'mark',
-    '--project',
-    shellQuote(paths.projectRoot),
-    '--plugin-data',
-    shellQuote(paths.dataDir),
-    '--source',
-    shellQuote(`git-hook:${hookName}`),
-    '|| true',
-  ].join(' ');
-  return `${DIRTY_HOOK_START}\n${command}\n${DIRTY_HOOK_END}`;
-}
-
-function splitDirtyHookBlock(text) {
-  const start = text.indexOf(DIRTY_HOOK_START);
-  const end = text.indexOf(DIRTY_HOOK_END);
-  if (start === -1 || end === -1 || end < start) {
-    return { before: text, block: null, after: '' };
-  }
-  const afterStart = end + DIRTY_HOOK_END.length;
-  return {
-    before: text.slice(0, start).replace(/[ \t]*\r?\n?$/u, ''),
-    block: text.slice(start, afterStart),
-    after: text.slice(afterStart).replace(/^\r?\n/u, ''),
-  };
-}
-
-function dirtyHookState(hookPath, expectedBlock) {
-  if (!fs.existsSync(hookPath)) {
-    return { state: 'not_installed', path: hookPath };
-  }
-  const text = fs.readFileSync(hookPath, 'utf8');
-  const parts = splitDirtyHookBlock(text);
-  if (!parts.block) {
-    return { state: 'foreign_hook_present', path: hookPath };
-  }
-  return {
-    state: parts.block === expectedBlock ? 'installed' : 'uninstall_required',
-    path: hookPath,
-  };
-}
-
-function dirtyHookSummary(results) {
-  const states = results.map((result) => result.state);
-  if (states.every((state) => state === 'installed')) return 'installed';
-  if (states.every((state) => state === 'not_installed')) return 'not_installed';
-  if (states.some((state) => state === 'uninstall_required')) return 'uninstall_required';
-  if (states.some((state) => state === 'installed')) return 'partially_installed';
-  if (states.some((state) => state === 'foreign_hook_present')) return 'foreign_hook_present';
-  return 'unknown';
-}
-
-function dirtyHookStatus(projectRoot, options = {}) {
-  const paths = hookManagerPaths(projectRoot, options);
-  if (!paths.dataDir || !paths.hooksDir) {
-    return {
-      status: !paths.dataDir ? 'plugin_data_required' : 'not_a_git_repository',
-      project_root: paths.projectRoot,
-      hooks: [],
-    };
-  }
-  const hooks = DIRTY_HOOK_NAMES.map((hookName) => {
-    return {
-      hook: hookName,
-      ...dirtyHookState(path.join(paths.hooksDir, hookName), dirtyHookBlock(paths, hookName)),
-    };
-  });
-  return {
-    status: dirtyHookSummary(hooks),
-    project_root: paths.projectRoot,
-    plugin_data: paths.dataDir,
-    hooks,
-  };
-}
-
-function installDirtyHooks(projectRoot, options = {}) {
-  const paths = hookManagerPaths(projectRoot, options);
-  if (!paths.dataDir) throw new Error('plugin data path is required');
-  if (!paths.hooksDir) throw new Error('project is not a git repository');
-  fs.mkdirSync(paths.hooksDir, { recursive: true });
-  const hooks = DIRTY_HOOK_NAMES.map((hookName) => {
-    const hookPath = path.join(paths.hooksDir, hookName);
-    const expectedBlock = dirtyHookBlock(paths, hookName);
-    const state = dirtyHookState(hookPath, expectedBlock);
-    if (state.state === 'installed') return { hook: hookName, ...state, changed: false };
-    if (state.state === 'uninstall_required') {
-      return { hook: hookName, ...state, changed: false };
-    }
-    const existing = fs.existsSync(hookPath) ? fs.readFileSync(hookPath, 'utf8').trimEnd() : '#!/bin/sh';
-    const next = `${existing}\n\n${expectedBlock}\n`;
-    fs.writeFileSync(hookPath, next, { mode: 0o755 });
-    return { hook: hookName, ...dirtyHookState(hookPath, expectedBlock), changed: true };
-  });
-  return {
-    status: dirtyHookSummary(hooks),
-    project_root: paths.projectRoot,
-    plugin_data: paths.dataDir,
-    hooks,
-  };
-}
-
-function uninstallDirtyHooks(projectRoot, options = {}) {
-  const paths = hookManagerPaths(projectRoot, options);
-  if (!paths.hooksDir) throw new Error('project is not a git repository');
-  const hooks = DIRTY_HOOK_NAMES.map((hookName) => {
-    const hookPath = path.join(paths.hooksDir, hookName);
-    if (!fs.existsSync(hookPath)) {
-      return { hook: hookName, state: 'not_installed', path: hookPath, changed: false };
-    }
-    const text = fs.readFileSync(hookPath, 'utf8');
-    const parts = splitDirtyHookBlock(text);
-    if (!parts.block) {
-      return { hook: hookName, state: 'foreign_hook_present', path: hookPath, changed: false };
-    }
-    const next = [parts.before, parts.after].filter(Boolean).join('\n').trimEnd();
-    if (next && next.trim() !== '#!/bin/sh') {
-      fs.writeFileSync(hookPath, `${next}\n`, { mode: 0o755 });
-    } else {
-      fs.rmSync(hookPath, { force: true });
-    }
-    return { hook: hookName, ...dirtyHookState(hookPath, dirtyHookBlock(paths, hookName)), changed: true };
-  });
-  return {
-    status: dirtyHookSummary(hooks),
-    project_root: paths.projectRoot,
-    plugin_data: paths.dataDir,
-    hooks,
-  };
-}
-
 function writeHookOutput(event, context) {
+  if (isCursor) {
+    process.stdout.write(JSON.stringify({ additional_context: context }));
+    return;
+  }
+
   if (isCopilot) {
     process.stdout.write(JSON.stringify({ additionalContext: context }));
     return;
@@ -320,12 +223,14 @@ function writeHookOutput(event, context) {
 }
 
 module.exports = {
+  confirmedCursorIdentity,
+  cursorDogfoodMarker,
   dirtyMarkerPathForProject,
-  dirtyHookStatus,
-  installDirtyHooks,
+  inferredCodexPluginDataDir,
+  inferredCursorPluginDataDir,
+  pluginDataDir,
   readActiveState,
   rememberActiveState,
-  uninstallDirtyHooks,
   writeDirtyMarker,
   writeHookOutput,
 };

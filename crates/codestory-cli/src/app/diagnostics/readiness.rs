@@ -1,5 +1,5 @@
 use super::super::readiness_commands::doctor_sidecar_status_is_live_ready;
-use super::sidecar::doctor_sidecar_status_for_runtime;
+use super::sidecar::doctor_sidecar_status_for_profile;
 use crate::args::{ReadinessLaneOutput, RetrievalStatusOutput};
 use crate::display;
 use crate::runtime::RuntimeContext;
@@ -12,12 +12,11 @@ pub(in crate::app) fn agent_readiness_status(
     runtime: &RuntimeContext,
     run_id: Option<&str>,
 ) -> RetrievalStatusOutput {
-    let agent_runtime = runtime.sidecar.with_profile_and_run_id(
-        Some(&runtime.project_root),
-        codestory_retrieval::SidecarProfile::Agent,
+    doctor_sidecar_status_for_profile(
+        runtime,
+        codestory_runtime::RuntimeRetrievalProfile::Agent,
         run_id,
-    );
-    doctor_sidecar_status_for_runtime(runtime, agent_runtime)
+    )
 }
 
 pub(crate) fn build_readiness_lanes_for_runtime(
@@ -28,20 +27,16 @@ pub(crate) fn build_readiness_lanes_for_runtime(
 ) -> BTreeMap<String, ReadinessLaneOutput> {
     let project = display::clean_path_string(&runtime.project_root.to_string_lossy());
     let project_arg = display::quote_command_argument_value(&project);
-    let local_runtime = runtime.sidecar.with_profile_and_run_id(
-        Some(&runtime.project_root),
-        codestory_retrieval::SidecarProfile::Local,
+    let local_status = doctor_sidecar_status_for_profile(
+        runtime,
+        codestory_runtime::RuntimeRetrievalProfile::Local,
         None,
     );
-    let local_status = doctor_sidecar_status_for_runtime(runtime, local_runtime);
     let agent_status = selected_agent_status.cloned().unwrap_or_else(|| {
-        doctor_sidecar_status_for_runtime(
+        doctor_sidecar_status_for_profile(
             runtime,
-            runtime.sidecar.with_profile_and_run_id(
-                Some(&runtime.project_root),
-                codestory_retrieval::SidecarProfile::Agent,
-                agent_run_id,
-            ),
+            codestory_runtime::RuntimeRetrievalProfile::Agent,
+            agent_run_id,
         )
     });
     let agent_verdict = readiness
@@ -71,9 +66,11 @@ pub(in crate::app) fn agent_readiness_sidecar_runtime(
 ) -> codestory_retrieval::SidecarRuntimeConfig {
     crate::sidecar_runtime::for_project_with_run_id(
         project_root,
-        codestory_retrieval::SidecarProfile::Agent,
+        codestory_runtime::RuntimeRetrievalProfile::Agent,
         run_id,
     )
+    .as_raw_config_for_test()
+    .clone()
 }
 
 pub(in crate::app) fn readiness_lane_output(

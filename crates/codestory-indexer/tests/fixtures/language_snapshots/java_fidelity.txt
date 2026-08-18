@@ -1,0 +1,58 @@
+node ANNOTATION name=Override qn=Override canonical=<ROOT>/fidelity.java:Override#0 line=9 col=6 end=9:14 file=FILE:<ROOT>/fidelity.java@1
+node CLASS name=ConsoleNotifier qn=ConsoleNotifier canonical=<ROOT>/fidelity.java:ConsoleNotifier line=8 col=1 end=17:2 file=FILE:<ROOT>/fidelity.java@1
+node CLASS name=Event qn=Event canonical=<ROOT>/fidelity.java:Event line=29 col=1 end=35:2 file=FILE:<ROOT>/fidelity.java@1
+node CLASS name=FidelityEntry qn=FidelityEntry canonical=<ROOT>/fidelity.java:FidelityEntry line=59 col=1 end=64:2 file=FILE:<ROOT>/fidelity.java@1
+node CLASS name=Repository qn=Repository canonical=<ROOT>/fidelity.java:Repository line=19 col=1 end=27:2 file=FILE:<ROOT>/fidelity.java@1
+node CLASS name=Workflow qn=Workflow canonical=<ROOT>/fidelity.java:Workflow line=37 col=1 end=57:2 file=FILE:<ROOT>/fidelity.java@1
+node FIELD name=Event.name qn=Event.name canonical=<ROOT>/fidelity.java:Event.name#0 line=30 col=5 end=30:23 file=FILE:<ROOT>/fidelity.java@1
+node FILE name=<ROOT>/fidelity.java qn=<ROOT>/fidelity.java canonical=<ROOT>/fidelity.java:<ROOT>/fidelity.java:1 line=1 col=1 end=64:0 file=FILE:<ROOT>/fidelity.java@1
+node INTERFACE name=Notifier qn=Notifier canonical=<ROOT>/fidelity.java:Notifier line=4 col=1 end=6:2 file=FILE:<ROOT>/fidelity.java@1
+node METHOD name=ConsoleNotifier.notifyEvent qn=ConsoleNotifier.notifyEvent canonical=<ROOT>/fidelity.java:ConsoleNotifier.notifyEvent#0 line=9 col=5 end=12:6 file=FILE:<ROOT>/fidelity.java@1
+node METHOD name=ConsoleNotifier.writeLog qn=ConsoleNotifier.writeLog canonical=<ROOT>/fidelity.java:ConsoleNotifier.writeLog#0 line=14 col=5 end=16:6 file=FILE:<ROOT>/fidelity.java@1
+node METHOD name=Event.Event qn=Event.Event canonical=<ROOT>/fidelity.java:Event.Event#0 line=32 col=5 end=34:6 file=FILE:<ROOT>/fidelity.java@1
+node METHOD name=FidelityEntry.orchestrateJava qn=FidelityEntry.orchestrateJava canonical=<ROOT>/fidelity.java:FidelityEntry.orchestrateJava#0 line=60 col=5 end=63:6 file=FILE:<ROOT>/fidelity.java@1
+node METHOD name=Notifier.notifyEvent qn=Notifier.notifyEvent canonical=<ROOT>/fidelity.java:Notifier.notifyEvent#0 line=5 col=5 end=5:36 file=FILE:<ROOT>/fidelity.java@1
+node METHOD name=Repository.save qn=Repository.save canonical=<ROOT>/fidelity.java:Repository.save#0 line=20 col=5 end=22:6 file=FILE:<ROOT>/fidelity.java@1
+node METHOD name=Repository.track qn=Repository.track canonical=<ROOT>/fidelity.java:Repository.track#0 line=24 col=5 end=26:6 file=FILE:<ROOT>/fidelity.java@1
+node METHOD name=Workflow.decorate qn=Workflow.decorate canonical=<ROOT>/fidelity.java:Workflow.decorate#0 line=54 col=5 end=56:6 file=FILE:<ROOT>/fidelity.java@1
+node METHOD name=Workflow.identity qn=Workflow.identity canonical=<ROOT>/fidelity.java:Workflow.identity#0 line=38 col=5 end=40:6 file=FILE:<ROOT>/fidelity.java@1
+node METHOD name=Workflow.run qn=Workflow.run canonical=<ROOT>/fidelity.java:Workflow.run#0 line=42 col=5 end=47:6 file=FILE:<ROOT>/fidelity.java@1
+node METHOD name=Workflow.runAsync qn=Workflow.runAsync canonical=<ROOT>/fidelity.java:Workflow.runAsync#0 line=49 col=5 end=52:6 file=FILE:<ROOT>/fidelity.java@1
+node MODULE name=java.util.concurrent.CompletableFuture qn=java.util.concurrent.CompletableFuture canonical=<ROOT>/fidelity.java:java.util.concurrent.CompletableFuture#0 line=1 col=8 end=1:46 file=FILE:<ROOT>/fidelity.java@1
+node MODULE name=java.util.function.Function qn=java.util.function.Function canonical=<ROOT>/fidelity.java:java.util.function.Function#0 line=2 col=8 end=2:35 file=FILE:<ROOT>/fidelity.java@1
+node UNKNOWN name=apply qn=apply canonical=<ROOT>/fidelity.java:apply#0 line=39 col=23 end=39:28 file=FILE:<ROOT>/fidelity.java@1
+node UNKNOWN name=completedFuture qn=completedFuture canonical=<ROOT>/fidelity.java:completedFuture#0 line=51 col=34 end=51:49 file=FILE:<ROOT>/fidelity.java@1
+node UNKNOWN name=decorate qn=decorate canonical=<ROOT>/fidelity.java:decorate#0 line=46 col=9 end=46:17 file=FILE:<ROOT>/fidelity.java@1
+node UNKNOWN name=identity qn=identity canonical=<ROOT>/fidelity.java:identity#0 line=43 col=24 end=43:32 file=FILE:<ROOT>/fidelity.java@1
+node UNKNOWN name=notifyEvent qn=notifyEvent canonical=<ROOT>/fidelity.java:notifyEvent#0 line=44 col=18 end=44:29 file=FILE:<ROOT>/fidelity.java@1
+node UNKNOWN name=run qn=run canonical=<ROOT>/fidelity.java:run#0 line=50 col=9 end=50:12 file=FILE:<ROOT>/fidelity.java@1
+node UNKNOWN name=run qn=run canonical=<ROOT>/fidelity.java:run#1 line=62 col=18 end=62:21 file=FILE:<ROOT>/fidelity.java@1
+node UNKNOWN name=save qn=save canonical=<ROOT>/fidelity.java:save#0 line=45 col=20 end=45:24 file=FILE:<ROOT>/fidelity.java@1
+node UNKNOWN name=track qn=track canonical=<ROOT>/fidelity.java:track#0 line=21 col=9 end=21:14 file=FILE:<ROOT>/fidelity.java@1
+node UNKNOWN name=writeLog qn=writeLog canonical=<ROOT>/fidelity.java:writeLog#0 line=11 col=9 end=11:17 file=FILE:<ROOT>/fidelity.java@1
+edge ANNOTATION_USAGE src=ANNOTATION:Override@9 dst=ANNOTATION:Override@9 resolved_src=- resolved_dst=- line=9 confidence=- certainty=- callsite=- candidates=[]
+edge CALL src=METHOD:ConsoleNotifier.notifyEvent@9 dst=UNKNOWN:writeLog@11 resolved_src=METHOD:ConsoleNotifier.notifyEvent@9 resolved_dst=METHOD:ConsoleNotifier.writeLog@14 line=11 confidence=0.9500 certainty=Certain callsite=h0:11:1:h1 candidates=[]
+edge CALL src=METHOD:FidelityEntry.orchestrateJava@60 dst=METHOD:Workflow.run@42 resolved_src=METHOD:FidelityEntry.orchestrateJava@60 resolved_dst=METHOD:Workflow.run@42 line=62 confidence=1.0000 certainty=Certain callsite=h0:62:1:h2 candidates=[]
+edge CALL src=METHOD:Repository.save@20 dst=UNKNOWN:track@21 resolved_src=METHOD:Repository.save@20 resolved_dst=METHOD:Repository.track@24 line=21 confidence=0.9500 certainty=Certain callsite=h0:21:1:h3 candidates=[]
+edge CALL src=METHOD:Workflow.identity@38 dst=UNKNOWN:apply@39 resolved_src=METHOD:Workflow.identity@38 resolved_dst=- line=39 confidence=- certainty=- callsite=h0:39:1:h4|syntax:java-member-call|receiver-owner:Function|receiver-module:java.util.function.Function candidates=[]
+edge CALL src=METHOD:Workflow.run@42 dst=METHOD:Notifier.notifyEvent@5 resolved_src=METHOD:Workflow.run@42 resolved_dst=METHOD:Notifier.notifyEvent@5 line=44 confidence=1.0000 certainty=Certain callsite=h0:44:1:h5 candidates=[]
+edge CALL src=METHOD:Workflow.run@42 dst=METHOD:Repository.save@20 resolved_src=METHOD:Workflow.run@42 resolved_dst=METHOD:Repository.save@20 line=45 confidence=1.0000 certainty=Certain callsite=h0:45:1:h6 candidates=[]
+edge CALL src=METHOD:Workflow.run@42 dst=UNKNOWN:decorate@46 resolved_src=METHOD:Workflow.run@42 resolved_dst=METHOD:Workflow.decorate@54 line=46 confidence=0.9500 certainty=Certain callsite=h0:46:1:h7 candidates=[]
+edge CALL src=METHOD:Workflow.run@42 dst=UNKNOWN:identity@43 resolved_src=METHOD:Workflow.run@42 resolved_dst=METHOD:Workflow.identity@38 line=43 confidence=0.9500 certainty=Certain callsite=h0:43:1:h8 candidates=[]
+edge CALL src=METHOD:Workflow.runAsync@49 dst=UNKNOWN:completedFuture@51 resolved_src=METHOD:Workflow.runAsync@49 resolved_dst=- line=51 confidence=- certainty=- callsite=h0:51:1:h9|syntax:java-member-call|receiver-owner:CompletableFuture|receiver-module:java.util.concurrent.CompletableFuture candidates=[]
+edge CALL src=METHOD:Workflow.runAsync@49 dst=UNKNOWN:run@50 resolved_src=METHOD:Workflow.runAsync@49 resolved_dst=METHOD:Workflow.run@42 line=50 confidence=0.9500 certainty=Certain callsite=h0:50:1:h10 candidates=[]
+edge IMPORT src=MODULE:java.util.concurrent.CompletableFuture@1 dst=MODULE:java.util.concurrent.CompletableFuture@1 resolved_src=MODULE:java.util.concurrent.CompletableFuture@1 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge IMPORT src=MODULE:java.util.function.Function@2 dst=MODULE:java.util.function.Function@2 resolved_src=MODULE:java.util.function.Function@2 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:ConsoleNotifier@8 dst=INTERFACE:Notifier@4 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ConsoleNotifier@8 dst=METHOD:ConsoleNotifier.notifyEvent@9 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ConsoleNotifier@8 dst=METHOD:ConsoleNotifier.writeLog@14 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Event@29 dst=FIELD:Event.name@30 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Event@29 dst=METHOD:Event.Event@32 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:FidelityEntry@59 dst=METHOD:FidelityEntry.orchestrateJava@60 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Repository@19 dst=METHOD:Repository.save@20 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Repository@19 dst=METHOD:Repository.track@24 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@37 dst=METHOD:Workflow.decorate@54 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@37 dst=METHOD:Workflow.identity@38 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@37 dst=METHOD:Workflow.run@42 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@37 dst=METHOD:Workflow.runAsync@49 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=INTERFACE:Notifier@4 dst=METHOD:Notifier.notifyEvent@5 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]

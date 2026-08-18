@@ -1,228 +1,396 @@
-use crate::candidate::{CandidateHit, CandidateSource, RankFeatures, is_phantom_sidecar_hit};
+use crate::candidate::{
+    CandidateHit, CandidateLane, CandidateLaneEvidence, CandidateSource, RankFeatures,
+    is_phantom_sidecar_hit,
+};
 use crate::query_features::{QueryFeatures, QueryShape};
+use codestory_contracts::graph::NodeKind;
 use codestory_store::FileRole;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
-struct RankWeights {
+struct RrfLaneWeights {
     lexical: f32,
     semantic: f32,
-    scip_distance: f32,
-    file_role_prior: f32,
-    definition_quality: f32,
-    token_overlap: f32,
+    graph: f32,
 }
 
-const STRUCTURAL_BASELINE_MULTIPLIER: f32 = 0.5;
-const STRUCTURAL_DYNAMIC_TOKEN_THRESHOLD: f32 = 0.35;
-const STRUCTURAL_DYNAMIC_SEMANTIC_THRESHOLD: f32 = 0.55;
-const STRUCTURAL_DYNAMIC_BOOST: f32 = 1.35;
+const RRF_K: f32 = 20.0;
+pub const RANKING_POLICY_VERSION: &str = "weighted_rrf_v2";
+const FUSED_RRF_WEIGHT: f32 = 0.70;
+const GRAPH_SUPPORT_WEIGHT: f32 = 0.15;
+const TEXT_QUALITY_WEIGHT: f32 = 0.05;
+const REQUESTED_ROLE_WEIGHT: f32 = 0.05;
+const QUERY_OVERLAP_WEIGHT: f32 = 0.05;
 
 pub fn rank_candidates(
     features: &QueryFeatures,
     mut candidates: Vec<CandidateHit>,
 ) -> Vec<CandidateHit> {
-    let weights = weights_for_shape(features.shape);
     let query_tokens = tokenize(&features.raw_query);
     candidates.retain(|candidate| !is_phantom_sidecar_hit(candidate));
-
-    let query_lower = features.raw_query.to_ascii_lowercase();
-    let code_intent = query_has_code_intent(&query_tokens);
-    let structural_intent = query_mentions_structural_role(&query_tokens);
-    let prefer_primary_code = prefers_primary_code_evidence(features.shape, &query_tokens);
+    retain_primary_candidates_for_query(features, &mut candidates);
     for candidate in &mut candidates {
-        let file_role = effective_file_role(candidate);
-        candidate.file_role.get_or_insert(file_role);
-        let rank_features = build_rank_features(candidate, &query_tokens);
-        let mut fused = score_features(&rank_features, weights);
-        fused *= structural_fusion_multiplier(candidate, &rank_features);
-        fused *= primary_code_role_multiplier(file_role, prefer_primary_code);
-        candidate.score = fused;
-        if looks_like_repo_relative_path(&candidate.file_path) {
-            candidate.score += 0.08;
-        }
-        if matches!(features.shape, QueryShape::PathLike)
-            && query_lower.contains(&candidate.file_path.to_ascii_lowercase())
-        {
-            candidate.score += 0.25;
-        }
-        if matches!(
-            features.shape,
-            QueryShape::NaturalLanguage | QueryShape::Mixed
-        ) {
-            let strong_token_hits = strong_query_token_hits(candidate, &query_tokens);
-            candidate.score += (strong_token_hits as f32) * 0.06;
-            if candidate.source == CandidateSource::Lexical && strong_token_hits >= 3 {
-                candidate.score += 0.08;
-            }
-        }
-        if prefer_primary_code && matches!(file_role, FileRole::Source | FileRole::Entrypoint) {
-            candidate.score += primary_source_path_bonus(&candidate.file_path, &query_tokens);
-        }
-        if prefer_primary_code && symbol_name_looks_test_like(candidate.symbol_name.as_deref()) {
-            candidate.score *= 0.55;
-        }
-        candidate.rank_features = Some(export_rank_features(candidate, rank_features));
+        candidate.ensure_source_lane();
     }
+    assign_missing_lane_ranks(&mut candidates, CandidateLane::Lexical);
+    assign_missing_lane_ranks(&mut candidates, CandidateLane::Semantic);
+    assign_missing_lane_ranks(&mut candidates, CandidateLane::Graph);
+    let pinned_exact_node = unique_exact_definition(features, &candidates);
 
-    apply_exact_code_evidence_anchor(features, &query_tokens, &mut candidates);
-
-    let min_rank_score = min_rank_score(features.shape);
-    candidates.retain(|candidate| candidate.score >= min_rank_score);
-
-    if code_intent && !structural_intent {
-        apply_structural_code_intent_cap(&mut candidates);
-    }
-    if prefer_primary_code {
-        cap_non_primary_below_best_primary(&mut candidates);
-        cap_dense_below_strong_lexical_source(&mut candidates, &query_tokens);
+    let lane_weights = rrf_weights_for_shape(features.shape);
+    for candidate in &mut candidates {
+        let rank_features = build_rank_features(candidate, features, &query_tokens);
+        let rrf = weighted_rrf(candidate, lane_weights);
+        candidate.score = FUSED_RRF_WEIGHT * rrf
+            + GRAPH_SUPPORT_WEIGHT * rank_features.scip_distance.clamp(0.0, 1.0)
+            + TEXT_QUALITY_WEIGHT * rank_features.text_quality
+            + REQUESTED_ROLE_WEIGHT * rank_features.requested_role_agreement
+            + QUERY_OVERLAP_WEIGHT * rank_features.token_overlap;
+        candidate.rank_features = Some(rank_features);
     }
 
     candidates.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let left_pinned = pinned_exact_node
+            .as_deref()
+            .is_some_and(|node_id| left.node_id.as_deref() == Some(node_id));
+        let right_pinned = pinned_exact_node
+            .as_deref()
+            .is_some_and(|node_id| right.node_id.as_deref() == Some(node_id));
+        right_pinned
+            .cmp(&left_pinned)
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| file_role_sort_rank(left).cmp(&file_role_sort_rank(right)))
             .then_with(|| source_sort_rank(left).cmp(&source_sort_rank(right)))
             .then_with(|| left.file_path.cmp(&right.file_path))
             .then_with(|| left.symbol_name.cmp(&right.symbol_name))
+            .then_with(|| left.start_line.cmp(&right.start_line))
+            .then_with(|| left.node_id.cmp(&right.node_id))
     });
     candidates
 }
 
-fn looks_like_repo_relative_path(file_path: &str) -> bool {
-    let trimmed = file_path.trim();
-    !trimmed.is_empty()
-        && !trimmed.contains(':')
-        && (trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains(char::from(46)))
+pub(crate) fn retain_primary_candidates_for_query(
+    features: &QueryFeatures,
+    candidates: &mut Vec<CandidateHit>,
+) {
+    let query_tokens = tokenize(&features.raw_query);
+    for candidate in candidates.iter_mut() {
+        candidate.file_role = Some(effective_file_role(candidate));
+    }
+    if candidates
+        .iter()
+        .all(|candidate| candidate.file_role.is_some_and(non_primary_search_role))
+    {
+        return;
+    }
+    candidates.retain(|candidate| {
+        let role = candidate.file_role.unwrap_or(FileRole::Source);
+        !non_primary_search_role(role)
+            || query_requests_file_role(&query_tokens, role)
+            || candidate.provenance.iter().any(|label| label == "exact")
+    });
 }
 
-fn weights_for_shape(shape: QueryShape) -> RankWeights {
+fn unique_exact_definition(
+    _features: &QueryFeatures,
+    candidates: &[CandidateHit],
+) -> Option<String> {
+    let mut node_ids = candidates
+        .iter()
+        .filter(|candidate| candidate.provenance.iter().any(|label| label == "exact"))
+        .filter_map(|candidate| candidate.node_id.clone())
+        .collect::<Vec<_>>();
+    node_ids.sort();
+    node_ids.dedup();
+    (node_ids.len() == 1).then(|| node_ids.remove(0))
+}
+
+fn rrf_weights_for_shape(shape: QueryShape) -> RrfLaneWeights {
     match shape {
-        QueryShape::SymbolLike => RankWeights {
-            lexical: 0.25,
-            semantic: 0.15,
-            scip_distance: 0.30,
-            file_role_prior: 0.10,
-            definition_quality: 0.15,
-            token_overlap: 0.05,
+        QueryShape::SymbolLike => RrfLaneWeights {
+            lexical: 1.0,
+            semantic: 0.5,
+            graph: 1.25,
         },
-        QueryShape::PathLike => RankWeights {
-            lexical: 0.45,
-            semantic: 0.05,
-            scip_distance: 0.15,
-            file_role_prior: 0.20,
-            definition_quality: 0.10,
-            token_overlap: 0.05,
+        QueryShape::PathLike => RrfLaneWeights {
+            lexical: 1.25,
+            semantic: 0.0,
+            graph: 0.75,
         },
-        QueryShape::NaturalLanguage => RankWeights {
-            lexical: 0.15,
-            semantic: 0.40,
-            scip_distance: 0.10,
-            file_role_prior: 0.10,
-            definition_quality: 0.10,
-            token_overlap: 0.15,
+        QueryShape::NaturalLanguage => RrfLaneWeights {
+            lexical: 1.0,
+            semantic: 1.0,
+            graph: 0.75,
         },
-        QueryShape::Mixed => RankWeights {
-            lexical: 0.25,
-            semantic: 0.25,
-            scip_distance: 0.20,
-            file_role_prior: 0.10,
-            definition_quality: 0.10,
-            token_overlap: 0.10,
+        QueryShape::Mixed => RrfLaneWeights {
+            lexical: 1.0,
+            semantic: 0.85,
+            graph: 1.0,
         },
     }
 }
 
-fn min_rank_score(shape: QueryShape) -> f32 {
-    match shape {
-        QueryShape::NaturalLanguage => 0.04,
-        QueryShape::Mixed => 0.06,
-        QueryShape::SymbolLike | QueryShape::PathLike => 0.08,
+fn assign_missing_lane_ranks(candidates: &mut [CandidateHit], lane: CandidateLane) {
+    let mut indices = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            lane_evidence(candidate, lane)
+                .is_some_and(|evidence| evidence.rank == 0)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let mut next_rank = candidates
+        .iter()
+        .filter_map(|candidate| lane_evidence(candidate, lane))
+        .map(|evidence| evidence.rank)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    indices.sort_by(|left, right| {
+        let left_candidate = &candidates[*left];
+        let right_candidate = &candidates[*right];
+        lane_evidence(right_candidate, lane)
+            .expect("ranked lane evidence")
+            .raw_score
+            .partial_cmp(
+                &lane_evidence(left_candidate, lane)
+                    .expect("ranked lane evidence")
+                    .raw_score,
+            )
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left_candidate.file_path.cmp(&right_candidate.file_path))
+            .then_with(|| left_candidate.symbol_name.cmp(&right_candidate.symbol_name))
+            .then_with(|| left_candidate.start_line.cmp(&right_candidate.start_line))
+    });
+    for index in indices {
+        lane_evidence_mut(&mut candidates[index], lane).rank = next_rank;
+        next_rank = next_rank.saturating_add(1);
     }
 }
 
-fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> RankFeatures {
+fn lane_evidence(candidate: &CandidateHit, lane: CandidateLane) -> Option<&CandidateLaneEvidence> {
+    match lane {
+        CandidateLane::Lexical => candidate.lane_scores.lexical.as_ref(),
+        CandidateLane::Semantic => candidate.lane_scores.semantic.as_ref(),
+        CandidateLane::Graph => candidate.lane_scores.graph.as_ref(),
+    }
+}
+
+fn lane_evidence_mut(
+    candidate: &mut CandidateHit,
+    lane: CandidateLane,
+) -> &mut CandidateLaneEvidence {
+    match lane {
+        CandidateLane::Lexical => candidate.lane_scores.lexical.as_mut(),
+        CandidateLane::Semantic => candidate.lane_scores.semantic.as_mut(),
+        CandidateLane::Graph => candidate.lane_scores.graph.as_mut(),
+    }
+    .expect("candidate selected from this lane")
+}
+
+fn weighted_rrf(candidate: &CandidateHit, weights: RrfLaneWeights) -> f32 {
+    let graph = candidate_has_typed_graph_support(candidate)
+        .then_some(candidate.lane_scores.graph.as_ref())
+        .flatten();
+    let weighted = [
+        (candidate.lane_scores.lexical.as_ref(), weights.lexical),
+        (candidate.lane_scores.semantic.as_ref(), weights.semantic),
+        (graph, weights.graph),
+    ]
+    .into_iter()
+    .filter_map(|(evidence, weight)| {
+        if weight <= 0.0 {
+            return None;
+        }
+        let evidence = evidence?;
+        Some(weight / (RRF_K + evidence.rank.max(1) as f32))
+    })
+    .sum::<f32>();
+    let maximum = (weights.lexical + weights.semantic + weights.graph) / (RRF_K + 1.0);
+    if maximum <= 0.0 {
+        0.0
+    } else {
+        (weighted / maximum).clamp(0.0, 1.0)
+    }
+}
+
+fn build_rank_features(
+    candidate: &CandidateHit,
+    query: &QueryFeatures,
+    query_tokens: &[String],
+) -> RankFeatures {
     let path_lower = candidate.file_path.to_ascii_lowercase();
     let symbol_lower = candidate
         .symbol_name
         .as_deref()
         .unwrap_or("")
         .to_ascii_lowercase();
+    let qualified_lower = candidate
+        .qualified_name
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
-    let has_lexical = matches!(candidate.source, CandidateSource::Lexical)
-        || candidate_has_provenance(candidate, "lexical_source");
-    let has_semantic = matches!(candidate.source, CandidateSource::Semantic)
-        || candidate_has_provenance(candidate, "dense_anchor")
-        || candidate_has_provenance(candidate, "component_report");
-    let has_graph = candidate_has_graph_provenance(candidate);
-
-    let lexical = if matches!(candidate.source, CandidateSource::Legacy) {
-        candidate.score * 0.5
-    } else if has_lexical {
-        candidate.score.max(0.35)
+    let lexical = candidate
+        .lane_scores
+        .lexical
+        .as_ref()
+        .map(|evidence| evidence.raw_score)
+        .unwrap_or(0.0);
+    let semantic = candidate
+        .lane_scores
+        .semantic
+        .as_ref()
+        .map(|evidence| evidence.raw_score)
+        .unwrap_or(0.0);
+    let scip_distance = if candidate_has_typed_graph_support(candidate) {
+        candidate
+            .lane_scores
+            .graph
+            .as_ref()
+            .map(|evidence| evidence.raw_score)
+            .unwrap_or(0.0)
     } else {
-        candidate.score * 0.6
-    };
-
-    let semantic = if has_semantic {
-        candidate.score.max(0.4)
-    } else {
-        candidate.score * 0.25
-    };
-
-    let scip_distance = if has_graph {
-        1.0 / (1.0 + candidate.scip_hop_distance.unwrap_or(0) as f32)
-    } else {
-        0.2
+        0.0
     };
 
     let file_role_prior = file_role_prior(effective_file_role(candidate));
-    let definition_quality = if candidate.symbol_name.is_some() {
-        0.85
-    } else {
-        0.45
-    };
-    let token_overlap = token_overlap_score(query_tokens, &path_lower, &symbol_lower);
+    let definition_quality = definition_quality(candidate);
+    let token_overlap = token_overlap_score(
+        query_tokens,
+        &path_lower,
+        &format!("{symbol_lower} {qualified_lower}"),
+    );
+    let text_quality = (0.75 * text_file_quality(effective_file_role(candidate), query_tokens)
+        + 0.25 * definition_quality)
+        .clamp(0.0, 1.0);
+    let requested_role_agreement = requested_role_agreement(
+        &query.intent.evidence_roles,
+        &query.intent.structural_kinds,
+        &path_lower,
+        &symbol_lower,
+        candidate.structural_kind,
+    );
 
     RankFeatures {
+        ranking_policy: RANKING_POLICY_VERSION.into(),
         lexical,
         semantic,
         scip_distance,
         file_role_prior,
         definition_quality,
         token_overlap,
+        text_quality,
+        requested_role_agreement,
     }
 }
 
-fn export_rank_features(candidate: &CandidateHit, mut features: RankFeatures) -> RankFeatures {
-    if !candidate_has_graph_provenance(candidate) {
-        features.scip_distance = 0.0;
-    }
-    features
+fn candidate_has_typed_graph_support(candidate: &CandidateHit) -> bool {
+    candidate.graph_evidence.is_some()
+        || candidate.scip_hop_distance.is_some()
+        || candidate
+            .provenance
+            .iter()
+            .any(|label| matches!(label.as_str(), "graph_neighbor" | "scip_graph_projection"))
 }
 
-fn score_features(features: &RankFeatures, weights: RankWeights) -> f32 {
-    weights.lexical * features.lexical
-        + weights.semantic * features.semantic
-        + weights.scip_distance * features.scip_distance
-        + weights.file_role_prior * features.file_role_prior
-        + weights.definition_quality * features.definition_quality
-        + weights.token_overlap * features.token_overlap
-}
-
-fn candidate_has_graph_provenance(candidate: &CandidateHit) -> bool {
-    matches!(candidate.source, CandidateSource::Scip)
-        || candidate_has_provenance(candidate, "graph_neighbor")
-        || candidate_has_provenance(candidate, "exact")
-}
-
-fn candidate_has_provenance(candidate: &CandidateHit, label: &str) -> bool {
-    candidate
-        .provenance
+fn requested_role_agreement(
+    evidence_roles: &[String],
+    structural_kinds: &[String],
+    path_lower: &str,
+    symbol_lower: &str,
+    structural_kind: Option<NodeKind>,
+) -> f32 {
+    let requested = evidence_roles
         .iter()
-        .any(|candidate_label| candidate_label == label)
+        .chain(structural_kinds)
+        .collect::<Vec<_>>();
+    if requested.is_empty() {
+        return 0.0;
+    }
+    let structural_label = structural_kind.map(structural_kind_label);
+    let matched = requested
+        .iter()
+        .filter(|term| {
+            path_lower.contains(term.as_str())
+                || symbol_lower.contains(term.as_str())
+                || structural_label.is_some_and(|label| label == term.as_str())
+        })
+        .count();
+    matched as f32 / requested.len() as f32
+}
+
+/// Definition quality claims a definition, so a bare display name cannot earn
+/// it: only a candidate resolved to an indexed node or anchored to a line has
+/// a definition site to report.
+fn definition_quality(candidate: &CandidateHit) -> f32 {
+    let named = candidate
+        .symbol_name
+        .as_deref()
+        .is_some_and(|symbol_name| !symbol_name.trim().is_empty());
+    let anchored = candidate.node_id.is_some() && candidate.start_line.is_some();
+    if !named || !anchored {
+        return 0.0;
+    }
+    match candidate.structural_kind {
+        Some(
+            NodeKind::FUNCTION
+            | NodeKind::METHOD
+            | NodeKind::STRUCT
+            | NodeKind::CLASS
+            | NodeKind::INTERFACE
+            | NodeKind::ENUM
+            | NodeKind::UNION
+            | NodeKind::TYPEDEF
+            | NodeKind::MODULE
+            | NodeKind::NAMESPACE
+            | NodeKind::PACKAGE,
+        ) => 1.0,
+        Some(
+            NodeKind::ANNOTATION
+            | NodeKind::GLOBAL_VARIABLE
+            | NodeKind::FIELD
+            | NodeKind::VARIABLE
+            | NodeKind::CONSTANT
+            | NodeKind::ENUM_CONSTANT,
+        ) => 0.65,
+        Some(NodeKind::MACRO) => 0.25,
+        Some(NodeKind::FILE | NodeKind::UNKNOWN | NodeKind::BUILTIN_TYPE) | None => 0.0,
+        Some(NodeKind::TYPE_PARAMETER) => 0.45,
+    }
+}
+
+fn structural_kind_label(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::MODULE => "module",
+        NodeKind::NAMESPACE => "namespace",
+        NodeKind::PACKAGE => "package",
+        NodeKind::FILE => "file",
+        NodeKind::STRUCT => "struct",
+        NodeKind::CLASS => "class",
+        NodeKind::INTERFACE => "interface",
+        NodeKind::ANNOTATION => "annotation",
+        NodeKind::UNION => "union",
+        NodeKind::ENUM => "enum",
+        NodeKind::TYPEDEF => "typedef",
+        NodeKind::TYPE_PARAMETER => "type_parameter",
+        NodeKind::BUILTIN_TYPE => "builtin_type",
+        NodeKind::FUNCTION => "function",
+        NodeKind::METHOD => "method",
+        NodeKind::MACRO => "macro",
+        NodeKind::GLOBAL_VARIABLE => "global_variable",
+        NodeKind::FIELD => "field",
+        NodeKind::VARIABLE => "variable",
+        NodeKind::CONSTANT => "constant",
+        NodeKind::ENUM_CONSTANT => "enum_constant",
+        NodeKind::UNKNOWN => "unknown",
+    }
 }
 
 fn file_role_prior(file_role: FileRole) -> f32 {
@@ -237,100 +405,86 @@ fn file_role_prior(file_role: FileRole) -> f32 {
     }
 }
 
-fn effective_file_role(candidate: &CandidateHit) -> FileRole {
-    candidate
-        .file_role
-        .unwrap_or_else(|| FileRole::classify_path(Path::new(&candidate.file_path)))
-}
-
-fn prefers_primary_code_evidence(shape: QueryShape, query_tokens: &[String]) -> bool {
-    matches!(shape, QueryShape::NaturalLanguage | QueryShape::Mixed)
-        && !query_mentions_non_primary_role(query_tokens)
-        && !query_mentions_structural_role(query_tokens)
-}
-
-fn query_mentions_non_primary_role(query_tokens: &[String]) -> bool {
-    const NON_PRIMARY_ROLE_TERMS: &[&str] = &[
-        "test",
-        "tests",
-        "spec",
-        "specs",
-        "fixture",
-        "fixtures",
-        "doc",
-        "docs",
-        "documentation",
-        "readme",
-        "benchmark",
-        "benchmarks",
-        "bench",
-        "generated",
-        "vendor",
-    ];
-    query_tokens
-        .iter()
-        .any(|token| NON_PRIMARY_ROLE_TERMS.contains(&token.as_str()))
-}
-
-fn query_mentions_structural_role(query_tokens: &[String]) -> bool {
-    const STRUCTURAL_ROLE_TERMS: &[&str] = &[
-        "css",
-        "html",
-        "layout",
-        "style",
-        "styles",
-        "stylesheet",
-        "sql",
-    ];
-    query_tokens
-        .iter()
-        .any(|token| STRUCTURAL_ROLE_TERMS.contains(&token.as_str()))
-}
-
-fn symbol_name_looks_test_like(symbol_name: Option<&str>) -> bool {
-    let Some(symbol_name) = symbol_name else {
-        return false;
+fn text_file_quality(file_role: FileRole, query_tokens: &[String]) -> f32 {
+    let asks_for = |labels: &[&str]| {
+        query_tokens
+            .iter()
+            .any(|token| labels.contains(&token.as_str()))
     };
-    let symbol = symbol_name.to_ascii_lowercase();
-    let local_name = symbol.rsplit("::").next().unwrap_or(symbol.as_str());
-    symbol.starts_with("tests::")
-        || symbol.contains("::tests::")
-        || local_name.starts_with("test_")
-        || local_name.ends_with("_test")
-        || local_name.ends_with("_tests")
-        || local_name.contains("_test_")
-        || local_name.contains("_tests_")
-}
-
-fn primary_code_role_multiplier(file_role: FileRole, prefer_primary_code: bool) -> f32 {
-    if !prefer_primary_code {
-        return 1.0;
-    }
     match file_role {
-        FileRole::Entrypoint => 1.08,
-        FileRole::Source => 1.02,
-        FileRole::Test => 0.58,
-        FileRole::Docs => 0.68,
-        FileRole::Benchmark => 0.55,
-        FileRole::Generated => 0.42,
-        FileRole::Vendor => 0.35,
+        FileRole::Entrypoint => 1.0,
+        FileRole::Source => 0.80,
+        FileRole::Test
+            if asks_for(&[
+                "test", "tests", "testing", "spec", "specs", "fixture", "fixtures",
+            ]) =>
+        {
+            1.0
+        }
+        FileRole::Docs if asks_for(&["doc", "docs", "documentation", "readme"]) => 1.0,
+        FileRole::Benchmark if asks_for(&["bench", "benchmark", "benchmarks", "performance"]) => {
+            1.0
+        }
+        FileRole::Generated if asks_for(&["generated", "codegen"]) => 1.0,
+        FileRole::Vendor
+            if asks_for(&["vendor", "dependency", "dependencies", "third", "party"]) =>
+        {
+            1.0
+        }
+        FileRole::Docs => 0.35,
+        FileRole::Benchmark => 0.20,
+        FileRole::Test | FileRole::Generated | FileRole::Vendor => 0.0,
     }
 }
 
-fn primary_source_path_bonus(file_path: &str, query_tokens: &[String]) -> f32 {
-    let path_lower = file_path.replace('\\', "/").to_ascii_lowercase();
-    let mut bonus = 0.0;
-    if path_lower.contains("/src/") || path_lower.starts_with("src/") {
-        bonus += 0.04;
+fn non_primary_search_role(role: FileRole) -> bool {
+    matches!(
+        role,
+        FileRole::Test | FileRole::Benchmark | FileRole::Generated | FileRole::Vendor
+    )
+}
+
+fn query_requests_file_role(query_tokens: &[String], role: FileRole) -> bool {
+    let asks_for = |labels: &[&str]| {
+        query_tokens
+            .iter()
+            .any(|token| labels.contains(&token.as_str()))
+    };
+    match role {
+        FileRole::Test => asks_for(&["test", "tests", "testing", "spec", "specs", "fixture"]),
+        FileRole::Benchmark => asks_for(&["bench", "benchmark", "benchmarks", "performance"]),
+        FileRole::Generated => asks_for(&["generated", "codegen"]),
+        FileRole::Vendor => asks_for(&["vendor", "dependency", "dependencies", "third", "party"]),
+        FileRole::Entrypoint | FileRole::Source | FileRole::Docs => true,
     }
-    if query_tokens
-        .iter()
-        .filter(|token| token.len() >= 4)
-        .any(|token| path_lower.contains(token.as_str()))
+}
+
+fn effective_file_role(candidate: &CandidateHit) -> FileRole {
+    if candidate.qualified_name.as_deref().is_some_and(|name| {
+        name.starts_with("tests::")
+            || name.contains("::tests::")
+            || name.starts_with("test::")
+            || name.contains("::test::")
+    }) {
+        return FileRole::Test;
+    }
+    let path = Path::new(&candidate.file_path);
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "md" | "mdx" | "rst"
+            )
+        })
     {
-        bonus += 0.03;
+        FileRole::Docs
+    } else {
+        candidate
+            .file_role
+            .unwrap_or_else(|| FileRole::classify_path(path))
     }
-    bonus
 }
 
 fn file_role_sort_rank(candidate: &CandidateHit) -> u8 {
@@ -354,31 +508,6 @@ fn source_sort_rank(candidate: &CandidateHit) -> u8 {
     }
 }
 
-fn cap_non_primary_below_best_primary(candidates: &mut [CandidateHit]) {
-    let best_primary = candidates
-        .iter()
-        .filter(|candidate| {
-            matches!(
-                effective_file_role(candidate),
-                FileRole::Source | FileRole::Entrypoint
-            )
-        })
-        .map(|candidate| candidate.score)
-        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    let Some(best_primary) = best_primary else {
-        return;
-    };
-    for candidate in candidates {
-        if !matches!(
-            effective_file_role(candidate),
-            FileRole::Source | FileRole::Entrypoint
-        ) && candidate.score >= best_primary
-        {
-            candidate.score = (best_primary - 0.001).max(0.0);
-        }
-    }
-}
-
 fn token_overlap_score(query_tokens: &[String], path_lower: &str, symbol_lower: &str) -> f32 {
     if query_tokens.is_empty() {
         return 0.0;
@@ -393,176 +522,6 @@ fn token_overlap_score(query_tokens: &[String], path_lower: &str, symbol_lower: 
         }
     }
     hits as f32 / query_tokens.len() as f32
-}
-
-fn strong_query_token_hits(candidate: &CandidateHit, query_tokens: &[String]) -> usize {
-    let path_lower = candidate.file_path.to_ascii_lowercase();
-    let symbol_lower = candidate
-        .symbol_name
-        .as_deref()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    query_tokens
-        .iter()
-        .filter(|token| token.len() >= 4)
-        .filter(|token| {
-            path_lower.contains(token.as_str()) || symbol_lower.contains(token.as_str())
-        })
-        .count()
-}
-
-fn cap_dense_below_strong_lexical_source(candidates: &mut [CandidateHit], query_tokens: &[String]) {
-    let Some((anchor_hits, anchor_score)) = candidates
-        .iter()
-        .filter(|candidate| candidate.source == CandidateSource::Lexical)
-        .filter(|candidate| {
-            matches!(
-                effective_file_role(candidate),
-                FileRole::Source | FileRole::Entrypoint
-            )
-        })
-        .filter_map(|candidate| {
-            let hits = strong_query_token_hits(candidate, query_tokens);
-            (hits >= 3).then_some((hits, candidate.score))
-        })
-        .max_by(|left, right| {
-            left.1
-                .partial_cmp(&right.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-    else {
-        return;
-    };
-
-    for candidate in candidates {
-        if candidate.source == CandidateSource::Semantic
-            && strong_query_token_hits(candidate, query_tokens) < anchor_hits
-            && candidate.score >= anchor_score
-        {
-            candidate.score = (anchor_score - 0.001).max(0.0);
-        }
-    }
-}
-
-fn apply_exact_code_evidence_anchor(
-    features: &QueryFeatures,
-    query_tokens: &[String],
-    candidates: &mut [CandidateHit],
-) {
-    if !matches!(
-        features.shape,
-        QueryShape::SymbolLike | QueryShape::PathLike | QueryShape::Mixed
-    ) {
-        return;
-    }
-    let top_exact_code_score = candidates
-        .iter()
-        .filter(|candidate| is_exact_code_evidence(candidate, query_tokens))
-        .map(|candidate| candidate.score)
-        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    let Some(top_exact_code_score) = top_exact_code_score else {
-        return;
-    };
-    for candidate in candidates.iter_mut() {
-        if matches!(candidate.source, CandidateSource::Semantic)
-            && !is_exact_code_evidence(candidate, query_tokens)
-            && candidate.score >= top_exact_code_score
-        {
-            candidate.score = (top_exact_code_score - 0.001).max(0.0);
-        }
-    }
-}
-
-fn is_exact_code_evidence(candidate: &CandidateHit, query_tokens: &[String]) -> bool {
-    if matches!(
-        candidate.source,
-        CandidateSource::Semantic | CandidateSource::Legacy
-    ) {
-        return false;
-    }
-    let Some(symbol) = candidate.symbol_name.as_deref() else {
-        return exact_path_match(&candidate.file_path, query_tokens);
-    };
-    let symbol_tail = symbol
-        .rsplit("::")
-        .next()
-        .unwrap_or(symbol)
-        .rsplit('.')
-        .next()
-        .unwrap_or(symbol)
-        .to_ascii_lowercase();
-    query_tokens.iter().any(|token| token == &symbol_tail)
-        || exact_path_match(&candidate.file_path, query_tokens)
-}
-
-fn exact_path_match(file_path: &str, query_tokens: &[String]) -> bool {
-    let path = std::path::Path::new(file_path);
-    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-        return false;
-    };
-    let stem = stem.to_ascii_lowercase();
-    query_tokens.iter().any(|token| token == &stem)
-}
-
-fn structural_fusion_multiplier(candidate: &CandidateHit, features: &RankFeatures) -> f32 {
-    if !is_structural_candidate_path(&candidate.file_path) {
-        return 1.0;
-    }
-    let mut multiplier = STRUCTURAL_BASELINE_MULTIPLIER;
-    if features.token_overlap >= STRUCTURAL_DYNAMIC_TOKEN_THRESHOLD
-        || features.semantic >= STRUCTURAL_DYNAMIC_SEMANTIC_THRESHOLD
-    {
-        multiplier *= STRUCTURAL_DYNAMIC_BOOST;
-    }
-    multiplier.min(1.0)
-}
-
-fn is_structural_candidate_path(file_path: &str) -> bool {
-    let path = std::path::Path::new(file_path);
-    if let Some(ext) = path.extension() {
-        let ext_str = ext.to_string_lossy().to_ascii_lowercase();
-        matches!(ext_str.as_str(), "html" | "htm" | "css" | "sql")
-    } else {
-        false
-    }
-}
-
-fn query_has_code_intent(query_tokens: &[String]) -> bool {
-    const CODE_INTENT: &[&str] = &[
-        "function",
-        "func",
-        "method",
-        "class",
-        "struct",
-        "trait",
-        "interface",
-        "enum",
-        "impl",
-        "def",
-        "fn",
-        "type",
-        "module",
-        "namespace",
-    ];
-    query_tokens
-        .iter()
-        .any(|token| CODE_INTENT.contains(&token.as_str()))
-}
-
-fn apply_structural_code_intent_cap(candidates: &mut [CandidateHit]) {
-    let top_graph_score = candidates
-        .iter()
-        .filter(|candidate| !is_structural_candidate_path(&candidate.file_path))
-        .map(|candidate| candidate.score)
-        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    let Some(top_graph_score) = top_graph_score else {
-        return;
-    };
-    for candidate in candidates.iter_mut() {
-        if is_structural_candidate_path(&candidate.file_path) && candidate.score > top_graph_score {
-            candidate.score = top_graph_score;
-        }
-    }
 }
 
 fn tokenize(query: &str) -> Vec<String> {
@@ -631,6 +590,25 @@ mod tests {
     }
 
     #[test]
+    fn ranker_exports_only_dense_feature_for_pure_dense_candidate() {
+        let features = classify_query("explain search service");
+        let mut dense = CandidateHit::with_source(
+            "src/search.rs",
+            Some("SearchService".into()),
+            0.9,
+            CandidateSource::Semantic,
+        );
+        dense.provenance = vec!["dense_anchor".into()];
+
+        let ranked = rank_candidates(&features, vec![dense]);
+        let rank_features = ranked[0].rank_features.as_ref().expect("rank features");
+
+        assert_eq!(rank_features.lexical, 0.0);
+        assert!(rank_features.semantic > 0.0);
+        assert_eq!(rank_features.scip_distance, 0.0);
+    }
+
+    #[test]
     fn ranker_prefers_entrypoint_role_over_test_role() {
         let features = classify_query("main startup entrypoint");
         let mut test_hit = CandidateHit::lexical_stub("src/main_test.rs", 0.94);
@@ -645,14 +623,14 @@ mod tests {
     }
 
     #[test]
-    fn ranker_soft_prior_downweights_structural_by_default() {
+    fn ranker_does_not_apply_a_hidden_structural_cap() {
         let features = classify_query("layout styles for dashboard");
         let mut structural = CandidateHit::lexical_stub("src/ui/layout.css", 0.9);
         let mut graph = CandidateHit::lexical_stub("src/app/dashboard.rs", 0.55);
         structural.source = CandidateSource::Lexical;
         graph.source = CandidateSource::Lexical;
         let ranked = rank_candidates(&features, vec![structural, graph]);
-        assert_eq!(ranked[0].file_path, "src/app/dashboard.rs");
+        assert_eq!(ranked[0].file_path, "src/ui/layout.css");
     }
 
     #[test]
@@ -660,6 +638,10 @@ mod tests {
         let features = classify_query("primary button layout css class");
         let mut structural = CandidateHit::lexical_stub("src/ui/primary.css", 0.7);
         structural.symbol_name = Some("primary".to_string());
+        // A lexical symbol document always resolves to an indexed node, which is
+        // what earns the candidate its definition-quality feature.
+        structural.node_id = Some("41".to_string());
+        structural.start_line = Some(12);
         structural.source = CandidateSource::Lexical;
         let mut graph = CandidateHit::lexical_stub("src/ui/components.rs", 0.72);
         graph.source = CandidateSource::Lexical;
@@ -668,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn ranker_caps_structural_on_code_intent_queries() {
+    fn ranker_combines_lane_rank_with_query_overlap_for_structural_files() {
         let features = classify_query("UserService class method");
         let mut structural = CandidateHit::lexical_stub("schema/users.sql", 0.99);
         let mut graph = CandidateHit::lexical_stub("src/user_service.rs", 0.8);
@@ -716,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn ranker_infers_missing_roles_and_demotes_semantic_tests_for_prompts() {
+    fn ranker_excludes_non_primary_roles_from_an_ordinary_source_query() {
         let features = classify_query("explain request json output event processing");
         let semantic_test = CandidateHit::with_source(
             "workspace/app/tests/event_processor_with_json_output.rs",
@@ -739,22 +721,19 @@ mod tests {
 
         let ranked = rank_candidates(&features, vec![semantic_test, colocated_test, source]);
 
-        assert_eq!(
-            ranked.first().map(|hit| hit.file_path.as_str()),
-            Some("workspace/app/src/event_processor.rs")
-        );
-        assert_eq!(ranked[0].file_role, Some(FileRole::Source));
+        assert!(ranked.iter().any(|hit| {
+            hit.file_path == "workspace/app/src/event_processor.rs"
+                && hit.file_role == Some(FileRole::Source)
+        }));
         assert!(
             ranked
                 .iter()
-                .filter(|hit| hit.file_role == Some(FileRole::Test))
-                .count()
-                >= 2
+                .all(|hit| hit.file_role != Some(FileRole::Test))
         );
     }
 
     #[test]
-    fn ranker_demotes_test_named_source_helpers_for_production_prompts() {
+    fn ranker_does_not_mutate_scores_from_symbol_name_heuristics() {
         let features = classify_query("explain runtime orchestration and search projection");
         let test_helper = CandidateHit::with_source(
             "crates/runtime/src/search/engine.rs",
@@ -773,7 +752,7 @@ mod tests {
 
         assert_eq!(
             ranked.first().and_then(|hit| hit.symbol_name.as_deref()),
-            Some("IndexService::run_indexing_blocking")
+            Some("EmbeddingRuntime::test_runtime")
         );
     }
 
@@ -804,19 +783,17 @@ mod tests {
 
     #[test]
     fn ranker_prefers_lexical_source_anchor_over_dense_dto_distractor() {
-        let features = classify_query(
-            "packet search output evidence packet indexed symbol hits retrieval shadow",
-        );
+        let features = classify_query("delivery adapter emits ranked findings with provenance");
         let mut source = CandidateHit::with_source(
-            "crates/codestory-cli/src/output.rs",
-            Some("append_search_evidence_packet".into()),
+            "src/delivery/output.rs",
+            Some("append_ranked_findings".into()),
             0.92,
             CandidateSource::Lexical,
         );
         source.file_role = Some(FileRole::Source);
         let mut dense_dto = CandidateHit::with_source(
-            "crates/codestory-contracts/src/api/dto.rs",
-            Some("PacketRetrievalTraceSummaryDto".into()),
+            "src/contracts/delivery.rs",
+            Some("DeliveryTraceSummary".into()),
             0.99,
             CandidateSource::Semantic,
         );
@@ -826,43 +803,26 @@ mod tests {
 
         assert_eq!(
             ranked.first().map(|hit| hit.file_path.as_str()),
-            Some("crates/codestory-cli/src/output.rs")
+            Some("src/delivery/output.rs")
         );
     }
 
     #[test]
     fn ranker_keeps_broad_lexical_source_anchor_inside_resolved_window() {
-        let features = classify_query(
-            "packet search output evidence packet indexed symbol hits retrieval shadow",
-        );
+        let features = classify_query("delivery adapter emits ranked findings with provenance");
         let mut source = CandidateHit::with_source(
-            "crates/codestory-runtime/src/agent/packet_evidence.rs",
-            Some("decorate_search_hit_evidence".into()),
+            "src/delivery/evidence.rs",
+            Some("decorate_ranked_finding".into()),
             0.82,
             CandidateSource::Lexical,
         );
         source.file_role = Some(FileRole::Source);
         let dense_distractors = [
-            (
-                "PacketTraceDto",
-                "crates/codestory-contracts/src/api/dto.rs",
-            ),
-            (
-                "RetrievalTraceDto",
-                "crates/codestory-contracts/src/api/retrieval.rs",
-            ),
-            (
-                "SearchResultDto",
-                "crates/codestory-contracts/src/api/search.rs",
-            ),
-            (
-                "IndexedSymbolDto",
-                "crates/codestory-contracts/src/api/symbol.rs",
-            ),
-            (
-                "SearchShadowDto",
-                "crates/codestory-contracts/src/api/shadow.rs",
-            ),
+            ("DeliveryTraceDto", "src/contracts/delivery.rs"),
+            ("FindingTraceDto", "src/contracts/findings.rs"),
+            ("RankedResultDto", "src/contracts/results.rs"),
+            ("IndexedRecordDto", "src/contracts/records.rs"),
+            ("FindingShadowDto", "src/contracts/shadow.rs"),
         ]
         .into_iter()
         .map(|(symbol, path)| {
@@ -880,15 +840,15 @@ mod tests {
 
         assert!(
             ranked.iter().take(5).any(|hit| {
-                hit.file_path == "crates/codestory-runtime/src/agent/packet_evidence.rs"
-                    && hit.symbol_name.as_deref() == Some("decorate_search_hit_evidence")
+                hit.file_path == "src/delivery/evidence.rs"
+                    && hit.symbol_name.as_deref() == Some("decorate_ranked_finding")
             }),
             "direct lexical source evidence should stay inside the resolved top-5 window: {ranked:#?}"
         );
     }
 
     #[test]
-    fn ranker_fuses_duplicate_lane_provenance_into_rank_features() {
+    fn ranker_does_not_export_graph_for_same_file_name_affinity() {
         let features = classify_query("how does service startup flow");
         let mut fused = CandidateHit::with_source(
             "src/service.rs",
@@ -899,7 +859,7 @@ mod tests {
         fused.provenance = vec![
             "lexical_source".into(),
             "dense_anchor".into(),
-            "graph_neighbor".into(),
+            "same_file_name_affinity".into(),
         ];
         fused.scip_hop_distance = Some(1);
 
@@ -907,7 +867,209 @@ mod tests {
         let rank_features = ranked[0].rank_features.as_ref().expect("rank features");
 
         assert_eq!(rank_features.lexical, 0.85);
-        assert_eq!(rank_features.semantic, 0.85);
-        assert_eq!(rank_features.scip_distance, 0.5);
+        assert_eq!(rank_features.semantic, 0.0);
+        assert_eq!(rank_features.scip_distance, 0.0);
+    }
+
+    #[test]
+    fn ranker_reports_the_measured_dense_similarity_without_a_floor() {
+        let features = classify_query("how does the request deadline reach a worker");
+        let mut weak_dense = CandidateHit::with_source(
+            "docs/notes/glossary.md",
+            Some("glossary".into()),
+            0.02,
+            CandidateSource::Semantic,
+        );
+        weak_dense.node_id = Some("91".into());
+        weak_dense.provenance = vec!["dense_anchor".into()];
+        let strong_lexical = CandidateHit::lexical_stub("src/worker/deadline.rs", 0.81);
+
+        let ranked = rank_candidates(&features, vec![weak_dense, strong_lexical]);
+
+        let dense = ranked
+            .iter()
+            .find(|hit| hit.file_path == "docs/notes/glossary.md");
+        assert!(
+            dense.is_none_or(
+                |hit| hit.rank_features.as_ref().expect("rank features").semantic < 0.4
+            ),
+            "a barely related vector must not report a floored dense feature: {ranked:#?}"
+        );
+        assert_eq!(
+            ranked.first().map(|hit| hit.file_path.as_str()),
+            Some("src/worker/deadline.rs"),
+            "measured lexical evidence must outrank an unrelated vector: {ranked:#?}"
+        );
+    }
+
+    #[test]
+    fn ranker_reserves_definition_quality_for_anchored_definitions() {
+        let features = classify_query("how does the worker drain requests");
+        let unanchored = CandidateHit::with_source(
+            "src/worker/pool.rs",
+            Some("worker pool overview".into()),
+            0.6,
+            CandidateSource::Semantic,
+        );
+        let mut anchored = unanchored.clone();
+        anchored.node_id = Some("77".into());
+        anchored.start_line = Some(31);
+        anchored.structural_kind = Some(NodeKind::FUNCTION);
+
+        let unanchored_quality = rank_candidates(&features, vec![unanchored])[0]
+            .rank_features
+            .as_ref()
+            .expect("rank features")
+            .definition_quality;
+        let anchored_quality = rank_candidates(&features, vec![anchored])[0]
+            .rank_features
+            .as_ref()
+            .expect("rank features")
+            .definition_quality;
+
+        assert_eq!(anchored_quality, 1.0);
+        assert_eq!(
+            unanchored_quality, 0.0,
+            "a display name with no definition site is not definition evidence"
+        );
+    }
+
+    #[test]
+    fn structural_kind_prevents_macro_invocations_from_claiming_definition_quality() {
+        let features = classify_query("how does packet evidence reach the output adapter");
+        let mut function = CandidateHit::with_source(
+            "src/output.rs",
+            Some("append_packet_evidence".into()),
+            0.7,
+            CandidateSource::Semantic,
+        );
+        function.node_id = Some("1".into());
+        function.start_line = Some(40);
+        function.structural_kind = Some(NodeKind::FUNCTION);
+        let mut invocation = CandidateHit::with_source(
+            "src/output.rs",
+            Some("assert_eq".into()),
+            0.7,
+            CandidateSource::Semantic,
+        );
+        invocation.node_id = Some("2".into());
+        invocation.start_line = Some(90);
+        invocation.structural_kind = Some(NodeKind::MACRO);
+
+        let ranked = rank_candidates(&features, vec![invocation, function]);
+        let quality = |name: &str| {
+            ranked
+                .iter()
+                .find(|candidate| candidate.symbol_name.as_deref() == Some(name))
+                .and_then(|candidate| candidate.rank_features.as_ref())
+                .map(|features| features.definition_quality)
+                .expect("ranked candidate")
+        };
+        assert_eq!(quality("append_packet_evidence"), 1.0);
+        assert_eq!(quality("assert_eq"), 0.25);
+    }
+
+    #[test]
+    fn ranker_exports_graph_only_for_explicit_graph_provenance() {
+        let features = classify_query("how does service startup flow");
+        let mut graph = CandidateHit::with_source(
+            "src/service.rs",
+            Some("ExtensionService".into()),
+            0.85,
+            CandidateSource::Scip,
+        );
+        graph.provenance = vec!["graph_neighbor".into()];
+        graph.scip_hop_distance = Some(1);
+
+        let ranked = rank_candidates(&features, vec![graph]);
+        let rank_features = ranked[0].rank_features.as_ref().expect("rank features");
+
+        assert_eq!(rank_features.lexical, 0.0);
+        assert_eq!(rank_features.semantic, 0.0);
+        assert_eq!(rank_features.scip_distance, 0.85);
+    }
+
+    #[test]
+    fn ranker_preserves_independent_lane_scores_through_rrf() {
+        let features = classify_query("explain how request dispatch calls a worker");
+        let mut candidate = CandidateHit::with_source(
+            "src/dispatch.rs",
+            Some("dispatch".into()),
+            0.31,
+            CandidateSource::Lexical,
+        );
+        candidate.record_lane(CandidateLane::Semantic, 0.83, 4, "dense_anchor");
+        candidate.record_lane(CandidateLane::Graph, 0.57, 2, "graph_neighbor");
+        candidate.add_provenance("graph_neighbor");
+
+        let ranked = rank_candidates(&features, vec![candidate]);
+        let rank_features = ranked[0].rank_features.as_ref().expect("rank features");
+
+        assert_eq!(rank_features.lexical, 0.31);
+        assert_eq!(rank_features.semantic, 0.83);
+        assert_eq!(rank_features.scip_distance, 0.57);
+    }
+
+    #[test]
+    fn lexical_score_scale_does_not_cross_contaminate_rrf() {
+        let features = classify_query("dispatch worker");
+        let first = vec![
+            CandidateHit::lexical_stub("src/a.rs", 0.9),
+            CandidateHit::lexical_stub("src/b.rs", 0.8),
+        ];
+        let rescaled = vec![
+            CandidateHit::lexical_stub("src/a.rs", 90.0),
+            CandidateHit::lexical_stub("src/b.rs", 80.0),
+        ];
+
+        let ranked = rank_candidates(&features, first);
+        let rescaled_ranked = rank_candidates(&features, rescaled);
+
+        assert_eq!(ranked[0].file_path, rescaled_ranked[0].file_path);
+        assert_eq!(ranked[1].file_path, rescaled_ranked[1].file_path);
+        assert_eq!(ranked[0].score, rescaled_ranked[0].score);
+        assert_eq!(ranked[1].score, rescaled_ranked[1].score);
+    }
+
+    #[test]
+    fn producer_lane_ranks_are_not_rewritten_from_raw_scores() {
+        let features = classify_query("worker");
+        let mut first = CandidateHit::lexical_stub("src/first.rs", 0.20);
+        first.record_lane(CandidateLane::Lexical, 0.20, 1, "lexical_source");
+        let mut second = CandidateHit::lexical_stub("src/second.rs", 0.90);
+        second.record_lane(CandidateLane::Lexical, 0.90, 2, "lexical_source");
+
+        let ranked = rank_candidates(&features, vec![second, first]);
+
+        assert_eq!(ranked[0].file_path, "src/first.rs");
+        assert_eq!(ranked[0].lane_scores.lexical.as_ref().unwrap().rank, 1);
+        assert_eq!(ranked[1].lane_scores.lexical.as_ref().unwrap().rank, 2);
+    }
+
+    #[test]
+    fn final_score_is_the_declared_convex_combination() {
+        let features = classify_query("explain dispatch worker flow");
+        let mut candidate = CandidateHit::with_source(
+            "src/dispatch_worker.rs",
+            Some("dispatch_worker".into()),
+            0.73,
+            CandidateSource::Lexical,
+        );
+        candidate.node_id = Some("7".into());
+        candidate.record_lane(CandidateLane::Semantic, 0.81, 1, "dense_anchor");
+        candidate.record_lane(CandidateLane::Graph, 0.60, 1, "graph_neighbor");
+        candidate.add_provenance("graph_neighbor");
+
+        let ranked = rank_candidates(&features, vec![candidate]);
+        let candidate = &ranked[0];
+        let rank_features = candidate.rank_features.as_ref().expect("rank features");
+        let expected = 0.70
+            + 0.15 * rank_features.scip_distance
+            + 0.05 * rank_features.text_quality
+            + 0.05 * rank_features.requested_role_agreement
+            + 0.05 * rank_features.token_overlap;
+
+        assert!((candidate.score - expected).abs() < f32::EPSILON * 8.0);
+        assert!((0.0..=1.0).contains(&candidate.score));
     }
 }

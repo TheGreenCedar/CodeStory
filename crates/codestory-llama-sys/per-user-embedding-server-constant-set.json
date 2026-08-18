@@ -1,15 +1,15 @@
 {
   "calibration_required_values": {
     "capacity_retry_policy": {
-      "retry_after_ms": 44,
+      "retry_after_ms": 40,
       "retry_class": "after_capacity_change",
       "retry_condition_source": "named_condition_from_typed_capacity_response"
     },
     "connect_timeout_ms": 2000,
     "election_backoff_policy": {
-      "initial_backoff_ms": 7,
+      "initial_backoff_ms": 8,
       "jitter": "sha256(process_start_id||attempt) modulo inclusive [initial_backoff_ms,maximum_backoff_ms]",
-      "maximum_backoff_ms": 122
+      "maximum_backoff_ms": 111
     },
     "hard_native_no_progress_ms": 385431,
     "request_deadlines_ms": {
@@ -44,20 +44,26 @@
     "true_idle_observation_grace_ms": 2500
   },
   "freeze_record": {
-    "calibration_bundle_sha256": "8e46bb349077ab8aa57c8641ead724b7550eae326dca5b2315a37b6131d65a92",
-    "calibration_freeze_digest": "9c84f7f2975edb0987c5e86b9e185f625293f9c0b97a2d60648150c5d11b6e32",
-    "input_constant_set_sha256": "ea58d298473ddf320469d15dc7c32176a1109d615a689c15ff76b67fb337e109",
-    "measurement_protocol_sha256": "d1bb9b2c7eb354fe98990aa32eedc0e165b0cf804212966e0a2ee362a2f5bf8e",
-    "protocol_sha256": "f4a3fa4afb4d5bcd8e707a5e21b687cdd023dc3398b28ff6891a2318e89c5ec7",
+    "calibration_bundle_sha256": "9159479f2dd9e7d8056388f4dc4aeef8273722b6d095dc1124af92f8132e6786",
+    "calibration_freeze_digest": "f933390d12cf61e4fe377bcd24a159d5c8f753667ec4715991b97517d6b7e612",
+    "input_constant_set_sha256": "2c4157ce273fd8b6bd3cf7764c53b51baec66874217f07868c6350e3072aa0ab",
+    "measurement_protocol_sha256": "9eb303b6204ca6218e97ae299356370b16921a485350146fe85203a298e59269",
+    "protocol_sha256": "25373a136cc1da119ed6829769b90aab075084406b0489f9f7698b370f5ee447",
     "run_artifact_sha256s": [
-      "1e163923abfa866471adf39cc8eaef76caf85f8e6b574e38c46f4d0521f784bc",
-      "5650984c5c20ae51dfd3d1d0a3991fcd8595cb56bb17c953363ed56a00455394",
-      "e7a17b60ac96684a952eeba8779bff6a2ac8614b8944d9e980120a6efc8dd0ee"
+      "57047430fda464b338472f0315307d9be1a7430717e225b4c02c2c9acb0a1e03",
+      "7aada4bb0df6fc2f2b330e188374ddf770bfe4e515d949b25100437f05794b6c",
+      "a3c0c08725fcdffcc3579ae50462c4974673b2e7bfe0476e7454da612d268d01"
     ],
-    "selected_at": "github-actions-run:30598888717:1",
+    "selected_at": "github-actions-run:32152267828:1",
     "selection_rule": "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
-    "selection_source_commit": "35efd4f08b6cc544dee11270fee3d61b28fd16a1",
-    "selection_source_tree": "9938542124d0b56578709efc13b30c077fa1eb1d"
+    "selection_source_commit": "6d5b4a74c1cea6151151b55c3c990d19055e8d0f",
+    "selection_source_tree": "5071dc56673e8d61de30e9d1fd56050bd506d249"
+  },
+  "qualification_threshold_overrides": {
+    "protected_windows_x64_vulkan": {
+      "existing_owner_connect": 125,
+      "spawn_convergence": 2000
+    }
   },
   "qualification_thresholds": {
     "backend_observed_accelerator_residency": 1,

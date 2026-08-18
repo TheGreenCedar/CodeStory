@@ -21,6 +21,38 @@ Criterion targets.
 | Docs only | Read changed pages, doc links, `git diff --check` | No package matrix |
 | Release/version | Release and workflow policy scripts | Main-only signing, notarization, publish, install, and live runtime proof |
 
+`retrieval-engine-smoke.yml` runs the sub-second `architecture_contracts`
+binary in its universal `linux-contracts` job. Store, indexer, workspace, and
+contracts changes additionally run the path-scoped, artifact-free
+`crate-durability.yml` lane with these serial commands:
+
+```bash
+cargo test --locked -p codestory-store
+cargo test --locked -p codestory-indexer --test fidelity_regression
+cargo test --locked -p codestory-indexer --test tictactoe_language_coverage
+```
+
+That lane has its own exact-key Cargo cache, derives the key from the Rust host
+and manifests plus `Cargo.lock`, and saves only after all three commands pass.
+It does not emit artifacts or turn unrelated crate changes into durability
+work. Run source stabilization once on the final pre-calibration source head
+rather than using this focused durability lane as a second proof coordinator.
+
+The same universal `linux-contracts` job also runs the merged proof suites as
+a blocking per-PR lane, so evidence classification, packet compilation,
+readiness leases, hook installation, and the confined workspace reader cannot
+regress between dispatch-gated workspace proofs:
+
+```bash
+cargo test --locked -p codestory-runtime --lib agent::packet_evidence::
+cargo test --locked -p codestory-runtime --lib agent::packet_compiler::tests
+cargo test --locked -p codestory-runtime --lib agent::packet_batch::
+cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::
+cargo test --locked -p codestory-runtime --lib services::
+cargo test --locked -p codestory-cli --lib
+cargo test --locked -p codestory-workspace
+```
+
 ## Draft source checks
 
 Run the relevant focused commands while implementing. A typical Rust lane is:
@@ -66,15 +98,20 @@ their error-only file outcomes must use the fallback replacement path without
 discarding the previous projection. Journal/checkpoint policy and
 multiple-writer changes remain separate lanes.
 
-## Exact-head source gate
+## Source stabilization gate
 
-After independent review finds no blocker, run once on the unchanged head:
+After every implementation, plugin, documentation, and workflow change is
+integrated and independent review finds no blocker, run once on the unchanged
+pre-calibration source head. The coordinator runs the generalization lane,
+Windows source contracts, and the Linux compile/lint/test lane concurrently.
+The Linux lane uses:
 
 ```sh
 cargo fmt --all -- --check
 cargo check --workspace --locked
-cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo nextest run --workspace --locked --no-fail-fast
+cargo test --workspace --doc --locked
 ```
 
 Run the two indexer acceptance binaries in full when parser, extraction,
@@ -84,6 +121,11 @@ resolution, language coverage, or retrieval document production changed:
 cargo test --locked -p codestory-indexer --test fidelity_regression
 cargo test --locked -p codestory-indexer --test tictactoe_language_coverage
 ```
+
+The resulting `source_stabilization` receipt is required before calibration.
+The generated constant-set-only child reuses this source-behavior evidence
+through calibration lineage and must not repeat the full workspace suite. Any
+other source change invalidates the receipt.
 
 The repo-scale stats lane runs once on the final merge-ready head only when
 default indexing, symbol/dense persistence, embedding reuse, or cold-start
@@ -196,10 +238,11 @@ it does not feed or block the frozen calibration bundle.
 
 Frozen-candidate qualification is a separate one-run-per-platform lane.
 Metal and Windows Vulkan each run the full lifecycle, fault, true-idle, memory,
-and accelerator suite once. Protected Linux Vulkan may run that same
-qualification through a standalone dispatch when its GPU runner is online; it
-is not a coordinator closeout dependency and cannot block qualification when
-that runner is absent.
+and accelerator suite once. A full coordinator dispatch with
+`qualify_linux_vulkan=true` runs the same qualification on the protected Linux
+Vulkan host and requires that job to pass before closeout. The default remains
+false, so the standard release can still qualify Metal and Windows without
+turning an unavailable Linux runner into a new claim or release gate.
 
 Answer quality is a separate, optional frozen-candidate adjunct. After the
 protected Metal package proof, it runs the checksum-bound Axios JavaScript and
@@ -208,6 +251,11 @@ macOS archive. Its failure or absence cannot block Metal, Windows, Linux, or
 closeout, and the standard release makes no answer-quality claim. Promotion and
 release decisions consume the coordinator's `closeout` job result directly;
 they do not wait for this optional job or for workflow-wide completion.
+The explicit Linux qualification opt-in is stricter: it also requires the
+current run attempt's exact-head Linux Axios artifact to contain three
+publishable cold-CLI rows with no blockers, gaps, degraded retrieval, or missed
+SLA. That receipt closes the issue-specific acceptance contract; it does not
+broaden the standard release's public answer-quality or performance claims.
 
 ### Packaged proof
 
@@ -428,8 +476,18 @@ node --test .github/scripts/run-actionlint.test.mjs
 node .github/scripts/run-actionlint.mjs
 node .github/scripts/check-workflow-policy.mjs
 node --test .github/scripts/check-workflow-policy.test.mjs
+node --test .github/scripts/windows-link-timing.test.mjs
 node .github/scripts/route-ci-proof.mjs --self-test
 ```
+
+Windows package timing reports cache restore, native setup, `cargo_graph`,
+`msvc_link`, feature probe, packaging, and artifact transfer as separate
+intervals. `msvc_link` comes from `.github/scripts/windows-link-timing.mjs`,
+which selects explicit `link /TIME` boundaries out of the captured build trace
+and writes `windows-link-timing.json` beside it; a build log that only mentions
+the crate named `time` leaves the phase `unavailable`. Linker timing is
+observational, so an unavailable phase never invalidates an authenticated
+package.
 
 Exact source and package jobs keep dependency downloads, compiler objects, and
 release artifacts separate. Compiler keys end in the exact candidate SHA but
@@ -508,6 +566,15 @@ target. Do not use `matrix`, `mixed`, or another
 aggregate placeholder for a host, runner, backend, installer, or native-engine
 identity.
 
+Each post-publish target performs one catalog installation and then launches
+two ordered fresh installed-runtime proof sessions against that same install.
+The retained restart-survival receipt hashes both summaries and the install
+attestation, requires stable package and managed-runtime identity, distinct
+server/process/engine identities, project-bound ground and search in both
+sessions, and full backend-observed accelerated retrieval in the second. This
+proves visibility after a fresh host/runtime launch; it does not claim the
+server persists after every client exits.
+
 Production producers use `scripts/codestory-release-cell-manifest.mjs`. They
 emit cells only after their job succeeds and bind workflow, job, run, attempt
 and Actions artifact identity. Artifact names are immutable and attempt
@@ -567,6 +634,25 @@ the first loss of a runner is still owed its one retry. The collector reads
 every attempt of the run to make that count possible, and counts a job Actions
 carried forward unchanged once. Jobs that failed on their own assertions are
 not named in the rerun request and stay red.
+
+Which execution the plan reads, and what one refused re-dispatch does to the
+others, are both declared in `workflow_policy.lost_runner_rerun`:
+
+- `selection: latest_execution_per_job_name`. The plan decides from each job
+  name's **newest** execution and reports the executions it superseded with
+  `retry_decision: superseded_by_later_execution`. A host that was lost and
+  then reported on a later attempt is therefore out of the plan entirely, and
+  its stale, already-consumed job id is never named. Executions are ordered by
+  run attempt and then by job id, because Actions allocates job ids in creation
+  order inside a run and also re-lists a carried-forward job under the newer
+  attempt number -- the attempt alone cannot order the two.
+- `dispatch_tolerance: per_job_id`. The hosts share one machine, so one incident
+  can lose two of them at once. `lost-runner-recovery.mjs dispatch-rerun` asks
+  Actions for every named id separately, records what each one answered in
+  `rerun-dispatch.json` (schema `codestory.lost-runner-rerun-dispatch/v1`), and
+  fails only when **no** id was accepted. A shell loop under `set -e` used to
+  abandon the ids after the first refusal, and workflow policy now refuses a
+  dispatch step that calls the API itself.
 
 If a host is lost twice, `release.yml`'s `accelerator-non-claim` job records a
 **populated non-claim** for that host in place of the cells that host would
@@ -679,10 +765,13 @@ controlled-invalid fixtures must retain their class-prefixed diagnostics.
 Draft pushes run focused checks and one Linux source check. Exact-head review
 runs the broad source gate once. Packaged matrices and protected hardware run
 only through the coordinator/platform-proof gate. Draft pushes cancel stale
-draft work. Exact source and platform coordinators run only when their label is
-applied; their concurrency and cache identities include the exact Actions SHA,
-so a later push cannot cancel or populate proof for an accepted old head. Each
-target is built once then reused by its proof steps.
+draft work. Exact source and platform coordinators are reusable
+`workflow_call` workflows with a `workflow_dispatch` entry; no pull-request
+label starts them. A maintainer dispatches `packaged-platform-pr.yml` against
+an exact accepted head, and it calls the coordinators. Their concurrency and
+cache identities include the exact Actions SHA, so a later push cannot cancel
+or populate proof for an accepted old head. Each target is built once then
+reused by its proof steps.
 
 Release signing, notarization, post-publish quarantine/Gatekeeper checks,
 installed plugin readback, and live full retrieval run only from the main
@@ -690,7 +779,7 @@ release workflow. No version bump, tag, signing, notarization, or release is
 part of ordinary remediation or embedding-engine PRs.
 
 Maintainers may manually dispatch `release.yml` from an exact
-`dev/codestory-next` SHA to authenticate the 7-cell pre-publish ledger without
+`dev/codestory-next` SHA to authenticate the graph-declared pre-publish ledger without
 publishing. The required `expected_head_sha` must equal both the workflow SHA
 and the live dev branch head. Manual dispatch exposes no publication input;
 only the automatic reusable-workflow caller on the live `main` head passes the

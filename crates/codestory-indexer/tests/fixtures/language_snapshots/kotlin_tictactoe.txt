@@ -1,0 +1,115 @@
+node CLASS name=ArtificialPlayer qn=tictactoe.ArtificialPlayer canonical=game.kt:tictactoe.ArtificialPlayer line=46 col=1 end=58:2 file=FILE:game.kt@1
+node CLASS name=Field qn=tictactoe.Field canonical=game.kt:tictactoe.Field line=19 col=1 end=34:2 file=FILE:game.kt@1
+node CLASS name=GameObject qn=GameObject canonical=game.kt:GameObject line=19 col=15 end=19:25 file=FILE:game.kt@1
+node CLASS name=GameObject qn=tictactoe.GameObject canonical=game.kt:tictactoe.GameObject line=15 col=1 end=17:2 file=FILE:game.kt@1
+node CLASS name=HumanPlayer qn=tictactoe.HumanPlayer canonical=game.kt:tictactoe.HumanPlayer line=40 col=1 end=44:2 file=FILE:game.kt@1
+node CLASS name=Player qn=Player canonical=game.kt:Player line=40 col=21 end=40:27 file=FILE:game.kt@1
+node CLASS name=TicTacToe qn=tictactoe.TicTacToe canonical=game.kt:tictactoe.TicTacToe line=60 col=1 end=68:2 file=FILE:game.kt@1
+node FILE name=game.kt qn=game.kt canonical=game.kt:game.kt:1 line=1 col=1 end=73:0 file=FILE:game.kt@1
+node FUNCTION name=main qn=main canonical=game.kt:main#0 line=70 col=1 end=73:2 file=FILE:game.kt@1
+node FUNCTION name=numberIn qn=numberIn canonical=game.kt:numberIn#0 line=5 col=1 end=5:24 file=FILE:game.kt@1
+node FUNCTION name=numberOut qn=numberOut canonical=game.kt:numberOut#0 line=7 col=1 end=9:2 file=FILE:game.kt@1
+node FUNCTION name=stringOut qn=stringOut canonical=game.kt:stringOut#0 line=11 col=1 end=13:2 file=FILE:game.kt@1
+node INTERFACE name=Player qn=tictactoe.Player canonical=game.kt:tictactoe.Player line=36 col=1 end=38:2 file=FILE:game.kt@1
+node METHOD name=ArtificialPlayer.minMax qn=tictactoe.ArtificialPlayer.minMax canonical=game.kt:tictactoe.ArtificialPlayer.minMax#0 line=47 col=5 end=52:6 file=FILE:game.kt@1
+node METHOD name=ArtificialPlayer.turn qn=tictactoe.ArtificialPlayer.turn canonical=game.kt:tictactoe.ArtificialPlayer.turn#0 line=54 col=5 end=57:6 file=FILE:game.kt@1
+node METHOD name=Field.makeMove qn=tictactoe.Field.makeMove canonical=game.kt:tictactoe.Field.makeMove#0 line=26 col=5 end=33:6 file=FILE:game.kt@1
+node METHOD name=Field.sameInRow qn=tictactoe.Field.sameInRow canonical=game.kt:tictactoe.Field.sameInRow#0 line=22 col=5 end=24:6 file=FILE:game.kt@1
+node METHOD name=GameObject.announce qn=tictactoe.GameObject.announce canonical=game.kt:tictactoe.GameObject.announce#0 line=16 col=5 end=16:22 file=FILE:game.kt@1
+node METHOD name=HumanPlayer.turn qn=tictactoe.HumanPlayer.turn canonical=game.kt:tictactoe.HumanPlayer.turn#0 line=41 col=5 end=43:6 file=FILE:game.kt@1
+node METHOD name=Player.turn qn=tictactoe.Player.turn canonical=game.kt:tictactoe.Player.turn#0 line=37 col=5 end=37:48 file=FILE:game.kt@1
+node METHOD name=TicTacToe.run qn=tictactoe.TicTacToe.run canonical=game.kt:tictactoe.TicTacToe.run#0 line=63 col=5 end=67:6 file=FILE:game.kt@1
+node MODULE name=kotlin.random.Random qn=kotlin.random.Random canonical=game.kt:kotlin.random.Random#0 line=3 col=8 end=3:28 file=FILE:game.kt@1
+node MODULE name=tictactoe qn=tictactoe canonical=game.kt:tictactoe#0 line=1 col=1 end=1:18 file=FILE:game.kt@1
+node UNKNOWN name=Field qn=Field canonical=game.kt:Field#0 line=61 col=17 end=61:22 file=FILE:game.kt@1
+node UNKNOWN name=TicTacToe qn=TicTacToe canonical=game.kt:TicTacToe#0 line=71 col=16 end=71:25 file=FILE:game.kt@1
+node UNKNOWN name=makeMove qn=makeMove canonical=game.kt:makeMove#0 line=42 col=22 end=42:30 file=FILE:game.kt@1
+node UNKNOWN name=minMax qn=minMax canonical=game.kt:minMax#0 line=51 col=16 end=51:22 file=FILE:game.kt@1
+node UNKNOWN name=minMax qn=minMax canonical=game.kt:minMax#1 line=55 col=9 end=55:15 file=FILE:game.kt@1
+node UNKNOWN name=nextInt qn=nextInt canonical=game.kt:nextInt#0 line=66 col=16 end=66:23 file=FILE:game.kt@1
+node UNKNOWN name=numberIn qn=numberIn canonical=game.kt:numberIn#1 line=64 col=9 end=64:17 file=FILE:game.kt@1
+node UNKNOWN name=println qn=println canonical=game.kt:println#0 line=8 col=5 end=8:12 file=FILE:game.kt@1
+node UNKNOWN name=println qn=println canonical=game.kt:println#1 line=12 col=5 end=12:12 file=FILE:game.kt@1
+node UNKNOWN name=run qn=run canonical=game.kt:run#0 line=72 col=10 end=72:13 file=FILE:game.kt@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=game.kt:sameInRow#0 line=31 col=9 end=31:18 file=FILE:game.kt@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.kt:stringOut#1 line=65 col=9 end=65:18 file=FILE:game.kt@1
+edge CALL src=FUNCTION:main@70 dst=METHOD:TicTacToe.run@63 resolved_src=- resolved_dst=METHOD:TicTacToe.run@63 line=72 confidence=1.0000 certainty=Certain callsite=h0:72:1:h1 candidates=[]
+edge CALL src=FUNCTION:main@70 dst=UNKNOWN:TicTacToe@71 resolved_src=- resolved_dst=- line=71 confidence=- certainty=- callsite=h0:71:1:h2 candidates=[]
+edge CALL src=FUNCTION:numberOut@7 dst=UNKNOWN:println@8 resolved_src=- resolved_dst=- line=8 confidence=- certainty=- callsite=h0:8:1:h3 candidates=[]
+edge CALL src=FUNCTION:stringOut@11 dst=UNKNOWN:println@12 resolved_src=- resolved_dst=- line=12 confidence=- certainty=- callsite=h0:12:1:h4 candidates=[]
+edge CALL src=METHOD:ArtificialPlayer.minMax@47 dst=UNKNOWN:minMax@51 resolved_src=- resolved_dst=- line=51 confidence=- certainty=- callsite=h0:51:1:h5 candidates=[]
+edge CALL src=METHOD:ArtificialPlayer.turn@54 dst=UNKNOWN:minMax@55 resolved_src=- resolved_dst=- line=55 confidence=- certainty=- callsite=h0:55:1:h6 candidates=[]
+edge CALL src=METHOD:Field.makeMove@26 dst=UNKNOWN:sameInRow@31 resolved_src=- resolved_dst=- line=31 confidence=- certainty=- callsite=h0:31:1:h7 candidates=[]
+edge CALL src=METHOD:HumanPlayer.turn@41 dst=METHOD:Field.makeMove@26 resolved_src=- resolved_dst=METHOD:Field.makeMove@26 line=42 confidence=1.0000 certainty=Certain callsite=h0:42:1:h8 candidates=[]
+edge CALL src=METHOD:TicTacToe.run@63 dst=UNKNOWN:nextInt@66 resolved_src=- resolved_dst=- line=66 confidence=- certainty=- callsite=h0:66:1:h9|syntax:kotlin-member-call candidates=[]
+edge CALL src=METHOD:TicTacToe.run@63 dst=UNKNOWN:numberIn@64 resolved_src=- resolved_dst=- line=64 confidence=- certainty=- callsite=h0:64:1:h10 candidates=[]
+edge CALL src=METHOD:TicTacToe.run@63 dst=UNKNOWN:stringOut@65 resolved_src=- resolved_dst=- line=65 confidence=- certainty=- callsite=h0:65:1:h11 candidates=[]
+edge IMPORT src=MODULE:kotlin.random.Random@3 dst=MODULE:kotlin.random.Random@3 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:ArtificialPlayer@46 dst=CLASS:Player@40 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:Field@19 dst=CLASS:GameObject@19 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:HumanPlayer@40 dst=CLASS:Player@40 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:TicTacToe@60 dst=CLASS:GameObject@19 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ArtificialPlayer@46 dst=METHOD:ArtificialPlayer.minMax@47 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ArtificialPlayer@46 dst=METHOD:ArtificialPlayer.turn@54 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@19 dst=METHOD:Field.makeMove@26 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@19 dst=METHOD:Field.sameInRow@22 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:GameObject@15 dst=METHOD:GameObject.announce@16 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:HumanPlayer@40 dst=METHOD:HumanPlayer.turn@41 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:TicTacToe@60 dst=METHOD:TicTacToe.run@63 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=INTERFACE:Player@36 dst=METHOD:Player.turn@37 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=MODULE:tictactoe@1 dst=CLASS:ArtificialPlayer@46 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=MODULE:tictactoe@1 dst=CLASS:Field@19 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=MODULE:tictactoe@1 dst=CLASS:GameObject@15 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=MODULE:tictactoe@1 dst=CLASS:HumanPlayer@40 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=MODULE:tictactoe@1 dst=CLASS:TicTacToe@60 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=MODULE:tictactoe@1 dst=INTERFACE:Player@36 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+file path=game.kt language=kotlin lines=73 complete=true role=Source
+occurrence element=CLASS:ArtificialPlayer@46 kind=DEFINITION span=46:1-58:2
+occurrence element=CLASS:Field@19 kind=DEFINITION span=19:1-34:2
+occurrence element=CLASS:GameObject@15 kind=DEFINITION span=15:1-17:2
+occurrence element=CLASS:GameObject@19 kind=DEFINITION span=19:15-19:25
+occurrence element=CLASS:GameObject@19 kind=DEFINITION span=60:19-60:29
+occurrence element=CLASS:HumanPlayer@40 kind=DEFINITION span=40:1-44:2
+occurrence element=CLASS:Player@40 kind=DEFINITION span=40:21-40:27
+occurrence element=CLASS:Player@40 kind=DEFINITION span=46:26-46:32
+occurrence element=CLASS:TicTacToe@60 kind=DEFINITION span=60:1-68:2
+occurrence element=FUNCTION:main@70 kind=DEFINITION span=70:1-73:2
+occurrence element=FUNCTION:numberIn@5 kind=DEFINITION span=5:1-5:24
+occurrence element=FUNCTION:numberOut@7 kind=DEFINITION span=7:1-9:2
+occurrence element=FUNCTION:stringOut@11 kind=DEFINITION span=11:1-13:2
+occurrence element=INTERFACE:Player@36 kind=DEFINITION span=36:1-38:2
+occurrence element=METHOD:ArtificialPlayer.minMax@47 kind=DEFINITION span=47:5-52:6
+occurrence element=METHOD:ArtificialPlayer.turn@54 kind=DEFINITION span=54:5-57:6
+occurrence element=METHOD:Field.makeMove@26 kind=DEFINITION span=26:5-33:6
+occurrence element=METHOD:Field.sameInRow@22 kind=DEFINITION span=22:5-24:6
+occurrence element=METHOD:GameObject.announce@16 kind=DEFINITION span=16:5-16:22
+occurrence element=METHOD:HumanPlayer.turn@41 kind=DEFINITION span=41:5-43:6
+occurrence element=METHOD:Player.turn@37 kind=DEFINITION span=37:5-37:48
+occurrence element=METHOD:TicTacToe.run@63 kind=DEFINITION span=63:5-67:6
+occurrence element=MODULE:kotlin.random.Random@3 kind=DEFINITION span=3:8-3:28
+occurrence element=MODULE:tictactoe@1 kind=DEFINITION span=1:1-1:18
+occurrence element=UNKNOWN:Field@61 kind=DEFINITION span=61:17-61:22
+occurrence element=UNKNOWN:TicTacToe@71 kind=DEFINITION span=71:16-71:25
+occurrence element=UNKNOWN:makeMove@42 kind=DEFINITION span=42:22-42:30
+occurrence element=UNKNOWN:minMax@51 kind=DEFINITION span=51:16-51:22
+occurrence element=UNKNOWN:minMax@55 kind=DEFINITION span=55:9-55:15
+occurrence element=UNKNOWN:nextInt@66 kind=DEFINITION span=66:16-66:23
+occurrence element=UNKNOWN:numberIn@64 kind=DEFINITION span=64:9-64:17
+occurrence element=UNKNOWN:println@12 kind=DEFINITION span=12:5-12:12
+occurrence element=UNKNOWN:println@8 kind=DEFINITION span=8:5-8:12
+occurrence element=UNKNOWN:run@72 kind=DEFINITION span=72:10-72:13
+occurrence element=UNKNOWN:sameInRow@31 kind=DEFINITION span=31:9-31:18
+occurrence element=UNKNOWN:stringOut@65 kind=DEFINITION span=65:9-65:18
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "13:main", node_id: NodeId(-3269461739909379704), signature_hash: -4671339478033693080, normalized_signature: Some("shape:-2692651601011948422"), body_hash: -8673273081720969995, start_line: 70, end_line: 73 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "13:numberIn", node_id: NodeId(3089308516238638639), signature_hash: 2477812878330356949, normalized_signature: Some("outline:-1793518511152586733"), body_hash: 7459896940976823828, start_line: 5, end_line: 5 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "13:numberOut", node_id: NodeId(-3709840166360608430), signature_hash: -1579019679195996938, normalized_signature: Some("shape:-1605510924220694893"), body_hash: 2936401094215417944, start_line: 7, end_line: 9 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "13:stringOut", node_id: NodeId(-4149573940085942370), signature_hash: -5818630870471287222, normalized_signature: Some("shape:1309767868204554717"), body_hash: -4220344892772128265, start_line: 11, end_line: 13 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.ArtificialPlayer.minMax", node_id: NodeId(-5761633344270872004), signature_hash: 7923513529814909507, normalized_signature: Some("shape:1015635496070560885"), body_hash: 4242977279514388040, start_line: 47, end_line: 52 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.ArtificialPlayer.turn", node_id: NodeId(5137820935137696609), signature_hash: 7173012715314331748, normalized_signature: Some("shape:8113778084223192606"), body_hash: 3184914660125496680, start_line: 54, end_line: 57 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.Field.makeMove", node_id: NodeId(-7313089341527803310), signature_hash: 5427009982719951223, normalized_signature: Some("shape:5939635087886849543"), body_hash: 8577733092547693783, start_line: 26, end_line: 33 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.Field.sameInRow", node_id: NodeId(-3798522297738322762), signature_hash: 13991502958346549, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -3596774140282798074, start_line: 22, end_line: 24 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.GameObject.announce", node_id: NodeId(6989368840253805161), signature_hash: -8484686843331876212, normalized_signature: Some("outline:-5083272169020481154"), body_hash: 5649390043764946485, start_line: 16, end_line: 16 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.HumanPlayer.turn", node_id: NodeId(6083351942803539678), signature_hash: 8396526627782628803, normalized_signature: Some("shape:8849405336717584789"), body_hash: 86375802672240801, start_line: 41, end_line: 43 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.Player.turn", node_id: NodeId(1806542613209924669), signature_hash: 3751145040262998084, normalized_signature: Some("outline:-5083272169020481154"), body_hash: -3888748658543768978, start_line: 37, end_line: 37 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.TicTacToe.run", node_id: NodeId(3180349830509067196), signature_hash: 7756538164283989331, normalized_signature: Some("shape:6107906801655771678"), body_hash: 2516058718679896838, start_line: 63, end_line: 67 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "__file_structural__", node_id: NodeId(-3740202488659960972), signature_hash: 8859361582818242897, normalized_signature: None, body_hash: 741816125663691004, start_line: 1, end_line: 73 }

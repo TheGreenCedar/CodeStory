@@ -7,9 +7,31 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   deriveProductRepositoryNames,
+  maskDeclarativeCoverageMetadata,
   parseBenchmarkPromptLiterals,
+  pendingClaimProfileProblem,
+  pendingInventoryTotalsProblem,
   runRetrievalGeneralizationLint,
 } from "../lib/retrieval-generalization-lint.mjs";
+
+test("declarative route coverage names do not become retrieval steering", () => {
+  const source = [
+    "FrameworkRouteCoverageEntry {",
+    '    framework: "example_framework",',
+    '    known_gaps: &["example_framework dispatch remains partial"],',
+    "}",
+    'if framework == "example_framework" { route(); }',
+  ].join("\n");
+  const masked = maskDeclarativeCoverageMetadata("route_coverage.rs", source);
+
+  assert.match(masked, /framework: "",/);
+  assert.match(masked, /known_gaps:.*example_framework/);
+  assert.match(masked, /framework == "example_framework"/);
+  assert.equal(
+    maskDeclarativeCoverageMetadata("packet_plan.rs", source),
+    source,
+  );
+});
 
 const repositoryRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -359,11 +381,22 @@ test("the full hostile matrix shares one policy load and never writes into the c
     "codestory-retrieval",
     "src",
   );
+  // Packet planning moved to its own crate; it carries the same full ban set as
+  // the runtime and retrieval slices it was cut out of, so the hostile matrix
+  // has to stand up that root as well or the lint fails closed on a missing
+  // required scan path before it reaches a single finding.
+  const agentRoot = path.join(
+    productionRepositoryRoot,
+    "crates",
+    "codestory-agent",
+    "src",
+  );
   const extraRustRoot = path.join(fixtureRoot, "extra-rust");
   const nonRustRoot = path.join(fixtureRoot, "non-rust");
   const taskRoot = path.join(fixtureRoot, "tasks");
   fs.mkdirSync(rustRoot, { recursive: true });
   fs.mkdirSync(retrievalRoot, { recursive: true });
+  fs.mkdirSync(agentRoot, { recursive: true });
   fs.mkdirSync(extraRustRoot);
   fs.mkdirSync(nonRustRoot);
   fs.mkdirSync(taskRoot);
@@ -378,6 +411,13 @@ test("the full hostile matrix shares one policy load and never writes into the c
   for (const fileName of ["search_plan.rs", "search_scoring.rs", "search_terms.rs"]) {
     write(rustRoot, fileName, "pub fn neutral_default_surface() {}\n");
   }
+  // The claim-profile registry is a required production *data* file: the `.rs` walk never
+  // reaches it, so the lint seeds it by name and refuses to run when it is absent.
+  write(
+    agentRoot,
+    path.join("data", "claim_profiles.v2.json"),
+    '{ "schema_version": 2, "pending_ratchet": 0, "profiles": [] }\n',
+  );
   write(retrievalRoot, "lib.rs", "pub fn neutral_retrieval_surface() {}\n");
   write(
     extraRustRoot,
@@ -450,6 +490,20 @@ mod tests {
   const CLAIM: &str =
     "The top-level request helper opens a Session and delegates to Session.request.";
 }
+pub fn neutral() -> &'static str { "generic role coverage stays neutral" }
+`);
+  // A lifetime and a possessive are not quotes. Read as quotes they pair off in
+  // file order, and everything between them -- here the split marker -- stops
+  // being a literal the compact pass can see, which made what the gate reads a
+  // function of how many apostrophes the file happens to contain.
+  reject("apostrophe-parity.rs", `
+pub fn version() -> &'static str { "neutral" }
+pub fn leaked() -> String { ["dispatch", "request"].concat() }
+// This file's own prose must not decide whether the line above is scanned.
+`);
+  allow("apostrophe-parity-neutral.rs", `
+pub fn newline() -> char { '\\n' }
+// The crate's own comment stays a comment.
 pub fn neutral() -> &'static str { "generic role coverage stays neutral" }
 `);
   const splitConstructionFiles = new Map([
@@ -816,8 +870,8 @@ pub const PLANTED_TERMS: &[(&str, &str)] = &[
     }
     assert.deepEqual(
       result.scanDirs,
-      [rustRoot, retrievalRoot, extraRustRoot],
-      "the canonical runtime/retrieval defaults must remain present before the additive extra root",
+      [agentRoot, rustRoot, retrievalRoot, extraRustRoot],
+      "the canonical agent/runtime/retrieval defaults must remain present before the additive extra root",
     );
     assert.ok(
       findingFor(result, "deep/new/ranking_scope_probe_generated.rs"),
@@ -848,6 +902,10 @@ pub const PLANTED_TERMS: &[(&str, &str)] = &[
     assert.ok(result.stderr.includes("codex-rs/prod/src/lib.rs"));
     assert.ok(!result.stderr.includes("crates/codestory-retrieval/src/ranker.rs (production slice)"));
 
+    assert.ok(
+      banFiredFor(result, "apostrophe-parity.rs", "dispatchrequest"),
+      "a lifetime and a possessive apostrophe hid a split marker from the compact pass",
+    );
     for (const marker of CURRENT_HOLDOUT_LITERALS) {
       assert.ok(
         banFiredFor(result, "current-holdouts.rs", marker),
@@ -1138,5 +1196,220 @@ test("ranker production has no repository filename literals", () => {
     finding,
     undefined,
     `ranker production contains a repository filename literal: ${JSON.stringify(finding)}`,
+  );
+});
+
+// The pending inventory is checked as data, not against the checkout: the lint
+// binary itself is what compares these declarations to the shipped tree, and it
+// exits non-zero on any drift. These cases pin the comparison in both directions.
+const PENDING_SURFACE_REASON =
+  "Recorded because the surface still exists and the burn-down is tracked on its issue.";
+
+function syntheticInventory() {
+  return {
+    total_markers: 2,
+    total_marker_occurrences: 5,
+    surfaces: {
+      "crates/first/src/lib.rs": {
+        issue: "https://github.com/TheGreenCedar/CodeStory/issues/1573",
+        reason: PENDING_SURFACE_REASON,
+        markers: { alpha: 3 },
+      },
+      "crates/second/src/lib.rs": {
+        issue: "https://github.com/TheGreenCedar/CodeStory/issues/1573",
+        reason: PENDING_SURFACE_REASON,
+        markers: { beta: 2 },
+      },
+    },
+  };
+}
+
+function syntheticBurnDownEntry(profile) {
+  return {
+    profile,
+    issue: "https://github.com/TheGreenCedar/CodeStory/issues/1674",
+    evidence:
+      `Measured fire triple for ${profile}: fires on the fitted family, fires on a second `
+      + "file type with a different claim, and measures zero on the helper.",
+  };
+}
+
+function syntheticClaimProfileRatchet() {
+  return {
+    file: "crates/codestory-runtime/src/agent/data/claim_profiles.v2.json",
+    declaration: '"status": "pending_migration"',
+    count: 3,
+    ratchet_ceiling: 5,
+    issue: "https://github.com/TheGreenCedar/CodeStory/issues/1573",
+    reason: PENDING_SURFACE_REASON,
+    burn_down: [
+      syntheticBurnDownEntry("example-one"),
+      syntheticBurnDownEntry("example-two"),
+    ],
+  };
+}
+
+function syntheticProfileRegistry(pendingCount) {
+  return '{ "status": "pending_migration" },\n'.repeat(pendingCount);
+}
+
+test("an exact pending inventory reports no totals problem", () => {
+  assert.equal(pendingInventoryTotalsProblem(syntheticInventory()), null);
+});
+
+test("either declared inventory total drifting fails in both directions", () => {
+  for (const field of ["total_markers", "total_marker_occurrences"]) {
+    for (const delta of [-1, 1]) {
+      const inventory = syntheticInventory();
+      inventory[field] += delta;
+      assert.match(
+        pendingInventoryTotalsProblem(inventory) ?? "",
+        new RegExp(`declares ${field} ${inventory[field]} but lists `, "u"),
+        `${field} must be exact, not a floor or a ceiling`,
+      );
+    }
+  }
+});
+
+test("occurrence drift inside one marker fails even when the marker count holds", () => {
+  const inventory = syntheticInventory();
+  inventory.surfaces["crates/first/src/lib.rs"].markers.alpha += 1;
+  const problem = pendingInventoryTotalsProblem(inventory);
+  assert.equal(problem.includes("total_markers "), false);
+  assert.match(problem, /declares total_marker_occurrences 5 but lists 6 occurrences/u);
+});
+
+test("a matching claim-profile ratchet reports no problem", () => {
+  const declared = syntheticClaimProfileRatchet();
+  assert.equal(
+    pendingClaimProfileProblem(declared, () => syntheticProfileRegistry(declared.count)),
+    null,
+  );
+});
+
+test("claim-profile ratchet drift fails deterministically in both directions", () => {
+  const declared = syntheticClaimProfileRatchet();
+  for (const observed of [declared.count - 1, declared.count + 1]) {
+    assert.match(
+      pendingClaimProfileProblem(declared, () => syntheticProfileRegistry(observed)) ?? "",
+      new RegExp(`declared ${declared.count} time\\(s\\), tree has ${observed}`, "u"),
+    );
+  }
+  assert.match(
+    pendingClaimProfileProblem(declared, () => null),
+    /which the tree no longer has/u,
+  );
+});
+
+test("a malformed claim-profile ratchet fails closed", () => {
+  const declared = syntheticClaimProfileRatchet();
+  const registry = () => syntheticProfileRegistry(declared.count);
+  for (const invalid of [
+    undefined,
+    null,
+    { ...declared, count: -1 },
+    { ...declared, count: 1.5 },
+    { ...declared, declaration: "" },
+    { ...declared, file: "" },
+    { ...declared, reason: "too short" },
+    { ...declared, issue: "https://example.com/issues/1" },
+  ]) {
+    assert.match(
+      pendingClaimProfileProblem(invalid, registry) ?? "",
+      /pending_claim_profiles must declare/u,
+    );
+  }
+});
+
+test("the claim-profile ratchet cannot be declared above its own ceiling", () => {
+  const declared = syntheticClaimProfileRatchet();
+  const registry = () => syntheticProfileRegistry(declared.count);
+  for (const ceiling of [declared.count - 1, undefined, "5", 5.5]) {
+    assert.match(
+      pendingClaimProfileProblem({ ...declared, ratchet_ceiling: ceiling }, registry) ?? "",
+      /must declare ratchet_ceiling as an integer at or above count/u,
+    );
+  }
+});
+
+test("every profile between the ceiling and the count needs a burn-down entry", () => {
+  const declared = syntheticClaimProfileRatchet();
+  const registry = (count) => () => syntheticProfileRegistry(count);
+
+  // Lowering the count without recording the migration that lowered it fails.
+  assert.match(
+    pendingClaimProfileProblem({ ...declared, count: 2 }, registry(2)) ?? "",
+    /ratchet_ceiling 5 and count 2 but lists 2 burn_down entr\(ies\)/u,
+  );
+  // So does deleting a recorded migration to make room for a new uncontracted profile.
+  assert.match(
+    pendingClaimProfileProblem(
+      { ...declared, burn_down: [syntheticBurnDownEntry("example-one")] },
+      registry(declared.count),
+    ) ?? "",
+    /ratchet_ceiling 5 and count 3 but lists 1 burn_down entr\(ies\)/u,
+  );
+  // A ledger that is not a ledger fails before the arithmetic does.
+  assert.match(
+    pendingClaimProfileProblem({ ...declared, burn_down: undefined }, registry(declared.count))
+      ?? "",
+    /must declare burn_down as the ledger of migrations/u,
+  );
+});
+
+test("a burn-down entry without measured evidence and an owning issue fails", () => {
+  const declared = syntheticClaimProfileRatchet();
+  const registry = () => syntheticProfileRegistry(declared.count);
+  const good = syntheticBurnDownEntry("example-one");
+  for (
+    const broken of [
+      { ...good, evidence: "measured" },
+      { ...good, evidence: undefined },
+      { ...good, profile: "" },
+      { ...good, issue: "https://example.com/issues/1" },
+      "example-one",
+      null,
+    ]
+  ) {
+    assert.match(
+      pendingClaimProfileProblem(
+        { ...declared, burn_down: [broken, syntheticBurnDownEntry("example-two")] },
+        registry,
+      ) ?? "",
+      /needs the profile it retired, the issue that retired it, and at least \d+ characters of measured evidence/u,
+    );
+  }
+
+  assert.match(
+    pendingClaimProfileProblem(
+      {
+        ...declared,
+        burn_down: [
+          syntheticBurnDownEntry("example-one"),
+          syntheticBurnDownEntry("example-one"),
+        ],
+      },
+      registry,
+    ) ?? "",
+    /lists example-one twice; one migration is one entry/u,
+  );
+});
+
+test("the shipped claim-profile ratchet is the shipped registry document", () => {
+  // The synthetic cases above prove the rule; this one proves the rule is pointed at the
+  // registry that actually ships, so moving the profiles to data cannot leave the ratchet
+  // counting a declaration no production file spells any more.
+  const inventory = JSON.parse(
+    fs.readFileSync(
+      path.join(repositoryRoot, "scripts", "retrieval-generalization-pending.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(
+    pendingClaimProfileProblem(
+      inventory.pending_claim_profiles,
+      (file) => fs.readFileSync(path.join(repositoryRoot, file), "utf8"),
+    ),
+    null,
   );
 });

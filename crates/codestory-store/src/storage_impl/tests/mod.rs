@@ -259,6 +259,149 @@ fn file_identity_lookup_rejects_runtime_limit_below_two_bindings() -> Result<(),
 }
 
 #[test]
+fn canonical_annotation_anchor_lookup_is_batched_deterministic_and_ambiguity_preserving()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(30),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "late".to_string(),
+            canonical_id: Some("rust:function:shared".to_string()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "early".to_string(),
+            canonical_id: Some("rust:function:shared".to_string()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(20),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "other".to_string(),
+            canonical_id: Some("rust:function:other".to_string()),
+            ..Default::default()
+        },
+    ])?;
+
+    let previous_limit = storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 1)?;
+    assert!(previous_limit >= 1);
+    let lookup = storage.node_ids_by_canonical_ids(&[
+        "rust:function:shared".to_string(),
+        "rust:function:missing".to_string(),
+        "rust:function:other".to_string(),
+        "rust:function:shared".to_string(),
+    ])?;
+
+    assert_eq!(
+        lookup,
+        BTreeMap::from([
+            ("rust:function:missing".to_string(), Vec::new()),
+            ("rust:function:other".to_string(), vec![NodeId(20)]),
+            (
+                "rust:function:shared".to_string(),
+                vec![NodeId(10), NodeId(30)]
+            ),
+        ])
+    );
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)?;
+    Ok(())
+}
+
+#[test]
+fn canonical_annotation_anchor_lookup_rejects_zero_bind_limit() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 0)?;
+
+    let error = storage
+        .node_ids_by_canonical_ids(&["rust:function:shared".to_string()])
+        .expect_err("canonical-ID lookup must reject a zero-variable runtime limit");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot support canonical-ID lookup"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_annotation_anchor_fallback_returns_every_match_in_node_id_order()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let file_identity = "/repo/src/lib.rs";
+    storage.insert_file(&FileInfo {
+        id: 100,
+        path: PathBuf::from(file_identity),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 20,
+        file_role: FileRole::Source,
+    })?;
+    storage.insert_nodes_batch(&[Node {
+        id: NodeId(100),
+        kind: NodeKind::FILE,
+        serialized_name: file_identity.to_string(),
+        ..Default::default()
+    }])?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(30),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "later".to_string(),
+            qualified_name: Some("crate::shared".to_string()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "earlier".to_string(),
+            qualified_name: Some("crate::shared".to_string()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(20),
+            kind: NodeKind::METHOD,
+            serialized_name: "wrong_kind".to_string(),
+            qualified_name: Some("crate::shared".to_string()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+    ])?;
+
+    assert_eq!(
+        storage.node_ids_by_file_identity_qualified_name_and_kind(
+            file_identity,
+            "crate::shared",
+            NodeKind::FUNCTION,
+        )?,
+        vec![NodeId(10), NodeId(30)]
+    );
+    assert!(
+        storage
+            .node_ids_by_file_identity_qualified_name_and_kind(
+                "/repo/src/missing.rs",
+                "crate::shared",
+                NodeKind::FUNCTION,
+            )?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
 fn observational_open_preserves_current_database_bytes_without_sidecars() {
     let path = unique_temp_db_path("observational-current");
     create_versioned_observation_fixture(&path, SCHEMA_VERSION);
@@ -1782,6 +1925,79 @@ fn test_resolution_indexes_are_created() -> Result<(), StorageError> {
 }
 
 #[test]
+fn annotation_anchor_and_error_indexes_are_created_and_used() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    assert!(sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    assert!(sqlite_index_exists(&storage, "idx_error_file")?);
+
+    let canonical_plan = storage
+        .conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT canonical_id, id
+             FROM node
+             WHERE canonical_id IN ('rust:function:shared')
+             ORDER BY canonical_id ASC, id ASC",
+        )?
+        .query_map([], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        canonical_plan
+            .iter()
+            .any(|line| line.contains("idx_node_canonical_id")),
+        "canonical lookup plan was {canonical_plan:?}"
+    );
+
+    let fallback_plan = storage
+        .conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT id
+             FROM node
+             WHERE file_node_id = 1
+               AND kind = 3
+               AND qualified_name = 'crate::shared'
+             ORDER BY id ASC",
+        )?
+        .query_map([], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        fallback_plan
+            .iter()
+            .any(|line| line.contains("USING INDEX idx_node_file")),
+        "fallback lookup plan was {fallback_plan:?}"
+    );
+
+    let error_delete_plan = storage
+        .conn
+        .prepare("EXPLAIN QUERY PLAN DELETE FROM error WHERE file_id IN (1, 2)")?
+        .query_map([], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        error_delete_plan
+            .iter()
+            .any(|line| line.contains("idx_error_file")),
+        "file-error delete plan was {error_delete_plan:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn error_file_index_is_available_before_deferred_build_indexes() -> Result<(), StorageError> {
+    let path = unique_temp_db_path("error-load-index");
+    let storage = Storage::open_build(&path)?;
+
+    assert!(sqlite_index_exists(&storage, "idx_error_file")?);
+    assert!(!sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    storage.create_deferred_secondary_indexes()?;
+    assert!(sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
 fn test_index_artifact_cache_round_trip() -> Result<(), StorageError> {
     let storage = Storage::new_in_memory()?;
     let payload = br#"{"cached":true}"#;
@@ -2757,6 +2973,7 @@ fn flush_projection_persistence_fixture(
         symbol_key: "a::run".to_string(),
         node_id: NodeId(2),
         signature_hash: 11,
+        normalized_signature: None,
         body_hash: 12,
         start_line: 2,
         end_line: 3,
@@ -4331,6 +4548,7 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
         symbol_key: "src/main.rs::main:FUNCTION".to_string(),
         node_id: function_node.id,
         signature_hash: 101,
+        normalized_signature: None,
         body_hash: 202,
         start_line: 1,
         end_line: 1,
@@ -4426,6 +4644,7 @@ fn test_callable_projection_state_round_trip() -> Result<(), StorageError> {
             symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
             node_id: NodeId(101),
             signature_hash: 111,
+            normalized_signature: None,
             body_hash: 211,
             start_line: 10,
             end_line: 20,
@@ -4435,6 +4654,7 @@ fn test_callable_projection_state_round_trip() -> Result<(), StorageError> {
             symbol_key: "src/lib.rs::helper:FUNCTION".to_string(),
             node_id: NodeId(102),
             signature_hash: 112,
+            normalized_signature: None,
             body_hash: 212,
             start_line: 30,
             end_line: 35,
@@ -4450,6 +4670,7 @@ fn test_callable_projection_state_round_trip() -> Result<(), StorageError> {
         symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
         node_id: NodeId(101),
         signature_hash: 111,
+        normalized_signature: None,
         body_hash: 299,
         start_line: 12,
         end_line: 22,
@@ -4529,6 +4750,7 @@ fn test_delete_callable_projection_states_for_file() -> Result<(), StorageError>
             symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
             node_id: NodeId(101),
             signature_hash: 111,
+            normalized_signature: None,
             body_hash: 211,
             start_line: 10,
             end_line: 20,
@@ -4538,6 +4760,7 @@ fn test_delete_callable_projection_states_for_file() -> Result<(), StorageError>
             symbol_key: "src/lib.rs::helper:FUNCTION".to_string(),
             node_id: NodeId(102),
             signature_hash: 112,
+            normalized_signature: None,
             body_hash: 212,
             start_line: 30,
             end_line: 35,
@@ -4547,6 +4770,7 @@ fn test_delete_callable_projection_states_for_file() -> Result<(), StorageError>
             symbol_key: "src/other.rs::keep:FUNCTION".to_string(),
             node_id: NodeId(201),
             signature_hash: 311,
+            normalized_signature: None,
             body_hash: 411,
             start_line: 1,
             end_line: 5,
@@ -4692,6 +4916,7 @@ fn test_delete_projection_for_callers_removes_callable_scoped_data() -> Result<(
             symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
             node_id: caller_a.id,
             signature_hash: 111,
+            normalized_signature: None,
             body_hash: 211,
             start_line: 1,
             end_line: 3,
@@ -4701,6 +4926,7 @@ fn test_delete_projection_for_callers_removes_callable_scoped_data() -> Result<(
             symbol_key: "src/lib.rs::keep:FUNCTION".to_string(),
             node_id: caller_b.id,
             signature_hash: 112,
+            normalized_signature: None,
             body_hash: 212,
             start_line: 10,
             end_line: 12,
@@ -4732,6 +4958,260 @@ fn test_delete_projection_for_callers_removes_callable_scoped_data() -> Result<(
     let remaining_states = storage.get_callable_projection_states_for_file(file_id)?;
     assert_eq!(remaining_states.len(), 1);
     assert_eq!(remaining_states[0].node_id, caller_b.id);
+    Ok(())
+}
+
+#[test]
+fn test_delete_unowned_projection_for_file_spares_nodes_and_annotations() -> Result<(), StorageError>
+{
+    // The reposition repair's whole reason to exist is that it removes the
+    // rows a re-parse re-emits and nothing else. Over-deleting here is exactly
+    // as damaging as the `FullReplace` it replaces, and the incremental
+    // integration probes cannot see it: they re-insert everything afterwards.
+    let mut storage = Storage::new_in_memory()?;
+    let file_id = 9_i64;
+    let file_node = Node {
+        id: NodeId(file_id),
+        kind: NodeKind::FILE,
+        serialized_name: "src/lib.rs".to_string(),
+        ..Default::default()
+    };
+    let callable = Node {
+        id: NodeId(901),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "run".to_string(),
+        file_node_id: Some(file_node.id),
+        ..Default::default()
+    };
+    let header = Node {
+        id: NodeId(902),
+        kind: NodeKind::STRUCT,
+        serialized_name: "Thing".to_string(),
+        file_node_id: Some(file_node.id),
+        ..Default::default()
+    };
+    let imported = Node {
+        id: NodeId(903),
+        kind: NodeKind::MODULE,
+        serialized_name: "std::fmt".to_string(),
+        file_node_id: Some(file_node.id),
+        ..Default::default()
+    };
+
+    storage.insert_file(&FileInfo {
+        id: file_id,
+        path: PathBuf::from("src/lib.rs"),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 50,
+        file_role: FileRole::Source,
+    })?;
+    storage.insert_nodes_batch(&[
+        file_node.clone(),
+        callable.clone(),
+        header.clone(),
+        imported.clone(),
+        Node {
+            id: NodeId(951),
+            kind: NodeKind::FILE,
+            serialized_name: "src/other.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(950),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "other".to_string(),
+            file_node_id: Some(NodeId(951)),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        // Owned: a call the caller-scoped cleanup rewrites.
+        Edge {
+            id: EdgeId(1),
+            source: callable.id,
+            target: imported.id,
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file_node.id),
+            line: Some(11),
+            ..Default::default()
+        },
+        // Unowned: an import edge the file sources.
+        Edge {
+            id: EdgeId(2),
+            source: file_node.id,
+            target: imported.id,
+            kind: EdgeKind::IMPORT,
+            file_node_id: Some(file_node.id),
+            line: Some(1),
+            ..Default::default()
+        },
+        // Unowned by kind even though a projected callable sources it.
+        Edge {
+            id: EdgeId(3),
+            source: callable.id,
+            target: header.id,
+            kind: EdgeKind::TYPE_USAGE,
+            file_node_id: Some(file_node.id),
+            line: Some(11),
+            ..Default::default()
+        },
+        // Another file's row, incidentally pointing into this one.
+        Edge {
+            id: EdgeId(4),
+            source: NodeId(950),
+            target: callable.id,
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(951)),
+            line: Some(4),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_occurrences_batch(&[
+        // Owned: the callable's own definition.
+        Occurrence {
+            element_id: callable.id.0,
+            kind: OccurrenceKind::DEFINITION,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 10,
+                start_col: 0,
+                end_line: 12,
+                end_col: 1,
+            },
+        },
+        // Owned: inside the callable's recorded extent.
+        Occurrence {
+            element_id: imported.id.0,
+            kind: OccurrenceKind::REFERENCE,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 11,
+                start_col: 4,
+                end_line: 11,
+                end_col: 10,
+            },
+        },
+        // Unowned: the import, above every callable.
+        Occurrence {
+            element_id: imported.id.0,
+            kind: OccurrenceKind::DEFINITION,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 14,
+            },
+        },
+        // Unowned: the struct header, between the import and the callable.
+        Occurrence {
+            element_id: header.id.0,
+            kind: OccurrenceKind::DEFINITION,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 3,
+                start_col: 0,
+                end_line: 3,
+                end_col: 12,
+            },
+        },
+    ])?;
+    storage.upsert_callable_projection_states(&[
+        CallableProjectionState {
+            file_id,
+            symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
+            node_id: callable.id,
+            signature_hash: 111,
+            normalized_signature: None,
+            body_hash: 211,
+            start_line: 10,
+            end_line: 12,
+        },
+        // The file-structural row: same `node_id` as the file, extent covering
+        // the whole file. Treated as an owner it would protect every row here.
+        CallableProjectionState {
+            file_id,
+            symbol_key: "__file_structural__".to_string(),
+            node_id: file_node.id,
+            signature_hash: 311,
+            normalized_signature: None,
+            body_hash: 411,
+            start_line: 1,
+            end_line: 50,
+        },
+    ])?;
+
+    let category = storage.create_bookmark_category("review")?;
+    let on_header = storage.add_bookmark(category, header.id, Some("the header"))?;
+    let on_import = storage.add_bookmark(category, imported.id, Some("the import"))?;
+
+    let summary = storage.delete_unowned_projection_for_file(file_id)?;
+    assert_eq!(
+        summary.removed_edge_count, 2,
+        "the import and the type usage"
+    );
+    assert_eq!(
+        summary.removed_occurrence_count, 2,
+        "the import definition and the struct header"
+    );
+
+    let mut remaining_edges = storage
+        .get_edges()?
+        .into_iter()
+        .map(|edge| edge.id.0)
+        .collect::<Vec<_>>();
+    remaining_edges.sort_unstable();
+    assert_eq!(
+        remaining_edges,
+        vec![1, 4],
+        "the caller-scoped call survives for the caller cleanup, and another \
+         file's row is not this file's to delete"
+    );
+
+    let mut remaining_occurrences = storage
+        .get_occurrences()?
+        .into_iter()
+        .map(|occurrence| (occurrence.element_id, occurrence.location.start_line))
+        .collect::<Vec<_>>();
+    remaining_occurrences.sort_unstable();
+    assert_eq!(
+        remaining_occurrences,
+        vec![(callable.id.0, 10), (imported.id.0, 11)],
+        "everything a projected callable owns survives"
+    );
+
+    let mut remaining_nodes = storage
+        .get_nodes()?
+        .into_iter()
+        .map(|node| node.id.0)
+        .collect::<Vec<_>>();
+    remaining_nodes.sort_unstable();
+    assert_eq!(
+        remaining_nodes,
+        vec![file_id, 901, 902, 903, 950, 951],
+        "the repair must not delete a single node row"
+    );
+    assert_eq!(
+        storage
+            .get_callable_projection_states_for_file(file_id)?
+            .len(),
+        2,
+        "projection state is rewritten by the flush, not by this cleanup"
+    );
+
+    let mut bookmarks = storage.get_bookmarks(Some(category))?;
+    bookmarks.sort_by_key(|bookmark| bookmark.id);
+    assert_eq!(
+        bookmarks
+            .iter()
+            .map(|bookmark| (bookmark.id, bookmark.node_id))
+            .collect::<Vec<_>>(),
+        vec![(on_header, header.id), (on_import, imported.id)],
+        "no annotation may be destroyed by the reposition repair"
+    );
     Ok(())
 }
 
@@ -7698,6 +8178,137 @@ fn batched_edges_for_node_ids_matches_single_node_lookup() -> Result<(), Storage
 }
 
 #[test]
+fn file_error_replacement_deletes_the_unique_file_set_with_a_batched_predicate()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let files = (1..=8)
+        .map(|id| FileInfo {
+            id,
+            path: PathBuf::from(format!("src/{id}.rs")),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: FileRole::Source,
+        })
+        .collect::<Vec<_>>();
+    storage.insert_files_batch(&files)?;
+    let error = |message: &str, file_id: i64| ErrorInfo {
+        message: message.to_string(),
+        file_id: Some(NodeId(file_id)),
+        line: None,
+        column: None,
+        is_fatal: false,
+        index_step: IndexStep::Indexing,
+        coverage_reason: None,
+    };
+    let old_errors = (1..=8)
+        .map(|file_id| error(&format!("old-{file_id}"), file_id))
+        .collect::<Vec<_>>();
+    storage.insert_errors_batch(&old_errors)?;
+
+    let delete_statements = Arc::new(AtomicUsize::new(0));
+    let observed_delete_statements = Arc::clone(&delete_statements);
+    storage
+        .conn
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(
+                context.action,
+                AuthAction::Delete {
+                    table_name: "error"
+                }
+            ) {
+                observed_delete_statements.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+            Authorization::Allow
+        }))?;
+
+    let previous_limit = storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 7)?;
+    assert!(previous_limit >= 7);
+    storage.replace_errors_for_files_batch(
+        &[7, 1, 3, 2, 5, 4, 6, 7],
+        &[error("new-one", 1), error("new-seven", 7)],
+    )?;
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)?;
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+
+    assert_eq!(delete_statements.load(AtomicOrdering::SeqCst), 1);
+
+    let mut errors = storage
+        .get_errors(None)?
+        .into_iter()
+        .map(|error| (error.file_id.expect("file-scoped error").0, error.message))
+        .collect::<Vec<_>>();
+    errors.sort();
+    assert_eq!(
+        errors,
+        vec![
+            (1, "new-one".to_string()),
+            (7, "new-seven".to_string()),
+            (8, "old-8".to_string()),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn file_error_replacement_rolls_back_batched_delete_when_insertion_fails()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_file(&FileInfo {
+        id: 1,
+        path: PathBuf::from("src/lib.rs"),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: FileRole::Source,
+    })?;
+    let old_error = ErrorInfo {
+        message: "old".to_string(),
+        file_id: Some(NodeId(1)),
+        line: None,
+        column: None,
+        is_fatal: false,
+        index_step: IndexStep::Indexing,
+        coverage_reason: None,
+    };
+    storage.insert_error(&old_error)?;
+    storage
+        .conn
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Insert {
+                table_name: "error",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))?;
+
+    let replacement = ErrorInfo {
+        message: "new".to_string(),
+        ..old_error
+    };
+    storage
+        .replace_errors_for_files_batch(&[1], &[replacement])
+        .expect_err("denied insertion must roll back the batched delete");
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+
+    let errors = storage.get_errors(None)?;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].message, "old");
+    Ok(())
+}
+
+#[test]
 fn test_error_storage_round_trips_coverage_reason() -> Result<(), StorageError> {
     let storage = Storage::new_in_memory()?;
     let info = FileInfo {
@@ -7900,6 +8511,7 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
         symbol_key: "src/main.rs::foo:FUNCTION".to_string(),
         node_id: func_node.id,
         signature_hash: 111,
+        normalized_signature: None,
         body_hash: 211,
         start_line: 1,
         end_line: 1,
@@ -8030,6 +8642,7 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
             symbol_key: "src/a.rs::caller:FUNCTION".to_string(),
             node_id: caller_in_a.id,
             signature_hash: 111,
+            normalized_signature: None,
             body_hash: 211,
             start_line: 1,
             end_line: 2,
@@ -8039,6 +8652,7 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
             symbol_key: "src/a.rs::stale-callee:FUNCTION".to_string(),
             node_id: callee_in_b.id,
             signature_hash: 112,
+            normalized_signature: None,
             body_hash: 212,
             start_line: 3,
             end_line: 4,
@@ -8068,7 +8682,292 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
     let remaining_states = storage.get_callable_projection_states_for_file(file_a_id)?;
     assert_eq!(remaining_states.len(), 1);
     assert_eq!(remaining_states[0].node_id, caller_in_a.id);
+    assert_eq!(summary.affected_caller_file_ids, vec![file_a_id]);
 
+    Ok(())
+}
+
+/// File ids used by the deletion-scope fixture below.
+const REMOVAL_FIXTURE_CALLER_FILE: i64 = 1_001;
+const REMOVAL_FIXTURE_PREFERRED_FILE: i64 = 2_001;
+const REMOVAL_FIXTURE_SECOND_FILE: i64 = 3_001;
+const REMOVAL_FIXTURE_BYSTANDER_FILE: i64 = 4_001;
+const REMOVAL_FIXTURE_THIRD_FILE: i64 = 5_001;
+
+/// A caller file resolved into two removable definition files, plus a
+/// bystander file that never points at anything removable and owns a bookmark.
+fn removal_scope_fixture() -> Result<Storage, StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let definition_files = [
+        (REMOVAL_FIXTURE_PREFERRED_FILE, "src/preferred.rs"),
+        (REMOVAL_FIXTURE_SECOND_FILE, "src/second.rs"),
+        (REMOVAL_FIXTURE_THIRD_FILE, "src/third.rs"),
+    ];
+    for (file_id, path) in [
+        (REMOVAL_FIXTURE_CALLER_FILE, "src/caller.rs"),
+        (REMOVAL_FIXTURE_BYSTANDER_FILE, "src/bystander.rs"),
+    ]
+    .into_iter()
+    .chain(definition_files)
+    {
+        storage.insert_file(&FileInfo {
+            id: file_id,
+            path: PathBuf::from(path),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 10,
+            file_role: FileRole::Source,
+        })?;
+    }
+
+    let mut nodes = Vec::new();
+    for (file_id, path) in [
+        (REMOVAL_FIXTURE_CALLER_FILE, "src/caller.rs"),
+        (REMOVAL_FIXTURE_BYSTANDER_FILE, "src/bystander.rs"),
+    ]
+    .into_iter()
+    .chain(definition_files)
+    {
+        nodes.push(Node {
+            id: NodeId(file_id),
+            kind: NodeKind::FILE,
+            serialized_name: path.to_string(),
+            ..Default::default()
+        });
+    }
+    // One caller and one call-site placeholder per removable definition.
+    let mut edges = Vec::new();
+    for (index, (file_id, _)) in definition_files.iter().enumerate() {
+        let caller_id = 10_001 + (index as i64) * 10;
+        let placeholder_id = caller_id + 1;
+        let definition_id = file_id + 100;
+        nodes.push(Node {
+            id: NodeId(caller_id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("caller_{index}"),
+            file_node_id: Some(NodeId(REMOVAL_FIXTURE_CALLER_FILE)),
+            ..Default::default()
+        });
+        nodes.push(Node {
+            id: NodeId(placeholder_id),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: format!("target_{index}"),
+            ..Default::default()
+        });
+        nodes.push(Node {
+            id: NodeId(definition_id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("target_{index}"),
+            file_node_id: Some(NodeId(*file_id)),
+            ..Default::default()
+        });
+        edges.push(Edge {
+            id: EdgeId(30_001 + index as i64),
+            source: NodeId(caller_id),
+            target: NodeId(placeholder_id),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(REMOVAL_FIXTURE_CALLER_FILE)),
+            resolved_target: Some(NodeId(definition_id)),
+            confidence: Some(0.91),
+            certainty: Some(ResolutionCertainty::Certain),
+            candidate_targets: vec![NodeId(definition_id)],
+            ..Default::default()
+        });
+    }
+    // The bystander resolves only inside itself, so no removal can touch it.
+    nodes.push(Node {
+        id: NodeId(40_101),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "bystander_caller".to_string(),
+        file_node_id: Some(NodeId(REMOVAL_FIXTURE_BYSTANDER_FILE)),
+        ..Default::default()
+    });
+    nodes.push(Node {
+        id: NodeId(40_102),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "bystander_target".to_string(),
+        file_node_id: Some(NodeId(REMOVAL_FIXTURE_BYSTANDER_FILE)),
+        ..Default::default()
+    });
+    edges.push(Edge {
+        id: EdgeId(30_900),
+        source: NodeId(40_101),
+        target: NodeId(40_102),
+        kind: EdgeKind::CALL,
+        file_node_id: Some(NodeId(REMOVAL_FIXTURE_BYSTANDER_FILE)),
+        resolved_target: Some(NodeId(40_102)),
+        confidence: Some(0.99),
+        certainty: Some(ResolutionCertainty::Certain),
+        candidate_targets: vec![NodeId(40_102)],
+        ..Default::default()
+    });
+
+    storage.insert_nodes_batch(&nodes)?;
+    storage.insert_edges_batch(&edges)?;
+
+    let category_id = storage.create_bookmark_category("Favorites")?;
+    storage.add_bookmark(category_id, NodeId(40_102), Some("user note"))?;
+    Ok(storage)
+}
+
+fn bookmarked_node_ids(storage: &Storage) -> Result<Vec<i64>, StorageError> {
+    let mut stmt = storage
+        .conn
+        .prepare("SELECT node_id FROM bookmark_node ORDER BY node_id")?;
+    let mut rows = stmt.query([])?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next()? {
+        ids.push(row.get::<_, i64>(0)?);
+    }
+    Ok(ids)
+}
+
+fn commits_during_removal(file_ids: &[i64]) -> Result<usize, StorageError> {
+    let mut storage = removal_scope_fixture()?;
+    let commits = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&commits);
+    storage.conn.commit_hook(Some(move || {
+        observed.fetch_add(1, AtomicOrdering::SeqCst);
+        false
+    }))?;
+    storage.delete_files_batch(file_ids)?;
+    storage.conn.commit_hook(None::<fn() -> bool>)?;
+    for file_id in file_ids {
+        assert!(
+            storage.get_node(NodeId(*file_id))?.is_none(),
+            "the measured batch must really have removed file {file_id}"
+        );
+    }
+    Ok(commits.load(AtomicOrdering::SeqCst))
+}
+
+#[test]
+fn batch_removal_reports_only_the_callers_it_unresolved() -> Result<(), StorageError> {
+    let mut storage = removal_scope_fixture()?;
+
+    let removal = storage
+        .delete_files_batch(&[REMOVAL_FIXTURE_PREFERRED_FILE, REMOVAL_FIXTURE_SECOND_FILE])?;
+
+    assert_eq!(
+        removal.affected_caller_file_ids,
+        vec![REMOVAL_FIXTURE_CALLER_FILE],
+        "the caller file that lost two resolutions must be reported exactly once, \
+         and the bystander must not appear"
+    );
+    let resolved_by_edge = storage
+        .get_edges()?
+        .into_iter()
+        .map(|edge| (edge.id, edge.resolved_target))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        resolved_by_edge.get(&EdgeId(30_001)),
+        Some(&None),
+        "the call into the first removed file must have lost its resolution"
+    );
+    assert_eq!(
+        resolved_by_edge.get(&EdgeId(30_002)),
+        Some(&None),
+        "the call into the second removed file must have lost its resolution"
+    );
+    assert_eq!(
+        resolved_by_edge.get(&EdgeId(30_003)),
+        Some(&Some(NodeId(REMOVAL_FIXTURE_THIRD_FILE + 100))),
+        "a call into a file the batch did not remove must keep its resolution"
+    );
+    assert_eq!(
+        resolved_by_edge.get(&EdgeId(30_900)),
+        Some(&Some(NodeId(40_102))),
+        "the bystander's resolution must survive untouched"
+    );
+    Ok(())
+}
+
+#[test]
+fn batch_removal_reports_a_removed_file_as_a_caller_of_no_one() -> Result<(), StorageError> {
+    let mut storage = removal_scope_fixture()?;
+
+    // Removing the definition alone reports the caller file...
+    let reported = storage.delete_files_batch(&[REMOVAL_FIXTURE_PREFERRED_FILE])?;
+    assert_eq!(
+        reported.affected_caller_file_ids,
+        vec![REMOVAL_FIXTURE_CALLER_FILE]
+    );
+
+    // ...but removing the caller in the same batch leaves nothing to re-resolve.
+    let mut storage = removal_scope_fixture()?;
+    let removal = storage
+        .delete_files_batch(&[REMOVAL_FIXTURE_PREFERRED_FILE, REMOVAL_FIXTURE_CALLER_FILE])?;
+    assert_eq!(
+        removal.affected_caller_file_ids,
+        Vec::<i64>::new(),
+        "a file removed by the same batch cannot be an affected caller"
+    );
+    Ok(())
+}
+
+#[test]
+fn batch_removal_commits_and_invalidates_once_per_batch() -> Result<(), StorageError> {
+    let single = commits_during_removal(&[REMOVAL_FIXTURE_PREFERRED_FILE])?;
+    let triple = commits_during_removal(&[
+        REMOVAL_FIXTURE_PREFERRED_FILE,
+        REMOVAL_FIXTURE_SECOND_FILE,
+        REMOVAL_FIXTURE_THIRD_FILE,
+    ])?;
+
+    assert!(single > 0, "the measurement must observe real commits");
+    assert_eq!(
+        single, triple,
+        "removal cost per batch must not scale with the number of removed files: \
+         one hoisted transaction plus one snapshot invalidation"
+    );
+    Ok(())
+}
+
+#[test]
+fn batch_removal_rolls_back_every_file_when_one_fails() -> Result<(), StorageError> {
+    let mut storage = removal_scope_fixture()?;
+    storage.conn.execute_batch(&format!(
+        "CREATE TEMP TRIGGER refuse_second_removal
+         BEFORE DELETE ON file
+         WHEN OLD.id = {REMOVAL_FIXTURE_SECOND_FILE}
+         BEGIN SELECT RAISE(ABORT, 'refuse this removal'); END;"
+    ))?;
+    let before = storage.get_stats()?;
+    let bookmarks_before = bookmarked_node_ids(&storage)?;
+    assert_eq!(bookmarks_before, vec![40_102]);
+
+    let error = storage
+        .delete_files_batch(&[REMOVAL_FIXTURE_PREFERRED_FILE, REMOVAL_FIXTURE_SECOND_FILE])
+        .expect_err("the trigger must fail the batch");
+    assert!(
+        format!("{error}").contains("refuse this removal"),
+        "unexpected failure: {error}"
+    );
+
+    assert!(
+        storage
+            .get_node(NodeId(REMOVAL_FIXTURE_PREFERRED_FILE))?
+            .is_some(),
+        "the first file's removal must roll back with the failed batch"
+    );
+    assert!(
+        storage
+            .get_node(NodeId(REMOVAL_FIXTURE_PREFERRED_FILE + 100))?
+            .is_some(),
+        "the first file's symbols must roll back with the failed batch"
+    );
+    assert_eq!(
+        storage.get_stats()?.node_count,
+        before.node_count,
+        "a failed batch must leave the graph exactly as it was"
+    );
+    assert_eq!(
+        bookmarked_node_ids(&storage)?,
+        bookmarks_before,
+        "a failed batch must not destroy user-authored bookmarks"
+    );
     Ok(())
 }
 
@@ -8105,7 +9004,7 @@ fn test_bookmark_crud() -> Result<(), StorageError> {
     assert_eq!(bookmarks[0].comment, Some("Important function".to_string()));
 
     // Update comment
-    storage.update_bookmark_comment(bm_id, "Updated comment")?;
+    storage.update_bookmark(bm_id, None, Some(Some("Updated comment")))?;
     let bookmarks = storage.get_bookmarks(Some(cat_id))?;
     assert_eq!(bookmarks[0].comment, Some("Updated comment".to_string()));
 
@@ -8665,6 +9564,130 @@ fn test_trail_production_scope_excludes_test_callers() -> Result<(), StorageErro
 }
 
 #[test]
+fn trail_production_scope_honours_every_classified_test_or_bench_marker() -> Result<(), StorageError>
+{
+    // Paths the file-role classifier already calls Test or Benchmark. Caller
+    // scoping used to carry its own shorter marker list, so these leaked into
+    // production-only trails even though the same store classified their files
+    // as tests or benchmarks.
+    let caller_files = [
+        "crates/engine/benchmarks/run.rs",
+        "crates/engine/benchmark/run.rs",
+        "src/spec/thing.rs",
+        "src/fixtures/thing.rs",
+        "pkg/util_test.py",
+        "web/widget.spec.ts",
+        "app/__test__/one.ts",
+        "node_modules/dep/test/dep.js",
+    ];
+    for path in caller_files {
+        assert!(
+            FileRole::path_is_test_or_bench(path),
+            "{path} must be recognised as a test or benchmark path"
+        );
+    }
+
+    let mut storage = Storage::new_in_memory()?;
+    let mut nodes = vec![
+        Node {
+            id: NodeId(100),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "target".to_string(),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+    ];
+    let mut edges = Vec::new();
+    for (index, path) in caller_files.iter().enumerate() {
+        let file_id = 200 + index as i64;
+        let caller_id = 300 + index as i64;
+        let placeholder_id = 400 + index as i64;
+        nodes.push(Node {
+            id: NodeId(file_id),
+            kind: NodeKind::FILE,
+            serialized_name: (*path).to_string(),
+            ..Default::default()
+        });
+        nodes.push(Node {
+            id: NodeId(caller_id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("caller_{index}"),
+            file_node_id: Some(NodeId(file_id)),
+            ..Default::default()
+        });
+        nodes.push(Node {
+            id: NodeId(placeholder_id),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "target".to_string(),
+            file_node_id: Some(NodeId(file_id)),
+            ..Default::default()
+        });
+        edges.push(Edge {
+            id: EdgeId(500 + index as i64),
+            source: NodeId(caller_id),
+            target: NodeId(placeholder_id),
+            kind: EdgeKind::CALL,
+            resolved_target: Some(NodeId(1)),
+            file_node_id: Some(NodeId(file_id)),
+            ..Default::default()
+        });
+    }
+    storage.insert_nodes_batch(&nodes)?;
+    storage.insert_edges_batch(&edges)?;
+
+    let config = |caller_scope| TrailConfig {
+        root_id: NodeId(1),
+        mode: TrailMode::Neighborhood,
+        target_id: None,
+        depth: 1,
+        direction: TrailDirection::Incoming,
+        caller_scope,
+        edge_filter: vec![EdgeKind::CALL],
+        show_utility_calls: true,
+        node_filter: Vec::new(),
+        max_nodes: 50,
+    };
+
+    let production_only = storage.get_trail(&config(TrailCallerScope::ProductionOnly))?;
+    let leaked = production_only
+        .edges
+        .iter()
+        .map(|edge| edge.id)
+        .collect::<Vec<_>>();
+    assert!(
+        leaked.is_empty(),
+        "test and benchmark callers leaked into a production-only trail: {leaked:?}"
+    );
+
+    let include_tests = storage.get_trail(&config(TrailCallerScope::IncludeTestsAndBenches))?;
+    assert_eq!(
+        include_tests.edges.len(),
+        caller_files.len(),
+        "every caller must still be reachable when tests and benches are included"
+    );
+    Ok(())
+}
+
+#[test]
+fn classified_role_precedence_does_not_hide_a_vendored_test_from_caller_scoping() {
+    // Role precedence answers "what is this file for" and reports the stronger
+    // Vendor role; caller scoping answers "may this caller count as production"
+    // and must still refuse. One rule set, two deliberately different questions.
+    let vendored_test = "node_modules/dep/test/dep.js";
+    assert_eq!(
+        FileRole::classify_path(Path::new(vendored_test)),
+        FileRole::Vendor
+    );
+    assert!(FileRole::path_is_test_or_bench(vendored_test));
+}
+
+#[test]
 fn test_trail_can_hide_utility_calls() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
 
@@ -9216,4 +10239,1097 @@ fn test_grounding_edge_digests_ignore_ambiguous_resolved_targets() -> Result<(),
     assert!(!counts.iter().any(|entry| entry.node_id == NodeId(3)));
 
     Ok(())
+}
+
+#[test]
+fn raw_call_edges_by_effective_source_match_the_broad_edge_filter() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FILE,
+            serialized_name: "src/routes.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "route".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(11),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "raw_caller".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            // A very common unqualified call name, so trail policy clears any
+            // resolution below `Certain`.
+            id: NodeId(20),
+            kind: NodeKind::METHOD,
+            serialized_name: "insert".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(21),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "handler".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(22),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "other".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        // Unresolved source, so the effective source is the raw source.
+        Edge {
+            id: EdgeId(1),
+            source: NodeId(10),
+            target: NodeId(21),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(1)),
+            line: Some(7),
+            resolved_target: Some(NodeId(21)),
+            confidence: Some(0.42),
+            callsite_identity: Some("routes.rs:7:handler".to_string()),
+            certainty: Some(ResolutionCertainty::Uncertain),
+            candidate_targets: vec![NodeId(21), NodeId(22)],
+            ..Default::default()
+        },
+        // A resolved source rewrites the effective source onto the route node.
+        Edge {
+            id: EdgeId(2),
+            source: NodeId(11),
+            target: NodeId(20),
+            kind: EdgeKind::CALL,
+            resolved_source: Some(NodeId(10)),
+            resolved_target: Some(NodeId(20)),
+            confidence: Some(0.8),
+            certainty: Some(ResolutionCertainty::Probable),
+            ..Default::default()
+        },
+        // Same raw source, but the resolved source moves it elsewhere.
+        Edge {
+            id: EdgeId(3),
+            source: NodeId(10),
+            target: NodeId(22),
+            kind: EdgeKind::CALL,
+            resolved_source: Some(NodeId(11)),
+            ..Default::default()
+        },
+        // Right source, wrong kind.
+        Edge {
+            id: EdgeId(4),
+            source: NodeId(10),
+            target: NodeId(21),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        },
+        // A later unresolved-branch edge, so the two branches interleave by id.
+        Edge {
+            id: EdgeId(5),
+            source: NodeId(10),
+            target: NodeId(22),
+            kind: EdgeKind::CALL,
+            resolved_target: Some(NodeId(21)),
+            certainty: Some(ResolutionCertainty::Certain),
+            confidence: Some(0.99),
+            ..Default::default()
+        },
+    ])?;
+
+    let expected = storage
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.effective_source() == NodeId(10))
+        .collect::<Vec<_>>();
+    let selective = storage.get_raw_call_edges_by_effective_source(NodeId(10))?;
+    assert_eq!(
+        selective, expected,
+        "selective route lookup diverged from the broad edge filter"
+    );
+    assert_eq!(
+        selective.iter().map(|edge| edge.id).collect::<Vec<_>>(),
+        vec![EdgeId(1), EdgeId(2), EdgeId(5)],
+        "selective route lookup lost deterministic edge-id order across branches"
+    );
+
+    // The trail accessor is not a substitute: its policy clears exactly the
+    // resolution fields the route-handler DTO reports, for both the uncertain
+    // call and the probable common-name call.
+    let trail_edges = storage.get_edges_for_node_id(NodeId(10))?;
+    for edge_id in [EdgeId(1), EdgeId(2)] {
+        let policied = trail_edges
+            .iter()
+            .find(|edge| edge.id == edge_id)
+            .unwrap_or_else(|| panic!("trail lookup returns {edge_id:?}"));
+        assert_eq!(policied.resolved_target, None, "{edge_id:?}");
+        assert_eq!(policied.certainty, None, "{edge_id:?}");
+        assert_eq!(policied.confidence, None, "{edge_id:?}");
+    }
+    let raw_uncertain = selective
+        .iter()
+        .find(|edge| edge.id == EdgeId(1))
+        .expect("raw lookup returns the uncertain call");
+    assert_eq!(raw_uncertain.resolved_target, Some(NodeId(21)));
+    assert_eq!(
+        raw_uncertain.certainty,
+        Some(ResolutionCertainty::Uncertain)
+    );
+    assert_eq!(raw_uncertain.confidence, Some(0.42));
+    let raw_common = selective
+        .iter()
+        .find(|edge| edge.id == EdgeId(2))
+        .expect("raw lookup returns the resolved-source call");
+    assert_eq!(raw_common.resolved_target, Some(NodeId(20)));
+    assert_eq!(raw_common.certainty, Some(ResolutionCertainty::Probable));
+    assert_eq!(raw_common.confidence, Some(0.8));
+
+    assert!(
+        storage
+            .get_raw_call_edges_by_effective_source(NodeId(22))?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn raw_route_edge_lookup_costs_less_vm_work_than_the_broad_edge_scan() -> Result<(), StorageError> {
+    const REPRESENTATIVE_NODE_COUNT: i64 = 12_000;
+    const REPRESENTATIVE_EDGE_COUNT: i64 = 48_000;
+    const ROUTE_NODE_ID: i64 = 7;
+
+    let storage = Storage::new_in_memory()?;
+    let call_kind = EdgeKind::CALL as i32;
+    storage.conn.execute_batch(&format!(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < {REPRESENTATIVE_NODE_COUNT}
+         )
+         INSERT INTO node(id, kind, serialized_name)
+         SELECT value, 3, printf('node-%d', value) FROM sequence;
+         WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < {REPRESENTATIVE_EDGE_COUNT}
+         )
+         INSERT INTO edge(
+             id,
+             source_node_id,
+             target_node_id,
+             kind,
+             resolved_source_node_id
+         )
+         SELECT
+             value,
+             (value % {REPRESENTATIVE_NODE_COUNT}) + 1,
+             ((value * 17) % {REPRESENTATIVE_NODE_COUNT}) + 1,
+             {call_kind},
+             CASE WHEN value % 3 = 0 THEN ((value * 19) % {REPRESENTATIVE_NODE_COUNT}) + 1 END
+         FROM sequence;"
+    ))?;
+
+    let plan = storage
+        .conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL}"
+        ))?
+        .query_map(rusqlite::params![ROUTE_NODE_ID, call_kind], |row| {
+            row.get::<_, String>(3)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("idx_edge_resolved_source")),
+        "route lookup lost the resolved-source index: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("idx_edge_kind_source")),
+        "route lookup lost the kind/source index: {plan:?}"
+    );
+    assert!(
+        plan.iter().all(|line| !line.contains("SCAN e")),
+        "route lookup still scans the edge table: {plan:?}"
+    );
+
+    let count_vm_steps = |run: &dyn Fn() -> Result<Vec<Edge>, StorageError>| {
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&callbacks);
+        storage.conn.progress_handler(
+            100,
+            Some(move || {
+                counter.fetch_add(1, AtomicOrdering::Relaxed);
+                false
+            }),
+        )?;
+        let edges = run()?;
+        storage.conn.progress_handler(0, None::<fn() -> bool>)?;
+        Ok::<_, StorageError>((edges, callbacks.load(AtomicOrdering::Relaxed)))
+    };
+
+    let (broad_edges, broad_callbacks) = count_vm_steps(&|| {
+        Ok(storage
+            .get_edges()?
+            .into_iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::CALL && edge.effective_source() == NodeId(ROUTE_NODE_ID)
+            })
+            .collect())
+    })?;
+    let (selective_edges, selective_callbacks) =
+        count_vm_steps(&|| storage.get_raw_call_edges_by_effective_source(NodeId(ROUTE_NODE_ID)))?;
+
+    assert!(
+        !selective_edges.is_empty(),
+        "representative fixture produced no route edges"
+    );
+    assert_eq!(
+        selective_edges, broad_edges,
+        "selective route lookup diverged from the broad scan on the representative fixture"
+    );
+    assert!(
+        broad_callbacks > selective_callbacks.saturating_mul(5),
+        "representative route lookup VM work did not improve enough: broad={broad_callbacks}, selective={selective_callbacks}"
+    );
+    eprintln!(
+        "raw route edge representative proof: nodes={REPRESENTATIVE_NODE_COUNT} edges={REPRESENTATIVE_EDGE_COUNT} broad_callbacks={broad_callbacks} selective_callbacks={selective_callbacks}"
+    );
+    Ok(())
+}
+
+#[test]
+fn node_ids_with_child_symbols_matches_per_node_children() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::CLASS,
+            serialized_name: "WithChild".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::CLASS,
+            serialized_name: "Childless".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(3),
+            kind: NodeKind::METHOD,
+            serialized_name: "child".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(4),
+            kind: NodeKind::CLASS,
+            serialized_name: "OnlyCalls".to_string(),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        Edge {
+            id: EdgeId(1),
+            source: NodeId(1),
+            target: NodeId(3),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(2),
+            source: NodeId(4),
+            target: NodeId(3),
+            kind: EdgeKind::CALL,
+            ..Default::default()
+        },
+    ])?;
+
+    let candidates = [NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(1)];
+    let batched = storage.node_ids_with_child_symbols(&candidates)?;
+    for node_id in candidates {
+        assert_eq!(
+            batched.contains(&node_id),
+            !storage.get_children_symbols(node_id)?.is_empty(),
+            "batched child presence diverged from per-node children for {node_id:?}"
+        );
+    }
+    assert!(storage.node_ids_with_child_symbols(&[])?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn node_ids_with_child_symbols_runs_one_statement_per_bind_limit_chunk() -> Result<(), StorageError>
+{
+    let mut storage = Storage::new_in_memory()?;
+    let parents = (1..=5_i64).collect::<Vec<_>>();
+    storage.insert_nodes_batch(
+        &parents
+            .iter()
+            .map(|id| Node {
+                id: NodeId(*id),
+                kind: NodeKind::CLASS,
+                serialized_name: format!("Parent{id}"),
+                ..Default::default()
+            })
+            .chain(std::iter::once(Node {
+                id: NodeId(100),
+                kind: NodeKind::METHOD,
+                serialized_name: "member".to_string(),
+                ..Default::default()
+            }))
+            .collect::<Vec<_>>(),
+    )?;
+    storage.insert_edges_batch(
+        &parents
+            .iter()
+            .filter(|id| **id % 2 == 1)
+            .map(|id| Edge {
+                id: EdgeId(*id),
+                source: NodeId(*id),
+                target: NodeId(100),
+                kind: EdgeKind::MEMBER,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    )?;
+
+    let node_ids = parents.iter().map(|id| NodeId(*id)).collect::<Vec<_>>();
+    let unchunked = storage.node_ids_with_child_symbols(&node_ids)?;
+    assert_eq!(
+        unchunked,
+        [NodeId(1), NodeId(3), NodeId(5)].into_iter().collect()
+    );
+
+    let previous_limit = storage.conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?;
+    storage
+        .conn
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 2)?;
+    let prepares = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&prepares);
+    storage
+        .conn
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(context.action, AuthAction::Select) {
+                counter.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Authorization::Allow
+        }))?;
+    let chunked = storage.node_ids_with_child_symbols(&node_ids);
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+    storage
+        .conn
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)?;
+    let chunked = chunked?;
+
+    assert_eq!(chunked, unchunked);
+    assert_eq!(
+        prepares.load(AtomicOrdering::Relaxed),
+        3,
+        "five candidates at a bind limit of two must run exactly three statements"
+    );
+    Ok(())
+}
+
+fn seed_annotation_anchor(
+    storage: &mut Storage,
+    node_id: i64,
+    path: &str,
+    qualified_name: &str,
+    normalized_signature: &str,
+) -> Result<(), StorageError> {
+    let existing_file_node_id: Option<i64> = storage
+        .get_connection()
+        .query_row(
+            "SELECT id FROM file WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let file_node_id = existing_file_node_id.unwrap_or(node_id - 1);
+    if existing_file_node_id.is_none() {
+        storage.insert_file(&FileInfo {
+            id: file_node_id,
+            path: PathBuf::from(path),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 10,
+            file_role: FileRole::Source,
+        })?;
+        storage.insert_node(&Node {
+            id: NodeId(file_node_id),
+            kind: NodeKind::FILE,
+            serialized_name: path.to_string(),
+            ..Default::default()
+        })?;
+    }
+    storage.insert_node(&Node {
+        id: NodeId(node_id),
+        kind: NodeKind::FUNCTION,
+        serialized_name: qualified_name.to_string(),
+        qualified_name: Some(qualified_name.to_string()),
+        file_node_id: Some(NodeId(file_node_id)),
+        start_line: Some(7),
+        end_line: Some(9),
+        ..Default::default()
+    })?;
+    storage.upsert_callable_projection_states(&[CallableProjectionState {
+        file_id: file_node_id,
+        symbol_key: qualified_name.to_string(),
+        node_id: NodeId(node_id),
+        // A change detector that deliberately disagrees with the normalized
+        // signature, so a lookup that reads the wrong column finds nothing.
+        signature_hash: 0x5a5a_5a5a,
+        normalized_signature: Some(normalized_signature.to_string()),
+        body_hash: 1,
+        start_line: 7,
+        end_line: 9,
+    }])?;
+    Ok(())
+}
+
+#[test]
+fn the_annotation_cutover_marker_is_inseparable_from_the_schema_barrier() -> Result<(), StorageError>
+{
+    // The schema bump is the writer barrier: forward-only migration already
+    // refuses a newer schema, so an older CLI fails closed on the whole
+    // database instead of writing the retained legacy annotation tables.
+    let storage = Storage::new_in_memory()?;
+
+    assert_eq!(CURRENT_SCHEMA_VERSION, 31);
+    let (sidecar_version, cutover_at) = storage
+        .annotation_sidecar_cutover()?
+        .expect("a current-schema database is stamped with the cutover marker");
+    assert_eq!(
+        sidecar_version,
+        crate::annotations::ANNOTATION_SCHEMA_VERSION
+    );
+    assert!(cutover_at >= 0);
+
+    storage.set_schema_version(CURRENT_SCHEMA_VERSION + 1)?;
+    let error = storage
+        .apply_schema_migrations()
+        .expect_err("a newer schema must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("Unsupported database schema version"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_pre_cutover_database_migrates_its_legacy_annotation_rows_intact() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    seed_annotation_anchor(&mut storage, 100, "/repo/src/lib.rs", "alpha", "shape:4242")?;
+    let category_id = storage.create_bookmark_category("Favorites")?;
+    let _ = storage.add_bookmark(category_id, NodeId(100), Some("keep"))?;
+
+    // A schema-30 database re-migrating must find the same legacy rows.
+    storage.set_schema_version(30)?;
+    storage.apply_schema_migrations()?;
+
+    let snapshot = storage.legacy_annotation_snapshot()?;
+    assert_eq!(snapshot.categories.len(), 1);
+    assert_eq!(snapshot.bookmarks.len(), 1);
+    let bookmark = &snapshot.bookmarks[0];
+    assert_eq!(bookmark.file_identity.as_deref(), Some("/repo/src/lib.rs"));
+    assert_eq!(bookmark.qualified_name.as_deref(), Some("alpha"));
+    assert_eq!(bookmark.kind, Some(NodeKind::FUNCTION as i64));
+    assert_eq!(
+        bookmark.normalized_signature.as_deref(),
+        Some("shape:4242"),
+        "the anchor must carry the normalized signature, not the change detector"
+    );
+    assert_eq!(bookmark.comment.as_deref(), Some("keep"));
+    assert!(storage.annotation_sidecar_cutover()?.is_some());
+    Ok(())
+}
+
+#[test]
+fn annotation_anchor_lookups_stay_selective_and_report_ambiguity() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    seed_annotation_anchor(&mut storage, 100, "/repo/src/lib.rs", "alpha", "shape:4242")?;
+    seed_annotation_anchor(
+        &mut storage,
+        200,
+        "/repo/src/other.rs",
+        "alpha",
+        "shape:4242",
+    )?;
+
+    let anchor = storage
+        .annotation_anchor_for_node(NodeId(100))?
+        .expect("anchor for node");
+    assert_eq!(anchor.file_identity.as_deref(), Some("/repo/src/lib.rs"));
+    assert_eq!(anchor.normalized_signature.as_deref(), Some("shape:4242"));
+
+    let unique = storage.annotation_anchors_by_anchor_tuple(
+        "/repo/src/lib.rs",
+        "alpha",
+        NodeKind::FUNCTION as i64,
+    )?;
+    assert_eq!(unique.len(), 1);
+    assert_eq!(unique[0].node_id, 100);
+
+    let by_name =
+        storage.annotation_anchors_by_qualified_name("alpha", NodeKind::FUNCTION as i64)?;
+    assert_eq!(
+        by_name
+            .iter()
+            .map(|anchor| anchor.node_id)
+            .collect::<Vec<_>>(),
+        vec![100, 200],
+        "the move probe must see the name in every file that carries it"
+    );
+
+    let scoped = storage.annotation_anchors_by_normalized_signature(
+        "shape:4242",
+        "/repo/src/other.rs",
+        NodeKind::FUNCTION as i64,
+    )?;
+    assert_eq!(
+        scoped.len(),
+        1,
+        "the signature probe is scoped to one file, so the other file's twin is invisible"
+    );
+    assert_eq!(scoped[0].node_id, 200);
+
+    seed_annotation_anchor(
+        &mut storage,
+        300,
+        "/repo/src/other.rs",
+        "twin",
+        "shape:4242",
+    )?;
+    let ambiguous = storage.annotation_anchors_by_normalized_signature(
+        "shape:4242",
+        "/repo/src/other.rs",
+        NodeKind::FUNCTION as i64,
+    )?;
+    assert_eq!(
+        ambiguous
+            .iter()
+            .map(|anchor| anchor.node_id)
+            .collect::<Vec<_>>(),
+        vec![200, 300],
+        "an ambiguous signature must surface a second candidate rather than pick one"
+    );
+
+    assert!(
+        storage
+            .annotation_anchors_by_normalized_signature(
+                "shape:no-such-hash",
+                "/repo/src/lib.rs",
+                NodeKind::FUNCTION as i64,
+            )?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn annotation_uniqueness_probes_never_read_more_rows_than_the_decision_needs()
+-> Result<(), StorageError> {
+    // A workspace-wide name probe is unbounded by nature. Every caller only
+    // asks "one, or more than one", so the read has to stop at two.
+    let mut storage = Storage::new_in_memory()?;
+    for index in 0..8 {
+        seed_annotation_anchor(
+            &mut storage,
+            100 + index * 10,
+            &format!("/repo/src/file{index}.rs"),
+            "new",
+            "shape:4242",
+        )?;
+    }
+
+    let by_name = storage.annotation_anchors_by_qualified_name("new", NodeKind::FUNCTION as i64)?;
+    assert_eq!(
+        by_name.len(),
+        2,
+        "a crowded name must not stream the whole workspace into the rebind ladder"
+    );
+
+    Ok(())
+}
+
+/// Seed one promotion-ready database whose structural evidence spans several
+/// files, each with several units, one projection, and one bound cache row.
+fn seed_structural_promotion_corpus(path: &Path, generation: i64) -> Result<(), StorageError> {
+    const FILE_COUNT: i64 = 4;
+    const UNITS_PER_FILE: i64 = 3;
+
+    let mut storage = Storage::open(path)?;
+    let mut files = Vec::new();
+    let mut file_content_hashes = Vec::new();
+    let mut nodes = Vec::new();
+    let mut units = Vec::new();
+    let mut projections = Vec::new();
+    for index in 0..FILE_COUNT {
+        let file_id = generation * 100 + index + 1;
+        let source_hash = format!("{file_id:064x}");
+        files.push(FileInfo {
+            id: file_id,
+            path: PathBuf::from(format!("src/module_{file_id}.rs")),
+            language: "rust".to_string(),
+            modification_time: file_id,
+            indexed: true,
+            complete: true,
+            line_count: 64,
+            file_role: FileRole::Source,
+        });
+        file_content_hashes.push(FileContentHash {
+            file_id,
+            content_hash: source_hash.clone(),
+        });
+        let first_unit = units.len();
+        for offset in 0..UNITS_PER_FILE {
+            let node_id = file_id * 10 + offset;
+            nodes.push(Node {
+                id: NodeId(node_id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: format!("module_{file_id}::f{offset}"),
+                ..Default::default()
+            });
+            units.push(structural_unit_fixture(node_id, file_id, &source_hash));
+        }
+        projections.push(StructuralTextProjection {
+            file_id,
+            source_content_hash: source_hash,
+            descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+            producer: "fixture".to_string(),
+            language: "rust".to_string(),
+            file_role: FileRole::Source,
+            unit_count: UNITS_PER_FILE as u64,
+            unit_digest: structural_text_unit_digest(&units[first_unit..]),
+        });
+    }
+    let cache_writes = files
+        .iter()
+        .map(|file| StructuralTextArtifactCacheWrite {
+            path: &file.path,
+            file_id: file.id,
+            cache_key: "v1:fixture",
+            artifact_blob: b"verified structural artifact",
+        })
+        .collect::<Vec<_>>();
+    storage.flush_projection_batch(ProjectionBatch {
+        files: &files,
+        file_content_hashes: &file_content_hashes,
+        nodes: &nodes,
+        structural_text_units: &units,
+        structural_text_projections: &projections,
+        structural_text_cache_writes: &cache_writes,
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+        file_errors: &[],
+    })?;
+    let publication = IndexPublicationRecord {
+        generation: generation.max(0) as u64,
+        generation_id: format!("generation-{generation}"),
+        run_id: format!("run-{generation}"),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: generation.max(0),
+    };
+    storage.put_index_publication(&publication)?;
+    storage.publish_structural_text_unit_generation(&publication)?;
+    storage.publish_source_policy_exclusion_generation(
+        &publication,
+        "test-project",
+        "test-workspace",
+        source_policy_identity(
+            OVERSIZED_SOURCE_POLICY_VERSION,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+        ),
+        &[],
+    )?;
+    storage.finalize_staged_snapshot()
+}
+
+#[test]
+fn structural_content_scan_reproduces_the_separate_summaries_and_per_file_digests()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("structural-content-scan-equivalence");
+    seed_structural_promotion_corpus(&path, 7)?;
+    let storage = Storage::open(&path)?;
+    let conn = storage.get_connection();
+
+    let (unit_count, unit_digest, unit_versions) = structural_text_unit_content_summary(conn)?;
+    let (projection_count, projection_digest, projection_versions) =
+        structural_text_projection_content_summary(conn)?;
+    validate_structural_text_projection_rows(conn)?;
+
+    let scan = scan_structural_text_content(conn)?;
+
+    assert_eq!(scan.unit_count, unit_count);
+    assert_eq!(scan.unit_digest, unit_digest);
+    assert_eq!(scan.unit_versions, unit_versions);
+    assert_eq!(scan.projection_count, projection_count);
+    assert_eq!(scan.projection_digest, projection_digest);
+    assert_eq!(scan.projection_versions, projection_versions);
+    assert_eq!(scan.unit_count, 12, "the fixture publishes twelve units");
+    assert_eq!(
+        scan.projection_count, 4,
+        "the fixture publishes four projections"
+    );
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn structural_content_scan_rejects_a_projection_that_no_longer_owns_its_units()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("structural-content-scan-lost-unit");
+    seed_structural_promotion_corpus(&path, 8)?;
+    let storage = Storage::open(&path)?;
+    let conn = storage.get_connection();
+    let (file_id, node_id) = conn.query_row(
+        "SELECT file_id, node_id FROM structural_text_unit ORDER BY node_id ASC LIMIT 1",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    conn.execute(
+        "DELETE FROM structural_text_unit WHERE node_id = ?1",
+        params![node_id],
+    )?;
+
+    let error = scan_structural_text_content(conn)
+        .expect_err("a projection that lost a unit must not validate");
+
+    assert_eq!(
+        error.to_string(),
+        format!("Other error: structural text projection {file_id} does not match its unit set"),
+        "the merged scan must report the same defect the separate pass reported"
+    );
+    assert_eq!(
+        validate_structural_text_projection_rows(conn)
+            .expect_err("the separate pass agrees")
+            .to_string(),
+        error.to_string()
+    );
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn structural_content_scan_rejects_units_without_an_owning_projection() -> Result<(), StorageError>
+{
+    let path = unique_temp_db_path("structural-content-scan-orphan-units");
+    seed_structural_promotion_corpus(&path, 9)?;
+    let storage = Storage::open(&path)?;
+    let conn = storage.get_connection();
+    let file_id = conn.query_row(
+        "SELECT file_id FROM structural_text_projection ORDER BY file_id ASC LIMIT 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    conn.execute(
+        "DELETE FROM structural_text_projection WHERE file_id = ?1",
+        params![file_id],
+    )?;
+
+    let error = scan_structural_text_content(conn).expect_err("orphaned units must not validate");
+
+    assert_eq!(
+        error.to_string(),
+        "Other error: structural text units exist without owning projections"
+    );
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn promotion_database_image_covers_content_and_ignores_only_sqlite_bookkeeping()
+-> Result<(), StorageError> {
+    let staged_path = unique_temp_db_path("promotion-image-source");
+    let live_path = unique_temp_db_path("promotion-image-destination");
+    seed_structural_promotion_corpus(&staged_path, 11)?;
+    seed_structural_promotion_corpus(&live_path, 12)?;
+
+    let staged_image = promotion_database_image(&staged_path)?.expect("staged image is provable");
+    assert_ne!(
+        promotion_database_image(&live_path)?.expect("live image is provable"),
+        staged_image,
+        "two different databases must not share an image"
+    );
+
+    let mut live_conn = Connection::open(sqlite_path::open_path(&live_path))?;
+    live_conn.restore(
+        MAIN_DB,
+        sqlite_path::open_path(&staged_path),
+        None::<fn(rusqlite::backup::Progress)>,
+    )?;
+    drop(live_conn);
+
+    assert_ne!(
+        fs::read(&staged_path).expect("read staged bytes"),
+        fs::read(&live_path).expect("read live bytes"),
+        "a restore leaves SQLite's own header counters different, which is why \
+         the image masks exactly those slots"
+    );
+    assert_eq!(
+        promotion_database_image(&live_path)?.expect("restored image is provable"),
+        staged_image,
+        "a faithful page-level restore carries the candidate's content"
+    );
+
+    let restored = fs::read(&live_path).expect("read live bytes");
+    let reimage = |mutate: &dyn Fn(&mut Vec<u8>)| -> Result<PromotionDatabaseImage, StorageError> {
+        let mut bytes = restored.clone();
+        mutate(&mut bytes);
+        fs::write(&live_path, &bytes).expect("write mutated live bytes");
+        Ok(promotion_database_image(&live_path)?.expect("mutated image is provable"))
+    };
+
+    // Only the three bookkeeping slots are outside the image.
+    for (start, end) in SQLITE_VOLATILE_HEADER_SLOTS {
+        assert_eq!(
+            reimage(&|bytes| bytes[start..end].iter_mut().for_each(|byte| *byte ^= 0xff))?,
+            staged_image,
+            "header slot {start}..{end} is SQLite bookkeeping, not content"
+        );
+    }
+    // Every other header byte is content: the page size, the text encoding, the
+    // freelist head, the user version and the application id all participate.
+    for offset in [16, 28, 32, 44, 56, 60, 68, 96] {
+        assert_ne!(
+            reimage(&|bytes| bytes[offset] ^= 0xff)?,
+            staged_image,
+            "header byte {offset} must participate in the image"
+        );
+    }
+    // And so does one byte of page content well past the header.
+    let content_offset = restored.len() / 2;
+    assert_ne!(
+        reimage(&|bytes| bytes[content_offset] ^= 0xff)?,
+        staged_image,
+        "byte drift in the pages must break the image"
+    );
+
+    cleanup_sqlite_sidecars(&staged_path)?;
+    cleanup_sqlite_sidecars(&live_path)?;
+    Ok(())
+}
+
+#[test]
+fn promotion_database_image_is_unprovable_when_content_sits_outside_the_main_file()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("promotion-image-hot-sidecar");
+    seed_structural_promotion_corpus(&path, 13)?;
+    let sealed = promotion_database_image(&path)?.expect("sealed image is provable");
+
+    for suffix in ["-wal", "-journal"] {
+        let sidecar = sqlite_sidecar_path(&path, suffix);
+        fs::write(&sidecar, b"pending frames").expect("stage a hot sidecar");
+        assert_eq!(
+            promotion_database_image(&path)?,
+            None,
+            "{suffix} content outside the main file must leave the image unprovable"
+        );
+        fs::remove_file(&sidecar).expect("remove the hot sidecar");
+    }
+    assert_eq!(
+        promotion_database_image(&path)?,
+        Some(sealed),
+        "removing the sidecars restores the same image"
+    );
+
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn promoted_receipt_reuse_is_sealed_to_the_restored_bytes() -> Result<(), StorageError> {
+    let staged_path = unique_temp_db_path("promoted-receipt-staged");
+    let live_path = unique_temp_db_path("promoted-receipt-live");
+    seed_structural_promotion_corpus(&staged_path, 21)?;
+    seed_structural_promotion_corpus(&live_path, 22)?;
+
+    let candidate =
+        require_complete_promotion_database_identity(&staged_path, "Staged promotion candidate")?;
+    let candidate_source_policy =
+        read_source_policy_exclusion_rollback_identity(&staged_path, &candidate)?;
+    let candidate_structural_text =
+        read_structural_text_unit_rollback_identity(&staged_path, &candidate)?;
+    let candidate_image = promotion_database_image(&staged_path)?.expect("candidate image");
+
+    let mut live_conn = Connection::open(sqlite_path::open_path(&live_path))?;
+    live_conn.restore(
+        MAIN_DB,
+        sqlite_path::open_path(&staged_path),
+        None::<fn(rusqlite::backup::Progress)>,
+    )?;
+    drop(live_conn);
+
+    assert_eq!(
+        validate_promoted_live_database(
+            &live_path,
+            &staged_path,
+            &candidate,
+            &candidate_source_policy,
+            &candidate_structural_text,
+            Some(candidate_image),
+        )?,
+        PromotedValidation::ReusedCandidateReceipt,
+        "a restore proven byte-identical to the validated candidate reuses its receipt"
+    );
+    assert_eq!(
+        validate_promoted_live_database(
+            &live_path,
+            &staged_path,
+            &candidate,
+            &candidate_source_policy,
+            &candidate_structural_text,
+            None,
+        )?,
+        PromotedValidation::Revalidated,
+        "without a candidate image the promoted copy is validated in full"
+    );
+
+    // In-place corruption after the restore leaves the publication identity
+    // untouched, so only the deep validation can catch it. The receipt must not
+    // be reusable here.
+    corrupt_test_structural_cache(&live_path, "blob")?;
+    assert_ne!(
+        promotion_database_image(&live_path)?.expect("corrupted image"),
+        candidate_image,
+        "in-place corruption must break the seal"
+    );
+    let error = validate_promoted_live_database(
+        &live_path,
+        &staged_path,
+        &candidate,
+        &candidate_source_policy,
+        &candidate_structural_text,
+        Some(candidate_image),
+    )
+    .expect_err("a corrupted restore must fail the post-restore fence");
+    assert!(
+        error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("structural artifact cache"),
+        "unexpected fence error: {error}"
+    );
+
+    cleanup_sqlite_sidecars(&staged_path)?;
+    cleanup_sqlite_sidecars(&live_path)?;
+    Ok(())
+}
+
+/// Read the durable schema shape a connection currently has.
+///
+/// `sqlite_master` is the only place both construction paths converge, so it
+/// is the only honest comparison surface for schema drift. Autoindexes are
+/// derived from the table SQL already present in the same dump, so including
+/// them would double-count rather than add signal.
+///
+/// Runs of whitespace are collapsed. SQLite stores the DDL text verbatim, and
+/// `create_tables` and the migration ladder indent the same table differently;
+/// that is layout, not shape. Everything that decides whether two caches are
+/// interchangeable — table set, index set, column names, types, defaults,
+/// constraints, and their order — survives the collapse.
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn sqlite_master_shape(conn: &rusqlite::Connection) -> Vec<(String, String, String, String)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT type, name, tbl_name, COALESCE(sql, '')
+             FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_autoindex_%'
+             ORDER BY type, name, tbl_name",
+        )
+        .expect("prepare sqlite_master read");
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                normalize_schema_sql(&row.get::<_, String>(3)?),
+            ))
+        })
+        .expect("query sqlite_master");
+    rows.map(|row| row.expect("read sqlite_master row"))
+        .collect()
+}
+
+#[test]
+fn a_replayed_migration_ladder_produces_the_same_schema_as_a_fresh_create() {
+    // ARCH-020: the CREATE TABLE definitions in `schema.rs` and the migration
+    // ladder are two sources of truth for one schema, and they have already
+    // drifted once. `init` stamps `user_version` to the current version before
+    // migrations run, so a freshly created database executes *no* migration —
+    // the ladder is only ever exercised on an upgraded cache, which is exactly
+    // where nothing was comparing the two shapes.
+    //
+    // This pins the drift direction that strands a rolled-back CLI: a
+    // conditional migration that changes the schema beyond what CREATE TABLE
+    // produces. Rewinding `user_version` replays the whole ladder over a
+    // freshly created database; the resulting `sqlite_master` must equal the
+    // fresh one, which also proves every migration is idempotent against the
+    // shape `schema.rs` ships.
+    //
+    // Scope, stated honestly: the tail of the ladder runs unconditionally on
+    // every open, so those steps already shape a fresh database and cannot
+    // drift from it. What this covers is the version-gated body — the steps a
+    // fresh create skips and only an upgraded cache ever runs.
+    let fresh_dir = tempfile::tempdir().expect("fresh schema directory");
+    let fresh_path = fresh_dir.path().join("codestory.db");
+    let fresh = Storage::open(&fresh_path).expect("create a fresh database");
+    let fresh_shape = sqlite_master_shape(fresh.get_connection());
+    drop(fresh);
+    assert!(
+        !fresh_shape.is_empty(),
+        "a fresh database must define a schema to compare"
+    );
+
+    let replay_dir = tempfile::tempdir().expect("replay schema directory");
+    let replay_path = replay_dir.path().join("codestory.db");
+    drop(Storage::open(&replay_path).expect("create the database to replay onto"));
+    let rewind = rusqlite::Connection::open(&replay_path).expect("open for version rewind");
+    rewind
+        .pragma_update(None, "user_version", 1i64)
+        .expect("rewind the recorded schema version");
+    drop(rewind);
+
+    let replayed = Storage::open(&replay_path).expect("replay the full migration ladder");
+    let replayed_shape = sqlite_master_shape(replayed.get_connection());
+    drop(replayed);
+
+    assert_eq!(
+        Storage::database_schema_version(&replay_path).expect("read replayed schema version"),
+        CURRENT_SCHEMA_VERSION,
+        "the replayed ladder must land on the current schema version"
+    );
+    assert_eq!(
+        replayed_shape, fresh_shape,
+        "the migration ladder and the CREATE TABLE definitions must agree; a fresh cache and a migrated cache have drifted"
+    );
 }

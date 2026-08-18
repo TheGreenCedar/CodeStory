@@ -192,8 +192,8 @@ export function packetEmbeddingExecutionProofBlockers(provenance) {
   if (proof.source !== "packet.answer.retrieval_trace") {
     reasons.push(`cold packet embedding execution source=${proof.source ?? "unknown"}; expected packet.answer.retrieval_trace`);
   }
-  if (proof.transport_mode !== "cold_cli_packet") {
-    reasons.push(`cold packet embedding execution transport=${proof.transport_mode ?? "unknown"}; expected cold_cli_packet`);
+  if (!["cold_cli_packet", "agent_harness_prelude"].includes(proof.transport_mode)) {
+    reasons.push(`cold packet embedding execution transport=${proof.transport_mode ?? "unknown"}; expected cold_cli_packet or agent_harness_prelude`);
   }
   if (proof.retrieval_contract !== "in_process_v1") {
     reasons.push(`cold packet retrieval contract=${proof.retrieval_contract ?? "unknown"}; expected in_process_v1`);

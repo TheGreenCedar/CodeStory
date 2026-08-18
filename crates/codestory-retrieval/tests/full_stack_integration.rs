@@ -4,7 +4,9 @@
 //! generation is published.
 
 use codestory_contracts::graph::{Node, NodeId, NodeKind};
-use codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture;
+use codestory_retrieval::test_support::{
+    publish_complete_core_fixture, publish_zero_dense_pinned_query_fixture,
+};
 use codestory_retrieval::{
     QueryRequest, RetrievalCache, RetrievalStageKind, SidecarProcessDefaults, SidecarProfile,
     SidecarRuntimeConfig, SidecarRuntimeDefaults, SidecarRuntimeOverrides, StageCompletionStatus,
@@ -94,15 +96,15 @@ fn seed_fixture_graph(storage: &mut Store, project_root: &Path) -> NodeId {
             updated_at_epoch_ms: 1,
         }])
         .expect("symbol search doc");
-    storage
-        .put_index_publication(&IndexPublicationRecord {
-            generation: 1,
-            generation_id: "11111111-1111-4111-8111-111111111111".into(),
-            run_id: "core-run-1".into(),
-            mode: IndexPublicationMode::Full,
-            published_at_epoch_ms: 1,
-        })
-        .expect("core publication");
+    let publication = IndexPublicationRecord {
+        generation: 1,
+        generation_id: "11111111-1111-4111-8111-111111111111".into(),
+        run_id: "core-run-1".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    publish_complete_core_fixture(storage, project_root, &publication)
+        .expect("complete core fixture");
     function.id
 }
 

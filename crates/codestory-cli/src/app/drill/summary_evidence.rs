@@ -11,7 +11,7 @@ use crate::args::{
     DrillSummaryOpenGapsOutput, DrillSummaryOutput, DrillSummarySourceTruthOutput,
 };
 use codestory_contracts::api::{
-    ClaimReadinessDto, IndexFreshnessStatusDto, PacketProofStatusDto, PacketSufficiencyStatusDto,
+    ClaimReadinessDto, IndexFreshnessStatusDto, PacketDispositionKindDto,
 };
 
 pub(super) fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
@@ -240,7 +240,8 @@ fn drill_summary_bridges(output: &DrillOutput) -> DrillSummaryBridgesOutput {
 }
 
 fn drill_summary_source_truth(output: &DrillOutput) -> DrillSummarySourceTruthOutput {
-    let sufficiency = &output.evidence_packet.sufficiency;
+    let disposition = &output.evidence_packet.disposition;
+    let support_count = output.evidence_packet.support.len();
     let mut target_files: Vec<_> = output
         .verification_targets
         .iter()
@@ -251,7 +252,7 @@ fn drill_summary_source_truth(output: &DrillOutput) -> DrillSummarySourceTruthOu
     let target_file_details =
         drill_summary_source_truth_target_details(&target_files, &output.verification_targets);
     let has_source_truth_checks = !target_files.is_empty();
-    let needs_source_truth = sufficiency.status != PacketSufficiencyStatusDto::Sufficient;
+    let needs_source_truth = disposition.kind != PacketDispositionKindDto::Supported;
     DrillSummarySourceTruthOutput {
         required: needs_source_truth,
         check_count: target_file_count,
@@ -269,9 +270,9 @@ fn drill_summary_source_truth(output: &DrillOutput) -> DrillSummarySourceTruthOu
         target_files,
         target_file_details,
         checklist_item_count: 0,
-        claim_count: sufficiency.covered_claims.len(),
-        pending_claim_count: sufficiency.gaps.len(),
-        verified_claim_count: sufficiency.covered_claims.len(),
+        claim_count: support_count,
+        pending_claim_count: disposition.omission_receipts.len(),
+        verified_claim_count: support_count,
     }
 }
 
@@ -280,24 +281,21 @@ fn drill_summary_open_gaps(
     source_truth: &DrillSummarySourceTruthOutput,
     stale_freshness: bool,
 ) -> DrillSummaryOpenGapsOutput {
-    let sufficiency = &output.evidence_packet.sufficiency;
-    let open_gap_friendly = !sufficiency.gaps.is_empty()
-        || !sufficiency.open_next.is_empty()
+    let disposition = &output.evidence_packet.disposition;
+    let support_count = output.evidence_packet.support.len();
+    let open_gap_friendly = !disposition.omission_receipts.is_empty()
+        || disposition.kind == PacketDispositionKindDto::DrillOnce
         || source_truth.required
         || stale_freshness;
     DrillSummaryOpenGapsOutput {
-        overall_status: drill_packet_claim_readiness(sufficiency.status),
-        answer_quality_status: packet_sufficiency_label(sufficiency.status).to_string(),
-        safe_to_say_count: sufficiency.covered_claims.len(),
-        inferred_claim_count: sufficiency
-            .covered_claims
-            .iter()
-            .filter(|claim| claim.proof_status != Some(PacketProofStatusDto::Proven))
-            .count(),
-        needs_verification_count: sufficiency.gaps.len(),
-        needs_verification_claim_count: sufficiency.gaps.len(),
+        overall_status: drill_packet_claim_readiness(disposition.kind),
+        answer_quality_status: packet_sufficiency_label(disposition.kind).to_string(),
+        safe_to_say_count: support_count,
+        inferred_claim_count: 0,
+        needs_verification_count: disposition.omission_receipts.len(),
+        needs_verification_claim_count: disposition.omission_receipts.len(),
         pending_claim_count: if source_truth.required {
-            sufficiency.gaps.len()
+            disposition.omission_receipts.len()
         } else {
             0
         },
@@ -306,7 +304,11 @@ fn drill_summary_open_gaps(
         } else {
             0
         },
-        next_command_count: sufficiency.follow_up_commands.len(),
+        next_command_count: disposition
+            .drill
+            .as_ref()
+            .map(|drill| drill.options.len())
+            .unwrap_or(0),
         open_gap_friendly,
         status: if open_gap_friendly {
             "open_gaps_explicit".to_string()
@@ -317,12 +319,14 @@ fn drill_summary_open_gaps(
 }
 
 pub(in crate::app) fn drill_packet_claim_readiness(
-    status: PacketSufficiencyStatusDto,
+    status: PacketDispositionKindDto,
 ) -> ClaimReadinessDto {
     match status {
-        PacketSufficiencyStatusDto::Sufficient => ClaimReadinessDto::Supported,
-        PacketSufficiencyStatusDto::Partial => ClaimReadinessDto::Partial,
-        PacketSufficiencyStatusDto::Insufficient => ClaimReadinessDto::NeedsSourceRead,
+        PacketDispositionKindDto::Supported => ClaimReadinessDto::Supported,
+        PacketDispositionKindDto::DrillOnce => ClaimReadinessDto::Partial,
+        PacketDispositionKindDto::NotEstablished | PacketDispositionKindDto::Unavailable => {
+            ClaimReadinessDto::NeedsSourceRead
+        }
     }
 }
 

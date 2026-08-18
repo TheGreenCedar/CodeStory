@@ -11,10 +11,16 @@
 //! reinterpreting the same contract differently.
 
 pub mod api;
+pub mod bounded_locks;
+pub mod config_registry;
 pub mod events;
 pub mod graph;
 pub mod grounding;
 pub mod language_support;
+pub mod owned_artifacts;
 pub mod query;
 pub mod trail;
+pub mod validation_receipts;
+
+pub mod wire;
 pub mod workspace;

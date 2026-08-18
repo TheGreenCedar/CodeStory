@@ -114,7 +114,9 @@ secret-bearing conventions, lockfiles, minified/generated outputs, and
 declared high-noise forms do not create file, unit, projection, or cache rows;
 an excluded path already present in stored inventory is scheduled for normal
 incremental deletion. Repository ancestors are never policy inputs. Admitted
-files are capped at 1 MiB and 2,048 units. A bound failure rejects the whole
+files are capped at 1 MiB and 2,048 units, both carried on `SourceIndexPolicy`
+rather than compiled into the collector, so an operator override reaches them and
+an exclusion names the bound that refused it. A bound failure rejects the whole
 file instead of publishing a truncated projection. Structural cache identity
 v2 invalidates pre-limit artifacts, and cache hits enforce the same unit cap.
 Invalid UTF-8/binary bytes, malformed format syntax, and unreadable sources

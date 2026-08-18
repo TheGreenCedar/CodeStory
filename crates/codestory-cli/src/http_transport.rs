@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     net::{IpAddr, TcpStream},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::args;
@@ -23,6 +23,17 @@ const BROWSER_REFERENCES_DEPTH: u32 = 0;
 const BROWSER_REFERENCES_MAX_NODES: u32 = 120;
 pub(crate) const BROWSER_SYMBOLS_DEFAULT_LIMIT: u32 = 300;
 pub(crate) const BROWSER_SYMBOLS_MAX_LIMIT: u32 = 2_000;
+
+/// How long one peer may take to finish sending its request headers.
+///
+/// Optional HTTP serving is loopback-only, explicitly invoked, and serial, so
+/// this is the whole time any single peer can occupy the serving thread before
+/// `/health` and every other route answer again.
+const HTTP_REQUEST_HEADER_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Polling granularity inside [`HTTP_REQUEST_HEADER_DEADLINE`], never a bound
+/// on the request: each read window restarts, the deadline does not.
+const HTTP_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HttpServePolicy {
@@ -40,11 +51,23 @@ pub(crate) fn handle_http_request(
     mut stream: TcpStream,
     policy: HttpServePolicy,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let header_deadline = Instant::now() + HTTP_REQUEST_HEADER_DEADLINE;
     let mut request_bytes = Vec::with_capacity(1024);
     let mut buffer = [0u8; 1024];
     let mut headers_complete = false;
+    let mut deadline_exceeded = false;
     loop {
+        // The per-read timeout alone bounded nothing: this accept loop is
+        // serial, and a peer that sent one byte just inside every read window
+        // held the only serving thread for as long as it liked, so `/health`
+        // never answered. The whole-request deadline is what actually bounds
+        // the peer; the per-read timeout stays as its polling granularity.
+        let remaining = header_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            deadline_exceeded = true;
+            break;
+        }
+        stream.set_read_timeout(Some(remaining.min(HTTP_REQUEST_READ_TIMEOUT)))?;
         let read = match stream.read(&mut buffer) {
             Ok(read) => read,
             Err(error)
@@ -53,7 +76,7 @@ pub(crate) fn handle_http_request(
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
-                break;
+                continue;
             }
             Err(error) => return Err(error.into()),
         };
@@ -68,6 +91,17 @@ pub(crate) fn handle_http_request(
         if request_bytes.len() >= 8192 {
             break;
         }
+    }
+    if deadline_exceeded {
+        return write_http_error_json(
+            &mut stream,
+            408,
+            "http_request_deadline_exceeded",
+            format!(
+                "Request headers did not arrive within {} seconds.",
+                HTTP_REQUEST_HEADER_DEADLINE.as_secs()
+            ),
+        );
     }
     if !headers_complete {
         return write_http_json(
@@ -122,12 +156,7 @@ pub(crate) fn handle_http_request(
             }) {
                 Ok(operation) => operation,
                 Err(error) => {
-                    return write_http_error_json(
-                        &mut stream,
-                        400,
-                        "search_unavailable",
-                        error.to_string(),
-                    );
+                    return write_http_typed_error(&mut stream, 400, "search_unavailable", &error);
                 }
             };
             write_http_json(
@@ -466,9 +495,26 @@ fn write_http_target_error(
 ) -> Result<()> {
     if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
         let output = build_ambiguous_target_error_output(&runtime.project_root, ambiguous);
-        write_http_json(stream, 400, &output)
-    } else {
-        write_http_error_json(stream, 400, "target_resolution_failed", error.to_string())
+        return write_http_json(stream, 400, &output);
+    }
+    write_http_typed_error(stream, 400, "target_resolution_failed", &error)
+}
+
+/// Emit the typed runtime classification when the adapter still holds one.
+///
+/// The HTTP surface answers the same graph operations as MCP, so a caller must
+/// be able to branch on `error.code` here too instead of matching message text.
+fn write_http_typed_error(
+    stream: &mut TcpStream,
+    status: u16,
+    fallback_code: &'static str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    match runtime::api_error_in_chain(error) {
+        Some(api_error) => {
+            write_http_json(stream, status, &serde_json::json!({"error": api_error}))
+        }
+        None => write_http_error_json(stream, status, fallback_code, error.to_string()),
     }
 }
 
@@ -509,6 +555,7 @@ fn write_http_json<T: serde::Serialize>(
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         _ => "OK",
     };
     write!(

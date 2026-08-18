@@ -905,6 +905,7 @@ fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
         line: node.start_line,
         score: 0.0,
         origin: SearchHitOrigin::IndexedSymbol,
+        target: None,
         match_quality: None,
         resolvable: true,
         evidence_tier: Some(
@@ -1090,6 +1091,7 @@ mod tests {
             line: None,
             score: 0.0,
             origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1113,6 +1115,7 @@ mod tests {
             line: Some(1),
             score,
             origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             source_excerpt: None,

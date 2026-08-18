@@ -20,6 +20,7 @@ from .foundation import (
     ProofFailure,
     require,
 )
+from .qualification_thresholds import windows_warm_connect_probe_rule
 
 QUALIFICATION_MEASUREMENT_SHAPE_FIELDS = (
     "required_scenarios",
@@ -28,6 +29,7 @@ QUALIFICATION_MEASUREMENT_SHAPE_FIELDS = (
     "phase_boundaries",
     "workloads",
     "metric_sampling",
+    "qualification_threshold_override_probes",
     "metric_contracts",
     "calibration_required_metrics",
     "calibration_phase_boundaries",
@@ -35,7 +37,7 @@ QUALIFICATION_MEASUREMENT_SHAPE_FIELDS = (
     "calibration_workload_state_overrides",
 )
 EXPECTED_QUALIFICATION_MEASUREMENT_SHAPE_SHA256 = (
-    "bc78e8c0277062f1274b0ed97e9bafbef2574b2d1934cb6ab89e7f514900fef8"
+    "5d94599071eeae658e70627e1827e13a01f666ec5fd82d0f95a8b4fa78bd5103"
 )
 
 
@@ -465,3 +467,4 @@ def _verify_measurement_sampling(
             aggregation == expected_aggregation,
             f"measurement metric {metric} aggregation is not conservative",
         )
+    windows_warm_connect_probe_rule(protocol)

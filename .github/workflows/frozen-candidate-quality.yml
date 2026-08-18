@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   quality:
-    name: Optional frozen-candidate Axios v2 quality
+    name: Optional frozen-candidate macOS Metal quality
     continue-on-error: true
     runs-on: [self-hosted, macOS, ARM64, codestory-metal]
     environment: macos-metal-release
@@ -275,6 +275,59 @@ jobs:
           echo "- Optional Axios v2 measurement: $(((finished_ns - started_ns) / 1000000)) ms" \
             >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Produce optional Ripgrep v2 quality evidence
+        id: ripgrep-quality
+        continue-on-error: true
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          CODESTORY_EMBED_ALLOW_CPU: "0"
+        run: |
+          set -euo pipefail
+          started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          version="${VERSION#v}"
+          archive="target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz"
+          quality_root=target/frozen-candidate-ripgrep-quality/evidence
+          packaged_root="$(mktemp -d "$RUNNER_TEMP/codestory-ripgrep-quality-cli.XXXXXX")"
+          export CODESTORY_CACHE_ROOT
+          CODESTORY_CACHE_ROOT="$(mktemp -d "$RUNNER_TEMP/codestory-ripgrep-quality-cache.XXXXXX")"
+          export CODESTORY_STDIO_CACHE_ROOT
+          CODESTORY_STDIO_CACHE_ROOT="$(mktemp -d "$RUNNER_TEMP/codestory-ripgrep-quality-stdio.XXXXXX")"
+          rm -rf "$quality_root"
+          mkdir -p "$quality_root"
+          tar -xzf "$archive" -C "$packaged_root"
+          packaged_cli="$(
+            find "$packaged_root" -type f -name codestory-cli -print
+          )"
+          test "$(printf '%s\n' "$packaged_cli" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          test -x "$packaged_cli"
+          export CODESTORY_RELEASE_EVIDENCE_COMMIT
+          CODESTORY_RELEASE_EVIDENCE_COMMIT="$(git rev-parse HEAD)"
+          export CODESTORY_RELEASE_EVIDENCE_TREE
+          CODESTORY_RELEASE_EVIDENCE_TREE="$(git rev-parse 'HEAD^{tree}')"
+          export CODESTORY_RELEASE_EVIDENCE_PROFILE=protected-macos-arm64-metal
+          export CODESTORY_RELEASE_EVIDENCE_CORPUS_ID=codestory-release-corpus-v0.17-ripgrep-rust-v2
+          export CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT=benchmarks/release-evidence/corpus-contracts/v0.17-ripgrep-rust-v2.json
+          export CODESTORY_RELEASE_EVIDENCE_CACHE_ID=frozen-candidate-ripgrep-rust-v2
+          export CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT
+          CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT="$(
+            shasum -a 256 target/frozen-candidate-quality/host.txt | awk '{print $1}'
+          )"
+          node scripts/codestory-agent-ab-benchmark.mjs \
+            --packet-runtime \
+            --packet-runtime-mode cold-cli \
+            --task-manifest benchmarks/tasks/release-evidence/ripgrep-search-pipeline-v2.task.json \
+            --materialize-repos \
+            --repeats 3 \
+            --publishable \
+            --max-source-reads-after-packet 0 \
+            --codestory-cli "$packaged_cli" \
+            --timeout-ms 180000 \
+            --out-dir "$quality_root/packet"
+          finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          echo "- Optional Ripgrep v2 measurement: $(((finished_ns - started_ns) / 1000000)) ms" \
+            >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload optional Axios v2 quality evidence
         id: quality-upload
         if: steps.quality.outcome == 'success'
@@ -287,16 +340,32 @@ jobs:
           retention-days: 30
           overwrite: true
 
+      - name: Upload optional Ripgrep v2 quality evidence
+        id: ripgrep-quality-upload
+        if: steps.ripgrep-quality.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: frozen-candidate-ripgrep-quality-${{ inputs.ref }}
+          path: target/frozen-candidate-ripgrep-quality/evidence
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
       - name: Record optional quality outcome
         if: always()
         shell: bash
         env:
           QUALITY_OUTCOME: ${{ steps.quality.outcome }}
           UPLOAD_OUTCOME: ${{ steps.quality-upload.outcome }}
+          RIPGREP_QUALITY_OUTCOME: ${{ steps.ripgrep-quality.outcome }}
+          RIPGREP_UPLOAD_OUTCOME: ${{ steps.ripgrep-quality-upload.outcome }}
         run: |
           set -euo pipefail
           quality_outcome="${QUALITY_OUTCOME:-skipped}"
           upload_outcome="${UPLOAD_OUTCOME:-skipped}"
+          ripgrep_quality_outcome="${RIPGREP_QUALITY_OUTCOME:-skipped}"
+          ripgrep_upload_outcome="${RIPGREP_UPLOAD_OUTCOME:-skipped}"
           case "$quality_outcome" in
             success | failure | cancelled | skipped) ;;
             *) exit 1 ;;
@@ -305,10 +374,233 @@ jobs:
             success | failure | cancelled | skipped) ;;
             *) exit 1 ;;
           esac
+          case "$ripgrep_quality_outcome" in
+            success | failure | cancelled | skipped) ;;
+            *) exit 1 ;;
+          esac
+          case "$ripgrep_upload_outcome" in
+            success | failure | cancelled | skipped) ;;
+            *) exit 1 ;;
+          esac
           {
             echo "### Optional Axios v2 quality outcome"
             echo
             echo "- Measurement: \`$quality_outcome\`"
             echo "- Artifact upload: \`$upload_outcome\`"
+            echo "- Ripgrep v2 measurement: \`$ripgrep_quality_outcome\`"
+            echo "- Ripgrep v2 artifact upload: \`$ripgrep_upload_outcome\`"
             echo "- Release or qualification gate: \`false\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  windows-quality:
+    name: Optional frozen-candidate Windows x64 Ripgrep v2 quality
+    continue-on-error: true
+    runs-on: [self-hosted, Windows, X64, codestory-vulkan]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact frozen candidate
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Capture optional Windows x64 quality host evidence
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          New-Item -ItemType Directory -Force target/frozen-candidate-windows-quality | Out-Null
+          Get-ComputerInfo | Out-File target/frozen-candidate-windows-quality/host.txt
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name, AdapterCompatibility, DriverVersion, VideoMemoryType |
+            Format-List | Out-File -Append target/frozen-candidate-windows-quality/host.txt
+          node --version | Out-File -Append target/frozen-candidate-windows-quality/host.txt
+
+      - name: Download exact Windows x64 candidate archive
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: codestory-cli-windows-x64
+          path: target/release-dist
+
+      - name: Produce optional Windows x64 Ripgrep v2 quality evidence
+        id: windows-quality
+        continue-on-error: true
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          VERSION: ${{ inputs.version }}
+          CODESTORY_EMBED_ALLOW_CPU: "0"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $started = [System.Diagnostics.Stopwatch]::StartNew()
+          $version = $env:VERSION.TrimStart("v")
+          $archive = "target/release-dist/codestory-cli-v$version-windows-x64.zip"
+          $qualityRoot = "target/frozen-candidate-windows-quality/evidence"
+          $packagedRoot = Join-Path $env:RUNNER_TEMP "codestory-windows-quality-cli-$([guid]::NewGuid())"
+          $env:CODESTORY_CACHE_ROOT = Join-Path $env:RUNNER_TEMP "codestory-windows-quality-cache-$([guid]::NewGuid())"
+          $env:CODESTORY_STDIO_CACHE_ROOT = Join-Path $env:RUNNER_TEMP "codestory-windows-quality-stdio-$([guid]::NewGuid())"
+          Remove-Item -Recurse -Force $qualityRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $qualityRoot, $packagedRoot, $env:CODESTORY_CACHE_ROOT, $env:CODESTORY_STDIO_CACHE_ROOT | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $packagedRoot
+          $packagedCli = @(Get-ChildItem -Path $packagedRoot -Recurse -File -Filter codestory-cli.exe)
+          if ($packagedCli.Count -ne 1) {
+            throw "expected one packaged CodeStory CLI, found $($packagedCli.Count)"
+          }
+          $packagedCliPath = $packagedCli[0].FullName
+          $env:CODESTORY_RELEASE_EVIDENCE_COMMIT = git rev-parse HEAD
+          $env:CODESTORY_RELEASE_EVIDENCE_TREE = git rev-parse 'HEAD^{tree}'
+          $env:CODESTORY_RELEASE_EVIDENCE_PROFILE = "protected-windows-x64-vulkan"
+          $env:CODESTORY_RELEASE_EVIDENCE_CORPUS_ID = "codestory-release-corpus-v0.17-ripgrep-rust-v2"
+          $env:CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT = "benchmarks/release-evidence/corpus-contracts/v0.17-ripgrep-rust-v2.json"
+          $env:CODESTORY_RELEASE_EVIDENCE_CACHE_ID = "frozen-candidate-windows-x64-ripgrep-rust-v2"
+          $env:CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT = (Get-FileHash -Algorithm SHA256 target/frozen-candidate-windows-quality/host.txt).Hash.ToLowerInvariant()
+          node scripts/codestory-agent-ab-benchmark.mjs `
+            --packet-runtime `
+            --packet-runtime-mode cold-cli `
+            --task-manifest benchmarks/tasks/release-evidence/ripgrep-search-pipeline-v2.task.json `
+            --materialize-repos `
+            --repeats 3 `
+            --publishable `
+            --max-source-reads-after-packet 0 `
+            --codestory-cli $packagedCliPath `
+            --timeout-ms 180000 `
+            --out-dir "$qualityRoot/packet"
+          if ($LASTEXITCODE -ne 0) { throw "Ripgrep v2 evaluator failed with exit code $LASTEXITCODE" }
+          $started.Stop()
+          "- Optional Windows x64 Ripgrep v2 measurement: $($started.ElapsedMilliseconds) ms" |
+            Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload optional Windows x64 Ripgrep v2 quality evidence
+        id: windows-quality-upload
+        if: steps.windows-quality.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: frozen-candidate-windows-x64-ripgrep-quality-${{ inputs.ref }}
+          path: target/frozen-candidate-windows-quality/evidence
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+      - name: Record optional Windows x64 quality outcome
+        if: always()
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          QUALITY_OUTCOME: ${{ steps.windows-quality.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.windows-quality-upload.outcome }}
+        run: |
+          $allowed = @("success", "failure", "cancelled", "skipped")
+          if ($env:QUALITY_OUTCOME -notin $allowed) { throw "invalid quality outcome" }
+          if ($env:UPLOAD_OUTCOME -notin $allowed) { throw "invalid upload outcome" }
+          @(
+            "### Optional Windows x64 Ripgrep v2 quality outcome"
+            ""
+            "- Measurement: ``$env:QUALITY_OUTCOME``"
+            "- Artifact upload: ``$env:UPLOAD_OUTCOME``"
+            "- Release or qualification gate: ``false``"
+          ) | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+  linux-quality:
+    name: Optional frozen-candidate Linux x64 Axios v2 quality
+    continue-on-error: true
+    runs-on: [self-hosted, Linux, X64, codestory-linux-vulkan]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact frozen candidate
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Capture optional Linux x64 quality host evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/frozen-candidate-linux-quality
+          {
+            uname -a
+            uname -m
+            node --version
+          } > target/frozen-candidate-linux-quality/host.txt 2>&1
+          test "$(uname -m)" = x86_64
+
+      - name: Download exact Linux x64 candidate archive
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: codestory-cli-linux-x64
+          path: target/release-dist
+
+      - name: Produce optional Linux x64 Axios v2 quality evidence
+        id: linux-quality
+        continue-on-error: true
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          CODESTORY_EMBED_ALLOW_CPU: "0"
+        run: |
+          set -euo pipefail
+          started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          version="${VERSION#v}"
+          archive="target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz"
+          quality_root=target/frozen-candidate-linux-quality/evidence
+          packaged_root="$(mktemp -d "$RUNNER_TEMP/codestory-linux-quality-cli.XXXXXX")"
+          export CODESTORY_CACHE_ROOT
+          CODESTORY_CACHE_ROOT="$(mktemp -d "$RUNNER_TEMP/codestory-linux-quality-cache.XXXXXX")"
+          export CODESTORY_STDIO_CACHE_ROOT
+          CODESTORY_STDIO_CACHE_ROOT="$(mktemp -d "$RUNNER_TEMP/codestory-linux-quality-stdio.XXXXXX")"
+          rm -rf "$quality_root"
+          mkdir -p "$quality_root"
+          tar -xzf "$archive" -C "$packaged_root"
+          packaged_cli="$(
+            find "$packaged_root" -type f -name codestory-cli -print
+          )"
+          test "$(printf '%s\n' "$packaged_cli" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          test -x "$packaged_cli"
+          export CODESTORY_RELEASE_EVIDENCE_COMMIT
+          CODESTORY_RELEASE_EVIDENCE_COMMIT="$(git rev-parse HEAD)"
+          export CODESTORY_RELEASE_EVIDENCE_TREE
+          CODESTORY_RELEASE_EVIDENCE_TREE="$(git rev-parse 'HEAD^{tree}')"
+          export CODESTORY_RELEASE_EVIDENCE_PROFILE=optional-linux-x64-quality
+          export CODESTORY_RELEASE_EVIDENCE_CORPUS_ID=codestory-release-corpus-v0.16-axios-js-ts-v2
+          export CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT=benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json
+          export CODESTORY_RELEASE_EVIDENCE_CACHE_ID=frozen-candidate-linux-x64-axios-js-ts-v2
+          export CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT
+          CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT="$(
+            sha256sum target/frozen-candidate-linux-quality/host.txt | awk '{print $1}'
+          )"
+          node scripts/codestory-agent-ab-benchmark.mjs \
+            --packet-runtime \
+            --packet-runtime-mode cold-cli \
+            --task-manifest benchmarks/tasks/release-evidence/axios-request-dispatch-v2.task.json \
+            --materialize-repos \
+            --repeats 3 \
+            --publishable \
+            --max-source-reads-after-packet 0 \
+            --codestory-cli "$packaged_cli" \
+            --timeout-ms 180000 \
+            --out-dir "$quality_root/packet"
+          finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          echo "- Optional Linux x64 Axios v2 measurement: $(((finished_ns - started_ns) / 1000000)) ms" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload optional Linux x64 Axios v2 quality evidence
+        if: steps.linux-quality.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: frozen-candidate-linux-x64-quality-${{ inputs.ref }}-attempt-${{ github.run_attempt }}
+          path: target/frozen-candidate-linux-quality/evidence
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+      - name: Record optional Linux x64 quality outcome
+        if: always()
+        shell: bash
+        env:
+          QUALITY_OUTCOME: ${{ steps.linux-quality.outcome }}
+        run: |
+          set -euo pipefail
+          case "${QUALITY_OUTCOME:-skipped}" in
+            success | failure | cancelled | skipped) ;;
+            *) exit 1 ;;
+          esac
+          echo "- Optional Linux x64 quality measurement: \`${QUALITY_OUTCOME:-skipped}\`" \
+            >> "$GITHUB_STEP_SUMMARY"

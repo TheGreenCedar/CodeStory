@@ -379,7 +379,24 @@ pub(crate) fn detect_resolver_language(path: Option<&str>) -> Option<&'static st
 }
 
 fn semantic_resolver_for_path(path: Option<&str>) -> Option<SemanticResolverKind> {
-    match detect_resolver_language(path)? {
+    let language = detect_resolver_language(path)?;
+    // Registry first; the arms below are the languages that have not moved into
+    // `crate::languages` yet.
+    if let Some(extraction) = crate::languages::extraction_for_language(language) {
+        if extraction.uses_generic_semantic_resolver {
+            return Some(SemanticResolverKind::Generic(GenericSemanticResolver::new(
+                extraction.language_name,
+            )));
+        }
+        // The dedicated resolver types are private to this module, so the
+        // registry records the choice and the residual match builds it.
+        return dedicated_semantic_resolver(extraction.language_name);
+    }
+    dedicated_semantic_resolver(language)
+}
+
+fn dedicated_semantic_resolver(language: &str) -> Option<SemanticResolverKind> {
+    match language {
         "c" => Some(SemanticResolverKind::C(CSemanticResolver)),
         "cpp" => Some(SemanticResolverKind::Cpp(CppSemanticResolver)),
         "javascript" | "vue" | "svelte" | "astro" => {
@@ -393,18 +410,6 @@ fn semantic_resolver_for_path(path: Option<&str>) -> Option<SemanticResolverKind
         "ruby" => Some(SemanticResolverKind::Ruby(RubySemanticResolver)),
         "php" => Some(SemanticResolverKind::Php(PhpSemanticResolver)),
         "csharp" => Some(SemanticResolverKind::CSharp(CSharpSemanticResolver)),
-        "kotlin" => Some(SemanticResolverKind::Generic(GenericSemanticResolver::new(
-            "kotlin",
-        ))),
-        "swift" => Some(SemanticResolverKind::Generic(GenericSemanticResolver::new(
-            "swift",
-        ))),
-        "dart" => Some(SemanticResolverKind::Generic(GenericSemanticResolver::new(
-            "dart",
-        ))),
-        "bash" => Some(SemanticResolverKind::Generic(GenericSemanticResolver::new(
-            "bash",
-        ))),
         _ => None,
     }
 }
@@ -573,20 +578,12 @@ fn tail_component(value: &str) -> Option<&str> {
 }
 
 fn language_family_bucket(language: &'static str) -> &'static str {
+    if let Some(extraction) = crate::languages::extraction_for_language(language) {
+        return extraction.semantic_family;
+    }
     match language {
-        "c" | "cpp" => "native",
-        "javascript" | "typescript" | "vue" | "svelte" | "astro" => "webscript",
-        "python" => "python",
-        "rust" => "rust",
-        "java" => "java",
-        "go" => "go",
-        "ruby" => "ruby",
-        "php" => "php",
-        "csharp" => "csharp",
-        "kotlin" => "kotlin",
-        "swift" => "swift",
-        "dart" => "dart",
-        "bash" => "bash",
+        "c" => "native",
+        "typescript" | "vue" | "svelte" | "astro" => "webscript",
         language if is_structural_language_name(language) => "structural",
         _ => language,
     }
@@ -799,6 +796,108 @@ mod tests {
             out.is_empty(),
             "unexpected cross-language candidates: {out:?}"
         );
+        Ok(())
+    }
+
+    /// Kotlin keeps its own semantic family after the bucket moved into the
+    /// extraction registry.
+    ///
+    /// The bucket is what stops a Kotlin caller from resolving onto a
+    /// same-named JavaScript declaration. Asserting the registry field's value
+    /// would be a tautology, so this drives the filter: the Kotlin caller must
+    /// see the Kotlin candidate and only the Kotlin candidate. Both halves
+    /// matter — a wrong bucket that merged Kotlin into `webscript` would flip
+    /// exactly these two assertions in opposite directions.
+    #[test]
+    fn kotlin_keeps_its_own_semantic_family_after_the_registry_move() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_file_node(&conn, 1, "Caller.kt")?;
+        insert_file_node(&conn, 2, "helper.js")?;
+        insert_file_node(&conn, 3, "Helper.kt")?;
+        for (id, file_id) in [(20_i64, 2_i64), (21_i64, 3_i64)] {
+            conn.execute(
+                "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    NodeKind::FUNCTION as i32,
+                    "persistRecord",
+                    "persistRecord",
+                    file_id,
+                    5_i64
+                ],
+            )?;
+        }
+
+        let index = SemanticCandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let out = resolve_call_candidates(
+            &index,
+            &[NodeKind::FUNCTION as i32],
+            "persistRecord",
+            Some(1),
+            detect_language(Some("Caller.kt")),
+            0.82,
+            0.70,
+        )?;
+
+        let ids = out
+            .iter()
+            .map(|candidate| candidate.target_node_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![21_i64], "kotlin caller candidates: {out:?}");
+        assert_eq!(language_family_bucket("kotlin"), "kotlin");
+        Ok(())
+    }
+
+    /// JavaScript keeps sharing the `webscript` family after the bucket moved
+    /// into the extraction registry.
+    ///
+    /// The single-file projection snapshots cannot see this field at all, and
+    /// asserting the registry value would be a tautology, so this drives the
+    /// filter instead: a JavaScript caller must still reach a same-named
+    /// TypeScript declaration (they share `webscript`) while a Kotlin
+    /// declaration stays out of reach. Giving JavaScript its own bucket would
+    /// silently drop the TypeScript candidate and no other test would notice.
+    #[test]
+    fn javascript_keeps_sharing_the_webscript_family_after_the_registry_move() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_file_node(&conn, 1, "caller.js")?;
+        insert_file_node(&conn, 2, "helper.ts")?;
+        insert_file_node(&conn, 3, "Helper.kt")?;
+        for (id, file_id) in [(30_i64, 2_i64), (31_i64, 3_i64)] {
+            conn.execute(
+                "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    NodeKind::FUNCTION as i32,
+                    "persistRecord",
+                    "persistRecord",
+                    file_id,
+                    5_i64
+                ],
+            )?;
+        }
+
+        let index = SemanticCandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let out = resolve_call_candidates(
+            &index,
+            &[NodeKind::FUNCTION as i32],
+            "persistRecord",
+            Some(1),
+            detect_language(Some("caller.js")),
+            0.82,
+            0.70,
+        )?;
+
+        let ids = out
+            .iter()
+            .map(|candidate| candidate.target_node_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![30_i64], "javascript caller candidates: {out:?}");
+        assert_eq!(language_family_bucket("javascript"), "webscript");
         Ok(())
     }
 

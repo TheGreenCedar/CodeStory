@@ -1,3 +1,8 @@
+use codestory_contracts::bounded_locks::{
+    self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
+};
+use codestory_contracts::owned_artifacts;
+
 use codestory_contracts::graph::{
     AccessKind, Bookmark, BookmarkCategory, CallableProjectionState, Edge, EdgeId, EdgeKind,
     EnumConversionError, FileCoverageReason, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
@@ -8,7 +13,6 @@ use codestory_contracts::workspace::OversizedSourceExclusionCandidate;
 use codestory_contracts::workspace::{
     DEFAULT_SOURCE_FILE_BYTE_CAP, OVERSIZED_SOURCE_POLICY_VERSION,
 };
-use fs4::fs_std::FileExt;
 use parking_lot::RwLock;
 use rusqlite::{
     Connection, MAIN_DB, OpenFlags, OptionalExtension, Result, Row, limits::Limit, params,
@@ -19,7 +23,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,13 +36,18 @@ mod row_mapping;
 mod schema;
 mod trail;
 
+use crate::annotations::{
+    AnnotationCategory, CoreAnchorCandidate, LegacyAnnotationSnapshot, LegacyBookmarkRow,
+};
 use crate::sqlite_path;
 use helpers::{
     decode_embedding_blob, deserialize_candidate_targets, encode_embedding_blob,
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 30;
+pub use helpers::{StoredVectorEncoding, stored_vector_encoding};
+
+const SCHEMA_VERSION: u32 = 31;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -57,6 +66,26 @@ const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id,
                  FROM edge e
                  JOIN node t ON t.id = e.target_node_id
                  LEFT JOIN node f ON f.id = e.file_node_id";
+/// `COALESCE(resolved_source_node_id, source_node_id) = ?1` is spelled as two
+/// branches because only a branch is index-seekable; the branches stay disjoint
+/// on `resolved_source_node_id IS NULL`, so their union is exactly the edges
+/// whose `Edge::effective_source` is `?1`. Both branches pin their index because
+/// an unpinned planner reads `resolved_source_node_id IS NULL` as the more
+/// selective term and seeks every unresolved CALL edge in the repository.
+/// `raw_call_edges_by_effective_source_plan_seeks_both_branches` holds the shape.
+/// `INDEXED BY` makes both indexes hard `prepare()` dependencies; storage_impl/schema.rs
+/// guarantees them with `CREATE INDEX IF NOT EXISTS` for every live store.
+const RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL: &str = "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, e.callsite_identity, e.certainty, e.candidate_target_node_ids
+     FROM edge e INDEXED BY idx_edge_resolved_source
+     WHERE e.resolved_source_node_id = ?1
+       AND e.kind = ?2
+     UNION ALL
+     SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, e.callsite_identity, e.certainty, e.candidate_target_node_ids
+     FROM edge e INDEXED BY idx_edge_kind_source
+     WHERE e.kind = ?2
+       AND e.source_node_id = ?1
+       AND e.resolved_source_node_id IS NULL
+     ORDER BY id ASC";
 pub const BUILD_EDGE_SEED_BATCH_SIZE: usize = 200;
 const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = BUILD_EDGE_SEED_BATCH_SIZE;
 const NODE_LOOKUP_BATCH_SIZE: usize = 200;
@@ -84,18 +113,22 @@ const LEGACY_PROMOTION_JOURNAL_VERSION: u32 = 1;
 const SOURCE_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 2;
 const STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION: u32 = 3;
 const STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 4;
-const PROMOTION_JOURNAL_VERSION: u32 = 5;
+const SEMANTIC_PROJECTION_PROMOTION_JOURNAL_VERSION: u32 = 5;
+const PROMOTION_JOURNAL_VERSION: u32 = 6;
 // Snapshot promotion first shipped with schema 21. Journal v2 added the
 // source-policy identity at schema 27, and journal v3 added structural-text
 // identity at schema 28. Journal v4 binds the structural-unit source-policy
 // identity added at schema 29. Journal v5 admits the semantic-projection
-// publication mode added at schema 30. Recovery runs before schema migration, so these
+// publication mode added at schema 30. Journal v6 admits the annotation-sidecar
+// cutover at schema 31, which moves user annotations out of the promoted
+// database entirely. Recovery runs before schema migration, so these
 // boundaries are part of the durable journal contract.
 const LEGACY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 21;
 const SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 27;
 const STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION: u32 = 28;
 const STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 29;
 const SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION: u32 = 30;
+const ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION: u32 = 31;
 const DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Successful SQLite backup timing and logical database-image sizes.
@@ -108,6 +141,15 @@ pub struct DatabaseSnapshotCopyStats {
     pub copy_ms: u32,
     pub source_bytes: u64,
     pub target_bytes: u64,
+}
+
+/// Rows rebound or invalidated while preparing a cache for a sibling worktree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RehydratedCacheRebaseStats {
+    pub rebased_path_bound_rows: usize,
+    pub invalidated_index_artifact_rows: usize,
+    pub invalidated_semantic_rows: usize,
+    pub carried_policy_exclusion_rows: usize,
 }
 
 /// Successful core promotion timing and logical database-image sizes.
@@ -133,6 +175,8 @@ pub struct CorePromotionStats {
     pub candidate_bytes: u64,
     pub previous_live_bytes: Option<u64>,
     pub rollback_backup_bytes: Option<u64>,
+    /// Which post-restore identity fence the promotion actually satisfied.
+    pub promoted_validation: PromotedValidation,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -165,6 +209,7 @@ impl CorePromotionDurations {
         candidate_bytes: u64,
         previous_live_bytes: Option<u64>,
         rollback_backup_bytes: Option<u64>,
+        promoted_validation: PromotedValidation,
     ) -> CorePromotionStats {
         let total_ms = duration_ms(total);
         let lock_recovery_ms = duration_ms(self.lock_recovery);
@@ -209,6 +254,7 @@ impl CorePromotionDurations {
             candidate_bytes,
             previous_live_bytes,
             rollback_backup_bytes,
+            promoted_validation,
         }
     }
 }
@@ -446,6 +492,38 @@ fn uniform_optional_u32_with_count(
     uniform_optional_u32(min_value, max_value)
 }
 
+/// Selective anchor projection shared by every annotation lookup.
+///
+/// `callable_projection_state.normalized_signature` carries the only
+/// position-and-name-independent evidence core owns, and it is joined rather
+/// than scanned so a rebind probe stays a keyed lookup. It is deliberately not
+/// `signature_hash`: that column binds the symbol's own name and its exact
+/// start position, so a rename or a move always changes it and a ladder built
+/// on it could never rebind either.
+/// Rows an annotation uniqueness probe needs: one candidate, plus one more to
+/// prove it was not the only one.
+const ANNOTATION_UNIQUENESS_PROBE_LIMIT: usize = 2;
+
+const ANNOTATION_ANCHOR_SELECT: &str = "SELECT n.id, n.canonical_id, f.path, n.qualified_name,
+            n.kind, cps.normalized_signature, n.start_line
+     FROM node n
+     LEFT JOIN file f ON f.id = n.file_node_id
+     LEFT JOIN callable_projection_state cps ON cps.node_id = n.id";
+
+fn annotation_anchor_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<CoreAnchorCandidate, StorageError> {
+    Ok(CoreAnchorCandidate {
+        node_id: row.get(0)?,
+        canonical_id: row.get(1)?,
+        file_identity: row.get(2)?,
+        qualified_name: row.get(3)?,
+        kind: row.get(4)?,
+        normalized_signature: row.get(5)?,
+        start_line: row.get(6)?,
+    })
+}
+
 fn current_epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -519,9 +597,14 @@ impl RecoveryDatabaseContract {
             Self::Journal(STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION) => {
                 schema_version == STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
             }
-            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+            Self::Journal(SEMANTIC_PROJECTION_PROMOTION_JOURNAL_VERSION) => {
                 (STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
                     ..=SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION)
+                    .contains(&schema_version)
+            }
+            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+                (STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
+                    ..=ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION)
                     .contains(&schema_version)
             }
             Self::Journal(_) => false,
@@ -732,7 +815,12 @@ fn read_source_policy_exclusion_rollback_identity(
                 || record.core_generation_id != identity.core_generation_id
                 || record.core_run_id != identity.core_run_id
                 || record.policy_version != identity.policy_version
-                || record.byte_cap != identity.byte_cap
+                // As at publication and validation: a row names the cap that
+                // refused it, which for a structural format sits below the
+                // policy headroom the identity carries. Only a row claiming
+                // more headroom than was published is invalid.
+                || record.byte_cap == 0
+                || record.byte_cap > identity.byte_cap
                 || record.structural_unit_cap != identity.structural_unit_cap
                 || !format.qualifies(record)
         })
@@ -826,10 +914,14 @@ fn read_structural_text_unit_rollback_identity(
     let Some(identity) = identity else {
         return Ok(None);
     };
-    let (unit_count, unit_digest, unit_versions) = structural_text_unit_content_summary(&conn)?;
-    let (projection_count, projection_digest, projection_versions) =
-        structural_text_projection_content_summary(&conn)?;
-    validate_structural_text_projection_rows(&conn)?;
+    let StructuralTextContentScan {
+        unit_count,
+        unit_digest,
+        unit_versions,
+        projection_count,
+        projection_digest,
+        projection_versions,
+    } = scan_structural_text_content(&conn)?;
     validate_structural_text_artifact_cache_rows(&conn).map_err(|error| {
         promotion_error(format!(
             "Structural artifact cache rollback identity does not match {}: {error}",
@@ -915,25 +1007,176 @@ fn require_candidate_structural_text_identity(
     require_recorded_structural_text_identity(path, publication, expected, role)
 }
 
+/// Byte extent of the SQLite database header.
+const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
+
+/// Header slots SQLite rewrites as bookkeeping when it commits or completes a
+/// `sqlite3_backup`, and which therefore carry no database content: the file
+/// change counter (24..28), the schema cookie (40..44), and the version-valid-for
+/// counter (92..96). Every other byte of the file, header included, participates.
+const SQLITE_VOLATILE_HEADER_SLOTS: [(usize, usize); 3] = [(24, 28), (40, 44), (92, 96)];
+
+/// Rollback-journal sidecars that can hold database content outside the main
+/// file. `-shm` is excluded on purpose: it is a rebuildable wal-index, never
+/// content.
+const SQLITE_CONTENT_SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-journal"];
+
+/// Whole-database byte identity for one promotion artifact.
+///
+/// This is content evidence, not a handle: two databases with the same image
+/// hold the same pages, so a validation that passed on one is a validation of
+/// the other. It is deliberately opaque so no caller can manufacture one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PromotionDatabaseImage([u8; 32]);
+
+/// Digest the whole database file, masking only the header slots SQLite itself
+/// rewrites.
+///
+/// `None` means the image is not provable — a hot `-wal` or `-journal` sidecar
+/// puts content outside the main file, and a file shorter than the header is not
+/// a database. An unprovable image never admits reuse; it forces full
+/// revalidation.
+fn promotion_database_image(path: &Path) -> Result<Option<PromotionDatabaseImage>, StorageError> {
+    for suffix in SQLITE_CONTENT_SIDECAR_SUFFIXES {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        match fs::metadata(&sidecar) {
+            Ok(metadata) if metadata.len() > 0 => return Ok(None),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(promotion_path_error("inspect", &sidecar, error)),
+        }
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(promotion_path_error("open", path, error)),
+    };
+    let mut reader = BufReader::new(file);
+    let mut header = [0_u8; SQLITE_DATABASE_HEADER_BYTES];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(promotion_path_error("read", path, error)),
+    }
+    for (start, end) in SQLITE_VOLATILE_HEADER_SLOTS {
+        header[start..end].fill(0);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(header);
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| promotion_path_error("read", path, error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(Some(PromotionDatabaseImage(hasher.finalize().into())))
+}
+
+/// How the post-restore fence was satisfied for one promotion.
+///
+/// This is reported, not merely logged, because whether a promotion can prove
+/// the published file byte-identical to the candidate it validated is the
+/// property any replacement for whole-database restore has to keep. A design
+/// that assembles the live image in place — a staged delta or an
+/// attached-database apply — never produces a file identical to a
+/// pre-validated candidate, so it can only ever report `Revalidated`. Without
+/// this field the difference is invisible in telemetry and the promotion fence
+/// could be weakened without any measurement moving.
+///
+/// `Revalidated` is the default because it is the weaker claim: an unset or
+/// older payload must not read as a proven byte-identical publication.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PromotedValidation {
+    /// The restored file is byte-identical to the validated candidate, so the
+    /// candidate's receipt covers it.
+    ReusedCandidateReceipt,
+    /// The restored file could not be proven identical, so it was validated in
+    /// full.
+    #[default]
+    Revalidated,
+}
+
+impl PromotedValidation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReusedCandidateReceipt => "reused_candidate_receipt",
+            Self::Revalidated => "revalidated",
+        }
+    }
+}
+
+/// Fence the restored live database before the promotion may commit.
+///
+/// The publication identity is always read back from the promoted file. The
+/// deep source-policy and structural-text validations are reused from the staged
+/// candidate only when the restored file's whole-database image equals the image
+/// sealed to that candidate's validation — which proves the two files hold the
+/// same pages, so re-deriving the same verdict from them is redundant work. A
+/// missing image on either side, or any difference at all, revalidates in full.
+fn validate_promoted_live_database(
+    live_path: &Path,
+    staged_path: &Path,
+    candidate: &IndexPublicationRecord,
+    candidate_source_policy: &Option<SourcePolicyExclusionRollbackIdentity>,
+    candidate_structural_text: &Option<StructuralTextUnitRollbackIdentity>,
+    candidate_image: Option<PromotionDatabaseImage>,
+) -> Result<PromotedValidation, StorageError> {
+    let published =
+        require_complete_promotion_database_identity(live_path, "Promoted live database")?;
+    if &published != candidate {
+        return Err(promotion_error(format!(
+            "Promoted live database identity does not match staged candidate {}",
+            staged_path.display()
+        )));
+    }
+    if let Some(candidate_image) = candidate_image
+        && promotion_database_image(live_path)? == Some(candidate_image)
+    {
+        return Ok(PromotedValidation::ReusedCandidateReceipt);
+    }
+    require_candidate_source_policy_identity(
+        live_path,
+        &published,
+        candidate_source_policy,
+        "Promoted live database",
+    )?;
+    require_candidate_structural_text_identity(
+        live_path,
+        &published,
+        candidate_structural_text,
+        "Promoted live database",
+    )?;
+    Ok(PromotedValidation::Revalidated)
+}
+
 fn promotion_lock_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.promotion.lock", path.display()))
+    promotion_sibling_path(path, owned_artifacts::PROMOTION_LOCK_SUFFIX)
 }
 
 fn promotion_prepared_journal_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.promotion.prepared.json", path.display()))
+    promotion_sibling_path(path, owned_artifacts::PROMOTION_PREPARED_JOURNAL_SUFFIX)
 }
 
 fn promotion_committed_journal_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.promotion.committed.json", path.display()))
+    promotion_sibling_path(path, owned_artifacts::PROMOTION_COMMITTED_JOURNAL_SUFFIX)
 }
 
 #[cfg(test)]
 fn promotion_cleanup_failure_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.promotion.cleanup-blocked", path.display()))
+    promotion_sibling_path(path, owned_artifacts::PROMOTION_CLEANUP_BLOCKED_SUFFIX)
+}
+
+fn promotion_sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{suffix}", path.display()))
 }
 
 fn promotion_artifacts_exist(path: &Path) -> bool {
-    path.with_extension("sqlite.backup").exists()
+    path.with_extension(owned_artifacts::ROLLBACK_BACKUP_EXTENSION)
+        .exists()
         || promotion_prepared_journal_path(path).exists()
         || promotion_committed_journal_path(path).exists()
 }
@@ -1065,6 +1308,7 @@ fn read_promotion_journal(path: &Path) -> Result<PromotionJournal, StorageError>
             | SOURCE_POLICY_PROMOTION_JOURNAL_VERSION
             | STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION
             | STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION
+            | SEMANTIC_PROJECTION_PROMOTION_JOURNAL_VERSION
             | PROMOTION_JOURNAL_VERSION
     ) {
         return Err(promotion_error(format!(
@@ -1178,12 +1422,24 @@ impl PromotionLock {
             })
     }
 
+    /// A peer holds this for the whole atomic old-or-new promotion, so the
+    /// budget is the publication one: a foreground budget would refuse
+    /// ordinary contention behind a legitimate commit. The wait stays
+    /// interruptible through the caller's ambient cancellation, so a cancelled
+    /// request or activation still leaves it at once.
     fn acquire(path: &Path) -> Result<Self, StorageError> {
         let file = Self::open(path)?;
-        FileExt::lock_exclusive(&file).map_err(|error| {
+        acquire_with_deadline(
+            &file,
+            FileLockKind::Exclusive,
+            LockDeadline::after(PUBLICATION_LOCK_WAIT),
+            None,
+        )
+        .map_err(|error| {
             StorageError::Other(format!(
-                "Failed to acquire promotion lock for {}: {error}",
-                path.display()
+                "Failed to acquire promotion lock for {} ({}): {error}",
+                path.display(),
+                error.code()
             ))
         })?;
         Ok(Self { file })
@@ -1191,7 +1447,7 @@ impl PromotionLock {
 
     fn try_acquire(path: &Path) -> Result<Option<Self>, StorageError> {
         let file = Self::open(path)?;
-        FileExt::try_lock_exclusive(&file)
+        bounded_locks::try_acquire(&file, FileLockKind::Exclusive)
             .map(|locked| locked.then_some(Self { file }))
             .map_err(|error| {
                 StorageError::Other(format!(
@@ -1204,7 +1460,7 @@ impl PromotionLock {
 
 impl Drop for PromotionLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let _ = bounded_locks::release(&self.file);
     }
 }
 
@@ -1221,7 +1477,7 @@ fn recover_interrupted_promotion(path: &Path) -> Result<(), StorageError> {
 }
 
 fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError> {
-    let backup_path = path.with_extension("sqlite.backup");
+    let backup_path = path.with_extension(owned_artifacts::ROLLBACK_BACKUP_EXTENSION);
     let prepared_path = promotion_prepared_journal_path(path);
     let committed_path = promotion_committed_journal_path(path);
 
@@ -1327,7 +1583,7 @@ fn rollback_prepared_promotion(
             live_path.display()
         )));
     }
-    let backup_path = live_path.with_extension("sqlite.backup");
+    let backup_path = live_path.with_extension(owned_artifacts::ROLLBACK_BACKUP_EXTENSION);
     let prepared_path = promotion_prepared_journal_path(live_path);
     let recovery_contract = RecoveryDatabaseContract::Journal(prepared.version);
     let live_identity = read_recovery_database_identity(live_path, recovery_contract)?;
@@ -1600,7 +1856,7 @@ fn cleanup_committed_promotion_artifacts(live_path: &Path) -> Result<(), Storage
         ));
     }
 
-    let backup_path = live_path.with_extension("sqlite.backup");
+    let backup_path = live_path.with_extension(owned_artifacts::ROLLBACK_BACKUP_EXTENSION);
     cleanup_sqlite_sidecars(&backup_path)?;
     let committed_path = promotion_committed_journal_path(live_path);
     remove_promotion_file(&committed_path)
@@ -1818,16 +2074,25 @@ GROUP BY
     f.line_count";
 
 fn outside_related_file_edge_predicate(file_param: &str) -> String {
+    outside_related_file_edge_predicate_for("", file_param)
+}
+
+/// The same "this edge survives the removal" predicate, qualified for joins.
+///
+/// `qualifier` is either empty (bare `edge` statements) or an alias prefix such
+/// as `"e."`. The affected-caller probe joins `node`, which also carries a
+/// `file_node_id` column, so the bare form would be ambiguous there.
+fn outside_related_file_edge_predicate_for(qualifier: &str, file_param: &str) -> String {
     format!(
-        "source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-         AND target_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+        "{qualifier}source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+         AND {qualifier}target_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
          AND {}",
-        outside_file_node_predicate(file_param)
+        outside_file_node_predicate(qualifier, file_param)
     )
 }
 
-fn outside_file_node_predicate(file_param: &str) -> String {
-    format!("(file_node_id IS NULL OR file_node_id != {file_param})")
+fn outside_file_node_predicate(qualifier: &str, file_param: &str) -> String {
+    format!("({qualifier}file_node_id IS NULL OR {qualifier}file_node_id != {file_param})")
 }
 
 fn get_index_artifact_cache_from_connection(
@@ -2470,6 +2735,158 @@ fn hash_structural_text_unit_part(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
+/// Everything a structural validation receipt needs from the unit and
+/// projection tables.
+#[derive(Debug)]
+struct StructuralTextContentScan {
+    unit_count: u64,
+    unit_digest: String,
+    unit_versions: HashSet<u32>,
+    projection_count: u64,
+    projection_digest: String,
+    projection_versions: HashSet<u32>,
+}
+
+/// Per-file unit evidence accumulated while the unit table is scanned.
+struct StructuralTextFileUnits {
+    count: u64,
+    digest: Sha256,
+}
+
+/// Read the structural unit and projection evidence in one ordered scan per
+/// table.
+///
+/// The publication summary and the per-file unit digests come from the same
+/// `structural_text_unit` cursor, and the projection summary and the per-file
+/// comparison come from the same `structural_text_projection` cursor, so a
+/// validation costs one pass over each table instead of two. Both digests keep
+/// the exact bytes their producers hashed: the publication summary hashes the
+/// stored column text, and the per-file digest hashes the decoded unit the way
+/// [`structural_text_unit_digest`] does. Neither validation is skipped.
+fn scan_structural_text_content(
+    conn: &Connection,
+) -> Result<StructuralTextContentScan, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT node_id, file_id, placement_id, content_hash, source_content_hash,
+                descriptor_version, producer, evidence_tier, resolution, language,
+                kind, start_line, start_col, end_line, end_col, file_role
+         FROM structural_text_unit ORDER BY node_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut unit_hasher = Sha256::new();
+    unit_hasher.update(STRUCTURAL_TEXT_UNIT_DIGEST_DOMAIN);
+    let mut unit_count = 0_u64;
+    let mut unit_versions = HashSet::new();
+    let mut units_by_file = HashMap::<i64, StructuralTextFileUnits>::new();
+    while let Some(row) = rows.next()? {
+        let descriptor_version = u32::try_from(row.get::<_, i64>(5)?).map_err(|_| {
+            StorageError::Other("structural text unit descriptor version is invalid".into())
+        })?;
+        unit_versions.insert(descriptor_version);
+        let file_id = row.get::<_, i64>(1)?;
+        let file_role = row.get::<_, String>(15)?;
+        let values = [
+            row.get::<_, i64>(0)?.to_string(),
+            file_id.to_string(),
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            descriptor_version.to_string(),
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, i64>(10)?.to_string(),
+            row.get::<_, i64>(11)?.to_string(),
+            row.get::<_, i64>(12)?.to_string(),
+            row.get::<_, i64>(13)?.to_string(),
+            row.get::<_, i64>(14)?.to_string(),
+            file_role.clone(),
+        ];
+        for value in &values {
+            hash_structural_text_unit_part(&mut unit_hasher, value.as_bytes());
+        }
+        unit_count = unit_count.saturating_add(1);
+
+        // The per-file digest is the producer's digest, so it hashes the
+        // decoded unit: an out-of-range kind or span is rejected here exactly as
+        // decoding a row would reject it, and the role is the decoded role.
+        let unit = structural_text_unit_from_row(row)?;
+        let file = units_by_file
+            .entry(file_id)
+            .or_insert_with(|| StructuralTextFileUnits {
+                count: 0,
+                digest: new_structural_text_file_unit_digest(),
+            });
+        file.count = file.count.saturating_add(1);
+        hash_structural_text_unit_fields(&mut file.digest, &unit);
+    }
+    drop(rows);
+    drop(stmt);
+
+    let mut stmt = conn.prepare(
+        "SELECT file_id, source_content_hash, descriptor_version, producer,
+                language, file_role, unit_count, unit_digest
+         FROM structural_text_projection ORDER BY file_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut projection_hasher = Sha256::new();
+    projection_hasher.update(b"codestory-structural-text-projection-publication-v1\0");
+    let mut projection_count = 0_u64;
+    let mut projection_versions = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let descriptor_version = u32::try_from(row.get::<_, i64>(2)?).map_err(|_| {
+            StorageError::Other("structural text projection descriptor version is invalid".into())
+        })?;
+        projection_versions.insert(descriptor_version);
+        let file_id = row.get::<_, i64>(0)?;
+        let declared_unit_count = u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0);
+        let declared_unit_digest = row.get::<_, String>(7)?;
+        let values = [
+            file_id.to_string(),
+            row.get::<_, String>(1)?,
+            descriptor_version.to_string(),
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?.to_string(),
+            declared_unit_digest.clone(),
+        ];
+        for value in &values {
+            hash_structural_text_unit_part(&mut projection_hasher, value.as_bytes());
+        }
+        projection_count = projection_count.saturating_add(1);
+
+        let observed = units_by_file
+            .remove(&file_id)
+            .unwrap_or_else(|| StructuralTextFileUnits {
+                count: 0,
+                digest: new_structural_text_file_unit_digest(),
+            });
+        if declared_unit_count != observed.count
+            || declared_unit_digest != format!("{:x}", observed.digest.finalize())
+        {
+            return Err(StorageError::Other(format!(
+                "structural text projection {file_id} does not match its unit set"
+            )));
+        }
+    }
+    if !units_by_file.is_empty() {
+        return Err(StorageError::Other(
+            "structural text units exist without owning projections".into(),
+        ));
+    }
+
+    Ok(StructuralTextContentScan {
+        unit_count,
+        unit_digest: format!("{:x}", unit_hasher.finalize()),
+        unit_versions,
+        projection_count,
+        projection_digest: format!("{:x}", projection_hasher.finalize()),
+        projection_versions,
+    })
+}
+
 fn structural_text_unit_content_summary(
     conn: &Connection,
 ) -> Result<(u64, String, HashSet<u32>), StorageError> {
@@ -2525,26 +2942,37 @@ pub fn structural_text_unit_digest(units: &[StructuralTextUnit]) -> String {
     structural_text_unit_digest_ordered(&units)
 }
 
-fn structural_text_unit_digest_ordered(units: &[&StructuralTextUnit]) -> String {
+const STRUCTURAL_TEXT_FILE_UNIT_DIGEST_DOMAIN: &[u8] = b"codestory-structural-text-file-units-v1\0";
+
+fn new_structural_text_file_unit_digest() -> Sha256 {
     let mut hasher = Sha256::new();
-    hasher.update(b"codestory-structural-text-file-units-v1\0");
+    hasher.update(STRUCTURAL_TEXT_FILE_UNIT_DIGEST_DOMAIN);
+    hasher
+}
+
+fn hash_structural_text_unit_fields(hasher: &mut Sha256, unit: &StructuralTextUnit) {
+    hash_structural_text_unit_part(hasher, unit.node_id.0.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.file_id.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.placement_id.as_bytes());
+    hash_structural_text_unit_part(hasher, unit.content_hash.as_bytes());
+    hash_structural_text_unit_part(hasher, unit.source_content_hash.as_bytes());
+    hash_structural_text_unit_part(hasher, unit.descriptor_version.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.producer.as_bytes());
+    hash_structural_text_unit_part(hasher, unit.evidence_tier.as_bytes());
+    hash_structural_text_unit_part(hasher, unit.resolution.as_bytes());
+    hash_structural_text_unit_part(hasher, unit.language.as_bytes());
+    hash_structural_text_unit_part(hasher, (unit.kind as i32).to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.start_line.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.start_col.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.end_line.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.end_col.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.file_role.as_str().as_bytes());
+}
+
+fn structural_text_unit_digest_ordered(units: &[&StructuralTextUnit]) -> String {
+    let mut hasher = new_structural_text_file_unit_digest();
     for unit in units {
-        hash_structural_text_unit_part(&mut hasher, unit.node_id.0.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.file_id.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.placement_id.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.content_hash.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.source_content_hash.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.descriptor_version.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.producer.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.evidence_tier.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.resolution.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.language.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, (unit.kind as i32).to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.start_line.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.start_col.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.end_line.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.end_col.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.file_role.as_str().as_bytes());
+        hash_structural_text_unit_fields(&mut hasher, unit);
     }
     format!("{:x}", hasher.finalize())
 }
@@ -2598,40 +3026,38 @@ fn structural_text_artifact_cache_key_is_valid(cache_key: &str) -> bool {
         && !identity.is_empty()
 }
 
+/// Validate every cached structural artifact against its verified projection in
+/// one ordered scan of the cache table.
+///
+/// The outer join carries the orphan check that used to need a second pass: a
+/// cache row whose projection is absent still arrives, and it is rejected on the
+/// same terms as before.
 fn validate_structural_text_artifact_cache_rows(conn: &Connection) -> Result<(), StorageError> {
-    let orphaned_rows = conn.query_row(
-        "SELECT COUNT(*)
-         FROM structural_text_artifact_cache c
-         LEFT JOIN structural_text_projection p ON p.file_id = c.file_id
-         WHERE p.file_id IS NULL",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?;
-    if orphaned_rows != 0 {
-        return Err(StorageError::Other(
-            "structural artifact cache contains rows without verified projections".into(),
-        ));
-    }
     let mut stmt = conn.prepare(
         "SELECT c.file_id, c.cache_key, c.source_content_hash,
                 c.descriptor_version, c.producer, c.artifact_digest, c.artifact_blob,
-                p.source_content_hash, p.descriptor_version, p.producer
+                p.file_id, p.source_content_hash, p.descriptor_version, p.producer
          FROM structural_text_artifact_cache c
-         INNER JOIN structural_text_projection p ON p.file_id = c.file_id
+         LEFT JOIN structural_text_projection p ON p.file_id = c.file_id
          ORDER BY c.file_id ASC",
     )?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let file_id = row.get::<_, i64>(0)?;
+        if row.get::<_, Option<i64>>(7)?.is_none() {
+            return Err(StorageError::Other(
+                "structural artifact cache contains rows without verified projections".into(),
+            ));
+        }
         let cache_key = row.get::<_, String>(1)?;
         let source_content_hash = row.get::<_, String>(2)?;
         let descriptor_version = row.get::<_, i64>(3)?;
         let producer = row.get::<_, String>(4)?;
         let artifact_digest = row.get::<_, String>(5)?;
         let artifact_blob = row.get::<_, Vec<u8>>(6)?;
-        let projection_source_content_hash = row.get::<_, String>(7)?;
-        let projection_descriptor_version = row.get::<_, i64>(8)?;
-        let projection_producer = row.get::<_, String>(9)?;
+        let projection_source_content_hash = row.get::<_, String>(8)?;
+        let projection_descriptor_version = row.get::<_, i64>(9)?;
+        let projection_producer = row.get::<_, String>(10)?;
         let expected_digest = format!("{:x}", Sha256::digest(&artifact_blob));
         if source_content_hash != projection_source_content_hash
             || descriptor_version != projection_descriptor_version
@@ -2758,28 +3184,25 @@ impl FileRole {
     }
 
     pub fn classify_path(path: &Path) -> Self {
-        let mut normalized = path
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_ascii_lowercase();
-        let mut best_repo_relative: Option<(usize, String)> = None;
-        for marker in ["/source/repos/", "source/repos/", "/repos/", "repos/"] {
-            if let Some(index) = normalized.rfind(marker) {
-                let remainder = &normalized[index + marker.len()..];
-                if let Some((_, repo_relative)) = remainder.split_once('/')
-                    && best_repo_relative
-                        .as_ref()
-                        .is_none_or(|(best_index, _)| index > *best_index)
-                {
-                    best_repo_relative = Some((index, repo_relative.to_string()));
-                }
-            }
-        }
-        if let Some((_, repo_relative)) = best_repo_relative {
-            normalized = repo_relative;
-        }
-        let marked = format!("/{normalized}");
-        let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+        Self::classify_normalized(&NormalizedRolePath::from_path(path))
+    }
+
+    /// The one owner of "this path names a test or benchmark file".
+    ///
+    /// Callers that only need the test/bench question must route through here
+    /// rather than re-listing directory and suffix markers: a second rule list
+    /// drifts from `classify_path` and the two then disagree about the same
+    /// file. Role precedence is deliberately *not* applied — a vendored or
+    /// generated test file is still a test file for scope filtering, even
+    /// though `classify_path` reports the stronger `Vendor`/`Generated` role.
+    pub fn path_is_test_or_bench(path: &str) -> bool {
+        let normalized = NormalizedRolePath::new(path);
+        normalized.matches_test_markers() || normalized.matches_benchmark_markers()
+    }
+
+    fn classify_normalized(normalized: &NormalizedRolePath) -> Self {
+        let marked = normalized.marked.as_str();
+        let file_name = normalized.file_name();
 
         if marked.contains("/node_modules/")
             || marked.contains("/vendor/")
@@ -2799,24 +3222,7 @@ impl FileRole {
         {
             return Self::Generated;
         }
-        if marked.contains("/tests/")
-            || marked.contains("/test/")
-            || marked.contains("/spec/")
-            || marked.contains("/fixtures/")
-            || marked.contains("/__tests__/")
-            || marked.contains("-test-client/")
-            || marked.contains("_test_client/")
-            || file_name.contains(".test.")
-            || file_name.contains(".spec.")
-            || file_name.ends_with("_test.rs")
-            || file_name.ends_with("_tests.rs")
-            || file_name.ends_with("_test.py")
-            || file_name.ends_with("_tests.py")
-            || file_name.ends_with("_test.ts")
-            || file_name.ends_with("_tests.ts")
-            || file_name.ends_with("_test.tsx")
-            || file_name.ends_with("_tests.tsx")
-        {
+        if normalized.matches_test_markers() {
             return Self::Test;
         }
         if marked.contains("/docs/")
@@ -2825,11 +3231,7 @@ impl FileRole {
         {
             return Self::Docs;
         }
-        if marked.contains("/benchmarks/")
-            || marked.contains("/benchmark/")
-            || marked.contains("/benches/")
-            || marked.contains("/bench/")
-        {
+        if normalized.matches_benchmark_markers() {
             return Self::Benchmark;
         }
         if matches!(
@@ -2849,6 +3251,82 @@ impl FileRole {
             return Self::Entrypoint;
         }
         Self::Source
+    }
+}
+
+/// A path reduced to the form every `FileRole` rule is written against.
+///
+/// Separator- and case-normalized, cut down to the repo-relative remainder when
+/// the path runs through a clone root, and prefixed with `/` so a single
+/// `contains("/tests/")` also matches a repo-root-relative `tests/...`.
+struct NormalizedRolePath {
+    marked: String,
+}
+
+impl NormalizedRolePath {
+    fn from_path(path: &Path) -> Self {
+        Self::new(&path.to_string_lossy())
+    }
+
+    fn new(path: &str) -> Self {
+        let mut normalized = path.replace('\\', "/").to_ascii_lowercase();
+        let mut best_repo_relative: Option<(usize, String)> = None;
+        for marker in ["/source/repos/", "source/repos/", "/repos/", "repos/"] {
+            if let Some(index) = normalized.rfind(marker) {
+                let remainder = &normalized[index + marker.len()..];
+                if let Some((_, repo_relative)) = remainder.split_once('/')
+                    && best_repo_relative
+                        .as_ref()
+                        .is_none_or(|(best_index, _)| index > *best_index)
+                {
+                    best_repo_relative = Some((index, repo_relative.to_string()));
+                }
+            }
+        }
+        if let Some((_, repo_relative)) = best_repo_relative {
+            normalized = repo_relative;
+        }
+        Self {
+            marked: format!("/{normalized}"),
+        }
+    }
+
+    fn file_name(&self) -> &str {
+        self.marked
+            .rsplit('/')
+            .next()
+            .unwrap_or(self.marked.as_str())
+    }
+
+    fn matches_test_markers(&self) -> bool {
+        let marked = self.marked.as_str();
+        let file_name = self.file_name();
+        marked.contains("/tests/")
+            || marked.contains("/test/")
+            || marked.contains("/spec/")
+            || marked.contains("/fixtures/")
+            || marked.contains("/__tests__/")
+            || marked.contains("/__test__/")
+            || marked.contains("-test-client/")
+            || marked.contains("_test_client/")
+            || marked.contains(".test.")
+            || marked.contains(".spec.")
+            || file_name.ends_with("_test.rs")
+            || file_name.ends_with("_tests.rs")
+            || file_name.ends_with("_test.py")
+            || file_name.ends_with("_tests.py")
+            || file_name.ends_with("_test.ts")
+            || file_name.ends_with("_tests.ts")
+            || file_name.ends_with("_test.tsx")
+            || file_name.ends_with("_tests.tsx")
+    }
+
+    fn matches_benchmark_markers(&self) -> bool {
+        let marked = self.marked.as_str();
+        marked.contains("/benchmarks/")
+            || marked.contains("/benchmark/")
+            || marked.contains("/benches/")
+            || marked.contains("/bench/")
     }
 }
 
@@ -3246,6 +3724,36 @@ pub struct FileProjectionRemovalSummary {
     pub removed_local_symbol_count: usize,
     pub removed_file_row_count: usize,
     pub removed_callable_projection_state_count: usize,
+    /// Canonical file node ids that still own an edge whose resolution this
+    /// removal cleared, ascending and deduplicated.
+    ///
+    /// Removing a file nulls `resolved_target_node_id`/`resolved_source_node_id`
+    /// on surviving edges that pointed into it. Those callers live in files the
+    /// incremental plan never scheduled, so unless the caller is carried into
+    /// the resolution scope the edge stays unresolved until a full rebuild —
+    /// deleting a preferred definition would silently shrink what later queries
+    /// can resolve. Collected before the clearing UPDATEs, which is the last
+    /// moment the pointers still exist.
+    #[serde(default)]
+    pub affected_caller_file_ids: Vec<i64>,
+}
+
+/// One file's in-transaction removal result.
+///
+/// `related_node_ids` is post-commit cache bookkeeping, not a reportable
+/// outcome, so it stays off the public summary.
+struct FileProjectionRemoval {
+    summary: FileProjectionRemovalSummary,
+    related_node_ids: Vec<i64>,
+}
+
+/// Aggregate of one hoisted `delete_files_batch` transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchProjectionRemovalSummary {
+    /// Union of every removed file's affected callers, ascending and
+    /// deduplicated, with the removed files themselves excluded: a file deleted
+    /// in the same batch has no surviving caller left to re-resolve.
+    pub affected_caller_file_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3254,6 +3762,17 @@ pub struct CallerProjectionRemovalSummary {
     pub removed_edge_count: usize,
     pub removed_occurrence_count: usize,
     pub removed_callable_projection_state_count: usize,
+}
+
+/// What a file-structural reposition repair removed.
+///
+/// Deliberately has no node, bookmark, or file-row counter: the repair exists
+/// precisely because it must not touch any of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnownedProjectionRemovalSummary {
+    pub file_id: i64,
+    pub removed_edge_count: usize,
+    pub removed_occurrence_count: usize,
 }
 
 /// Lightweight symbol projection used by lexical search sidecars.
@@ -4023,6 +4542,36 @@ impl Storage {
         )?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         Ok(version.max(0) as u32)
+    }
+
+    /// Count retained legacy annotation rows without migrating or recovering.
+    ///
+    /// The cutover has to know whether a core-replacing operation would destroy
+    /// user annotations, and it has to know it on any schema old enough to
+    /// still own them, so this read accepts whatever schema is on disk and
+    /// treats absent tables as zero.
+    pub fn database_legacy_annotation_count(path: &Path) -> Result<u64, StorageError> {
+        let conn = Connection::open_with_flags(
+            sqlite_path::open_path(path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let mut total = 0_i64;
+        for table in ["bookmark_category", "bookmark_node"] {
+            let exists: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if exists.is_none() {
+                continue;
+            }
+            total += conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        }
+        Ok(total.max(0) as u64)
     }
 
     /// Read the incomplete-run fence without migrating or otherwise mutating a live database.
@@ -5093,23 +5642,16 @@ impl Storage {
         &mut self,
         source_root: &Path,
         target_root: &Path,
-    ) -> Result<(usize, usize), StorageError> {
+    ) -> Result<RehydratedCacheRebaseStats, StorageError> {
         let source_root = source_root.to_string_lossy().to_string();
         let target_root = target_root.to_string_lossy().to_string();
-        let mut updated = self.rebase_path_bound_text_columns(&source_root, &target_root)?;
-        updated = updated.saturating_add(self.refresh_rebased_file_metadata()?);
-        let invalidated_artifacts = self.clear_legacy_index_artifact_cache()?;
-        self.cache.nodes.write().clear();
-        Ok((updated, invalidated_artifacts))
-    }
-
-    fn rebase_path_bound_text_columns(
-        &self,
-        source_root: &str,
-        target_root: &str,
-    ) -> Result<usize, StorageError> {
-        let tx = self.conn.unchecked_transaction()?;
-        let mut updated = 0usize;
+        let tx = self.conn.transaction()?;
+        let carried_policy_exclusion_rows = tx
+            .query_row("SELECT COUNT(*) FROM source_policy_exclusion", [], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .max(0) as usize;
+        let mut rebased_path_bound_rows = 0usize;
         for statement in [
             "UPDATE file
              SET path = replace(path, ?1, ?2)
@@ -5131,109 +5673,148 @@ impl Storage {
             "UPDATE error
              SET message = replace(message, ?1, ?2)
              WHERE instr(message, ?1) > 0",
-            "UPDATE llm_symbol_doc
-             SET
-                display_name = replace(display_name, ?1, ?2),
-                qualified_name = replace(qualified_name, ?1, ?2),
-                file_path = replace(file_path, ?1, ?2),
-                doc_text = replace(doc_text, ?1, ?2)
-             WHERE instr(display_name, ?1) > 0
-                OR instr(COALESCE(qualified_name, ''), ?1) > 0
-                OR instr(COALESCE(file_path, ''), ?1) > 0
-                OR instr(doc_text, ?1) > 0",
-            "UPDATE symbol_search_doc
-             SET
-                display_name = replace(display_name, ?1, ?2),
-                qualified_name = replace(qualified_name, ?1, ?2),
-                file_path = replace(file_path, ?1, ?2),
-                doc_text = replace(doc_text, ?1, ?2),
-                source_provenance = replace(source_provenance, ?1, ?2)
-             WHERE instr(display_name, ?1) > 0
-                OR instr(COALESCE(qualified_name, ''), ?1) > 0
-                OR instr(COALESCE(file_path, ''), ?1) > 0
-                OR instr(doc_text, ?1) > 0
-                OR instr(source_provenance, ?1) > 0",
-            "UPDATE dense_anchor_input
-             SET
-                display_name = replace(display_name, ?1, ?2),
-                qualified_name = replace(qualified_name, ?1, ?2),
-                file_path = replace(file_path, ?1, ?2),
-                source_provenance = replace(source_provenance, ?1, ?2),
-                document_text = replace(document_text, ?1, ?2)
-             WHERE instr(display_name, ?1) > 0
-                OR instr(COALESCE(qualified_name, ''), ?1) > 0
-                OR instr(COALESCE(file_path, ''), ?1) > 0
-                OR instr(source_provenance, ?1) > 0
-                OR instr(document_text, ?1) > 0",
             "UPDATE search_symbol_projection
              SET display_name = replace(display_name, ?1, ?2)
              WHERE instr(display_name, ?1) > 0",
-            "UPDATE grounding_file_snapshot
-             SET path = replace(path, ?1, ?2)
-             WHERE instr(path, ?1) > 0",
-            "UPDATE grounding_node_snapshot
-             SET
-                serialized_name = replace(serialized_name, ?1, ?2),
-                qualified_name = replace(qualified_name, ?1, ?2),
-                canonical_id = replace(canonical_id, ?1, ?2),
-                display_name = replace(display_name, ?1, ?2),
-                file_path = replace(file_path, ?1, ?2)
-             WHERE instr(serialized_name, ?1) > 0
-                OR instr(COALESCE(qualified_name, ''), ?1) > 0
-                OR instr(COALESCE(canonical_id, ''), ?1) > 0
-                OR instr(display_name, ?1) > 0
-                OR instr(COALESCE(file_path, ''), ?1) > 0",
         ] {
-            updated =
-                updated.saturating_add(tx.execute(statement, params![source_root, target_root])?);
+            rebased_path_bound_rows = rebased_path_bound_rows
+                .saturating_add(tx.execute(statement, params![source_root, target_root])?);
         }
-        // Dense anchor rows have been rebound to a different project identity. Keep them
-        // available as incremental inputs, but require core indexing to publish a new,
-        // internally consistent manifest before retrieval can consume them.
-        tx.execute("DELETE FROM dense_anchor_publication", [])?;
-        // Structural placement identity is file-scoped. A rehydrated project must
-        // recollect verified units rather than relabel path-bound rows.
-        tx.execute("DELETE FROM structural_text_unit_publication", [])?;
-        tx.execute("DELETE FROM structural_text_unit", [])?;
-        tx.execute("DELETE FROM structural_text_projection", [])?;
-        tx.execute("DELETE FROM structural_text_artifact_cache", [])?;
-        tx.commit()?;
-        Ok(updated)
-    }
 
-    fn clear_legacy_index_artifact_cache(&self) -> Result<usize, StorageError> {
-        // ponytail: v2 artifact keys are root-portable; delete this cleanup when migrations no longer see pre-v2 caches.
-        Ok(self.conn.execute(
-            "DELETE FROM index_artifact_cache
-             WHERE cache_key NOT LIKE 'v2:%'",
-            [],
-        )?)
-    }
+        tx.execute("DELETE FROM index_publication", [])?;
+        tx.execute("DELETE FROM source_policy_exclusion_publication", [])?;
+        let invalidated_index_artifact_rows = tx.execute("DELETE FROM index_artifact_cache", [])?;
 
-    fn refresh_rebased_file_metadata(&self) -> Result<usize, StorageError> {
-        let files = self.get_files()?;
-        let tx = self.conn.unchecked_transaction()?;
-        let mut updated = 0usize;
-        for file in files {
-            let Ok(metadata) = fs::metadata(&file.path) else {
-                continue;
-            };
-            let Ok(modified) = metadata.modified() else {
-                continue;
-            };
-            let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
-                continue;
-            };
-            let modification_time = duration.as_millis().min(i64::MAX as u128) as i64;
-            updated = updated.saturating_add(tx.execute(
-                "UPDATE file
-                 SET modification_time = ?2
-                 WHERE id = ?1",
-                params![file.id, modification_time],
-            )?);
+        let mut invalidated_semantic_rows = 0usize;
+        for statement in [
+            "DELETE FROM llm_symbol_doc",
+            "DELETE FROM symbol_search_doc",
+            "DELETE FROM symbol_summary",
+            "DELETE FROM dense_anchor_input",
+            "DELETE FROM dense_anchor_publication",
+            "DELETE FROM structural_text_unit_publication",
+            "DELETE FROM structural_text_unit",
+            "DELETE FROM structural_text_projection",
+            "DELETE FROM structural_text_artifact_cache",
+            "DELETE FROM grounding_repo_stats_snapshot",
+            "DELETE FROM grounding_file_snapshot",
+            "DELETE FROM grounding_node_snapshot",
+            "DELETE FROM grounding_node_summary_snapshot",
+            "DELETE FROM grounding_node_edge_digest_snapshot",
+        ] {
+            invalidated_semantic_rows =
+                invalidated_semantic_rows.saturating_add(tx.execute(statement, [])?);
         }
+        for statement in [
+            "DELETE FROM edge
+             WHERE source_node_id IN (
+                    SELECT id FROM node
+                    WHERE serialized_name LIKE 'component_report:%'
+                       OR canonical_id LIKE 'codestory:component_report:%'
+                )
+                OR target_node_id IN (
+                    SELECT id FROM node
+                    WHERE serialized_name LIKE 'component_report:%'
+                       OR canonical_id LIKE 'codestory:component_report:%'
+                )
+                OR file_node_id IN (
+                    SELECT id FROM node
+                    WHERE serialized_name LIKE 'component_report:%'
+                       OR canonical_id LIKE 'codestory:component_report:%'
+                )
+                OR resolved_source_node_id IN (
+                    SELECT id FROM node
+                    WHERE serialized_name LIKE 'component_report:%'
+                       OR canonical_id LIKE 'codestory:component_report:%'
+                )
+                OR resolved_target_node_id IN (
+                    SELECT id FROM node
+                    WHERE serialized_name LIKE 'component_report:%'
+                       OR canonical_id LIKE 'codestory:component_report:%'
+                )",
+            "DELETE FROM occurrence
+             WHERE element_id IN (
+                SELECT id FROM node
+                WHERE serialized_name LIKE 'component_report:%'
+                   OR canonical_id LIKE 'codestory:component_report:%'
+             )",
+            "DELETE FROM component_access
+             WHERE node_id IN (
+                SELECT id FROM node
+                WHERE serialized_name LIKE 'component_report:%'
+                   OR canonical_id LIKE 'codestory:component_report:%'
+             )",
+            "DELETE FROM bookmark_node
+             WHERE node_id IN (
+                SELECT id FROM node
+                WHERE serialized_name LIKE 'component_report:%'
+                   OR canonical_id LIKE 'codestory:component_report:%'
+             )",
+            "DELETE FROM search_symbol_projection
+             WHERE node_id IN (
+                SELECT id FROM node
+                WHERE serialized_name LIKE 'component_report:%'
+                   OR canonical_id LIKE 'codestory:component_report:%'
+             )",
+            "DELETE FROM callable_projection_state
+             WHERE node_id IN (
+                SELECT id FROM node
+                WHERE serialized_name LIKE 'component_report:%'
+                   OR canonical_id LIKE 'codestory:component_report:%'
+             )",
+            "DELETE FROM node
+             WHERE serialized_name LIKE 'component_report:%'
+                OR canonical_id LIKE 'codestory:component_report:%'",
+        ] {
+            invalidated_semantic_rows =
+                invalidated_semantic_rows.saturating_add(tx.execute(statement, [])?);
+        }
+        tx.execute(
+            "INSERT INTO grounding_snapshot_meta (
+                id,
+                snapshot_version,
+                summary_state,
+                detail_state,
+                summary_built_at_epoch_ms,
+                detail_built_at_epoch_ms
+             )
+             VALUES (1, ?1, ?2, ?2, NULL, NULL)
+             ON CONFLICT(id) DO UPDATE SET
+                snapshot_version = excluded.snapshot_version,
+                summary_state = excluded.summary_state,
+                detail_state = excluded.detail_state,
+                summary_built_at_epoch_ms = NULL,
+                detail_built_at_epoch_ms = NULL",
+            params![
+                GROUNDING_SNAPSHOT_VERSION,
+                GroundingSnapshotState::Dirty.db_value()
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO resolution_support_snapshot (
+                id,
+                snapshot_version,
+                state,
+                snapshot_blob,
+                built_at_epoch_ms
+             )
+             VALUES (1, 0, ?1, NULL, NULL)
+             ON CONFLICT(id) DO UPDATE SET
+                snapshot_version = 0,
+                state = excluded.state,
+                snapshot_blob = NULL,
+                built_at_epoch_ms = NULL",
+            params![GroundingSnapshotState::Dirty.db_value()],
+        )?;
         tx.commit()?;
-        Ok(updated)
+
+        self.cache.nodes.write().clear();
+        Ok(RehydratedCacheRebaseStats {
+            rebased_path_bound_rows,
+            invalidated_index_artifact_rows,
+            invalidated_semantic_rows,
+            carried_policy_exclusion_rows,
+        })
     }
 
     pub fn path_bound_text_match_count(&self, prefix: &str) -> Result<usize, StorageError> {
@@ -5370,12 +5951,13 @@ impl Storage {
                 live_path.display()
             )));
         }
-        let backup_path = live_path.with_extension("sqlite.backup");
+        let backup_path = live_path.with_extension(owned_artifacts::ROLLBACK_BACKUP_EXTENSION);
         let prepared_path = promotion_prepared_journal_path(live_path);
         let committed_path = promotion_committed_journal_path(live_path);
         durations.lock_recovery = lock_recovery_started.elapsed();
 
         let candidate_validation_started = Instant::now();
+        let candidate_image_before_validation = promotion_database_image(staged_path)?;
         let candidate = require_complete_promotion_database_identity(
             staged_path,
             "Staged promotion candidate",
@@ -5396,6 +5978,16 @@ impl Storage {
                 staged_path.display()
             )));
         }
+        // A receipt may only seal bytes the validation above actually read, so
+        // the image is taken on both sides of it. A staged file that moved under
+        // its own validation seals nothing and the promoted copy is revalidated.
+        let candidate_image = match (
+            candidate_image_before_validation,
+            promotion_database_image(staged_path)?,
+        ) {
+            (Some(before), Some(after)) if before == after => Some(after),
+            _ => None,
+        };
         let candidate_bytes = database_logical_bytes_at_path(staged_path)?;
         durations.candidate_validation = candidate_validation_started.elapsed();
 
@@ -5531,33 +6123,25 @@ impl Storage {
         durations.staged_to_live_restore = staged_to_live_restore_started.elapsed();
 
         let promoted_validation_started = Instant::now();
-        let published =
-            require_complete_promotion_database_identity(live_path, "Promoted live database")?;
-        if published != candidate {
-            let _ = rollback_prepared_promotion(live_path, &prepared);
-            return Err(promotion_error(format!(
-                "Promoted live database identity does not match staged candidate {}",
-                staged_path.display()
-            )));
-        }
-        if let Err(error) = require_candidate_source_policy_identity(
+        let promoted_validation = match validate_promoted_live_database(
             live_path,
-            &published,
+            staged_path,
+            &candidate,
             &candidate_source_policy,
-            "Promoted live database",
-        ) {
-            let _ = rollback_prepared_promotion(live_path, &prepared);
-            return Err(error);
-        }
-        if let Err(error) = require_candidate_structural_text_identity(
-            live_path,
-            &published,
             &candidate_structural_text,
-            "Promoted live database",
+            candidate_image,
         ) {
-            let _ = rollback_prepared_promotion(live_path, &prepared);
-            return Err(error);
-        }
+            Ok(promoted_validation) => promoted_validation,
+            Err(error) => {
+                let _ = rollback_prepared_promotion(live_path, &prepared);
+                return Err(error);
+            }
+        };
+        tracing::debug!(
+            live_path = %live_path.display(),
+            promoted_validation = promoted_validation.as_str(),
+            "promotion fenced the restored live database"
+        );
         durations.promoted_validation = promoted_validation_started.elapsed();
 
         let committed_journal_started = Instant::now();
@@ -5590,6 +6174,7 @@ impl Storage {
             candidate_bytes,
             previous_live_bytes,
             rollback_backup_bytes,
+            promoted_validation,
         ))
     }
 
@@ -6186,6 +6771,103 @@ impl Storage {
         Ok(nodes)
     }
 
+    /// Return every node ID for each requested durable canonical symbol ID.
+    ///
+    /// Missing IDs remain present with an empty match set, and duplicate rows
+    /// are returned in node-ID order so annotation rebinding can treat
+    /// ambiguity explicitly instead of selecting an arbitrary row.
+    pub fn node_ids_by_canonical_ids(
+        &self,
+        canonical_ids: &[String],
+    ) -> Result<BTreeMap<String, Vec<NodeId>>, StorageError> {
+        if canonical_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let variable_limit = usize::try_from(self.conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?)
+            .map_err(|_| {
+                StorageError::Other(
+                    "SQLite reported a negative bind-variable limit for canonical-ID lookup"
+                        .to_string(),
+                )
+            })?;
+        if variable_limit == 0 {
+            return Err(StorageError::Other(
+                "SQLite bind-variable limit 0 cannot support canonical-ID lookup".to_string(),
+            ));
+        }
+
+        let mut unique_canonical_ids = canonical_ids.to_vec();
+        unique_canonical_ids.sort();
+        unique_canonical_ids.dedup();
+        let mut node_ids_by_canonical_id = unique_canonical_ids
+            .iter()
+            .cloned()
+            .map(|canonical_id| (canonical_id, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+
+        for batch in unique_canonical_ids.chunks(variable_limit) {
+            let placeholders = question_placeholders(batch.len());
+            let query = format!(
+                "SELECT canonical_id, id
+                 FROM node
+                 WHERE canonical_id IN ({placeholders})
+                 ORDER BY canonical_id ASC, id ASC"
+            );
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(batch.iter()))?;
+            while let Some(row) = rows.next()? {
+                let canonical_id: String = row.get(0)?;
+                let node_id = NodeId(row.get(1)?);
+                if let Some(node_ids) = node_ids_by_canonical_id.get_mut(&canonical_id) {
+                    node_ids.push(node_id);
+                }
+            }
+        }
+
+        Ok(node_ids_by_canonical_id)
+    }
+
+    /// Resolve a legacy annotation anchor without guessing between matches.
+    ///
+    /// `file_identity` is the exact path stored in the core `file` row. The
+    /// complete `(file_identity, qualified_name, kind)` tuple is required, and
+    /// every match is returned in node-ID order for the caller to classify as
+    /// unique, missing, or ambiguous.
+    pub fn node_ids_by_file_identity_qualified_name_and_kind(
+        &self,
+        file_identity: &str,
+        qualified_name: &str,
+        kind: NodeKind,
+    ) -> Result<Vec<NodeId>, StorageError> {
+        let Some(file_id) = self
+            .conn
+            .query_row(
+                "SELECT id FROM file WHERE path = ?1",
+                params![file_identity],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id
+             FROM node
+             WHERE file_node_id = ?1
+               AND kind = ?2
+               AND qualified_name = ?3
+             ORDER BY id ASC",
+        )?;
+        let mut rows = stmt.query(params![file_id, kind as i32, qualified_name])?;
+        let mut node_ids = Vec::new();
+        while let Some(row) = rows.next()? {
+            node_ids.push(NodeId(row.get(0)?));
+        }
+        Ok(node_ids)
+    }
+
     /// Reads one deterministic page of accepted node kinds from a staged build.
     ///
     /// `NOT INDEXED` keeps the keyset traversal on the node table's integer
@@ -6261,6 +6943,28 @@ impl Storage {
             .prepare("SELECT id, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence, callsite_identity, certainty, candidate_target_node_ids FROM edge")?;
         let mut edges = Vec::new();
         let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            edges.push(Self::edge_from_row(row)?);
+        }
+        Ok(edges)
+    }
+
+    /// Reads the CALL edges whose effective source is `source_node_id`, unpolicied.
+    ///
+    /// Route metadata reports the persisted resolution of a handler call, so this
+    /// accessor deliberately skips the trail policy that
+    /// [`Self::get_edges_for_node_ids`] applies: that policy clears
+    /// `resolved_target`, `confidence`, and `certainty` on uncertain and
+    /// common-unqualified calls, which are exactly the fields the route handler
+    /// DTO reports. Every other field, and the edge-ID row order, match filtering
+    /// [`Self::get_edges`] by `Edge::effective_source`.
+    pub fn get_raw_call_edges_by_effective_source(
+        &self,
+        source_node_id: NodeId,
+    ) -> Result<Vec<Edge>, StorageError> {
+        let mut stmt = self.conn.prepare(RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL)?;
+        let mut rows = stmt.query(params![source_node_id.0, EdgeKind::CALL as i32])?;
+        let mut edges = Vec::new();
         while let Some(row) = rows.next()? {
             edges.push(Self::edge_from_row(row)?);
         }
@@ -6491,7 +7195,8 @@ impl Storage {
         file_id: i64,
     ) -> Result<Vec<CallableProjectionState>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT file_id, symbol_key, node_id, signature_hash, body_hash, start_line, end_line
+            "SELECT file_id, symbol_key, node_id, signature_hash, normalized_signature,
+                    body_hash, start_line, end_line
              FROM callable_projection_state
              WHERE file_id = ?1
              ORDER BY start_line, symbol_key",
@@ -6502,9 +7207,10 @@ impl Storage {
                 symbol_key: row.get(1)?,
                 node_id: NodeId(row.get(2)?),
                 signature_hash: row.get(3)?,
-                body_hash: row.get(4)?,
-                start_line: row.get(5)?,
-                end_line: row.get(6)?,
+                normalized_signature: row.get(4)?,
+                body_hash: row.get(5)?,
+                start_line: row.get(6)?,
+                end_line: row.get(7)?,
             })
         })?;
 
@@ -6527,11 +7233,13 @@ impl Storage {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO callable_projection_state (
-                    file_id, symbol_key, node_id, signature_hash, body_hash, start_line, end_line
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    file_id, symbol_key, node_id, signature_hash, normalized_signature,
+                    body_hash, start_line, end_line
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(file_id, symbol_key) DO UPDATE SET
                     node_id = excluded.node_id,
                     signature_hash = excluded.signature_hash,
+                    normalized_signature = excluded.normalized_signature,
                     body_hash = excluded.body_hash,
                     start_line = excluded.start_line,
                     end_line = excluded.end_line",
@@ -6542,6 +7250,7 @@ impl Storage {
                     state.symbol_key,
                     state.node_id.0,
                     state.signature_hash,
+                    state.normalized_signature,
                     state.body_hash,
                     state.start_line,
                     state.end_line
@@ -7039,11 +7748,13 @@ impl Storage {
             let started = std::time::Instant::now();
             let mut stmt = tx.prepare(
                 "INSERT INTO callable_projection_state (
-                    file_id, symbol_key, node_id, signature_hash, body_hash, start_line, end_line
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    file_id, symbol_key, node_id, signature_hash, normalized_signature,
+                    body_hash, start_line, end_line
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(file_id, symbol_key) DO UPDATE SET
                     node_id = excluded.node_id,
                     signature_hash = excluded.signature_hash,
+                    normalized_signature = excluded.normalized_signature,
                     body_hash = excluded.body_hash,
                     start_line = excluded.start_line,
                     end_line = excluded.end_line",
@@ -7054,6 +7765,7 @@ impl Storage {
                     state.symbol_key,
                     state.node_id.0,
                     state.signature_hash,
+                    state.normalized_signature,
                     state.body_hash,
                     state.start_line,
                     state.end_line,
@@ -7071,7 +7783,7 @@ impl Storage {
                 record_projection_statement(
                     &mut breakdown.persistence.callable_projection,
                     1,
-                    projection_scalar_binds(6)
+                    projection_scalar_binds(7)
                         .saturating_add(projection_text_bind_bytes(&state.symbol_key)),
                 );
             }
@@ -7199,6 +7911,11 @@ impl Storage {
             }
         }
 
+        // The caller-scoped repair owns exactly the call and usage edges this
+        // file records for the caller. `callable_edge_projection_parts` in the
+        // indexer counts the same two kinds, and anything else is fenced by the
+        // file-structural row instead; the three definitions have to agree or a
+        // delta leaves a row nothing rewrote.
         let removed_edges = tx.execute(
             &format!(
                 "DELETE FROM edge
@@ -7248,6 +7965,85 @@ impl Storage {
             removed_edge_count: removed_edges,
             removed_occurrence_count: removed_occurrences,
             removed_callable_projection_state_count,
+        })
+    }
+
+    /// Remove exactly the rows the file-structural fence owns.
+    ///
+    /// This is the third cleanup, between `delete_projection_for_callers` (the
+    /// rows of one changed callable) and `delete_file_projection` (the file and
+    /// every node in it, which is what destroys annotations). It exists so a
+    /// file whose unowned declarations only *moved* — a shifted import, a
+    /// shifted top-level constant, a shifted class header — can be repaired by
+    /// re-inserting those rows at their new positions instead of by deleting
+    /// the file.
+    ///
+    /// It deletes nothing keyed to a node: no `node`, no `bookmark_node`, no
+    /// `component_access`, no `file` row. The node table is upserted by id, so
+    /// positions self-heal there, and the caller is responsible for having
+    /// established that no node identity changed.
+    ///
+    /// Ownership is read off the stored `callable_projection_state` rows, which
+    /// still hold the *pre-edit* extents at this point — the same rows, and the
+    /// same containment test, `delete_projection_for_callers` uses. The
+    /// file-structural row is excluded by `node_id <> file_node_id`: it is not a
+    /// callable, and its extent is the whole file, so treating it as an owner
+    /// would protect every row in the file from the cleanup.
+    pub fn delete_unowned_projection_for_file(
+        &mut self,
+        file_node_id: i64,
+    ) -> Result<UnownedProjectionRemovalSummary, StorageError> {
+        let tx = self.conn.transaction()?;
+
+        // Mirror of `structural_projection_fence`'s occurrence arm: an
+        // occurrence is unowned when it is neither a projected callable's own
+        // definition nor inside a projected callable's recorded extent.
+        let removed_occurrences = tx.execute(
+            "DELETE FROM occurrence
+             WHERE file_node_id = ?1
+             AND element_id NOT IN (
+                SELECT node_id FROM callable_projection_state
+                WHERE file_id = ?1 AND node_id <> ?1
+             )
+             AND NOT EXISTS (
+                SELECT 1
+                FROM callable_projection_state cps
+                WHERE cps.file_id = ?1
+                AND cps.node_id <> ?1
+                AND occurrence.start_line >= cps.start_line
+                AND occurrence.end_line <= cps.end_line
+             )",
+            params![file_node_id],
+        )?;
+
+        // Mirror of the edge arm: an edge is unowned unless it is one of the
+        // two kinds the caller-scoped cleanup rewrites *and* a projected
+        // callable of this file sources it. Scoped to `file_node_id` because
+        // that is the set this file's parse re-emits.
+        let removed_edges = tx.execute(
+            &format!(
+                "DELETE FROM edge
+                 WHERE file_node_id = ?1
+                 AND NOT (
+                    kind IN ({}, {})
+                    AND source_node_id IN (
+                        SELECT node_id FROM callable_projection_state
+                        WHERE file_id = ?1 AND node_id <> ?1
+                    )
+                 )",
+                EdgeKind::CALL as i32,
+                EdgeKind::USAGE as i32
+            ),
+            params![file_node_id],
+        )?;
+
+        tx.commit()?;
+        self.invalidate_grounding_snapshots()?;
+
+        Ok(UnownedProjectionRemovalSummary {
+            file_id: file_node_id,
+            removed_edge_count: removed_edges,
+            removed_occurrence_count: removed_occurrences,
         })
     }
 
@@ -8153,12 +8949,18 @@ impl Storage {
                     .all(|value| value.is_ascii_hexdigit())
                 || candidate.observed_size > i64::MAX as u64
                 || candidate.observed_unit_count > i64::MAX as u64
-                || !((candidate.observed_size > policy.byte_cap
+                // Evaluated against the candidate's own cap, matching
+                // `SourcePolicyExclusionPublicationFormat::qualifies`. A row's
+                // `byte_cap` is the cap that refused *this* source, which for a
+                // structural format sits below the policy headroom; only the
+                // headroom itself is a global bound, so it is checked as one.
+                || !((candidate.observed_size > candidate.byte_cap
                     && candidate.observed_unit_count == 0)
-                    || (candidate.observed_size <= policy.byte_cap
-                        && candidate.observed_unit_count > policy.structural_unit_cap))
+                    || (candidate.observed_size <= candidate.byte_cap
+                        && candidate.observed_unit_count > candidate.structural_unit_cap))
                 || candidate.policy_version != policy.policy_version
-                || candidate.byte_cap != policy.byte_cap
+                || candidate.byte_cap == 0
+                || candidate.byte_cap > policy.byte_cap
                 || candidate.structural_unit_cap != policy.structural_unit_cap
             {
                 return Err(StorageError::Other(format!(
@@ -8319,7 +9121,15 @@ impl Storage {
                     || record.core_generation_id != manifest.core_generation_id
                     || record.core_run_id != manifest.core_run_id
                     || record.policy_version != manifest.policy_version
-                    || record.byte_cap != manifest.byte_cap
+                    // A row names the cap that refused it, which for a
+                    // structural format is below the manifest's headroom. Only
+                    // a row claiming *more* headroom than was published is
+                    // invalid. The manifest-versus-policy check above stays a
+                    // strict equality: the headroom itself is a policy
+                    // dimension, and its equality is what forces republication
+                    // when the cap moves.
+                    || record.byte_cap == 0
+                    || record.byte_cap > manifest.byte_cap
                     || record.structural_unit_cap != manifest.structural_unit_cap
                     || !format.qualifies(record)
             })
@@ -11068,6 +11878,60 @@ impl Storage {
         Ok(nodes)
     }
 
+    /// Returns the subset of `node_ids` that has at least one child symbol.
+    ///
+    /// Membership is exactly `!get_children_symbols(id).is_empty()`, so the
+    /// `node` join stays: a MEMBER edge whose target row is absent yields no
+    /// child there and must yield no presence here. Input IDs carry set
+    /// semantics and each SQLite bind-limit chunk runs one statement, replacing
+    /// one materialising child query per rendered symbol.
+    pub fn node_ids_with_child_symbols(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<HashSet<NodeId>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let variable_limit = usize::try_from(self.conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?)
+            .map_err(|_| {
+                StorageError::Other(
+                    "SQLite reported a negative bind-variable limit for child-presence lookup"
+                        .to_string(),
+                )
+            })?;
+        if variable_limit == 0 {
+            return Err(StorageError::Other(
+                "SQLite bind-variable limit 0 cannot support child-presence lookup".to_string(),
+            ));
+        }
+
+        let mut unique_node_ids = node_ids.to_vec();
+        unique_node_ids.sort_unstable_by_key(|node_id| node_id.0);
+        unique_node_ids.dedup();
+
+        let kind_member = codestory_contracts::graph::EdgeKind::MEMBER as i32;
+        let mut with_children = HashSet::new();
+        for batch in unique_node_ids.chunks(variable_limit) {
+            let placeholders = question_placeholders(batch.len());
+            // The MEMBER kind is an inlined enum discriminant so a chunk binds
+            // exactly `variable_limit` values.
+            let query = format!(
+                "SELECT DISTINCT e.source_node_id
+                 FROM edge e
+                 JOIN node n ON n.id = e.target_node_id
+                 WHERE e.source_node_id IN ({placeholders})
+                   AND e.kind = {kind_member}"
+            );
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(batch.iter().map(|id| id.0)))?;
+            while let Some(row) = rows.next()? {
+                with_children.insert(NodeId(row.get(0)?));
+            }
+        }
+        Ok(with_children)
+    }
+
     /// Return store counts, preferring ready summary snapshots when available.
     pub fn get_stats(&self) -> Result<StorageStats, StorageError> {
         let fatal_error_count = self.fatal_error_count()?;
@@ -11123,6 +11987,62 @@ impl Storage {
         file_node_id: i64,
     ) -> Result<FileProjectionRemovalSummary, StorageError> {
         let tx = self.conn.transaction()?;
+        let removal = Self::delete_file_projection_in_tx(&tx, file_node_id)?;
+        tx.commit()?;
+        self.invalidate_grounding_snapshots()?;
+        self.evict_cached_nodes(removal.related_node_ids);
+        Ok(removal.summary)
+    }
+
+    /// Delete every listed file's projection in one transaction.
+    ///
+    /// The transaction and the snapshot invalidation are hoisted out of the
+    /// per-file loop: one commit and one invalidation for the whole batch
+    /// instead of two per file. The batch is therefore all-or-nothing — a
+    /// failure part-way through leaves every file's projection intact rather
+    /// than a half-removed graph.
+    pub fn delete_files_batch(
+        &mut self,
+        file_ids: &[i64],
+    ) -> Result<BatchProjectionRemovalSummary, StorageError> {
+        if file_ids.is_empty() {
+            return Ok(BatchProjectionRemovalSummary::default());
+        }
+
+        let mut affected_caller_file_ids = BTreeSet::new();
+        let mut related_node_ids = Vec::new();
+        let tx = self.conn.transaction()?;
+        for file_id in file_ids {
+            let removal = Self::delete_file_projection_in_tx(&tx, *file_id)?;
+            affected_caller_file_ids.extend(removal.summary.affected_caller_file_ids);
+            related_node_ids.extend(removal.related_node_ids);
+        }
+        tx.commit()?;
+        self.invalidate_grounding_snapshots()?;
+        self.evict_cached_nodes(related_node_ids);
+
+        for removed in file_ids {
+            affected_caller_file_ids.remove(removed);
+        }
+        Ok(BatchProjectionRemovalSummary {
+            affected_caller_file_ids: affected_caller_file_ids.into_iter().collect(),
+        })
+    }
+
+    fn evict_cached_nodes(&self, node_ids: Vec<i64>) {
+        if node_ids.is_empty() {
+            return;
+        }
+        let mut nodes = self.cache.nodes.write();
+        for node_id in node_ids {
+            nodes.remove(&NodeId(node_id));
+        }
+    }
+
+    fn delete_file_projection_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        file_node_id: i64,
+    ) -> Result<FileProjectionRemoval, StorageError> {
         tx.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS related_node_ids (
                 node_id INTEGER PRIMARY KEY
@@ -11148,6 +12068,34 @@ impl Storage {
         }
 
         let outside_related_file_edges = outside_related_file_edge_predicate("?1");
+
+        // Collect the callers whose resolution the two UPDATEs below are about
+        // to clear. This must happen first: afterwards the pointers into the
+        // removed file are NULL and the affected callers are unrecoverable.
+        // `COALESCE(caller.file_node_id, e.file_node_id)` matches how the
+        // incremental resolution pass keys a caller's owning file.
+        let affected_caller_file_ids = {
+            let joined_outside_related_file_edges =
+                outside_related_file_edge_predicate_for("e.", "?1");
+            let mut stmt = tx.prepare(&format!(
+                "SELECT DISTINCT COALESCE(caller.file_node_id, e.file_node_id) AS caller_file_id
+                 FROM edge e
+                 LEFT JOIN node caller ON caller.id = e.source_node_id
+                 WHERE (
+                     e.resolved_target_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                     OR e.resolved_source_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                 )
+                 AND {joined_outside_related_file_edges}
+                 AND COALESCE(caller.file_node_id, e.file_node_id) IS NOT NULL
+                 ORDER BY caller_file_id"
+            ))?;
+            let mut rows = stmt.query(params![file_node_id])?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next()? {
+                ids.push(row.get::<_, i64>(0)?);
+            }
+            ids
+        };
 
         tx.execute(
             &format!(
@@ -11292,42 +12240,22 @@ impl Storage {
         let removed_file_rows =
             tx.execute("DELETE FROM file WHERE id = ?1", params![file_node_id])?;
 
-        tx.commit()?;
-        self.invalidate_grounding_snapshots()?;
-
-        {
-            let mut nodes = self.cache.nodes.write();
-            for node_id in related_node_ids {
-                nodes.remove(&NodeId(node_id));
-            }
-        }
-
-        Ok(FileProjectionRemovalSummary {
-            canonical_file_node_id: file_node_id,
-            removed_node_count: removed_nodes,
-            removed_edge_count: removed_edges,
-            removed_occurrence_count: removed_occurrences,
-            removed_error_count: removed_errors,
-            removed_bookmark_node_count: removed_bookmarks,
-            removed_component_access_count: removed_component_access,
-            removed_local_symbol_count: removed_local_symbols,
-            removed_file_row_count: removed_file_rows,
-            removed_callable_projection_state_count,
+        Ok(FileProjectionRemoval {
+            summary: FileProjectionRemovalSummary {
+                canonical_file_node_id: file_node_id,
+                removed_node_count: removed_nodes,
+                removed_edge_count: removed_edges,
+                removed_occurrence_count: removed_occurrences,
+                removed_error_count: removed_errors,
+                removed_bookmark_node_count: removed_bookmarks,
+                removed_component_access_count: removed_component_access,
+                removed_local_symbol_count: removed_local_symbols,
+                removed_file_row_count: removed_file_rows,
+                removed_callable_projection_state_count,
+                affected_caller_file_ids,
+            },
+            related_node_ids,
         })
-    }
-
-    /// Delete a file and all associated projection data.
-    pub fn delete_file(&mut self, file_id: i64) -> Result<(), StorageError> {
-        self.delete_file_projection(file_id)?;
-        Ok(())
-    }
-
-    /// Delete multiple files by their IDs
-    pub fn delete_files_batch(&mut self, file_ids: &[i64]) -> Result<(), StorageError> {
-        for id in file_ids {
-            self.delete_file(*id)?;
-        }
-        Ok(())
     }
 
     // ========================================================================
@@ -11404,20 +12332,36 @@ impl Storage {
             return Ok(());
         }
 
-        let file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
+        let variable_limit = usize::try_from(self.conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?)
+            .map_err(|_| {
+                StorageError::Other(
+                    "SQLite reported a negative bind-variable limit for file-error replacement"
+                        .to_string(),
+                )
+            })?;
+        if variable_limit == 0 {
+            return Err(StorageError::Other(
+                "SQLite bind-variable limit 0 cannot support file-error replacement".to_string(),
+            ));
+        }
+
+        let mut file_ids = file_ids.to_vec();
+        file_ids.sort_unstable();
+        file_ids.dedup();
         debug_assert!(errors.iter().all(|error| {
             error
                 .file_id
-                .is_some_and(|file_id| file_ids.contains(&file_id.0))
+                .is_some_and(|file_id| file_ids.binary_search(&file_id.0).is_ok())
         }));
 
         let tx = self.conn.transaction()?;
         let mut removed_error_count = 0;
-        {
-            let mut delete = tx.prepare("DELETE FROM error WHERE file_id = ?1")?;
-            for file_id in &file_ids {
-                removed_error_count += delete.execute(params![file_id])?;
-            }
+        for batch in file_ids.chunks(variable_limit) {
+            let placeholders = question_placeholders(batch.len());
+            removed_error_count += tx.execute(
+                &format!("DELETE FROM error WHERE file_id IN ({placeholders})"),
+                params_from_iter(batch.iter()),
+            )?;
         }
         {
             let mut insert = tx.prepare(
@@ -11444,7 +12388,177 @@ impl Storage {
     }
 
     // ========================================================================
-    // Bookmark Management
+    // Annotation anchors (sidecar-owned user state)
+    // ========================================================================
+
+    /// Cutover marker stamped by the schema-31 writer barrier.
+    ///
+    /// `Some` means annotations are owned by the sidecar and the core
+    /// `bookmark_category`/`bookmark_node` tables are retained-only.
+    pub fn annotation_sidecar_cutover(&self) -> Result<Option<(u32, i64)>, StorageError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT sidecar_schema_version, cutover_at_epoch_ms
+                 FROM annotation_sidecar_cutover WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .map(|(version, at)| (version.max(0) as u32, at)))
+    }
+
+    /// Read the retained core annotation tables as sidecar-shaped rows.
+    ///
+    /// This is the only remaining core annotation read: the cutover imports it
+    /// once, and afterwards the sidecar is the sole source of truth.
+    pub fn legacy_annotation_snapshot(&self) -> Result<LegacyAnnotationSnapshot, StorageError> {
+        let categories = bookmarks::get_bookmark_categories(&self.conn)?
+            .into_iter()
+            .map(|category| AnnotationCategory {
+                id: category.id,
+                name: category.name,
+            })
+            .collect();
+        let mut stmt = self.conn.prepare(
+            "SELECT b.id, b.category_id, b.comment, n.canonical_id, f.path, n.qualified_name,
+                    n.kind, cps.normalized_signature, n.start_line
+             FROM bookmark_node b
+             LEFT JOIN node n ON n.id = b.node_id
+             LEFT JOIN file f ON f.id = n.file_node_id
+             LEFT JOIN callable_projection_state cps ON cps.node_id = n.id
+             ORDER BY b.id ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut bookmarks = Vec::new();
+        while let Some(row) = rows.next()? {
+            bookmarks.push(LegacyBookmarkRow {
+                id: row.get(0)?,
+                category_id: row.get(1)?,
+                comment: row.get(2)?,
+                canonical_id: row.get(3)?,
+                file_identity: row.get(4)?,
+                qualified_name: row.get(5)?,
+                kind: row.get(6)?,
+                normalized_signature: row.get(7)?,
+                start_line: row.get(8)?,
+            });
+        }
+        Ok(LegacyAnnotationSnapshot {
+            categories,
+            bookmarks,
+        })
+    }
+
+    /// Anchor evidence for one node, used when an annotation is created.
+    pub fn annotation_anchor_for_node(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<CoreAnchorCandidate>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{ANNOTATION_ANCHOR_SELECT} WHERE n.id = ?1"))?;
+        let mut rows = stmt.query(params![node_id.0])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(annotation_anchor_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every anchor candidate carrying one durable canonical symbol id.
+    pub fn annotation_anchors_by_canonical_id(
+        &self,
+        canonical_id: &str,
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        self.annotation_anchors(
+            &format!("{ANNOTATION_ANCHOR_SELECT} WHERE n.canonical_id = ?1 ORDER BY n.id ASC"),
+            params![canonical_id],
+        )
+    }
+
+    /// Every anchor candidate matching the complete legacy anchor tuple.
+    pub fn annotation_anchors_by_anchor_tuple(
+        &self,
+        file_identity: &str,
+        qualified_name: &str,
+        kind: i64,
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        self.annotation_anchors(
+            &format!(
+                "{ANNOTATION_ANCHOR_SELECT}
+                 WHERE f.path = ?1 AND n.qualified_name = ?2 AND n.kind = ?3
+                 ORDER BY n.id ASC"
+            ),
+            params![file_identity, qualified_name, kind],
+        )
+    }
+
+    /// Anchor candidates carrying one qualified name and kind.
+    ///
+    /// This is the move probe's keyed lookup: a moved symbol keeps its
+    /// qualified name and changes its file, so the anchor-tuple lookup misses
+    /// it and this one finds it. `idx_node_qualified_name` keeps it selective.
+    ///
+    /// A workspace-wide name lookup is unbounded by nature — thousands of types
+    /// declare a `new` — and every caller only asks whether the name names one
+    /// symbol or several, so the row set is capped at the two rows needed to
+    /// answer that.
+    pub fn annotation_anchors_by_qualified_name(
+        &self,
+        qualified_name: &str,
+        kind: i64,
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        self.annotation_anchors(
+            &format!(
+                "{ANNOTATION_ANCHOR_SELECT}
+                 WHERE n.qualified_name = ?1 AND n.kind = ?2
+                 ORDER BY n.id ASC
+                 LIMIT {ANNOTATION_UNIQUENESS_PROBE_LIMIT}"
+            ),
+            params![qualified_name, kind],
+        )
+    }
+
+    /// Anchor candidates carrying one normalized signature inside one file.
+    ///
+    /// The lookup is selective on
+    /// `idx_callable_projection_state_normalized_signature` and is always
+    /// scoped to a single file and kind, so a rename probe never scans the
+    /// workspace graph. Like the name probe it is capped at the two rows that
+    /// decide uniqueness.
+    pub fn annotation_anchors_by_normalized_signature(
+        &self,
+        normalized_signature: &str,
+        file_identity: &str,
+        kind: i64,
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        self.annotation_anchors(
+            &format!(
+                "{ANNOTATION_ANCHOR_SELECT}
+                 WHERE cps.normalized_signature = ?1 AND f.path = ?2 AND n.kind = ?3
+                 ORDER BY n.id ASC
+                 LIMIT {ANNOTATION_UNIQUENESS_PROBE_LIMIT}"
+            ),
+            params![normalized_signature, file_identity, kind],
+        )
+    }
+
+    fn annotation_anchors(
+        &self,
+        query: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        let mut stmt = self.conn.prepare(query)?;
+        let mut rows = stmt.query(params)?;
+        let mut candidates = Vec::new();
+        while let Some(row) = rows.next()? {
+            candidates.push(annotation_anchor_from_row(row)?);
+        }
+        Ok(candidates)
+    }
+
+    // ========================================================================
+    // Bookmark Management (retained legacy tables; sidecar owns annotations)
     // ========================================================================
 
     /// Create a bookmark category
@@ -11480,11 +12594,6 @@ impl Storage {
     /// Get bookmarks, optionally filtered by category
     pub fn get_bookmarks(&self, category_id: Option<i64>) -> Result<Vec<Bookmark>, StorageError> {
         bookmarks::get_bookmarks(&self.conn, category_id)
-    }
-
-    /// Update a bookmark's comment
-    pub fn update_bookmark_comment(&self, id: i64, comment: &str) -> Result<(), StorageError> {
-        bookmarks::update_bookmark_comment(&self.conn, id, comment)
     }
 
     /// Update bookmark fields.
@@ -11631,28 +12740,9 @@ fn is_caller_scope_allowed(scope: TrailCallerScope, caller_file_path: Option<&st
     match scope {
         TrailCallerScope::IncludeTestsAndBenches => true,
         TrailCallerScope::ProductionOnly => caller_file_path
-            .map(|path| !is_test_or_bench_path(path))
+            .map(|path| !FileRole::path_is_test_or_bench(path))
             .unwrap_or(true),
     }
-}
-
-fn is_test_or_bench_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    normalized.starts_with("tests/")
-        || normalized.starts_with("test/")
-        || normalized.starts_with("benches/")
-        || normalized.starts_with("bench/")
-        || normalized.starts_with("__tests__/")
-        || normalized.starts_with("__test__/")
-        || normalized.contains("/tests/")
-        || normalized.contains("/test/")
-        || normalized.contains("/__tests__/")
-        || normalized.contains("/__test__/")
-        || normalized.contains("/benches/")
-        || normalized.contains("/bench/")
-        || normalized.ends_with("_test.rs")
-        || normalized.contains(".test.")
-        || normalized.contains(".spec.")
 }
 
 fn should_ignore_call_resolution(

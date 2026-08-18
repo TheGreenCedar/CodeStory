@@ -430,6 +430,81 @@ fn http_serve_rejects_non_loopback_host_and_origin_headers() {
     );
 }
 
+/// One slow peer must not own the only serving thread.
+///
+/// Optional HTTP serving accepts serially, so the bound that matters is on the
+/// whole request, not on one read. A peer dribbling a byte just inside every
+/// read window renewed the per-read timeout forever and `/health` never
+/// answered; the whole-request deadline ends that peer with a typed 408 and
+/// hands the thread back.
+#[test]
+fn a_dribbling_peer_cannot_hold_the_serial_http_loop_past_the_request_deadline() {
+    let fixture = indexed_fixture();
+    let (_server, addr) = spawn_http_server(&fixture);
+
+    let mut slow = TcpStream::connect(&addr).expect("connect slow peer");
+    slow.set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("slow peer read timeout");
+    write!(slow, "GET /health HTTP/1.1\r\nHost: {addr}\r\n").expect("slow peer preamble");
+    slow.flush().expect("flush slow peer preamble");
+
+    // Never send the blank line that ends the headers, and keep the connection
+    // demonstrably live with a byte well inside the 2s read window.
+    let dribbler = {
+        let mut slow = slow.try_clone().expect("clone slow peer");
+        thread::spawn(move || {
+            for _ in 0..30 {
+                if write!(slow, "X").is_err() || slow.flush().is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+        })
+    };
+
+    let started = Instant::now();
+    let mut response_bytes = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match slow.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => response_bytes.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+            Err(error) => panic!("slow peer read: {error}"),
+        }
+        // Header and body may arrive in separate TCP reads. Keep reading until
+        // the server closes the connection so the typed JSON body is observed.
+    }
+    let elapsed = started.elapsed();
+    let response = String::from_utf8_lossy(&response_bytes).to_string();
+    let _ = dribbler.join();
+
+    assert!(
+        response.starts_with("HTTP/1.1 408 Request Timeout\r\n"),
+        "slow peer should be ended with a typed request-deadline status after {elapsed:?}: \
+         {response:?}"
+    );
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("the 408 must include headers and a body: {response:?}"));
+    let body: Value = serde_json::from_str(body.trim())
+        .unwrap_or_else(|error| panic!("the 408 body must be JSON: {error}: {body:?}"));
+    assert_eq!(
+        body.pointer("/error/code").and_then(Value::as_str),
+        Some("http_request_deadline_exceeded"),
+        "the 408 must carry its typed code: {body}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the whole-request deadline should end the peer promptly, took {elapsed:?}"
+    );
+
+    // The serving thread is back: the route the slow peer was blocking answers.
+    let health = http_get(&addr, "/health").expect("health after the slow peer");
+    assert_eq!(health.status, 200, "{}", health.body);
+    assert_eq!(health.body["ok"], true, "{}", health.body);
+}
+
 fn get_json(addr: &str, target: &str) -> Value {
     let response = http_get(addr, target).unwrap_or_else(|error| panic!("GET {target}: {error}"));
     assert_eq!(
@@ -680,8 +755,17 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
     );
     assert_eq!(
         search.body.pointer("/error/code").and_then(Value::as_str),
-        Some("search_unavailable"),
-        "HTTP /search should return a structured mandatory-sidecar error: {}",
+        Some("retrieval_unavailable"),
+        "HTTP /search must preserve the runtime's machine classification: {}",
+        search.body
+    );
+    assert_eq!(
+        search
+            .body
+            .pointer("/error/details/failed_layer")
+            .and_then(Value::as_str),
+        Some("retrieval_engine"),
+        "HTTP /search must preserve the typed repair details: {}",
         search.body
     );
     assert!(

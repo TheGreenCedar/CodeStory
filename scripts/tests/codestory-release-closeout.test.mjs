@@ -86,7 +86,7 @@ function identityFor(cell, producerRunAttempt = "1") {
           ? "codex_marketplace_install"
           : "managed_plugin";
         break;
-      case "profile": identity[key] = "codestory-release-evidence-linux-arm64-v2"; break;
+      case "profile": identity[key] = "release-evidence-fixture-profile-v1"; break;
       case "corpus_id": identity[key] = "v0.16-axios-js-ts-v1"; break;
       case "cache_id": identity[key] = "cold-full-retrieval-v1"; break;
       case "machine_fingerprint": identity[key] = "fixture/machine"; break;
@@ -181,11 +181,11 @@ function manifestsFor(phase, prePublishLedger = null, { attempt = "1", withheldH
   });
 }
 
-function trustedProducersFor(phase, withheldHost = null) {
+function trustedProducersFor(phase, withheldHost = null, options = {}) {
   const artifactByName = new Map();
-  const attempt = withheldHostList(withheldHost).length > 0
+  const attempt = options.attempt ?? (withheldHostList(withheldHost).length > 0
     ? String(nonClaimPolicy.maximum_run_attempts)
-    : "1";
+    : "1");
   let nextId = 1000;
   const producers = deriveReleaseCells(graph, phase).map((cell) => {
     const withheld = withheldHostOf(withheldHost, cell.id) !== null;
@@ -213,6 +213,9 @@ function trustedProducersFor(phase, withheldHost = null) {
     return {
       cell_id: cell.id,
       ...(withheld ? { non_claim: true } : {}),
+      ...(withheld && options.nonClaimReason !== undefined
+        ? { non_claim_reason: options.nonClaimReason }
+        : {}),
       producer_workflow: constraints.producer_workflow,
       producer_job: constraints.producer_job,
       producer_job_name: constraints.producer_job_name,
@@ -295,7 +298,8 @@ function evaluate(
     trustedExceptionDocument,
     artifactBindings: bindings,
     verifyReuseBinding,
-    resolveCommitIdentity,
+    resolveCommitIdentity:
+      resolveCommitIdentity ?? verifyReuseBinding?.resolveCommitIdentity ?? null,
   });
 }
 
@@ -303,21 +307,28 @@ function evaluate(
 
 const reusedRunId = "777";
 const reusedCommit = "3".repeat(40);
+const sourceReuseTree = "d".repeat(40);
 
 /// Stands in for the git binding proof `main()` runs against the closeout's own checkout.
 function reuseVerifier({
-  // A commit is its own ancestor, so the release commit always satisfies the tree binding.
   ancestors = [reusedCommit, gitIdentity.commit],
-  value = gitIdentity.source_tree,
+  value = sourceReuseTree,
 } = {}) {
-  return ({ binding, releaseCommit, reusedCommit: reused }) => {
+  const verify = ({ binding, releaseCommit, reusedCommit: reused }) => {
     assert.equal(releaseCommit, gitIdentity.commit);
-    if (binding !== "source_tree") throw new Error(`unknown reuse binding ${binding}`);
+    if (binding !== "calibration_source_lineage") {
+      throw new Error(`unknown reuse binding ${binding}`);
+    }
     if (!ancestors.includes(reused)) {
       throw new Error(`reused commit ${reused} is not an ancestor of the release commit`);
     }
     return value;
   };
+  verify.resolveCommitIdentity = (commit) => {
+    if (commit !== reusedCommit) throw new Error(`git cat-file -e ${commit} failed`);
+    return { repository: gitIdentity.repository, commit, source_tree: sourceReuseTree };
+  };
+  return verify;
 }
 
 /// Re-anchor the source cell's producer row onto a prior run, exactly as the producer map does
@@ -328,8 +339,8 @@ function reuseSourceBehavior(trustedProducers, manifests, reusedFrom = {}) {
   row.reused_from = {
     run_id: reusedRunId,
     head_sha: reusedCommit,
-    binding: "source_tree",
-    binding_value: gitIdentity.source_tree,
+    binding: "calibration_source_lineage",
+    binding_value: sourceReuseTree,
     ...reusedFrom,
   };
   row.artifact.workflow_run_id = reusedRunId;
@@ -340,6 +351,7 @@ function reuseSourceBehavior(trustedProducers, manifests, reusedFrom = {}) {
   const manifest = manifests.find(({ cell_id: cellId }) => cellId === "source_behavior");
   manifest.evidence.identity.producer_run_id = reusedRunId;
   manifest.evidence.identity.commit = reusedCommit;
+  manifest.evidence.identity.source_tree = sourceReuseTree;
   return row;
 }
 
@@ -765,16 +777,18 @@ test("a binding-verified reuse row is anchored to the run and commit it was prod
   reuseSourceBehavior(trusted, manifests);
   const calls = [];
   const verify = reuseVerifier();
-  const accepted = evaluate("pre_publish", manifests, null, trusted, null, null, (request) => {
+  const recordingVerifier = (request) => {
     calls.push(request);
     return verify(request);
-  });
+  };
+  recordingVerifier.resolveCommitIdentity = verify.resolveCommitIdentity;
+  const accepted = evaluate("pre_publish", manifests, null, trusted, null, null, recordingVerifier);
   assert.equal(accepted.decision, "accept");
   assert.deepEqual(accepted.summary.input_errors, []);
   assert.deepEqual(accepted.summary.failed_cells, []);
   // The closeout re-proves the binding itself rather than trusting the producer map's word.
   assert.deepEqual(calls, [{
-    binding: "source_tree",
+    binding: "calibration_source_lineage",
     releaseCommit: gitIdentity.commit,
     reusedCommit,
   }]);
@@ -818,7 +832,7 @@ test("a reuse row whose binding the closeout cannot reprove fails closed", () =>
       // A verifier that proves the tree binding cannot prove it here.
       trusted.producers.find(({ cell_id: cellId }) => cellId === "source_behavior")
         .reused_from.binding_value = "e".repeat(40);
-    }, "source_behavior recorded source_tree value does not bind this release"],
+    }, "source_behavior recorded calibration_source_lineage value does not bind this release"],
     ["the reused run identity is malformed", (trusted, manifests) => {
       reuseSourceBehavior(trusted, manifests, { run_id: "0" });
     }, "source_behavior reused run identity is invalid"],
@@ -966,17 +980,19 @@ test("a reuse block naming the publishing run is not reuse", () => {
   trusted.producers.find(({ cell_id: cellId }) => cellId === "source_behavior").reused_from = {
     run_id: trusted.run_id,
     head_sha: gitIdentity.commit,
-    binding: "source_tree",
-    binding_value: gitIdentity.source_tree,
+    binding: "calibration_source_lineage",
+    binding_value: sourceReuseTree,
   };
   manifests.find(({ cell_id: cellId }) => cellId === "source_behavior")
     .evidence.identity.commit = "d".repeat(40);
   const calls = [];
   const verify = reuseVerifier();
-  const rejected = evaluate("pre_publish", manifests, null, trusted, null, null, (request) => {
+  const recordingVerifier = (request) => {
     calls.push(request);
     return verify(request);
-  });
+  };
+  recordingVerifier.resolveCommitIdentity = verify.resolveCommitIdentity;
+  const rejected = evaluate("pre_publish", manifests, null, trusted, null, null, recordingVerifier);
   assert.equal(rejected.decision, "reject");
   assert.ok(rejected.summary.input_errors.some((message) =>
     message.includes("source_behavior reuses evidence from the publishing run")));
@@ -1558,6 +1574,25 @@ test("the post-publish closeout resolves and records which catalog served the re
   // warning in a log that expires.
   assert.notDeepEqual(deferred.ledger.catalog_delivery, published.ledger.catalog_delivery);
 
+  // A successful automatic restore proves the released plugin through its candidate-pinned
+  // fixture, but the ledger must say the public catalog was rolled back. It may never retain the
+  // provisional published state from before the failed live-catalog smoke.
+  const restoredManifests = manifestsFor("post_publish", prePublish.ledger);
+  for (const manifest of restoredManifests) {
+    if (manifest.cell_id.startsWith("installed_runtime_behavior:")) {
+      manifest.evidence.identity.installer = "codex_marketplace_restored_fixture";
+    }
+  }
+  const restored = evaluate("post_publish", restoredManifests, prePublish.ledger);
+  assert.equal(restored.decision, "accept");
+  assert.deepEqual(restored.ledger.catalog_delivery, {
+    state: "restored",
+    installer: "codex_marketplace_restored_fixture",
+    live_catalog_revision: false,
+  });
+  assert.deepEqual(restored.summary.catalog_delivery, restored.ledger.catalog_delivery);
+  assert.notEqual(restored.ledger.catalog_delivery.state, "published");
+
   // The pre-publish closeout has no post-publish installed cells, so it states nothing here
   // rather than inventing a delivery state.
   assert.equal(prePublish.ledger.catalog_delivery, undefined);
@@ -1568,7 +1603,12 @@ test("a post-publish closeout that cannot resolve one catalog delivery state is 
 
   // An installer identity no delivery state declares -- including the pre-publish lane's own
   // candidate installer, which would otherwise sail through as a plausible-looking string.
-  for (const installer of ["candidate_managed_plugin", "managed_plugin", ""]) {
+  for (const installer of [
+    "candidate_managed_plugin",
+    "managed_plugin",
+    "codex_marketplace_restored_fixture_v2",
+    "",
+  ]) {
     const manifests = manifestsFor("post_publish", prePublish.ledger);
     for (const manifest of manifests) {
       if (manifest.cell_id.startsWith("installed_runtime_behavior:")) {
@@ -1596,5 +1636,228 @@ test("a post-publish closeout that cannot resolve one catalog delivery state is 
     rejected.ledger.input_errors.some((message) =>
       message.includes("disagree on the catalog delivery state")),
     JSON.stringify(rejected.ledger.input_errors),
+  );
+});
+
+// ── The typed pre-assignment withhold ───────────────────────────────────────────────────────
+
+const reservationPolicy = nonClaimPolicy.reservation;
+
+function preAssignmentReservationFacts() {
+  return {
+    schema: reservationPolicy.schema,
+    state: "unproven",
+    observation_attempts: reservationPolicy.maximum_observation_attempts,
+    maximum_observation_attempts: reservationPolicy.maximum_observation_attempts,
+  };
+}
+
+/// A run whose Linux proof was never assigned: the reservation receipt typed the host unproven
+/// before dispatch, so everything is recorded at attempt 1 -- there was never a job to re-run.
+function preAssignmentPrePublish(hosts = linuxHost) {
+  const manifests = manifestsFor("pre_publish", null, { attempt: "1", withheldHost: hosts });
+  for (const manifest of manifests) {
+    if (manifest.evidence.status !== "withheld") continue;
+    delete manifest.non_claim.annotation;
+    manifest.non_claim.non_claim_reason = nonClaimPolicy.pre_assignment_reason;
+    manifest.non_claim.reservation = preAssignmentReservationFacts();
+  }
+  return {
+    manifests,
+    trustedProducers: trustedProducersFor("pre_publish", hosts, {
+      attempt: "1",
+      nonClaimReason: nonClaimPolicy.pre_assignment_reason,
+    }),
+  };
+}
+
+test("a host typed unproven before dispatch is withheld at attempt 1 under its own reason", () => {
+  const { manifests, trustedProducers } = preAssignmentPrePublish();
+  const result = evaluate("pre_publish", manifests, null, trustedProducers);
+
+  // Attempt 1 is the point: the proof job never existed, so the run-attempt recovery bound has
+  // nothing to spend, and the receipt's recorded recheck is the bound that was spent instead.
+  assert.equal(result.decision, "accept");
+  assert.deepEqual(
+    result.summary.withheld_cells,
+    ["accelerator_execution:linux-x64-vulkan", "candidate_installed_behavior:linux-x64"],
+  );
+  assert.deepEqual(result.summary.withheld_hosts, ["linux-x64-vulkan"]);
+  const row = result.ledger.cells.find(({ id }) => id === "accelerator_execution:linux-x64-vulkan");
+  assert.equal(row.status, "withheld");
+  assert.equal(row.non_claim.non_claim_reason, "accelerator_host_offline_pre_assignment");
+  assert.equal(row.non_claim.annotation, undefined);
+  assert.equal(row.non_claim.reservation.state, "unproven");
+  assert.equal(
+    row.non_claim.reservation.observation_attempts,
+    reservationPolicy.maximum_observation_attempts,
+  );
+  assert.equal(row.identity.producer_run_attempt, "1");
+
+  // The published notes quote the recorded reason, not the graph default.
+  const out = mkdtempSync(path.join(os.tmpdir(), "codestory-preassign-notes-"));
+  writeReleaseCloseout(out, result);
+  const notes = spawnSync(
+    process.execPath,
+    [
+      path.join(root, "scripts/codestory-release-claims.mjs"),
+      "release-platform-notes",
+      "--ledger",
+      path.join(out, "ledger.json"),
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(notes.status, 0, notes.stderr);
+  assert.match(
+    notes.stdout,
+    /^- Linux x64: Vulkan not proven for this release \(accelerator_host_offline_pre_assignment\)$/mu,
+  );
+});
+
+test("pre-assignment withholds count against the same withheld-hosts cap", () => {
+  const two = nonClaimPolicy.hosts.filter(({ id }) => id !== "windows-x64-vulkan");
+  const { manifests, trustedProducers } = preAssignmentPrePublish(two);
+  const result = evaluate("pre_publish", manifests, null, trustedProducers);
+  assert.equal(result.decision, "reject");
+  assert.ok(
+    result.summary.input_errors.some((message) =>
+      message === "withheld hosts linux-x64-vulkan, macos-arm64-metal exceed the 1-host withhold cap"),
+    JSON.stringify(result.summary.input_errors),
+  );
+});
+
+test("a reason-mismatched withheld manifest is refused in both directions", () => {
+  // The closeout confirmed the pre-assignment route; a manifest recorded under the mid-job
+  // lost-runner reason is describing a different fact.
+  const midJobManifest = preAssignmentPrePublish();
+  for (const manifest of midJobManifest.manifests) {
+    if (manifest.evidence.status !== "withheld") continue;
+    delete manifest.non_claim.reservation;
+    manifest.non_claim.non_claim_reason = nonClaimPolicy.reason;
+    manifest.non_claim.annotation = nonClaimPolicy.annotation;
+    // Even with its own internal bound satisfied, the route mismatch alone must refuse it.
+    manifest.non_claim.run_attempt = withheldAttempt;
+    manifest.evidence.identity.producer_run_attempt = withheldAttempt;
+  }
+  // The producer rows built below carry the manifests' own attempt, so the only disagreement
+  // left standing is the reason itself.
+  const cellId = "accelerator_execution:linux-x64-vulkan";
+  const midJobResult = evaluate(
+    "pre_publish",
+    midJobManifest.manifests,
+    null,
+    trustedProducersFor("pre_publish", linuxHost, {
+      nonClaimReason: nonClaimPolicy.pre_assignment_reason,
+    }),
+  );
+  assert.equal(midJobResult.decision, "reject");
+  assert.ok(
+    midJobResult.evaluations.get(cellId).value.failures.some((message) =>
+      /non_claim_reason must be the accelerator_host_offline_pre_assignment route/u.test(message)),
+    JSON.stringify(midJobResult.evaluations.get(cellId).value.failures),
+  );
+
+  // And the reverse: the closeout confirmed the mid-job route (untagged row), so a manifest
+  // recorded under the pre-assignment reason is refused.
+  const preAssignmentManifests = manifestsFor("pre_publish", null, {
+    attempt: withheldAttempt,
+    withheldHost: linuxHost,
+  });
+  for (const manifest of preAssignmentManifests) {
+    if (manifest.evidence.status !== "withheld") continue;
+    delete manifest.non_claim.annotation;
+    manifest.non_claim.non_claim_reason = nonClaimPolicy.pre_assignment_reason;
+    manifest.non_claim.reservation = preAssignmentReservationFacts();
+  }
+  const reverse = evaluate(
+    "pre_publish",
+    preAssignmentManifests,
+    null,
+    trustedProducersFor("pre_publish", linuxHost),
+  );
+  assert.equal(reverse.decision, "reject");
+  assert.ok(
+    reverse.evaluations.get(cellId).value.failures.some((message) =>
+      /non_claim_reason must be the accelerator_host_unavailable route/u.test(message)),
+    JSON.stringify(reverse.evaluations.get(cellId).value.failures),
+  );
+
+  // A producer map row tagged with an invented reason is refused as an input error.
+  const invented = preAssignmentPrePublish();
+  for (const row of invented.trustedProducers.producers) {
+    if (row.non_claim === true) row.non_claim_reason = "we_were_in_a_hurry";
+  }
+  const inventedResult = evaluate("pre_publish", invented.manifests, null, invented.trustedProducers);
+  assert.equal(inventedResult.decision, "reject");
+  assert.ok(
+    inventedResult.summary.input_errors.some((message) =>
+      /non_claim_reason must be the declared pre-assignment reason/u.test(message)),
+    JSON.stringify(inventedResult.summary.input_errors),
+  );
+});
+
+test("a pre-assignment withheld cell must carry honest receipt facts", () => {
+  const cellId = "accelerator_execution:linux-x64-vulkan";
+  const cases = [
+    ["quoted annotation", (nonClaim) => {
+      nonClaim.annotation = nonClaimPolicy.annotation;
+    }, /annotation is scoped to accelerator_host_unavailable/u],
+    ["missing reservation facts", (nonClaim) => {
+      delete nonClaim.reservation;
+    }, /must carry its reservation receipt facts/u],
+    ["unspent recheck bound", (nonClaim) => {
+      nonClaim.reservation.observation_attempts = 1;
+    }, /observation recheck bound/u],
+    ["softened reservation state", (nonClaim) => {
+      nonClaim.reservation.state = "alive";
+    }, /reservation state must be unproven/u],
+    ["stale reservation schema", (nonClaim) => {
+      nonClaim.reservation.schema = "codestory.protected-runner-reservation/v0";
+    }, /reservation schema must be/u],
+  ];
+  for (const [label, mutate, pattern] of cases) {
+    const { manifests, trustedProducers } = preAssignmentPrePublish();
+    mutate(manifests.find(({ cell_id: id }) => id === cellId).non_claim);
+    const result = evaluate("pre_publish", manifests, null, trustedProducers);
+    assert.equal(result.decision, "reject", label);
+    assert.ok(
+      result.evaluations.get(cellId).value.failures.some((message) => pattern.test(message)),
+      `${label}: ${JSON.stringify(result.evaluations.get(cellId).value.failures)}`,
+    );
+  }
+
+  // A mid-job withheld manifest smuggling reservation facts is refused the same way.
+  const { manifests, trustedProducers } = withheldPrePublish();
+  manifests.find(({ cell_id: id }) => id === cellId).non_claim.reservation =
+    preAssignmentReservationFacts();
+  const smuggled = evaluate("pre_publish", manifests, null, trustedProducers);
+  assert.equal(smuggled.decision, "reject");
+  assert.ok(
+    smuggled.evaluations.get(cellId).value.failures.some((message) =>
+      /reservation facts are scoped to accelerator_host_offline_pre_assignment/u.test(message)),
+    JSON.stringify(smuggled.evaluations.get(cellId).value.failures),
+  );
+});
+
+test("a forged pre-assignment withheld cell without closeout confirmation is refused", () => {
+  // The manifest says withheld; the closeout's own producer map -- built from evidence it
+  // collected itself -- confirmed no withheld route for the cell. The forgery is refused on the
+  // state mismatch, before any of the manifest's own claims are believed.
+  const { manifests } = preAssignmentPrePublish();
+  const unconfirmed = trustedProducersFor("pre_publish", linuxHost, {
+    attempt: "1",
+    nonClaimReason: nonClaimPolicy.pre_assignment_reason,
+  });
+  for (const row of unconfirmed.producers) {
+    delete row.non_claim;
+    delete row.non_claim_reason;
+  }
+  const result = evaluate("pre_publish", manifests, null, unconfirmed);
+  assert.equal(result.decision, "reject");
+  const cellId = "accelerator_execution:linux-x64-vulkan";
+  assert.ok(
+    result.evaluations.get(cellId).value.failures.some((message) =>
+      /withheld state does not match the trusted producer map/u.test(message)),
+    JSON.stringify(result.evaluations.get(cellId).value.failures),
   );
 });

@@ -133,7 +133,7 @@ pub(super) fn drill_degraded_next_action(
     dedupe_and_rank_drill_files(&mut files);
 
     let mut action = "write a CodeStory-only draft".to_string();
-    let pending_claim_count = output.evidence_packet.sufficiency.gaps.len();
+    let pending_claim_count = output.evidence_packet.disposition.omission_receipts.len();
     if pending_claim_count > 0 && degraded_bridge_count > 0 {
         let _ = write!(
             action,
@@ -156,13 +156,14 @@ pub(super) fn drill_degraded_next_action(
         let preview = files.into_iter().take(3).collect::<Vec<_>>().join("; ");
         let _ = write!(action, " including {preview}");
     }
-    if !output
+    if output
         .evidence_packet
-        .sufficiency
-        .follow_up_commands
-        .is_empty()
+        .disposition
+        .drill
+        .as_ref()
+        .is_some_and(|drill| !drill.options.is_empty())
     {
-        action.push_str("; use emitted packet follow-up commands before finalizing");
+        action.push_str("; execute the listed packet drill option ids once before finalizing");
     }
     action
 }

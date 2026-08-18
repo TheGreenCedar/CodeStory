@@ -635,6 +635,18 @@
       "qualification_runs_per_available_gpu_platform": 1
     }
   },
+  "qualification_threshold_override_probes": {
+    "protected_windows_x64_vulkan": {
+      "existing_owner_connect": {
+        "aggregation": "maximum",
+        "connect_poll_interval_ms": 25,
+        "maximum_probe_duration_ms": 90000,
+        "poll_intervals": 5,
+        "qualification_samples_are_selection_inputs": false,
+        "sample_count": 30
+      }
+    }
+  },
   "calibration_bundle_contract": {
     "schema_version": 1,
     "required_for_frozen_qualification": true,

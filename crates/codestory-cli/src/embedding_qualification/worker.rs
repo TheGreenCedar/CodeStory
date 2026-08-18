@@ -1,8 +1,8 @@
 use self::gate::{
     current_process_start_identity, project_identity_sha256, qualification_nonce,
-    read_private_request, required_absolute_directory, sha256_bytes, validate_direct_child,
-    validate_gate_path, validate_private_directory, validate_worker_project, wait_for_gate,
-    worker_error, write_atomic_json,
+    read_private_request, required_absolute_qualification_directory, sha256_bytes,
+    validate_direct_child, validate_gate_path, validate_private_directory, validate_worker_project,
+    wait_for_gate, worker_error, write_atomic_json,
 };
 use self::operations::{
     run_activate_probe, run_cold_race_protocol_exchange, run_dead_client_load,
@@ -27,7 +27,6 @@ mod gate;
 mod operations;
 mod protocol;
 
-const QUALIFICATION_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
 const ANTI_IDLE_PROTOCOL_DEADLINE_MS: u64 = 90_000;
 
 pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> {
@@ -37,7 +36,7 @@ pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> 
     if request.schema_version != EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION {
         bail!("embedding_qualification_worker_schema_invalid");
     }
-    let directory = required_absolute_directory(QUALIFICATION_DIR_ENV)?;
+    let directory = required_absolute_qualification_directory()?;
     validate_private_directory(&directory)?;
     validate_direct_child(&command.request, &directory, true)?;
     validate_direct_child(&command.output, &directory, false)?;
@@ -86,7 +85,7 @@ pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> 
     let inclusive_started_ns = crate::embedding_server_transport::inclusive_now_ns()?;
     let started_ns = clock.now_ns();
     let defaults = crate::sidecar_runtime::process_defaults();
-    let runtime = crate::sidecar_runtime::for_project_auto_with_process_defaults(
+    let runtime = codestory_retrieval::SidecarRuntimeConfig::for_project_auto_with_process_defaults(
         &request.project,
         &defaults,
         &SidecarRuntimeOverrides::default(),

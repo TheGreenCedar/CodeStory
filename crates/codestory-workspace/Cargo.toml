@@ -1,14 +1,20 @@
 [package]
 name = "codestory-workspace"
-version = "0.16.3"
+version = "0.17.0"
 edition = "2024"
+
+[features]
+test-support = []
 
 [dependencies]
 anyhow = { workspace = true }
 codestory-contracts = { workspace = true }
 fs_at = { workspace = true }
 glob = { workspace = true }
+gix = { workspace = true }
 ignore = { workspace = true }
+notify = { workspace = true }
+rayon = { workspace = true }
 remove_dir_all = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,4 +28,4 @@ tempfile = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true }
+windows-sys = { workspace = true, features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_System_IO"] }

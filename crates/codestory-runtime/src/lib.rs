@@ -4,7 +4,6 @@
 //! retrieval sidecar coordination. Packet/search methods are sidecar-primary: degraded retrieval
 //! is surfaced as diagnostics or errors, not as product-equivalent answer evidence.
 
-use crate::agent::packet_evidence::decorate_search_hit_evidence;
 use codestory_contracts::api::{
     AffectedAnalysisBoundsDto, AffectedAnalysisCompletenessDto, AffectedAnalysisDto,
     AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
@@ -12,22 +11,25 @@ use codestory_contracts::api::{
     AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
     AffectedUncoveredInputDto, AffectedUnmatchedPathDto, AgentHybridWeightsDto, ApiError,
     AppEventPayload, EdgeKind, EmbeddingProfileContractDto, FrameworkRouteCoverageDto,
-    GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto,
-    GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingOrientationConfidenceDto,
-    GroundingOrientationDto, GroundingOrientationUncertaintyDto, GroundingSnapshotDto,
-    GroundingSymbolDigestDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
-    IndexFreshnessNotCheckedCauseDto, IndexFreshnessSampleDto, IndexFreshnessStatusDto,
-    IndexedFileRoleDto, IndexingPhaseTimings, NodeDetailsRequest, NodeId, NodeKind,
-    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto,
-    RetrievalStateDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
+    GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
+    GroundingFileDigestDto, GroundingOrientationConfidenceDto, GroundingOrientationDto,
+    GroundingOrientationUncertaintyDto, GroundingSnapshotDto, GroundingSymbolDigestDto,
+    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto,
+    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexPublicationDto, IndexedFileRoleDto,
+    IndexingPhaseTimings, NodeDetailsRequest, NodeId, NodeKind, RepoTextScanStatsDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
+    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
     SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
     SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
     SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
     SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
     SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
     SearchRepoTextMode, SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto,
-    StorageStatsDto, StoredSemanticDocsContractDto, SymbolContextDto, SystemActionResponse,
-    TrailConfigDto, TrailContextDto, WorkspaceMemberIndexDto,
+    StorageStatsDto, StoredSemanticDocsContractDto, SymbolContextDto, TrailConfigDto,
+    TrailContextDto, WorkspaceMemberIndexDto,
+};
+use codestory_contracts::bounded_locks::{
+    self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
 };
 use codestory_contracts::graph::{AccessKind, Edge as GraphEdge, Node as GraphNode};
 use codestory_contracts::language_support::{
@@ -35,8 +37,6 @@ use codestory_contracts::language_support::{
     language_support_profile_for_language_name,
 };
 use codestory_indexer::CancellationToken;
-#[cfg(test)]
-use codestory_store::RetrievalIndexManifest;
 use codestory_store::{
     BUILD_EDGE_SEED_BATCH_SIZE, CURRENT_SCHEMA_VERSION, DenseAnchorInput,
     DenseAnchorInputReuseMetadata, FileInfo, FileRole as StoreFileRole, GroundingEdgeKindCount,
@@ -52,7 +52,6 @@ use codestory_workspace::{
     WorkspaceManifest, WorkspacePathIdentity,
 };
 use crossbeam_channel::{Receiver, Sender};
-use fs4::fs_std::FileExt;
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -87,9 +86,27 @@ mod search_terms;
 mod semantic_projection;
 mod semantic_republish;
 mod snippets;
+mod source_coverage;
 mod workspace_state;
 use affected::{AffectedOperationIdentityIndex, IndexFreshnessObservation};
-pub use agent::{packet_step_trace_json, plan_packet};
+pub use agent::{
+    bind_packet_follow_up_program, enforce_packet_output_budget_for_representation,
+    packet_step_trace_json, plan_packet,
+};
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod agent_test_support {
+    use codestory_contracts::api::{AgentAnswerDto, IndexFreshnessDto, PacketClaimDto};
+
+    pub fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
+        crate::agent::packet_claims::packet_supported_claims_with_telemetry(answer).0
+    }
+
+    pub fn fresh_index_observation() -> IndexFreshnessDto {
+        crate::agent::packet_freshness::fresh_index_observation()
+    }
+}
 use index_commit::*;
 pub(crate) use index_coverage::{
     current_epoch_ms, file_coverage_retryable, full_refresh_execution_plan_with_coverage,
@@ -286,8 +303,10 @@ mod path_resolution;
 pub use path_resolution::resolve_project_file_path_from_root;
 mod process_config;
 pub use process_config::RuntimeProcessConfig;
+mod activation_retrieval;
 mod query_language;
 mod repository_identity;
+mod retrieval_boundary;
 mod search;
 mod search_runtime;
 #[cfg(feature = "benchmark-support")]
@@ -295,18 +314,28 @@ pub mod benchmark_support {
     pub use crate::search::engine::{SearchEngine, SymbolIndexSession, SymbolIndexWriteStats};
 }
 
+mod activation_status;
 mod semantic_doc_text;
 mod services;
 mod support;
 mod symbol_query;
 mod symbol_workflow;
-mod system_actions;
 mod target_resolution;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 mod trail_story;
 
+pub use activation_status::{
+    ReadyLeaseEvidence, RetrievalEngineDiagnostics, RetrievalEngineDiagnosticsError,
+    RetrievalEngineDiagnosticsStage, RetrievalStatusObservation, RetrievalStatusObservationError,
+    RetrievalStatusSelection, process_owner_state, process_start_identity,
+};
 pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
+// Separate export so the pinned read-only-browser boundary line above stays byte-exact for
+// `runtime_exposes_read_only_browser_service_boundary`.
+pub use browser::{SourceRangeRequest, SourceRangeSnippet};
 pub use cache_rehydrate::{CacheRehydrateOutput, CacheRehydrateRequest, rehydrate_cache};
 pub use codestory_contracts as contracts;
 pub(crate) use graph_dto::{
@@ -317,6 +346,16 @@ use path_identity::{OperationPathIdentityResolver, PathIdentityUnavailable};
 pub use query_language::{GraphQueryParseError, parse_graph_query};
 pub use repository_identity::{
     REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentityReport, inspect_repository_identity,
+};
+pub use retrieval_boundary::{
+    CacheCleanPlan, CacheCleanReport, FinalizeIndexOutcome, GenerationRetentionApplyReport,
+    GenerationRetentionPlan, ProcessOwnerState, ProcessStartProbe, QueryResult,
+    RetainedRollbackObservation, RetrievalIndexManifest, RetrievalProcessDefaults,
+    RetrievalRuntimeDefaults, RetrievalRuntimeOverrides, RetrievalStatusReport,
+    RollbackActivationError, RollbackActivationOutcome, RollbackActivationRefusal,
+    RuntimeRetrievalConfig, RuntimeRetrievalProfile, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
+    SidecarGcReport, SidecarInventoryReport, apply_cache_clean,
+    ensure_product_embedding_backend_for_runtime, plan_cache_clean, retrieval_process_defaults,
 };
 pub(crate) use search_runtime::SearchEngine;
 
@@ -353,11 +392,12 @@ use semantic_doc_text::{
 #[doc(hidden)]
 pub use services::set_before_retrieval_pin_test_hook;
 pub use services::{
-    ActivationCapabilities, ActivationCapabilityState, ActivationOperation, ActivationRun,
+    ACTIVATION_QUIESCENCE_FAIL_STOP, ActivationCapabilities, ActivationCapabilityState,
+    ActivationFailStopHook, ActivationOperation, ActivationQuiescence, ActivationRun,
     ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
     ActivePublicOperationPublication, AgentService, BookmarkService, GroundingService,
     IndexService, ProjectService, PublicOperation, PublicOperationService, SearchService,
-    TrailService, embedding_api_error,
+    TrailService, embedding_api_error, set_activation_fail_stop_hook,
 };
 pub use symbol_workflow::{
     SymbolWorkflowCaps, SymbolWorkflowMode, SymbolWorkflowNode, SymbolWorkflowOutcome,
@@ -369,13 +409,16 @@ pub use target_resolution::{
     prefer_function_body_target,
 };
 
+pub(crate) use services::active_public_operation_cancellation;
 pub(crate) use support::{
-    FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES,
-    SEMANTIC_FILE_TEXT_MAX_BYTES, aggregate_symbol_matches, clamp_i64_to_u32, clamp_u64_to_u32,
-    clamp_u128_to_u32, clamp_usize_to_u32, extract_symbol_search_terms, file_text_match_line,
-    hybrid_retrieval_enabled, looks_like_repo_text_query, node_display_name, preferred_occurrence,
-    query_has_symbol_or_literal_signal, read_file_text_limited, read_searchable_file_contents,
-    should_expand_symbol_query,
+    BoundedTextRead, FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV,
+    SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES, SEMANTIC_FILE_TEXT_MAX_BYTES, aggregate_symbol_matches,
+    clamp_i64_to_u32, clamp_u64_to_u32, clamp_u128_to_u32, clamp_usize_to_u32,
+    extract_symbol_search_terms, file_text_match_line, hybrid_retrieval_enabled,
+    looks_like_repo_text_query, node_display_name, preferred_occurrence,
+    query_has_symbol_or_literal_signal, read_file_text_limited,
+    read_searchable_file_contents_limited, should_expand_symbol_query,
+    source_freshness_telemetry_for_operation,
 };
 #[cfg(test)]
 pub(crate) use support::{apply_hybrid_limits, normalized_hybrid_weights};
@@ -386,6 +429,7 @@ pub use symbol_query::{
     normalize_symbol_query, retrieval_file_role_for_hit, retrieval_file_role_from_path,
     symbol_name_match_rank, symbol_query_tokens, terminal_symbol_segment,
 };
+#[allow(unused_imports)]
 pub(crate) use symbol_query::{
     compare_search_hits_with_project_root, exact_symbol_query_terms, is_non_primary_source_term,
     looks_like_standalone_symbol_query, query_mentions_non_primary_source,
@@ -530,6 +574,7 @@ struct AppState {
     node_names: HashMap<codestory_contracts::graph::NodeId, String>,
     search_engine: Option<SearchEngine>,
     search_publication: Option<IndexPublicationRecord>,
+    observed_core_publication: Option<IndexPublicationDto>,
     is_indexing: bool,
     index_freshness_cache: Option<CachedIndexFreshness>,
     #[cfg(test)]
@@ -543,6 +588,7 @@ fn publish_search_engine(
     publication: Option<IndexPublicationRecord>,
 ) {
     state.index_freshness_cache = None;
+    state.observed_core_publication = publication.clone().map(index_publication_dto);
     state.search_engine = Some(engine);
     state.search_publication = publication;
 }
@@ -562,10 +608,40 @@ fn clear_search_engine(state: &mut AppState) {
 pub struct AppController {
     state: Arc<Mutex<AppState>>,
     sidecar_query_cache: Arc<Mutex<SidecarQueryCacheState>>,
+    pub(crate) canonical_symbol_names:
+        Arc<Mutex<crate::agent::retrieval_primary::CanonicalSymbolNamesState>>,
+    source_observer: Arc<Mutex<SourceObserverState>>,
     events_tx: Sender<AppEventPayload>,
     events_rx: Receiver<AppEventPayload>,
     runtime_config: Arc<codestory_retrieval::SidecarRuntimeConfig>,
     source_index_policy: Arc<SourceIndexPolicy>,
+}
+
+/// The filesystem observer this controller has armed, if any.
+///
+/// One session per project root per process. `refused` records a root the platform declined so
+/// the controller does not re-probe an unsupported filesystem on every serving read; that answer
+/// cannot change while the root stays put.
+#[derive(Default)]
+pub(crate) struct SourceObserverState {
+    root: Option<PathBuf>,
+    session: Option<Arc<codestory_workspace::filesystem_observer::FilesystemObserverSession>>,
+    refused: Option<codestory_workspace::filesystem_observer::FilesystemObserverGap>,
+    #[cfg(any(test, feature = "test-support"))]
+    arm_requests: u64,
+}
+
+/// What one armed observer session said about a root at a single moment.
+///
+/// The session id pins *which* observer made the claim, because a re-armed session knows nothing
+/// about the window before it. The epoch is the part that moves: it counts every mutation the
+/// scope filter admitted, so two readings that agree are a positive statement that no admitted
+/// path changed in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedSourceEpoch {
+    session_id: String,
+    backend: &'static str,
+    epoch: codestory_workspace::filesystem_observer::ObserverEpoch,
 }
 
 #[derive(Debug)]

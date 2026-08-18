@@ -110,7 +110,8 @@ admission evaluates only workspace-relative paths and rejects
 generated/vendor, secret-bearing, lockfile, minified, and declared high-noise
 descendants before inventory metadata or content reads. Repository ancestors
 with those names do not affect admission. A structural file is accepted only
-as a complete UTF-8 projection within the 1 MiB and 2,048-unit bounds;
+as a complete UTF-8 projection within the 1 MiB and 2,048-unit bounds
+(policy-carried, and deliberately below the larger parser-backed headroom);
 malformed, binary, unreadable, source-drifted, cancelled, or failed collection
 does not publish reusable units. Cache identity v2 invalidates pre-limit
 artifacts, and cache hits independently enforce the same unit bound.

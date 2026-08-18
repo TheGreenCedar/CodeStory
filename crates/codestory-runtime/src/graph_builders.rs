@@ -1,8 +1,9 @@
 use super::{
-    ApiError, AppController, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse,
-    NodeId, NodeKind, TrailConfigDto, app_graph_flags, graph_canonical, graph_edge_dto,
-    is_structural_kind, member_access_dto, node_display_name,
+    ApiError, AppController, GraphNodeDto, GraphRequest, GraphResponse, NodeId, NodeKind,
+    TrailConfigDto, app_graph_flags, graph_canonical, graph_edge_dto, is_structural_kind,
+    member_access_dto, node_display_name,
 };
+pub(crate) use codestory_agent::trail::is_speculative_trail_edge;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(super) fn graph_neighborhood(
@@ -447,40 +448,13 @@ fn hide_speculative_trail_edges(mut response: GraphResponse) -> GraphResponse {
     response
 }
 
-pub(crate) fn is_speculative_trail_edge(edge: &GraphEdgeDto) -> bool {
-    if is_speculative_certainty_label(edge.certainty.as_deref()) {
-        return true;
-    }
-    is_runtime_bridge_edge(edge.kind)
-        && (is_probable_certainty_label(edge.certainty.as_deref())
-            || edge.confidence.is_some_and(|confidence| {
-                confidence < codestory_contracts::graph::ResolutionCertainty::CERTAIN_MIN
-            }))
-}
-
-fn is_speculative_certainty_label(certainty: Option<&str>) -> bool {
-    matches!(
-        certainty.map(|value| value.to_ascii_lowercase()).as_deref(),
-        Some("uncertain" | "speculative")
-    )
-}
-
-fn is_probable_certainty_label(certainty: Option<&str>) -> bool {
-    certainty
-        .map(|value| value.eq_ignore_ascii_case("probable"))
-        .unwrap_or(false)
-}
-
-fn is_runtime_bridge_edge(kind: EdgeKind) -> bool {
-    matches!(kind, EdgeKind::CALL | EdgeKind::MACRO_USAGE)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use codestory_contracts::api::{
         CanonicalEdgeDto, CanonicalEdgeFamily, CanonicalLayoutDto, CanonicalRouteKind,
     };
+    use codestory_contracts::api::{EdgeKind, GraphEdgeDto};
 
     fn edge(id: i64, source: &str, target: &str) -> GraphEdgeDto {
         GraphEdgeDto {

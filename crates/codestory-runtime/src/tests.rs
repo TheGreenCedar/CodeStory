@@ -3,7 +3,7 @@ use super::{
     BUILD_EDGE_SEED_BATCH_SIZE, CURRENT_SCHEMA_VERSION, CancellationToken,
     DEFAULT_SOURCE_FILE_BYTE_CAP, DENSE_CENTRAL_RELATIONSHIP_THRESHOLD,
     DENSE_CENTRAL_SCORE_THRESHOLD, DIRECT_SNIPPET_MAX_BYTES, DIRECT_SNIPPET_TRUNCATION_SUFFIX,
-    DenseAnchorCentrality, DenseAnchorInput, DenseAnchorReason, FileExt, FileInfo, GraphRequest,
+    DenseAnchorCentrality, DenseAnchorInput, DenseAnchorReason, FileInfo, GraphRequest,
     GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV, HybridSearchConfig, IndexFreshnessStatusDto,
     IndexPublicationRecord, IndexWriterGuard, IndexedFileRoleDto, IndexingPhaseTimings,
     LEGACY_OVERSIZED_SOURCE_POLICY_VERSION, LLM_DOC_EMBED_BATCH_SIZE_ENV,
@@ -64,6 +64,7 @@ use crate::search_plan::{
     search_plan_anchor_groups, search_plan_eligible, search_plan_next_actions,
     search_plan_path_is_test_or_bench, search_plan_rejected_hits,
     search_plan_runtime_call_is_speculative, search_plan_subqueries,
+    select_broad_search_result_breadth,
 };
 use crate::search_publication::{
     SearchGenerationCatalogGuard, prune_search_generations, read_search_generation_completion,
@@ -79,16 +80,22 @@ use crate::search_terms::search_plan_terms;
 use crate::semantic_projection::{
     LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION, SEMANTIC_POLICY_VERSION,
     SemanticProjectionSourcePolicyCompatibility, SemanticProjectionStats,
-    semantic_component_key_for_path, semantic_graph_dependent_file_ids_by_seed,
+    build_component_report_docs_with_policy, build_llm_symbol_doc_text_with_policy,
+    dense_anchor_reason_for_node_with_flow_neighbors, flow_neighbor_edge_is_eligible,
+    retain_bounded_flow_neighbor_candidate, route_endpoint_is_parser_backed,
+    semantic_component_key_for_path, semantic_doc_field_budgets,
+    semantic_file_is_package_callable_surface, semantic_graph_dependent_file_ids_by_seed,
     semantic_projection_source_policy_compatibility,
 };
 use crate::semantic_republish::semantic_projection_republish_for_runtime;
 use crate::snippets::bounded_direct_markdown_snippet;
 use crate::snippets::bounded_markdown_snippet_from_path;
 use codestory_contracts::api::{
-    ArtifactCachePolicyDto, CorePromotionTimings, IndexMode, IndexedFilesRequest,
-    ListRootSymbolsRequest, OpenProjectRequest, StartIndexingRequest,
-    UpdateBookmarkCategoryRequest, WriteFileTextRequest,
+    ArtifactCachePolicyDto, BookmarkOrphanReasonDto, BookmarkResolutionStatusDto,
+    CorePromotionTimings, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
+    IncrementalPlanProbeOutcomeDto, IndexMode, IndexedFilesRequest, ListRootSymbolsRequest,
+    OpenProjectRequest, PromotedValidationDto, StartIndexingRequest, UpdateBookmarkCategoryRequest,
+    UpdateBookmarkRequest, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::FileCoverageReason;
@@ -106,11 +113,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, MutexGuard as StdMutexGuard};
 use std::time::{Duration, Instant};
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 #[path = "tests/activation_coverage_tests.rs"]
 mod activation_coverage_tests;
 
+#[path = "tests/freshness_observer.rs"]
+pub(crate) mod freshness_observer_tests;
 #[path = "tests/repo_text.rs"]
 mod repo_text_tests;
 #[path = "tests/search_intent.rs"]
@@ -249,6 +258,7 @@ fn semantic_projection_source_policy_bridge_is_directional_and_cap_exact() {
     let legacy_runtime = SourceIndexPolicy {
         policy_version: LEGACY_OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
         byte_cap: current.byte_cap,
+        structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
         structural_unit_cap: current.structural_unit_cap,
     };
     assert_eq!(
@@ -624,6 +634,45 @@ fn semantic_doc_token_budget_defaults_to_safe_window() {
     assert!(semantic_doc_shape_contract().contains("max_tokens=128"));
 }
 
+#[test]
+fn semantic_doc_token_budget_matches_the_owning_module_at_the_clamp_floor() {
+    let _lock = process_env_test_lock();
+    // The setting is declared to codestory-retrieval/src/config.rs, which
+    // clamps a below-floor request up to 16. The runtime used to read the
+    // variable itself and reject a zero back to the 128-token default, so the
+    // same environment described a 16-token budget to publication planning and
+    // a 128-token budget to the projection that wrote the docs.
+    let _env = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "0");
+
+    let owner = codestory_retrieval::retrieval_runtime_config_from_process_env();
+    assert_eq!(owner.semantic_doc_max_tokens, 16);
+    assert_eq!(semantic_doc_max_tokens_from_env(), 16);
+}
+
+#[test]
+fn hybrid_retrieval_flag_matches_the_owning_module() {
+    let _lock = process_env_test_lock();
+    // CODESTORY_HYBRID_RETRIEVAL_ENABLED is declared to
+    // codestory-retrieval/src/config.rs. The runtime's query path asks that
+    // module rather than parsing the variable with its own boolean vocabulary.
+    let _env = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "off");
+    assert!(!crate::hybrid_retrieval_enabled());
+    assert_eq!(
+        crate::hybrid_retrieval_enabled(),
+        codestory_retrieval::retrieval_runtime_config_from_process_env().hybrid_enabled
+    );
+
+    let _env = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "sometimes");
+    assert!(
+        crate::hybrid_retrieval_enabled(),
+        "an unreadable value falls back to the owner's default"
+    );
+    assert_eq!(
+        crate::hybrid_retrieval_enabled(),
+        codestory_retrieval::retrieval_runtime_config_from_process_env().hybrid_enabled
+    );
+}
+
 fn pending_semantic_doc_for_test(node_id: i64, doc_text: &str) -> PendingLlmSymbolDoc {
     PendingLlmSymbolDoc {
         node_id: CoreNodeId(node_id),
@@ -677,6 +726,209 @@ fn dense_policy_skips_private_trivial_helpers() {
     );
 
     assert_eq!(reason, None);
+}
+
+#[test]
+fn package_callable_surfaces_accept_relative_roots_without_admitting_tests() {
+    for path in ["lib/application.js", "src/server.js"] {
+        assert!(semantic_file_is_package_callable_surface(Some(path)));
+
+        let node = semantic_policy_node(11, NodeKind::FUNCTION, "handle", 1);
+        let context = semantic_policy_context(path, &node);
+        assert_eq!(
+            dense_anchor_reason_for_node(
+                &context,
+                &node,
+                "handle",
+                Some(path),
+                "semantic_doc_version: 9\nsymbol: handle\n",
+                Some(AccessKind::Private),
+            ),
+            Some(DenseAnchorReason::PublicApi),
+            "top-level package callable surface {path}"
+        );
+    }
+
+    let test_path = "test/lib/application.js";
+    let test_node = semantic_policy_node(12, NodeKind::FUNCTION, "handle", 1);
+    let test_context = semantic_policy_context(test_path, &test_node);
+    assert_eq!(
+        dense_anchor_reason_for_node(
+            &test_context,
+            &test_node,
+            "handle",
+            Some(test_path),
+            "semantic_doc_version: 9\nsymbol: handle\n",
+            Some(AccessKind::Private),
+        ),
+        None,
+        "a package-like segment cannot bypass the non-primary source policy"
+    );
+}
+
+#[test]
+fn semantic_projection_v3_reserves_independent_identity_source_and_graph_budgets() {
+    assert_eq!(semantic_doc_field_budgets(128), [32, 48, 48]);
+    assert_eq!(semantic_doc_field_budgets(16), [4, 6, 6]);
+    assert_eq!(semantic_doc_field_budgets(0), [0, 0, 0]);
+    assert_eq!(semantic_doc_field_budgets(127).iter().sum::<usize>(), 127);
+    assert_eq!(semantic_doc_field_budgets(256), [75, 91, 90]);
+}
+
+#[test]
+fn semantic_projection_v3_flow_neighbor_only_fills_a_missing_base_reason() {
+    let helper = semantic_policy_node(101, NodeKind::FUNCTION, "helper", 1);
+    let public = semantic_policy_node(102, NodeKind::STRUCT, "PublicType", 1);
+    let context = semantic_policy_context("src/lib.rs", &helper);
+    let flow_neighbors = std::collections::HashSet::from([helper.id, public.id]);
+
+    assert_eq!(
+        dense_anchor_reason_for_node_with_flow_neighbors(
+            &context,
+            &helper,
+            "helper",
+            Some("src/internal/helper.rs"),
+            "semantic_doc_version: 9\nsymbol: helper\n",
+            Some(AccessKind::Private),
+            &flow_neighbors,
+        ),
+        Some(DenseAnchorReason::FlowNeighbor)
+    );
+    assert_eq!(
+        dense_anchor_reason_for_node_with_flow_neighbors(
+            &context,
+            &public,
+            "PublicType",
+            Some("src/lib.rs"),
+            "semantic_doc_version: 9\nsymbol: PublicType\n",
+            Some(AccessKind::Public),
+            &flow_neighbors,
+        ),
+        Some(DenseAnchorReason::PublicApi)
+    );
+}
+
+#[test]
+fn semantic_projection_v3_flow_neighbor_admission_is_typed_primary_and_deterministic() {
+    let seed = semantic_policy_node(201, NodeKind::FUNCTION, "seed", 1);
+    let mut candidates = (0..9)
+        .map(|index| {
+            semantic_policy_node(
+                300 + index,
+                NodeKind::FUNCTION,
+                &format!("helper_{}", 8 - index),
+                10 + index,
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.reverse();
+    let mut file_paths = HashMap::from([(CoreNodeId(1), "src/seed.rs".to_string())]);
+    for candidate in &candidates {
+        file_paths.insert(
+            candidate.file_node_id.expect("candidate file"),
+            format!("src/{}.rs", candidate.serialized_name),
+        );
+    }
+    let edge = Edge {
+        id: EdgeId(1),
+        source: seed.id,
+        target: candidates[0].id,
+        kind: EdgeKind::CALL,
+        resolved_target: Some(candidates[0].id),
+        certainty: Some(ResolutionCertainty::Certain),
+        ..Default::default()
+    };
+    assert!(flow_neighbor_edge_is_eligible(
+        &seed,
+        &edge,
+        &candidates[0],
+        &file_paths
+    ));
+    let unresolved = Edge {
+        resolved_target: None,
+        ..edge.clone()
+    };
+    assert!(!flow_neighbor_edge_is_eligible(
+        &seed,
+        &unresolved,
+        &candidates[0],
+        &file_paths
+    ));
+    let test_paths = HashMap::from([(
+        candidates[0].file_node_id.expect("file"),
+        "tests/helper.rs".to_string(),
+    )]);
+    assert!(!flow_neighbor_edge_is_eligible(
+        &seed,
+        &edge,
+        &candidates[0],
+        &test_paths
+    ));
+
+    let mut bounded = Vec::new();
+    for (edge_id, candidate) in candidates.iter().enumerate() {
+        let candidate_edge = Edge {
+            id: EdgeId(100 + edge_id as i64),
+            source: seed.id,
+            target: candidate.id,
+            kind: EdgeKind::CALL,
+            file_node_id: seed.file_node_id,
+            line: candidate.start_line,
+            resolved_target: Some(candidate.id),
+            certainty: Some(ResolutionCertainty::Certain),
+            callsite_identity: candidate
+                .start_line
+                .map(|line| format!("1:{line}:1:{}", candidate.id.0)),
+            ..Default::default()
+        };
+        retain_bounded_flow_neighbor_candidate(
+            &mut bounded,
+            &candidate_edge,
+            candidate,
+            &file_paths,
+        );
+    }
+    retain_bounded_flow_neighbor_candidate(&mut bounded, &edge, &candidates[0], &file_paths);
+    let selected = bounded
+        .iter()
+        .map(|candidate| candidate.node_id())
+        .collect::<Vec<_>>();
+    assert_eq!(selected, (300..308).map(CoreNodeId).collect::<Vec<_>>());
+
+    let mut parser_route = semantic_policy_node(210, NodeKind::FUNCTION, "GET /health", 1);
+    parser_route.canonical_id = Some(
+        r#"route_endpoint:{"claim_tier":"parser_backed","extraction_provenance":"tree_sitter_query"}"#.to_string(),
+    );
+    let route_edge = Edge {
+        source: parser_route.id,
+        target: candidates[0].id,
+        kind: EdgeKind::CALL,
+        certainty: Some(ResolutionCertainty::Probable),
+        ..Default::default()
+    };
+    assert!(route_endpoint_is_parser_backed(&parser_route));
+    assert!(flow_neighbor_edge_is_eligible(
+        &parser_route,
+        &route_edge,
+        &candidates[0],
+        &file_paths
+    ));
+    parser_route.canonical_id = Some(
+        r#"route_endpoint:{"claim_tier":"parser_backed","extraction_provenance":"structural"}"#
+            .to_string(),
+    );
+    assert!(!route_endpoint_is_parser_backed(&parser_route));
+    assert!(!flow_neighbor_edge_is_eligible(
+        &parser_route,
+        &route_edge,
+        &candidates[0],
+        &file_paths
+    ));
+    parser_route.canonical_id = Some(
+        r#"route_endpoint:{"claim_tier":"parser_backed","extraction_provenance":"lexical"}"#
+            .to_string(),
+    );
+    assert!(!route_endpoint_is_parser_backed(&parser_route));
 }
 
 #[test]
@@ -789,7 +1041,7 @@ fn dense_policy_keeps_low_degree_local_functions_and_variables_sparse() {
                 node,
                 &node.serialized_name,
                 Some("src/internal/local.rs"),
-                "semantic_doc_version: 6\nkind: local\n",
+                "semantic_doc_version: 7\nkind: local\n",
                 Some(AccessKind::Private),
             ),
             None
@@ -1025,6 +1277,37 @@ fn component_reports_are_extracted_dense_anchors_with_virtual_ids() {
 }
 
 #[test]
+fn semantic_projection_v3_component_reports_keep_graph_evidence_after_source_compaction() {
+    let node = semantic_policy_node(121, NodeKind::FUNCTION, "central_service", 1);
+    let long_path = format!("src/{}", "very_long_component_path_".repeat(40));
+    let mut context = semantic_policy_context(&long_path, &node);
+    context.centrality.insert(
+        node.id,
+        DenseAnchorCentrality {
+            child_count: 0,
+            related_count: DENSE_CENTRAL_RELATIONSHIP_THRESHOLD,
+            edge_count: DENSE_CENTRAL_SCORE_THRESHOLD,
+        },
+    );
+    let reports = build_component_report_docs_with_policy(
+        &context,
+        &[&node],
+        &std::collections::HashMap::new(),
+        123,
+        SemanticDocAliasMode::NoAlias,
+        128,
+    );
+    let doc = &reports[0].symbol_doc.doc_text;
+    assert!(doc.contains(&format!(
+        "semantic_doc_version: {LLM_SYMBOL_DOC_SCHEMA_VERSION}"
+    )));
+    assert!(
+        doc.contains("god_nodes:"),
+        "current semantic report lost graph fragment: {doc}"
+    );
+}
+
+#[test]
 fn component_reports_group_root_level_source_files() {
     assert_eq!(
         semantic_component_key_for_path(Some("nvm.sh")).as_deref(),
@@ -1112,6 +1395,174 @@ fn semantic_graph_context_keeps_normalized_paths_once_per_file() {
             .symbol_doc
             .doc_text
             .contains("component_report: dir:.")
+    );
+}
+
+#[test]
+fn semantic_graph_text_binds_direction_certainty_and_source_order() {
+    let mut storage = Storage::new_in_memory().expect("storage");
+    let file = Node {
+        id: CoreNodeId(1),
+        kind: NodeKind::FILE,
+        serialized_name: "semantic.rs".to_string(),
+        ..Default::default()
+    };
+    let caller = semantic_policy_node(401, NodeKind::FUNCTION, "Caller", 1);
+    let worker = semantic_policy_node(402, NodeKind::FUNCTION, "Worker", 1);
+    let controller = semantic_policy_node(403, NodeKind::FUNCTION, "Controller", 1);
+    let speculative = semantic_policy_node(404, NodeKind::FUNCTION, "Speculative", 1);
+    let type_record = semantic_policy_node(405, NodeKind::STRUCT, "TypeRecord", 1);
+    let nodes = vec![
+        file,
+        caller.clone(),
+        worker.clone(),
+        controller.clone(),
+        speculative.clone(),
+        type_record.clone(),
+    ];
+    storage.insert_nodes_batch(&nodes).expect("nodes");
+    storage
+        .insert_edges_batch(&[
+            Edge {
+                id: EdgeId(1),
+                source: caller.id,
+                target: worker.id,
+                kind: EdgeKind::CALL,
+                line: Some(40),
+                resolved_target: Some(worker.id),
+                certainty: Some(ResolutionCertainty::Certain),
+                callsite_identity: Some("1:40:5:402".into()),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(2),
+                source: controller.id,
+                target: caller.id,
+                kind: EdgeKind::CALL,
+                line: Some(10),
+                resolved_target: Some(caller.id),
+                certainty: Some(ResolutionCertainty::Probable),
+                callsite_identity: Some("1:10:3:401".into()),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(3),
+                source: caller.id,
+                target: speculative.id,
+                kind: EdgeKind::CALL,
+                line: Some(1),
+                resolved_target: Some(speculative.id),
+                certainty: Some(ResolutionCertainty::Uncertain),
+                callsite_identity: Some("1:1:1:404".into()),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(4),
+                source: caller.id,
+                target: type_record.id,
+                kind: EdgeKind::TYPE_USAGE,
+                line: Some(1),
+                resolved_target: Some(type_record.id),
+                certainty: Some(ResolutionCertainty::Certain),
+                ..Default::default()
+            },
+        ])
+        .expect("edges");
+
+    let context = SemanticDocGraphContext::build(&storage, &[&caller], &nodes).expect("context");
+    assert_eq!(
+        context.typed_relations.get(&caller.id),
+        Some(&vec![
+            "called_by pkg::Controller [probable@line:10:col:3]".to_string(),
+            "calls pkg::Worker [certain@line:40:col:5]".to_string(),
+            "uses_type pkg::TypeRecord [certain@line:1]".to_string(),
+        ])
+    );
+    assert_eq!(
+        context.edge_digests.get(&caller.id),
+        Some(&vec!["CALL=2".to_string(), "TYPE_USAGE=1".to_string()])
+    );
+
+    let doc = build_llm_symbol_doc_text_with_policy(
+        &context,
+        &caller,
+        "Caller",
+        None,
+        &HashMap::new(),
+        SemanticDocAliasMode::NoAlias,
+        256,
+    );
+    assert!(doc.contains("typed_relations: called_by pkg::Controller [probable@line:10:col:3]; calls pkg::Worker [certain@line:40:col:5]; uses_type pkg::TypeRecord [certain@line:1]"));
+    assert!(!doc.contains("Speculative"));
+    assert!(!doc.contains("related_symbols:"));
+}
+
+#[test]
+fn semantic_graph_text_reserves_certain_calls_in_both_directions() {
+    let mut storage = Storage::new_in_memory().expect("storage");
+    let file = Node {
+        id: CoreNodeId(1),
+        kind: NodeKind::FILE,
+        serialized_name: "semantic.rs".to_string(),
+        ..Default::default()
+    };
+    let center = semantic_policy_node(500, NodeKind::FUNCTION, "Center", 1);
+    let incoming = semantic_policy_node(501, NodeKind::FUNCTION, "Incoming", 1);
+    let outgoing = (0..9)
+        .map(|index| {
+            semantic_policy_node(
+                510 + index,
+                NodeKind::FUNCTION,
+                &format!("Outgoing{index}"),
+                1,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut nodes = vec![file, center.clone(), incoming.clone()];
+    nodes.extend(outgoing.iter().cloned());
+    storage.insert_nodes_batch(&nodes).expect("nodes");
+
+    let mut edges = outgoing
+        .iter()
+        .enumerate()
+        .map(|(index, target)| Edge {
+            id: EdgeId(index as i64 + 1),
+            source: center.id,
+            target: target.id,
+            kind: EdgeKind::CALL,
+            line: Some(index as u32 + 1),
+            resolved_target: Some(target.id),
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    edges.push(Edge {
+        id: EdgeId(100),
+        source: incoming.id,
+        target: center.id,
+        kind: EdgeKind::CALL,
+        line: Some(100),
+        resolved_target: Some(center.id),
+        certainty: Some(ResolutionCertainty::Certain),
+        ..Default::default()
+    });
+    storage.insert_edges_batch(&edges).expect("edges");
+
+    let context = SemanticDocGraphContext::build(&storage, &[&center], &nodes).expect("context");
+    let relations = context
+        .typed_relations
+        .get(&center.id)
+        .expect("typed relations");
+    assert_eq!(relations.len(), 8);
+    assert!(
+        relations
+            .iter()
+            .any(|relation| relation.starts_with("called_by pkg::Incoming"))
+    );
+    assert!(
+        relations
+            .iter()
+            .any(|relation| relation.starts_with("calls pkg::Outgoing"))
     );
 }
 
@@ -1402,16 +1853,19 @@ fn semantic_doc_text_adds_kind_role_owner_and_path_alias_context() {
 }
 
 #[test]
-fn semantic_doc_text_keeps_comments_before_long_file_path() {
+fn semantic_doc_text_reserves_signature_and_body_before_comments_without_fragments() {
     let _lock = process_env_test_lock();
     let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
     let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "128");
     let file_path = r"\\?\C:\Users\alber\AppData\Local\Temp\codestory-search-quality-fixture-with-a-long-path\src\architecture.ts";
-    let file_text = r#"// Project source groups create indexing commands and storage access.
-export class SourceGroupCxxCdb {
-  getIndexerCommands() { return []; }
-}
-"#;
+    let oversized_comment = "OVERSIZED_COMMENT_TOKEN".repeat(24);
+    let file_text = format!(
+        r#"// {oversized_comment}
+export class SourceGroupCxxCdb {{
+  getIndexerCommands() {{ return []; }}
+}}
+"#
+    );
     let node = Node {
         id: CoreNodeId(10),
         kind: NodeKind::CLASS,
@@ -1423,7 +1877,7 @@ export class SourceGroupCxxCdb {
         ..Default::default()
     };
     let mut file_text_cache = HashMap::new();
-    file_text_cache.insert(file_path.to_string(), Some(file_text.to_string()));
+    file_text_cache.insert(file_path.to_string(), Some(file_text));
 
     let doc = build_llm_symbol_doc_text(
         &SemanticDocGraphContext::default(),
@@ -1433,11 +1887,20 @@ export class SourceGroupCxxCdb {
         &file_text_cache,
     );
 
+    let signature = doc
+        .find("signature: export class SourceGroupCxxCdb {")
+        .expect("signature");
+    let body = doc
+        .find("body_summary: getIndexerCommands() { return []; }")
+        .expect("body");
+    let comments = doc.find("comments:").expect("comment field");
     assert!(
-        doc.contains(
-            "comments: // Project source groups create indexing commands and storage access."
-        ),
-        "symbol docs should preserve nearby comments before long file paths consume the token budget:\n{doc}"
+        signature < body && body < comments,
+        "source priority changed:\n{doc}"
+    );
+    assert!(
+        !doc.contains("OVERSIZED_COMMENT_TOKEN"),
+        "oversized source tokens must be omitted whole rather than emitted as prefixes:\n{doc}"
     );
 }
 
@@ -1462,8 +1925,12 @@ fn semantic_doc_text_token_budget_respects_configured_limit() {
         "budgeted semantic doc should preserve the leading version field:\n{doc}"
     );
     assert!(
-        doc.contains("symbol: AppController::openProjectWithStoragePath"),
-        "budgeted semantic doc should preserve the symbol identity:\n{doc}"
+        !doc.contains("symbol: App"),
+        "budgeted semantic docs must not emit partial identifier prefixes:\n{doc}"
+    );
+    assert!(
+        doc.contains("file: crates/codestory-runtime/src/lib.rs"),
+        "the independent graph budget should preserve source identity:\n{doc}"
     );
 }
 
@@ -1624,6 +2091,7 @@ fn search_plan_test_hit(
         line: Some(line),
         score: 1.0,
         origin,
+        target: None,
         match_quality: None,
         resolvable,
         evidence_tier: None,
@@ -1851,7 +2319,7 @@ fn run_indexing_without_runtime_refresh_populates_dense_anchor_inputs_in_storage
 }
 
 #[test]
-fn unchanged_incremental_refresh_rebinds_the_complete_dense_anchor_generation() {
+fn publishing_incremental_refresh_rebinds_the_complete_dense_anchor_generation() {
     let _env = hybrid_test_env();
     let workspace = copy_tictactoe_workspace();
     let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -1875,9 +2343,44 @@ fn unchanged_incremental_refresh_rebinds_the_complete_dense_anchor_generation() 
         .expect("first dense manifest");
     drop(first_storage);
 
+    // An empty refresh plan is short-circuited and publishes nothing: the
+    // carried dense anchors stay bound to the still-live publication.
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
         .expect("unchanged incremental index");
+    {
+        let storage = Storage::open(&storage_path).expect("unchanged incremental storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("unchanged publication")
+            .expect("complete unchanged publication");
+        assert_eq!(publication, first_publication);
+        let manifest = storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("unchanged dense manifest");
+        assert_eq!(manifest.anchor_digest, first_manifest.anchor_digest);
+        assert_eq!(manifest.core_run_id, first_manifest.core_run_id);
+        let live_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
+        assert!(
+            storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("carried dense anchors")
+                .iter()
+                .all(|anchor| anchor.source_identity == live_source),
+            "a short-circuited refresh must leave every dense anchor bound to the live publication"
+        );
+    }
+
+    // A refresh with real work rebinds the carried anchors onto the new
+    // publication identity.
+    fs::write(
+        workspace.path().join("dense_anchor_rebind_probe.md"),
+        "# rebind probe\n\nA documented change.\n",
+    )
+    .expect("write changed source");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("publishing incremental index");
     let storage = Storage::open(&storage_path).expect("incremental storage");
     let publication = storage
         .get_complete_index_publication()
@@ -1886,7 +2389,6 @@ fn unchanged_incremental_refresh_rebinds_the_complete_dense_anchor_generation() 
     let manifest = storage
         .validate_dense_anchor_publication(&publication)
         .expect("incremental dense manifest");
-    assert_eq!(manifest.anchor_digest, first_manifest.anchor_digest);
     assert_ne!(manifest.core_run_id, first_manifest.core_run_id);
     let expected_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
     assert!(
@@ -2669,8 +3171,11 @@ fn full_refresh_publishes_structural_unit_exclusion_without_graph_claims() {
         files.policy_exclusions[0].observed_unit_count,
         codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP + 1
     );
-    let workspace_manifest =
-        WorkspaceManifest::open(workspace.path().to_path_buf()).expect("workspace manifest");
+    let workspace_manifest = WorkspaceManifest::open_with_storage_owned_exclusions(
+        workspace.path().to_path_buf(),
+        &storage_path,
+    )
+    .expect("workspace manifest");
     let freshness = index_freshness_from_storage(workspace.path(), &workspace_manifest, &storage);
     assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
     assert_eq!(freshness.changed_file_count, 0);
@@ -2870,6 +3375,7 @@ fn structural_unit_policy_change_invalidates_exclusion_and_forces_reevaluation()
     let excluding_policy = SourceIndexPolicy {
         policy_version: OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
         byte_cap: DEFAULT_SOURCE_FILE_BYTE_CAP,
+        structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
         structural_unit_cap: 2,
     };
     let excluding_controller = AppController::new_with_source_index_policy(
@@ -3072,8 +3578,11 @@ fn first_full_refresh_publishes_verified_oversized_exclusion_without_graph_cover
             .iter()
             .any(|entry| entry.role == IndexedFileRoleDto::Vendor)
     );
-    let workspace_manifest =
-        WorkspaceManifest::open(workspace.path().to_path_buf()).expect("workspace manifest");
+    let workspace_manifest = WorkspaceManifest::open_with_storage_owned_exclusions(
+        workspace.path().to_path_buf(),
+        &storage_path,
+    )
+    .expect("workspace manifest");
     let freshness = index_freshness_from_storage(workspace.path(), &workspace_manifest, &storage);
     assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
     storage
@@ -3303,6 +3812,7 @@ fn non_default_source_policy_cap_is_shared_by_planning_indexer_publication_and_r
         SourceIndexPolicy {
             policy_version: "oversized-source-v2".into(),
             byte_cap: 64,
+            structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
             structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         },
     ] {
@@ -3341,9 +3851,16 @@ fn special_collector_growth_after_planning_cannot_publish() {
     fs::write(&source_path, "CREATE TABLE drifted (id INTEGER);\n")
         .expect("write below-cap structural source");
     let storage_path = workspace.path().join(".cache/codestory.db");
+    // The structural bound has to sit strictly below the parser headroom, or
+    // the generic guard refuses the grown file first and the collector bound
+    // this test is named for is never reached. With both at 64 the test passed
+    // while the structural guard was disabled.
     let controller = AppController::new_with_source_index_policy(
         test_sidecar_runtime_from_env(),
-        SourceIndexPolicy::oversized(64),
+        SourceIndexPolicy {
+            structural_byte_cap: 64,
+            ..SourceIndexPolicy::oversized(4_096)
+        },
     );
     controller
         .open_project_summary_with_storage_path(
@@ -3543,6 +4060,204 @@ fn changed_source_is_reevaluated_into_a_new_verified_exclusion() {
     assert!(changed.observed_size > first_exclusion.observed_size);
 }
 
+/// CAP-1b: a partially parsed file is not "covered".
+///
+/// `ParserPartial` is the one coverage reason that survives publication — both
+/// refresh gates refuse to commit on any other — so it is precisely the defect
+/// a *served* packet can rest on. Reporting such a file `Indexed` would
+/// contradict this contract's own definition of the word, and would leave the
+/// half of the coverage surface that can actually occur doing nothing.
+#[test]
+fn a_partially_parsed_file_is_reported_incomplete_not_indexed() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    let partial = workspace.path().join("job-store.ts");
+    fs::write(
+        &partial,
+        "declare function sql<T>(parts: TemplateStringsArray): T;\n\
+         export const row = sql<unknown>`SELECT 1`;\n",
+    )
+    .expect("write a source the parser only partly understands");
+
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("a parser-partial file must not block publication");
+
+    let observations =
+        crate::source_coverage::observe_source_coverage(&controller, &["job-store.ts".to_string()]);
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0].status,
+        codestory_contracts::api::SourceCoverageStatusDto::Incomplete,
+        "a file with a recorded coverage defect is not covered: {observations:?}"
+    );
+    assert_eq!(
+        observations[0].reason,
+        Some(codestory_contracts::graph::FileCoverageReason::ParserPartial),
+        "{observations:?}"
+    );
+
+    let input =
+        crate::agent::packet_coverage::PacketCoverageInput::from_observations(&observations);
+    assert!(
+        input.caps_sufficiency(),
+        "an incompletely parsed file must stop a packet claiming sufficiency"
+    );
+}
+
+/// CAP-1b: the production path from a citation's path to an exclusion row.
+///
+/// The unit tests for the cap set `source_coverage` directly, so they never
+/// exercise the matching — which is where this change could most easily do
+/// nothing at all. Exclusion rows store a workspace-relative `normalized_path`
+/// while citations carry whatever the retrieval layer produced, so a string
+/// comparison would match on some platforms and silently never match on
+/// others: plumbing complete, tests green, nothing ever capped.
+#[test]
+fn coverage_observation_matches_an_exclusion_by_path_identity() {
+    let _env = hybrid_test_env();
+    let workspace = copy_tictactoe_workspace();
+    let structural = workspace.path().join("docs").join("api.json");
+    fs::create_dir_all(structural.parent().expect("docs dir")).expect("create docs dir");
+    fs::write(&structural, vec![b'x'; 1_300_010]).expect("write oversized structural source");
+
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish complete core");
+
+    // Every spelling a citation might carry for the same file must resolve to
+    // the one exclusion row.
+    for spelling in [
+        "docs/api.json".to_string(),
+        structural.to_string_lossy().to_string(),
+        format!(
+            ".{}docs{}api.json",
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        ),
+    ] {
+        let observations = crate::source_coverage::observe_source_coverage(
+            &controller,
+            std::slice::from_ref(&spelling),
+        );
+        assert_eq!(observations.len(), 1, "{spelling}: {observations:?}");
+        assert_eq!(
+            observations[0].status,
+            codestory_contracts::api::SourceCoverageStatusDto::PolicyExcluded,
+            "spelling {spelling} must resolve to the exclusion row: {observations:?}"
+        );
+        assert_eq!(
+            observations[0].byte_cap,
+            Some(codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP),
+            "the observation must carry the cap that refused the file"
+        );
+    }
+
+    // And two spellings of one file are one file: the packet must not ship the
+    // same gap twice. This is why the dedup compares path identity rather than
+    // strings, like everything else here.
+    let duplicated = crate::source_coverage::observe_source_coverage(
+        &controller,
+        &[
+            "docs/api.json".to_string(),
+            structural.to_string_lossy().to_string(),
+        ],
+    );
+    assert_eq!(
+        duplicated.len(),
+        1,
+        "two spellings of one file must dedup: {duplicated:?}"
+    );
+
+    // Distinct files still get one observation each — the map-not-filter
+    // contract, which the dedup must not quietly break.
+    let distinct = crate::source_coverage::observe_source_coverage(
+        &controller,
+        &["docs/api.json".to_string(), "game.kt".to_string()],
+    );
+    assert_eq!(distinct.len(), 2, "{distinct:?}");
+
+    // A file the index did cover must not be reported as excluded, or the cap
+    // would fire on every packet in the repository.
+    let covered =
+        crate::source_coverage::observe_source_coverage(&controller, &["game.kt".to_string()]);
+    assert_eq!(covered.len(), 1);
+    assert_eq!(
+        covered[0].status,
+        codestory_contracts::api::SourceCoverageStatusDto::Indexed,
+        "{covered:?}"
+    );
+}
+
+#[test]
+fn republishing_projections_keeps_a_structural_exclusion_publishable() {
+    // `codestory retrieval republish-projections` is the documented no-reindex
+    // migration, and it rebinds every pinned exclusion row to the active
+    // policy. While all rows carried the parser headroom that rebinding was a
+    // no-op; once a structural row names its own smaller cap, stamping the
+    // headroom on it makes `observed_size > byte_cap` false, the row stops
+    // qualifying, and publication refuses it on every attempt with no
+    // re-index able to clear it.
+    let _env = hybrid_test_env();
+    let workspace = copy_tictactoe_workspace();
+    let structural = workspace.path().join("docs").join("api.json");
+    fs::create_dir_all(structural.parent().expect("docs dir")).expect("create docs dir");
+    // Between the structural bound and the parser headroom: excluded by
+    // planning, and only classified correctly if the per-kind cap is honoured.
+    fs::write(&structural, vec![b'x'; 1_300_010]).expect("write oversized structural source");
+
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish complete core");
+
+    {
+        let storage = Storage::open(&storage_path).expect("open complete core");
+        let rows = storage
+            .get_source_policy_exclusions()
+            .expect("read published exclusions");
+        let row = rows
+            .iter()
+            .find(|row| row.normalized_path.ends_with("api.json"))
+            .expect("the structural source must be published as an exclusion");
+        assert_eq!(
+            row.byte_cap,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
+            "the row must name the cap that refused it"
+        );
+    }
+
+    // The migration must survive being run, and run twice.
+    for attempt in 1..=2 {
+        controller
+            .republish_semantic_projections_blocking()
+            .unwrap_or_else(|error| panic!("republish attempt {attempt} failed: {error:?}"));
+    }
+}
+
 #[test]
 fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
     let _env = hybrid_test_env();
@@ -3676,7 +4391,7 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
             .get_connection()
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("schema version"),
-        30
+        codestory_store::CURRENT_SCHEMA_VERSION
     );
     assert_eq!(
         storage
@@ -3776,6 +4491,95 @@ fn semantic_projection_republish_fails_closed_when_stored_document_is_missing() 
         Some(before)
     );
     assert_no_staged_publication_artifacts(&storage_path);
+}
+
+#[test]
+fn previous_semantic_body_contract_requires_source_refresh_before_republish() {
+    const UNPROVEN_SOURCE_BODY_DOC_VERSION: u32 = 6;
+
+    let _env = hybrid_test_env();
+    let workspace = copy_tictactoe_workspace();
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish current semantic core");
+
+    let mut storage = Storage::open(&storage_path).expect("open current semantic core");
+    let before = storage
+        .get_complete_index_publication()
+        .expect("read current publication")
+        .expect("complete current publication");
+    let mut retained_docs = storage
+        .get_symbol_search_docs_batch_after(None, 10_000)
+        .expect("read current semantic documents");
+    assert!(
+        !retained_docs.is_empty(),
+        "fixture must contain semantic documents"
+    );
+    for doc in &mut retained_docs {
+        assert_eq!(doc.doc_hash, llm_symbol_doc_hash(&doc.doc_text));
+        assert_eq!(doc.policy_version, SEMANTIC_POLICY_VERSION);
+        doc.doc_version = UNPROVEN_SOURCE_BODY_DOC_VERSION;
+    }
+    let retained_count = retained_docs.len();
+    storage
+        .upsert_symbol_search_docs_batch(&retained_docs)
+        .expect("persist retained pre-cap-provenance semantic documents");
+    drop(storage);
+
+    assert!(
+        controller
+            .complete_core_requires_publication_repair(&storage_path)
+            .expect("inspect retained semantic contract"),
+        "a core whose semantic documents cannot prove the active source cap must require repair"
+    );
+    let error = controller
+        .republish_semantic_projections_blocking()
+        .expect_err("StoredCore republish must not restamp the unproven document contract");
+    assert_eq!(error.code, "semantic_projection_migration_required");
+    assert_eq!(
+        Storage::database_complete_index_publication(&storage_path)
+            .expect("read publication after rejected republish"),
+        Some(before)
+    );
+    assert_no_staged_publication_artifacts(&storage_path);
+
+    let repair = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("repair retained semantic documents from source");
+    let probe = repair
+        .incremental_plan_probe
+        .as_ref()
+        .expect("source-backed repair must report its plan decision");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::SemanticDocContractDrift
+    );
+    assert!(
+        repair.symbol_search_docs_written.unwrap_or(0) >= clamp_usize_to_u32(retained_count),
+        "contract drift must rebuild every semantic document from source"
+    );
+    let repaired = Storage::open(&storage_path).expect("open repaired semantic core");
+    assert!(
+        repaired
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("read repaired semantic documents")
+            .iter()
+            .all(|doc| doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION)
+    );
+    drop(repaired);
+    assert!(
+        !controller
+            .complete_core_requires_publication_repair(&storage_path)
+            .expect("inspect repaired semantic contract")
+    );
 }
 
 #[test]
@@ -5234,6 +6038,7 @@ fn staged_semantic_graph_context_bounds_high_degree_endpoint_state() {
                 source: hub.id,
                 target: CoreNodeId(10_000 + offset),
                 kind: EdgeKind::CALL,
+                certainty: Some(ResolutionCertainty::Certain),
                 ..Default::default()
             })
             .collect::<Vec<_>>(),
@@ -5266,6 +6071,7 @@ fn staged_semantic_graph_context_bounds_high_degree_endpoint_state() {
 
     assert_eq!(streamed.child_labels, legacy.child_labels);
     assert_eq!(streamed.referenced_labels, legacy.referenced_labels);
+    assert_eq!(streamed.typed_relations, legacy.typed_relations);
     assert_eq!(streamed.edge_digests, legacy.edge_digests);
     assert_eq!(streamed.centrality, legacy.centrality);
     assert!(
@@ -5280,18 +6086,26 @@ fn staged_semantic_graph_context_bounds_high_degree_endpoint_state() {
             .get(&hub.id)
             .expect("bounded related labels")
             .len(),
-        6
+        8
+    );
+    assert_eq!(
+        streamed
+            .typed_relations
+            .get(&hub.id)
+            .expect("bounded typed relations")
+            .len(),
+        8
     );
     assert_eq!(
         streamed.edge_digests.get(&hub.id),
-        Some(&vec![format!("CALL={}", INCIDENT_EDGE_COUNT + 1)])
+        Some(&vec![format!("CALL={INCIDENT_EDGE_COUNT}")])
     );
     assert_eq!(
         streamed.centrality.get(&hub.id),
         Some(&DenseAnchorCentrality {
             child_count: 0,
             related_count: INCIDENT_EDGE_COUNT as usize,
-            edge_count: INCIDENT_EDGE_COUNT as usize + 1,
+            edge_count: INCIDENT_EDGE_COUNT as usize,
         })
     );
     assert!(dense_anchor_is_central(&streamed, hub.id));
@@ -5337,6 +6151,7 @@ fn staged_semantic_graph_context_counts_cross_seed_chunk_edge_once_per_endpoint(
             source: nodes[0].id,
             target: nodes[BUILD_EDGE_SEED_BATCH_SIZE].id,
             kind: EdgeKind::USAGE,
+            certainty: Some(ResolutionCertainty::Certain),
             ..Default::default()
         }])
         .expect("insert cross-chunk edge");
@@ -5366,6 +6181,7 @@ fn staged_semantic_graph_context_counts_cross_seed_chunk_edge_once_per_endpoint(
 
     assert_eq!(streamed.child_labels, legacy.child_labels);
     assert_eq!(streamed.referenced_labels, legacy.referenced_labels);
+    assert_eq!(streamed.typed_relations, legacy.typed_relations);
     assert_eq!(streamed.edge_digests, legacy.edge_digests);
     for endpoint in [nodes[0].id, nodes[BUILD_EDGE_SEED_BATCH_SIZE].id] {
         assert_eq!(
@@ -5452,8 +6268,11 @@ fn staged_semantic_stream_matches_legacy_bytes_order_pruning_and_component_repor
             kind: EdgeKind::CALL,
             resolved_target: (*node_id == SYMBOL_COUNT).then_some(CoreNodeId(2)),
             confidence: (*node_id == SYMBOL_COUNT).then_some(0.2),
-            certainty: (*node_id == SYMBOL_COUNT)
-                .then_some(codestory_contracts::graph::ResolutionCertainty::Uncertain),
+            certainty: Some(if *node_id == SYMBOL_COUNT {
+                codestory_contracts::graph::ResolutionCertainty::Uncertain
+            } else {
+                codestory_contracts::graph::ResolutionCertainty::Certain
+            }),
             ..Default::default()
         })
         .collect::<Vec<_>>();
@@ -5694,6 +6513,7 @@ fn embedded_exact_symbol_terms_count_and_annotate_exact_hits() {
         line: Some(1769),
         score: 0.25,
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+        target: None,
         match_quality: None,
         resolvable: true,
         evidence_tier: None,
@@ -6064,6 +6884,7 @@ fn empty_indexing_run_summary() -> IndexingRunSummary {
             published_at_epoch_ms: 1,
         },
         prepared_search_state: None,
+        unchanged_publication: false,
     }
 }
 
@@ -6289,6 +7110,14 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
     assert!(full_promotion.backup_validation_ms.is_none());
     assert!(full_promotion.rollback_backup_bytes.is_none());
     assert!(full_promotion.candidate_bytes > 0);
+    // Whole-database restore publishes a file byte-identical to the candidate
+    // it validated, so the post-restore fence is satisfied by that receipt
+    // rather than by re-deriving the verdict. Any publication design that
+    // assembles the live image in place cannot report this.
+    assert_eq!(
+        full_promotion.promoted_validation,
+        PromotedValidationDto::ReusedCandidateReceipt
+    );
     assert_promotion_reconciles(full_promotion);
     assert_eq!(full_timings.search_projection_rebuild_ms, Some(0));
     assert!(full_timings.search_symbol_stream_ms.is_some());
@@ -6460,6 +7289,10 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
     );
     assert!(incremental_promotion.rollback_backup_copy_ms.is_some());
     assert!(incremental_promotion.backup_validation_ms.is_some());
+    assert_eq!(
+        incremental_promotion.promoted_validation,
+        PromotedValidationDto::ReusedCandidateReceipt
+    );
     assert_promotion_reconciles(incremental_promotion);
     assert_eq!(incremental_timings.search_projection_rebuild_ms, Some(0));
     assert!(incremental_timings.search_symbol_stream_ms.is_some());
@@ -6492,6 +7325,10 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
     assert_eq!(
         second_full_promotion.rollback_backup_bytes,
         second_full_promotion.previous_live_bytes
+    );
+    assert_eq!(
+        second_full_promotion.promoted_validation,
+        PromotedValidationDto::ReusedCandidateReceipt
     );
     assert_promotion_reconciles(second_full_promotion);
     let third = controller
@@ -6739,6 +7576,48 @@ fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_in
         "unreadable replacement changed the prior core publication, structural manifest, or cache identity"
     );
     assert_no_staged_publication_artifacts(&storage_path);
+}
+
+#[test]
+fn full_refresh_excludes_controlled_negative_fixture_but_rejects_production_malformed_source() {
+    let workspace = tempdir().expect("workspace dir");
+    let fixture = workspace
+        .path()
+        .join(".github/scripts/fixtures/actionlint-invalid.yml");
+    fs::create_dir_all(fixture.parent().expect("fixture parent")).expect("create fixture parent");
+    fs::write(workspace.path().join("lib.rs"), "pub fn ready() {}\n").expect("write parser source");
+    fs::write(&fixture, "jobs: [\n").expect("write controlled invalid fixture");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new();
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("controlled negative fixture must not block full publication");
+    Store::database_index_publication(&storage_path)
+        .expect("read publication")
+        .expect("complete publication");
+
+    fs::write(
+        workspace.path().join("production-malformed.json"),
+        "{\"missing_value\":",
+    )
+    .expect("write malformed production source");
+    let error = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect_err("malformed production source must still fail closed");
+    assert_eq!(error.code, "source_malformed");
+    assert!(error.details.as_ref().is_some_and(|details| {
+        details
+            .coverage_gaps
+            .iter()
+            .any(|gap| gap.reason == FileCoverageReason::Malformed)
+    }));
 }
 
 #[test]
@@ -7466,8 +8345,14 @@ fn incremental_publication_ignores_changed_files_without_graph_collectors() {
         "pub fn first_value() -> i32 { 1 }\n",
     )
     .expect("write source");
-    let unsupported = workspace.path().join("notes.txt");
-    fs::write(&unsupported, "Initial notes\n").expect("write unsupported file");
+    // `.scss` is a companion extension: the policy-aware inventory admits it
+    // into the refresh plan (`has_supported_source_route`), but no parser,
+    // template, structural, or text-only collector claims it, so indexing it
+    // is required to invent no graph structure. A `.txt` fixture cannot prove
+    // this: unsupported extensions are filtered from discovery before the
+    // plan, so the file never appears in `files_to_index` at all.
+    let collectorless = workspace.path().join("styles.scss");
+    fs::write(&collectorless, ".initial { color: red; }\n").expect("write collectorless file");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
     let controller = AppController::new();
     controller
@@ -7485,20 +8370,33 @@ fn incremental_publication_ignores_changed_files_without_graph_collectors() {
         .expect("read first publication")
         .expect("first publication identity");
 
-    fs::write(&unsupported, "Updated notes\n").expect("update unsupported file");
+    // A different byte length plus an explicitly advanced mtime keeps the
+    // change visible even where filesystem timestamp granularity would let a
+    // same-length same-instant rewrite go unnoticed.
+    fs::write(&collectorless, ".updated { color: rebeccapurple; }\n")
+        .expect("update collectorless file");
+    fs::File::options()
+        .write(true)
+        .open(&collectorless)
+        .expect("open changed collectorless file")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() + Duration::from_secs(2)),
+        )
+        .expect("advance changed collectorless mtime");
     let dry_run = controller
         .dry_run_index(IndexMode::Incremental)
-        .expect("plan unsupported file refresh");
+        .expect("plan collectorless file refresh");
     assert!(
         dry_run
             .sample_files_to_index
             .iter()
-            .any(|path| path == "notes.txt"),
+            .any(|path| path == "styles.scss"),
         "the regression must exercise a discovered file in the refresh plan: {dry_run:?}"
     );
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-        .expect("incremental publication after unsupported file change");
+        .expect("incremental publication after collectorless file change");
     let second = controller
         .index_publication()
         .expect("read second publication")
@@ -7509,8 +8407,8 @@ fn incremental_publication_ignores_changed_files_without_graph_collectors() {
     assert!(
         Storage::open(&storage_path)
             .expect("open published storage")
-            .get_file_by_path(&unsupported)
-            .expect("look up unsupported file")
+            .get_file_by_path(&collectorless)
+            .expect("look up collectorless file")
             .is_none(),
         "files without graph collectors should not be invented in semantic scope"
     );
@@ -7921,6 +8819,502 @@ fn assert_incremental_boundary_is_atomic(boundary: IncrementalFailureBoundary) {
         baseline_publication.generation + 1
     );
     assert_eq!(retried_publication.mode, IndexPublicationMode::Incremental);
+}
+
+struct EmptyPlanShortCircuitFixture {
+    _workspace: tempfile::TempDir,
+    controller: AppController,
+    storage_path: PathBuf,
+    source_path: PathBuf,
+    baseline_publication: IndexPublicationRecord,
+    baseline_search_generations: Vec<String>,
+}
+
+fn publish_empty_plan_short_circuit_baseline() -> EmptyPlanShortCircuitFixture {
+    let workspace = tempdir().expect("workspace dir");
+    let source_path = workspace.path().join("lib.rs");
+    fs::write(&source_path, "pub fn steady_state() -> i32 { 1 }\n").expect("write baseline source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new();
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open short-circuit project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish short-circuit baseline");
+    let baseline_publication = Storage::open(&storage_path)
+        .expect("open baseline storage")
+        .get_complete_index_publication()
+        .expect("read baseline publication record")
+        .expect("complete baseline publication record");
+    let baseline_search_generations = persisted_search_generation_names(&storage_path);
+    assert_eq!(
+        baseline_search_generations.len(),
+        1,
+        "the baseline must publish exactly one completed search generation"
+    );
+    EmptyPlanShortCircuitFixture {
+        _workspace: workspace,
+        controller,
+        storage_path,
+        source_path,
+        baseline_publication,
+        baseline_search_generations,
+    }
+}
+
+#[test]
+fn unchanged_incremental_refresh_short_circuits_without_publishing_or_rebuilding_search() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("unchanged incremental refresh");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::ShortCircuited,
+        "an unchanged workspace must resolve to the short-circuit outcome: {probe:?}"
+    );
+    assert_eq!(probe.files_to_index, 0);
+    assert_eq!(probe.files_to_remove, 0);
+    assert_eq!(
+        probe.skipped_database_copies, 3,
+        "skipping the staged pipeline avoids the staged clone, the rollback backup copy, and the staged-to-live restore"
+    );
+    assert!(probe.skipped_search_state_rebuild);
+    assert!(
+        probe.live_database_file_bytes > 0,
+        "the saved work must be measured against the published core size"
+    );
+    assert_eq!(
+        probe.skipped_database_copy_bytes,
+        probe.live_database_file_bytes * 3
+    );
+    assert_eq!(
+        timings.publish_ms, None,
+        "a short-circuited refresh must not record a publication"
+    );
+    assert_eq!(timings.staged_snapshot_copy, None);
+    assert_eq!(timings.core_promotion, None);
+    assert_eq!(
+        timings.cache_refresh_ms, None,
+        "a short-circuited refresh must not enter the runtime cache rebuild at all"
+    );
+    assert!(
+        !fixture.controller.state.lock().is_indexing,
+        "a short-circuited refresh must release the indexing state"
+    );
+
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    assert_eq!(
+        storage
+            .get_complete_index_publication()
+            .expect("read post-refresh publication"),
+        Some(fixture.baseline_publication.clone()),
+        "a short-circuited refresh must leave the published core generation in place"
+    );
+    assert!(
+        !storage
+            .has_incomplete_incremental_run()
+            .expect("read post-refresh incremental marker"),
+        "a short-circuited refresh must not leave a recovery marker behind"
+    );
+    drop(storage);
+    assert_eq!(
+        persisted_search_generation_names(&fixture.storage_path),
+        fixture.baseline_search_generations,
+        "a short-circuited refresh must not build a new search generation"
+    );
+    assert_no_staged_publication_artifacts(&fixture.storage_path);
+}
+
+#[test]
+fn changed_incremental_refresh_publishes_and_reports_the_probe_as_overhead() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    fs::write(&fixture.source_path, "pub fn steady_state() -> i32 { 2 }\n").expect("change source");
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("changed incremental refresh");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::PlanNotEmpty,
+        "a changed workspace must not be reported as short-circuited: {probe:?}"
+    );
+    assert_eq!(probe.files_to_index, 1);
+    assert_eq!(probe.skipped_database_copies, 0);
+    assert_eq!(probe.skipped_database_copy_bytes, 0);
+    assert!(!probe.skipped_search_state_rebuild);
+    assert!(
+        timings.publish_ms.is_some(),
+        "a changed workspace must still publish"
+    );
+    assert!(
+        timings.cache_refresh_ms.is_some(),
+        "a changed workspace must still run the runtime cache rebuild"
+    );
+
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    let published = storage
+        .get_complete_index_publication()
+        .expect("read post-refresh publication")
+        .expect("complete post-refresh publication");
+    assert_eq!(
+        published.generation,
+        fixture.baseline_publication.generation + 1
+    );
+    assert_eq!(published.mode, IndexPublicationMode::Incremental);
+    drop(storage);
+    assert_ne!(
+        persisted_search_generation_names(&fixture.storage_path),
+        fixture.baseline_search_generations,
+        "a changed workspace must build a new search generation"
+    );
+}
+
+#[test]
+fn incremental_refresh_republishes_when_the_completed_search_generation_is_missing() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    let generation_root = search_index_generation_root(&fixture.storage_path);
+    for name in &fixture.baseline_search_generations {
+        fs::remove_dir_all(generation_root.join(name)).expect("remove completed search generation");
+    }
+    assert!(persisted_search_generation_names(&fixture.storage_path).is_empty());
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh without a reusable search generation");
+
+    let rebuilt = persisted_search_generation_names(&fixture.storage_path);
+    assert_eq!(
+        rebuilt.len(),
+        1,
+        "the refresh must rebuild the missing search generation: {rebuilt:?}"
+    );
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    assert_eq!(
+        storage
+            .get_complete_index_publication()
+            .expect("read post-refresh publication")
+            .expect("complete post-refresh publication")
+            .generation,
+        fixture.baseline_publication.generation + 1
+    );
+    drop(storage);
+    assert!(timings.publish_ms.is_some());
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete,
+        "an empty plan must not short-circuit when the published search generation is gone: {probe:?}"
+    );
+    assert_eq!(probe.skipped_database_copies, 0);
+    assert!(!probe.skipped_search_state_rebuild);
+}
+
+#[test]
+fn incremental_refresh_republishes_when_the_dense_anchor_manifest_is_missing() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    Storage::open(&fixture.storage_path)
+        .expect("open live storage")
+        .get_connection()
+        .execute_batch("DELETE FROM dense_anchor_publication;")
+        .expect("clear dense anchor manifest");
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh without a dense anchor manifest");
+
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    assert!(
+        storage
+            .get_dense_anchor_publication_manifest()
+            .expect("read rebuilt dense anchor manifest")
+            .is_some(),
+        "the refresh must republish the dense anchor manifest it could not reuse"
+    );
+    assert_eq!(
+        storage
+            .get_complete_index_publication()
+            .expect("read post-refresh publication")
+            .expect("complete post-refresh publication")
+            .generation,
+        fixture.baseline_publication.generation + 1
+    );
+    drop(storage);
+    assert!(timings.publish_ms.is_some());
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::DenseAnchorManifestMissing,
+        "an empty plan must not short-circuit while a complete dense anchor rebuild is owed: {probe:?}"
+    );
+}
+
+#[test]
+fn incremental_refresh_republishes_when_the_source_policy_byte_cap_changes() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    let workspace_root = fixture
+        .source_path
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    // The whole point of the regression: a repository with no oversized files
+    // has an empty exclusion set under both the old and the new policy, so a
+    // row-only comparison is trivially satisfied.
+    assert!(
+        Storage::open(&fixture.storage_path)
+            .expect("open baseline storage")
+            .get_source_policy_exclusions()
+            .expect("read baseline exclusions")
+            .is_empty(),
+        "the fixture must carry no oversized-source exclusions"
+    );
+
+    let changed_policy = SourceIndexPolicy::oversized(DEFAULT_SOURCE_FILE_BYTE_CAP / 2);
+    assert_ne!(
+        changed_policy.byte_cap,
+        SourceIndexPolicy::default().byte_cap
+    );
+    let controller = AppController::new_with_source_index_policy(
+        codestory_retrieval::SidecarRuntimeConfig::local(),
+        changed_policy,
+    );
+    controller
+        .open_project_summary_with_storage_path(workspace_root, fixture.storage_path.clone())
+        .expect("open the published core under the changed policy");
+    assert!(
+        controller
+            .complete_core_requires_publication_repair(&fixture.storage_path)
+            .expect("read publication repair readiness under the changed policy"),
+        "a policy change must leave the published exclusion manifest owing a repair"
+    );
+
+    let timings = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh under the changed policy");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::SourcePolicyPublicationStale,
+        "an empty plan must not short-circuit while the exclusion manifest is bound to a superseded policy: {probe:?}"
+    );
+    assert_eq!(probe.files_to_index, 0);
+    assert_eq!(probe.files_to_remove, 0);
+    assert_eq!(probe.skipped_database_copies, 0);
+    assert!(timings.publish_ms.is_some());
+    assert_eq!(
+        Storage::open(&fixture.storage_path)
+            .expect("open post-refresh storage")
+            .get_complete_index_publication()
+            .expect("read post-refresh publication")
+            .expect("complete post-refresh publication")
+            .generation,
+        fixture.baseline_publication.generation + 1,
+        "the prescribed `index --refresh incremental` repair must republish"
+    );
+    assert!(
+        !controller
+            .complete_core_requires_publication_repair(&fixture.storage_path)
+            .expect("read publication repair readiness after the repair"),
+        "the repair must leave the published core readable under the current policy"
+    );
+}
+
+#[test]
+fn incremental_refresh_refuses_an_empty_plan_over_a_stored_coverage_gap() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    // An indexed file published without verified content and without completion
+    // is a stored `CollectorFailure` gap. It does not schedule any work, so only
+    // the coverage check stands between it and a successful refresh.
+    Storage::open(&fixture.storage_path)
+        .expect("open live storage")
+        .get_connection()
+        .execute_batch(
+            "UPDATE file SET complete = 0, content_hash = NULL WHERE path LIKE '%lib.rs';",
+        )
+        .expect("stage a stored coverage gap");
+
+    let error = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect_err("an incremental refresh must refuse a stored coverage gap");
+
+    assert_eq!(error.code, "source_collector_failure");
+    let coverage_gaps = error
+        .details
+        .as_ref()
+        .map(|details| details.coverage_gaps.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        coverage_gaps.len(),
+        1,
+        "the refusal must carry the gap it could not verify: {coverage_gaps:?}"
+    );
+    assert_eq!(
+        coverage_gaps[0].reason,
+        FileCoverageReason::CollectorFailure
+    );
+    assert_eq!(
+        Storage::open(&fixture.storage_path)
+            .expect("open post-refusal storage")
+            .get_complete_index_publication()
+            .expect("read post-refusal publication"),
+        Some(fixture.baseline_publication.clone()),
+        "a refused refresh must preserve the previous complete publication"
+    );
+    assert_no_staged_publication_artifacts(&fixture.storage_path);
+}
+
+#[test]
+fn incremental_refresh_rebinds_a_dense_anchor_carrying_a_stale_source_identity() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    let live_source = format!(
+        "core:{}:{}",
+        fixture.baseline_publication.generation_id, fixture.baseline_publication.run_id
+    );
+    {
+        let storage = Storage::open(&fixture.storage_path).expect("open live storage");
+        assert!(
+            !storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("read baseline dense anchors")
+                .is_empty(),
+            "the fixture must publish at least one dense anchor to drift"
+        );
+        // Per-row source identity is outside the manifest digest, so count and
+        // digest still match: only the strict publication validation sees this.
+        storage
+            .get_connection()
+            .execute_batch(
+                "UPDATE dense_anchor_input SET source_identity = 'core:stale-generation:stale-run'
+                 WHERE node_id = (SELECT MIN(node_id) FROM dense_anchor_input);",
+            )
+            .expect("stage a stale dense anchor source identity");
+        assert!(
+            storage
+                .validate_dense_anchor_publication(&fixture.baseline_publication)
+                .is_err(),
+            "the staged drift must be visible to the strict publication validation"
+        );
+    }
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh over drifted dense anchors");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::DenseAnchorPublicationStale,
+        "an empty plan must not short-circuit over a dense anchor publication readers refuse: {probe:?}"
+    );
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    let publication = storage
+        .get_complete_index_publication()
+        .expect("read post-refresh publication")
+        .expect("complete post-refresh publication");
+    assert_eq!(
+        publication.generation,
+        fixture.baseline_publication.generation + 1
+    );
+    storage
+        .validate_dense_anchor_publication(&publication)
+        .expect("the repair must leave a dense anchor publication readers accept");
+    let repaired_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
+    assert_ne!(repaired_source, live_source);
+    assert!(
+        storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("read repaired dense anchors")
+            .iter()
+            .all(|anchor| anchor.source_identity == repaired_source),
+        "the repair must rebind every anchor onto the republished identity"
+    );
+}
+
+#[test]
+fn incremental_refresh_adjudicates_mixed_dense_anchor_policy_versions() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    // `publish_dense_anchor_generation` refuses a mixed anchor policy set. That
+    // refusal is unreachable on a short-circuited run, so the mixed set must at
+    // minimum reach the staged pipeline that owns it.
+    Storage::open(&fixture.storage_path)
+        .expect("open live storage")
+        .get_connection()
+        .execute_batch(
+            "UPDATE dense_anchor_input SET policy_version = 'superseded-anchor-policy'
+             WHERE node_id = (SELECT MIN(node_id) FROM dense_anchor_input);",
+        )
+        .expect("stage a mixed dense anchor policy version");
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh over a mixed anchor policy set");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::DenseAnchorPublicationStale,
+        "an empty plan must not short-circuit over a mixed anchor policy set: {probe:?}"
+    );
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    let publication = storage
+        .get_complete_index_publication()
+        .expect("read post-refresh publication")
+        .expect("complete post-refresh publication");
+    assert_eq!(
+        publication.generation,
+        fixture.baseline_publication.generation + 1
+    );
+    storage
+        .validate_dense_anchor_publication(&publication)
+        .expect("the staged pipeline must leave one accepted anchor policy behind");
+    assert!(
+        storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("read post-refresh dense anchors")
+            .iter()
+            .all(|anchor| anchor.policy_version == SEMANTIC_POLICY_VERSION),
+        "no anchor may keep the superseded policy version"
+    );
 }
 
 #[test]
@@ -9400,4 +10794,774 @@ fn update_bookmark_category_returns_not_found_when_missing() {
         .expect_err("missing category should return not_found");
 
     assert_eq!(err.code, "not_found");
+}
+
+struct AnnotationProject {
+    _workspace: TempDir,
+    root: PathBuf,
+    source_path: PathBuf,
+    storage_path: PathBuf,
+    controller: AppController,
+}
+
+impl AnnotationProject {
+    fn open(source: &str) -> Self {
+        let workspace = tempdir().expect("workspace dir");
+        let root = workspace.path().to_path_buf();
+        let source_path = root.join("lib.rs");
+        fs::write(&source_path, source).expect("write source");
+        let storage_path = root.join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(root.clone(), storage_path.clone())
+            .expect("open annotation project");
+        Self {
+            _workspace: workspace,
+            root,
+            source_path,
+            storage_path,
+            controller,
+        }
+    }
+
+    fn index(&self) {
+        self.controller
+            .run_indexing_blocking(IndexMode::Full)
+            .expect("index annotation project");
+        self.controller
+            .open_project_summary_with_storage_path(self.root.clone(), self.storage_path.clone())
+            .expect("reopen annotation project");
+    }
+
+    /// Drive the sibling asynchronous entry point rather than the blocking one.
+    fn index_async(&self) {
+        let events = self.controller.events();
+        self.controller
+            .start_indexing(StartIndexingRequest {
+                mode: IndexMode::Full,
+            })
+            .expect("start asynchronous full refresh");
+        loop {
+            match events
+                .recv_timeout(Duration::from_secs(120))
+                .expect("asynchronous indexing terminal event")
+            {
+                AppEventPayload::IndexingComplete { .. } => break,
+                AppEventPayload::IndexingFailed { error } => {
+                    panic!("asynchronous full refresh failed: {error}")
+                }
+                _ => {}
+            }
+        }
+        self.controller
+            .open_project_summary_with_storage_path(self.root.clone(), self.storage_path.clone())
+            .expect("reopen annotation project");
+    }
+
+    fn write(&self, relative: &str, source: &str) {
+        fs::write(self.root.join(relative), source).expect("write source");
+    }
+
+    /// Seed the retained core tables the way a pre-cutover release would have.
+    fn seed_legacy_bookmark(&self, symbol: &str, comment: &str) -> i64 {
+        let node_id = self.node_id_for(symbol).to_core().expect("core node id");
+        let storage = Storage::open(&self.storage_path).expect("open core");
+        let category_id = storage
+            .create_bookmark_category("Legacy")
+            .expect("legacy category");
+        storage
+            .add_bookmark(category_id, node_id, Some(comment))
+            .expect("legacy bookmark")
+    }
+
+    fn sidecar_path(&self) -> PathBuf {
+        codestory_contracts::owned_artifacts::annotations_sidecar_path(&self.storage_path)
+    }
+
+    fn node_id_for(&self, name: &str) -> codestory_contracts::api::NodeId {
+        let storage = Storage::open(&self.storage_path).expect("open core");
+        let node = storage
+            .get_nodes()
+            .expect("read nodes")
+            .into_iter()
+            .find(|node| node.serialized_name == name)
+            .unwrap_or_else(|| panic!("no node named {name}"));
+        codestory_contracts::api::NodeId::from(node.id)
+    }
+
+    fn bookmark(&self, name: &str) -> codestory_contracts::api::BookmarkDto {
+        let category = self
+            .controller
+            .create_bookmark_category(CreateBookmarkCategoryRequest {
+                name: "Favorites".to_string(),
+            })
+            .expect("create category");
+        self.controller
+            .create_bookmark(CreateBookmarkRequest {
+                category_id: category.id,
+                node_id: self.node_id_for(name),
+                comment: Some("keep".to_string()),
+            })
+            .expect("create bookmark")
+    }
+
+    fn legacy_row_counts(&self) -> (i64, i64) {
+        let storage = Storage::open(&self.storage_path).expect("open core");
+        let categories = storage
+            .get_connection()
+            .query_row("SELECT COUNT(*) FROM bookmark_category", [], |row| {
+                row.get(0)
+            })
+            .expect("legacy category count");
+        let bookmarks = storage
+            .get_connection()
+            .query_row("SELECT COUNT(*) FROM bookmark_node", [], |row| row.get(0))
+            .expect("legacy bookmark count");
+        (categories, bookmarks)
+    }
+}
+
+#[test]
+fn observational_annotation_paths_never_materialize_the_sidecar() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+
+    assert!(
+        project
+            .controller
+            .list_bookmark_categories()
+            .expect("list categories")
+            .is_empty()
+    );
+    assert!(
+        project
+            .controller
+            .list_bookmarks(None)
+            .expect("list bookmarks")
+            .is_empty()
+    );
+    assert!(
+        !project.sidecar_path().exists(),
+        "project-open and listing must stay observational"
+    );
+
+    project.index();
+    assert!(
+        !project.sidecar_path().exists(),
+        "indexing a project with no annotations must not create the sidecar"
+    );
+}
+
+#[test]
+fn the_cutover_imports_legacy_annotations_once_and_never_writes_them_again() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    // Seed the retained core tables the way a pre-cutover release would have.
+    let node_id = project
+        .node_id_for("alpha")
+        .to_core()
+        .expect("core node id");
+    {
+        let storage = Storage::open(&project.storage_path).expect("open core");
+        let category_id = storage
+            .create_bookmark_category("Legacy")
+            .expect("legacy category");
+        storage
+            .add_bookmark(category_id, node_id, Some("legacy note"))
+            .expect("legacy bookmark");
+    }
+    let legacy_before = project.legacy_row_counts();
+    assert_eq!(legacy_before, (1, 1));
+
+    // Reading still sees the legacy rows while the sidecar does not exist.
+    assert_eq!(
+        project
+            .controller
+            .list_bookmarks(None)
+            .expect("pre-cutover read")
+            .len(),
+        1
+    );
+    assert!(!project.sidecar_path().exists());
+
+    // The first annotation write cuts over.
+    let category = project
+        .controller
+        .create_bookmark_category(CreateBookmarkCategoryRequest {
+            name: "Favorites".to_string(),
+        })
+        .expect("create category");
+    assert!(project.sidecar_path().is_file());
+    let migrated = project
+        .controller
+        .list_bookmarks(None)
+        .expect("post-cutover read");
+    assert_eq!(migrated.len(), 1);
+    assert_eq!(migrated[0].comment.as_deref(), Some("legacy note"));
+    assert_eq!(
+        migrated[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+    assert!(
+        codestory_contracts::owned_artifacts::annotations_migration_backup_path(
+            &project.storage_path
+        )
+        .is_file(),
+        "the pre-migration backup must be retained"
+    );
+
+    let created = project
+        .controller
+        .create_bookmark(CreateBookmarkRequest {
+            category_id: category.id.clone(),
+            node_id: project.node_id_for("alpha"),
+            comment: None,
+        })
+        .expect("create bookmark");
+    project
+        .controller
+        .update_bookmark(
+            &created.id,
+            UpdateBookmarkRequest {
+                category_id: None,
+                comment: Some(Some("edited".to_string())),
+            },
+        )
+        .expect("update bookmark");
+    project
+        .controller
+        .delete_bookmark(&created.id)
+        .expect("delete bookmark");
+
+    assert_eq!(
+        project.legacy_row_counts(),
+        legacy_before,
+        "retained legacy tables must receive no writes after the cutover"
+    );
+    assert_eq!(
+        project
+            .controller
+            .list_bookmarks(None)
+            .expect("post-crud read")
+            .len(),
+        1,
+        "the migrated annotation is the only surviving one"
+    );
+}
+
+#[test]
+fn annotations_survive_position_shifting_edits_and_full_refresh() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    let bookmark = project.bookmark("alpha");
+    assert_eq!(
+        bookmark.resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+
+    fs::write(
+        &project.source_path,
+        "// a new leading comment\n// and another\npub fn alpha() -> i32 { 1 }\n",
+    )
+    .expect("shift positions");
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after refresh");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, bookmark.id);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound,
+        "a position-shifting edit must not orphan an annotation"
+    );
+    assert_eq!(after[0].node_kind, NodeKind::FUNCTION.into());
+    assert_eq!(
+        project
+            .controller
+            .list_bookmark_categories()
+            .expect("categories after refresh")
+            .len(),
+        1,
+        "categories are user-owned and survive a full refresh"
+    );
+}
+
+#[test]
+fn a_deleted_target_stays_a_visible_orphan_and_rebinds_on_reappearance() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    let bookmark = project.bookmark("alpha");
+
+    fs::write(&project.source_path, "pub fn beta() -> i32 { 2 }\n").expect("remove target");
+    project.index();
+    let orphaned = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after deletion");
+    assert_eq!(
+        orphaned.len(),
+        1,
+        "a deleted target never deletes user state"
+    );
+    assert_eq!(orphaned[0].id, bookmark.id);
+    assert_eq!(
+        orphaned[0].resolution_status,
+        BookmarkResolutionStatusDto::Orphaned
+    );
+    assert_eq!(orphaned[0].comment.as_deref(), Some("keep"));
+    assert!(orphaned[0].orphan_reason.is_some());
+
+    fs::write(&project.source_path, "pub fn alpha() -> i32 { 1 }\n").expect("restore target");
+    project.index();
+    let restored = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after reappearance");
+    assert_eq!(restored.len(), 1);
+    assert_eq!(
+        restored[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound,
+        "a reappearing target rebinds by exact anchor identity"
+    );
+}
+
+#[test]
+fn a_cache_reset_leaves_annotations_intact_and_user_owned() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    let bookmark = project.bookmark("alpha");
+
+    // A derived-cache reset removes the core projections; the sidecar sits
+    // outside the promotion fence and is untouched.
+    {
+        let storage = Storage::open(&project.storage_path).expect("open core");
+        storage.clear().expect("clear derived core state");
+    }
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after cache reset");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, bookmark.id);
+    assert_eq!(after[0].comment.as_deref(), Some("keep"));
+
+    project.index();
+    let rebound = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after reindex");
+    assert_eq!(
+        rebound[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound,
+        "reindexing after a reset rebinds the surviving annotation"
+    );
+}
+
+#[test]
+fn a_full_refresh_rescues_legacy_annotations_before_it_replaces_core() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    let node_id = project
+        .node_id_for("alpha")
+        .to_core()
+        .expect("core node id");
+    {
+        let storage = Storage::open(&project.storage_path).expect("open core");
+        let category_id = storage
+            .create_bookmark_category("Legacy")
+            .expect("legacy category");
+        storage
+            .add_bookmark(category_id, node_id, Some("legacy note"))
+            .expect("legacy bookmark");
+    }
+    assert!(!project.sidecar_path().exists());
+
+    // A full refresh installs a database built from scratch, which never
+    // carried the legacy annotation tables.
+    project.index();
+
+    let surviving = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after full refresh");
+    assert_eq!(
+        surviving.len(),
+        1,
+        "the core-replacing operation must not be able to destroy user annotations"
+    );
+    assert_eq!(surviving[0].comment.as_deref(), Some("legacy note"));
+    assert_eq!(
+        surviving[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+}
+
+#[test]
+fn annotations_outlive_a_quarantined_core_database() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    let bookmark = project.bookmark("alpha");
+
+    // A guided derived-cache reset can take the core database away entirely.
+    // The sidecar sits outside the promotion fence, so the annotation is still
+    // readable from its own durable state.
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", project.storage_path.display()));
+        let _ = fs::remove_file(path);
+    }
+
+    let surviving = project
+        .controller
+        .list_bookmarks(None)
+        .expect("annotations remain readable without core");
+    assert_eq!(surviving.len(), 1);
+    assert_eq!(surviving[0].id, bookmark.id);
+    assert_eq!(surviving[0].comment.as_deref(), Some("keep"));
+    assert!(
+        surviving[0].last_known_evidence.is_some(),
+        "an annotation without core still reports its last known evidence"
+    );
+    assert_eq!(
+        project
+            .controller
+            .list_bookmark_categories()
+            .expect("categories remain readable without core")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_foreign_native_root_fails_closed_and_requires_export_import() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    let bookmark = project.bookmark("alpha");
+    let export = project
+        .controller
+        .export_annotations()
+        .expect("export annotations");
+
+    // Copying a project cache into a different native root is a clone, not a
+    // move, so the sidecar refuses to adopt it.
+    let clone = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    clone.index();
+    fs::create_dir_all(clone.sidecar_path().parent().expect("cache root"))
+        .expect("create cache root");
+    fs::copy(project.sidecar_path(), clone.sidecar_path()).expect("copy sidecar");
+    let error = clone
+        .controller
+        .create_bookmark_category(CreateBookmarkCategoryRequest {
+            name: "Adopted".to_string(),
+        })
+        .expect_err("a foreign native root must fail closed");
+    assert!(
+        error.message.contains("export"),
+        "the failure must name the export/import path: {}",
+        error.message
+    );
+
+    // Explicit import is the supported path for a clone.
+    fs::remove_file(clone.sidecar_path()).expect("discard the foreign sidecar");
+    assert_eq!(
+        clone
+            .controller
+            .import_annotations(&export)
+            .expect("import annotations"),
+        1
+    );
+    let imported = clone
+        .controller
+        .list_bookmarks(None)
+        .expect("read imported annotations");
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0].comment.as_deref(), Some("keep"));
+    assert_ne!(
+        imported[0].id, bookmark.id,
+        "an import creates new annotation identities rather than replacing them"
+    );
+}
+
+/// Two callables whose shapes differ, so the annotated one has a normalized
+/// signature that separates it from its neighbours. `alpha` calls `helper`;
+/// `gamma` calls nothing.
+const RENAMEABLE_SOURCE: &str = "pub fn alpha(value: i32) -> i32 {\n    helper(value) + 1\n}\n\npub fn helper(value: i32) -> i32 {\n    value * 2\n}\n\npub fn gamma() -> i32 {\n    7\n}\n";
+
+#[test]
+fn a_unique_rename_rebinds_the_annotation_one_generation_later() {
+    let project = AnnotationProject::open(RENAMEABLE_SOURCE);
+    project.index();
+    let bookmark = project.bookmark("alpha");
+    assert_eq!(
+        bookmark.resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+
+    // The symbol keeps its file and its code and takes a new name. Nothing
+    // about the old anchor tuple still matches, so only real normalized
+    // signature evidence can carry the annotation across.
+    project.write(
+        "lib.rs",
+        &RENAMEABLE_SOURCE.replace("pub fn alpha(", "pub fn renamed_alpha("),
+    );
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after rename");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, bookmark.id);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound,
+        "a unique rename must rebind rather than orphan"
+    );
+    assert_eq!(
+        after[0].node_label, "renamed_alpha",
+        "the annotation must follow the symbol to its new name"
+    );
+    assert_eq!(after[0].comment.as_deref(), Some("keep"));
+}
+
+#[test]
+fn a_unique_move_rebinds_the_annotation_one_generation_later() {
+    let project = AnnotationProject::open(
+        "pub fn alpha(value: i32) -> i32 {\n    value * 3 + 1\n}\n\npub fn gamma() -> i32 {\n    7\n}\n",
+    );
+    project.index();
+    let bookmark = project.bookmark("alpha");
+
+    // The symbol keeps its name and its code and lands in another file, at a
+    // different line. Position and file both changed.
+    project.write("lib.rs", "pub fn gamma() -> i32 {\n    7\n}\n");
+    project.write(
+        "moved.rs",
+        "// a new leading comment\npub fn alpha(value: i32) -> i32 {\n    value * 3 + 1\n}\n",
+    );
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after move");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, bookmark.id);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound,
+        "a unique move must rebind rather than orphan"
+    );
+    assert!(
+        after[0]
+            .file_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("moved.rs")),
+        "the annotation must follow the symbol to its new file: {:?}",
+        after[0].file_path
+    );
+}
+
+#[test]
+fn a_moved_name_whose_code_changed_is_a_visible_signature_changed_orphan() {
+    let project = AnnotationProject::open(
+        "pub fn alpha(value: i32) -> i32 {\n    value * 3 + 1\n}\n\npub fn gamma() -> i32 {\n    7\n}\n",
+    );
+    project.index();
+    project.bookmark("alpha");
+
+    // The name turns up in another file, but the code there is not the code
+    // the user annotated. Sharing a name is not evidence of a move.
+    project.write("lib.rs", "pub fn gamma() -> i32 {\n    7\n}\n");
+    project.write(
+        "moved.rs",
+        "pub fn alpha(value: i32) -> i32 {\n    let doubled = gamma() + value;\n    doubled * 9\n}\n",
+    );
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after the name reappeared elsewhere");
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Orphaned
+    );
+    assert_eq!(
+        after[0].orphan_reason,
+        Some(BookmarkOrphanReasonDto::SignatureChanged),
+        "a disagreeing shape must be reported as such, not silently rebound"
+    );
+}
+
+#[test]
+fn a_deleted_symbol_never_hands_its_annotation_to_a_same_shaped_sibling() {
+    // `alpha` and `gamma` have the same normalized signature, which is exactly
+    // what a shape hash is allowed to do. Deleting `alpha` leaves `gamma` as
+    // the sole same-shaped candidate in the file, so a rename probe that only
+    // asked "is there exactly one" would hand the annotation to `gamma`.
+    let project = AnnotationProject::open(
+        "pub fn alpha(value: i32) -> i32 {\n    value * 3 + 1\n}\n\npub fn gamma(value: i32) -> i32 {\n    value * 4 + 2\n}\n",
+    );
+    project.index();
+    let bookmark = project.bookmark("alpha");
+
+    project.write(
+        "lib.rs",
+        "pub fn gamma(value: i32) -> i32 {\n    value * 4 + 2\n}\n",
+    );
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after deletion");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, bookmark.id);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Orphaned,
+        "a surviving same-shaped sibling must never inherit the annotation"
+    );
+    assert_ne!(after[0].node_label, "gamma");
+}
+
+#[test]
+fn a_partially_completed_cutover_still_reports_every_annotation() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    project.seed_legacy_bookmark("alpha", "legacy note");
+    assert_eq!(
+        project
+            .controller
+            .list_bookmarks(None)
+            .expect("pre-cutover read")
+            .len(),
+        1
+    );
+
+    // The cutover creates and binds the sidecar first and imports afterwards.
+    // Anything that fails in between — a backup write onto a full disk, an
+    // unreadable core, a process kill — leaves exactly this state: a schema'd,
+    // bound, empty sidecar sitting on top of intact legacy rows.
+    {
+        let root = project.root.clone();
+        let token = codestory_workspace::workspace_path_identity_token(&root)
+            .expect("observe the native root");
+        let partial = codestory_store::AnnotationStore::open_for_write(
+            &project.sidecar_path(),
+            &codestory_store::NativeRootBinding::new(token, root),
+        )
+        .expect("create the sidecar without importing");
+        assert!(
+            !partial.core_import_completed().expect("journal"),
+            "the import must not have completed"
+        );
+    }
+    assert!(project.sidecar_path().is_file());
+
+    let during = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read during a partial cutover");
+    assert_eq!(
+        during.len(),
+        1,
+        "an unfinished cutover must not hide annotations that core still owns"
+    );
+    assert_eq!(during[0].comment.as_deref(), Some("legacy note"));
+    assert_eq!(
+        project
+            .controller
+            .list_bookmark_categories()
+            .expect("categories during a partial cutover")
+            .len(),
+        1
+    );
+
+    // Finishing the cutover moves the same annotation across exactly once.
+    project
+        .controller
+        .create_bookmark_category(CreateBookmarkCategoryRequest {
+            name: "Favorites".to_string(),
+        })
+        .expect("finish the cutover");
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after the cutover finished");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].comment.as_deref(), Some("legacy note"));
+}
+
+#[test]
+fn the_asynchronous_refresh_entry_point_also_rescues_legacy_annotations() {
+    // `start_indexing` is public on the controller and re-exported on both
+    // index-service facades. It publishes a from-scratch database, so it has
+    // to move annotations out of core first, exactly like its blocking
+    // sibling.
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    project.seed_legacy_bookmark("alpha", "legacy note");
+    assert!(!project.sidecar_path().exists());
+
+    project.index_async();
+
+    let surviving = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after the asynchronous full refresh");
+    assert_eq!(
+        surviving.len(),
+        1,
+        "an asynchronous full refresh must not be able to destroy user annotations"
+    );
+    assert_eq!(surviving[0].comment.as_deref(), Some("legacy note"));
+    assert_eq!(
+        surviving[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+}
+
+#[test]
+fn a_pre_cutover_bookmark_id_still_addresses_its_annotation_after_the_cutover() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    project.seed_legacy_bookmark("alpha", "legacy note");
+
+    // The id a caller holds is the one the last read handed it, and that read
+    // happened before any write triggered the cutover.
+    let listed = project
+        .controller
+        .list_bookmarks(None)
+        .expect("pre-cutover read");
+    assert_eq!(listed.len(), 1);
+    let id = listed[0].id.clone();
+
+    let updated = project
+        .controller
+        .update_bookmark(
+            &id,
+            UpdateBookmarkRequest {
+                category_id: None,
+                comment: Some(Some("edited".to_string())),
+            },
+        )
+        .expect("the id the API just returned must stay usable");
+    assert_eq!(updated.comment.as_deref(), Some("edited"));
+
+    project
+        .controller
+        .delete_bookmark(&id)
+        .expect("the id the API just returned must stay usable");
+    assert!(
+        project
+            .controller
+            .list_bookmarks(None)
+            .expect("read after delete")
+            .is_empty()
+    );
 }

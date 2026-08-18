@@ -475,6 +475,40 @@ fn assert_error_envelope(response: &Value, id: Value) -> &Value {
     error
 }
 
+/// Assert a `tools/call` was rejected by catalog argument validation and that
+/// the typed data names the offending member and the violated rule.
+fn assert_invalid_params(
+    response: &Value,
+    id: Value,
+    tool: &str,
+    pointer: &str,
+    violation_code: &str,
+) {
+    let error = assert_error_envelope(response, id);
+    assert_error_code(error, -32602);
+    assert_eq!(
+        error.pointer("/data/code").and_then(Value::as_str),
+        Some("invalid_params"),
+        "catalog rejections must carry the typed invalid_params code: {response}"
+    );
+    assert_eq!(
+        error.pointer("/data/tool").and_then(Value::as_str),
+        Some(tool),
+        "catalog rejections must name the tool: {response}"
+    );
+    let violations = error
+        .pointer("/data/violations")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("catalog rejection should list violations: {response}"));
+    assert!(
+        violations.iter().any(|violation| {
+            violation.get("pointer").and_then(Value::as_str) == Some(pointer)
+                && violation.get("code").and_then(Value::as_str) == Some(violation_code)
+        }),
+        "expected {violation_code} at {pointer}: {response}"
+    );
+}
+
 fn assert_error_code(error: &Value, code: i64) {
     assert_eq!(
         error.get("code").and_then(Value::as_i64),
@@ -483,14 +517,31 @@ fn assert_error_code(error: &Value, code: i64) {
     );
 }
 
-fn assert_search_repaired_before_terminal_model_absence(
+/// True when activation terminated instead of staying retryable.
+///
+/// Activation can end terminally for more than one environment reason: the package may
+/// carry no embedded model (`native_model_not_embedded`), or the host may be unable to
+/// produce the evidence a candidate generation requires — an accelerator proof, for
+/// instance, which needs a live per-user embedding server reporting an accelerated device.
+/// Both are properties of the machine, not of the code under test, so the suite asserts the
+/// degradation contract rather than assuming one of them.
+fn activation_terminated(error: &Value) -> bool {
+    error["state"] == json!("unavailable")
+}
+
+fn assert_search_repaired_before_terminal_activation(
     server: &mut StdioServer,
     error: &Value,
     search_generations: &Path,
     id: &str,
 ) {
     assert_eq!(error["code"], json!("codestory_unavailable"));
-    assert_eq!(error["cause_code"], json!("native_model_not_embedded"));
+    assert!(
+        error["cause_code"]
+            .as_str()
+            .is_some_and(|cause| !cause.is_empty()),
+        "a terminal activation failure must name its cause: {error}"
+    );
     assert_eq!(error["retry_tool"], Value::Null);
     assert!(
         search_generations.is_dir(),
@@ -852,10 +903,15 @@ fn assert_tool_safety_metadata(tool: &Value) {
         .or_else(|| tool.get("metadata"))
         .unwrap_or_else(|| panic!("{name} should include safety metadata: {tool}"));
 
+    // Every tool is read-only with respect to the caller's repository, activation or not:
+    // managed activation writes only to a per-user cache outside the checkout. A
+    // non-read-only hint is auto-cancelled by non-interactive clients, which silently
+    // disabled 19 of these 20 tools. Managed activation stays disclosed via `effect`,
+    // `sideEffects`, and `activatesProject`, asserted below.
     assert!(
-        annotations.get("readOnlyHint").and_then(Value::as_bool) == Some(observational)
-            && safety.get("readOnly").and_then(Value::as_bool) == Some(observational),
-        "{name} should distinguish observation from managed activation: {tool}"
+        annotations.get("readOnlyHint").and_then(Value::as_bool) == Some(true)
+            && safety.get("readOnly").and_then(Value::as_bool) == Some(true),
+        "{name} should report repository-read-only regardless of managed activation: {tool}"
     );
     assert_eq!(
         safety.get("effect").and_then(Value::as_str),
@@ -931,7 +987,7 @@ fn initialize_preserves_id_and_reports_server_info_and_capabilities() {
     assert_eq!(
         result.get("protocolVersion"),
         Some(&json!("2024-11-05")),
-        "initialize should echo the requested protocol version: {response}"
+        "initialize should agree to a supported protocol version: {response}"
     );
     assert!(
         result
@@ -954,6 +1010,229 @@ fn initialize_preserves_id_and_reports_server_info_and_capabilities() {
     assert!(
         result.get("capabilities").is_some(),
         "initialize should report server capabilities: {response}"
+    );
+}
+
+/// CR-064 + ARCH-035. `initialize` is the first frame an out-of-repo consumer
+/// sees, so it is where the session's two compatibility identities must be
+/// truthful: the protocol revision the server actually implements, and the
+/// response-schema version that defines the vocabulary of everything after it.
+#[test]
+fn initialize_negotiates_the_protocol_revision_and_stamps_the_wire_contract() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let agreed = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init-agreed",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "contract-test", "version": "0"}
+            }
+        }),
+    );
+    let agreed = assert_success_envelope(&agreed, json!("init-agreed"));
+    assert_eq!(agreed.get("protocolVersion"), Some(&json!("2024-11-05")));
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_protocol"),
+        Some(&json!({
+            "requested": "2024-11-05",
+            "negotiated": "2024-11-05",
+            "supported": ["2024-11-05"],
+            "status": "agreed",
+            "compatible": true
+        })),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_publication/schema_version"),
+        Some(&json!(2)),
+        "the session-start stamp publishes the v0.17.0 response schema: {agreed}"
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
+        Some(&json!(2)),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_publication/served_from"),
+        Some(&json!("contract_only")),
+        "initialize serves no publication and must not claim one: {agreed}"
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_publication/contract_runtime/cli_version"),
+        Some(&json!(env!("CARGO_PKG_VERSION"))),
+    );
+
+    let unsupported = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init-unsupported",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "contract-test", "version": "0"}
+            }
+        }),
+    );
+    let unsupported = assert_success_envelope(&unsupported, json!("init-unsupported"));
+    assert_eq!(
+        unsupported.get("protocolVersion"),
+        Some(&json!("2024-11-05")),
+        "an unimplemented revision must not be echoed back as supported: {unsupported}"
+    );
+    assert_eq!(
+        unsupported.pointer("/_meta/codestory_protocol"),
+        Some(&json!({
+            "requested": "2025-06-18",
+            "negotiated": "2024-11-05",
+            "supported": ["2024-11-05"],
+            "status": "unsupported_client_revision",
+            "compatible": false
+        })),
+    );
+
+    let defaulted = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init-defaulted",
+            "method": "initialize",
+            "params": {"capabilities": {}}
+        }),
+    );
+    let defaulted = assert_success_envelope(&defaulted, json!("init-defaulted"));
+    assert_eq!(defaulted.get("protocolVersion"), Some(&json!("2024-11-05")));
+    assert_eq!(
+        defaulted.pointer("/_meta/codestory_protocol/status"),
+        Some(&json!("defaulted")),
+    );
+    assert_eq!(
+        defaulted.pointer("/_meta/codestory_protocol/requested"),
+        Some(&Value::Null),
+    );
+}
+
+/// ARCH-035 + EV-5. `proof_status: "reported"` is a v2 vocabulary value: it
+/// names a carrier lead that failed its typed proof contract. An out-of-repo
+/// reader may only interpret it when the response says which schema produced
+/// it, so every publication-backed tool payload carries the stamp.
+#[test]
+fn tool_results_carry_the_publication_schema_that_defines_their_vocabulary() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut server, "init-stamp");
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-stamp",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {
+                    "project": fixture.workspace.path(),
+                    "budget": "strict"
+                }
+            }
+        }),
+    );
+    assert_tool_success(&response, json!("ground-stamp"));
+    let result = assert_success_envelope(&response, json!("ground-stamp"));
+    assert_eq!(
+        result.pointer("/_meta/codestory_publication/schema_version"),
+        Some(&json!(2)),
+        "a served payload must name the schema its vocabulary belongs to: {response}"
+    );
+    assert_eq!(
+        result.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
+        Some(&json!(2)),
+    );
+    assert_eq!(
+        result.pointer("/_meta/codestory_publication/served_from"),
+        Some(&json!("complete_publication")),
+        "a served payload must name the publication it came from: {response}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tools_call_never_executes_hostile_repository_fsmonitor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = tempfile::tempdir().expect("hostile repository");
+    let cache_root = tempfile::tempdir().expect("multi-project cache");
+    write_tiny_rust_workspace(project.path());
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(project.path())
+            .args(args)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "codestory-tests@example.invalid"]);
+    git(&["config", "user.name", "CodeStory Tests"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://example.com/codestory/hostile-fixture.git",
+    ]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "fixture"]);
+
+    let marker = project.path().join("fsmonitor-executed");
+    let hook = project.path().join("hostile-fsmonitor.sh");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch \"{}\"\n", marker.display()),
+    )
+    .expect("write hostile fsmonitor hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
+        .expect("make hostile hook executable");
+    git(&[
+        "config",
+        "core.fsmonitor",
+        hook.to_str().expect("UTF-8 hostile hook"),
+    ]);
+
+    git(&["status", "--porcelain"]);
+    assert!(
+        marker.exists(),
+        "the hostile fsmonitor sentinel must be live"
+    );
+    fs::remove_file(&marker).expect("reset fsmonitor sentinel");
+
+    let mut server = spawn_multi_project_stdio_server(cache_root.path());
+    initialize_stdio_server(&mut server, "hostile-init");
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "hostile-ground",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"project": project.path(), "budget": "strict"}
+            }
+        }),
+    );
+    assert_tool_success(&response, json!("hostile-ground"));
+    assert!(
+        !marker.exists(),
+        "the real MCP tools/call path executed repository core.fsmonitor"
     );
 }
 
@@ -1517,11 +1796,11 @@ fn tool_catalog_keeps_stable_product_tool_names() {
         .expect("packet description");
     assert!(
         packet_description.contains("broad structural questions")
-            && packet_description.contains("repository evidence")
-            && packet_description.contains("truncation")
-            && packet_description.contains("follow-up commands")
+            && packet_description.contains("compiled support units")
+            && packet_description.contains("one-round drill")
+            && packet_description.contains("option_ids")
             && packet_description.contains("before source snippets"),
-        "packet description should route broad questions to proof-bearing packet evidence first: {packet_description}"
+        "packet description should route broad questions to compiled support and a typed stop/drill: {packet_description}"
     );
     let search_description = tool_by_name(&tools, "search")["description"]
         .as_str()
@@ -1651,7 +1930,7 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
     );
     assert_eq!(
         schema_property(packet, "budget").get("default"),
-        Some(&json!("compact")),
+        Some(&json!("standard")),
         "packet.budget should document the stdio default: {packet}"
     );
     assert_schema_enum_values(
@@ -2055,7 +2334,8 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 "plan",
                 "answer",
                 "budget",
-                "sufficiency",
+                "support",
+                "disposition",
                 "retrieval_trace_summary",
             ] {
                 assert!(
@@ -2657,12 +2937,12 @@ fn ground_tool_returns_budgeted_grounding_snapshot() {
             }
         }),
     );
-    let error = assert_tool_error(&bad_response, json!("ground-bad-budget"));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("ground.budget")),
-        "ground tool should fail closed on unknown budgets: {bad_response}"
+    assert_invalid_params(
+        &bad_response,
+        json!("ground-bad-budget"),
+        "ground",
+        "/arguments/budget",
+        "invalid_enum_value",
     );
 }
 
@@ -2802,12 +3082,12 @@ fn files_tool_lists_indexed_files_without_sidecars() {
             }
         }),
     );
-    let error = assert_tool_error(&bad_role, json!("files-bad-role"));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("files.role")),
-        "files tool should fail closed on unknown roles: {bad_role}"
+    assert_invalid_params(
+        &bad_role,
+        json!("files-bad-role"),
+        "files",
+        "/arguments/role",
+        "invalid_enum_value",
     );
 }
 
@@ -3342,12 +3622,12 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
             }
         }),
     );
-    let error = assert_tool_error(&bad_paths, json!("affected-bad-paths"));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("affected.changed_paths")),
-        "affected should fail closed on malformed path input: {bad_paths}"
+    assert_invalid_params(
+        &bad_paths,
+        json!("affected-bad-paths"),
+        "affected",
+        "/arguments/changed_paths",
+        "invalid_type",
     );
 
     let conflict = send_json(
@@ -3365,8 +3645,13 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
             }
         }),
     );
-    let error = assert_tool_error(&conflict, json!("affected-input-conflict"));
-    assert_eq!(error["code"], json!("affected_input_conflict"));
+    assert_invalid_params(
+        &conflict,
+        json!("affected-input-conflict"),
+        "affected",
+        "/arguments",
+        "invalid_selector",
+    );
 
     let empty_property_conflict = send_json(
         &mut server,
@@ -3383,14 +3668,13 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
             }
         }),
     );
-    let error = assert_tool_error(
+    // Input exclusivity is decided on property presence, not on non-empty arrays.
+    assert_invalid_params(
         &empty_property_conflict,
         json!("affected-empty-property-conflict"),
-    );
-    assert_eq!(
-        error["code"],
-        json!("affected_input_conflict"),
-        "input exclusivity must use property presence, not non-empty arrays"
+        "affected",
+        "/arguments",
+        "invalid_selector",
     );
 
     let empty_input = send_json(
@@ -3405,13 +3689,12 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
             }
         }),
     );
-    let error = assert_tool_error(&empty_input, json!("affected-empty-input"));
-    assert_eq!(error["code"], json!("invalid_argument"));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("at least one")),
-        "empty affected input should fail the adapter minimum: {empty_input}"
+    assert_invalid_params(
+        &empty_input,
+        json!("affected-empty-input"),
+        "affected",
+        "/arguments/paths",
+        "below_min_items",
     );
 
     let too_many_paths = vec!["src/runtime.rs"; 201];
@@ -3427,13 +3710,12 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
             }
         }),
     );
-    let error = assert_tool_error(&oversized_input, json!("affected-oversized-input"));
-    assert_eq!(error["code"], json!("invalid_argument"));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("at most 200")),
-        "oversized affected input should fail the adapter maximum: {oversized_input}"
+    assert_invalid_params(
+        &oversized_input,
+        json!("affected-oversized-input"),
+        "affected",
+        "/arguments/paths",
+        "above_max_items",
     );
 
     let bad_record = send_json(
@@ -3452,12 +3734,12 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
             }
         }),
     );
-    let error = assert_tool_error(&bad_record, json!("affected-bad-record"));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("affected.change_records")),
-        "affected should fail closed on malformed change records: {bad_record}"
+    assert_invalid_params(
+        &bad_record,
+        json!("affected-bad-record"),
+        "affected",
+        "/arguments/change_records/0/kind",
+        "invalid_enum_value",
     );
 }
 
@@ -3478,8 +3760,13 @@ fn malformed_affected_on_cold_project_does_not_activate_before_legacy_retry() {
             }
         }),
     );
-    let error = assert_tool_error(&malformed, json!("affected-cold-malformed"));
-    assert_eq!(error["code"], json!("invalid_argument"));
+    assert_invalid_params(
+        &malformed,
+        json!("affected-cold-malformed"),
+        "affected",
+        "/arguments/paths/0",
+        "below_min_length",
+    );
 
     let cold_status = send_json(
         &mut server,
@@ -3915,6 +4202,15 @@ fn resources_read_status_uses_full_storage_state_for_dirty_marker_freshness() {
         }),
     );
     thread::sleep(Duration::from_millis(1200));
+    // An incremental refresh with an empty plan is short-circuited and writes
+    // no publication, so it cannot advance storage state past the marker. The
+    // marker-versus-index freshness contract is exercised by a refresh that
+    // actually republishes.
+    fs::write(
+        fixture.workspace.path().join("src/dirty_marker_probe.rs"),
+        "pub fn dirty_marker_probe() -> u32 {\n    7\n}\n",
+    )
+    .expect("write dirty marker probe source");
     refresh_fixture_index(&fixture);
     fixture.dirty_marker_path = Some(marker_path.clone());
     fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
@@ -5200,8 +5496,11 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
         "agent guide should distinguish discovery clues from evidence: {guide}"
     );
     assert!(
-        guide_text.contains("unsafe to claim") && guide_text.contains("follow_up_commands"),
-        "agent guide should name unsafe-to-claim and follow-up states: {guide}"
+        guide_text.contains("supported")
+            && guide_text.contains("drillonce")
+            && guide_text.contains("option_ids")
+            && guide_text.contains("terminal"),
+        "agent guide should name the typed stop/drill contract: {guide}"
     );
     assert!(
         guide_text.contains("direct_source_reads")
@@ -5278,9 +5577,18 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
         error["operation"]["capabilities"]["local_navigation"],
         json!("ready")
     );
-    if error["cause_code"] == "native_model_not_embedded" {
+    // Activation either stays retryable or terminates, depending on what this host can
+    // prove -- an embedded model, and a per-user embedding server able to satisfy the
+    // device policy. Both outcomes have a contract, and both are asserted; what must never
+    // happen is broad search degrading without local navigation surviving it.
+    if activation_terminated(error) {
         assert_eq!(error["code"], json!("codestory_unavailable"));
-        assert_eq!(error["state"], json!("unavailable"));
+        assert!(
+            error["cause_code"]
+                .as_str()
+                .is_some_and(|cause| !cause.is_empty()),
+            "a terminal activation failure must name its cause: {error}"
+        );
         assert_eq!(error["retry_tool"], Value::Null);
         assert_eq!(
             error["operation"]["capabilities"]["broad_search"],
@@ -5294,11 +5602,23 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
             error["operation"]["capabilities"]["broad_search"],
             json!("retryable")
         );
+        // Only a retryable activation publishes a retry class; a terminated one has
+        // nothing left to retry after, which is what `retry_tool: null` above says.
+        //
+        // Which class appears depends on why the embedding runtime is unavailable, and both
+        // are correct: `after_server_change` when the live server's engine contract no
+        // longer matches, `after_owner_idle` when another CodeStory process on this machine
+        // currently owns it. Pinning one made the suite assert a property of the host rather
+        // than of the contract, which is that a retryable activation always tells the client
+        // what to wait for.
+        let retry_class = error["operation"]["embedding_retry"]["retry_class"]
+            .as_str()
+            .expect("a retryable activation publishes a retry class");
+        assert!(
+            matches!(retry_class, "after_server_change" | "after_owner_idle"),
+            "retry class should name a known wait condition, got {retry_class}: {error}"
+        );
     }
-    assert_eq!(
-        error["operation"]["embedding_retry"]["retry_class"],
-        json!("after_server_change")
-    );
 
     let fixture = indexed_fixture();
     write_live_local_refresh(&fixture);
@@ -5316,9 +5636,14 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
         }),
     );
     let error = assert_tool_error(&response, json!("migration-search-preparing"));
-    if error["cause_code"] == "native_model_not_embedded" {
+    if activation_terminated(error) {
         assert_eq!(error["code"], json!("codestory_unavailable"));
-        assert_eq!(error["state"], json!("unavailable"));
+        assert!(
+            error["cause_code"]
+                .as_str()
+                .is_some_and(|cause| !cause.is_empty()),
+            "a terminal activation failure must name its cause: {error}"
+        );
         assert_eq!(error["retry_tool"], Value::Null);
     } else {
         assert_eq!(error["code"], json!("codestory_preparing"));
@@ -5358,8 +5683,8 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
         return;
     }
     let first_error = assert_tool_error(&first, json!("packet-search-repair-first"));
-    if first_error["cause_code"] == "native_model_not_embedded" {
-        assert_search_repaired_before_terminal_model_absence(
+    if activation_terminated(first_error) {
+        assert_search_repaired_before_terminal_activation(
             &mut server,
             first_error,
             &search_generations,
@@ -5391,8 +5716,8 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
             return;
         }
         let error = assert_tool_error(&response, json!(id));
-        if error["cause_code"] == "native_model_not_embedded" {
-            assert_search_repaired_before_terminal_model_absence(
+        if activation_terminated(error) {
+            assert_search_repaired_before_terminal_activation(
                 &mut server,
                 error,
                 &search_generations,
@@ -5714,6 +6039,59 @@ fn oversized_stdio_frame_returns_structured_protocol_error() {
     assert_success_envelope(&follow_up, json!("after-oversized"));
 }
 
+#[cfg(unix)]
+#[test]
+fn sigterm_drains_the_stdio_serve_loop_instead_of_killing_the_process() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut server, "before-termination");
+
+    let pid = server.child.id();
+    let delivered = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(delivered.success(), "SIGTERM delivery failed for pid {pid}");
+
+    let signalled = Instant::now();
+    let deadline = signalled + Duration::from_secs(30);
+    let status = loop {
+        match server.child.try_wait().expect("poll stdio server") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                panic!("stdio server did not drain within 30s of SIGTERM");
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    };
+
+    // The drain is bounded, so the server stops on its own well inside the
+    // grace window a host allows between SIGTERM and SIGKILL.
+    let drained_in = signalled.elapsed();
+    assert!(
+        drained_in < Duration::from_secs(10),
+        "the terminating drain must be bounded, not open-ended: took {drained_in:?}"
+    );
+    // Exit code 0: the host asked the server to stop and it stopped after
+    // answering everything it owed. A completed shutdown must not look like a
+    // crash to a supervisor or to a restart policy.
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGTERM should drain the serve loop and report a completed shutdown: {status:?}"
+    );
+    let mut trailing = String::new();
+    let bytes = server
+        .stdout
+        .read_line(&mut trailing)
+        .expect("read trailing stdout");
+    assert_eq!(
+        bytes, 0,
+        "no request was pending, so termination must emit nothing: {trailing}"
+    );
+}
+
 #[test]
 fn bad_tool_call_args_return_jsonrpc_error() {
     let fixture = indexed_fixture();
@@ -5738,6 +6116,126 @@ fn bad_tool_call_args_return_jsonrpc_error() {
             .contains("tool"),
         "bad tools/call args should name the tool problem: {response}"
     );
+}
+
+#[test]
+fn advertised_tool_argument_contract_is_enforced_instead_of_silently_repaired() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    for (id, tool, arguments, pointer, code) in [
+        (
+            "args-unknown-property",
+            "search",
+            json!({"query": "AppController", "limt": 3}),
+            "/arguments/limt",
+            "unknown_property",
+        ),
+        (
+            "args-bad-enum",
+            "search",
+            json!({"query": "AppController", "repo_text": "yes"}),
+            "/arguments/repo_text",
+            "invalid_enum_value",
+        ),
+        (
+            "args-out-of-range",
+            "search",
+            json!({"query": "AppController", "limit": 5000}),
+            "/arguments/limit",
+            "above_maximum",
+        ),
+        (
+            "args-wrong-type",
+            "search",
+            json!({"query": "AppController", "limit": "10"}),
+            "/arguments/limit",
+            "invalid_type",
+        ),
+        (
+            "args-missing-required",
+            "packet",
+            json!({"budget": "compact"}),
+            "/arguments/question",
+            "missing_required",
+        ),
+        (
+            "args-ambiguous-selector",
+            "symbol",
+            json!({"query": "AppController", "id": "42"}),
+            "/arguments",
+            "invalid_selector",
+        ),
+        (
+            "args-absent-selector",
+            "trail",
+            json!({"depth": 1}),
+            "/arguments",
+            "invalid_selector",
+        ),
+    ] {
+        let response = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments}
+            }),
+        );
+        assert_invalid_params(&response, json!(id), tool, pointer, code);
+    }
+}
+
+#[test]
+fn graph_family_tool_errors_preserve_machine_classification() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    for (id, tool, arguments) in [
+        (
+            "typed-symbol-miss",
+            "symbol",
+            json!({"query": "definitely-not-an-indexed-symbol-zzz"}),
+        ),
+        (
+            "typed-node-miss",
+            "get_node",
+            json!({"id": "definitely-not-a-node-zzz"}),
+        ),
+        (
+            "typed-bookmark-miss",
+            "context",
+            json!({"bookmark": "definitely-not-a-bookmark-zzz"}),
+        ),
+    ] {
+        let response = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments}
+            }),
+        );
+        let error = assert_tool_error(&response, json!(id));
+        let code = error["code"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{tool} error must carry a machine code: {response}"));
+        assert!(
+            !code.is_empty()
+                && code
+                    .chars()
+                    .all(|character| character.is_ascii_lowercase() || character == '_'),
+            "{tool} must classify with a typed code rather than prose: {response}"
+        );
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "{tool} must keep the human-readable message beside the code: {response}"
+        );
+    }
 }
 
 #[test]

@@ -1,9 +1,9 @@
 use crate::index_commit::{IndexWriterGuard, index_publication_dto};
 use crate::index_coverage::indexed_files_from_storage;
 use crate::index_freshness::{
-    CachedIndexFreshness, index_freshness_cache_ttl_secs, index_freshness_from_storage_with_policy,
-    open_storage_for_read, storage_fingerprint, workspace_member_index_summaries,
-    workspace_member_storage_summaries,
+    CachedIndexFreshness, FreshnessObservation, index_freshness_cache_ttl_secs,
+    index_freshness_from_storage_with_policy, open_storage_for_read, storage_fingerprint,
+    workspace_member_index_summaries, workspace_member_storage_summaries,
 };
 use crate::index_full::index_full_for_runtime;
 use crate::index_incremental::{
@@ -23,8 +23,8 @@ use crate::search_state_cache::{
     rebuild_search_state_from_storage_for_runtime, refresh_caches, workspace_refresh_inputs,
 };
 use crate::semantic_projection::{
-    CacheRefreshStats, SEMANTIC_POLICY_VERSION, SemanticProjectionRepublishOutcome,
-    apply_cache_refresh_stats, summarize_symbol_doc,
+    CacheRefreshStats, LLM_SYMBOL_DOC_SCHEMA_VERSION, SEMANTIC_POLICY_VERSION,
+    SemanticProjectionRepublishOutcome, apply_cache_refresh_stats, summarize_symbol_doc,
 };
 use crate::semantic_republish::semantic_projection_republish_for_runtime;
 use crate::support::{clamp_i64_to_u32, clamp_u128_to_u32};
@@ -132,14 +132,34 @@ impl AppController {
             ))
         })?;
 
-        {
+        let changed = {
             let mut s = self.state.lock();
+            let target_changed =
+                s.project_root.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &root)
+                }) || s.storage_path.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &storage_path)
+                });
+            let core_changed = s.observed_core_publication.as_ref() != summary.publication.as_ref();
+            let resident_search_changed = s
+                .search_publication
+                .as_ref()
+                .cloned()
+                .map(index_publication_dto)
+                .is_some_and(|publication| Some(&publication) != summary.publication.as_ref());
+            let changed = target_changed || core_changed || resident_search_changed;
             s.project_root = Some(root);
             s.storage_path = Some(storage_path);
-            s.node_names.clear();
-            clear_search_engine(&mut s);
+            s.observed_core_publication = summary.publication.clone();
+            if changed {
+                s.node_names.clear();
+                clear_search_engine(&mut s);
+            }
+            changed
+        };
+        if changed {
+            self.sidecar_query_cache.lock().clear();
         }
-        self.sidecar_query_cache.lock().clear();
 
         Ok(summary)
     }
@@ -166,6 +186,7 @@ impl AppController {
             let mut s = self.state.lock();
             s.project_root = Some(root);
             s.storage_path = Some(storage_path);
+            s.observed_core_publication = summary.publication.clone();
             s.node_names = loaded.node_names;
             publish_search_engine(&mut s, loaded.engine, loaded.publication);
         }
@@ -348,8 +369,9 @@ impl AppController {
         std::thread::spawn(move || {
             let indexing_started = std::time::Instant::now();
             let result = match IndexWriterGuard::try_acquire(&storage_path) {
-                Ok(_writer_guard) => {
-                    let result = match req.mode {
+                Ok(_writer_guard) => controller
+                    .ensure_annotations_owned_before_core_replacement()
+                    .and_then(|annotations_owned| match req.mode {
                         IndexMode::Full => index_full_for_runtime(
                             &root,
                             &storage_path,
@@ -357,6 +379,7 @@ impl AppController {
                             None,
                             &controller.runtime_config,
                             &controller.source_index_policy,
+                            &annotations_owned,
                         ),
                         IndexMode::Incremental => index_incremental_for_runtime(
                             &root,
@@ -365,12 +388,12 @@ impl AppController {
                             None,
                             &controller.runtime_config,
                             &controller.source_index_policy,
+                            &annotations_owned,
                         ),
-                    };
-                    result.and_then(|summary| {
-                        controller.finish_successful_indexing(summary, &storage_path, true, None)
                     })
-                }
+                    .and_then(|summary| {
+                        controller.finish_successful_indexing(summary, &storage_path, true, None)
+                    }),
                 Err(error) => Err(error),
             };
 
@@ -434,6 +457,17 @@ impl AppController {
             }
         };
 
+        // A refresh can install a database that never carried the legacy
+        // annotation tables, so annotations move to the sidecar before the run
+        // starts rather than after it publishes.
+        let annotations_owned = match self.ensure_annotations_owned_before_core_replacement() {
+            Ok(annotations_owned) => annotations_owned,
+            Err(error) => {
+                self.state.lock().is_indexing = false;
+                return Err(error);
+            }
+        };
+
         let result = match mode {
             IndexMode::Full => index_full_for_runtime(
                 &root,
@@ -442,6 +476,7 @@ impl AppController {
                 cancel_token,
                 &self.runtime_config,
                 &self.source_index_policy,
+                &annotations_owned,
             ),
             IndexMode::Incremental => index_incremental_for_runtime(
                 &root,
@@ -450,6 +485,7 @@ impl AppController {
                 cancel_token,
                 &self.runtime_config,
                 &self.source_index_policy,
+                &annotations_owned,
             ),
         };
 
@@ -474,6 +510,13 @@ impl AppController {
         refresh_runtime_caches: bool,
         _cancel_token: Option<&CancellationToken>,
     ) -> Result<IndexingPhaseTimings, ApiError> {
+        if summary.unchanged_publication {
+            // Nothing was staged or published, so the live publication and its
+            // completed search generation are still the ones already pinned.
+            // Rebuilding either would only reproduce what is on disk.
+            self.state.lock().is_indexing = false;
+            return Ok(summary.phase_timings);
+        }
         if refresh_runtime_caches {
             #[cfg(test)]
             let boundary_result =
@@ -549,6 +592,16 @@ impl AppController {
             cache_stats.semantic_stats = summary.staged_semantic_stats;
         }
         apply_cache_refresh_stats(&mut summary.phase_timings, cache_stats);
+        // The publication that just replaced core projections is the mutating
+        // trigger for annotations: rebinding here keeps recorded anchor
+        // evidence one generation behind the live core, which is exactly the
+        // window the conservative rebind gate accepts.
+        if let Err(error) = self.rebind_annotations_after_core_publication() {
+            tracing::warn!(
+                error = %error.message,
+                "Annotation rebinding failed after core publication; annotations stay at their last recorded binding"
+            );
+        }
         Ok(summary.phase_timings)
     }
 
@@ -600,6 +653,16 @@ impl AppController {
                     "The complete core publication disappeared before search preparation.",
                 )
             })?;
+        let resident_search_is_current = {
+            let state = self.state.lock();
+            state.storage_path.as_ref().is_some_and(|current| {
+                codestory_workspace::same_workspace_path(current, &storage_path)
+            }) && state.search_engine.is_some()
+                && state.search_publication.as_ref() == Some(&expected_publication)
+        };
+        if resident_search_is_current {
+            return Ok(());
+        }
         let mut validate_before_completion =
             |prepared_publication: &IndexPublicationRecord| -> Result<(), ApiError> {
                 if cancel_token.is_cancelled() {
@@ -668,12 +731,12 @@ impl AppController {
         }
         let storage = Store::open_read_only(storage_path).map_err(|error| {
             ApiError::internal(format!(
-                "Failed to inspect dense-anchor publication readiness: {error}"
+                "Failed to inspect core publication readiness: {error}"
             ))
         })?;
         let Some(publication) = storage.get_complete_index_publication().map_err(|error| {
             ApiError::internal(format!(
-                "Failed to inspect dense-anchor core publication: {error}"
+                "Failed to inspect complete core publication: {error}"
             ))
         })?
         else {
@@ -685,6 +748,19 @@ impl AppController {
             || storage
                 .validate_structural_text_unit_publication(&publication)
                 .is_err()
+        {
+            return Ok(true);
+        }
+        if storage
+            .has_symbol_search_doc_contract_mismatch(
+                LLM_SYMBOL_DOC_SCHEMA_VERSION,
+                SEMANTIC_POLICY_VERSION,
+            )
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to inspect semantic document publication readiness: {error}"
+                ))
+            })?
         {
             return Ok(true);
         }
@@ -1071,6 +1147,7 @@ impl AppController {
                 workspace,
                 storage,
                 &self.source_index_policy,
+                FreshnessObservation::Unobserved,
             );
         }
         let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
@@ -1087,11 +1164,14 @@ impl AppController {
             }
         }
 
+        // The cached project summary feeds observational surfaces. They read what already
+        // exists and never create observers.
         let freshness = index_freshness_from_storage_with_policy(
             root,
             workspace,
             storage,
             &self.source_index_policy,
+            FreshnessObservation::Unobserved,
         );
         let mut state = self.state.lock();
         state.index_freshness_cache = Some(CachedIndexFreshness {

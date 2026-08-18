@@ -8,7 +8,8 @@ use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
     EmbeddingClientBudgets, EmbeddingQualificationAttemptResult, EmbeddingQualificationParameters,
     EmbeddingResult, PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS,
-    PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS, ProcessStartProbe,
+    PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS, ProcessOwnerState, ProcessStartProbe,
+    process_owner_state,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -111,24 +112,64 @@ pub(super) fn wait_for_process_start(clock: &super::CoordinatorClock, pid: u32) 
     }
 }
 
-pub(super) fn wait_for_process_exit(
+pub(super) fn wait_for_exact_process_exit(
     clock: &super::CoordinatorClock,
     pid: u32,
+    process_start_id: &str,
     timeout: Duration,
 ) -> Result<()> {
-    let started = clock.now_ns();
+    wait_for_exact_process_exit_with(
+        pid,
+        process_start_id,
+        timeout,
+        || clock.now_ns(),
+        |duration| clock.sleep(duration),
+        || codestory_retrieval::probe_process_start_identity(pid),
+    )
+}
+
+fn wait_for_exact_process_exit_with(
+    pid: u32,
+    process_start_id: &str,
+    timeout: Duration,
+    mut now_ns: impl FnMut() -> u64,
+    mut sleep: impl FnMut(Duration),
+    mut probe: impl FnMut() -> ProcessStartProbe,
+) -> Result<()> {
+    let started_ns = now_ns();
+    // Phase one is an unconditional identity classification at entry. If the
+    // recorded owner is already gone or the PID is already reused, the fence
+    // is satisfied even with a zero budget or a slow initial native probe.
+    if process_owner_state(&probe(), Some(process_start_id)) == ProcessOwnerState::GoneOrReused {
+        return Ok(());
+    }
+
+    // Phase two polls under a strict deadline. Sleeping happens before the
+    // next probe; an oversleep is rejected by the pre-probe gate, and a slow
+    // native probe is rejected by the post-probe gate before its answer can be
+    // accepted. Unknown remains non-terminal throughout.
     loop {
-        if matches!(
-            codestory_retrieval::probe_process_start_identity(pid),
-            ProcessStartProbe::NotRunning
-        ) {
+        if Duration::from_nanos(now_ns().saturating_sub(started_ns)) >= timeout {
+            return Err(exact_process_exit_timeout(pid, process_start_id));
+        }
+        sleep(POLL);
+        if Duration::from_nanos(now_ns().saturating_sub(started_ns)) >= timeout {
+            return Err(exact_process_exit_timeout(pid, process_start_id));
+        }
+        let state = process_owner_state(&probe(), Some(process_start_id));
+        if Duration::from_nanos(now_ns().saturating_sub(started_ns)) >= timeout {
+            return Err(exact_process_exit_timeout(pid, process_start_id));
+        }
+        if state == ProcessOwnerState::GoneOrReused {
             return Ok(());
         }
-        if elapsed(clock, started) >= timeout {
-            bail!("embedding_qualification_server_process_exit_timeout");
-        }
-        clock.sleep(POLL);
     }
+}
+
+fn exact_process_exit_timeout(pid: u32, process_start_id: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "embedding_qualification_server_process_exit_timeout:pid={pid}:process_start_id={process_start_id}"
+    )
 }
 
 pub(super) fn wait_for_child(
@@ -186,6 +227,12 @@ pub(super) fn validate_worker_output(
 }
 
 pub(super) fn require_worker_success(output: &WorkerOutput, phase: &str) -> Result<()> {
+    if let Some(error) = output.error.as_ref() {
+        bail!(
+            "embedding_qualification_worker_error:{phase}:{}",
+            error.code
+        );
+    }
     let result = output
         .result
         .as_ref()
@@ -447,4 +494,258 @@ pub(super) fn load_establishment_timeout(phase: &str) -> Result<Duration> {
 /// ramping its 16+16 held requests under host load.
 pub(super) fn dead_client_setup_timeout() -> Duration {
     QUEUE_SETUP_TIMEOUT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_retrieval::{EmbeddingQualificationWorkerError, EmbeddingServerClockSnapshot};
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+
+    fn advance(clock_ns: &Cell<u64>, duration: Duration) {
+        let delta_ns = u64::try_from(duration.as_nanos()).expect("test duration fits u64");
+        clock_ns.set(clock_ns.get().saturating_add(delta_ns));
+    }
+
+    #[test]
+    fn exact_process_exit_requires_gone_or_reused_and_preserves_probe_uncertainty() {
+        let cases = [
+            ("owner already gone", vec![ProcessStartProbe::NotRunning], 1),
+            (
+                "matching owner exits",
+                vec![
+                    ProcessStartProbe::Running {
+                        start_identity: "start-a".into(),
+                    },
+                    ProcessStartProbe::NotRunning,
+                ],
+                2,
+            ),
+            (
+                "matching pid is reused",
+                vec![
+                    ProcessStartProbe::Running {
+                        start_identity: "start-a".into(),
+                    },
+                    ProcessStartProbe::Running {
+                        start_identity: "start-b".into(),
+                    },
+                ],
+                2,
+            ),
+            (
+                "unknown probe does not prove exit",
+                vec![
+                    ProcessStartProbe::Unknown {
+                        reason: "probe unavailable".into(),
+                    },
+                    ProcessStartProbe::NotRunning,
+                ],
+                2,
+            ),
+        ];
+
+        for (case, probes, expected_probes) in cases {
+            let clock_ns = Cell::new(0_u64);
+            let mut probes = VecDeque::from(probes);
+            let mut observed = 0_u32;
+            wait_for_exact_process_exit_with(
+                41732,
+                "start-a",
+                Duration::from_secs(1),
+                || clock_ns.get(),
+                |duration| advance(&clock_ns, duration),
+                || {
+                    observed = observed.saturating_add(1);
+                    probes.pop_front().expect("bounded probe sequence")
+                },
+            )
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+            assert_eq!(
+                observed, expected_probes,
+                "{case}: returned at the wrong probe"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_process_exit_timeout_names_the_identity_that_never_exited() {
+        let clock_ns = Cell::new(0_u64);
+        let error = wait_for_exact_process_exit_with(
+            41732,
+            "windows:639221697923142260",
+            Duration::ZERO,
+            || clock_ns.get(),
+            |duration| advance(&clock_ns, duration),
+            || ProcessStartProbe::Running {
+                start_identity: "windows:639221697923142260".into(),
+            },
+        )
+        .expect_err("a matching predecessor must not satisfy the exit fence");
+        assert_eq!(
+            error.to_string(),
+            "embedding_qualification_server_process_exit_timeout:pid=41732:process_start_id=windows:639221697923142260"
+        );
+    }
+
+    #[test]
+    fn exact_process_exit_accepts_zero_time_and_slow_initial_absence() {
+        let zero_clock_ns = Cell::new(0_u64);
+        wait_for_exact_process_exit_with(
+            41732,
+            "start-a",
+            Duration::ZERO,
+            || zero_clock_ns.get(),
+            |duration| advance(&zero_clock_ns, duration),
+            || ProcessStartProbe::NotRunning,
+        )
+        .expect("the unconditional initial probe may prove zero-time absence");
+
+        let slow_clock_ns = Cell::new(0_u64);
+        let timeout = Duration::from_millis(10);
+        wait_for_exact_process_exit_with(
+            41732,
+            "start-a",
+            timeout,
+            || slow_clock_ns.get(),
+            |duration| advance(&slow_clock_ns, duration),
+            || {
+                advance(
+                    &slow_clock_ns,
+                    timeout.saturating_add(Duration::from_millis(1)),
+                );
+                ProcessStartProbe::NotRunning
+            },
+        )
+        .expect("slow initial absence still classifies the owner as already gone");
+    }
+
+    #[test]
+    fn exact_process_exit_rejects_oversleep_and_an_exit_reported_after_deadline() {
+        let timeout = Duration::from_millis(10);
+
+        let oversleep_clock_ns = Cell::new(0_u64);
+        let oversleep_probes = Cell::new(0_u32);
+        let oversleep_error = wait_for_exact_process_exit_with(
+            41732,
+            "start-a",
+            timeout,
+            || oversleep_clock_ns.get(),
+            |_| {
+                advance(
+                    &oversleep_clock_ns,
+                    timeout.saturating_add(Duration::from_nanos(1)),
+                )
+            },
+            || {
+                oversleep_probes.set(oversleep_probes.get().saturating_add(1));
+                ProcessStartProbe::Running {
+                    start_identity: "start-a".into(),
+                }
+            },
+        )
+        .expect_err("an overshooting sleep must expire before another probe");
+        assert_eq!(oversleep_probes.get(), 1);
+        assert!(oversleep_error.to_string().contains("process_exit_timeout"));
+
+        let late_probe_clock_ns = Cell::new(0_u64);
+        let late_probe_count = Cell::new(0_u32);
+        let late_probe_error = wait_for_exact_process_exit_with(
+            41732,
+            "start-a",
+            timeout,
+            || late_probe_clock_ns.get(),
+            |_| late_probe_clock_ns.set(1),
+            || {
+                let count = late_probe_count.get().saturating_add(1);
+                late_probe_count.set(count);
+                if count == 1 {
+                    ProcessStartProbe::Running {
+                        start_identity: "start-a".into(),
+                    }
+                } else {
+                    late_probe_clock_ns
+                        .set(u64::try_from(timeout.as_nanos()).expect("test timeout fits u64"));
+                    ProcessStartProbe::NotRunning
+                }
+            },
+        )
+        .expect_err("an exit first observed at the deadline must not pass");
+        assert_eq!(late_probe_count.get(), 2);
+        assert!(
+            late_probe_error
+                .to_string()
+                .contains("process_exit_timeout")
+        );
+    }
+
+    #[test]
+    fn exact_process_exit_keeps_permanent_unknown_fail_closed_at_deadline() {
+        let clock_ns = Cell::new(0_u64);
+        let probes = Cell::new(0_u32);
+        let timeout = POLL.saturating_mul(2);
+        let error = wait_for_exact_process_exit_with(
+            41732,
+            "start-a",
+            timeout,
+            || clock_ns.get(),
+            |duration| advance(&clock_ns, duration),
+            || {
+                probes.set(probes.get().saturating_add(1));
+                ProcessStartProbe::Unknown {
+                    reason: "probe unavailable".into(),
+                }
+            },
+        )
+        .expect_err("Unknown cannot become exit evidence at the deadline");
+        assert_eq!(probes.get(), 2, "deadline must stop the third probe");
+        assert!(error.to_string().contains("process_exit_timeout"));
+    }
+
+    #[test]
+    fn worker_typed_error_precedes_the_generic_result_missing_error() {
+        let output = WorkerOutput {
+            schema_version: EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
+            pid: 42,
+            process_start_id: "start-a".into(),
+            executable_sha256: "a".repeat(64),
+            executable_version: "0.16.1".into(),
+            project_identity_sha256: "b".repeat(64),
+            clock: EmbeddingServerClockSnapshot {
+                domain: "awake_monotonic".into(),
+                api: "test".into(),
+                boot_id: "boot".into(),
+                resolution_ns: 1,
+            },
+            started_ns: 1,
+            finished_ns: 2,
+            inclusive_clock_api: "test".into(),
+            inclusive_started_ns: 1,
+            inclusive_finished_ns: 2,
+            boot_id_started: "boot".into(),
+            boot_id_finished: "boot".into(),
+            result: None,
+            protocol_exchange: None,
+            queue_operations: None,
+            engine_identity: None,
+            measurement: None,
+            error: Some(EmbeddingQualificationWorkerError {
+                code: "embedding_qualification_owner_replaced".into(),
+                message_head: "owner replaced".into(),
+                retry_class: "never".into(),
+                retry_after_ms: 0,
+                retry_condition: "none".into(),
+                capacity: None,
+            }),
+        };
+
+        let error = require_worker_success(&output, "reset_owner")
+            .expect_err("typed worker failure must reject the output");
+        assert_eq!(
+            error.to_string(),
+            "embedding_qualification_worker_error:reset_owner:embedding_qualification_owner_replaced"
+        );
+        assert!(!error.to_string().contains("result_missing"));
+    }
 }

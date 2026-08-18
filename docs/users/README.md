@@ -15,20 +15,20 @@ reports progress while it runs, and resumes if it is interrupted. See
 | Host | Setup | What is automatic |
 | --- | --- | --- |
 | [Codex](codex.md) | Install from `/plugins` | MCP, hooks, skill, matching CLI |
-| [Cursor](cursor.md) | Add the rule and MCP config | Repository preparation after MCP connects |
+| [Cursor](cursor.md) | Install from Customize, then enable MCP once | Rule, hook, skill, and launcher; matching CLI fetched after the first MCP call |
 | [Claude Code](claude-code.md) | Install the plugin and configure MCP | Hooks; preparation after MCP connects |
 | [Copilot CLI](copilot.md#copilot-cli) | Install hooks and configure MCP | Session instructions; preparation after MCP connects |
 | [Copilot editor](copilot.md#copilot-editor) | Add repository instructions and optionally MCP | CodeStory evidence only when MCP is connected |
 
-Codex is the reference experience. Other hosts use the same project-scoped MCP
-runtime but require more adapter setup.
+Codex and Cursor install complete host packages. Other hosts use the same
+project-scoped MCP runtime with the adapter setup described in their guides.
 
 ## Capability matrix
 
 | Host | MCP auto-start | Hooks | Grounding skill or rule | Managed CLI through adapter |
 | --- | --- | --- | --- | --- |
 | Codex | Yes | Yes | Full skill | Yes |
-| Cursor | No | Rule only | Project rule | Yes, after MCP connects |
+| Cursor | User-enabled | Yes | Full skill and rule | Yes, after MCP connects |
 | Claude Code | Usually manual | Session hook | Host-dependent | Yes, after MCP connects |
 | Copilot CLI | No | Session hook | Partial | Yes, after MCP connects |
 | Copilot editor | No | No | Repository instructions | Only when MCP is configured |

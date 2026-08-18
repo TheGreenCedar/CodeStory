@@ -1,55 +1,95 @@
 import test from "node:test";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 
 import {
+  aggregateShardRuns,
+  agentRunnerEnv,
   analyzeTranscript,
   agentPublishableBlockers,
   assertSafeWindowsCmdArgs,
   baselineSearchPreludeStatus,
   benchmarkAgentScopeArgs,
+  benchmarkContractEnvironmentSha256,
+  benchmarkContractForRun,
+  benchmarkHostClass,
   benchmarkRunId,
+  benchmarkShardAttestation,
+  benchmarkShardAttestationForCloseout,
+  cachePreparationCanaryBlockers,
+  cachePreparationIdentityBlockers,
+  codeStoryBinaryIdentity,
   commandCategory,
+  codestoryDoctorSnapshot,
+  codestoryRetrievalEngineDiagnosticsSnapshot,
+  codestoryRetrievalStatusSnapshot,
   copyResultArtifact,
+  createDurableJsonlAppender,
+  groupPacketRuntimeColdJobs,
+  gitCheckedOutput,
   isTrustedPublishableRepoUrl,
   isPathInside,
+  interactionTurnTelemetry,
   loadTaskForResult,
   loadReleaseEvidenceCorpusContract,
   loadTasks,
+  markdownCostAccounting,
   manifestRepoMaterializationBlockers,
   materializeRepos,
+  mergeRetrievalStatusWithEngineDiagnostics,
   MAX_REUSED_ARTIFACT_BYTES,
   parseArgs as parseBenchmarkArgs,
   parseJsonLines,
   packetComposition,
   packetCommandArgs,
   packetRuntimeCacheObservations,
+  agentPacketPreludeCacheObservations,
   packetEmbeddingExecutionProof,
+  packetSufficiencyTelemetry,
   packetForAgentPrompt,
   packetManifestExtraProbes,
   packetManifestQualitySummary,
+  packetObligationAccounting,
+  packetDispositionTelemetry,
+  packetPreludeContractBlockers,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetFirstCommandForPrompt,
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
   publicCoreCorpusAudit,
+  projectResourceUri,
+  planAgentRuns,
+  repoProvenance,
   repoProvenanceBlockers,
   resolveRunArtifactPath,
   resolveCodeStoryCli,
+  runnerCommand,
   retrievalIndexCommandArgs,
   retrievalStatusCommandArgs,
+  retrievalEngineDiagnosticsSnapshotFromOutput,
+  retrievalStatusSnapshotFromOutput,
+  resourceUriMatches,
   scoreQuality,
+  sortAgentResultsCanonical,
   summarizeCostAccounting,
+  summarizePacketObligationAccounting,
   summarizePacketRuntimeRuns,
+  runAgentBenchmarkPipeline,
+  runPlannedAgentRuns,
+  runProcess,
   buildQualityDebugPayload,
   qualityFailureReasons,
   taskSnapshotForResult,
+  taskShardIndex,
+  tasksForShard,
   cachePolicyForRun,
   cacheProvenanceBlockers,
 } from "../codestory-agent-ab-benchmark.mjs";
@@ -64,6 +104,77 @@ const RUNTIME_SERVICE_FILE = "crates/codestory-runtime/src/services.rs";
 const RUN_INDEX_SYMBOL = "IndexService::run_indexing_blocking";
 const RUNTIME_REFRESH_CLAIM =
   "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.";
+
+test("keeps CLI overrides out of both isolated agent arms", () => {
+  const opts = {
+    runner: "codex",
+    sandbox: "read-only",
+    model: "gpt-5.6-sol",
+  };
+  const baseline = runnerCommand(opts, "/tmp/repo", "prompt", "without_codestory");
+  const measured = runnerCommand(opts, "/tmp/repo", "prompt", "with_codestory");
+  assert.ok(baseline.args.includes("--ignore-user-config"));
+  assert.ok(!measured.args.includes("--ignore-user-config"));
+  assert.deepEqual(
+    baseline.args.filter((arg) => arg !== "--ignore-user-config"),
+    measured.args,
+  );
+  for (const setting of [
+    'approval_policy="never"',
+    'model_reasoning_effort="xhigh"',
+    'service_tier="default"',
+    'personality="pragmatic"',
+    'model_verbosity="low"',
+  ]) {
+    assert.ok(measured.args.includes(setting), `missing pinned runner setting ${setting}`);
+  }
+
+  const env = agentRunnerEnv(
+    {
+      CODESTORY_CLI: "/tmp/stale-codestory-cli",
+      CODESTORY_EMBED_ALLOW_CPU: "0",
+    },
+    "/tmp/isolated-codex-home",
+  );
+  assert.equal(env.CODESTORY_CLI, undefined);
+  assert.equal(env.CODESTORY_RETRIEVAL, "1");
+  assert.equal(env.CODEX_HOME, "/tmp/isolated-codex-home");
+});
+
+test("groups cold packet-runtime jobs by repo", () => {
+  const expressRouting = { repo: "express", id: "express-routing" };
+  const muxRouting = { repo: "mux", id: "mux-routing" };
+  const expressResponse = { repo: "express", id: "express-response" };
+
+  const groups = groupPacketRuntimeColdJobs(
+    [expressRouting, muxRouting, expressResponse],
+    3,
+  );
+
+  assert.deepEqual(
+    groups.map(({ repo, jobs }) => ({
+      repo,
+      jobs: jobs.map(({ task, repeat }) => `${task.id}:${repeat}`),
+    })),
+    [
+      {
+        repo: "express",
+        jobs: [
+          "express-routing:1",
+          "express-routing:2",
+          "express-routing:3",
+          "express-response:1",
+          "express-response:2",
+          "express-response:3",
+        ],
+      },
+      {
+        repo: "mux",
+        jobs: ["mux-routing:1", "mux-routing:2", "mux-routing:3"],
+      },
+    ],
+  );
+});
 
 test("parses packet-runtime benchmark run id", () => {
   const opts = parseBenchmarkArgs([
@@ -103,6 +214,2178 @@ test("parses packet-runtime benchmark run id", () => {
   );
 });
 
+test("defaults preparation concurrency to two and validates deterministic shard options", () => {
+  const opts = parseBenchmarkArgs([
+    "--task-suite",
+    "language-expansion-holdout",
+    "--shard-count",
+    "3",
+    "--shard-index",
+    "1",
+  ]);
+  assert.equal(opts.prepareCodestoryJobs, 2);
+  assert.equal(opts.shardCount, 3);
+  assert.equal(opts.shardIndex, 1);
+  assert.throws(
+    () => parseBenchmarkArgs(["--shard-count", "2", "--shard-index", "2"]),
+    /--shard-index must be zero-based/,
+  );
+});
+
+test("manifest declares the real Requests canary and sharding keeps whole tasks", async () => {
+  const opts = {
+    taskSuite: "language-expansion-holdout",
+    taskManifest: null,
+    taskIds: null,
+    repoCacheDir: path.join(os.tmpdir(), "codestory-shard-fixture"),
+    canaryTaskId: null,
+  };
+  const tasks = await loadTasks(opts);
+  assert.equal(opts.manifestCanaryTaskId, "python-requests-session-flow");
+  assert.equal(opts.canaryTaskId, "python-requests-session-flow");
+  const shard = taskShardIndex(opts.canaryTaskId, 4);
+  assert.ok(tasksForShard(tasks, 4, shard).some((task) => task.id === opts.canaryTaskId));
+  assert.ok(!tasksForShard(tasks, 4, (shard + 1) % 4).some((task) => task.id === opts.canaryTaskId));
+});
+
+function exactPacketStdout(packet) {
+  for (;;) {
+    const stdout = `${JSON.stringify(packet, null, 2)}\n`;
+    const bytes = Buffer.byteLength(stdout, "utf8");
+    if (packet.budget.used.output_bytes === bytes) {
+      return stdout;
+    }
+    packet.budget.used.output_bytes = bytes;
+  }
+}
+
+function managedRuntimeIdentity(overrides = {}) {
+  return {
+    plugin_version: "0.17.0",
+    plugin_cli_version: "0.17.0",
+    cli_version: "0.17.0",
+    cli_source: "managed",
+    pinned_pair_matches: true,
+    known_override_skew_channel: false,
+    ...overrides,
+  };
+}
+
+test("packet canary rejects exact byte and graph-limit escapes before the agent", () => {
+  const packet = {
+    packet_id: "packet-1",
+    _meta: {
+      codestory_publication: { contract_runtime: managedRuntimeIdentity() },
+    },
+    plan: { obligations: { claim_obligations: [] } },
+    answer: {
+      citations: [{ node_id: "carrier", file_path: "src/lib.rs" }],
+      graphs: Array.from(
+        { length: 21 },
+        () => ({ graph: { edges: [{ id: "protected" }] } }),
+      ),
+      retrieval_trace: {
+        steps: [{ kind: "source_read", status: "ok" }],
+        retrieval_shadow: { retrieval_mode: "full" },
+      },
+    },
+    support: [{ id: "support-1", kind: "symbol_location", summary: "carrier", path: "src/lib.rs" }],
+    disposition: { kind: "supported", omission_receipts: [] },
+    budget: {
+      limits: {
+        max_anchors: 13,
+        max_files: 1,
+        max_output_bytes: 98_304,
+        max_snippets: 1,
+        max_trail_edges: 20,
+      },
+      used: { anchors: 1, files: 1, output_bytes: 0, snippets: 1, trail_edges: 21 },
+    },
+  };
+  const stdout = exactPacketStdout(packet);
+  const blockers = packetPreludeContractBlockers(packet, stdout, {
+    requireSupported: true,
+    requireManagedRuntime: true,
+  });
+  assert.ok(blockers.some((blocker) => blocker.includes("trail_edges=21 exceeds 20")));
+  assert.equal(blockers.some((blocker) => blocker.includes("stdout bytes")), false);
+
+  packet.answer.graphs.pop();
+  packet.budget.used.trail_edges = 20;
+  const validStdout = exactPacketStdout(packet);
+  assert.deepEqual(packetPreludeContractBlockers(packet, validStdout, {
+    requireSupported: true,
+    requireManagedRuntime: true,
+  }), []);
+  assert.deepEqual(packetDispositionTelemetry(packet, { pass: true }), {
+    kind: "supported",
+    terminal: true,
+    reason: null,
+    support_count: 1,
+    support_kind_counts: { symbol_location: 1 },
+    omission_receipts_count: 0,
+    drill_option_count: 0,
+    drill_option_ids: [],
+    parent_packet_id: null,
+    core_generation_id: null,
+    retrieval_generation: null,
+    remaining_rounds: null,
+    retrieval_mode: "full",
+    degraded_reason: null,
+    supported_quality_mismatch: false,
+  });
+
+  for (const [field, lowered, publicCap] of [
+    ["max_anchors", 12, 13],
+    ["max_trail_edges", 19, 20],
+    ["max_output_bytes", 90_000, 98_304],
+  ]) {
+    const original = packet.budget.limits[field];
+    packet.budget.limits[field] = lowered;
+    const loweredLimitStdout = exactPacketStdout(packet);
+    assert.ok(
+      packetPreludeContractBlockers(packet, loweredLimitStdout, {
+        requireSupported: true,
+        requireManagedRuntime: true,
+      }).some((blocker) =>
+        blocker.includes(
+          `budget.limits.${field}=${lowered} does not equal public cap=${publicCap}`,
+        )
+      ),
+    );
+    packet.budget.limits[field] = original;
+  }
+
+  packet.budget.used.files = 0;
+  packet.budget.used.snippets = 0;
+  const invalidStructuralCounts = exactPacketStdout(packet);
+  const countBlockers = packetPreludeContractBlockers(packet, invalidStructuralCounts, {
+    requireSupported: true,
+    requireManagedRuntime: true,
+  });
+  assert.ok(countBlockers.some((blocker) => blocker.includes("unique citation files=1")));
+  assert.ok(countBlockers.some((blocker) => blocker.includes("successful source reads=1")));
+  packet.budget.used.files = 1;
+  packet.budget.used.snippets = 1;
+
+  packet.disposition = {
+    kind: "drill_once",
+    reason: "one bounded gap",
+    drill: {
+      parent_packet_id: "wrong-parent",
+      core_generation_id: "core-1",
+      options: [],
+      remaining_rounds: 2,
+    },
+  };
+  const invalidDrill = exactPacketStdout(packet);
+  assert.match(
+    packetPreludeContractBlockers(packet, invalidDrill, {
+      requireSupported: true,
+      requireManagedRuntime: true,
+    }).join("\n"),
+    /parent_packet_id.*option count=0.*remaining_rounds=2.*expected supported/s,
+  );
+  packet.disposition = { kind: "supported", omission_receipts: [] };
+
+  packet.answer.retrieval_trace.retrieval_shadow = {
+    retrieval_mode: "degraded",
+    degraded_reason: "semantic unavailable",
+  };
+  const degradedRetrieval = exactPacketStdout(packet);
+  assert.match(
+    packetPreludeContractBlockers(packet, degradedRetrieval, {
+      requireSupported: true,
+      requireManagedRuntime: true,
+    }).join("\n"),
+    /retrieval shadow mode=degraded.*degraded_reason=semantic unavailable/s,
+  );
+  packet.answer.retrieval_trace.retrieval_shadow = { retrieval_mode: "full" };
+
+  packet.budget.limits.max_output_bytes = 200_000;
+  packet.hostile_padding = "x".repeat(100_000);
+  const raisedLimitStdout = exactPacketStdout(packet);
+  assert.ok(packet.budget.used.output_bytes > 98_304);
+  assert.match(
+    packetPreludeContractBlockers(packet, raisedLimitStdout, {
+      requireSupported: true,
+      requireManagedRuntime: true,
+    }).join("\n"),
+    /max_output_bytes=200000 does not equal public cap=98304.*used\.output_bytes=.*exceeds public cap=98304/s,
+  );
+  delete packet.hostile_padding;
+  packet.budget.limits.max_output_bytes = 98_304;
+
+  for (const identity of [
+    managedRuntimeIdentity({ plugin_version: "0.16.3" }),
+    managedRuntimeIdentity({ cli_source: "override", known_override_skew_channel: true }),
+  ]) {
+    packet._meta.codestory_publication.contract_runtime = identity;
+    const staleStdout = exactPacketStdout(packet);
+    assert.match(
+      packetPreludeContractBlockers(packet, staleStdout, {
+        requireSupported: true,
+        requireManagedRuntime: true,
+      }).join("\n"),
+      /runtime identity is not managed 0\.17\.0/,
+    );
+  }
+  packet._meta.codestory_publication.contract_runtime = managedRuntimeIdentity();
+
+  packet.plan.obligations.claim_obligations.push({ material: null, proof_status: "proven" });
+  const invalidObligationsStdout = exactPacketStdout(packet);
+  assert.deepEqual(packetPreludeContractBlockers(packet, invalidObligationsStdout, {
+    requireSupported: true,
+    requireManagedRuntime: true,
+  }), []);
+});
+
+test("packet obligation accounting preserves the historical material split", () => {
+  const materialGroups = [
+    [33, { proof_status: "proven" }],
+    [105, { proof_status: "reported", reason: "packet_budget_truncated" }],
+    [33, { proof_status: "reported", reason: "carrier_not_sufficiency_eligible" }],
+    [18, { proof_status: "reported", reason: "carrier_does_not_satisfy_role_contract" }],
+    [6, { proof_status: "reported", reason: "required_evidence_edge_missing" }],
+    [3, { proof_status: "unsupported", reason: "requested_claim_binding_limit_exceeded:7" }],
+  ];
+  const packet = {
+    plan: {
+      obligations: {
+        claim_obligations: [
+          ...materialGroups.flatMap(([count, obligation]) =>
+            Array.from({ length: count }, () => ({ material: true, ...obligation }))
+          ),
+          ...Array.from({ length: 18 }, () => ({
+            material: false,
+            proof_status: "planned",
+          })),
+        ],
+      },
+    },
+  };
+
+  assert.deepEqual(packetObligationAccounting(packet), {
+    total: 216,
+    material: 198,
+    nonmaterial: 18,
+    material_status_buckets: {
+      carrier_does_not_satisfy_role_contract: 18,
+      carrier_not_sufficiency_eligible: 33,
+      packet_budget_truncated: 105,
+      proven: 33,
+      requested_claim_binding_limit_exceeded: 3,
+      required_evidence_edge_missing: 6,
+    },
+  });
+
+  assert.deepEqual(packetObligationAccounting({
+    plan: {
+      obligations: {
+        claim_obligations: [
+          { material: true, proof_status: "reported" },
+          { material: true, proof_status: "unsupported", reason: "new reason!" },
+        ],
+      },
+    },
+  }).material_status_buckets, {
+    missing_reason: 1,
+    "unclassified_reason:new_reason": 1,
+  });
+});
+
+test("packet obligation accounting rejects unreconciled summaries", () => {
+  const row = (accounting) => ({
+    repo: "fixture",
+    task_id: "generic-flow",
+    mode: "cold_cli_packet",
+    repeat: 1,
+    status: "pass",
+    sufficiency: {
+      status: "partial",
+      obligation_accounting: accounting,
+    },
+  });
+  assert.throws(
+    () => summarizePacketObligationAccounting([
+      row({
+        total: 215,
+        material: 198,
+        nonmaterial: 18,
+        material_status_buckets: { proven: 198 },
+      }),
+    ], "benchmark summary"),
+    /total=215 does not reconcile with material=198 \+ nonmaterial=18/,
+  );
+  assert.throws(
+    () => summarizePacketObligationAccounting([
+      row({
+        total: 216,
+        material: 198,
+        nonmaterial: 18,
+        material_status_buckets: { proven: 197 },
+      }),
+    ], "benchmark summary"),
+    /material=198 does not reconcile with material status buckets=197/,
+  );
+  assert.equal(
+    summarizePacketObligationAccounting([
+      { repo: "fixture", task_id: "baseline", arm: "without_codestory", repeat: 1 },
+    ], "benchmark summary"),
+    null,
+  );
+  for (const missing of [
+    { repo: "fixture", task_id: "measured", arm: "with_codestory", repeat: 1, status: "pass" },
+    { repo: "fixture", task_id: "runtime", mode: "cold_cli_packet", repeat: 1, status: "pass" },
+    { repo: "fixture", task_id: "legacy", arm: "with_codestory", repeat: 1 },
+  ]) {
+    assert.throws(
+      () => summarizePacketObligationAccounting([missing], "benchmark summary"),
+      /packet obligation accounting is missing/,
+    );
+  }
+  for (const status of ["cancelled", "fail", "failed", "partial"]) {
+    assert.equal(
+      summarizePacketObligationAccounting([{
+        repo: "fixture",
+        task_id: status,
+        arm: "with_codestory",
+        repeat: 1,
+        status,
+      }], "benchmark summary"),
+      null,
+      `${status} rows that emitted no packet have no packet accounting to report`,
+    );
+  }
+  for (const emitted of [
+    { sufficiency: { status: "partial" } },
+    { packet_shape: {} },
+    { codestory_harness_prelude: { packet_sufficiency: { status: "partial" } } },
+  ]) {
+    assert.throws(
+      () => summarizePacketObligationAccounting([{
+        repo: "fixture",
+        task_id: "failed-packet",
+        mode: "cold_cli_packet",
+        repeat: 1,
+        status: "fail",
+        ...emitted,
+      }], "benchmark summary"),
+      /packet obligation accounting is missing/,
+      "a failed row with evidence that its packet path began cannot omit accounting",
+    );
+  }
+  assert.equal(
+    summarizePacketObligationAccounting([{
+      repo: "fixture",
+      task_id: "aborted-before-packet",
+      arm: "with_codestory",
+      repeat: 1,
+      status: "cancelled",
+      response_bytes: 0,
+      codestory_harness_prelude: {
+        status: "fail",
+        process_status: "aborted",
+        stdout_bytes: 0,
+        packet_parse_error: null,
+        packet_sufficiency_status: null,
+        packet_sufficiency: null,
+      },
+    }], "benchmark summary"),
+    null,
+    "an aborted prelude with no parsed packet has no packet accounting to report",
+  );
+});
+
+test("packet obligation accounting aggregates valid failed packets and skips cancelled omissions", () => {
+  const accounting = (proven, reported = 0) => ({
+    total: proven + reported,
+    material: proven + reported,
+    nonmaterial: 0,
+    material_status_buckets: {
+      ...(proven ? { proven } : {}),
+      ...(reported ? { required_evidence_edge_missing: reported } : {}),
+    },
+  });
+  const rows = [
+    {
+      repo: "z-pass",
+      task_id: "pass",
+      arm: "with_codestory",
+      repeat: 1,
+      status: "pass",
+      sufficiency: { obligation_accounting: accounting(2) },
+    },
+    {
+      repo: "a-cancelled",
+      task_id: "cancelled",
+      arm: "with_codestory",
+      repeat: 1,
+      status: "cancelled",
+    },
+    {
+      repo: "m-partial",
+      task_id: "partial",
+      arm: "with_codestory",
+      repeat: 1,
+      status: "fail",
+      sufficiency: { obligation_accounting: accounting(1, 1) },
+    },
+    {
+      repo: "n-failed-before-packet",
+      task_id: "failed-before-packet",
+      arm: "with_codestory",
+      repeat: 1,
+      status: "fail",
+    },
+  ];
+  assert.deepEqual(
+    summarizePacketObligationAccounting(rows, "fail-fast summary"),
+    {
+      packets: 2,
+      total: 4,
+      material: 4,
+      nonmaterial: 0,
+      material_status_buckets: {
+        proven: 3,
+        required_evidence_edge_missing: 1,
+      },
+    },
+  );
+});
+
+const FIXTURE_MODEL_SHA256 = "a".repeat(64);
+const FIXTURE_SERVER_SHA256 = "b".repeat(64);
+
+function eligibleRetrievalStatus(overrides = {}) {
+  const serverOverrides = overrides.embedding_server_identity ?? {};
+  return {
+    status: "pass",
+    retrieval_mode: "full",
+    degraded_reason: null,
+    semantic_generation: "semantic-generation-1",
+    engine_diagnostics_status: "pass",
+    engine_diagnostics_error: null,
+    embedding_device_policy: "accelerator_required",
+    embedding_device_state: "accelerated",
+    embedding_device_observation_source: "runtime_probe",
+    embedding_cpu_allowed: false,
+    embedding_model_sha256: FIXTURE_MODEL_SHA256,
+    manifest_embedding_backend:
+      `per-user-server:coderank-embed:q8_0:sha256-${FIXTURE_MODEL_SHA256}:fixture`,
+    embedding_ggml_build_identity: "ggml-fixture",
+    embedding_backend: "Metal",
+    embedding_adapter: "Apple M5 GPU",
+    embedding_adapter_description: "Apple family 9 GPU",
+    embedding_policy: "accelerated",
+    embedding_engine_instance_id: "engine-1",
+    embedding_engine_residency: "resident",
+    embedding_engine_load_generation: 1,
+    embedding_engine_load_error: null,
+    embedding_model_load_count: 1,
+    embedding_smoke_ms: 1,
+    embedding_initialization_ms: 2,
+    embedding_materialized_reused: false,
+    embedding_accelerator_execution_verified: true,
+    embedding_execution_devices: ["Apple M5 GPU"],
+    embedding_execution_backends: ["Metal"],
+    embedding_execution_observation_source: "ggml_eval_callback",
+    embedding_encode_count: 2,
+    embedding_execution_node_count: 3,
+    embedding_resident_accelerator_tensor_count: 4,
+    embedding_resident_accelerator_tensor_bytes: 4096,
+    embedding_model_layer_count: 13,
+    embedding_offloaded_layer_count: 13,
+    local_only: true,
+    embedding_server_identity: {
+      lifecycle: "resident",
+      peer_verified: true,
+      server_instance_id: "engine-1",
+      executable_sha256: FIXTURE_SERVER_SHA256,
+      executable_version: "0.17.0",
+      load_generation: 1,
+      model_load_count: 1,
+      successful_encode_count: 2,
+      ...serverOverrides,
+    },
+    ...overrides,
+    embedding_server_identity: {
+      lifecycle: "resident",
+      peer_verified: true,
+      server_instance_id: "engine-1",
+      executable_sha256: FIXTURE_SERVER_SHA256,
+      executable_version: "0.17.0",
+      load_generation: 1,
+      model_load_count: 1,
+      successful_encode_count: 2,
+      ...serverOverrides,
+    },
+  };
+}
+
+function pipelinePreparation(repo, retrievalOverrides = {}) {
+  return {
+    repo,
+    retrieval_index_status: "pass",
+    retrieval_status: eligibleRetrievalStatus(retrievalOverrides),
+  };
+}
+
+test("canary preparation requires complete live accelerator and server identity", () => {
+  const preparation = pipelinePreparation("canary");
+  assert.deepEqual(
+    cachePreparationCanaryBlockers(preparation, { CODESTORY_EMBED_ALLOW_CPU: "0" }),
+    [],
+  );
+  for (const [overrides, expected] of [
+    [{ degraded_reason: "semantic stale" }, /retrieval is degraded/],
+    [{ embedding_accelerator_execution_verified: false }, /accelerator execution was not verified/],
+    [{ embedding_model_sha256: "bad" }, /model digest is missing or malformed/],
+    [{ embedding_adapter: "llvmpipe" }, /software accelerator adapter/],
+    [{ embedding_execution_observation_source: "inferred_from_request" }, /not backend-measured/],
+    [{ embedding_execution_devices: [] }, /execution devices are missing/],
+    [{ embedding_offloaded_layer_count: 12 }, /not every embedding model layer was offloaded/],
+    [{ embedding_server_identity: { peer_verified: false } }, /peer identity is not verified/],
+    [{ embedding_server_identity: { load_generation: 2 } }, /load identities disagree/],
+    [{ embedding_server_identity: { executable_version: "0.16.0" } }, /expected 0\.17\.0/],
+  ]) {
+    const blockers = cachePreparationCanaryBlockers(
+      pipelinePreparation("canary", overrides),
+      { CODESTORY_EMBED_ALLOW_CPU: "0" },
+    );
+    assert.match(blockers.join("\n"), expected);
+  }
+});
+
+function retrievalEngineDiagnosticsPayload(overrides = {}) {
+  const engineOverrides = overrides.engine ?? {};
+  const serverOverrides = overrides.embedding_server ?? {};
+  return {
+    retrieval_mode: "full",
+    degraded_reason: null,
+    engine: {
+      ...eligibleRetrievalStatus(),
+      embedding_adapter: "Métal GPU",
+      embedding_materialized_path: "/private/host/model.gguf",
+      ...engineOverrides,
+    },
+    embedding_server: {
+      lifecycle: "resident",
+      authority: { peer_verified: true },
+      process: {
+        server_instance_id: "engine-1",
+        executable_sha256: FIXTURE_SERVER_SHA256,
+        executable_version: "0.17.0",
+        pid: 4242,
+        endpoint: "/private/host/server.sock",
+      },
+      engine: {
+        load_generation: 1,
+        model_load_count: 1,
+        successful_encode_count: 2,
+      },
+      ...serverOverrides,
+    },
+    ...overrides,
+    engine: {
+      ...eligibleRetrievalStatus(),
+      embedding_adapter: "Métal GPU",
+      embedding_materialized_path: "/private/host/model.gguf",
+      ...engineOverrides,
+    },
+    embedding_server: {
+      lifecycle: "resident",
+      authority: { peer_verified: true },
+      process: {
+        server_instance_id: "engine-1",
+        executable_sha256: FIXTURE_SERVER_SHA256,
+        executable_version: "0.17.0",
+        pid: 4242,
+        endpoint: "/private/host/server.sock",
+        ...(serverOverrides.process ?? {}),
+      },
+      engine: {
+        load_generation: 1,
+        model_load_count: 1,
+        successful_encode_count: 2,
+        ...(serverOverrides.engine ?? {}),
+      },
+      ...serverOverrides,
+    },
+  };
+}
+
+function retrievalEngineResourceResponse(uri, diagnostics = retrievalEngineDiagnosticsPayload()) {
+  return {
+    jsonrpc: "2.0",
+    id: "benchmark-retrieval-engine",
+    result: {
+      contents: [{ uri, mimeType: "application/json", text: JSON.stringify(diagnostics) }],
+    },
+  };
+}
+
+function scriptedStdioChild(onFrame, options = {}) {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = new PassThrough();
+  child.frames = [];
+  child.signals = [];
+  let input = "";
+  let closed = false;
+  const close = (exitCode, signal = null) => {
+    if (closed) return;
+    closed = true;
+    child.stdout.end();
+    child.stderr.end();
+    queueMicrotask(() => child.emit("close", exitCode, signal));
+  };
+  const respond = (value, splitUnicode = false) => {
+    const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+    if (!splitUnicode) {
+      child.stdout.write(bytes);
+      return;
+    }
+    const marker = Buffer.from("é", "utf8");
+    const index = bytes.indexOf(marker);
+    assert.ok(index >= 0, "scripted response lacks the split Unicode marker");
+    child.stdout.write(bytes.subarray(0, index + 1));
+    child.stdout.write(bytes.subarray(index + 1));
+  };
+  child.stdin.on("data", (chunk) => {
+    input += chunk.toString();
+    for (;;) {
+      const newline = input.indexOf("\n");
+      if (newline < 0) break;
+      const line = input.slice(0, newline).trim();
+      input = input.slice(newline + 1);
+      if (!line) continue;
+      const frame = JSON.parse(line);
+      child.frames.push(frame);
+      onFrame?.(frame, { respond, close, child });
+    }
+  });
+  child.stdin.on("finish", () => {
+    if (!options.hangOnEnd) close(0);
+  });
+  child.kill = (signal) => {
+    child.signals.push(signal);
+    if (signal === "SIGKILL" || options.closeOnTerm) close(null, signal);
+    return true;
+  };
+  return child;
+}
+
+test("retrieval engine diagnostics follows MCP lifecycle and redacts host state", async () => {
+  const project = "/tmp/CodeStory space !'()*é";
+  const expectedUri = projectResourceUri("codestory://diagnostics/retrieval-engine", project);
+  let spawnCall = null;
+  const initializeSeen = deferred();
+  let releaseInitialize = null;
+  const child = scriptedStdioChild((frame, { respond }) => {
+    if (frame.method === "initialize") {
+      releaseInitialize = () => respond({
+          jsonrpc: "2.0",
+          id: frame.id,
+          result: {
+            protocolVersion: "2024-11-05",
+            _meta: { codestory_protocol: { status: "agreed", compatible: true } },
+          },
+        });
+      initializeSeen.resolve();
+    } else if (frame.method === "resources/read") {
+      respond(retrievalEngineResourceResponse(
+        expectedUri,
+        retrievalEngineDiagnosticsPayload({
+          engine: {
+            embedding_engine_load_error: "/private/host/load-error.gguf could not be read",
+          },
+        }),
+      ), true);
+    }
+  });
+  const snapshotPromise = codestoryRetrievalEngineDiagnosticsSnapshot(
+    "/fixture/codestory-cli",
+    project,
+    1_000,
+    { CODESTORY_RETRIEVAL_RUN_ID: "hostile-run" },
+    null,
+    {
+      spawnProcess: (command, args, options) => {
+        spawnCall = { command, args, options };
+        return child;
+      },
+    },
+  );
+  await initializeSeen.promise;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(child.frames.map((frame) => frame.method), ["initialize"]);
+  releaseInitialize();
+  const snapshot = await snapshotPromise;
+
+  assert.equal(snapshot.status, "pass");
+  assert.equal(snapshot.engine.embedding_adapter, "Métal GPU");
+  assert.deepEqual(child.frames.map((frame) => frame.method), [
+    "initialize",
+    "notifications/initialized",
+    "resources/read",
+  ]);
+  assert.deepEqual(child.frames[0].params.clientInfo, {
+    name: "codestory-benchmark",
+    version: "1",
+  });
+  assert.equal(child.frames[2].params.uri, expectedUri);
+  assert.equal(spawnCall.command, "/fixture/codestory-cli");
+  assert.deepEqual(spawnCall.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
+  assert.equal(spawnCall.options.env.CODESTORY_RETRIEVAL_PROFILE, "agent");
+  assert.equal(spawnCall.options.env.CODESTORY_RETRIEVAL_RUN_ID, "shared-agent");
+  assert.deepEqual(child.signals, []);
+  const retained = JSON.stringify(snapshot);
+  assert.doesNotMatch(retained, /model\.gguf|server\.sock|4242/);
+  assert.doesNotMatch(retained, /load-error\.gguf/);
+  assert.equal(snapshot.engine.embedding_engine_load_error, "present");
+});
+
+test("retrieval engine diagnostics refuses invalid negotiation before resource reads", async () => {
+  for (const response of [
+    { jsonrpc: "2.0", id: "benchmark-initialize", error: { code: -32000, message: "no" } },
+    {
+      jsonrpc: "2.0",
+      id: "benchmark-initialize",
+      result: {
+        protocolVersion: "2025-01-01",
+        _meta: { codestory_protocol: { status: "agreed", compatible: true } },
+      },
+    },
+  ]) {
+    const child = scriptedStdioChild((frame, { respond }) => {
+      if (frame.method === "initialize") respond(response);
+    }, { closeOnTerm: true });
+    const snapshot = await codestoryRetrievalEngineDiagnosticsSnapshot(
+      "fixture-cli",
+      "/fixture/project",
+      1_000,
+      {},
+      null,
+      { spawnProcess: () => child },
+    );
+    assert.equal(snapshot.status, "fail");
+    assert.deepEqual(child.frames.map((frame) => frame.method), ["initialize"]);
+  }
+});
+
+test("retrieval engine diagnostics rejects malformed resource envelopes", () => {
+  const uri = projectResourceUri("codestory://diagnostics/retrieval-engine", "/fixture/project");
+  const valid = retrievalEngineResourceResponse(uri);
+  const cases = [
+    { ...valid, error: { code: -32000, message: "failed" }, result: undefined },
+    { ...valid, result: { contents: [{ ...valid.result.contents[0], uri: `${uri}-wrong` }] } },
+    { ...valid, result: { contents: [valid.result.contents[0], valid.result.contents[0]] } },
+    { ...valid, result: { contents: [{ ...valid.result.contents[0], mimeType: "text/plain" }] } },
+    { ...valid, result: { contents: [{ ...valid.result.contents[0], text: "{" }] } },
+    { ...valid, result: { contents: [{ ...valid.result.contents[0], text: "[]" }] } },
+    {
+      ...valid,
+      result: { contents: [{ ...valid.result.contents[0], text: JSON.stringify({ retrieval_mode: "full" }) }] },
+    },
+  ];
+  for (const response of cases) {
+    const snapshot = retrievalEngineDiagnosticsSnapshotFromOutput(response, uri, 1);
+    assert.equal(snapshot.status, "fail");
+    assert.ok(snapshot.error);
+  }
+});
+
+test("retrieval engine resource URIs are strict and filesystem-identity aware", async () => {
+  const base = "codestory://diagnostics/retrieval-engine";
+  assert.equal(
+    projectResourceUri(base, "/tmp/space !'()*é"),
+    `${base}?project=%2Ftmp%2Fspace%20%21%27%28%29%2A%C3%A9`,
+  );
+  assert.equal(
+    projectResourceUri(base, String.raw`\\?\C:\Repo Space\!`, "win32"),
+    `${base}?project=C%3A%2FRepo%20Space%2F%21`,
+  );
+  assert.equal(
+    projectResourceUri(base, String.raw`\\?\UNC\server\share\repo`, "win32"),
+    `${base}?project=%2F%2Fserver%2Fshare%2Frepo`,
+  );
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-resource-uri-"));
+  const real = path.join(root, "real");
+  const alias = path.join(root, "alias");
+  await mkdir(real);
+  await symlink(real, alias, process.platform === "win32" ? "junction" : "dir");
+  assert.equal(
+    resourceUriMatches(projectResourceUri(base, alias), projectResourceUri(base, real), process.platform),
+    true,
+  );
+  const other = path.join(root, "other");
+  await mkdir(other);
+  assert.equal(
+    resourceUriMatches(projectResourceUri(base, real), projectResourceUri(base, other), process.platform),
+    false,
+  );
+  assert.equal(
+    resourceUriMatches(
+      projectResourceUri(base, "C:/repo", "win32"),
+      projectResourceUri(base, "c:/REPO", "win32"),
+      "win32",
+      () => true,
+    ),
+    true,
+  );
+  await rm(root, { recursive: true, force: true });
+});
+
+test("retrieval status and diagnostics merge preserve public ownership", () => {
+  const uri = projectResourceUri("codestory://diagnostics/retrieval-engine", "/fixture/project");
+  const diagnostics = retrievalEngineDiagnosticsSnapshotFromOutput(
+    retrievalEngineResourceResponse(uri),
+    uri,
+    3,
+  );
+  const publicStatus = {
+    status: "pass",
+    retrieval_mode: "full",
+    degraded_reason: null,
+    semantic_generation: "semantic-generation-1",
+    manifest_embedding_backend:
+      `per-user-server:coderank-embed:q8_0:sha256-${FIXTURE_MODEL_SHA256}:fixture`,
+    embedding_device_policy: "accelerator_required",
+    embedding_device_state: "accelerated",
+    embedding_cpu_allowed: false,
+  };
+  const merged = mergeRetrievalStatusWithEngineDiagnostics(publicStatus, diagnostics);
+  assert.equal(merged.engine_diagnostics_status, "pass");
+  assert.equal(merged.embedding_device_policy, "accelerator_required");
+  assert.equal(merged.embedding_device_state, "accelerated");
+  assert.equal(merged.embedding_model_sha256, FIXTURE_MODEL_SHA256);
+  assert.equal(merged.local_only, true);
+  assert.deepEqual(
+    cachePreparationCanaryBlockers(
+      { retrieval_index_status: "pass", retrieval_status: merged },
+      { CODESTORY_EMBED_ALLOW_CPU: "0" },
+    ),
+    [],
+  );
+  const disagreement = mergeRetrievalStatusWithEngineDiagnostics(
+    publicStatus,
+    { ...diagnostics, retrieval_mode: "degraded" },
+  );
+  assert.equal(disagreement.engine_diagnostics_status, "fail");
+  assert.match(disagreement.engine_diagnostics_error, /disagree/);
+});
+
+test("public retrieval status cannot inject maintainer engine identity", () => {
+  const snapshot = retrievalStatusSnapshotFromOutput(
+    { status: "pass", exitCode: 0, timedOut: false },
+    {
+      retrieval_mode: "full",
+      degraded_reason: null,
+      embedding_device_policy: "accelerator_required",
+      embedding_device_state: "accelerated",
+      embedding_cpu_allowed: false,
+      embedding_backend: "hostile-backend",
+      embedding_policy: "hostile-policy",
+      embedding_engine_instance_id: "hostile-engine",
+      embedding_accelerator_execution_verified: true,
+      local_only: true,
+    },
+    null,
+    1,
+  );
+  assert.equal(snapshot.embedding_device_policy, "accelerator_required");
+  assert.equal(snapshot.embedding_device_state, "accelerated");
+  assert.equal(snapshot.embedding_cpu_allowed, false);
+  assert.equal(snapshot.embedding_backend, null);
+  assert.equal(snapshot.embedding_policy, null);
+  assert.equal(snapshot.embedding_engine_instance_id, null);
+  assert.equal(snapshot.embedding_accelerator_execution_verified, null);
+  assert.equal(snapshot.local_only, null);
+});
+
+test("retrieval engine diagnostics abort and EOF hang terminate task-owned children", async () => {
+  const abortSignals = [];
+  const abortChild = scriptedStdioChild(null, { hangOnEnd: true });
+  abortChild.kill = (signal) => {
+    abortSignals.push(signal);
+    if (signal === "SIGKILL") queueMicrotask(() => abortChild.emit("close", null, signal));
+    return true;
+  };
+  const controller = new AbortController();
+  const aborted = codestoryRetrievalEngineDiagnosticsSnapshot(
+    "fixture-cli",
+    "/fixture/project",
+    60_000,
+    {},
+    controller.signal,
+    { forceKillAfterMs: 5, spawnProcess: () => abortChild },
+  );
+  controller.abort();
+  assert.equal((await aborted).status, "aborted");
+  assert.deepEqual(abortSignals, ["SIGTERM", "SIGKILL"]);
+
+  const eofSignals = [];
+  const uri = projectResourceUri("codestory://diagnostics/retrieval-engine", "/fixture/project");
+  const eofChild = scriptedStdioChild((frame, { respond }) => {
+    if (frame.method === "initialize") {
+      respond({
+        jsonrpc: "2.0",
+        id: frame.id,
+        result: {
+          protocolVersion: "2024-11-05",
+          _meta: { codestory_protocol: { status: "agreed", compatible: true } },
+        },
+      });
+    } else if (frame.method === "resources/read") {
+      respond(retrievalEngineResourceResponse(uri));
+    }
+  }, { hangOnEnd: true });
+  eofChild.kill = (signal) => {
+    eofSignals.push(signal);
+    if (signal === "SIGKILL") queueMicrotask(() => eofChild.emit("close", null, signal));
+    return true;
+  };
+  const timedOut = await codestoryRetrievalEngineDiagnosticsSnapshot(
+    "fixture-cli",
+    "/fixture/project",
+    20,
+    {},
+    null,
+    { forceKillAfterMs: 5, spawnProcess: () => eofChild },
+  );
+  assert.equal(timedOut.status, "timeout");
+  assert.deepEqual(eofSignals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("retrieval engine diagnostics bounds cumulative output and stream errors", async () => {
+  for (const emitFailure of [
+    (child) => {
+      for (let index = 0; index < 1100; index += 1) child.stdout.write(`${" ".repeat(1024)}\n`);
+    },
+    (child) => child.stdout.emit("error", new Error("fixture stdout broke")),
+    (child) => child.stderr.emit("error", new Error("fixture stderr broke")),
+  ]) {
+    const child = scriptedStdioChild((frame, { child: runningChild }) => {
+      if (frame.method === "initialize") emitFailure(runningChild);
+    }, { hangOnEnd: true });
+    const snapshot = await codestoryRetrievalEngineDiagnosticsSnapshot(
+      "fixture-cli",
+      "/fixture/project",
+      1_000,
+      {},
+      null,
+      { forceKillAfterMs: 5, spawnProcess: () => child },
+    );
+    assert.notEqual(snapshot.status, "pass");
+    assert.match(snapshot.error, /exceeded 1 MiB|stdout error|stderr error/);
+    assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+  }
+});
+
+const CLEAN_SHARD_ATTESTATION = {
+  sourceCommit: "source",
+  sourceTree: "tree",
+  trackedDirty: false,
+  cliSha256: "cli",
+};
+
+function pipelineResult(run, status = "pass") {
+  return {
+    benchmark_run_id: `${run.task.id}-${run.arm}-${run.repeat}`,
+    repo: run.repo,
+    task_id: run.task.id,
+    arm: run.arm,
+    repeat: run.repeat,
+    canary: run.canary === true,
+    preparation_overlap: run.preparation_overlap === true,
+    comparative_wall_time_eligible: run.comparative_wall_time_eligible !== false,
+    status,
+  };
+}
+
+function pipelineFixture(overrides = {}) {
+  const tasks = (overrides.repos ?? ["canary", "second"]).map((repo) => ({
+    id: `${repo}-task`,
+    repo,
+    prompt: `trace ${repo}`,
+  }));
+  const opts = {
+    arms: ["with_codestory", "without_codestory"],
+    repeats: overrides.repeats ?? 1,
+    jobs: overrides.jobs ?? 4,
+    prepareCodestoryJobs: 2,
+    publishable: false,
+    collectAllFailures: false,
+    canaryTaskId: overrides.canaryTaskId ?? tasks[0].id,
+    manifestCanaryTaskId: overrides.canaryTaskId ?? tasks[0].id,
+  };
+  return { tasks, opts, plannedRuns: planAgentRuns(opts, tasks) };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}
+
+test("benchmark pipeline fences a failed canary and counts a passing canary once", async () => {
+  const fixture = pipelineFixture({ repeats: 2 });
+  const materialized = [];
+  const prepared = [];
+  const launched = [];
+  const failed = await runAgentBenchmarkPipeline({
+    ...fixture,
+    materializeGroup: async (group) => materialized.push(group.repo),
+    prepareGroup: async (group) => {
+      prepared.push(group.repo);
+      return [pipelinePreparation(group.repo)];
+    },
+    executeRun: async (_opts, run) => {
+      launched.push(`${run.repo}/${run.arm}/${run.repeat}`);
+      return pipelineResult(run, run.canary ? "fail" : "pass");
+    },
+  });
+  assert.deepEqual(materialized, ["canary"]);
+  assert.deepEqual(prepared, ["canary"]);
+  assert.deepEqual(launched, ["canary/with_codestory/1"]);
+  assert.equal(failed.firstFailure.task_id, "canary-task");
+
+  const passingLaunches = [];
+  const passing = await runAgentBenchmarkPipeline({
+    ...pipelineFixture({ repeats: 2 }),
+    materializeGroup: async () => {},
+    prepareGroup: async (group) => [pipelinePreparation(group.repo)],
+    executeRun: async (_opts, run) => {
+      passingLaunches.push(`${run.repo}/${run.arm}/${run.repeat}`);
+      return pipelineResult(run);
+    },
+  });
+  assert.equal(passing.firstFailure, null);
+  assert.equal(passing.results.length, passingLaunches.length);
+  assert.equal(passing.results.length, 8);
+  assert.equal(
+    passing.results.filter((row) =>
+      row.task_id === "canary-task" &&
+      row.arm === "with_codestory" &&
+      row.repeat === 1
+    ).length,
+    1,
+  );
+  assert.equal(new Set(passingLaunches).size, passingLaunches.length);
+
+  const nonOwner = pipelineFixture({ repos: ["second"], canaryTaskId: "canary-task" });
+  const nonOwnerResult = await runAgentBenchmarkPipeline({
+    ...nonOwner,
+    materializeGroup: async () => {},
+    prepareGroup: async (group) => [pipelinePreparation(group.repo)],
+    executeRun: async (_opts, run) => pipelineResult(run),
+  });
+  assert.equal(nonOwnerResult.results.some((row) => row.canary), false);
+});
+
+test("benchmark pipeline rejects missing or wrong-repository canary preparation before agents", async () => {
+  for (const prepared of [[], [pipelinePreparation("wrong-repo")]]) {
+    const launched = [];
+    const outcome = await runAgentBenchmarkPipeline({
+      ...pipelineFixture({ repos: ["canary", "second"] }),
+      materializeGroup: async () => {},
+      prepareGroup: async () => prepared,
+      executeRun: async (_opts, run) => {
+        launched.push(run.repo);
+        return pipelineResult(run);
+      },
+    });
+    assert.equal(outcome.firstFailure.kind, "preparation_contract_failed");
+    assert.deepEqual(outcome.cachePreparation, []);
+    assert.deepEqual(launched, []);
+  }
+});
+
+test("preparation identity drift aborts before later rows and remains evidence only", async () => {
+  for (const [field, value] of [
+    ["embedding_model_sha256", "c".repeat(64)],
+    ["embedding_backend", "Vulkan"],
+    ["embedding_adapter", "Different GPU"],
+    ["embedding_policy", "different-policy"],
+    ["embedding_engine_instance_id", "engine-2"],
+  ]) {
+    const evidence = [];
+    const launched = [];
+    const fixture = pipelineFixture({ repos: ["canary", "second"] });
+    const outcome = await runAgentBenchmarkPipeline({
+      ...fixture,
+      materializeGroup: async () => {},
+      prepareGroup: async (group) => [
+        pipelinePreparation(group.repo, group.repo === "second" ? { [field]: value } : {}),
+      ],
+      recordPreparation: async (row) => evidence.push(row),
+      executeRun: async (_opts, run) => {
+        launched.push(`${run.repo}/${run.arm}`);
+        return pipelineResult(run);
+      },
+    });
+    assert.equal(outcome.firstFailure.kind, "preparation_identity_mismatch", field);
+    assert.deepEqual(outcome.cachePreparation.map((row) => row.repo), ["canary"]);
+    assert.deepEqual(evidence.map((row) => row.repo), ["canary", "second"]);
+    assert.equal(fixture.opts.cachePreparationByRepo.has("canary"), true);
+    assert.equal(fixture.opts.cachePreparationByRepo.has("second"), false);
+    assert.equal(launched.some((row) => row.startsWith("second/")), false);
+  }
+});
+
+test("nonowner shard establishes a local preparation identity reference", async () => {
+  const fixture = pipelineFixture({
+    repos: ["first", "second"],
+    canaryTaskId: "global-canary-not-on-this-shard",
+  });
+  const launched = [];
+  const outcome = await runAgentBenchmarkPipeline({
+    ...fixture,
+    materializeGroup: async () => {},
+    prepareGroup: async (group) => [
+      pipelinePreparation(group.repo, group.repo === "second"
+        ? { embedding_engine_instance_id: "engine-2" }
+        : {}),
+    ],
+    executeRun: async (_opts, run) => {
+      launched.push(run.repo);
+      return pipelineResult(run);
+    },
+  });
+  assert.equal(outcome.firstFailure.kind, "preparation_identity_mismatch");
+  assert.deepEqual(outcome.cachePreparation.map((row) => row.repo), ["first"]);
+  assert.equal(launched.includes("second"), false);
+  assert.equal(
+    outcome.results.some((row) => row.arm === "with_codestory"),
+    false,
+  );
+});
+
+test("identity failure aborts sibling preparation before durable failure recording completes", async () => {
+  const fixture = pipelineFixture({ repos: ["canary", "failing", "sibling"] });
+  const bothStarted = deferred();
+  const siblingObservedAbort = deferred();
+  const releaseFailureWrite = deferred();
+  const launched = [];
+  let activePreparations = 0;
+  const pipelinePromise = runAgentBenchmarkPipeline({
+    ...fixture,
+    materializeGroup: async () => {},
+    prepareGroup: async (group, signal) => {
+      if (group.repo === "canary") return [pipelinePreparation(group.repo)];
+      activePreparations += 1;
+      if (activePreparations === 2) bothStarted.resolve();
+      await bothStarted.promise;
+      if (group.repo === "failing") {
+        return [pipelinePreparation(group.repo, { embedding_engine_instance_id: "engine-2" })];
+      }
+      await new Promise((resolve) => {
+        if (signal.aborted) return resolve();
+        signal.addEventListener("abort", resolve, { once: true });
+      });
+      siblingObservedAbort.resolve();
+      return [pipelinePreparation(group.repo)];
+    },
+    recordFirstFailure: async (failure) => {
+      if (failure.kind === "preparation_identity_mismatch") {
+        await releaseFailureWrite.promise;
+      }
+    },
+    executeRun: async (_opts, run) => {
+      launched.push(run.repo);
+      return pipelineResult(run);
+    },
+  });
+  await siblingObservedAbort.promise;
+  assert.equal(fixture.opts.cachePreparationByRepo.has("failing"), false);
+  assert.equal(fixture.opts.cachePreparationByRepo.has("sibling"), false);
+  assert.equal(launched.includes("failing"), false);
+  assert.equal(launched.includes("sibling"), false);
+  releaseFailureWrite.resolve();
+  const outcome = await pipelinePromise;
+  assert.equal(outcome.firstFailure.kind, "preparation_identity_mismatch");
+});
+
+test("host class and shard attestation reject inconsistent preparation identity", async () => {
+  const first = pipelinePreparation("first");
+  const second = pipelinePreparation("second");
+  const hostClass = benchmarkHostClass([first, second]);
+  assert.equal(hostClass.model_sha256, FIXTURE_MODEL_SHA256);
+  assert.equal(Object.hasOwn(hostClass, "embedding_engine_instance_id"), false);
+  for (const [field, value] of [
+    ["embedding_model_sha256", "c".repeat(64)],
+    ["embedding_backend", "Vulkan"],
+    ["embedding_adapter", "Different GPU"],
+    ["embedding_policy", "different-policy"],
+    ["embedding_engine_instance_id", "engine-2"],
+  ]) {
+    const changed = pipelinePreparation("second", { [field]: value });
+    assert.match(cachePreparationIdentityBlockers(first, changed).join("\n"), new RegExp(field));
+    assert.throws(
+      () => benchmarkHostClass([first, changed]),
+      /do not share one retrieval engine identity/,
+    );
+  }
+  const fixture = pipelineFixture({ repos: ["first", "second"] });
+  fixture.opts.prepareCodestoryCache = true;
+  fixture.opts.shardCount = 1;
+  fixture.opts.shardIndex = 0;
+  const attestation = await benchmarkShardAttestation(
+    fixture.opts,
+    fixture.tasks,
+    [first, second],
+    [],
+    CLEAN_SHARD_ATTESTATION,
+  );
+  assert.equal(attestation.model_sha256, attestation.host_class.model_sha256);
+  await assert.rejects(
+    () => benchmarkShardAttestation(
+      fixture.opts,
+      fixture.tasks,
+      [first, first],
+      [],
+      CLEAN_SHARD_ATTESTATION,
+    ),
+    /preparation rows do not match/,
+  );
+  await assert.rejects(
+    () => benchmarkShardAttestation(
+      fixture.opts,
+      fixture.tasks,
+      [first, second, pipelinePreparation("extra")],
+      [],
+      CLEAN_SHARD_ATTESTATION,
+    ),
+    /preparation rows do not match/,
+  );
+  await assert.rejects(
+    () => benchmarkShardAttestation(
+      fixture.opts,
+      fixture.tasks,
+      [first, pipelinePreparation("second", { embedding_engine_instance_id: "engine-2" })],
+      [],
+      CLEAN_SHARD_ATTESTATION,
+    ),
+    /do not share one retrieval engine identity/,
+  );
+});
+
+test("fail-fast closeout keeps the first failure instead of requiring unfinished shard preparation", async () => {
+  const fixture = pipelineFixture({ repos: ["canary", "second"] });
+  fixture.opts.prepareCodestoryCache = true;
+  fixture.opts.publishable = true;
+  fixture.opts.shardCount = 1;
+  fixture.opts.shardIndex = 0;
+  const retainedPreparation = [pipelinePreparation("canary")];
+  const firstFailure = {
+    kind: "canary_preparation",
+    repo: "canary",
+    task_id: "canary-task",
+    blockers: [{ category: "environment", reasons: ["fixture canary failed"] }],
+  };
+
+  assert.equal(
+    await benchmarkShardAttestationForCloseout(
+      fixture.opts,
+      fixture.tasks,
+      retainedPreparation,
+      [],
+      firstFailure,
+      CLEAN_SHARD_ATTESTATION,
+    ),
+    null,
+  );
+  await assert.rejects(
+    () => benchmarkShardAttestationForCloseout(
+      fixture.opts,
+      fixture.tasks,
+      retainedPreparation,
+      [],
+      null,
+      CLEAN_SHARD_ATTESTATION,
+    ),
+    /preparation rows do not match/,
+    "a successful publishable closeout must still reconcile every owned repository",
+  );
+});
+
+test("benchmark pipeline retains product rows after an overlap baseline failure", async () => {
+  const fixture = pipelineFixture({
+    repos: ["canary", "alpha", "beta", "gamma", "delta", "epsilon"],
+  });
+  const baselineStarted = [];
+  const comparativeFailures = [];
+  const twoBaselinesStarted = deferred();
+  const releaseRemainingPreparation = deferred();
+  let abortedBaselineSiblings = 0;
+  const outcome = await runAgentBenchmarkPipeline({
+    ...fixture,
+    materializeGroup: async () => {},
+    prepareGroup: async (group) => {
+      if (!["canary", "alpha"].includes(group.repo)) {
+        await releaseRemainingPreparation.promise;
+      }
+      return [pipelinePreparation(group.repo)];
+    },
+    recordComparativeFailure: async (failure) => comparativeFailures.push(failure),
+    executeRun: async (runOpts, run) => {
+      if (run.arm === "with_codestory") return pipelineResult(run);
+      baselineStarted.push(run.repo);
+      if (baselineStarted.length === 2) {
+        twoBaselinesStarted.resolve();
+        releaseRemainingPreparation.resolve();
+      }
+      if (run.repo === "canary") {
+        await twoBaselinesStarted.promise;
+        return pipelineResult(run, "fail");
+      }
+      await new Promise((resolve) => {
+        if (runOpts.signal.aborted) return resolve();
+        runOpts.signal.addEventListener("abort", resolve, { once: true });
+      });
+      abortedBaselineSiblings += 1;
+      return pipelineResult(run, "cancelled");
+    },
+  });
+  assert.equal(outcome.firstFailure, null);
+  assert.equal(outcome.comparativeFailure.kind, "comparative_baseline_failure");
+  assert.equal(outcome.comparativePublishable, false);
+  assert.equal(comparativeFailures.length, 1);
+  assert.ok(abortedBaselineSiblings >= 1);
+  assert.ok(baselineStarted.length >= 2);
+  assert.ok(baselineStarted.length < fixture.tasks.length);
+  assert.equal(outcome.cachePreparation.length, fixture.tasks.length);
+  assert.equal(
+    outcome.results.filter((row) => row.arm === "with_codestory" && row.status === "pass").length,
+    fixture.tasks.length,
+  );
+  assert.equal(
+    outcome.results.some((row) => row.arm === "without_codestory" && row.status === "pass"),
+    false,
+  );
+});
+
+test("benchmark pipeline prepares two repos while baselines overlap and waits before CodeStory", async () => {
+  const fixture = pipelineFixture({ repos: ["canary", "alpha", "beta", "gamma"] });
+  const barriers = new Map();
+  const started = [];
+  const startedTwo = deferred();
+  const startedThree = deferred();
+  let active = 0;
+  let maxActive = 0;
+  let completed = 0;
+  let codeStoryStartedBeforeDrain = false;
+  const pipelinePromise = runAgentBenchmarkPipeline({
+    ...fixture,
+    materializeGroup: async () => {},
+    prepareGroup: async (group) => {
+      if (group.repo === "canary") {
+        return [pipelinePreparation(group.repo)];
+      }
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      started.push(group.repo);
+      const barrier = deferred();
+      barriers.set(group.repo, barrier);
+      if (started.length === 2) startedTwo.resolve();
+      if (started.length === 3) startedThree.resolve();
+      await barrier.promise;
+      active -= 1;
+      completed += 1;
+      return [pipelinePreparation(group.repo)];
+    },
+    executeRun: async (_opts, run) => {
+      if (run.arm === "with_codestory" && !run.canary && completed < 3) {
+        codeStoryStartedBeforeDrain = true;
+      }
+      return pipelineResult(run);
+    },
+  });
+
+  await startedTwo.promise;
+  assert.equal(started.length, 2);
+  assert.equal(maxActive, 2);
+  assert.equal(codeStoryStartedBeforeDrain, false);
+  barriers.get(started[0]).resolve();
+  await startedThree.promise;
+  assert.equal(started.length, 3);
+  assert.equal(maxActive, 2);
+  for (const barrier of barriers.values()) barrier.resolve();
+  const outcome = await pipelinePromise;
+
+  assert.equal(completed, 3);
+  assert.equal(codeStoryStartedBeforeDrain, false);
+  const overlapBaselines = outcome.results.filter((row) =>
+    row.arm === "without_codestory" && row.preparation_overlap
+  );
+  assert.ok(overlapBaselines.length > 0);
+  assert.ok(overlapBaselines.every((row) => row.comparative_wall_time_eligible === false));
+});
+
+test("agent fail-fast aborts active siblings and stops queued repo groups", async () => {
+  const fixture = pipelineFixture({ repos: ["first", "second", "third"], jobs: 2 });
+  const runs = fixture.plannedRuns.filter((run) => run.arm === "with_codestory");
+  const bothStarted = deferred();
+  const launched = [];
+  const recorded = [];
+  let siblingAborted = false;
+  const controller = new AbortController();
+  const outcome = await runPlannedAgentRuns(
+    fixture.opts,
+    runs,
+    new Map(),
+    null,
+    {
+      signal: controller.signal,
+      abortController: controller,
+      failFast: true,
+      onResult: async (row) => recorded.push(row),
+      runOne: async (runOpts, run) => {
+        launched.push(run.repo);
+        if (launched.length === 2) bothStarted.resolve();
+        await bothStarted.promise;
+        if (run.repo === "first") return pipelineResult(run, "fail");
+        await new Promise((resolve) => {
+          if (runOpts.signal.aborted) return resolve();
+          runOpts.signal.addEventListener("abort", resolve, { once: true });
+        });
+        siblingAborted = true;
+        return pipelineResult(run, "cancelled");
+      },
+    },
+  );
+  assert.deepEqual(new Set(launched), new Set(["first", "second"]));
+  assert.equal(siblingAborted, true);
+  assert.equal(controller.signal.aborted, true);
+  assert.equal(outcome.results.length, 2);
+  assert.equal(recorded.length, 2);
+});
+
+test("fail-fast pipeline summary retains the causal partial packet and cancelled sibling", async () => {
+  const fixture = pipelineFixture({ repos: ["apache", "express", "ripgrep"], jobs: 3 });
+  const runs = fixture.plannedRuns.filter((run) => run.arm === "with_codestory");
+  const allStarted = deferred();
+  const launched = [];
+  const controller = new AbortController();
+  const partialAccounting = {
+    total: 2,
+    material: 2,
+    nonmaterial: 0,
+    material_status_buckets: {
+      proven: 1,
+      required_evidence_edge_missing: 1,
+    },
+  };
+  const outcome = await runPlannedAgentRuns(
+    fixture.opts,
+    runs,
+    new Map(),
+    null,
+    {
+      signal: controller.signal,
+      abortController: controller,
+      failFast: true,
+      runOne: async (runOpts, run) => {
+        launched.push(run.repo);
+        if (launched.length === runs.length) allStarted.resolve();
+        await allStarted.promise;
+        if (run.repo === "express") {
+          return {
+            ...pipelineResult(run, "fail"),
+            sufficiency: {
+              status: "partial",
+              obligation_accounting: partialAccounting,
+            },
+          };
+        }
+        await new Promise((resolve) => {
+          if (runOpts.signal.aborted) return resolve();
+          runOpts.signal.addEventListener("abort", resolve, { once: true });
+        });
+        return pipelineResult(run, "cancelled");
+      },
+    },
+  );
+
+  assert.equal(outcome.firstFailure.repo, "express");
+  const canonical = sortAgentResultsCanonical(
+    outcome.results,
+    [...fixture.tasks].sort((left, right) => left.repo.localeCompare(right.repo)),
+    fixture.opts.arms,
+  );
+  assert.equal(canonical[0].repo, "apache");
+  assert.equal(canonical[0].status, "cancelled");
+  assert.deepEqual(
+    summarizePacketObligationAccounting(canonical, "agent benchmark report"),
+    {
+      packets: 1,
+      total: 2,
+      material: 2,
+      nonmaterial: 0,
+      material_status_buckets: {
+        proven: 1,
+        required_evidence_edge_missing: 1,
+      },
+    },
+    "summary closeout must not let a cancelled alphabetically earlier sibling mask Express",
+  );
+});
+
+test("agent scheduler durably retains sibling rows after an active run exception", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-run-exception-"));
+  const runsLedger = await createDurableJsonlAppender(path.join(root, "runs.jsonl"));
+  const firstFailurePath = path.join(root, "first-failure.json");
+  const fixture = pipelineFixture({ repos: ["first", "second", "third"], jobs: 2 });
+  const runs = fixture.plannedRuns.filter((run) => run.arm === "with_codestory");
+  const controller = new AbortController();
+  const bothStarted = deferred();
+  const launched = [];
+  let outcome;
+  try {
+    outcome = await runPlannedAgentRuns(
+      fixture.opts,
+      runs,
+      new Map(),
+      root,
+      {
+        signal: controller.signal,
+        abortController: controller,
+        failFast: true,
+        onResult: (row) => runsLedger.append(row),
+        onFirstFailure: (failure) => writeFile(
+          firstFailurePath,
+          `${JSON.stringify(failure)}\n`,
+        ),
+        runOne: async (runOpts, run) => {
+          launched.push(run.repo);
+          if (launched.length === 2) bothStarted.resolve();
+          await bothStarted.promise;
+          if (run.repo === "first") {
+            throw new Error("fixture provenance write failed");
+          }
+          await new Promise((resolve) => {
+            if (runOpts.signal.aborted) return resolve();
+            runOpts.signal.addEventListener("abort", resolve, { once: true });
+          });
+          return pipelineResult(run, "cancelled");
+        },
+      },
+    );
+  } finally {
+    await runsLedger.close();
+  }
+
+  const firstFailure = JSON.parse(await readFile(firstFailurePath, "utf8"));
+  const rows = (await readFile(path.join(root, "runs.jsonl"), "utf8"))
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map(JSON.parse);
+  assert.deepEqual(new Set(launched), new Set(["first", "second"]));
+  assert.equal(controller.signal.aborted, true);
+  assert.equal(firstFailure.kind, "run_exception");
+  assert.equal(firstFailure.repo, "first");
+  assert.equal(firstFailure.task_id, "first-task");
+  assert.equal(firstFailure.arm, "with_codestory");
+  assert.equal(firstFailure.repeat, 1);
+  assert.deepEqual(firstFailure.blockers, [{
+    category: "harness-contract",
+    reasons: ["agent run raised an exception: fixture provenance write failed"],
+  }]);
+  assert.deepEqual(rows.map((row) => row.repo), ["second"]);
+  assert.deepEqual(outcome.results.map((row) => row.repo), ["second"]);
+  assert.equal(outcome.firstFailure.kind, "run_exception");
+  await rm(root, { recursive: true, force: true });
+});
+
+test("task-owned process abort escalates and timeout keeps precedence", async () => {
+  const ignoringChild = (signals) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = { end() {} };
+    child.kill = (signal) => {
+      signals.push(signal);
+      if (signal === "SIGKILL") {
+        queueMicrotask(() => child.emit("close", null, signal));
+      }
+      return true;
+    };
+    return child;
+  };
+
+  const abortSignals = [];
+  const abortController = new AbortController();
+  const aborted = runProcess("fixture", [], {
+    signal: abortController.signal,
+    timeoutMs: 1,
+    forceKillAfterMs: 5,
+    spawnProcess: () => ignoringChild(abortSignals),
+  });
+  abortController.abort();
+  const abortResult = await aborted;
+  assert.equal(abortResult.status, "aborted");
+  assert.deepEqual(abortSignals, ["SIGTERM", "SIGKILL"]);
+
+  const timeoutSignals = [];
+  const timeoutController = new AbortController();
+  const timedOut = runProcess("fixture", [], {
+    signal: timeoutController.signal,
+    timeoutMs: 1,
+    forceKillAfterMs: 5,
+    spawnProcess: () => ignoringChild(timeoutSignals),
+  });
+  setTimeout(() => timeoutController.abort(), 2);
+  const timeoutResult = await timedOut;
+  assert.equal(timeoutResult.status, "timeout");
+  assert.equal(timeoutResult.aborted, false);
+  assert.deepEqual(timeoutSignals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("snapshot child abort reaches doctor and retrieval-status probes", async () => {
+  for (const snapshot of [codestoryDoctorSnapshot, codestoryRetrievalStatusSnapshot]) {
+    const signals = [];
+    const controller = new AbortController();
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = { end() {} };
+    child.kill = (signal) => {
+      signals.push(signal);
+      if (signal === "SIGKILL") {
+        queueMicrotask(() => child.emit("close", null, signal));
+      }
+      return true;
+    };
+    const resultPromise = snapshot(
+      "fixture-codestory-cli",
+      "/fixture/project",
+      60_000,
+      {},
+      controller.signal,
+      { forceKillAfterMs: 5, spawnProcess: () => child },
+    );
+    controller.abort();
+    const result = await resultPromise;
+    assert.equal(result.status, "aborted");
+    assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  }
+});
+
+test("benchmark pipeline aborts active materialization and provenance git children", async () => {
+  const base = pipelineFixture({ repos: ["canary", "failing", "sibling"] });
+  const opts = { ...base.opts, arms: ["with_codestory"] };
+  const fixture = { ...base, opts, plannedRuns: planAgentRuns(opts, base.tasks) };
+  const materializationChildStarted = deferred();
+  const materializationSignals = [];
+  const ignoringChild = (signals, onStart = () => {}) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = { end() {} };
+    child.kill = (signal) => {
+      signals.push(signal);
+      if (signal === "SIGKILL") {
+        queueMicrotask(() => child.emit("close", null, signal));
+      }
+      return true;
+    };
+    onStart();
+    return child;
+  };
+
+  const outcome = await runAgentBenchmarkPipeline({
+    ...fixture,
+    materializeGroup: async (group, signal) => {
+      if (group.repo === "canary") return;
+      if (group.repo === "failing") {
+        await materializationChildStarted.promise;
+        throw new Error("fixture materialization failed");
+      }
+      await gitCheckedOutput(["status"], "/fixture", {
+        timeoutMs: 60_000,
+        signal,
+        forceKillAfterMs: 5,
+        spawnProcess: () => ignoringChild(
+          materializationSignals,
+          () => materializationChildStarted.resolve(),
+        ),
+      });
+    },
+    prepareGroup: async (group) => [pipelinePreparation(group.repo)],
+    executeRun: async (_runOpts, run) => pipelineResult(run),
+  });
+  assert.equal(outcome.firstFailure.kind, "materialization_failed");
+  assert.equal(outcome.aborted, true);
+  assert.deepEqual(materializationSignals, ["SIGTERM", "SIGKILL"]);
+  assert.equal(outcome.results.length, 1);
+  assert.equal(outcome.results[0].canary, true);
+
+  const provenanceSignals = [];
+  const provenanceController = new AbortController();
+  const provenanceRemoteStarted = deferred();
+  const provenanceCommands = [];
+  const completedChild = (stdout) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = { end() {} };
+    child.kill = () => true;
+    queueMicrotask(() => {
+      if (stdout) child.stdout.write(stdout);
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("close", 0, null);
+    });
+    return child;
+  };
+  const provenance = repoProvenance(
+    {
+      path: "/fixture/project",
+      checkout_path: "/fixture/project",
+      url: "https://example.test/project.git",
+      ref: "fixture",
+    },
+    provenanceController.signal,
+    {
+      forceKillAfterMs: 5,
+      spawnProcess: (_command, args) => {
+        provenanceCommands.push(args);
+        if (provenanceCommands.length === 1) return completedChild("");
+        if (provenanceCommands.length === 2) return completedChild(`${"a".repeat(40)}\n`);
+        return ignoringChild(provenanceSignals, () => provenanceRemoteStarted.resolve());
+      },
+    },
+  );
+  await provenanceRemoteStarted.promise;
+  provenanceController.abort();
+  const provenanceResult = await provenance;
+  assert.equal(provenanceResult.git_head, "a".repeat(40));
+  assert.equal(provenanceResult.git_origin, null);
+  assert.deepEqual(provenanceCommands, [
+    ["-C", "/fixture/project", "status", "--short"],
+    ["-C", "/fixture/project", "rev-parse", "HEAD"],
+    ["-C", "/fixture/project", "remote", "get-url", "origin"],
+  ]);
+  assert.deepEqual(provenanceSignals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("benchmark pipeline durably retains preparation and first failure state", async () => {
+  for (const stage of ["materialization", "preparation", "agent_isolation"]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), `codestory-pipeline-${stage}-`));
+    const runsLedger = await createDurableJsonlAppender(path.join(root, "runs.jsonl"));
+    const preparationLedger = await createDurableJsonlAppender(path.join(root, "preparations.jsonl"));
+    const firstFailurePath = path.join(root, "first-failure.json");
+    const fixture = pipelineFixture();
+    const launched = [];
+    try {
+      await runAgentBenchmarkPipeline({
+        ...fixture,
+        materializeGroup: async (group) => {
+          if (group.repo === "second" && stage === "materialization") {
+            throw new Error("fixture materialization failed");
+          }
+        },
+        prepareGroup: async (group) => {
+          if (group.repo === "second" && stage === "preparation") {
+            const error = new Error("fixture preparation failed");
+            error.preparation = { repo: group.repo, error: error.message };
+            throw error;
+          }
+          return [pipelinePreparation(group.repo)];
+        },
+        prepareIsolation: async () => {
+          if (stage === "agent_isolation") {
+            throw new Error("fixture agent isolation failed");
+          }
+          return null;
+        },
+        executeRun: async (_opts, run) => {
+          launched.push(run.repo);
+          return pipelineResult(run);
+        },
+        recordResult: (row) => runsLedger.append(row),
+        recordPreparation: (row) => preparationLedger.append({ kind: "preparation", ...row }),
+        recordPreparationState: (row) => preparationLedger.append(row),
+        recordFirstFailure: (failure) => writeFile(
+          firstFailurePath,
+          `${JSON.stringify(failure)}\n`,
+        ),
+      });
+    } finally {
+      await runsLedger.close();
+      await preparationLedger.close();
+    }
+    const parseLedger = (contents) => contents.split(/\r?\n/).filter(Boolean).map(JSON.parse);
+    const runRows = parseLedger(await readFile(path.join(root, "runs.jsonl"), "utf8"));
+    const preparationRows = parseLedger(
+      await readFile(path.join(root, "preparations.jsonl"), "utf8"),
+    );
+    const firstFailure = JSON.parse(await readFile(firstFailurePath, "utf8"));
+    assert.equal(preparationRows.some((row) => row.repo === "canary"), true);
+    if (stage === "preparation") {
+      assert.equal(preparationRows.some((row) => row.repo === "second" && row.error), true);
+    }
+    if (stage === "agent_isolation") {
+      assert.equal(runRows.length, 0);
+      assert.equal(firstFailure.kind, "agent_isolation_failed");
+      assert.equal(firstFailure.repo, "canary");
+      assert.deepEqual(launched, []);
+    } else {
+      assert.equal(runRows.some((row) => row.canary), true);
+      assert.equal(firstFailure.kind, `${stage}_failed`);
+      assert.equal(firstFailure.repo, "second");
+      assert.equal(launched.every((repo) => repo === "canary"), true);
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("shard aggregation binds canary, contract, accounting, and host-class latency", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-shards-"));
+  try {
+    const taskIds = [null, null];
+    for (let index = 0; taskIds.some((value) => value == null); index += 1) {
+      const id = `task-${index}`;
+      taskIds[taskShardIndex(id, 2)] ??= id;
+    }
+    const tasks = taskIds.map((id, index) => ({
+      id,
+      name: id,
+      repo: `repo-${index}`,
+      task_class: "route_tracing",
+      prompt: `trace ${id}`,
+      quality_thresholds: {},
+    }));
+    const canaryTask = tasks[0];
+    const opts = {
+      aggregateShards: null,
+      outDir: path.join(root, "aggregate"),
+      arms: ["with_codestory"],
+      repeats: 1,
+      jobs: 4,
+      timeoutMs: 600_000,
+      prepareCodestoryCache: true,
+      prepareCodestoryJobs: 2,
+      prepareCodestoryTimeoutMs: 1_800_000,
+      packetRuntime: false,
+      packetRuntimeMode: "both",
+      materializeRepos: true,
+      collectAllFailures: false,
+      shardCount: 2,
+      runner: "codex",
+      model: "gpt-5.6-sol",
+      sandbox: "read-only",
+      taskSuite: null,
+      maxSourceReadsAfterPacket: 0,
+      diagnosticExtraProbesFromManifest: false,
+      packetGateImprovedFrom: null,
+      codestoryCli: process.execPath,
+      candidatePackageSha256: "package",
+      canaryTaskId: canaryTask.id,
+      manifestCanaryTaskId: canaryTask.id,
+      publishable: false,
+    };
+    const planned = planAgentRuns(opts, tasks);
+    const emptyAccounting = {
+      total: 0,
+      material: 0,
+      nonmaterial: 0,
+      material_status_buckets: {},
+    };
+    const rows = planned.map((run) => ({
+      repo: run.repo,
+      task_id: run.task.id,
+      arm: run.arm,
+      repeat: run.repeat,
+      canary: run.task.id === canaryTask.id,
+      status: "pass",
+      wall_ms: 10,
+      benchmark_contract: benchmarkContractForRun(opts, run),
+      codestory_harness_prelude: {
+        packet_sufficiency: { obligation_accounting: emptyAccounting },
+      },
+    }));
+    const writeShards = async (rowValues = rows, summaryMutator = (summary) => summary) => {
+      const directories = [];
+      for (const index of [0, 1]) {
+        const directory = path.join(root, `shard-${index}`);
+        await mkdir(directory, { recursive: true });
+        const shardRows = rowValues.filter((row) => taskShardIndex(row.task_id, 2) === index);
+        const preparation = tasksForShard(tasks, 2, index).map((task) =>
+          pipelinePreparation(task.repo)
+        );
+        const attestation = await benchmarkShardAttestation(
+          { ...opts, shardIndex: index },
+          tasks,
+          preparation,
+          shardRows,
+          CLEAN_SHARD_ATTESTATION,
+        );
+        const summary = summaryMutator({
+          publishable: false,
+          expected_rows: shardRows.length,
+          completed_rows: shardRows.length,
+          first_failure: null,
+          canary_task_id: canaryTask.id,
+          effective_canary_task_id:
+            shardRows.some((row) => row.canary === true) ? canaryTask.id : null,
+          packet_obligation_accounting: emptyAccounting,
+          shard: { count: 2, index, attestation },
+        }, index);
+        await writeFile(path.join(directory, "summary.json"), `${JSON.stringify(summary)}\n`);
+        await writeFile(
+          path.join(directory, "runs.jsonl"),
+          shardRows.map((row) => JSON.stringify(row)).join("\n") + (shardRows.length ? "\n" : ""),
+        );
+        directories.push(directory);
+      }
+      return directories;
+    };
+
+    let shardDirs = await writeShards();
+    await aggregateShardRuns({ ...opts, aggregateShards: shardDirs }, tasks);
+    let aggregate = JSON.parse(await readFile(path.join(opts.outDir, "summary.json"), "utf8"));
+    assert.equal(aggregate.latency_pooling_eligible, true);
+    assert.equal(aggregate.pooled_latency_summary.length, 2);
+    const shardOneRows = rows.filter((row) => taskShardIndex(row.task_id, 2) === 1);
+    const shardOnePreparation = tasksForShard(tasks, 2, 1).map((task) =>
+      pipelinePreparation(task.repo)
+    );
+    const shardOneSummaryPath = path.join(shardDirs[1], "summary.json");
+    const shardOneSummary = JSON.parse(await readFile(shardOneSummaryPath, "utf8"));
+    shardOneSummary.shard.attestation = await benchmarkShardAttestation(
+      { ...opts, jobs: 8, shardIndex: 1 },
+      tasks,
+      shardOnePreparation,
+      shardOneRows,
+      CLEAN_SHARD_ATTESTATION,
+    );
+    await writeFile(shardOneSummaryPath, `${JSON.stringify(shardOneSummary)}\n`);
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: path.join(root, "different-jobs") }, tasks),
+      /attestation does not match/,
+    );
+    await assert.rejects(
+      () => benchmarkShardAttestation(
+        { ...opts, shardIndex: 1 },
+        tasks,
+        shardOnePreparation,
+        shardOneRows,
+        {
+        ...CLEAN_SHARD_ATTESTATION,
+        trackedDirty: true,
+        },
+      ),
+      /clean tracked source checkout/,
+    );
+    shardDirs = await writeShards(rows, (summary, index) => index === 1
+      ? {
+          ...summary,
+          shard: {
+            ...summary.shard,
+            attestation: { ...summary.shard.attestation, tracked_dirty: true },
+          },
+        }
+      : summary);
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: path.join(root, "dirty") }, tasks),
+      /clean tracked source checkout/,
+    );
+
+    const noCanaryRows = rows.map((row) => ({ ...row, canary: false }));
+    shardDirs = await writeShards(noCanaryRows);
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: path.join(root, "no-canary") }, tasks),
+      /must appear exactly once/,
+    );
+
+    shardDirs = await writeShards(rows);
+    const wrongContractRow = {
+      ...rows[0],
+      benchmark_contract: {
+        ...rows[0].benchmark_contract,
+        task_manifest_hash: "different-task-contract",
+      },
+    };
+    const wrongContractShard = taskShardIndex(wrongContractRow.task_id, 2);
+    await writeFile(
+      path.join(shardDirs[wrongContractShard], "runs.jsonl"),
+      `${JSON.stringify(wrongContractRow)}\n`,
+    );
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: path.join(root, "contract") }, tasks),
+      /compatibility fingerprint does not match its contents/,
+    );
+
+    const invalidAccounting = {
+      total: 216,
+      material: 198,
+      nonmaterial: 18,
+      material_status_buckets: { proven: 197 },
+    };
+    const invalidRows = rows.map((row, index) => index === 0
+      ? {
+          ...row,
+          codestory_harness_prelude: {
+            packet_sufficiency: { obligation_accounting: invalidAccounting },
+          },
+        }
+      : row);
+    shardDirs = await writeShards(invalidRows);
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: path.join(root, "obligations") }, tasks),
+      /material=198 does not reconcile with material status buckets=197/,
+    );
+
+    shardDirs = await writeShards(rows, (summary, index) => index === 1
+      ? {
+          ...summary,
+          shard: {
+            ...summary.shard,
+            attestation: {
+              ...summary.shard.attestation,
+              cli_sha256: "different-same-host-cli",
+            },
+          },
+        }
+      : summary);
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: path.join(root, "same-host-binary") }, tasks),
+      /platform artifacts do not match its host class/,
+    );
+
+    shardDirs = await writeShards(rows, (summary, index) => ({
+      ...summary,
+      shard: {
+        ...summary.shard,
+        attestation: {
+          ...summary.shard.attestation,
+          host_class: {
+            platform: "darwin",
+            arch: "arm64",
+            cpu_model: index === 0 ? "Apple M1 Pro" : "Apple M5 Pro",
+            logical_cpu_count: 10,
+            total_memory_bytes: 34_359_738_368,
+            accelerator_backend: "Metal",
+            accelerator_adapter: "MTL0",
+            embedding_policy: "accelerated",
+            model_sha256: FIXTURE_MODEL_SHA256,
+          },
+        },
+      },
+    }));
+    const cpuClassOut = path.join(root, "different-cpu-class");
+    await aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: cpuClassOut }, tasks);
+    const cpuClassAggregate = JSON.parse(
+      await readFile(path.join(cpuClassOut, "summary.json"), "utf8"),
+    );
+    assert.equal(cpuClassAggregate.latency_pooling_eligible, false);
+    assert.equal(cpuClassAggregate.pooled_latency_summary, null);
+    assert.equal(cpuClassAggregate.latency_summaries_by_host_class.length, 2);
+
+    for (const [field, value, expected] of [
+      ["accelerator_backend", null, /accelerator backend and adapter/],
+      ["accelerator_adapter", "llvmpipe", /software accelerator/],
+      ["embedding_policy", "cpu_explicit", /policy is not accelerated/],
+      ["model_sha256", "bad", /model digest is missing or malformed/],
+    ]) {
+      shardDirs = await writeShards(rows, (summary, index) => index === 1
+        ? {
+            ...summary,
+            shard: {
+              ...summary.shard,
+              attestation: {
+                ...summary.shard.attestation,
+                host_class: {
+                  ...summary.shard.attestation.host_class,
+                  [field]: value,
+                },
+              },
+            },
+          }
+        : summary);
+      await assert.rejects(
+        () => aggregateShardRuns({
+          ...opts,
+          aggregateShards: shardDirs,
+          outDir: path.join(root, `bad-host-${field}`),
+        }, tasks),
+        expected,
+      );
+    }
+    shardDirs = await writeShards(rows, (summary, index) => index === 1
+      ? {
+          ...summary,
+          shard: {
+            ...summary.shard,
+            attestation: {
+              ...summary.shard.attestation,
+              host_class: {
+                ...summary.shard.attestation.host_class,
+                model_sha256: "c".repeat(64),
+              },
+            },
+          },
+        }
+      : summary);
+    await assert.rejects(
+      () => aggregateShardRuns({
+        ...opts,
+        aggregateShards: shardDirs,
+        outDir: path.join(root, "host-model-disagreement"),
+      }, tasks),
+      /host-class model does not match/,
+    );
+
+    const mixedRows = rows.map((row) => {
+      if (taskShardIndex(row.task_id, 2) !== 1) return row;
+      const run = planned.find((candidate) => candidate.task.id === row.task_id);
+      return {
+        ...row,
+        benchmark_contract: benchmarkContractForRun(
+          { ...opts, codestoryCli: "C:\\managed\\codestory-cli.exe" },
+          run,
+        ),
+      };
+    });
+    shardDirs = await writeShards(mixedRows, (summary, index) => index === 1
+      ? {
+          ...summary,
+          shard: {
+            ...summary.shard,
+            attestation: {
+              ...summary.shard.attestation,
+              cli_sha256: "other-platform-cli",
+              package_sha256: "other-platform-package",
+              host_class: {
+                ...summary.shard.attestation.host_class,
+                platform: "linux",
+                arch: "x64",
+                accelerator_backend: "Vulkan",
+              },
+            },
+          },
+        }
+      : summary);
+    const mixedOut = path.join(root, "mixed-hosts");
+    await aggregateShardRuns({ ...opts, aggregateShards: shardDirs, outDir: mixedOut }, tasks);
+    aggregate = JSON.parse(await readFile(path.join(mixedOut, "summary.json"), "utf8"));
+    assert.equal(aggregate.latency_pooling_eligible, false);
+    assert.equal(aggregate.pooled_latency_summary, null);
+    assert.equal(aggregate.latency_summaries_by_host_class.length, 2);
+    assert.ok(aggregate.latency_summaries_by_host_class.every((entry) => entry.cost_accounting));
+    assert.ok(aggregate.summary.every((entry) => entry.median_wall_ms === null));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("packet-runtime cache observations preserve prepared cache provenance", () => {
   const cachePreparation = [
     {
@@ -121,6 +2404,63 @@ test("packet-runtime cache observations preserve prepared cache provenance", () 
     assert.equal(observations.cache_preparation, cachePreparation[0]);
     assert.equal(cachePolicyForRun(observations), "prepared-retrieval-cache-read-only");
   }
+});
+
+test("agent packet prelude carries exact semantic execution after the server idles", () => {
+  const preparation = {
+    repo: "codestory",
+    retrieval_contract: {
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      execution_policy: "accelerated",
+    },
+    retrieval_status: { semantic_generation: "semantic-1" },
+  };
+  const packet = {
+    answer: {
+      retrieval_trace: {
+        retrieval_publication: { semantic_generation: "semantic-1" },
+        semantic_fallback_count: 0,
+        packet_sidecar_diagnostics: [{ retrieval_mode: "full" }],
+        retrieval_shadow: {
+          degraded_reason: null,
+          error: null,
+          cancel_reason: null,
+          stage_timings: [{
+            stage: "stage1b_semantic",
+            completion_status: "completed",
+            degraded: false,
+            stub_reason: null,
+            cancel_reason: null,
+          }],
+        },
+      },
+    },
+  };
+  const observations = agentPacketPreludeCacheObservations(
+    { cachePreparationByRepo: new Map([[preparation.repo, preparation]]) },
+    preparation.repo,
+    packet,
+    { codestory_index_commands_observed: 0 },
+  );
+  const provenance = localCacheProvenance({
+    semantic_ready: false,
+    embedding_engine_instance_id: null,
+    semantic_generation: "semantic-1",
+    transport_mode: observations.transport_mode,
+    packet_embedding_execution: observations.packet_embedding_execution,
+  });
+
+  assert.equal(observations.transport_mode, "agent_harness_prelude");
+  assert.equal(observations.cache_preparation, preparation);
+  assert.deepEqual(cacheProvenanceBlockers({ codestory_cache_provenance: provenance }), []);
+
+  observations.packet_embedding_execution.semantic_generation = "other-generation";
+  provenance.packet_embedding_execution = observations.packet_embedding_execution;
+  assert.match(
+    cacheProvenanceBlockers({ codestory_cache_provenance: provenance }).join("\n"),
+    /does not match the prepared generation/,
+  );
 });
 
 test("cold packet embedding execution binds full retrieval to the prepared semantic generation", () => {
@@ -1118,6 +3458,181 @@ test("counts modern Codex JSONL tool categories including web search", () => {
   assert.match(blockers[0].reasons.join("\n"), /external web\/search tool calls=1 > 0/);
 });
 
+test("interaction turns count agent messages and tool actions but exclude reasoning and errors", () => {
+  const telemetry = interactionTurnTelemetry([
+    { type: "item.completed", item: { type: "reasoning" } },
+    { type: "item.completed", item: { type: "error" } },
+    { type: "item.completed", item: { type: "agent_message" } },
+    { type: "item.completed", item: { type: "command_execution", status: "completed" } },
+    { type: "item.completed", item: { type: "mcp_tool_call", status: "failed" } },
+  ]);
+  assert.deepEqual(telemetry, {
+    total: 3,
+    model_messages: 1,
+    tool_actions: 2,
+    failed_tool_actions: 1,
+    reasoning_items_excluded: 1,
+    error_items_excluded: 1,
+    taxonomy: "completed_agent_messages_plus_tool_actions_v1",
+  });
+});
+
+test("same-binary identity requires every completed MCP call to declare the prelude SHA", () => {
+  const sha = "a".repeat(64);
+  assert.equal(codeStoryBinaryIdentity(sha, {
+    codestory_mcp_completed_calls_observed: 0,
+    codestory_mcp_runtime_identities: [],
+  }).status, "prelude_only");
+  assert.equal(codeStoryBinaryIdentity(sha, {
+    codestory_mcp_completed_calls_observed: 1,
+    codestory_mcp_runtime_identities: [{ cli_sha256: sha }],
+  }).status, "exact_match");
+  assert.equal(codeStoryBinaryIdentity(sha, {
+    codestory_mcp_completed_calls_observed: 1,
+    codestory_mcp_runtime_identities: [{ cli_sha256: "b".repeat(64) }],
+  }).status, "mismatch");
+  assert.equal(codeStoryBinaryIdentity(sha, {
+    codestory_mcp_completed_calls_observed: 1,
+    codestory_mcp_runtime_identities: [{ cli_sha256: null }],
+  }).status, "mcp_sha_missing_or_invalid");
+});
+
+test("counts only started CodeStory MCP calls", () => {
+  const events = [
+    {
+      type: "item.started",
+      item: { id: "codestory", type: "mcp_tool_call", server: "codestory", tool: "packet" },
+    },
+    {
+      type: "item.completed",
+      item: {
+        id: "codestory",
+        type: "mcp_tool_call",
+        server: "codestory",
+        tool: "packet",
+        result: null,
+      },
+    },
+    {
+      type: "item.started",
+      item: { id: "other", type: "mcp_tool_call", server: "other", tool: "packet" },
+    },
+  ];
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.codestory_mcp_tool_calls_observed, 1);
+  assert.equal(analysis.codestory_mcp_completed_calls_observed, 0);
+  assert.deepEqual(analysis.codestory_mcp_runtime_identities, []);
+});
+
+test("extracts managed runtime identity from completed CodeStory MCP results", () => {
+  const identity = {
+    plugin_version: "0.17.0",
+    plugin_cli_version: "0.17.0",
+    cli_version: "0.17.0",
+    cli_sha256: "a".repeat(64),
+    cli_source: "managed",
+    pinned_pair_matches: true,
+    known_override_skew_channel: false,
+  };
+  const analysis = analyzeTranscript([
+    {
+      type: "item.started",
+      item: { id: "codestory", type: "mcp_tool_call", server: "codestory", tool: "packet" },
+    },
+    {
+      type: "item.completed",
+      item: {
+        id: "codestory",
+        type: "mcp_tool_call",
+        server: "codestory",
+        tool: "packet",
+        result: { _meta: { codestory_publication: { contract_runtime: identity } } },
+      },
+    },
+  ]);
+  assert.equal(analysis.codestory_mcp_tool_calls_observed, 1);
+  assert.equal(analysis.codestory_mcp_completed_calls_observed, 1);
+  assert.deepEqual(analysis.codestory_mcp_runtime_identities, [identity]);
+});
+
+test("publishable measured rows fail closed without managed runtime identity", () => {
+  const blockers = agentPublishableBlockers(
+    [
+      {
+        arm: "with_codestory",
+        status: "pass",
+        wall_ms: 1,
+        usage: { total_tokens: 1 },
+        tool_calls_observed: 1,
+        packet_first_required: false,
+        packet_first_pass: true,
+        transcript_analysis: {
+          command_count: 1,
+          command_categories: {},
+          codestory_mcp_tool_calls_observed: 1,
+          codestory_mcp_completed_calls_observed: 1,
+          codestory_mcp_runtime_identities: [],
+          external_context_tool_calls: 0,
+        },
+      },
+    ],
+    { publishable: true },
+  );
+  assert.match(
+    blockers.flatMap((blocker) => blocker.reasons).join("\n"),
+    /no managed CodeStory runtime identity/,
+  );
+});
+
+test("publishable measured rows accept a validated managed packet prelude without a redundant MCP call", () => {
+  const transcriptAnalysis = {
+    codestory_mcp_tool_calls_observed: 0,
+    codestory_mcp_completed_calls_observed: 0,
+    codestory_mcp_runtime_identities: [],
+  };
+  const managedRuntime = {
+    plugin_version: "0.17.0",
+    plugin_cli_version: "0.17.0",
+    cli_version: "0.17.0",
+    cli_source: "managed",
+    pinned_pair_matches: true,
+    known_override_skew_channel: false,
+  };
+  const valid = publishableWithCodeStoryResult({
+    transcript_analysis: transcriptAnalysis,
+    codestory_harness_prelude: { packet_contract_runtime: managedRuntime },
+  });
+
+  assert.deepEqual(
+    agentPublishableBlockers([valid], {
+      publishable: true,
+      maxSourceReadsAfterPacket: 0,
+    }),
+    [],
+  );
+
+  for (const codestoryPrelude of [
+    { status: "fail", packet_contract_runtime: managedRuntime },
+    {
+      packet_contract_runtime: {
+        ...managedRuntime,
+        cli_source: "override",
+      },
+    },
+  ]) {
+    const invalid = publishableWithCodeStoryResult({
+      transcript_analysis: transcriptAnalysis,
+      codestory_harness_prelude: codestoryPrelude,
+    });
+    assert.ok(
+      agentPublishableBlockers([invalid], {
+        publishable: true,
+        maxSourceReadsAfterPacket: 0,
+      }).length > 0,
+    );
+  }
+});
+
 test("summarizes A/B cost accounting totals and ratios", () => {
   const costAccounting = summarizeCostAccounting([
     {
@@ -1195,6 +3710,59 @@ test("summarizes A/B cost accounting totals and ratios", () => {
   assert.equal(costAccounting.with_vs_without.total_tokens.ratio, 0.4);
   assert.equal(costAccounting.with_vs_without.all_in_wall_ms.ratio, 0.325);
   assert.equal(costAccounting.with_vs_without.tool_calls.with_minus_without, -2);
+});
+
+test("renders ineligible comparative wall time without losing other accounting", () => {
+  const costAccounting = summarizeCostAccounting([
+    {
+      arm: "without_codestory",
+      status: "pass",
+      wall_ms: 200,
+      comparative_wall_time_eligible: false,
+      usage: { input_tokens: 80, output_tokens: 20, total_tokens: 100 },
+      tool_calls_observed: 4,
+      transcript_analysis: { command_count: 4, command_categories: {} },
+    },
+    {
+      arm: "with_codestory",
+      status: "pass",
+      wall_ms: 50,
+      comparative_wall_time_eligible: true,
+      usage: { input_tokens: 30, output_tokens: 10, total_tokens: 40 },
+      tool_calls_observed: 1,
+      transcript_analysis: { command_count: 1, command_categories: {} },
+    },
+    {
+      arm: "with_codestory",
+      status: "fail",
+      wall_ms: 5,
+      usage: null,
+      tool_calls_observed: 1,
+      transcript_analysis: { command_count: 1, command_categories: {} },
+    },
+    {
+      arm: "with_codestory",
+      status: "cancelled",
+      wall_ms: 1,
+      usage: null,
+      tool_calls_observed: 0,
+      transcript_analysis: { command_count: 0, command_categories: {} },
+    },
+  ]);
+
+  assert.equal(costAccounting.with_vs_without.runner_wall_ms, null);
+  assert.equal(costAccounting.with_vs_without.all_in_wall_ms, null);
+  const markdown = markdownCostAccounting(costAccounting).join("\n");
+  assert.match(
+    markdown,
+    /\| runner_wall_ms \| ineligible \| ineligible \| ineligible \| ineligible \|/,
+  );
+  assert.match(
+    markdown,
+    /\| all_in_wall_ms \| ineligible \| ineligible \| ineligible \| ineligible \|/,
+  );
+  assert.match(markdown, /\| total_tokens \| 40 \| 100 \| -60 \| 0\.4 \|/);
+  assert.match(markdown, /\| tool_calls \| 2 \| 4 \| -2 \| 0\.5 \|/);
 });
 
 test("parses JSONL transcript text before analysis", () => {
@@ -1588,31 +4156,19 @@ test("packet prompt excerpt keeps answer support while dropping bulky packet fie
         },
       ],
     },
-    sufficiency: {
-      status: "partial",
-      gaps: ["drop me"],
-      open_next: ["drop me too"],
-      avoid_opening: [
-        "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/legacy.py because legacy prose",
-      ],
-      avoid_opening_paths: [
-        "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/api.py",
-      ],
-      follow_up_commands: ["a", "b", "c", "d", "e"],
-      covered_claims: [
-        {
-          claim: "Session.request prepares requests.",
-          citations: [
-            {
-              display_name: "Session.request",
-              file_path:
-                "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/sessions.py",
-              line: 557,
-            },
-          ],
-        },
-      ],
-    },
+    packet_id: "packet-requests",
+    support: [
+      {
+        id: "support-1",
+        kind: "source_range",
+        summary: "Session.request prepares requests.",
+        path: "src/requests/sessions.py",
+        start_line: 557,
+        end_line: 557,
+        snippet: "def request(...)",
+      },
+    ],
+    disposition: { kind: "supported", omission_receipts: [] },
   });
 
   assert.equal(promptPacket.answer.summary, "Requests flow");
@@ -1626,14 +4182,12 @@ test("packet prompt excerpt keeps answer support while dropping bulky packet fie
       line: 557,
     },
   ]);
-  assert.deepEqual(promptPacket.sufficiency.avoid_opening, ["src/requests/api.py"]);
-  assert.deepEqual(promptPacket.sufficiency.follow_up_commands, ["a", "b", "c", "d"]);
-  assert.deepEqual(promptPacket.sufficiency.covered_claims, [
-    "Session.request prepares requests.",
-  ]);
+  assert.equal(promptPacket.packet_id, "packet-requests");
+  assert.deepEqual(promptPacket.disposition, { kind: "supported", omission_receipts: [] });
+  assert.equal(promptPacket.support.length, 1);
+  assert.equal(promptPacket.support[0].summary, "Session.request prepares requests.");
   assert.equal(Object.hasOwn(promptPacket.answer, "sections"), false);
-  assert.equal(Object.hasOwn(promptPacket.sufficiency, "gaps"), false);
-  assert.equal(Object.hasOwn(promptPacket.sufficiency, "open_next"), false);
+  assert.equal(Object.hasOwn(promptPacket, "sufficiency"), false);
 });
 
 test("packet manifest completion is gated by packet quality evidence", () => {
@@ -1654,9 +4208,8 @@ test("packet manifest completion is gated by packet quality evidence", () => {
         },
       ],
     },
-    sufficiency: {
-      covered_claims: [{ claim: "Session.request prepares requests." }],
-    },
+    support: [{ summary: "Session.request prepares requests." }],
+    disposition: { kind: "supported" },
   };
 
   const quality = packetManifestQualitySummary(packet, task);
@@ -1665,7 +4218,8 @@ test("packet manifest completion is gated by packet quality evidence", () => {
     packetPreludeManifestComplete({
       packet_manifest_quality: quality,
       packet_composition: packetComposition(packet, task),
-      packet_sufficiency: { status: "sufficient", follow_up_commands_count: 0 },
+      packet_disposition_kind: "supported",
+      packet_support_count: 1,
     }),
     true,
   );
@@ -1673,7 +4227,8 @@ test("packet manifest completion is gated by packet quality evidence", () => {
     packetPreludeManifestComplete({
       packet_manifest_quality: quality,
       packet_composition: packetComposition(packet, task),
-      packet_sufficiency: { status: "sufficient", follow_up_commands_count: 1 },
+      packet_disposition_kind: "supported",
+      packet_support_count: 0,
     }),
     false,
   );
@@ -1681,7 +4236,8 @@ test("packet manifest completion is gated by packet quality evidence", () => {
     packetPreludeManifestComplete({
       packet_manifest_quality: quality,
       packet_composition: packetComposition(packet, task),
-      packet_sufficiency: { status: "partial", follow_up_commands_count: 0 },
+      packet_disposition_kind: "drill_once",
+      packet_support_count: 1,
     }),
     false,
   );
@@ -1698,7 +4254,7 @@ test("packet manifest completion is gated by packet quality evidence", () => {
           },
         ],
       },
-      sufficiency: { covered_claims: [] },
+      support: [],
     },
     task,
   );
@@ -1710,6 +4266,57 @@ test("packet manifest completion is gated by packet quality evidence", () => {
     }),
     false,
   );
+});
+
+test("packet manifest quality counts exact edge-derived server flow receipts", () => {
+  const task = manifestFixture({
+    id: "server-flow-receipts",
+    task_class: "route_tracing",
+    expected_files: ["lib/express.js", "lib/application.js", "lib/request.js", "lib/response.js"],
+    expected_symbols: ["createApplication", "app.init", "app.handle", "app.use", "app.route", "res.send"],
+    expected_claims: [
+      "createApplication builds a callable app object and mixes in request and response prototypes.",
+      "app.use registers middleware on the router.",
+      "app.handle delegates request handling to the router.",
+      "res.send prepares and sends the response body.",
+    ],
+    quality_thresholds: {
+      min_expected_anchor_recall: 0.62,
+      min_expected_file_recall: 0.6,
+      min_expected_symbol_recall: 0.55,
+      min_expected_claim_recall: 0.65,
+      min_citation_coverage: 0.6,
+      max_forbidden_claims: 0,
+    },
+  });
+  const citations = [
+    ["createApplication", "lib/express.js"],
+    ["app.init", "lib/application.js"],
+    ["app.handle", "lib/application.js"],
+    ["app.use", "lib/application.js"],
+    ["app.route", "lib/application.js"],
+    ["res.send", "lib/response.js"],
+    ["req.header", "lib/request.js"],
+  ].map(([display_name, file_path], index) => ({ display_name, file_path, line: index + 1 }));
+  const packet = {
+    answer: { summary: "Server request flow", sections: [], citations },
+    support: [
+      {
+        summary:
+          "`app.use` registers middleware through the retained `app.router.use` call on the router.",
+      },
+      { summary: "`app.handle` delegates request handling through the retained `handle` call boundary." },
+      {
+        summary:
+          "`res.send` sends output through the retained `end` call, completing the response body.",
+      },
+    ],
+  };
+
+  const quality = packetManifestQualitySummary(packet, task);
+  assert.equal(quality.expected_claim_recall, 0.75);
+  assert.equal(quality.expected_symbol_recall, 1);
+  assert.equal(quality.pass, true);
 });
 
 test("baseline prelude tolerates benign ripgrep missing-path warnings when matches exist", () => {
@@ -2070,7 +4677,50 @@ test("warm process provenance still requires live engine identity and semantic r
   assert.match(blockers.join("\n"), /CodeStory semantic docs are not ready/);
 });
 
+function emptyPacketObligationAccounting() {
+  return {
+    total: 0,
+    material: 0,
+    nonmaterial: 0,
+    material_status_buckets: {},
+  };
+}
+
 function publishableWithCodeStoryResult(overrides = {}) {
+  const transcriptAnalysis = {
+    command_count: 1,
+    ordinary_source_reads_after_first_packet: 0,
+    codestory_mcp_tool_calls_observed: 1,
+    codestory_mcp_completed_calls_observed: 1,
+    codestory_mcp_runtime_identities: [
+      {
+        plugin_version: "0.17.0",
+        plugin_cli_version: "0.17.0",
+        cli_version: "0.17.0",
+        cli_source: "managed",
+        pinned_pair_matches: true,
+        known_override_skew_channel: false,
+      },
+    ],
+    ...(overrides.transcript_analysis ?? {}),
+  };
+  const defaultPrelude = {
+    status: "pass",
+    packet_sufficiency_status: "sufficient",
+    packet_sufficiency: {
+      status: "sufficient",
+      obligation_accounting: emptyPacketObligationAccounting(),
+    },
+  };
+  const preludeOverride = overrides.codestory_harness_prelude;
+  const codestoryPrelude = {
+    ...defaultPrelude,
+    ...(preludeOverride ?? {}),
+    packet_sufficiency: {
+      ...defaultPrelude.packet_sufficiency,
+      ...(preludeOverride?.packet_sufficiency ?? {}),
+    },
+  };
   return {
     repo: "codestory",
     task_id: "codestory-indexing-flow",
@@ -2083,17 +4733,130 @@ function publishableWithCodeStoryResult(overrides = {}) {
     packet_first_required: true,
     packet_first_pass: true,
     quality: { pass: true },
-    transcript_analysis: {
-      command_count: 1,
-      ordinary_source_reads_after_first_packet: 0,
-    },
     repo_provenance: pinnedRepoProvenance(),
     codestory_cache_provenance: localCacheProvenance(),
     ...overrides,
+    transcript_analysis: transcriptAnalysis,
+    codestory_harness_prelude: codestoryPrelude,
   };
 }
 
+test("publishable shard aggregation rejects incomplete, failed, and low-quality shards", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-publishable-shard-"));
+  try {
+    const task = {
+      id: "codestory-indexing-flow",
+      name: "CodeStory indexing flow",
+      repo: "codestory",
+      task_class: "route_tracing",
+      prompt: "Trace indexing",
+      quality_thresholds: {},
+    };
+    const directory = path.join(root, "shard-0");
+    await mkdir(directory);
+    const opts = {
+      aggregateShards: [directory],
+      outDir: path.join(root, "aggregate"),
+      arms: ["with_codestory"],
+      repeats: 3,
+      jobs: 4,
+      timeoutMs: 600_000,
+      prepareCodestoryCache: true,
+      prepareCodestoryJobs: 2,
+      prepareCodestoryTimeoutMs: 1_800_000,
+      packetRuntime: false,
+      packetRuntimeMode: "both",
+      materializeRepos: true,
+      collectAllFailures: false,
+      shardCount: 1,
+      shardIndex: 0,
+      runner: "codex",
+      model: "gpt-5.6-sol",
+      sandbox: "read-only",
+      taskSuite: null,
+      maxSourceReadsAfterPacket: 0,
+      diagnosticExtraProbesFromManifest: false,
+      packetGateImprovedFrom: null,
+      codestoryCli: process.execPath,
+      candidatePackageSha256: "package",
+      canaryTaskId: task.id,
+      manifestCanaryTaskId: task.id,
+      publishable: true,
+    };
+    const planned = planAgentRuns(opts, [task]);
+    const validRows = planned.map((run) => publishableWithCodeStoryResult({
+      repo: task.repo,
+      task_id: task.id,
+      repeat: run.repeat,
+      canary: run.repeat === 1,
+      benchmark_contract: benchmarkContractForRun(opts, run),
+    }));
+    const preparation = [pipelinePreparation(task.repo)];
+    const writeFixture = async (rows, summaryOverrides = {}) => {
+      const attestation = await benchmarkShardAttestation(
+        opts,
+        [task],
+        preparation,
+        rows,
+        CLEAN_SHARD_ATTESTATION,
+      );
+      await writeFile(
+        path.join(directory, "runs.jsonl"),
+        `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
+      );
+      await writeFile(
+        path.join(directory, "summary.json"),
+        `${JSON.stringify({
+          publishable: true,
+          comparative_publishable: true,
+          comparative_failure: null,
+          expected_rows: 3,
+          completed_rows: rows.length,
+          first_failure: null,
+          canary_task_id: task.id,
+          effective_canary_task_id: task.id,
+          packet_obligation_accounting: emptyPacketObligationAccounting(),
+          shard: { count: 1, index: 0, attestation },
+          ...summaryOverrides,
+        })}\n`,
+      );
+    };
+
+    await writeFixture(validRows);
+    await aggregateShardRuns(opts, [task]);
+
+    await writeFixture(validRows, { publishable: false });
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, outDir: path.join(root, "not-publishable") }, [task]),
+      /summary is not publishable and complete/,
+    );
+
+    await writeFixture(validRows.map((row, index) => index === 1
+      ? { ...row, status: "fail" }
+      : row));
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, outDir: path.join(root, "failed") }, [task]),
+      /Publishable shard rows failed/,
+    );
+
+    await writeFixture(validRows.map((row, index) => index === 1
+      ? { ...row, quality: { pass: false } }
+      : row));
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, outDir: path.join(root, "low-quality") }, [task]),
+      /Publishable shard rows failed/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function publishablePacketRuntimeResult(overrides = {}) {
+  const defaultSufficiency = {
+    status: "sufficient",
+    sufficient_quality_mismatch: false,
+    obligation_accounting: emptyPacketObligationAccounting(),
+  };
   return {
     repo: "codestory",
     task_id: "codestory-indexing-flow",
@@ -2101,10 +4864,7 @@ function publishablePacketRuntimeResult(overrides = {}) {
     repeat: 1,
     status: "pass",
     quality: { pass: true },
-    sufficiency: {
-      status: "sufficient",
-      sufficient_quality_mismatch: false,
-    },
+    sufficiency: defaultSufficiency,
     packet_latency: {
       sla_missed: false,
       retrieval_shadow: {
@@ -2114,8 +4874,81 @@ function publishablePacketRuntimeResult(overrides = {}) {
     repo_provenance: pinnedRepoProvenance(),
     codestory_cache_provenance: localCacheProvenance(),
     ...overrides,
+    sufficiency: overrides.sufficiency === null
+      ? null
+      : { ...defaultSufficiency, ...(overrides.sufficiency ?? {}) },
   };
 }
+
+test("publishable packet obligation accounting rejects mismatched rows", () => {
+  assert.deepEqual(
+    agentPublishableBlockers(
+      [publishableWithCodeStoryResult()],
+      { publishable: true, maxSourceReadsAfterPacket: 0 },
+    ),
+    [],
+  );
+  assert.deepEqual(
+    packetRuntimePublishableBlockers(
+      [publishablePacketRuntimeResult()],
+      { publishable: true },
+    ),
+    [],
+  );
+  const mismatched = {
+    total: 3,
+    material: 2,
+    nonmaterial: 1,
+    material_status_buckets: { proven: 1 },
+  };
+  const agentBlockers = agentPublishableBlockers(
+    [
+      publishableWithCodeStoryResult({
+        codestory_harness_prelude: {
+          packet_sufficiency: { obligation_accounting: mismatched },
+        },
+      }),
+    ],
+    { publishable: true, maxSourceReadsAfterPacket: 0 },
+  );
+  assert.match(
+    agentBlockers.flatMap((blocker) => blocker.reasons).join("\n"),
+    /material=2 does not reconcile with material status buckets=1/,
+  );
+
+  const runtimeBlockers = packetRuntimePublishableBlockers(
+    [
+      publishablePacketRuntimeResult({
+        sufficiency: { obligation_accounting: mismatched },
+      }),
+    ],
+    { publishable: true },
+  );
+  assert.match(
+    runtimeBlockers.flatMap((blocker) => blocker.reasons).join("\n"),
+    /material=2 does not reconcile with material status buckets=1/,
+  );
+
+  const failedWithoutPacket = publishableWithCodeStoryResult({
+    status: "cancelled",
+    codestory_harness_prelude: null,
+    transcript_analysis: {
+      command_count: 0,
+      codestory_mcp_tool_calls_observed: 0,
+      codestory_mcp_completed_calls_observed: 0,
+      codestory_mcp_runtime_identities: [],
+    },
+  });
+  const failedReasons = agentPublishableBlockers(
+    [failedWithoutPacket],
+    { publishable: true, maxSourceReadsAfterPacket: 0 },
+  ).flatMap((blocker) => blocker.reasons);
+  assert.equal(
+    failedReasons.includes("codestory prelude packet obligation accounting is missing"),
+    false,
+    "a cancelled row with no packet must not claim that packet accounting was omitted",
+  );
+});
 
 test("publishable gate blocks avoidable source reads after packet", () => {
   const blockers = agentPublishableBlockers(
@@ -2246,6 +5079,33 @@ test("publishable gate rejects CodeStory use in the without arm", () => {
         command_categories: {
           codestory_cli: 1,
         },
+        external_context_tool_calls: 0,
+      },
+    },
+  ]);
+
+  assert.equal(blockers.length, 1);
+  assert.match(blockers[0].reasons.join("\n"), /without_codestory arm used CodeStory/);
+});
+
+test("publishable gate rejects CodeStory MCP use in the without arm", () => {
+  const blockers = agentPublishableBlockers([
+    {
+      repo: "codestory",
+      task_id: "codestory-indexing-flow",
+      arm: "without_codestory",
+      repeat: 1,
+      status: "pass",
+      wall_ms: 10,
+      usage: { total_tokens: 100 },
+      tool_calls_observed: 2,
+      packet_first_required: false,
+      packet_first_pass: true,
+      quality: { pass: true },
+      transcript_analysis: {
+        command_count: 1,
+        command_categories: { shell_search: 1 },
+        codestory_mcp_tool_calls_observed: 1,
         external_context_tool_calls: 0,
       },
     },
@@ -2531,6 +5391,7 @@ test("publishable gate requires resource accounting fields", () => {
         usage: { total_tokens: null },
         tool_calls_observed: null,
         transcript_analysis: {
+          command_count: null,
           ordinary_source_reads_after_first_packet: 0,
         },
       }),
@@ -2630,6 +5491,53 @@ test("packet runtime publishable gate rejects diagnostic packet probes", () => {
 
   assert.equal(blockers.length, 1);
   assert.match(blockers[0].reasons.join("\n"), /diagnostic packet extra probes used/);
+});
+
+test("packet coverage unresolved accounting follows material query completion", () => {
+  const packet = {
+    plan: {
+      obligations: {
+        query_obligations: [
+          {
+            query: "public facade",
+            material: true,
+            completion: { status: "completed" },
+          },
+          {
+            query: "supplemental wording",
+            material: false,
+            completion: { status: "cancelled", reason: "not_dispatched" },
+          },
+        ],
+      },
+    },
+    sufficiency: {
+      status: "sufficient",
+      coverage_report: {
+        unresolved: ["public facade", "supplemental wording"],
+      },
+    },
+  };
+
+  let telemetry = packetSufficiencyTelemetry(packet, { pass: true });
+  assert.equal(telemetry.coverage_unresolved_count, 2);
+  assert.equal(telemetry.coverage_unresolved_blocking_count, 0);
+
+  packet.plan.obligations.query_obligations[0].completion = {
+    status: "cancelled",
+    reason: "deadline",
+  };
+  telemetry = packetSufficiencyTelemetry(packet, { pass: true });
+  assert.equal(telemetry.coverage_unresolved_blocking_count, 1);
+
+  packet.sufficiency.coverage_report.unresolved = ["unknown query"];
+  telemetry = packetSufficiencyTelemetry(packet, { pass: true });
+  assert.equal(telemetry.coverage_unresolved_blocking_count, 1);
+
+  delete packet.plan.obligations;
+  packet.sufficiency.coverage_report.unresolved = ["public facade"];
+  telemetry = packetSufficiencyTelemetry(packet, { pass: true });
+  assert.equal(telemetry.coverage_unresolved_blocking_count, 1);
 });
 
 test("packet runtime publishable gate blocks unresolved packet diagnostics as product blockers", () => {

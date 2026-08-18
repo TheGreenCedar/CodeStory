@@ -35,7 +35,11 @@ use codestory_contracts::language_support::{
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-pub const MAX_STRUCTURAL_SOURCE_BYTES: u64 = 1024 * 1024;
+/// Default structural byte bound. No longer the only value: the collector is
+/// handed the bound the active `SourceIndexPolicy` carries, so an operator's
+/// override reaches it and the reported limit is the one that did the refusing.
+pub const MAX_STRUCTURAL_SOURCE_BYTES: u64 =
+    codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP;
 pub const MAX_STRUCTURAL_UNITS_PER_FILE: usize =
     codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP as usize;
 
@@ -45,10 +49,8 @@ pub enum StructuralCollectionError {
     Binary,
     #[error("{0}")]
     Malformed(String),
-    #[error(
-        "structural source exceeds the {MAX_STRUCTURAL_SOURCE_BYTES}-byte collector limit: {0} bytes"
-    )]
-    SourceByteLimit(u64),
+    #[error("structural source exceeds the {byte_cap}-byte collector limit: {observed_size} bytes")]
+    SourceByteLimit { observed_size: u64, byte_cap: u64 },
     #[error(
         "structural source exceeds the {structural_unit_cap}-unit collector limit: {observed_unit_count} units"
     )]
@@ -73,7 +75,11 @@ pub fn is_structural_format_path(path: &Path) -> bool {
 pub fn index_structural_file(path: &Path) -> Result<IntermediateStorage> {
     let bytes = std::fs::read(path)?;
     if bytes.len() as u64 > MAX_STRUCTURAL_SOURCE_BYTES {
-        return Err(StructuralCollectionError::SourceByteLimit(bytes.len() as u64).into());
+        return Err(StructuralCollectionError::SourceByteLimit {
+            observed_size: bytes.len() as u64,
+            byte_cap: MAX_STRUCTURAL_SOURCE_BYTES,
+        }
+        .into());
     }
     let source = decode_structural_source(bytes.clone())?;
     let source_content_hash = format!("{:x}", Sha256::digest(&bytes));
@@ -311,6 +317,7 @@ pub fn index_structural_source(
         path,
         source,
         codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+        MAX_STRUCTURAL_SOURCE_BYTES,
     )
 }
 
@@ -318,11 +325,13 @@ pub(crate) fn index_structural_source_with_unit_cap(
     path: &Path,
     source: &str,
     structural_unit_cap: u64,
+    structural_byte_cap: u64,
 ) -> std::result::Result<IntermediateStorage, StructuralCollectionError> {
-    if source.len() as u64 > MAX_STRUCTURAL_SOURCE_BYTES {
-        return Err(StructuralCollectionError::SourceByteLimit(
-            source.len() as u64
-        ));
+    if source.len() as u64 > structural_byte_cap {
+        return Err(StructuralCollectionError::SourceByteLimit {
+            observed_size: source.len() as u64,
+            byte_cap: structural_byte_cap,
+        });
     }
     if matches!(structural_extension(path).as_deref(), Some("yml" | "yaml")) {
         validate_yaml_syntax(source)?;
@@ -411,11 +420,7 @@ fn structural_extension(path: &Path) -> Option<String> {
 fn file_modification_time(path: &Path) -> i64 {
     std::fs::metadata(path)
         .and_then(|meta| meta.modified())
-        .map(|time| {
-            time.duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64
-        })
+        .map(codestory_workspace::clamp_system_time_to_epoch_millis)
         .unwrap_or(0)
 }
 
@@ -468,15 +473,30 @@ mod tests {
             ),
             (
                 "web/index.html",
-                "<main id=\"app\">\n<style>.shell { --accent: blue; }</style>\n<script type=\"module\">const boot = () => 1;</script>\n</main>\n",
+                "<main id=\"app\">\n<style>.shell { --accent: blue; animation-name: glow; } @keyframes glow { to { opacity: 1; } }</style>\n<script type=\"module\">const boot = () => 1;</script>\n</main>\n",
                 "structural_html_collector",
-                &["<main", "app", "shell", "--accent", "<script"],
+                &[
+                    "<main",
+                    "app",
+                    "shell",
+                    "--accent",
+                    "@keyframes glow",
+                    "<script",
+                ],
             ),
             (
                 "web/styles.css",
-                ".shell, #app { color: red; --accent: blue; }\n",
+                "@import './theme/_vars.css';\n@import url(missing.css) print;\n.shell, #app { color: red; --accent: blue; animation: pulse 2s ease-in-out .5s infinite; }\n/* .ghost { --fake: red; } @import 'commented.css'; */\n@keyframes pulse { from { opacity: .4; } to { opacity: 1; } }\n.badge { animation-name: pulse; transition: all .3s; }\n",
                 "structural_css_collector",
-                &["shell", "app", "--accent"],
+                &[
+                    "@import './theme/_vars.css';",
+                    "@import url(missing.css) print;",
+                    "shell",
+                    "app",
+                    "--accent",
+                    "@keyframes pulse",
+                    "badge",
+                ],
             ),
             (
                 "db/schema.sql",
@@ -942,9 +962,12 @@ mod tests {
                     continue;
                 }
             };
-            if let Err(error) =
-                index_structural_source_with_unit_cap(&canonical, &source, usize::MAX as u64)
-            {
+            if let Err(error) = index_structural_source_with_unit_cap(
+                &canonical,
+                &source,
+                usize::MAX as u64,
+                MAX_STRUCTURAL_SOURCE_BYTES,
+            ) {
                 failures.push(format!("{relative}: {error}"));
             }
         }
@@ -989,7 +1012,7 @@ mod tests {
         let oversized = "x".repeat(MAX_STRUCTURAL_SOURCE_BYTES as usize + 1);
         assert!(matches!(
             index_structural_source(Path::new("guide.md"), &oversized),
-            Err(StructuralCollectionError::SourceByteLimit(_))
+            Err(StructuralCollectionError::SourceByteLimit { .. })
         ));
 
         let mut keys = String::from("{");

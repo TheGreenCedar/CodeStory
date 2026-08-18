@@ -13,25 +13,37 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { parsePublishedArchiveDigests } from "../lib/pinned-archive-digests.mjs";
+import { workspaceMemberNames } from "../lib/workspace-members.mjs";
+
 const repositoryRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../..",
 );
+/// The fixture carries the real workspace's crates so a new crate cannot slip past these tests.
+const workspaceCrates = workspaceMemberNames(
+  readFileSync(path.join(repositoryRoot, "Cargo.toml"), "utf8"),
+);
+const testPython = ["python", "python3"].find((candidate) => {
+  try {
+    execFileSync(candidate, ["-c", "import tomllib"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+});
+assert.ok(testPython, "bump-version tests require Python with tomllib");
 
 /// A minimal tree carrying every surface the script owns.
 function fixtureRoot(version) {
   const root = mkdtempSync(path.join(tmpdir(), "codestory-bump-"));
-  const crates = [
-    "codestory-llama-sys",
-    "codestory-contracts",
-    "codestory-workspace",
-    "codestory-store",
-    "codestory-indexer",
-    "codestory-retrieval",
-    "codestory-runtime",
-    "codestory-cli",
-    "codestory-bench",
-  ];
+  const crates = workspaceCrates;
+  writeFileSync(
+    path.join(root, "Cargo.toml"),
+    `[workspace]\nresolver = "2"\nmembers = [\n${crates
+      .map((crate) => `    "crates/${crate}",\n`)
+      .join("")}]\n`,
+  );
   for (const crate of crates) {
     const directory = path.join(root, "crates", crate);
     mkdirSync(directory, { recursive: true });
@@ -48,7 +60,9 @@ function fixtureRoot(version) {
       .join("\n")}`,
   );
   for (const manifest of [
+    "plugins/codestory/plugin.json",
     "plugins/codestory/.codex-plugin/plugin.json",
+    "plugins/codestory/.cursor-plugin/plugin.json",
     "plugins/codestory/.claude-plugin/plugin.json",
     "plugins/codestory/.github/plugin/plugin.json",
   ]) {
@@ -62,7 +76,14 @@ function fixtureRoot(version) {
   writeFileSync(
     path.join(root, "crates/codestory-llama-sys/model-contract.json"),
     `${JSON.stringify(
-      { model: { file_name: "m.gguf" }, producer: { name: "codestory-llama-sys", version } },
+      {
+        model: { file_name: "m.gguf" },
+        producer: {
+          name: "codestory-llama-sys",
+          version,
+          embedding_revision: version,
+        },
+      },
       null,
       2,
     )}\n`,
@@ -89,6 +110,18 @@ function fixtureRoot(version) {
     path.join(repositoryRoot, "scripts/bump-version.mjs"),
     path.join(root, "scripts/bump-version.mjs"),
   );
+  mkdirSync(path.join(root, "scripts/lib"), { recursive: true });
+  for (const module of ["pinned-archive-digests.mjs", "workspace-members.mjs"]) {
+    cpSync(
+      path.join(repositoryRoot, "scripts/lib", module),
+      path.join(root, "scripts/lib", module),
+    );
+  }
+  mkdirSync(path.join(root, ".github/scripts"), { recursive: true });
+  cpSync(
+    path.join(repositoryRoot, ".github/scripts/check-codestory-release.py"),
+    path.join(root, ".github/scripts/check-codestory-release.py"),
+  );
   return root;
 }
 
@@ -105,23 +138,54 @@ function readVersions(root) {
   return {
     cli: crateVersion("codestory-cli"),
     bench: crateVersion("codestory-bench"),
+    portablePlugin: jsonVersion("plugins/codestory/plugin.json", ["version"]),
     codexPlugin: jsonVersion("plugins/codestory/.codex-plugin/plugin.json", ["version"]),
+    cursorPlugin: jsonVersion("plugins/codestory/.cursor-plugin/plugin.json", ["version"]),
     claudePlugin: jsonVersion("plugins/codestory/.claude-plugin/plugin.json", ["version"]),
     githubPlugin: jsonVersion("plugins/codestory/.github/plugin/plugin.json", ["version"]),
     producer: jsonVersion("crates/codestory-llama-sys/model-contract.json", [
       "producer",
       "version",
     ]),
+    pin: JSON.parse(
+      readFileSync(path.join(root, "plugins/codestory/cli-version.json"), "utf8"),
+    ),
+    cargoLock: readFileSync(path.join(root, "Cargo.lock"), "utf8"),
     changelog: readFileSync(path.join(root, "CHANGELOG.md"), "utf8"),
   };
 }
 
-/// Run the script without cargo/python, which the fixture tree cannot satisfy.
+function publishedChecksums(root, version, digests = {}) {
+  const values = {
+    "macos-arm64": "1".repeat(64),
+    "windows-x64": "2".repeat(64),
+    "linux-x64": "3".repeat(64),
+    ...digests,
+  };
+  const checksumPath = path.join(root, "SHA256SUMS.txt");
+  writeFileSync(
+    checksumPath,
+    [
+      `${values["macos-arm64"]}  codestory-cli-v${version}-macos-arm64.tar.gz`,
+      `${values["windows-x64"]}  codestory-cli-v${version}-windows-x64.zip`,
+      `${values["linux-x64"]}  codestory-cli-v${version}-linux-x64.tar.gz`,
+      `${"4".repeat(64)}  unrelated-release-asset.txt`,
+    ].join("\n") + "\n",
+  );
+  return { checksumPath, values };
+}
+
+/// Run the version owner against the isolated fixture and the real release validator.
 function bump(root, args) {
   return execFileSync(
     process.execPath,
     [path.join(root, "scripts/bump-version.mjs"), ...args],
-    { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, CODESTORY_PYTHON: testPython },
+    },
   );
 }
 
@@ -138,6 +202,7 @@ test("--check reports every surface that has not been bumped", () => {
     const message = `${failure.stdout}${failure.stderr}`;
     for (const surface of [
       "crates/codestory-cli/Cargo.toml",
+      "plugins/codestory/plugin.json",
       "plugins/codestory/.codex-plugin/plugin.json",
       "crates/codestory-llama-sys/model-contract.json",
       "plugins/codestory/cli-version.json",
@@ -184,13 +249,125 @@ test("--check rejects a stale Cargo.lock when every source manifest is current",
   }
 });
 
-test("a bad version is rejected before anything is written", () => {
+test("non-stable versions are rejected before anything is written", () => {
   const root = fixtureRoot("0.16.1");
   try {
-    assert.throws(() => bump(root, ["--version", "0.17"]), /strict semver/u);
-    assert.throws(() => bump(root, ["--version", "not-a-version"]), /strict semver/u);
+    for (const version of ["0.17", "not-a-version", "0.17.0-rc.1", "0.17.0+build.1", "00.17.0"]) {
+      assert.throws(
+        () => bump(root, ["--version", version]),
+        /stable release version/u,
+        `admitted ${version}`,
+      );
+    }
+    assert.throws(
+      () => bump(root, ["--version", "0.16.2", "--lane", "plugin", "--archive-checksums"]),
+      /--archive-checksums requires a value/u,
+    );
     assert.equal(readVersions(root).cli, "0.16.1");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("the plugin lane pins published CLI digests without moving native versions", () => {
+  const root = fixtureRoot("0.16.1");
+  try {
+    const before = readVersions(root);
+    const { checksumPath, values } = publishedChecksums(root, "0.16.1");
+    const output = bump(root, [
+      "--version",
+      "0.16.2",
+      "--lane",
+      "plugin",
+      "--archive-checksums",
+      checksumPath,
+    ]);
+    const after = readVersions(root);
+    assert.match(output, /Set plugin 0\.16\.2/u);
+    assert.equal(after.cli, "0.16.1");
+    assert.equal(after.bench, "0.16.1");
+    assert.equal(after.producer, "0.16.1");
+    assert.equal(after.cargoLock, before.cargoLock);
+    assert.equal(after.portablePlugin, "0.16.2");
+    assert.equal(after.codexPlugin, "0.16.2");
+    assert.equal(after.cursorPlugin, "0.16.2");
+    assert.equal(after.claudePlugin, "0.16.2");
+    assert.equal(after.githubPlugin, "0.16.2");
+    assert.equal(after.pin.cli_version, "0.16.1");
+    assert.equal(after.pin.release_tag, "v0.16.1");
+    assert.deepEqual(after.pin.archives, values);
+    assert.match(after.changelog, /\n## 0\.16\.2\n/u);
+
+    assert.match(
+      bump(root, [
+        "--version=0.16.2",
+        "--lane=plugin",
+        "--check",
+        `--archive-checksums=${checksumPath}`,
+      ]),
+      /already carries 0\.16\.2 with pinned CLI digests/u,
+    );
+
+    after.pin.archives["linux-x64"] = "f".repeat(64);
+    writeFileSync(
+      path.join(root, "plugins/codestory/cli-version.json"),
+      `${JSON.stringify(after.pin, null, 2)}\n`,
+    );
+    assert.throws(
+      () =>
+        bump(root, [
+          "--version=0.16.2",
+          "--lane=plugin",
+          "--check",
+          `--archive-checksums=${checksumPath}`,
+        ]),
+      /plugins\/codestory\/cli-version\.json/u,
+    );
+    assert.equal(
+      readVersions(root).pin.archives["linux-x64"],
+      "f".repeat(64),
+      "check mode must not repair drift",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a missing published archive fails before the plugin bump writes", () => {
+  const root = fixtureRoot("0.16.1");
+  try {
+    const before = readVersions(root);
+    const checksumPath = path.join(root, "SHA256SUMS.txt");
+    writeFileSync(
+      checksumPath,
+      `${"1".repeat(64)}  codestory-cli-v0.16.1-macos-arm64.tar.gz\n`,
+    );
+    assert.throws(
+      () =>
+        bump(root, [
+          "--version=0.16.2",
+          "--lane=plugin",
+          `--archive-checksums=${checksumPath}`,
+        ]),
+      /does not contain codestory-cli-v0\.16\.1-windows-x64\.zip/u,
+    );
+    assert.deepEqual(readVersions(root), before);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("published checksum parsing rejects malformed and duplicate rows", () => {
+  assert.throws(
+    () => parsePublishedArchiveDigests("not a checksum\n", "0.16.1"),
+    /line 1 is malformed/u,
+  );
+  const digest = "a".repeat(64);
+  const duplicate =
+    `${digest}  codestory-cli-v0.16.1-macos-arm64.tar.gz\n` +
+    `${digest}  codestory-cli-v0.16.1-macos-arm64.tar.gz\n`;
+  assert.throws(
+    () => parsePublishedArchiveDigests(duplicate, "0.16.1"),
+    /repeats codestory-cli-v0\.16\.1-macos-arm64\.tar\.gz/u,
+  );
 });

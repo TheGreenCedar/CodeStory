@@ -1,27 +1,28 @@
 use super::{
-    AgentHybridWeightsDto, AppController, CancellationToken, CoreNodeId, EnvGuard, FileExt,
-    GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, HybridSearchConfig,
+    AgentHybridWeightsDto, AppController, CancellationToken, CoreNodeId, Edge, EdgeId, EdgeKind,
+    EnvGuard, GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, HybridSearchConfig,
     IndexFreshnessStatusDto, IndexMode, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
     OpenProjectRequest, Path, PathBuf, PublicationTestAction, PublicationTestBoundary,
-    RetrievalModeDto, SEMANTIC_DOC_ALIAS_MODE_ENV, SEMANTIC_DOC_MAX_TOKENS_ENV, SearchEngine,
-    SearchGenerationCatalogGuard, SearchGenerationCompletion, SearchHit, SearchRepoTextMode,
-    SearchRequest, SearchSymbolProjection, SemanticProjectionStats, SnapshotStore, SourceLocation,
-    Storage, apply_hybrid_limits, arm_publication_test_fault,
-    assert_mandatory_retrieval_unavailable, assert_no_staged_publication_artifacts,
-    build_persisted_search_state_from_canonical_symbols, build_search_state, compare_search_hits,
-    copy_tictactoe_workspace, current_epoch_ms, dedupe_inexact_search_hits_by_display_key,
-    default_source_policy_identity, finalize_staged_semantic_docs,
-    flush_pending_dense_anchor_inputs, fs, hybrid_search_config_for_request, hybrid_test_env,
-    insert_semantic_fixture_nodes, llm_symbol_doc_hash, load_persisted_search_state,
-    merge_search_hits_by_node_id, normalized_hybrid_weights, pending_semantic_doc_for_test,
-    persisted_search_generation_names, primary_source_retention_threshold, process_env_test_lock,
-    project_identity_v3, prune_search_generations, rebuild_search_state_from_storage,
-    search_generation_completion_path, search_index_generation_root,
-    search_index_path_for_publication, search_index_storage_path, semantic_doc_text_for_test,
-    semantic_projection_republish_for_runtime, tempdir, test_index_publication,
-    test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
+    ResolutionCertainty, RetrievalModeDto, SEMANTIC_DOC_ALIAS_MODE_ENV,
+    SEMANTIC_DOC_MAX_TOKENS_ENV, SearchEngine, SearchGenerationCatalogGuard,
+    SearchGenerationCompletion, SearchHit, SearchRepoTextMode, SearchRequest,
+    SearchSymbolProjection, SemanticProjectionStats, SnapshotStore, SourceLocation, Storage,
+    apply_hybrid_limits, arm_publication_test_fault, assert_mandatory_retrieval_unavailable,
+    assert_no_staged_publication_artifacts, build_persisted_search_state_from_canonical_symbols,
+    build_search_state, compare_search_hits, copy_tictactoe_workspace, current_epoch_ms,
+    dedupe_inexact_search_hits_by_display_key, default_source_policy_identity,
+    finalize_staged_semantic_docs, flush_pending_dense_anchor_inputs, fs,
+    hybrid_search_config_for_request, hybrid_test_env, insert_semantic_fixture_nodes,
+    llm_symbol_doc_hash, load_persisted_search_state, merge_search_hits_by_node_id,
+    normalized_hybrid_weights, pending_semantic_doc_for_test, persisted_search_generation_names,
+    primary_source_retention_threshold, process_env_test_lock, project_identity_v3,
+    prune_search_generations, rebuild_search_state_from_storage, search_generation_completion_path,
+    search_index_generation_root, search_index_path_for_publication, search_index_storage_path,
+    semantic_doc_text_for_test, semantic_projection_republish_for_runtime, tempdir,
+    test_index_publication, test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
     write_search_generation_completion, write_semantic_fixture,
 };
+use codestory_contracts::bounded_locks::{self, FileLockKind};
 
 #[test]
 fn semantic_doc_text_alias_modes_are_switchable_for_research() {
@@ -266,15 +267,226 @@ fn build_search_hit_adjusts_route_scores_by_extraction_provenance() {
     assert_eq!(tree_sitter.score, ast.score);
     assert_eq!(lexical_fallback.score, text_only.score);
     assert_eq!(normal.score, 1.0);
-    assert_eq!(
-        normal.evidence_tier,
-        Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
-        "a valid missing unit remains resolved graph evidence"
-    );
+    assert_eq!(normal.evidence_tier, None);
+    assert_eq!(normal.evidence_producer, None);
+    assert_eq!(normal.resolution_status, None);
+    assert_eq!(normal.eligible_for_sufficiency, None);
 
     let mut hits = [text_only, ast.clone()];
     hits.sort_by(|left, right| compare_search_hits("/api/users", left, right));
     assert_eq!(hits.first().map(|hit| &hit.node_id), Some(&ast.node_id));
+}
+
+#[test]
+fn canonical_and_openapi_route_metadata_keep_uncertain_resolved_handlers() {
+    let route_canonical_id = format!(
+        "route_endpoint:{}",
+        serde_json::json!({
+            "kind": "framework_route",
+            "framework": "express",
+            "method": "GET",
+            "path": "/api/users",
+            "provenance": ["framework:express"],
+        })
+    );
+    let mut storage = Storage::new_in_memory().expect("storage");
+    storage
+        .insert_nodes_batch(&[
+            Node {
+                id: CoreNodeId(100),
+                kind: NodeKind::FILE,
+                serialized_name: "src/routes.ts".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(101),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "GET /api/users".to_string(),
+                canonical_id: Some(route_canonical_id),
+                file_node_id: Some(CoreNodeId(100)),
+                start_line: Some(10),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(102),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "POST /api/users".to_string(),
+                canonical_id: Some("openapi:endpoint:POST /api/users".to_string()),
+                file_node_id: Some(CoreNodeId(100)),
+                start_line: Some(20),
+                ..Default::default()
+            },
+            // The raw call targets are the router verbs the handler filter drops.
+            Node {
+                id: CoreNodeId(103),
+                kind: NodeKind::METHOD,
+                serialized_name: "get".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(104),
+                kind: NodeKind::METHOD,
+                serialized_name: "post".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(105),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "list_users".to_string(),
+                qualified_name: Some("handlers::list_users".to_string()),
+                file_node_id: Some(CoreNodeId(100)),
+                start_line: Some(40),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(106),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "create_user".to_string(),
+                qualified_name: Some("handlers::create_user".to_string()),
+                file_node_id: Some(CoreNodeId(100)),
+                start_line: Some(50),
+                ..Default::default()
+            },
+        ])
+        .expect("insert route graph");
+    storage
+        .insert_edges_batch(&[
+            Edge {
+                id: EdgeId(1),
+                source: CoreNodeId(101),
+                target: CoreNodeId(103),
+                kind: EdgeKind::CALL,
+                resolved_target: Some(CoreNodeId(105)),
+                confidence: Some(0.25),
+                certainty: Some(ResolutionCertainty::Uncertain),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(2),
+                source: CoreNodeId(102),
+                target: CoreNodeId(104),
+                kind: EdgeKind::CALL,
+                resolved_target: Some(CoreNodeId(106)),
+                confidence: Some(0.2),
+                certainty: Some(ResolutionCertainty::Uncertain),
+                ..Default::default()
+            },
+        ])
+        .expect("insert route handler edges");
+
+    for route_id in [CoreNodeId(101), CoreNodeId(102)] {
+        let trail_edges = storage
+            .get_edges_for_node_ids(&[route_id])
+            .expect("trail edge lookup");
+        assert!(
+            trail_edges[&route_id]
+                .iter()
+                .all(|edge| edge.resolved_target.is_none()),
+            "the trail accessor must remain an invalid substitute for raw route metadata"
+        );
+    }
+
+    let controller = AppController::new();
+    for (route_id, expected_handler) in [
+        (CoreNodeId(101), NodeId("105".to_string())),
+        (CoreNodeId(102), NodeId("106".to_string())),
+    ] {
+        let route = storage
+            .get_node(route_id)
+            .expect("load route")
+            .expect("route node");
+        let metadata = controller
+            .route_endpoint_metadata(&storage, &route, Some("src/routes.ts"), "route")
+            .expect("route metadata");
+        let handler = metadata.handler.expect("resolved handler");
+        assert_eq!(handler.node_id, expected_handler);
+        assert_eq!(handler.certainty.as_deref(), Some("uncertain"));
+        assert_eq!(handler.file_path.as_deref(), Some("src/routes.ts"));
+        assert!(
+            metadata
+                .provenance
+                .iter()
+                .any(|entry| entry == "graph:handler_edge")
+        );
+    }
+}
+
+#[test]
+fn symbol_summaries_batch_child_presence_for_the_rendered_window() {
+    let mut storage = Storage::new_in_memory().expect("storage");
+    storage
+        .insert_nodes_batch(&[
+            Node {
+                id: CoreNodeId(1),
+                kind: NodeKind::CLASS,
+                serialized_name: "WithChild".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(2),
+                kind: NodeKind::CLASS,
+                serialized_name: "Childless".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(3),
+                kind: NodeKind::METHOD,
+                serialized_name: "child".to_string(),
+                ..Default::default()
+            },
+        ])
+        .expect("insert nodes");
+    storage
+        .insert_edges_batch(&[Edge {
+            id: EdgeId(1),
+            source: CoreNodeId(1),
+            target: CoreNodeId(3),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        }])
+        .expect("insert member edge");
+
+    let nodes = [CoreNodeId(1), CoreNodeId(2), CoreNodeId(3)]
+        .into_iter()
+        .map(|id| storage.get_node(id).expect("load node").expect("node"))
+        .collect::<Vec<_>>();
+    let labels = HashMap::from([(CoreNodeId(1), "WithChild".to_string())]);
+    let summaries = AppController::symbol_summaries_for_nodes(&storage, &labels, nodes.clone())
+        .expect("symbol summaries");
+
+    assert_eq!(summaries.len(), nodes.len());
+    for (summary, node) in summaries.iter().zip(nodes.iter()) {
+        assert_eq!(
+            summary.has_children,
+            !storage
+                .get_children_symbols(node.id)
+                .expect("children")
+                .is_empty(),
+            "batched child presence diverged for {:?}",
+            node.id
+        );
+    }
+    assert_eq!(summaries[0].label, "WithChild");
+    assert_eq!(summaries[1].label, "Childless");
+}
+
+#[test]
+fn indexed_symbol_name_lookup_is_bounded_by_the_candidate_ids() {
+    let node_names = HashMap::from([
+        (CoreNodeId(1), "one".to_string()),
+        (CoreNodeId(2), "two".to_string()),
+        (CoreNodeId(3), "three".to_string()),
+    ]);
+
+    let bounded =
+        crate::controller_symbols::node_names_for_ids(&node_names, [CoreNodeId(2), CoreNodeId(9)]);
+
+    assert_eq!(
+        bounded,
+        HashMap::from([(CoreNodeId(2), "two".to_string())]),
+        "only the candidate ids may be copied out of the symbol-name table"
+    );
+    assert!(crate::controller_symbols::node_names_for_ids(&node_names, []).is_empty());
 }
 
 #[test]
@@ -624,8 +836,35 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
 
     let controller = AppController::new();
     controller
-        .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+        .open_project_with_storage_path(temp.path().to_path_buf(), db_path.clone())
         .expect("open project");
+
+    let indexed = controller
+        .resolve_indexed_symbol_candidates("AppController", 10)
+        .expect("resolve indexed candidates");
+    let storage = Storage::open(&db_path).expect("reopen storage");
+    let expanded = controller
+        .expanded_symbol_hits(&storage, "AppController")
+        .expect("resolve expanded candidates");
+    for (lane, hits) in [("indexed", indexed), ("expanded", expanded)] {
+        assert!(!hits.is_empty(), "{lane} lexical lane should return hits");
+        assert!(
+            hits.iter().all(|hit| {
+                hit.evidence_tier
+                    == Some(codestory_contracts::api::PacketEvidenceTierDto::LexicalSource)
+                    && hit.resolution_status
+                        == Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved)
+                    && hit.eligible_for_sufficiency == Some(true)
+                    && hit.score_breakdown.as_ref().is_some_and(|breakdown| {
+                        breakdown.lexical > 0.0
+                            && breakdown.semantic == 0.0
+                            && breakdown.graph == 0.0
+                            && breakdown.provenance == ["lexical_source"]
+                    })
+            }),
+            "{lane} lexical lane must bind provenance before classification: {hits:#?}"
+        );
+    }
 
     let error = controller
         .search(SearchRequest {
@@ -650,6 +889,7 @@ fn compare_search_hits_prefers_function_over_method_for_equal_symbol_matches() {
         line: None,
         score: 184.0,
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+        target: None,
         match_quality: None,
         resolvable: true,
         evidence_tier: None,
@@ -670,6 +910,7 @@ fn compare_search_hits_prefers_function_over_method_for_equal_symbol_matches() {
         line: None,
         score: 184.0,
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+        target: None,
         match_quality: None,
         resolvable: true,
         evidence_tier: None,
@@ -845,25 +1086,220 @@ fn build_search_state_prefers_qualified_name() {
 }
 
 #[test]
-fn open_project_summary_clears_search_state() {
-    let temp = tempdir().expect("create temp dir");
+fn open_project_summary_preserves_search_state_for_the_same_complete_publication() {
+    let temp = copy_tictactoe_workspace();
     let storage_path = temp.path().join("cache").join("codestory.db");
     let controller = AppController::new();
 
     controller
-        .open_project_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
-        .expect("open project with search state");
-    assert!(
-        controller.state.lock().search_engine.is_some(),
-        "expected full open to initialize search state"
+        .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
+        .expect("open project summary");
+    controller
+        .run_indexing_blocking(IndexMode::Full)
+        .expect("publish complete project and search state");
+    let before_cache_generation = controller.sidecar_query_cache.lock().snapshot().0;
+    let before = controller.state.lock();
+    assert!(before.search_engine.is_some());
+    assert!(!before.node_names.is_empty());
+    let publication = before
+        .search_publication
+        .clone()
+        .expect("search publication");
+    let node_count = before.node_names.len();
+    drop(before);
+
+    controller
+        .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path)
+        .expect("open project summary");
+    let state = controller.state.lock();
+    assert!(state.search_engine.is_some());
+    assert_eq!(state.search_publication.as_ref(), Some(&publication));
+    assert_eq!(state.node_names.len(), node_count);
+    assert_eq!(
+        controller.sidecar_query_cache.lock().snapshot().0,
+        before_cache_generation,
+        "unchanged summary open must preserve the sidecar query cache epoch"
     );
+}
+
+#[test]
+fn activation_search_preparation_preserves_resident_state_for_retrieval_only_replacement() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    fs::write(
+        project.path().join("metadata.rs"),
+        "// RETRIEVAL_ONLY_REPLACEMENT_ANCHOR\n",
+    )
+    .expect("write zero-dense project");
+    let sidecar_cache = cache.path().join("sidecar");
+    fs::create_dir_all(&sidecar_cache).expect("create sidecar cache");
+    let runtime = codestory_retrieval::with_test_cache_root(&sidecar_cache, || {
+        codestory_retrieval::SidecarRuntimeConfig::for_project_profile(
+            Some(project.path()),
+            codestory_retrieval::SidecarProfile::Agent,
+        )
+    });
+    let storage_path = cache.path().join("codestory.db");
+    let controller = AppController::new_with_config(runtime.clone());
+    controller
+        .open_project_summary_with_storage_path(project.path().to_path_buf(), storage_path.clone())
+        .expect("open project summary");
+    controller
+        .run_indexing_blocking(IndexMode::Full)
+        .expect("publish complete core and resident search state");
+    let manifest_a = codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+        project.path(),
+        &storage_path,
+        &runtime,
+    )
+    .expect("publish retrieval identity A");
+    let mut manifest_b = manifest_a.clone();
+    manifest_b.built_at_epoch_ms += 1;
+    Storage::open(&storage_path)
+        .expect("open retrieval pointer store")
+        .upsert_retrieval_index_manifest(&manifest_b)
+        .expect("publish retrieval-only identity B");
+
+    let sentinel_id = CoreNodeId(9_999_991);
+    let sentinel_name = "retrieval_only_resident_search_sentinel";
+    let core_publication = {
+        let mut state = controller.state.lock();
+        state
+            .node_names
+            .insert(sentinel_id, sentinel_name.to_string());
+        let engine = state
+            .search_engine
+            .as_mut()
+            .expect("resident search engine");
+        engine.extend_symbol_projection([(sentinel_id, sentinel_name.to_string())]);
+        state
+            .search_publication
+            .clone()
+            .expect("resident search publication")
+    };
+    let cache_key = codestory_retrieval::RetrievalCacheKey::from_manifest(
+        &manifest_b,
+        "retrieval-only-cache-sentinel",
+    );
+    controller.sidecar_query_cache.lock().insert(
+        cache_key.clone(),
+        vec![codestory_retrieval::CandidateHit::lexical_stub(
+            "metadata.rs",
+            1.0,
+        )],
+    );
+    let cache_generation = controller.sidecar_query_cache.lock().snapshot().0;
+
+    controller
+        .prepare_search_state_for_activation(&CancellationToken::new())
+        .expect("same-core retrieval replacement must reuse resident search state");
+
+    {
+        let state = controller.state.lock();
+        assert_eq!(
+            state.node_names.get(&sentinel_id).map(String::as_str),
+            Some(sentinel_name)
+        );
+        assert_eq!(state.search_publication.as_ref(), Some(&core_publication));
+        assert!(
+            state
+                .search_engine
+                .as_ref()
+                .expect("resident search engine survives")
+                .search_symbol(sentinel_name)
+                .contains(&sentinel_id),
+            "retrieval-only activation rebuilt the resident search engine"
+        );
+    }
+    let cache = controller.sidecar_query_cache.lock();
+    assert_eq!(cache.snapshot().0, cache_generation);
+    assert_eq!(
+        cache.get(&cache_key).expect("sidecar cache entry survives")[0].file_path,
+        "metadata.rs"
+    );
+    drop(cache);
+
+    codestory_retrieval::test_support::publish_replacement_core_and_zero_dense_fixture(
+        project.path(),
+        &storage_path,
+        &runtime,
+        core_publication.generation + 1,
+        "33333333-3333-4333-8333-333333333333",
+        "retrieval-only-core-replacement",
+    )
+    .expect("publish true core replacement");
+    controller
+        .open_project_summary_with_storage_path(project.path().to_path_buf(), storage_path.clone())
+        .expect("observe true core replacement");
+    {
+        let state = controller.state.lock();
+        assert!(state.search_engine.is_none());
+        assert!(state.search_publication.is_none());
+        assert!(state.node_names.is_empty());
+    }
+    assert_eq!(
+        controller.sidecar_query_cache.lock().snapshot().0,
+        cache_generation.wrapping_add(1),
+        "true core replacement must clear the sidecar cache once"
+    );
+    controller
+        .open_project_summary_with_storage_path(project.path().to_path_buf(), storage_path)
+        .expect("reobserve unchanged replacement core");
+    assert_eq!(
+        controller.sidecar_query_cache.lock().snapshot().0,
+        cache_generation.wrapping_add(1),
+        "one core transition must not repeatedly clear resident state"
+    );
+}
+
+#[test]
+fn open_project_summary_clears_state_bound_to_another_core_publication() {
+    let temp = copy_tictactoe_workspace();
+    let storage_path = temp.path().join("cache").join("codestory.db");
+    let controller = AppController::new();
+
+    controller
+        .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
+        .expect("open project summary");
+    controller
+        .run_indexing_blocking(IndexMode::Full)
+        .expect("publish complete project and search state");
+    let before_cache_generation = controller.sidecar_query_cache.lock().snapshot().0;
+    {
+        let mut state = controller.state.lock();
+        let mut stale = state
+            .search_publication
+            .clone()
+            .expect("search publication");
+        stale.generation_id = "stale-search-publication".into();
+        state.search_publication = Some(stale);
+    }
 
     controller
         .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path)
         .expect("open project summary");
     let state = controller.state.lock();
     assert!(state.search_engine.is_none());
+    assert!(state.search_publication.is_none());
     assert!(state.node_names.is_empty());
+    assert_eq!(
+        controller.sidecar_query_cache.lock().snapshot().0,
+        before_cache_generation.wrapping_add(1),
+        "changed core identity must invalidate the sidecar query cache once"
+    );
+    drop(state);
+
+    controller
+        .open_project_summary_with_storage_path(
+            temp.path().to_path_buf(),
+            temp.path().join("cache").join("codestory.db"),
+        )
+        .expect("reopen the already-observed core publication");
+    assert_eq!(
+        controller.sidecar_query_cache.lock().snapshot().0,
+        before_cache_generation.wrapping_add(1),
+        "one publication transition must not repeatedly invalidate resident caches"
+    );
 }
 
 #[test]
@@ -1529,14 +1965,21 @@ fn search_generation_retention_keeps_active_and_one_verified_rollback() {
         .write(true)
         .open(&partial_lock_path)
         .expect("open second durable lock handle");
-    assert!(FileExt::try_lock_exclusive(&first_lock).expect("lock first handle"));
     assert!(
-        !FileExt::try_lock_exclusive(&second_lock).expect("contend second handle"),
+        bounded_locks::try_acquire(&first_lock, FileLockKind::Exclusive)
+            .expect("lock first handle")
+    );
+    assert!(
+        !bounded_locks::try_acquire(&second_lock, FileLockKind::Exclusive)
+            .expect("contend second handle"),
         "both handles must coordinate through the same durable lock file"
     );
-    FileExt::unlock(&first_lock).expect("unlock first handle");
-    assert!(FileExt::try_lock_exclusive(&second_lock).expect("lock second handle after release"));
-    FileExt::unlock(&second_lock).expect("unlock second handle");
+    bounded_locks::release(&first_lock).expect("unlock first handle");
+    assert!(
+        bounded_locks::try_acquire(&second_lock, FileLockKind::Exclusive)
+            .expect("lock second handle after release")
+    );
+    bounded_locks::release(&second_lock).expect("unlock second handle");
     assert!(
         search_index_generation_root(&storage_path)
             .join(ids[0])
@@ -1592,6 +2035,7 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
             line: Some(10),
             score: 0.25,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1612,6 +2056,7 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
             line: Some(20),
             score: 0.75,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1636,6 +2081,7 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
             line: Some(10),
             score: 250.0,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1675,6 +2121,7 @@ fn inexact_search_results_deduplicate_repeated_display_keys() {
             line: Some(178),
             score: 0.90,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1695,6 +2142,7 @@ fn inexact_search_results_deduplicate_repeated_display_keys() {
             line: Some(187),
             score: 0.80,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1715,6 +2163,7 @@ fn inexact_search_results_deduplicate_repeated_display_keys() {
             line: Some(194),
             score: 0.70,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1757,6 +2206,7 @@ fn exact_search_results_keep_repeated_display_keys() {
             line: Some(178),
             score: 0.90,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1777,6 +2227,7 @@ fn exact_search_results_keep_repeated_display_keys() {
             line: Some(187),
             score: 0.80,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1889,7 +2340,9 @@ fn staged_recovery_search_failure_preserves_the_marked_live_database() {
         .index_freshness()
         .expect("cached recovery freshness");
     let uncached = controller
-        .index_freshness_uncached()
+        .index_freshness_uncached(
+            crate::index_freshness::FreshnessObservationPolicy::ObserveSourceRoot,
+        )
         .expect("uncached recovery freshness");
     for freshness in [&cached, &uncached] {
         assert_eq!(freshness.status, IndexFreshnessStatusDto::Stale);

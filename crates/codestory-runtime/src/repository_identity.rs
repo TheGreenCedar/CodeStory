@@ -62,8 +62,8 @@ pub fn inspect_repository_identity(project_root: &Path) -> RepositoryIdentityRep
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{git, git_available};
     use std::fs;
-    use std::process::Command;
     use tempfile::tempdir;
 
     #[test]
@@ -99,7 +99,7 @@ mod tests {
     }
 
     fn git_project() -> Option<tempfile::TempDir> {
-        if Command::new("git").arg("--version").output().is_err() {
+        if !git_available() {
             return None;
         }
         let project = tempdir().expect("project");
@@ -122,20 +122,5 @@ mod tests {
         git(project.path(), &["add", "."]);
         git(project.path(), &["commit", "-m", "init"]);
         Some(project)
-    }
-
-    fn git(project: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(project)
-            .args(args)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 }

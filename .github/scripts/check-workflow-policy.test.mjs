@@ -23,8 +23,10 @@ import {
 import {
   absorbedFailureViolations,
   annotationScopeViolations,
+  callerInputBindings,
   basicWorkflowViolations,
   benchmarkDependencyIsolationViolations,
+  crateDurabilityFile,
   dispatchInputInterpolationViolations,
   draftSourcePolicyViolations,
   draftWorkflowPolicyViolations,
@@ -35,10 +37,10 @@ import {
   notaryStepViolations,
   packagedPrSigningViolations,
   parseWorkflow,
+  proofFloorPolicyViolations,
+  protectedRunnerReservationViolations,
   qualificationDriverArtifactViolations,
-  releaseEvidenceApprovalViolations,
   releaseProofCpuSelectorViolations,
-  releaseEvidenceWorkflowRef,
   releaseFreezeBarrierWorkflowViolations,
   releaseWorkflowContractViolations,
   retrievalGeneralizationSuitePolicyViolations,
@@ -112,6 +114,373 @@ function draftStep(job, name) {
   assert.equal(matches.length, 1, `expected one ${name} step`);
   return matches[0];
 }
+
+function runCloseDevIssuesFixture(fixture) {
+  const workflow = loadWorkflows().get("close-dev-issues.yml");
+  const run = draftStep(
+    workflow.jobs["close-linked-issues"],
+    "Close issues referenced by the merged PR",
+  ).run;
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-close-dev-"));
+  const fixturePath = path.join(directory, "fixture.json");
+  const eventPath = path.join(directory, "event.json");
+  const closedLog = path.join(directory, "closed.log");
+  const fakeGh = path.join(directory, "gh");
+  writeFileSync(fixturePath, JSON.stringify(fixture));
+  writeFileSync(eventPath, JSON.stringify({
+    after: fixture.commit,
+    repository: { full_name: "TheGreenCedar/CodeStory" },
+  }));
+  writeFileSync(closedLog, "");
+  writeFileSync(fakeGh, `#!/usr/bin/env node
+const fs = require("node:fs");
+const fixture = JSON.parse(fs.readFileSync(process.env.CLOSE_DEV_FIXTURE, "utf8"));
+const args = process.argv.slice(2);
+const respond = value => process.stdout.write(JSON.stringify(value));
+
+if (args[0] !== "api") process.exit(2);
+if (args[1] === "graphql") {
+  const field = args.find(argument => argument.startsWith("number="));
+  const number = field ? field.slice("number=".length) : "";
+  if ((fixture.graphqlFailures ?? []).includes(Number(number))) process.exit(9);
+  const cursorField = args.find(argument => argument.startsWith("cursor="));
+  const cursor = cursorField ? cursorField.slice("cursor=".length) : null;
+  let response = fixture.graphql[number] ?? {
+    data: { repository: { pullRequest: { stack: null } } },
+  };
+  if (Array.isArray(response)) {
+    const page = cursor === null ? 0 : Number(cursor);
+    response = response[page];
+  }
+  respond(response);
+  process.exit(0);
+}
+
+const endpoint = args.find(argument => argument.startsWith("repos/"));
+if (endpoint && endpoint.includes("/commits/") && endpoint.endsWith("/pulls")) {
+  respond(fixture.associatedPullRequests);
+  process.exit(0);
+}
+
+const issueMatch = endpoint?.match(/\\/issues\\/(\\d+)$/u);
+if (issueMatch && args.includes("--method")) {
+  fs.appendFileSync(process.env.CLOSE_DEV_CLOSED_LOG, issueMatch[1] + "\\n");
+  respond({ state: "closed" });
+  process.exit(0);
+}
+if (issueMatch) {
+  respond(fixture.issues[issueMatch[1]] ?? { state: "open" });
+  process.exit(0);
+}
+process.exit(3);
+`);
+  chmodSync(fakeGh, 0o755);
+  const result = spawnSync("python", ["-c", run], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${directory}:${process.env.PATH}`,
+      GH_TOKEN: "test-token",
+      GITHUB_EVENT_PATH: eventPath,
+      CLOSE_DEV_FIXTURE: fixturePath,
+      CLOSE_DEV_CLOSED_LOG: closedLog,
+    },
+  });
+  const closedIssues = readFileSync(closedLog, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map(Number);
+  rmSync(directory, { recursive: true, force: true });
+  return { result, closedIssues };
+}
+
+function mergedPullRequest(number, body, commit, base = "dev/codestory-next") {
+  return {
+    number,
+    body,
+    merged_at: "2026-08-01T00:00:00Z",
+    merge_commit_sha: commit,
+    base: { ref: base },
+  };
+}
+
+function stackQueryResponse(
+  baseRefName,
+  pullRequests,
+  size = pullRequests.length,
+  options = {},
+) {
+  return {
+    data: {
+      repository: {
+        pullRequest: {
+          stack: {
+            id: options.id ?? "stack-id",
+            baseRefName,
+            size,
+            entries: {
+              totalCount: options.totalCount ?? size,
+              pageInfo: {
+                hasNextPage: options.hasNextPage ?? false,
+                endCursor: options.endCursor ?? null,
+              },
+              nodes: pullRequests.map((pullRequest, index) => ({
+                position: options.positions?.[index] ?? index + 1,
+                pullRequest: {
+                  mergedAt: pullRequest.merged
+                    ? "2026-08-01T00:00:00Z"
+                    : null,
+                  repository: { nameWithOwner: "TheGreenCedar/CodeStory" },
+                  ...pullRequest,
+                },
+              })),
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+test("dev issue closeout follows every exact native-stack layer once", () => {
+  const commit = "a".repeat(40);
+  const otherCommit = "b".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(41, "Closes #101", commit)],
+    graphql: {
+      41: stackQueryResponse("dev/codestory-next", [
+        { number: 41, body: "Closes #101", merged: true, mergeCommit: { oid: commit } },
+        { number: 42, body: "Fixes #102", merged: true, mergeCommit: { oid: commit } },
+        { number: 43, body: "Closes #103", merged: true, mergeCommit: { oid: otherCommit } },
+        { number: 44, body: "Closes #104", merged: false, mergeCommit: null },
+      ]),
+    },
+    issues: {
+      101: { state: "open" },
+      102: { state: "open" },
+      103: { state: "open" },
+      104: { state: "open" },
+    },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(closedIssues, [101, 102]);
+});
+
+test("dev issue closeout preserves direct non-stack merges", () => {
+  const commit = "c".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(51, "Resolves #105", commit)],
+    graphql: {},
+    issues: { 105: { state: "open" } },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(closedIssues, [105]);
+});
+
+test("dev issue closeout rejects entries from a stack on another trunk", () => {
+  const commit = "d".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(61, "Closes #106", commit)],
+    graphql: {
+      61: stackQueryResponse("main", [
+        { number: 61, body: "Closes #106", merged: true, mergeCommit: { oid: commit } },
+        { number: 62, body: "Closes #106", merged: true, mergeCommit: { oid: commit } },
+      ]),
+    },
+    issues: { 106: { state: "open" } },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout fails closed on a truncated stack query", () => {
+  const commit = "e".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(71, "Closes #107", commit)],
+    graphql: {
+      71: stackQueryResponse(
+        "dev/codestory-next",
+        [{ number: 71, body: "Closes #107", merged: true, mergeCommit: { oid: commit } }],
+        2,
+      ),
+    },
+    issues: { 107: { state: "open" } },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /native pull request stack query was incomplete/u);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout enumerates every native-stack page", () => {
+  const commit = "f".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(81, "Closes #108", commit)],
+    graphql: {
+      81: [
+        stackQueryResponse(
+          "dev/codestory-next",
+          [{ number: 81, body: "Closes #108", merged: true, mergeCommit: { oid: commit } }],
+          2,
+          { hasNextPage: true, endCursor: "1", positions: [1] },
+        ),
+        stackQueryResponse(
+          "dev/codestory-next",
+          [{ number: 82, body: "Fixes #109", merged: true, mergeCommit: { oid: commit } }],
+          2,
+          { positions: [2] },
+        ),
+      ],
+    },
+    issues: {
+      108: { state: "open" },
+      109: { state: "open" },
+    },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(closedIssues, [108, 109]);
+});
+
+test("dev issue closeout fails closed when a stack crosses repositories", () => {
+  const commit = "1".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(91, "Closes #110", commit)],
+    graphql: {
+      91: stackQueryResponse("dev/codestory-next", [
+        { number: 91, body: "Closes #110", merged: true, mergeCommit: { oid: commit } },
+        {
+          number: 92,
+          body: "Closes #111",
+          merged: true,
+          repository: { nameWithOwner: "another/repository" },
+          mergeCommit: { oid: commit },
+        },
+      ]),
+    },
+    issues: {
+      110: { state: "open" },
+      111: { state: "open" },
+    },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /crossed repository boundaries/u);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout fails closed on a repeated pagination cursor", () => {
+  const commit = "2".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(101, "Closes #112", commit)],
+    graphql: {
+      101: [
+        stackQueryResponse(
+          "dev/codestory-next",
+          [{ number: 101, body: "Closes #112", merged: true, mergeCommit: { oid: commit } }],
+          2,
+          { hasNextPage: true, endCursor: "1", positions: [1] },
+        ),
+        stackQueryResponse(
+          "dev/codestory-next",
+          [{ number: 102, body: "Closes #113", merged: true, mergeCommit: { oid: commit } }],
+          2,
+          { hasNextPage: true, endCursor: "1", positions: [2] },
+        ),
+      ],
+    },
+    issues: {
+      112: { state: "open" },
+      113: { state: "open" },
+    },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /repeated a cursor/u);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout finishes stack discovery before issue mutation", () => {
+  const commit = "3".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [
+      mergedPullRequest(111, "Closes #114", commit),
+      mergedPullRequest(112, "Closes #115", commit),
+    ],
+    graphql: {},
+    graphqlFailures: [112],
+    issues: {
+      114: { state: "open" },
+      115: { state: "open" },
+    },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.notEqual(result.status, 0);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout ignores associated PRs outside the dev trunk", () => {
+  const commit = "4".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [
+      mergedPullRequest(121, "Closes #116", commit, "codex/dependent-layer"),
+    ],
+    graphql: {},
+    issues: { 116: { state: "open" } },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout rejects a malformed missing stack field", () => {
+  const commit = "5".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(131, "Closes #117", commit)],
+    graphql: {
+      131: { data: { repository: { pullRequest: {} } } },
+    },
+    issues: { 117: { state: "open" } },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /stack query was malformed/u);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout rejects stack and REST anchor drift", () => {
+  const commit = "6".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(141, "Closes #118", commit)],
+    graphql: {
+      141: stackQueryResponse("dev/codestory-next", [
+        { number: 141, body: "Closes #119", merged: true, mergeCommit: { oid: commit } },
+      ]),
+    },
+    issues: {
+      118: { state: "open" },
+      119: { state: "open" },
+    },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /anchor did not match REST/u);
+  assert.deepEqual(closedIssues, []);
+});
 
 function moveNamedStepAfter(job, movedName, afterName) {
   const movedIndex = job.steps.findIndex(step => step.name === movedName);
@@ -321,53 +690,6 @@ function windowsManifestStep(workflow, name) {
   return draftStep(windowsManifestJob(workflow), name);
 }
 
-function releaseEvidenceApprovalBoundary() {
-  return {
-    callers: [
-      ["release.yml", {
-        uses: releaseEvidenceWorkflowRef,
-        with: { source_run_id: "${{ inputs.source_run_id }}" },
-        secrets: {
-          CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON:
-            "${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}",
-        },
-      }, true],
-      ["packaged-platform-pr.yml", {
-        uses: releaseEvidenceWorkflowRef,
-        with: { source_run_id: "${{ inputs.source_run_id }}" },
-      }, false],
-    ],
-    called: {
-      on: {
-        workflow_call: {
-          secrets: {
-            CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON: { required: false },
-          },
-        },
-      },
-      jobs: {
-        measure: {
-          environment: "release-evidence",
-          steps: [
-            {
-              name: "Produce and evaluate same-SHA candidate",
-              env: {
-                APPROVAL_JSON: "${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}",
-              },
-              run: [
-                'if [ -n "$SOURCE_RUN_ID" ] && [ -z "$APPROVAL_JSON" ]; then',
-                '  echo "::error::Protected release-evidence approval is required for source-run re-evaluation."',
-                "  exit 1",
-                "fi",
-              ].join("\n"),
-            },
-          ],
-        },
-      },
-    },
-  };
-}
-
 test("parser ignores YAML comments and harmless formatting", () => {
   const block = parseWorkflow(`
 on:
@@ -387,36 +709,6 @@ permissions: { contents: read }
 jobs: { check: { runs-on: ubuntu-latest, steps: [ { uses: vendor/action@${fullSha} } ] } }
 `);
   assert.deepEqual(block, flow);
-});
-
-test("release evidence policy pins the release-only Axios v2 task and corpus", async (t) => {
-  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
-  const file = "release-candidate-evidence.yml";
-  const mutations = [
-    ["repo corpus drifts", workflow => {
-      draftStep(workflow.jobs.measure, "Produce full-retrieval repo evidence")
-        .env.CODESTORY_RELEASE_EVIDENCE_CORPUS_ID = "codestory-release-corpus-v0.16-axios-js-ts-v1";
-    }, /repo evidence must bind the v0\.16 Axios v2 corpus/u],
-    ["packet corpus contract drifts", workflow => {
-      draftStep(workflow.jobs.measure, "Produce publishable packet evidence")
-        .env.CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT
-          = "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v1.json";
-    }, /packet evidence must bind the v0\.16 Axios v2 corpus contract/u],
-    ["packet task falls back to the holdout suite", workflow => {
-      const step = draftStep(workflow.jobs.measure, "Produce publishable packet evidence");
-      step.run = step.run.replace(
-        /--task-manifest [^\\\n]+/u,
-        "--task-suite holdout-retrieval --task-ids axios-request-dispatch",
-      );
-    }, /must select only the corpus-bound release task manifest/u],
-  ];
-  for (const [name, mutate, expected] of mutations) {
-    await t.test(name, () => {
-      const workflows = loadWorkflows();
-      mutate(workflows.get(file));
-      assert.match(validateWorkflows(workflows).join("\n"), expected);
-    });
-  }
 });
 
 test("every release-proof workflow rejects CPU selectors at every structural level", async (t) => {
@@ -598,47 +890,10 @@ test("every release-proof workflow rejects CPU selectors at every structural lev
 
   const supportSources = new Map([
     [
-      "scripts/release-evidence/guest-runner.sh",
-      readFileSync(path.join(root, "scripts/release-evidence/guest-runner.sh"), "utf8"),
-    ],
-    [
       ".github/scripts/check-linux-glibc-baseline.sh",
       readFileSync(path.join(root, ".github/scripts/check-linux-glibc-baseline.sh"), "utf8"),
     ],
-    [
-      "scripts/release-evidence/guest-verify.sh",
-      readFileSync(path.join(root, "scripts/release-evidence/guest-verify.sh"), "utf8"),
-    ],
   ]);
-  await t.test("runner service re-enables CPU", () => {
-    const mutated = new Map(supportSources);
-    mutated.set(
-      "scripts/release-evidence/guest-runner.sh",
-      mutated.get("scripts/release-evidence/guest-runner.sh")
-        .replace("CODESTORY_EMBED_ALLOW_CPU=0", "CODESTORY_EMBED_ALLOW_CPU=1"),
-    );
-    assert.match(
-      releaseProofCpuSelectorViolations(loadWorkflows(), graph, mutated).join("\n"),
-      /guest-runner\.sh contains a CPU proof selector/u,
-    );
-  });
-  for (const [shape, assignment] of [
-    ["arithmetic", "CODESTORY_EMBED_ALLOW_CPU=$((1))"],
-    ["command substitution", "CODESTORY_EMBED_ALLOW_CPU=$(printf 1)"],
-  ]) {
-    await t.test(`runner service re-enables CPU through ${shape}`, () => {
-      const mutated = new Map(supportSources);
-      mutated.set(
-        "scripts/release-evidence/guest-runner.sh",
-        mutated.get("scripts/release-evidence/guest-runner.sh")
-          .replace("CODESTORY_EMBED_ALLOW_CPU=0", assignment),
-      );
-      assert.match(
-        releaseProofCpuSelectorViolations(loadWorkflows(), graph, mutated).join("\n"),
-        /guest-runner\.sh contains a CPU proof selector/u,
-      );
-    });
-  }
   await t.test("glibc smoke re-enables CPU", () => {
     const mutated = new Map(supportSources);
     mutated.set(
@@ -649,18 +904,6 @@ test("every release-proof workflow rejects CPU selectors at every structural lev
     assert.match(
       releaseProofCpuSelectorViolations(loadWorkflows(), graph, mutated).join("\n"),
       /check-linux-glibc-baseline\.sh contains a CPU proof selector/u,
-    );
-  });
-  await t.test("runner verification stops proving CPU disabled", () => {
-    const mutated = new Map(supportSources);
-    mutated.set(
-      "scripts/release-evidence/guest-verify.sh",
-      mutated.get("scripts/release-evidence/guest-verify.sh")
-        .replace('grep -qxF "CODESTORY_EMBED_ALLOW_CPU=0"', "grep -qxF ignored"),
-    );
-    assert.match(
-      releaseProofCpuSelectorViolations(loadWorkflows(), graph, mutated).join("\n"),
-      /guest-verify\.sh must prove CPU is disabled/u,
     );
   });
 });
@@ -1069,42 +1312,90 @@ test("frozen-candidate quality stays optional, exact, and archive-authenticated"
     ["Windows qualification becomes server-behavior only", coordinatorFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].with.server_behavior_only = true;
     }, /qualification must run full Windows lifecycle and fault proof/u],
-    ["coordinator schedules Linux during qualification", coordinatorFile, workflow => {
+    ["coordinator schedules Linux during qualification without the opt-in", coordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].if
         = workflow.jobs["linux-vulkan-proof"].if.replace(
-          "needs.route.outputs.mode != 'qualification' &&",
-          "",
+          "(needs.route.outputs.mode != 'qualification' || inputs.qualify_linux_vulkan)",
+          "true",
         );
-    }, /qualification modes must skip coordinator Linux proof/u],
-    ["qualification closeout blocks on Linux", coordinatorFile, workflow => {
+    }, /qualification must schedule Linux proof only when the explicit lifecycle opt-in is true/u],
+    ["qualification closeout requires Linux without the opt-in", coordinatorFile, workflow => {
       const closeout = draftStep(
         workflow.jobs.closeout,
         "Require one coherent accepted proof",
       );
       closeout.run = closeout.run.replace(
-        `if [ "$MODE" = qualification ]; then
-      require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
-    else`,
-        `if [ "$MODE" = qualification ]; then
-      require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
-    else`,
+        'if [ "$QUALIFY_LINUX_VULKAN" = true ]; then',
+        "if true; then",
       );
-    }, /qualification closeout must accept skipped optional Linux proof without blocking/u],
+    }, /qualification closeout must require Linux success exactly when the explicit lifecycle opt-in is true/u],
+    ["opted-in Linux quality validation becomes advisory", coordinatorFile, workflow => {
+      draftStep(
+        workflow.jobs.closeout,
+        "Validate opted-in Linux quality evidence",
+      )["continue-on-error"] = true;
+    }, /Linux quality validation must fail closed on the routed frozen head/u],
+    ["opted-in Linux quality accepts a green wrapper without publishable rows", coordinatorFile, workflow => {
+      const validation = draftStep(
+        workflow.jobs.closeout,
+        "Validate opted-in Linux quality evidence",
+      );
+      validation.run = validation.run.replace(
+        "and .release_evidence.publishable_blockers == []",
+        "and true",
+      );
+    }, /authenticate and inspect every three-repeat publishable predicate/u],
+    ["opted-in Linux quality accepts an artifact from another head", coordinatorFile, workflow => {
+      const validation = draftStep(
+        workflow.jobs.closeout,
+        "Validate opted-in Linux quality evidence",
+      );
+      validation.run = validation.run.replace(
+        ".workflow_run.head_sha == $sha",
+        ".workflow_run.head_sha != $sha",
+      );
+    }, /authenticate and inspect every three-repeat publishable predicate/u],
+    ["opted-in Linux quality accepts an artifact from another attempt", coordinatorFile, workflow => {
+      const validation = draftStep(
+        workflow.jobs.closeout,
+        "Validate opted-in Linux quality evidence",
+      );
+      validation.run = validation.run.replace(
+        "-$GITHUB_RUN_ATTEMPT",
+        "-1",
+      );
+    }, /authenticate and inspect every three-repeat publishable predicate/u],
+    ["Linux quality publishes one reusable head-only artifact", qualityFile, workflow => {
+      draftStep(
+        workflow.jobs["linux-quality"],
+        "Upload optional Linux x64 Axios v2 quality evidence",
+      ).with.name = "frozen-candidate-linux-x64-quality-${{ inputs.ref }}";
+    }, /must run the same isolated Axios v2 smoke entrypoint/u],
+    ["opted-in Linux quality receipt is not retained", coordinatorFile, workflow => {
+      draftStep(
+        workflow.jobs.closeout,
+        "Upload opted-in Linux quality validation",
+      ).if = "false";
+    }, /must retain its exact-head receipt/u],
     ["qualification closeout hides the accepted Linux branch in dead code", coordinatorFile, workflow => {
       const closeout = draftStep(
         workflow.jobs.closeout,
         "Require one coherent accepted proof",
       );
       const accepted = `if [ "$MODE" = qualification ]; then
-      require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
+      if [ "$QUALIFY_LINUX_VULKAN" = true ]; then
+        require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
+      else
+        require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
+      fi
     else
       require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
     fi`;
       closeout.run = closeout.run.replace(
         accepted,
         accepted.replace(
-          'require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof',
-          'require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof',
+          'if [ "$QUALIFY_LINUX_VULKAN" = true ]; then',
+          "if true; then",
         ),
       );
       closeout.run += `\nif false; then\n${accepted}\nfi\n`;
@@ -1117,13 +1408,13 @@ test("frozen-candidate quality stays optional, exact, and archive-authenticated"
         workflow.jobs.closeout,
         "Require one coherent accepted proof",
       ).if = "${{ false }}";
-    }, /closeout must run one unconditional proof step under the reviewed Bash interpreter/u],
+    }, /closeout must retain one unconditional result proof plus the two opted-in Linux quality receipt steps/u],
     ["qualification closeout shell ignores the reviewed script", coordinatorFile, workflow => {
       draftStep(
         workflow.jobs.closeout,
         "Require one coherent accepted proof",
       ).shell = "bash -c 'true' {0}";
-    }, /closeout must run one unconditional proof step under the reviewed Bash interpreter/u],
+    }, /closeout must retain one unconditional result proof plus the two opted-in Linux quality receipt steps/u],
     ["qualification closeout mode is rebound away from the route", coordinatorFile, workflow => {
       draftStep(
         workflow.jobs.closeout,
@@ -1136,6 +1427,9 @@ test("frozen-candidate quality stays optional, exact, and archive-authenticated"
     ["optional quality owner job becomes blocking", qualityFile, workflow => {
       workflow.jobs.quality["continue-on-error"] = false;
     }, /optional quality must stay nonblocking on protected Metal/u],
+    ["optional Windows quality owner job becomes blocking", qualityFile, workflow => {
+      delete workflow.jobs["windows-quality"]["continue-on-error"];
+    }, /optional Windows x64 quality must remain non-gating on Vulkan/u],
     ["optional quality runs outside qualification", coordinatorFile, workflow => {
       workflow.jobs["frozen-candidate-quality"].if
         = workflow.jobs["frozen-candidate-quality"].if.replace(
@@ -1358,6 +1652,15 @@ test("frozen-candidate quality stays optional, exact, and archive-authenticated"
       );
     });
   }
+  await t.test("claim graph rejects a nonexistent answer-quality workflow", () => {
+    const graph = structuredClone(loadReleaseClaimGraph(root));
+    graph.evidence_types.find(({ id }) => id === "answer_quality").proof_lanes
+      = [".github/workflows/does-not-exist.yml"];
+    assert.match(
+      validateWorkflows(loadWorkflows(), graph).join("\n"),
+      /\[proof_lane\] evidence type answer_quality workflow does-not-exist\.yml must exist/u,
+    );
+  });
 });
 
 test("qualification driver is built once, retained privately, authenticated, and reused", async (t) => {
@@ -1893,6 +2196,39 @@ test("Windows packages one release graph into exact public and private artifacts
     ["the public package stable artifact stops replacing its same-run name", workflow => {
       step(workflow, "Upload release asset").with.overwrite = false;
     }, /public package artifact must contain exactly the archive and its two candidate-local checksum files|stable release artifact/u],
+    ["linker timing regresses to a substring count over the build log", workflow => {
+      replaceRun(
+        workflow,
+        "Build package and qualification driver",
+        /node \.github\/scripts\/windows-link-timing\.mjs select \\\n(?:.*\\\n)*.*\n/u,
+        "linker_rows=\"$(grep -Eic '(^|[[:space:]])time([[:space:](:]|$)' \"$linker_log\" || true)\"\n"
+          + "            echo \"- MSVC /TIME linker rows retained: ${linker_rows}\" >> \"$GITHUB_STEP_SUMMARY\"\n",
+      );
+    }, /Windows linker timing must be selected from the explicit link boundary/u],
+    ["linker timing is selected without the build boundary that bounds it", workflow => {
+      replaceRun(
+        workflow,
+        "Build package and qualification driver",
+        ' \\\n    --build-elapsed-ms "$build_elapsed_ms"',
+        "",
+      );
+    }, /Windows linker timing must be selected from the explicit link boundary/u],
+    ["the linker trace is read from an unwaited process substitution", workflow => {
+      replaceRun(
+        workflow,
+        "Build package and qualification driver",
+        '2> "$linker_log"',
+        '2> >(tee "$linker_log" >&2)',
+      );
+    }, /Windows linker timing must be selected from the explicit link boundary/u],
+    ["the Rust compilation interval loses its distinct phase label", workflow => {
+      replaceRun(
+        workflow,
+        "Build package and qualification driver",
+        "- Exact release graph build (cargo_graph):",
+        "- Exact release graph build:",
+      );
+    }, /Windows linker timing must be selected from the explicit link boundary/u],
   ];
 
   for (const [name, mutate, expected] of mutations) {
@@ -1902,6 +2238,47 @@ test("Windows packages one release graph into exact public and private artifacts
       const violations = validateWorkflows(workflows);
       assert.notDeepEqual(violations, []);
       assert.match(violations.join("\n"), expected);
+    });
+  }
+});
+
+test("the declared Windows linker phase cannot drift from the selector it names", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const mutations = [
+    ["the phase is deleted from the claim graph", graph => {
+      delete graph.workflow_policy.windows_package_graph.link_timing;
+    }],
+    ["substring evidence is re-admitted", graph => {
+      graph.workflow_policy.windows_package_graph.link_timing.substring_match = true;
+    }],
+    ["the declared evidence stops being an explicit boundary", graph => {
+      graph.workflow_policy.windows_package_graph.link_timing.evidence = "build_log_substring";
+    }],
+    ["the declared selector names another script", graph => {
+      graph.workflow_policy.windows_package_graph.link_timing.selector =
+        ".github/scripts/cargo-cache-contract.mjs";
+    }],
+    ["the declared receipt schema drifts from the selector", graph => {
+      graph.workflow_policy.windows_package_graph.link_timing.record_schema =
+        "codestory.windows-link-timing/v2";
+    }],
+    ["missing timing is made able to invalidate a package", graph => {
+      graph.workflow_policy.windows_package_graph.link_timing.observational = false;
+    }],
+    ["a typed unavailable state disappears from the claim graph", graph => {
+      const timing = graph.workflow_policy.windows_package_graph.link_timing;
+      timing.unavailable_reasons = timing.unavailable_reasons
+        .filter(reason => reason !== "link-exceeds-build-interval");
+    }],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const graph = structuredClone(loadReleaseClaimGraph(root));
+      mutate(graph);
+      assert.match(
+        validateWorkflows(loadWorkflows(), graph).join("\n"),
+        /declared Windows linker timing must mirror the selector the workflow runs/u,
+      );
     });
   }
 });
@@ -2805,8 +3182,8 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
     ["platform resolver backslash continuation blank line", packagedCoordinatorFile, workflow => {
       packagedResolver(workflow).run = packagedResolver(workflow).run
         .replace(
-          'if [ -n "$INPUT_SOURCE_RUN_ID" ] \\\n    ||',
-          'if [ -n "$INPUT_SOURCE_RUN_ID" ] \\\n\n    ||',
+          'if [ -n "$INPUT_CALIBRATION_ARTIFACT" ] \\\n    ||',
+          'if [ -n "$INPUT_CALIBRATION_ARTIFACT" ] \\\n\n    ||',
         );
     }, /exact normalized trusted resolver script contract/u],
     ["platform route becomes conditional", packagedCoordinatorFile, workflow => {
@@ -2825,18 +3202,25 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       const step = draftStep(workflow.jobs.route, "Select change-aware proof scope");
       step.run = step.run.replace(' || [ "$REQUESTED_SCOPE" = linux ]', "");
     }, /integration must preserve explicit no-op and Linux scopes/u],
-    ["release evidence runs implicitly", packagedCoordinatorFile, workflow => {
-      workflow.jobs["release-evidence"].if = "needs.route.outputs.mode != 'calibration'";
-    }, /optional release evidence must run only in explicit release-evidence mode/u],
-    ["package waits for release evidence", packagedCoordinatorFile, workflow => {
-      workflow.jobs["packaged-proof"].needs.push("release-evidence");
-    }, /package proof must not depend on optional release evidence/u],
     ["protected Linux proof removed", packagedCoordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].uses = "./.github/workflows/packaged-platform-proof.yml";
     }, /Linux proof must use the protected Vulkan workflow/u],
+    ["Linux lifecycle qualification becomes implicit", packagedCoordinatorFile, workflow => {
+      workflow.on.workflow_dispatch.inputs.qualify_linux_vulkan.default = true;
+    }, /Linux lifecycle qualification must remain an explicit non-default dispatch opt-in/u],
+    ["Linux lifecycle qualification is admitted outside qualification mode", packagedCoordinatorFile, workflow => {
+      const resolver = packagedResolver(workflow);
+      resolver.run = resolver.run.replace(
+        'if [ "$qualify_linux_vulkan" = true ] && [ "$mode" != qualification ]; then',
+        'if [ "$qualify_linux_vulkan" = true ] && false; then',
+      );
+    }, /Linux lifecycle qualification opt-in must fail outside qualification mode/u],
     ["protected Linux candidate proof disabled", packagedCoordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].with.candidate_installed_proof = false;
-    }, /Linux proof must close Vulkan and candidate-installed claims/u],
+    }, /Linux proof must keep platform mode candidate-installed and run full lifecycle only in qualification/u],
+    ["protected Linux lifecycle proof loses calibration binding", packagedCoordinatorFile, workflow => {
+      delete workflow.jobs["linux-vulkan-proof"].with.calibration_bundle_artifact;
+    }, /full lifecycle only in qualification with the authenticated calibration bundle/u],
     ["Linux direct dispatch returns", linuxVulkanFile, workflow => {
       workflow.on.workflow_dispatch = { inputs: {} };
     }, /coordinator-only and not directly dispatchable/u],
@@ -2844,9 +3228,9 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       workflow.jobs.closeout.needs = workflow.jobs.closeout.needs
         .filter(name => name !== "linux-vulkan-proof");
     }, /closeout must wait for every selected platform proof/u],
-    ["closeout waits for release evidence", packagedCoordinatorFile, workflow => {
-      workflow.jobs.closeout.needs.push("release-evidence");
-    }, /normal closeout must not depend on optional release or quality evidence/u],
+    ["closeout waits for optional quality", packagedCoordinatorFile, workflow => {
+      workflow.jobs.closeout.needs.push("frozen-candidate-quality");
+    }, /normal closeout must not depend on optional quality evidence/u],
     ["Linux package matrix scope removed", packagedProofFile, workflow => {
       workflow.jobs.build.strategy.matrix
         = workflow.jobs.build.strategy.matrix.replace("inputs.scope == 'linux'", "inputs.scope == 'windows'");
@@ -2886,7 +3270,7 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
     }, /Prove frozen calibration source lineage must be reachable from a packaged-platform-pr\.yml frozen-candidate dispatch/u],
     ["lineage proof moved onto a package cell the matrix never builds", packagedProofFile, workflow => {
       const step = draftStep(workflow.jobs.build, "Prove frozen calibration source lineage");
-      step.if = step.if.replace("linux-x64", "linux-arm64");
+      step.if = step.if.replace("linux-x64", "linux-s390x");
     }, /Prove frozen calibration source lineage must be reachable from a packaged-platform-pr\.yml frozen-candidate dispatch/u],
     ["frozen-candidate coordinator stops forwarding the calibration bundle", packagedCoordinatorFile, workflow => {
       workflow.jobs["packaged-proof"].with.calibration_bundle_artifact = "";
@@ -2971,7 +3355,14 @@ test("source proof keeps retrieval generalization parallel on the resolved head"
     }, /hostile matrix must run its exact blocking Node command/u],
     ["full source reuse guard widened", workflow => {
       workflow.jobs["full-source-gate"].if = "always()";
-    }, /full source gate may skip only a completed exact-head proof/u],
+    }, /full source gate must run exactly once during source stabilization/u],
+    ["workspace test regains fail-fast", workflow => {
+      const step = draftStep(
+        workflow.jobs["full-source-gate"],
+        "Test the complete workspace once",
+      );
+      step.run = step.run.replace(" --no-fail-fast", "");
+    }, /complete workspace without fail-fast/u],
   ];
 
   for (const [name, mutate, expectedReason] of mutations) {
@@ -3009,13 +3400,13 @@ test("source proof reuse accepts only whole successful workflow runs", async (t)
     ["packaged prior proof lookup", workflows => {
       const step = draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       );
       step.run = step.run.replace(
         '.event == "workflow_dispatch" and .conclusion == "success"',
         '.event == "workflow_dispatch"',
       );
-    }, /packaged-platform-pr\.yml step Require successful exact-head source proof.*conclusion/u],
+    }, /packaged-platform-pr\.yml step Require successful source-stabilization proof.*conclusion/u],
   ];
 
   for (const [name, mutate, expectedReason] of mutations) {
@@ -3122,6 +3513,109 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       workflows.get("source-proof.yml").on.workflow_dispatch
         .inputs.acceptance_phase.options.push("pre_calibration_source_proof");
     }, /separate acceptance from broad proof/u],
+    ["frozen acceptance stops requiring a frozen record", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Resolve frozen calibration acceptance identity",
+      );
+      step.run = step.run.replace('--github-output "$GITHUB_OUTPUT"', "");
+    }, /resolve a frozen direct constant-only child/u],
+    ["frozen acceptance trusts the recorded source as its checkout", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Resolve frozen calibration acceptance identity",
+      );
+      step.env.HEAD_SHA = "${{ steps.frozen-calibration.outputs.source_commit }}";
+    }, /must bind HEAD_SHA/u],
+    ["frozen acceptance permits a later Rust or docs commit", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Resolve frozen calibration acceptance identity",
+      );
+      step.run += " \\\n  --allow-promotion-commit\n";
+    }, /canonical acceptance job manifest/u],
+    ["frozen acceptance authenticates the latest run attempt", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Authenticate frozen calibration producer",
+      );
+      step.run = step.run.replace(
+        "/attempts/$PRODUCER_RUN_ATTEMPT",
+        "",
+      );
+    }, /recorded calibration run, attempt, and artifact/u],
+    ["frozen acceptance trusts a different calibration workflow", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Authenticate frozen calibration producer",
+      );
+      step.run = step.run.replace(
+        ".github/workflows/packaged-platform-pr.yml",
+        ".github/workflows/source-proof.yml",
+      );
+    }, /recorded calibration run, attempt, and artifact/u],
+    ["frozen acceptance admits an artifact from another run", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Authenticate frozen calibration producer",
+      );
+      step.run = step.run.replace(".workflow_run.id == $run_id", "true");
+    }, /recorded calibration run, attempt, and artifact/u],
+    ["frozen acceptance admits an artifact from another attempt", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Authenticate frozen calibration producer",
+      );
+      step.run = step.run.replace(".created_at >= $attempt_started", "true");
+    }, /recorded calibration run, attempt, and artifact/u],
+    ["frozen acceptance downloads by mutable artifact name", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Download frozen calibration bundle",
+      );
+      step.run = step.run.replace(
+        "actions/artifacts/$ARTIFACT_ID/zip",
+        "actions/runs/$PRODUCER_RUN_ID/artifacts",
+      );
+    }, /exact authenticated calibration artifact container/u],
+    ["frozen acceptance skips the artifact container digest", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Download frozen calibration bundle",
+      );
+      step.run = step.run.replace(
+        'test "$actual_digest" = "$CONTAINER_DIGEST"',
+        "true",
+      );
+    }, /exact authenticated calibration artifact container/u],
+    ["frozen acceptance compares the checked-in constant to itself", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Verify frozen calibration acceptance",
+      );
+      step.run = step.run.replace(
+        "$RUNNER_TEMP/frozen-calibration-bundle/per-user-embedding-server-constant-set.json",
+        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+      );
+    }, /recompute the downloaded calibration and compare the checked-in freeze/u],
+    ["frozen acceptance verifies the wrong downloaded bundle", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Verify frozen calibration acceptance",
+      );
+      step.run = step.run.replace(
+        "$RUNNER_TEMP/frozen-calibration-bundle/calibration-bundle.json",
+        "$RUNNER_TEMP/frozen-calibration-bundle/assembly.json",
+      );
+    }, /recompute the downloaded calibration and compare the checked-in freeze/u],
+    ["frozen acceptance mints the receipt before recomputation", workflows => {
+      const job = workflows.get("source-proof.yml").jobs.resolve;
+      const verification = job.steps.splice(
+        job.steps.findIndex(({ name }) => name === "Verify frozen calibration acceptance"),
+        1,
+      )[0];
+      job.steps.push(verification);
+    }, /only after frozen calibration acceptance/u],
     ["acceptance adds an Ubuntu workspace test job", workflows => {
       workflows.get("source-proof.yml").jobs["acceptance-ubuntu-workspace"] = {
         if: "inputs.acceptance_only",
@@ -3271,6 +3765,19 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         "Execute exact-head hostile mutation matrix",
       )["continue-on-error"] = true;
     }, /exact blocking hostile mutation job/u],
+    ["Windows packaged proof self-test is recombined with the timed probe", workflows => {
+      const job = workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"];
+      const selfTest = draftStep(job, "Run packaged proof self-test");
+      const probe = draftStep(job, "Run exact-head Windows native probe");
+      probe.run = `${selfTest.run}\n${probe.run}`;
+      job.steps = job.steps.filter(step => step.name !== "Run packaged proof self-test");
+    }, /canonical acceptance job manifest/u],
+    ["Windows packaged proof self-test becomes advisory", workflows => {
+      draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],
+        "Run packaged proof self-test",
+      )["continue-on-error"] = true;
+    }, /canonical acceptance job manifest/u],
     ["Windows probe leaves the protected runner", workflows => {
       workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"]["runs-on"]
         = ["self-hosted", "Windows", "X64"];
@@ -3349,7 +3856,7 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
     ["acceptance publisher stops waiting for Windows", workflows => {
       workflows.get("source-proof.yml").jobs["freeze-acceptance"].needs
         = ["resolve", "freeze-hostile-mutations"];
-    }, /publisher must depend on both exact successful mutation jobs/u],
+    }, /publisher must require broad source success for source stabilization/u],
     ["acceptance publisher stops downloading the Actions receipt", workflows => {
       const job = workflows.get("source-proof.yml").jobs["freeze-acceptance"];
       job.steps = job.steps.filter(({ name }) =>
@@ -3379,16 +3886,16 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       );
       step.run = step.run.replace("verify-status", "verify-pending");
     }, /caller-authored pending status/u],
-    ["broad source proof accepts a calibration-source receipt", workflows => {
+    ["broad source proof accepts a frozen-candidate receipt", workflows => {
       const step = draftStep(
         workflows.get("source-proof.yml").jobs.resolve,
         "Require executable release freeze",
       );
       step.run = step.run.replace(
+        "--phase source_stabilization",
         "--phase frozen_candidate",
-        "--phase calibration_source",
       );
-    }, /Require executable release freeze.*frozen_candidate/u],
+    }, /Require executable release freeze.*source_stabilization/u],
     ["acceptance publisher loses Actions provenance", workflows => {
       const step = draftStep(
         workflows.get("source-proof.yml").jobs["freeze-acceptance"],
@@ -3415,46 +3922,56 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         "Require executable release freeze",
       ).if = "steps.resolve.outputs.mode != 'qualification'";
     }, /every packaged proof mode must authenticate the exact candidate head/u],
-    ["calibration regains a pre-freeze source proof", workflows => {
+    ["calibration repeats the stabilized source proof", workflows => {
       draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if = "steps.resolve.outputs.mode != 'integration'";
-    }, /calibration must precede the sole frozen-candidate source proof/u],
-    ["qualification loses the frozen-head source proof", workflows => {
+    }, /frozen candidates must reuse the pre-calibration source-stabilization proof/u],
+    ["qualification loses the stabilized source proof", workflows => {
       draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if
         = "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration' && steps.resolve.outputs.mode != 'qualification'";
-    }, /calibration must precede the sole frozen-candidate source proof/u],
-    ["release searches the calibration source instead of the frozen tree", workflows => {
+    }, /frozen candidates must reuse the pre-calibration source-stabilization proof/u],
+    ["release searches the frozen head instead of the selected source", workflows => {
       const step = draftStep(
         workflows.get("release.yml").jobs.preflight,
         "Resolve reusable prior evidence",
       );
-      step.run = step.run.replace(
-        'release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"',
-        'release_tree="$(git rev-parse "$SOURCE_SHA^{tree}")"',
-      );
-    }, /Resolve reusable prior evidence.*release_tree/u],
-    ["release restores post-calibration fallback", workflows => {
+      step.env.SOURCE_SHA = "${{ github.sha }}";
+    }, /SOURCE_SHA/u],
+    ["release restores a second source-proof fallback", workflows => {
       workflows.get("release.yml").jobs["source-proof"].if = "always()";
-    }, /post-calibration source-proof fallback unreachable/u],
+    }, /second source-proof fallback unreachable/u],
     ["source reuse accepts an expired cell", workflows => {
       const step = draftStep(
         workflows.get("source-proof.yml").jobs.resolve,
         "Reuse a completed gate for this exact head",
       );
-      step.run = step.run.replace(".expired == false", "true");
+      step.run = step.run.replaceAll(".expired == false", "true");
     }, /Reuse a completed gate.*expired/u],
+    ["release accepts an expired freeze receipt", workflows => {
+      const step = draftStep(
+        workflows.get("release.yml").jobs.preflight,
+        "Resolve reusable prior evidence",
+      );
+      step.run = step.run.replace(
+        "select(.name == $receipt and .expired == false)",
+        "select(.name == $receipt)",
+      );
+    }, /Resolve reusable prior evidence.*select\(\.name == \$receipt and \.expired == false\)/u],
     ["release accepts an expired source cell", workflows => {
       const step = draftStep(
         workflows.get("release.yml").jobs.preflight,
         "Resolve reusable prior evidence",
       );
-      step.run = step.run.replace(".expired == false", "true");
-    }, /Resolve reusable prior evidence.*expired/u],
+      step.run = step.run.replace(
+        "select(.name == $source and .expired == false)",
+        "select(.name == $source)",
+      );
+    }, /Resolve reusable prior evidence.*select\(\.name == \$source and \.expired == false\)/u],
     ["qualification trusts a bare success status", workflows => {
       const step = draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
@@ -3729,27 +4246,27 @@ test("release freeze policy authenticates the complete acceptance job manifest",
   }
 });
 
-test("calibration precedes the sole frozen-candidate source proof", async (t) => {
+test("frozen candidates reuse the pre-calibration source-stabilization proof", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
   const coordinatorFile = "packaged-platform-pr.yml";
   const mutations = [
-    ["calibration regains a pre-freeze source proof", workflow => {
+    ["calibration repeats the stabilized source proof", workflow => {
       draftStep(
         workflow.jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if = "steps.resolve.outputs.mode != 'integration'";
     }],
-    ["qualification loses the frozen-head source proof", workflow => {
+    ["qualification loses the stabilized source proof", workflow => {
       draftStep(
         workflow.jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if
         = "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration' && steps.resolve.outputs.mode != 'qualification'";
     }],
-    ["every mode loses the exact-head source proof", workflow => {
+    ["every mode loses the source-stabilization proof", workflow => {
       draftStep(
         workflow.jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful source-stabilization proof",
       ).if = "false";
     }],
   ];
@@ -3760,7 +4277,7 @@ test("calibration precedes the sole frozen-candidate source proof", async (t) =>
       mutate(workflows.get(coordinatorFile));
       assert.match(
         validateWorkflows(workflows).join("\n"),
-        /calibration must precede the sole frozen-candidate source proof/u,
+        /frozen candidates must reuse the pre-calibration source-stabilization proof/u,
       );
     });
   }
@@ -3879,6 +4396,9 @@ test("exact-head source proof owns Windows path and native-staging harnesses", a
     ["job becomes advisory", workflow => {
       workflow.jobs["windows-native-contracts"]["continue-on-error"] = true;
     }],
+    ["cold-build timeout is shortened", workflow => {
+      workflow.jobs["windows-native-contracts"]["timeout-minutes"] = 15;
+    }],
     ["checkout stops using the resolved head", workflow => {
       workflow.jobs["windows-native-contracts"].steps[0].with.ref = "dev/codestory-next";
     }],
@@ -3918,6 +4438,107 @@ test("exact-head source proof owns Windows path and native-staging harnesses", a
       assert.match(
         validateWorkflows(workflows).join("\n"),
         /Windows native source contracts|Prove Windows path and native-staging source contracts|Windows path and native-staging contracts/u,
+      );
+    });
+  }
+});
+
+test("Windows-native source receipt stays exact-head and contract-complete", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "source-proof.yml";
+  const receiptName = "Emit authenticated Windows-native source receipt";
+  const uploadName = "Upload authenticated Windows-native source receipt";
+  const receiptMutation = (workflow, from, to, label) => {
+    const step = draftStep(workflow.jobs["windows-native-contracts"], receiptName);
+    const before = step.run;
+    step.run = step.run.replace(from, to);
+    assert.notEqual(step.run, before, `${label} mutation did not apply`);
+  };
+  const mutations = [
+    ["dirty checkout is accepted", workflow => {
+      receiptMutation(workflow, "$dirty.Count -ne 0", "$dirty.Count -lt 0", "dirty checkout");
+    }, /Windows-native source receipt must bind the clean routed head and every proved contract/u],
+    ["routed-head mismatch is accepted", workflow => {
+      receiptMutation(
+        workflow,
+        "$commit -ne $env:EXPECTED_HEAD_SHA",
+        "$false",
+        "routed head",
+      );
+    }, /Windows-native source receipt must bind the clean routed head and every proved contract/u],
+    ["receipt schema is changed", workflow => {
+      receiptMutation(
+        workflow,
+        'schema = "codestory.windows-native-source-proof/v1"',
+        'schema = "codestory.windows-native-source-proof/v0"',
+        "schema",
+      );
+    }, /Windows-native source receipt must bind the clean routed head and every proved contract/u],
+    ["one proved contract is recorded false", workflow => {
+      receiptMutation(
+        workflow,
+        "native_staging = $true",
+        "native_staging = $false",
+        "contract boolean",
+      );
+    }, /Windows-native source receipt must bind the clean routed head and every proved contract/u],
+    ["artifact name drops the exact head", workflow => {
+      const step = draftStep(workflow.jobs["windows-native-contracts"], uploadName);
+      step.with.name = "windows-native-source-proof-attempt-${{ github.run_attempt }}";
+    }, /Windows-native source receipt upload must retain one exact-head attempt-qualified JSON artifact/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
+test("exact-head source proof owns the Windows-native qualification harness regression", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "source-proof.yml";
+  const stepName = "Prove the Windows-native qualification harness contracts";
+  const mutations = [
+    ["regression is removed", workflow => {
+      const job = workflow.jobs["windows-native-contracts"];
+      job.steps = job.steps.filter(step => step.name !== stepName);
+    }],
+    ["regression is deferred behind the build steps", workflow => {
+      const job = workflow.jobs["windows-native-contracts"];
+      const [step] = job.steps.splice(
+        job.steps.findIndex(candidate => candidate.name === stepName),
+        1,
+      );
+      job.steps.push(step);
+    }],
+    ["harness self-test stops running", workflow => {
+      const step = draftStep(workflow.jobs["windows-native-contracts"], stepName);
+      step.run = step.run.replace(
+        "python .github/scripts/check-packaged-agent-proof.py --self-test",
+        "python --version",
+      );
+    }],
+    ["regression budget is dropped", workflow => {
+      const step = draftStep(workflow.jobs["windows-native-contracts"], stepName);
+      step.run = step.run.replace("past their 90000 ms budget", "slow");
+    }],
+    ["regression becomes advisory", workflow => {
+      draftStep(
+        workflow.jobs["windows-native-contracts"],
+        stepName,
+      )["continue-on-error"] = true;
+    }],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(
+        validateWorkflows(workflows).join("\n"),
+        /Windows native source contracts|Windows-native qualification harness contracts|qualification harness before any build step/u,
       );
     });
   }
@@ -4179,7 +4800,7 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     ["package mode enables protected Linux proof", coordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].if = workflow.jobs["linux-vulkan-proof"].if
         .replace("needs.route.outputs.mode != 'package' &&", "");
-    }, /package-only and qualification modes must skip coordinator Linux proof/u],
+    }, /package mode must skip Linux proof/u],
     ["calibration mode restores hosted Linux CPU calibration", coordinatorFile, workflow => {
       workflow.jobs["calibration-linux"] = {
         if: "needs.route.outputs.mode == 'calibration'",
@@ -5356,6 +5977,91 @@ test("post-publish proof uses an immutable real Codex marketplace install", asyn
   }
 });
 
+test("post-publish installed runtime proof survives one real restart", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "post-publish-release-smoke.yml";
+  const proofName = "Prove the catalog-resolved published runtime";
+  const mutateRun = (workflow, from, to, label) => {
+    const step = draftStep(workflow.jobs.smoke, proofName);
+    const before = step.run;
+    step.run = step.run.replace(from, to);
+    assert.notEqual(step.run, before, `${label} mutation did not apply`);
+  };
+  const mutations = [
+    ["second installed-runtime session is omitted", workflow => {
+      mutateRun(
+        workflow,
+        '"${common[@]}" --out-dir "$proof_root/session-2"',
+        "true",
+        "second proof",
+      );
+    }, /must execute exactly two distinct sessions through the common invocation/u],
+    ["both installed-runtime sessions share one output directory", workflow => {
+      mutateRun(
+        workflow,
+        '"${common[@]}" --out-dir "$proof_root/session-2"',
+        '"${common[@]}" --out-dir "$proof_root/session-1"',
+        "session output",
+      );
+    }, /must execute exactly two distinct sessions through the common invocation/u],
+    ["restart receipt helper is omitted", workflow => {
+      mutateRun(
+        workflow,
+        "node .github/scripts/restart-survival-receipt.mjs",
+        "node --version",
+        "receipt helper",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt helper becomes advisory", workflow => {
+      mutateRun(
+        workflow,
+        '--out "$proof_root/restart-survival.json"',
+        '--out "$proof_root/restart-survival.json" || true',
+        "advisory receipt",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt omits catalog delivery state", workflow => {
+      mutateRun(
+        workflow,
+        '--catalog-delivery-state "$CATALOG_DELIVERY_STATE"',
+        '--catalog-delivery-state omitted',
+        "catalog state",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt omits delivered installer identity", workflow => {
+      mutateRun(
+        workflow,
+        '--expected-installer-identity "$DELIVERED_INSTALLER"',
+        '--expected-installer-identity omitted',
+        "installer identity",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt omits source-tree identity", workflow => {
+      mutateRun(
+        workflow,
+        '--expected-source-commit "$source_sha" \\\n  --expected-source-tree "$source_tree"',
+        '--expected-source-commit "$source_sha" \\\n  --expected-source-tree omitted',
+        "source identity",
+      );
+    }, /restart receipt must bind both sessions/u],
+    ["restart receipt omits the final session timestamp", workflow => {
+      mutateRun(
+        workflow,
+        '--session-2-finished-ms "$session_2_finished_ms"',
+        '--session-2-finished-ms omitted',
+        "session timing",
+      );
+    }, /restart receipt must bind both sessions/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
 test("post-publish proof keeps every release asset on its protected accelerator", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 
@@ -5444,6 +6150,152 @@ test("package workflow keeps a packaging-only timeout", () => {
     validateWorkflows(workflows).join("\n"),
     /package build timeout must cover only signed macOS packaging/u,
   );
+});
+
+test("proof floor keeps architecture universal and durability path-scoped", async (t) => {
+  assert.deepEqual(proofFloorPolicyViolations(loadWorkflows()), []);
+
+  const redirectedGraph = structuredClone(loadReleaseClaimGraph(root));
+  redirectedGraph.workflow_policy.proof_floor.architecture_contract.workflow =
+    "alternate-proof.yml";
+  const aliasedWorkflows = loadWorkflows();
+  aliasedWorkflows.set(
+    "alternate-proof.yml",
+    structuredClone(aliasedWorkflows.get(retrievalFile)),
+  );
+  assert.notDeepEqual(
+    proofFloorPolicyViolations(aliasedWorkflows, redirectedGraph),
+    [],
+  );
+
+  for (const requiredPath of ["Cargo.toml", "Cargo.lock", "vendor/**"]) {
+    await t.test(`${requiredPath} remains a dependency-graph trigger`, () => {
+      const workflows = loadWorkflows();
+      const graph = structuredClone(loadReleaseClaimGraph(root));
+      graph.workflow_policy.proof_floor.crate_durability.paths =
+        graph.workflow_policy.proof_floor.crate_durability.paths
+          .filter(triggerPath => triggerPath !== requiredPath);
+      const workflow = workflows.get(crateDurabilityFile);
+      for (const event of ["pull_request", "push"]) {
+        workflow.on[event].paths = workflow.on[event].paths
+          .filter(triggerPath => triggerPath !== requiredPath);
+      }
+
+      const violations = proofFloorPolicyViolations(workflows, graph).join("\n");
+      assert.match(
+        violations,
+        /crate-durability\.yml pull_request paths must cover root Cargo manifests, the lockfile, and vendored dependencies/u,
+      );
+      assert.match(
+        violations,
+        /crate-durability\.yml push paths must cover root Cargo manifests, the lockfile, and vendored dependencies/u,
+      );
+    });
+  }
+
+  const mutations = [
+    ["architecture command removed", workflows => {
+      const steps = workflows.get(retrievalFile).jobs["linux-contracts"].steps;
+      steps.splice(steps.findIndex(step =>
+        step.name === "Architecture ownership contract tests"), 1);
+    }],
+    ["architecture job made conditional", workflows => {
+      workflows.get(retrievalFile).jobs["linux-contracts"].if =
+        "github.event_name == 'workflow_dispatch'";
+    }],
+    ["architecture job made dependent", workflows => {
+      workflows.get(retrievalFile).jobs["linux-contracts"].needs =
+        "windows-manifest-missing";
+    }],
+    ["architecture job put behind an environment", workflows => {
+      workflows.get(retrievalFile).jobs["linux-contracts"].environment =
+        "source-proof";
+    }],
+    ["architecture job made nonblocking", workflows => {
+      workflows.get(retrievalFile).jobs["linux-contracts"]["continue-on-error"] = true;
+    }],
+    ["owning path removed", workflows => {
+      workflows.get(crateDurabilityFile).on.pull_request.paths.shift();
+    }],
+    ["unrelated crate path added", workflows => {
+      const workflow = workflows.get(crateDurabilityFile);
+      workflow.on.pull_request.paths.push("crates/codestory-runtime/**");
+      workflow.on.push.paths.push("crates/codestory-runtime/**");
+    }],
+    ["commands reordered", workflows => {
+      const job = workflows.get(crateDurabilityFile).jobs["linux-durability"];
+      const proof = draftStep(job, "Run durability and coverage contracts");
+      const commands = proof.run.trim().split("\n");
+      [commands[0], commands[1]] = [commands[1], commands[0]];
+      proof.run = commands.join("\n");
+    }],
+    ["cache namespace shared", workflows => {
+      const job = workflows.get(crateDurabilityFile).jobs["linux-durability"];
+      draftStep(job, "Restore durability Cargo cache").with.key =
+        "${{ runner.os }}-draft-v2";
+    }],
+    ["cache fallback added", workflows => {
+      const job = workflows.get(crateDurabilityFile).jobs["linux-durability"];
+      draftStep(job, "Restore durability Cargo cache").with["restore-keys"] =
+        "${{ runner.os }}-draft-";
+    }],
+    ["cache saved before proof", workflows => {
+      const steps = workflows.get(crateDurabilityFile).jobs["linux-durability"].steps;
+      const saveIndex = steps.findIndex(step => step.name === "Save durability Cargo cache");
+      const [save] = steps.splice(saveIndex, 1);
+      const proofIndex = steps.findIndex(step =>
+        step.name === "Run durability and coverage contracts");
+      steps.splice(proofIndex, 0, save);
+    }],
+    ["artifact upload added", workflows => {
+      workflows.get(crateDurabilityFile).jobs["linux-durability"].steps.push({
+        name: "Upload durability output",
+        uses: "actions/upload-artifact@v4",
+        with: { path: "target" },
+      });
+    }],
+    ["dev push removed", workflows => {
+      workflows.get(crateDurabilityFile).on.push.branches = ["main"];
+    }],
+    ["write permission granted", workflows => {
+      workflows.get(crateDurabilityFile).permissions.contents = "write";
+    }],
+    ["merged suite lane step removed", workflows => {
+      const steps = workflows.get(retrievalFile).jobs["linux-contracts"].steps;
+      steps.splice(steps.findIndex(step =>
+        step.name === "Evidence, readiness, hooks, and workspace contract tests"), 1);
+    }],
+    ["merged suite lane command dropped", workflows => {
+      const job = workflows.get(retrievalFile).jobs["linux-contracts"];
+      const lane = draftStep(job, "Evidence, readiness, hooks, and workspace contract tests");
+      lane.run = lane.run.trim().split("\n").slice(1).join("\n");
+    }],
+    ["merged suite lane made conditional", workflows => {
+      const job = workflows.get(retrievalFile).jobs["linux-contracts"];
+      const lane = draftStep(job, "Evidence, readiness, hooks, and workspace contract tests");
+      lane.if = "github.event_name == 'workflow_dispatch'";
+    }],
+    ["merged suite lane made nonblocking", workflows => {
+      const job = workflows.get(retrievalFile).jobs["linux-contracts"];
+      const lane = draftStep(job, "Evidence, readiness, hooks, and workspace contract tests");
+      lane["continue-on-error"] = true;
+    }],
+    ["merged suite lane moved after artifact seeding", workflows => {
+      const steps = workflows.get(retrievalFile).jobs["linux-contracts"].steps;
+      const laneIndex = steps.findIndex(step =>
+        step.name === "Evidence, readiness, hooks, and workspace contract tests");
+      const [lane] = steps.splice(laneIndex, 1);
+      steps.push(lane);
+    }],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows);
+      assert.notDeepEqual(proofFloorPolicyViolations(workflows), []);
+    });
+  }
 });
 
 test("draft source workflow freezes its complete top-level contract", async (t) => {
@@ -5601,40 +6453,6 @@ test("PR package proof cannot opt into signing credentials", () => {
     const candidate = structuredClone(workflow);
     mutate(candidate);
     assert.notDeepEqual(packagedPrSigningViolations(candidate), []);
-  }
-});
-
-test("release approval crosses only the protected release boundary", () => {
-  const boundary = releaseEvidenceApprovalBoundary();
-  assert.deepEqual(releaseEvidenceApprovalViolations(boundary.callers, boundary.called), []);
-
-  for (const mutate of [
-    candidate => { candidate.callers[0][1] = undefined; },
-    candidate => { candidate.callers[1][1].uses = "./.github/workflows/release.yml"; },
-    candidate => { delete candidate.callers[1][1].with.source_run_id; },
-    candidate => { delete candidate.callers[0][1].secrets; },
-    candidate => {
-      candidate.callers[0][1].secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON
-        = "${{ secrets.WRONG_SECRET }}";
-    },
-    candidate => { candidate.callers[0][1].secrets.EXTRA_SECRET = "${{ secrets.EXTRA }}"; },
-    candidate => { candidate.callers[0][1].secrets = "inherit"; },
-    candidate => { candidate.callers[1][1].secrets = "inherit"; },
-    candidate => { delete candidate.called.on.workflow_call.secrets; },
-    candidate => {
-      candidate.called.on.workflow_call.secrets
-        .CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON.required = true;
-    },
-    candidate => { candidate.called.jobs.measure.environment = "release"; },
-    candidate => {
-      candidate.called.jobs.measure.steps[0].env.APPROVAL_JSON
-        = "${{ inputs.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}";
-    },
-    candidate => { candidate.called.jobs.measure.steps[0].run = "exit 1"; },
-  ]) {
-    const candidate = structuredClone(boundary);
-    mutate(candidate);
-    assert.notDeepEqual(releaseEvidenceApprovalViolations(candidate.callers, candidate.called), []);
   }
 });
 
@@ -6054,6 +6872,54 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
   }
 });
 
+test("post-publish closeout authenticates cumulative reused release cells", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "release.yml";
+  const closeout = workflow => workflow.jobs["post-publish-closeout"];
+  const mutations = [
+    ["container digest comparison is omitted", workflow => {
+      const step = draftStep(
+        closeout(workflow),
+        "Download and verify selected cumulative release cells",
+      );
+      const before = step.run;
+      step.run = step.run.replace(
+        'test "$actual_digest" = "$expected_digest"',
+        'echo "$actual_digest $expected_digest"',
+      );
+      assert.notEqual(step.run, before, "digest mutation did not apply");
+    }, /must reject a selected artifact container digest mismatch/u],
+    ["selected containers are flattened during extraction", workflow => {
+      const step = draftStep(
+        closeout(workflow),
+        "Download and verify selected cumulative release cells",
+      );
+      const before = step.run;
+      step.run = step.run.replace(
+        'destination="target/release-cell-manifests/$artifact_name"',
+        'destination="target/release-cell-manifests"',
+      );
+      assert.notEqual(step.run, before, "flattening mutation did not apply");
+    }, /must create one exact artifact-name directory per selected container/u],
+    ["post-publish producer map omits the preflight reuse selection", workflow => {
+      const step = draftStep(
+        closeout(workflow),
+        "Authenticate post-publish Actions provenance",
+      );
+      const before = step.run;
+      step.run = step.run.replace('  --reuse "$REUSE_SELECTION" \\\n', "");
+      assert.notEqual(step.run, before, "reuse mutation did not apply");
+    }, /post-publish producer map must consume the preflight reuse selection/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
 // The gate `publish` sits behind was asserted by a condition that could never fail. The claim
 // graph now owns the whole plugin chain, so this suite proves the graph-driven assertion actually
 // refuses each way the gate can be dropped -- and, because `needs:` is an unordered set in GitHub
@@ -6119,14 +6985,17 @@ test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
     }, /must run commit_shape='\^\[0-9a-fA-F\]\{7,40\}\$'/u],
     ["the version shape check disappears", workflow => {
       const step = draftStep(workflow.jobs.sync, guard);
-      step.run = step.run.replace("^[0-9]+\\.[0-9]+\\.[0-9]+", "^.+");
+      step.run = step.run.replace(
+        "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)",
+        "^.+",
+      );
     }, /must run version_shape=/u],
     // A prefix fragment cannot see a dropped closing anchor, and an unanchored version regex admits
     // `0.16.3; id`. The pinned fragment carries the anchor, so the truncation is a violation.
     ["the version regex loses its closing anchor", workflow => {
       const step = draftStep(workflow.jobs.sync, guard);
-      step.run = step.run.replace("(-[0-9A-Za-z.]+)?$'", "'");
-    }, /must run version_shape='\^\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\(-\[0-9A-Za-z\.\]\+\)\?\$'/u],
+      step.run = step.run.replace("(0|[1-9][0-9]*)$'", "(0|[1-9][0-9]*)'");
+    }, /must run version_shape=/u],
     // Substring assertions prove a string is present, not that it is consulted. This body satisfies
     // every fragment above -- both anchored regexes, both comparisons, no grep -- and refuses
     // nothing, so only a pin over the whole script can see it.
@@ -6206,14 +7075,14 @@ test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
         uses: `actions/github-script@${fullSha}`,
         with: { script: 'console.log("${{ inputs.commit }}")' },
       });
-    }, /jobs\.sync\.steps\.5 must not splice a dispatch input into an action input/u],
+    }, /jobs\.sync\.steps\.6 must not splice a dispatch input into an action input/u],
     ["a pinned action takes the unvalidated spelling of the input", workflow => {
       workflow.jobs.sync.steps.push({
         name: "Report the dispatched commit",
         uses: `actions/github-script@${fullSha}`,
         with: { script: 'console.log("${{ github.event.inputs.commit }}")' },
       });
-    }, /jobs\.sync\.steps\.5 must not splice a dispatch input into an action input/u],
+    }, /jobs\.sync\.steps\.6 must not splice a dispatch input into an action input/u],
     // `$NAME` and `${NAME}` are the same read, so a binding assertion that only sees the bare form
     // is evaded by writing the brace form and deleting the bindings.
     ["a brace-form read loses both of its env bindings", workflow => {
@@ -6233,7 +7102,7 @@ test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
         env: { INPUT_COMMIT: "${{ github.event.inputs.commit }}" },
         run: "echo bound\n",
       });
-    }, /jobs\.sync\.steps\.5 must bind INPUT_COMMIT/u],
+    }, /jobs\.sync\.steps\.6 must bind INPUT_COMMIT/u],
     // Job-level `env:` is below every step's own binding check, so the unvalidated spelling is
     // refused by name wherever it appears rather than only where a step declares it.
     ["the unvalidated spelling hides in job-level env", workflow => {
@@ -6705,6 +7574,127 @@ test("a script that absorbs its own failure must hand that failure to something 
         + " needs.plugin-static.result required",
     ]);
   });
+
+  // The job-level rule accepted exactly the `if:`-only read the step-level rule above
+  // deliberately refuses, and it scanned the absorbing job's own text too, so a job could
+  // satisfy the rule by mentioning its own name. Both readings are the same mistake: a
+  // condition decides whether a reader runs, and a skipped reader is not a failed run.
+  const absorbingCoordinator = () => {
+    const workflows = loadWorkflows();
+    workflows.get("plugin-static.yml").jobs["plugin-static"]["continue-on-error"] = true;
+    return workflows;
+  };
+  const jobViolation = "plugin-static.yml jobs.plugin-static absorbs its own failure and must have"
+    + " needs.plugin-static.result required";
+
+  await t.test("a downstream if: does not make an absorbed job failure required", () => {
+    const workflows = absorbingCoordinator();
+    workflows.get("plugin-static.yml").jobs.reader = {
+      needs: ["plugin-static"],
+      "runs-on": "ubuntu-latest",
+      if: "needs.plugin-static.result == 'success'",
+      steps: [{ name: "Report", shell: "bash", run: "echo reported\n" }],
+    };
+    assert.deepEqual(absorbedFailureViolations(workflows), [jobViolation]);
+  });
+
+  await t.test("a step-level if: inside the reader is no better", () => {
+    const workflows = absorbingCoordinator();
+    workflows.get("plugin-static.yml").jobs.reader = {
+      needs: ["plugin-static"],
+      "runs-on": "ubuntu-latest",
+      steps: [{
+        name: "Report",
+        if: "needs.plugin-static.result == 'success'",
+        shell: "bash",
+        run: "echo reported\n",
+      }],
+    };
+    assert.deepEqual(absorbedFailureViolations(workflows), [jobViolation]);
+  });
+
+  await t.test("the absorbing job cannot answer for itself", () => {
+    const workflows = absorbingCoordinator();
+    workflows.get("plugin-static.yml").jobs["plugin-static"].steps.push({
+      name: "Mention the result",
+      shell: "bash",
+      run: "echo needs.plugin-static.result\n",
+    });
+    assert.deepEqual(absorbedFailureViolations(workflows), [jobViolation]);
+  });
+
+  await t.test("a reader that absorbs its own failure is not a successor", () => {
+    const workflows = absorbingCoordinator();
+    workflows.get("plugin-static.yml").jobs.reader = {
+      needs: ["plugin-static"],
+      "runs-on": "ubuntu-latest",
+      "continue-on-error": true,
+      steps: [{
+        name: "Require the coordinator",
+        shell: "bash",
+        env: { COORDINATOR: "${{ needs.plugin-static.result }}" },
+        run: 'test "$COORDINATOR" = success\n',
+      }],
+    };
+    assert.match(absorbedFailureViolations(workflows).join("\n"), /jobs\.plugin-static absorbs/u);
+  });
+
+  // And the shape that is allowed, one level up: a blocking downstream job that receives the
+  // result where a script can test it and exit non-zero.
+  await t.test("a blocking downstream job that can fail on the result is a successor", () => {
+    const workflows = absorbingCoordinator();
+    workflows.get("plugin-static.yml").jobs.reader = {
+      needs: ["plugin-static"],
+      "runs-on": "ubuntu-latest",
+      steps: [{
+        name: "Require the coordinator",
+        shell: "bash",
+        env: { COORDINATOR: "${{ needs.plugin-static.result }}" },
+        run: 'test "$COORDINATOR" = success\n',
+      }],
+    };
+    assert.deepEqual(absorbedFailureViolations(workflows), []);
+  });
+});
+
+// A caller can pin a callee input to a literal, or it can hand over an expression. Only the
+// first is fixed for every run of that caller; everything interpolated is free, because this
+// check must never invent reachability the caller cannot actually deliver.
+//
+// There used to be a `${{ inputs.x || '' }}` regex separating a verbatim-forwarded dispatch
+// input from every other expression -- and both branches then produced the same free binding.
+// The regex decided nothing, so the guard was exactly as lax as "any expression is free" while
+// its comment claimed a narrower rule. This pins the behaviour that is actually correct, so
+// reintroducing a special case that treats some expressions as fixed fails here.
+test("every interpolated caller input is free and only literals are fixed", () => {
+  const specifications = new Map([
+    ["forwarded", { boolean: false, default: "" }],
+    ["computed", { boolean: false, default: "" }],
+    ["flag", { boolean: true, default: false }],
+    ["pinned", { boolean: false, default: "" }],
+    ["omitted", { boolean: false, default: "fallback" }],
+    ["omitted_flag", { boolean: true, default: false }],
+  ]);
+  const bindings = callerInputBindings({
+    with: {
+      forwarded: "${{ inputs.forwarded || '' }}",
+      computed: "${{ github.event.pull_request.head.sha }}",
+      flag: "${{ github.event_name == 'workflow_dispatch' }}",
+      pinned: "release",
+    },
+  }, specifications);
+
+  const free = { fixed: false, values: ["", "supplied-by-dispatch"] };
+  assert.deepEqual(bindings.get("forwarded"), free);
+  assert.deepEqual(bindings.get("computed"), free);
+  assert.deepEqual(bindings.get("flag"), { fixed: false, values: [true, false] });
+  assert.deepEqual(bindings.get("pinned"), { fixed: true, values: ["release"] });
+  assert.deepEqual(bindings.get("omitted"), { fixed: true, values: ["fallback"] });
+  assert.deepEqual(bindings.get("omitted_flag"), { fixed: true, values: [false] });
+
+  // The retired regex must not come back as a distinction the bindings do not make.
+  const source = readFileSync(path.join(root, ".github", "scripts", "check-workflow-policy.mjs"), "utf8");
+  assert.equal(source.includes("dispatchForwardedPattern"), false, "the dead forwarding branch is retired");
 });
 
 // Routing a dispatched value through `env:` removes it from the script's text -- and from the
@@ -6825,6 +7815,9 @@ test("the marketplace dispatch guard refuses whole values, not first lines", asy
     ["an empty commit", { INPUT_COMMIT: "", INPUT_VERSION: version }],
     ["an empty version", { INPUT_COMMIT: commit, INPUT_VERSION: "" }],
     ["a v-prefixed version", { INPUT_COMMIT: commit, INPUT_VERSION: "v0.16.3" }],
+    ["a prerelease version", { INPUT_COMMIT: commit, INPUT_VERSION: "0.16.3-rc.1" }],
+    ["a build version", { INPUT_COMMIT: commit, INPUT_VERSION: "0.16.3+build.1" }],
+    ["a version with a leading zero", { INPUT_COMMIT: commit, INPUT_VERSION: "00.16.3" }],
   ];
   for (const [name, environment] of refused) {
     await t.test(`refuses ${name}`, () => {
@@ -6836,7 +7829,6 @@ test("the marketplace dispatch guard refuses whole values, not first lines", asy
   const admitted = [
     ["an abbreviated sha", { INPUT_COMMIT: "abc1234", INPUT_VERSION: version }],
     ["a full sha", { INPUT_COMMIT: commit, INPUT_VERSION: "1.0.0" }],
-    ["a prerelease version", { INPUT_COMMIT: commit, INPUT_VERSION: "0.16.3-rc.1" }],
     ["an uppercase sha", { INPUT_COMMIT: "ABC1234DEF", INPUT_VERSION: version }],
   ];
   for (const [name, environment] of admitted) {
@@ -7188,11 +8180,31 @@ test("lost-runner recovery stays automatic, bounded, and blind to job names", ()
     ["blanket failed-job rerun", workflows => {
       const step = workflows.get(rerunFile).jobs["rerun-lost-jobs"].steps
         .find(({ name }) => name === "Re-dispatch only the lost jobs");
-      step.run = step.run.replace(
-        "actions/jobs/$job_id/rerun",
-        "actions/runs/$FAILED_RUN_ID/rerun-failed-jobs",
-      );
+      step.run = 'gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$FAILED_RUN_ID/rerun-failed-jobs"\n';
     }],
+    // The hosts share one machine, so one incident loses two of them at once. A loop that calls
+    // the API directly stops at the first refusal under `set -e` and abandons the rest of the
+    // recovery, which is the shape the tolerant dispatcher replaced.
+    ["shell-loop re-dispatch with no per-id tolerance", workflows => {
+      const step = workflows.get(rerunFile).jobs["rerun-lost-jobs"].steps
+        .find(({ name }) => name === "Re-dispatch only the lost jobs");
+      step.run = [
+        "set -euo pipefail",
+        'test -n "$JOB_IDS"',
+        'for job_id in $JOB_IDS; do',
+        '  gh api --method POST "repos/$GITHUB_REPOSITORY/actions/jobs/$job_id/rerun"',
+        "done",
+        "",
+      ].join("\n");
+    }, /must not run for job_id in/u],
+    ["re-dispatch that records no per-id receipt", workflows => {
+      const step = workflows.get(rerunFile).jobs["rerun-lost-jobs"].steps
+        .find(({ name }) => name === "Re-dispatch only the lost jobs");
+      step.run = step.run.replace(
+        /\s*--out target\/lost-runner\/rerun-dispatch\.json/u,
+        "",
+      );
+    }, /must run --out target\/lost-runner\/rerun-dispatch\.json/u],
     ["ungated re-dispatch", workflows => {
       delete workflows.get(rerunFile).jobs["rerun-lost-jobs"].steps
         .find(({ name }) => name === "Re-dispatch only the lost jobs").if;
@@ -7256,10 +8268,14 @@ test("lost-runner recovery stays automatic, bounded, and blind to job names", ()
       });
     }],
   ];
-  for (const [label, mutate] of mutations) {
+  for (const [label, mutate, expected] of mutations) {
     const workflows = loadWorkflows();
     mutate(workflows);
-    assert.notDeepEqual(validateWorkflows(workflows), [], label);
+    const violations = validateWorkflows(workflows);
+    assert.notDeepEqual(violations, [], label);
+    // Some mutations name the rule that has to catch them, so a rule that stopped looking cannot
+    // hide behind an unrelated violation the same edit happened to trip.
+    if (expected) assert.match(violations.join("\n"), expected, label);
   }
 
   // A recovery bound that drifts from the release claim graph is caught even when the workflows
@@ -7270,6 +8286,136 @@ test("lost-runner recovery stays automatic, bounded, and blind to job names", ()
   const rephrased = structuredClone(graph);
   rephrased.non_claim_policy.annotation = "The runner went away.";
   assert.notDeepEqual(lostRunnerRecoveryViolations(loadWorkflows(), rephrased), []);
+
+  // The two recovery properties a reader cannot recover from the YAML alone -- which execution of
+  // a job the plan reads, and what one refused re-dispatch does to the others -- are graph facts,
+  // so the graph losing them is a violation even with the workflows untouched.
+  for (const drift of [
+    (value) => { value.workflow_policy.lost_runner_rerun.selection = "every_collected_execution"; },
+    (value) => { value.workflow_policy.lost_runner_rerun.dispatch_tolerance = "abort_on_first_refusal"; },
+    (value) => { value.workflow_policy.lost_runner_rerun.dispatch_failure = "never_fail"; },
+    (value) => { value.workflow_policy.lost_runner_rerun.plan_schema = "codestory.lost-runner-rerun-plan/v1"; },
+    (value) => { value.workflow_policy.lost_runner_rerun.dispatch_schema = "codestory.something-else/v1"; },
+    (value) => { value.workflow_policy.lost_runner_rerun.recovery_contract = ".github/scripts/other.mjs"; },
+  ]) {
+    const mutated = structuredClone(graph);
+    drift(mutated);
+    assert.notDeepEqual(lostRunnerRecoveryViolations(loadWorkflows(), mutated), []);
+  }
+});
+
+test("the protected-runner reservation stays machine-decided, single-producer, and self-confirmed", () => {
+  const graph = loadReleaseClaimGraph(root);
+  const reservation = graph.non_claim_policy.reservation;
+  const heartbeatFile = reservation.heartbeat.workflow.split("/").at(-1);
+
+  // The live repository satisfies the whole contract.
+  assert.deepEqual(protectedRunnerReservationViolations(loadWorkflows(), graph), []);
+
+  const mutations = [
+    // The gate is what stands between an offline host and a proof queueing invisibly for a day.
+    ["the gate is removed from release.yml", workflows => {
+      delete workflows.get("release.yml").jobs["reserve-protected-runners"];
+    }, /release\.yml must contain job reserve-protected-runners/u],
+    // An approval environment would put a human click between every finished build and its
+    // proofs -- the same failure the lost-runner recovery refuses.
+    ["an approval environment on the gate", workflows => {
+      workflows.get("release.yml").jobs["reserve-protected-runners"].environment =
+        "release-recovery";
+    }, /reserve-protected-runners must not wait on an approval environment/u],
+    ["a conditional gate", workflows => {
+      workflows.get("release.yml").jobs["reserve-protected-runners"].if = "inputs.publish_release";
+    }, /must type the hosts unconditionally/u],
+    // Without the per-host condition an unproven host's proof is dispatched anyway, and the
+    // invisible queue this contract removes is back.
+    ["a proof dispatch condition is dropped", workflows => {
+      delete workflows.get("release.yml").jobs["macos-metal-proof"].if;
+    }, /must dispatch only on dispatch_macos_arm64_metal/u],
+    ["a proof dispatch condition is rewired to a literal", workflows => {
+      workflows.get("release.yml").jobs["linux-vulkan-proof"].if = "true";
+    }, /must dispatch only on dispatch_linux_x64_vulkan/u],
+    ["the heartbeat workflow is removed", workflows => {
+      workflows.delete(heartbeatFile);
+    }, /protected-runner-heartbeat\.yml must exist/u],
+    ["a heartbeat job moves off its protected labels", workflows => {
+      workflows.get(heartbeatFile).jobs["heartbeat-linux-x64-vulkan"]["runs-on"] = "ubuntu-latest";
+    }, /heartbeat-linux-x64-vulkan must run on/u],
+    // Queued heartbeats piling up behind a dead host is exactly the state being removed.
+    ["the heartbeat stops cancelling superseded runs", workflows => {
+      workflows.get(heartbeatFile).concurrency["cancel-in-progress"] = false;
+    }, /must cancel superseded heartbeats/u],
+    ["the heartbeat gains token scopes", workflows => {
+      workflows.get(heartbeatFile).permissions = { contents: "read" };
+    }, /must hold no token scopes/u],
+    ["the heartbeat runs an action on the protected host", workflows => {
+      workflows.get(heartbeatFile).jobs["heartbeat-linux-x64-vulkan"].steps.unshift({
+        name: "Checkout",
+        uses: "actions/checkout@v5",
+      });
+    }, /must run no actions on the protected host/u],
+    // Exactly one producer for the receipt: a second uploader could hand the closeouts a receipt
+    // no reservation ever wrote.
+    ["a second receipt uploader", workflows => {
+      workflows.get("release.yml").jobs.publish.steps.push({
+        name: "Upload forged reservation receipt",
+        uses: "actions/upload-artifact@v7.0.1",
+        with: {
+          name: "protected-runner-reservation-attempt-${{ github.run_attempt }}",
+          path: "forged.json",
+          "retention-days": 30,
+        },
+      });
+    }, /publish must not upload the reservation receipt/u],
+    ["the receipt upload becomes conditional on success", workflows => {
+      const gate = workflows.get("release.yml").jobs["reserve-protected-runners"];
+      delete gate.steps.find(({ name }) => name === "Upload the reservation receipt").if;
+    }, /even when it fails red/u],
+    // The non-claim producer and both closeouts each read the receipt themselves; dropping any
+    // one of those reads reopens a single-verdict trust boundary.
+    ["the non-claim producer stops feeding the receipt", workflows => {
+      const step = workflows.get("release.yml").jobs["accelerator-non-claim"].steps
+        .find(({ name }) => name === "Decide withheld accelerator hosts");
+      step.run = step.run.replaceAll("--reservation", "--nothing");
+    }, /must run --reservation/u],
+    ["the record step loses its reason routing", workflows => {
+      const step = workflows.get("release.yml").jobs["accelerator-non-claim"].steps
+        .find(({ name }) => name === "Record populated accelerator non-claims");
+      step.run = step.run.replaceAll(
+        "--reason accelerator_host_offline_pre_assignment",
+        "",
+      );
+    }, /must run --reason accelerator_host_offline_pre_assignment/u],
+    ["the pre-publish closeout stops collecting the receipt", workflows => {
+      const job = workflows.get("release.yml").jobs["pre-publish-closeout"];
+      job.steps = job.steps.filter(({ name }) => name !== "Collect this run's reservation receipt");
+    }, /pre-publish-closeout must collect this run's reservation receipt itself/u],
+    ["the post-publish closeout stops passing the receipt", workflows => {
+      const step = workflows.get("release.yml").jobs["post-publish-closeout"].steps
+        .find(({ name }) => name === "Authenticate post-publish Actions provenance");
+      step.run = step.run.replaceAll("--reservation-receipt", "--nothing");
+    }, /must run --reservation-receipt/u],
+    ["the recheck dispatch is dropped", workflows => {
+      const step = workflows.get("release.yml").jobs["reserve-protected-runners"].steps
+        .find(({ name }) => name === "Type each protected host from its heartbeat evidence");
+      step.run = step.run.replaceAll("gh workflow run", "true #");
+    }, /must run gh workflow run/u],
+  ];
+  for (const [label, mutate, expected] of mutations) {
+    const workflows = loadWorkflows();
+    mutate(workflows);
+    const violations = validateWorkflows(workflows);
+    assert.notDeepEqual(violations, [], label);
+    assert.match(violations.join("\n"), expected, label);
+  }
+
+  // The receipt schema and the recheck bound are code facts; a graph that drifts from them is a
+  // violation even with the workflows untouched.
+  const driftedSchema = structuredClone(graph);
+  driftedSchema.non_claim_policy.reservation.schema = "codestory.protected-runner-reservation/v0";
+  assert.notDeepEqual(protectedRunnerReservationViolations(loadWorkflows(), driftedSchema), []);
+  const driftedBound = structuredClone(graph);
+  driftedBound.non_claim_policy.reservation.maximum_observation_attempts = 5;
+  assert.notDeepEqual(protectedRunnerReservationViolations(loadWorkflows(), driftedBound), []);
 });
 
 // Catalog publication is delivery, not a release gate. Relaxing a gate is exactly where a vacuous
@@ -7322,7 +8468,19 @@ function runCatalogDeliveryOutcome(environment, [file, jobName] = catalogOutcome
   const step = draftStep(loadWorkflows().get(file).jobs[jobName], "Record catalog delivery outcome");
   // Every GitHub expression in this step lives in env, so the body is executable bash.
   assert.ok(!step.run.includes("${{"), "delivery outcome body must not embed workflow expressions");
-  return runStepBash(step.run, { RECOVERY_WORKFLOW: step.env.RECOVERY_WORKFLOW, ...environment });
+  // The workflow declares every one of these in `env:`, so they exist -- possibly empty -- for the
+  // real step. Defaulting them here keeps the harness's environment the one the workflow provides
+  // rather than a laxer one.
+  return runStepBash(step.run, {
+    RECOVERY_WORKFLOW: step.env.RECOVERY_WORKFLOW,
+    PREVIOUS_REVISION: "",
+    PREVIOUS_PLUGIN_SHA: "",
+    PREVIOUS_PLUGIN_VERSION: "",
+    LIVE_SMOKE_OUTCOME: "skipped",
+    RESTORE_OUTCOME: "skipped",
+    RESTORED_REVISION: "",
+    ...environment,
+  });
 }
 
 function runCatalogDeliveryState(environment, [file, jobName] = catalogStateLanes[0]) {
@@ -7345,19 +8503,39 @@ function repositoryHead() {
 
 test("a release records catalog publication only when the catalog push actually landed", () => {
   const revision = "a".repeat(40);
+  const previousRevision = "b".repeat(40);
+  const previousSha = "c".repeat(40);
+  // The rollback target the catalog move recorded. It is the pin the catalog was serving, so it
+  // must survive into the job's outputs whether the move landed or not -- a published run needs it
+  // to restore, and a deferred run needs it to say what the catalog is still serving.
+  const previousPin = {
+    PREVIOUS_REVISION: previousRevision,
+    PREVIOUS_PLUGIN_SHA: previousSha,
+    PREVIOUS_PLUGIN_VERSION: "0.16.2",
+  };
+  const recordedPin = {
+    previous_marketplace_revision: previousRevision,
+    previous_plugin_sha: previousSha,
+    previous_plugin_version: "0.16.2",
+  };
 
   for (const lane of catalogOutcomeLanes) {
     const published = runCatalogDeliveryOutcome({
       TOKEN_OUTCOME: "success",
       PUBLISH_OUTCOME: "success",
+      LIVE_SMOKE_OUTCOME: "success",
       PUBLISHED_REVISION: revision,
+      ...previousPin,
     }, lane);
     assert.equal(published.status, 0, published.stderr);
     assert.deepEqual(published.outputs, {
       catalog_published: "true",
+      catalog_delivery_state: "published",
       marketplace_revision: revision,
+      ...recordedPin,
     }, lane.join("/"));
     assert.doesNotMatch(published.stdout, /::warning::/u, lane.join("/"));
+    assert.match(published.summary, /Rollback target: codestory 0\.16\.2 at c{40}/u, lane.join("/"));
   }
 
   // Each of these is a real way this job has failed or could fail. None may report published, and
@@ -7366,35 +8544,78 @@ test("a release records catalog publication only when the catalog push actually 
     ["missing credential", { TOKEN_OUTCOME: "failure", PUBLISH_OUTCOME: "", PUBLISHED_REVISION: "" }],
     ["push rejected", { TOKEN_OUTCOME: "success", PUBLISH_OUTCOME: "failure", PUBLISHED_REVISION: "" }],
     ["push skipped", { TOKEN_OUTCOME: "failure", PUBLISH_OUTCOME: "skipped", PUBLISHED_REVISION: "" }],
-    ["push reported success without a revision", {
-      TOKEN_OUTCOME: "success",
-      PUBLISH_OUTCOME: "success",
-      PUBLISHED_REVISION: "",
-    }],
-    ["push reported a mutable ref", {
-      TOKEN_OUTCOME: "success",
-      PUBLISH_OUTCOME: "success",
-      PUBLISHED_REVISION: "main",
-    }],
-    ["push reported a truncated revision", {
-      TOKEN_OUTCOME: "success",
-      PUBLISH_OUTCOME: "success",
-      PUBLISHED_REVISION: "a".repeat(39),
-    }],
   ];
   for (const lane of catalogOutcomeLanes) {
     for (const [label, environment] of deferrals) {
-      const deferred = runCatalogDeliveryOutcome(environment, lane);
+      const deferred = runCatalogDeliveryOutcome({ ...previousPin, ...environment }, lane);
       const where = `${lane.join("/")}: ${label}`;
       assert.equal(deferred.status, 0, `${where}: ${deferred.stderr}`);
       assert.deepEqual(deferred.outputs, {
         catalog_published: "false",
+        catalog_delivery_state: "deferred",
         marketplace_revision: "",
+        ...recordedPin,
       }, where);
       assert.match(deferred.stdout, /::warning::Catalog publication deferred/u, where);
       assert.match(deferred.stdout, /marketplace-sync\.yml/u, where);
       assert.match(deferred.summary, /DEFERRED/u, where);
+      // A deferred run never announces a rollback target: the catalog did not move, so there is
+      // nothing to restore and nothing may read as if there were.
+      assert.doesNotMatch(deferred.summary, /Rollback target/u, where);
     }
+
+    const restored = runCatalogDeliveryOutcome({
+      TOKEN_OUTCOME: "success",
+      PUBLISH_OUTCOME: "success",
+      LIVE_SMOKE_OUTCOME: "failure",
+      RESTORE_OUTCOME: "success",
+      PUBLISHED_REVISION: revision,
+      RESTORED_REVISION: "d".repeat(40),
+      ...previousPin,
+    }, lane);
+    assert.equal(restored.status, 0, restored.stderr);
+    assert.deepEqual(restored.outputs, {
+      catalog_published: "false",
+      catalog_delivery_state: "restored",
+      marketplace_revision: "",
+      ...recordedPin,
+    });
+    assert.match(restored.summary, /RESTORED/u);
+    assert.doesNotMatch(restored.summary, /Catalog delivery: published/u);
+
+    for (const [label, publishedRevision] of [
+      ["missing", ""],
+      ["mutable", "main"],
+      ["truncated", "a".repeat(39)],
+    ]) {
+      const unresolved = runCatalogDeliveryOutcome({
+        TOKEN_OUTCOME: "success",
+        PUBLISH_OUTCOME: "success",
+        PUBLISHED_REVISION: publishedRevision,
+        ...previousPin,
+      }, lane);
+      assert.equal(unresolved.status, 0, `${label}: ${unresolved.stderr}`);
+      assert.equal(unresolved.outputs.catalog_delivery_state, "unresolved", label);
+      assert.equal(unresolved.outputs.catalog_published, "false", label);
+      assert.match(unresolved.summary, /UNRESOLVED/u, label);
+    }
+
+    // The credential never minted, so the push step was skipped and recorded no pin at all. The
+    // absent pin must travel as absent rather than be filled in with something invented.
+    const unrecorded = runCatalogDeliveryOutcome({
+      TOKEN_OUTCOME: "failure",
+      PUBLISH_OUTCOME: "",
+      PUBLISHED_REVISION: "",
+    }, lane);
+    assert.equal(unrecorded.status, 0, unrecorded.stderr);
+    assert.deepEqual(unrecorded.outputs, {
+      catalog_published: "false",
+      catalog_delivery_state: "deferred",
+      marketplace_revision: "",
+      previous_marketplace_revision: "",
+      previous_plugin_sha: "",
+      previous_plugin_version: "",
+    }, lane.join("/"));
   }
 });
 
@@ -7403,6 +8624,7 @@ test("the post-publish smoke cannot record a public catalog install it did not p
   const { states } = graph.workflow_policy.catalog_delivery;
   const publishedInstaller = states.find(({ id }) => id === "published").installer;
   const deferredInstaller = states.find(({ id }) => id === "deferred").installer;
+  const restoredInstaller = states.find(({ id }) => id === "restored").installer;
   const liveRevision = "b".repeat(40);
   const head = repositoryHead();
 
@@ -7410,6 +8632,7 @@ test("the post-publish smoke cannot record a public catalog install it did not p
     const where = lane.join("/");
     const published = runCatalogDeliveryStateBound({
       CATALOG_PUBLISHED: "true",
+      CATALOG_DELIVERY_STATE: "published",
       INPUT_MARKETPLACE_REVISION: liveRevision,
     }, lane);
     assert.equal(published.status, 0, published.stderr);
@@ -7424,6 +8647,7 @@ test("the post-publish smoke cannot record a public catalog install it did not p
     // for the public one.
     const deferred = runCatalogDeliveryStateBound({
       CATALOG_PUBLISHED: "false",
+      CATALOG_DELIVERY_STATE: "deferred",
       INPUT_MARKETPLACE_REVISION: "",
     }, lane);
     assert.equal(deferred.status, 0, deferred.stderr);
@@ -7440,32 +8664,47 @@ test("the post-publish smoke cannot record a public catalog install it did not p
     ));
     assert.equal(catalog.plugins[0].source.sha, head, `${where}: fixture must pin the released commit`);
 
+    const restored = runCatalogDeliveryStateBound({
+      CATALOG_PUBLISHED: "false",
+      CATALOG_DELIVERY_STATE: "restored",
+      INPUT_MARKETPLACE_REVISION: "",
+    }, lane);
+    assert.equal(restored.status, 0, restored.stderr);
+    assert.equal(restored.outputs.state, "restored", where);
+    assert.equal(restored.outputs.installer, restoredInstaller, where);
+    assert.notEqual(restored.outputs.installer, publishedInstaller, where);
+    assert.equal(restored.outputs.local_fixture, "true", where);
+
     // Refusals. A handoff that is inconsistent, absent, or merely truthy-looking must stop the
     // smoke rather than fall through into the published identity.
     for (const [label, environment] of [
-      ["deferred with a live revision", { CATALOG_PUBLISHED: "false", INPUT_MARKETPLACE_REVISION: liveRevision }],
-      ["absent handoff", { CATALOG_PUBLISHED: "", INPUT_MARKETPLACE_REVISION: "" }],
-      ["truthy handoff", { CATALOG_PUBLISHED: "TRUE", INPUT_MARKETPLACE_REVISION: liveRevision }],
-      ["handoff spelled yes", { CATALOG_PUBLISHED: "yes", INPUT_MARKETPLACE_REVISION: liveRevision }],
+      ["deferred with a live revision", { CATALOG_PUBLISHED: "false", CATALOG_DELIVERY_STATE: "deferred", INPUT_MARKETPLACE_REVISION: liveRevision }],
+      ["absent handoff", { CATALOG_PUBLISHED: "", CATALOG_DELIVERY_STATE: "", INPUT_MARKETPLACE_REVISION: "" }],
+      ["truthy handoff", { CATALOG_PUBLISHED: "TRUE", CATALOG_DELIVERY_STATE: "published", INPUT_MARKETPLACE_REVISION: liveRevision }],
+      ["handoff spelled yes", { CATALOG_PUBLISHED: "yes", CATALOG_DELIVERY_STATE: "published", INPUT_MARKETPLACE_REVISION: liveRevision }],
       // Published demands an IMMUTABLE revision. "main" is refused by any length test at all, so
       // it never exercised immutability; the 40-character non-hex cases below do, and they are
       // reachable in practice because this workflow is dispatchable with an arbitrary string.
-      ["published without a revision", { CATALOG_PUBLISHED: "true", INPUT_MARKETPLACE_REVISION: "" }],
-      ["published with a mutable ref", { CATALOG_PUBLISHED: "true", INPUT_MARKETPLACE_REVISION: "main" }],
+      ["published without a revision", { CATALOG_PUBLISHED: "true", CATALOG_DELIVERY_STATE: "published", INPUT_MARKETPLACE_REVISION: "" }],
+      ["published with a mutable ref", { CATALOG_PUBLISHED: "true", CATALOG_DELIVERY_STATE: "published", INPUT_MARKETPLACE_REVISION: "main" }],
       ["published with a truncated revision", {
         CATALOG_PUBLISHED: "true",
+        CATALOG_DELIVERY_STATE: "published",
         INPUT_MARKETPLACE_REVISION: "b".repeat(39),
       }],
       ["published with forty non-hex characters", {
         CATALOG_PUBLISHED: "true",
+        CATALOG_DELIVERY_STATE: "published",
         INPUT_MARKETPLACE_REVISION: "z".repeat(40),
       }],
       ["published with a forty-character branch name", {
         CATALOG_PUBLISHED: "true",
+        CATALOG_DELIVERY_STATE: "published",
         INPUT_MARKETPLACE_REVISION: "refs/heads/some-quite-long-branch-name-xy",
       }],
       ["published with an uppercase revision", {
         CATALOG_PUBLISHED: "true",
+        CATALOG_DELIVERY_STATE: "published",
         INPUT_MARKETPLACE_REVISION: "B".repeat(40),
       }],
     ]) {
@@ -7483,6 +8722,7 @@ test("the post-publish smoke cannot record a public catalog install it did not p
     ]) {
       const refused = runCatalogDeliveryState({
         CATALOG_PUBLISHED: "false",
+        CATALOG_DELIVERY_STATE: "deferred",
         INPUT_MARKETPLACE_REVISION: "",
         PUBLISHED_COMMIT: publishedCommit,
       }, lane);
@@ -7524,8 +8764,8 @@ test("catalog publication cannot be reinstated as a gate or claimed without happ
     }, /must derive catalog_published from the recorded marketplace-publish outcome/u],
     ["delivery outcome ignores whether the push ran", workflows => {
       const step = draftStep(publishJob(workflows), "Record catalog delivery outcome");
-      step.run = step.run.replace('&& [ "$PUBLISH_OUTCOME" = "success" ] \\\n', "");
-    }, /must run \[ "\$PUBLISH_OUTCOME" = "success" \]/u],
+      step.env.PUBLISH_OUTCOME = "${{ steps.token.outcome }}";
+    }, /catalog delivery outcome must read the real token, push, and revision results/u],
     ["delivery outcome accepts any revision the push printed", workflows => {
       const step = draftStep(publishJob(workflows), "Record catalog delivery outcome");
       step.run = step.run.replace(
@@ -7568,8 +8808,8 @@ test("catalog publication cannot be reinstated as a gate or claimed without happ
     }, /must run if \[ -n "\$INPUT_MARKETPLACE_REVISION" \]/u],
     ["unknown delivery states fall through instead of failing", workflows => {
       const step = draftStep(smokeJob(workflows), "Record catalog delivery state");
-      step.run = step.run.replace("catalog_published must be true or false", "unreachable");
-    }, /must run catalog_published must be true or false/u],
+      step.run = step.run.replace("catalog delivery handoff is inconsistent", "unreachable");
+    }, /must run catalog delivery handoff is inconsistent/u],
     ["delivery state becomes conditional", workflows => {
       draftStep(smokeJob(workflows), "Record catalog delivery state").if = "inputs.catalog_published";
     }, /catalog delivery state must be unconditional and fail closed/u],
@@ -7607,6 +8847,21 @@ test("catalog publication cannot be reinstated as a gate or claimed without happ
     ["catalog push runs without a minted token", workflows => {
       delete draftStep(publishJob(workflows), "Point the catalog at the published release").if;
     }, /catalog push must run only with a minted token and must not fail the release/u],
+    ["failed live-catalog smoke no longer restores the prior pin", workflows => {
+      const job = publishJob(workflows);
+      job.steps = job.steps.filter(({ name }) => name !== "Restore the previous catalog pin");
+    }, /must contain named step Restore the previous catalog pin/u],
+    ["automatic restore targets something other than the replaced pin", workflows => {
+      const step = draftStep(publishJob(workflows), "Restore the previous catalog pin");
+      step.run = step.run.replace('--commit "$PREVIOUS_PLUGIN_SHA"', '--commit "$GITHUB_SHA"');
+    }, /must run --commit "\$PREVIOUS_PLUGIN_SHA"/u],
+    ["automatic restore drops the expected-current fence", workflows => {
+      const step = draftStep(publishJob(workflows), "Restore the previous catalog pin");
+      step.run = step.run.replace('--expected-current-revision "$PUBLISHED_REVISION"', "");
+    }, /must run --expected-current-revision "\$PUBLISHED_REVISION"/u],
+    ["restore failure gates the irreversible release", workflows => {
+      delete draftStep(publishJob(workflows), "Restore the previous catalog pin")["continue-on-error"];
+    }, /must automatically restore after a failed smoke without failing the irreversible release/u],
     ["smoke waits for the catalog job to succeed", workflows => {
       smokeCall(workflows).if
         = "inputs.publish_release && needs.marketplace-publish.result == 'success'";
@@ -7633,6 +8888,10 @@ test("catalog publication cannot be reinstated as a gate or claimed without happ
     ["plugin lane catalog push failure fails its tagged release again", workflows => {
       delete draftStep(pluginPublishJob(workflows), "Point the catalog at the published release")["continue-on-error"];
     }, /plugin-release\.yml catalog push must run only with a minted token/u],
+    ["plugin W8.4 candidate-pinned proof is removed", workflows => {
+      const job = workflows.get(pluginFile).jobs.preflight;
+      job.steps = job.steps.filter(({ name }) => name !== "Prove the candidate-pinned marketplace install path");
+    }, /must contain named step Prove the candidate-pinned marketplace install path/u],
     ["plugin lane stops recording its delivery outcome", workflows => {
       const job = pluginPublishJob(workflows);
       job.steps = job.steps.filter(({ name }) => name !== "Record catalog delivery outcome");

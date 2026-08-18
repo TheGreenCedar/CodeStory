@@ -9,10 +9,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::api::{
     ApiError, AppEventPayload, IndexMode, IndexingPhaseTimings, ProjectSummary, SearchHit,
 };
+use codestory_contracts::config_registry;
 use codestory_runtime::{
     ActivationService, BookmarkService, GroundingService, IndexService, ProjectService,
     PublicOperation, PublicOperationService, ReadOnlyBrowserService, Runtime, RuntimeProcessConfig,
-    TargetResolution,
+    RuntimeRetrievalConfig, RuntimeRetrievalProfile, TargetResolution,
 };
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
@@ -21,6 +22,18 @@ use std::sync::atomic::AtomicBool;
 
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
 use crate::display::{clean_path_string, quote_command_path};
+
+#[cfg(test)]
+thread_local! {
+    static RUNTIME_CONTEXT_CONSTRUCTION_COUNT: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_context_construction_count_for_test() -> u64 {
+    RUNTIME_CONTEXT_CONSTRUCTION_COUNT.with(std::cell::Cell::get)
+}
 
 #[derive(Debug)]
 /// Project state after a command has opened or refreshed the repository.
@@ -55,6 +68,7 @@ pub(crate) struct RuntimeContext {
     pub(crate) browser: ReadOnlyBrowserService,
     pub(crate) events: crossbeam_channel::Receiver<AppEventPayload>,
     pub(crate) project_root: PathBuf,
+    project_identity: codestory_workspace::ProjectIdentityV3,
     /// Stable logical/workspace identity plus the immutable runtime
     /// configuration used to build this context. Multi-project transports use
     /// this key instead of a path spelling, mutable artifact eligibility, or a
@@ -62,7 +76,8 @@ pub(crate) struct RuntimeContext {
     pub(crate) context_key: ProjectContextKey,
     pub(crate) cache_root: PathBuf,
     pub(crate) storage_path: PathBuf,
-    pub(crate) sidecar: codestory_retrieval::SidecarRuntimeConfig,
+    pub(crate) sidecar: RuntimeRetrievalConfig,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) source_index_policy: codestory_contracts::workspace::SourceIndexPolicy,
 }
 
@@ -70,7 +85,116 @@ pub(crate) struct RuntimeContext {
 pub(crate) struct ProjectContextKey {
     pub(crate) project_id: String,
     pub(crate) workspace_id: String,
+    pub(crate) repository_instance: codestory_workspace::RepositoryInstanceIdentity,
     pub(crate) configuration_id: String,
+}
+
+struct RuntimeContextConfiguration {
+    project_root: PathBuf,
+    project_identity: codestory_workspace::ProjectIdentityV3,
+    context_key: ProjectContextKey,
+    cache_root: PathBuf,
+    storage_path: PathBuf,
+    sidecar: RuntimeRetrievalConfig,
+    source_index_policy: codestory_contracts::workspace::SourceIndexPolicy,
+}
+
+impl RuntimeContextConfiguration {
+    fn resolve(
+        args: &ProjectArgs,
+        startup: &crate::config::CliStartupConfig,
+        retained_project_identity: Option<&codestory_workspace::ProjectIdentityV3>,
+        retained_logical_identity: Option<&codestory_workspace::LogicalProjectIdentityV3>,
+    ) -> Result<Self> {
+        let project_root = canonicalize_project_root(&args.project)?;
+        let project_identity = retained_project_identity.cloned().unwrap_or_else(|| {
+            let repository_identity =
+                codestory_workspace::inspect_repository_identity_v2(&project_root);
+            codestory_workspace::project_identity_v3_from_repository(
+                &project_root,
+                &repository_identity,
+            )
+        });
+        let logical_identity = retained_logical_identity.cloned().unwrap_or_else(|| {
+            codestory_workspace::observe_logical_project_identity_v3(&project_root)
+        });
+        let config = crate::config::load_config_with_startup(&project_root, startup)
+            .map_err(|error| map_api_error(error.into_api_error()))?;
+        let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());
+        let process_cache_root = canonicalize_configuration_path(
+            startup
+                .stdio_cache_root
+                .as_deref()
+                .unwrap_or_else(|| startup.sidecar_defaults.cache_root()),
+        )?;
+        let cache_root = cache_root_for_project_in(
+            &project_root,
+            cache_override.as_deref(),
+            &process_cache_root,
+        )?;
+        let storage_path = canonicalize_configuration_path(&cache_root.join("codestory.db"))?;
+        let sidecar_defaults = startup.sidecar_defaults.with_cache_root(process_cache_root);
+        let sidecar = crate::sidecar_runtime::for_project_auto_with_process_defaults_and_identity(
+            &project_identity,
+            &sidecar_defaults,
+            &config.runtime_overrides(),
+        );
+        let source_index_policy = startup.source_index_policy.clone();
+        let context_key = ProjectContextKey {
+            project_id: project_identity.project_id.clone(),
+            workspace_id: project_identity.workspace_id.clone(),
+            repository_instance: logical_identity.repository_instance,
+            configuration_id: runtime_configuration_id(&cache_root, &sidecar, &source_index_policy),
+        };
+        Ok(Self {
+            project_root,
+            project_identity,
+            context_key,
+            cache_root,
+            storage_path,
+            sidecar,
+            source_index_policy,
+        })
+    }
+
+    fn with_profile_and_run_id(
+        mut self,
+        profile: RuntimeRetrievalProfile,
+        run_id: Option<&str>,
+    ) -> Self {
+        self.sidecar =
+            self.sidecar
+                .with_profile_and_run_id(Some(&self.project_root), profile, run_id);
+        self.context_key.configuration_id =
+            runtime_configuration_id(&self.cache_root, &self.sidecar, &self.source_index_policy);
+        self
+    }
+
+    fn build(self) -> RuntimeContext {
+        let runtime =
+            Runtime::new_with_process_config(RuntimeProcessConfig::new_with_retrieval_config(
+                self.sidecar.clone(),
+                self.source_index_policy.clone(),
+            ));
+        let events = runtime.events();
+        RuntimeContext {
+            activation: runtime.activation_service(),
+            public_operation: runtime.public_operation_service(),
+            project: runtime.project_service(),
+            index: runtime.index_service(),
+            grounding: runtime.grounding_service(),
+            bookmarks: runtime.bookmark_service(),
+            browser: runtime.browser_service(),
+            events,
+            project_root: self.project_root,
+            project_identity: self.project_identity,
+            context_key: self.context_key,
+            cache_root: self.cache_root,
+            storage_path: self.storage_path,
+            sidecar: self.sidecar,
+            source_index_policy: self.source_index_policy,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +274,8 @@ impl RuntimeContext {
         args: &ProjectArgs,
         startup: &crate::config::CliStartupConfig,
     ) -> Result<Self> {
+        #[cfg(test)]
+        RUNTIME_CONTEXT_CONSTRUCTION_COUNT.with(|count| count.set(count.get() + 1));
         Self::new_agent_sidecar_with_startup_and_selection(args, startup, None, None)
     }
 
@@ -172,32 +298,39 @@ impl RuntimeContext {
         profile: Option<crate::args::CliSidecarProfile>,
         run_id: Option<&str>,
     ) -> Result<Self> {
-        let mut context = Self::new_with_startup(args, startup)?;
         let selected = profile
             .map(Into::into)
-            .unwrap_or(codestory_retrieval::SidecarProfile::Agent);
-        context.sidecar =
-            context
-                .sidecar
-                .with_profile_and_run_id(Some(&context.project_root), selected, run_id);
-        context.context_key.configuration_id = runtime_configuration_id(
-            &context.cache_root,
-            &context.sidecar,
-            &context.source_index_policy,
-        );
-        let runtime = Runtime::new_with_process_config(RuntimeProcessConfig::new(
-            context.sidecar.clone(),
-            context.source_index_policy.clone(),
-        ));
-        context.project = runtime.project_service();
-        context.index = runtime.index_service();
-        context.grounding = runtime.grounding_service();
-        context.bookmarks = runtime.bookmark_service();
-        context.browser = runtime.browser_service();
-        context.activation = runtime.activation_service();
-        context.public_operation = runtime.public_operation_service();
-        context.events = runtime.events();
-        Ok(context)
+            .unwrap_or(RuntimeRetrievalProfile::Agent);
+        Ok(
+            RuntimeContextConfiguration::resolve(args, startup, None, None)?
+                .with_profile_and_run_id(selected, run_id)
+                .build(),
+        )
+    }
+
+    pub(crate) fn agent_sidecar_context_key_with_startup(
+        args: &ProjectArgs,
+        startup: &crate::config::CliStartupConfig,
+        retained: &Self,
+    ) -> Result<Option<ProjectContextKey>> {
+        let logical =
+            codestory_workspace::observe_logical_project_identity_v3(&retained.project_root);
+        if logical.project_id != retained.context_key.project_id
+            || logical.workspace_id != retained.context_key.workspace_id
+            || logical.repository_instance != retained.context_key.repository_instance
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            RuntimeContextConfiguration::resolve(
+                args,
+                startup,
+                Some(&retained.project_identity),
+                Some(&logical),
+            )?
+            .with_profile_and_run_id(RuntimeRetrievalProfile::Agent, None)
+            .context_key,
+        ))
     }
 
     /// Open runtime services without initializing the embedded engine.
@@ -217,55 +350,7 @@ impl RuntimeContext {
         args: &ProjectArgs,
         startup: &crate::config::CliStartupConfig,
     ) -> Result<Self> {
-        let project_root = canonicalize_project_root(&args.project)?;
-        let project_identity = codestory_workspace::project_identity_v3(&project_root);
-        let config = crate::config::load_config_with_startup(&project_root, startup)?;
-        let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());
-        let process_cache_root = canonicalize_configuration_path(
-            startup
-                .stdio_cache_root
-                .as_deref()
-                .unwrap_or_else(|| startup.sidecar_defaults.cache_root()),
-        )?;
-        let cache_root = cache_root_for_project_in(
-            &project_root,
-            cache_override.as_deref(),
-            &process_cache_root,
-        )?;
-        let storage_path = canonicalize_configuration_path(&cache_root.join("codestory.db"))?;
-        let sidecar_defaults = startup.sidecar_defaults.with_cache_root(process_cache_root);
-        let sidecar = crate::sidecar_runtime::for_project_auto_with_process_defaults(
-            &project_root,
-            &sidecar_defaults,
-            &config.runtime_overrides(),
-        );
-        let source_index_policy = startup.source_index_policy.clone();
-        let context_key = ProjectContextKey {
-            project_id: project_identity.project_id.clone(),
-            workspace_id: project_identity.workspace_id.clone(),
-            configuration_id: runtime_configuration_id(&cache_root, &sidecar, &source_index_policy),
-        };
-        let runtime = Runtime::new_with_process_config(RuntimeProcessConfig::new(
-            sidecar.clone(),
-            source_index_policy.clone(),
-        ));
-        let events = runtime.events();
-        Ok(Self {
-            activation: runtime.activation_service(),
-            public_operation: runtime.public_operation_service(),
-            project: runtime.project_service(),
-            index: runtime.index_service(),
-            grounding: runtime.grounding_service(),
-            bookmarks: runtime.bookmark_service(),
-            browser: runtime.browser_service(),
-            events,
-            project_root,
-            context_key,
-            cache_root,
-            storage_path,
-            sidecar,
-            source_index_policy,
-        })
+        Ok(RuntimeContextConfiguration::resolve(args, startup, None, None)?.build())
     }
 
     /// Open project state and run the resolved refresh request when needed.
@@ -446,9 +531,99 @@ impl RuntimeContext {
     }
 }
 
-/// Serialize one publication-backed response with the canonical adapter
-/// metadata envelope. HTTP and ordinary CLI JSON use this exact helper so the
-/// shape cannot drift between transports.
+/// Public response-envelope contract version. `codestory_contracts::wire` owns
+/// the value and documents each revision; a missing stamp stays legacy v0.
+pub(crate) const CODESTORY_PUBLICATION_META_SCHEMA_VERSION: u32 =
+    codestory_contracts::wire::PUBLICATION_STAMP_SCHEMA_VERSION;
+
+/// Oldest reader schema that can still interpret this stamp. Published so a
+/// consumer decides from the payload instead of guessing that every bump is
+/// additive.
+pub(crate) const CODESTORY_PUBLICATION_META_MINIMUM_COMPATIBLE_SCHEMA_VERSION: u32 =
+    codestory_contracts::wire::MINIMUM_COMPATIBLE_PUBLICATION_STAMP_SCHEMA_VERSION;
+
+pub(crate) fn codestory_publication_contract_runtime_meta() -> serde_json::Value {
+    let active_cli_version = env!("CARGO_PKG_VERSION");
+    // The plugin identities are declared to stdio_transport.rs, which reads
+    // them; this stamp consumes that value rather than reading them again.
+    let host = crate::stdio_transport::host_provisioning_identity();
+    let cli_source = host
+        .cli_source
+        .unwrap_or_else(|| "direct_cli_launch".to_string());
+    let override_configured = publication_env_nonempty(config_registry::CLI_ENV).is_some()
+        || cli_source == "local_dev_override";
+    codestory_publication_contract_runtime_meta_from(
+        active_cli_version,
+        host.plugin_version,
+        host.plugin_cli_version,
+        host.cli_sha256,
+        cli_source,
+        override_configured,
+    )
+}
+
+pub(crate) fn codestory_publication_contract_runtime_meta_from(
+    active_cli_version: &str,
+    plugin_version: Option<String>,
+    plugin_cli_version: Option<String>,
+    cli_sha256: Option<String>,
+    cli_source: String,
+    override_configured: bool,
+) -> serde_json::Value {
+    let pinned_pair_matches = plugin_cli_version
+        .as_deref()
+        .map(|version| version == active_cli_version);
+    serde_json::json!({
+        "cli_version": active_cli_version,
+        "plugin_version": plugin_version,
+        "plugin_cli_version": plugin_cli_version,
+        "cli_sha256": cli_sha256,
+        "cli_source": cli_source,
+        "pinned_pair_matches": pinned_pair_matches,
+        "known_override_skew_channel": override_configured,
+    })
+}
+
+fn publication_env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Build the canonical publication/contract stamp shared by CLI JSON, HTTP, and stdio.
+pub(crate) fn codestory_publication_meta(
+    core_publication: Option<serde_json::Value>,
+    retrieval_publication: Option<serde_json::Value>,
+    operation_id: Option<&str>,
+    attempt: Option<u32>,
+    refreshing: bool,
+) -> serde_json::Value {
+    let served_from = if core_publication.is_none() && retrieval_publication.is_none() {
+        "contract_only"
+    } else if refreshing {
+        "last_complete_publication"
+    } else {
+        "complete_publication"
+    };
+    serde_json::json!({
+        "schema_version": CODESTORY_PUBLICATION_META_SCHEMA_VERSION,
+        "minimum_compatible_schema_version":
+            CODESTORY_PUBLICATION_META_MINIMUM_COMPATIBLE_SCHEMA_VERSION,
+        "served_from": served_from,
+        "publication": core_publication,
+        "core_publication": core_publication,
+        "retrieval_publication": retrieval_publication,
+        "contract_runtime": codestory_publication_contract_runtime_meta(),
+        "operation": {
+            "operation_id": operation_id,
+            "attempt": attempt,
+        }
+    })
+}
+
+/// Serialize one publication-backed response with the canonical adapter metadata envelope. HTTP,
+/// ordinary CLI JSON, and stdio share this contract so proof-status consumers see one schema stamp.
 pub(crate) fn public_operation_json_value<T, V: Serialize>(
     operation: &PublicOperation<T>,
     response: &V,
@@ -457,8 +632,16 @@ pub(crate) fn public_operation_json_value<T, V: Serialize>(
     if !value.is_object() {
         value = serde_json::json!({"result": value});
     }
-    let core_publication = &operation.core_publication;
-    let retrieval_publication = &operation.retrieval_publication;
+    let core_publication = operation
+        .core_publication
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?;
+    let retrieval_publication = operation
+        .retrieval_publication
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?;
     let object = value
         .as_object_mut()
         .expect("public operation payload is an object");
@@ -473,16 +656,13 @@ pub(crate) fn public_operation_json_value<T, V: Serialize>(
         .expect("public operation metadata is an object")
         .insert(
             "codestory_publication".to_string(),
-            serde_json::json!({
-                "served_from": "complete_publication",
-                "publication": core_publication,
-                "core_publication": core_publication,
-                "retrieval_publication": retrieval_publication,
-                "operation": {
-                    "operation_id": &operation.operation_id,
-                    "attempt": operation.attempt,
-                }
-            }),
+            codestory_publication_meta(
+                core_publication,
+                retrieval_publication,
+                Some(&operation.operation_id),
+                Some(operation.attempt),
+                false,
+            ),
         );
     Ok(value)
 }
@@ -502,120 +682,11 @@ pub(crate) fn map_public_operation<T, U>(
 
 fn runtime_configuration_id(
     cache_root: &Path,
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    sidecar: &RuntimeRetrievalConfig,
     source_index_policy: &codestory_contracts::workspace::SourceIndexPolicy,
 ) -> String {
-    // Do not hash credentials. Their presence participates in the immutable
-    // configuration boundary, while secret material remains outside logs and
-    // diagnostic identifiers.
-    let mut identity = format!(
-        "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-        configuration_path_identity(cache_root),
-        sidecar.profile,
-        sidecar.namespace,
-        sidecar.embedding.allow_cpu,
-        sidecar.retrieval.hybrid_enabled,
-        sidecar.retrieval.semantic_doc_scope,
-        sidecar.retrieval.semantic_doc_alias_mode,
-        sidecar.retrieval.semantic_doc_max_tokens,
-        sidecar.retrieval.llm_doc_embed_batch_size,
-        sidecar.retrieval.stream_pending_docs,
-        sidecar.retrieval.stream_sort_window_batches,
-        sidecar.summary.endpoint.as_deref().unwrap_or(""),
-        sidecar.summary.api_key.is_some(),
-    );
-    identity.push_str(&format!(
-        "\0{}\0{:?}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-        sidecar.summary.model,
-        sidecar.summary.max_tokens,
-        sidecar.summary.timeout,
-        sidecar.run_id.as_deref().unwrap_or(""),
-        configuration_path_identity(&sidecar.layout.lexical_data_dir),
-        configuration_path_identity(&sidecar.layout.semantic_data_dir),
-        configuration_path_identity(&sidecar.layout.scip_artifacts_root),
-        configuration_path_identity(&sidecar.layout.state_file),
-        source_index_policy.policy_version,
-        source_index_policy.byte_cap,
-        source_index_policy.structural_unit_cap,
-    ));
-    fnv1a_hex(identity.as_bytes())
-}
-
-fn configuration_path_identity(path: &Path) -> String {
-    #[cfg(windows)]
-    {
-        windows_ordinal_configuration_path_identity(path)
-    }
-    #[cfg(not(windows))]
-    {
-        clean_path_string(&path.to_string_lossy())
-    }
-}
-
-#[cfg(windows)]
-fn windows_ordinal_configuration_path_identity(path: &Path) -> String {
-    use std::ptr;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn LCMapStringEx(
-            locale_name: *const u16,
-            map_flags: u32,
-            source: *const u16,
-            source_len: i32,
-            destination: *mut u16,
-            destination_len: i32,
-            version_information: *mut std::ffi::c_void,
-            reserved: *mut std::ffi::c_void,
-            sort_handle: isize,
-        ) -> i32;
-    }
-
-    const LCMAP_UPPERCASE: u32 = 0x0000_0200;
-    let normalized = clean_path_string(&path.to_string_lossy()).replace('/', "\\");
-    let source = normalized.encode_utf16().collect::<Vec<_>>();
-    let Ok(source_len) = i32::try_from(source.len()) else {
-        return normalized.to_uppercase();
-    };
-    let invariant_locale = [0_u16];
-    // SAFETY: all pointers remain valid for the supplied lengths. The invariant
-    // locale uses the same language-independent uppercase table as Windows
-    // ordinal ignore-case comparison.
-    let required = unsafe {
-        LCMapStringEx(
-            invariant_locale.as_ptr(),
-            LCMAP_UPPERCASE,
-            source.as_ptr(),
-            source_len,
-            ptr::null_mut(),
-            0,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            0,
-        )
-    };
-    if required <= 0 {
-        return normalized.to_uppercase();
-    }
-    let mut mapped = vec![0_u16; required as usize];
-    // SAFETY: `mapped` has the size returned by the preceding mapping query.
-    let written = unsafe {
-        LCMapStringEx(
-            invariant_locale.as_ptr(),
-            LCMAP_UPPERCASE,
-            source.as_ptr(),
-            source_len,
-            mapped.as_mut_ptr(),
-            required,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            0,
-        )
-    };
-    if written <= 0 {
-        return normalized.to_uppercase();
-    }
-    String::from_utf16_lossy(&mapped[..written as usize])
+    RuntimeProcessConfig::new_with_retrieval_config(sidecar.clone(), source_index_policy.clone())
+        .configuration_id(cache_root)
 }
 
 /// Resolve a CLI target selector into one graph-backed search hit.
@@ -668,7 +739,9 @@ fn resolve_target_with(
             message: ambiguous.message,
         }
         .into()),
-        Ok(TargetResolution::Rejected(message)) => Err(anyhow!(message)),
+        Ok(TargetResolution::Rejected(message)) => {
+            Err(typed_api_error(ApiError::not_found(message)))
+        }
         Err(error) => Err(map_api_error(error)),
     }
 }
@@ -805,6 +878,7 @@ fn normalize_canonical_configuration_path(path: PathBuf) -> PathBuf {
 }
 
 /// Small stable hash used for path-derived cache directory names.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
@@ -915,6 +989,19 @@ impl std::fmt::Display for CliApiError {
 
 impl std::error::Error for CliApiError {}
 
+/// Carry a machine code beside an adapter-owned failure without rewriting the
+/// text.
+///
+/// `map_api_error` renders `code: message` plus recovery commands for human CLI
+/// output. Adapter-level classifications — a rejected target, a missing
+/// bookmark — already read correctly on their own, so this keeps the displayed
+/// message intact while `api_error_in_chain` still recovers the code for the
+/// HTTP and MCP adapters.
+pub(crate) fn typed_api_error(error: ApiError) -> anyhow::Error {
+    let message = error.message.clone();
+    anyhow::Error::new(CliApiError { error, message })
+}
+
 /// Return the typed runtime error retained by the CLI adapter, including when
 /// command-specific context has been attached above it.
 pub(crate) fn api_error_in_chain(error: &anyhow::Error) -> Option<&ApiError> {
@@ -927,6 +1014,8 @@ pub(crate) fn api_error_in_chain(error: &anyhow::Error) -> Option<&ApiError> {
 fn map_api_error_with_project(error: ApiError, project: Option<&Path>) -> anyhow::Error {
     let message = if api_error_is_cache_busy(&error) {
         cache_busy_message(project)
+    } else if api_error_is_schema_too_new(&error) {
+        schema_too_new_message(&error, project)
     } else {
         let mut message = format!("{}: {}", error.code, error.message);
         if let Some((minimum_next, full_repair)) = api_error_repair_groups(&error) {
@@ -990,6 +1079,32 @@ fn api_error_is_cache_busy(error: &ApiError) -> bool {
 fn is_cache_busy_text(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
     text.contains("database is locked") || text.contains("sqlite_busy")
+}
+
+fn api_error_is_schema_too_new(error: &ApiError) -> bool {
+    is_schema_too_new_text(&format!("{} {}", error.code, error.message))
+}
+
+fn is_schema_too_new_text(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains("unsupported database schema version")
+}
+
+/// Name the executable downgrade path on a schema-too-new cache.
+///
+/// Migrations are forward-only, so an older CodeStory refuses a newer cache
+/// and the advertised `--refresh full` repair refuses it too. Without this the
+/// operator is told only that the cache is unsupported, with no in-band way
+/// out. The reset is a move, not a delete, and preserves annotations, so it is
+/// safe to recommend directly.
+fn schema_too_new_message(error: &ApiError, project: Option<&Path>) -> String {
+    let project = project
+        .map(quote_command_path)
+        .unwrap_or_else(|| "<repo>".to_string());
+    format!(
+        "{}: {}\n\nThis CodeStory build is older than the cache it was pointed at. Migrations are forward-only, so `--refresh full` refuses it too. Quarantine the derived cache (annotations are preserved, nothing is deleted) and rebuild:\n\nMinimum next:\n  codestory-cli cache reset --project {project} --derived-only --dry-run\n  codestory-cli cache reset --project {project} --derived-only --confirm\n  codestory-cli index --project {project} --refresh full\n\nAdditional checks:\n  codestory-cli doctor --project {project} --format markdown",
+        error.code, error.message
+    )
 }
 
 fn cache_busy_message(project: Option<&Path>) -> String {
@@ -1117,6 +1232,68 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_too_new_cache_names_the_derived_reset_recovery() {
+        // ARCH-020: migrations are forward-only, so an older CodeStory refuses
+        // a cache a newer release wrote, and the advertised `--refresh full`
+        // repair refuses it too. The operator was told the cache was
+        // unsupported and nothing else. This drives the real production path —
+        // a real store, its version stamped past what this build supports,
+        // opened through the same `RuntimeContext` every command uses — and
+        // pins that the executable recovery reaches the operator.
+        let _env_lock = crate::config::config_env_test_lock();
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("repo");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        fs::create_dir_all(&cache).expect("create cache");
+        fs::write(project.join("lib.rs"), "pub fn alpha() {}\n").expect("seed source");
+        let args = ProjectArgs {
+            project: project.clone(),
+            cache_dir: Some(cache),
+        };
+        let seed = RuntimeContext::new_inspect_only(&args).expect("resolve runtime paths");
+        seed.ensure_open(RefreshMode::Full)
+            .expect("publish a cache this build supports");
+        let storage_path = seed.storage_path.clone();
+        drop(seed);
+
+        // Stamp the cache one version past whatever this build wrote, which is
+        // exactly the shape a rolled-back CLI meets in the field.
+        let stamp = rusqlite::Connection::open(&storage_path).expect("open cache for stamping");
+        let supported: i64 = stamp
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read the supported schema version");
+        assert!(supported > 0, "the seeded cache must record a version");
+        stamp
+            .pragma_update(None, "user_version", supported + 1)
+            .expect("stamp a newer schema version");
+        drop(stamp);
+
+        let runtime = RuntimeContext::new_inspect_only(&args).expect("resolve runtime paths");
+        let error = runtime
+            .open_project_summary()
+            .expect_err("a newer schema must fail closed");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("Unsupported database schema version"),
+            "the fail-closed reason must survive into the CLI message: {rendered}"
+        );
+        assert!(
+            rendered.contains("cache reset"),
+            "a schema-too-new cache must name the derived reset: {rendered}"
+        );
+        assert!(
+            rendered.contains("--derived-only --confirm"),
+            "the recovery must be executable, not a hint: {rendered}"
+        );
+        assert!(
+            rendered.contains("--refresh full"),
+            "the recovery must name the reindex step that follows: {rendered}"
+        );
+    }
+
+    #[test]
     fn public_operation_metadata_preserves_existing_meta_fields() {
         let operation = PublicOperation {
             value: (),
@@ -1142,7 +1319,22 @@ mod tests {
         );
         assert_eq!(
             value.pointer("/_meta/codestory_publication/served_from"),
-            Some(&serde_json::json!("complete_publication"))
+            Some(&serde_json::json!("contract_only"))
+        );
+        // Literal, not the constant: the CLI JSON envelope publishes the same
+        // number the stdio and HTTP adapters do, and a consumer pinned to it
+        // must see the bump rather than a self-referential comparison.
+        assert_eq!(
+            value.pointer("/_meta/codestory_publication/schema_version"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            value.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            value.pointer("/_meta/codestory_publication/contract_runtime/cli_version"),
+            Some(&serde_json::json!(env!("CARGO_PKG_VERSION")))
         );
         assert_eq!(
             value.pointer("/_meta/codestory_publication/operation/operation_id"),
@@ -1337,7 +1529,8 @@ mod tests {
 
         let assert_isolated_paths =
             |runtime: &RuntimeContext, expected_root: &Path, other_root: &Path| {
-                assert_eq!(runtime.sidecar.cache_root.as_path(), expected_root);
+                let sidecar = runtime.sidecar.as_raw_config_for_test();
+                assert_eq!(sidecar.cache_root.as_path(), expected_root);
                 assert_eq!(
                     runtime.storage_path,
                     runtime.cache_root.join("codestory.db")
@@ -1345,11 +1538,11 @@ mod tests {
                 for path in [
                     runtime.cache_root.as_path(),
                     runtime.storage_path.as_path(),
-                    runtime.sidecar.cache_root.as_path(),
-                    runtime.sidecar.layout.lexical_data_dir.as_path(),
-                    runtime.sidecar.layout.semantic_data_dir.as_path(),
-                    runtime.sidecar.layout.scip_artifacts_root.as_path(),
-                    runtime.sidecar.layout.state_file.as_path(),
+                    sidecar.cache_root.as_path(),
+                    sidecar.layout.lexical_data_dir.as_path(),
+                    sidecar.layout.semantic_data_dir.as_path(),
+                    sidecar.layout.scip_artifacts_root.as_path(),
+                    sidecar.layout.state_file.as_path(),
                 ] {
                     assert!(
                         path.starts_with(expected_root),
@@ -1371,6 +1564,45 @@ mod tests {
             first.context_key.configuration_id,
             second.context_key.configuration_id
         );
+    }
+
+    #[test]
+    fn runtime_context_construction_observes_repository_identity_once() {
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        let startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.clone()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache,
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+
+        let runtime =
+            codestory_workspace::with_repository_metadata_observation_limit_for_test(1, || {
+                RuntimeContext::new_agent_sidecar_with_startup(
+                    &ProjectArgs {
+                        project,
+                        cache_dir: None,
+                    },
+                    &startup,
+                )
+                .expect("runtime context")
+            });
+
+        let retained = runtime
+            .sidecar
+            .as_raw_config_for_test()
+            .project_identity
+            .as_ref()
+            .expect("sidecar retains observed project identity");
+        assert_eq!(retained.project_id, runtime.context_key.project_id);
+        assert_eq!(retained.workspace_id, runtime.context_key.workspace_id);
     }
 
     #[test]
@@ -1499,18 +1731,19 @@ mod tests {
         let before_folded = canonicalize_configuration_path(&folded).expect("folded missing path");
         let before_extended =
             canonicalize_configuration_path(&extended).expect("extended missing path");
-        let expected = configuration_path_identity(&before_mixed);
-        assert_eq!(configuration_path_identity(&before_folded), expected);
-        assert_eq!(configuration_path_identity(&before_extended), expected);
+        let configuration = RuntimeProcessConfig::local();
+        let expected = configuration.configuration_id(&before_mixed);
+        assert_eq!(configuration.configuration_id(&before_folded), expected);
+        assert_eq!(configuration.configuration_id(&before_extended), expected);
 
         fs::create_dir_all(&mixed).expect("create mixed-case configuration path");
         let after_mixed = canonicalize_configuration_path(&mixed).expect("mixed existing path");
         let after_folded = canonicalize_configuration_path(&folded).expect("folded existing path");
         let after_extended =
             canonicalize_configuration_path(&extended).expect("extended existing path");
-        assert_eq!(configuration_path_identity(&after_mixed), expected);
-        assert_eq!(configuration_path_identity(&after_folded), expected);
-        assert_eq!(configuration_path_identity(&after_extended), expected);
+        assert_eq!(configuration.configuration_id(&after_mixed), expected);
+        assert_eq!(configuration.configuration_id(&after_folded), expected);
+        assert_eq!(configuration.configuration_id(&after_extended), expected);
     }
 
     #[test]
@@ -1713,13 +1946,13 @@ mod tests {
         codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
             &project,
             &reader.storage_path,
-            &reader.sidecar,
+            reader.sidecar.as_raw_config_for_test(),
         )
         .expect("publish retrieval generation A");
         let retrieval_a = codestory_retrieval::strict_sidecar_status_for_runtime(
             &project,
             Some(&reader.storage_path),
-            reader.sidecar.clone(),
+            reader.sidecar.as_raw_config_for_test().clone(),
         )
         .expect("inspect retrieval generation A");
         assert!(retrieval_a.is_live_ready(), "{retrieval_a:?}");
@@ -1738,7 +1971,7 @@ mod tests {
         let replacement_run_id = "between-pins-run-b".to_string();
         let publisher_project = project.clone();
         let publisher_storage = reader.storage_path.clone();
-        let publisher_runtime = reader.sidecar.clone();
+        let publisher_runtime = reader.sidecar.as_raw_config_for_test().clone();
         let publisher_generation_id = replacement_generation_id.clone();
         let publisher_run_id = replacement_run_id.clone();
         codestory_runtime::set_before_retrieval_pin_test_hook(move || {
@@ -1777,7 +2010,7 @@ mod tests {
         let retrieval_b = codestory_retrieval::strict_sidecar_status_for_runtime(
             &project,
             Some(&reader.storage_path),
-            reader.sidecar.clone(),
+            reader.sidecar.as_raw_config_for_test().clone(),
         )
         .expect("inspect retrieval generation B");
         assert!(retrieval_b.is_live_ready(), "{retrieval_b:?}");

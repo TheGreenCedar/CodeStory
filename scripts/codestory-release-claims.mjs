@@ -2,14 +2,15 @@
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { RELEASE_MANIFEST_ASSET } from "./lib/release-manifest.mjs";
 
 const GRAPH_SCHEMA = "codestory.release-claims/v1";
 const GRAPH_VERSION = 11;
 const KNOWN_PACKAGE_TARGETS = new Set([
-  "linux-arm64",
   "linux-x64",
   "macos-arm64",
   "macos-x64",
@@ -80,6 +81,270 @@ const REQUIRED_FAILURE_CONTROLS = [
 ];
 const BENCHMARK_LEAKAGE_COMMAND =
   "node --test scripts/tests/lint-retrieval-generalization.test.mjs";
+// The graph owns every exact program pin the workflow-policy checker enforces; the
+// checker owns only the hashing predicates and their reviewed violation messages.
+// Membership is exact and fail-closed: a graph that drops, renames, or invents a
+// pinned program must not load, so a rule instance cannot disappear by data edit.
+// Subject kinds name what the checker actually hashes for that row.
+const PINNED_PROGRAM_CONTRACTS = new Map([
+  ["nextest_linux_archive", { subject: "downloaded_archive", job: true, step: true }],
+  ["source_proof_resolver", { subject: "step_script_raw_text", job: true, step: true }],
+  ["packaged_platform_pr_resolver", { subject: "step_script_raw_text", job: true, step: true }],
+  ["marketplace_sync_dispatch_guard", { subject: "step_script_executable_text", job: true, step: true }],
+  ["packaged_platform_pr_closeout", { subject: "step_script_executable_text", job: true, step: true }],
+  ["packaged_platform_proof_workflow", { subject: "parsed_workflow_json", job: false, step: false }],
+  ["packaged_platform_pr_workflow", { subject: "parsed_workflow_json", job: false, step: false }],
+  ["frozen_candidate_quality_workflow", { subject: "parsed_workflow_json", job: false, step: false }],
+  ["macos_metal_proof_workflow", { subject: "parsed_workflow_json", job: false, step: false }],
+  ["windows_vulkan_proof_workflow", { subject: "parsed_workflow_json", job: false, step: false }],
+  ["linux_vulkan_proof_workflow", { subject: "parsed_workflow_json", job: false, step: false }],
+  ["release_source_proof_sentinel", { subject: "parsed_job_json", job: true, step: false }],
+  ["packaged_sccache_identity", { subject: "step_script_raw_text", job: true, step: true }],
+  ["packaged_linux_build", { subject: "step_script_raw_text", job: true, step: true }],
+  ["packaged_compile_clock_stop", { subject: "step_script_raw_text", job: true, step: true }],
+  ["packaged_host_compiler_finalizer", { subject: "step_script_raw_text", job: true, step: true }],
+  ["qualification_driver_artifact", { subject: "helper_file_text", job: false, step: false }],
+]);
+// The graph owns every step-fragment rule instance for workflow families migrated
+// off inline requireStepRun/forbidStepRun calls; the checker owns only those two
+// predicates and their message shapes. Membership is exact and fail-closed: a graph
+// that drops, renames, or invents a step-fragment rule must not load, so a rule
+// instance cannot disappear by data edit. Kind names the predicate a row binds.
+const STEP_FRAGMENT_CONTRACTS = new Map([
+  ["saga_issue_link_guard", { kind: "require" }],
+  ["close_dev_issues", { kind: "require" }],
+  ["marketplace_sync_dispatch_guard", { kind: "require" }],
+  ["marketplace_sync_dispatch_guard_line_tests", { kind: "forbid" }],
+  ["marketplace_sync_catalog_push", { kind: "require" }],
+  ["marketplace_sync_recovery_identity", { kind: "require" }],
+  ["plugin_static_install_dependencies", { kind: "require" }],
+  ["plugin_static_workflow_policy", { kind: "require" }],
+  ["plugin_static_plugin_wiring", { kind: "require" }],
+  ["plugin_static_embedded_model", { kind: "require" }],
+  ["plugin_static_pinned_provision_proof", { kind: "require" }],
+  ["plugin_static_marketplace_evidence_contracts", { kind: "require" }],
+  ["plugin_static_workflow_syntax", { kind: "require" }],
+  ["plugin_static_release_claim_contracts", { kind: "require" }],
+  ["plugin_static_ci_proof_routing", { kind: "require" }],
+  ["plugin_static_packaged_proof_harness", { kind: "require" }],
+  ["plugin_static_marketplace_install", { kind: "require" }],
+  ["source_proof_resolve_trusted_head", { kind: "require" }],
+  ["source_proof_resolve_reuse_gate", { kind: "require" }],
+  ["source_proof_resolve_release_freeze", { kind: "require" }],
+  ["source_proof_windows_native_qualification_harness", { kind: "require" }],
+  ["source_proof_windows_native_rust_stable", { kind: "require" }],
+  ["source_proof_windows_native_short_target", { kind: "require" }],
+  ["source_proof_windows_native_embedded_model", { kind: "require" }],
+  ["source_proof_windows_native_vulkan_sdk", { kind: "require" }],
+  ["source_proof_windows_native_source_contracts", { kind: "require" }],
+  ["source_proof_full_gate_compiler_cache_env", { kind: "require" }],
+  ["source_proof_full_gate_dependency_cache_bound", { kind: "require" }],
+  ["source_proof_full_gate_compile", { kind: "require" }],
+  ["source_proof_full_gate_cache_restore_report", { kind: "require" }],
+  ["source_proof_full_gate_cache_save_report", { kind: "require" }],
+  ["source_proof_full_gate_compilation_outcome", { kind: "require" }],
+  ["source_proof_full_gate_workspace_tests", { kind: "require" }],
+  ["source_proof_full_gate_clippy", { kind: "require" }],
+  ["source_proof_full_gate_release_cell", { kind: "require" }],
+  ["macos_metal_validate_candidate_installed_mode", { kind: "require" }],
+  ["macos_metal_embedded_model", { kind: "require" }],
+  ["macos_metal_host_evidence", { kind: "require" }],
+  ["macos_metal_candidate_authentication", { kind: "require" }],
+  ["macos_metal_candidate_cache_restore", { kind: "require" }],
+  ["macos_metal_candidate_cache_miss", { kind: "require" }],
+  ["macos_metal_calibration_producer_authentication", { kind: "require" }],
+  ["macos_metal_constant_calibration_runs", { kind: "require" }],
+  ["macos_metal_protected_runtime_proof", { kind: "require" }],
+  ["macos_metal_candidate_staging", { kind: "require" }],
+  ["macos_metal_candidate_installed_proof", { kind: "require" }],
+  ["macos_metal_release_cell", { kind: "require" }],
+  ["macos_metal_retrieval_readiness_cell", { kind: "require" }],
+  ["macos_metal_candidate_installed_cell", { kind: "require" }],
+  ["macos_metal_release_cell_no_calibration", { kind: "forbid" }],
+  ["macos_metal_candidate_installed_cell_no_calibration", { kind: "forbid" }],
+  ["windows_vulkan_validate_candidate_installed_mode", { kind: "require" }],
+  ["windows_vulkan_source_build_tools", { kind: "require" }],
+  ["windows_vulkan_embedded_model", { kind: "require" }],
+  ["windows_vulkan_candidate_cache_restore", { kind: "require" }],
+  ["windows_vulkan_candidate_cache_miss", { kind: "require" }],
+  ["windows_vulkan_calibration_producer_authentication", { kind: "require" }],
+  ["windows_vulkan_protected_runtime_proof", { kind: "require" }],
+  ["windows_vulkan_candidate_staging", { kind: "require" }],
+  ["windows_vulkan_candidate_installed_proof", { kind: "require" }],
+  ["windows_vulkan_release_cell", { kind: "require" }],
+  ["windows_vulkan_candidate_installed_cell", { kind: "require" }],
+  ["windows_vulkan_retrieval_readiness_cell", { kind: "require" }],
+  ["windows_vulkan_release_cell_no_calibration", { kind: "forbid" }],
+  ["windows_vulkan_candidate_installed_cell_no_calibration", { kind: "forbid" }],
+  ["linux_vulkan_route_upstream_package", { kind: "require" }],
+  ["linux_vulkan_host_evidence", { kind: "require" }],
+  ["linux_vulkan_validate_candidate_installed_mode", { kind: "require" }],
+  ["linux_vulkan_candidate_cache_restore", { kind: "require" }],
+  ["linux_vulkan_candidate_cache_miss", { kind: "require" }],
+  ["linux_vulkan_calibration_producer_authentication", { kind: "require" }],
+  ["linux_vulkan_offline_retrieval_proof", { kind: "require" }],
+  ["linux_vulkan_candidate_staging", { kind: "require" }],
+  ["linux_vulkan_candidate_installed_proof", { kind: "require" }],
+  ["linux_vulkan_candidate_installed_proof_scope", { kind: "forbid" }],
+  ["linux_vulkan_release_cells", { kind: "require" }],
+  ["linux_vulkan_release_cells_no_calibration", { kind: "forbid" }],
+  ["linux_vulkan_optional_calibration_embedded_model", { kind: "require" }],
+  ["linux_vulkan_optional_calibration_collector", { kind: "require" }],
+  ["release_policy_install_dependencies", { kind: "require" }],
+  ["release_policy_workflow_syntax", { kind: "require" }],
+  ["release_policy_claim_contracts", { kind: "require" }],
+  ["release_policy_enforce_workflow_policy", { kind: "require" }],
+  ["release_preflight_release_authority", { kind: "require" }],
+  ["release_preflight_calibration_lineage", { kind: "require" }],
+  ["release_preflight_changelog_notes", { kind: "require" }],
+  ["release_preflight_refuse_existing_tag", { kind: "require" }],
+  ["release_preflight_marketplace_install_path", { kind: "require" }],
+  ["release_preflight_marketplace_fixture", { kind: "require" }],
+  ["release_preflight_resolve_reusable_evidence", { kind: "require" }],
+  ["release_preflight_resolve_no_freeze_replay", { kind: "forbid" }],
+  ["release_source_proof_refusal", { kind: "require" }],
+  ["release_pre_publish_closeout_reuse_binding", { kind: "require" }],
+  ["release_pre_publish_closeout_provenance", { kind: "require" }],
+  ["release_pre_publish_closeout_cell_download", { kind: "require" }],
+  ["release_pre_publish_closeout_evaluation", { kind: "require" }],
+  ["release_pre_publish_closeout_dev_revalidation", { kind: "require" }],
+  ["release_publish_release_notes", { kind: "require" }],
+  ["release_publish_manifest_generation", { kind: "require" }],
+  ["release_publish_closeout_summary", { kind: "require" }],
+  ["release_publish_refuse_existing_tag", { kind: "require" }],
+  ["release_publish_create_release", { kind: "require" }],
+  ["release_catalog_push", { kind: "require" }],
+  ["post_publish_smoke_restart_survival", { kind: "require" }],
+  ["release_post_publish_closeout_provenance", { kind: "require" }],
+  ["release_post_publish_container_digests", { kind: "require" }],
+  ["release_post_publish_closeout_evaluation", { kind: "require" }],
+  ["macos_metal_release_retrieval_cell_id", { kind: "require" }],
+  ["windows_vulkan_release_retrieval_cell_id", { kind: "require" }],
+  ["linux_vulkan_release_cell_ids", { kind: "require" }],
+  ["packaged_platform_pr_route_resolve_trusted_head", { kind: "require" }],
+  ["packaged_platform_pr_route_release_freeze", { kind: "require" }],
+  ["packaged_platform_pr_route_exact_head_source_proof", { kind: "require" }],
+  ["packaged_platform_pr_route_scope_selection", { kind: "require" }],
+  ["packaged_platform_pr_route_calibration_producer_authentication", { kind: "require" }],
+  ["packaged_platform_pr_route_cancel_superseded", { kind: "require" }],
+  ["packaged_platform_pr_calibration_assembly", { kind: "require" }],
+  ["packaged_platform_pr_closeout_proof", { kind: "require" }],
+  ["frozen_candidate_quality_candidate_cache_restore", { kind: "require" }],
+  ["frozen_candidate_quality_candidate_cache_miss", { kind: "require" }],
+  ["freeze_invalidation_superseded_revocation", { kind: "require" }],
+  ["freeze_invalidation_no_pending_reuse", { kind: "forbid" }],
+  ["source_proof_resolve_cancel_superseded", { kind: "require" }],
+  ["source_proof_resolve_record_freeze_receipt", { kind: "require" }],
+  ["freeze_barrier_source_resolve_release_freeze", { kind: "require" }],
+  ["source_proof_freeze_hostile_mutation_suites", { kind: "require" }],
+  ["source_proof_freeze_windows_native_probe", { kind: "require" }],
+  ["source_proof_freeze_windows_native_probe_isolation", { kind: "forbid" }],
+  ["source_proof_freeze_acceptance_publication", { kind: "require" }],
+  ["freeze_barrier_packaged_route_release_freeze", { kind: "require" }],
+  ["freeze_barrier_packaged_route_source_proof", { kind: "require" }],
+  ["freeze_barrier_release_reuse_resolution", { kind: "require" }],
+  ["freeze_barrier_release_no_freeze_replay", { kind: "forbid" }],
+]);
+// The graph owns every structural-pin rule instance (job existence, needs edges,
+// and workflow- or job-scoped permission grants) for workflow families migrated
+// off inline requireJob, needs, and permission checks; the checker owns only those
+// predicates and their message shapes.
+// Membership is exact and fail-closed: a graph that drops, renames, or invents a
+// structural pin must not load, so a rule instance cannot disappear by data edit.
+// Kind names the predicate a row binds.
+const STRUCTURAL_PIN_CONTRACTS = new Map([
+  ["saga_issue_link_guard_job", { kind: "job" }],
+  ["saga_issue_link_guard_pull_requests_read", { kind: "permission" }],
+  ["close_dev_issues_job", { kind: "job" }],
+  ["close_dev_issues_issues_write", { kind: "permission" }],
+  ["close_dev_issues_pull_requests_read", { kind: "permission" }],
+  ["post_publish_smoke_job", { kind: "job" }],
+  ["post_publish_smoke_actions_read", { kind: "permission" }],
+  ["plugin_static_job", { kind: "job" }],
+  ["rust_ci_linux_draft_job", { kind: "job" }],
+  ["source_proof_resolve_job", { kind: "job" }],
+  ["source_proof_full_source_gate_job", { kind: "job" }],
+  ["source_proof_full_source_gate_needs_resolve", { kind: "needs" }],
+  ["source_proof_retrieval_generalization_job", { kind: "job" }],
+  ["source_proof_windows_native_contracts_job", { kind: "job" }],
+  ["auto_release_detect_version_job", { kind: "job" }],
+  ["auto_release_release_job", { kind: "job" }],
+  ["auto_release_release_needs_detect_version", { kind: "needs" }],
+  ["auto_release_release_contents_write", { kind: "job_permission" }],
+  ["auto_release_release_actions_write", { kind: "job_permission" }],
+  ["auto_release_release_pull_requests_read", { kind: "job_permission" }],
+  ["macos_metal_packaged_metal_job", { kind: "job" }],
+  ["windows_vulkan_packaged_vulkan_job", { kind: "job" }],
+  ["linux_vulkan_route_job", { kind: "job" }],
+  ["linux_vulkan_packaged_vulkan_job", { kind: "job" }],
+  ["linux_vulkan_optional_constant_calibration_job", { kind: "job" }],
+  ["main_branch_source_guard_enforce_source_branch_job", { kind: "job" }],
+  ["release_actions_write", { kind: "permission" }],
+  ["release_pull_requests_read", { kind: "permission" }],
+  ["release_workflow_policy_job", { kind: "job" }],
+  ["release_preflight_job", { kind: "job" }],
+  ["release_source_proof_job", { kind: "job" }],
+  ["release_packaged_proof_job", { kind: "job" }],
+  ["release_macos_metal_proof_job", { kind: "job" }],
+  ["release_windows_vulkan_proof_job", { kind: "job" }],
+  ["release_linux_vulkan_proof_job", { kind: "job" }],
+  ["release_pre_publish_closeout_job", { kind: "job" }],
+  ["release_publish_job", { kind: "job" }],
+  ["release_marketplace_publish_job", { kind: "job" }],
+  ["release_post_publish_smoke_job", { kind: "job" }],
+  ["release_post_publish_closeout_job", { kind: "job" }],
+  ["packaged_platform_pr_route_job", { kind: "job" }],
+  ["packaged_platform_pr_calibration_macos_job", { kind: "job" }],
+  ["packaged_platform_pr_calibration_assemble_job", { kind: "job" }],
+  ["packaged_platform_pr_source_proof_job", { kind: "job" }],
+  ["packaged_platform_pr_packaged_proof_job", { kind: "job" }],
+  ["packaged_platform_pr_macos_metal_proof_job", { kind: "job" }],
+  ["packaged_platform_pr_frozen_candidate_quality_job", { kind: "job" }],
+  ["packaged_platform_pr_windows_vulkan_proof_job", { kind: "job" }],
+  ["packaged_platform_pr_linux_vulkan_proof_job", { kind: "job" }],
+  ["packaged_platform_pr_closeout_job", { kind: "job" }],
+  ["packaged_platform_pr_actions_write", { kind: "permission" }],
+  ["packaged_platform_pr_contents_read", { kind: "permission" }],
+  ["packaged_platform_pr_macos_metal_proof_needs", { kind: "needs" }],
+  ["packaged_platform_pr_windows_vulkan_proof_needs", { kind: "needs" }],
+  ["packaged_platform_pr_linux_vulkan_proof_needs", { kind: "needs" }],
+  ["packaged_platform_pr_closeout_needs", { kind: "needs" }],
+  ["frozen_candidate_quality_quality_job", { kind: "job" }],
+  ["frozen_candidate_quality_windows_quality_job", { kind: "job" }],
+  ["frozen_candidate_quality_linux_quality_job", { kind: "job" }],
+  ["release_freeze_invalidation_invalidate_job", { kind: "job" }],
+  ["source_proof_freeze_hostile_mutations_job", { kind: "job" }],
+  ["source_proof_freeze_windows_native_probe_job", { kind: "job" }],
+  ["source_proof_freeze_acceptance_job", { kind: "job" }],
+  ["freeze_barrier_source_proof_statuses_write", { kind: "permission" }],
+  ["freeze_barrier_source_proof_actions_write", { kind: "permission" }],
+  ["freeze_barrier_packaged_platform_pr_statuses_read", { kind: "permission" }],
+  ["freeze_barrier_packaged_platform_pr_actions_write", { kind: "permission" }],
+]);
+// The graph owns every cross-file constant-mirror rule instance (a repository file
+// that must repeat a reviewed constant verbatim) for families migrated off inline
+// file/fragment tables; the checker owns only the source-inclusion predicate and its
+// message shape. All rows bind that one predicate, so membership carries names
+// alone. Membership is exact and fail-closed: a graph that drops, renames, or
+// invents a mirror row must not load, so a rule instance cannot disappear by data
+// edit.
+const CONSTANT_MIRROR_ROWS = new Set([
+  "cargo_config_retrieval_aliases",
+  "codex_worktree_setup",
+  "grounding_setup_sh",
+  "grounding_setup_ps1",
+]);
+// The graph owns every command-list rule instance (an exact serial command sequence
+// a reviewed workflow step must run) for families migrated off inline checker
+// constants; the checker owns only the sequence-equality predicate, its message
+// shapes, and the cache-key composition digested from the declared seed commands.
+// All rows bind that one predicate, so membership carries names alone. Membership
+// is exact and fail-closed: a graph that drops, renames, or invents a command-list
+// row must not load, so a rule instance cannot disappear by data edit.
+const COMMAND_LIST_ROWS = new Set([
+  "draft_proof_commands",
+  "draft_seed_commands",
+]);
 const FAILURE_ORDER = new Map([
   ["unsupported_claim", 0],
   ["missing", 1],
@@ -186,12 +451,18 @@ export function deriveTrustedGitIdentity({ repoRoot, expectedSha }) {
 ///   * `source_tree` proves the reused commit resolves to this release's own tree. Nothing needs
 ///     substituting: every tree-derived identity a reused row declares is still checkable directly
 ///     against this release, and equating one would replace a live check with nothing. Hence [].
+///   * `calibration_source_lineage` runs the canonical calibration-lineage verifier against the
+///     release commit and proves that the reused commit is the selected source whose only product
+///     delta is the generated constant set. That determines the source tree exercised by the
+///     authoritative pre-calibration source gate, so that tree may replace the release tree for
+///     source-behavior evidence and nothing else.
 ///   * `native_fingerprint` proves the two commits' native build inputs -- crates/**, Cargo.lock,
 ///     vendor/**, the packaging scripts, the toolchain pins, version-normalized -- hash equal. That
 ///     determines the built accelerator, so accelerator execution evidence transfers across the
 ///     source_tree difference the binding exists to tolerate. It determines nothing about the
 ///     repository, the packaged bytes, the host, or the version, so none of those may be equated.
 const REUSE_BINDING_EQUATABLE_IDENTITY = Object.freeze({
+  calibration_source_lineage: Object.freeze(["source_tree"]),
   source_tree: Object.freeze([]),
   native_fingerprint: Object.freeze(["source_tree"]),
 });
@@ -222,6 +493,41 @@ export function verifyReuseBinding({ binding, repository, releaseCommit, reusedC
       fail(`reused commit ${reusedCommit} tree ${reusedTree} does not match release tree ${releaseTree}`);
     }
     return releaseTree;
+  }
+  if (binding === "calibration_source_lineage") {
+    const script = fileURLToPath(new URL(
+      "../.github/scripts/check-calibration-release-lineage.py",
+      import.meta.url,
+    ));
+    const result = spawnSync("python3", [
+      script,
+      "--repo",
+      repository,
+      "--expected-sha",
+      releaseCommit,
+      "--allow-promotion-commit",
+    ], {
+      cwd: repository,
+      encoding: "utf8",
+    });
+    if (result.status !== 0) {
+      fail(`calibration lineage of ${releaseCommit} failed: ${result.stderr.trim()}`);
+    }
+    let lineage;
+    try {
+      lineage = JSON.parse(result.stdout);
+    } catch (error) {
+      fail(`calibration lineage of ${releaseCommit} returned invalid JSON: ${error.message}`);
+    }
+    if (lineage.status !== "passed" || lineage.selection_commit !== reusedCommit) {
+      fail(
+        `reused commit ${reusedCommit} is not the calibrated source selected by ${releaseCommit}`,
+      );
+    }
+    if (!FULL_SHA.test(String(lineage.selection_tree ?? ""))) {
+      fail(`calibration lineage of ${releaseCommit} returned an invalid source tree`);
+    }
+    return lineage.selection_tree;
   }
   if (binding === "native_fingerprint") {
     const script = fileURLToPath(new URL("./native-fingerprint.mjs", import.meta.url));
@@ -400,6 +706,57 @@ function validateWithholdPolicy(policy, hosts, cellGroups) {
   }
 }
 
+/// The pre-dispatch reservation contract: a scheduled heartbeat whose tiny jobs run ON the three
+/// protected hosts, and a receipt the release writes before it dispatches any proof. The heartbeat
+/// shape exists because GITHUB_TOKEN cannot list self-hosted runners -- the runner-administration
+/// endpoints need an `administration` scope that workflow `permissions:` blocks cannot grant, and
+/// the program keeps new credentials out -- so liveness is proven by jobs the hosts themselves ran.
+function validateRunnerReservation(policy) {
+  const reservation = object(
+    policy.reservation,
+    "release claim graph.non_claim_policy.reservation",
+  );
+  if (reservation.schema !== "codestory.protected-runner-reservation/v1") {
+    fail(
+      "release claim graph.non_claim_policy.reservation.schema must be "
+      + "codestory.protected-runner-reservation/v1",
+    );
+  }
+  if (reservation.producer_workflow !== policy.producer_workflow) {
+    fail(
+      "non_claim_policy.reservation.producer_workflow must be the release workflow that "
+      + "dispatches the proofs the receipt gates",
+    );
+  }
+  nonEmptyText(reservation.producer_job, "non_claim_policy.reservation.producer_job");
+  const receiptArtifact = nonEmptyText(
+    reservation.receipt_artifact,
+    "non_claim_policy.reservation.receipt_artifact",
+  );
+  if (!receiptArtifact.includes("{attempt}")) {
+    fail("non_claim_policy.reservation.receipt_artifact must be attempt-qualified");
+  }
+  // One bounded recheck, mirroring the one automatic rerun a lost runner is owed: the same shape
+  // of bound in both routes keeps "the recovery was spent first" one idea, not two.
+  if (reservation.maximum_observation_attempts !== policy.maximum_run_attempts) {
+    fail(
+      "non_claim_policy.reservation.maximum_observation_attempts must mirror maximum_run_attempts",
+    );
+  }
+  const heartbeat = object(reservation.heartbeat, "non_claim_policy.reservation.heartbeat");
+  const heartbeatWorkflow = nonEmptyText(
+    heartbeat.workflow,
+    "non_claim_policy.reservation.heartbeat.workflow",
+  );
+  if (!heartbeatWorkflow.startsWith(".github/workflows/") || !heartbeatWorkflow.endsWith(".yml")) {
+    fail("non_claim_policy.reservation.heartbeat.workflow must be a repository workflow path");
+  }
+  nonEmptyText(heartbeat.cron, "non_claim_policy.reservation.heartbeat.cron");
+  if (!Number.isInteger(heartbeat.tolerance_minutes) || heartbeat.tolerance_minutes <= 0) {
+    fail("non_claim_policy.reservation.heartbeat.tolerance_minutes must be a positive integer");
+  }
+}
+
 function validateNonClaimPolicy(graph, cellGroups) {
   const policy = object(graph.non_claim_policy, "release claim graph.non_claim_policy");
   if (policy.schema !== "codestory.release-non-claim/v1") {
@@ -411,7 +768,26 @@ function validateNonClaimPolicy(graph, cellGroups) {
     fail("release claim graph.non_claim_policy.runtime_execution must be not_proven_by_package");
   }
   nonEmptyText(policy.reason, "release claim graph.non_claim_policy.reason");
+  nonEmptyText(
+    policy.pre_assignment_reason,
+    "release claim graph.non_claim_policy.pre_assignment_reason",
+  );
+  if (policy.pre_assignment_reason === policy.reason) {
+    fail(
+      "release claim graph.non_claim_policy.pre_assignment_reason must be a distinct typed reason: "
+      + "a host that was never assigned its job and a host lost mid-job are different facts",
+    );
+  }
   nonEmptyText(policy.annotation, "release claim graph.non_claim_policy.annotation");
+  // The annotation is what Actions writes on a job whose runner died mid-execution. A job that was
+  // never assigned has no annotation, so the field is scoped to the lost-runner reason and a
+  // pre-assignment non-claim must not quote it.
+  if (policy.annotation_reason !== policy.reason) {
+    fail(
+      "release claim graph.non_claim_policy.annotation_reason must scope the annotation to the "
+      + "mid-job lost-runner reason; a never-assigned job carries no Actions annotation",
+    );
+  }
   nonEmptyText(policy.recovery_contract, "release claim graph.non_claim_policy.recovery_contract");
   if (policy.maximum_run_attempts !== 2) {
     fail("release claim graph.non_claim_policy.maximum_run_attempts must be 2");
@@ -419,6 +795,7 @@ function validateNonClaimPolicy(graph, cellGroups) {
   for (const key of ["producer_workflow", "producer_job", "producer_job_name"]) {
     nonEmptyText(policy[key], `release claim graph.non_claim_policy.${key}`);
   }
+  validateRunnerReservation(policy);
   const producedCells = cellsByProducerJobName(cellGroups);
   const hosts = uniqueById(policy.hosts, "release claim graph.non_claim_policy.hosts");
   validateWithholdPolicy(policy, hosts, cellGroups);
@@ -428,12 +805,41 @@ function validateNonClaimPolicy(graph, cellGroups) {
   if (JSON.stringify([...hosts.keys()].sort()) !== JSON.stringify(acceleratorInstances)) {
     fail("non_claim_policy.hosts must name exactly the protected accelerator instances");
   }
+  const protectedRunnersByWorkflow = new Map(
+    (graph.workflow_policy?.protected_jobs ?? []).map((row) => [row.workflow, row.runner]),
+  );
+  const heartbeatJobNames = new Set();
   for (const [hostId, host] of hosts) {
     nonEmptyText(host.unavailable_producer_workflow, `non_claim_policy.hosts ${hostId}.unavailable_producer_workflow`);
     const jobName = nonEmptyText(
       host.unavailable_producer_job_name,
       `non_claim_policy.hosts ${hostId}.unavailable_producer_job_name`,
     );
+    // The labels the heartbeat has to run on are the labels the proof runs on: a heartbeat that
+    // proves some other machine alive vouches for nothing. The protected_jobs contract already
+    // pins the proof's labels, so the host's copy is held to that same row rather than trusted.
+    const runnerLabels = stringArray(
+      host.runner_labels,
+      `non_claim_policy.hosts ${hostId}.runner_labels`,
+      { nonEmpty: true },
+    );
+    const protectedRunner = protectedRunnersByWorkflow.get(
+      host.unavailable_producer_workflow.split("/").at(-1),
+    );
+    if (JSON.stringify(runnerLabels) !== JSON.stringify(protectedRunner ?? null)) {
+      fail(
+        `non_claim_policy.hosts ${hostId}.runner_labels must equal the protected_jobs runner `
+        + "labels of the proof the heartbeat vouches for",
+      );
+    }
+    const heartbeatJobName = nonEmptyText(
+      host.heartbeat_job_name,
+      `non_claim_policy.hosts ${hostId}.heartbeat_job_name`,
+    );
+    if (heartbeatJobNames.has(heartbeatJobName)) {
+      fail(`non_claim_policy.hosts duplicates heartbeat job name ${heartbeatJobName}`);
+    }
+    heartbeatJobNames.add(heartbeatJobName);
     // One artifact container may only hold cells of a single closeout phase, because the phase's
     // trusted producer map is what authorizes every manifest inside the container it downloads.
     const hostArtifacts = object(
@@ -466,7 +872,7 @@ function validateNonClaimPolicy(graph, cellGroups) {
 // Marketplace catalog publication is delivery, not a release gate: it happens after the tag and
 // the GitHub release already exist, so failing the release on it would only convert a recoverable
 // delivery gap into an unrecoverable one. The price of that is that the release must say which of
-// the two states it is in, so the graph names both and pins a distinct installer identity to each.
+// the state it is in, so the graph names each and pins a distinct installer identity to each.
 // A run that could not publish records the deferred identity in its post-publish cells; nothing in
 // the pipeline is allowed to record the published identity without the catalog push succeeding.
 function validateCatalogDelivery(policy, dependencies, cellGroups) {
@@ -479,8 +885,8 @@ function validateCatalogDelivery(policy, dependencies, cellGroups) {
   if (delivery.release_gate !== false) {
     fail("workflow_policy.catalog_delivery.release_gate must be false: catalog publication is delivery, not a release gate");
   }
-  if (!Array.isArray(delivery.states) || delivery.states.length !== 2) {
-    fail("workflow_policy.catalog_delivery.states must name exactly the published and deferred states");
+  if (!Array.isArray(delivery.states) || delivery.states.length !== 3) {
+    fail("workflow_policy.catalog_delivery.states must name exactly the published, deferred, and restored states");
   }
   const installers = new Set();
   const byId = new Map();
@@ -503,7 +909,7 @@ function validateCatalogDelivery(policy, dependencies, cellGroups) {
     installers.add(installer);
     byId.set(id, state);
   }
-  for (const id of ["published", "deferred"]) {
+  for (const id of ["published", "deferred", "restored"]) {
     if (!byId.has(id)) fail(`workflow_policy.catalog_delivery.states must declare the ${id} state`);
   }
   if (byId.get("published").live_catalog_revision !== true) {
@@ -512,7 +918,10 @@ function validateCatalogDelivery(policy, dependencies, cellGroups) {
   if (byId.get("deferred").live_catalog_revision !== false) {
     fail("workflow_policy.catalog_delivery deferred state must not consume a live catalog revision");
   }
-  // Naming the two states is not enough on its own: something has to read the mark, or a
+  if (byId.get("restored").live_catalog_revision !== false) {
+    fail("workflow_policy.catalog_delivery restored state must not consume the failed live catalog revision");
+  }
+  // Naming the states is not enough on its own: something has to read the mark, or a
   // deferred release's closeout verdict stays indistinguishable from a published one. This
   // names the post-publish cell family whose signed `installer` identity the closeout resolves
   // the delivery state from, so the graph cannot declare the states without a reader.
@@ -532,6 +941,44 @@ function validateCatalogDelivery(policy, dependencies, cellGroups) {
       fail(`workflow_policy.catalog_delivery.installed_cell_group ${installedCellGroup} must carry installer in ${key}`);
     }
   }
+  // Publication and recovery are different events and the ledger has to be able to tell them
+  // apart, so recovery gets its own declared identity rather than reusing the published one. The
+  // rollback it performs is only real if something records what to roll back TO, which is what
+  // `previous_pin_outputs` names: the publication job carries them out of the catalog move, and a
+  // catalog that cannot name its previous pin is never moved.
+  const recovery = object(delivery.recovery, "workflow_policy.catalog_delivery.recovery");
+  const recoveryId = nonEmptyText(recovery.id, "workflow_policy.catalog_delivery.recovery.id");
+  if (byId.has(recoveryId)) {
+    fail(`workflow_policy.catalog_delivery.recovery.id ${recoveryId} must be distinct from the delivery states`);
+  }
+  if (!identityMatchesFormat(recoveryId, "identifier")) {
+    fail("workflow_policy.catalog_delivery.recovery.id does not match identifier");
+  }
+  const pinOutputs = recovery.previous_pin_outputs;
+  if (!Array.isArray(pinOutputs) || pinOutputs.length === 0) {
+    fail("workflow_policy.catalog_delivery.recovery.previous_pin_outputs must name the recorded rollback target");
+  }
+  for (const [index, name] of pinOutputs.entries()) {
+    const output = nonEmptyText(
+      name,
+      `workflow_policy.catalog_delivery.recovery.previous_pin_outputs[${index}]`,
+    );
+    if (!identityMatchesFormat(output, "identifier")) {
+      fail(`workflow_policy.catalog_delivery.recovery.previous_pin_outputs[${index}] does not match identifier`);
+    }
+  }
+  const restoredState = nonEmptyText(
+    recovery.restored_state,
+    "workflow_policy.catalog_delivery.recovery.restored_state",
+  );
+  if (restoredState !== "restored" || !byId.has(restoredState)) {
+    fail("workflow_policy.catalog_delivery.recovery.restored_state must name the declared restored state");
+  }
+  // Stated, not implied. This may be true only with a distinct closeout-readable restored state;
+  // workflow policy separately proves the release lane executes the prior-pin restore.
+  if (recovery.automatic_restore !== true) {
+    fail("workflow_policy.catalog_delivery.recovery.automatic_restore must be true with executable prior-pin restore");
+  }
   return delivery;
 }
 
@@ -541,10 +988,10 @@ function validateCalibrationPolicy(value) {
     calibration.coordinator_workflow !== "packaged-platform-pr.yml"
     || calibration.mode !== "calibration"
     || calibration.assembly_job !== "calibration-assemble"
-    || calibration.pre_collection_source_proof_required !== false
-    || calibration.source_proof_stage !== "frozen_candidate_before_qualification"
+    || calibration.pre_collection_source_proof_required !== true
+    || calibration.source_proof_stage !== "source_stabilization_before_calibration"
   ) {
-    fail("workflow_policy.calibration must collect before the sole frozen-candidate source proof");
+    fail("workflow_policy.calibration must require source stabilization before collection");
   }
   if (calibration.runs_per_required_cell !== 3) {
     fail("workflow_policy.calibration must require exactly three clean runs per required cell");
@@ -643,7 +1090,185 @@ function validateCalibrationPolicy(value) {
   }
 }
 
-function validateQualificationPolicy(value) {
+function validatePinnedPrograms(policy) {
+  const programs = object(policy.pinned_programs, "workflow_policy.pinned_programs");
+  for (const name of Object.keys(programs)) {
+    if (!PINNED_PROGRAM_CONTRACTS.has(name)) {
+      fail(`workflow_policy.pinned_programs names unknown pinned program ${name}`);
+    }
+  }
+  for (const [name, contract] of PINNED_PROGRAM_CONTRACTS) {
+    if (programs[name] === undefined) {
+      fail(`workflow_policy.pinned_programs must declare ${name}`);
+    }
+    const label = `workflow_policy.pinned_programs.${name}`;
+    const row = object(programs[name], label);
+    const expectedKeys = [
+      "subject",
+      "file",
+      ...(contract.job ? ["job"] : []),
+      ...(contract.step ? ["step"] : []),
+      "sha256",
+      "reason",
+    ];
+    if (
+      JSON.stringify([...Object.keys(row)].sort())
+        !== JSON.stringify([...expectedKeys].sort())
+    ) {
+      fail(`${label} must carry exactly ${expectedKeys.join(", ")}`);
+    }
+    if (row.subject !== contract.subject) {
+      fail(`${label}.subject must be ${contract.subject}`);
+    }
+    nonEmptyText(row.file, `${label}.file`);
+    if (contract.job) nonEmptyText(row.job, `${label}.job`);
+    if (contract.step) nonEmptyText(row.step, `${label}.step`);
+    if (typeof row.sha256 !== "string" || !SHA256.test(row.sha256)) {
+      fail(`${label}.sha256 must be a 64-hex sha256 digest`);
+    }
+    nonEmptyText(row.reason, `${label}.reason`);
+  }
+  return programs;
+}
+
+function validateStepFragments(policy) {
+  const rules = object(policy.step_fragments, "workflow_policy.step_fragments");
+  for (const name of Object.keys(rules)) {
+    if (!STEP_FRAGMENT_CONTRACTS.has(name)) {
+      fail(`workflow_policy.step_fragments names unknown step fragment rule ${name}`);
+    }
+  }
+  for (const [name, contract] of STEP_FRAGMENT_CONTRACTS) {
+    if (rules[name] === undefined) {
+      fail(`workflow_policy.step_fragments must declare ${name}`);
+    }
+    const label = `workflow_policy.step_fragments.${name}`;
+    const row = object(rules[name], label);
+    const expectedKeys = ["kind", "file", "job", "step", "fragments", "reason"];
+    if (
+      JSON.stringify([...Object.keys(row)].sort())
+        !== JSON.stringify([...expectedKeys].sort())
+    ) {
+      fail(`${label} must carry exactly ${expectedKeys.join(", ")}`);
+    }
+    if (row.kind !== contract.kind) {
+      fail(`${label}.kind must be ${contract.kind}`);
+    }
+    nonEmptyText(row.file, `${label}.file`);
+    nonEmptyText(row.job, `${label}.job`);
+    nonEmptyText(row.step, `${label}.step`);
+    stringArray(row.fragments, `${label}.fragments`, { nonEmpty: true });
+    nonEmptyText(row.reason, `${label}.reason`);
+  }
+  return rules;
+}
+
+function validateStructuralPins(policy) {
+  const pins = object(policy.structural_pins, "workflow_policy.structural_pins");
+  for (const name of Object.keys(pins)) {
+    if (!STRUCTURAL_PIN_CONTRACTS.has(name)) {
+      fail(`workflow_policy.structural_pins names unknown structural pin ${name}`);
+    }
+  }
+  for (const [name, contract] of STRUCTURAL_PIN_CONTRACTS) {
+    if (pins[name] === undefined) {
+      fail(`workflow_policy.structural_pins must declare ${name}`);
+    }
+    const label = `workflow_policy.structural_pins.${name}`;
+    const row = object(pins[name], label);
+    const expectedKeys = contract.kind === "job"
+      ? ["kind", "file", "job", "reason"]
+      : contract.kind === "needs"
+        ? ["kind", "file", "job", "needs", "reason"]
+        : contract.kind === "job_permission"
+          ? ["kind", "file", "job", "scope", "access", "reason"]
+          : ["kind", "file", "scope", "access", "reason"];
+    if (
+      JSON.stringify([...Object.keys(row)].sort())
+        !== JSON.stringify([...expectedKeys].sort())
+    ) {
+      fail(`${label} must carry exactly ${expectedKeys.join(", ")}`);
+    }
+    if (row.kind !== contract.kind) {
+      fail(`${label}.kind must be ${contract.kind}`);
+    }
+    nonEmptyText(row.file, `${label}.file`);
+    if (contract.kind === "job") {
+      nonEmptyText(row.job, `${label}.job`);
+    } else if (contract.kind === "needs") {
+      nonEmptyText(row.job, `${label}.job`);
+      stringArray(row.needs, `${label}.needs`, { nonEmpty: true });
+    } else {
+      if (contract.kind === "job_permission") {
+        nonEmptyText(row.job, `${label}.job`);
+      }
+      nonEmptyText(row.scope, `${label}.scope`);
+      if (row.access !== "read" && row.access !== "write") {
+        fail(`${label}.access must be read or write`);
+      }
+    }
+    nonEmptyText(row.reason, `${label}.reason`);
+  }
+  return pins;
+}
+
+function validateConstantMirrors(policy) {
+  const mirrors = object(policy.constant_mirrors, "workflow_policy.constant_mirrors");
+  for (const name of Object.keys(mirrors)) {
+    if (!CONSTANT_MIRROR_ROWS.has(name)) {
+      fail(`workflow_policy.constant_mirrors names unknown constant mirror ${name}`);
+    }
+  }
+  for (const name of CONSTANT_MIRROR_ROWS) {
+    if (mirrors[name] === undefined) {
+      fail(`workflow_policy.constant_mirrors must declare ${name}`);
+    }
+    const label = `workflow_policy.constant_mirrors.${name}`;
+    const row = object(mirrors[name], label);
+    const expectedKeys = ["file", "fragments", "reason"];
+    if (
+      JSON.stringify([...Object.keys(row)].sort())
+        !== JSON.stringify([...expectedKeys].sort())
+    ) {
+      fail(`${label} must carry exactly ${expectedKeys.join(", ")}`);
+    }
+    nonEmptyText(row.file, `${label}.file`);
+    stringArray(row.fragments, `${label}.fragments`, { nonEmpty: true });
+    nonEmptyText(row.reason, `${label}.reason`);
+  }
+  return mirrors;
+}
+
+function validateCommandLists(policy) {
+  const lists = object(policy.command_lists, "workflow_policy.command_lists");
+  for (const name of Object.keys(lists)) {
+    if (!COMMAND_LIST_ROWS.has(name)) {
+      fail(`workflow_policy.command_lists names unknown command list ${name}`);
+    }
+  }
+  for (const name of COMMAND_LIST_ROWS) {
+    if (lists[name] === undefined) {
+      fail(`workflow_policy.command_lists must declare ${name}`);
+    }
+    const label = `workflow_policy.command_lists.${name}`;
+    const row = object(lists[name], label);
+    const expectedKeys = ["file", "job", "step", "commands", "reason"];
+    if (
+      JSON.stringify([...Object.keys(row)].sort())
+        !== JSON.stringify([...expectedKeys].sort())
+    ) {
+      fail(`${label} must carry exactly ${expectedKeys.join(", ")}`);
+    }
+    nonEmptyText(row.file, `${label}.file`);
+    nonEmptyText(row.job, `${label}.job`);
+    nonEmptyText(row.step, `${label}.step`);
+    stringArray(row.commands, `${label}.commands`, { nonEmpty: true });
+    nonEmptyText(row.reason, `${label}.reason`);
+  }
+  return lists;
+}
+
+function validateQualificationPolicy(value, pinnedPrograms) {
   const qualification = object(value, "workflow_policy.qualification");
   if (
     qualification.coordinator_workflow !== "packaged-platform-pr.yml"
@@ -756,8 +1381,14 @@ function validateQualificationPolicy(value) {
     archive_cache_contract: "candidate_archive_cache",
     archive_transfer: "authenticated_miss_only",
     evaluation_owner: "isolated_reusable_workflow",
+    // The graph is its own digest authority here: the quality contract must cite the
+    // same evaluation-owner pin the pinned_programs block carries, so the two rows
+    // cannot drift apart and the workflow-policy checker enforces the single value.
     evaluation_owner_sha256:
-      "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173",
+      object(
+        pinnedPrograms.frozen_candidate_quality_workflow,
+        "workflow_policy.pinned_programs.frozen_candidate_quality_workflow",
+      ).sha256,
     evaluation_contract: "publishable-three-repeat-packet/v1",
     task_count: 1,
     repeats_per_task: 3,
@@ -826,6 +1457,132 @@ function exactStringList(value, expected, label) {
   return actual;
 }
 
+function validateProofFloor(value) {
+  const floor = object(value, "workflow_policy.proof_floor");
+  if (
+    floor.schema !== 1
+    || JSON.stringify(Object.keys(floor).sort())
+      !== JSON.stringify([
+        "architecture_contract",
+        "crate_durability",
+        "merged_suite_lanes",
+        "schema",
+      ])
+  ) {
+    fail("workflow_policy.proof_floor must use the exact schema 1 contract");
+  }
+
+  const architecture = object(
+    floor.architecture_contract,
+    "workflow_policy.proof_floor.architecture_contract",
+  );
+  nonEmptyText(
+    architecture.workflow,
+    "workflow_policy.proof_floor.architecture_contract.workflow",
+  );
+  if (
+    JSON.stringify(Object.keys(architecture).sort())
+      !== JSON.stringify(["command", "job", "workflow"])
+    || architecture.job !== "linux-contracts"
+    || architecture.command
+      !== "cargo test --locked -p codestory-cli --test architecture_contracts"
+  ) {
+    fail("workflow_policy.proof_floor architecture contract must stay in the universal linux-contracts lane");
+  }
+
+  const durability = object(
+    floor.crate_durability,
+    "workflow_policy.proof_floor.crate_durability",
+  );
+  if (
+    JSON.stringify(Object.keys(durability).sort())
+      !== JSON.stringify([
+        "artifact_free",
+        "branches",
+        "cache_namespace",
+        "commands",
+        "job",
+        "paths",
+        "timeout_minutes",
+        "workflow",
+      ])
+    || durability.workflow !== "crate-durability.yml"
+    || durability.job !== "linux-durability"
+    || durability.artifact_free !== true
+    || durability.timeout_minutes !== 60
+    || durability.cache_namespace !== "crate-durability-v1"
+  ) {
+    fail("workflow_policy.proof_floor crate durability lane must keep its source-only identity and bound");
+  }
+  exactStringList(
+    durability.branches,
+    ["main", "dev/codestory-next"],
+    "workflow_policy.proof_floor.crate_durability.branches",
+  );
+  exactStringList(
+    durability.paths,
+    [
+      "Cargo.toml",
+      "Cargo.lock",
+      "vendor/**",
+      "crates/codestory-store/**",
+      "crates/codestory-indexer/**",
+      "crates/codestory-workspace/**",
+      "crates/codestory-contracts/**",
+      "crates/codestory-agent/**",
+      ".github/workflows/crate-durability.yml",
+      ".github/scripts/check-workflow-policy.mjs",
+      ".github/scripts/check-workflow-policy.test.mjs",
+      "release-claims.json",
+      "scripts/codestory-release-claims.mjs",
+      "scripts/tests/codestory-release-claims.test.mjs",
+      "docs/contributors/testing-matrix.md",
+    ],
+    "workflow_policy.proof_floor.crate_durability.paths",
+  );
+  exactStringList(
+    durability.commands,
+    [
+      "cargo test --locked -p codestory-store",
+      "cargo test --locked -p codestory-indexer --test fidelity_regression",
+      "cargo test --locked -p codestory-indexer --test tictactoe_language_coverage",
+      "cargo test --locked -p codestory-agent",
+    ],
+    "workflow_policy.proof_floor.crate_durability.commands",
+  );
+
+  const mergedLanes = object(
+    floor.merged_suite_lanes,
+    "workflow_policy.proof_floor.merged_suite_lanes",
+  );
+  nonEmptyText(
+    mergedLanes.workflow,
+    "workflow_policy.proof_floor.merged_suite_lanes.workflow",
+  );
+  if (
+    JSON.stringify(Object.keys(mergedLanes).sort())
+      !== JSON.stringify(["commands", "job", "step", "workflow"])
+    || mergedLanes.job !== "linux-contracts"
+    || mergedLanes.step !== "Evidence, readiness, hooks, and workspace contract tests"
+  ) {
+    fail("workflow_policy.proof_floor merged suite lanes must stay in the universal linux-contracts lane");
+  }
+  exactStringList(
+    mergedLanes.commands,
+    [
+      "cargo test --locked -p codestory-runtime --lib agent::packet_evidence::",
+      "cargo test --locked -p codestory-runtime --lib agent::packet_compiler::tests",
+      "cargo test --locked -p codestory-runtime --lib agent::packet_batch::",
+      "cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::",
+      "cargo test --locked -p codestory-runtime --lib services::",
+      "cargo test --locked -p codestory-cli --lib",
+      "cargo test --locked -p codestory-workspace",
+      "cargo test --locked -p codestory-agent",
+    ],
+    "workflow_policy.proof_floor.merged_suite_lanes.commands",
+  );
+}
+
 function validateWindowsPackageGraph(value) {
   const graph = object(value, "workflow_policy.windows_package_graph");
   if (
@@ -876,6 +1633,41 @@ function validateWindowsPackageGraph(value) {
       "artifact_transfer",
     ],
     "workflow_policy.windows_package_graph.timing_phases",
+  );
+  validateWindowsLinkTiming(graph.link_timing);
+}
+
+// `msvc_link` was reported from a substring count that the Cargo progress line
+// for the crate named `time` satisfied. The claim graph now names the selector,
+// the receipt it writes, and the typed states it may report, so a package can
+// only claim a linker duration that came from an explicit link boundary.
+function validateWindowsLinkTiming(value) {
+  const timing = object(value, "workflow_policy.windows_package_graph.link_timing");
+  if (
+    timing.phase !== "msvc_link"
+    || timing.selector !== ".github/scripts/windows-link-timing.mjs"
+    || timing.record_schema !== "codestory.windows-link-timing/v1"
+    || timing.record_file !== "windows-link-timing.json"
+    || timing.evidence !== "explicit_link_time_boundary"
+  ) {
+    fail("workflow_policy.windows_package_graph.link_timing must bind the explicit linker boundary selector");
+  }
+  if (timing.substring_match !== false) {
+    fail("workflow_policy.windows_package_graph.link_timing.substring_match must be false");
+  }
+  if (timing.observational !== true) {
+    fail("workflow_policy.windows_package_graph.link_timing.observational must be true: missing timing cannot invalidate a package");
+  }
+  exactStringList(
+    timing.unavailable_reasons,
+    [
+      "incoherent-linker-report",
+      "link-exceeds-build-interval",
+      "linker-log-empty",
+      "linker-log-missing",
+      "no-explicit-linker-report",
+    ],
+    "workflow_policy.windows_package_graph.link_timing.unavailable_reasons",
   );
 }
 
@@ -1440,6 +2232,12 @@ export function validateReleaseClaimGraph(graph) {
   if (!Number.isInteger(policy.artifact_retention_days) || policy.artifact_retention_days <= 0) {
     fail("workflow_policy.artifact_retention_days must be a positive integer");
   }
+  const pinnedPrograms = validatePinnedPrograms(policy);
+  validateStepFragments(policy);
+  validateStructuralPins(policy);
+  validateConstantMirrors(policy);
+  validateCommandLists(policy);
+  validateProofFloor(policy.proof_floor);
   if (!Array.isArray(policy.package_matrix) || policy.package_matrix.length !== 3) {
     fail("workflow_policy.package_matrix must define three release package rows");
   }
@@ -1460,7 +2258,7 @@ export function validateReleaseClaimGraph(graph) {
   validateCandidateArchiveCache(policy.candidate_archive_cache);
   validateModelMaterialCache(policy.model_material_cache);
   validateCalibrationPolicy(policy.calibration);
-  validateQualificationPolicy(policy.qualification);
+  validateQualificationPolicy(policy.qualification, pinnedPrograms);
   validatePublicSupport(graph, targets, cellGroups);
   if (!Array.isArray(policy.protected_jobs) || policy.protected_jobs.length === 0) {
     fail("workflow_policy.protected_jobs must be a non-empty array");
@@ -1632,45 +2430,44 @@ export function validateReleaseClaimGraph(graph) {
   );
   if (
     JSON.stringify(Object.keys(freezePhases).sort())
-      !== JSON.stringify(["calibration_source", "frozen_candidate"])
+      !== JSON.stringify(["frozen_candidate", "source_stabilization"])
   ) {
     fail(
       "workflow_policy.release_freeze_barrier.acceptance.phases must define "
-      + "exactly calibration_source and frozen_candidate",
+      + "exactly source_stabilization and frozen_candidate",
     );
   }
   const constantSet =
     "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
-  const calibrationSource = object(
-    freezePhases.calibration_source,
-    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source",
+  const sourceStabilization = object(
+    freezePhases.source_stabilization,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.source_stabilization",
   );
-  const calibrationFuture = stringArray(
-    calibrationSource.known_future_source_changes,
-    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source.known_future_source_changes",
+  const stabilizationFuture = stringArray(
+    sourceStabilization.known_future_source_changes,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.source_stabilization.known_future_source_changes",
     { nonEmpty: true },
   );
-  const calibrationActions = stringArray(
-    calibrationSource.planned_actions,
-    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source.planned_actions",
+  const stabilizationActions = stringArray(
+    sourceStabilization.planned_actions,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.source_stabilization.planned_actions",
     { nonEmpty: true },
   );
   if (
-    JSON.stringify(calibrationFuture) !== JSON.stringify([constantSet])
-    || JSON.stringify(calibrationActions) !== JSON.stringify([
-      "calibration-source-acceptance",
+    JSON.stringify(stabilizationFuture) !== JSON.stringify([constantSet])
+    || JSON.stringify(stabilizationActions) !== JSON.stringify([
+      "source-stabilization",
       "calibration",
       "generated-constant-freeze",
       "frozen-candidate-acceptance",
-      "source-proof",
       "qualification",
       "release",
     ])
-    || calibrationSource.next_permitted_mutation !== constantSet
+    || sourceStabilization.next_permitted_mutation !== constantSet
   ) {
     fail(
-      "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source "
-      + "must permit only calibration then the generated constant-set freeze before source proof",
+      "workflow_policy.release_freeze_barrier.acceptance.phases.source_stabilization "
+      + "must finish source proof before permitting only calibration and the generated constant-set freeze",
     );
   }
   const frozenCandidate = object(
@@ -1690,7 +2487,6 @@ export function validateReleaseClaimGraph(graph) {
     frozenFuture.length !== 0
     || JSON.stringify(frozenActions) !== JSON.stringify([
       "frozen-candidate-acceptance",
-      "source-proof",
       "qualification",
       "release",
     ])
@@ -1705,7 +2501,7 @@ export function validateReleaseClaimGraph(graph) {
   if (actionlint.version !== "1.7.12") fail("workflow_policy.actionlint.version must be 1.7.12");
   nonEmptyText(actionlint.config, "workflow_policy.actionlint.config");
   const assets = object(actionlint.assets, "workflow_policy.actionlint.assets");
-  const requiredAssets = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-arm64", "win32-x64"];
+  const requiredAssets = ["darwin-arm64", "darwin-x64", "linux-x64", "win32-arm64", "win32-x64"];
   if (JSON.stringify(Object.keys(assets).sort()) !== JSON.stringify(requiredAssets)) {
     fail(`workflow_policy.actionlint.assets must define exactly ${requiredAssets.join(", ")}`);
   }
@@ -1725,7 +2521,42 @@ export function loadReleaseClaimGraph(repoRoot = path.resolve(path.dirname(fileU
   } catch (error) {
     fail(`failed to read release claim graph ${graphPath}: ${error.message}`);
   }
-  return validateReleaseClaimGraph(graph);
+  const validated = validateReleaseClaimGraph(graph);
+  // Shape validation is filesystem-free so hostile-graph tests stay hermetic; loading
+  // a graph for this repository additionally requires every pinned program's subject
+  // file to exist, so a pin cannot outlive or predate the program it vouches for.
+  for (const [name, row] of Object.entries(validated.workflow_policy.pinned_programs)) {
+    const relative = row.subject === "helper_file_text"
+      ? row.file
+      : path.join(".github", "workflows", row.file);
+    if (!existsSync(path.join(repoRoot, relative))) {
+      fail(`workflow_policy.pinned_programs.${name} pins missing file ${relative}`);
+    }
+  }
+  for (const [name, row] of Object.entries(validated.workflow_policy.step_fragments)) {
+    const relative = path.join(".github", "workflows", row.file);
+    if (!existsSync(path.join(repoRoot, relative))) {
+      fail(`workflow_policy.step_fragments.${name} binds missing file ${relative}`);
+    }
+  }
+  for (const [name, row] of Object.entries(validated.workflow_policy.structural_pins)) {
+    const relative = path.join(".github", "workflows", row.file);
+    if (!existsSync(path.join(repoRoot, relative))) {
+      fail(`workflow_policy.structural_pins.${name} binds missing file ${relative}`);
+    }
+  }
+  for (const [name, row] of Object.entries(validated.workflow_policy.constant_mirrors)) {
+    if (!existsSync(path.join(repoRoot, row.file))) {
+      fail(`workflow_policy.constant_mirrors.${name} binds missing file ${row.file}`);
+    }
+  }
+  for (const [name, row] of Object.entries(validated.workflow_policy.command_lists)) {
+    const relative = path.join(".github", "workflows", row.file);
+    if (!existsSync(path.join(repoRoot, relative))) {
+      fail(`workflow_policy.command_lists.${name} binds missing file ${relative}`);
+    }
+  }
+  return validated;
 }
 
 const PUBLIC_SUPPORT_START = "<!-- codestory-public-support:start -->";
@@ -1827,6 +2658,12 @@ export function releaseAssetNames(graph, version) {
         `codestory-cli-v${version}-${target}.${extension}`,
     ),
     "SHA256SUMS.txt",
+    // The native lane's archive digests. They cannot be pinned in source -- the archives are built
+    // from the tree that would carry them -- so the release generates them from the archives it
+    // just built and ships them here, where the launcher and the pre-publish provision proof can
+    // read them. Digest data over TLS until the signature arms: corruption detection, not
+    // authentication.
+    RELEASE_MANIFEST_ASSET,
     // The one machine-readable statement of what this release did and did not prove. It ships with
     // the release because the README tells readers to consult the ledger rather than the platform
     // table, and an Actions artifact with a 30-day retention is not something a release consumer
@@ -1861,14 +2698,22 @@ export function renderReleasePlatformNotes(graph, ledger) {
   const withheldCells = new Set(stringArray(closeout.withheld_cells, "closeout ledger.withheld_cells"));
   const hostByTarget = acceleratorHostByTarget(graph);
   const reason = graph.non_claim_policy.reason;
+  // The ledger records WHICH typed reason withheld a cell -- lost mid-job and never assigned are
+  // different facts -- so the published wording quotes the recorded reason, not the graph default.
+  const recordedReasons = new Map(
+    (Array.isArray(closeout.cells) ? closeout.cells : [])
+      .filter((row) => typeof row?.non_claim?.non_claim_reason === "string")
+      .map((row) => [row.id, row.non_claim.non_claim_reason]),
+  );
   const packages = graph.public_support.packages.map(({ label, target, accelerator_claim: claim }) => {
     const accelerator = claim === "metal" ? "Metal" : "Vulkan";
     const host = hostByTarget.get(target);
-    const withheld = host !== undefined
-      && host.withheld_cells.some((cellId) =>
+    const withheldCellId = host === undefined
+      ? undefined
+      : host.withheld_cells.find((cellId) =>
         cellId.startsWith("accelerator_execution:") && withheldCells.has(cellId));
-    return withheld
-      ? `- ${label}: ${accelerator} not proven for this release (${reason})`
+    return withheldCellId !== undefined
+      ? `- ${label}: ${accelerator} not proven for this release (${recordedReasons.get(withheldCellId) ?? reason})`
       : `- ${label}: supported with ${accelerator}`;
   });
   const unsupported = graph.public_support.unsupported.map(

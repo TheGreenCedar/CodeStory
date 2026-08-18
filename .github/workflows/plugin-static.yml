@@ -5,6 +5,8 @@ on:
     paths:
       - plugins/codestory/**
       - .github/scripts/detect-codestory-release.py
+      - .github/scripts/publish-marketplace-catalog.mjs
+      - .github/scripts/publish-marketplace-catalog.test.mjs
       - .github/scripts/test-detect-codestory-release.py
       - .github/scripts/check-codestory-release.py
       - .github/scripts/check-packaged-agent-proof.py
@@ -12,11 +14,14 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/check-workflow-policy-literal-ratchet.test.mjs
       - .github/scripts/collect-actions-job-evidence.sh
       - .github/scripts/lost-runner-recovery.mjs
       - .github/scripts/lost-runner-recovery.test.mjs
       - .github/scripts/cargo-cache-contract.mjs
       - .github/scripts/cargo-cache-contract.test.mjs
+      - .github/scripts/windows-link-timing.mjs
+      - .github/scripts/windows-link-timing.test.mjs
       - .github/scripts/install-codestory-marketplace-proof.mjs
       - .github/scripts/install-codestory-marketplace-proof.test.mjs
       - .github/scripts/fixtures/workflow-policy-invalid.json
@@ -28,6 +33,9 @@ on:
       - scripts/codestory-release-claims.mjs
       - scripts/codestory-release-closeout.mjs
       - scripts/codestory-release-evidence-gate.mjs
+      - scripts/native-fingerprint.mjs
+      - scripts/bump-version.mjs
+      - scripts/lib/workspace-members.mjs
       - scripts/tests/codestory-release-claims.test.mjs
       - scripts/tests/codestory-release-closeout.test.mjs
       - scripts/tests/codestory-release-evidence-gate.test.mjs
@@ -66,7 +74,11 @@ on:
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
       - scripts/prove-plugin-pinned-provision.mjs
+      - scripts/build-release-manifest.mjs
       - scripts/lib/wait-for-managed-runtime.mjs
+      - scripts/lib/pinned-archive-digests.mjs
+      - scripts/lib/provision-proof-lanes.mjs
+      - scripts/lib/release-manifest.mjs
       - scripts/tests/prove-plugin-pinned-provision.test.mjs
       - .codex/environments/environment.toml
   push:
@@ -76,6 +88,8 @@ on:
     paths:
       - plugins/codestory/**
       - .github/scripts/detect-codestory-release.py
+      - .github/scripts/publish-marketplace-catalog.mjs
+      - .github/scripts/publish-marketplace-catalog.test.mjs
       - .github/scripts/test-detect-codestory-release.py
       - .github/scripts/check-codestory-release.py
       - .github/scripts/check-packaged-agent-proof.py
@@ -83,11 +97,14 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/check-workflow-policy-literal-ratchet.test.mjs
       - .github/scripts/collect-actions-job-evidence.sh
       - .github/scripts/lost-runner-recovery.mjs
       - .github/scripts/lost-runner-recovery.test.mjs
       - .github/scripts/cargo-cache-contract.mjs
       - .github/scripts/cargo-cache-contract.test.mjs
+      - .github/scripts/windows-link-timing.mjs
+      - .github/scripts/windows-link-timing.test.mjs
       - .github/scripts/install-codestory-marketplace-proof.mjs
       - .github/scripts/install-codestory-marketplace-proof.test.mjs
       - .github/scripts/fixtures/workflow-policy-invalid.json
@@ -99,6 +116,9 @@ on:
       - scripts/codestory-release-claims.mjs
       - scripts/codestory-release-closeout.mjs
       - scripts/codestory-release-evidence-gate.mjs
+      - scripts/native-fingerprint.mjs
+      - scripts/bump-version.mjs
+      - scripts/lib/workspace-members.mjs
       - scripts/tests/codestory-release-claims.test.mjs
       - scripts/tests/codestory-release-closeout.test.mjs
       - scripts/tests/codestory-release-evidence-gate.test.mjs
@@ -137,7 +157,11 @@ on:
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
       - scripts/prove-plugin-pinned-provision.mjs
+      - scripts/build-release-manifest.mjs
       - scripts/lib/wait-for-managed-runtime.mjs
+      - scripts/lib/pinned-archive-digests.mjs
+      - scripts/lib/provision-proof-lanes.mjs
+      - scripts/lib/release-manifest.mjs
       - scripts/tests/prove-plugin-pinned-provision.test.mjs
       - .codex/environments/environment.toml
   workflow_dispatch:
@@ -185,6 +209,7 @@ jobs:
       - name: Check release claim and evidence contracts
         run: >-
           node --test
+          .github/scripts/publish-marketplace-catalog.test.mjs
           scripts/tests/codestory-release-claims.test.mjs
           scripts/tests/codestory-release-closeout.test.mjs
           scripts/tests/codestory-release-evidence-gate.test.mjs
@@ -194,8 +219,10 @@ jobs:
         run: |
           node .github/scripts/check-workflow-policy.mjs
           node --test .github/scripts/check-workflow-policy.test.mjs
+          node --test .github/scripts/check-workflow-policy-literal-ratchet.test.mjs
           node --test .github/scripts/lost-runner-recovery.test.mjs
           node --test .github/scripts/cargo-cache-contract.test.mjs
+          node --test .github/scripts/windows-link-timing.test.mjs
 
       - name: Check real Codex marketplace installation
         run: node --test .github/scripts/install-codestory-marketplace-proof.test.mjs

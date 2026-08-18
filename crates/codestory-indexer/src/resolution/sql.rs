@@ -98,7 +98,7 @@ pub(super) fn unresolved_edges(
 
     let mut query = String::from(
         "SELECT e.id, COALESCE(caller.file_node_id, e.file_node_id), caller.qualified_name, caller.serialized_name, target.serialized_name, e.target_node_id,
-                file_node.serialized_name, e.callsite_identity
+                file_node.serialized_name, e.callsite_identity, caller.kind
          FROM edge e
          JOIN node caller ON caller.id = e.source_node_id
          JOIN node target ON target.id = e.target_node_id
@@ -109,6 +109,9 @@ pub(super) fn unresolved_edges(
              AND target.canonical_id NOT LIKE 'openapi:endpoint:%'
              AND target.canonical_id NOT LIKE 'route_endpoint:%'
              AND target.canonical_id NOT LIKE 'payload:collection:%'
+             AND target.canonical_id NOT LIKE 'css:import-ref:%'
+             AND target.canonical_id NOT LIKE 'css:var-ref:%'
+             AND target.canonical_id NOT LIKE 'css:keyframes-ref:%'
            ))",
     );
     append_resolution_worklist_metadata_filter(&mut query, kind);
@@ -222,5 +225,6 @@ fn map_unresolved_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Unresolv
         row.get::<_, i64>(5)?,
         row.get::<_, Option<String>>(6)?,
         row.get::<_, Option<String>>(7)?,
+        row.get::<_, Option<i64>>(8)?,
     ))
 }

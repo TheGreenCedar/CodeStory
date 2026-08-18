@@ -154,10 +154,25 @@ jobs:
         run: |
           cargo test --locked -p codestory-runtime --lib agent::retrieval_primary::tests
           cargo test --locked -p codestory-runtime --lib agent::packet_search::tests
-          cargo test --locked -p codestory-runtime --lib agent::packet_claim_profiles::tests
+          cargo test --locked -p codestory-runtime --lib agent::packet_claim_profile
           cargo test --locked -p codestory-runtime --lib -- --exact tests::search_scoring_tests::search_rejects_natural_language_queries_without_full_sidecars
           cargo test --locked -p codestory-runtime --lib -- --exact tests::repo_text_tests::search_results_ignores_repo_text_hits_without_full_sidecars
           cargo test --locked -p codestory-runtime --lib -- --exact tests::repo_text_tests::repo_text_auto_fallback_is_not_product_search_without_full_sidecars
+
+      # Merged proof suites from EV-FIX (#1718), READY-A (#1727), HOOK (#1672),
+      # and W1.SEC (#1643) previously ran only in the dispatch-gated workspace
+      # suite; a regression in any of them merged green. This step is their
+      # per-PR lane (#1735).
+      - name: Evidence, readiness, hooks, and workspace contract tests
+        run: |
+          cargo test --locked -p codestory-runtime --lib agent::packet_evidence::
+          cargo test --locked -p codestory-runtime --lib agent::packet_compiler::tests
+          cargo test --locked -p codestory-runtime --lib agent::packet_batch::
+          cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::
+          cargo test --locked -p codestory-runtime --lib services::
+          cargo test --locked -p codestory-cli --lib
+          cargo test --locked -p codestory-workspace
+          cargo test --locked -p codestory-agent
 
       - name: Stdio protocol contract tests
         run: cargo test --locked -p codestory-cli --test stdio_protocol_contracts
@@ -169,7 +184,15 @@ jobs:
         run: cargo test --locked -p codestory-cli --test packet_search_eval
 
       - name: Retrieval crate unit tests
-        run: cargo test --locked -p codestory-retrieval
+        run: |
+          cargo test --locked -p codestory-retrieval
+          # Rollback activation fixtures need an admissible embedding device,
+          # which only exists under test-support (EV-9, #1652). Without this
+          # invocation the whole module is compiled out of the PR lane.
+          cargo test --locked -p codestory-retrieval --features test-support --lib rollback::
+
+      - name: Architecture ownership contract tests
+        run: cargo test --locked -p codestory-cli --test architecture_contracts
 
       - name: Seed draft proof test-profile artifacts
         run: |

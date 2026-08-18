@@ -1,9 +1,10 @@
 use super::{
-    ApiError, CancellationToken, EmbeddingProfileContractDto, FileExt,
-    HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, IndexPublicationRecord, Instant, OwnedDeletionRoot,
-    Path, PathBuf, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchEngine,
-    SearchSymbolProjection, SemanticModeDto, Storage, Store, StoredSemanticDocsContractDto,
-    UNIX_EPOCH, Uuid, clamp_u128_to_u32, clamp_usize_to_u32,
+    ApiError, CancellationToken, EmbeddingProfileContractDto, FileLockKind,
+    HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, IndexPublicationRecord, Instant, LockDeadline,
+    OwnedDeletionRoot, PUBLICATION_LOCK_WAIT, Path, PathBuf, RetrievalFallbackReasonDto,
+    RetrievalModeDto, RetrievalStateDto, SearchEngine, SearchSymbolProjection, SemanticModeDto,
+    Storage, Store, StoredSemanticDocsContractDto, UNIX_EPOCH, Uuid, acquire_with_deadline,
+    bounded_locks, clamp_u128_to_u32, clamp_usize_to_u32,
     embedding_runtime_availability_from_config, indexing_cancelled_error, is_indexing_cancelled,
     open_storage_for_read,
 };
@@ -13,9 +14,7 @@ use super::{
     test_sidecar_runtime_from_env,
 };
 #[cfg(test)]
-use crate::semantic_projection::{
-    LLM_DOC_EMBED_BATCH_SIZE, LLM_DOC_EMBED_BATCH_SIZE_ENV, current_embedding_contract_from_env,
-};
+use crate::semantic_projection::current_embedding_contract_from_env;
 use crate::semantic_projection::{
     SEARCH_SYMBOL_STREAM_BATCH_SIZE, SearchStateBuildStats, current_embedding_contract_for_runtime,
     load_persisted_semantic_docs_for_runtime,
@@ -178,10 +177,19 @@ impl SearchGenerationCatalogGuard {
                     path.display()
                 ))
             })?;
-        FileExt::lock_exclusive(&file).map_err(|error| {
+        acquire_with_deadline(
+            &file,
+            FileLockKind::Exclusive,
+            LockDeadline::after(PUBLICATION_LOCK_WAIT),
+            None,
+        )
+        .map_err(|error| {
+            // The typed code rides in the message; the public error code stays
+            // `internal`, as it was before acquisition became bounded.
             ApiError::internal(format!(
-                "Failed to acquire search generation catalog lock {}: {error}",
-                path.display()
+                "Failed to acquire search generation catalog lock {} ({}): {error}",
+                path.display(),
+                error.code()
             ))
         })?;
         Ok(Self { file, path })
@@ -190,7 +198,7 @@ impl SearchGenerationCatalogGuard {
 
 impl Drop for SearchGenerationCatalogGuard {
     fn drop(&mut self) {
-        if let Err(error) = FileExt::unlock(&self.file) {
+        if let Err(error) = bounded_locks::release(&self.file) {
             tracing::warn!(
                 path = %self.path.display(),
                 "Failed to unlock search generation catalog: {error}"
@@ -213,10 +221,11 @@ pub(super) fn inspect_search_generation(path: &Path) -> Result<Option<bool>, Api
                 lock_path.display()
             ))
         })?;
-    if !FileExt::try_lock_shared(&lock).map_err(|error| {
+    if !bounded_locks::try_acquire(&lock, FileLockKind::Shared).map_err(|error| {
         ApiError::internal(format!(
-            "Failed to inspect persisted search generation lock {}: {error}",
-            lock_path.display()
+            "Failed to inspect persisted search generation lock {} ({}): {error}",
+            lock_path.display(),
+            error.code()
         ))
     })? {
         return Ok(None);
@@ -230,7 +239,7 @@ pub(super) fn inspect_search_generation(path: &Path) -> Result<Option<bool>, Api
         SearchEngine::open_existing(path)
             .is_ok_and(|engine| engine.tantivy_doc_count() as u64 == marker.tantivy_doc_count)
     });
-    let _ = FileExt::unlock(&lock);
+    let _ = bounded_locks::release(&lock);
     Ok(Some(valid))
 }
 
@@ -252,16 +261,17 @@ pub(super) fn try_remove_search_generation(
                 lock_path.display()
             ))
         })?;
-    if !FileExt::try_lock_exclusive(&lock).map_err(|error| {
+    if !bounded_locks::try_acquire(&lock, FileLockKind::Exclusive).map_err(|error| {
         ApiError::internal(format!(
-            "Failed to lock persisted search generation {} for removal: {error}",
-            path.display()
+            "Failed to lock persisted search generation {} for removal ({}): {error}",
+            path.display(),
+            error.code()
         ))
     })? {
         return Ok(false);
     }
     let removal = deletion.remove(relative);
-    let _ = FileExt::unlock(&lock);
+    let _ = bounded_locks::release(&lock);
     let removed = removal.map_err(|error| {
         ApiError::internal(format!(
             "Failed to remove persisted search generation {}: {error}",
@@ -587,13 +597,14 @@ pub(super) fn load_persisted_search_state_for_runtime(
     })
 }
 
+/// Documents per embedding batch, as the setting's owner reads it.
+///
+/// `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` is declared to
+/// `codestory-retrieval/src/config.rs` and read there; publication takes the
+/// clamped value rather than parsing the variable again.
 #[cfg(test)]
 pub(super) fn llm_doc_embed_batch_size() -> usize {
-    std::env::var(LLM_DOC_EMBED_BATCH_SIZE_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .map(|value| value.clamp(1, 2_048))
-        .unwrap_or(LLM_DOC_EMBED_BATCH_SIZE)
+    codestory_retrieval::retrieval_runtime_config_from_process_env().llm_doc_embed_batch_size
 }
 
 #[cfg(test)]

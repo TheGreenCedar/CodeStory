@@ -52,8 +52,9 @@ after restart.
 ## When output looks weak
 
 Blocked or degraded broad-search infrastructure returns no packet evidence. A
-returned packet with partial sufficiency is a **lead to inspect**, not proof
-that the answer is complete. Local graph tools may still be reliable meanwhile.
+returned packet whose disposition is `drill_once` or `not_established` is a
+**lead to inspect**, not proof that the answer is complete. Local graph tools
+may still be reliable meanwhile.
 
 Plain-language trust boundaries and good vs blocked sessions:
 [Trust and readiness](trust-and-readiness.md).

@@ -1,0 +1,127 @@
+name: EV-7b real-notifier parity
+
+# The final closure proof for issue #1651: the freshness-observer matrices run
+# against each platform's REAL notifier (FSEvents / ReadDirectoryChangesW /
+# WSL inotify) on the protected hosts, proving watcher-driven freshness without
+# per-operation full scans. The push trigger is the bootstrap: dev-only
+# workflows are not dispatchable until they have run once.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact source SHA to prove. Defaults to the dispatched branch head.
+        required: false
+        default: ""
+        type: string
+  push:
+    branches:
+      - dev/codestory-next
+    paths:
+      - .github/workflows/notifier-parity.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notifier-parity-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  parity-macos-fsevents:
+    name: Parity macOS FSEvents
+    runs-on: [self-hosted, macOS, ARM64, codestory-metal]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - name: Prove real-notifier parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -a
+          cargo test --locked -p codestory-workspace --lib filesystem_observer
+          cargo test --locked -p codestory-runtime --lib freshness_observer
+          cargo test --locked -p codestory-runtime --lib affected
+
+  parity-windows-rdcw:
+    name: Parity Windows ReadDirectoryChangesW
+    runs-on: [self-hosted, Windows, X64, codestory-vulkan]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      # The self-hosted Windows service account runs under the default Restricted
+      # execution policy, so every run step carries the bypass shell.
+      - name: Install pinned Rust
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - name: Prove real-notifier parity
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          CMAKE_GENERATOR: Ninja
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmd /c ver
+          cargo test --locked -p codestory-workspace --lib filesystem_observer
+          if ($LASTEXITCODE -ne 0) { throw "workspace observer parity failed" }
+          cargo test --locked -p codestory-runtime --lib freshness_observer
+          if ($LASTEXITCODE -ne 0) { throw "runtime freshness parity failed" }
+          cargo test --locked -p codestory-runtime --lib affected
+          if ($LASTEXITCODE -ne 0) { throw "runtime affected parity failed" }
+
+  parity-linux-wsl-inotify:
+    name: Parity Linux WSL inotify
+    runs-on: [self-hosted, Linux, X64, codestory-linux-vulkan]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      # The WSL runner service does not inherit the interactive shell's user
+      # toolchain paths even though the pinned Rust and native build dependencies
+      # live there.
+      - name: Expose the protected-host toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew_prefix=/home/linuxbrew/.linuxbrew
+          test -f "$brew_prefix/include/spirv/unified1/spirv.hpp"
+          test -f "$brew_prefix/lib/libclang.so"
+          {
+            echo "$HOME/.cargo/bin"
+            echo "$brew_prefix/bin"
+          } >> "$GITHUB_PATH"
+          {
+            echo "CPLUS_INCLUDE_PATH=$brew_prefix/include"
+            echo "LIBCLANG_PATH=$brew_prefix/lib"
+            echo "BINDGEN_EXTRA_CLANG_ARGS=-resource-dir=$($brew_prefix/opt/llvm/bin/clang -print-resource-dir)"
+          } >> "$GITHUB_ENV"
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - name: Prove real-notifier parity over WSL inotify
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -a
+          # The WSL claim is load-bearing: prove the Microsoft kernel, and show the
+          # observed roots live on the Linux filesystem, where the observer treats
+          # inotify as the real notifier (only /mnt/<drive> interop mounts refuse).
+          grep -qiE 'microsoft|wsl' /proc/sys/kernel/osrelease
+          df -T /tmp "$PWD"
+          cargo test --locked -p codestory-workspace --lib filesystem_observer
+          cargo test --locked -p codestory-runtime --lib freshness_observer
+          cargo test --locked -p codestory-runtime --lib affected

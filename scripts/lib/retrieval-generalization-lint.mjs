@@ -124,6 +124,160 @@ function structuredFinding(message) {
   return { kind: "lint", pattern: null, file: null, message: String(message) };
 }
 
+const pendingSurfaceIssuePattern =
+  /^https:\/\/github\.com\/TheGreenCedar\/CodeStory\/issues\/\d+$/;
+const pendingSurfaceReasonFloor = 60;
+
+// Both declared totals have to be exact: `total_markers` is how many markers are
+// listed, `total_marker_occurrences` is how many production lines they occupy.
+// Counting only the markers let a surface grow line by line under an unchanged
+// number, so the second total is what makes the inventory a size bound rather
+// than an entry bound. Either total drifting fails the lint in both directions.
+export function pendingInventoryTotalsProblem(inventory) {
+  let markers = 0;
+  let occurrences = 0;
+  for (const entry of Object.values(inventory?.surfaces ?? {})) {
+    const counts = Object.entries(entry?.markers ?? {});
+    markers += counts.length;
+    occurrences += counts.reduce((total, [, count]) => total + count, 0);
+  }
+  for (
+    const [field, declared, listed, unit] of [
+      ["total_markers", inventory?.total_markers, markers, "markers"],
+      [
+        "total_marker_occurrences",
+        inventory?.total_marker_occurrences,
+        occurrences,
+        "occurrences",
+      ],
+    ]
+  ) {
+    if (declared !== listed) {
+      return `pending inventory declares ${field} ${JSON.stringify(declared)} but lists `
+        + `${listed} ${unit}; the declared total is the bound on this file and must match it `
+        + "exactly";
+    }
+  }
+  return null;
+}
+
+// The uncontracted claim profiles are the other half of this debt: each one
+// answers on shape alone, with no fixture proving it does not fire on a helper.
+// The inventory states how many are left and the lint counts the declarations,
+// so a new uncontracted profile cannot land without raising a stated number and
+// migrating one cannot land without lowering it.
+//
+// `count` alone is a number somebody can retype. `ratchet_ceiling` is the
+// high-water this burn-down started from, and `burn_down` has to name one
+// evidence-backed migration for every profile between the ceiling and the
+// count. That makes the fall auditable in both directions: lowering the count
+// without adding a ledger entry fails, and quietly deleting a ledger entry to
+// make room for a new uncontracted profile fails too.
+export function pendingClaimProfileProblem(declared, readSource) {
+  if (
+    typeof declared !== "object" || declared == null || Array.isArray(declared)
+    || typeof declared.file !== "string" || declared.file.length === 0
+    || typeof declared.declaration !== "string" || declared.declaration.length === 0
+    || !Number.isInteger(declared.count) || declared.count < 0
+    || typeof declared.reason !== "string"
+    || declared.reason.trim().length < pendingSurfaceReasonFloor
+    || typeof declared.issue !== "string"
+    || !pendingSurfaceIssuePattern.test(declared.issue.trim())
+  ) {
+    return "pending_claim_profiles must declare file, declaration, a non-negative count, a "
+      + `reason of at least ${pendingSurfaceReasonFloor} characters, and the issue tracking the `
+      + "migration";
+  }
+  if (!Number.isInteger(declared.ratchet_ceiling) || declared.ratchet_ceiling < declared.count) {
+    return "pending_claim_profiles must declare ratchet_ceiling as an integer at or above "
+      + `count; got ${JSON.stringify(declared.ratchet_ceiling)} against ${declared.count}`;
+  }
+  const ledger = declared.burn_down;
+  if (!Array.isArray(ledger)) {
+    return "pending_claim_profiles must declare burn_down as the ledger of migrations that "
+      + "carried the count down from ratchet_ceiling";
+  }
+  const retired = new Set();
+  for (const entry of ledger) {
+    if (
+      typeof entry !== "object" || entry == null || Array.isArray(entry)
+      || typeof entry.profile !== "string" || entry.profile.trim().length === 0
+      || typeof entry.evidence !== "string"
+      || entry.evidence.trim().length < pendingSurfaceReasonFloor
+      || typeof entry.issue !== "string"
+      || !pendingSurfaceIssuePattern.test(entry.issue.trim())
+    ) {
+      return "every pending_claim_profiles.burn_down entry needs the profile it retired, the "
+        + `issue that retired it, and at least ${pendingSurfaceReasonFloor} characters of `
+        + "measured evidence";
+    }
+    if (retired.has(entry.profile.trim())) {
+      return `pending_claim_profiles.burn_down lists ${entry.profile.trim()} twice; one `
+        + "migration is one entry";
+    }
+    retired.add(entry.profile.trim());
+  }
+  if (ledger.length !== declared.ratchet_ceiling - declared.count) {
+    return `pending_claim_profiles declares ratchet_ceiling ${declared.ratchet_ceiling} and `
+      + `count ${declared.count} but lists ${ledger.length} burn_down entr(ies); the ratchet `
+      + "only falls through migrations this ledger accounts for";
+  }
+  const source = readSource(declared.file);
+  if (source == null) {
+    return `pending_claim_profiles names ${declared.file}, which the tree no longer has`;
+  }
+  const observed = source.split(declared.declaration).length - 1;
+  if (observed !== declared.count) {
+    return `${declared.file}: ${declared.declaration} declared ${declared.count} time(s), `
+      + `tree has ${observed}`;
+  }
+  return null;
+}
+
+const doubleQuotedLiteralAlternatives = 'b?r#*"[^"]*"#*|"(?:\\\\[\\s\\S]|[^"\\\\])*"';
+const backtickLiteralAlternative = "`(?:\\\\[\\s\\S]|[^`\\\\])*`";
+// Rust spells three unrelated things with `'`: a char literal (`'\n'`), a
+// lifetime (`&'static str`), and an apostrophe in prose (`this packet's own`).
+// Only the first is a literal. Reading `'...'` the way a single-quoted-*string*
+// language spells it makes every one of them an opening quote, so the scanner
+// pairs them off in file order: one lifetime swallows every string literal down
+// to the next apostrophe, and adding or removing a single apostrophe anywhere
+// -- in a comment, in prose -- re-pairs the rest of the file and silently
+// changes which literals the benchmark-marker passes can see. What the gate
+// reads then depends on apostrophe parity rather than on the code. A Rust char
+// literal is exactly one character or one escape wide, and that bound is what
+// no lifetime and no possessive can satisfy.
+const rustCharLiteralAlternative =
+  "'(?:\\\\(?:x[0-9A-Fa-f]{2}|u\\{[0-9A-Fa-f]{1,6}\\}|[^\\r\\n])|[^'\\\\\\r\\n])'";
+// Languages that really do quote strings with `'` -- YAML, shell, JavaScript --
+// keep the string reading, which the non-Rust passes and their fixtures rely on.
+const singleQuotedStringAlternative = "'(?:\\\\[\\s\\S]|[^'\\\\])*'";
+
+function staticLiteralPattern(extension) {
+  const singleQuoted = extension == null || extension === ".rs"
+    ? rustCharLiteralAlternative
+    : singleQuotedStringAlternative;
+  return new RegExp(
+    `(?:${doubleQuotedLiteralAlternatives}|${singleQuoted}|${backtickLiteralAlternative})`,
+    "g",
+  );
+}
+
+export function maskDeclarativeCoverageMetadata(filePath, source) {
+  if (path.basename(filePath) !== "route_coverage.rs") {
+    return source;
+  }
+  // The framework coverage matrix is user-facing capability metadata. Its
+  // `framework` field is not consulted by retrieval, ranking, or packet
+  // planning, so corpus-derived name bans must not force that report to omit a
+  // framework it actually describes. Only the standalone struct-literal field
+  // is masked; executable comparisons and every other string remain guarded.
+  return source.replace(
+    /^(\s*framework:\s*)"[^"\r\n]*"(,\s*)$/gm,
+    '$1""$2',
+  );
+}
+
 export function runRetrievalGeneralizationLint({
   repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.."),
   productionRepositoryRoot = repositoryRoot,
@@ -237,7 +391,6 @@ const corpusHarnessNonRustFiles = new Set([
   path.join(repoRoot, ".github", "scripts", "test-detect-codestory-release.py"),
   path.join(repoRoot, ".github", "scripts", "check-workflow-policy.test.mjs"),
   path.join(repoRoot, ".github", "workflows", "frozen-candidate-quality.yml"),
-  path.join(repoRoot, ".github", "workflows", "release-candidate-evidence.yml"),
   path.join(repoRoot, ".github", "workflows", "retrieval-engine-smoke.yml"),
 ].map((filePath) => path.resolve(filePath)));
 const corpusSupportNonRustFiles = new Set([
@@ -279,16 +432,6 @@ const allowedHarnessReferences = [
   ],
   [
     path.join(".github", "scripts", "check-workflow-policy.mjs"),
-    ".github/workflows/release-candidate-evidence.yml",
-    'const evidenceFile = "release-candidate-evidence.yml";',
-  ],
-  [
-    path.join(".github", "scripts", "check-workflow-policy.mjs"),
-    ".github/workflows/release-candidate-evidence.yml",
-    'export const releaseEvidenceWorkflowRef = "./.github/workflows/release-candidate-evidence.yml";',
-  ],
-  [
-    path.join(".github", "scripts", "check-workflow-policy.mjs"),
     ".github/workflows/frozen-candidate-quality.yml",
     'export const frozenCandidateQualityWorkflowRef = "./.github/workflows/frozen-candidate-quality.yml";',
   ],
@@ -296,16 +439,6 @@ const allowedHarnessReferences = [
     path.join(".github", "workflows", "packaged-platform-pr.yml"),
     ".github/workflows/frozen-candidate-quality.yml",
     "uses: ./.github/workflows/frozen-candidate-quality.yml",
-  ],
-  [
-    path.join(".github", "workflows", "packaged-platform-pr.yml"),
-    ".github/workflows/release-candidate-evidence.yml",
-    "uses: ./.github/workflows/release-candidate-evidence.yml",
-  ],
-  [
-    path.join(".github", "workflows", "release.yml"),
-    ".github/workflows/release-candidate-evidence.yml",
-    "uses: ./.github/workflows/release-candidate-evidence.yml",
   ],
   [
     path.join(".github", "workflows", "plugin-static.yml"),
@@ -343,6 +476,7 @@ const protectedNonRustExtensions = new Set([
 const agentInstructionExtensions = new Set([".md", ".mdc"]);
 const agentInstructionPathFragments = [
   path.join("plugins", "codestory", "skills", "codestory-grounding"),
+  path.join("plugins", "codestory", "rules"),
   path.join(".cursor", "rules"),
 ];
 
@@ -390,10 +524,12 @@ const guardedStructuralScanDirs = readdirSync(
 // ban, so a ranking module added tomorrow is covered on the day it is written
 // rather than on the day someone remembers to list it.
 const requiredScanDirs = [
+  path.join(productionRepoRoot, "crates", "codestory-agent", "src"),
   path.join(productionRepoRoot, "crates", "codestory-runtime", "src"),
   path.join(productionRepoRoot, "crates", "codestory-retrieval", "src"),
 ];
 const guardedRequiredScanDirs = [
+  path.join(repoRoot, "crates", "codestory-agent", "src"),
   path.join(repoRoot, "crates", "codestory-runtime", "src"),
   path.join(repoRoot, "crates", "codestory-retrieval", "src"),
 ];
@@ -474,6 +610,32 @@ const guardedRequiredProductionOnlyFiles = [
   path.join(repoRoot, "crates", "codestory-runtime", "src", "search_terms.rs"),
 ];
 
+// Production data documents that are not Rust. The directory walk collects
+// `.rs` only, so a claim registry that moved out of a Rust array and into a
+// checked-in document would leave the scan the day it moved -- and the document
+// is exactly where a corpus symbol would next be spelled. These are seeded by
+// name and carry the same banned-pattern pass as the code beside them.
+const requiredProductionDataFiles = [
+  path.join(
+    productionRepoRoot,
+    "crates",
+    "codestory-agent",
+    "src",
+    "data",
+    "claim_profiles.v2.json",
+  ),
+];
+const guardedRequiredProductionDataFiles = [
+  path.join(
+    repoRoot,
+    "crates",
+    "codestory-agent",
+    "src",
+    "data",
+    "claim_profiles.v2.json",
+  ),
+];
+
 // Term extraction decides which words become queries, so a word table there is
 // the injection this lint exists to catch. The language-level stopword list is
 // the one table that cannot encode a repository: it names question filler.
@@ -497,7 +659,7 @@ const configuredDefaultScanRoots = defaultScanRoots == null
 // what the guarded-path dump declares by name, and a dump that names a file the
 // tree no longer has would hand CI a trigger for a path that cannot fire.
 const missingRequiredPaths = usesDefaultScanRoots && defaultScanRoots == null
-  ? [...requiredScanDirs, ...requiredProductionOnlyFiles]
+  ? [...requiredScanDirs, ...requiredProductionOnlyFiles, ...requiredProductionDataFiles]
     .filter((requiredPath) => !existsSync(requiredPath))
   : [];
 if (missingRequiredPaths.length > 0) {
@@ -519,7 +681,7 @@ metadata.structuralScanDirs = structuralScanDirs.map((root) => path.resolve(root
 
 const evalOnlyProductionFiles = new Set(
   (evalOnlyProductionPaths ?? [
-    path.join(productionRepoRoot, "crates", "codestory-runtime", "src", "agent", "eval_probes.rs"),
+    path.join(productionRepoRoot, "crates", "codestory-agent", "src", "eval_probes.rs"),
   ]).map((filePath) => path.resolve(filePath)),
 );
 
@@ -554,9 +716,8 @@ const benchmarkEvalProbeManifestPath = path.join(benchmarkTaskRoot, "eval-probes
 const benchmarkEvalProbeSourcePath = path.join(
   repoRoot,
   "crates",
-  "codestory-runtime",
+  "codestory-agent",
   "src",
-  "agent",
   "eval_probes.rs",
 );
 const evalCorpusRoots = [
@@ -587,6 +748,7 @@ function guardedPathDocument() {
     ]),
     productionFiles: asRepoPaths([
       ...guardedRequiredProductionOnlyFiles,
+      ...guardedRequiredProductionDataFiles,
       benchmarkEvalProbeSourcePath,
     ]),
     // Corpus the bans are derived from. All three eval roots, not just the task
@@ -2292,9 +2454,12 @@ function rustBlockCommentEnd(text, start) {
 }
 
 function prepareProductionFile(filePath) {
-  const production = productionSource(filePath);
+  const production = maskDeclarativeCoverageMetadata(filePath, productionSource(filePath));
   return {
     filePath,
+    // Stated rather than left undefined: it is what tells the literal scanner
+    // that `'` here is a char literal, not a string quote.
+    extension: ".rs",
     production,
     lines: production.split(/\r?\n/),
     literals: null,
@@ -2793,7 +2958,7 @@ function scanProductionCompactPatterns(
   const markerLower = marker.toLowerCase();
   const hits = [];
   if (prepared.literals == null) {
-    prepared.literals = staticStringLiteralSpans(production);
+    prepared.literals = staticStringLiteralSpans(production, prepared.extension);
   }
   const literals = prepared.literals;
   for (let start = 0; start < literals.length; start += 1) {
@@ -2873,7 +3038,7 @@ function compactMarkerOccurrences(compact, marker, allowSurroundingText, require
   return occurrences;
 }
 
-function staticStringLiteralSpans(text) {
+function staticStringLiteralSpans(text, extension) {
   const literals = [];
   const lineStarts = [0];
   for (let index = 0; index < text.length; index += 1) {
@@ -2882,7 +3047,7 @@ function staticStringLiteralSpans(text) {
     }
   }
 
-  const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`)/g;
+  const stringLiteral = staticLiteralPattern(extension);
   let match;
   while ((match = stringLiteral.exec(text)) != null) {
     literals.push({
@@ -2942,7 +3107,7 @@ function compactPatternHit(prepared, startLine, endLine, marker) {
 /// literal; `"storage", // still pending` loses only the note.
 function codeBeforeLineComment(line) {
   const spans = [];
-  const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/g;
+  const stringLiteral = staticLiteralPattern(".rs");
   let match;
   while ((match = stringLiteral.exec(line)) != null) {
     spans.push([match.index, match.index + match[0].length]);
@@ -2962,7 +3127,7 @@ function codeBeforeLineComment(line) {
 
 function staticStringLiteralsOnLine(line) {
   const literals = [];
-  const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/g;
+  const stringLiteral = staticLiteralPattern(".rs");
   let match;
   while ((match = stringLiteral.exec(line)) != null) {
     literals.push(match[0]);
@@ -2987,44 +3152,52 @@ function isEvalOnlyProductionFile(filePath) {
 // file.
 //
 // It is also bounded and attributable. Every surface has to carry a reason and
-// the issue that tracks its deletion, and the declared `total_markers` has to
-// equal the number of markers actually listed - no slack in either direction.
-// Recording one more marker is therefore a reviewable diff that raises a stated
-// number and answers "why is this still here", and deleting a surface forces
-// that number down.
-const pendingSurfaceIssuePattern =
-  /^https:\/\/github\.com\/TheGreenCedar\/CodeStory\/issues\/\d+$/;
-const pendingSurfaceReasonFloor = 60;
-
+// the issue that tracks its deletion, and both declared totals have to be exact
+// (see `pendingInventoryTotalsProblem`). Recording one more line is therefore a
+// reviewable diff that raises a stated number and answers "why is this still
+// here", and deleting a surface forces both numbers down.
 function loadPendingSurfaces() {
-  let inventory;
-  try {
-    inventory = JSON.parse(readFileSync(pendingSurfacePath, "utf8"));
-  } catch (error) {
-    console.error(`lint-retrieval-generalization: unreadable pending inventory: ${error}`);
-    process.exit(2);
-  }
+  const inventory = readPendingInventory();
   const surfaces = new Map();
-  let declaredMarkers = 0;
   for (const [file, entry] of Object.entries(inventory?.surfaces ?? {})) {
     const problem = pendingSurfaceEntryProblem(entry);
     if (problem != null) {
       console.error(`lint-retrieval-generalization: invalid pending entry for ${file}: ${problem}`);
       process.exit(2);
     }
-    const counts = Object.entries(entry.markers);
-    declaredMarkers += counts.length;
-    surfaces.set(path.resolve(repoRoot, file), new Map(counts));
+    surfaces.set(path.resolve(repoRoot, file), new Map(Object.entries(entry.markers)));
   }
-  if (inventory?.total_markers !== declaredMarkers) {
-    console.error(
-      `lint-retrieval-generalization: pending inventory declares total_markers `
-      + `${JSON.stringify(inventory?.total_markers)} but lists ${declaredMarkers}; `
-      + `the declared total is the bound on this file and must match it exactly`,
-    );
+  const totalsProblem = pendingInventoryTotalsProblem(inventory);
+  if (totalsProblem != null) {
+    console.error(`lint-retrieval-generalization: ${totalsProblem}`);
     process.exit(2);
   }
   return surfaces;
+}
+
+function readPendingInventory() {
+  try {
+    return JSON.parse(readFileSync(pendingSurfacePath, "utf8"));
+  } catch (error) {
+    console.error(`lint-retrieval-generalization: unreadable pending inventory: ${error}`);
+    process.exit(2);
+  }
+  return undefined;
+}
+
+function pendingClaimProfileDrift() {
+  // The inventory describes the shipped tree; a caller-supplied scan root has no
+  // reason to reach the claim-profile registry.
+  if (!validatePendingSurfaceInventory || !usesDefaultScanRoots) {
+    return null;
+  }
+  return pendingClaimProfileProblem(
+    readPendingInventory()?.pending_claim_profiles,
+    (file) => {
+      const profilePath = path.resolve(repoRoot, file);
+      return existsSync(profilePath) ? readFileSync(profilePath, "utf8") : null;
+    },
+  );
 }
 
 function pendingSurfaceEntryProblem(entry) {
@@ -3198,6 +3371,11 @@ const observedPendingSurfaces = new Map();
 const scanFiles = new Set();
 for (const root of scanDirs) {
   for (const filePath of walkRustProductionFiles(root, { excludeCfgTestModuleBodies: true })) {
+    scanFiles.add(filePath);
+  }
+}
+if (usesDefaultScanRoots && defaultScanRoots == null) {
+  for (const filePath of requiredProductionDataFiles) {
     scanFiles.add(filePath);
   }
 }
@@ -3443,6 +3621,14 @@ if (stalePending.length > 0) {
   failed = true;
 }
 
+const claimProfileDrift = pendingClaimProfileDrift();
+if (claimProfileDrift != null) {
+  console.error(
+    `Pending claim-profile ratchet no longer matches the tree; restate it in ${path.relative(repoRoot, pendingSurfacePath)}:\n${claimProfileDrift}\n`,
+  );
+  failed = true;
+}
+
 if (failed) {
   console.error(
     "retrieval generalization lint failed: remove eval/query dependencies from protected product paths",
@@ -3452,8 +3638,13 @@ if (failed) {
 
 const pendingSurfaceCount = [...pendingSurfaces.values()]
   .reduce((total, markers) => total + markers.size, 0);
+const pendingOccurrenceCount = [...pendingSurfaces.values()].reduce(
+  (total, markers) => total + [...markers.values()].reduce((sum, count) => sum + count, 0),
+  0,
+);
+const pendingClaimProfileCount = readPendingInventory()?.pending_claim_profiles?.count ?? 0;
 console.log(
-  `lint-retrieval-generalization: ok (${scanDirs.length} retrieval dir(s), ${scanFiles.size} retrieval file(s), ${structuralFiles.size} production file(s), ${protectedNonRustScanFiles.size} protected non-Rust file(s), ${bannedPatterns.length} patterns, ${pendingSurfaceCount} pending benchmark-family surface(s) in ${pendingSurfaces.size} file(s) awaiting deletion)`,
+  `lint-retrieval-generalization: ok (${scanDirs.length} retrieval dir(s), ${scanFiles.size} retrieval file(s), ${structuralFiles.size} production file(s), ${protectedNonRustScanFiles.size} protected non-Rust file(s), ${bannedPatterns.length} patterns, ${pendingSurfaceCount} pending benchmark-family surface(s) over ${pendingOccurrenceCount} production line(s) in ${pendingSurfaces.size} file(s) awaiting deletion, ${pendingClaimProfileCount} uncontracted claim profile(s))`,
 );
     return result(0);
   } catch (error) {

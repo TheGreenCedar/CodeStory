@@ -1,0 +1,96 @@
+name: crate-durability
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - vendor/**
+      - crates/codestory-store/**
+      - crates/codestory-indexer/**
+      - crates/codestory-workspace/**
+      - crates/codestory-contracts/**
+      - crates/codestory-agent/**
+      - .github/workflows/crate-durability.yml
+      - .github/scripts/check-workflow-policy.mjs
+      - .github/scripts/check-workflow-policy.test.mjs
+      - release-claims.json
+      - scripts/codestory-release-claims.mjs
+      - scripts/tests/codestory-release-claims.test.mjs
+      - docs/contributors/testing-matrix.md
+  push:
+    branches:
+      - main
+      - dev/codestory-next
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - vendor/**
+      - crates/codestory-store/**
+      - crates/codestory-indexer/**
+      - crates/codestory-workspace/**
+      - crates/codestory-contracts/**
+      - crates/codestory-agent/**
+      - .github/workflows/crate-durability.yml
+      - .github/scripts/check-workflow-policy.mjs
+      - .github/scripts/check-workflow-policy.test.mjs
+      - release-claims.json
+      - scripts/codestory-release-claims.mjs
+      - scripts/tests/codestory-release-claims.test.mjs
+      - docs/contributors/testing-matrix.md
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crate-durability-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-durability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Capture Rust cache identity
+        id: rust-cache-key
+        shell: bash
+        run: |
+          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+          echo "target=$(rustc -Vv | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore durability Cargo cache
+        id: cargo-cache-restore
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-crate-durability-v1-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run durability and coverage contracts
+        run: |
+          cargo test --locked -p codestory-store
+          cargo test --locked -p codestory-indexer --test fidelity_regression
+          cargo test --locked -p codestory-indexer --test tictactoe_language_coverage
+          cargo test --locked -p codestory-agent
+
+      - name: Save durability Cargo cache
+        if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}

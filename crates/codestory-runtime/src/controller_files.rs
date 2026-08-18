@@ -3,14 +3,11 @@ use crate::snippets::{
     bounded_markdown_snippet_range_from_path,
 };
 use crate::support::clamp_i64_to_u32;
-use crate::system_actions::status_response;
-use crate::{AppController, path_resolution, system_actions};
+use crate::{AppController, path_resolution};
 use codestory_contracts::api::{
-    ApiError, OpenContainingFolderRequest, OpenDefinitionRequest, ReadFileTextRequest,
-    ReadFileTextResponse, SystemActionResponse, WriteFileResponse, WriteFileTextRequest,
+    ApiError, ReadFileTextRequest, ReadFileTextResponse, WriteFileResponse, WriteFileTextRequest,
 };
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 impl AppController {
     pub(crate) fn resolve_project_file_path(
@@ -19,58 +16,6 @@ impl AppController {
         allow_missing_leaf: bool,
     ) -> Result<PathBuf, ApiError> {
         path_resolution::resolve_project_file_path(self, path, allow_missing_leaf)
-    }
-
-    fn open_folder_in_os(path: &Path) -> io::Result<()> {
-        system_actions::open_folder_in_os(path)
-    }
-
-    fn launch_definition_in_ide(
-        &self,
-        path: &Path,
-        line: Option<u32>,
-        col: Option<u32>,
-    ) -> Result<SystemActionResponse, ApiError> {
-        system_actions::launch_definition_in_ide(path, line, col)
-    }
-
-    pub fn open_definition(
-        &self,
-        req: OpenDefinitionRequest,
-    ) -> Result<SystemActionResponse, ApiError> {
-        let node_id = req.node_id.to_core()?;
-        let storage = self.open_storage_read_only()?;
-        let node = storage
-            .get_node(node_id)
-            .map_err(|e| ApiError::internal(format!("Failed to load node: {e}")))?
-            .ok_or_else(|| ApiError::not_found(format!("Node not found: {}", req.node_id.0)))?;
-
-        let raw_path = if node.kind == codestory_contracts::graph::NodeKind::FILE {
-            Some(node.serialized_name.clone())
-        } else {
-            Self::file_path_for_node(&storage, &node)?
-        }
-        .ok_or_else(|| ApiError::invalid_argument("Node has no file path for definition open."))?;
-
-        let resolved = self.resolve_project_file_path(&raw_path, false)?;
-        self.launch_definition_in_ide(&resolved, node.start_line, node.start_col)
-    }
-
-    pub fn open_containing_folder(
-        &self,
-        req: OpenContainingFolderRequest,
-    ) -> Result<SystemActionResponse, ApiError> {
-        let resolved = self.resolve_project_file_path(&req.path, false)?;
-        Self::open_folder_in_os(&resolved).map_err(|e| {
-            ApiError::internal(format!(
-                "Failed to open containing folder for {}: {e}",
-                resolved.display()
-            ))
-        })?;
-        Ok(status_response(format!(
-            "Opened containing folder for {}",
-            resolved.display()
-        )))
     }
 
     pub fn read_file_text(

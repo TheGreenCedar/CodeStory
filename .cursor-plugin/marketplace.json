@@ -1,0 +1,16 @@
+{
+  "name": "codestory",
+  "owner": {
+    "name": "The Green Cedar"
+  },
+  "metadata": {
+    "description": "CodeStory local grounding for Cursor"
+  },
+  "plugins": [
+    {
+      "name": "codestory",
+      "source": "plugins/codestory",
+      "description": "Local repository grounding, cited search, and managed CodeStory runtime for Cursor."
+    }
+  ]
+}

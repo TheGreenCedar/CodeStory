@@ -15,9 +15,143 @@ use crate::config::SidecarRuntimeConfig;
 use crate::embedding_contract::RETRIEVAL_EMBEDDING_DIM;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// Smallest timeout armed on a socket. A zero `Duration` means "block
+/// forever" to both the Unix and the Windows transport, so an almost-expired
+/// budget must never be handed over verbatim.
+const MIN_ARMED_TIMEOUT: Duration = Duration::from_millis(1);
+
+thread_local! {
+    static EXCHANGE_DEADLINE: RefCell<Option<ExchangeDeadline>> = const { RefCell::new(None) };
+}
+
+/// One absolute deadline for a whole exchange.
+///
+/// Socket timeouts restart on every `read`/`write` syscall, and one exchange
+/// issues several: two length reads, two body reads, four writes and a flush.
+/// Installing the full remaining budget as the socket timeout therefore
+/// bounded each syscall, not the exchange — a peer that trickled bytes held
+/// the caller without limit. Every syscall is re-armed from this absolute
+/// point instead, so the exchange as a whole cannot outlive it.
+#[derive(Clone)]
+pub(super) struct ExchangeDeadline {
+    clock: Arc<dyn AwakeMonotonicClock>,
+    deadline_ns: u64,
+}
+
+impl ExchangeDeadline {
+    pub(super) fn new(clock: Arc<dyn AwakeMonotonicClock>, budget: Duration) -> Result<Self> {
+        if budget.is_zero() {
+            bail!("embedding_server_timeout_invalid");
+        }
+        let budget_ns = budget.as_nanos().min(u128::from(u64::MAX)) as u64;
+        let deadline_ns = clock.now_ns().saturating_add(budget_ns);
+        Ok(Self { clock, deadline_ns })
+    }
+
+    /// Budget left for the next syscall, or a timed-out error once the
+    /// absolute deadline has passed.
+    fn remaining(&self) -> io::Result<Duration> {
+        let now = self.clock.now_ns();
+        if now >= self.deadline_ns {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the embedding exchange deadline elapsed",
+            ));
+        }
+        Ok(Duration::from_nanos(self.deadline_ns - now).max(MIN_ARMED_TIMEOUT))
+    }
+}
+
+/// Restores the enclosing exchange deadline, so a nested exchange (the
+/// best-effort cancel connection, for instance) cannot widen its parent's.
+pub(super) struct ArmedExchangeDeadline {
+    previous: Option<ExchangeDeadline>,
+}
+
+impl Drop for ArmedExchangeDeadline {
+    fn drop(&mut self) {
+        EXCHANGE_DEADLINE.with(|armed| {
+            armed.replace(self.previous.take());
+        });
+    }
+}
+
+/// Arm the absolute deadline covering every syscall of the next exchange on
+/// this thread. Replaces `configure_exchange_timeout`'s whole-budget-per-call
+/// arming at every exchange call site.
+pub(super) fn arm_exchange_deadline(
+    clock: Arc<dyn AwakeMonotonicClock>,
+    budget: Duration,
+) -> Result<ArmedExchangeDeadline> {
+    let deadline = ExchangeDeadline::new(clock, budget)?;
+    let previous = EXCHANGE_DEADLINE.with(|armed| armed.replace(Some(deadline)));
+    Ok(ArmedExchangeDeadline { previous })
+}
+
+fn armed_deadline() -> Option<ExchangeDeadline> {
+    EXCHANGE_DEADLINE.with(|armed| armed.borrow().clone())
+}
+
+/// Read exactly `buffer.len()` bytes, re-arming the read timeout with the
+/// budget remaining on the exchange deadline before every syscall.
+fn read_exact_bounded(stream: &mut dyn EmbeddingServerStream, buffer: &mut [u8]) -> io::Result<()> {
+    let Some(deadline) = armed_deadline() else {
+        return stream.read_exact(buffer);
+    };
+    let mut filled = 0;
+    while filled < buffer.len() {
+        stream.set_read_timeout(Some(deadline.remaining()?))?;
+        match stream.read(&mut buffer[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the embedding peer closed the connection mid-frame",
+                ));
+            }
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Write every byte, re-arming the write timeout with the budget remaining on
+/// the exchange deadline before every syscall.
+fn write_all_bounded(stream: &mut dyn EmbeddingServerStream, bytes: &[u8]) -> io::Result<()> {
+    let Some(deadline) = armed_deadline() else {
+        return stream.write_all(bytes);
+    };
+    let mut written = 0;
+    while written < bytes.len() {
+        stream.set_write_timeout(Some(deadline.remaining()?))?;
+        match stream.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "the embedding peer accepted no bytes",
+                ));
+            }
+            Ok(wrote) => written += wrote,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn flush_bounded(stream: &mut dyn EmbeddingServerStream) -> io::Result<()> {
+    if let Some(deadline) = armed_deadline() {
+        stream.set_write_timeout(Some(deadline.remaining()?))?;
+    }
+    stream.flush()
+}
 
 pub(super) fn request(
     request_id: &str,
@@ -239,19 +373,13 @@ pub(super) fn write_frame<T: Serialize>(
     {
         bail!("embedding_server_frame_too_large");
     }
-    stream
-        .write_all(&(control.len() as u32).to_be_bytes())
+    write_all_bounded(stream, &(control.len() as u32).to_be_bytes())
         .context("write embedding control length")?;
-    stream
-        .write_all(&(payload.len() as u32).to_be_bytes())
+    write_all_bounded(stream, &(payload.len() as u32).to_be_bytes())
         .context("write embedding payload length")?;
-    stream
-        .write_all(&control)
-        .context("write embedding control frame")?;
-    stream
-        .write_all(payload)
-        .context("write embedding payload frame")?;
-    stream.flush().context("flush embedding protocol frame")
+    write_all_bounded(stream, &control).context("write embedding control frame")?;
+    write_all_bounded(stream, payload).context("write embedding payload frame")?;
+    flush_bounded(stream).context("flush embedding protocol frame")
 }
 
 pub(super) fn read_frame<T: for<'de> Deserialize<'de>>(
@@ -259,12 +387,8 @@ pub(super) fn read_frame<T: for<'de> Deserialize<'de>>(
 ) -> Result<(T, Vec<u8>)> {
     let mut control_len = [0_u8; 4];
     let mut payload_len = [0_u8; 4];
-    stream
-        .read_exact(&mut control_len)
-        .context("read embedding control length")?;
-    stream
-        .read_exact(&mut payload_len)
-        .context("read embedding payload length")?;
+    read_exact_bounded(stream, &mut control_len).context("read embedding control length")?;
+    read_exact_bounded(stream, &mut payload_len).context("read embedding payload length")?;
     let control_len = u32::from_be_bytes(control_len) as usize;
     let payload_len = u32::from_be_bytes(payload_len) as usize;
     if control_len == 0
@@ -275,12 +399,8 @@ pub(super) fn read_frame<T: for<'de> Deserialize<'de>>(
     }
     let mut control = vec![0_u8; control_len];
     let mut payload = vec![0_u8; payload_len];
-    stream
-        .read_exact(&mut control)
-        .context("read embedding control frame")?;
-    stream
-        .read_exact(&mut payload)
-        .context("read embedding payload frame")?;
+    read_exact_bounded(stream, &mut control).context("read embedding control frame")?;
+    read_exact_bounded(stream, &mut payload).context("read embedding payload frame")?;
     let control =
         serde_json::from_slice(&control).context("decode embedding protocol control frame")?;
     Ok((control, payload))
@@ -427,34 +547,6 @@ pub(super) fn validate_server_snapshot(
         bail!("embedding_server_executable_identity_mismatch");
     }
     Ok(())
-}
-
-pub(super) fn configure_exchange_timeout(
-    stream: &dyn EmbeddingServerStream,
-    timeout: Duration,
-) -> Result<()> {
-    if timeout.is_zero() {
-        bail!("embedding_server_timeout_invalid");
-    }
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(exchange_timeout_configuration_error)?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(exchange_timeout_configuration_error)?;
-    Ok(())
-}
-
-pub(super) fn exchange_timeout_configuration_error(error: io::Error) -> anyhow::Error {
-    PerUserEmbeddingError {
-        code: "embedding_server_owner_unresponsive".into(),
-        message: format!("could not bound the embedding server exchange: {error}"),
-        retry_class: "after_server_change".into(),
-        retry_after_ms: duration_ms(EmbeddingClientBudgets::current().retry_after),
-        retry_condition: "the lifetime authority or server instance changes".into(),
-        capacity: None,
-    }
-    .into()
 }
 
 pub(super) fn is_sha256(value: &str) -> bool {

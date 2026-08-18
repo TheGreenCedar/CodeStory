@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "fixture_file": "production_packet_search_fixtures.json",
   "k": 5,
   "packet_anchor_budget": 6000,
@@ -34,5 +34,25 @@
       "anchor_in_packet": 1.0,
       "anchor_before_budget": 1.0
     }
+  },
+  "source_fixture_verdicts": {
+    "sufficiency_counts": {
+      "not_established": 2
+    },
+    "proof_status_counts": {
+      "reported": 4
+    },
+    "verdict_cause_table": {
+      "anchor_placement": [
+        "required_carrier_missing"
+      ],
+      "readiness_boundary": [
+        "required_carrier_missing"
+      ]
+    }
+  },
+  "live_verdict_calibration": {
+    "status": "pending",
+    "issue": "#1351"
   }
 }

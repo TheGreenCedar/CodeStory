@@ -1,6 +1,6 @@
 [package]
 name = "codestory-cli"
-version = "0.16.3"
+version = "0.17.0"
 edition = "2024"
 description = "Local repository evidence and grounding CLI for source-backed coding workflows."
 license = "Apache-2.0"
@@ -25,11 +25,13 @@ codestory-runtime = { workspace = true }
 codestory-workspace = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-fs4 = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+# `signal` lets the stdio serve loop drain on SIGTERM instead of relying on a
+# stdin EOF the host may never send; `time` bounds that drain so a host which
+# stops reading stdout cannot hold the process past its own kill deadline.
+tokio = { workspace = true, features = ["signal", "time"] }
 toml = { workspace = true }
 sha2 = { workspace = true }
 ureq = { workspace = true }
@@ -37,6 +39,9 @@ notify = { workspace = true }
 crossbeam-channel = { workspace = true }
 crossterm = { workspace = true }
 ratatui = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -56,6 +61,10 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+codestory-workspace = { workspace = true, features = ["test-support"] }
+# Integration tests hold raw advisory locks to build hostile fixtures;
+# production CLI source takes them through codestory_contracts::bounded_locks.
+fs4 = { workspace = true }
 codestory-retrieval = { workspace = true, features = ["test-support"] }
 codestory-runtime = { workspace = true, features = ["test-support"] }
 rusqlite = { workspace = true }

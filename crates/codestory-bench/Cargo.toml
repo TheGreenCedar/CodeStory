@@ -1,6 +1,6 @@
 [package]
 name = "codestory-bench"
-version = "0.16.3"
+version = "0.17.0"
 edition = "2024"
 publish = false
 
@@ -19,6 +19,7 @@ sha2 = { workspace = true }
 codestory-cli = { workspace = true }
 codestory-contracts = { workspace = true }
 codestory-indexer = { workspace = true }
+codestory-retrieval = { workspace = true, features = ["benchmark-support"] }
 codestory-runtime = { workspace = true, features = ["benchmark-support"] }
 codestory-store = { workspace = true }
 criterion = { workspace = true }

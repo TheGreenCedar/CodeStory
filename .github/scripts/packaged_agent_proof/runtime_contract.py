@@ -27,6 +27,11 @@ def run_runtime_proof(
     manifest: dict[str, object],
     measurement_contract: dict[str, object],
 ) -> dict[str, object]:
+    # This call is intentionally inside the temporary-package context and is
+    # the last native-server owner before that directory is deleted. Every
+    # server-producing platform tier must finish its exact process wait here;
+    # a retry in TemporaryDirectory.__exit__ cannot prove which process is
+    # still writing the cache tree.
     server_cleanup_control = {"_waiters": []}
     runtime = None
     runtime_error = None

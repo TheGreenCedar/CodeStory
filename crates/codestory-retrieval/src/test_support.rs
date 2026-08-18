@@ -1,7 +1,11 @@
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::EmbeddingVectorPublicationIdentityDto;
-use codestory_store::{RetrievalIndexManifest, SourcePolicyExclusionPolicyIdentity, Store};
-use std::path::Path;
+use codestory_contracts::owned_artifacts::embedded_model_digest_root;
+use codestory_store::{
+    RetrievalIndexManifest, RetrievalIndexRollbackRecord, SourcePolicyExclusionPolicyIdentity,
+    Store,
+};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -13,6 +17,47 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
     ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Publish the minimum complete core identity required by retrieval fixtures
+/// that hash lexical source input from a pinned store.
+pub fn publish_complete_core_fixture(
+    storage: &mut Store,
+    project_root: &Path,
+    publication: &codestory_store::IndexPublicationRecord,
+) -> Result<()> {
+    let identity = codestory_workspace::project_identity_v3(project_root);
+    let source_policy = codestory_contracts::workspace::SourceIndexPolicy::default();
+    storage
+        .publish_source_policy_exclusion_generation(
+            publication,
+            &identity.project_id,
+            &identity.workspace_id,
+            SourcePolicyExclusionPolicyIdentity::new(
+                &source_policy.policy_version,
+                source_policy.byte_cap,
+                source_policy.structural_unit_cap,
+            ),
+            &[],
+        )
+        .context("publish empty source policy exclusion fixture")?;
+    storage
+        .put_index_publication(publication)
+        .context("publish complete core fixture")?;
+    Ok(())
+}
+
+/// Create the empty complete core used by cross-crate retrieval fixtures.
+pub fn publish_empty_complete_core_fixture(project_root: &Path, storage_path: &Path) -> Result<()> {
+    let mut storage = Store::open(storage_path).context("open empty complete core fixture")?;
+    let publication = codestory_store::IndexPublicationRecord {
+        generation: 1,
+        generation_id: "11111111-1111-4111-8111-111111111111".into(),
+        run_id: "operation-oracle-run".into(),
+        mode: codestory_store::IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    publish_complete_core_fixture(&mut storage, project_root, &publication)
 }
 
 pub fn retrieval_manifest_fixture(
@@ -49,6 +94,87 @@ pub fn retrieval_manifest_fixture(
         precise_semantic_import_revision: None,
         precise_semantic_import_producer: None,
     }
+}
+
+pub const CACHE_CLEAN_OTHER_MODEL_DIGEST: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
+pub const CACHE_CLEAN_LIVE_WORKSPACE: &str = "aaaa000000000001";
+pub const CACHE_CLEAN_DEAD_WORKSPACE: &str = "bbbb000000000002";
+pub const CACHE_CLEAN_UNREGISTERED_WORKSPACE: &str = "cccc000000000003";
+
+/// Populate the complete process-cache cleanup matrix for boundary tests.
+///
+/// The fixture deliberately uses the retrieval owner's real Store and
+/// retention-marker writers. External crates cannot otherwise construct the
+/// positive evidence that distinguishes a retired cache from an unregistered
+/// one.
+pub fn populate_cache_clean_fixture(cache_root: &Path, worktrees_root: &Path) -> Result<()> {
+    std::fs::create_dir_all(cache_root).context("create cache-clean fixture root")?;
+    std::fs::create_dir_all(worktrees_root).context("create cache-clean worktrees root")?;
+    let live_root = worktrees_root.join("live");
+    let dead_root = worktrees_root.join("dead");
+    std::fs::create_dir_all(&live_root).context("create live fixture worktree")?;
+    std::fs::create_dir_all(&dead_root).context("create dead fixture worktree")?;
+
+    register_cache_clean_workspace(
+        cache_root,
+        CACHE_CLEAN_LIVE_WORKSPACE,
+        &live_root,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )?;
+    register_cache_clean_workspace(
+        cache_root,
+        CACHE_CLEAN_DEAD_WORKSPACE,
+        &dead_root,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )?;
+
+    let unregistered = cache_root.join(CACHE_CLEAN_UNREGISTERED_WORKSPACE);
+    std::fs::create_dir_all(&unregistered).context("create unregistered fixture cache")?;
+    std::fs::write(unregistered.join("codestory.db"), b"unregistered")
+        .context("write unregistered fixture cache")?;
+
+    write_cache_clean_model(cache_root, codestory_llama_sys::MODEL_SHA256, 8)?;
+    write_cache_clean_model(cache_root, CACHE_CLEAN_OTHER_MODEL_DIGEST, 12)?;
+    let unrecognized = embedded_model_digest_root(cache_root).join("not-a-digest");
+    std::fs::create_dir_all(&unrecognized).context("create unrecognized model fixture")?;
+    std::fs::write(unrecognized.join("model.gguf"), b"unrecognized")
+        .context("write unrecognized model fixture")?;
+
+    std::fs::remove_dir_all(dead_root).context("retire dead fixture worktree")?;
+    Ok(())
+}
+
+fn register_cache_clean_workspace(
+    cache_root: &Path,
+    workspace_id: &str,
+    project_root: &Path,
+    input_hash: &str,
+) -> Result<()> {
+    let cache_dir = cache_root.join(workspace_id);
+    std::fs::create_dir_all(&cache_dir).context("create registered fixture cache")?;
+    drop(Store::open(cache_dir.join("codestory.db")).context("create fixture core store")?);
+
+    let mut manifest = retrieval_manifest_fixture("cache-clean-project", input_hash);
+    manifest.built_at_epoch_ms = 1;
+    let marker = crate::retention::GenerationRetentionMarker::next(
+        workspace_id,
+        project_root,
+        manifest,
+        None,
+        1,
+    )?;
+    let state_file = cache_root.join(crate::config::RETRIEVAL_STATE_FILE);
+    crate::retention::write_retention_marker(&state_file, &marker)?;
+    Ok(())
+}
+
+fn write_cache_clean_model(cache_root: &Path, digest: &str, bytes: usize) -> Result<PathBuf> {
+    let directory = embedded_model_digest_root(cache_root).join(digest);
+    std::fs::create_dir_all(&directory).context("create fixture model digest")?;
+    let path = directory.join("model.gguf");
+    std::fs::write(&path, vec![b'm'; bytes]).context("write fixture model bytes")?;
+    Ok(path)
 }
 
 /// Publish a strict, zero-dense query fixture with the same vector-generation evidence required
@@ -118,28 +244,39 @@ pub fn publish_zero_dense_pinned_query_fixture(
     let scip_dir = runtime.layout.scip_project_dir(generation);
     std::fs::create_dir_all(&scip_dir).context("create pinned query fixture SCIP directory")?;
     let symbol = crate::scip_index::ScipSymbolRecord {
-        node_id: None,
+        node_id: Some("1".into()),
         path: "fixture.rs".into(),
         symbol: "fixture::symbol".into(),
         start_line: 1,
         end_line: 1,
     };
+    let definition = crate::scip_index::ScipProofRecord {
+        role: crate::scip_index::SCIP_DEFINITION_ROLE.into(),
+        path: symbol.path.clone(),
+        symbol: symbol.symbol.clone(),
+        start_line: symbol.start_line,
+        start_character_utf16: 0,
+        end_line: symbol.end_line,
+        end_character_utf16: 0,
+        target_symbol: None,
+        node_id: symbol.node_id.clone(),
+        target_node_id: None,
+        edge_kind: None,
+    };
     let index = crate::scip_index::ScipSymbolsIndex {
+        generation: generation.to_string(),
         revision: revision.clone(),
         contract: crate::scip_index::ScipProofAdapterContract::graph_projection(&revision),
         symbols: vec![symbol],
-        proofs: Vec::new(),
+        proofs: vec![definition],
     };
     std::fs::write(
         scip_dir.join(crate::scip_index::SCIP_SYMBOLS_FILE),
         serde_json::to_vec_pretty(&index).context("serialize pinned query fixture SCIP index")?,
     )
     .context("write pinned query fixture SCIP index")?;
-    std::fs::write(
-        scip_dir.join(crate::scip_index::SCIP_INDEX_FILE),
-        format!("codestory-scip-v1\nrevision={revision}\n"),
-    )
-    .context("write pinned query fixture SCIP marker")?;
+    crate::scip_index::write_scip_index_marker(&scip_dir, &revision)
+        .context("write pinned query fixture SCIP marker")?;
     std::fs::write(scip_dir.join("revision.txt"), format!("{revision}\n"))
         .context("write pinned query fixture SCIP revision")?;
     manifest.scip_revision = Some(revision);
@@ -150,6 +287,73 @@ pub fn publish_zero_dense_pinned_query_fixture(
 
     publish_zero_dense_vector_evidence(runtime, &manifest, &publication)?;
     Ok(manifest)
+}
+
+/// Publish two live-ready generations and retain the older one for rollback.
+///
+/// Cross-crate boundary tests use this to exercise the public observation and
+/// activation operations without recreating private vector-evidence details.
+pub fn publish_retained_rollback_fixture(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &crate::SidecarRuntimeConfig,
+) -> Result<(RetrievalIndexManifest, RetrievalIndexRollbackRecord)> {
+    std::fs::write(
+        project_root.join("rollback_old.rs"),
+        "pub fn rollback_old() {}\n",
+    )
+    .context("write retained rollback source")?;
+    let older = publish_zero_dense_pinned_query_fixture(project_root, storage_path, runtime)
+        .context("publish retained rollback generation")?;
+    std::fs::write(
+        project_root.join("rollback_current.rs"),
+        "pub fn rollback_current() {}\n",
+    )
+    .context("write current rollback source")?;
+    let current = publish_zero_dense_pinned_query_fixture(project_root, storage_path, runtime)
+        .context("publish current rollback generation")?;
+    if older.sidecar_generation == current.sidecar_generation {
+        bail!("retained rollback fixture requires distinct generations");
+    }
+    let rollback = RetrievalIndexRollbackRecord {
+        manifest: older,
+        verified_at_epoch_ms: 4_242,
+    };
+    let mut storage =
+        Store::open(storage_path).context("open retained rollback fixture storage")?;
+    storage
+        .publish_retrieval_index_publication(&current, Some(&rollback))
+        .context("arm retained rollback fixture")?;
+    Ok((current, rollback))
+}
+
+/// Add one unprotected generation bundle to an otherwise valid fixture.
+pub fn write_reclaimable_generation_fixture(
+    runtime: &crate::SidecarRuntimeConfig,
+    project_id: &str,
+    suffix: &str,
+) -> Result<Vec<PathBuf>> {
+    let generation = format!("{project_id}-{suffix}");
+    let paths = vec![
+        runtime
+            .layout
+            .lexical_data_dir
+            .join("shards")
+            .join(&generation),
+        runtime.layout.scip_artifacts_root.join(&generation),
+        runtime
+            .layout
+            .semantic_data_dir
+            .join("collections")
+            .join(format!("codestory_{project_id}_{suffix}")),
+    ];
+    for (path, bytes) in paths.iter().zip([7_usize, 8, 9]) {
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("create reclaimable fixture {}", path.display()))?;
+        std::fs::write(path.join("data"), vec![b'x'; bytes])
+            .with_context(|| format!("write reclaimable fixture {}", path.display()))?;
+    }
+    Ok(paths)
 }
 
 /// Publish a replacement core identity and its strict zero-dense retrieval

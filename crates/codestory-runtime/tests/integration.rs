@@ -191,3 +191,194 @@ fn test_repo_scale_call_resolution() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Excluded from the measurement project copy: build output, dependency
+/// caches, and version-control state are not project source and would dwarf
+/// the tracked tree. `.git` is excluded by name whether it is a directory or a
+/// worktree pointer file, because a copied pointer would make discovery
+/// enumerate the original checkout's tracked paths against a tree that does not
+/// contain them. `.github` is excluded because it carries deliberately
+/// malformed CI fixtures that fail source verification by design, which would
+/// abort the full refresh this measurement needs.
+const MEASUREMENT_PROJECT_SKIPPED_ENTRIES: [&str; 5] =
+    [".git", ".github", ".claude", "target", "node_modules"];
+
+/// Copy the repository's source tree into a scratch root.
+///
+/// The measurement needs a project it may edit. Indexing the checkout in place
+/// would mean mutating the working tree to produce an incremental plan.
+fn copy_measurement_project(source: &std::path::Path, target: &std::path::Path) -> u64 {
+    let mut copied = 0;
+    fs::create_dir_all(target).expect("create measurement project directory");
+    for entry in fs::read_dir(source).expect("read measurement source directory") {
+        let entry = entry.expect("read measurement source entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy().to_string();
+        if MEASUREMENT_PROJECT_SKIPPED_ENTRIES.contains(&name.as_str()) {
+            continue;
+        }
+        let file_type = entry.file_type().expect("read measurement entry type");
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            copied += copy_measurement_project(&entry.path(), &target.join(&name));
+            continue;
+        }
+        fs::copy(entry.path(), target.join(&name)).expect("copy measurement project file");
+        copied += 1;
+    }
+    copied
+}
+
+/// S7 measurement: what an incremental publication spends moving whole
+/// databases, which is the ceiling on any staged-delta or attached-database
+/// apply that replaces the clone/backup/restore trio.
+///
+/// The numbers this prints are the decision input recorded in
+/// `docs/architecture/indexing-pipeline.md`. Build it optimized: a `-O0` build
+/// inflates the indexer far more than it inflates SQLite's copy path, which
+/// would make the movement share look smaller than it is.
+///
+/// ```text
+/// CARGO_PROFILE_DEV_OPT_LEVEL=3 CARGO_PROFILE_DEV_DEBUG=0 \
+///   cargo test -p codestory-runtime --test integration \
+///   incremental_publication_whole_database_movement_measurement -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "measurement lane; build optimized and run with --ignored --nocapture"]
+fn incremental_publication_whole_database_movement_measurement() -> anyhow::Result<()> {
+    let repo_root = std::env::current_dir()?.join("../../").canonicalize()?;
+    if !repo_root.join("Cargo.toml").exists() {
+        println!("Skipping measurement: not at the workspace root: {repo_root:?}");
+        return Ok(());
+    }
+
+    let scratch = tempdir()?;
+    let project_root = scratch.path().join("project");
+    let copied = copy_measurement_project(&repo_root, &project_root);
+    let storage_path = scratch.path().join("cache").join("codestory.db");
+
+    let controller = AppController::new();
+    controller
+        .open_project_with_storage_path(project_root.clone(), storage_path.clone())
+        .expect("open measurement project");
+
+    let full_started = std::time::Instant::now();
+    let full = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("full measurement index");
+    let full_wall_ms = full_started.elapsed().as_millis();
+    let published_file_bytes = fs::metadata(&storage_path)?.len();
+    println!(
+        "measurement project: {copied} files copied from {}",
+        repo_root.display()
+    );
+    println!(
+        "full refresh: wall_ms={full_wall_ms} published_core_file_bytes={published_file_bytes} candidate_bytes={:?}",
+        full.core_promotion.as_ref().map(|p| p.candidate_bytes)
+    );
+
+    // One changed file is the auto-refresh shape a delta apply would target:
+    // the smallest non-empty plan against the whole published core. An empty
+    // plan already short-circuits, so it is not the case in question.
+    let edited = project_root.join("crates/codestory-store/src/sqlite_path.rs");
+    let mut edited_source = fs::read_to_string(&edited)?;
+
+    for round in 1..=5 {
+        edited_source.push_str(&format!(
+            "\n#[allow(dead_code)]\npub fn s7_measurement_probe_{round}() -> u32 {{ {round} }}\n"
+        ));
+        fs::write(&edited, &edited_source)?;
+
+        let incremental_started = std::time::Instant::now();
+        let incremental = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental measurement index");
+        let incremental_wall_ms = incremental_started.elapsed().as_millis();
+
+        let probe = incremental
+            .incremental_plan_probe
+            .as_ref()
+            .expect("incremental plan probe telemetry");
+        let clone = incremental
+            .staged_snapshot_copy
+            .as_ref()
+            .expect("incremental clone telemetry");
+        let promotion = incremental
+            .core_promotion
+            .as_ref()
+            .expect("incremental promotion telemetry");
+
+        // The three whole-database movements one incremental publication
+        // performs: clone live into the stage, copy live into the rollback
+        // backup, restore the stage over live.
+        let movement_ms = u128::from(clone.copy_ms)
+            + u128::from(promotion.rollback_backup_copy_ms.unwrap_or_default())
+            + u128::from(promotion.staged_to_live_restore_ms);
+        // Promotion work no apply strategy removes: it validates identities,
+        // digests images, and fsyncs the journal.
+        let fence_ms = u128::from(promotion.total_ms)
+            .saturating_sub(u128::from(
+                promotion.rollback_backup_copy_ms.unwrap_or_default(),
+            ))
+            .saturating_sub(u128::from(promotion.staged_to_live_restore_ms));
+
+        println!(
+            "incremental round {round}: files_to_index={} files_to_remove={} outcome={:?}",
+            probe.files_to_index, probe.files_to_remove, probe.outcome
+        );
+        println!(
+            "  wall_ms={incremental_wall_ms} publish_ms={:?} promotion_total_ms={}",
+            incremental.publish_ms, promotion.total_ms
+        );
+        println!(
+            "  movement_ms={movement_ms} (clone={} rollback_backup={:?} restore={}) live_bytes={:?} candidate_bytes={}",
+            clone.copy_ms,
+            promotion.rollback_backup_copy_ms,
+            promotion.staged_to_live_restore_ms,
+            promotion.previous_live_bytes,
+            promotion.candidate_bytes
+        );
+        println!(
+            "  promotion_fence_ms={fence_ms} (lock_recovery={} candidate_validation={} previous_validation={} backup_validation={:?} journal_write={} journal_file_sync={} journal_dir_sync={} promoted_validation={} committed_journal={} cleanup={} unattributed={})",
+            promotion.lock_recovery_ms,
+            promotion.candidate_validation_ms,
+            promotion.previous_validation_ms,
+            promotion.backup_validation_ms,
+            promotion.prepared_journal_write_ms,
+            promotion.prepared_journal_file_sync_ms,
+            promotion.prepared_journal_directory_sync_ms,
+            promotion.promoted_validation_ms,
+            promotion.committed_journal_ms,
+            promotion.cleanup_ms,
+            promotion.unattributed_ms
+        );
+        // The two phases that carry the whole-file digests: the candidate is
+        // digested on each side of its own validation and the published file
+        // once more. Each phase also does cheap indexed identity reads, so this
+        // bounds the digest cost from above rather than isolating it. An apply
+        // strategy that keeps no candidate file cannot seal a receipt this way,
+        // so this is the price of the identity it would have to replace.
+        let digest_bearing_ms = u128::from(promotion.candidate_validation_ms)
+            + u128::from(promotion.promoted_validation_ms);
+        // A single-transaction apply against live is the only shape that keeps
+        // old-or-new without a staged copy. This counts the projection commits
+        // the incremental indexer performs today, which such a design would
+        // have to collapse to one along with every other write in the refresh.
+        println!(
+            "  digest_bearing_validation_ms={digest_bearing_ms} indexer_projection_transactions={:?}",
+            incremental.projection_batch_transactions
+        );
+        println!(
+            "  post_restore_fence={} movement_share_of_refresh={:.1}% publish_share_of_refresh={:.1}%",
+            promotion.promoted_validation.as_str(),
+            (movement_ms as f64 / incremental_wall_ms.max(1) as f64) * 100.0,
+            (f64::from(incremental.publish_ms.unwrap_or_default())
+                / incremental_wall_ms.max(1) as f64)
+                * 100.0
+        );
+    }
+
+    Ok(())
+}

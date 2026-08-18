@@ -7,7 +7,9 @@
 
 mod app;
 mod args;
+mod cache_reset;
 mod config;
+mod diagnostics;
 mod display;
 mod drill_targeting;
 mod embedding_config;
@@ -23,6 +25,9 @@ mod report;
 mod retrieval;
 mod runtime;
 mod sidecar_runtime;
+#[cfg(test)]
+mod status_wire_test_support;
+mod stdio_arguments;
 mod stdio_catalog;
 mod stdio_transport;
 
@@ -52,5 +57,6 @@ pub fn install_native_embedding_client_transport() -> Result<()> {
 
 /// Run the native embedding server entrypoint for this exact executable.
 pub fn run_native_embedding_server() -> Result<()> {
+    diagnostics::install_process_diagnostics();
     embedding_server_transport::run_internal_embedding_server()
 }

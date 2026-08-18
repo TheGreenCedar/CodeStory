@@ -189,6 +189,24 @@ Check:
 - whether JSON and markdown output still match the runtime DTO shape
 - whether the change belongs in runtime rather than the adapter layer
 
+## Runtime Failure Evidence
+
+WARN-and-higher process diagnostics are JSONL under
+`<process-cache-root>/diagnostics/codestory.jsonl`. The sink retains three
+bounded rotations plus fixed emergency slots, uses private directory and file
+permissions, and fails closed on free-form text: string, debug, error, panic,
+and child-stderr content is never retained or hashed. Each row carries the
+process ID and the correlation ID passed by the plugin launcher. A panic keeps
+only typed payload metadata and its code location. An embedding-server
+fail-stop makes one best-effort marker attempt in a fixed bounded slot and
+aborts after a short fixed deadline even if the cache filesystem stalls.
+
+`CODESTORY_LOG=error` narrows tracing records to errors.
+`CODESTORY_LOG=off` suppresses ordinary tracing records, but command failures,
+panics, and fail-stop markers remain available. Launcher status diagnostics
+record only saturating stderr byte/chunk counts together with the child exit
+code, signal, and matching correlation ID.
+
 ## If A Release Build Cannot Find The Embedded Model
 
 Release Cargo builds deliberately perform no acquisition or process launch. If
@@ -228,14 +246,19 @@ checkout, merge, or rewrite operations. Install them only when you want that
 repo-level signal:
 
 ```sh
-node plugins/codestory/hooks/codestory-dirty-hook.cjs install --project <target-workspace> --plugin-data <plugin-data-dir>
-node plugins/codestory/hooks/codestory-dirty-hook.cjs status --project <target-workspace> --plugin-data <plugin-data-dir>
+node plugins/codestory/hooks/codestory-dirty-hook.cjs install --project <target-workspace> --plugin-data <plugin-data-dir> --cli <absolute-codestory-cli-path>
+node plugins/codestory/hooks/codestory-dirty-hook.cjs status --project <target-workspace> --plugin-data <plugin-data-dir> --cli <absolute-codestory-cli-path>
 ```
+
+The installed plugin may omit `--cli` after one successful runtime launch has
+published a checksummed CLI receipt in its plugin-data directory. A source
+checkout should pass its explicit development CLI. `status` only uses those
+existing seams; it never provisions or downloads a CLI.
 
 Uninstall is safe and removes only CodeStory-managed hook blocks:
 
 ```sh
-node plugins/codestory/hooks/codestory-dirty-hook.cjs uninstall --project <target-workspace> --plugin-data <plugin-data-dir>
+node plugins/codestory/hooks/codestory-dirty-hook.cjs uninstall --project <target-workspace> --plugin-data <plugin-data-dir> --cli <absolute-codestory-cli-path>
 ```
 
 `foreign_hook_present` means existing hook content was preserved.

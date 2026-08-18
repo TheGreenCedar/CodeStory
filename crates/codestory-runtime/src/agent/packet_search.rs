@@ -1,28 +1,29 @@
 //! AppController batch search paths for packet retrieval.
 
+use crate::AppController;
+use crate::agent::packet_candidate::PacketSearchHit;
 use crate::agent::retrieval_primary::{
     packet_batch_should_use_sidecar, search_sidecar_packet_batch,
     sidecar_retrieval_unavailable_error, sidecar_retrieval_unavailable_reason,
 };
-use crate::{AppController, HybridSearchScoredHit};
-use codestory_contracts::api::{
-    AgentHybridWeightsDto, ApiError, PacketSidecarQueryDiagnosticDto, SearchHit,
-    SemanticFallbackRecordDto,
-};
+use codestory_contracts::api::{ApiError, PacketSidecarQueryDiagnosticDto};
 
-pub(crate) struct SemanticHybridBatchOutcome {
-    pub results: Vec<(String, Vec<HybridSearchScoredHit>)>,
-    pub fallbacks: Vec<SemanticFallbackRecordDto>,
-    pub sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
-}
-
-pub(crate) struct LexicalBatchOutcome {
-    pub results: Vec<(String, Vec<SearchHit>)>,
+#[derive(Debug)]
+pub(crate) struct PacketFusedBatchOutcome {
+    pub results: Vec<(String, Vec<PacketSearchHit>)>,
+    pub retryable_queries: Vec<String>,
     pub sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
 }
 
 fn packet_batch_error(controller: &AppController, error: ApiError, context: &str) -> ApiError {
-    if error.code == "publication_changed" {
+    if matches!(
+        error.code.as_str(),
+        "embedding_capacity"
+            | "embedding_retryable"
+            | "cache_busy"
+            | "publication_changed"
+            | "cancelled"
+    ) {
         error
     } else {
         sidecar_retrieval_unavailable_error(
@@ -36,47 +37,36 @@ fn packet_batch_error(controller: &AppController, error: ApiError, context: &str
 }
 
 impl AppController {
-    pub(crate) fn search_symbolic_packet_anchor_batch(
-        &self,
-        queries: &[String],
-        max_results: usize,
-        latency_budget_ms: Option<u32>,
-    ) -> Result<LexicalBatchOutcome, ApiError> {
-        let batched = queries
-            .iter()
-            .map(|query| (query.clone(), max_results))
-            .collect::<Vec<_>>();
-        self.search_lexical_hybrid_batch(&batched, latency_budget_ms)
-    }
-
-    pub(crate) fn search_lexical_hybrid_batch(
+    pub(crate) fn search_packet_fused_batch(
         &self,
         queries: &[(String, usize)],
         latency_budget_ms: Option<u32>,
-    ) -> Result<LexicalBatchOutcome, ApiError> {
+    ) -> Result<PacketFusedBatchOutcome, ApiError> {
         if queries.is_empty() {
-            return Ok(LexicalBatchOutcome {
+            return Ok(PacketFusedBatchOutcome {
                 results: Vec::new(),
+                retryable_queries: Vec::new(),
                 sidecar_diagnostics: Vec::new(),
             });
         }
         if packet_batch_should_use_sidecar(self) {
             match search_sidecar_packet_batch(self, queries, latency_budget_ms) {
                 Ok(outcome) => {
-                    return Ok(LexicalBatchOutcome {
+                    return Ok(PacketFusedBatchOutcome {
                         results: outcome.results,
+                        retryable_queries: outcome.retryable_queries,
                         sidecar_diagnostics: outcome.diagnostics,
                     });
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "sidecar retrieval packet lexical batch unavailable; fail-closed: {}",
+                        "sidecar retrieval packet fused batch unavailable; fail-closed: {}",
                         error.message
                     );
                     return Err(packet_batch_error(
                         self,
                         error,
-                        "sidecar retrieval packet lexical batch unavailable",
+                        "sidecar retrieval packet fused batch unavailable",
                     ));
                 }
             }
@@ -85,88 +75,7 @@ impl AppController {
         }
         Err(sidecar_retrieval_unavailable_error(
             self,
-            "full retrieval is mandatory for packet lexical batch",
-        ))
-    }
-
-    pub(crate) fn search_semantic_hybrid_batch(
-        &self,
-        queries: &[(String, usize, Option<AgentHybridWeightsDto>)],
-        latency_budget_ms: Option<u32>,
-    ) -> Result<SemanticHybridBatchOutcome, ApiError> {
-        if queries.is_empty() {
-            return Ok(SemanticHybridBatchOutcome {
-                results: Vec::new(),
-                fallbacks: Vec::new(),
-                sidecar_diagnostics: Vec::new(),
-            });
-        }
-        if packet_batch_should_use_sidecar(self) {
-            let batch = queries
-                .iter()
-                .map(|(query, max_results, _)| (query.clone(), *max_results))
-                .collect::<Vec<_>>();
-            match search_sidecar_packet_batch(self, &batch, latency_budget_ms) {
-                Ok(outcome) => {
-                    return Ok(SemanticHybridBatchOutcome {
-                        results: outcome
-                            .results
-                            .into_iter()
-                            .map(|(query, hits)| {
-                                (
-                                    query,
-                                    hits.into_iter()
-                                        .map(|hit| HybridSearchScoredHit {
-                                            lexical_score: hit.score,
-                                            semantic_score: 0.0,
-                                            graph_score: 0.0,
-                                            total_score: hit.score,
-                                            hit,
-                                        })
-                                        .collect(),
-                                )
-                            })
-                            .collect(),
-                        fallbacks: Vec::new(),
-                        sidecar_diagnostics: outcome.diagnostics,
-                    });
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "sidecar retrieval packet semantic batch unavailable; fail-closed: {}",
-                        error.message
-                    );
-                    return Err(packet_batch_error(
-                        self,
-                        error,
-                        "sidecar retrieval packet semantic batch unavailable",
-                    ));
-                }
-            }
-        } else if let Some(reason) = sidecar_retrieval_unavailable_reason(self) {
-            return Err(sidecar_retrieval_unavailable_error(self, reason));
-        }
-        Err(sidecar_retrieval_unavailable_error(
-            self,
-            "full retrieval is mandatory for packet semantic batch",
-        ))
-    }
-
-    pub(crate) fn warm_packet_subquery_embeddings(
-        &self,
-        queries: &[String],
-    ) -> Result<(), ApiError> {
-        if queries.is_empty() {
-            return Ok(());
-        }
-        if packet_batch_should_use_sidecar(self) {
-            return Ok(());
-        } else if let Some(reason) = sidecar_retrieval_unavailable_reason(self) {
-            return Err(sidecar_retrieval_unavailable_error(self, reason));
-        }
-        Err(sidecar_retrieval_unavailable_error(
-            self,
-            "full retrieval is mandatory for packet subquery warmup",
+            "full retrieval is mandatory for packet fused batch",
         ))
     }
 }
@@ -185,6 +94,61 @@ mod tests {
 
         assert_eq!(error.code, "publication_changed");
         assert_eq!(error.message, "generation drift");
+    }
+
+    #[test]
+    fn packet_batch_preserves_public_cancellation() {
+        let error = packet_batch_error(
+            &AppController::new(),
+            ApiError::new("cancelled", "request cancelled"),
+            "packet batch",
+        );
+
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(error.message, "request cancelled");
+    }
+
+    #[test]
+    fn packet_batch_preserves_embedding_capacity_without_reindex_advice() {
+        let error = packet_batch_error(
+            &AppController::new(),
+            ApiError::embedding_capacity(
+                "embedding connection admission is full",
+                codestory_contracts::api::EmbeddingCapacityPressureDto {
+                    reason: "connection_limit".to_string(),
+                    queue_class: "packet".to_string(),
+                    capacity: 1,
+                    depth: 1,
+                    retry_after_ms: 25,
+                    retry_condition: "after_capacity_change".to_string(),
+                    owner_state: "busy".to_string(),
+                    active_scope_id: Some("project-a".to_string()),
+                    active_request_id: Some("packet-a".to_string()),
+                    active_request_class: Some("packet".to_string()),
+                },
+            ),
+            "packet batch",
+        );
+
+        assert_eq!(error.code, "embedding_capacity");
+        let details = error.details.expect("typed capacity details");
+        assert!(details.next_commands.is_empty());
+        assert!(details.minimum_next.is_empty());
+        assert!(details.full_repair.is_empty());
+        assert_eq!(
+            details
+                .embedding_retry
+                .as_ref()
+                .map(|retry| retry.retry_after_ms),
+            Some(25)
+        );
+        assert_eq!(
+            details
+                .embedding_capacity
+                .as_ref()
+                .map(|pressure| pressure.owner_state.as_str()),
+            Some("busy")
+        );
     }
 
     struct EnvVarGuard {
@@ -217,18 +181,18 @@ mod tests {
     }
 
     #[test]
-    fn packet_subquery_warmup_fails_closed_without_sidecar_primary() {
+    fn packet_fused_batch_fails_closed_without_sidecar_primary() {
         let _lock = crate::process_env_test_lock();
         let _retrieval_env = EnvVarGuard::cleared("CODESTORY_RETRIEVAL");
         let controller = AppController::new_with_config(crate::test_sidecar_runtime_from_env());
 
         let error = controller
-            .warm_packet_subquery_embeddings(&["run_exec_session".to_string()])
-            .expect_err("packet warmup must not fall back to the legacy in-process search engine");
+            .search_packet_fused_batch(&[("run_exec_session".to_string(), 5)], None)
+            .expect_err("packet fused batch must not fall back to legacy in-process search");
 
         assert!(
             error.message.contains("retrieval requires an open project"),
-            "warmup should report the mandatory retrieval gate, got: {}",
+            "fused batch should report the mandatory retrieval gate, got: {}",
             error.message
         );
         assert_eq!(error.code, "retrieval_unavailable");
@@ -236,7 +200,7 @@ mod tests {
         assert_eq!(details.failed_layer.as_deref(), Some("retrieval_engine"));
         assert!(
             !details.next_commands.is_empty(),
-            "warmup should include recovery commands"
+            "fused batch should include recovery commands"
         );
     }
 }

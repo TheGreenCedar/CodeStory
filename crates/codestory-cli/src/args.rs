@@ -14,8 +14,9 @@ use codestory_contracts::api::{
     PacketProbeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto,
     ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
     RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
-    SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
-    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode, validate_packet_probe,
+    SearchQueryAssessmentDto, SearchTargetDto, SnippetContextDto, SummaryGenerationDto,
+    SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
+    validate_packet_probe,
 };
 use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf};
@@ -24,8 +25,10 @@ const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` fo
 const READ_REFRESH_HELP: &str = "Read commands default to `none` so they only query the existing cache. Use `incremental` to \
 refresh an existing cache in place, or `full` after a cache reset, schema change, or indexing \
 failure. Explicit `incremental` fails with `full_refresh_required` instead of escalating.";
-const DRILL_REFRESH_HELP: &str = "Drill defaults to `full` so each report is mechanically fresh. Use `none` only after a \
-fresh index, or `incremental` to refresh a compatible existing cache without allowing full-refresh escalation.";
+const DRILL_REFRESH_HELP: &str = "Drill defaults to `auto`: it chooses `full` for an empty, pre-current, or structurally \
+incompatible cache and `incremental` for a compatible existing publication, so each report is mechanically fresh without \
+forcing a full rebuild of a compatible cache. Use `none` to query the existing cache only, or `full` to force a rebuild \
+after a cache reset, schema change, or indexing failure. Explicit `incremental` never escalates to `full`.";
 const CLI_LONG_ABOUT: &str = "\
 CodeStory turns a local repository into auditable grounding evidence.
 
@@ -118,6 +121,8 @@ pub(crate) enum Command {
     Retrieval(RetrievalCommand),
     #[command(name = "internal-owned-delete", hide = true)]
     InternalOwnedDelete(InternalOwnedDeleteCommand),
+    #[command(name = "internal-dirty-hook", hide = true)]
+    InternalDirtyHook(InternalDirtyHookCommand),
     #[command(name = "internal-embedding-server", hide = true)]
     InternalEmbeddingServer,
     #[command(name = "internal-embedding-qualification-worker", hide = true)]
@@ -130,6 +135,27 @@ pub(crate) struct InternalOwnedDeleteCommand {
     pub(crate) root: PathBuf,
     #[arg(long, value_name = "RELATIVE_PATH")]
     pub(crate) relative: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum InternalDirtyHookAction {
+    Install,
+    Uninstall,
+    Status,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct InternalDirtyHookCommand {
+    #[arg(value_enum)]
+    pub(crate) action: InternalDirtyHookAction,
+    #[arg(long, value_name = "REPOSITORY")]
+    pub(crate) project: PathBuf,
+    #[arg(long, value_name = "DIR")]
+    pub(crate) plugin_data: PathBuf,
+    #[arg(long, value_name = "EXECUTABLE")]
+    pub(crate) node: PathBuf,
+    #[arg(long, value_name = "SCRIPT")]
+    pub(crate) script: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -485,7 +511,7 @@ pub(crate) struct PacketCommand {
         help = "Broad repository question or task to ground in one packet."
     )]
     pub(crate) question: String,
-    #[arg(long, value_enum, default_value_t = CliPacketBudget::Compact)]
+    #[arg(long, value_enum, default_value_t = CliPacketBudget::Standard)]
     pub(crate) budget: CliPacketBudget,
     #[arg(long, value_enum)]
     pub(crate) task_class: Option<CliPacketTaskClass>,
@@ -567,7 +593,7 @@ pub(crate) struct TaskBriefCommand {
         help = "Implementation task or issue brief to ground."
     )]
     pub(crate) prompt: String,
-    #[arg(long, value_enum, default_value_t = CliPacketBudget::Compact)]
+    #[arg(long, value_enum, default_value_t = CliPacketBudget::Standard)]
     pub(crate) budget: CliPacketBudget,
     #[arg(
         long = "probe",
@@ -690,6 +716,82 @@ pub(crate) enum CacheAction {
     Identity(CacheIdentityCommand),
     #[command(about = "Rehydrate a compatible cache from another worktree.")]
     Rehydrate(CacheRehydrateCommand),
+    #[command(
+        about = "Report, and optionally reclaim, cache state no live workspace or model can claim."
+    )]
+    Clean(CacheCleanCommand),
+    #[command(
+        about = "Quarantine this project's derived cache so it can be rebuilt.",
+        long_about = "Quarantine this project's derived cache so it can be rebuilt.\n\nDerived state is moved into a quarantine directory beside the cache, never deleted, and user-authored annotations are preserved in place. Use this after rolling a CodeStory release back onto a cache written by a newer schema; the reindex step is printed on completion."
+    )]
+    Reset(CacheResetCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CacheCleanCommand {
+    #[arg(
+        long,
+        help = "Reclaim the proven candidates in the plan. Omit for a dry-run plan that leaves the cache tree untouched."
+    )]
+    pub(crate) apply: bool,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+#[command(group(
+    ArgGroup::new("cache_reset_intent")
+        .args(["confirm", "dry_run"])
+        .required(true)
+))]
+pub(crate) struct CacheResetCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        required = true,
+        help = "Required scope acknowledgement. Only derived cache state is reset; user-authored annotations are preserved."
+    )]
+    pub(crate) derived_only: bool,
+    #[arg(
+        long,
+        help = "Move the derived cache into quarantine. Exactly one of --confirm or --dry-run is required."
+    )]
+    pub(crate) confirm: bool,
+    #[arg(
+        long,
+        help = "Print the quarantine plan without moving anything. Exactly one of --confirm or --dry-run is required."
+    )]
+    pub(crate) dry_run: bool,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+/// JSON contract for `cache reset`.
+pub(crate) struct CacheResetOutput {
+    pub(crate) project: String,
+    pub(crate) storage_path: String,
+    /// Only `derived_only` exists. The field is emitted so a later scope can
+    /// be told apart by machine readers without a schema guess.
+    pub(crate) scope: &'static str,
+    pub(crate) applied: bool,
+    pub(crate) quarantine_dir: String,
+    pub(crate) quarantined: Vec<String>,
+    pub(crate) preserved: Vec<String>,
+    pub(crate) next_commands: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -770,6 +872,39 @@ pub(crate) enum RetrievalAction {
     RepublishProjections(RetrievalRepublishProjectionsCommand),
     /// Execute a standalone query against published retrieval artifacts.
     Query(RetrievalQueryCommand),
+    /// Validate the retained rollback generation and make it current.
+    ///
+    /// Retention keeps one deeply verified previous generation. Activation
+    /// re-proves it against live state before moving the pointer and refuses
+    /// with a typed code when it no longer proves out.
+    ActivateRollback(RetrievalActivateRollbackCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RetrievalActivateRollbackCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        help = "Validate the retained rollback generation without changing the current pointer."
+    )]
+    pub(crate) dry_run: bool,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+/// JSON contract for `retrieval activate-rollback`.
+pub(crate) struct RetrievalActivateRollbackOutput {
+    pub(crate) project: String,
+    pub(crate) outcome: codestory_runtime::RollbackActivationOutcome,
+    pub(crate) next_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -778,7 +913,7 @@ pub(crate) enum CliSidecarProfile {
     Agent,
 }
 
-impl From<CliSidecarProfile> for codestory_retrieval::SidecarProfile {
+impl From<CliSidecarProfile> for codestory_runtime::RuntimeRetrievalProfile {
     fn from(value: CliSidecarProfile) -> Self {
         match value {
             CliSidecarProfile::Local => Self::Local,
@@ -954,7 +1089,7 @@ pub(crate) struct DrillCommand {
     #[arg(
         long,
         value_enum,
-        default_value_t = RefreshMode::Full,
+        default_value_t = RefreshMode::Auto,
         long_help = DRILL_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
@@ -968,14 +1103,23 @@ pub(crate) struct DrillCommand {
     pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
+    /// Deprecated no-op, retained for one release so pinned invocations keep
+    /// parsing.
+    ///
+    /// The evidence packet owns internal batch scheduling, so a single drill
+    /// has no anchor or bridge worker pool to size — `execute_drill` discarded
+    /// this value while help and the grounding skill advertised it as a real
+    /// control. It is hidden from help and warns when supplied this release;
+    /// removal is next release. `drill-suite --jobs` is a different flag and
+    /// still schedules cases.
     #[arg(
         long,
         value_name = "N",
-        default_value_t = 1,
         value_parser = parse_positive_usize,
-        help = "Read-only anchor and bridge evidence workers for --refresh none drills. Defaults to 1."
+        hide = true,
+        help = "Deprecated and ignored; the evidence packet owns drill scheduling. Removed next release."
     )]
-    pub(crate) jobs: usize,
+    pub(crate) jobs: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -997,7 +1141,7 @@ pub(crate) struct DrillSuiteCommand {
     #[arg(
         long,
         value_enum,
-        default_value_t = RefreshMode::Full,
+        default_value_t = RefreshMode::Auto,
         long_help = DRILL_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
@@ -1612,6 +1756,8 @@ pub(crate) struct SearchHitOutput {
     pub(crate) line: Option<u32>,
     pub(crate) score: f32,
     pub(crate) origin: SearchHitOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target: Option<SearchTargetDto>,
     pub(crate) match_quality: SearchMatchQualityDto,
     pub(crate) resolvable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2315,6 +2461,8 @@ pub(crate) struct RetrievalStatusOutput {
     pub(crate) precise_semantic_import_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) precise_semantic_import_producer: Option<String>,
+    #[serde(flatten)]
+    pub(crate) ready_lease: codestory_runtime::ReadyLeaseEvidence,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2502,6 +2650,123 @@ mod tests {
         subcommand.render_long_help().to_string()
     }
 
+    /// Reclaiming cache state is opt-in. A `cache clean` invocation that
+    /// forgets `--apply` must produce a plan, never a deletion.
+    #[test]
+    fn cache_clean_reclaims_nothing_without_an_explicit_apply() {
+        let planned = Cli::try_parse_from(["codestory-cli", "cache", "clean"])
+            .expect("cache clean should parse without flags");
+        let Command::Cache(CacheCommand {
+            action: CacheAction::Clean(planned),
+        }) = planned.command
+        else {
+            panic!("expected cache clean command");
+        };
+        assert!(!planned.apply, "cache clean must default to a dry-run plan");
+
+        let applied = Cli::try_parse_from(["codestory-cli", "cache", "clean", "--apply"])
+            .expect("cache clean --apply should parse");
+        let Command::Cache(CacheCommand {
+            action: CacheAction::Clean(applied),
+        }) = applied.command
+        else {
+            panic!("expected cache clean command");
+        };
+        assert!(applied.apply);
+    }
+
+    #[test]
+    fn cache_reset_refuses_to_parse_without_an_explicit_scope_and_intent() {
+        // Quarantining a cache is destructive-looking even though it only
+        // moves files, so neither the scope nor the intent may be implicit.
+        let missing_everything = Cli::try_parse_from(["codestory-cli", "cache", "reset"])
+            .expect_err("cache reset must not parse bare");
+        assert!(
+            missing_everything.to_string().contains("--derived-only"),
+            "the scope acknowledgement must be named: {missing_everything}"
+        );
+
+        let missing_intent =
+            Cli::try_parse_from(["codestory-cli", "cache", "reset", "--derived-only"])
+                .expect_err("cache reset must not parse without an intent");
+        let rendered = missing_intent.to_string();
+        assert!(
+            rendered.contains("--confirm") && rendered.contains("--dry-run"),
+            "the required intent flags must be named: {rendered}"
+        );
+
+        let both = Cli::try_parse_from([
+            "codestory-cli",
+            "cache",
+            "reset",
+            "--derived-only",
+            "--confirm",
+            "--dry-run",
+        ])
+        .expect_err("cache reset must not accept both intents at once");
+        assert!(
+            both.to_string().contains("cannot be used with"),
+            "confirm and dry-run must be mutually exclusive: {both}"
+        );
+
+        let parsed = Cli::try_parse_from([
+            "codestory-cli",
+            "cache",
+            "reset",
+            "--derived-only",
+            "--confirm",
+        ])
+        .expect("an explicit scope and intent must parse");
+        let Command::Cache(cache) = parsed.command else {
+            panic!("expected the cache command");
+        };
+        let CacheAction::Reset(reset) = cache.action else {
+            panic!("expected the reset action");
+        };
+        assert!(reset.derived_only);
+        assert!(reset.confirm);
+        assert!(!reset.dry_run);
+    }
+
+    #[test]
+    fn retrieval_activate_rollback_defaults_to_applying_and_accepts_dry_run() {
+        let applied = Cli::try_parse_from([
+            "codestory-cli",
+            "retrieval",
+            "activate-rollback",
+            "--project",
+            "/repo",
+        ])
+        .expect("activate-rollback must parse");
+        let Command::Retrieval(retrieval) = applied.command else {
+            panic!("expected the retrieval command");
+        };
+        let RetrievalAction::ActivateRollback(activate) = retrieval.action else {
+            panic!("expected the activate-rollback action");
+        };
+        assert!(
+            !activate.dry_run,
+            "activation applies unless validation-only is requested"
+        );
+
+        let validated = Cli::try_parse_from([
+            "codestory-cli",
+            "retrieval",
+            "activate-rollback",
+            "--project",
+            "/repo",
+            "--dry-run",
+        ])
+        .expect("activate-rollback --dry-run must parse");
+        let Command::Retrieval(retrieval) = validated.command else {
+            panic!("expected the retrieval command");
+        };
+        let RetrievalAction::ActivateRollback(activate) = retrieval.action else {
+            panic!("expected the activate-rollback action");
+        };
+        assert!(activate.dry_run);
+    }
+
     #[test]
     fn packet_cli_parses_tagged_and_legacy_probes() {
         let parsed = Cli::try_parse_from([
@@ -2566,7 +2831,7 @@ mod tests {
     }
 
     #[test]
-    fn embedding_server_entrypoint_is_parsable_but_hidden() {
+    fn internal_entrypoints_are_parsable_but_hidden() {
         let parsed = Cli::try_parse_from(["codestory-cli", "internal-embedding-server"])
             .expect("hidden embedding server entrypoint should parse");
         assert!(matches!(parsed.command, Command::InternalEmbeddingServer));
@@ -2593,6 +2858,36 @@ mod tests {
         assert!(
             !help.contains("internal-embedding-qualification-worker"),
             "internal qualification worker leaked into public help: {help}"
+        );
+
+        let dirty_hook = Cli::try_parse_from([
+            "codestory-cli",
+            "internal-dirty-hook",
+            "install",
+            "--project",
+            "/tmp/project",
+            "--plugin-data",
+            "/tmp/plugin-data",
+            "--node",
+            "/usr/bin/node",
+            "--script",
+            "/tmp/codestory-dirty-hook.cjs",
+        ])
+        .expect("hidden dirty-hook adapter should parse");
+        let Command::InternalDirtyHook(dirty_hook) = dirty_hook.command else {
+            panic!("expected internal dirty-hook command");
+        };
+        assert_eq!(dirty_hook.action, InternalDirtyHookAction::Install);
+        assert_eq!(dirty_hook.project, PathBuf::from("/tmp/project"));
+        assert_eq!(dirty_hook.plugin_data, PathBuf::from("/tmp/plugin-data"));
+        assert_eq!(dirty_hook.node, PathBuf::from("/usr/bin/node"));
+        assert_eq!(
+            dirty_hook.script,
+            PathBuf::from("/tmp/codestory-dirty-hook.cjs")
+        );
+        assert!(
+            !help.contains("internal-dirty-hook"),
+            "internal dirty-hook adapter leaked into public help: {help}"
         );
     }
 
@@ -2648,11 +2943,53 @@ mod tests {
         assert!(help.contains("--output-dir <DIR>"));
         assert!(help.contains("--label <LABEL>"));
         assert!(help.contains("--question <QUESTION>"));
-        assert!(help.contains("--jobs <N>"));
         assert!(help.contains("--profile <PROFILE>"));
         assert!(help.contains("--run-id <ID>"));
         assert!(help.contains("Stored in the report only; it is not interpreted"));
-        assert!(help.contains("Drill defaults to `full`"));
+        assert!(help.contains("Drill defaults to `auto`"));
+        assert!(help.contains("without forcing a full rebuild of a compatible cache"));
+    }
+
+    #[test]
+    fn drill_commands_default_to_auto_refresh() {
+        // `full` replaces the database without copying its bookmark tables, so
+        // making it the default drops annotations even when the existing cache
+        // is compatible. `auto` still guarantees a mechanically fresh report
+        // because it escalates to `full` whenever the cache is empty,
+        // pre-current, or structurally incompatible. Ordinary incremental
+        // `FullReplace` updates have their own annotation-loss path through
+        // `delete_file_projection`; this default change is only containment.
+        let drill = Cli::try_parse_from([
+            "codestory-cli",
+            "drill",
+            "--project",
+            ".",
+            "--anchors",
+            "Alpha",
+            "--output-dir",
+            "target/drill",
+        ])
+        .expect("parse drill");
+        let Command::Drill(drill) = drill.command else {
+            panic!("expected drill command");
+        };
+        assert_eq!(drill.refresh, RefreshMode::Auto);
+
+        let suite = Cli::try_parse_from([
+            "codestory-cli",
+            "drill-suite",
+            "--project",
+            ".",
+            "--case-file",
+            "cases.json",
+            "--output-dir",
+            "target/drill-suite",
+        ])
+        .expect("parse drill-suite");
+        let Command::DrillSuite(suite) = suite.command else {
+            panic!("expected drill-suite command");
+        };
+        assert_eq!(suite.refresh, RefreshMode::Auto);
     }
 
     #[test]
@@ -2663,8 +3000,18 @@ mod tests {
         assert!(!help.contains("--ledger"));
     }
 
+    /// `drill --jobs` is a deprecated no-op in its final release: it must still
+    /// parse so pinned invocations keep working, must no longer be advertised
+    /// in help, and must be distinguishable from "not supplied" so the run can
+    /// say it is being ignored. Removal is next release.
     #[test]
-    fn drill_jobs_parse_with_conservative_default() {
+    fn deprecated_drill_jobs_stays_parseable_but_unadvertised() {
+        let help = render_subcommand_help("drill");
+        assert!(
+            !help.contains("--jobs"),
+            "a flag that schedules nothing must not be advertised: {help}"
+        );
+
         let drill = Cli::try_parse_from([
             "codestory-cli",
             "drill",
@@ -2673,9 +3020,9 @@ mod tests {
             "--output-dir",
             "target/drill/test",
         ])
-        .expect("drill default jobs");
+        .expect("drill without the deprecated flag");
         match drill.command {
-            Command::Drill(cmd) => assert_eq!(cmd.jobs, 1),
+            Command::Drill(cmd) => assert_eq!(cmd.jobs, None),
             _ => panic!("expected drill command"),
         }
 
@@ -2689,9 +3036,9 @@ mod tests {
             "--jobs",
             "4",
         ])
-        .expect("drill explicit jobs");
+        .expect("a pinned invocation must keep parsing for one more release");
         match drill.command {
-            Command::Drill(cmd) => assert_eq!(cmd.jobs, 4),
+            Command::Drill(cmd) => assert_eq!(cmd.jobs, Some(4)),
             _ => panic!("expected drill command"),
         }
 
@@ -2919,6 +3266,40 @@ mod tests {
         match cli.command {
             Command::Context(cmd) => assert_eq!(cmd.id.as_deref(), Some("-3816661223164617416")),
             _ => panic!("expected context command"),
+        }
+    }
+
+    #[test]
+    fn packet_and_task_brief_default_to_the_standard_evidence_budget() {
+        let packet = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--project",
+            "/tmp/project",
+            "--question",
+            "explain indexing",
+        ])
+        .expect("packet should parse with its default budget");
+        match packet.command {
+            Command::Packet(cmd) => assert_eq!(cmd.budget, CliPacketBudget::Standard),
+            _ => panic!("expected packet command"),
+        }
+
+        let brief = Cli::try_parse_from([
+            "codestory-cli",
+            "task",
+            "brief",
+            "--project",
+            "/tmp/project",
+            "--prompt",
+            "change indexing",
+        ])
+        .expect("task brief should parse with its default budget");
+        match brief.command {
+            Command::Task(TaskCommand {
+                action: TaskAction::Brief(cmd),
+            }) => assert_eq!(cmd.budget, CliPacketBudget::Standard),
+            _ => panic!("expected task brief command"),
         }
     }
 }

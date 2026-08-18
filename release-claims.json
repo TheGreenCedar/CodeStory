@@ -15,7 +15,7 @@
     "answer_quality"
   ],
   "public_support": {
-    "release_line": "0.16",
+    "release_line": "0.17",
     "packages": [
       {
         "target": "macos-arm64",
@@ -40,7 +40,6 @@
       }
     ],
     "unshipped_targets": [
-      "linux-arm64",
       "macos-x64",
       "windows-arm64"
     ],
@@ -119,6 +118,15 @@
         "source_tree": {
           "admits": "Evidence from a prior run is admissible when its producing commit resolves to the identical source tree and is an ancestor of the release commit on the promotion path.",
           "equates": []
+        },
+        "calibration_source_lineage": {
+          "admits": "Source-behavior evidence from the stabilized calibration source is admissible when the canonical calibration-lineage verifier proves that commit is the selected source and that the release differs only by the generated constant set plus an optional tree-preserving promotion commit.",
+          "equates": [
+            {
+              "identity": "source_tree",
+              "justification": "The canonical calibration-lineage proof binds the reused commit and tree as the exact source whose behavior was compiled, linted, tested, and checked on Windows before calibration. The generated constant-set child does not change source behavior, so the stabilized source tree is the one source_behavior evidence must continue to name."
+            }
+          ]
         },
         "native_fingerprint": {
           "admits": "Accelerator evidence from the previous published release is admissible when the reused commit is an ancestor of the release commit and the version-normalized native fingerprint (scripts/native-fingerprint.mjs) of both commits is identical: the built inputs differ only by the embedded version string. Packaging and signing always rerun; only accelerator behavior is inherited.",
@@ -280,8 +288,7 @@
       "proof_lanes": [
         ".github/workflows/macos-metal-proof.yml",
         ".github/workflows/windows-vulkan-proof.yml",
-        ".github/workflows/linux-vulkan-proof.yml",
-        ".github/workflows/release-candidate-evidence.yml"
+        ".github/workflows/linux-vulkan-proof.yml"
       ],
       "required_identity": [
         "repository",
@@ -295,7 +302,7 @@
       "id": "performance",
       "tier": "live_behavior",
       "proof_lanes": [
-        ".github/workflows/release-candidate-evidence.yml"
+        ".github/workflows/frozen-candidate-quality.yml"
       ],
       "required_identity": [
         "repository",
@@ -316,7 +323,7 @@
       "id": "answer_quality",
       "tier": "answer_quality",
       "proof_lanes": [
-        ".github/workflows/release-candidate-evidence.yml"
+        ".github/workflows/frozen-candidate-quality.yml"
       ],
       "required_identity": [
         "repository",
@@ -617,7 +624,7 @@
           "producer_artifact": "release-cell-prepublish-source-attempt-{attempt}"
         },
         "archive_role": "none",
-        "reuse_binding": "source_tree"
+        "reuse_binding": "calibration_source_lineage"
       },
       {
         "id": "package_identity",
@@ -973,12 +980,26 @@
     "schema": "codestory.release-non-claim/v1",
     "runtime_execution": "not_proven_by_package",
     "reason": "accelerator_host_unavailable",
+    "pre_assignment_reason": "accelerator_host_offline_pre_assignment",
     "annotation": "The self-hosted runner lost communication with the server. Verify the machine is running and has a healthy network connection.",
+    "annotation_reason": "accelerator_host_unavailable",
     "maximum_run_attempts": 2,
     "recovery_contract": ".github/scripts/lost-runner-recovery.mjs",
     "producer_workflow": ".github/workflows/release.yml",
     "producer_job": "accelerator-non-claim",
     "producer_job_name": "Withhold unproven accelerator claims",
+    "reservation": {
+      "schema": "codestory.protected-runner-reservation/v1",
+      "producer_workflow": ".github/workflows/release.yml",
+      "producer_job": "reserve-protected-runners",
+      "receipt_artifact": "protected-runner-reservation-attempt-{attempt}",
+      "maximum_observation_attempts": 2,
+      "heartbeat": {
+        "workflow": ".github/workflows/protected-runner-heartbeat.yml",
+        "cron": "*/15 * * * *",
+        "tolerance_minutes": 30
+      }
+    },
     "withhold_policy": {
       "maximum_withheld_hosts": 1,
       "archive_identity_source": "candidate_archive_record",
@@ -992,6 +1013,13 @@
     "hosts": [
       {
         "id": "macos-arm64-metal",
+        "runner_labels": [
+          "self-hosted",
+          "macOS",
+          "ARM64",
+          "codestory-metal"
+        ],
+        "heartbeat_job_name": "Heartbeat macos-arm64-metal",
         "unavailable_producer_workflow": ".github/workflows/macos-metal-proof.yml",
         "unavailable_producer_job_name": "Packaged Apple Silicon Metal engine",
         "producer_artifacts": {
@@ -1006,6 +1034,13 @@
       },
       {
         "id": "windows-x64-vulkan",
+        "runner_labels": [
+          "self-hosted",
+          "Windows",
+          "X64",
+          "codestory-vulkan"
+        ],
+        "heartbeat_job_name": "Heartbeat windows-x64-vulkan",
         "unavailable_producer_workflow": ".github/workflows/windows-vulkan-proof.yml",
         "unavailable_producer_job_name": "Packaged Windows Vulkan engine",
         "producer_artifacts": {
@@ -1020,6 +1055,13 @@
       },
       {
         "id": "linux-x64-vulkan",
+        "runner_labels": [
+          "self-hosted",
+          "Linux",
+          "X64",
+          "codestory-linux-vulkan"
+        ],
+        "heartbeat_job_name": "Heartbeat linux-x64-vulkan",
         "unavailable_producer_workflow": ".github/workflows/linux-vulkan-proof.yml",
         "unavailable_producer_job_name": "Packaged Linux Vulkan engine",
         "producer_artifacts": {
@@ -1036,6 +1078,63 @@
   },
   "workflow_policy": {
     "artifact_retention_days": 30,
+    "proof_floor": {
+      "schema": 1,
+      "architecture_contract": {
+        "workflow": "retrieval-engine-smoke.yml",
+        "job": "linux-contracts",
+        "command": "cargo test --locked -p codestory-cli --test architecture_contracts"
+      },
+      "crate_durability": {
+        "workflow": "crate-durability.yml",
+        "job": "linux-durability",
+        "artifact_free": true,
+        "timeout_minutes": 60,
+        "branches": [
+          "main",
+          "dev/codestory-next"
+        ],
+        "paths": [
+          "Cargo.toml",
+          "Cargo.lock",
+          "vendor/**",
+          "crates/codestory-store/**",
+          "crates/codestory-indexer/**",
+          "crates/codestory-workspace/**",
+          "crates/codestory-contracts/**",
+          "crates/codestory-agent/**",
+          ".github/workflows/crate-durability.yml",
+          ".github/scripts/check-workflow-policy.mjs",
+          ".github/scripts/check-workflow-policy.test.mjs",
+          "release-claims.json",
+          "scripts/codestory-release-claims.mjs",
+          "scripts/tests/codestory-release-claims.test.mjs",
+          "docs/contributors/testing-matrix.md"
+        ],
+        "cache_namespace": "crate-durability-v1",
+        "commands": [
+          "cargo test --locked -p codestory-store",
+          "cargo test --locked -p codestory-indexer --test fidelity_regression",
+          "cargo test --locked -p codestory-indexer --test tictactoe_language_coverage",
+          "cargo test --locked -p codestory-agent"
+        ]
+      },
+      "merged_suite_lanes": {
+        "workflow": "retrieval-engine-smoke.yml",
+        "job": "linux-contracts",
+        "step": "Evidence, readiness, hooks, and workspace contract tests",
+        "commands": [
+          "cargo test --locked -p codestory-runtime --lib agent::packet_evidence::",
+          "cargo test --locked -p codestory-runtime --lib agent::packet_compiler::tests",
+          "cargo test --locked -p codestory-runtime --lib agent::packet_batch::",
+          "cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::",
+          "cargo test --locked -p codestory-runtime --lib services::",
+          "cargo test --locked -p codestory-cli --lib",
+          "cargo test --locked -p codestory-workspace",
+          "cargo test --locked -p codestory-agent"
+        ]
+      }
+    },
     "package_matrix": [
       {
         "os": "windows-latest",
@@ -1087,7 +1186,23 @@
         "feature_probe",
         "packaging",
         "artifact_transfer"
-      ]
+      ],
+      "link_timing": {
+        "phase": "msvc_link",
+        "selector": ".github/scripts/windows-link-timing.mjs",
+        "record_schema": "codestory.windows-link-timing/v1",
+        "record_file": "windows-link-timing.json",
+        "evidence": "explicit_link_time_boundary",
+        "substring_match": false,
+        "observational": true,
+        "unavailable_reasons": [
+          "incoherent-linker-report",
+          "link-exceeds-build-interval",
+          "linker-log-empty",
+          "linker-log-missing",
+          "no-explicit-linker-report"
+        ]
+      }
     },
     "candidate_archive_cache": {
       "record_schema": "codestory-candidate-archive-store/v1",
@@ -1133,8 +1248,8 @@
       "coordinator_workflow": "packaged-platform-pr.yml",
       "mode": "calibration",
       "assembly_job": "calibration-assemble",
-      "pre_collection_source_proof_required": false,
-      "source_proof_stage": "frozen_candidate_before_qualification",
+      "pre_collection_source_proof_required": true,
+      "source_proof_stage": "source_stabilization_before_calibration",
       "required_cells": [
         {
           "id": "protected_macos_arm64_metal",
@@ -1259,7 +1374,7 @@
         "archive_cache_contract": "candidate_archive_cache",
         "archive_transfer": "authenticated_miss_only",
         "evaluation_owner": "isolated_reusable_workflow",
-        "evaluation_owner_sha256": "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173",
+        "evaluation_owner_sha256": "5b97ee71393c5f72ef106d0d1e238cb1323e930204a06a4557f8e63725b0f8cd",
         "evaluation_contract": "publishable-three-repeat-packet/v1",
         "task_count": 1,
         "repeats_per_task": 3,
@@ -1361,21 +1476,29 @@
         "packaged-proof": [
           "preflight"
         ],
-        "macos-metal-proof": [
+        "reserve-protected-runners": [
           "preflight",
           "packaged-proof"
+        ],
+        "macos-metal-proof": [
+          "preflight",
+          "packaged-proof",
+          "reserve-protected-runners"
         ],
         "windows-vulkan-proof": [
           "preflight",
-          "packaged-proof"
+          "packaged-proof",
+          "reserve-protected-runners"
         ],
         "linux-vulkan-proof": [
           "preflight",
-          "packaged-proof"
+          "packaged-proof",
+          "reserve-protected-runners"
         ],
         "accelerator-non-claim": [
           "preflight",
           "packaged-proof",
+          "reserve-protected-runners",
           "macos-metal-proof",
           "windows-vulkan-proof",
           "linux-vulkan-proof"
@@ -1447,12 +1570,41 @@
           "id": "deferred",
           "installer": "codex_marketplace_deferred_fixture",
           "live_catalog_revision": false
+        },
+        {
+          "id": "restored",
+          "installer": "codex_marketplace_restored_fixture",
+          "live_catalog_revision": false
         }
-      ]
+      ],
+      "recovery": {
+        "id": "recovered",
+        "previous_pin_outputs": [
+          "previous_marketplace_revision",
+          "previous_plugin_sha",
+          "previous_plugin_version"
+        ],
+        "automatic_restore": true,
+        "restored_state": "restored"
+      }
+    },
+    "lost_runner_rerun": {
+      "workflow": "lost-runner-rerun.yml",
+      "job": "rerun-lost-jobs",
+      "recovery_contract": ".github/scripts/lost-runner-recovery.mjs",
+      "plan_schema": "codestory.lost-runner-rerun-plan/v2",
+      "plan_file": "target/lost-runner/rerun-plan.json",
+      "dispatch_schema": "codestory.lost-runner-rerun-dispatch/v1",
+      "dispatch_file": "target/lost-runner/rerun-dispatch.json",
+      "dispatch_step": "Re-dispatch only the lost jobs",
+      "dispatch_command": "node .github/scripts/lost-runner-recovery.mjs dispatch-rerun",
+      "selection": "latest_execution_per_job_name",
+      "dispatch_tolerance": "per_job_id",
+      "dispatch_failure": "fail_only_when_no_job_was_accepted"
     },
     "artifact_workflows": [
       "source-proof.yml",
-      "release-candidate-evidence.yml",
+      "frozen-candidate-quality.yml",
       "packaged-platform-proof.yml",
       "macos-metal-proof.yml",
       "windows-vulkan-proof.yml",
@@ -1523,18 +1675,17 @@
         "publisher_step": "Publish executable release freeze",
         "status_creator": "github-actions[bot]",
         "job_manifest": ".github/scripts/release-freeze-acceptance-jobs.json",
-        "job_manifest_sha256": "bb0a23ed7f74528fc3d4e4962c1b34f98758a628f48dd943b9d1356149e453c5",
+        "job_manifest_sha256": "b1ae13eabcbda9c99f7d0ba17cae97ca292d11fa4b010f87c534f9b7938843c7",
         "phases": {
-          "calibration_source": {
+          "source_stabilization": {
             "known_future_source_changes": [
               "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
             ],
             "planned_actions": [
-              "calibration-source-acceptance",
+              "source-stabilization",
               "calibration",
               "generated-constant-freeze",
               "frozen-candidate-acceptance",
-              "source-proof",
               "qualification",
               "release"
             ],
@@ -1544,7 +1695,6 @@
             "known_future_source_changes": [],
             "planned_actions": [
               "frozen-candidate-acceptance",
-              "source-proof",
               "qualification",
               "release"
             ],
@@ -1560,10 +1710,6 @@
         "linux-x64": {
           "archive": "actionlint_1.7.12_linux_amd64.tar.gz",
           "sha256": "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
-        },
-        "linux-arm64": {
-          "archive": "actionlint_1.7.12_linux_arm64.tar.gz",
-          "sha256": "325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6"
         },
         "darwin-x64": {
           "archive": "actionlint_1.7.12_darwin_amd64.tar.gz",
@@ -1581,6 +1727,2558 @@
           "archive": "actionlint_1.7.12_windows_arm64.zip",
           "sha256": "cadcf7ea4efe3a68728893813643cebe1185e5b1d4be5b96245f65c9a4d5ea41"
         }
+      }
+    },
+    "pinned_programs": {
+      "nextest_linux_archive": {
+        "subject": "downloaded_archive",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Install pinned cargo-nextest",
+        "sha256": "7d07712519615722b19ffe3b3d1097b7d4fa390995e3cac1f9d6dda1ba61b2a7",
+        "reason": "The pinned test runner is fetched over the network, so the install step must verify this exact cargo-nextest 0.9.98 Linux x64 archive with sha256sum --check --strict before it executes."
+      },
+      "source_proof_resolver": {
+        "subject": "step_script_raw_text",
+        "file": "source-proof.yml",
+        "job": "resolve",
+        "step": "Resolve trusted exact head",
+        "sha256": "2fe869b675010f5db29259aff38d83456c01dbc9885989afbf7c92a2826791af",
+        "reason": "The trusted-head resolver authenticates which commit the broad source proof runs against; fragment checks alone cannot prove the authentication logic was not rewritten around them."
+      },
+      "packaged_platform_pr_resolver": {
+        "subject": "step_script_raw_text",
+        "file": "packaged-platform-pr.yml",
+        "job": "route",
+        "step": "Resolve trusted exact head",
+        "sha256": "057bb7924c9ec281671defe683519debfb71359729d66fb0afb84513dc22bf5f",
+        "reason": "The coordinator's trusted-head resolver authenticates the exact frozen-candidate head for every broad proof mode; its executable text must match the reviewed contract, not merely contain its tokens."
+      },
+      "marketplace_sync_dispatch_guard": {
+        "subject": "step_script_executable_text",
+        "file": "marketplace-sync.yml",
+        "job": "sync",
+        "step": "Validate the dispatched release coordinates",
+        "sha256": "3935d34bb0922b6d8489699693f504369068f7590fa2cf4372b6e7945ef6f00f",
+        "reason": "check-workflow-policy.test.mjs runs this exact script against hostile dispatch values and proves it exits non-zero, so the digest stands for a rejection that was measured, not merely read."
+      },
+      "packaged_platform_pr_closeout": {
+        "subject": "step_script_executable_text",
+        "file": "packaged-platform-pr.yml",
+        "job": "closeout",
+        "step": "Require one coherent accepted proof",
+        "sha256": "998c75f00069e3b2a22bddd3be003b23b9dc34c31f14b06410ad53582e7e1097",
+        "reason": "The closeout is a small shell control-flow program. Substring checks can be satisfied by parking the accepted qualification branch in dead code while the live branch blocks on optional Linux hardware, so its reviewed executable text is pinned as well as its reader-facing invariants."
+      },
+      "packaged_platform_proof_workflow": {
+        "subject": "parsed_workflow_json",
+        "file": "packaged-platform-proof.yml",
+        "sha256": "443c65ea54f92260e664bdeaceabb43e57ac1dc9cb5d15f2783690f6102823fa",
+        "reason": "This workflow builds release archives on three operating systems and carries state between many shell steps through GITHUB_ENV and GITHUB_PATH. Its parsed executable structure is pinned so an unreviewed earlier step cannot replace an owner binary while leaving the locally digested finalizer unchanged."
+      },
+      "packaged_platform_pr_workflow": {
+        "subject": "parsed_workflow_json",
+        "file": "packaged-platform-pr.yml",
+        "sha256": "a633fd7e6def5305940844aca96a6869fca77622050dc79f0c4682f5e0a9c1c3",
+        "reason": "The frozen-candidate coordinator is a small release-control program, not a loose collection of independently safe fragments. Its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
+      },
+      "frozen_candidate_quality_workflow": {
+        "subject": "parsed_workflow_json",
+        "file": "frozen-candidate-quality.yml",
+        "sha256": "5b97ee71393c5f72ef106d0d1e238cb1323e930204a06a4557f8e63725b0f8cd",
+        "reason": "The isolated evaluation owner runs optional quality evidence against the exact frozen candidate; pinning its complete parsed structure keeps the adjunct from acquiring authority or losing its isolation unreviewed. The qualification quality contract cites this same pin as evaluation_owner_sha256."
+      },
+      "macos_metal_proof_workflow": {
+        "subject": "parsed_workflow_json",
+        "file": "macos-metal-proof.yml",
+        "sha256": "55581330f6a035b84e1224dbd5469d812ab2fa444914157e22a39cccc64f4627",
+        "reason": "The protected Metal proof is a release-control program on protected hardware; its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
+      },
+      "windows_vulkan_proof_workflow": {
+        "subject": "parsed_workflow_json",
+        "file": "windows-vulkan-proof.yml",
+        "sha256": "c2272dbf4c550ba4a21372e772a87f6df3307f5f4f709b216473f85958157ffe",
+        "reason": "The protected Windows Vulkan proof is a release-control program on protected hardware; its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
+      },
+      "linux_vulkan_proof_workflow": {
+        "subject": "parsed_workflow_json",
+        "file": "linux-vulkan-proof.yml",
+        "sha256": "b2efe3dec20a466cb798752c714f50e64e265856e80ffafc15b28ea2390367d3",
+        "reason": "The standalone Linux Vulkan evidence workflow is a release-control program on protected hardware; its complete parsed structure is pinned so a nonblocking evidence lane cannot quietly acquire blocking authority or leak beyond its reviewed scope."
+      },
+      "release_source_proof_sentinel": {
+        "subject": "parsed_job_json",
+        "file": "release.yml",
+        "job": "source-proof",
+        "sha256": "522027695f3fe82d01f7dc00514661d45483ef44e61e8f399955593444ec0d0d",
+        "reason": "The release chain's source-proof job is a fail-closed placeholder that must refuse to run a second source proof; its complete parsed job body is pinned so the refusal cannot be disabled, made conditional, or made advisory."
+      },
+      "packaged_sccache_identity": {
+        "subject": "step_script_raw_text",
+        "file": "packaged-platform-proof.yml",
+        "job": "build",
+        "step": "Capture pinned sccache identity",
+        "sha256": "f844b8a3b2e0f0013b43f4ec661c237fb090a01c49316d8c2b301ba01cac4342",
+        "reason": "The identity capture binds later compiler-cache assertions to the exact installed sccache binary; raw text is hashed because a line that begins with # is not necessarily a comment when the preceding line opened a quote."
+      },
+      "packaged_linux_build": {
+        "subject": "step_script_raw_text",
+        "file": "packaged-platform-proof.yml",
+        "job": "build",
+        "step": "Build Linux x64 at the glibc 2.31 baseline",
+        "sha256": "f101cc525f52f75686acbb1cf240412409f3f388793890993cefae9175685a6f",
+        "reason": "Linux owns its compiler server inside Docker while macOS and Windows own one in the host shell; both executable programs are pinned so a swallowed stop or a dead-code copy cannot satisfy the ownership fragments."
+      },
+      "packaged_compile_clock_stop": {
+        "subject": "step_script_raw_text",
+        "file": "packaged-platform-proof.yml",
+        "job": "build",
+        "step": "Stop compilation clock",
+        "sha256": "ef9f7ee4636c3466830447e2ed8a10c2030ca3949bca082652d9262848d258a5",
+        "reason": "The compiler clock stop is a strict telemetry-only boundary; its raw text is pinned so the timing boundary cannot absorb build or reporting authority unreviewed."
+      },
+      "packaged_host_compiler_finalizer": {
+        "subject": "step_script_raw_text",
+        "file": "packaged-platform-proof.yml",
+        "job": "build",
+        "step": "Finalize compiler objects",
+        "sha256": "b77d8bb12c2748bfe016ab65ccb2f4581356f3ccf1d666e747306caffd6c0c46",
+        "reason": "The host finalizer must strictly stop only the host package-build compiler server; its raw text is pinned so a swallowed stop or a dead-code copy cannot satisfy the ownership fragments."
+      },
+      "qualification_driver_artifact": {
+        "subject": "helper_file_text",
+        "file": ".github/scripts/qualification-driver-artifact.mjs",
+        "sha256": "efc5126e24162d52f9da8bac38c3414b3a7492fb17eed5ff19867fadad69623e",
+        "reason": "The companion qualification driver is intentionally retained only inside the private Actions package artifact. This digest pins both sides of that contract: the producer may read Cargo's trusted hard-linked build output but retains only a new singly linked copy bound to the exact candidate archive, and the consumer rejects symlinks, retained hardlinks, extra files, identity drift, and byte drift before restoring execute permission. Any helper edit therefore requires policy and mutation-test review in the same PR."
+      }
+    },
+    "step_fragments": {
+      "saga_issue_link_guard": {
+        "kind": "require",
+        "file": "saga-issue-link-guard.yml",
+        "job": "require-closing-issue-link",
+        "step": "Check PR issue relationship",
+        "fragments": [
+          "close[sd]?|fix(?:e[sd])?|resolve[sd]?",
+          "#\\d+|https://github\\.com/TheGreenCedar/CodeStory/issues/\\d+"
+        ],
+        "reason": "Every codex pull request must name the issue it closes before review. The guard's matcher must keep recognizing both the closing keywords and both issue-reference spellings; each fragment is one reviewed half of that grep, owned here so it cannot be weakened by a checker edit alone."
+      },
+      "close_dev_issues": {
+        "kind": "require",
+        "file": "close-dev-issues.yml",
+        "job": "close-linked-issues",
+        "step": "Close issues referenced by the merged PR",
+        "fragments": [
+          "commit = event[\"after\"]",
+          "pull_request.get(\"merged_at\")",
+          "pull_request.get(\"merge_commit_sha\") == commit",
+          "pull_request.get(\"base\", {}).get(\"ref\") == \"dev/codestory-next\"",
+          "pullRequest(number: $number)",
+          "entries(first: 100, after: $cursor)",
+          "if stack_response.get(\"errors\")",
+          "if \"stack\" not in pull_request_node",
+          "stack.get(\"baseRefName\") != \"dev/codestory-next\"",
+          "metadata != expected_stack",
+          "expected_stack[2] != len(entries)",
+          "if next_cursor == cursor or next_cursor in seen_cursors",
+          "if stack_repository != repository",
+          "existing = merged_pull_requests_by_number.get(number)",
+          "stacked_pull_request.get(\"merged\")",
+          "stacked_pull_request.get(\"mergedAt\")",
+          "merge_commit.get(\"oid\") == commit",
+          "anchor.get(\"body\") != pull_request.get(\"body\")",
+          "if \"pull_request\" in issue:",
+          "\"state_reason=completed\"",
+          "https://github\\.com/TheGreenCedar/CodeStory/issues/(\\d+)"
+        ],
+        "reason": "The close automation decides which issues a push to dev/codestory-next may close as completed. Each fragment pins one authentication, stack-integrity, or pagination check inside the inline Python program - merge-commit identity, base-branch and stack verification, cursor-loop and repository guards, and the completed state_reason - so none of those checks can be deleted without a reviewed graph edit."
+      },
+      "marketplace_sync_dispatch_guard": {
+        "kind": "require",
+        "file": "marketplace-sync.yml",
+        "job": "sync",
+        "step": "Validate the dispatched release coordinates",
+        "fragments": [
+          "commit_shape='^[0-9a-fA-F]{7,40}$'",
+          "version_shape='^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$'",
+          "if [[ ! \"$INPUT_COMMIT\" =~ $commit_shape ]]; then",
+          "if [[ ! \"$INPUT_VERSION\" =~ $version_shape ]]; then"
+        ],
+        "reason": "The manual catalog sync executes whatever coordinates a human dispatches, beside a marketplace token. Each fragment pins an anchored shape together with the [[ =~ ]] test that consumes it, so neither the closing anchor nor the comparison can go missing on its own; a prefix pin alone would be satisfied by an unanchored rewrite that accepts '0.16.3; id'."
+      },
+      "marketplace_sync_dispatch_guard_line_tests": {
+        "kind": "forbid",
+        "file": "marketplace-sync.yml",
+        "job": "sync",
+        "step": "Validate the dispatched release coordinates",
+        "fragments": [
+          "grep"
+        ],
+        "reason": "grep anchors per line, so a printf-into-grep rewrite passes any dispatched value whose first line is well formed. The guard must match whole values with the shell's own [[ =~ ]] test; this ban keeps that property from being quietly traded back for a line-oriented test."
+      },
+      "marketplace_sync_catalog_push": {
+        "kind": "require",
+        "file": "marketplace-sync.yml",
+        "job": "sync",
+        "step": "Point the catalog at the published release",
+        "fragments": [
+          "publish-marketplace-catalog.mjs",
+          "--github-output \"$GITHUB_OUTPUT\""
+        ],
+        "reason": "A catalog moved by this workflow is a recovery, and the rollback it performs is only undoable if the pin it replaced is recorded with it. The push must delegate to publish-marketplace-catalog.mjs and write the replaced pin to $GITHUB_OUTPUT, because the recovery-identity step reads exactly those recorded outputs."
+      },
+      "marketplace_sync_recovery_identity": {
+        "kind": "require",
+        "file": "marketplace-sync.yml",
+        "job": "sync",
+        "step": "Record catalog recovery identity",
+        "fragments": [
+          "printf '%s' \"$MARKETPLACE_REVISION\" | grep -Eq '^[0-9a-f]{40}$'",
+          "echo \"Catalog delivery state: $CATALOG_DELIVERY"
+        ],
+        "reason": "A recovery that cannot name the immutable catalog revision it produced has not recorded a distinguishable identity, only a claim that one happened. The first fragment pins the whole-value revision check; the second pins the delivery-state record that keeps this recovery lane distinguishable from the publication that shipped the plugin."
+      },
+      "plugin_static_install_dependencies": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Install workflow policy dependencies",
+        "fragments": [
+          "npm ci --ignore-scripts"
+        ],
+        "reason": "The policy checker's only dependency is the locked yaml parser, and installing it with npm ci --ignore-scripts keeps the lockfile authoritative and keeps install-time scripts out of the lane that evaluates every other workflow. This fragment pins that exact install so it cannot degrade into an unlocked or script-running npm install."
+      },
+      "plugin_static_workflow_policy": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check workflow policy",
+        "fragments": [
+          "node .github/scripts/check-workflow-policy.mjs",
+          "node --test .github/scripts/check-workflow-policy.test.mjs",
+          "node --test .github/scripts/check-workflow-policy-literal-ratchet.test.mjs",
+          "node --test .github/scripts/cargo-cache-contract.test.mjs",
+          "node --test .github/scripts/windows-link-timing.test.mjs"
+        ],
+        "reason": "This step is where the workflow policy proves itself: the checker must run against the real tree with its own hostile-fixture suite beside it, and the Cargo cache contract suite rides along. The Windows linker-timing selector is the only thing standing between a reported msvc_link duration and a substring match over the build log, so its hostile-fixture suite runs wherever the policy itself runs. The literal ratchet freezes the migrated checker's residual policy literals, so a rule cannot quietly move back from the graph into checker source without review."
+      },
+      "plugin_static_plugin_wiring": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check plugin static wiring",
+        "fragments": [
+          "node --test plugins/codestory/tests/plugin-static.test.mjs"
+        ],
+        "reason": "The plugin's static wiring suite is the only check that proves the shipped plugin manifest, skills, and generated catalog stay mutually consistent; this fragment pins its execution in the lane that gates plugin changes."
+      },
+      "plugin_static_embedded_model": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check embedded model preparation",
+        "fragments": [
+          "node --test scripts/tests/prepare-embedded-model.test.mjs"
+        ],
+        "reason": "The embedded model preparation script stages checksum-pinned model material for every proof lane; its suite must run in the plugin lane so a preparation regression is caught before any lane that downloads a model executes."
+      },
+      "plugin_static_pinned_provision_proof": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check the pinned provision proof",
+        "fragments": [
+          "node --test scripts/tests/prove-plugin-pinned-provision.test.mjs"
+        ],
+        "reason": "The pinned-provision proof is the plugin lane's tag gate. Its own suite has to run somewhere, or a gate that exits 0 without proving anything reads as a pass; this fragment pins that suite to the lane the gate protects."
+      },
+      "plugin_static_marketplace_evidence_contracts": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check release claim and evidence contracts",
+        "fragments": [
+          ".github/scripts/publish-marketplace-catalog.test.mjs",
+          "scripts/tests/release-evidence-runner-contract.test.mjs"
+        ],
+        "reason": "The catalog publisher and the release-evidence runner contract are the two delivery-side programs whose regressions otherwise surface only at publish time; their suites are pinned into the pre-merge lane so a delivery break is caught while it is still recoverable."
+      },
+      "plugin_static_workflow_syntax": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check workflow syntax",
+        "fragments": [
+          "node --test .github/scripts/run-actionlint.test.mjs",
+          "node .github/scripts/run-actionlint.mjs"
+        ],
+        "reason": "actionlint parses every workflow the policy checker reasons about, and the wrapper's own suite proves the pinned binary and the hostile fixture still fail loudly. Both fragments are pinned so syntax checking cannot silently become a no-op wrapper."
+      },
+      "plugin_static_release_claim_contracts": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check release claim and evidence contracts",
+        "fragments": [
+          "scripts/tests/codestory-release-claims.test.mjs",
+          "scripts/tests/codestory-release-closeout.test.mjs",
+          "scripts/tests/codestory-release-evidence-gate.test.mjs"
+        ],
+        "reason": "The release claim graph, the closeout, and the evidence gate are the programs that decide whether a release may ship; their suites must run in the lane that gates every policy and graph edit, so a claims regression cannot merge unproven."
+      },
+      "plugin_static_ci_proof_routing": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check CI proof routing fixtures",
+        "fragments": [
+          "node .github/scripts/route-ci-proof.mjs --self-test"
+        ],
+        "reason": "Proof routing decides which lanes a change must prove itself in; the router's self-test replays its fixture table so a routing edit that silently drops a required lane fails this pinned step."
+      },
+      "plugin_static_packaged_proof_harness": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check packaged proof harness",
+        "fragments": [
+          "python .github/scripts/check-packaged-agent-proof.py --self-test"
+        ],
+        "reason": "The packaged-agent proof harness authenticates candidate archives on protected hosts; its self-test is pinned here so a harness edit cannot merge without replaying its own contract fixtures."
+      },
+      "plugin_static_marketplace_install": {
+        "kind": "require",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "step": "Check real Codex marketplace installation",
+        "fragments": [
+          "node --test .github/scripts/install-codestory-marketplace-proof.test.mjs"
+        ],
+        "reason": "The marketplace installation proof is the only check that exercises the real Codex install path end to end against the local fixture; this fragment pins its suite so the shipped install flow cannot drift from the one the proof validates."
+      },
+      "source_proof_resolve_trusted_head": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "resolve",
+        "step": "Resolve trusted exact head",
+        "fragments": [
+          "test \"$EVENT_HEAD_REPO\" = \"$GITHUB_REPOSITORY\"",
+          "test \"$current_head\" = \"$EVENT_HEAD_SHA\"",
+          "head_ref=\"$(jq -r '.head.ref'",
+          "test \"$GITHUB_REF\" = \"refs/heads/$head_ref\"",
+          "test \"$GITHUB_SHA\" = \"$EXPECTED_HEAD_SHA\"",
+          "test \"$GITHUB_SHA\" = \"$CALLER_REF\"",
+          "--ref $head_ref"
+        ],
+        "reason": "The resolve job turns an untrusted dispatch input into the one exact head every downstream gate proves. Each fragment pins one authentication step - the same-repository head, current-head, branch-to-ref, expected-SHA, and caller-ref equality tests, plus the jq head-ref extraction and the --ref checkout binding - so none of the identity checks can be deleted without a reviewed graph edit."
+      },
+      "source_proof_resolve_reuse_gate": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "resolve",
+        "step": "Reuse a completed gate for this exact head",
+        "fragments": [
+          ".path == \".github/workflows/source-proof.yml\"",
+          ".event == \"workflow_dispatch\" and .conclusion == \"success\"",
+          ".name == \"full-source-gate\" and .conclusion == \"success\"",
+          "artifact_name=\"release-cell-prepublish-source-attempt-$run_attempt\"",
+          ".expired == false",
+          "test \"$artifact_count\" = 1 || continue"
+        ],
+        "reason": "Reuse is only sound when the prior run is this workflow, dispatched, successful, and carrying exactly one unexpired source release cell for the same attempt. Each fragment pins one of those conjuncts so a reuse rewrite cannot quietly accept a partial or foreign proof."
+      },
+      "source_proof_resolve_release_freeze": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "resolve",
+        "step": "Require executable release freeze",
+        "fragments": [
+          "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA",
+          "release-freeze-barrier.mjs",
+          "verify-status",
+          "--receipt-digest \"$FREEZE_RECEIPT_DIGEST\""
+        ],
+        "reason": "A frozen head must be proven against the commit the API reports, through the freeze barrier's verify-status path, with the receipt digest bound in - otherwise a freeze claim is a log line, not a gate. The fragments pin that verification chain."
+      },
+      "source_proof_windows_native_qualification_harness": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "step": "Prove the Windows-native qualification harness contracts",
+        "fragments": [
+          "python .github/scripts/check-packaged-agent-proof.py --self-test",
+          "Windows-native qualification harness contracts failed",
+          "past their 90000 ms budget",
+          "Windows-native qualification harness contracts:"
+        ],
+        "reason": "A Windows-native reproduction of the control-directory mismatch is worth nothing if it only reports after a Vulkan SDK install and a release Cargo test have already spent the job. The harness self-test, its failure banner, its 90000 ms budget message, and its report prefix are pinned so the pre-build proof cannot silently weaken."
+      },
+      "source_proof_windows_native_rust_stable": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "step": "Install Rust stable",
+        "fragments": [
+          "rustup toolchain install stable --profile minimal",
+          "rustup default stable"
+        ],
+        "reason": "The Windows contracts compile against the stable toolchain this step installs and selects; pinning both rustup commands keeps the job from silently inheriting whatever toolchain the runner image ships."
+      },
+      "source_proof_windows_native_short_target": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "step": "Configure short Windows Cargo target",
+        "fragments": [
+          "$workspaceTarget = Join-Path $env:GITHUB_WORKSPACE \"target\"",
+          "$shortTarget = Join-Path $runnerRoot \"t\"",
+          "New-Item -ItemType Junction -Path $shortTarget -Target $workspaceTarget",
+          "\"CARGO_TARGET_DIR=$shortTarget\""
+        ],
+        "reason": "Windows path-length limits are exactly what this job exists to exercise, so the Cargo target directory is junctioned to a short root before any build. Each fragment pins one link in that setup - the workspace target, the short target, the junction, and the CARGO_TARGET_DIR export."
+      },
+      "source_proof_windows_native_embedded_model": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "step": "Prepare checksum-pinned embedded model",
+        "fragments": [
+          "node scripts/prepare-embedded-model.mjs"
+        ],
+        "reason": "The native-staging contract stages the embedded model, so the checksum-pinned preparation script must run before the Cargo proof; the fragment pins that invocation."
+      },
+      "source_proof_windows_native_vulkan_sdk": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "step": "Install checksum-pinned Windows Vulkan SDK",
+        "fragments": [
+          ".github/scripts/install-windows-vulkan-sdk.ps1"
+        ],
+        "reason": "The Vulkan SDK reaches the job over the network, so installation must go through the checksum-pinned installer script; the fragment pins that path so an inline download cannot replace it."
+      },
+      "source_proof_windows_native_source_contracts": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "step": "Prove Windows path and native-staging source contracts",
+        "fragments": [
+          "cargo test --release --locked",
+          "-p codestory-workspace --test windows_path_identity",
+          "-p codestory-llama-sys --test native_staging",
+          "Windows native source contracts failed",
+          "Windows path and native-staging source contracts:"
+        ],
+        "reason": "The one release-mode Cargo invocation proves both the Windows path identity and the native staging contracts and must say so when it fails. The fragments pin the locked release test, both -p test selectors, the failure banner, and the report prefix."
+      },
+      "source_proof_full_gate_compiler_cache_env": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Configure bounded compiler cache",
+        "fragments": [
+          "CARGO_HOME=$RUNNER_TEMP/codestory-source-cargo",
+          "SCCACHE_DIR=$RUNNER_TEMP/codestory-source-sccache",
+          "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE",
+          "RUSTC_WRAPPER=sccache",
+          "CARGO_INCREMENTAL=0",
+          "CMAKE_C_COMPILER_LAUNCHER=sccache",
+          "CMAKE_CXX_COMPILER_LAUNCHER=sccache"
+        ],
+        "reason": "The full gate's caches are only sound while every compiler write lands under the runner-temp roots with sccache wrapping both rustc and CMake and incremental compilation off. Each fragment pins one of those environment bindings so the cache contract cannot drift by a step edit."
+      },
+      "source_proof_full_gate_dependency_cache_bound": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Bound Cargo dependency cache",
+        "fragments": [
+          "--max-bytes \"$CARGO_DEPENDENCY_CACHE_MAX_BYTES\"",
+          "--path \"$CARGO_HOME/registry\"",
+          "--path \"$CARGO_HOME/git\""
+        ],
+        "reason": "An unbounded dependency cache grows until restores are slower than cold installs; the bound step must measure exactly the registry and git paths against the declared byte limit. The fragments pin the limit flag and both measured paths."
+      },
+      "source_proof_full_gate_compile": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Compile the complete workspace test suite",
+        "fragments": [
+          "cargo test --workspace --locked --no-run"
+        ],
+        "reason": "Compilation is separated from execution so cache state can be saved even when tests later fail; the fragment pins the locked --no-run workspace compile that staging relies on."
+      },
+      "source_proof_full_gate_cache_restore_report": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Report compiler cache restore",
+        "fragments": [
+          "--requested-key",
+          "--matched-key",
+          "--compatibility-prefix",
+          "--cache-hit",
+          "--path \"$SCCACHE_DIR\""
+        ],
+        "reason": "A cache that degrades silently is indistinguishable from one that works; the restore report must record the requested and matched keys, the compatibility prefix, the hit flag, and the measured path. Each fragment pins one of those recorded facts."
+      },
+      "source_proof_full_gate_cache_save_report": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Report compiler cache save",
+        "fragments": [
+          "--restored-bytes",
+          "--started-ms",
+          "--ended-ms",
+          "--save-started-ms",
+          "--save-result",
+          "--path \"$SCCACHE_DIR\""
+        ],
+        "reason": "The save report closes the cache ledger: restored bytes, the compile clock, the save clock, the save result, and the measured path. Each fragment pins one recorded fact so cache health stays observable across runs."
+      },
+      "source_proof_full_gate_compilation_outcome": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Require successful source compilation",
+        "fragments": [
+          "test \"$COMPILE_OUTCOME\" = success",
+          "test \"$LINT_OUTCOME\" = success"
+        ],
+        "reason": "Compile and lint run with continue-on-error so cache state survives a failure, which is only honest if a later step turns their real outcomes back into the job's verdict; the fragments pin both outcome tests."
+      },
+      "source_proof_full_gate_workspace_tests": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Test the complete workspace once",
+        "fragments": [
+          "cargo nextest run --workspace --locked --no-fail-fast",
+          "cargo test --workspace --doc --locked"
+        ],
+        "reason": "nextest owns unit and integration execution; the doc pass rides along so a future doctest can never silently stop being run, because nextest does not execute doctests. Both locked invocations are pinned."
+      },
+      "source_proof_full_gate_clippy": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Lint every workspace target and feature once",
+        "fragments": [
+          "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"
+        ],
+        "reason": "The single clippy pass covers every target and feature with warnings promoted to errors; the fragment pins that exact locked invocation so lint coverage cannot quietly narrow."
+      },
+      "source_proof_full_gate_release_cell": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "step": "Emit authenticated source release cell",
+        "fragments": [
+          "codestory-release-cell-manifest.mjs produce",
+          "--cell-id source_behavior",
+          "--producer-job full-source-gate",
+          "--expected-sha \"$RESOLVED_REF\""
+        ],
+        "reason": "The source release cell is the proof the release chain later consumes, so it must be produced by the manifest tool, name the source_behavior cell and this producer job, and bind the resolved SHA. Each fragment pins one of those identity conjuncts."
+      },
+      "macos_metal_validate_candidate_installed_mode": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Validate candidate-installed mode",
+        "fragments": [
+          "test \"$SERVER_BEHAVIOR_ONLY\" = true",
+          "test \"$CALIBRATION_MODE\" = false"
+        ],
+        "reason": "Candidate-installed mode on the Metal host is only sound as a server-behavior claim outside calibration; the fragments pin both mode tests so the validation cannot silently accept a wider claim scope."
+      },
+      "macos_metal_embedded_model": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Prepare checksum-pinned embedded model",
+        "fragments": [
+          "node scripts/prepare-embedded-model.mjs",
+          "--cache-root \"$RUNNER_TOOL_CACHE/codestory/model-material\""
+        ],
+        "reason": "Model material reaches the protected Metal host only through the checksum-pinned preparation script and the runner tool cache root; the fragments pin that invocation and its cache root."
+      },
+      "macos_metal_host_evidence": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Capture host evidence",
+        "fragments": [
+          "python3 --version",
+          "test \"$macos_major\" -ge 15"
+        ],
+        "reason": "Host evidence must record the interpreter the proof depends on and refuse a macOS older than the qualified floor; the fragments pin the version capture and the major-version gate."
+      },
+      "macos_metal_candidate_authentication": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Authenticate exact candidate artifacts",
+        "fragments": [
+          "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100",
+          ".github/workflows/auto-release.yml",
+          ".github/workflows/release.yml",
+          ".github/workflows/packaged-platform-pr.yml",
+          "if [ \"$SERVER_BEHAVIOR_ONLY\" != true ]; then",
+          "test \"$CANDIDATE_PRODUCER_WORKFLOW_PATH\" =",
+          ".head_repository.full_name",
+          ".path' <<<\"$producer_run\")\" = \"$CANDIDATE_PRODUCER_WORKFLOW_PATH\"",
+          ".head_sha' <<<\"$producer_run\")\" = \"$(git rev-parse HEAD)\"",
+          ".run_attempt' <<<\"$producer_run\")\" = \"$GITHUB_RUN_ATTEMPT\"",
+          ".workflow_run.id == $run_id",
+          ".workflow_run.head_sha == $sha",
+          "expected one exact candidate artifact",
+          "artifact=\"$(select_artifact \"$ARTIFACT_NAME\")\"",
+          "record_artifact=\"$(select_artifact \"$CANDIDATE_RECORD_ARTIFACT\")\"",
+          "select_artifact \"$QUALIFICATION_ARTIFACT\"",
+          "package-id=$artifact_id",
+          "package-bytes=$expected_size",
+          "package-sha256=${expected_digest#sha256:}"
+        ],
+        "reason": "The packaged proof consumes exactly the artifacts its own run produced from an allowlisted producer at this head and attempt. Each fragment pins one authentication conjunct - the run-scoped artifact listing, the producer allowlist, the same-repository, path, head-SHA, and attempt tests, the run-bound artifact filters, the one-artifact expectation, the three exact artifact selections, and the recorded package identity outputs."
+      },
+      "macos_metal_candidate_cache_restore": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Restore exact candidate archive from protected host",
+        "fragments": [
+          "--arg repository \"$GITHUB_REPOSITORY\"",
+          "--arg source_sha \"$(git rev-parse HEAD)\"",
+          "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
+          "--arg target macos-arm64",
+          "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
+          "candidate-archive-store.mjs restore",
+          "--record \"$record\"",
+          "--output-dir target/release-dist",
+          "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\""
+        ],
+        "reason": "A protected-host cache hit is only the reviewed archive when the record binds this repository, source commit and tree, and the macOS target, and the restore goes through the archive store into the exact output directory; the fragments pin those bindings and the recorded hit output."
+      },
+      "macos_metal_candidate_cache_miss": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Download, authenticate, and admit candidate archive on miss",
+        "fragments": [
+          "actions/artifacts/$ARTIFACT_ID/zip",
+          "--continue-at -",
+          "--max-time 120",
+          "test \"$actual_size\" = \"$EXPECTED_SIZE\"",
+          "test \"$actual_digest\" = \"$EXPECTED_SHA256\"",
+          "extract-candidate-actions-artifact.py",
+          "candidate-archive-store.mjs admit",
+          "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
+          "--output-dir target/release-dist"
+        ],
+        "reason": "A cache miss may transfer the large Actions artifact only through the resumable bounded download, must prove the outer size and digest before extraction, and must admit the archive through the store into the exact output directory; the fragments pin that authenticated admission chain."
+      },
+      "macos_metal_calibration_producer_authentication": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Authenticate calibration bundle producer",
+        "fragments": [
+          "actions/runs/",
+          ".github/workflows/packaged-platform-pr.yml",
+          "workflow_dispatch",
+          "success",
+          "embedding-calibration-bundle-",
+          "artifacts?per_page=100",
+          "expired"
+        ],
+        "reason": "A calibration bundle is trusted only when its producer run is the frozen-candidate coordinator's dispatched, successful run and the bundle artifact is the unexpired one it named; the fragments pin the producer-run lookup, the coordinator path, the dispatch event, the success conclusion, the bundle name prefix, the artifact listing, and the expiry check."
+      },
+      "macos_metal_constant_calibration_runs": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Collect three independent Metal constant calibration runs",
+        "fragments": [
+          "--proof-tier calibration",
+          "--engine-policy accelerated",
+          "--expected-backend Metal",
+          "--qualification-matrix-cell protected_macos_arm64_metal",
+          "--collect-constant-calibration",
+          "--constant-calibration-output-dir target/calibration-runs/macos",
+          "--qualification-driver target/release/codestory_embedding_constant_calibration",
+          "--out-dir target/calibration-proof/macos"
+        ],
+        "reason": "Calibration collects constants through the dedicated collector with the accelerated Metal engine on the protected matrix cell and writes runs and proof to the reviewed directories; each fragment pins one flag of that single collector invocation."
+      },
+      "macos_metal_protected_runtime_proof": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Prove protected Metal runtime",
+        "fragments": [
+          "--engine-policy accelerated",
+          "--expected-backend Metal",
+          "--offline",
+          "--proof-tier protected_hardware",
+          "--qualification-matrix-cell protected_macos_arm64_metal",
+          "--calibration-producer-run-id",
+          "--calibration-producer-artifact",
+          "--server-behavior-only"
+        ],
+        "reason": "The protected Metal proof must run the accelerated offline harness against the protected matrix cell with the calibration producer bound and the server-behavior scope explicit; each fragment pins one flag of that invocation."
+      },
+      "macos_metal_candidate_staging": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Stage isolated candidate-managed macOS install",
+        "fragments": [
+          "--prepare-candidate-installed-proof",
+          "--candidate-plugin-root-output",
+          "--candidate-plugin-data-output",
+          "--installed-plugin-attestation-output",
+          "--candidate-producer-workflow-path",
+          "gh api",
+          ".head_repository.full_name",
+          ".path",
+          ".head_sha",
+          ".run_attempt",
+          "$CANDIDATE_PRODUCER_WORKFLOW_PATH",
+          "$RUNNER_TEMP/codestory-candidate-installed-macos.",
+          "candidate_root=\"$(cd \"$candidate_root\" && pwd -P)\"",
+          "\"$GITHUB_WORKSPACE/\"*",
+          "CODESTORY_CANDIDATE_MACOS_ROOT="
+        ],
+        "reason": "Candidate-managed staging must go through the harness staging flags, authenticate the producer run by repository, path, head SHA, and attempt, and land in an isolated runner-temp root outside the workspace; the fragments pin that staging chain and the exported root."
+      },
+      "macos_metal_candidate_installed_proof": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Prove candidate-installed macOS Metal runtime",
+        "fragments": [
+          "--engine-policy accelerated",
+          "--expected-backend Metal",
+          "--proof-tier installed_runtime",
+          "--installed-plugin-attestation",
+          "--installed-plugin-data",
+          "$CANDIDATE_PRODUCER_WORKFLOW_PATH",
+          "--server-behavior-only",
+          "$CODESTORY_CANDIDATE_MACOS_ROOT/plugin",
+          "$CODESTORY_CANDIDATE_MACOS_ROOT/data"
+        ],
+        "reason": "The candidate-installed proof must run the accelerated Metal harness at the installed-runtime tier against the staged plugin root and data with the producer path and server-behavior scope bound; each fragment pins one of those conjuncts."
+      },
+      "macos_metal_release_cell": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Emit authenticated Metal release cell",
+        "fragments": [
+          "codestory-release-cell-manifest.mjs produce",
+          "accelerator_execution:macos-arm64-metal",
+          "--producer-job packaged-metal",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The Metal release cell must be produced by the manifest tool, name the accelerator-execution macOS cell and this producer job, and bind the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "macos_metal_retrieval_readiness_cell": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Emit authenticated macOS retrieval-readiness release cell",
+        "fragments": [
+          "retrieval_readiness:macos-arm64",
+          "--producer-job packaged-metal",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The macOS retrieval-readiness cell must name its cell, this producer job, and the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "macos_metal_candidate_installed_cell": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Emit authenticated candidate-installed macOS release cell",
+        "fragments": [
+          "candidate_installed_behavior:macos-arm64",
+          "--producer-job packaged-metal",
+          "candidate_managed_plugin",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The candidate-installed macOS cell must name its cell, this producer job, the candidate-managed plugin claim, and the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "macos_metal_release_cell_no_calibration": {
+        "kind": "forbid",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Emit authenticated Metal release cell",
+        "fragments": [
+          "calibration"
+        ],
+        "reason": "The Metal release cell is a qualification artifact; a calibration reference inside it would let calibration evidence leak into the release chain, so the fragment forbids the word outright."
+      },
+      "macos_metal_candidate_installed_cell_no_calibration": {
+        "kind": "forbid",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Emit authenticated candidate-installed macOS release cell",
+        "fragments": [
+          "calibration"
+        ],
+        "reason": "The candidate-installed macOS cell must stay a runtime-behavior artifact; the fragment forbids any calibration reference so the candidate lane cannot smuggle calibration claims."
+      },
+      "windows_vulkan_validate_candidate_installed_mode": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Validate candidate-installed mode",
+        "fragments": [
+          "if ($env:SERVER_BEHAVIOR_ONLY -ne \"true\")",
+          "candidate_installed_proof requires server_behavior_only"
+        ],
+        "reason": "Candidate-installed mode on the Windows host is only sound as a server-behavior claim; the fragments pin the PowerShell mode test and its failure message so the validation cannot widen the claim scope."
+      },
+      "windows_vulkan_source_build_tools": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Capture source build tool evidence",
+        "fragments": [
+          "CMAKE_GENERATOR=Ninja",
+          "cmake --version",
+          "ninja --version"
+        ],
+        "reason": "The source fallback builds native code with the Ninja generator, so the evidence step must export that generator and record the exact cmake and ninja versions; the fragments pin all three."
+      },
+      "windows_vulkan_embedded_model": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Prepare checksum-pinned embedded model",
+        "fragments": [
+          "node scripts/prepare-embedded-model.mjs",
+          "--cache-root \"$env:RUNNER_TOOL_CACHE/codestory/model-material\""
+        ],
+        "reason": "Model material reaches the protected Windows host only through the checksum-pinned preparation script and the runner tool cache root; the fragments pin that invocation and its cache root."
+      },
+      "windows_vulkan_candidate_cache_restore": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Restore exact candidate archive from protected host",
+        "fragments": [
+          "$record.source.commit -ne $sourceSha",
+          "$record.source.tree -ne $sourceTree",
+          "$record.target -ne \"windows-x64\"",
+          "codestory/candidate-archives",
+          "candidate-archive-store.mjs restore",
+          "--record $recordPath",
+          "--output-dir target/release-dist",
+          "\"hit=$hit\"",
+          "$env:GITHUB_OUTPUT"
+        ],
+        "reason": "A protected-host cache hit is only the reviewed archive when the record matches this source commit and tree and the Windows target, and the restore goes through the archive store into the exact output directory; the fragments pin those checks and the recorded hit output."
+      },
+      "windows_vulkan_candidate_cache_miss": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Download, authenticate, and admit candidate archive on miss",
+        "fragments": [
+          "actions/artifacts/$env:ARTIFACT_ID/zip",
+          "--continue-at -",
+          "--max-time 120",
+          "$actualSize -ne [long]$env:EXPECTED_SIZE",
+          "$actualDigest -ne $env:EXPECTED_SHA256",
+          "extract-candidate-actions-artifact.py",
+          "candidate-archive-store.mjs admit",
+          "--store-root $store",
+          "--output-dir target/release-dist"
+        ],
+        "reason": "A cache miss may transfer the large Actions artifact only through the resumable bounded download, must prove the outer size and digest before extraction, and must admit the archive through the store into the exact output directory; the fragments pin that authenticated admission chain."
+      },
+      "windows_vulkan_calibration_producer_authentication": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Authenticate calibration bundle producer",
+        "fragments": [
+          "actions/runs/",
+          ".github/workflows/packaged-platform-pr.yml",
+          "workflow_dispatch",
+          "success",
+          "embedding-calibration-bundle-",
+          "artifacts?per_page=100",
+          "expired"
+        ],
+        "reason": "A calibration bundle is trusted only when its producer run is the frozen-candidate coordinator's dispatched, successful run and the bundle artifact is the unexpired one it named; the fragments pin the producer-run lookup, the coordinator path, the dispatch event, the success conclusion, the bundle name prefix, the artifact listing, and the expiry check."
+      },
+      "windows_vulkan_protected_runtime_proof": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Prove protected Windows Vulkan runtime",
+        "fragments": [
+          "--engine-policy accelerated",
+          "--expected-backend Vulkan",
+          "--offline",
+          "--proof-tier protected_hardware",
+          "--qualification-matrix-cell protected_windows_x64_vulkan",
+          "--calibration-producer-run-id",
+          "--calibration-producer-artifact",
+          "--server-behavior-only"
+        ],
+        "reason": "The protected Windows Vulkan proof must run the accelerated offline harness against the protected matrix cell with the calibration producer bound and the server-behavior scope explicit; each fragment pins one flag of that invocation."
+      },
+      "windows_vulkan_candidate_staging": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Stage isolated candidate-managed Windows install",
+        "fragments": [
+          "--prepare-candidate-installed-proof",
+          "--candidate-plugin-root-output",
+          "--candidate-plugin-data-output",
+          "--installed-plugin-attestation-output",
+          "--candidate-producer-workflow-path",
+          "gh api",
+          "$run.head_repository.full_name",
+          "$run.path",
+          "$run.head_sha",
+          "$run.run_attempt",
+          "$env:CANDIDATE_PRODUCER_WORKFLOW_PATH",
+          "[IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)",
+          "cs-ci-",
+          "Substring(0, 12)",
+          "[IO.Path]::GetFullPath",
+          "$env:GITHUB_WORKSPACE",
+          "CODESTORY_CANDIDATE_WINDOWS_ROOT="
+        ],
+        "reason": "Candidate-managed staging must go through the harness staging flags, authenticate the producer run by repository, path, head SHA, and attempt, and land in a short isolated root on the workspace drive outside the workspace tree; the fragments pin that staging chain and the exported root."
+      },
+      "windows_vulkan_candidate_installed_proof": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Prove candidate-installed Windows Vulkan runtime",
+        "fragments": [
+          "--proof-tier installed_runtime",
+          "--engine-policy accelerated",
+          "--expected-backend Vulkan",
+          "--installed-plugin-attestation",
+          "--installed-plugin-data",
+          "--candidate-producer-workflow-path",
+          "$env:CANDIDATE_PRODUCER_WORKFLOW_PATH",
+          "--server-behavior-only",
+          "--expected-source-sha",
+          "--expected-source-tree",
+          "$env:CODESTORY_CANDIDATE_WINDOWS_ROOT",
+          "$env:TEMP = $proofTemp",
+          "$env:TMP = $proofTemp",
+          "$env:TMPDIR = $proofTemp"
+        ],
+        "reason": "The candidate-installed proof must run the accelerated Vulkan harness at the installed-runtime tier against the staged install with the producer path, server-behavior scope, and expected source identity bound, and must redirect every temp root into the proof's own directory; each fragment pins one of those conjuncts."
+      },
+      "windows_vulkan_release_cell": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Vulkan release cell",
+        "fragments": [
+          "codestory-release-cell-manifest.mjs produce",
+          "accelerator_execution:windows-x64-vulkan",
+          "--producer-job packaged-vulkan",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The Vulkan release cell must be produced by the manifest tool, name the accelerator-execution Windows cell and this producer job, and bind the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "windows_vulkan_candidate_installed_cell": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated candidate-installed Windows release cell",
+        "fragments": [
+          "candidate_installed_behavior:windows-x64",
+          "--producer-job packaged-vulkan",
+          "candidate_managed_plugin",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The candidate-installed Windows cell must name its cell, this producer job, the candidate-managed plugin claim, and the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "windows_vulkan_retrieval_readiness_cell": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Windows retrieval-readiness release cell",
+        "fragments": [
+          "retrieval_readiness:windows-x64",
+          "--producer-job packaged-vulkan",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The Windows retrieval-readiness cell must name its cell, this producer job, and the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "windows_vulkan_release_cell_no_calibration": {
+        "kind": "forbid",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Vulkan release cell",
+        "fragments": [
+          "calibration"
+        ],
+        "reason": "The Vulkan release cell is a qualification artifact; the fragment forbids any calibration reference so calibration evidence cannot leak into the release chain."
+      },
+      "windows_vulkan_candidate_installed_cell_no_calibration": {
+        "kind": "forbid",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated candidate-installed Windows release cell",
+        "fragments": [
+          "calibration"
+        ],
+        "reason": "The candidate-installed Windows cell must stay a runtime-behavior artifact; the fragment forbids any calibration reference so the candidate lane cannot smuggle calibration claims."
+      },
+      "linux_vulkan_route_upstream_package": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "route",
+        "step": "Require an upstream package for standalone protected proof",
+        "fragments": [
+          "if [ \"$EVENT_NAME\" = workflow_dispatch ] && [ \"$CONSTANT_CALIBRATION_MODE\" != true ]; then",
+          "test -n \"$PACKAGE_RUN_ID\""
+        ],
+        "reason": "A standalone dispatch without an upstream package would rebuild the candidate on the protected host; the fragments pin the dispatch-mode test and the package-run requirement so standalone proofs always consume a prior package."
+      },
+      "linux_vulkan_host_evidence": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Capture Linux Vulkan host evidence",
+        "fragments": [
+          "uname -m",
+          "vulkaninfo --summary",
+          "test \"$(uname -m)\" = x86_64"
+        ],
+        "reason": "Host evidence must prove the machine is the x86_64 Vulkan host the claim names; the fragments pin the architecture capture, the Vulkan summary, and the architecture test."
+      },
+      "linux_vulkan_validate_candidate_installed_mode": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Validate candidate-installed mode",
+        "fragments": [
+          "test \"$SERVER_BEHAVIOR_ONLY\" = true"
+        ],
+        "reason": "Candidate-installed mode on the Linux host is only sound as a server-behavior claim; the fragment pins the mode test so the validation cannot widen the claim scope."
+      },
+      "linux_vulkan_candidate_cache_restore": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Restore exact candidate archive from protected host",
+        "fragments": [
+          "--arg repository \"$GITHUB_REPOSITORY\"",
+          "--arg source_sha \"$(git rev-parse HEAD)\"",
+          "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
+          "--arg target linux-x64",
+          "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
+          "candidate-archive-store.mjs restore",
+          "--record \"$record\"",
+          "--output-dir target/release-dist",
+          "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\""
+        ],
+        "reason": "A protected-host cache hit is only the reviewed archive when the record binds this repository, source commit and tree, and the Linux target, and the restore goes through the archive store into the exact output directory; the fragments pin those bindings and the recorded hit output."
+      },
+      "linux_vulkan_candidate_cache_miss": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Download, authenticate, and admit candidate archive on miss",
+        "fragments": [
+          "actions/artifacts/$ARTIFACT_ID/zip",
+          "--continue-at -",
+          "--max-time 120",
+          "test \"$actual_size\" = \"$EXPECTED_SIZE\"",
+          "test \"$actual_digest\" = \"$EXPECTED_SHA256\"",
+          "extract-candidate-actions-artifact.py",
+          "candidate-archive-store.mjs admit",
+          "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
+          "--output-dir target/release-dist"
+        ],
+        "reason": "A cache miss may transfer the large Actions artifact only through the resumable bounded download, must prove the outer size and digest before extraction, and must admit the archive through the store into the exact output directory; the fragments pin that authenticated admission chain."
+      },
+      "linux_vulkan_calibration_producer_authentication": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Authenticate calibration bundle producer",
+        "fragments": [
+          "actions/runs/",
+          ".github/workflows/packaged-platform-pr.yml",
+          "workflow_dispatch",
+          "success",
+          "embedding-calibration-bundle-",
+          "artifacts?per_page=100",
+          "expired"
+        ],
+        "reason": "A calibration bundle is trusted only when its producer run is the frozen-candidate coordinator's dispatched, successful run and the bundle artifact is the unexpired one it named; the fragments pin the producer-run lookup, the coordinator path, the dispatch event, the success conclusion, the bundle name prefix, the artifact listing, and the expiry check."
+      },
+      "linux_vulkan_offline_retrieval_proof": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Prove offline Linux Vulkan retrieval",
+        "fragments": [
+          "--engine-policy accelerated",
+          "--expected-backend Vulkan",
+          "--offline",
+          "--proof-tier protected_hardware",
+          "--qualification-matrix-cell protected_linux_x64_vulkan",
+          "--calibration-producer-run-id",
+          "--calibration-producer-artifact",
+          "--server-behavior-only"
+        ],
+        "reason": "The offline Linux Vulkan proof must run the accelerated offline harness against the protected matrix cell with the calibration producer bound and the server-behavior scope explicit; each fragment pins one flag of that invocation."
+      },
+      "linux_vulkan_candidate_staging": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Stage isolated candidate-managed Linux install",
+        "fragments": [
+          "--prepare-candidate-installed-proof",
+          "--candidate-plugin-root-output",
+          "--candidate-plugin-data-output",
+          "--installed-plugin-attestation-output",
+          "--candidate-producer-workflow-path",
+          "gh api",
+          "$RUNNER_TEMP/codestory-candidate-installed-linux.",
+          "CODESTORY_CANDIDATE_LINUX_ROOT="
+        ],
+        "reason": "Candidate-managed staging must go through the harness staging flags, authenticate the producer run, and land in an isolated runner-temp root; the fragments pin that staging chain and the exported root."
+      },
+      "linux_vulkan_candidate_installed_proof": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Prove candidate-installed Linux Vulkan runtime",
+        "fragments": [
+          "--engine-policy accelerated",
+          "--expected-backend Vulkan",
+          "--proof-tier installed_runtime",
+          "--installed-plugin-attestation",
+          "--installed-plugin-data",
+          "--server-behavior-only"
+        ],
+        "reason": "The candidate-installed proof must run the accelerated Vulkan harness at the installed-runtime tier against the staged plugin attestation and data with the server-behavior scope explicit; each fragment pins one of those conjuncts."
+      },
+      "linux_vulkan_candidate_installed_proof_scope": {
+        "kind": "forbid",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Prove candidate-installed Linux Vulkan runtime",
+        "fragments": [
+          "calibration",
+          "--ground-only",
+          "--engine-policy cpu_explicit"
+        ],
+        "reason": "The candidate-installed lane is a bounded accelerated runtime proof; the fragments forbid calibration, ground-only retrieval, and the explicit CPU engine so the lane cannot quietly become a weaker or different claim."
+      },
+      "linux_vulkan_release_cells": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Linux Vulkan release cells",
+        "fragments": [
+          "accelerator_execution:linux-x64-vulkan",
+          "retrieval_readiness:linux-x64",
+          "candidate_installed_behavior:linux-x64",
+          "--producer-job packaged-vulkan",
+          "--expected-sha \"$INPUT_REF\""
+        ],
+        "reason": "The single Linux cell step must name all three Linux cells and this producer job and bind the caller's expected SHA; each fragment pins one identity conjunct."
+      },
+      "linux_vulkan_release_cells_no_calibration": {
+        "kind": "forbid",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Linux Vulkan release cells",
+        "fragments": [
+          "calibration"
+        ],
+        "reason": "The Linux release cells are qualification artifacts; the fragment forbids any calibration reference so calibration evidence cannot leak into the release chain."
+      },
+      "linux_vulkan_optional_calibration_embedded_model": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "optional-constant-calibration",
+        "step": "Prepare checksum-pinned embedded model",
+        "fragments": [
+          "node scripts/prepare-embedded-model.mjs",
+          "--cache-root \"$RUNNER_TOOL_CACHE/codestory/model-material\""
+        ],
+        "reason": "Model material reaches the optional calibration job only through the checksum-pinned preparation script and the runner tool cache root; the fragments pin that invocation and its cache root."
+      },
+      "linux_vulkan_optional_calibration_collector": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "optional-constant-calibration",
+        "step": "Collect optional Linux Vulkan constant calibration",
+        "fragments": [
+          "test \"$CONSTANT_CALIBRATION_MODE\" = true",
+          "--engine-policy accelerated",
+          "--expected-backend Vulkan",
+          "--proof-tier calibration",
+          "--qualification-matrix-cell protected_linux_x64_vulkan",
+          "--collect-constant-calibration",
+          "--constant-calibration-output-dir target/calibration-runs/linux-vulkan",
+          "--qualification-driver target/release/codestory_embedding_constant_calibration",
+          "--out-dir target/calibration-proof/linux-vulkan"
+        ],
+        "reason": "Optional calibration must gate on its explicit mode and collect constants through the dedicated collector with the accelerated Vulkan engine on the protected matrix cell, writing runs and proof to the reviewed directories; each fragment pins one flag of that single collector invocation."
+      },
+      "release_policy_install_dependencies": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "workflow-policy",
+        "step": "Install workflow policy dependencies",
+        "fragments": [
+          "npm ci --ignore-scripts"
+        ],
+        "reason": "The release lane's policy job depends only on the locked yaml parser; installing it with scripts disabled keeps the release supply chain at exactly the reviewed lockfile."
+      },
+      "release_policy_workflow_syntax": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "workflow-policy",
+        "step": "Check workflow syntax",
+        "fragments": [
+          "node --test .github/scripts/run-actionlint.test.mjs",
+          "node .github/scripts/run-actionlint.mjs"
+        ],
+        "reason": "actionlint parses every workflow the policy checker reasons about, and the wrapper's own suite runs wherever the syntax gate runs, so the release lane carries both commands."
+      },
+      "release_policy_claim_contracts": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "workflow-policy",
+        "step": "Check release claim and evidence contracts",
+        "fragments": [
+          ".github/scripts/build-marketplace-fixture.test.mjs",
+          ".github/scripts/publish-marketplace-catalog.test.mjs",
+          "scripts/tests/codestory-release-claims.test.mjs",
+          "scripts/tests/codestory-release-cell-manifest.test.mjs",
+          "scripts/tests/codestory-release-closeout.test.mjs",
+          "scripts/tests/codestory-release-evidence-gate.test.mjs",
+          "scripts/tests/prove-plugin-pinned-provision.test.mjs"
+        ],
+        "reason": "The catalog publisher records the pin a rollback would restore and refuses to move a catalog it cannot name a rollback target for, and the publish job generates the release manifest with a generator that must refuse drifted archives. Both are release behaviour, so their suites and the claim, manifest, closeout, and evidence-gate contracts all run on the release lane's own policy job before any proof does."
+      },
+      "release_policy_enforce_workflow_policy": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "workflow-policy",
+        "step": "Enforce workflow policy",
+        "fragments": [
+          "node .github/scripts/check-workflow-policy.mjs",
+          "node --test .github/scripts/lost-runner-recovery.test.mjs"
+        ],
+        "reason": "The recovery contract decides whether a lost host may withhold a claim, so the release's own policy gate must execute its tests before any proof runs."
+      },
+      "release_preflight_release_authority": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Validate release authority",
+        "fragments": [
+          "if [ \"$PUBLISH_RELEASE\" = \"true\" ]; then",
+          "\"$GITHUB_EVENT_NAME\" != \"push\"",
+          "\"$GITHUB_REF\" != \"refs/heads/main\"",
+          "$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main",
+          "\"$GITHUB_WORKFLOW_REF\" != \"$expected_caller\"",
+          "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
+          "\"$GITHUB_EVENT_NAME\" != \"workflow_dispatch\"",
+          "\"$GITHUB_REF\" != \"refs/heads/dev/codestory-next\"",
+          "\"$EXPECTED_HEAD_SHA\" != \"$GITHUB_SHA\"",
+          "repos/$GITHUB_REPOSITORY/git/ref/heads/dev/codestory-next",
+          "dev/codestory-next moved from proved head"
+        ],
+        "reason": "Publication authority is admissible only from the trusted auto-release caller on a live main head, and a proof-only dispatch only from the dev head it names while that head still stands; each fragment pins one conjunct of that refusal."
+      },
+      "release_preflight_calibration_lineage": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Verify release-head calibration lineage",
+        "fragments": [
+          "/usr/bin/python3 -E -s",
+          "\"$GITHUB_WORKSPACE/.github/scripts/check-calibration-release-lineage.py\"",
+          "--repo \"$GITHUB_WORKSPACE\"",
+          "--expected-sha \"$GITHUB_SHA\"",
+          "--allow-promotion-commit",
+          "selection_commit",
+          "selection_tree"
+        ],
+        "reason": "Calibration lineage must be proved by the hermetic system interpreter against the exact release head, allowing only the promotion commit, so the frozen constant selection cannot be swapped between proof and publication."
+      },
+      "release_preflight_changelog_notes": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Validate versioned changelog notes",
+        "fragments": [
+          "node .github/scripts/extract-codestory-release-notes.mjs",
+          "--version \"$VERSION\""
+        ],
+        "reason": "A release whose notes cannot be extracted for its exact version would publish an empty or mismatched announcement, so preflight proves the extraction before any proof runs."
+      },
+      "release_preflight_refuse_existing_tag": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Refuse existing tag or release",
+        "fragments": [
+          "git ls-remote --exit-code --tags origin \"refs/tags/$TAG\"",
+          "gh release view \"$TAG\"",
+          "exit 1"
+        ],
+        "reason": "An existing tag or release means this version already shipped, so preflight must refuse rather than overwrite published history."
+      },
+      "release_preflight_marketplace_install_path": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Prove the public marketplace install path",
+        "fragments": [
+          "git ls-remote",
+          "refs/heads/main",
+          "\"@openai/codex@$CODEX_CLI_VERSION\"",
+          "install-codestory-marketplace-proof.mjs",
+          "--source-repository \"$GITHUB_WORKSPACE\"",
+          "marketplace_revision=$marketplace_revision",
+          "printf '%s' \"$marketplace_revision\" | grep -Eq '^[0-9a-f]{40}$'",
+          "printf '%s' \"$fixture_revision\" | grep -Eq '^[0-9a-f]{40}$'",
+          "fixture_revision=\"$(git -C \"$fixture_root\" rev-parse HEAD)\"",
+          "--marketplace-revision \"$fixture_revision\""
+        ],
+        "reason": "The public install proof must run the pinned Codex CLI against this repository and record an immutable forty-hex revision. Fixture mode resolves from the locally built catalog, so provenance is checked against that repository's own revision; checking it against the live revision can never match, which is how the fixture path shipped unexercised."
+      },
+      "release_preflight_marketplace_fixture": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Prove the public marketplace install path",
+        "fragments": [
+          "build-marketplace-fixture.mjs",
+          "--local-fixture true"
+        ],
+        "reason": "The marketplace proof must build its fixture catalog locally so preflight exercises the real fixture install path rather than the live catalog alone."
+      },
+      "release_preflight_resolve_reusable_evidence": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Resolve reusable prior evidence",
+        "fragments": [
+          "test \"$head_sha\" = \"$SOURCE_SHA\"",
+          "full-source-gate",
+          "freeze-acceptance",
+          ".path == \".github/workflows/source-proof.yml\"",
+          ".event == \"workflow_dispatch\" and .conclusion == \"success\"",
+          "The calibrated source has no reusable source-stabilization proof",
+          "artifact_name=\"release-cell-prepublish-source-attempt-$run_attempt\"",
+          "release-freeze-receipt-attempt-$run_attempt",
+          "select(.name == $receipt and .expired == false)",
+          "select(.name == $source and .expired == false)",
+          "source_proof_reused=true"
+        ],
+        "reason": "Prior source evidence is reusable only from the calibration lineage's selected source commit and a successful source-stabilization run carrying both the immutable freeze receipt and source release cell; each fragment pins one conjunct of that resolution."
+      },
+      "release_preflight_resolve_no_freeze_replay": {
+        "kind": "forbid",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Resolve reusable prior evidence",
+        "fragments": [
+          "release-freeze-barrier.mjs verify-status",
+          "freeze_receipt_digest"
+        ],
+        "reason": "The release resolver reuses proof evidence, not the freeze acceptance: replaying the freeze-status verification here would let a stale receipt stand in for the source proof's own live check."
+      },
+      "release_source_proof_refusal": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "source-proof",
+        "step": "Refuse a second source proof",
+        "fragments": [
+          "test \"$SOURCE_SHA\" = \"$GITHUB_SHA\"",
+          "Preflight did not resolve reusable source-stabilization proof",
+          "exit 1"
+        ],
+        "reason": "The placeholder's only step must fail closed when preflight did not resolve reusable exact-head evidence, so the release chain can never quietly start a second broad source proof."
+      },
+      "release_pre_publish_closeout_reuse_binding": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "pre-publish-closeout",
+        "step": "Authenticate pre-publish Actions provenance",
+        "fragments": [
+          "--reuse \"$REUSE_SELECTION\""
+        ],
+        "reason": "The closeout must receive exactly the reuse selection preflight resolved, or a skipped source gate would enter the ledger without its authenticated binding."
+      },
+      "release_pre_publish_closeout_provenance": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "pre-publish-closeout",
+        "step": "Authenticate pre-publish Actions provenance",
+        "fragments": [
+          "producer-map",
+          "--phase pre_publish",
+          "bash .github/scripts/collect-actions-job-evidence.sh",
+          "--job-evidence target/release-closeout/job-evidence.json"
+        ],
+        "reason": "The producer map is the trust boundary between a real proof and a non-claim, so the closeout collects the lost-runner evidence itself instead of inheriting the non-claim producer's verdict."
+      },
+      "release_pre_publish_closeout_cell_download": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "pre-publish-closeout",
+        "step": "Download and verify selected pre-publish release cells",
+        "fragments": [
+          "test \"$(jq -r '.artifacts | length' \"$producer_map\")\" -gt 0",
+          ".artifacts[] | [.id, .name, .digest] | @tsv",
+          "destination=\"target/release-cell-manifests/$artifact_name\"",
+          "test ! -e \"$destination\"",
+          "/actions/artifacts/$artifact_id/zip",
+          "sha256sum",
+          "test \"$actual_digest\" = \"$expected_digest\"",
+          "unzip -q \"$archive\" -d \"$destination\"",
+          "test -d \"target/release-cell-manifests/$artifact_name\""
+        ],
+        "reason": "Every selected release cell must be fetched by exact Actions artifact id, digest-verified, and unpacked into a fresh per-artifact destination; each fragment pins one link of that authenticated chain."
+      },
+      "release_pre_publish_closeout_evaluation": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "pre-publish-closeout",
+        "step": "Evaluate authenticated pre-publish closeout",
+        "fragments": [
+          "--trusted-producers",
+          "codestory-release-closeout.mjs evaluate",
+          "--version \"$RELEASE_VERSION\""
+        ],
+        "reason": "The closeout evaluation must run against the trusted producer set and the exact release version; the version reaches the evaluator as a variable, so the flag spelling is what binds the ledger to this release."
+      },
+      "release_pre_publish_closeout_dev_revalidation": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "pre-publish-closeout",
+        "step": "Revalidate proof-only dev head",
+        "fragments": [
+          "repos/$GITHUB_REPOSITORY/git/ref/heads/dev/codestory-next",
+          "\"$live_head\" != \"$GITHUB_SHA\"",
+          "dev/codestory-next moved from accepted ledger head"
+        ],
+        "reason": "A proof-only ledger is only valid for the dev head it proved, so the upload must refuse when dev/codestory-next has moved from the accepted head."
+      },
+      "release_publish_release_notes": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "publish",
+        "step": "Compose versioned GitHub release notes",
+        "fragments": [
+          "node .github/scripts/extract-codestory-release-notes.mjs",
+          "--output target/release-assets/release-notes.md",
+          "node scripts/codestory-release-claims.mjs release-platform-notes",
+          "--ledger target/release-closeout/pre_publish/ledger.json"
+        ],
+        "reason": "The published platform table is a claim about this release, so it is rendered from the accepted ledger. Rendering it from the static graph is how a release whose accelerator proof was withheld still announced that accelerator as supported."
+      },
+      "release_publish_manifest_generation": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "publish",
+        "step": "Generate the release manifest",
+        "fragments": [
+          "node scripts/build-release-manifest.mjs",
+          "--version \"$VERSION\"",
+          "--tag \"$TAG\"",
+          "--commit \"$GITHUB_SHA\"",
+          "--assets target/release-assets",
+          "--output target/release-assets/codestory-release-manifest.json"
+        ],
+        "reason": "The native lane's archive digests cannot be carried by the frozen source, so the manifest is generated here from the built archives and shipped with the release; the generator cross-checks the verified checksums, so every coordinate of its invocation is pinned."
+      },
+      "release_publish_closeout_summary": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "publish",
+        "step": "Ship the accepted closeout summary with the release",
+        "fragments": [
+          "target/release-closeout/pre_publish/summary.json",
+          "\"$(jq -r .decision \"$summary\")\" = accept",
+          "target/release-assets/release-closeout-summary.json"
+        ],
+        "reason": "The ledger the README tells readers to consult has to be reachable from the release itself, and only an accepted closeout decision may ship as that summary."
+      },
+      "release_publish_refuse_existing_tag": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "publish",
+        "step": "Refuse existing tag or release",
+        "fragments": [
+          "git ls-remote --exit-code --tags origin \"refs/tags/$TAG\"",
+          "gh release view \"$TAG\"",
+          "exit 1"
+        ],
+        "reason": "The publish job re-checks for an existing tag or release immediately before creating one, so a racing publication fails closed instead of overwriting."
+      },
+      "release_publish_create_release": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "publish",
+        "step": "Create GitHub release",
+        "fragments": [
+          "--notes-file target/release-assets/release-notes.md",
+          "node scripts/codestory-release-claims.mjs release-assets",
+          "for name in \"${expected_names[@]}\"; do",
+          "if [ ! -f \"$asset\" ]; then",
+          "Release assets differ from the release claim graph",
+          "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
+          "\"$live_head\" != \"$GITHUB_SHA\"",
+          "main moved from publishable head"
+        ],
+        "reason": "The release is created only with the curated notes file, exactly the graph-declared asset set, and a final live check that main still points at the publishable head; each fragment pins one conjunct of that creation."
+      },
+      "release_catalog_push": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "marketplace-publish",
+        "step": "Point the catalog at the published release",
+        "fragments": [
+          "--version \"$RELEASE_VERSION\""
+        ],
+        "reason": "The version the catalog is pointed at reaches the push as a variable, so the command text no longer says which release it published; the flag spelling is pinned here and the env binding stays a code-owned check, as in the plugin lane."
+      },
+      "post_publish_smoke_restart_survival": {
+        "kind": "require",
+        "file": "post-publish-release-smoke.yml",
+        "job": "smoke",
+        "step": "Prove the catalog-resolved published runtime",
+        "fragments": [
+          "common=(",
+          "python .github/scripts/check-packaged-agent-proof.py",
+          "--expected-backend \"$EXPECTED_BACKEND\"",
+          "\"${common[@]}\" --out-dir \"$proof_root/session-1\"",
+          "\"${common[@]}\" --out-dir \"$proof_root/session-2\"",
+          "time.time_ns() // 1_000_000",
+          "node .github/scripts/restart-survival-receipt.mjs",
+          "--session-1-summary \"$proof_root/session-1/summary.json\"",
+          "--session-2-summary \"$proof_root/session-2/summary.json\"",
+          "--install-attestation \"$INSTALLED_ATTESTATION\"",
+          "--catalog-delivery-state \"$CATALOG_DELIVERY_STATE\"",
+          "--expected-installer-identity \"$DELIVERED_INSTALLER\"",
+          "--expected-source-commit \"$source_sha\"",
+          "--expected-source-tree \"$source_tree\"",
+          "--expected-version \"$RELEASE_VERSION\"",
+          "--expected-archive-sha256 \"$archive_sha256\"",
+          "--expected-binary-sha256 \"$binary_sha256\"",
+          "--session-1-start-ms \"$session_1_started_ms\"",
+          "--session-1-finished-ms \"$session_1_finished_ms\"",
+          "--session-2-start-ms \"$session_2_started_ms\"",
+          "--session-2-finished-ms \"$session_2_finished_ms\"",
+          "--out \"$proof_root/restart-survival.json\""
+        ],
+        "reason": "Each post-publish target must reuse one catalog installation across two ordered fresh installed-runtime sessions, prove distinct runtime identities and full accelerated retrieval after restart, and retain a hashed restart-survival receipt before release cells are emitted."
+      },
+      "release_post_publish_closeout_provenance": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "post-publish-closeout",
+        "step": "Authenticate post-publish Actions provenance",
+        "fragments": [
+          "producer-map",
+          "--phase post_publish",
+          "--reuse \"$REUSE_SELECTION\"",
+          "bash .github/scripts/collect-actions-job-evidence.sh",
+          "--job-evidence target/release-closeout/job-evidence.json"
+        ],
+        "reason": "The post-publish producer map must be collected by the closeout itself, scoped to its phase, and must consume the preflight-authenticated reuse selection so the cumulative ledger retains an earlier exact-tree source proof."
+      },
+      "release_post_publish_container_digests": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "post-publish-closeout",
+        "step": "Download and verify selected cumulative release cells",
+        "fragments": [
+          "/actions/artifacts/$artifact_id/zip",
+          "sha256sum",
+          "test \"$actual_digest\" = \"$expected_digest\""
+        ],
+        "reason": "Each same-run or reused artifact container selected by the cumulative producer map must be downloaded by authenticated artifact id and digest-verified against that provenance before any cell inside it is trusted."
+      },
+      "release_post_publish_closeout_evaluation": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "post-publish-closeout",
+        "step": "Evaluate authenticated post-publish closeout",
+        "fragments": [
+          "--trusted-producers",
+          "--pre-publish-ledger",
+          "codestory-release-closeout.mjs evaluate",
+          "--version \"$RELEASE_VERSION\""
+        ],
+        "reason": "The post-publish evaluation must run against the trusted producer set, the accepted pre-publish ledger, and the exact release version, closing the ledger over what actually shipped."
+      },
+      "macos_metal_release_retrieval_cell_id": {
+        "kind": "require",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "step": "Emit authenticated macOS retrieval-readiness release cell",
+        "fragments": [
+          "--cell-id retrieval_readiness:macos-arm64",
+          "release-cell-postpublish-retrieval-macos-arm64-attempt-$GITHUB_RUN_ATTEMPT"
+        ],
+        "reason": "The release chain consumes the macOS retrieval-readiness cell under its exact --cell-id spelling and attempt-qualified post-publish artifact name, so the emitting step must pin both coordinates."
+      },
+      "windows_vulkan_release_retrieval_cell_id": {
+        "kind": "require",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Windows retrieval-readiness release cell",
+        "fragments": [
+          "--cell-id retrieval_readiness:windows-x64",
+          "release-cell-postpublish-retrieval-windows-x64-attempt-$GITHUB_RUN_ATTEMPT"
+        ],
+        "reason": "The release chain consumes the Windows retrieval-readiness cell under its exact --cell-id spelling and attempt-qualified post-publish artifact name, so the emitting step must pin both coordinates."
+      },
+      "linux_vulkan_release_cell_ids": {
+        "kind": "require",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "step": "Emit authenticated Linux Vulkan release cells",
+        "fragments": [
+          "--cell-id accelerator_execution:linux-x64-vulkan",
+          "--cell-id retrieval_readiness:linux-x64",
+          "--cell-id candidate_installed_behavior:linux-x64"
+        ],
+        "reason": "The release chain requires the single Linux cell step to emit all three Linux cells under their exact --cell-id spellings, so a renamed or dropped cell id cannot masquerade as coverage."
+      },
+      "packaged_platform_pr_route_resolve_trusted_head": {
+        "kind": "require",
+        "file": "packaged-platform-pr.yml",
+        "job": "route",
+        "step": "Resolve trusted exact head",
+        "fragments": [
+          "test \"$head_repo\" = \"$GITHUB_REPOSITORY\"",
+          "test \"$current_head\" = \"$EVENT_HEAD_SHA\"",
+          "test \"$INPUT_HEAD_SHA\" = \"$current_head\"",
+          "test \"$GITHUB_REF\" = \"refs/heads/$head_ref\"",
+          "test \"$GITHUB_SHA\" = \"$INPUT_HEAD_SHA\"",
+          "test \"$base_ref\" = \"dev/codestory-next\"",
+          "test \"$INPUT_HEAD_SHA\" = \"$dev_head\"",
+          "test \"$GITHUB_REF\" = \"refs/heads/dev/codestory-next\"",
+          "test \"$GITHUB_SHA\" = \"$dev_head\"",
+          "elif [ \"$mode\" = \"qualification\" ]; then",
+          "test -n \"$INPUT_CALIBRATION_ARTIFACT\"",
+          "test -n \"$INPUT_CALIBRATION_RUN_ID\"",
+          "--ref $head_ref"
+        ],
+        "reason": "The coordinator may run only for an exact trusted head: same-repository PR heads must match the event and input SHA, branch dispatches must resolve to the live dev/codestory-next head, and qualification dispatches must name the calibration bundle and its producer run. Each fragment pins one conjunct of that resolution."
+      },
+      "packaged_platform_pr_route_release_freeze": {
+        "kind": "require",
+        "file": "packaged-platform-pr.yml",
+        "job": "route",
+        "step": "Require executable release freeze",
+        "fragments": [
+          "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA",
+          "release-freeze-barrier.mjs verify-status",
+          "--commit \"$HEAD_SHA\"",
+          "if [ \"$RESOLVED_MODE\" = calibration ]; then",
+          "freeze_phase=source_stabilization",
+          "freeze_phase=frozen_candidate",
+          "--phase \"$freeze_phase\"",
+          "--receipt-digest \"$FREEZE_RECEIPT_DIGEST\""
+        ],
+        "reason": "Every broad proof mode must verify the executable freeze against the commit the API reports, selecting source_stabilization for calibration and frozen_candidate otherwise, with the receipt digest bound in; the fragments pin that phase selection and verification chain."
+      },
+      "packaged_platform_pr_route_exact_head_source_proof": {
+        "kind": "require",
+        "file": "packaged-platform-pr.yml",
+        "job": "route",
+        "step": "Require successful source-stabilization proof",
+        "fragments": [
+          "actions/runs?head_sha=$source_sha",
+          "freeze_record.selection_source_commit",
+          ".path == \".github/workflows/source-proof.yml\"",
+          ".event == \"workflow_dispatch\" and .conclusion == \"success\"",
+          ".name == \"full-source-gate\" and .conclusion == \"success\"",
+          ".name == \"freeze-acceptance\" and .conclusion == \"success\"",
+          "release-freeze-receipt-attempt-$run_attempt",
+          "release-cell-prepublish-source-attempt-$run_attempt"
+        ],
+        "reason": "A frozen-candidate proof may start only after the selected calibration source has a successful source-stabilization run, full-source gate, published receipt, and source cell; the fragments pin that lineage-scoped lookup and its proof artifacts."
+      },
+      "packaged_platform_pr_route_scope_selection": {
+        "kind": "require",
+        "file": "packaged-platform-pr.yml",
+        "job": "route",
+        "step": "Select change-aware proof scope",
+        "fragments": [
+          "if [ \"$REQUESTED_SCOPE\" = none ] || [ \"$REQUESTED_SCOPE\" = linux ]; then",
+          "elif [ \"$RESOLVED_MODE\" = \"package\" ]; then",
+          "test \"$REQUESTED_SCOPE\" != none",
+          "if [ \"$REQUESTED_SCOPE\" = auto ]; then",
+          "elif [ \"$RESOLVED_MODE\" = \"qualification\" ]; then",
+          "test \"$REQUESTED_SCOPE\" = auto || test \"$REQUESTED_SCOPE\" = full",
+          "scope=\"$REQUESTED_SCOPE\"",
+          "scope=full",
+          "node .github/scripts/route-ci-proof.mjs --stdin"
+        ],
+        "reason": "Scope selection must keep the explicit no-op and Linux integration scopes, force package mode away from none, widen qualification to auto or full only, and delegate auto to the change-aware router; the fragments pin those mode branches and the router invocation."
+      },
+      "packaged_platform_pr_route_calibration_producer_authentication": {
+        "kind": "require",
+        "file": "packaged-platform-pr.yml",
+        "job": "route",
+        "step": "Authenticate calibration bundle producer",
+        "fragments": [
+          "actions/runs/",
+          ".github/workflows/packaged-platform-pr.yml",
+          "workflow_dispatch",
+          "success",
+          "embedding-calibration-bundle-",
+          "artifacts?per_page=100",
+          "expired"
+        ],
+        "reason": "A calibration bundle is trusted only when its producer run is the frozen-candidate coordinator's dispatched, successful run and the bundle artifact is the unexpired one it named; the fragments pin the producer-run lookup, the coordinator path, the dispatch event, the success conclusion, the bundle name prefix, the artifact listing, and the expiry check."
+      },
+      "packaged_platform_pr_route_cancel_superseded": {
+        "kind": "require",
+        "file": "packaged-platform-pr.yml",
+        "job": "route",
+        "step": "Cancel superseded proof runs",
+        "fragments": [
+          "release-freeze-barrier.mjs cancel-superseded",
+          "--commit \"$HEAD_SHA\"",
+          "--broad-workflow \"Exact-head source proof\"",
+          "--broad-workflow \"Platform and integration proof\"",
+          "--broad-workflow \"Release\"",
+          "--broad-workflow \"Auto Release\""
+        ],
+        "reason": "Before package or hardware proof starts, the router must cancel every superseded run of the four broad workflows for this head through the freeze barrier's cancel-superseded path; the fragments pin the invocation, the commit binding, and each named broad workflow."
+      },
+      "packaged_platform_pr_calibration_assembly": {
+        "kind": "require",
+        "file": "packaged-platform-pr.yml",
+        "job": "calibration-assemble",
+        "step": "Assemble frozen calibration candidate",
+        "fragments": [
+          "--assemble-calibration-bundle",
+          "find target/calibration-inputs/macos",
+          "test \"${#runs[@]}\" = 3",
+          ".run_count == 3",
+          ".matrix_cell_count == 1",
+          "--calibration-producer-workflow-path",
+          "--calibration-producer-run-id",
+          "--calibration-producer-artifact"
+        ],
+        "reason": "Calibration assembly must build the frozen candidate from exactly three protected macOS runs of one matrix cell and record the producer workflow, run, and artifact coordinates; the fragments pin the assembler flag, the macOS-only input discovery, the run-count and cell-count checks, and the producer bindings."
+      },
+      "packaged_platform_pr_closeout_proof": {
+        "kind": "require",
+        "file": "packaged-platform-pr.yml",
+        "job": "closeout",
+        "step": "Require one coherent accepted proof",
+        "fragments": [
+          "if [ \"$MODE\" = package ]",
+          "require_result \"$PACKAGE_RESULT\" success packaged-proof",
+          "require_result \"$METAL_RESULT\" skipped macos-metal-proof",
+          "if [ \"$SCOPE\" = none ]",
+          "[ \"$SCOPE\" = linux ]",
+          "WINDOWS_VULKAN_RESULT",
+          "LINUX_VULKAN_RESULT",
+          "if [ \"$MODE\" = qualification ]; then",
+          "if [ \"$QUALIFY_LINUX_VULKAN\" = true ]; then",
+          "require_result \"$LINUX_VULKAN_RESULT\" skipped linux-vulkan-proof",
+          "require_result \"$LINUX_VULKAN_RESULT\" success linux-vulkan-proof",
+          "dev/codestory-next moved from proved head"
+        ],
+        "reason": "Closeout must accept exactly one coherent proof shape per mode - package-only skips hardware, the no-op and Linux scopes bind the Vulkan set, and qualification requires Linux success exactly when its explicit lifecycle opt-in is true - and must refuse a moved dev head; the fragments pin those mode branches and the moved-head refusal."
+      },
+      "frozen_candidate_quality_candidate_cache_restore": {
+        "kind": "require",
+        "file": "frozen-candidate-quality.yml",
+        "job": "quality",
+        "step": "Restore exact candidate archive from protected host",
+        "fragments": [
+          "--arg repository \"$GITHUB_REPOSITORY\"",
+          "--arg source_sha \"$(git rev-parse HEAD)\"",
+          "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
+          "--arg target macos-arm64",
+          ".source.commit == $source_sha",
+          ".source.tree == $source_tree",
+          ".target == $target",
+          "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
+          "candidate-archive-store.mjs restore",
+          "--record \"$record\"",
+          "--output-dir target/release-dist",
+          "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\""
+        ],
+        "reason": "The optional quality lane may reuse a candidate archive only when the protected host's store row matches this repository, the exact source commit and tree, and the macOS target; the fragments pin those restore-selection arguments, the store location, the restore invocation, and the hit signal."
+      },
+      "frozen_candidate_quality_candidate_cache_miss": {
+        "kind": "require",
+        "file": "frozen-candidate-quality.yml",
+        "job": "quality",
+        "step": "Download, authenticate, and admit candidate archive on miss",
+        "fragments": [
+          "actions/artifacts/$ARTIFACT_ID/zip",
+          "--continue-at -",
+          "--max-time 120",
+          "test \"$actual_size\" = \"$EXPECTED_SIZE\"",
+          "test \"$actual_digest\" = \"$EXPECTED_SHA256\"",
+          "extract-candidate-actions-artifact.py",
+          "candidate-archive-store.mjs admit",
+          "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
+          "--output-dir target/release-dist"
+        ],
+        "reason": "On a cache miss the archive must be transferred resumably with a bounded timeout, authenticated against the recorded size and outer digest, extracted by the pinned helper, and admitted into the protected store before use; each fragment pins one link of that transfer chain."
+      },
+      "freeze_invalidation_superseded_revocation": {
+        "kind": "require",
+        "file": "release-freeze-invalidation.yml",
+        "job": "invalidate",
+        "step": "Invalidate a superseded release freeze",
+        "fragments": [
+          "test \"$BEFORE_SHA\" != \"$AFTER_SHA\"",
+          "commits/$BEFORE_SHA/statuses?per_page=100",
+          ".state == \"success\"",
+          "startswith(\"codestory/release-freeze/\")",
+          "if [ -z \"$freeze_contexts\" ]; then",
+          "\"repos/$GITHUB_REPOSITORY/statuses/$BEFORE_SHA\"",
+          "-f state=error",
+          "-f \"context=$context\"",
+          "-f \"description=superseded-by=$AFTER_SHA\"",
+          "release-freeze-barrier.mjs invalidate-superseded",
+          "--commit \"$AFTER_SHA\"",
+          "--broad-workflow \"Exact-head source proof\"",
+          "--broad-workflow \"Platform and integration proof\"",
+          "--broad-workflow \"Release\"",
+          "--broad-workflow \"Auto Release\""
+        ],
+        "reason": "When a candidate head is superseded, the previous head's successful freeze statuses must be revoked with an error status naming the superseding commit, and every obsolete broad proof run must be cancelled; the fragments pin the head-change guard, the status enumeration and freeze-context filter, the revocation call, and each named broad workflow."
+      },
+      "freeze_invalidation_no_pending_reuse": {
+        "kind": "forbid",
+        "file": "release-freeze-invalidation.yml",
+        "job": "invalidate",
+        "step": "Invalidate a superseded release freeze",
+        "fragments": [
+          ".state == \"pending\"",
+          ".state == 'pending'"
+        ],
+        "reason": "Revocation targets only successful freeze statuses: touching pending states would let the invalidator manufacture or launder an in-flight acceptance instead of revoking a completed one."
+      },
+      "source_proof_resolve_cancel_superseded": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "resolve",
+        "step": "Cancel superseded proof runs",
+        "fragments": [
+          "release-freeze-barrier.mjs cancel-superseded",
+          "--commit \"$HEAD_SHA\"",
+          "--broad-workflow \"Exact-head source proof\"",
+          "--broad-workflow \"Platform and integration proof\"",
+          "--broad-workflow \"Release\"",
+          "--broad-workflow \"Auto Release\""
+        ],
+        "reason": "Before broad source proof starts, the resolver must cancel every superseded run of the four broad workflows for this head through the freeze barrier's cancel-superseded path; the fragments pin the invocation, the commit binding, and each named broad workflow."
+      },
+      "source_proof_resolve_record_freeze_receipt": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "resolve",
+        "step": "Record executable release freeze",
+        "fragments": [
+          "test -z \"$CALLER_FREEZE_RECEIPT_DIGEST\"",
+          "release-freeze-barrier.mjs record-actions-receipt",
+          "--repository \"$GITHUB_REPOSITORY\"",
+          "--repo \"$GITHUB_WORKSPACE\"",
+          "--branch \"$GITHUB_REF_NAME\"",
+          "--commit \"$HEAD_SHA\"",
+          "--tree \"$tree\"",
+          "--release-pr \"$PR_NUMBER\"",
+          "--support-prs-json \"$SUPPORT_PRS_JSON\"",
+          "--reusable-evidence-json \"$REUSABLE_EVIDENCE_JSON\"",
+          "--invalidated-evidence-json \"$INVALIDATED_EVIDENCE_JSON\"",
+          "--cancelled-runs-json \"$CANCELLED_RUNS_JSON\"",
+          "--run-id \"$GITHUB_RUN_ID\"",
+          "--run-attempt \"$GITHUB_RUN_ATTEMPT\"",
+          "--phase \"$ACCEPTANCE_PHASE\"",
+          "--output \"$RUNNER_TEMP/release-freeze-receipt.json\"",
+          "--github-output \"$GITHUB_OUTPUT\""
+        ],
+        "reason": "An Actions-minted freeze receipt may be generated only when no caller supplied one, and must bind the repository, workspace, branch, commit, tree, release PR, support PRs, the reusable, invalidated, and cancelled evidence records, the exact run and attempt, and the acceptance phase; each fragment pins one bound coordinate of that receipt."
+      },
+      "freeze_barrier_source_resolve_release_freeze": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "resolve",
+        "step": "Require executable release freeze",
+        "fragments": [
+          "release-freeze-barrier.mjs verify-status",
+          "--commit \"$HEAD_SHA\"",
+          "--tree \"$tree\"",
+          "--phase source_stabilization",
+          "--receipt-digest \"$FREEZE_RECEIPT_DIGEST\""
+        ],
+        "reason": "Broad source proof must verify the source_stabilization freeze status for the exact commit and tree with the caller's receipt digest bound in; the fragments pin that verify-status invocation beside the source family's own wider pin so neither can drop alone."
+      },
+      "source_proof_freeze_hostile_mutation_suites": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "freeze-hostile-mutations",
+        "step": "Execute exact-head hostile mutation matrix",
+        "fragments": [
+          "node --test",
+          ".github/scripts/check-workflow-policy.test.mjs",
+          ".github/scripts/release-freeze-barrier.test.mjs",
+          ".github/scripts/cargo-build-artifacts.test.mjs",
+          ".github/scripts/candidate-archive-store.test.mjs"
+        ],
+        "reason": "Acceptance must execute the exact-head hostile mutation suites - the workflow policy, freeze barrier, build artifact, and candidate archive store tests - under node --test; the fragments pin the runner and each blocking suite."
+      },
+      "source_proof_freeze_windows_native_probe": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "freeze-windows-native-probe",
+        "step": "Run exact-head Windows native probe",
+        "fragments": [
+          "cargo new --quiet --bin",
+          "cargo build --release --quiet",
+          "node --test .github/scripts/cargo-build-artifacts.test.mjs",
+          "const [root, deps] = process.argv.slice(2);",
+          "left.dev !== right.dev",
+          "left.ino !== right.ino",
+          "left.nlink !== 2n",
+          "right.nlink !== 2n",
+          "$identityScriptPath = Join-Path $probeRoot \"verify-hardlink-identity.cjs\"",
+          "Set-Content -LiteralPath $identityScriptPath -Value $identityScript -Encoding UTF8",
+          "node $identityScriptPath $rootExe $depsExe",
+          "Elapsed.TotalSeconds -ge 90",
+          "Remove-Item -LiteralPath $probeRoot -Recurse -Force"
+        ],
+        "reason": "The protected Windows probe must build a fresh native crate, verify Cargo's hard-linked build outputs by device, inode, and link count through a materialized identity script, complete inside the 90-second bound, and remove its probe root; each fragment pins one leg of that probe."
+      },
+      "source_proof_freeze_windows_native_probe_isolation": {
+        "kind": "forbid",
+        "file": "source-proof.yml",
+        "job": "freeze-windows-native-probe",
+        "step": "Run exact-head Windows native probe",
+        "fragments": [
+          "node -e $identityScript",
+          "process.argv.slice(1)"
+        ],
+        "reason": "The identity script must run from a materialized file with explicit argument slicing, not from an inline -e program whose argv indexing can silently shift which paths are compared."
+      },
+      "source_proof_freeze_acceptance_publication": {
+        "kind": "require",
+        "file": "source-proof.yml",
+        "job": "freeze-acceptance",
+        "step": "Publish executable release freeze",
+        "fragments": [
+          "release-freeze-barrier.mjs verify-file",
+          "--receipt \"$RUNNER_TEMP/release-freeze-receipt/release-freeze-receipt.json\"",
+          "--repository \"$GITHUB_REPOSITORY\"",
+          "--commit \"$HEAD_SHA\"",
+          "--tree \"$tree\"",
+          "--run-id \"$GITHUB_RUN_ID\"",
+          "--run-attempt \"$GITHUB_RUN_ATTEMPT\"",
+          "--phase \"$ACCEPTANCE_PHASE\"",
+          "test \"$verified_digest\" = \"$FREEZE_RECEIPT_DIGEST\"",
+          "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA",
+          "-f state=success",
+          "-f \"context=codestory/release-freeze/$FREEZE_RECEIPT_DIGEST\"",
+          "-f \"description=tree=$tree\"",
+          "actions/runs/$GITHUB_RUN_ID"
+        ],
+        "reason": "Publication must re-verify the downloaded receipt against the repository, commit, tree, exact run and attempt, and phase, prove the verified digest equals the resolver's, and publish the success status carrying the digest-scoped context and tree description from the current run; each fragment pins one conjunct of that publication."
+      },
+      "freeze_barrier_packaged_route_release_freeze": {
+        "kind": "require",
+        "file": "packaged-platform-pr.yml",
+        "job": "route",
+        "step": "Require executable release freeze",
+        "fragments": [
+          "release-freeze-barrier.mjs verify-status",
+          "--commit \"$HEAD_SHA\"",
+          "if [ \"$RESOLVED_MODE\" = calibration ]; then",
+          "freeze_phase=source_stabilization",
+          "freeze_phase=frozen_candidate",
+          "--phase \"$freeze_phase\"",
+          "--receipt-digest \"$FREEZE_RECEIPT_DIGEST\""
+        ],
+        "reason": "The freeze family independently pins the router's phase-selecting verify-status call so the packaged coordinator cannot drop source_stabilization or frozen_candidate authentication while the coordinator family's wider pin survives; the fragments pin the invocation, the commit and phase bindings, and the receipt digest."
+      },
+      "freeze_barrier_packaged_route_source_proof": {
+        "kind": "require",
+        "file": "packaged-platform-pr.yml",
+        "job": "route",
+        "step": "Require successful source-stabilization proof",
+        "fragments": [
+          "actions/runs?head_sha=$source_sha",
+          ".event == \"workflow_dispatch\" and .conclusion == \"success\"",
+          ".name == \"full-source-gate\" and .conclusion == \"success\"",
+          ".name == \"freeze-acceptance\" and .conclusion == \"success\""
+        ],
+        "reason": "The freeze family independently pins the lineage-scoped source-stabilization lookup and its dispatched, full-source, and acceptance success conjuncts, so packaged proof cannot start from an unproved source even if the coordinator family's wider pin changes."
+      },
+      "freeze_barrier_release_reuse_resolution": {
+        "kind": "require",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Resolve reusable prior evidence",
+        "fragments": [
+          "test \"$head_sha\" = \"$SOURCE_SHA\"",
+          "artifact_name=\"release-cell-prepublish-source-attempt-$run_attempt\"",
+          "release-freeze-receipt-attempt-$run_attempt",
+          "select(.name == $receipt and .expired == false)",
+          "select(.name == $source and .expired == false)",
+          "The calibrated source has no reusable source-stabilization proof",
+          "source_proof_reused=true"
+        ],
+        "reason": "The freeze family independently pins the reuse resolver's selected source commit, attempt-qualified receipt and source cell, and reuse signal, so release-time reuse cannot widen even if the release family's own pin changes."
+      },
+      "freeze_barrier_release_no_freeze_replay": {
+        "kind": "forbid",
+        "file": "release.yml",
+        "job": "preflight",
+        "step": "Resolve reusable prior evidence",
+        "fragments": [
+          "release-freeze-barrier.mjs verify-status",
+          "freeze_receipt_digest"
+        ],
+        "reason": "The freeze family independently forbids replaying freeze-status verification in the release reuse resolver, where a stale receipt could stand in for the source proof's own live check, beside the release family's identical pin so neither can drop alone."
+      }
+    },
+    "structural_pins": {
+      "saga_issue_link_guard_job": {
+        "kind": "job",
+        "file": "saga-issue-link-guard.yml",
+        "job": "require-closing-issue-link",
+        "reason": "The guard exists only through this job: it is the sole gate that refuses a codex pull request whose body names no closing issue. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments then constrain what the surviving job must run."
+      },
+      "saga_issue_link_guard_pull_requests_read": {
+        "kind": "permission",
+        "file": "saga-issue-link-guard.yml",
+        "scope": "pull-requests",
+        "access": "read",
+        "reason": "The guard runs on pull_request_target, where the token can reach repository secrets. Reading the pull request body is the only scope its check needs, so the workflow-level grant is pinned to exactly pull-requests: read - any widening toward write access on a fork-triggered workflow requires a reviewed graph edit."
+      },
+      "close_dev_issues_job": {
+        "kind": "job",
+        "file": "close-dev-issues.yml",
+        "job": "close-linked-issues",
+        "reason": "The close automation exists only through this job: it is the sole writer that marks issues completed after a dev/codestory-next push. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments then constrain the authentication and stack-integrity checks the surviving job must run."
+      },
+      "close_dev_issues_issues_write": {
+        "kind": "permission",
+        "file": "close-dev-issues.yml",
+        "scope": "issues",
+        "access": "write",
+        "reason": "Closing an issue as completed is a write to the tracker, so the automation must hold exactly issues: write - enough to close what a merged pull request names, pinned here so the grant cannot silently widen or silently drop and leave the automation failing open."
+      },
+      "close_dev_issues_pull_requests_read": {
+        "kind": "permission",
+        "file": "close-dev-issues.yml",
+        "scope": "pull-requests",
+        "access": "read",
+        "reason": "The automation authenticates a close request by reading the merged pull request - merge commit, base branch, and stack metadata - before it touches any issue. That verification needs only pull-requests: read, pinned here so the read-side scope cannot widen into write access on the automation's token."
+      },
+      "post_publish_smoke_job": {
+        "kind": "job",
+        "file": "post-publish-release-smoke.yml",
+        "job": "smoke",
+        "reason": "The post-publish check exists only through this job: it is the sole matrix that proves the published release still installs and answers on every platform after publication. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the checker's step and toolchain pins then constrain what the surviving job must run."
+      },
+      "post_publish_smoke_actions_read": {
+        "kind": "permission",
+        "file": "post-publish-release-smoke.yml",
+        "scope": "actions",
+        "access": "read",
+        "reason": "The smoke verifies a release that already shipped, and its only trusted input from the release run is the accepted pre-publish closeout artifact. Downloading that artifact needs exactly actions: read, pinned here so the reusable workflow's token cannot silently widen toward write access on the Actions surface it merely reads, and cannot silently drop the scope and leave the closeout unreadable."
+      },
+      "plugin_static_job": {
+        "kind": "job",
+        "file": "plugin-static.yml",
+        "job": "plugin-static",
+        "reason": "The plugin lane exists only through this job: it is the sole pre-merge gate that runs the policy checker, the claim-graph suites, and the plugin proofs. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments then constrain what the surviving job must run."
+      },
+      "rust_ci_linux_draft_job": {
+        "kind": "job",
+        "file": "rust-ci.yml",
+        "job": "linux-draft",
+        "reason": "The draft lane exists only through this job: it is the serial Linux proof every pull request must pass before review. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the checker's draft-source rules and the graph-owned command lists then constrain what the surviving job must run."
+      },
+      "source_proof_resolve_job": {
+        "kind": "job",
+        "file": "source-proof.yml",
+        "job": "resolve",
+        "reason": "Every other job in the source proof checks out the ref this job resolves, so deleting or renaming it would sever the trusted-head chain the whole workflow exists to enforce. Its existence is pinned here; the graph-owned step fragments then constrain the authentication checks the surviving job must run."
+      },
+      "source_proof_full_source_gate_job": {
+        "kind": "job",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "reason": "The full source gate is the one job that compiles, lints, and tests the complete workspace and emits the authenticated source release cell. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments and the checker's cache rules then constrain what the surviving job must run."
+      },
+      "source_proof_full_source_gate_needs_resolve": {
+        "kind": "needs",
+        "file": "source-proof.yml",
+        "job": "full-source-gate",
+        "needs": [
+          "resolve"
+        ],
+        "reason": "The full source gate proves exactly the head the resolve job authenticated, so its needs edge must name resolve and nothing else - an added dependency would let another job influence when the gate runs, and a dropped one would let it run on an unresolved ref. The edge is pinned here so it cannot change by a workflow edit alone."
+      },
+      "source_proof_retrieval_generalization_job": {
+        "kind": "job",
+        "file": "source-proof.yml",
+        "job": "retrieval-generalization",
+        "reason": "The generalization lint runs as its own blocking job so a lint failure is attributable and cannot hide inside a larger gate. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the checker's exact-shape rules then constrain the surviving job's steps."
+      },
+      "source_proof_windows_native_contracts_job": {
+        "kind": "job",
+        "file": "source-proof.yml",
+        "job": "windows-native-contracts",
+        "reason": "The Windows-native contracts job is the only place the path-identity and native-staging tests run on a real Windows toolchain before merge. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments and the checker's shape rules then constrain what the surviving job must run."
+      },
+      "auto_release_detect_version_job": {
+        "kind": "job",
+        "file": "auto-release.yml",
+        "job": "detect-version",
+        "reason": "Version detection is the job that decides whether a main push is a release at all. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the checker's shape rules then constrain what the surviving job must not do."
+      },
+      "auto_release_release_job": {
+        "kind": "job",
+        "file": "auto-release.yml",
+        "job": "release",
+        "reason": "The release job is the one trusted caller of the reusable release workflow on main. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned needs edge and permission grants then constrain how the surviving job calls it."
+      },
+      "auto_release_release_needs_detect_version": {
+        "kind": "needs",
+        "file": "auto-release.yml",
+        "job": "release",
+        "needs": [
+          "detect-version"
+        ],
+        "reason": "The trusted main caller may invoke the release workflow only after version detection has decided a release is due, and nothing else may gate it - an added dependency would let another job influence publication and a dropped one would release undetected versions. The edge is pinned here so it cannot change by a workflow edit alone."
+      },
+      "auto_release_release_contents_write": {
+        "kind": "job_permission",
+        "file": "auto-release.yml",
+        "job": "release",
+        "scope": "contents",
+        "access": "write",
+        "reason": "The release caller publishes tags and release assets, which requires exactly contents write on the caller side; the grant is pinned here so it cannot silently widen or drop by a workflow edit alone."
+      },
+      "auto_release_release_actions_write": {
+        "kind": "job_permission",
+        "file": "auto-release.yml",
+        "job": "release",
+        "scope": "actions",
+        "access": "write",
+        "reason": "Superseded-run cancellation is an Actions-surface write, so the caller must grant actions write; the grant is pinned here so it cannot silently widen or drop by a workflow edit alone."
+      },
+      "auto_release_release_pull_requests_read": {
+        "kind": "job_permission",
+        "file": "auto-release.yml",
+        "job": "release",
+        "scope": "pull-requests",
+        "access": "read",
+        "reason": "The exact source proof reads pull-request metadata to authenticate the head it releases, which requires exactly pull-requests read from the caller; the grant is pinned here so it cannot silently widen or drop by a workflow edit alone."
+      },
+      "macos_metal_packaged_metal_job": {
+        "kind": "job",
+        "file": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "reason": "The packaged-metal job is the only lane that proves accelerated execution on protected Apple Silicon. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments and the checker's shape rules then constrain what the surviving job must run."
+      },
+      "windows_vulkan_packaged_vulkan_job": {
+        "kind": "job",
+        "file": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "reason": "The packaged-vulkan job is the only lane that proves accelerated execution on the protected Windows Vulkan host. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments and the checker's shape rules then constrain what the surviving job must run."
+      },
+      "linux_vulkan_route_job": {
+        "kind": "job",
+        "file": "linux-vulkan-proof.yml",
+        "job": "route",
+        "reason": "The route job is the bounded hosted gate that validates a standalone dispatch before anything reaches the protected Linux host. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments then constrain what the surviving job must run."
+      },
+      "linux_vulkan_packaged_vulkan_job": {
+        "kind": "job",
+        "file": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "reason": "The packaged-vulkan job is the only lane that proves accelerated execution on the protected Linux Vulkan host. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments and the checker's shape rules then constrain what the surviving job must run."
+      },
+      "linux_vulkan_optional_constant_calibration_job": {
+        "kind": "job",
+        "file": "linux-vulkan-proof.yml",
+        "job": "optional-constant-calibration",
+        "reason": "Optional Linux constant calibration runs as its own coordinator-gated job so calibration can never share a lane with release proof. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the graph-owned step fragments and the checker's shape rules then constrain what the surviving job must run."
+      },
+      "main_branch_source_guard_enforce_source_branch_job": {
+        "kind": "job",
+        "file": "main-branch-source-guard.yml",
+        "job": "enforce-source-branch",
+        "reason": "The source-branch guard is the only check standing between an arbitrary branch and a main merge. Its existence is pinned here so the job cannot be renamed or deleted by a workflow edit alone; the checker's identity and branch rules then constrain what the surviving job must compare."
+      },
+      "release_actions_write": {
+        "kind": "permission",
+        "file": "release.yml",
+        "scope": "actions",
+        "access": "write",
+        "reason": "Cancelling superseded proof runs before starting release work is an Actions-surface write, so the coordinator must hold exactly actions write at the workflow scope."
+      },
+      "release_pull_requests_read": {
+        "kind": "permission",
+        "file": "release.yml",
+        "scope": "pull-requests",
+        "access": "read",
+        "reason": "The exact source resolver authenticates the head it proves by reading pull-request metadata, so the coordinator must grant exactly pull-requests read."
+      },
+      "release_workflow_policy_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "workflow-policy",
+        "reason": "The release lane's own policy gate exists only through this job: it re-proves the workflow policy and the claim contracts before any release proof runs."
+      },
+      "release_preflight_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "preflight",
+        "reason": "Preflight is the trusted entry of the release chain: it validates publication authority, calibration lineage, the version, and the marketplace path before any proof starts."
+      },
+      "release_source_proof_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "source-proof",
+        "reason": "The source-proof placeholder is the fail-closed sentinel standing where the broad source workflow would otherwise re-run; deleting it would silently reshape evidence reuse."
+      },
+      "release_packaged_proof_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "packaged-proof",
+        "reason": "The packaged-proof call is the only producer of the release archives every later proof and the publication itself consume."
+      },
+      "release_macos_metal_proof_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "macos-metal-proof",
+        "reason": "The Metal proof call is the only lane that closes the macOS accelerator and candidate-installed claims for a release."
+      },
+      "release_windows_vulkan_proof_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "windows-vulkan-proof",
+        "reason": "The Windows Vulkan proof call is the only lane that closes the Windows accelerator and candidate-installed claims for a release."
+      },
+      "release_linux_vulkan_proof_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "linux-vulkan-proof",
+        "reason": "The Linux Vulkan proof call is the only lane that closes the Linux accelerator, retrieval, and candidate-installed claims for a release."
+      },
+      "release_pre_publish_closeout_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "pre-publish-closeout",
+        "reason": "The pre-publish closeout is the sole authenticated evaluator standing between the proofs and publication; without it the publish gate would rest on job results alone."
+      },
+      "release_publish_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "publish",
+        "reason": "The publish job is the one writer of the tag, the GitHub release, and its assets."
+      },
+      "release_marketplace_publish_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "marketplace-publish",
+        "reason": "Marketplace publication is the one delivery job holding the scoped cross-repository credential, isolated from every job that runs release code."
+      },
+      "release_post_publish_smoke_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "post-publish-smoke",
+        "reason": "The post-publish smoke call is the only check that proves the assets that actually shipped install and run."
+      },
+      "release_post_publish_closeout_job": {
+        "kind": "job",
+        "file": "release.yml",
+        "job": "post-publish-closeout",
+        "reason": "The post-publish closeout is the sole authenticated evaluator that closes the ledger over what shipped."
+      },
+      "packaged_platform_pr_route_job": {
+        "kind": "job",
+        "file": "packaged-platform-pr.yml",
+        "job": "route",
+        "reason": "Every other coordinator job consumes the head, mode, and scope this job resolves, so deleting or renaming it would sever the trusted-head chain the coordinator exists to enforce; the graph-owned step fragments then constrain what the surviving job must run."
+      },
+      "packaged_platform_pr_calibration_macos_job": {
+        "kind": "job",
+        "file": "packaged-platform-pr.yml",
+        "job": "calibration-macos",
+        "reason": "Calibration evidence comes only from the protected macOS Metal lane; deleting this caller would leave calibration assembly with nothing trustworthy to assemble."
+      },
+      "packaged_platform_pr_calibration_assemble_job": {
+        "kind": "job",
+        "file": "packaged-platform-pr.yml",
+        "job": "calibration-assemble",
+        "reason": "The assembler is the sole producer of the frozen calibration bundle; deleting it would leave qualification without a graph-authenticated constant candidate."
+      },
+      "packaged_platform_pr_source_proof_job": {
+        "kind": "job",
+        "file": "packaged-platform-pr.yml",
+        "job": "source-proof",
+        "reason": "The coordinator's source-proof caller is part of the reviewed job set the closeout waits on; deleting it would silently drop the source lane from the proof topology."
+      },
+      "packaged_platform_pr_packaged_proof_job": {
+        "kind": "job",
+        "file": "packaged-platform-pr.yml",
+        "job": "packaged-proof",
+        "reason": "Package archives exist only through this reusable call; deleting it would leave every hardware proof consuming artifacts nothing produced."
+      },
+      "packaged_platform_pr_macos_metal_proof_job": {
+        "kind": "job",
+        "file": "packaged-platform-pr.yml",
+        "job": "macos-metal-proof",
+        "reason": "The protected Metal lane closes the macOS hardware claims; deleting its caller would drop those claims from every broad proof mode."
+      },
+      "packaged_platform_pr_frozen_candidate_quality_job": {
+        "kind": "job",
+        "file": "packaged-platform-pr.yml",
+        "job": "frozen-candidate-quality",
+        "reason": "The optional quality caller is the one reviewed seam to the isolated evaluation owner; deleting it would silently retire the frozen-candidate quality packet."
+      },
+      "packaged_platform_pr_windows_vulkan_proof_job": {
+        "kind": "job",
+        "file": "packaged-platform-pr.yml",
+        "job": "windows-vulkan-proof",
+        "reason": "The protected Windows Vulkan lane closes the Windows hardware claims; deleting its caller would drop those claims from qualification."
+      },
+      "packaged_platform_pr_linux_vulkan_proof_job": {
+        "kind": "job",
+        "file": "packaged-platform-pr.yml",
+        "job": "linux-vulkan-proof",
+        "reason": "The optional Linux Vulkan lane carries the platform-mode Linux evidence; deleting its caller would silently narrow platform proof to two platforms."
+      },
+      "packaged_platform_pr_closeout_job": {
+        "kind": "job",
+        "file": "packaged-platform-pr.yml",
+        "job": "closeout",
+        "reason": "Closeout is the single job that turns per-lane results into one accepted proof; deleting it would leave broad proof with no coherence check at all."
+      },
+      "packaged_platform_pr_actions_write": {
+        "kind": "permission",
+        "file": "packaged-platform-pr.yml",
+        "scope": "actions",
+        "access": "write",
+        "reason": "Cancelling superseded proof runs before package or hardware work is an Actions-surface write, so the coordinator must hold exactly actions write at the workflow scope."
+      },
+      "packaged_platform_pr_contents_read": {
+        "kind": "permission",
+        "file": "packaged-platform-pr.yml",
+        "scope": "contents",
+        "access": "read",
+        "reason": "The coordinator only reads the tree it proves; a wider contents grant would let a proof lane mutate the candidate it is supposed to authenticate."
+      },
+      "packaged_platform_pr_macos_metal_proof_needs": {
+        "kind": "needs",
+        "file": "packaged-platform-pr.yml",
+        "job": "macos-metal-proof",
+        "needs": [
+          "route",
+          "packaged-proof"
+        ],
+        "reason": "Metal proof consumes routing outputs and the packaged CLI and nothing else; a wider needs edge would serialize protected hardware behind unrelated lanes, a narrower one would run it before its inputs exist."
+      },
+      "packaged_platform_pr_windows_vulkan_proof_needs": {
+        "kind": "needs",
+        "file": "packaged-platform-pr.yml",
+        "job": "windows-vulkan-proof",
+        "needs": [
+          "route",
+          "packaged-proof"
+        ],
+        "reason": "Windows qualification must run independently of optional Metal quality: its needs edge carries only routing and package proof, so optional evaluation can never gate a required platform lane."
+      },
+      "packaged_platform_pr_linux_vulkan_proof_needs": {
+        "kind": "needs",
+        "file": "packaged-platform-pr.yml",
+        "job": "linux-vulkan-proof",
+        "needs": [
+          "route",
+          "packaged-proof"
+        ],
+        "reason": "Linux Vulkan proof consumes routing outputs and the packaged CLI and nothing else; the pinned edge keeps the optional lane from serializing behind or gating on other hardware."
+      },
+      "packaged_platform_pr_closeout_needs": {
+        "kind": "needs",
+        "file": "packaged-platform-pr.yml",
+        "job": "closeout",
+        "needs": [
+          "route",
+          "source-proof",
+          "packaged-proof",
+          "macos-metal-proof",
+          "windows-vulkan-proof",
+          "linux-vulkan-proof"
+        ],
+        "reason": "Closeout must observe every selected platform lane's result - and only those - so a lane can neither escape the coherence check nor be joined by an unreviewed gate."
+      },
+      "frozen_candidate_quality_quality_job": {
+        "kind": "job",
+        "file": "frozen-candidate-quality.yml",
+        "job": "quality",
+        "reason": "The macOS quality job is the pinned evaluation owner's only protected Metal packet producer; deleting it would retire the Axios quality packet without review."
+      },
+      "frozen_candidate_quality_windows_quality_job": {
+        "kind": "job",
+        "file": "frozen-candidate-quality.yml",
+        "job": "windows-quality",
+        "reason": "The optional Windows quality job is the one reviewed Ripgrep v2 measurement on Vulkan hardware; deleting it would retire that packet without review."
+      },
+      "frozen_candidate_quality_linux_quality_job": {
+        "kind": "job",
+        "file": "frozen-candidate-quality.yml",
+        "job": "linux-quality",
+        "reason": "The optional Linux quality job is the one reviewed Axios v2 smoke on Linux Vulkan hardware; deleting it would retire that packet without review."
+      },
+      "release_freeze_invalidation_invalidate_job": {
+        "kind": "job",
+        "file": "release-freeze-invalidation.yml",
+        "job": "invalidate",
+        "reason": "Automatic freeze revocation lives in this single bounded job; deleting it would let a superseded candidate head keep its executable freeze statuses."
+      },
+      "source_proof_freeze_hostile_mutations_job": {
+        "kind": "job",
+        "file": "source-proof.yml",
+        "job": "freeze-hostile-mutations",
+        "reason": "Acceptance is publishable only after the hostile mutation matrix ran on the exact head; deleting the job would let a freeze publish without its blocking mutation evidence."
+      },
+      "source_proof_freeze_windows_native_probe_job": {
+        "kind": "job",
+        "file": "source-proof.yml",
+        "job": "freeze-windows-native-probe",
+        "reason": "Acceptance is publishable only after the protected Windows native probe ran on the exact head; deleting the job would let a freeze publish without its blocking Windows evidence."
+      },
+      "source_proof_freeze_acceptance_job": {
+        "kind": "job",
+        "file": "source-proof.yml",
+        "job": "freeze-acceptance",
+        "reason": "The publisher is the only job allowed to turn a verified receipt into an executable freeze status; deleting it would leave acceptance runs with nothing to publish their result."
+      },
+      "freeze_barrier_source_proof_statuses_write": {
+        "kind": "permission",
+        "file": "source-proof.yml",
+        "scope": "statuses",
+        "access": "write",
+        "reason": "Publishing the exact-head freeze status is a commit-status write, so the acceptance workflow must hold statuses write at the workflow scope."
+      },
+      "freeze_barrier_source_proof_actions_write": {
+        "kind": "permission",
+        "file": "source-proof.yml",
+        "scope": "actions",
+        "access": "write",
+        "reason": "Cancelling superseded broad proof runs is an Actions-surface write, so the source proof must hold actions write; the freeze family pins the grant so it cannot drop by a workflow edit alone."
+      },
+      "freeze_barrier_packaged_platform_pr_statuses_read": {
+        "kind": "permission",
+        "file": "packaged-platform-pr.yml",
+        "scope": "statuses",
+        "access": "read",
+        "reason": "The packaged coordinator authenticates the exact-head freeze status but must never be able to mint one; statuses read is exactly the authority that split requires."
+      },
+      "freeze_barrier_packaged_platform_pr_actions_write": {
+        "kind": "permission",
+        "file": "packaged-platform-pr.yml",
+        "scope": "actions",
+        "access": "write",
+        "reason": "Cancelling superseded broad proof runs is an Actions-surface write, so the coordinator must hold actions write; the freeze family pins the grant beside the coordinator family's own pin so neither can drop alone."
+      }
+    },
+    "constant_mirrors": {
+      "cargo_config_retrieval_aliases": {
+        "file": ".cargo/config.toml",
+        "fragments": [
+          "retrieval-setup = \"run --locked -p codestory-cli",
+          "retrieval-status = \"run --locked -p codestory-cli"
+        ],
+        "reason": "The cargo aliases are the human entry points into retrieval setup and status. Each alias must keep running the codestory-cli binary with --locked so a hand-typed `cargo retrieval-setup` resolves the exact dependency set the lockfile reviewed, mirroring the same locked invocation the setup scripts pin - one surface cannot drift to an unlocked build while the others stay locked."
+      },
+      "codex_worktree_setup": {
+        "file": "scripts/codex-worktree-setup.mjs",
+        "fragments": [
+          "[\"build\", \"--release\", \"--locked\", \"-p\", \"codestory-cli\"]",
+          "prepare-embedded-model.mjs",
+          "CODESTORY_EMBED_MODEL_SOURCE"
+        ],
+        "reason": "The worktree bootstrap is the agent-facing setup surface. It must keep the exact locked release build of codestory-cli and the embedded-model staging pair - the prepare script and its source override variable - so a fresh worktree reproduces the reviewed toolchain instead of resolving new dependency versions or skipping model provisioning."
+      },
+      "grounding_setup_sh": {
+        "file": "plugins/codestory/skills/codestory-grounding/scripts/setup.sh",
+        "fragments": [
+          "cargo build --release --locked -p codestory-cli",
+          "prepare-embedded-model.mjs",
+          "CODESTORY_EMBED_MODEL_SOURCE"
+        ],
+        "reason": "The POSIX skill setup is the shipped plugin's own bootstrap. It must mirror the same locked release build of codestory-cli and the embedded-model staging pair the worktree setup pins, so an installed skill and a development worktree provision identical binaries from identical dependency sets."
+      },
+      "grounding_setup_ps1": {
+        "file": "plugins/codestory/skills/codestory-grounding/scripts/setup.ps1",
+        "fragments": [
+          "@(\"build\", \"--release\", \"--locked\", \"-p\", \"codestory-cli\"",
+          "prepare-embedded-model.mjs",
+          "CODESTORY_EMBED_MODEL_SOURCE"
+        ],
+        "reason": "The Windows skill setup is the same bootstrap spelled for PowerShell. It must mirror the locked release build argument vector and the embedded-model staging pair verbatim, so the Windows install path cannot quietly diverge from the POSIX and worktree surfaces it mirrors."
+      }
+    },
+    "command_lists": {
+      "draft_proof_commands": {
+        "file": "rust-ci.yml",
+        "job": "linux-draft",
+        "step": "Prove focused publication contracts",
+        "commands": [
+          "cargo test --locked -p codestory-llama-sys --test native_staging",
+          "cargo test --locked -p codestory-llama-sys --test model_staging",
+          "cargo test --locked -p codestory-cli --test native_launcher_contracts",
+          "cargo test --locked -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
+          "cargo test --locked -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture",
+          "cargo test --locked -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture"
+        ],
+        "reason": "The draft lane's publication proof is this exact serial command sequence: the two locked llama-sys staging harnesses, the CLI native-launcher and stdio-protocol contracts, and the runtime and store publication-atomicity proofs. The sequence is owned here so a workflow edit alone cannot drop, reorder, or dilute a proof target; the checker keeps only the sequence-equality predicate and its reviewed messages."
+      },
+      "draft_seed_commands": {
+        "file": "retrieval-engine-smoke.yml",
+        "job": "linux-contracts",
+        "step": "Seed draft proof test-profile artifacts",
+        "commands": [
+          "cargo test --locked -p codestory-llama-sys --test native_staging --no-run",
+          "cargo test --locked -p codestory-llama-sys --test model_staging --no-run",
+          "cargo test --locked -p codestory-cli --test stdio_protocol_contracts --no-run two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
+          "cargo test --locked -p codestory-runtime --no-run publication_transitions_fail_or_cancel_atomically -- --nocapture",
+          "cargo test --locked -p codestory-store --no-run staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture"
+        ],
+        "reason": "The retrieval producer seeds the draft proof's test-profile artifacts with the --no-run counterparts of the focused targets, and this list is also the digest input for the shared proof5 cache topology: the checker derives the draft and retrieval cache keys from these graph-declared seed commands, so cache identity and seeded content cannot drift apart through a checker edit alone."
       }
     }
   }

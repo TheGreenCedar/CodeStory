@@ -198,10 +198,12 @@ Protected run `29623187686` stopped before measurement after detecting a stale
 retrieval namespace in the harness. Run `29624645979` at
 `dd14e2d0e29b9e09438a0aa4f9a6ea6250e69738` then completed the source and Serde
 gates plus all six cold packet rows. Axios passed all three repeats. Ripgrep
-failed all three at 0.60 file recall and 0.60 citation coverage against the
-fixed 0.70 thresholds, and a later status process could not report the packet
-process's local engine identity. Those failures are retained; they do not
-define a baseline.
+measured 0.60 file recall and 0.60 citation coverage on all three repeats,
+with 0.80 symbol and anchor recall, 1.0 claim recall, and zero forbidden
+claims. Those retained rows define the v0.17 release-only Ripgrep contract's
+D2-corrected 0.60 floors; v0.16 remains Axios-only. A later status process
+could not report the packet process's local engine identity, so the retained
+run does not replace current-host quality-lane proof.
 
 Before another protected measurement, v0.16 is narrowed to the new hash-bound
 `codestory-release-corpus-v0.16-axios-js-ts-v1` contract: exactly the Axios task
@@ -309,9 +311,44 @@ banned marker outside that inventory, on one more occurrence of a marker inside
 it, and on any listed entry that stops matching, so both growing and deleting
 such a surface must edit the inventory. The inventory is bounded and
 attributable as well as recorded: every surface carries a reason and the issue
-tracking its deletion, and its declared `total_markers` must equal the number of
-markers listed, so it cannot grow without a reviewable diff that raises a stated
-number.
+tracking its deletion, its declared `total_markers` must equal the number of
+markers listed, and its declared `total_marker_occurrences` must equal the sum of
+their counts, so neither the number of surfaces nor the number of production
+lines they occupy can move without a reviewable diff that restates both numbers.
+
+The same file carries the `pending_claim_profiles` ratchet: how many product
+claim profiles still ship without an anti-overfit contract and fixture triple.
+The registry itself is checked-in, schema-versioned data
+(`crates/codestory-agent/src/data/claim_profiles.v2.json`), seeded into
+the lint by name because the directory walk collects Rust only — so the document
+carries the same banned-marker pass as the code beside it. The lint counts the
+pending rows in that document, so a new uncontracted profile cannot land without
+raising a stated number and migrating one cannot land without lowering it and
+the matching `PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET` constant. The
+ratchet is auditable in both directions as well as bounded: `ratchet_ceiling`
+records the high-water the burn-down started from and `burn_down` must name one
+migration, with its issue and its measured evidence, for every profile between
+the ceiling and the count. Leaving the pending set costs a measured fixture
+triple — the profile has to fire on its fitted example, fire on a second example
+of a different file type with a different claim, and measure zero on a helper —
+read from the same fire-rate counters the field trace publishes.
+
+Every packet also publishes the contract version, per-profile fire rates, and
+per-layer claim counts on the typed
+`retrieval_trace.packet_claim_profile_telemetry` field, so which profiles fired
+— and whether the packet fell back to name-derived templates — is observable in
+the field. The loader fails closed, so the same field reports what it refused:
+`rejected_profiles` with its distinct `rejected_reasons`, and `registry_error`
+when a whole document was refused and the registry loaded empty. Those counters
+carry static profile ids, static reason codes, and integers only; no citation
+name, path, or source text enters them.
+
+The telemetry deliberately does not travel in `retrieval_trace.annotations`.
+Annotations are the packet's evidence channel: consumers scan the free text for
+gap markers and downgrade packet confidence when one matches. Always-on
+telemetry published there is read as a permanent evidence gap on every packet,
+so counters get a typed field rather than wording chosen to dodge a substring
+heuristic.
 
 The inventory is executable rather than documentation-only. Supported text and
 configuration files under `scripts/`, `.github/scripts/`,

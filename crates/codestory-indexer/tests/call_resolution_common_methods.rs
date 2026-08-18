@@ -128,6 +128,7 @@ const RUST_RESOLVED: &[ResolvedCallExpectation] = &[
     ("run", "Notifier", "notify_event"),
     ("run", "Repository", "save"),
     ("run", "Workflow", "persist"),
+    ("run", "Workflow", "audit"),
 ];
 const RUST_RESOLVED_BY_NAME: &[ResolvedNameExpectation] = &[];
 const JAVASCRIPT_RESOLVED: &[ResolvedCallExpectation] = &[
@@ -829,7 +830,6 @@ impl RuntimeContext {
             describe_call_edges(&edges, &nodes)
         );
     }
-
     Ok(())
 }
 
@@ -1583,6 +1583,115 @@ def run():
 }
 
 #[test]
+fn test_python_annotated_factory_local_resolves_declared_interface_not_implementation()
+-> anyhow::Result<()> {
+    let adapters_source = r#"
+class BaseAdapter:
+    def send(self, request):
+        pass
+
+class HTTPAdapter(BaseAdapter):
+    def send(self, request):
+        pass
+"#;
+    let sessions_source = r#"
+from .adapters import BaseAdapter
+
+class Session:
+    def get_adapter(self, request) -> BaseAdapter:
+        raise NotImplementedError
+
+    def send(self, request):
+        adapter = self.get_adapter(request)
+        return adapter.send(request)
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("requests/adapters.py", adapters_source),
+        ("requests/sessions.py", sessions_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "python annotated factory interface receiver",
+        &nodes,
+        &edges,
+        "Session.send",
+        "BaseAdapter",
+        "send",
+        "requests/adapters.py",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "python annotated factory does not guess implementation",
+        &nodes,
+        &edges,
+        "Session.send",
+        "HTTPAdapter",
+        "send",
+        "requests/adapters.py",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_python_factory_receiver_without_one_precise_return_type_stays_unresolved()
+-> anyhow::Result<()> {
+    let source = r#"
+class BaseAdapter:
+    def send(self, request):
+        pass
+
+class HTTPAdapter(BaseAdapter):
+    def send(self, request):
+        pass
+
+class UnannotatedSession:
+    def get_adapter(self, request):
+        return BaseAdapter()
+
+    def send(self, request):
+        adapter = self.get_adapter(request)
+        return adapter.send(request)
+
+class UnionSession:
+    def get_adapter(self, request) -> BaseAdapter | HTTPAdapter:
+        return BaseAdapter()
+
+    def send(self, request):
+        adapter = self.get_adapter(request)
+        return adapter.send(request)
+
+class ReassignedSession:
+    def get_adapter(self, request) -> BaseAdapter:
+        return BaseAdapter()
+
+    def send(self, request, runtime_adapter):
+        adapter = self.get_adapter(request)
+        adapter = runtime_adapter
+        return adapter.send(request)
+"#;
+
+    let (nodes, edges) = index_single_file("requests/sessions.py", source)?;
+    for caller in [
+        "UnannotatedSession.send",
+        "UnionSession.send",
+        "ReassignedSession.send",
+    ] {
+        for owner in ["BaseAdapter", "HTTPAdapter"] {
+            assert_no_resolved_call_to_method_owner(
+                "python imprecise factory return",
+                &nodes,
+                &edges,
+                caller,
+                owner,
+                "send",
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_python_imported_constructor_local_receiver_resolves_to_imported_owner_method()
 -> anyhow::Result<()> {
     let workflow_source = r#"
@@ -1675,6 +1784,281 @@ def run():
         "Workflow",
         "run",
     );
+
+    Ok(())
+}
+
+#[test]
+fn test_python_with_item_constructor_receiver_resolves_to_exact_owner_method() -> anyhow::Result<()>
+{
+    let sessions_source = r#"
+class Session:
+    def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+"#;
+    let shadow_source = r#"
+class Session:
+    def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+"#;
+    let api_source = r#"
+from . import sessions
+
+def request(method, url):
+    """Send one outbound request."""
+    # Session owns request preparation and adapter selection.
+    # Closing the context releases session-owned resources.
+    with sessions.Session() as session:
+        return session.request(method=method, url=url)
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("src/requests/sessions.py", sessions_source),
+        ("src/shadow/sessions.py", shadow_source),
+        ("src/requests/api.py", api_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "python with-item imported module constructor",
+        &nodes,
+        &edges,
+        "request",
+        "Session",
+        "request",
+        "src/requests/sessions.py",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "python with-item imported module constructor",
+        &nodes,
+        &edges,
+        "request",
+        "Session",
+        "request",
+        "src/shadow/sessions.py",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_python_with_item_constructor_receiver_fails_closed_on_imprecise_bindings()
+-> anyhow::Result<()> {
+    let sessions_source = r#"
+class Session:
+    def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+
+class UnannotatedSession:
+    def request(self, method, url):
+        pass
+
+class OtherSession:
+    def request(self, method, url):
+        pass
+
+class WrongReturnSession:
+    def __enter__(self) -> OtherSession:
+        return OtherSession()
+
+    def request(self, method, url):
+        pass
+
+class StaticEnterSession:
+    @staticmethod
+    def __enter__() -> Self:
+        return StaticEnterSession()
+
+    def request(self, method, url):
+        pass
+
+class DuplicateEnterSession:
+    def __enter__(self) -> Self:
+        return self
+
+    def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+
+class AsyncEnterSession:
+    async def __enter__(self) -> Self:
+        return self
+
+    def request(self, method, url):
+        pass
+"#;
+    let api_source = r#"
+from . import sessions
+from .sessions import Session
+
+def unannotated_context(method, url):
+    with sessions.UnannotatedSession() as session:
+        return session.request(method, url)
+
+def wrong_return_context(method, url):
+    with sessions.WrongReturnSession() as session:
+        return session.request(method, url)
+
+def static_enter_context(method, url):
+    with sessions.StaticEnterSession() as session:
+        return session.request(method, url)
+
+def duplicate_enter_context(method, url):
+    with sessions.DuplicateEnterSession() as session:
+        return session.request(method, url)
+
+def parameter_shadowed_module(sessions, method, url):
+    with sessions.Session() as session:
+        return session.request(method, url)
+
+def parameter_shadowed_type(Session, method, url):
+    with Session() as session:
+        return session.request(method, url)
+
+def defaulted_parameter_shadowed_module(method, url, sessions=alternate):
+    with sessions.Session() as session:
+        return session.request(method, url)
+
+def defaulted_parameter_shadowed_type(method, url, Session=Other):
+    with Session() as session:
+        return session.request(method, url)
+
+def imported_bare_type_context(method, url):
+    with Session() as session:
+        return session.request(method, url)
+
+def constructor_argument_context(method, url):
+    with sessions.Session(option := make_option()) as session:
+        return session.request(method, url)
+
+def multi_with_item_context(method, url):
+    with sessions.Session() as session, sessions.Session() as other:
+        return session.request(method, url)
+
+async def async_with_context(method, url):
+    async with sessions.AsyncEnterSession() as session:
+        return session.request(method, url)
+
+def async_enter_context(method, url):
+    with sessions.AsyncEnterSession() as session:
+        return session.request(method, url)
+
+def except_alias_context(method, url):
+    with sessions.Session() as session:
+        try:
+            raise RuntimeError()
+        except RuntimeError as session:
+            return session.request(method, url)
+
+def walrus_branch_context(method, url):
+    with sessions.Session() as session:
+        if session := make_session():
+            return session.request(method, url)
+
+def comprehension_context(method, url):
+    with sessions.Session() as session:
+        return [session.request(method, url) for session in sessions]
+
+def enclosing_except_context(method, url):
+    try:
+        raise RuntimeError()
+    except RuntimeError:
+        with sessions.Session() as session:
+            return session.request(method, url)
+
+def untyped_factory(method, url):
+    with make_session() as session:
+        return session.request(method, url)
+
+def context_expression(method, url):
+    with sessions.open_session() as session:
+        return session.request(method, url)
+
+def subscript_alias(method, url):
+    with sessions.Session() as state["session"]:
+        return state["session"].request(method, url)
+
+def shadowed_alias(method, url):
+    with sessions.Session() as session:
+        session = make_session()
+        return session.request(method, url)
+
+def loop_shadow(method, url):
+    with sessions.Session() as session:
+        for session in pool:
+            return session.request(method, url)
+
+def nested_scope(method, url):
+    with sessions.Session() as session:
+        def inner():
+            return session.request(method, url)
+        return inner()
+
+def shadowed_module(method, url):
+    sessions = load_sessions()
+    with sessions.Session() as session:
+        return session.request(method, url)
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("src/requests/sessions.py", sessions_source),
+        ("src/requests/api.py", api_source),
+    ])?;
+    for caller in [
+        "unannotated_context",
+        "wrong_return_context",
+        "static_enter_context",
+        "duplicate_enter_context",
+        "parameter_shadowed_module",
+        "parameter_shadowed_type",
+        "defaulted_parameter_shadowed_module",
+        "defaulted_parameter_shadowed_type",
+        "imported_bare_type_context",
+        "constructor_argument_context",
+        "multi_with_item_context",
+        "async_with_context",
+        "async_enter_context",
+        "except_alias_context",
+        "walrus_branch_context",
+        "comprehension_context",
+        "enclosing_except_context",
+        "untyped_factory",
+        "context_expression",
+        "subscript_alias",
+        "shadowed_alias",
+        "loop_shadow",
+        "nested_scope",
+        "shadowed_module",
+    ] {
+        for owner in [
+            "Session",
+            "UnannotatedSession",
+            "OtherSession",
+            "WrongReturnSession",
+            "StaticEnterSession",
+            "DuplicateEnterSession",
+            "AsyncEnterSession",
+        ] {
+            assert_no_resolved_call_to_method_owner_in_file(
+                "python with-item fail-closed guard",
+                &nodes,
+                &edges,
+                caller,
+                owner,
+                "request",
+                "src/requests/sessions.py",
+            );
+        }
+    }
 
     Ok(())
 }
@@ -6770,6 +7154,902 @@ function run(Mailer $notifier): void
     Ok(())
 }
 
+const PHP_LOOP_MARKER_PREFIX: &str = "receiver-binding:loop-element@";
+
+const PHP_LISTENER_INTERFACE_SOURCE: &str = r#"
+<?php
+
+namespace Acme\Events;
+
+interface Listener
+{
+    public function handle(string $payload): void;
+}
+"#;
+
+const PHP_AUDITOR_CLASS_SOURCE: &str = r#"
+<?php
+
+namespace Acme\Events;
+
+class Auditor
+{
+    public function __construct() {}
+
+    public function handle(string $payload): void {}
+}
+"#;
+
+fn call_edges_from_caller_at_line<'a>(
+    nodes: &[Node],
+    edges: &'a [Edge],
+    caller_name: &str,
+    line: u32,
+) -> Vec<&'a Edge> {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(line))
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, caller_name))
+        })
+        .collect()
+}
+
+fn callsite_has_segment(edge: &Edge, segment: &str) -> bool {
+    edge.callsite_identity
+        .as_deref()
+        .is_some_and(|identity| identity.split('|').any(|part| part == segment))
+}
+
+fn callsite_has_segment_with_prefix(edge: &Edge, prefix: &str) -> bool {
+    edge.callsite_identity
+        .as_deref()
+        .is_some_and(|identity| identity.split('|').any(|part| part.starts_with(prefix)))
+}
+
+fn assert_no_call_self_edges(case_name: &str, edges: &[Edge]) {
+    let self_edges = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == edge.target)
+        .count();
+    assert_eq!(
+        self_edges, 0,
+        "Case `{case_name}`: persisted CALL self-edges should have been dropped"
+    );
+}
+
+fn assert_no_loop_marker_from_caller(
+    case_name: &str,
+    nodes: &[Node],
+    edges: &[Edge],
+    caller: &str,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let marked = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+        })
+        .filter(|edge| callsite_has_segment_with_prefix(edge, PHP_LOOP_MARKER_PREFIX))
+        .count();
+    assert_eq!(
+        marked,
+        0,
+        "Case `{case_name}`: no CALL edge from `{caller}` may carry a loop-element binding marker. Calls: {:?}",
+        describe_call_edges(edges, nodes)
+    );
+}
+
+#[test]
+fn test_php_foreach_without_provable_element_binding_emits_no_marker_and_no_resolution()
+-> anyhow::Result<()> {
+    let hostile_source = r#"
+<?php
+
+namespace Acme\App;
+
+use Acme\Events\Listener;
+
+function no_docblock(array $listeners): void
+{
+    foreach ($listeners as $listener) {
+        $listener->handle('ready');
+    }
+}
+
+function unresolvable_type(array $listeners): void
+{
+    /** @var list<MissingType> $listeners */
+    foreach ($listeners as $listener) {
+        $listener->handle('ready');
+    }
+}
+
+function union_docblock(array $listeners): void
+{
+    /** @var list<Listener|Auditor> $listeners */
+    foreach ($listeners as $listener) {
+        $listener->handle('ready');
+    }
+}
+
+function wrong_variable_docblock(array $listeners): void
+{
+    /** @var list<Listener> $others */
+    foreach ($listeners as $listener) {
+        $listener->handle('ready');
+    }
+}
+
+function outside_scope(array $listeners): void
+{
+    /** @var list<Listener> $listeners */
+    foreach ($listeners as $listener) {
+        $listener->handle('ready');
+    }
+    $listener->handle('after');
+}
+
+function commented_and_quoted(array $listeners): void
+{
+    // foreach ($listeners as $listener) { $listener->handle('ready'); }
+    $note = 'foreach ($listeners as $listener) { $listener->handle("x"); }';
+    echo $note;
+}
+
+function nested_shadowing(array $listeners, array $inner): void
+{
+    /** @var list<Listener> $listeners */
+    foreach ($listeners as $listener) {
+        foreach ($inner as $listener) {
+            $listener->handle('inner');
+        }
+    }
+}
+"#;
+    let (nodes, edges) = index_files(&[
+        (
+            "src/Acme/Events/Listener.php",
+            PHP_LISTENER_INTERFACE_SOURCE,
+        ),
+        ("src/Acme/App/hostile.php", hostile_source),
+    ])?;
+
+    for hostile_caller in [
+        "no_docblock",
+        "unresolvable_type",
+        "union_docblock",
+        "wrong_variable_docblock",
+        "commented_and_quoted",
+        "nested_shadowing",
+    ] {
+        assert_no_resolved_call_to_method_owner_in_file(
+            "php foreach hostile fails closed",
+            &nodes,
+            &edges,
+            hostile_caller,
+            "Listener",
+            "handle",
+            "src/Acme/Events/Listener.php",
+        );
+        assert_no_loop_marker_from_caller(
+            "php foreach hostile fails closed",
+            &nodes,
+            &edges,
+            hostile_caller,
+        );
+    }
+
+    // The scope hostile is per-callsite: the in-loop call proves the binding,
+    // the same-spelled call after the loop body must not inherit it.
+    let after_loop_edges = call_edges_from_caller_at_line(&nodes, &edges, "outside_scope", 45);
+    assert!(
+        !after_loop_edges.is_empty(),
+        "expected the after-loop callsite to keep its unannotated placeholder edge. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    for edge in &after_loop_edges {
+        assert_eq!(
+            edge.resolved_target, None,
+            "a call on the element after the loop body ends must stay unresolved"
+        );
+        assert!(
+            !callsite_has_segment_with_prefix(edge, PHP_LOOP_MARKER_PREFIX),
+            "a call on the element after the loop body ends must not carry the loop marker: {:?}",
+            edge.callsite_identity
+        );
+    }
+
+    // The comment/string hostile parses no call at all.
+    let commented_edges: Vec<_> =
+        call_edges_from_caller_at_line(&nodes, &edges, "commented_and_quoted", 50)
+            .into_iter()
+            .chain(call_edges_from_caller_at_line(
+                &nodes,
+                &edges,
+                "commented_and_quoted",
+                51,
+            ))
+            .collect();
+    assert!(
+        commented_edges.is_empty(),
+        "foreach text inside comments and strings must produce no CALL edges. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+
+    assert_no_call_self_edges("php foreach hostile fails closed", &edges);
+    Ok(())
+}
+
+#[test]
+fn test_php_foreach_var_list_docblock_binds_element_and_lands_combined_loop_marker()
+-> anyhow::Result<()> {
+    let dispatch_source = r#"
+<?php
+
+namespace Acme\App;
+
+use Acme\Events\Listener;
+
+function dispatch_all(array $listeners): void
+{
+    /** @var list<Listener> $listeners */
+    foreach ($listeners as $listener) {
+        $listener->handle('ready');
+    }
+}
+
+function dispatch_suffixed(array $listeners): void
+{
+    /** @var Listener[] $listeners */
+    foreach ($listeners as $listener) {
+        $listener->handle('ready');
+    }
+}
+"#;
+    let (nodes, edges) = index_files(&[
+        (
+            "src/Acme/Events/Listener.php",
+            PHP_LISTENER_INTERFACE_SOURCE,
+        ),
+        ("src/Acme/App/dispatch.php", dispatch_source),
+    ])?;
+
+    assert_resolved_call_to_method_owner_in_file(
+        "php foreach list docblock element resolves interface method",
+        &nodes,
+        &edges,
+        "dispatch_all",
+        "Listener",
+        "handle",
+        "src/Acme/Events/Listener.php",
+    );
+    assert_resolved_call_to_method_owner_in_file(
+        "php foreach suffixed docblock element resolves interface method",
+        &nodes,
+        &edges,
+        "dispatch_suffixed",
+        "Listener",
+        "handle",
+        "src/Acme/Events/Listener.php",
+    );
+
+    // The `list<T>` loop: foreach spans lines 11-13, the callsite is line 12.
+    let loop_edges = call_edges_from_caller_at_line(&nodes, &edges, "dispatch_all", 12);
+    assert_eq!(
+        loop_edges.len(),
+        1,
+        "expected exactly one CALL edge for the loop callsite. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    let loop_edge = loop_edges[0];
+    assert!(callsite_has_segment(loop_edge, "syntax:php-member-call"));
+    assert!(callsite_has_segment(loop_edge, "receiver-owner:Listener"));
+    assert!(callsite_has_segment(
+        loop_edge,
+        r"receiver-module:Acme\Events.Listener"
+    ));
+    assert!(
+        callsite_has_segment(loop_edge, "receiver-binding:loop-element@11-13"),
+        "the combined loop marker must carry the exact foreach statement span: {:?}",
+        loop_edge.callsite_identity
+    );
+    assert_eq!(loop_edge.certainty, Some(ResolutionCertainty::Certain));
+    assert!(loop_edge.resolved_target.is_some());
+
+    // The `T[]` loop: foreach spans lines 19-21, the callsite is line 20.
+    let suffixed_edges = call_edges_from_caller_at_line(&nodes, &edges, "dispatch_suffixed", 20);
+    assert_eq!(suffixed_edges.len(), 1);
+    assert!(
+        callsite_has_segment(suffixed_edges[0], "receiver-binding:loop-element@19-21"),
+        "the suffixed-array loop marker must carry its own foreach span: {:?}",
+        suffixed_edges[0].callsite_identity
+    );
+    assert_eq!(
+        suffixed_edges[0].certainty,
+        Some(ResolutionCertainty::Certain)
+    );
+
+    assert_no_call_self_edges("php foreach docblock binds element", &edges);
+
+    // Property-backed collections: a `$this->handlers` foreach binds through
+    // its own property declaration's docblock; a sibling property's typed
+    // docblock never leaks onto a different property's loop.
+    let property_source = r#"
+<?php
+
+namespace Acme\App;
+
+use Acme\Events\Listener;
+
+class Dispatcher
+{
+    /** @var Listener[] */
+    private array $handlers = [];
+
+    public function flush(string $payload): void
+    {
+        foreach ($this->handlers as $handler) {
+            $handler->handle($payload);
+        }
+    }
+}
+
+class AmbiguousDispatcher
+{
+    /** @var Listener[] */
+    private array $handlers = [];
+
+    /** @var string[] */
+    private array $handlers2 = [];
+
+    public function flush(string $payload): void
+    {
+        foreach ($this->handlers2 as $handler) {
+            $handler->handle($payload);
+        }
+    }
+}
+"#;
+    let (property_nodes, property_edges) = index_files(&[
+        (
+            "src/Acme/Events/Listener.php",
+            PHP_LISTENER_INTERFACE_SOURCE,
+        ),
+        ("src/Acme/App/Dispatcher.php", property_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "php property-collection foreach element resolves interface method",
+        &property_nodes,
+        &property_edges,
+        "flush",
+        "Listener",
+        "handle",
+        "src/Acme/Events/Listener.php",
+    );
+    // Dispatcher::flush: foreach spans lines 15-17, callsite line 16.
+    let property_loop_edges =
+        call_edges_from_caller_at_line(&property_nodes, &property_edges, "Dispatcher.flush", 16);
+    assert_eq!(
+        property_loop_edges.len(),
+        1,
+        "expected one CALL edge for the property-collection loop callsite. Calls: {:?}",
+        describe_call_edges(&property_edges, &property_nodes)
+    );
+    assert!(callsite_has_segment(
+        property_loop_edges[0],
+        "receiver-binding:loop-element@15-17"
+    ));
+    assert_eq!(
+        property_loop_edges[0].certainty,
+        Some(ResolutionCertainty::Certain)
+    );
+    // AmbiguousDispatcher iterates a string[] property; the Listener docblock
+    // on the sibling property must not bind it.
+    assert_no_loop_marker_from_caller(
+        "php ambiguous property collection fails closed",
+        &property_nodes,
+        &property_edges,
+        "AmbiguousDispatcher.flush",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_php_foreach_loop_marker_lands_regardless_of_which_spec_pass_claims_the_callsite()
+-> anyhow::Result<()> {
+    // Order 1 — the foreach pass annotates first: a same-named typed
+    // parameter also targets the loop callsite, but the element binding
+    // shadows it inside the body, so the edge carries the foreach owner AND
+    // the marker.
+    let foreach_first_source = r#"
+<?php
+
+namespace Acme\App;
+
+use Acme\Events\Auditor;
+use Acme\Events\Listener;
+
+function relay(Auditor $listener, array $listeners): void
+{
+    /** @var list<Listener> $listeners */
+    foreach ($listeners as $listener) {
+        $listener->handle('ready');
+    }
+}
+"#;
+    let (foreach_first_nodes, foreach_first_edges) = index_files(&[
+        (
+            "src/Acme/Events/Listener.php",
+            PHP_LISTENER_INTERFACE_SOURCE,
+        ),
+        ("src/Acme/Events/Auditor.php", PHP_AUDITOR_CLASS_SOURCE),
+        ("src/Acme/App/relay.php", foreach_first_source),
+    ])?;
+    let relay_edges =
+        call_edges_from_caller_at_line(&foreach_first_nodes, &foreach_first_edges, "relay", 13);
+    assert_eq!(
+        relay_edges.len(),
+        1,
+        "expected one CALL edge for the shadowed loop callsite. Calls: {:?}",
+        describe_call_edges(&foreach_first_edges, &foreach_first_nodes)
+    );
+    let relay_edge = relay_edges[0];
+    assert!(
+        !callsite_has_segment(relay_edge, "receiver-owner:Auditor"),
+        "the loop element shadows the same-named parameter inside the body: {:?}",
+        relay_edge.callsite_identity
+    );
+    assert!(callsite_has_segment(relay_edge, "receiver-owner:Listener"));
+    assert!(callsite_has_segment(
+        relay_edge,
+        "receiver-binding:loop-element@12-14"
+    ));
+    assert_resolved_call_to_method_owner_in_file(
+        "php foreach-first order resolves to the element interface",
+        &foreach_first_nodes,
+        &foreach_first_edges,
+        "relay",
+        "Listener",
+        "handle",
+        "src/Acme/Events/Listener.php",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "php foreach-first order does not resolve to the shadowed parameter type",
+        &foreach_first_nodes,
+        &foreach_first_edges,
+        "relay",
+        "Auditor",
+        "handle",
+        "src/Acme/Events/Auditor.php",
+    );
+
+    // Order 2 — another spec annotates first: a local constructor binding for
+    // the same variable claims the callsite before the foreach pass runs; the
+    // marker must still be appended to that already-annotated edge.
+    let other_first_source = r#"
+<?php
+
+namespace Acme\App;
+
+use Acme\Events\Auditor;
+use Acme\Events\Listener;
+
+function primed(array $listeners): void
+{
+    $listener = new Auditor();
+    $listener->handle('primed');
+    /** @var list<Listener> $listeners */
+    foreach ($listeners as $listener) {
+        $listener->handle('ready');
+    }
+}
+"#;
+    let (other_first_nodes, other_first_edges) = index_files(&[
+        (
+            "src/Acme/Events/Listener.php",
+            PHP_LISTENER_INTERFACE_SOURCE,
+        ),
+        ("src/Acme/Events/Auditor.php", PHP_AUDITOR_CLASS_SOURCE),
+        ("src/Acme/App/primed.php", other_first_source),
+    ])?;
+    let loop_edges =
+        call_edges_from_caller_at_line(&other_first_nodes, &other_first_edges, "primed", 15);
+    assert_eq!(
+        loop_edges.len(),
+        1,
+        "the losing foreach spec must not spawn a competing edge. Calls: {:?}",
+        describe_call_edges(&other_first_edges, &other_first_nodes)
+    );
+    let loop_edge = loop_edges[0];
+    assert!(
+        callsite_has_segment(loop_edge, "receiver-owner:Auditor"),
+        "the first annotating spec keeps the owner annotation: {:?}",
+        loop_edge.callsite_identity
+    );
+    assert!(!callsite_has_segment(loop_edge, "receiver-owner:Listener"));
+    assert!(
+        callsite_has_segment(loop_edge, "receiver-binding:loop-element@14-16"),
+        "the loop marker must still be appended to the already-annotated edge: {:?}",
+        loop_edge.callsite_identity
+    );
+    let pre_loop_edges =
+        call_edges_from_caller_at_line(&other_first_nodes, &other_first_edges, "primed", 12);
+    assert_eq!(pre_loop_edges.len(), 1);
+    assert!(
+        !callsite_has_segment_with_prefix(pre_loop_edges[0], PHP_LOOP_MARKER_PREFIX),
+        "the same-spelled callsite before the loop must not carry the marker: {:?}",
+        pre_loop_edges[0].callsite_identity
+    );
+
+    // Order 2, resolved variant — the earlier binding resolves in-file and
+    // replaces the placeholder entirely; the marker must land on the resolved
+    // edge itself.
+    let resolved_first_source = r#"
+<?php
+
+namespace Acme\App;
+
+class LocalAuditor
+{
+    public function handle(string $payload): void {}
+}
+
+function tracked(array $listeners): void
+{
+    $listener = new LocalAuditor();
+    /** @var list<LocalAuditor> $listeners */
+    foreach ($listeners as $listener) {
+        $listener->handle('ready');
+    }
+}
+"#;
+    let (resolved_first_nodes, resolved_first_edges) =
+        index_files(&[("src/Acme/App/tracked.php", resolved_first_source)])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "php resolved-first order keeps the in-file resolution",
+        &resolved_first_nodes,
+        &resolved_first_edges,
+        "tracked",
+        "LocalAuditor",
+        "handle",
+        "src/Acme/App/tracked.php",
+    );
+    let tracked_edges =
+        call_edges_from_caller_at_line(&resolved_first_nodes, &resolved_first_edges, "tracked", 16);
+    assert_eq!(
+        tracked_edges.len(),
+        1,
+        "expected one resolved edge for the loop callsite. Calls: {:?}",
+        describe_call_edges(&resolved_first_edges, &resolved_first_nodes)
+    );
+    assert!(tracked_edges[0].resolved_target.is_some());
+    assert!(
+        callsite_has_segment(tracked_edges[0], "receiver-binding:loop-element@15-17"),
+        "the loop marker must land on the resolved edge that replaced the placeholder: {:?}",
+        tracked_edges[0].callsite_identity
+    );
+
+    assert_no_call_self_edges(
+        "php foreach marker order-independence",
+        &foreach_first_edges,
+    );
+    assert_no_call_self_edges("php foreach marker order-independence", &other_first_edges);
+    assert_no_call_self_edges(
+        "php foreach marker order-independence",
+        &resolved_first_edges,
+    );
+    Ok(())
+}
+
+#[test]
+fn test_php_construction_placeholder_annotates_owner_and_resolves_to_constructor()
+-> anyhow::Result<()> {
+    let construction_source = r#"
+<?php
+
+namespace Acme\App;
+
+use Acme\Events\Auditor;
+
+class Widget
+{
+    public function __construct(string $label) {}
+}
+
+class Plain
+{
+    public function touch(): void {}
+}
+
+function build_all(): void
+{
+    $widget = new Widget('w');
+    $auditor = new Auditor();
+    $plain = new Plain();
+    $unknown = new Mystery();
+}
+
+function hostile_texts(): void
+{
+    // new Widget('comment');
+    $note = "new Widget('quoted')";
+    echo $note;
+}
+"#;
+    let (nodes, edges) = index_files(&[
+        ("src/Acme/Events/Auditor.php", PHP_AUDITOR_CLASS_SOURCE),
+        ("src/Acme/App/build.php", construction_source),
+    ])?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+
+    // Hostile first: `new` text in comments and strings parses no callsite.
+    for hostile_line in [28, 29] {
+        assert!(
+            call_edges_from_caller_at_line(&nodes, &edges, "hostile_texts", hostile_line)
+                .is_empty(),
+            "`new` inside comments and strings must produce no CALL edges. Calls: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+
+    // Hostile: a bare `new` name unknown to the tables carries only the
+    // namespace-derived module guess, and with no matching class in that
+    // namespace the resolution fails closed.
+    let mystery_edges = call_edges_from_caller_at_line(&nodes, &edges, "build_all", 23);
+    assert_eq!(mystery_edges.len(), 1);
+    assert!(callsite_has_segment(mystery_edges[0], "syntax:php-new"));
+    assert!(callsite_has_segment(
+        mystery_edges[0],
+        "receiver-owner:Mystery"
+    ));
+    assert!(callsite_has_segment(
+        mystery_edges[0],
+        r"receiver-module:Acme\App.Mystery"
+    ));
+    assert_eq!(
+        mystery_edges[0].resolved_target, None,
+        "a same-namespace construction with no matching class must fail closed"
+    );
+    assert_eq!(mystery_edges[0].certainty, None);
+
+    // Hostile: an annotated construction of a class with no declared
+    // constructor stays unresolved.
+    let plain_edges = call_edges_from_caller_at_line(&nodes, &edges, "build_all", 22);
+    assert_eq!(plain_edges.len(), 1);
+    assert!(callsite_has_segment(plain_edges[0], "syntax:php-new"));
+    assert!(callsite_has_segment(plain_edges[0], "receiver-owner:Plain"));
+    assert_eq!(
+        plain_edges[0].resolved_target, None,
+        "a class without `__construct` must fail the construction resolution closed"
+    );
+
+    // Same-file construction: placeholder named by the callee TYPE text,
+    // `syntax:php-new`-marked, owner-annotated, resolved to the constructor
+    // with resolver-set certainty.
+    let widget_edges = call_edges_from_caller_at_line(&nodes, &edges, "build_all", 20);
+    assert_eq!(widget_edges.len(), 1);
+    let widget_edge = widget_edges[0];
+    assert_eq!(
+        node_by_id
+            .get(&widget_edge.target)
+            .map(|target| target.serialized_name.as_str()),
+        Some("Widget"),
+        "the construction placeholder must be named by the callee type text"
+    );
+    assert!(callsite_has_segment(widget_edge, "syntax:php-new"));
+    assert!(callsite_has_segment(widget_edge, "receiver-owner:Widget"));
+    let widget_resolved = widget_edge
+        .resolved_target
+        .and_then(|id| node_by_id.get(&id))
+        .map(|node| node.serialized_name.as_str());
+    assert_eq!(
+        widget_resolved,
+        Some("Widget.__construct"),
+        "same-file construction must resolve to the owner's constructor. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert_eq!(widget_edge.certainty, Some(ResolutionCertainty::Certain));
+
+    // Imported construction resolves through the annotated receiver module.
+    let auditor_edges = call_edges_from_caller_at_line(&nodes, &edges, "build_all", 21);
+    assert_eq!(auditor_edges.len(), 1);
+    let auditor_edge = auditor_edges[0];
+    assert!(callsite_has_segment(auditor_edge, "syntax:php-new"));
+    assert!(callsite_has_segment(auditor_edge, "receiver-owner:Auditor"));
+    assert!(callsite_has_segment(
+        auditor_edge,
+        r"receiver-module:Acme\Events.Auditor"
+    ));
+    let auditor_resolved = auditor_edge
+        .resolved_target
+        .and_then(|id| node_by_id.get(&id))
+        .map(|node| node.serialized_name.as_str());
+    assert_eq!(
+        auditor_resolved,
+        Some("Auditor.__construct"),
+        "imported construction must resolve to the imported owner's constructor. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert_eq!(auditor_edge.certainty, Some(ResolutionCertainty::Certain));
+
+    assert_no_call_self_edges("php construction placeholders", &edges);
+
+    // Outside any namespace declaration there is no namespace to guess from:
+    // an unknown bare construction stays entirely unannotated.
+    let global_namespace_source = r#"
+<?php
+
+function bare_build(): void
+{
+    $thing = new Mystery();
+}
+"#;
+    let (global_nodes, global_edges) =
+        index_files(&[("src/scripts/bare.php", global_namespace_source)])?;
+    let bare_edges = call_edges_from_caller_at_line(&global_nodes, &global_edges, "bare_build", 6);
+    assert_eq!(bare_edges.len(), 1);
+    assert!(callsite_has_segment(bare_edges[0], "syntax:php-new"));
+    assert!(
+        !callsite_has_segment_with_prefix(bare_edges[0], "receiver-owner:"),
+        "a global-namespace unknown construction must stay unannotated: {:?}",
+        bare_edges[0].callsite_identity
+    );
+    assert_eq!(bare_edges[0].resolved_target, None);
+
+    Ok(())
+}
+
+#[test]
+fn test_php_multiline_named_argument_construction_resolves_same_namespace_constructor()
+-> anyhow::Result<()> {
+    let record_source = r#"
+<?php
+
+namespace Acme\Logs;
+
+class Record
+{
+    public function __construct(
+        public Stamp $stamp,
+        public string $channel
+    ) {
+    }
+}
+
+class Stamp
+{
+    public function __construct() {}
+}
+"#;
+    // `Record` and `Stamp` are referenced unqualified from a sibling file of
+    // the same namespace — no `use` statement, exactly the Monolog
+    // `new LogRecord(...)` shape — across a multi-line, named-argument
+    // construction with a nested construction inside one argument.
+    let factory_source = r#"
+<?php
+
+namespace Acme\Logs;
+
+function make_record(string $channel): Record
+{
+    $record = new Record(
+        stamp: new Stamp(),
+        channel: $channel,
+    );
+    return $record;
+}
+
+function miss_record(): void
+{
+    $ghost = new MissingRecord(
+        channel: 'app',
+    );
+}
+"#;
+    let (nodes, edges) = index_files(&[
+        ("src/Acme/Logs/Record.php", record_source),
+        ("src/Acme/Logs/factory.php", factory_source),
+    ])?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+
+    // Hostile first: the same-namespace miss carries the namespace-derived
+    // annotation but resolves nothing.
+    let miss_edges = call_edges_from_caller_at_line(&nodes, &edges, "miss_record", 17);
+    assert_eq!(
+        miss_edges.len(),
+        1,
+        "expected one placeholder for the missing-class construction. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert!(callsite_has_segment(miss_edges[0], "syntax:php-new"));
+    assert!(callsite_has_segment(
+        miss_edges[0],
+        "receiver-owner:MissingRecord"
+    ));
+    assert!(callsite_has_segment(
+        miss_edges[0],
+        r"receiver-module:Acme\Logs.MissingRecord"
+    ));
+    assert_eq!(
+        miss_edges[0].resolved_target, None,
+        "an unqualified name with no matching same-namespace class must fail closed"
+    );
+    assert_eq!(miss_edges[0].certainty, None);
+
+    // The outer multi-line named-argument construction: annotated with the
+    // namespace-derived module and resolved certain to the promoted-property
+    // constructor in the sibling file.
+    let record_edges = call_edges_from_caller_at_line(&nodes, &edges, "make_record", 8);
+    assert_eq!(
+        record_edges.len(),
+        1,
+        "expected one CALL edge for the outer multi-line construction. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    let record_edge = record_edges[0];
+    assert_eq!(
+        node_by_id
+            .get(&record_edge.target)
+            .map(|target| target.serialized_name.as_str()),
+        Some("Record"),
+        "the multi-line construction placeholder must be named by the callee type text"
+    );
+    assert!(callsite_has_segment(record_edge, "syntax:php-new"));
+    assert!(callsite_has_segment(record_edge, "receiver-owner:Record"));
+    assert!(callsite_has_segment(
+        record_edge,
+        r"receiver-module:Acme\Logs.Record"
+    ));
+    assert_eq!(
+        record_edge
+            .resolved_target
+            .and_then(|id| node_by_id.get(&id))
+            .map(|node| node.serialized_name.as_str()),
+        Some("Record.__construct"),
+        "the same-namespace construction must resolve to the sibling file's constructor. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert_eq!(record_edge.certainty, Some(ResolutionCertainty::Certain));
+
+    // The nested construction inside the outer named argument gets its own
+    // annotated, certain edge — nesting shadows nothing.
+    let stamp_edges = call_edges_from_caller_at_line(&nodes, &edges, "make_record", 9);
+    assert_eq!(
+        stamp_edges.len(),
+        1,
+        "expected one CALL edge for the nested construction. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    let stamp_edge = stamp_edges[0];
+    assert!(callsite_has_segment(stamp_edge, "syntax:php-new"));
+    assert!(callsite_has_segment(stamp_edge, "receiver-owner:Stamp"));
+    assert!(callsite_has_segment(
+        stamp_edge,
+        r"receiver-module:Acme\Logs.Stamp"
+    ));
+    assert_eq!(
+        stamp_edge
+            .resolved_target
+            .and_then(|id| node_by_id.get(&id))
+            .map(|node| node.serialized_name.as_str()),
+        Some("Stamp.__construct"),
+        "the nested construction must resolve to its own constructor. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert_eq!(stamp_edge.certainty, Some(ResolutionCertainty::Certain));
+
+    assert_no_call_self_edges("php multiline same-namespace construction", &edges);
+    Ok(())
+}
+
 #[test]
 fn test_javascript_same_file_receiver_call_resolves_to_declared_owner_method() -> anyhow::Result<()>
 {
@@ -6872,6 +8152,692 @@ function scopedTwo(workflow) {
         "run",
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_javascript_property_assigned_functions_preserve_receiver_and_import_boundaries()
+-> anyhow::Result<()> {
+    let source = r#"
+const send = require('wire-send');
+
+const app = {};
+app.handle = function handle(req, res) {
+    return [req].map(() => this.router.handle(req, res));
+};
+app.regular = function regular(req, res) {
+    return [req].map(function () {
+        return this.router.handle(req, res);
+    });
+};
+app.use = function use(path) {
+    var router = this.router;
+    return [path].map(function () {
+        return router.use(path);
+    });
+};
+app.arrowAlias = function arrowAlias(path) {
+    let router = this.router;
+    return [path].map(() => router.use(path));
+};
+app.reassigned = function reassigned(path, other) {
+    var router = this.router;
+    router = other;
+    return router.use(path);
+};
+app.blockReassigned = function blockReassigned(path, other) {
+    let router = this.router;
+    {
+        router = other;
+    }
+    return router.use(path);
+};
+app.closureReassigned = function closureReassigned(path, other) {
+    let router = this.router;
+    (() => { router = other; })();
+    return router.use(path);
+};
+app.dormantClosure = function dormantClosure(path, other) {
+    let router = this.router;
+    const mutate = () => { router = other; };
+    return router.use(path);
+};
+app.localShadowClosure = function localShadowClosure(path, other) {
+    let router = this.router;
+    (() => {
+        let router = other;
+        router = other;
+    })();
+    return router.use(path);
+};
+app.parameterShadowClosure = function parameterShadowClosure(path, other) {
+    let router = this.router;
+    ((router) => { router = other; })(other);
+    return router.use(path);
+};
+app.laterDirectWrite = function laterDirectWrite(path, other) {
+    let router = this.router;
+    const result = router.use(path);
+    router = other;
+    return result;
+};
+app.hoistedClosure = function hoistedClosure(path, other) {
+    let router = this.router;
+    mutate();
+    return router.use(path);
+    function mutate() { router = other; }
+};
+app.hoistedShadowClosure = function hoistedShadowClosure(path, other) {
+    let router = this.router;
+    mutate(other);
+    return router.use(path);
+    function mutate(router) { router = other; }
+};
+app.loopReassigned = function loopReassigned(path, other) {
+    let router = this.router;
+    for (let index = 0; index < 2; index++) {
+        if (index > 0) router.use(path);
+        router = other;
+    }
+};
+app.loneLoopLaterWrite = function loneLoopLaterWrite(path, other) {
+    let router = this.router;
+    const result = router.use(path);
+    for (let index = 0; index < 2; index++) {
+        router = other;
+    }
+    return result;
+};
+app.shadowed = function shadowed(path, other) {
+    var router = this.router;
+    return (function (router) {
+        return router.use(path);
+    })(other);
+};
+app.foreign = function foreign(path, other) {
+    var router = other.router;
+    return router.use(path);
+};
+
+const res = {};
+res.end = function end(body) {
+    return body;
+};
+res.send = function send(body) {
+    return this.end(body);
+};
+res.sendFile = function sendFile(path) {
+    return send(path);
+};
+"#;
+
+    let (nodes, edges) = index_single_file("server.js", source)?;
+    assert_resolved_call_to_method_owner(
+        "javascript property-assigned this receiver",
+        &nodes,
+        &edges,
+        "res.send",
+        "res",
+        "end",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "javascript imported bare call avoids same-name receiver method",
+        &nodes,
+        &edges,
+        "res.sendFile",
+        "res",
+        "send",
+    );
+
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let external_router_call = edges.iter().find(|edge| {
+        if edge.kind != EdgeKind::CALL {
+            return false;
+        }
+        let Some(source) = node_by_id.get(&edge.source) else {
+            return false;
+        };
+        let Some(target) = node_by_id.get(&edge.target) else {
+            return false;
+        };
+        is_matching_name(&source.serialized_name, "app.handle")
+            && is_matching_name(&target.serialized_name, "handle")
+    });
+    let external_router_call = external_router_call.unwrap_or_else(|| {
+        panic!(
+            "expected exact app.handle external callsite. Calls: {:?}",
+            describe_call_edges(&edges, &nodes)
+        )
+    });
+    assert_eq!(external_router_call.resolved_target, None);
+    assert!(
+        external_router_call
+            .callsite_identity
+            .as_deref()
+            .is_some_and(|identity| identity.contains("receiver-owner:app.router")),
+        "external callsite should retain its receiver provenance without a resolved target: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    let alias_edges = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge
+                    .callsite_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.contains("receiver-owner:app.router"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        alias_edges.len(),
+        8,
+        "only lexical `this.router` and its exact local alias may carry app.router provenance: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert!(
+        alias_edges.iter().all(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_none_or(|source| !is_matching_name(&source.serialized_name, "app.regular"))
+        }),
+        "a nested regular function owns its own `this` and must not inherit app.router provenance: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    let alias_use = alias_edges
+        .iter()
+        .find(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, "app.use"))
+                && node_by_id
+                    .get(&edge.target)
+                    .is_some_and(|target| is_matching_name(&target.serialized_name, "use"))
+        })
+        .expect("exact router alias call");
+    assert_eq!(alias_use.resolved_target, None);
+    assert!(
+        node_by_id
+            .get(&alias_use.source)
+            .is_some_and(|source| is_matching_name(&source.serialized_name, "app.use")),
+        "alias provenance should stay attached to the owning property-assigned callable: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert!(
+        alias_edges.iter().any(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, "app.arrowAlias"))
+        }),
+        "a nested arrow must retain the exact lexical router alias: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert!(
+        edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::CALL
+                    && node_by_id.get(&edge.source).is_some_and(|source| {
+                        is_matching_name(&source.serialized_name, "app.blockReassigned")
+                    })
+            })
+            .all(|edge| {
+                !edge
+                    .callsite_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.contains("receiver-owner:app.router"))
+                    && edge.resolved_target.is_none_or(|target| {
+                        node_by_id.get(&target).is_none_or(|resolved| {
+                            !is_matching_name(&resolved.serialized_name, "app.router.use")
+                        })
+                    })
+            }),
+        "an unconditional nested-block write must invalidate router alias provenance: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    for caller in [
+        "app.closureReassigned",
+        "app.dormantClosure",
+        "app.hoistedClosure",
+        "app.loopReassigned",
+    ] {
+        assert!(
+            edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::CALL
+                        && node_by_id
+                            .get(&edge.source)
+                            .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+                })
+                .all(|edge| !edge
+                    .callsite_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.contains("receiver-owner:app.router"))),
+            "a prior nested closure write to the captured outer alias must invalidate provenance even when invocation is unknown in `{caller}`: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+    for caller in [
+        "app.localShadowClosure",
+        "app.parameterShadowClosure",
+        "app.laterDirectWrite",
+        "app.hoistedShadowClosure",
+        "app.loneLoopLaterWrite",
+    ] {
+        assert!(
+            alias_edges.iter().any(|edge| {
+                node_by_id
+                    .get(&edge.source)
+                    .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+            }),
+            "a nested closure write to its own shadow must not invalidate the outer alias in `{caller}`: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_javascript_runtime_import_boundaries_follow_exact_binding_scope_and_alias()
+-> anyhow::Result<()> {
+    let source = r#"
+const direct = require('wire-direct');
+const { send: dispatch } = require('wire-dispatch');
+const relay = require('wire-relay').send;
+let assigned;
+assigned = require('wire-assigned');
+let reassigned;
+reassigned = require('wire-reassigned');
+reassigned = (value) => value;
+let dynamic;
+dynamic = require(moduleName);
+let destructured;
+({ destructured } = require('wire-destructured'));
+const holder = {};
+holder.member = require('wire-member');
+let parameterBound;
+const captured = require('wire-captured');
+const dormant = require('wire-dormant');
+const shadowLocal = require('wire-shadow-local');
+const shadowParameter = require('wire-shadow-parameter');
+let laterWrite = require('wire-later-write');
+let hoistedWrite = require('wire-hoisted-write');
+let hoistedShadow = require('wire-hoisted-shadow');
+let loopWrite = require('wire-loop-write');
+let loneLoopWrite = require('wire-lone-loop-write');
+
+function local(value) { return value; }
+(() => { captured = local; })();
+const mutateDormant = () => { dormant = local; };
+(() => {
+    let shadowLocal = local;
+    shadowLocal = local;
+})();
+((shadowParameter) => { shadowParameter = local; })(local);
+
+class Response {
+    direct(body) { return body; }
+    dispatch(body) { return body; }
+    relay(body) { return body; }
+    assigned(body) { return body; }
+    reassigned(body) { return body; }
+    dynamic(body) { return body; }
+    destructured(body) { return body; }
+}
+
+function externalCalls(body) {
+    direct(body);
+    dispatch(body);
+    relay(body);
+    assigned(body);
+    reassigned(body);
+    dynamic(body);
+    destructured(body);
+}
+
+function memberExternal(body) {
+    holder.member(body);
+}
+
+function parameterAssignment(parameterBound, body) {
+    parameterBound = require('wire-parameter');
+    parameterBound(body);
+}
+
+function shadowedLocal(body) {
+    const dispatch = (value) => value;
+    dispatch(body);
+}
+
+function shadowedDeclaration(body) {
+    function relay(value) { return value; }
+    relay(body);
+}
+
+const NamedClass = class dispatch {
+    static namedClassCall(body) { return dispatch(body); }
+};
+
+const AnonymousClass = class {
+    static anonymousClassCall(body) { return dispatch(body); }
+};
+
+function outerClassCall(body) {
+    return dispatch(body);
+}
+
+function capturedExternal(body) {
+    return captured(body);
+}
+
+function dormantExternal(body) {
+    return dormant(body);
+}
+
+function shadowLocalExternal(body) {
+    return shadowLocal(body);
+}
+
+function shadowParameterExternal(body) {
+    return shadowParameter(body);
+}
+
+function laterWriteExternal(body) {
+    return laterWrite(body);
+}
+
+laterWrite = local;
+
+function hoistedWriteExternal(body) {
+    return hoistedWrite(body);
+}
+
+mutateHoistedWrite();
+function mutateHoistedWrite() {
+    hoistedWrite = local;
+}
+
+function hoistedShadowExternal(body) {
+    return hoistedShadow(body);
+}
+
+mutateHoistedShadow(local);
+function mutateHoistedShadow(hoistedShadow) {
+    hoistedShadow = local;
+}
+
+function loopWriteExternal(body) {
+    for (let index = 0; index < 2; index++) {
+        if (index > 0) loopWrite(body);
+        loopWrite = local;
+    }
+}
+
+function loneLoopWriteExternal(body) {
+    const result = loneLoopWrite(body);
+    for (let index = 0; index < 2; index++) {
+        loneLoopWrite = local;
+    }
+    return result;
+}
+"#;
+    let (nodes, edges) = index_single_file("neutral.js", source)?;
+    for method in ["direct", "dispatch", "relay", "assigned"] {
+        assert_no_resolved_call_to_method_owner(
+            "exact CommonJS aliases stay external",
+            &nodes,
+            &edges,
+            "externalCalls",
+            "Response",
+            method,
+        );
+    }
+
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let mut external_markers = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && node_by_id.get(&edge.source).is_some_and(|source| {
+                    is_matching_name(&source.serialized_name, "externalCalls")
+                })
+                && edge
+                    .callsite_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call"))
+        })
+        .map(|edge| {
+            node_by_id
+                .get(&edge.target)
+                .expect("runtime import call target")
+                .serialized_name
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    external_markers.sort();
+    assert_eq!(
+        external_markers,
+        ["assigned", "direct", "dispatch", "relay"],
+        "declarator aliases and one simple assignment binding need exact external-boundary markers: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    for (caller, reason) in [
+        ("memberExternal", "member-assignment"),
+        ("parameterAssignment", "parameter-shadowed assignment"),
+    ] {
+        assert!(
+            edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::CALL
+                        && node_by_id
+                            .get(&edge.source)
+                            .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+                })
+                .all(|edge| !edge
+                    .callsite_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call"))),
+            "{reason} must not create a bare-binding marker: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+    for caller in ["shadowedLocal", "shadowedDeclaration"] {
+        let calls = edges.iter().filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && node_by_id
+                    .get(&edge.source)
+                    .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+        });
+        assert!(
+            calls.into_iter().all(|edge| !edge
+                .callsite_identity
+                .as_deref()
+                .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call"))),
+            "shadowed local binding in `{caller}` must not inherit the file import marker: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+    for (caller, method) in [
+        ("shadowedLocal", "dispatch"),
+        ("shadowedDeclaration", "relay"),
+    ] {
+        assert_no_resolved_call_to_method_owner(
+            "shadowed import name avoids unrelated receiver method",
+            &nodes,
+            &edges,
+            caller,
+            "Response",
+            method,
+        );
+    }
+    for caller in ["shadowedLocal", "shadowedDeclaration"] {
+        assert!(
+            edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::CALL)
+                .any(|edge| {
+                    node_by_id
+                        .get(&edge.source)
+                        .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+                        && edge.resolved_target.is_some_and(|target| {
+                            node_by_id.get(&target).is_some_and(|resolved| {
+                                resolved.kind == codestory_contracts::graph::NodeKind::FUNCTION
+                                    && matches!(
+                                        resolved.serialized_name.as_str(),
+                                        "dispatch" | "relay"
+                                    )
+                            })
+                        })
+                }),
+            "local callable shadow in `{caller}` should resolve locally: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+    for (caller, should_inherit_import) in [
+        ("namedClassCall", false),
+        ("anonymousClassCall", true),
+        ("outerClassCall", true),
+    ] {
+        let import_marked = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL)
+            .any(|edge| {
+                node_by_id
+                    .get(&edge.source)
+                    .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+                    && edge
+                        .callsite_identity
+                        .as_deref()
+                        .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call"))
+            });
+        assert_eq!(
+            import_marked,
+            should_inherit_import,
+            "named class expressions shadow only within their class; anonymous classes and outer calls retain the import: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+    for (caller, should_inherit_import) in [
+        ("capturedExternal", false),
+        ("dormantExternal", false),
+        ("shadowLocalExternal", true),
+        ("shadowParameterExternal", true),
+        ("laterWriteExternal", true),
+        ("hoistedWriteExternal", false),
+        ("hoistedShadowExternal", true),
+        ("loopWriteExternal", false),
+        ("loneLoopWriteExternal", true),
+    ] {
+        let import_marked = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL)
+            .any(|edge| {
+                node_by_id
+                    .get(&edge.source)
+                    .is_some_and(|source| is_matching_name(&source.serialized_name, caller))
+                    && edge
+                        .callsite_identity
+                        .as_deref()
+                        .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call"))
+            });
+        assert_eq!(
+            import_marked,
+            should_inherit_import,
+            "outer-binding closure writes invalidate runtime-import provenance conservatively, while local and parameter shadows do not in `{caller}`: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+    }
+    let import_binding_ids = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::IMPORT
+                && node_by_id
+                    .get(&edge.target)
+                    .is_some_and(|target| target.serialized_name.contains("wire-dispatch"))
+        })
+        .map(|edge| edge.source)
+        .collect::<HashSet<_>>();
+    assert!(
+        !import_binding_ids.is_empty(),
+        "expected the outer CommonJS import binding"
+    );
+    let named_class_calls = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && node_by_id.get(&edge.source).is_some_and(|source| {
+                    is_matching_name(&source.serialized_name, "namedClassCall")
+                })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !named_class_calls.is_empty()
+            && named_class_calls.iter().all(|edge| edge
+                .resolved_target
+                .is_none_or(|target| !import_binding_ids.contains(&target))),
+        "the named class binding must not resolve to the outer CommonJS import: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_typescript_family_member_calls_never_inherit_runtime_import_markers() -> anyhow::Result<()>
+{
+    for (filename, source) in [
+        (
+            "neutral.ts",
+            r#"
+const dispatch = require('wire-dispatch');
+class Response { dispatch(body: string) { return body; } }
+function invoke(response: Response, body: string) {
+    dispatch(body);
+    response.dispatch(body);
+}
+"#,
+        ),
+        (
+            "neutral.tsx",
+            r#"
+const dispatch = require('wire-dispatch');
+class Response { dispatch(body: string) { return body; } }
+function Widget({ response, body }: { response: Response; body: string }) {
+    dispatch(body);
+    response.dispatch(body);
+    return <span>{body}</span>;
+}
+"#,
+        ),
+    ] {
+        let (nodes, edges) = index_single_file(filename, source)?;
+        let marked = edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::CALL
+                    && edge
+                        .callsite_identity
+                        .as_deref()
+                        .is_some_and(|identity| identity.contains("syntax:js-runtime-import-call"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            marked.len(),
+            1,
+            "only the exact bare import call in `{filename}` should carry the marker: {:?}",
+            describe_call_edges(&edges, &nodes)
+        );
+        let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+        assert_eq!(
+            node_by_id
+                .get(&marked[0].target)
+                .map(|target| target.serialized_name.as_str()),
+            Some("dispatch"),
+            "the member expression target must not inherit the bare import marker"
+        );
+    }
     Ok(())
 }
 
@@ -10544,6 +12510,18 @@ void run(Notifier notifier) {
   notifier.notifyEvent('ready');
 }
 "#;
+    let commented_import_source = r#"
+/*
+import './mail/notifier.dart';
+*/
+const importExample = """
+import './mail/notifier.dart';
+""";
+
+void run(Notifier notifier) {
+  notifier.notifyEvent('ready');
+}
+"#;
 
     let (nodes, edges) = index_files(&[
         ("lib/mail/notifier.dart", notifier_source),
@@ -10603,6 +12581,20 @@ void run(Notifier notifier) {
         "dart unimported receiver type stays unresolved",
         &no_import_nodes,
         &no_import_edges,
+        "run",
+        "Notifier",
+        "notifyEvent",
+        "lib/mail/notifier.dart",
+    );
+
+    let (commented_import_nodes, commented_import_edges) = index_files(&[
+        ("lib/mail/notifier.dart", notifier_source),
+        ("lib/workflow.dart", commented_import_source),
+    ])?;
+    assert_no_resolved_call_to_method_owner_in_file(
+        "dart comment and string text cannot prove an import",
+        &commented_import_nodes,
+        &commented_import_edges,
         "run",
         "Notifier",
         "notifyEvent",
@@ -13126,5 +15118,1444 @@ fn test_comprehensive_polymorphic_call_resolution_fixtures() -> anyhow::Result<(
         }
     }
 
+    Ok(())
+}
+
+#[test]
+fn test_java_argument_carrying_method_annotation_keeps_parameter_receiver_types()
+-> anyhow::Result<()> {
+    // The parameter surface used to be scanned from the first `(` in the
+    // method's own text, and a leading annotation with an argument list puts
+    // that `(` inside the annotation (CR-009). `@GetMapping("/dispatch")`
+    // yielded `"/dispatch"` as the parameter list, so the receiver map came out
+    // empty and `listener.handleEvent()` never resolved.
+    let source = r#"
+class Listener {
+    void handleEvent() {}
+}
+
+class AuditListener {
+    void handleEvent() {}
+}
+
+class Bus {
+    @GetMapping("/dispatch")
+    @Transactional(readOnly = true)
+    void dispatchTo(Listener listener) {
+        listener.handleEvent();
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("Bus.java", source)?;
+    assert_resolved_call_to_method_owner(
+        "java annotated method",
+        &nodes,
+        &edges,
+        "dispatchTo",
+        "Listener",
+        "handleEvent",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "java annotated method",
+        &nodes,
+        &edges,
+        "dispatchTo",
+        "AuditListener",
+        "handleEvent",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_java_parameter_annotation_does_not_become_the_receiver_owner_type() -> anyhow::Result<()> {
+    // `f(@RequestParam("id") Listener listener)` recorded the owner type of
+    // `listener` as `@RequestParam`, because the annotation is just another
+    // whitespace-separated token and the type surface truncates at its `(`.
+    let source = r#"
+class Listener {
+    void handleEvent() {}
+}
+
+class AuditListener {
+    void handleEvent() {}
+}
+
+class Bus {
+    void dispatchTo(@RequestParam(value = "id") final Listener listener) {
+        listener.handleEvent();
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("Bus.java", source)?;
+    assert_resolved_call_to_method_owner(
+        "java annotated parameter",
+        &nodes,
+        &edges,
+        "dispatchTo",
+        "Listener",
+        "handleEvent",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "java annotated parameter",
+        &nodes,
+        &edges,
+        "dispatchTo",
+        "AuditListener",
+        "handleEvent",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_kotlin_argument_carrying_annotations_keep_parameter_and_property_bindings()
+-> anyhow::Result<()> {
+    // Two separate CR-009 failures on one path: `@Throws(IOException::class)`
+    // on a function turned `IOException::class` into the parameter surface, and
+    // `@Table(name = "users")` on a data class swallowed the whole primary
+    // constructor, so the class lost every property binding.
+    let source = r#"
+package app
+
+class Repository {
+    fun save() {}
+}
+
+class Audit {
+    fun save() {}
+}
+
+@Table(name = "users")
+data class User(private val repository: Repository) {
+    fun persist() {
+        repository.save()
+    }
+}
+
+class Bus {
+    @Throws(IllegalStateException::class)
+    fun dispatchTo(repository: Repository) {
+        repository.save()
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("App.kt", source)?;
+    assert_resolved_call_to_method_owner(
+        "kotlin annotated data class",
+        &nodes,
+        &edges,
+        "persist",
+        "Repository",
+        "save",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "kotlin annotated data class",
+        &nodes,
+        &edges,
+        "persist",
+        "Audit",
+        "save",
+    );
+    assert_resolved_call_to_method_owner(
+        "kotlin annotated function",
+        &nodes,
+        &edges,
+        "dispatchTo",
+        "Repository",
+        "save",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "kotlin annotated function",
+        &nodes,
+        &edges,
+        "dispatchTo",
+        "Audit",
+        "save",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_kotlin_trailing_lambda_call_keeps_its_receiver() -> anyhow::Result<()> {
+    // A trailing lambda has no argument parentheses, so cutting the callee at
+    // the first `(` and splitting on the last `.` reached into the lambda body:
+    // `repository.forEach { it.hashCode() }` produced the receiver
+    // `repository.forEach { it` and the member `hashCode`, and the real call to
+    // `forEach` was lost (CR-010).
+    let source = r#"
+package app
+
+class Repository {
+    fun forEach(block: (Int) -> Unit) {}
+}
+
+class Audit {
+    fun forEach(block: (Int) -> Unit) {}
+}
+
+class Bus {
+    fun run(repository: Repository) {
+        repository.forEach { it.hashCode() }
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("Bus.kt", source)?;
+    assert_resolved_call_to_method_owner(
+        "kotlin trailing lambda",
+        &nodes,
+        &edges,
+        "run",
+        "Repository",
+        "forEach",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "kotlin trailing lambda",
+        &nodes,
+        &edges,
+        "run",
+        "Audit",
+        "forEach",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_rust_untyped_cross_file_method_stays_unresolved() -> anyhow::Result<()>
+{
+    let worker = r#"
+pub struct Worker;
+impl Worker {
+    pub fn execute(&mut self) {}
+}
+"#;
+    let factory = r#"
+pub struct Factory;
+impl Factory {
+    pub fn make(&self) -> Result<Worker, ()> { unimplemented!() }
+}
+"#;
+    let caller = r#"
+fn run(factory: &Factory) -> Result<(), ()> {
+    let mut worker = factory.make()?;
+    worker.execute();
+    Ok(())
+}
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("worker.rs", worker),
+        ("factory.rs", factory),
+        ("caller.rs", caller),
+    ])?;
+    assert_no_resolved_call_to_method_owner(
+        "rust cross-file return type remains fail-closed",
+        &nodes,
+        &edges,
+        "run",
+        "Worker",
+        "execute",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_rust_trait_default_self_calls_keep_trait_owner() -> anyhow::Result<()>
+{
+    let source = r#"
+trait Workflow {
+    fn persist(&self);
+    fn audit(&self) {}
+
+    fn run(&self) {
+        self.persist();
+        self.audit();
+    }
+}
+
+trait OtherWorkflow {
+    fn persist(&self);
+    fn audit(&self);
+}
+
+struct Other;
+impl Other {
+    fn inspect(&self) {}
+}
+
+trait ConstructorWorkflow {
+    fn new() -> Other;
+    fn inspect(&self) {}
+
+    fn run_constructor(&self) {
+        let value = Self::new();
+        value.inspect();
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("workflow.rs", source)?;
+    for method in ["persist", "audit"] {
+        assert_resolved_call_to_method_owner(
+            "rust trait default self call",
+            &nodes,
+            &edges,
+            "run",
+            "Workflow",
+            method,
+        );
+        assert_no_resolved_call_to_method_owner(
+            "rust trait default self call",
+            &nodes,
+            &edges,
+            "run",
+            "OtherWorkflow",
+            method,
+        );
+    }
+    assert_no_resolved_call_to_method_owner(
+        "rust trait constructor return remains fail closed",
+        &nodes,
+        &edges,
+        "run_constructor",
+        "ConstructorWorkflow",
+        "inspect",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_rust_local_generic_bound_requires_one_trait_method()
+-> anyhow::Result<()> {
+    let source = r#"
+trait Handler {
+    fn handle(&self);
+}
+
+trait Auditor {
+    fn handle(&self);
+}
+
+fn dispatch<T: Handler>(target: &T) {
+    target.handle();
+}
+
+fn ambiguous<T: Handler + Auditor>(target: &T) {
+    target.handle();
+}
+"#;
+
+    let (nodes, edges) = index_single_file("workflow.rs", source)?;
+    assert_resolved_call_to_method_owner(
+        "rust unique local generic trait bound",
+        &nodes,
+        &edges,
+        "dispatch",
+        "Handler",
+        "handle",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "rust ambiguous local generic trait bound",
+        &nodes,
+        &edges,
+        "ambiguous",
+        "Handler",
+        "handle",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "rust ambiguous local generic trait bound",
+        &nodes,
+        &edges,
+        "ambiguous",
+        "Auditor",
+        "handle",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_rust_local_unit_struct_constructor_keeps_owner() -> anyhow::Result<()>
+{
+    let source = r#"
+struct Runner;
+impl Runner {
+    fn execute(&self) {}
+}
+
+struct OtherRunner;
+impl OtherRunner {
+    fn execute(&self) {}
+}
+
+fn entrypoint() {
+    let runner = Runner;
+    runner.execute();
+}
+"#;
+
+    let (nodes, edges) = index_single_file("runner.rs", source)?;
+    assert_resolved_call_to_method_owner(
+        "rust local unit struct constructor",
+        &nodes,
+        &edges,
+        "entrypoint",
+        "Runner",
+        "execute",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "rust local unit struct constructor",
+        &nodes,
+        &edges,
+        "entrypoint",
+        "OtherRunner",
+        "execute",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_go_cross_file_typed_receivers_resolve_without_guessing()
+-> anyhow::Result<()> {
+    let types = r#"
+package router
+
+type node struct{}
+func (*node) addRoute() {}
+
+type Context struct{}
+func (*Context) Next() {}
+
+type other struct{}
+func (*other) addRoute() {}
+"#;
+    let callers = r#"
+package router
+
+func dispatch(c *Context) {
+    c.Next()
+}
+
+func build() {
+    var root *node
+    root = new(node)
+    root.addRoute()
+}
+
+func shadowed(new func(node) *other) {
+    root := new(node)
+    root.addRoute()
+}
+"#;
+
+    let (nodes, edges) = index_files(&[("types.go", types), ("callers.go", callers)])?;
+    assert_resolved_call_to_method_owner(
+        "go cross-file typed parameter",
+        &nodes,
+        &edges,
+        "dispatch",
+        "Context",
+        "Next",
+    );
+    assert_resolved_call_to_method_owner(
+        "go builtin new binding",
+        &nodes,
+        &edges,
+        "build",
+        "node",
+        "addRoute",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "go shadowed new remains fail-closed",
+        &nodes,
+        &edges,
+        "shadowed",
+        "node",
+        "addRoute",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_go_file_scope_new_shadow_stays_unresolved() -> anyhow::Result<()> {
+    let source = r#"
+package router
+
+type node struct{}
+func (*node) addRoute() {}
+
+type other struct{}
+func (*other) addRoute() {}
+
+var new = func(node) *other { return &other{} }
+
+func build() {
+    root := new(node)
+    root.addRoute()
+}
+"#;
+
+    let (nodes, edges) = index_files(&[("router.go", source)])?;
+    assert_no_resolved_call_to_method_owner(
+        "go file-scope new shadow remains fail-closed",
+        &nodes,
+        &edges,
+        "build",
+        "node",
+        "addRoute",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_dart_arrow_and_initializer_calls_are_typed() -> anyhow::Result<()> {
+    let request = r#"
+class BaseRequest {
+  void finalize() {}
+}
+"#;
+    let client = r#"
+class BaseClient {
+  Object get(Object url) => _sendUnstreamed(url);
+  Object _sendUnstreamed(Object url) => url;
+}
+"#;
+    let io_client = r#"
+import 'base_request.dart';
+
+class IOClient {
+  void send(BaseRequest request) {
+    var stream = request.finalize();
+  }
+
+  void untyped(dynamic request) {
+    var stream = request.finalize();
+  }
+}
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("lib/base_request.dart", request),
+        ("lib/base_client.dart", client),
+        ("lib/io_client.dart", io_client),
+    ])?;
+    assert_resolved_call_to_method_owner(
+        "dart arrow body direct call",
+        &nodes,
+        &edges,
+        "BaseClient.get",
+        "BaseClient",
+        "_sendUnstreamed",
+    );
+    assert_resolved_call_to_method_owner(
+        "dart typed initializer receiver",
+        &nodes,
+        &edges,
+        "IOClient.send",
+        "BaseRequest",
+        "finalize",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "dart untyped initializer remains fail-closed",
+        &nodes,
+        &edges,
+        "IOClient.untyped",
+        "BaseRequest",
+        "finalize",
+    );
+
+    let worker = r#"
+class Worker {
+  void run() {}
+}
+"#;
+    let unimported_entry = r#"
+void call(Worker worker) {
+  worker.run();
+}
+"#;
+    let (unimported_nodes, unimported_edges) = index_files(&[
+        ("lib/worker.dart", worker),
+        ("lib/entry.dart", unimported_entry),
+    ])?;
+    assert_no_resolved_call_to_method_owner(
+        "dart unimported typed parameter remains fail-closed",
+        &unimported_nodes,
+        &unimported_edges,
+        "call",
+        "Worker",
+        "run",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_projection_regression_dart_duplicate_local_owner_stays_unresolved() -> anyhow::Result<()> {
+    let first_request = r#"
+class Request {
+  void finish() {}
+}
+"#;
+    let second_request = r#"
+class Request {
+  void finish() {}
+}
+"#;
+    let caller = r#"
+import 'first_request.dart';
+
+class Client {
+  void send(Request request) {
+    request.finish();
+  }
+}
+"#;
+
+    let (nodes, edges) = index_files(&[
+        ("lib/first_request.dart", first_request),
+        ("lib/second_request.dart", second_request),
+        ("lib/client.dart", caller),
+    ])?;
+    assert_no_resolved_call_to_method_owner(
+        "dart duplicate same-directory owner remains fail-closed",
+        &nodes,
+        &edges,
+        "Client.send",
+        "Request",
+        "finish",
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// C# stage 3b: ManualTypeUsageSpec channel + constructor-body visibility (P2).
+//
+// TYPE_USAGE certainty is stamped at emit and only for types that resolved
+// against the file's binding tables, so the negative tests come first: every
+// hostile surface below must produce NO TYPE_USAGE edge at all.
+// ---------------------------------------------------------------------------
+
+fn type_usage_edges_from_source<'a>(
+    nodes: &[Node],
+    edges: &'a [Edge],
+    source_name: &str,
+) -> Vec<&'a Edge> {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::TYPE_USAGE)
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.source)
+                .is_some_and(|source| is_matching_name(&source.serialized_name, source_name))
+        })
+        .collect()
+}
+
+fn describe_type_usage_edges(nodes: &[Node], edges: &[Edge]) -> Vec<String> {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::TYPE_USAGE)
+        .map(|edge| {
+            let label = |id: &NodeId| {
+                node_by_id
+                    .get(id)
+                    .map(|n| format!("{:?}:{}", n.kind, n.serialized_name))
+                    .unwrap_or_else(|| format!("<missing:{}>", id.0))
+            };
+            format!(
+                "{} -> {} (line: {:?}, certainty: {:?})",
+                label(&edge.source),
+                label(&edge.target),
+                edge.line,
+                edge.certainty
+            )
+        })
+        .collect()
+}
+
+struct ExpectedTypeUsage<'a> {
+    source_name: &'a str,
+    source_kind: codestory_contracts::graph::NodeKind,
+    target_name: &'a str,
+    /// The target node's qualified name, when the type resolved through an
+    /// import table and the edge must land on a module-qualified reference
+    /// node rather than on the alias surface.
+    target_qualified: Option<&'a str>,
+    /// File the EFFECTIVE target must live in — the declaration's own file
+    /// for the same-root channel, which resolves cross-file at finalize.
+    target_file_suffix: Option<&'a str>,
+}
+
+fn assert_certain_type_usage(
+    case_name: &str,
+    nodes: &[Node],
+    edges: &[Edge],
+    expected: ExpectedTypeUsage<'_>,
+) {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let found = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::TYPE_USAGE)
+        .any(|edge| {
+            let Some(source) = node_by_id.get(&edge.source) else {
+                return false;
+            };
+            // Effective target: same-root edges carry the declaration in
+            // `resolved_target`; emit-resolved edges carry it raw.
+            let effective_target = edge.resolved_target.unwrap_or(edge.target);
+            let Some(target) = node_by_id.get(&effective_target) else {
+                return false;
+            };
+            is_matching_name(&source.serialized_name, expected.source_name)
+                && source.kind == expected.source_kind
+                && is_matching_name(&target.serialized_name, expected.target_name)
+                && expected
+                    .target_qualified
+                    .is_none_or(|qualified| target.qualified_name.as_deref() == Some(qualified))
+                && expected.target_file_suffix.is_none_or(|suffix| {
+                    file_path_for_node(&node_by_id, target)
+                        .map(|path| path.replace('\\', "/").ends_with(suffix))
+                        .unwrap_or(false)
+                })
+                && edge.certainty == Some(ResolutionCertainty::Certain)
+        });
+    assert!(
+        found,
+        "Case `{case_name}`: expected a certain TYPE_USAGE from {:?} `{}` to `{}` (qualified {:?}). TYPE_USAGE edges: {:?}",
+        expected.source_kind,
+        expected.source_name,
+        expected.target_name,
+        expected.target_qualified,
+        describe_type_usage_edges(nodes, edges)
+    );
+}
+
+fn assert_no_type_usage_from(case_name: &str, nodes: &[Node], edges: &[Edge], source_name: &str) {
+    let from_source = type_usage_edges_from_source(nodes, edges, source_name);
+    assert!(
+        from_source.is_empty(),
+        "Case `{case_name}`: expected NO TYPE_USAGE edge from `{source_name}`. TYPE_USAGE edges: {:?}",
+        describe_type_usage_edges(nodes, edges)
+    );
+}
+
+fn assert_no_type_usage_self_edges(case_name: &str, edges: &[Edge]) {
+    let self_edges = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::TYPE_USAGE && edge.source == edge.target)
+        .count();
+    assert_eq!(
+        self_edges, 0,
+        "Case `{case_name}`: TYPE_USAGE self-edges must never be emitted"
+    );
+}
+
+/// Every hostile type surface fails closed: no TYPE_USAGE edge exists at all.
+///
+/// This is the guard on the `csharp_receiver_owner_from_type` fallthrough
+/// (it returns `Some((owner_name, None))` for ANY unknown surface, which is
+/// safe for CALL annotation but must never feed the certainty-stamped
+/// TYPE_USAGE channel).
+#[test]
+fn test_csharp_type_usage_hostile_surfaces_emit_no_edges() -> anyhow::Result<()> {
+    let hostile_source = r#"
+using System;
+
+namespace Acme.App;
+
+class Known
+{
+    public void Announce() {}
+}
+
+class HostileOwner
+{
+    private readonly UnknownType missing;
+    private readonly Acme.External.Widget external;
+    // private readonly CommentType commented;
+    private string note = "StringType inside a literal";
+
+    public void Run()
+    {
+        var mystery = MakeSomething();
+    }
+
+    static object MakeSomething() => new object();
+}
+"#;
+    let (nodes, edges) = index_files(&[("src/Acme/App/Hostile.cs", hostile_source)])?;
+
+    // The unknown-type fallthrough, the qualified-but-unimported surface, the
+    // comment and string mentions, and the unresolvable `var` all fail closed.
+    assert_no_type_usage_from("csharp hostile type usage", &nodes, &edges, "HostileOwner");
+    assert_no_type_usage_from("csharp hostile type usage", &nodes, &edges, "Run");
+    assert_no_type_usage_from("csharp hostile type usage", &nodes, &edges, "MakeSomething");
+    for absent in ["UnknownType", "Widget", "CommentType", "StringType"] {
+        assert!(
+            !has_node_name(&nodes, absent),
+            "hostile type surface `{absent}` must not mint a node"
+        );
+    }
+    assert_no_type_usage_self_edges("csharp hostile type usage", &edges);
+    Ok(())
+}
+
+/// Generic type parameters never resolve, even when a single plain namespace
+/// import would otherwise claim any bare name in the file.
+#[test]
+fn test_csharp_type_usage_generic_parameters_fail_closed_despite_namespace_import()
+-> anyhow::Result<()> {
+    let generic_source = r#"
+using Acme.Events;
+
+namespace Acme.App;
+
+class GenericOwner<T>
+{
+    private readonly T item;
+    private readonly Listener listener;
+
+    public void Fill<TItem>(TItem seed) {}
+}
+"#;
+    let (nodes, edges) = index_files(&[("src/Acme/App/GenericOwner.cs", generic_source)])?;
+
+    // The leak guard: without the generic-parameter check, `T` would resolve
+    // to `Acme.Events.T` through the single-namespace-import heuristic.
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let generic_targets = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::TYPE_USAGE)
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.target)
+                .is_some_and(|target| matches!(target.serialized_name.as_str(), "T" | "TItem"))
+        })
+        .count();
+    assert_eq!(
+        generic_targets,
+        0,
+        "generic type parameters must never become TYPE_USAGE targets. TYPE_USAGE edges: {:?}",
+        describe_type_usage_edges(&nodes, &edges)
+    );
+    assert_no_type_usage_from("csharp generic parameter", &nodes, &edges, "Fill");
+
+    // Positive control in the same file: the namespace-import table itself
+    // works — the field of imported type `Listener` produces the certain,
+    // class-anchored, module-qualified edge.
+    assert_certain_type_usage(
+        "csharp namespace-imported field type",
+        &nodes,
+        &edges,
+        ExpectedTypeUsage {
+            source_name: "GenericOwner",
+            source_kind: codestory_contracts::graph::NodeKind::CLASS,
+            target_name: "Listener",
+            target_qualified: Some("Acme.Events.Listener"),
+            target_file_suffix: None,
+        },
+    );
+    assert_no_type_usage_self_edges("csharp generic parameter", &edges);
+    Ok(())
+}
+
+/// Same-file positives: field declarations and constructor-context facts are
+/// CLASS-anchored, method parameters are METHOD-anchored, and the
+/// constructor-body receiver call resolves exactly like the method path with
+/// the enclosing class as its source anchor.
+#[test]
+fn test_csharp_field_and_constructor_type_usage_and_constructor_call_resolve_same_file()
+-> anyhow::Result<()> {
+    let source = r#"
+namespace Acme.Mapper;
+
+class ConfigType {}
+
+class Builder
+{
+    public Builder(ConfigType cfg) {}
+
+    public void Prepare() {}
+}
+
+class PlanOwner
+{
+    private readonly Builder builder;
+
+    public PlanOwner(ConfigType cfg)
+    {
+        var b = new Builder(cfg);
+        b.Prepare();
+    }
+
+    public void Drive(Builder builder)
+    {
+        builder.Prepare();
+    }
+}
+"#;
+    let (nodes, edges) = index_files(&[("src/Acme/Mapper/PlanOwner.cs", source)])?;
+    let class_kind = codestory_contracts::graph::NodeKind::CLASS;
+    let method_kind = codestory_contracts::graph::NodeKind::METHOD;
+
+    // Field declaration: certain TYPE_USAGE from the CLASS node.
+    assert_certain_type_usage(
+        "csharp same-file field type usage",
+        &nodes,
+        &edges,
+        ExpectedTypeUsage {
+            source_name: "PlanOwner",
+            source_kind: class_kind,
+            target_name: "Builder",
+            target_qualified: None,
+            target_file_suffix: None,
+        },
+    );
+    // Constructor parameter: class-anchored (A1's Builder -> ConfigType shape).
+    assert_certain_type_usage(
+        "csharp constructor parameter type usage",
+        &nodes,
+        &edges,
+        ExpectedTypeUsage {
+            source_name: "Builder",
+            source_kind: class_kind,
+            target_name: "ConfigType",
+            target_qualified: None,
+            target_file_suffix: None,
+        },
+    );
+    assert_certain_type_usage(
+        "csharp constructor parameter type usage",
+        &nodes,
+        &edges,
+        ExpectedTypeUsage {
+            source_name: "PlanOwner",
+            source_kind: class_kind,
+            target_name: "ConfigType",
+            target_qualified: None,
+            target_file_suffix: None,
+        },
+    );
+    // Method parameter: METHOD-anchored.
+    assert_certain_type_usage(
+        "csharp method parameter type usage",
+        &nodes,
+        &edges,
+        ExpectedTypeUsage {
+            source_name: "Drive",
+            source_kind: method_kind,
+            target_name: "Builder",
+            target_qualified: None,
+            target_file_suffix: None,
+        },
+    );
+
+    // Constructor body `var b = new Builder(cfg); b.Prepare();` resolves the
+    // receiver call with the enclosing CLASS as the edge source.
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let constructor_call = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .find(|edge| {
+            node_by_id.get(&edge.source).is_some_and(|source| {
+                source.kind == class_kind && is_matching_name(&source.serialized_name, "PlanOwner")
+            }) && edge
+                .resolved_target
+                .and_then(|id| node_by_id.get(&id))
+                .is_some_and(|resolved| {
+                    is_matching_owned_method(&resolved.serialized_name, "Builder", "Prepare")
+                })
+        });
+    let constructor_call = constructor_call.unwrap_or_else(|| {
+        panic!(
+            "expected the constructor-body call to resolve class-anchored to Builder::Prepare. \
+             Calls: {:?}",
+            describe_call_edges(&edges, &nodes)
+        )
+    });
+    assert_eq!(
+        constructor_call.certainty,
+        Some(ResolutionCertainty::Certain),
+        "the class-anchored constructor-body call must be certain"
+    );
+
+    // The method_declaration path is untouched: the same call from a method
+    // body still resolves METHOD-anchored.
+    assert_resolved_call_to_method_owner_in_file(
+        "csharp method receiver path unchanged",
+        &nodes,
+        &edges,
+        "Drive",
+        "Builder",
+        "Prepare",
+        "src/Acme/Mapper/PlanOwner.cs",
+    );
+    assert_no_call_self_edges("csharp constructor visibility", &edges);
+    assert_no_type_usage_self_edges("csharp constructor visibility", &edges);
+    Ok(())
+}
+
+/// Imported positives: a `using` alias resolves through the alias table for
+/// fields, method-body creations, and constructor-body creations, and the
+/// constructor-body receiver call on the aliased type resolves cross-file.
+#[test]
+fn test_csharp_aliased_type_usage_and_constructor_call_resolve_through_alias_table()
+-> anyhow::Result<()> {
+    let builder_source = r#"
+namespace Acme.Builders;
+
+public class Builder
+{
+    public void Prepare() {}
+}
+"#;
+    let consumer_source = r#"
+using B = Acme.Builders.Builder;
+
+namespace Acme.App;
+
+class FieldOwner
+{
+    private readonly B builder;
+}
+
+class MakerOwner
+{
+    public void Make()
+    {
+        var built = new B();
+        built.Prepare();
+    }
+}
+
+class CtorOwner
+{
+    public CtorOwner()
+    {
+        var built = new B();
+        built.Prepare();
+    }
+}
+"#;
+    let (nodes, edges) = index_files(&[
+        ("src/Acme/Builders/Builder.cs", builder_source),
+        ("src/Acme/App/Consumer.cs", consumer_source),
+    ])?;
+    let class_kind = codestory_contracts::graph::NodeKind::CLASS;
+    let method_kind = codestory_contracts::graph::NodeKind::METHOD;
+
+    // Imported field variant: the edge target carries the alias-resolved
+    // module-qualified identity, never the alias surface `B`.
+    assert_certain_type_usage(
+        "csharp aliased field type usage",
+        &nodes,
+        &edges,
+        ExpectedTypeUsage {
+            source_name: "FieldOwner",
+            source_kind: class_kind,
+            target_name: "Builder",
+            target_qualified: Some("Acme.Builders.Builder"),
+            target_file_suffix: None,
+        },
+    );
+    // Aliased object creation in a method body: METHOD-anchored.
+    assert_certain_type_usage(
+        "csharp aliased object creation",
+        &nodes,
+        &edges,
+        ExpectedTypeUsage {
+            source_name: "Make",
+            source_kind: method_kind,
+            target_name: "Builder",
+            target_qualified: Some("Acme.Builders.Builder"),
+            target_file_suffix: None,
+        },
+    );
+    // Aliased object creation in a constructor body: CLASS-anchored.
+    assert_certain_type_usage(
+        "csharp aliased constructor-body creation",
+        &nodes,
+        &edges,
+        ExpectedTypeUsage {
+            source_name: "CtorOwner",
+            source_kind: class_kind,
+            target_name: "Builder",
+            target_qualified: Some("Acme.Builders.Builder"),
+            target_file_suffix: None,
+        },
+    );
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let alias_targets = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::TYPE_USAGE)
+        .filter(|edge| {
+            node_by_id
+                .get(&edge.target)
+                .is_some_and(|target| target.serialized_name == "B")
+        })
+        .count();
+    assert_eq!(
+        alias_targets, 0,
+        "the alias surface `B` must never be a TYPE_USAGE target"
+    );
+
+    // The aliased method-body receiver call resolves cross-file (pre-existing
+    // behaviour), and the constructor-body call now resolves the same way,
+    // class-anchored.
+    assert_resolved_call_to_method_owner_in_file(
+        "csharp aliased method receiver",
+        &nodes,
+        &edges,
+        "Make",
+        "Builder",
+        "Prepare",
+        "src/Acme/Builders/Builder.cs",
+    );
+    assert_resolved_call_to_method_owner_in_file(
+        "csharp aliased constructor receiver",
+        &nodes,
+        &edges,
+        "CtorOwner",
+        "Builder",
+        "Prepare",
+        "src/Acme/Builders/Builder.cs",
+    );
+    let constructor_call = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .find(|edge| {
+            node_by_id.get(&edge.source).is_some_and(|source| {
+                source.kind == class_kind && is_matching_name(&source.serialized_name, "CtorOwner")
+            }) && edge
+                .resolved_target
+                .and_then(|id| node_by_id.get(&id))
+                .is_some_and(|resolved| {
+                    is_matching_owned_method(&resolved.serialized_name, "Builder", "Prepare")
+                })
+        });
+    assert!(
+        constructor_call.is_some(),
+        "the constructor-body call must resolve with the enclosing CLASS as its source. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    assert_no_call_self_edges("csharp aliased constructor visibility", &edges);
+    assert_no_type_usage_self_edges("csharp aliased constructor visibility", &edges);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// C# stage 3b revision: primary constructors, chained creation receivers, and
+// the same-root-namespace declaration lookup. Negative-first: every hostile
+// shape fails closed before the positives prove the AutoMapper mirror.
+// ---------------------------------------------------------------------------
+
+fn assert_no_pending_type_usage_nodes(case_name: &str, nodes: &[Node]) {
+    let leftover = nodes
+        .iter()
+        .filter(|node| {
+            node.canonical_id
+                .as_deref()
+                .is_some_and(|canonical| canonical.starts_with("type_ref_pending:"))
+        })
+        .count();
+    assert_eq!(
+        leftover, 0,
+        "Case `{case_name}`: failed same-root facts must clean their pending reference nodes"
+    );
+}
+
+/// Same-root hostiles, all fail closed: a bare name whose only declaration
+/// lives under a DIFFERENT root namespace (the vendor-shadow shape), and a
+/// bare name with TWO declarations under the caller's root (ambiguity).
+/// Neither the TYPE_USAGE channel nor the chained-creation CALL channel may
+/// produce anything, and the failed pending facts must leave no residue.
+#[test]
+fn test_csharp_same_root_hostile_shapes_fail_closed() -> anyhow::Result<()> {
+    let vendor_source = r#"
+namespace Vendor.Ui;
+
+public class Widget
+{
+    public void Render() {}
+}
+"#;
+    let panel_a_source = r#"
+namespace Acme.A;
+
+public class Panel
+{
+    public void Draw() {}
+}
+"#;
+    let panel_b_source = r#"
+namespace Acme.B;
+
+public class Panel
+{
+    public void Draw() {}
+}
+"#;
+    let consumer_source = r#"
+namespace Acme.App;
+
+class ShadowOwner
+{
+    private Widget vendorShadow;
+
+    public void Chain()
+    {
+        new Widget().Render();
+    }
+}
+
+class PanelOwner
+{
+    private Panel ambiguous;
+
+    public void Chain()
+    {
+        new Panel().Draw();
+    }
+}
+"#;
+    let (nodes, edges) = index_files(&[
+        ("src/Vendor/Widget.cs", vendor_source),
+        ("src/Acme/A/Panel.cs", panel_a_source),
+        ("src/Acme/B/Panel.cs", panel_b_source),
+        ("src/Acme/App/Consumer.cs", consumer_source),
+    ])?;
+
+    // Vendor shadow: Widget's only declaration is under root `Vendor`.
+    assert_no_type_usage_from("csharp vendor shadow", &nodes, &edges, "ShadowOwner");
+    assert_no_resolved_call_to_method_owner_in_file(
+        "csharp vendor shadow chained call",
+        &nodes,
+        &edges,
+        "ShadowOwner.Chain",
+        "Widget",
+        "Render",
+        "src/Vendor/Widget.cs",
+    );
+
+    // Ambiguity: two Panel declarations under root `Acme`.
+    assert_no_type_usage_from("csharp same-root ambiguity", &nodes, &edges, "PanelOwner");
+    for panel_file in ["src/Acme/A/Panel.cs", "src/Acme/B/Panel.cs"] {
+        assert_no_resolved_call_to_method_owner_in_file(
+            "csharp same-root ambiguity chained call",
+            &nodes,
+            &edges,
+            "PanelOwner.Chain",
+            "Panel",
+            "Draw",
+            panel_file,
+        );
+    }
+
+    assert_no_type_usage_from("csharp same-root hostiles", &nodes, &edges, "Chain");
+    assert_no_pending_type_usage_nodes("csharp same-root hostiles", &nodes);
+    assert_no_call_self_edges("csharp same-root hostiles", &edges);
+    assert_no_type_usage_self_edges("csharp same-root hostiles", &edges);
+    Ok(())
+}
+
+/// Generic parameters of a PRIMARY constructor never resolve, even though
+/// the parameter list hangs directly off the type declaration.
+#[test]
+fn test_csharp_primary_constructor_generic_parameter_fails_closed() -> anyhow::Result<()> {
+    let source = r#"
+namespace Acme.App;
+
+class Box<T>(T seed)
+{
+    private readonly T item = seed;
+}
+"#;
+    let (nodes, edges) = index_files(&[("src/Acme/App/Box.cs", source)])?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let generic_targets = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::TYPE_USAGE)
+        .filter(|edge| {
+            let effective_target = edge.resolved_target.unwrap_or(edge.target);
+            node_by_id
+                .get(&effective_target)
+                .is_some_and(|target| target.serialized_name == "T")
+        })
+        .count();
+    assert_eq!(
+        generic_targets,
+        0,
+        "a primary-constructor type parameter must never become a TYPE_USAGE target. Edges: {:?}",
+        describe_type_usage_edges(&nodes, &edges)
+    );
+    assert_no_pending_type_usage_nodes("csharp primary ctor generic", &nodes);
+    Ok(())
+}
+
+/// The AutoMapper mirror (A1 + A3 shapes, all three review findings at once):
+///
+/// * `TypeMapPlanBuilder` is a C#12 primary-constructor REF STRUCT whose
+///   parameter types are the A1 facts — type-anchored TYPE_USAGE, resolved
+///   cross-file through the same-root rule (namespace `Acme.Execution` sees
+///   `Acme`'s TypeMap with no using of any kind);
+/// * `TypeMap.CreateMapperLambda` hands off through a member call whose
+///   receiver IS the object creation, in an expression-bodied method, with a
+///   deliberate name collision against the enclosing method;
+/// * `MEMBER(TypeMapPlanBuilder -> CreateMapperLambda)` comes from the
+///   member collector's struct arm.
+#[test]
+fn test_csharp_primary_ctor_type_usage_and_chained_creation_call_resolve_same_root()
+-> anyhow::Result<()> {
+    let type_map_source = r#"
+namespace Acme;
+
+public class TypeMap
+{
+    internal object CreateMapperLambda() =>
+        new TypeMapPlanBuilder(this).CreateMapperLambda();
+}
+
+class Holder
+{
+    private object plan = new TypeMapPlanBuilder(null).CreateMapperLambda();
+}
+"#;
+    let builder_source = r#"
+namespace Acme.Execution;
+
+public ref struct TypeMapPlanBuilder(TypeMap typeMap)
+{
+    public object CreateMapperLambda() => typeMap;
+}
+"#;
+    let (nodes, edges) = index_files(&[
+        ("src/Acme/TypeMap.cs", type_map_source),
+        ("src/Acme/Execution/TypeMapPlanBuilder.cs", builder_source),
+    ])?;
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+    let struct_kind = codestory_contracts::graph::NodeKind::STRUCT;
+    let method_kind = codestory_contracts::graph::NodeKind::METHOD;
+
+    // A1 mirror: primary-ctor parameter type, type-anchored on the ref
+    // struct, resolved to the real declaration in the OTHER file.
+    assert_certain_type_usage(
+        "csharp primary ctor same-root type usage",
+        &nodes,
+        &edges,
+        ExpectedTypeUsage {
+            source_name: "TypeMapPlanBuilder",
+            source_kind: struct_kind,
+            target_name: "TypeMap",
+            target_qualified: Some("Acme.TypeMap"),
+            target_file_suffix: Some("src/Acme/TypeMap.cs"),
+        },
+    );
+    // Reverse direction: the creation's type in TypeMap.cs resolves into the
+    // Execution namespace the same way (the csproj-global-using shape).
+    assert_certain_type_usage(
+        "csharp chained creation type usage",
+        &nodes,
+        &edges,
+        ExpectedTypeUsage {
+            source_name: "TypeMap.CreateMapperLambda",
+            source_kind: method_kind,
+            target_name: "TypeMapPlanBuilder",
+            target_qualified: Some("Acme.Execution.TypeMapPlanBuilder"),
+            target_file_suffix: Some("src/Acme/Execution/TypeMapPlanBuilder.cs"),
+        },
+    );
+
+    // A3 mirror: the chained-creation handoff resolves cross-file to the
+    // struct's method — never to the same-named enclosing method.
+    assert_resolved_call_to_method_owner_in_file(
+        "csharp chained creation handoff",
+        &nodes,
+        &edges,
+        "TypeMap.CreateMapperLambda",
+        "TypeMapPlanBuilder",
+        "CreateMapperLambda",
+        "src/Acme/Execution/TypeMapPlanBuilder.cs",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "csharp chained creation must not self-resolve",
+        &nodes,
+        &edges,
+        "TypeMap.CreateMapperLambda",
+        "TypeMap",
+        "CreateMapperLambda",
+        "src/Acme/TypeMap.cs",
+    );
+    let handoff = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .find(|edge| {
+            node_by_id.get(&edge.source).is_some_and(|source| {
+                is_matching_name(&source.serialized_name, "TypeMap.CreateMapperLambda")
+            }) && edge
+                .resolved_target
+                .and_then(|id| node_by_id.get(&id))
+                .is_some_and(|resolved| {
+                    is_matching_owned_method(
+                        &resolved.serialized_name,
+                        "TypeMapPlanBuilder",
+                        "CreateMapperLambda",
+                    )
+                })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the chained-creation handoff edge. Calls: {:?}",
+                describe_call_edges(&edges, &nodes)
+            )
+        });
+    assert!(
+        callsite_has_segment(handoff, "receiver-owner:TypeMapPlanBuilder"),
+        "the handoff callsite must carry the syntactic owner annotation: {:?}",
+        handoff.callsite_identity
+    );
+    assert_eq!(
+        handoff.certainty,
+        Some(ResolutionCertainty::Certain),
+        "the same-root handoff resolution must be certain"
+    );
+
+    // Field-initializer chained call: no method or constructor encloses it,
+    // so the spec anchors at the class and still resolves.
+    assert_resolved_call_to_method_owner_in_file(
+        "csharp field initializer chained call",
+        &nodes,
+        &edges,
+        "Holder",
+        "TypeMapPlanBuilder",
+        "CreateMapperLambda",
+        "src/Acme/Execution/TypeMapPlanBuilder.cs",
+    );
+
+    // MEMBER through the struct arm (the A3 join edge).
+    let member_present = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::MEMBER)
+        .any(|edge| {
+            node_by_id.get(&edge.source).is_some_and(|source| {
+                source.kind == struct_kind
+                    && is_matching_name(&source.serialized_name, "TypeMapPlanBuilder")
+            }) && node_by_id.get(&edge.target).is_some_and(|target| {
+                is_matching_owned_method(
+                    &target.serialized_name,
+                    "TypeMapPlanBuilder",
+                    "CreateMapperLambda",
+                )
+            })
+        });
+    assert!(
+        member_present,
+        "expected MEMBER(TypeMapPlanBuilder -> CreateMapperLambda) via the struct arm"
+    );
+
+    assert_no_call_self_edges("csharp automapper mirror", &edges);
+    assert_no_type_usage_self_edges("csharp automapper mirror", &edges);
     Ok(())
 }

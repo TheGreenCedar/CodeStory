@@ -18,8 +18,8 @@ sequenceDiagram
     Launcher->>CLI: use verified matching executable when present
     alt executable is missing or incompatible
         Launcher-->>Host: expose fail-open tool catalog and diagnostics
-        Launcher->>Release: fetch archive and SHA256SUMS
-        Launcher->>Launcher: bounded download, safe extraction, checksum and version checks
+        Launcher->>Release: fetch archive, SHA256SUMS, and release manifest
+        Launcher->>Launcher: bounded download, manifest binding, safe extraction, checksum and version checks
         Launcher->>CLI: validate stdio initialize
     end
     Launcher->>CLI: hand off requests without host restart
@@ -29,6 +29,30 @@ Provisioning is single-flight and bounded. A failed or incomplete download is
 not installed as current. The launcher may download the version-matched
 executable; the executable never downloads an embedding model, accelerator
 backend, helper executable, or retrieval service.
+
+### What the archive digests do and do not prove
+
+Two independent records name the archive the launcher installs, and neither is
+a signature.
+
+- The **source pin** in `plugins/codestory/cli-version.json` carries archive
+  digests only when the plugin fast lane pinned an already published CLI. That
+  pin ships inside the reviewed plugin package, so it is a record from a
+  different channel than the download. A native release cannot carry one: its
+  archives are built from the very tree that would hold the digests.
+- The **release manifest** (`codestory-release-manifest.json`) is generated
+  from the archives a release built, carries the release identity and each
+  target's filename, byte length, and SHA-256, and is attached to the release.
+  The launcher fetches it and holds the downloaded archive against it *before*
+  extracting. A release published before the manifest existed carries none;
+  the launcher records that absence rather than treating it as agreement.
+
+Because the manifest travels over the same channel as the archive it
+describes, it is corruption and drift detection, not authentication. Until the
+manifest is signed, the containment for a native release is: an exact
+repository commit pinned in the marketplace catalog over TLS, plus
+`SHA256SUMS.txt` and manifest digests. Signature verification is not shipped,
+and nothing in this repository claims it is.
 
 The fail-open catalog prevents installation work from looking like a missing
 plugin. It keeps diagnostics and the complete tool schema visible while the
@@ -43,6 +67,41 @@ revalidates that receipt before treating the CLI as a local-development
 override. A declared but invalid receipt, or a receipt combined with the raw
 `CODESTORY_CLI` override, fails closed and cannot fall through to managed
 release provisioning.
+
+## Wire compatibility
+
+`codestory_contracts::wire` owns two identities the launcher and the native
+process must agree on: the `_meta.codestory_publication` schema version and the
+MCP protocol revisions the executable implements. The generated MCP catalog
+records both, read back out of the real binary, so the launcher's mirrored
+constants are pinned to the CLI it ships with.
+
+`initialize` negotiates. The server answers with a revision it implements and
+reports the requested revision, the negotiated revision, the supported set, and
+whether they agree in `_meta.codestory_protocol`. It never echoes an
+unimplemented revision back as supported.
+
+The launcher answers `initialize` for the host and suppresses the native
+process's own answer, so the answer the host reads at handshake is the
+launcher's. It stamps that answer with its own `_meta.codestory_publication`:
+the same schema and minimum-compatible versions the launcher pins, with
+`served_from=contract_only` because no publication identity exists at session
+start, and a `contract_runtime` recording the launcher's half of the pinned pair
+(`pinned_pair_matches` is `null` while no CLI is resolved, which is "cannot
+compare", not "mismatch"). Without that stamp the packaged handshake would read
+as a legacy v0 producer whatever the pinned runtime implements.
+
+Being the only reader of the native answer, the launcher compares the
+negotiated revision and the publication schema version against its pinned
+contract. A stamp that is absent (legacy v0), unreadable, older than the
+launcher's minimum, or newer than it understands refuses the handoff: the
+runtime is shut down, every delegated request already in flight is answered with
+a typed `runtime_wire_contract_skew` failure, nothing that runtime wrote is
+relayed to the host, and the fail-open diagnostic reports the skew as the
+degraded reason. Provisioning applies the same check
+before staging an archive. Released pairs always match; the documented
+`CODESTORY_CLI` override is the one supported way to skew them, and this
+comparison is the only detector that channel leaves available.
 
 ## Request routing
 

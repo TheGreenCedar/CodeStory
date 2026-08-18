@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 from .contract_primitives import sha256, write_json
+from .candidate_installation import _managed_manifest as _candidate_managed_manifest
 from .foundation import ProofFailure, require
 from .managed_layout import (
     MANAGED_MANIFEST_NAME,
@@ -50,6 +51,7 @@ def _managed_manifest(package_root: Path) -> dict:
         "archive": _archive_name(),
         "archive_url": f"candidate-archive:{'d' * 64}",
         "archive_sha256": "d" * 64,
+        "archive_bytes": 4096,
         "target": _TARGET,
         "stdio_initialize_verified": True,
         "provisioned_at": f"candidate-proof:{'1' * 40}",
@@ -158,6 +160,8 @@ def _manifest_divergence_rejection_test(root: Path) -> None:
         ("foreign archive name", {"archive": managed_archive_name("9.9.9", _TARGET)}),
         ("foreign target", {"target": "linux-x64"}),
         ("unverified stdio handshake", {"stdio_initialize_verified": False}),
+        ("missing archive bytes", {"archive_bytes": None}),
+        ("nonpositive archive bytes", {"archive_bytes": 0}),
     ]
     for label, overrides in hostile_manifests:
         write_json(manifest_path, {**json.loads(json.dumps(valid_manifest)), **overrides})
@@ -177,6 +181,24 @@ def _manifest_divergence_rejection_test(root: Path) -> None:
         raise ProofFailure("managed manifest without its staged launcher was accepted")
 
 
+def _candidate_manifest_archive_size_test(root: Path) -> None:
+    archive = root / _archive_name()
+    archive.write_bytes(b"candidate-archive-bytes")
+    manifest = _candidate_managed_manifest(
+        archive,
+        {
+            "asset_target": _TARGET,
+            "binary": {"sha256": "a" * 64},
+            "source": {"commit": "1" * 40},
+        },
+        _VERSION,
+    )
+    require(
+        manifest["archive_bytes"] == archive.stat().st_size,
+        "candidate managed manifest did not bind the exact archive byte length",
+    )
+
+
 def run_managed_layout_self_tests() -> None:
     with tempfile.TemporaryDirectory(prefix="codestory-managed-layout-") as raw:
         root = Path(raw)
@@ -184,3 +206,4 @@ def run_managed_layout_self_tests() -> None:
         _nested_staging_rejection_test(root)
         _package_root_hostiles_test(root)
         _manifest_divergence_rejection_test(root)
+        _candidate_manifest_archive_size_test(root)

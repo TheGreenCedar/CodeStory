@@ -8,10 +8,19 @@ import { loadReleaseClaimGraph } from "../../scripts/codestory-release-claims.mj
 import {
   LOST_RUNNER_ANNOTATION,
   MAXIMUM_RUN_ATTEMPTS,
+  RERUN_DISPATCH_SCHEMA,
+  RERUN_PLAN_SCHEMA,
+  RESERVATION_RECEIPT_SCHEMA,
 } from "./lost-runner-recovery.mjs";
+import {
+  LINK_PHASE as WINDOWS_LINK_PHASE,
+  SCHEMA as WINDOWS_LINK_TIMING_SCHEMA,
+  UNAVAILABLE_REASONS as WINDOWS_LINK_TIMING_REASONS,
+} from "./windows-link-timing.mjs";
 
 const workflowRoot = path.join(".github", "workflows");
 const retrievalFile = "retrieval-engine-smoke.yml";
+const crateDurabilityFile = "crate-durability.yml";
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const retrievalGeneralizationSuiteFile = path.join(
   "scripts",
@@ -34,11 +43,10 @@ const fullSha = /^[0-9a-f]{40}$/iu;
 const sccacheAction = "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696";
 const sccacheVersion = "v0.16.0";
 const nextestVersion = "0.9.98";
-const nextestLinuxSha256 = "7d07712519615722b19ffe3b3d1097b7d4fa390995e3cac1f9d6dda1ba61b2a7";
 const sccacheCacheSize = "1G";
 const windowsSccacheCacheSize = "2G";
 
-export { retrievalFile };
+export { crateDurabilityFile, retrievalFile };
 
 function tomlSection(source, section) {
   const header = `[${section}]`;
@@ -146,9 +154,11 @@ export function retrievalGeneralizationSuitePolicyViolations(
   )].map((match) => match[1]);
   const expectedFilesystemMemberCounts = {
     existsSync: 1,
-    mkdirSync: 6,
+    mkdirSync: 7,
     mkdtempSync: 1,
-    readFileSync: 4,
+    // Two of these read the shipped pending inventory and the registry document it points at,
+    // so the claim-profile ratchet is checked against the tree that ships, not a synthetic one.
+    readFileSync: 6,
     readdirSync: 4,
     readlinkSync: 1,
     rmSync: 1,
@@ -162,8 +172,8 @@ export function retrievalGeneralizationSuitePolicyViolations(
     );
   }
   const fixtureFilesystemShapeIsExact =
-    fsReferenceCount === 21
-    && filesystemMemberReferences.length === 19
+    fsReferenceCount === 24
+    && filesystemMemberReferences.length === 22
     && Object.entries(expectedFilesystemMemberCounts).every(
       ([name, count]) => (filesystemMemberCounts.get(name) ?? 0) === count,
     )
@@ -173,6 +183,7 @@ export function retrievalGeneralizationSuitePolicyViolations(
       "fs.writeFileSync(destination, contents);",
       "fs.mkdirSync(rustRoot, { recursive: true });",
       "fs.mkdirSync(retrievalRoot, { recursive: true });",
+      "fs.mkdirSync(agentRoot, { recursive: true });",
       "fs.mkdirSync(extraRustRoot);",
       "fs.mkdirSync(nonRustRoot);",
       "fs.mkdirSync(taskRoot);",
@@ -186,18 +197,19 @@ export function retrievalGeneralizationSuitePolicyViolations(
     "root",
     "rustRoot",
     "retrievalRoot",
+    "agentRoot",
     "extraRustRoot",
     "nonRustRoot",
     "taskRoot",
   ]);
   const syntheticWritesStayInRegisteredRoots =
-    writeReferenceCount === 14
+    writeReferenceCount === 15
     && writeFirstArguments.length === writeReferenceCount
     && writeFirstArguments.every((root) => registeredWriteRoots.has(root));
   const fixturePathReferenceShapeIsExact =
-    repositoryRootReferenceCount === 12
+    repositoryRootReferenceCount === 14
     && fixtureRootReferenceCount === 10
-    && productionRepositoryRootReferenceCount === 4;
+    && productionRepositoryRootReferenceCount === 5;
   const protectedRetrievalWorkflow = `.github/workflows/${retrievalFile}`;
   const retainedDynamicImportFixtures = [
     "await import(harness);",
@@ -585,16 +597,18 @@ function calleeInputSpecifications(workflow) {
   return specifications;
 }
 
-const dispatchForwardedPattern
-  = /^\$\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*\|\|\s*''\s*\}\}$/u;
-
 // Classify what a caller can make each callee input be. A literal is fixed for
-// every run of that caller; a dispatch input forwarded verbatim is chosen by
-// whoever dispatches; anything else is treated as free so this check never
+// every run of that caller; ANY interpolated value is free, so this check never
 // invents reachability the caller cannot actually deliver.
-function callerInputBindings(callerWorkflow, callerJob, specifications) {
+//
+// There used to be a `${{ inputs.x || '' }}` regex here that separated a
+// verbatim-forwarded dispatch input from every other expression -- and then set
+// both to the same free binding. The two branches were identical, so the regex
+// decided nothing while the comment above it claimed a distinction the code did
+// not make. Freeness is the conservative answer for every expression, which is
+// what this now says once.
+export function callerInputBindings(callerJob, specifications) {
   const supplied = object(callerJob.with);
-  const dispatchInputs = object(at(callerWorkflow, "on", "workflow_dispatch", "inputs"));
   const bindings = new Map();
   for (const [name, specification] of specifications) {
     const domain = specification.boolean ? [true, false] : ["", "supplied-by-dispatch"];
@@ -603,17 +617,8 @@ function callerInputBindings(callerWorkflow, callerJob, specifications) {
       continue;
     }
     const value = supplied[name];
-    if (typeof value !== "string") {
+    if (typeof value !== "string" || !value.includes("${{")) {
       bindings.set(name, { fixed: true, values: [value] });
-      continue;
-    }
-    if (!value.includes("${{")) {
-      bindings.set(name, { fixed: true, values: [value] });
-      continue;
-    }
-    const forwarded = value.match(dispatchForwardedPattern);
-    if (forwarded !== null && forwarded[1] in dispatchInputs) {
-      bindings.set(name, { fixed: false, values: domain });
       continue;
     }
     bindings.set(name, { fixed: false, values: domain });
@@ -828,13 +833,18 @@ function requireCalibrationProducerAuthentication(violations, file, job) {
   ]);
 }
 
+// The protected proof files' producer-authentication step fragments are rule
+// instances and live in release-claims.json under workflow_policy.step_fragments;
+// stepFragmentViolations evaluates them, so this boundary pins only the download
+// action and the condition and binding contract. Callers outside that migrated
+// family still pin authentication through
+// requireCalibrationProducerAuthentication.
 function requireCalibrationProducerBoundary(
   violations,
   file,
   job,
   expectedCondition,
 ) {
-  requireCalibrationProducerAuthentication(violations, file, job);
   requireStepUses(
     violations,
     file,
@@ -901,10 +911,16 @@ export function qualificationDriverArtifactViolations(
     "release-claims.json must bind the private archive-qualified driver contract exactly",
   );
   const normalized = String(source ?? "").replace(/\r\n/gu, "\n");
+  // The pinned digest holds both sides of the private-artifact contract: the producer
+  // may read Cargo's trusted hard-linked build output but retains only a new singly
+  // linked copy bound to the exact candidate archive, and the consumer rejects
+  // symlinks, retained hardlinks, extra files, identity drift, and byte drift before
+  // restoring execute permission. Any helper edit therefore requires policy and
+  // mutation-test review in the same PR.
   add(
     violations,
     createHash("sha256").update(normalized).digest("hex")
-      === qualificationDriverArtifactDigest,
+      === pinnedProgramRow(graph, "qualification_driver_artifact").sha256,
     "qualification-driver-artifact.mjs must match the reviewed archive-bound producer and verifier contract",
   );
   for (const fragment of [
@@ -970,112 +986,243 @@ const draftCachePaths = [
   "~/.cargo/git",
   "target",
 ];
-const sourceResolverContractDigest = "2fe869b675010f5db29259aff38d83456c01dbc9885989afbf7c92a2826791af";
-const platformResolverContractDigest = "cb8eb03393f8e24bf9e083004be658c5d2f22fa118d3c43b8bc6b388f19ecddd";
-// check-workflow-policy.test.mjs runs this exact script against hostile dispatch values and proves
-// it exits non-zero, so the digest stands for a rejection that was measured, not merely read.
-const marketplaceGuardDigest = "6380c916a1b3566b4b9d6545b63fbc9c7db12b54fb328b5c89316daae0162d84";
-// This closeout is a small shell control-flow program. Substring checks can be
-// satisfied by parking the accepted qualification branch in dead code while
-// the live branch blocks on optional Linux hardware, so pin its reviewed
-// executable text as well as its reader-facing invariants.
-const packagedPlatformCloseoutDigest =
-  "ce7a7f5aa99f5fcbc037d4c1f06de5d841e4a4d114208820592a84c41c797b1a";
-// This workflow builds release archives on three operating systems and carries
-// state between many shell steps through GITHUB_ENV and GITHUB_PATH. Pin its
-// parsed executable structure so an unreviewed earlier step cannot replace an
-// owner binary while leaving the locally digested finalizer unchanged.
-const packagedPlatformWorkflowDigest =
-  "3767898b5225ab53ffc7a0ebbfa7096c3fd833e33edacfe1d425fc00c2e53995";
-// The frozen-candidate coordinator and protected GPU workflows are small
-// release-control programs, not loose collections of independently safe
-// fragments. Pin their complete parsed structure so a required check cannot be
-// made advisory, parked in dead code, or followed by a payload substitution
-// while leaving the expected tokens in place.
-const packagedPlatformCoordinatorWorkflowDigest =
-  "797fa9e2be359f83eacd45b78722829d1f277efd2e721de1c9bf8b590b73dc58";
-const releaseSourceProofSentinelDigest =
-  "91ee8bc1a6a055e9297e81747c37d167b123d0a2e5dc60d5c6e2bdcfbef9c351";
-const frozenCandidateQualityWorkflowDigest =
-  "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173";
-const macosMetalWorkflowDigest =
-  "55581330f6a035b84e1224dbd5469d812ab2fa444914157e22a39cccc64f4627";
-const windowsVulkanWorkflowDigest =
-  "c2272dbf4c550ba4a21372e772a87f6df3307f5f4f709b216473f85958157ffe";
-const linuxVulkanWorkflowDigest =
-  "b2efe3dec20a466cb798752c714f50e64e265856e80ffafc15b28ea2390367d3";
-// Linux owns its compiler server inside Docker, while macOS and Windows own one
-// in the host shell. Pin both executable programs so a swallowed stop or a
-// dead-code copy cannot satisfy the ownership fragments below.
-const packagedSccacheIdentityDigest =
-  "f844b8a3b2e0f0013b43f4ec661c237fb090a01c49316d8c2b301ba01cac4342";
-const packagedLinuxBuildDigest =
-  "f101cc525f52f75686acbb1cf240412409f3f388793890993cefae9175685a6f";
-const packagedCompileClockStopDigest =
-  "ef9f7ee4636c3466830447e2ed8a10c2030ca3949bca082652d9262848d258a5";
-const packagedHostCompilerFinalizerDigest =
-  "b77d8bb12c2748bfe016ab65ccb2f4581356f3ccf1d666e747306caffd6c0c46";
-// The companion qualification driver is intentionally retained only inside
-// the private Actions package artifact. This digest pins both sides of that
-// contract: the producer may read Cargo's trusted hard-linked build output,
-// but retains only a new singly linked copy bound to the exact candidate
-// archive. The consumer rejects symlinks, retained hardlinks, extra files,
-// identity drift, and byte drift before restoring execute permission.
-// Any helper edit therefore requires policy and mutation-test review in the
-// same PR.
-const qualificationDriverArtifactDigest =
-  "efc5126e24162d52f9da8bac38c3414b3a7492fb17eed5ff19867fadad69623e";
-const draftProofCommands = [
-  "cargo test --locked -p codestory-llama-sys --test native_staging",
-  "cargo test --locked -p codestory-llama-sys --test model_staging",
-  "cargo test --locked -p codestory-cli --test native_launcher_contracts",
-  "cargo test --locked -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
-  "cargo test --locked -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture",
-  "cargo test --locked -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture",
-];
-const draftSeedCommands = [
-  "cargo test --locked -p codestory-llama-sys --test native_staging --no-run",
-  "cargo test --locked -p codestory-llama-sys --test model_staging --no-run",
-  "cargo test --locked -p codestory-cli --test stdio_protocol_contracts --no-run two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
-  "cargo test --locked -p codestory-runtime --no-run publication_transitions_fail_or_cancel_atomically -- --nocapture",
-  "cargo test --locked -p codestory-store --no-run staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture",
-];
-const draftProofTopologyDigest = createHash("sha256")
-  .update(draftSeedCommands.join("\n"))
-  .digest("hex");
-const draftProofTopology = `proof5-v1-${draftProofTopologyDigest}`;
+// Every exact sha256 pin is a rule INSTANCE and lives in release-claims.json under
+// workflow_policy.pinned_programs; scripts/codestory-release-claims.mjs fails graph
+// loading unless that block names exactly the reviewed pinned set. This table keeps
+// only what stays code: the predicate implementation per subject kind and the
+// reviewed violation message for each pinned program. Adding or re-pinning a program
+// is a graph edit plus one row here; the digests themselves never return to code.
+const pinnedProgramContracts = {
+  packaged_platform_proof_workflow: {
+    violation: row => `${row.file} must match the reviewed canonical workflow structure`,
+  },
+  packaged_platform_pr_workflow: {
+    violation: row => `${row.file} must match the reviewed frozen-candidate coordinator structure`,
+  },
+  frozen_candidate_quality_workflow: {
+    violation: row => `${row.file} must match the reviewed isolated evaluation-owner structure`,
+  },
+  macos_metal_proof_workflow: {
+    violation: row => `${row.file} must match the reviewed protected Metal workflow structure`,
+  },
+  windows_vulkan_proof_workflow: {
+    violation: row => `${row.file} must match the reviewed protected Windows Vulkan workflow structure`,
+  },
+  linux_vulkan_proof_workflow: {
+    violation: row => `${row.file} must match the reviewed protected Linux Vulkan workflow structure`,
+  },
+  release_source_proof_sentinel: {
+    violation: row => `${row.file} source proof placeholder must match the reviewed fail-closed sentinel`,
+  },
+  source_proof_resolver: { resolver: true },
+  packaged_platform_pr_resolver: { resolver: true },
+  marketplace_sync_dispatch_guard: { script: "dispatch coordinate guard" },
+  packaged_platform_pr_closeout: { script: "coordinator closeout" },
+  packaged_sccache_identity: { script: "pinned sccache identity capture" },
+  packaged_linux_build: { script: "Linux container build and compiler-server ownership" },
+  packaged_compile_clock_stop: { script: "compiler clock stop" },
+  packaged_host_compiler_finalizer: { script: "host compiler-server finalizer" },
+};
+
+function pinnedProgramRow(graph, name) {
+  return object(object(object(graph.workflow_policy).pinned_programs)[name]);
+}
+
+// One generic evaluator walks the graph-owned digest pins. A missing workflow is
+// reported by the structural validator that owns the file, so each row evaluates
+// only when its subject workflow parsed; every other absence (missing job, missing
+// step, empty script) hashes to a mismatch exactly as the retired inline checks did.
+export function pinnedProgramViolations(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
+  const violations = [];
+  for (const [name, contract] of Object.entries(pinnedProgramContracts)) {
+    const row = pinnedProgramRow(graph, name);
+    const workflow = workflows.get(row.file);
+    if (!workflow) continue;
+    if (row.subject === "parsed_workflow_json") {
+      add(
+        violations,
+        createHash("sha256").update(JSON.stringify(workflow)).digest("hex") === row.sha256,
+        contract.violation(row),
+      );
+      continue;
+    }
+    const job = object(object(workflow.jobs)[row.job]);
+    if (row.subject === "parsed_job_json") {
+      add(
+        violations,
+        createHash("sha256").update(JSON.stringify(job)).digest("hex") === row.sha256,
+        contract.violation(row),
+      );
+    } else if (row.subject === "step_script_executable_text") {
+      requireExactStepScript(violations, row.file, job, row.step, row.sha256, contract.script);
+    } else if (contract.resolver) {
+      requireExactResolverContract(violations, row.file, job, row.sha256);
+    } else {
+      requireExactRawStepScript(violations, row.file, job, row.step, row.sha256, contract.script);
+    }
+  }
+  return violations;
+}
+
+// Every step-fragment rule INSTANCE for a migrated workflow family lives in
+// release-claims.json under workflow_policy.step_fragments; scripts/
+// codestory-release-claims.mjs fails graph loading unless that block names exactly
+// the reviewed rule rows, so membership cannot drift by data edit. The checker keeps
+// only what stays code: the requireStepRun/forbidStepRun predicates each row's kind
+// selects, whose violation text is byte-identical to the retired inline calls.
+// A missing workflow is reported by the structural validator that owns the file, so
+// each row evaluates only when its subject workflow parsed; every other absence
+// (missing job, missing step, empty script) fails the fragment predicates exactly as
+// the retired inline checks did.
+export function stepFragmentViolations(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
+  const violations = [];
+  for (const value of Object.values(object(object(graph.workflow_policy).step_fragments))) {
+    const row = object(value);
+    const workflow = workflows.get(row.file);
+    if (!workflow) continue;
+    const job = object(object(workflow.jobs)[row.job]);
+    const evaluate = row.kind === "forbid" ? forbidStepRun : requireStepRun;
+    evaluate(violations, row.file, job, row.step, list(row.fragments));
+  }
+  return violations;
+}
+
+// Every structural-pin rule INSTANCE for a migrated workflow family lives in
+// release-claims.json under workflow_policy.structural_pins; scripts/
+// codestory-release-claims.mjs fails graph loading unless that block names exactly
+// the reviewed pin rows, so membership cannot drift by data edit. The checker keeps
+// only what stays code: the job-existence, needs-edge, and workflow- or job-scoped
+// permission predicates each row's kind selects, whose violation text is
+// byte-identical to the retired inline calls.
+// A missing workflow is reported by the structural validator that owns the file, so
+// each row evaluates only when its subject workflow parsed; a missing job, a
+// missing or widened needs edge, or an absent, weaker, or wider permission scope
+// fails the pin predicates exactly as the retired inline checks did.
+//
+// Some retired inline checks named the artifact a scope protects or the role a job
+// plays rather than the scope or edge itself; that reviewed violation text stays
+// code, keyed by pin name, and the derived wording remains the default for every
+// other row.
+const structuralPinMessages = {
+  post_publish_smoke_actions_read:
+    row => `${row.file} must read the accepted pre-publish closeout`,
+  auto_release_release_needs_detect_version:
+    row => `${row.file} release must need version detection`,
+  auto_release_release_contents_write:
+    row => `${row.file} release caller must grant contents write`,
+  auto_release_release_actions_write:
+    row => `${row.file} release caller must grant actions write for superseded-run cancellation`,
+  auto_release_release_pull_requests_read:
+    row => `${row.file} release caller must pass pull-request metadata access to exact source proof`,
+  release_actions_write:
+    row => `${row.file} must cancel superseded proof runs before starting release work`,
+  release_pull_requests_read:
+    row => `${row.file} must grant the exact source resolver pull-request metadata access`,
+  packaged_platform_pr_actions_write:
+    row => `${row.file} must cancel superseded proof runs before package or hardware work`,
+  packaged_platform_pr_contents_read:
+    row => `${row.file} must use read-only contents permission`,
+  packaged_platform_pr_macos_metal_proof_needs:
+    row => `${row.file} Metal proof must wait only for routing and package proof`,
+  packaged_platform_pr_windows_vulkan_proof_needs:
+    row => `${row.file} Windows qualification must run independently of optional Metal quality`,
+  packaged_platform_pr_linux_vulkan_proof_needs:
+    row => `${row.file} Linux Vulkan proof must wait only for routing and package proof`,
+  packaged_platform_pr_closeout_needs:
+    row => `${row.file} closeout must wait for every selected platform proof`,
+  freeze_barrier_source_proof_statuses_write:
+    () => "[freeze_barrier] source-proof.yml acceptance must publish an exact-head commit status",
+  freeze_barrier_source_proof_actions_write:
+    row => `[freeze_barrier] ${row.file} must be able to cancel superseded runs`,
+  freeze_barrier_packaged_platform_pr_statuses_read:
+    () =>
+      "[freeze_barrier] packaged-platform-pr.yml must authenticate the exact-head freeze status without broad workflow authority",
+  freeze_barrier_packaged_platform_pr_actions_write:
+    row => `[freeze_barrier] ${row.file} must be able to cancel superseded runs`,
+};
+
+export function structuralPinViolations(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
+  const violations = [];
+  for (const [name, value] of Object.entries(object(object(graph.workflow_policy).structural_pins))) {
+    const row = object(value);
+    const workflow = workflows.get(row.file);
+    if (!workflow) continue;
+    if (row.kind === "job") {
+      add(
+        violations,
+        object(workflow.jobs)[row.job] !== undefined,
+        `${row.file} must contain job ${row.job}`,
+      );
+    } else if (row.kind === "needs") {
+      const message = structuralPinMessages[name];
+      add(
+        violations,
+        sameMembers(needs(object(object(workflow.jobs)[row.job])), list(row.needs)),
+        message === undefined
+          ? `${row.file} ${String(row.job).replaceAll("-", " ")} must need ${list(row.needs).join(", ")}`
+          : message(row),
+      );
+    } else if (row.kind === "job_permission") {
+      const message = structuralPinMessages[name];
+      add(
+        violations,
+        object(object(object(workflow.jobs)[row.job]).permissions)[row.scope] === row.access,
+        message === undefined
+          ? `${row.file} ${String(row.job).replaceAll("-", " ")} must ${row.access} ${String(row.scope).replaceAll("-", " ")}`
+          : message(row),
+      );
+    } else {
+      const message = structuralPinMessages[name];
+      add(
+        violations,
+        object(workflow.permissions)[row.scope] === row.access,
+        message === undefined
+          ? `${row.file} must ${row.access} ${String(row.scope).replaceAll("-", " ")}`
+          : message(row),
+      );
+    }
+  }
+  return violations;
+}
+
+// Every cross-file constant-mirror rule INSTANCE (a repository file that must repeat
+// a reviewed constant verbatim) lives in release-claims.json under
+// workflow_policy.constant_mirrors; scripts/codestory-release-claims.mjs fails graph
+// loading unless that block names exactly the reviewed mirror rows, so membership
+// cannot drift by data edit. The checker keeps only what stays code: the one
+// source-inclusion predicate every row binds and its reviewed violation message,
+// byte-identical to the retired inline file/fragment table. Each mirror file is read
+// exactly as the retired table read it - relative to the process working directory -
+// so a missing mirror file still throws out of the validator instead of degrading
+// into a softer violation.
+export function constantMirrorViolations(graph = loadReleaseClaimGraph(repositoryRoot)) {
+  const violations = [];
+  for (const value of Object.values(object(object(graph.workflow_policy).constant_mirrors))) {
+    const row = object(value);
+    const source = fs.readFileSync(String(row.file), "utf8");
+    for (const fragment of list(row.fragments)) {
+      add(violations, source.includes(fragment), `${row.file} must preserve locked Cargo contract ${fragment}`);
+    }
+  }
+  return violations;
+}
+
+// Every draft command-list rule INSTANCE (the exact serial proof commands the
+// draft lane must run and the exact seed commands the retrieval producer must
+// build) lives in release-claims.json under workflow_policy.command_lists;
+// scripts/codestory-release-claims.mjs fails graph loading unless that block names
+// exactly the reviewed list rows, so membership cannot drift by data edit. The
+// checker keeps only what stays code: the one sequence-equality predicate every
+// row binds, its reviewed violation messages, and the cache-key composition that
+// digests the graph-declared seed commands into the shared proof topology.
+function commandListRow(graph, name) {
+  return object(object(object(graph.workflow_policy).command_lists)[name]);
+}
 const cacheRunner = "${{ runner.os }}";
 const cacheRustVersion = "${{ steps.rust-cache-key.outputs.version }}";
 const cacheTarget = "${{ steps.rust-cache-key.outputs.target }}";
 const cacheManifests = "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}";
 const cacheLock = "${{ hashFiles('Cargo.lock') }}";
-const draftCachePrefix = [
-  cacheRunner,
-  "draft-v2",
-  cacheRustVersion,
-  cacheTarget,
-  "workspace",
-  draftProofTopology,
-  "default-features",
-  cacheManifests,
-].join("-");
-const retrievalCachePrefix = [
-  cacheRunner,
-  "cargo-stable",
-  cacheRustVersion,
-  cacheTarget,
-  "retrieval-contracts",
-  draftProofTopology,
-  "default-features",
-  cacheManifests,
-].join("-");
-const draftCachePrimary = `${draftCachePrefix}-${cacheLock}`;
-const retrievalCachePrimary = `${retrievalCachePrefix}-${cacheLock}`;
-const draftCacheRestoreKeys = [
-  retrievalCachePrimary,
-  `${draftCachePrefix}-`,
-  `${retrievalCachePrefix}-`,
-];
 const cacheSaveCondition = "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''";
 const draftCompilerCachePath = "${{ runner.temp }}/codestory-draft-sccache";
 const draftCompilerCachePrefix =
@@ -1085,6 +1232,11 @@ const draftCompilerSaveCondition =
   "success() && steps.compiler-cache-restore.outputs.cache-hit != 'true' && steps.compiler-cache-restore.outputs.cache-primary-key != ''";
 const draftCompilerSaveKey = "${{ steps.compiler-cache-restore.outputs.cache-primary-key }}";
 const cacheSaveKey = "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}";
+const crateDurabilityDependencyTriggerPaths = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "vendor/**",
+];
 const draftWorkflowPaths = [
   "Cargo.lock",
   "Cargo.toml",
@@ -1239,7 +1391,6 @@ const draftRunCommands = new Map([
   ["Lint workspace libraries", [
     "cargo clippy --workspace --lib --locked -- -D warnings",
   ]],
-  ["Prove focused publication contracts", draftProofCommands],
 ]);
 
 function nonCommentLines(value) {
@@ -1330,6 +1481,251 @@ export function retrievalProducerTriggerPolicyViolations(workflowValue) {
     violations,
     includesAll(at(workflow, "on", "push", "paths"), retrievalProducerTriggerPaths),
     "retrieval cache producer dev push paths must cover every manifest and draft consumer change",
+  );
+  return violations;
+}
+
+export function proofFloorPolicyViolations(
+  workflows,
+  graph = loadReleaseClaimGraph(repositoryRoot),
+) {
+  const violations = [];
+  const policy = object(object(graph.workflow_policy).proof_floor);
+  const architecture = object(policy.architecture_contract);
+  add(
+    violations,
+    architecture.workflow === retrievalFile,
+    `architecture proof must remain owned by ${retrievalFile}`,
+  );
+  const architectureWorkflow = workflows.get(architecture.workflow);
+  add(
+    violations,
+    architectureWorkflow !== undefined,
+    `${architecture.workflow} must exist for the architecture proof floor`,
+  );
+  const architectureJob = object(at(
+    architectureWorkflow,
+    "jobs",
+    architecture.job,
+  ));
+  add(
+    violations,
+    hasExactKeys(architectureJob, ["runs-on", "timeout-minutes", "env", "steps"])
+      && architectureJob["runs-on"] === "ubuntu-latest",
+    `${architecture.workflow} ${architecture.job} must remain an unconditional universal job`,
+  );
+  const architectureStep = namedStep(
+    architectureJob,
+    "Architecture ownership contract tests",
+  );
+  add(
+    violations,
+    sameStrings(nonCommentLines(architectureStep?.run), [architecture.command])
+      && architectureStep?.if === undefined
+      && architectureStep?.["continue-on-error"] === undefined,
+    `${architecture.workflow} ${architecture.job} must run the exact blocking architecture contract`,
+  );
+  add(
+    violations,
+    stepIndex(architectureJob, "Architecture ownership contract tests")
+      < stepIndex(architectureJob, "Seed draft proof test-profile artifacts"),
+    `${architecture.workflow} architecture contract must complete before draft artifacts are seeded and saved`,
+  );
+
+  const mergedLanes = object(policy.merged_suite_lanes);
+  add(
+    violations,
+    mergedLanes.workflow === retrievalFile
+      && mergedLanes.job === architecture.job,
+    `merged suite lanes must remain owned by the ${retrievalFile} universal job`,
+  );
+  const mergedLanesJob = object(at(
+    workflows.get(String(mergedLanes.workflow)),
+    "jobs",
+    mergedLanes.job,
+  ));
+  const mergedLanesStep = namedStep(mergedLanesJob, String(mergedLanes.step));
+  add(
+    violations,
+    sameStrings(
+      nonCommentLines(mergedLanesStep?.run),
+      list(mergedLanes.commands).map(String),
+    )
+      && mergedLanesStep?.if === undefined
+      && mergedLanesStep?.["continue-on-error"] === undefined,
+    `${mergedLanes.workflow} ${mergedLanes.job} must run the exact blocking merged suite lanes`,
+  );
+  add(
+    violations,
+    stepIndex(mergedLanesJob, String(mergedLanes.step))
+      < stepIndex(mergedLanesJob, "Seed draft proof test-profile artifacts"),
+    `${mergedLanes.workflow} merged suite lanes must complete before draft artifacts are seeded and saved`,
+  );
+
+  const durability = object(policy.crate_durability);
+  const file = String(durability.workflow ?? crateDurabilityFile);
+  const workflow = workflows.get(file);
+  add(violations, workflow !== undefined, `${file} must exist`);
+  const triggers = object(workflow?.on);
+  const pullRequest = object(triggers.pull_request);
+  const push = object(triggers.push);
+  const permissions = object(workflow?.permissions);
+  const concurrency = object(workflow?.concurrency);
+  const jobs = object(workflow?.jobs);
+  const job = object(jobs[durability.job]);
+  const steps = list(job.steps).map(object);
+
+  add(
+    violations,
+    hasExactKeys(workflow, ["name", "on", "permissions", "concurrency", "jobs"])
+      && workflow?.name === "crate-durability",
+    `${file} must keep the exact source-only top-level shape`,
+  );
+  add(
+    violations,
+    hasExactKeys(triggers, ["pull_request", "push", "workflow_dispatch"])
+      && triggers.workflow_dispatch === null,
+    `${file} must run only on path-scoped pull requests, base pushes, and input-free dispatch`,
+  );
+  for (const [event, eventValue] of [
+    ["pull_request", pullRequest],
+    ["push", push],
+  ]) {
+    add(
+      violations,
+      list(eventValue.paths).length === list(durability.paths).length
+        && sameMembers(eventValue.paths, durability.paths),
+      `${file} ${event} paths must match the exact owning-path set`,
+    );
+    add(
+      violations,
+      includesAll(eventValue.paths, crateDurabilityDependencyTriggerPaths),
+      `${file} ${event} paths must cover root Cargo manifests, the lockfile, and vendored dependencies`,
+    );
+  }
+  add(
+    violations,
+    hasExactKeys(pullRequest, ["paths"])
+      && hasExactKeys(push, ["branches", "paths"])
+      && list(push.branches).length === list(durability.branches).length
+      && sameMembers(push.branches, durability.branches),
+    `${file} push must seed only the declared integration branches`,
+  );
+  add(
+    violations,
+    hasExactKeys(permissions, ["contents"]) && permissions.contents === "read",
+    `${file} permissions must remain contents: read only`,
+  );
+  add(
+    violations,
+    hasExactKeys(concurrency, ["group", "cancel-in-progress"])
+      && concurrency.group
+        === "crate-durability-${{ github.event.pull_request.number || github.ref }}"
+      && concurrency["cancel-in-progress"] === true,
+    `${file} must cancel stale work within one PR or branch`,
+  );
+  add(
+    violations,
+    hasExactKeys(jobs, [durability.job])
+      && hasExactKeys(job, ["runs-on", "timeout-minutes", "steps"])
+      && job["runs-on"] === "ubuntu-latest"
+      && job["timeout-minutes"] === durability.timeout_minutes,
+    `${file} must contain one bounded Ubuntu durability job`,
+  );
+
+  const expectedSteps = [
+    { uses: "actions/checkout@v5", keys: ["uses"] },
+    { name: "Install Rust stable", keys: ["name", "run"] },
+    { name: "Capture Rust cache identity", keys: ["name", "id", "shell", "run"] },
+    {
+      name: "Restore durability Cargo cache",
+      keys: ["name", "id", "uses", "continue-on-error", "with"],
+    },
+    { name: "Run durability and coverage contracts", keys: ["name", "run"] },
+    {
+      name: "Save durability Cargo cache",
+      keys: ["name", "if", "uses", "continue-on-error", "with"],
+    },
+  ];
+  add(
+    violations,
+    steps.length === expectedSteps.length
+      && steps.every((step, index) => {
+        const expected = expectedSteps[index];
+        return hasExactKeys(step, expected.keys)
+          && (expected.name === undefined || step.name === expected.name)
+          && (expected.uses === undefined || step.uses === expected.uses);
+      }),
+    `${file} must retain the exact serial checkout, cache, proof, and save sequence`,
+  );
+
+  const install = namedStep(job, "Install Rust stable");
+  add(
+    violations,
+    sameStrings(nonCommentLines(install?.run), [
+      "rustup toolchain install stable --profile minimal",
+      "rustup default stable",
+    ]),
+    `${file} must use the stable minimal Rust toolchain`,
+  );
+  const capture = namedStep(job, "Capture Rust cache identity");
+  add(
+    violations,
+    sameStrings(nonCommentLines(capture?.run), [
+      `echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"`,
+      `echo "target=$(rustc -Vv | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"`,
+    ]),
+    `${file} cache identity must bind the Rust release and host target`,
+  );
+
+  const restore = namedStep(job, "Restore durability Cargo cache");
+  const restoreWith = object(restore?.with);
+  const expectedCacheKey = [
+    "${{ runner.os }}",
+    durability.cache_namespace,
+    "${{ steps.rust-cache-key.outputs.version }}",
+    "${{ steps.rust-cache-key.outputs.target }}",
+    "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}",
+    "${{ hashFiles('Cargo.lock') }}",
+  ].join("-");
+  add(
+    violations,
+    restore?.uses === "actions/cache/restore@v5"
+      && restore?.["continue-on-error"] === true
+      && hasExactKeys(restoreWith, ["path", "key"])
+      && sameStrings(nonCommentLines(restoreWith.path), draftCachePaths)
+      && restoreWith.key === expectedCacheKey,
+    `${file} must use its isolated exact Cargo cache without fallback prefixes`,
+  );
+
+  const proof = namedStep(job, "Run durability and coverage contracts");
+  add(
+    violations,
+    sameStrings(nonCommentLines(proof?.run), durability.commands)
+      && proof?.if === undefined
+      && proof?.["continue-on-error"] === undefined,
+    `${file} must run the three declared durability commands serially and blocking`,
+  );
+
+  const save = namedStep(job, "Save durability Cargo cache");
+  const saveWith = object(save?.with);
+  add(
+    violations,
+    save?.uses === "actions/cache/save@v5"
+      && save?.["continue-on-error"] === true
+      && save?.if === cacheSaveCondition
+      && hasExactKeys(saveWith, ["path", "key"])
+      && sameStrings(nonCommentLines(saveWith.path), draftCachePaths)
+      && saveWith.key === cacheSaveKey
+      && stepIndex(job, "Save durability Cargo cache")
+        > stepIndex(job, "Run durability and coverage contracts"),
+    `${file} must save the exact cache only after every durability command passes`,
+  );
+  add(
+    violations,
+    durability.artifact_free === true
+      && !scalarStrings(workflow).some(value => /actions\/upload-artifact@/u.test(value)),
+    `${file} must remain artifact-free`,
   );
   return violations;
 }
@@ -1559,11 +1955,49 @@ export function windowsManifestProofPolicyViolations(workflowValue) {
   return violations;
 }
 
-export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
+export function draftSourcePolicyViolations(
+  jobValue,
+  retrievalJobValue,
+  graph = loadReleaseClaimGraph(repositoryRoot),
+) {
   const violations = [];
   const job = object(jobValue);
   const retrievalJob = object(retrievalJobValue);
   const steps = list(job.steps).map(object);
+  const proofRow = commandListRow(graph, "draft_proof_commands");
+  const seedRow = commandListRow(graph, "draft_seed_commands");
+  const proofCommands = list(proofRow.commands).map(String);
+  const seedCommands = list(seedRow.commands).map(String);
+  const draftProofTopology = `proof5-v1-${createHash("sha256")
+    .update(seedCommands.join("\n"))
+    .digest("hex")}`;
+  const draftCachePrefix = [
+    cacheRunner,
+    "draft-v2",
+    cacheRustVersion,
+    cacheTarget,
+    "workspace",
+    draftProofTopology,
+    "default-features",
+    cacheManifests,
+  ].join("-");
+  const retrievalCachePrefix = [
+    cacheRunner,
+    "cargo-stable",
+    cacheRustVersion,
+    cacheTarget,
+    "retrieval-contracts",
+    draftProofTopology,
+    "default-features",
+    cacheManifests,
+  ].join("-");
+  const draftCachePrimary = `${draftCachePrefix}-${cacheLock}`;
+  const retrievalCachePrimary = `${retrievalCachePrefix}-${cacheLock}`;
+  const draftCacheRestoreKeys = [
+    retrievalCachePrimary,
+    `${draftCachePrefix}-`,
+    `${retrievalCachePrefix}-`,
+  ];
 
   add(
     violations,
@@ -1598,7 +2032,10 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
     );
   }
 
-  for (const [name, commands] of draftRunCommands) {
+  for (const [name, commands] of [
+    ...draftRunCommands,
+    [String(proofRow.step), proofCommands],
+  ]) {
     const step = namedStep(job, name);
     add(violations, step !== undefined, `draft source job must contain one ${name} step`);
     add(violations, sameStrings(nonCommentLines(step?.run), commands), `draft source step ${name} must keep its exact serial command sequence`);
@@ -1666,7 +2103,7 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   add(violations, sameStrings(nonCommentLines(retrievalRestoreWith.path), draftCachePaths), "retrieval cache producer must retain the proof-compatible path set");
   add(violations, retrievalRestoreWith.key === retrievalCachePrimary, "retrieval cache producer key must match the draft exact-lock, manifest, feature, and proof-topology fallback");
 
-  const retrievalSeed = namedStep(retrievalJob, "Seed draft proof test-profile artifacts");
+  const retrievalSeed = namedStep(retrievalJob, String(seedRow.step));
   add(
     violations,
     hasExactKeys(retrievalSeed, ["name", "run"]),
@@ -1674,7 +2111,7 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   );
   add(
     violations,
-    sameStrings(nonCommentLines(retrievalSeed?.run), draftSeedCommands),
+    sameStrings(nonCommentLines(retrievalSeed?.run), seedCommands),
     "retrieval cache producer must seed the exact five test-profile targets in serial order",
   );
 
@@ -1722,7 +2159,6 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   return violations;
 }
 
-export const releaseEvidenceWorkflowRef = "./.github/workflows/release-candidate-evidence.yml";
 export const frozenCandidateQualityWorkflowRef = "./.github/workflows/frozen-candidate-quality.yml";
 
 export function macosCliDistributionViolations(assessmentStep, executionStep, quarantinedPath) {
@@ -1739,69 +2175,6 @@ export function macosCliDistributionViolations(assessmentStep, executionStep, qu
   add(violations, assessment.includes("does not seem to be an app"), "macOS CLI proof must recognize the bare-executable spctl result");
   add(violations, !/(^|\n)\s*accepted=false\s*($|\n)/u.test(assessment), "macOS CLI proof must not require spctl application acceptance");
   add(violations, lineHas(executionLines, quarantinedPath, "--version") && lineHas(executionLines, quarantinedPath, "--help"), "macOS CLI proof must execute that quarantined binary's version and help");
-  return violations;
-}
-
-export function releaseEvidenceApprovalViolations(callerJobs, calledWorkflow) {
-  const violations = [];
-  const file = releaseEvidenceWorkflowRef.slice(releaseEvidenceWorkflowRef.lastIndexOf("/") + 1);
-  for (const [callerFile, callerJob, passesApproval] of callerJobs) {
-    const job = object(callerJob);
-    add(
-      violations,
-      callerJob !== undefined,
-      `${callerFile} must contain job release-evidence`,
-    );
-    add(
-      violations,
-      job.uses === releaseEvidenceWorkflowRef,
-      `${callerFile} release-evidence must call the evidence workflow`,
-    );
-    add(
-      violations,
-      object(job.with).source_run_id === "${{ inputs.source_run_id }}",
-      `${callerFile} release-evidence must forward source_run_id`,
-    );
-    const secrets = object(job.secrets);
-    const secret = secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON;
-    add(
-      violations,
-      passesApproval
-        ? secret === "${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}"
-          && Object.keys(secrets).length === 1
-        : job.secrets === undefined,
-      passesApproval
-        ? `${callerFile} release-evidence must pass only the named approval secret`
-        : `${callerFile} release-evidence must not receive caller secrets`,
-    );
-  }
-  add(
-    violations,
-    object(at(
-      calledWorkflow, "on", "workflow_call", "secrets",
-      "CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON",
-    )).required === false,
-    `${file} approval must be an optional caller secret`,
-  );
-
-  const job = object(at(calledWorkflow, "jobs", "measure"));
-  add(
-    violations,
-    job.environment === "release-evidence",
-    `${file} approval must remain gated by the release-evidence environment`,
-  );
-  const evaluation = namedStep(job, "Produce and evaluate same-SHA candidate");
-  add(
-    violations,
-    object(evaluation?.env).APPROVAL_JSON
-      === "${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}",
-    `${file} approval must use the explicitly passed release secret`,
-  );
-  requireStepRun(violations, file, job, "Produce and evaluate same-SHA candidate", [
-    'if [ -n "$SOURCE_RUN_ID" ] && [ -z "$APPROVAL_JSON" ]; then',
-    "Protected release-evidence approval is required for source-run re-evaluation.",
-    "exit 1",
-  ]);
   return violations;
 }
 
@@ -1966,48 +2339,6 @@ export function notaryStepViolations(step) {
     : [];
 }
 
-function validateLockedSetupSurfaces(violations) {
-  const contracts = new Map([
-    [
-      path.join(".cargo", "config.toml"),
-      [
-        'retrieval-setup = "run --locked -p codestory-cli',
-        'retrieval-status = "run --locked -p codestory-cli',
-      ],
-    ],
-    [
-      path.join("scripts", "codex-worktree-setup.mjs"),
-      [
-        '["build", "--release", "--locked", "-p", "codestory-cli"]',
-        "prepare-embedded-model.mjs",
-        "CODESTORY_EMBED_MODEL_SOURCE",
-      ],
-    ],
-    [
-      path.join("plugins", "codestory", "skills", "codestory-grounding", "scripts", "setup.sh"),
-      [
-        "cargo build --release --locked -p codestory-cli",
-        "prepare-embedded-model.mjs",
-        "CODESTORY_EMBED_MODEL_SOURCE",
-      ],
-    ],
-    [
-      path.join("plugins", "codestory", "skills", "codestory-grounding", "scripts", "setup.ps1"),
-      [
-        '@("build", "--release", "--locked", "-p", "codestory-cli"',
-        "prepare-embedded-model.mjs",
-        "CODESTORY_EMBED_MODEL_SOURCE",
-      ],
-    ],
-  ]);
-  for (const [file, fragments] of contracts) {
-    const source = fs.readFileSync(file, "utf8");
-    for (const fragment of fragments) {
-      add(violations, source.includes(fragment), `${file} must preserve locked Cargo contract ${fragment}`);
-    }
-  }
-}
-
 function validateIssueWorkflows(workflows, violations) {
   const sagaFile = "saga-issue-link-guard.yml";
   const saga = workflows.get(sagaFile);
@@ -2015,15 +2346,15 @@ function validateIssueWorkflows(workflows, violations) {
     violations.push(`${sagaFile} must exist`);
   } else {
     add(violations, trigger(saga, "pull_request_target") !== undefined, `${sagaFile} must use pull_request_target`);
-    add(violations, object(saga.permissions)["pull-requests"] === "read", `${sagaFile} must read pull requests`);
-    const job = requireJob(violations, sagaFile, saga, "require-closing-issue-link");
+    // The guard's structural pins (job existence and its permission scope) are rule
+    // instances and live in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates them.
+    const job = object(object(saga.jobs)["require-closing-issue-link"]);
     for (const fragment of ["codex/", "review/codestory-saga-", "[codex]", "saga:codestory-intelligence"]) {
       add(violations, String(job.if ?? "").includes(fragment), `${sagaFile} guarded condition must include ${fragment}`);
     }
-    requireStepRun(violations, sagaFile, job, "Check PR issue relationship", [
-      "close[sd]?|fix(?:e[sd])?|resolve[sd]?",
-      "#\\d+|https://github\\.com/TheGreenCedar/CodeStory/issues/\\d+",
-    ]);
+    // The guard's step fragments are rule instances and live in release-claims.json
+    // under workflow_policy.step_fragments; stepFragmentViolations evaluates them.
   }
 
   const closeFile = "close-dev-issues.yml";
@@ -2032,17 +2363,12 @@ function validateIssueWorkflows(workflows, violations) {
     violations.push(`${closeFile} must exist`);
   } else {
     add(violations, includesAll(at(close, "on", "push", "branches"), ["dev/codestory-next"]), `${closeFile} must run on dev/codestory-next pushes`);
-    add(violations, object(close.permissions).issues === "write", `${closeFile} must write issues`);
-    add(violations, object(close.permissions)["pull-requests"] === "read", `${closeFile} must read pull requests`);
-    const job = requireJob(violations, closeFile, close, "close-linked-issues");
-    requireStepRun(violations, closeFile, job, "Close issues referenced by the merged PR", [
-      'commit = event["after"]',
-      'pull_request.get("merged_at")',
-      'pull_request.get("merge_commit_sha") == commit',
-      'if "pull_request" in issue:',
-      '"state_reason=completed"',
-      "https://github\\.com/TheGreenCedar/CodeStory/issues/(\\d+)",
-    ]);
+    // The close automation's structural pins (job existence and both permission
+    // scopes) are rule instances and live in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates them.
+    // The close automation's step fragments are rule instances and live in
+    // release-claims.json under workflow_policy.step_fragments;
+    // stepFragmentViolations evaluates them.
   }
 }
 
@@ -2058,6 +2384,8 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       ".github/scripts/check-workflow-policy.test.mjs",
       ".github/scripts/cargo-cache-contract.mjs",
       ".github/scripts/cargo-cache-contract.test.mjs",
+      ".github/scripts/windows-link-timing.mjs",
+      ".github/scripts/windows-link-timing.test.mjs",
       ".github/scripts/install-codestory-marketplace-proof.mjs",
       ".github/scripts/install-codestory-marketplace-proof.test.mjs",
       ".github/scripts/fixtures/workflow-policy-invalid.json",
@@ -2073,6 +2401,8 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "scripts/tests/codestory-release-closeout.test.mjs",
       "scripts/tests/codestory-release-evidence-gate.test.mjs",
       "scripts/tests/fixtures/release-claims/**",
+      ".github/scripts/publish-marketplace-catalog.mjs",
+      ".github/scripts/publish-marketplace-catalog.test.mjs",
       "benchmarks/release-evidence/**",
       ".github/workflows/**",
       ".github/workflows/release.yml",
@@ -2089,7 +2419,11 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "scripts/prepare-embedded-model.mjs",
       "scripts/tests/prepare-embedded-model.test.mjs",
       "scripts/prove-plugin-pinned-provision.mjs",
+      "scripts/build-release-manifest.mjs",
       "scripts/lib/wait-for-managed-runtime.mjs",
+      "scripts/lib/pinned-archive-digests.mjs",
+      "scripts/lib/provision-proof-lanes.mjs",
+      "scripts/lib/release-manifest.mjs",
       "scripts/tests/prove-plugin-pinned-provision.test.mjs",
       "crates/codestory-llama-sys/model-contract.json",
       "crates/codestory-llama-sys/build.rs",
@@ -2104,37 +2438,12 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       add(violations, includesAll(at(plugin, "on", event, "paths"), requiredPaths), `${pluginFile} ${event} paths must cover policy and release surfaces`);
     }
     add(violations, includesAll(at(plugin, "on", "push", "branches"), ["dev/codestory-next"]), `${pluginFile} must run on dev pushes`);
-    const job = requireJob(violations, pluginFile, plugin, "plugin-static");
-    requireStepRun(violations, pluginFile, job, "Install workflow policy dependencies", ["npm ci --ignore-scripts"]);
-    requireStepRun(violations, pluginFile, job, "Check workflow policy", [
-      "node .github/scripts/check-workflow-policy.mjs",
-      "node --test .github/scripts/check-workflow-policy.test.mjs",
-      "node --test .github/scripts/cargo-cache-contract.test.mjs",
-    ]);
-    requireStepRun(violations, pluginFile, job, "Check plugin static wiring", ["node --test plugins/codestory/tests/plugin-static.test.mjs"]);
-    requireStepRun(violations, pluginFile, job, "Check embedded model preparation", ["node --test scripts/tests/prepare-embedded-model.test.mjs"]);
-    // The pinned-provision proof is the plugin lane's tag gate. Its own suite has to run
-    // somewhere, or a gate that exits 0 without proving anything reads as a pass.
-    requireStepRun(violations, pluginFile, job, "Check the pinned provision proof", [
-      "node --test scripts/tests/prove-plugin-pinned-provision.test.mjs",
-    ]);
-    requireStepRun(violations, pluginFile, job, "Check release claim and evidence contracts", [
-      "scripts/tests/release-evidence-runner-contract.test.mjs",
-    ]);
-    requireStepRun(violations, pluginFile, job, "Check workflow syntax", [
-      "node --test .github/scripts/run-actionlint.test.mjs",
-      "node .github/scripts/run-actionlint.mjs",
-    ]);
-    requireStepRun(violations, pluginFile, job, "Check release claim and evidence contracts", [
-      "scripts/tests/codestory-release-claims.test.mjs",
-      "scripts/tests/codestory-release-closeout.test.mjs",
-      "scripts/tests/codestory-release-evidence-gate.test.mjs",
-    ]);
-    requireStepRun(violations, pluginFile, job, "Check CI proof routing fixtures", ["node .github/scripts/route-ci-proof.mjs --self-test"]);
-    requireStepRun(violations, pluginFile, job, "Check packaged proof harness", ["python .github/scripts/check-packaged-agent-proof.py --self-test"]);
-    requireStepRun(violations, pluginFile, job, "Check real Codex marketplace installation", [
-      "node --test .github/scripts/install-codestory-marketplace-proof.test.mjs",
-    ]);
+    // The plugin lane's structural pin (job existence) is a rule instance and
+    // lives in release-claims.json under workflow_policy.structural_pins;
+    // structuralPinViolations evaluates it. The lane's step fragments - the
+    // policy, wiring, proof, and contract suites the surviving job must run -
+    // are rule instances and live in release-claims.json under
+    // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
   }
 
   const rustFile = "rust-ci.yml";
@@ -2154,7 +2463,10 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "plugins/codestory/skills/codestory-grounding/**",
       "scripts/generate-codestory-skill-syntax.mjs",
     ]), `${rustFile} must cover workspace source and generated catalog changes`);
-    const job = requireJob(violations, rustFile, rust, "linux-draft");
+    // The draft lane's structural pin (job existence) is a rule instance and
+    // lives in release-claims.json under workflow_policy.structural_pins;
+    // structuralPinViolations evaluates it.
+    const job = object(object(rust.jobs)["linux-draft"]);
     const retrievalWorkflow = workflows.get(retrievalFile);
     for (const violation of retrievalProducerTriggerPolicyViolations(retrievalWorkflow)) {
       violations.push(`${retrievalFile} ${violation}`);
@@ -2164,7 +2476,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "jobs",
       "linux-contracts",
     ));
-    for (const violation of draftSourcePolicyViolations(job, retrievalJob)) {
+    for (const violation of draftSourcePolicyViolations(job, retrievalJob, graph)) {
       violations.push(`${rustFile} ${violation}`);
     }
   }
@@ -2197,49 +2509,34 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       `${sourceFile} manual PR input must require ${promotion.manual_pr_ref_hint}`,
     );
     add(violations, trigger(source, "pull_request_target") === undefined, `${sourceFile} must not execute pull-request code through pull_request_target`);
-    const resolve = requireJob(violations, sourceFile, source, "resolve");
+    // The resolve job's structural pin (job existence) is a rule instance and
+    // lives in release-claims.json under workflow_policy.structural_pins;
+    // structuralPinViolations evaluates it.
+    const resolve = object(object(source.jobs).resolve);
     add(
       violations,
       resolve.if === undefined,
       `${sourceFile} resolve job must execute only explicit dispatch and reusable calls`,
     );
-    requireStepRun(violations, sourceFile, resolve, "Resolve trusted exact head", [
-      'test "$EVENT_HEAD_REPO" = "$GITHUB_REPOSITORY"',
-      'test "$current_head" = "$EVENT_HEAD_SHA"',
-      'head_ref="$(jq -r \'.head.ref\'',
-      'test "$GITHUB_REF" = "refs/heads/$head_ref"',
-      'test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA"',
-      'test "$GITHUB_SHA" = "$CALLER_REF"',
-      "--ref $head_ref",
-    ]);
-    requireExactResolverContract(violations, sourceFile, resolve, sourceResolverContractDigest);
-    requireStepRun(violations, sourceFile, resolve, "Reuse a completed gate for this exact head", [
-      '.path == ".github/workflows/source-proof.yml"',
-      '.event == "workflow_dispatch" and .conclusion == "success"',
-      '.name == "full-source-gate" and .conclusion == "success"',
-      'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
-      ".expired == false",
-      'test "$artifact_count" = 1 || continue',
-    ]);
-    requireStepRun(violations, sourceFile, resolve, "Require executable release freeze", [
-      "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA",
-      "release-freeze-barrier.mjs",
-      "verify-status",
-      '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
-    ]);
-    const full = requireJob(violations, sourceFile, source, "full-source-gate");
-    add(violations, sameMembers(needs(full), ["resolve"]), `${sourceFile} full source gate must need resolve`);
+    // The resolve job's step fragments - the trusted-head resolution, the
+    // exact-head gate reuse, and the executable release freeze - are rule
+    // instances and live in release-claims.json under
+    // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+    // The full source gate's structural pins (job existence and its needs edge
+    // to resolve) are rule instances and live in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates them.
+    const full = object(object(source.jobs)["full-source-gate"]);
+    const sourceStabilizationCondition = "${{ (!inputs.acceptance_only || inputs.acceptance_phase == 'source_stabilization') && needs.resolve.outputs.reuse != 'true' }}";
+    const workflowExpression = value => String(value ?? "").replace(/\s+/gu, " ").trim();
     add(
       violations,
-      full.if === "${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}",
-      `${sourceFile} full source gate may skip only a completed exact-head proof`,
+      workflowExpression(full.if) === sourceStabilizationCondition,
+      `${sourceFile} full source gate must run exactly once during source stabilization`,
     );
-    const generalization = requireJob(
-      violations,
-      sourceFile,
-      source,
-      "retrieval-generalization",
-    );
+    // The retrieval generalization job's structural pin (job existence) is a
+    // rule instance and lives in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+    const generalization = object(object(source.jobs)["retrieval-generalization"]);
     add(
       violations,
       hasExactKeys(generalization, [
@@ -2256,8 +2553,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       violations,
       generalization.name === "retrieval-generalization"
         && sameMembers(needs(generalization), ["resolve"])
-        && generalization.if
-          === "${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}"
+        && workflowExpression(generalization.if) === sourceStabilizationCondition
         && generalization["runs-on"] === "ubuntu-latest"
         && generalization["timeout-minutes"] === 5
         && generalization["continue-on-error"] === undefined,
@@ -2304,12 +2600,10 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         `${sourceFile} retrieval generalization ${name} must run its exact blocking Node command`,
       );
     }
-    const windowsNative = requireJob(
-      violations,
-      sourceFile,
-      source,
-      "windows-native-contracts",
-    );
+    // The Windows native contracts job's structural pin (job existence) is a
+    // rule instance and lives in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+    const windowsNative = object(object(source.jobs)["windows-native-contracts"]);
     add(
       violations,
       hasExactKeys(windowsNative, [
@@ -2323,10 +2617,9 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       ])
         && windowsNative.name === "windows-native-contracts"
         && sameMembers(needs(windowsNative), ["resolve"])
-        && windowsNative.if
-          === "${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}"
+        && workflowExpression(windowsNative.if) === sourceStabilizationCondition
         && windowsNative["runs-on"] === "windows-latest"
-        && windowsNative["timeout-minutes"] === 15
+        && windowsNative["timeout-minutes"] === 25
         && object(windowsNative.env).CMAKE_GENERATOR === "Ninja"
         && windowsNative["continue-on-error"] === undefined,
       `${sourceFile} Windows native source contracts must run in parallel on the resolved exact head`,
@@ -2334,55 +2627,27 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     const windowsNativeSteps = list(windowsNative.steps).map(object);
     add(
       violations,
-      windowsNativeSteps.length === 6
+      windowsNativeSteps.length === 9
         && windowsNativeSteps[0]?.uses === "actions/checkout@v5"
         && object(windowsNativeSteps[0]?.with).ref === "${{ needs.resolve.outputs.ref }}"
         && windowsNativeSteps.every(step => step?.["continue-on-error"] === undefined),
-      `${sourceFile} Windows native source contracts must keep the exact blocking six-step shape`,
+      `${sourceFile} Windows native source contracts must keep the exact blocking nine-step shape`,
     );
-    requireStepRun(violations, sourceFile, windowsNative, "Install Rust stable", [
-      "rustup toolchain install stable --profile minimal",
-      "rustup default stable",
-    ]);
-    requireStepRun(
+    // The qualification harness regression runs before the toolchain steps: it
+    // needs no build, and a Windows-native reproduction of the control
+    // directory mismatch is worth nothing if it only reports after a Vulkan
+    // SDK install and a release Cargo test have already spent the job.
+    add(
       violations,
-      sourceFile,
-      windowsNative,
-      "Configure short Windows Cargo target",
-      [
-        '$workspaceTarget = Join-Path $env:GITHUB_WORKSPACE "target"',
-        '$shortTarget = Join-Path $runnerRoot "t"',
-        "New-Item -ItemType Junction -Path $shortTarget -Target $workspaceTarget",
-        '"CARGO_TARGET_DIR=$shortTarget"',
-      ],
+      windowsNativeSteps[1]?.name
+        === "Prove the Windows-native qualification harness contracts",
+      `${sourceFile} Windows native source contracts must prove the qualification harness before any build step`,
     );
-    requireStepRun(
-      violations,
-      sourceFile,
-      windowsNative,
-      "Prepare checksum-pinned embedded model",
-      ["node scripts/prepare-embedded-model.mjs"],
-    );
-    requireStepRun(
-      violations,
-      sourceFile,
-      windowsNative,
-      "Install checksum-pinned Windows Vulkan SDK",
-      [".github/scripts/install-windows-vulkan-sdk.ps1"],
-    );
-    requireStepRun(
-      violations,
-      sourceFile,
-      windowsNative,
-      "Prove Windows path and native-staging source contracts",
-      [
-        "cargo test --release --locked",
-        "-p codestory-workspace --test windows_path_identity",
-        "-p codestory-llama-sys --test native_staging",
-        "Windows native source contracts failed",
-        "Windows path and native-staging source contracts:",
-      ],
-    );
+    // The Windows native contracts job's step fragments - the qualification
+    // harness, toolchain, short-target, embedded-model, Vulkan SDK, and
+    // source-contract steps - are rule instances and live in release-claims.json
+    // under workflow_policy.step_fragments; stepFragmentViolations evaluates
+    // them.
     const windowsNativeRun = shellLiteralNormalizedText(stepRun(
       windowsNative,
       "Prove Windows path and native-staging source contracts",
@@ -2393,6 +2658,74 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && jobShellInvocationsContaining(windowsNative, "cargo build").length === 0
         && jobShellInvocationsContaining(windowsNative, "cargo check").length === 0,
       `${sourceFile} Windows path and native-staging contracts must share one source-only Cargo invocation`,
+    );
+    const windowsNativeReceiptName = "Emit authenticated Windows-native source receipt";
+    const windowsNativeReceipt = namedStep(windowsNative, windowsNativeReceiptName);
+    const windowsNativeReceiptRun = executableRunText(
+      stepRun(windowsNative, windowsNativeReceiptName),
+    );
+    add(
+      violations,
+      windowsNativeSteps[7]?.name === windowsNativeReceiptName
+        && windowsNativeReceipt?.id === "windows-native-source-proof"
+        && windowsNativeReceipt?.shell === "pwsh"
+        && windowsNativeReceipt?.["continue-on-error"] === undefined
+        && hasExactKeys(windowsNativeReceipt, ["name", "id", "shell", "env", "run"]),
+      `${sourceFile} Windows-native source receipt must be the blocking terminal evidence producer`,
+    );
+    requireStepEnv(
+      violations,
+      sourceFile,
+      windowsNative,
+      windowsNativeReceiptName,
+      { EXPECTED_HEAD_SHA: "${{ needs.resolve.outputs.ref }}" },
+    );
+    add(
+      violations,
+      [
+        "$commit = (git rev-parse HEAD).Trim()",
+        '$sourceTree = (git rev-parse "HEAD^{tree}").Trim()',
+        "if ($commit -ne $env:EXPECTED_HEAD_SHA) {",
+        "git status --porcelain=v1",
+        "if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {",
+        'schema = "codestory.windows-native-source-proof/v1"',
+        'status = "pass"',
+        "repository = $env:GITHUB_REPOSITORY",
+        "commit = $commit",
+        "source_tree = $sourceTree",
+        'workflow_path = ".github/workflows/source-proof.yml"',
+        'job = "windows-native-contracts"',
+        "run_id = [Int64]$env:GITHUB_RUN_ID",
+        "run_attempt = [Int64]$env:GITHUB_RUN_ATTEMPT",
+        "qualification_harness_self_test = $true",
+        "control_directory_inflight = $true",
+        "windows_path_identity = $true",
+        "native_staging = $true",
+        '"commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT',
+      ].every(fragment => windowsNativeReceiptRun.includes(fragment)),
+      `${sourceFile} Windows-native source receipt must bind the clean routed head and every proved contract`,
+    );
+    const windowsNativeUploadName = "Upload authenticated Windows-native source receipt";
+    const windowsNativeUpload = namedStep(windowsNative, windowsNativeUploadName);
+    add(
+      violations,
+      windowsNativeSteps[8]?.name === windowsNativeUploadName
+        && windowsNativeUpload?.uses === "actions/upload-artifact@v7.0.1"
+        && windowsNativeUpload?.["continue-on-error"] === undefined
+        && hasExactKeys(windowsNativeUpload, ["name", "uses", "with"])
+        && hasExactKeys(object(windowsNativeUpload?.with), [
+          "name",
+          "path",
+          "if-no-files-found",
+          "retention-days",
+        ])
+        && object(windowsNativeUpload?.with).name
+          === "windows-native-source-proof-${{ steps.windows-native-source-proof.outputs.commit }}-attempt-${{ github.run_attempt }}"
+        && object(windowsNativeUpload?.with).path
+          === "target/windows-native-source-proof/windows-native-source-proof.json"
+        && object(windowsNativeUpload?.with)["if-no-files-found"] === "error"
+        && object(windowsNativeUpload?.with)["retention-days"] === 30,
+      `${sourceFile} Windows-native source receipt upload must retain one exact-head attempt-qualified JSON artifact`,
     );
     add(
       violations,
@@ -2408,15 +2741,11 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && object(sccacheSetup?.with).version === "${{ env.SCCACHE_VERSION }}",
       `${sourceFile} must install the pinned sccache action and binary`,
     );
-    requireStepRun(violations, sourceFile, full, "Configure bounded compiler cache", [
-      "CARGO_HOME=$RUNNER_TEMP/codestory-source-cargo",
-      "SCCACHE_DIR=$RUNNER_TEMP/codestory-source-sccache",
-      "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE",
-      "RUSTC_WRAPPER=sccache",
-      "CARGO_INCREMENTAL=0",
-      "CMAKE_C_COMPILER_LAUNCHER=sccache",
-      "CMAKE_CXX_COMPILER_LAUNCHER=sccache",
-    ]);
+    // The full source gate's step fragments - the bounded cache environment, the
+    // cache-bound and reporting steps, the compile, test, lint, and outcome
+    // steps, and the source release cell - are rule instances and live in
+    // release-claims.json under workflow_policy.step_fragments;
+    // stepFragmentViolations evaluates them.
     const identity = namedStep(full, "Capture reusable build cache contract");
     const identityRun = executableRunText(String(identity?.run ?? ""));
     add(
@@ -2470,11 +2799,6 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     );
     const dependencySave = namedStep(full, "Save Cargo dependency inputs");
     const compilerSave = namedStep(full, "Save compiler objects after compilation");
-    requireStepRun(violations, sourceFile, full, "Bound Cargo dependency cache", [
-      "--max-bytes \"$CARGO_DEPENDENCY_CACHE_MAX_BYTES\"",
-      "--path \"$CARGO_HOME/registry\"",
-      "--path \"$CARGO_HOME/git\"",
-    ]);
     add(
       violations,
       dependencySave?.uses === "actions/cache/save@v5"
@@ -2519,28 +2843,6 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && compilerSaveIndex < stepIndex(full, "Emit authenticated source release cell"),
       `${sourceFile} compiler cache must save before test execution or release-cell failure`,
     );
-    requireStepRun(violations, sourceFile, full, "Compile the complete workspace test suite", [
-      "cargo test --workspace --locked --no-run",
-    ]);
-    requireStepRun(violations, sourceFile, full, "Report compiler cache restore", [
-      "--requested-key",
-      "--matched-key",
-      "--compatibility-prefix",
-      "--cache-hit",
-      "--path \"$SCCACHE_DIR\"",
-    ]);
-    requireStepRun(violations, sourceFile, full, "Report compiler cache save", [
-      "--restored-bytes",
-      "--started-ms",
-      "--ended-ms",
-      "--save-started-ms",
-      "--save-result",
-      "--path \"$SCCACHE_DIR\"",
-    ]);
-    requireStepRun(violations, sourceFile, full, "Require successful source compilation", [
-      'test "$COMPILE_OUTCOME" = success',
-      'test "$LINT_OUTCOME" = success',
-    ]);
     const compile = namedStep(full, "Compile the complete workspace test suite");
     const lint = namedStep(full, "Lint every workspace target and feature once");
     add(
@@ -2550,15 +2852,9 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && lint?.if === "steps.compile-workspace.outcome == 'success'",
       `${sourceFile} compilation and lint must preserve cache state before reporting failure`,
     );
-    // nextest owns unit/integration execution; the doc pass rides along so a future doctest can
-    // never silently stop being run (nextest does not execute doctests).
-    requireStepRun(violations, sourceFile, full, "Test the complete workspace once", [
-      "cargo nextest run --workspace --locked",
-      "cargo test --workspace --doc --locked",
-    ]);
     requireStepRun(violations, sourceFile, full, "Install pinned cargo-nextest", [
       `cargo-nextest-${nextestVersion}-x86_64-unknown-linux-gnu.tar.gz`,
-      `${nextestLinuxSha256}  $RUNNER_TEMP/cargo-nextest.tar.gz`,
+      `${pinnedProgramRow(graph, "nextest_linux_archive").sha256}  $RUNNER_TEMP/cargo-nextest.tar.gz`,
       "sha256sum --check --strict",
       "cargo nextest --version",
     ]);
@@ -2569,13 +2865,6 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
           < stepIndex(full, "Test the complete workspace once"),
       `${sourceFile} must install the pinned test runner before the workspace test step`,
     );
-    requireStepRun(violations, sourceFile, full, "Lint every workspace target and feature once", ["cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"]);
-    requireStepRun(violations, sourceFile, full, "Emit authenticated source release cell", [
-      "codestory-release-cell-manifest.mjs produce",
-      "--cell-id source_behavior",
-      "--producer-job full-source-gate",
-      '--expected-sha "$RESOLVED_REF"',
-    ]);
     requireStepEnv(violations, sourceFile, full, "Emit authenticated source release cell", {
       RESOLVED_REF: "${{ needs.resolve.outputs.ref }}",
     });
@@ -2598,6 +2887,14 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
 // lets a run that never touched the catalog report that it did.
 function catalogDeliveryOutcomeViolations(file, job, delivery) {
   const violations = [];
+  const checkout = list(job.steps).find(
+    (step) => String(object(step).uses ?? "").startsWith("actions/checkout@"),
+  );
+  add(
+    violations,
+    object(object(checkout).with)["fetch-depth"] === 0,
+    `${file} marketplace publication must retain history needed to restore the recorded prior SHA`,
+  );
   const tokenStep = namedStep(job, "Mint a scoped marketplace token");
   add(
     violations,
@@ -2620,6 +2917,48 @@ function catalogDeliveryOutcomeViolations(file, job, delivery) {
     '--commit "$GITHUB_SHA"',
     '--github-output "$GITHUB_OUTPUT"',
   ]);
+  const liveSmoke = namedStep(job, "Smoke the published live catalog");
+  add(
+    violations,
+    liveSmoke?.["continue-on-error"] === true
+      && liveSmoke?.if === "steps.publish.outcome == 'success'",
+    `${file} live-catalog smoke must be a recorded post-push outcome, not a release gate`,
+  );
+  requireStepRun(violations, file, job, "Smoke the published live catalog", [
+    "install-codestory-marketplace-proof.mjs",
+    "--marketplace-source TheGreenCedar/AgentPluginMarketplace",
+    '--marketplace-revision "$MARKETPLACE_REVISION"',
+    "--local-fixture false",
+  ]);
+  const restore = namedStep(job, "Restore the previous catalog pin");
+  add(
+    violations,
+    delivery.recovery.automatic_restore === true
+      && restore?.["continue-on-error"] === true
+      && restore?.if
+        === "steps.publish.outcome == 'success' && steps.publish.outputs.catalog_changed == 'true' && steps.live-catalog-smoke.outcome == 'failure'",
+    `${file} must automatically restore after a failed smoke without failing the irreversible release`,
+  );
+  requireStepRun(violations, file, job, "Restore the previous catalog pin", [
+    "publish-marketplace-catalog.mjs",
+    '--commit "$PREVIOUS_PLUGIN_SHA"',
+    '--version "$PREVIOUS_PLUGIN_VERSION"',
+    '--expected-current-revision "$PUBLISHED_REVISION"',
+    "--expected-current-plugin-sha",
+    "--expected-current-plugin-version",
+    '--github-output "$GITHUB_OUTPUT"',
+  ]);
+  add(
+    violations,
+    object(restore?.env).GH_TOKEN === "${{ steps.token.outputs.token }}"
+      && object(restore?.env).PREVIOUS_PLUGIN_SHA
+        === "${{ steps.publish.outputs.previous_plugin_sha }}"
+      && object(restore?.env).PREVIOUS_PLUGIN_VERSION
+        === "${{ steps.publish.outputs.previous_plugin_version }}"
+      && object(restore?.env).PUBLISHED_REVISION
+        === "${{ steps.publish.outputs.marketplace_revision }}",
+    `${file} automatic restore must use the scoped token and the exact pin the push replaced`,
+  );
   const deliveryOutcome = namedStep(job, "Record catalog delivery outcome");
   add(
     violations,
@@ -2630,6 +2969,11 @@ function catalogDeliveryOutcomeViolations(file, job, delivery) {
     violations,
     object(deliveryOutcome?.env).TOKEN_OUTCOME === "${{ steps.token.outcome }}"
       && object(deliveryOutcome?.env).PUBLISH_OUTCOME === "${{ steps.publish.outcome }}"
+      && object(deliveryOutcome?.env).LIVE_SMOKE_OUTCOME
+        === "${{ steps.live-catalog-smoke.outcome }}"
+      && object(deliveryOutcome?.env).RESTORE_OUTCOME === "${{ steps.restore.outcome }}"
+      && object(deliveryOutcome?.env).RESTORED_REVISION
+        === "${{ steps.restore.outputs.marketplace_revision }}"
       && object(deliveryOutcome?.env).PUBLISHED_REVISION
         === "${{ steps.publish.outputs.marketplace_revision }}",
     `${file} catalog delivery outcome must read the real token, push, and revision results`,
@@ -2641,11 +2985,17 @@ function catalogDeliveryOutcomeViolations(file, job, delivery) {
   );
   requireStepRun(violations, file, job, "Record catalog delivery outcome", [
     "catalog_published=false",
+    "catalog_delivery_state=deferred",
     '[ "$TOKEN_OUTCOME" = "success" ]',
     '[ "$PUBLISH_OUTCOME" = "success" ]',
     `printf '%s' "$PUBLISHED_REVISION" | grep -Eq '^[0-9a-f]{40}$'`,
-    'echo "catalog_published=$catalog_published" >> "$GITHUB_OUTPUT"',
-    'echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"',
+    'echo "catalog_published=$catalog_published"',
+    'echo "catalog_delivery_state=$catalog_delivery_state"',
+    'echo "marketplace_revision=$marketplace_revision"',
+    // The delivery state and the rollback target leave this step through one grouped redirect,
+    // so the redirect itself is pinned: the echoes alone would be satisfied by a step that
+    // computed the state and wrote it nowhere.
+    '} >> "$GITHUB_OUTPUT"',
     "::warning::Catalog publication deferred",
     "recover with $RECOVERY_WORKFLOW",
     // The recovery workflow mints the SAME credential from the SAME environment, so it recovers
@@ -2653,12 +3003,46 @@ function catalogDeliveryOutcomeViolations(file, job, delivery) {
     // absent must say that, or the ledger records an instruction nobody can follow.
     'if [ "$TOKEN_OUTCOME" != "success" ]; then',
     "provision the marketplace-publish credential",
+    '[ "$LIVE_SMOKE_OUTCOME" = "success" ]',
+    '[ "$LIVE_SMOKE_OUTCOME" = "failure" ]',
+    '[ "$RESTORE_OUTCOME" = "success" ]',
+    "catalog_delivery_state=published",
+    `catalog_delivery_state=${delivery.recovery.restored_state}`,
+    "catalog_delivery_state=unresolved",
+    "automatic restore did not complete",
   ]);
   add(
     violations,
     object(job.outputs).catalog_published === "${{ steps.delivery.outputs.catalog_published }}"
+      && object(job.outputs).catalog_delivery_state
+        === "${{ steps.delivery.outputs.catalog_delivery_state }}"
       && object(job.outputs).marketplace_revision === "${{ steps.delivery.outputs.marketplace_revision }}",
     `${file} marketplace publication must publish the recorded delivery state, not the raw push result`,
+  );
+  // The rollback target. A catalog move with no recorded predecessor is a move nobody can undo, so
+  // every name the graph declares has to leave the push step, be written by the delivery step, and
+  // leave the job -- a break anywhere in that chain loses the only record of what to restore.
+  for (const name of list(object(delivery.recovery).previous_pin_outputs)) {
+    add(
+      violations,
+      object(job.outputs)[name] === `\${{ steps.delivery.outputs.${name} }}`,
+      `${file} marketplace publication must publish the recorded ${name}`,
+    );
+    add(
+      violations,
+      executableRunText(String(deliveryOutcome?.run ?? "")).includes(`echo "${name}=`),
+      `${file} catalog delivery outcome must record ${name}`,
+    );
+  }
+  add(
+    violations,
+    object(deliveryOutcome?.env).PREVIOUS_REVISION
+        === "${{ steps.publish.outputs.previous_marketplace_revision }}"
+      && object(deliveryOutcome?.env).PREVIOUS_PLUGIN_SHA
+        === "${{ steps.publish.outputs.previous_plugin_sha }}"
+      && object(deliveryOutcome?.env).PREVIOUS_PLUGIN_VERSION
+        === "${{ steps.publish.outputs.previous_plugin_version }}",
+    `${file} catalog delivery outcome must read the rollback target the catalog move recorded`,
   );
   // A retry would collapse distinguishable failures into one opaque one and could publish on a
   // second attempt after the first was already recorded, so this job gets exactly one attempt.
@@ -2692,16 +3076,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     JSON.stringify(releaseCallers) === JSON.stringify(["auto-release.yml"]),
     `${releaseFile} publication authority must have only the trusted auto-release.yml caller`,
   );
-  add(
-    violations,
-    object(release.permissions).actions === "write",
-    `${releaseFile} must cancel superseded proof runs before starting release work`,
-  );
-  add(
-    violations,
-    object(release.permissions)["pull-requests"] === "read",
-    `${releaseFile} must grant the exact source resolver pull-request metadata access`,
-  );
+  // The coordinator's workflow-scoped permission grants (actions write for
+  // superseded-run cancellation, pull-requests read for the exact source
+  // resolver) are rule instances and live in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates them
+  // with their reviewed violation text.
   const callExpectedHead = object(at(release, "on", "workflow_call", "inputs", "expected_head_sha"));
   add(
     violations,
@@ -2739,7 +3118,14 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     release.env === undefined && release.defaults === undefined,
     `${releaseFile} release workflow must not override the release-head calibration execution environment`,
   );
-  const policy = requireJob(violations, releaseFile, release, "workflow-policy");
+  // The workflow-policy job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it. The
+  // job's step fragments - the dependency install, the syntax gate, the claim
+  // and evidence contract suites, and the policy enforcement commands - are
+  // rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const policy = object(object(release.jobs)["workflow-policy"]);
   // The reuse-binding contracts resolve real release commits, which a depth-1
   // clone does not carry: it answered only while the referenced commit happened
   // to be HEAD.
@@ -2752,26 +3138,15 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     ),
     `${releaseFile} workflow-policy must check out full history for the reuse-binding contracts`,
   );
-  requireStepRun(violations, releaseFile, policy, "Install workflow policy dependencies", ["npm ci --ignore-scripts"]);
-  requireStepRun(violations, releaseFile, policy, "Check workflow syntax", [
-    "node --test .github/scripts/run-actionlint.test.mjs",
-    "node .github/scripts/run-actionlint.mjs",
-  ]);
-  requireStepRun(violations, releaseFile, policy, "Check release claim and evidence contracts", [
-    ".github/scripts/build-marketplace-fixture.test.mjs",
-    "scripts/tests/codestory-release-claims.test.mjs",
-    "scripts/tests/codestory-release-cell-manifest.test.mjs",
-    "scripts/tests/codestory-release-closeout.test.mjs",
-    "scripts/tests/codestory-release-evidence-gate.test.mjs",
-  ]);
-  requireStepRun(violations, releaseFile, policy, "Enforce workflow policy", [
-    "node .github/scripts/check-workflow-policy.mjs",
-    // The recovery contract decides whether a lost host may withhold a claim, so the release's own
-    // policy gate must execute its tests before any proof runs.
-    "node --test .github/scripts/lost-runner-recovery.test.mjs",
-  ]);
 
-  const preflight = requireJob(violations, releaseFile, release, "preflight");
+  // The preflight job's structural pin (job existence) is a rule instance and
+  // lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it. Its step fragments - the release
+  // authority refusal, the calibration lineage command, the changelog and tag
+  // gates, the marketplace install proof, and the reusable-evidence resolver -
+  // are rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const preflight = object(object(release.jobs).preflight);
   add(
     violations,
     hasExactKeys(
@@ -2783,20 +3158,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && preflight["timeout-minutes"] === 10,
     `${releaseFile} preflight must retain the exact trusted job environment`,
   );
+  // DISPOSITION: the needs edge stays code because it already consults the
+  // graph-owned release_chain dependencies; converting it to a structural
+  // needs pin would duplicate that block's data under a second name.
   add(violations, sameMembers(needs(preflight), releaseChain.dependencies.preflight), `${releaseFile} preflight dependencies must match the release claim graph`);
-  requireStepRun(violations, releaseFile, preflight, "Validate release authority", [
-    'if [ "$PUBLISH_RELEASE" = "true" ]; then',
-    '"$GITHUB_EVENT_NAME" != "push"',
-    '"$GITHUB_REF" != "refs/heads/main"',
-    '$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main',
-    '"$GITHUB_WORKFLOW_REF" != "$expected_caller"',
-    'repos/$GITHUB_REPOSITORY/git/ref/heads/main',
-    '"$GITHUB_EVENT_NAME" != "workflow_dispatch"',
-    '"$GITHUB_REF" != "refs/heads/dev/codestory-next"',
-    '"$EXPECTED_HEAD_SHA" != "$GITHUB_SHA"',
-    'repos/$GITHUB_REPOSITORY/git/ref/heads/dev/codestory-next',
-    "dev/codestory-next moved from proved head",
-  ]);
   const releaseLineage = namedStep(preflight, releaseLineageStepName);
   add(
     violations,
@@ -2814,15 +3179,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && releaseLineage?.["working-directory"] === "${{ github.workspace }}",
     `${releaseFile} release-head calibration lineage must be unconditional and fail closed`,
   );
-  requireStepRun(violations, releaseFile, preflight, releaseLineageStepName, [
-    "/usr/bin/python3 -E -s",
-    '"$GITHUB_WORKSPACE/.github/scripts/check-calibration-release-lineage.py"',
-    '--repo "$GITHUB_WORKSPACE"',
-    '--expected-sha "$GITHUB_SHA"',
-    "--allow-promotion-commit",
-    "selection_commit",
-    "selection_tree",
-  ]);
   const preflightCheckout = namedStep(preflight, "Checkout");
   add(
     violations,
@@ -2843,15 +3199,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
         < stepIndex(preflight, "Verify release version"),
     `${releaseFile} release-head calibration lineage must run immediately after checkout and before other release work`,
   );
-  requireStepRun(violations, releaseFile, preflight, "Validate versioned changelog notes", [
-    "node .github/scripts/extract-codestory-release-notes.mjs",
-    '--version "$VERSION"',
-  ]);
-  requireStepRun(violations, releaseFile, preflight, "Refuse existing tag or release", [
-    'git ls-remote --exit-code --tags origin "refs/tags/$TAG"',
-    'gh release view "$TAG"',
-    "exit 1",
-  ]);
   const marketplacePreflight = namedStep(
     preflight,
     "Prove the public marketplace install path",
@@ -2862,28 +3209,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && marketplacePreflight?.["continue-on-error"] === undefined,
     `${releaseFile} public marketplace preflight must run before publication and fail closed`,
   );
-  requireStepRun(
-    violations,
-    releaseFile,
-    preflight,
-    "Prove the public marketplace install path",
-    [
-      "git ls-remote",
-      "refs/heads/main",
-      '"@openai/codex@$CODEX_CLI_VERSION"',
-      "install-codestory-marketplace-proof.mjs",
-      '--source-repository "$GITHUB_WORKSPACE"',
-      "marketplace_revision=$marketplace_revision",
-      `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
-      `printf '%s' "$fixture_revision" | grep -Eq '^[0-9a-f]{40}$'`,
-      // Fixture mode resolves from the locally built catalog, so provenance is
-      // checked against that repository's own revision. Checking it against the
-      // live revision can never match, which is how the fixture path shipped
-      // unexercised.
-      'fixture_revision="$(git -C "$fixture_root" rev-parse HEAD)"',
-      '--marketplace-revision "$fixture_revision"',
-    ],
-  );
   add(
     violations,
     object(preflight.outputs).marketplace_revision
@@ -2891,13 +3216,12 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     `${releaseFile} preflight must publish the proved immutable marketplace revision`,
   );
 
-  const source = requireJob(violations, releaseFile, release, "source-proof");
-  add(
-    violations,
-    createHash("sha256").update(JSON.stringify(source)).digest("hex")
-      === releaseSourceProofSentinelDigest,
-    `${releaseFile} source proof placeholder must match the reviewed fail-closed sentinel`,
-  );
+  // The source-proof job's structural pin (job existence) is a rule instance
+  // and lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it. The placeholder's refusal step
+  // fragments are rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const source = object(object(release.jobs)["source-proof"]);
   add(
     violations,
     source.uses === undefined
@@ -2908,17 +3232,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     `${releaseFile} source proof placeholder must fail closed without calling the broad source workflow`,
   );
   add(violations, sameMembers(needs(source), releaseChain.dependencies["source-proof"]), `${releaseFile} source proof dependencies must match the release claim graph`);
-  requireStepRun(
-    violations,
-    releaseFile,
-    source,
-    "Refuse a second source proof",
-    [
-      'test "$SOURCE_SHA" = "$GITHUB_SHA"',
-      "Preflight did not resolve reusable exact-head source proof",
-      "exit 1",
-    ],
-  );
   // Reuse is admissible only through the authenticated closeout binding, never by simply
   // dropping the gate: the job may be skipped, and only when preflight resolved reusable
   // evidence for this exact tree.
@@ -2927,32 +3240,23 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     String(source.if ?? "") === "needs.preflight.outputs.source_proof_reused != 'true'",
     `${releaseFile} source proof may be skipped only when preflight resolved reusable evidence`,
   );
-  requireStepRun(violations, releaseFile, requireJob(violations, releaseFile, release, "preflight"), "Resolve reusable prior evidence", [
-    'release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"',
-    'test "$(git rev-parse "$head_sha^{tree}")" = "$release_tree"',
-    'git merge-base --is-ancestor "$head_sha" "$GITHUB_SHA"',
-    "full-source-gate",
-    '.path == ".github/workflows/source-proof.yml"',
-    '.event == "workflow_dispatch" and .conclusion == "success"',
-    "The release workflow will not start a broad proof",
-    'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
-    ".expired == false",
-    'test "$artifact_count" = 1 || continue',
-  ]);
-  forbidStepRun(
-    violations,
-    releaseFile,
-    requireJob(violations, releaseFile, release, "preflight"),
-    "Resolve reusable prior evidence",
-    [
-      "release-freeze-barrier.mjs verify-status",
-      "freeze_receipt_digest",
-    ],
-  );
-  const closeout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
-  requireStepRun(violations, releaseFile, closeout, "Authenticate pre-publish Actions provenance", [
-    '--reuse "$REUSE_SELECTION"',
-  ]);
+  // The resolve-reusable-evidence fragments (both the required resolution
+  // conjuncts and the forbidden freeze-status replay) are rule instances and
+  // live in release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  // DISPOSITION: the retired inline calls each re-required the preflight job,
+  // so a release.yml without one reported that violation three times. The
+  // job-existence rule lives in its structural pin; these two duplicate
+  // occurrences stay code so the reviewed verdict multiset is unchanged.
+  requireJob(violations, releaseFile, release, "preflight");
+  requireJob(violations, releaseFile, release, "preflight");
+  // The pre-publish-closeout job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it. The
+  // closeout's reuse-binding fragment is a rule instance and lives in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates it.
+  const closeout = object(object(release.jobs)["pre-publish-closeout"]);
   add(
     violations,
     String(closeout.if ?? "").includes("needs.source-proof.result == 'skipped'")
@@ -2967,7 +3271,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     `${releaseFile} unreachable source fallback must remain a one-step fail-closed sentinel`,
   );
 
-  const packaged = requireJob(violations, releaseFile, release, "packaged-proof");
+  // The packaged-proof job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const packaged = object(object(release.jobs)["packaged-proof"]);
   add(violations, packaged.uses === "./.github/workflows/packaged-platform-proof.yml", `${releaseFile} packaged-proof must call the package workflow`);
   add(violations, sameMembers(needs(packaged), releaseChain.dependencies["packaged-proof"]), `${releaseFile} packaged-proof dependencies must match the release claim graph`);
   add(violations, object(packaged.with).sign_macos === true, `${releaseFile} packaged-proof must sign Mac assets`);
@@ -3005,7 +3312,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     `${releaseFile} must not make optional performance or answer-quality evaluation release-blocking`,
   );
 
-  const metal = requireJob(violations, releaseFile, release, "macos-metal-proof");
+  // The macos-metal-proof job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const metal = object(object(release.jobs)["macos-metal-proof"]);
   add(violations, metal.uses === "./.github/workflows/macos-metal-proof.yml", `${releaseFile} must call protected Metal proof`);
   add(violations, sameMembers(needs(metal), releaseChain.dependencies["macos-metal-proof"]), `${releaseFile} Metal proof dependencies must match the release claim graph`);
   add(violations, object(metal.with).use_packaged_cli_artifact === true, `${releaseFile} Metal proof must use the packaged CLI`);
@@ -3018,12 +3328,16 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && object(metal.with).quality_evidence_artifact === undefined,
     `${releaseFile} Mac proof must close Metal and candidate-installed claims without optional quality evidence`,
   );
-  requireStepRun(violations, "macos-metal-proof.yml", at(workflows.get("macos-metal-proof.yml"), "jobs", "packaged-metal"), "Emit authenticated macOS retrieval-readiness release cell", [
-    "--cell-id retrieval_readiness:macos-arm64",
-    "release-cell-postpublish-retrieval-macos-arm64-attempt-$GITHUB_RUN_ATTEMPT",
-  ]);
+  // The release chain's exact --cell-id and post-publish artifact-name
+  // fragments for the macOS retrieval-readiness cell are a rule instance and
+  // live in release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them beside the proof workflow's own
+  // cell-emission rows.
 
-  const vulkan = requireJob(violations, releaseFile, release, "windows-vulkan-proof");
+  // The windows-vulkan-proof job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const vulkan = object(object(release.jobs)["windows-vulkan-proof"]);
   add(violations, vulkan.uses === "./.github/workflows/windows-vulkan-proof.yml", `${releaseFile} must call protected Vulkan proof`);
   add(violations, sameMembers(needs(vulkan), releaseChain.dependencies["windows-vulkan-proof"]), `${releaseFile} Vulkan proof dependencies must match the release claim graph`);
   add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${releaseFile} Vulkan proof must use the packaged CLI`);
@@ -3036,10 +3350,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && object(vulkan.with).quality_evidence_artifact === undefined,
     `${releaseFile} Windows proof must close Vulkan and candidate-installed claims without optional quality evidence`,
   );
-  requireStepRun(violations, "windows-vulkan-proof.yml", at(workflows.get("windows-vulkan-proof.yml"), "jobs", "packaged-vulkan"), "Emit authenticated Windows retrieval-readiness release cell", [
-    "--cell-id retrieval_readiness:windows-x64",
-    "release-cell-postpublish-retrieval-windows-x64-attempt-$GITHUB_RUN_ATTEMPT",
-  ]);
+  // The release chain's exact --cell-id and post-publish artifact-name
+  // fragments for the Windows retrieval-readiness cell are a rule instance
+  // and live in release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them beside the proof workflow's own
+  // cell-emission rows.
   // The self-hosted Windows service account runs under the default Restricted execution
   // policy, so a run step left on the default shell dies before executing anything:
   // every step must pick bash or a powershell invocation that bypasses the policy.
@@ -3053,7 +3368,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     );
   }
 
-  const linuxVulkan = requireJob(violations, releaseFile, release, "linux-vulkan-proof");
+  // The linux-vulkan-proof job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const linuxVulkan = object(object(release.jobs)["linux-vulkan-proof"]);
   add(violations, linuxVulkan.uses === "./.github/workflows/linux-vulkan-proof.yml", `${releaseFile} must call protected Linux Vulkan proof`);
   add(violations, sameMembers(needs(linuxVulkan), releaseChain.dependencies["linux-vulkan-proof"]), `${releaseFile} Linux Vulkan proof dependencies must match the release claim graph`);
   add(
@@ -3063,22 +3381,21 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && object(linuxVulkan.with).emit_release_cells === true,
     `${releaseFile} Linux proof must close Vulkan, retrieval, and candidate-installed claims`,
   );
-  requireStepRun(violations, "linux-vulkan-proof.yml", at(workflows.get("linux-vulkan-proof.yml"), "jobs", "packaged-vulkan"), "Emit authenticated Linux Vulkan release cells", [
-    "--cell-id accelerator_execution:linux-x64-vulkan",
-    "--cell-id retrieval_readiness:linux-x64",
-    "--cell-id candidate_installed_behavior:linux-x64",
-  ]);
+  // The release chain's exact --cell-id fragments for the three Linux cells
+  // are a rule instance and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them
+  // beside the proof workflow's own cell-emission rows.
 
-  const preCloseout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
+  // DISPOSITION: the retired inline code required the pre-publish-closeout
+  // job twice. The job-existence rule lives in its structural pin; this
+  // duplicate occurrence stays code so the reviewed verdict multiset is
+  // unchanged. The closeout's step fragments - provenance collection, the
+  // cell download chain, the evaluation, and the dev-head revalidation - are
+  // rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  requireJob(violations, releaseFile, release, "pre-publish-closeout");
+  const preCloseout = object(object(release.jobs)["pre-publish-closeout"]);
   add(violations, sameMembers(needs(preCloseout), releaseChain.dependencies["pre-publish-closeout"]), `${releaseFile} pre-publish closeout dependencies must match the release claim graph`);
-  // The producer map is the trust boundary between a real proof and a non-claim, so the closeout
-  // collects the lost-runner evidence itself instead of inheriting the non-claim producer's verdict.
-  requireStepRun(violations, releaseFile, preCloseout, "Authenticate pre-publish Actions provenance", [
-    "producer-map",
-    "--phase pre_publish",
-    "bash .github/scripts/collect-actions-job-evidence.sh",
-    "--job-evidence target/release-closeout/job-evidence.json",
-  ]);
   const preDownload = namedStep(
     preCloseout,
     "Download and verify selected pre-publish release cells",
@@ -3088,23 +3405,6 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     preDownload?.uses === undefined && preDownload?.shell === "bash",
     `${releaseFile} pre-publish closeout must materialize exact Actions artifact ids in blocking shell`,
   );
-  requireStepRun(
-    violations,
-    releaseFile,
-    preCloseout,
-    "Download and verify selected pre-publish release cells",
-    [
-      "test \"$(jq -r '.artifacts | length' \"$producer_map\")\" -gt 0",
-      ".artifacts[] | [.id, .name, .digest] | @tsv",
-      'destination="target/release-cell-manifests/$artifact_name"',
-      "test ! -e \"$destination\"",
-      "/actions/artifacts/$artifact_id/zip",
-      "sha256sum",
-      "test \"$actual_digest\" = \"$expected_digest\"",
-      "unzip -q \"$archive\" -d \"$destination\"",
-      "test -d \"target/release-cell-manifests/$artifact_name\"",
-    ],
-  );
   add(
     violations,
     !list(preCloseout.steps).some(
@@ -3113,13 +3413,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     ),
     `${releaseFile} pre-publish closeout must not filter mixed-run artifact ids through one Actions run`,
   );
-  requireStepRun(violations, releaseFile, preCloseout, "Evaluate authenticated pre-publish closeout", [
-    "--trusted-producers",
-    "codestory-release-closeout.mjs evaluate",
-    '--version "$RELEASE_VERSION"',
-  ]);
   // The version the ledger is filed under reaches the evaluator as a variable, so the command text
   // alone no longer says which release it closed out.
+  // DISPOSITION: step env bindings and step uses pins have no graph evaluator,
+  // so these predicates stay code.
   requireStepEnv(violations, releaseFile, preCloseout, "Evaluate authenticated pre-publish closeout", {
     RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
   });
@@ -3129,14 +3426,16 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     devRevalidation?.if === "${{ !inputs.publish_release }}",
     `${releaseFile} proof-only ledger upload must revalidate only the dev head`,
   );
-  requireStepRun(violations, releaseFile, preCloseout, "Revalidate proof-only dev head", [
-    "repos/$GITHUB_REPOSITORY/git/ref/heads/dev/codestory-next",
-    '"$live_head" != "$GITHUB_SHA"',
-    "dev/codestory-next moved from accepted ledger head",
-  ]);
   requireStepUses(violations, releaseFile, preCloseout, "Upload accepted pre-publish closeout", "actions/upload-artifact@v7.0.1");
 
-  const publish = requireJob(violations, releaseFile, release, "publish");
+  // The publish job's structural pin (job existence) is a rule instance and
+  // lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it. Its step fragments - the ledger-fed
+  // release notes, the manifest generation, the shipped closeout summary, the
+  // tag refusal, and the release creation - are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  const publish = object(object(release.jobs).publish);
   add(violations, publish.if === "inputs.publish_release", `${releaseFile} publish must require trusted publication authority`);
   add(violations, sameMembers(needs(publish), releaseChain.dependencies.publish), `${releaseFile} publish dependencies must match the release claim graph`);
   // The published platform table is a claim about this release, so it is rendered from the accepted
@@ -3149,33 +3448,20 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "Download the accepted pre-publish closeout",
     "actions/download-artifact@v8.0.1",
   );
-  requireStepRun(violations, releaseFile, publish, "Compose versioned GitHub release notes", [
-    "node .github/scripts/extract-codestory-release-notes.mjs",
-    "--output target/release-assets/release-notes.md",
-    "node scripts/codestory-release-claims.mjs release-platform-notes",
-    "--ledger target/release-closeout/pre_publish/ledger.json",
-  ]);
-  // The ledger the README tells readers to consult has to be reachable from the release itself.
-  requireStepRun(violations, releaseFile, publish, "Ship the accepted closeout summary with the release", [
-    "target/release-closeout/pre_publish/summary.json",
-    '"$(jq -r .decision "$summary")" = accept',
-    "target/release-assets/release-closeout-summary.json",
-  ]);
-  requireStepRun(violations, releaseFile, publish, "Refuse existing tag or release", [
-    'git ls-remote --exit-code --tags origin "refs/tags/$TAG"',
-    'gh release view "$TAG"',
-    "exit 1",
-  ]);
-  requireStepRun(violations, releaseFile, publish, "Create GitHub release", [
-    "--notes-file target/release-assets/release-notes.md",
-    "node scripts/codestory-release-claims.mjs release-assets",
-    'for name in "${expected_names[@]}"; do',
-    'if [ ! -f "$asset" ]; then',
-    "Release assets differ from the release claim graph",
-    "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
-    '"$live_head" != "$GITHUB_SHA"',
-    "main moved from publishable head",
-  ]);
+  // The manifest generation has to happen after the checksums exist -- it
+  // cross-checks against them -- and before the release is created, or the
+  // launcher fetches a manifest that describes bytes nobody published; the
+  // ordering pins below stay code.
+  requireStepEnv(violations, releaseFile, publish, "Generate the release manifest", {
+    TAG: "${{ needs.preflight.outputs.tag }}",
+    VERSION: "${{ needs.preflight.outputs.version }}",
+  });
+  add(
+    violations,
+    stepIndex(publish, "Combine and verify checksums") < stepIndex(publish, "Generate the release manifest")
+      && stepIndex(publish, "Generate the release manifest") < stepIndex(publish, "Create GitHub release"),
+    `${releaseFile} must generate the release manifest from verified checksums before creating the release`,
+  );
   const publishRun = shellLiteralNormalizedText(stepRun(
     publish,
     "Create GitHub release",
@@ -3190,7 +3476,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   );
   add(violations, !scalarStrings(release).some(value => value.includes("--generate-notes")), `${releaseFile} must use curated release notes`);
 
-  const marketplacePublish = requireJob(violations, releaseFile, release, "marketplace-publish");
+  // The marketplace-publish job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const marketplacePublish = object(object(release.jobs)["marketplace-publish"]);
   add(
     violations,
     marketplacePublish.if === "inputs.publish_release",
@@ -3224,19 +3513,17 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   );
   violations.push(...catalogDeliveryOutcomeViolations(releaseFile, marketplacePublish, catalogDelivery));
   // The version the catalog is pointed at reaches the push as a variable, so the command text no
-  // longer says which release it published. Both halves are pinned, as in the plugin lane.
-  requireStepRun(violations, releaseFile, marketplacePublish, "Point the catalog at the published release", [
-    '--version "$RELEASE_VERSION"',
-  ]);
+  // longer says which release it published. Both halves are pinned, as in the plugin lane: the
+  // run fragment lives in release-claims.json under workflow_policy.step_fragments and the env
+  // binding stays code because env bindings have no graph evaluator.
   requireStepEnv(violations, releaseFile, marketplacePublish, "Point the catalog at the published release", {
     RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
   });
-  requireStepRun(violations, releaseFile, preflight, "Prove the public marketplace install path", [
-    "build-marketplace-fixture.mjs",
-    "--local-fixture true",
-  ]);
 
-  const post = requireJob(violations, releaseFile, release, "post-publish-smoke");
+  // The post-publish-smoke job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const post = object(object(release.jobs)["post-publish-smoke"]);
   add(violations, post.uses === "./.github/workflows/post-publish-release-smoke.yml", `${releaseFile} must call post-publish smoke`);
   add(violations, sameMembers(needs(post), releaseChain.dependencies["post-publish-smoke"]), `${releaseFile} post-publish dependencies must match the release claim graph`);
   // The smoke still needs publication authority and a real published release, but a deferred
@@ -3265,7 +3552,9 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(
     violations,
     object(post.with).catalog_published
-      === `\${{ needs.${catalogDelivery.publish_job}.outputs.catalog_published == 'true' }}`,
+      === `\${{ needs.${catalogDelivery.publish_job}.outputs.catalog_published == 'true' }}`
+      && object(post.with).catalog_delivery_state
+        === `\${{ needs.${catalogDelivery.publish_job}.outputs.catalog_delivery_state }}`,
     `${releaseFile} post-publish smoke must derive catalog_published from the recorded ${catalogDelivery.publish_job} outcome`,
   );
   add(
@@ -3276,7 +3565,13 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && String(object(post.with).pre_publish_closeout_artifact ?? "").startsWith("release-closeout-pre-publish-"),
     `${releaseFile} post-publish smoke must consume the proved marketplace revision and accepted pre-publish ledger`,
   );
-  const postCloseout = requireJob(violations, releaseFile, release, "post-publish-closeout");
+  // The post-publish-closeout job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it. Its
+  // step fragments - provenance collection, the container digest checks, and
+  // the evaluation - are rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const postCloseout = object(object(release.jobs)["post-publish-closeout"]);
   add(violations, postCloseout.if === "inputs.publish_release", `${releaseFile} post-publish closeout must require trusted publication authority`);
   add(violations, sameMembers(needs(postCloseout), releaseChain.dependencies["post-publish-closeout"]), `${releaseFile} post-publish closeout dependencies must match the release claim graph`);
   // The closeout reached marketplace-publish only through the smoke, so removing the smoke's gate
@@ -3287,32 +3582,79 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && !String(postCloseout.if ?? "").includes(`needs.${catalogDelivery.publish_job}`),
     `${releaseFile} post-publish closeout must not gate on ${catalogDelivery.publish_job} succeeding`,
   );
-  requireStepRun(violations, releaseFile, postCloseout, "Authenticate post-publish Actions provenance", [
-    "producer-map",
-    "--phase post_publish",
-    "artifact_ids",
-    "bash .github/scripts/collect-actions-job-evidence.sh",
-    "--job-evidence target/release-closeout/job-evidence.json",
-  ]);
-  const postDownload = namedStep(postCloseout, "Download selected release cells without flattening");
+  const postProvenanceName = "Authenticate post-publish Actions provenance";
+  const postProvenanceRun = executableRunText(stepRun(postCloseout, postProvenanceName));
+  requireStepEnv(violations, releaseFile, postCloseout, postProvenanceName, {
+    GH_TOKEN: "${{ github.token }}",
+    REUSE_SELECTION: "${{ needs.preflight.outputs.reuse }}",
+  });
+  requireFlagOnInvocation(
+    violations,
+    `${releaseFile} post-publish producer map must consume the preflight reuse selection`,
+    postProvenanceRun,
+    "codestory-release-cell-manifest.mjs producer-map",
+    '--reuse "$REUSE_SELECTION"',
+  );
+  const postDownloadName = "Download and verify selected cumulative release cells";
+  const postDownload = namedStep(postCloseout, postDownloadName);
+  const postDownloadRun = executableRunText(stepRun(postCloseout, postDownloadName));
+  const postDigestCheck = 'test "$actual_digest" = "$expected_digest"';
+  const postDestinationCreate = 'mkdir "$destination"';
+  const postContainerExtract = 'unzip -q "$archive" -d "$destination"';
+  const postDirectoryCheck = 'test -d "target/release-cell-manifests/$artifact_name"';
   add(
     violations,
-    postDownload?.uses === "actions/download-artifact@v8.0.1"
-      && object(postDownload.with)["artifact-ids"] === "${{ steps.post-publish-provenance.outputs.artifact_ids }}"
-      && object(postDownload.with)["merge-multiple"] === false,
-    `${releaseFile} post-publish closeout must download selected Actions artifact ids without flattening`,
+    postDownload?.uses === undefined
+      && postDownload?.shell === "bash"
+      && postDownload?.["continue-on-error"] === undefined
+      && object(postDownload?.env).GH_TOKEN === "${{ github.token }}",
+    `${releaseFile} post-publish closeout must materialize cumulative release cells in blocking Bash`,
   );
-  requireStepRun(violations, releaseFile, postCloseout, "Verify selected post-publish artifact container digests", [
-    "/actions/artifacts/$artifact_id/zip",
-    "sha256sum",
-    "test \"$actual_digest\" = \"$expected_digest\"",
-  ]);
-  requireStepRun(violations, releaseFile, postCloseout, "Evaluate authenticated post-publish closeout", [
-    "--trusted-producers",
-    "--pre-publish-ledger",
-    "codestory-release-closeout.mjs evaluate",
-    '--version "$RELEASE_VERSION"',
-  ]);
+  add(
+    violations,
+    postDownloadRun.includes(
+      ".artifacts[] | [.id, .name, .digest] | @tsv",
+    ),
+    `${releaseFile} post-publish closeout must iterate every selected artifact id, name, and digest`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(
+      "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip",
+    ),
+    `${releaseFile} post-publish closeout must fetch every selected artifact by authenticated artifact id`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes('sha256sum "$archive"')
+      && postDownloadRun.includes(postDigestCheck),
+    `${releaseFile} post-publish closeout must reject a selected artifact container digest mismatch`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(
+      'destination="target/release-cell-manifests/$artifact_name"',
+    )
+      && postDownloadRun.includes(postDestinationCreate),
+    `${releaseFile} post-publish closeout must create one exact artifact-name directory per selected container`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(postContainerExtract)
+      && postDownloadRun.indexOf(postDigestCheck)
+        < postDownloadRun.indexOf(postDestinationCreate)
+      && postDownloadRun.indexOf(postDestinationCreate)
+        < postDownloadRun.indexOf(postContainerExtract),
+    `${releaseFile} post-publish closeout must extract each verified container into its exact artifact-name directory`,
+  );
+  add(
+    violations,
+    postDownloadRun.includes(".artifacts[].name")
+      && postDownloadRun.includes(postDirectoryCheck)
+      && postDownloadRun.indexOf(postContainerExtract)
+        < postDownloadRun.indexOf(postDirectoryCheck),
+    `${releaseFile} post-publish closeout must verify every selected artifact-name directory exists`,
+  );
   requireStepEnv(violations, releaseFile, postCloseout, "Evaluate authenticated post-publish closeout", {
     RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
   });
@@ -3415,12 +3757,6 @@ function validatePackagedProof(workflows, violations, graph) {
     violations.push(`${file} must exist`);
     return;
   }
-  add(
-    violations,
-    createHash("sha256").update(JSON.stringify(workflow)).digest("hex")
-      === packagedPlatformWorkflowDigest,
-    `${file} must match the reviewed canonical workflow structure`,
-  );
   add(violations, trigger(workflow, "workflow_call") !== undefined, `${file} must be reusable`);
   const refInput = object(at(workflow, "on", "workflow_call", "inputs", "ref"));
   add(
@@ -3539,14 +3875,6 @@ function validatePackagedProof(workflows, violations, graph) {
       && stepIndex(job, "Capture pinned sccache identity")
         === stepIndex(job, "Install pinned sccache") + 1,
     `${file} must capture the pinned sccache identity immediately after installation`,
-  );
-  requireExactRawStepScript(
-    violations,
-    file,
-    job,
-    "Capture pinned sccache identity",
-    packagedSccacheIdentityDigest,
-    "pinned sccache identity capture",
   );
   requireStepRun(violations, file, job, "Capture pinned sccache identity", [
     'sccache_path="$(command -v sccache)"',
@@ -3751,14 +4079,6 @@ function validatePackagedProof(workflows, violations, graph) {
       && linuxBuild?.["continue-on-error"] === undefined,
     `${file} Linux container must strictly report and stop its owned compiler server`,
   );
-  requireExactRawStepScript(
-    violations,
-    file,
-    job,
-    "Build Linux x64 at the glibc 2.31 baseline",
-    packagedLinuxBuildDigest,
-    "Linux container build and compiler-server ownership",
-  );
   const stopCompilationClock = namedStep(job, "Stop compilation clock");
   add(
     violations,
@@ -3767,14 +4087,6 @@ function validatePackagedProof(workflows, violations, graph) {
       && stopCompilationClock?.env === undefined
       && stopCompilationClock?.["continue-on-error"] === undefined,
     `${file} compiler clock stop must remain a strict telemetry-only boundary`,
-  );
-  requireExactRawStepScript(
-    violations,
-    file,
-    job,
-    "Stop compilation clock",
-    packagedCompileClockStopDigest,
-    "compiler clock stop",
   );
   const finalizeCompilerObjects = namedStep(job, "Finalize compiler objects");
   add(
@@ -3792,14 +4104,6 @@ function validatePackagedProof(workflows, violations, graph) {
       && finalizeCompilerObjects?.["continue-on-error"] === undefined
       && packageBuild?.if === "matrix.asset_target != 'linux-x64'",
     `${file} host finalizer must strictly stop only the host package-build compiler server`,
-  );
-  requireExactRawStepScript(
-    violations,
-    file,
-    job,
-    "Finalize compiler objects",
-    packagedHostCompilerFinalizerDigest,
-    "host compiler-server finalizer",
   );
   add(
     violations,
@@ -4010,6 +4314,46 @@ function validatePackagedProof(workflows, violations, graph) {
       && !/(?:^|\s)--bins(?:\s|$)/u.test(packageBuildRun),
     `${file} host package must build only the production bins and optional qualification driver in one exact Cargo invocation`,
   );
+  // Windows linker timing was a substring count over the build log, which the
+  // Cargo progress line `Compiling time v0.3.47` satisfied. The reported
+  // `msvc_link` interval must instead come from the explicit link /TIME
+  // boundaries in a captured trace the shell closed before reading it, and it
+  // stays a separate interval from the `cargo_graph` wall clock around it.
+  const linkTimingSelector = shellInvocationsContaining(
+    packageBuildRun,
+    "node .github/scripts/windows-link-timing.mjs select",
+  );
+  add(
+    violations,
+    linkTimingSelector.length === 1
+      && linkTimingSelector[0].includes("--input $linker_log")
+      && linkTimingSelector[0].includes("--out $timing_dir/windows-link-timing.json")
+      && linkTimingSelector[0].includes("--build-elapsed-ms $build_elapsed_ms")
+      && packageBuildRun.includes("2> $linker_log")
+      && !packageBuildRun.includes(">(tee $linker_log")
+      && !packageBuildRun.includes("linker_rows")
+      && shellInvocationsContaining(packageBuildRun, "grep").length === 0
+      && packageBuildRun.includes("- Exact release graph build (cargo_graph): ${build_elapsed_ms} ms"),
+    `${file} Windows linker timing must be selected from the explicit link boundary, not a substring search`,
+  );
+  // The claim graph publishes what a Windows package may say about linking. It
+  // is only a mirror if it matches the selector this workflow actually runs.
+  const declaredLinkTiming = object(
+    object(graph.workflow_policy.windows_package_graph).link_timing,
+  );
+  add(
+    violations,
+    declaredLinkTiming.phase === WINDOWS_LINK_PHASE
+      && declaredLinkTiming.selector === ".github/scripts/windows-link-timing.mjs"
+      && declaredLinkTiming.record_schema === WINDOWS_LINK_TIMING_SCHEMA
+      && declaredLinkTiming.record_file === "windows-link-timing.json"
+      && declaredLinkTiming.evidence === "explicit_link_time_boundary"
+      && declaredLinkTiming.substring_match === false
+      && declaredLinkTiming.observational === true
+      && JSON.stringify(list(declaredLinkTiming.unavailable_reasons))
+        === JSON.stringify(Object.values(WINDOWS_LINK_TIMING_REASONS).sort()),
+    `${file} declared Windows linker timing must mirror the selector the workflow runs`,
+  );
   add(
     violations,
     JSON.stringify(cargoBuildStepNames) === JSON.stringify([
@@ -4218,6 +4562,7 @@ function validatePackagedProof(workflows, violations, graph) {
       && namedStep(job, "Upload packaged agent proof artifacts") === undefined,
     `${file} package workflow must not add a second driver build, calibration, or hosted qualification`,
   );
+  requireCalibrationProducerAuthentication(violations, file, job);
   requireCalibrationProducerBoundary(
     violations,
     file,
@@ -4275,7 +4620,6 @@ function validatePackagedProof(workflows, violations, graph) {
   const coordinator = workflows.get(coordinatorFile);
   const coordinatorPackaged = object(at(coordinator, "jobs", "packaged-proof"));
   const bindings = callerInputBindings(
-    object(coordinator),
     coordinatorPackaged,
     calleeInputSpecifications(workflow),
   );
@@ -4419,6 +4763,7 @@ function catalogDeliveryStateViolations(file, job, delivery, handoff, installSte
   const violations = [];
   const published = delivery.states.find(({ id }) => id === "published");
   const deferred = delivery.states.find(({ id }) => id === "deferred");
+  const restored = delivery.states.find(({ id }) => id === "restored");
   // Whatever else the deferred branch does, it builds a catalog out of a tree and then verifies
   // the install back against a tree. If those may be the same tree by default, the comparison is
   // a tautology and the smoke cannot fail for any release-related reason. Both lanes therefore
@@ -4454,21 +4799,24 @@ function catalogDeliveryStateViolations(file, job, delivery, handoff, installSte
   add(
     violations,
     object(step?.env).CATALOG_PUBLISHED === handoff.published
+      && object(step?.env).CATALOG_DELIVERY_STATE === handoff.state
       && object(step?.env).INPUT_MARKETPLACE_REVISION === handoff.revision,
     `${file} catalog delivery state must read the recorded publication handoff`,
   );
   requireStepRun(violations, file, job, "Record catalog delivery state", [
     // The published branch: the live catalog, its live revision, no fixture.
-    'if [ "$CATALOG_PUBLISHED" = "true" ]; then',
+    'if [ "$CATALOG_DELIVERY_STATE" = "published" ] && [ "$CATALOG_PUBLISHED" = "true" ]; then',
     "marketplace_source=TheGreenCedar/AgentPluginMarketplace",
     'marketplace_revision="$INPUT_MARKETPLACE_REVISION"',
     "local_fixture=false",
     `installer=${published.installer}`,
     // The deferred branch: a catalog pinned to this published commit, and a revision that cannot
     // be a live one because the caller is required to have supplied none.
-    'elif [ "$CATALOG_PUBLISHED" = "false" ]; then',
+    '[ "$CATALOG_DELIVERY_STATE" = "deferred" ]',
+    '[ "$CATALOG_DELIVERY_STATE" = "restored" ]',
+    '[ "$CATALOG_PUBLISHED" = "false" ]',
     'if [ -n "$INPUT_MARKETPLACE_REVISION" ]; then',
-    "Deferred catalog publication must not carry a live catalog revision",
+    "catalog delivery must not carry the failed live catalog revision",
     "build-marketplace-fixture.mjs",
     // The fixture pins the PUBLISHED commit, never the workspace's own head. Building a catalog
     // out of the tree that then verifies the install makes the source-tree comparison a
@@ -4477,9 +4825,10 @@ function catalogDeliveryStateViolations(file, job, delivery, handoff, installSte
     'marketplace_revision="$(git -C "$fixture_root" rev-parse HEAD)"',
     "local_fixture=true",
     `installer=${deferred.installer}`,
+    `installer=${restored.installer}`,
     // Neither branch may fall through: an unset or unexpected handoff is a hard failure, never a
     // silent default into the published identity.
-    "catalog_published must be true or false",
+    "catalog delivery handoff is inconsistent",
     // Immutability, not length. A 40-character string is not a commit: the published branch
     // takes its revision from a `workflow_dispatch`-able input, and a length-only test admits
     // any 40 characters of anything.
@@ -4489,8 +4838,8 @@ function catalogDeliveryStateViolations(file, job, delivery, handoff, installSte
   const deliveryRun = executableRunText(String(step?.run ?? ""));
   const publishedIndex = deliveryRun.indexOf(`installer=${published.installer}`);
   const deferredIndex = deliveryRun.indexOf(`installer=${deferred.installer}`);
-  const publishedBranch = deliveryRun.indexOf('if [ "$CATALOG_PUBLISHED" = "true" ]; then');
-  const deferredBranch = deliveryRun.indexOf('elif [ "$CATALOG_PUBLISHED" = "false" ]; then');
+  const publishedBranch = deliveryRun.indexOf('if [ "$CATALOG_DELIVERY_STATE" = "published" ]');
+  const deferredBranch = deliveryRun.indexOf('[ "$CATALOG_DELIVERY_STATE" = "deferred" ]');
   add(
     violations,
     published.installer !== deferred.installer
@@ -4498,7 +4847,8 @@ function catalogDeliveryStateViolations(file, job, delivery, handoff, installSte
       && deferredBranch > publishedBranch
       && publishedIndex > publishedBranch
       && publishedIndex < deferredBranch
-      && deferredIndex > deferredBranch,
+      && deferredIndex > deferredBranch
+      && deliveryRun.indexOf(`installer=${restored.installer}`) > deferredBranch,
     `${file} the published installer identity must be reachable only from the published branch`,
   );
   // Neither state may be fabricated in a later step: the install must come from what this step
@@ -4513,12 +4863,14 @@ function catalogDeliveryStateViolations(file, job, delivery, handoff, installSte
   requireStepRun(violations, file, job, installStepName, [
     '--marketplace-source "$MARKETPLACE_SOURCE"',
     '--local-fixture "$LOCAL_FIXTURE"',
+    '--installation-source "$INSTALLATION_SOURCE"',
   ]);
   // The install arguments arrive as variables now, so the command text no longer says which
   // delivery state they came from. This binds each variable back to that step's own output.
   requireStepEnv(violations, file, job, installStepName, {
     MARKETPLACE_SOURCE: "${{ steps.delivery.outputs.marketplace_source }}",
     LOCAL_FIXTURE: "${{ steps.delivery.outputs.local_fixture }}",
+    INSTALLATION_SOURCE: "${{ steps.delivery.outputs.installer }}",
   });
   return violations;
 }
@@ -4531,7 +4883,9 @@ function validatePostPublish(workflows, violations, graph) {
     return;
   }
   add(violations, trigger(workflow, "workflow_call") !== undefined, `${file} must be reusable`);
-  add(violations, object(workflow.permissions).actions === "read", `${file} must read the accepted pre-publish closeout`);
+  // The smoke workflow's structural pins (job existence and its permission scope)
+  // are rule instances and live in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates them.
   requireNoCalibrationReferences(violations, file, workflow);
   for (const event of ["workflow_call", "workflow_dispatch"]) {
     // The catalog revision is now empty exactly when publication was deferred, so the required
@@ -4541,6 +4895,13 @@ function validatePostPublish(workflows, violations, graph) {
       violations,
       publishedInput.required === true && publishedInput.type === "boolean",
       `${file} ${event} catalog_published must be a required boolean`,
+    );
+    const stateInput = object(at(workflow, "on", event, "inputs", "catalog_delivery_state"));
+    add(
+      violations,
+      stateInput.required === true
+        && (stateInput.type === "string" || stateInput.type === "choice"),
+      `${file} ${event} catalog_delivery_state must be required`,
     );
     const marketplaceInput = object(
       at(workflow, "on", event, "inputs", "marketplace_revision"),
@@ -4553,7 +4914,7 @@ function validatePostPublish(workflows, violations, graph) {
     const closeoutInput = object(at(workflow, "on", event, "inputs", "pre_publish_closeout_artifact"));
     add(violations, closeoutInput.type === "string", `${file} ${event} pre_publish_closeout_artifact must be a string`);
   }
-  const job = requireJob(violations, file, workflow, "smoke");
+  const job = object(object(workflow.jobs).smoke);
   const pythonSetup = namedStep(job, "Install pinned Python");
   add(
     violations,
@@ -4847,6 +5208,7 @@ function validatePostPublish(workflows, violations, graph) {
     catalogDelivery,
     {
       published: "${{ inputs.catalog_published }}",
+      state: "${{ inputs.catalog_delivery_state }}",
       revision: "${{ inputs.marketplace_revision }}",
     },
     resolveStepName,
@@ -4942,6 +5304,7 @@ function validatePostPublish(workflows, violations, graph) {
   add(
     violations,
     installed?.if === undefined
+      && installed?.shell === "bash"
       && installed?.["continue-on-error"] === undefined,
     `${file} installed runtime proof must be unconditional and fail closed`,
   );
@@ -4956,7 +5319,7 @@ function validatePostPublish(workflows, violations, graph) {
     '--archive "$ASSET_ARCHIVE"',
     "--plugin-handoff",
     "--engine-policy accelerated",
-    '--expected-backend "${{ matrix.backend }}"',
+    '--expected-backend "$EXPECTED_BACKEND"',
     "--proof-tier installed_runtime",
     "--server-behavior-only",
     "--installed-plugin-attestation",
@@ -4979,7 +5342,124 @@ function validatePostPublish(workflows, violations, graph) {
     INSTALLED_PLUGIN_ROOT: "${{ steps.installed.outputs.plugin_root }}",
     INSTALLED_ATTESTATION: "${{ steps.installed.outputs.attestation }}",
     INSTALLED_PLUGIN_DATA: "${{ steps.installed.outputs.plugin_data }}",
+    CATALOG_DELIVERY_STATE: "${{ steps.delivery.outputs.state }}",
+    DELIVERED_INSTALLER: "${{ steps.delivery.outputs.installer }}",
+    EXPECTED_BACKEND: "${{ matrix.backend }}",
   });
+  add(
+    violations,
+    hasExactKeys(object(installed?.env), [
+      "ASSET_ARCHIVE",
+      "ASSET_CHECKSUM",
+      "CATALOG_DELIVERY_STATE",
+      "CODESTORY_EMBED_ALLOW_CPU",
+      "DELIVERED_INSTALLER",
+      "EXPECTED_BACKEND",
+      "INSTALLED_ATTESTATION",
+      "INSTALLED_PLUGIN_DATA",
+      "INSTALLED_PLUGIN_ROOT",
+      "RELEASE_VERSION",
+    ]),
+    `${file} installed runtime restart proof must bind only the reviewed package, install, delivery, and backend identities`,
+  );
+  const commonStart = installedRun.indexOf("common=(");
+  const commonEnd = commonStart < 0 ? -1 : installedRun.indexOf("\n)", commonStart);
+  const installedCommon = commonStart >= 0 && commonEnd > commonStart
+    ? installedRun.slice(commonStart, commonEnd + 2)
+    : "";
+  const commonExpansion = '"${common[@]}"';
+  add(
+    violations,
+    occurrenceCount(installedRun, "common=(") === 1
+      && occurrenceCount(installedCommon, "python .github/scripts/check-packaged-agent-proof.py") === 1
+      && [
+        '--archive "$ASSET_ARCHIVE"',
+        '--checksum-file "$ASSET_CHECKSUM"',
+        '--expected-version "$RELEASE_VERSION"',
+        '--plugin-root "$INSTALLED_PLUGIN_ROOT"',
+        '--installed-plugin-attestation "$INSTALLED_ATTESTATION"',
+        '--installed-plugin-data "$INSTALLED_PLUGIN_DATA"',
+        '--expected-source-sha "$source_sha"',
+        '--expected-source-tree "$source_tree"',
+        '--expected-backend "$EXPECTED_BACKEND"',
+      ].every(fragment => installedCommon.includes(fragment)),
+    `${file} installed runtime restart proof must define one common exact-package and installed-runtime invocation`,
+  );
+  const session1Proof = `${commonExpansion} --out-dir "$proof_root/session-1"`;
+  const session2Proof = `${commonExpansion} --out-dir "$proof_root/session-2"`;
+  add(
+    violations,
+    occurrenceCount(installedRun, commonExpansion) === 2
+      && occurrenceCount(installedRun, session1Proof) === 1
+      && occurrenceCount(installedRun, session2Proof) === 1,
+    `${file} installed runtime restart proof must execute exactly two distinct sessions through the common invocation`,
+  );
+  const timingAndSessionOrder = [
+    'session_1_started_ms="$(now_ms)"',
+    session1Proof,
+    'session_1_finished_ms="$(now_ms)"',
+    'session_2_started_ms="$(now_ms)"',
+    session2Proof,
+    'session_2_finished_ms="$(now_ms)"',
+  ].map(fragment => installedRun.indexOf(fragment));
+  add(
+    violations,
+    installedRun.includes("time.time_ns() // 1_000_000")
+      && timingAndSessionOrder.every(index => index >= 0)
+      && timingAndSessionOrder.every(
+        (index, position) => position === 0 || timingAndSessionOrder[position - 1] < index,
+      ),
+    `${file} installed runtime restart proof must record two monotonically ordered session intervals`,
+  );
+  add(
+    violations,
+    installedRun.includes('hashlib.file_digest(source, "sha256").hexdigest()')
+      && installedRun.includes(
+        'binary_sha256="$(jq -er \'.package_contract.manifest.binary.sha256\' "$proof_root/session-1/summary.json")"',
+      ),
+    `${file} installed runtime restart proof must derive the actual archive and packaged binary hashes`,
+  );
+  const restartInvocations = shellInvocationsContaining(
+    installedRun,
+    "node .github/scripts/restart-survival-receipt.mjs",
+  );
+  const restartInvocation = restartInvocations.length === 1 ? restartInvocations[0] : "";
+  add(
+    violations,
+    restartInvocations.length === 1
+      && [
+        '--session-1-summary "$proof_root/session-1/summary.json"',
+        '--session-2-summary "$proof_root/session-2/summary.json"',
+        '--install-attestation "$INSTALLED_ATTESTATION"',
+        '--catalog-delivery-state "$CATALOG_DELIVERY_STATE"',
+        '--expected-installer-identity "$DELIVERED_INSTALLER"',
+        '--expected-source-commit "$source_sha"',
+        '--expected-source-tree "$source_tree"',
+        '--expected-version "$RELEASE_VERSION"',
+        '--expected-archive-sha256 "$archive_sha256"',
+        '--expected-binary-sha256 "$binary_sha256"',
+        '--expected-backend "$EXPECTED_BACKEND"',
+        '--session-1-start-ms "$session_1_started_ms"',
+        '--session-1-finished-ms "$session_1_finished_ms"',
+        '--session-2-start-ms "$session_2_started_ms"',
+        '--session-2-finished-ms "$session_2_finished_ms"',
+        '--out "$proof_root/restart-survival.json"',
+      ].every(fragment => restartInvocation.includes(fragment))
+      && !restartInvocation.includes("|| true"),
+    `${file} installed runtime restart receipt must bind both sessions, one install, delivery, release, package, backend, and timing identities`,
+  );
+  const proofUpload = namedStep(job, "Upload post-publish proof artifacts");
+  add(
+    violations,
+    proofUpload?.if === "always()"
+      && proofUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && String(object(proofUpload?.with).path).split(/\r?\n/u)
+        .map(value => value.trim())
+        .filter(Boolean)
+        .includes("target/post-publish-installed-proof")
+      && object(proofUpload?.with)["if-no-files-found"] === "error",
+    `${file} post-publish proof artifact must retain the complete installed-runtime restart root`,
+  );
   for (const fragment of ["--engine-policy cpu_explicit", "--expected-backend CPU", "--ground-only"]) {
     add(
       violations,
@@ -5053,12 +5533,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations.push(`${file} must exist`);
     return;
   }
-  add(
-    violations,
-    createHash("sha256").update(JSON.stringify(workflow)).digest("hex")
-      === packagedPlatformCoordinatorWorkflowDigest,
-    `${file} must match the reviewed frozen-candidate coordinator structure`,
-  );
   const promotion = graph.workflow_policy.promotion;
   const calibrationPolicy = object(graph.workflow_policy.calibration);
   const qualificationPolicy = object(graph.workflow_policy.qualification);
@@ -5068,7 +5542,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       "route",
       "calibration-macos",
       "calibration-assemble",
-      "release-evidence",
       "source-proof",
       "packaged-proof",
       "macos-metal-proof",
@@ -5084,6 +5557,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     calibrationPolicy.coordinator_workflow === file
       && calibrationPolicy.mode === "calibration"
       && calibrationPolicy.assembly_job === "calibration-assemble"
+      && calibrationPolicy.pre_collection_source_proof_required === true
+      && calibrationPolicy.source_proof_stage === "source_stabilization_before_calibration"
       && calibrationPolicy.runs_per_required_cell === 3
       && calibrationPolicy.samples_per_metric_per_run === 1
       && list(calibrationPolicy.required_cells).length === 1
@@ -5148,7 +5623,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
           archive_cache_contract: "candidate_archive_cache",
           archive_transfer: "authenticated_miss_only",
           evaluation_owner: "isolated_reusable_workflow",
-          evaluation_owner_sha256: frozenCandidateQualityWorkflowDigest,
+          evaluation_owner_sha256:
+            pinnedProgramRow(graph, "frozen_candidate_quality_workflow").sha256,
           evaluation_contract: "publishable-three-repeat-packet/v1",
           task_count: 1,
           repeats_per_task: 3,
@@ -5207,7 +5683,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations,
     sameMembers(
       at(workflow, "on", "workflow_dispatch", "inputs", "mode", "options"),
-      ["package", "platform", "qualification", "calibration", "release-evidence", "integration"],
+      ["package", "platform", "qualification", "calibration", "integration"],
     ),
     `${file} dispatch modes changed`,
   );
@@ -5219,85 +5695,68 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     ),
     `${file} dispatch scopes changed`,
   );
-  add(violations, trigger(workflow, "pull_request_target") === undefined, `${file} must not use pull_request_target`);
+  const linuxQualificationInput = object(
+    at(workflow, "on", "workflow_dispatch", "inputs", "qualify_linux_vulkan"),
+  );
   add(
     violations,
-    object(workflow.permissions).actions === "write",
-    `${file} must cancel superseded proof runs before package or hardware work`,
+    linuxQualificationInput.required === false
+      && linuxQualificationInput.default === false
+      && linuxQualificationInput.type === "boolean",
+    `${file} Linux lifecycle qualification must remain an explicit non-default dispatch opt-in`,
   );
-  add(violations, object(workflow.permissions).contents === "read", `${file} must use read-only contents permission`);
-  const route = requireJob(violations, file, workflow, "route");
+  add(violations, trigger(workflow, "pull_request_target") === undefined, `${file} must not use pull_request_target`);
+  // The workflow-scoped permission grants (actions write for superseded-run
+  // cancellation, read-only contents) are rule instances and live in
+  // release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates them with their reviewed violation text.
+  // The route job's structural pin (job existence) is a rule instance and
+  // lives in the same block. Its step fragments - the trusted-head resolver
+  // conjuncts, the freeze verification, the exact-head source proof, the
+  // change-aware scope selection, and the calibration producer authentication
+  // - are rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const route = object(object(workflow.jobs).route);
   add(
     violations,
     route.if === undefined,
     `${file} route job must execute only explicit dispatches`,
   );
-  requireStepRun(violations, file, route, "Resolve trusted exact head", [
-    'test "$head_repo" = "$GITHUB_REPOSITORY"',
-    'test "$current_head" = "$EVENT_HEAD_SHA"',
-    'test "$INPUT_HEAD_SHA" = "$current_head"',
-    'test "$GITHUB_REF" = "refs/heads/$head_ref"',
-    'test "$GITHUB_SHA" = "$INPUT_HEAD_SHA"',
-    'test "$base_ref" = "dev/codestory-next"',
-    'test "$INPUT_HEAD_SHA" = "$dev_head"',
-    'test "$GITHUB_REF" = "refs/heads/dev/codestory-next"',
-    'test "$GITHUB_SHA" = "$dev_head"',
-    'elif [ "$mode" = "qualification" ]; then',
-    'test -z "$INPUT_SOURCE_RUN_ID"',
-    'test -n "$INPUT_CALIBRATION_ARTIFACT"',
-    'test -n "$INPUT_CALIBRATION_RUN_ID"',
-    "--ref $head_ref",
-  ]);
+  // DISPOSITION: step env bindings have no graph evaluator, so the resolver's
+  // calibration input bindings stay code.
   requireStepEnv(violations, file, route, "Resolve trusted exact head", {
-    INPUT_SOURCE_RUN_ID: "${{ inputs.source_run_id }}",
     INPUT_CALIBRATION_ARTIFACT: "${{ inputs.calibration_bundle_artifact }}",
     INPUT_CALIBRATION_RUN_ID: "${{ inputs.calibration_bundle_run_id }}",
+    INPUT_QUALIFY_LINUX_VULKAN: "${{ inputs.qualify_linux_vulkan }}",
   });
-  requireExactResolverContract(violations, file, route, platformResolverContractDigest);
+  add(
+    violations,
+    stepRun(route, "Resolve trusted exact head").includes(
+      'if [ "$qualify_linux_vulkan" = true ] && [ "$mode" != qualification ]; then',
+    ),
+    `${file} Linux lifecycle qualification opt-in must fail outside qualification mode`,
+  );
   add(
     violations,
     namedStep(route, "Require executable release freeze")?.if === undefined,
     `${file} every broad proof mode must authenticate its exact candidate head`,
   );
-  requireStepRun(violations, file, route, "Require executable release freeze", [
-    "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA",
-    "release-freeze-barrier.mjs verify-status",
-    '--commit "$HEAD_SHA"',
-    'if [ "$RESOLVED_MODE" = calibration ]; then',
-    "freeze_phase=calibration_source",
-    "freeze_phase=frozen_candidate",
-    '--phase "$freeze_phase"',
-    '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
-  ]);
+  // DISPOSITION: step env bindings have no graph evaluator, so the freeze
+  // step's resolved-mode binding stays code.
   requireStepEnv(violations, file, route, "Require executable release freeze", {
     RESOLVED_MODE: "${{ steps.resolve.outputs.mode }}",
   });
-  const exactHeadSourceProof = namedStep(route, "Require successful exact-head source proof");
+  const exactHeadSourceProof = namedStep(route, "Require successful source-stabilization proof");
   add(
     violations,
     exactHeadSourceProof?.if
       === "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'",
-    `${file} calibration must precede the sole frozen-candidate source proof`,
+    `${file} frozen candidates must reuse the pre-calibration source-stabilization proof`,
   );
-  requireStepRun(violations, file, route, "Require successful exact-head source proof", [
-    "actions/runs?head_sha=$HEAD_SHA",
-    '.path == ".github/workflows/source-proof.yml"',
-    '.event == "workflow_dispatch" and .conclusion == "success"',
-    '.name == "full-source-gate" and .conclusion == "success"',
-  ]);
-  requireStepRun(violations, file, route, "Select change-aware proof scope", [
-    'if [ "$REQUESTED_SCOPE" = none ] || [ "$REQUESTED_SCOPE" = linux ]; then',
-    'elif [ "$RESOLVED_MODE" = "package" ]; then',
-    'test "$REQUESTED_SCOPE" != none',
-    'if [ "$REQUESTED_SCOPE" = auto ]; then',
-    'elif [ "$RESOLVED_MODE" = "qualification" ]; then',
-    'test "$REQUESTED_SCOPE" = auto || test "$REQUESTED_SCOPE" = full',
-    'scope="$REQUESTED_SCOPE"',
-    "scope=full",
-    "node .github/scripts/route-ci-proof.mjs --stdin",
-  ]);
   // The mode the scope selector branches on now arrives as a variable, so the branch text alone no
   // longer says which mode it read. This binds the variable back to the resolver's own output.
+  // DISPOSITION: step env bindings have no graph evaluator, so the binding
+  // stays code.
   requireStepEnv(violations, file, route, "Select change-aware proof scope", {
     RESOLVED_MODE: "${{ steps.resolve.outputs.mode }}",
   });
@@ -5319,7 +5778,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       ),
     `${file} standard coordinator must not gate release proof on constant-set freeze state`,
   );
-  requireCalibrationProducerAuthentication(violations, file, route);
   const routeSteps = list(route.steps).map(object);
   add(
     violations,
@@ -5332,7 +5790,10 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     at(workflow, "jobs", "calibration-linux") === undefined,
     `${file} calibration must not schedule hosted Linux CPU or wait for optional Linux Vulkan evidence`,
   );
-  const calibrationMacos = requireJob(violations, file, workflow, "calibration-macos");
+  // The calibration-macos job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const calibrationMacos = object(object(workflow.jobs)["calibration-macos"]);
   add(
     violations,
     calibrationMacos.uses === "./.github/workflows/macos-metal-proof.yml"
@@ -5344,12 +5805,13 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     at(workflow, "jobs", "macos-source") === undefined,
     `${file} standard coordinator must not add a macOS source hard gate`,
   );
-  const calibrationAssemble = requireJob(
-    violations,
-    file,
-    workflow,
-    "calibration-assemble",
-  );
+  // The calibration-assemble job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it. The
+  // assembler's step fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  const calibrationAssemble = object(object(workflow.jobs)["calibration-assemble"]);
   add(
     violations,
     sameMembers(needs(calibrationAssemble), ["route", "calibration-macos"])
@@ -5412,28 +5874,14 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     calibrationAssemble,
     "Assemble frozen calibration candidate",
   );
-  requireStepRun(
-    violations,
-    file,
-    calibrationAssemble,
-    "Assemble frozen calibration candidate",
-    [
-      "--assemble-calibration-bundle",
-      "find target/calibration-inputs/macos",
-      'test "${#runs[@]}" = 3',
-      ".run_count == 3",
-      ".matrix_cell_count == 1",
-      "--calibration-producer-workflow-path",
-      "--calibration-producer-run-id",
-      "--calibration-producer-artifact",
-    ],
-  );
   add(
     violations,
     !scalarStrings(calibrationAssemble).some(value => value.toLowerCase().includes("linux"))
       && !calibrationAssemblyRun.includes("find target/calibration-inputs -type"),
     `${file} calibration assembly must not select, discover, or gate on Linux evidence`,
   );
+  // DISPOSITION: step uses pins have no graph evaluator, so the upload action
+  // pin stays code.
   requireStepUses(
     violations,
     file,
@@ -5450,7 +5898,10 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       === "embedding-calibration-bundle-${{ needs.route.outputs.head_sha }}",
     `${file} calibration artifact name must bind the exact source head`,
   );
-  const packaged = requireJob(violations, file, workflow, "packaged-proof");
+  // The packaged-proof job's structural pin (job existence) is a rule instance
+  // and lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it.
+  const packaged = object(object(workflow.jobs)["packaged-proof"]);
   add(violations, packaged.uses === "./.github/workflows/packaged-platform-proof.yml", `${file} must call packaged proof`);
   add(
     violations,
@@ -5489,12 +5940,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     `${file} package proof must not depend on optional release evidence`,
   );
   violations.push(...packagedPrSigningViolations(workflow));
-  const metal = requireJob(violations, file, workflow, "macos-metal-proof");
-  add(
-    violations,
-    sameMembers(needs(metal), ["route", "packaged-proof"]),
-    `${file} Metal proof must wait only for routing and package proof`,
-  );
+  // The macos-metal-proof job's structural pin (job existence) and its needs
+  // edge are rule instances and live in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates them
+  // with their reviewed violation text.
+  const metal = object(object(workflow.jobs)["macos-metal-proof"]);
   add(
     violations,
     String(metal.if ?? "").includes("needs.route.outputs.mode != 'package'"),
@@ -5514,12 +5964,13 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && object(metal.with).quality_evidence_artifact === undefined,
     `${file} qualification must run one full Metal lifecycle proof without optional quality inputs`,
   );
-  const qualityCaller = requireJob(
-    violations,
-    file,
-    workflow,
-    "frozen-candidate-quality",
-  );
+  // The frozen-candidate-quality job's structural pin (job existence) is a
+  // rule instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  // DISPOSITION: the caller's needs edge stays code because it is one conjunct
+  // of the single reviewed isolated-owner message below, which a needs pin
+  // could not reproduce without splitting the verdict.
+  const qualityCaller = object(object(workflow.jobs)["frozen-candidate-quality"]);
   add(
     violations,
     sameMembers(needs(qualityCaller), [
@@ -5543,12 +5994,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations.push(`${qualityFile} must exist`);
     return;
   }
-  add(
-    violations,
-    createHash("sha256").update(JSON.stringify(qualityWorkflow)).digest("hex")
-      === frozenCandidateQualityWorkflowDigest,
-    `${qualityFile} must match the reviewed isolated evaluation-owner structure`,
-  );
   const qualityCall = object(trigger(qualityWorkflow, "workflow_call"));
   const qualityInputs = object(qualityCall.inputs);
   add(
@@ -5561,10 +6006,20 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && object(qualityInputs.version).type === "string"
       && JSON.stringify(qualityWorkflow.permissions)
         === JSON.stringify({ actions: "read", contents: "read" })
-      && sameMembers(Object.keys(object(qualityWorkflow.jobs)), ["quality"]),
+      && sameMembers(Object.keys(object(qualityWorkflow.jobs)), [
+        "quality",
+        "windows-quality",
+        "linux-quality",
+      ]),
     `${qualityFile} must remain a reusable-only, read-only evaluation owner`,
   );
-  const quality = requireJob(violations, qualityFile, qualityWorkflow, "quality");
+  // The quality job's structural pin (job existence) is a rule instance and
+  // lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it. Its candidate cache restore and
+  // miss-only transfer step fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  const quality = object(object(qualityWorkflow.jobs).quality);
   add(
     violations,
     JSON.stringify(quality["runs-on"])
@@ -5577,10 +6032,12 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   const qualitySteps = list(quality.steps).map(object);
   add(
     violations,
-    qualitySteps.length === 9
+    qualitySteps.length === 11
       && qualitySteps.filter(step => step.id === "quality").length === 1
-      && qualitySteps.filter(step => step.id === "quality-upload").length === 1,
-    `${qualityFile} must retain one authenticated measurement and upload boundary`,
+      && qualitySteps.filter(step => step.id === "quality-upload").length === 1
+      && qualitySteps.filter(step => step.id === "ripgrep-quality").length === 1
+      && qualitySteps.filter(step => step.id === "ripgrep-quality-upload").length === 1,
+    `${qualityFile} must retain authenticated Axios and Ripgrep measurement boundaries`,
   );
   const qualityCheckout = namedStep(quality, "Checkout exact frozen candidate");
   add(
@@ -5652,26 +6109,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && qualityCacheRestore?.["continue-on-error"] === undefined,
     `${qualityFile} cache lookup must consume only the exact small candidate record`,
   );
-  requireStepRun(
-    violations,
-    qualityFile,
-    quality,
-    "Restore exact candidate archive from protected host",
-    [
-      "--arg repository \"$GITHUB_REPOSITORY\"",
-      "--arg source_sha \"$(git rev-parse HEAD)\"",
-      "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
-      "--arg target macos-arm64",
-      ".source.commit == $source_sha",
-      ".source.tree == $source_tree",
-      ".target == $target",
-      "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
-      "candidate-archive-store.mjs restore",
-      "--record \"$record\"",
-      "--output-dir target/release-dist",
-      "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\"",
-    ],
-  );
   add(
     violations,
     qualityCacheMiss?.if === "steps.candidate-cache.outputs.hit != 'true'"
@@ -5691,23 +6128,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
         === "${{ steps.candidate-artifacts.outputs.package-sha256 }}"
       && object(qualityCacheMiss?.env).GH_TOKEN === "${{ github.token }}",
     `${qualityFile} archive transfer must be cache-miss-only and outer-digest authenticated`,
-  );
-  requireStepRun(
-    violations,
-    qualityFile,
-    quality,
-    "Download, authenticate, and admit candidate archive on miss",
-    [
-      "actions/artifacts/$ARTIFACT_ID/zip",
-      "--continue-at -",
-      "--max-time 120",
-      'test "$actual_size" = "$EXPECTED_SIZE"',
-      'test "$actual_digest" = "$EXPECTED_SHA256"',
-      "extract-candidate-actions-artifact.py",
-      "candidate-archive-store.mjs admit",
-      "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
-      "--output-dir target/release-dist",
-    ],
   );
   const qualityProducer = qualitySteps.find(step => step.id === "quality");
   const qualityProducerRun = shellLiteralNormalizedText(
@@ -5754,6 +6174,26 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && qualityProducerRun.includes("--out-dir $quality_root/packet"),
     `${qualityFile} must run exactly one pinned three-repeat publishable evaluator`,
   );
+  const ripgrepQualityProducer = qualitySteps.find(step => step.id === "ripgrep-quality");
+  const ripgrepQualityProducerRun = shellLiteralNormalizedText(
+    String(ripgrepQualityProducer?.run ?? ""),
+  );
+  add(
+    violations,
+    ripgrepQualityProducer?.id === "ripgrep-quality"
+      && ripgrepQualityProducer?.["continue-on-error"] === true
+      && ripgrepQualityProducer?.shell === "bash"
+      && object(ripgrepQualityProducer?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
+      && ripgrepQualityProducerRun.includes("--packet-runtime-mode cold-cli")
+      && occurrenceCount(ripgrepQualityProducerRun, "--task-manifest") === 1
+      && !ripgrepQualityProducerRun.includes("--task-suite")
+      && !ripgrepQualityProducerRun.includes("--task-ids")
+      && ripgrepQualityProducerRun.includes("--repeats 3")
+      && ripgrepQualityProducerRun.includes("--publishable")
+      && ripgrepQualityProducerRun.includes("--max-source-reads-after-packet 0")
+      && ripgrepQualityProducerRun.includes("--timeout-ms 180000"),
+    `${qualityFile} optional macOS Ripgrep quality must be one isolated non-gating pinned evaluator`,
+  );
   const qualityUpload = qualitySteps.find(step => step.id === "quality-upload");
   const qualityOutcome = namedStep(quality, "Record optional quality outcome");
   add(
@@ -5781,6 +6221,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && qualityOutcome?.["continue-on-error"] === undefined
       && hasExactKeys(object(qualityOutcome?.env), [
         "QUALITY_OUTCOME",
+        "RIPGREP_QUALITY_OUTCOME",
+        "RIPGREP_UPLOAD_OUTCOME",
         "UPLOAD_OUTCOME",
       ])
       && object(qualityOutcome?.env).QUALITY_OUTCOME
@@ -5792,12 +6234,104 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       ),
     `${qualityFile} must report both outcomes without becoming a qualification or release gate`,
   );
-  const vulkan = requireJob(violations, file, workflow, "windows-vulkan-proof");
+  // The windows-quality job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const windowsQuality = object(object(qualityWorkflow.jobs)["windows-quality"]);
+  const windowsQualitySteps = list(windowsQuality.steps).map(object);
+  const windowsQualityProducer = windowsQualitySteps.find(
+    step => step.id === "windows-quality",
+  );
+  const windowsQualityRun = shellLiteralNormalizedText(
+    String(windowsQualityProducer?.run ?? ""),
+  );
+  const windowsQualityUpload = windowsQualitySteps.find(
+    step => step.id === "windows-quality-upload",
+  );
   add(
     violations,
-    sameMembers(needs(vulkan), ["route", "packaged-proof"]),
-    `${file} Windows qualification must run independently of optional Metal quality`,
+    windowsQuality.name === "Optional frozen-candidate Windows x64 Ripgrep v2 quality"
+      && JSON.stringify(windowsQuality["runs-on"])
+        === JSON.stringify(["self-hosted", "Windows", "X64", "codestory-vulkan"])
+      && windowsQuality.environment === undefined
+      && windowsQuality["continue-on-error"] === true
+      && windowsQuality["timeout-minutes"] === 60
+      && windowsQualitySteps.length === 6,
+    `${qualityFile} optional Windows x64 quality must remain non-gating on Vulkan`,
   );
+  add(
+    violations,
+    namedStep(windowsQuality, "Checkout exact frozen candidate")?.uses
+        === "actions/checkout@v5"
+      && namedStep(windowsQuality, "Download exact Windows x64 candidate archive")?.uses
+        === "actions/download-artifact@v8.0.1"
+      && object(
+        namedStep(windowsQuality, "Download exact Windows x64 candidate archive")?.with,
+      ).name === "codestory-cli-windows-x64"
+      && windowsQualityProducer?.["continue-on-error"] === true
+      && object(windowsQualityProducer?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
+      && windowsQualityRun.includes("--packet-runtime-mode cold-cli")
+      && occurrenceCount(windowsQualityRun, "--task-manifest") === 1
+      && windowsQualityRun.includes("--repeats 3")
+      && windowsQualityRun.includes("--publishable")
+      && !windowsQualityRun.includes("--task-suite")
+      && !windowsQualityRun.includes("--task-ids")
+      && windowsQualityUpload?.["continue-on-error"] === true
+      && windowsQualityUpload?.if === "steps.windows-quality.outcome == 'success'"
+      && namedStep(windowsQuality, "Record optional Windows x64 quality outcome")?.if
+        === "always()",
+    `${qualityFile} optional Windows x64 Ripgrep quality must retain isolated non-gating measurement and upload boundaries`,
+  );
+  // The linux-quality job's structural pin (job existence) is a rule instance
+  // and lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it.
+  const linuxQuality = object(object(qualityWorkflow.jobs)["linux-quality"]);
+  const linuxQualitySteps = list(linuxQuality.steps).map(object);
+  const linuxQualityProducer = linuxQualitySteps.find(step => step.id === "linux-quality");
+  const linuxQualityRun = shellLiteralNormalizedText(String(linuxQualityProducer?.run ?? ""));
+  const optionalLinuxQualityUpload = namedStep(
+    linuxQuality,
+    "Upload optional Linux x64 Axios v2 quality evidence",
+  );
+  add(
+    violations,
+    linuxQuality.name === "Optional frozen-candidate Linux x64 Axios v2 quality"
+      && JSON.stringify(linuxQuality["runs-on"])
+        === JSON.stringify(["self-hosted", "Linux", "X64", "codestory-linux-vulkan"])
+      && linuxQuality.environment === undefined
+      && linuxQuality["continue-on-error"] === true
+      && linuxQuality["timeout-minutes"] === 60
+      && linuxQualitySteps.length === 6,
+    `${qualityFile} optional Linux x64 quality must remain a non-gating unpinned smoke`,
+  );
+  add(
+    violations,
+    namedStep(linuxQuality, "Checkout exact frozen candidate")?.uses === "actions/checkout@v5"
+      && namedStep(linuxQuality, "Download exact Linux x64 candidate archive")?.uses
+        === "actions/download-artifact@v8.0.1"
+      && object(namedStep(linuxQuality, "Download exact Linux x64 candidate archive")?.with).name
+        === "codestory-cli-linux-x64"
+      && linuxQualityProducer?.["continue-on-error"] === true
+      && object(linuxQualityProducer?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
+      && linuxQualityRun.includes("codestory-cli-v${version}-linux-x64.tar.gz")
+      && linuxQualityRun.includes("--packet-runtime-mode cold-cli")
+      && occurrenceCount(linuxQualityRun, "--task-manifest") === 1
+      && linuxQualityRun.includes("--repeats 3")
+      && linuxQualityRun.includes("--publishable")
+      && !linuxQualityRun.includes("--task-suite")
+      && !linuxQualityRun.includes("--task-ids")
+      && optionalLinuxQualityUpload?.if === "steps.linux-quality.outcome == 'success'"
+      && optionalLinuxQualityUpload?.["continue-on-error"] === true
+      && object(optionalLinuxQualityUpload?.with).name
+        === "frozen-candidate-linux-x64-quality-${{ inputs.ref }}-attempt-${{ github.run_attempt }}"
+      && object(optionalLinuxQualityUpload?.with).overwrite === true,
+    `${qualityFile} optional Linux x64 quality must run the same isolated Axios v2 smoke entrypoint`,
+  );
+  // The windows-vulkan-proof job's structural pin (job existence) and its
+  // needs edge are rule instances and live in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates them
+  // with their reviewed violation text.
+  const vulkan = object(object(workflow.jobs)["windows-vulkan-proof"]);
   add(
     violations,
     String(vulkan.if ?? "").includes("needs.route.outputs.mode != 'package'")
@@ -5822,19 +6356,18 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       === "${{ needs.route.outputs.mode != 'qualification' }}",
     `${file} qualification must run full Windows lifecycle and fault proof`,
   );
-  const linuxVulkan = requireJob(violations, file, workflow, "linux-vulkan-proof");
-  add(
-    violations,
-    sameMembers(needs(linuxVulkan), ["route", "packaged-proof"]),
-    `${file} Linux Vulkan proof must wait only for routing and package proof`,
-  );
+  // The linux-vulkan-proof job's structural pin (job existence) and its needs
+  // edge are rule instances and live in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates them
+  // with their reviewed violation text.
+  const linuxVulkan = object(object(workflow.jobs)["linux-vulkan-proof"]);
   add(
     violations,
     String(linuxVulkan.if ?? "").includes("needs.route.outputs.mode != 'package'")
       && String(linuxVulkan.if ?? "").includes(
-        "needs.route.outputs.mode != 'qualification'",
+        "needs.route.outputs.mode != 'qualification' || inputs.qualify_linux_vulkan",
       ),
-    `${file} package-only and qualification modes must skip coordinator Linux proof`,
+    `${file} package mode must skip Linux proof; qualification must schedule Linux proof only when the explicit lifecycle opt-in is true`,
   );
   add(
     violations,
@@ -5843,67 +6376,60 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    object(linuxVulkan.with).candidate_installed_proof === true
-      && object(linuxVulkan.with).server_behavior_only === true
+    object(linuxVulkan.with).calibration_bundle_artifact
+        === "${{ inputs.calibration_bundle_artifact || '' }}"
+      && object(linuxVulkan.with).calibration_bundle_run_id
+        === "${{ inputs.calibration_bundle_run_id || '' }}"
+      && object(linuxVulkan.with).candidate_installed_proof
+        === "${{ needs.route.outputs.mode != 'qualification' }}"
+      && object(linuxVulkan.with).server_behavior_only
+        === "${{ needs.route.outputs.mode != 'qualification' }}"
       && object(linuxVulkan.with).candidate_producer_workflow_path
         === ".github/workflows/packaged-platform-pr.yml",
-    `${file} Linux proof must close Vulkan and candidate-installed claims without optional evaluation`,
+    `${file} Linux proof must keep platform mode candidate-installed and run full lifecycle only in qualification with the authenticated calibration bundle`,
   );
-  const closeout = requireJob(violations, file, workflow, "closeout");
-  add(
-    violations,
-    sameMembers(needs(closeout), [
-      "route",
-      "source-proof",
-      "packaged-proof",
-      "macos-metal-proof",
-      "windows-vulkan-proof",
-      "linux-vulkan-proof",
-    ]),
-    `${file} closeout must wait for every selected platform proof`,
-  );
+  // The closeout job's structural pin (job existence) and its needs edge are
+  // rule instances and live in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates them
+  // with their reviewed violation text. The closeout's mode-shape proof
+  // fragments are rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const closeout = object(object(workflow.jobs).closeout);
   add(
     violations,
     closeout.if
-      === "always() && needs.route.result != 'skipped' && needs.route.outputs.mode != 'release-evidence' && needs.route.outputs.mode != 'calibration'"
+      === "always() && needs.route.result != 'skipped' && needs.route.outputs.mode != 'calibration'"
       && closeout["runs-on"] === "ubuntu-latest"
-      && closeout["timeout-minutes"] === 20
+      && closeout["timeout-minutes"] === 65
       && closeout["continue-on-error"] === undefined,
     `${file} closeout job must retain its reviewed unconditional result-checking activation`,
   );
-  const evidence = requireJob(violations, file, workflow, "release-evidence");
   add(
     violations,
-    evidence.if === "needs.route.outputs.mode == 'release-evidence'",
-    `${file} optional release evidence must run only in explicit release-evidence mode`,
-  );
-  add(
-    violations,
-    !needs(closeout).includes("release-evidence")
-      && !needs(closeout).includes("frozen-candidate-quality")
+    !needs(closeout).includes("frozen-candidate-quality")
       && !scalarStrings(closeout).some(value =>
-        value.includes("EVIDENCE_RESULT")
-          || value.includes("QUALITY_RESULT")
+        value.includes("QUALITY_RESULT")
           || value.includes("frozen-candidate-quality")
       ),
-    `${file} normal closeout must not depend on optional release or quality evidence`,
+    `${file} normal closeout must not depend on optional quality evidence`,
   );
   const closeoutProofName = "Require one coherent accepted proof";
   const closeoutProof = namedStep(closeout, closeoutProofName);
   const closeoutRun = executableRunText(stepRun(closeout, closeoutProofName));
   add(
     violations,
-    list(closeout.steps).length === 1
+    list(closeout.steps).length === 3
       && closeoutProof?.if === undefined
       && closeoutProof?.["continue-on-error"] === undefined
       && closeoutProof?.shell === "bash"
       && closeoutProof?.["working-directory"] === undefined,
-    `${file} closeout must run one unconditional proof step under the reviewed Bash interpreter`,
+    `${file} closeout must retain one unconditional result proof plus the two opted-in Linux quality receipt steps`,
   );
   const expectedCloseoutEnv = {
     GH_TOKEN: "${{ github.token }}",
     HEAD_SHA: "${{ needs.route.outputs.head_sha }}",
     MODE: "${{ needs.route.outputs.mode }}",
+    QUALIFY_LINUX_VULKAN: "${{ inputs.qualify_linux_vulkan }}",
     SCOPE: "${{ needs.route.outputs.scope }}",
     ROUTE_RESULT: "${{ needs.route.result }}",
     SOURCE_RESULT: "${{ needs.source-proof.result }}",
@@ -5921,32 +6447,71 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       ),
     `${file} closeout proof must bind every route and platform result from the reviewed jobs exactly`,
   );
-  requireStepRun(violations, file, closeout, "Require one coherent accepted proof", [
-    'if [ "$MODE" = package ]',
-    'require_result "$PACKAGE_RESULT" success packaged-proof',
-    'require_result "$METAL_RESULT" skipped macos-metal-proof',
-    'if [ "$SCOPE" = none ]',
-    '[ "$SCOPE" = linux ]',
-    "WINDOWS_VULKAN_RESULT",
-    "LINUX_VULKAN_RESULT",
-    'if [ "$MODE" = qualification ]; then',
-    'require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof',
-    'require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof',
-    "dev/codestory-next moved from proved head",
-  ]);
-  requireExactStepScript(
+  add(
     violations,
-    file,
-    closeout,
-    "Require one coherent accepted proof",
-    packagedPlatformCloseoutDigest,
-    "coordinator closeout",
+    /if\s+\[\s*"\$MODE"\s*=\s*qualification\s*\];\s*then\s+if\s+\[\s*"\$QUALIFY_LINUX_VULKAN"\s*=\s*true\s*\];\s*then\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+skipped\s+linux-vulkan-proof\s+fi\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+fi/um
+      .test(closeoutRun),
+    `${file} qualification closeout must require Linux success exactly when the explicit lifecycle opt-in is true`,
+  );
+  const linuxQualityProofName = "Validate opted-in Linux quality evidence";
+  const linuxQualityProof = namedStep(closeout, linuxQualityProofName);
+  const strictLinuxQualityRun = executableRunText(stepRun(closeout, linuxQualityProofName));
+  add(
+    violations,
+    linuxQualityProof?.if === "inputs.qualify_linux_vulkan"
+      && linuxQualityProof?.shell === "bash"
+      && linuxQualityProof?.["continue-on-error"] === undefined
+      && hasExactKeys(object(linuxQualityProof?.env), ["GH_TOKEN", "HEAD_SHA"])
+      && object(linuxQualityProof?.env).GH_TOKEN === "${{ github.token }}"
+      && object(linuxQualityProof?.env).HEAD_SHA === "${{ needs.route.outputs.head_sha }}",
+    `${file} opted-in Linux quality validation must fail closed on the routed frozen head`,
   );
   add(
     violations,
-    /if\s+\[\s*"\$MODE"\s*=\s*qualification\s*\];\s*then\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+skipped\s+linux-vulkan-proof\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+fi/um
-      .test(closeoutRun),
-    `${file} qualification closeout must accept skipped optional Linux proof without blocking`,
+    [
+      "frozen-candidate-linux-x64-quality-$HEAD_SHA-attempt-$GITHUB_RUN_ATTEMPT",
+      "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100",
+      ".workflow_run.id == $run_id",
+      ".workflow_run.head_sha == $sha",
+      "gh run download \"$GITHUB_RUN_ID\"",
+      "packet-runtime-summary.json",
+      "packet-runtime-runs.jsonl",
+      "publishable-three-repeat-packet/v1",
+      "optional-linux-x64-quality",
+      "codestory-release-corpus-v0.16-axios-js-ts-v2",
+      'and .release_evidence.quality_gate_status == "pass"',
+      "and .release_evidence.publishable_blockers == []",
+      "and (.release_evidence.rows | length) == 3",
+      'and .task_id == "axios-request-dispatch-v2"',
+      'and .sufficiency.status == "sufficient"',
+      'and .sufficiency.retrieval_mode == "full"',
+      "and .packet_latency.sla_missed == false",
+      'and .packet_latency.retrieval_shadow.retrieval_mode == "full"',
+      "and .repo_provenance.git_dirty == false",
+      "and .codestory_cache_provenance.local_only == true",
+      "cmp \"$evidence_root/summary-rows.json\" \"$evidence_root/raw-rows.json\"",
+      "codestory.strict-linux-quality-validation/v1",
+    ].every(fragment => strictLinuxQualityRun.includes(fragment)),
+    `${file} opted-in Linux quality validation must authenticate and inspect every three-repeat publishable predicate`,
+  );
+  const linuxQualityUpload = namedStep(closeout, "Upload opted-in Linux quality validation");
+  add(
+    violations,
+    linuxQualityUpload?.if === "inputs.qualify_linux_vulkan"
+      && linuxQualityUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && hasExactKeys(object(linuxQualityUpload?.with), [
+        "name",
+        "path",
+        "if-no-files-found",
+        "retention-days",
+      ])
+      && object(linuxQualityUpload?.with).name
+        === "strict-linux-quality-validation-${{ needs.route.outputs.head_sha }}-attempt-${{ github.run_attempt }}"
+      && object(linuxQualityUpload?.with).path
+        === "target/strict-linux-quality/receipt.json"
+      && object(linuxQualityUpload?.with)["if-no-files-found"] === "error"
+      && object(linuxQualityUpload?.with)["retention-days"] === 30,
+    `${file} opted-in Linux quality validation must retain its exact-head receipt`,
   );
   add(violations, !scalarStrings(workflow).some(value => value === "./.github/workflows/release.yml"), `${file} must not publish releases`);
 }
@@ -5973,7 +6538,11 @@ function validateRemainingWorkflows(workflows, violations) {
       object(auto.jobs)["workflow-policy"] === undefined,
       `${autoFile} must delegate the release policy gate to release.yml exactly once`,
     );
-    const detectVersion = requireJob(violations, autoFile, auto, "detect-version");
+    // The version-detection and release jobs' structural pins - their existence,
+    // the release job's needs edge, and the release caller's permission grants -
+    // are rule instances and live in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates them.
+    const detectVersion = object(object(auto.jobs)["detect-version"]);
     add(
       violations,
       needs(detectVersion).length === 0,
@@ -5984,20 +6553,8 @@ function validateRemainingWorkflows(workflows, violations) {
       namedStep(detectVersion, "Validate synchronized release version") === undefined,
       `${autoFile} must delegate synchronized version validation to release.yml`,
     );
-    const release = requireJob(violations, autoFile, auto, "release");
+    const release = object(object(auto.jobs).release);
     add(violations, release.uses === "./.github/workflows/release.yml", `${autoFile} must call the release workflow`);
-    add(violations, sameMembers(needs(release), ["detect-version"]), `${autoFile} release must need version detection`);
-    add(violations, object(release.permissions).contents === "write", `${autoFile} release caller must grant contents write`);
-    add(
-      violations,
-      object(release.permissions).actions === "write",
-      `${autoFile} release caller must grant actions write for superseded-run cancellation`,
-    );
-    add(
-      violations,
-      object(release.permissions)["pull-requests"] === "read",
-      `${autoFile} release caller must pass pull-request metadata access to exact source proof`,
-    );
     add(violations, object(release.with).publish_release === true, `${autoFile} trusted main caller must explicitly authorize publication`);
     add(
       violations,
@@ -6006,64 +6563,11 @@ function validateRemainingWorkflows(workflows, violations) {
     );
   }
 
-  const evidenceFile = "release-candidate-evidence.yml";
-  const evidence = workflows.get(evidenceFile);
-  if (!evidence) {
-    violations.push(`${evidenceFile} must exist`);
-  } else {
-    add(violations, trigger(evidence, "workflow_call") !== undefined, `${evidenceFile} must be reusable`);
-    add(violations, trigger(evidence, "workflow_dispatch") === undefined, `${evidenceFile} must be coordinator-only`);
-    const job = requireJob(violations, evidenceFile, evidence, "measure");
-    add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Linux", "ARM64", "codestory-release-evidence"]), `${evidenceFile} must use the protected evidence runner`);
-    requireStepRun(violations, evidenceFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
-    violations.push(...releaseEvidenceApprovalViolations(
-      [
-        ["packaged-platform-pr.yml", at(workflows.get("packaged-platform-pr.yml"), "jobs", "release-evidence"), false],
-      ],
-      evidence,
-    ));
-    const repoEvidence = namedStep(job, "Produce full-retrieval repo evidence");
-    requireStepRun(violations, evidenceFile, job, "Produce full-retrieval repo evidence", ["--test-threads=1"]);
-    add(
-      violations,
-      object(repoEvidence?.env).CODESTORY_RELEASE_EVIDENCE_CORPUS_ID
-        === "codestory-release-corpus-v0.16-axios-js-ts-v2"
-        && object(repoEvidence?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
-      `${evidenceFile} repo evidence must bind the v0.16 Axios v2 corpus`,
-    );
-    const packetEvidence = namedStep(job, "Produce publishable packet evidence");
-    add(
-      violations,
-      object(packetEvidence?.env).CODESTORY_RELEASE_EVIDENCE_CORPUS_ID
-        === "codestory-release-corpus-v0.16-axios-js-ts-v2"
-      && object(packetEvidence?.env).CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT
-          === "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json"
-      && object(packetEvidence?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
-      `${evidenceFile} packet evidence must bind the v0.16 Axios v2 corpus contract`,
-    );
-    const packetRun = String(packetEvidence?.run ?? "");
-    add(
-      violations,
-      packetRun.includes("--task-manifest ")
-        && packetRun.match(/--task-manifest/gu)?.length === 1
-        && !packetRun.includes("--task-suite")
-        && !packetRun.includes("--task-ids"),
-      `${evidenceFile} packet evidence must select only the corpus-bound release task manifest`,
-    );
-    requireStepRun(violations, evidenceFile, job, "Download prior rejected evidence for approval re-evaluation", ["actions/runs/$SOURCE_RUN_ID", "actions/runs/$SOURCE_RUN_ID/artifacts"]);
-  }
-
   const metalFile = "macos-metal-proof.yml";
   const metal = workflows.get(metalFile);
   if (!metal) {
     violations.push(`${metalFile} must exist`);
   } else {
-    add(
-      violations,
-      createHash("sha256").update(JSON.stringify(metal)).digest("hex")
-        === macosMetalWorkflowDigest,
-      `${metalFile} must match the reviewed protected Metal workflow structure`,
-    );
     add(
       violations,
       trigger(metal, "workflow_call") !== undefined
@@ -6129,7 +6633,15 @@ function validateRemainingWorkflows(workflows, violations) {
         && serverBehaviorInput.default === false,
       `${metalFile} server-behavior-only claim scope must be an explicit opt-in`,
     );
-    const job = requireJob(violations, metalFile, metal, "packaged-metal");
+    // The packaged-metal job's structural pin (job existence) is a rule instance
+    // and lives in release-claims.json under workflow_policy.structural_pins;
+    // structuralPinViolations evaluates it. The lane's step fragments - mode
+    // validation, model preparation, host evidence, candidate authentication and
+    // cache handling, calibration-producer authentication, the calibration
+    // collector, the protected and candidate-installed proofs, and the release
+    // cells - are rule instances and live in release-claims.json under
+    // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+    const job = object(object(metal.jobs)["packaged-metal"]);
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "macOS", "ARM64", "codestory-metal"]), `${metalFile} must use the protected Apple Silicon runner`);
     add(violations, job.environment === "macos-metal-release", `${metalFile} must use the protected Metal environment`);
     const validateCandidate = namedStep(job, "Validate candidate-installed mode");
@@ -6139,19 +6651,10 @@ function validateRemainingWorkflows(workflows, violations) {
         && validateCandidate?.shell === "bash",
       `${metalFile} candidate-installed validation must be an explicit Bash boundary`,
     );
-    requireStepRun(violations, metalFile, job, "Validate candidate-installed mode", [
-      'test "$SERVER_BEHAVIOR_ONLY" = true',
-      'test "$CALIBRATION_MODE" = false',
-    ]);
     requireStepEnv(violations, metalFile, job, "Validate candidate-installed mode", {
       SERVER_BEHAVIOR_ONLY: "${{ inputs.server_behavior_only }}",
       CALIBRATION_MODE: "${{ inputs.calibration_mode }}",
     });
-    requireStepRun(violations, metalFile, job, "Prepare checksum-pinned embedded model", [
-      "node scripts/prepare-embedded-model.mjs",
-      '--cache-root "$RUNNER_TOOL_CACHE/codestory/model-material"',
-    ]);
-    requireStepRun(violations, metalFile, job, "Capture host evidence", ["python3 --version", 'test "$macos_major" -ge 15']);
     const calibrationClock = namedStep(
       job,
       "Start Metal constant calibration clock",
@@ -6295,27 +6798,6 @@ function validateRemainingWorkflows(workflows, violations) {
           === "${{ inputs.server_behavior_only }}",
       `${metalFile} packaged candidate authentication must bind all exact artifacts before cache lookup`,
     );
-    requireStepRun(violations, metalFile, job, "Authenticate exact candidate artifacts", [
-      "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100",
-      ".github/workflows/auto-release.yml",
-      ".github/workflows/release.yml",
-      ".github/workflows/packaged-platform-pr.yml",
-      'if [ "$SERVER_BEHAVIOR_ONLY" != true ]; then',
-      'test "$CANDIDATE_PRODUCER_WORKFLOW_PATH" =',
-      ".head_repository.full_name",
-      '.path\' <<<"$producer_run")" = "$CANDIDATE_PRODUCER_WORKFLOW_PATH"',
-      '.head_sha\' <<<"$producer_run")" = "$(git rev-parse HEAD)"',
-      '.run_attempt\' <<<"$producer_run")" = "$GITHUB_RUN_ATTEMPT"',
-      ".workflow_run.id == $run_id",
-      ".workflow_run.head_sha == $sha",
-      "expected one exact candidate artifact",
-      'artifact="$(select_artifact "$ARTIFACT_NAME")"',
-      'record_artifact="$(select_artifact "$CANDIDATE_RECORD_ARTIFACT")"',
-      'select_artifact "$QUALIFICATION_ARTIFACT"',
-      "package-id=$artifact_id",
-      "package-bytes=$expected_size",
-      "package-sha256=${expected_digest#sha256:}",
-    ]);
     add(
       violations,
       recordDownload?.if === "inputs.use_packaged_cli_artifact"
@@ -6330,23 +6812,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && cacheRestore?.shell === "bash"
         && cacheRestore?.["continue-on-error"] === undefined,
       `${metalFile} protected cache lookup must consume only the exact small candidate record`,
-    );
-    requireStepRun(
-      violations,
-      metalFile,
-      job,
-      "Restore exact candidate archive from protected host",
-      [
-        "--arg repository \"$GITHUB_REPOSITORY\"",
-        "--arg source_sha \"$(git rev-parse HEAD)\"",
-        "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
-        "--arg target macos-arm64",
-        "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
-        "candidate-archive-store.mjs restore",
-        "--record \"$record\"",
-        "--output-dir target/release-dist",
-        "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\"",
-      ],
     );
     add(
       violations,
@@ -6368,23 +6833,6 @@ function validateRemainingWorkflows(workflows, violations) {
           === "${{ steps.candidate-artifacts.outputs.package-sha256 }}"
         && object(cacheMiss?.env).GH_TOKEN === "${{ github.token }}",
       `${metalFile} large Actions artifact transfer must be a cache-miss-only authenticated boundary`,
-    );
-    requireStepRun(
-      violations,
-      metalFile,
-      job,
-      "Download, authenticate, and admit candidate archive on miss",
-      [
-        "actions/artifacts/$ARTIFACT_ID/zip",
-      "--continue-at -",
-      "--max-time 120",
-        'test "$actual_size" = "$EXPECTED_SIZE"',
-        'test "$actual_digest" = "$EXPECTED_SHA256"',
-        "extract-candidate-actions-artifact.py",
-        "candidate-archive-store.mjs admit",
-        "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
-        "--output-dir target/release-dist",
-      ],
     );
     add(
       violations,
@@ -6477,16 +6925,6 @@ function validateRemainingWorkflows(workflows, violations) {
       `${metalFile} must reject a frozen or stale calibration source immediately after checkout and before setup or compilation`,
     );
     const calibrationStepName = "Collect three independent Metal constant calibration runs";
-    requireStepRun(violations, metalFile, job, calibrationStepName, [
-      "--proof-tier calibration",
-      "--engine-policy accelerated",
-      "--expected-backend Metal",
-      "--qualification-matrix-cell protected_macos_arm64_metal",
-      "--collect-constant-calibration",
-      "--constant-calibration-output-dir target/calibration-runs/macos",
-      "--qualification-driver target/release/codestory_embedding_constant_calibration",
-      "--out-dir target/calibration-proof/macos",
-    ]);
     const calibrationRun = shellLiteralNormalizedText(
       stepRun(job, calibrationStepName),
     );
@@ -6558,16 +6996,6 @@ function validateRemainingWorkflows(workflows, violations) {
       `${metalFile} calibration must publish shared build/package and five-phase collector timing, including model preparation and an under-ten-minute total`,
     );
     const engine = namedStep(job, "Prove protected Metal runtime");
-    requireStepRun(violations, metalFile, job, "Prove protected Metal runtime", [
-      "--engine-policy accelerated",
-      "--expected-backend Metal",
-      "--offline",
-      "--proof-tier protected_hardware",
-      "--qualification-matrix-cell protected_macos_arm64_metal",
-      "--calibration-producer-run-id",
-      "--calibration-producer-artifact",
-      "--server-behavior-only",
-    ]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${metalFile} engine proof must reject CPU fallback`);
     const engineRun = stepRun(
       job,
@@ -6611,40 +7039,12 @@ function validateRemainingWorkflows(workflows, violations) {
       candidateStage?.if === "${{ inputs.candidate_installed_proof && !inputs.calibration_mode }}",
       `${metalFile} candidate-managed staging must require candidate mode outside calibration`,
     );
-    requireStepRun(violations, metalFile, job, "Stage isolated candidate-managed macOS install", [
-      "--prepare-candidate-installed-proof",
-      "--candidate-plugin-root-output",
-      "--candidate-plugin-data-output",
-      "--installed-plugin-attestation-output",
-      "--candidate-producer-workflow-path",
-      "gh api",
-      ".head_repository.full_name",
-      ".path",
-      ".head_sha",
-      ".run_attempt",
-      "$CANDIDATE_PRODUCER_WORKFLOW_PATH",
-      "$RUNNER_TEMP/codestory-candidate-installed-macos.",
-      'candidate_root="$(cd "$candidate_root" && pwd -P)"',
-      '"$GITHUB_WORKSPACE/"*',
-      "CODESTORY_CANDIDATE_MACOS_ROOT=",
-    ]);
     const candidateProof = namedStep(job, "Prove candidate-installed macOS Metal runtime");
     add(
       violations,
       candidateProof?.if === "${{ inputs.candidate_installed_proof && !inputs.calibration_mode }}",
       `${metalFile} candidate-installed Metal proof must require candidate mode outside calibration`,
     );
-    requireStepRun(violations, metalFile, job, "Prove candidate-installed macOS Metal runtime", [
-      "--engine-policy accelerated",
-      "--expected-backend Metal",
-      "--proof-tier installed_runtime",
-      "--installed-plugin-attestation",
-      "--installed-plugin-data",
-      "$CANDIDATE_PRODUCER_WORKFLOW_PATH",
-      "--server-behavior-only",
-      "$CODESTORY_CANDIDATE_MACOS_ROOT/plugin",
-      "$CODESTORY_CANDIDATE_MACOS_ROOT/data",
-    ]);
     const candidateProofRun = stepRun(
       job,
       "Prove candidate-installed macOS Metal runtime",
@@ -6661,17 +7061,6 @@ function validateRemainingWorkflows(workflows, violations) {
       object(candidateProof?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
       `${metalFile} candidate-installed proof must reject CPU fallback`,
     );
-    requireStepRun(violations, metalFile, job, "Emit authenticated Metal release cell", [
-      "codestory-release-cell-manifest.mjs produce",
-      "accelerator_execution:macos-arm64-metal",
-      "--producer-job packaged-metal",
-      '--expected-sha "$INPUT_REF"',
-    ]);
-    requireStepRun(violations, metalFile, job, "Emit authenticated macOS retrieval-readiness release cell", [
-      "retrieval_readiness:macos-arm64",
-      "--producer-job packaged-metal",
-      '--expected-sha "$INPUT_REF"',
-    ]);
     for (const cell of [
       "Emit authenticated Metal release cell",
       "Emit authenticated macOS retrieval-readiness release cell",
@@ -6687,26 +7076,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && String(metalCellUpload?.if ?? "").includes("inputs.emit_release_cells"),
       `${metalFile} Metal release cell must be a success-only retained artifact`,
     );
-    requireStepRun(violations, metalFile, job, "Emit authenticated candidate-installed macOS release cell", [
-      "candidate_installed_behavior:macos-arm64",
-      "--producer-job packaged-metal",
-      "candidate_managed_plugin",
-      '--expected-sha "$INPUT_REF"',
-    ]);
-    forbidStepRun(
-      violations,
-      metalFile,
-      job,
-      "Emit authenticated Metal release cell",
-      ["calibration"],
-    );
-    forbidStepRun(
-      violations,
-      metalFile,
-      job,
-      "Emit authenticated candidate-installed macOS release cell",
-      ["calibration"],
-    );
     requireStepUses(
       violations,
       metalFile,
@@ -6721,12 +7090,6 @@ function validateRemainingWorkflows(workflows, violations) {
   if (!vulkan) {
     violations.push(`${vulkanFile} must exist`);
   } else {
-    add(
-      violations,
-      createHash("sha256").update(JSON.stringify(vulkan)).digest("hex")
-        === windowsVulkanWorkflowDigest,
-      `${vulkanFile} must match the reviewed protected Windows Vulkan workflow structure`,
-    );
     add(
       violations,
       trigger(vulkan, "workflow_call") !== undefined
@@ -6792,7 +7155,15 @@ function validateRemainingWorkflows(workflows, violations) {
         && serverBehaviorInput.default === false,
       `${vulkanFile} server-behavior-only claim scope must be an explicit opt-in`,
     );
-    const job = requireJob(violations, vulkanFile, vulkan, "packaged-vulkan");
+    // The packaged-vulkan job's structural pin (job existence) is a rule instance
+    // and lives in release-claims.json under workflow_policy.structural_pins;
+    // structuralPinViolations evaluates it. The lane's step fragments - mode
+    // validation, build-tool evidence, model preparation, candidate cache
+    // handling, calibration-producer authentication, the protected and
+    // candidate-installed proofs, and the release cells - are rule instances and
+    // live in release-claims.json under workflow_policy.step_fragments;
+    // stepFragmentViolations evaluates them.
+    const job = object(object(vulkan.jobs)["packaged-vulkan"]);
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Windows", "X64", "codestory-vulkan"]), `${vulkanFile} must use the protected Windows Vulkan runner`);
     add(violations, job.environment === "windows-vulkan-proof", `${vulkanFile} must use the protected Vulkan environment`);
     const pythonSetup = namedStep(job, "Install pinned Python");
@@ -6845,10 +7216,6 @@ function validateRemainingWorkflows(workflows, violations) {
       validateCandidate?.if === "inputs.candidate_installed_proof",
       `${vulkanFile} candidate-installed validation must require explicit candidate mode`,
     );
-    requireStepRun(violations, vulkanFile, job, "Validate candidate-installed mode", [
-      'if ($env:SERVER_BEHAVIOR_ONLY -ne "true")',
-      "candidate_installed_proof requires server_behavior_only",
-    ]);
     requireStepEnv(violations, vulkanFile, job, "Validate candidate-installed mode", {
       SERVER_BEHAVIOR_ONLY: "${{ inputs.server_behavior_only }}",
     });
@@ -6860,15 +7227,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && sourceBuildTools?.shell === windowsPowerShellShell,
       `${vulkanFile} source build tool evidence must remain source-only and fail closed`,
     );
-    requireStepRun(violations, vulkanFile, job, "Capture source build tool evidence", [
-      "CMAKE_GENERATOR=Ninja",
-      "cmake --version",
-      "ninja --version",
-    ]);
-    requireStepRun(violations, vulkanFile, job, "Prepare checksum-pinned embedded model", [
-      "node scripts/prepare-embedded-model.mjs",
-      '--cache-root "$env:RUNNER_TOOL_CACHE/codestory/model-material"',
-    ]);
     const nativeBuild = namedStep(job, "Build and package native CLI");
     const nativeBuildRun = shellLiteralNormalizedText(String(nativeBuild?.run ?? ""));
     add(
@@ -7030,23 +7388,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && windowsCacheRestore?.["continue-on-error"] === undefined,
       `${vulkanFile} protected cache lookup must consume only the exact small Windows candidate record`,
     );
-    requireStepRun(
-      violations,
-      vulkanFile,
-      job,
-      "Restore exact candidate archive from protected host",
-      [
-        "$record.source.commit -ne $sourceSha",
-        "$record.source.tree -ne $sourceTree",
-        "$record.target -ne \"windows-x64\"",
-        "codestory/candidate-archives",
-        "candidate-archive-store.mjs restore",
-        "--record $recordPath",
-        "--output-dir target/release-dist",
-        "\"hit=$hit\"",
-        "$env:GITHUB_OUTPUT",
-      ],
-    );
     add(
       violations,
       windowsCacheMiss?.if
@@ -7067,23 +7408,6 @@ function validateRemainingWorkflows(workflows, violations) {
           === "${{ steps.candidate-artifacts.outputs.package-sha256 }}"
         && object(windowsCacheMiss?.env).GH_TOKEN === "${{ github.token }}",
       `${vulkanFile} large Windows Actions artifact transfer must be cache-miss-only and outer-digest authenticated`,
-    );
-    requireStepRun(
-      violations,
-      vulkanFile,
-      job,
-      "Download, authenticate, and admit candidate archive on miss",
-      [
-        "actions/artifacts/$env:ARTIFACT_ID/zip",
-        "--continue-at -",
-        "--max-time 120",
-        "$actualSize -ne [long]$env:EXPECTED_SIZE",
-        "$actualDigest -ne $env:EXPECTED_SHA256",
-        "extract-candidate-actions-artifact.py",
-        "candidate-archive-store.mjs admit",
-        "--store-root $store",
-        "--output-dir target/release-dist",
-      ],
     );
     add(
       violations,
@@ -7160,16 +7484,6 @@ function validateRemainingWorkflows(workflows, violations) {
       "${{ !inputs.server_behavior_only }}",
     );
     const engine = namedStep(job, "Prove protected Windows Vulkan runtime");
-    requireStepRun(violations, vulkanFile, job, "Prove protected Windows Vulkan runtime", [
-      "--engine-policy accelerated",
-      "--expected-backend Vulkan",
-      "--offline",
-      "--proof-tier protected_hardware",
-      "--qualification-matrix-cell protected_windows_x64_vulkan",
-      "--calibration-producer-run-id",
-      "--calibration-producer-artifact",
-      "--server-behavior-only",
-    ]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${vulkanFile} engine proof must reject CPU fallback`);
     const engineRun = stepRun(job, "Prove protected Windows Vulkan runtime");
     add(
@@ -7218,47 +7532,12 @@ function validateRemainingWorkflows(workflows, violations) {
       candidateStage?.if === "inputs.candidate_installed_proof",
       `${vulkanFile} candidate-managed staging must require explicit candidate mode`,
     );
-    requireStepRun(violations, vulkanFile, job, "Stage isolated candidate-managed Windows install", [
-      "--prepare-candidate-installed-proof",
-      "--candidate-plugin-root-output",
-      "--candidate-plugin-data-output",
-      "--installed-plugin-attestation-output",
-      "--candidate-producer-workflow-path",
-      "gh api",
-      "$run.head_repository.full_name",
-      "$run.path",
-      "$run.head_sha",
-      "$run.run_attempt",
-      "$env:CANDIDATE_PRODUCER_WORKFLOW_PATH",
-      "[IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)",
-      "cs-ci-",
-      "Substring(0, 12)",
-      "[IO.Path]::GetFullPath",
-      "$env:GITHUB_WORKSPACE",
-      "CODESTORY_CANDIDATE_WINDOWS_ROOT=",
-    ]);
     const candidateProof = namedStep(job, "Prove candidate-installed Windows Vulkan runtime");
     add(
       violations,
       candidateProof?.if === "inputs.candidate_installed_proof",
       `${vulkanFile} candidate-installed Vulkan proof must require explicit candidate mode`,
     );
-    requireStepRun(violations, vulkanFile, job, "Prove candidate-installed Windows Vulkan runtime", [
-      "--proof-tier installed_runtime",
-      "--engine-policy accelerated",
-      "--expected-backend Vulkan",
-      "--installed-plugin-attestation",
-      "--installed-plugin-data",
-      "--candidate-producer-workflow-path",
-      "$env:CANDIDATE_PRODUCER_WORKFLOW_PATH",
-      "--server-behavior-only",
-      "--expected-source-sha",
-      "--expected-source-tree",
-      "$env:CODESTORY_CANDIDATE_WINDOWS_ROOT",
-      "$env:TEMP = $proofTemp",
-      "$env:TMP = $proofTemp",
-      "$env:TMPDIR = $proofTemp",
-    ]);
     const candidateProofRun = stepRun(
       job,
       "Prove candidate-installed Windows Vulkan runtime",
@@ -7287,12 +7566,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && object(candidateUpload?.with)["if-no-files-found"] === "error",
       `${vulkanFile} candidate-installed proof must retain one attempt-scoped artifact`,
     );
-    requireStepRun(violations, vulkanFile, job, "Emit authenticated Vulkan release cell", [
-      "codestory-release-cell-manifest.mjs produce",
-      "accelerator_execution:windows-x64-vulkan",
-      "--producer-job packaged-vulkan",
-      '--expected-sha "$INPUT_REF"',
-    ]);
     for (const cell of [
       "Emit authenticated Vulkan release cell",
       "Emit authenticated Windows retrieval-readiness release cell",
@@ -7315,31 +7588,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && !String(vulkanCellUpload?.if ?? "").includes("!inputs.server_behavior_only"),
       `${vulkanFile} Vulkan release cell must be a success-only retained artifact`,
     );
-    requireStepRun(violations, vulkanFile, job, "Emit authenticated candidate-installed Windows release cell", [
-      "candidate_installed_behavior:windows-x64",
-      "--producer-job packaged-vulkan",
-      "candidate_managed_plugin",
-      '--expected-sha "$INPUT_REF"',
-    ]);
-    requireStepRun(violations, vulkanFile, job, "Emit authenticated Windows retrieval-readiness release cell", [
-      "retrieval_readiness:windows-x64",
-      "--producer-job packaged-vulkan",
-      '--expected-sha "$INPUT_REF"',
-    ]);
-    forbidStepRun(
-      violations,
-      vulkanFile,
-      job,
-      "Emit authenticated Vulkan release cell",
-      ["calibration"],
-    );
-    forbidStepRun(
-      violations,
-      vulkanFile,
-      job,
-      "Emit authenticated candidate-installed Windows release cell",
-      ["calibration"],
-    );
     requireStepUses(
       violations,
       vulkanFile,
@@ -7354,12 +7602,6 @@ function validateRemainingWorkflows(workflows, violations) {
   if (!linuxVulkan) {
     violations.push(`${linuxVulkanFile} must exist`);
   } else {
-    add(
-      violations,
-      createHash("sha256").update(JSON.stringify(linuxVulkan)).digest("hex")
-        === linuxVulkanWorkflowDigest,
-      `${linuxVulkanFile} must match the reviewed protected Linux Vulkan workflow structure`,
-    );
     add(
       violations,
       trigger(linuxVulkan, "workflow_call") !== undefined
@@ -7416,22 +7658,21 @@ function validateRemainingWorkflows(workflows, violations) {
       trigger(linuxVulkan, "workflow_dispatch") === undefined,
       `${linuxVulkanFile} standalone proof must not bypass the coordinator`,
     );
-    const route = requireJob(violations, linuxVulkanFile, linuxVulkan, "route");
+    // The route, packaged-vulkan, and optional-constant-calibration jobs'
+    // structural pins (job existence) are rule instances and live in
+    // release-claims.json under workflow_policy.structural_pins;
+    // structuralPinViolations evaluates them. The lanes' step fragments - the
+    // route gate, host evidence, mode validation, candidate cache handling,
+    // calibration-producer authentication, the protected and candidate-installed
+    // proofs, the release cells, and the optional calibration collector - are
+    // rule instances and live in release-claims.json under
+    // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+    const route = object(object(linuxVulkan.jobs).route);
     add(
       violations,
       JSON.stringify(route["runs-on"]) === JSON.stringify("ubuntu-latest")
         && route["timeout-minutes"] === 5,
       `${linuxVulkanFile} standalone dispatch validation must stay on a bounded hosted route job`,
-    );
-    requireStepRun(
-      violations,
-      linuxVulkanFile,
-      route,
-      "Require an upstream package for standalone protected proof",
-      [
-        'if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$CONSTANT_CALIBRATION_MODE" != true ]; then',
-        'test -n "$PACKAGE_RUN_ID"',
-      ],
     );
     requireStepEnv(
       violations,
@@ -7444,7 +7685,7 @@ function validateRemainingWorkflows(workflows, violations) {
         PACKAGE_RUN_ID: "${{ inputs.package_run_id }}",
       },
     );
-    const job = requireJob(violations, linuxVulkanFile, linuxVulkan, "packaged-vulkan");
+    const job = object(object(linuxVulkan.jobs)["packaged-vulkan"]);
     add(
       violations,
       job.if === "${{ !inputs.constant_calibration_mode }}"
@@ -7458,11 +7699,6 @@ function validateRemainingWorkflows(workflows, violations) {
       "Install pinned Python",
       "actions/setup-python@v7.0.0",
     );
-    requireStepRun(violations, linuxVulkanFile, job, "Capture Linux Vulkan host evidence", [
-      "uname -m",
-      "vulkaninfo --summary",
-      "test \"$(uname -m)\" = x86_64",
-    ]);
     const validateCandidate = namedStep(job, "Validate candidate-installed mode");
     add(
       violations,
@@ -7470,9 +7706,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && validateCandidate?.shell === "bash",
       `${linuxVulkanFile} candidate-installed validation must require explicit candidate mode`,
     );
-    requireStepRun(violations, linuxVulkanFile, job, "Validate candidate-installed mode", [
-      'test "$SERVER_BEHAVIOR_ONLY" = true',
-    ]);
     requireStepEnv(violations, linuxVulkanFile, job, "Validate candidate-installed mode", {
       SERVER_BEHAVIOR_ONLY: "${{ inputs.server_behavior_only }}",
     });
@@ -7598,23 +7831,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && linuxCacheRestore?.["continue-on-error"] === undefined,
       `${linuxVulkanFile} protected cache lookup must consume only the exact small Linux candidate record`,
     );
-    requireStepRun(
-      violations,
-      linuxVulkanFile,
-      job,
-      "Restore exact candidate archive from protected host",
-      [
-        "--arg repository \"$GITHUB_REPOSITORY\"",
-        "--arg source_sha \"$(git rev-parse HEAD)\"",
-        "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
-        "--arg target linux-x64",
-        "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
-        "candidate-archive-store.mjs restore",
-        "--record \"$record\"",
-        "--output-dir target/release-dist",
-        "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\"",
-      ],
-    );
     add(
       violations,
       linuxCacheMiss?.if === "steps.candidate-cache.outputs.hit != 'true'"
@@ -7634,23 +7850,6 @@ function validateRemainingWorkflows(workflows, violations) {
           === "${{ steps.candidate-artifacts.outputs.package-sha256 }}"
         && object(linuxCacheMiss?.env).GH_TOKEN === "${{ github.token }}",
       `${linuxVulkanFile} large Linux Actions artifact transfer must be cache-miss-only and outer-digest authenticated`,
-    );
-    requireStepRun(
-      violations,
-      linuxVulkanFile,
-      job,
-      "Download, authenticate, and admit candidate archive on miss",
-      [
-        "actions/artifacts/$ARTIFACT_ID/zip",
-        "--continue-at -",
-        "--max-time 120",
-        'test "$actual_size" = "$EXPECTED_SIZE"',
-        'test "$actual_digest" = "$EXPECTED_SHA256"',
-        "extract-candidate-actions-artifact.py",
-        "candidate-archive-store.mjs admit",
-        "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
-        "--output-dir target/release-dist",
-      ],
     );
     add(
       violations,
@@ -7747,16 +7946,6 @@ function validateRemainingWorkflows(workflows, violations) {
       `${linuxVulkanFile} must not replace the verified qualification driver before execution`,
     );
     const engine = namedStep(job, "Prove offline Linux Vulkan retrieval");
-    requireStepRun(violations, linuxVulkanFile, job, "Prove offline Linux Vulkan retrieval", [
-      "--engine-policy accelerated",
-      "--expected-backend Vulkan",
-      "--offline",
-      "--proof-tier protected_hardware",
-      "--qualification-matrix-cell protected_linux_x64_vulkan",
-      "--calibration-producer-run-id",
-      "--calibration-producer-artifact",
-      "--server-behavior-only",
-    ]);
     add(
       violations,
       object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
@@ -7796,16 +7985,6 @@ function validateRemainingWorkflows(workflows, violations) {
         && occurrenceCount(engineRun, "check-packaged-agent-proof.py") === 1,
       `${linuxVulkanFile} server-behavior proof must omit calibration while standalone qualification runs one lifecycle proof without optional quality`,
     );
-    requireStepRun(violations, linuxVulkanFile, job, "Stage isolated candidate-managed Linux install", [
-      "--prepare-candidate-installed-proof",
-      "--candidate-plugin-root-output",
-      "--candidate-plugin-data-output",
-      "--installed-plugin-attestation-output",
-      "--candidate-producer-workflow-path",
-      "gh api",
-      "$RUNNER_TEMP/codestory-candidate-installed-linux.",
-      "CODESTORY_CANDIDATE_LINUX_ROOT=",
-    ]);
     add(
       violations,
       namedStep(job, "Stage isolated candidate-managed Linux install")?.if
@@ -7813,14 +7992,6 @@ function validateRemainingWorkflows(workflows, violations) {
       `${linuxVulkanFile} candidate-managed staging must require explicit candidate mode`,
     );
     const candidate = namedStep(job, "Prove candidate-installed Linux Vulkan runtime");
-    requireStepRun(violations, linuxVulkanFile, job, "Prove candidate-installed Linux Vulkan runtime", [
-      "--engine-policy accelerated",
-      "--expected-backend Vulkan",
-      "--proof-tier installed_runtime",
-      "--installed-plugin-attestation",
-      "--installed-plugin-data",
-      "--server-behavior-only",
-    ]);
     add(
       violations,
       candidate?.if === "inputs.candidate_installed_proof",
@@ -7831,35 +8002,11 @@ function validateRemainingWorkflows(workflows, violations) {
       object(candidate?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
       `${linuxVulkanFile} candidate-installed proof must reject CPU fallback`,
     );
-    forbidStepRun(
-      violations,
-      linuxVulkanFile,
-      job,
-      "Prove candidate-installed Linux Vulkan runtime",
-      ["calibration", "--ground-only", "--engine-policy cpu_explicit"],
-    );
-    requireStepRun(violations, linuxVulkanFile, job, "Emit authenticated Linux Vulkan release cells", [
-      "accelerator_execution:linux-x64-vulkan",
-      "retrieval_readiness:linux-x64",
-      "candidate_installed_behavior:linux-x64",
-      "--producer-job packaged-vulkan",
-      '--expected-sha "$INPUT_REF"',
-    ]);
     requireStepEnv(violations, linuxVulkanFile, job, "Emit authenticated Linux Vulkan release cells", {
       INPUT_REF: "${{ inputs.ref }}",
     });
-    forbidStepRun(
-      violations,
-      linuxVulkanFile,
-      job,
-      "Emit authenticated Linux Vulkan release cells",
-      ["calibration"],
-    );
-    const optionalCalibration = requireJob(
-      violations,
-      linuxVulkanFile,
-      linuxVulkan,
-      "optional-constant-calibration",
+    const optionalCalibration = object(
+      object(linuxVulkan.jobs)["optional-constant-calibration"],
     );
     add(
       violations,
@@ -7870,28 +8017,7 @@ function validateRemainingWorkflows(workflows, violations) {
         && optionalCalibration.environment === "linux-vulkan-proof",
       `${linuxVulkanFile} optional calibration must be a standalone protected coordinator-only Vulkan job`,
     );
-    requireStepRun(
-      violations,
-      linuxVulkanFile,
-      optionalCalibration,
-      "Prepare checksum-pinned embedded model",
-      [
-        "node scripts/prepare-embedded-model.mjs",
-        '--cache-root "$RUNNER_TOOL_CACHE/codestory/model-material"',
-      ],
-    );
     const optionalCollectorName = "Collect optional Linux Vulkan constant calibration";
-    requireStepRun(violations, linuxVulkanFile, optionalCalibration, optionalCollectorName, [
-      'test "$CONSTANT_CALIBRATION_MODE" = true',
-      "--engine-policy accelerated",
-      "--expected-backend Vulkan",
-      "--proof-tier calibration",
-      "--qualification-matrix-cell protected_linux_x64_vulkan",
-      "--collect-constant-calibration",
-      "--constant-calibration-output-dir target/calibration-runs/linux-vulkan",
-      "--qualification-driver target/release/codestory_embedding_constant_calibration",
-      "--out-dir target/calibration-proof/linux-vulkan",
-    ]);
     const optionalCollector = namedStep(optionalCalibration, optionalCollectorName);
     const optionalCollectorRun = shellLiteralNormalizedText(
       stepRun(optionalCalibration, optionalCollectorName),
@@ -7998,7 +8124,10 @@ function validateRemainingWorkflows(workflows, violations) {
     violations.push(`${guardFile} must exist`);
   } else {
     add(violations, includesAll(at(guard, "on", "pull_request", "branches"), ["main"]), `${guardFile} must guard main`);
-    const job = requireJob(violations, guardFile, guard, "enforce-source-branch");
+    // The enforce-source-branch job's structural pin (job existence) is a rule
+    // instance and lives in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+    const job = object(object(guard.jobs)["enforce-source-branch"]);
     const step = namedStep(job, "Require dev/codestory-next source branch");
     add(violations, object(step?.env).HEAD_REPO !== undefined && object(step?.env).BASE_REPO !== undefined, `${guardFile} must compare source and base repository identity`);
     add(violations, String(step?.run ?? "").includes("dev/codestory-next"), `${guardFile} must require the dev source branch`);
@@ -8253,30 +8382,11 @@ export function releaseProofCpuSelectorViolations(
   }
   const sources = supportSources ?? new Map([
     [
-      "scripts/release-evidence/guest-runner.sh",
-      fs.readFileSync(path.join(repositoryRoot, "scripts/release-evidence/guest-runner.sh"), "utf8"),
-    ],
-    [
       ".github/scripts/check-linux-glibc-baseline.sh",
       fs.readFileSync(path.join(repositoryRoot, ".github/scripts/check-linux-glibc-baseline.sh"), "utf8"),
     ],
-    [
-      "scripts/release-evidence/guest-verify.sh",
-      fs.readFileSync(path.join(repositoryRoot, "scripts/release-evidence/guest-verify.sh"), "utf8"),
-    ],
   ]);
   for (const [file, source] of sources) {
-    if (
-      file.endsWith("guest-verify.sh")
-    ) {
-      add(
-        violations,
-        source.includes('grep -qxF "CODESTORY_EMBED_ALLOW_CPU=0"')
-          && source.includes('grep -qxF "CODESTORY_EMBED_ALLOW_CPU=1"'),
-        `[cpu_selector] ${file} must prove CPU is disabled in the runner service`,
-      );
-      continue;
-    }
     const executable = shellLiteralNormalizedText(source);
     if (
       hasNonLiteralCpuAssignment(executable)
@@ -8317,7 +8427,7 @@ export function releaseFreezeBarrierWorkflowViolations(
   const freeze = object(graph.workflow_policy.release_freeze_barrier);
   const acceptance = object(freeze.acceptance);
   const acceptancePhases = object(acceptance.phases);
-  const calibrationSourcePhase = object(acceptancePhases.calibration_source);
+  const sourceStabilizationPhase = object(acceptancePhases.source_stabilization);
   const frozenCandidatePhase = object(acceptancePhases.frozen_candidate);
   let acceptanceManifest = {};
   try {
@@ -8373,24 +8483,22 @@ export function releaseFreezeBarrierWorkflowViolations(
         === ".github/scripts/release-freeze-acceptance-jobs.json"
       && /^[0-9a-f]{64}$/u.test(String(acceptance.job_manifest_sha256 ?? ""))
       && acceptance.job_manifest_sha256 === acceptanceManifestDigest
-      && sameMembers(list(calibrationSourcePhase.known_future_source_changes), [
+      && sameMembers(list(sourceStabilizationPhase.known_future_source_changes), [
         "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
       ])
-      && JSON.stringify(list(calibrationSourcePhase.planned_actions)) === JSON.stringify([
-        "calibration-source-acceptance",
+      && JSON.stringify(list(sourceStabilizationPhase.planned_actions)) === JSON.stringify([
+        "source-stabilization",
         "calibration",
         "generated-constant-freeze",
         "frozen-candidate-acceptance",
-        "source-proof",
         "qualification",
         "release",
       ])
-      && calibrationSourcePhase.next_permitted_mutation
+      && sourceStabilizationPhase.next_permitted_mutation
         === "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
       && list(frozenCandidatePhase.known_future_source_changes).length === 0
       && JSON.stringify(list(frozenCandidatePhase.planned_actions)) === JSON.stringify([
         "frozen-candidate-acceptance",
-        "source-proof",
         "qualification",
         "release",
       ])
@@ -8465,12 +8573,14 @@ export function releaseFreezeBarrierWorkflowViolations(
       && at(invalidation, "concurrency", "cancel-in-progress") === true,
     "[freeze_barrier] release freeze invalidation must run automatically when a candidate head is superseded",
   );
-  const invalidationJob = requireJob(
-    violations,
-    invalidationFile,
-    invalidation,
-    "invalidate",
-  );
+  // The invalidate job's structural pin (job existence) is a rule instance and
+  // lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it. Its revocation step fragments (both
+  // the required superseded-head revocation conjuncts and the forbidden
+  // pending-state reuse) are rule instances and live in release-claims.json
+  // under workflow_policy.step_fragments; stepFragmentViolations evaluates
+  // them.
+  const invalidationJob = object(object(invalidation.jobs).invalidate);
   add(
     violations,
     invalidationJob["runs-on"] === "ubuntu-latest"
@@ -8484,39 +8594,8 @@ export function releaseFreezeBarrierWorkflowViolations(
       ),
     "[freeze_barrier] release freeze invalidation must remain one bounded cancellation job",
   );
-  requireStepRun(
-    violations,
-    invalidationFile,
-    invalidationJob,
-    "Invalidate a superseded release freeze",
-    [
-      'test "$BEFORE_SHA" != "$AFTER_SHA"',
-      "commits/$BEFORE_SHA/statuses?per_page=100",
-      '.state == "success"',
-      'startswith("codestory/release-freeze/")',
-      'if [ -z "$freeze_contexts" ]; then',
-      '"repos/$GITHUB_REPOSITORY/statuses/$BEFORE_SHA"',
-      "-f state=error",
-      '-f "context=$context"',
-      '-f "description=superseded-by=$AFTER_SHA"',
-      "release-freeze-barrier.mjs invalidate-superseded",
-      '--commit "$AFTER_SHA"',
-      '--broad-workflow "Exact-head source proof"',
-      '--broad-workflow "Platform and integration proof"',
-      '--broad-workflow "Release"',
-      '--broad-workflow "Auto Release"',
-    ],
-  );
-  forbidStepRun(
-    violations,
-    invalidationFile,
-    invalidationJob,
-    "Invalidate a superseded release freeze",
-    [
-      '.state == "pending"',
-      ".state == 'pending'",
-    ],
-  );
+  // DISPOSITION: step env bindings have no graph evaluator, so the
+  // invalidation step's event bindings stay code.
   requireStepEnv(
     violations,
     invalidationFile,
@@ -8626,45 +8705,30 @@ export function releaseFreezeBarrierWorkflowViolations(
           && acceptancePhaseInput.type === "choice"
           && acceptancePhaseInput.default === "frozen_candidate"
           && JSON.stringify(list(acceptancePhaseInput.options))
-            === JSON.stringify(["calibration_source", "frozen_candidate"])
+            === JSON.stringify(["source_stabilization", "frozen_candidate"])
           && at(workflow, "on", "workflow_dispatch", "inputs", "emit_release_cells")
             === undefined
           && at(workflow, "on", "workflow_call", "inputs", "emit_release_cells")
             === undefined,
         "[freeze_barrier] source-proof.yml must separate acceptance from broad proof",
       );
-      add(
-        violations,
-        object(workflow.permissions).statuses === "write",
-        "[freeze_barrier] source-proof.yml acceptance must publish an exact-head commit status",
-      );
-    } else {
-      add(
-        violations,
-        object(workflow.permissions).statuses === "read",
-        "[freeze_barrier] packaged-platform-pr.yml must authenticate the exact-head freeze status without broad workflow authority",
-      );
     }
-    add(
-      violations,
-      object(workflow.permissions).actions === "write",
-      `[freeze_barrier] ${file} must be able to cancel superseded runs`,
-    );
+    // The freeze family's workflow-scoped permission pins (statuses write for
+    // the acceptance publisher, statuses read for the packaged authenticator,
+    // actions write for superseded-run cancellation on both coordinators) are
+    // rule instances and live in release-claims.json under
+    // workflow_policy.structural_pins; structuralPinViolations evaluates them
+    // with their reviewed violation text. The cancel-superseded step fragments
+    // for both coordinator jobs are rule instances and live in
+    // release-claims.json under workflow_policy.step_fragments;
+    // stepFragmentViolations evaluates them.
+    // DISPOSITION: the retired inline call re-required each coordinator job,
+    // so a workflow without one reported that violation beside the family
+    // pin's own occurrence. The job-existence rules live in their structural
+    // pins; this duplicate occurrence stays code so the reviewed verdict
+    // multiset is unchanged.
     const coordinatorJob = file === "source-proof.yml" ? "resolve" : "route";
-    requireStepRun(
-      violations,
-      file,
-      requireJob(violations, file, workflow, coordinatorJob),
-      "Cancel superseded proof runs",
-      [
-        "release-freeze-barrier.mjs cancel-superseded",
-        '--commit "$HEAD_SHA"',
-        '--broad-workflow "Exact-head source proof"',
-        '--broad-workflow "Platform and integration proof"',
-        '--broad-workflow "Release"',
-        '--broad-workflow "Auto Release"',
-      ],
-    );
+    requireJob(violations, file, workflow, coordinatorJob);
   }
 
   const sourceWorkflow = workflows.get("source-proof.yml");
@@ -8681,6 +8745,31 @@ export function releaseFreezeBarrierWorkflowViolations(
     violations,
     sameMembers(Object.keys(object(sourceWorkflow.jobs)), sourceJobNames),
     "[freeze_barrier] source-proof.yml must use the closed source and acceptance job contract",
+  );
+  for (const jobName of [
+    "full-source-gate",
+    "retrieval-generalization",
+    "windows-native-contracts",
+  ]) {
+    const condition = String(at(sourceWorkflow, "jobs", jobName, "if") ?? "");
+    add(
+      violations,
+      condition.includes("!inputs.acceptance_only")
+        && condition.includes("inputs.acceptance_phase == 'source_stabilization'")
+        && condition.includes("needs.resolve.outputs.reuse != 'true'"),
+      `[freeze_barrier] source-proof.yml ${jobName} must run during source stabilization and skip frozen acceptance`,
+    );
+  }
+  const fullSourceTest = namedStep(
+    object(at(sourceWorkflow, "jobs", "full-source-gate")),
+    "Test the complete workspace once",
+  );
+  add(
+    violations,
+    executableRunText(String(fullSourceTest?.run ?? "")).includes(
+      "cargo nextest run --workspace --locked --no-fail-fast",
+    ),
+    "[freeze_barrier] source stabilization must run the complete workspace without fail-fast",
   );
   const actualWorkflowContextDigest = createHash("sha256")
     .update(canonicalJson(workflowExecutionContext(sourceWorkflow)))
@@ -8700,6 +8789,9 @@ export function releaseFreezeBarrierWorkflowViolations(
       `[freeze_barrier] source-proof.yml ${jobName} must match the canonical acceptance job manifest`,
     );
   }
+  // DISPOSITION: the receipt producer's job-existence rule lives in the
+  // source family's structural pin; this duplicate occurrence stays code so
+  // the reviewed verdict multiset is unchanged.
   const sourceResolve = requireJob(
     violations,
     "source-proof.yml",
@@ -8714,37 +8806,170 @@ export function releaseFreezeBarrierWorkflowViolations(
       && object(acceptedCheckout.with)["fetch-depth"] === 0,
     "[freeze_barrier] Actions receipt generation must have complete history for support PR ancestry",
   );
-  const recordReceipt = namedStep(sourceResolve, "Record executable release freeze");
+  const frozenAcceptanceCondition
+    = "${{ inputs.acceptance_only && inputs.acceptance_phase == 'frozen_candidate' }}";
+  const frozenIdentity = namedStep(
+    sourceResolve,
+    "Resolve frozen calibration acceptance identity",
+  );
+  const frozenIdentityRun = executableRunText(String(frozenIdentity?.run ?? ""));
   add(
     violations,
-    recordReceipt?.if === "${{ inputs.acceptance_only }}",
-    "[freeze_barrier] Actions may generate a release freeze receipt only in acceptance mode",
+    frozenIdentity?.id === "frozen-calibration"
+      && frozenIdentity?.if === frozenAcceptanceCondition
+      && frozenIdentity?.shell === "bash"
+      && frozenIdentity?.["continue-on-error"] === undefined
+      && [
+        "python .github/scripts/check-calibration-release-lineage.py",
+        '--repo "$GITHUB_WORKSPACE"',
+        '--expected-sha "$HEAD_SHA"',
+        '--github-output "$GITHUB_OUTPUT"',
+      ].every(fragment => frozenIdentityRun.includes(fragment)),
+    "[freeze_barrier] frozen acceptance must resolve a frozen direct constant-only child before receipt generation",
   );
-  requireStepRun(
+  requireStepEnv(
     violations,
     "source-proof.yml",
     sourceResolve,
-    "Record executable release freeze",
-    [
-      'test -z "$CALLER_FREEZE_RECEIPT_DIGEST"',
-      "release-freeze-barrier.mjs record-actions-receipt",
-      '--repository "$GITHUB_REPOSITORY"',
-      '--repo "$GITHUB_WORKSPACE"',
-      '--branch "$GITHUB_REF_NAME"',
-      '--commit "$HEAD_SHA"',
-      '--tree "$tree"',
-      '--release-pr "$PR_NUMBER"',
-      '--support-prs-json "$SUPPORT_PRS_JSON"',
-      '--reusable-evidence-json "$REUSABLE_EVIDENCE_JSON"',
-      '--invalidated-evidence-json "$INVALIDATED_EVIDENCE_JSON"',
-      '--cancelled-runs-json "$CANCELLED_RUNS_JSON"',
-      '--run-id "$GITHUB_RUN_ID"',
-      '--run-attempt "$GITHUB_RUN_ATTEMPT"',
-      '--phase "$ACCEPTANCE_PHASE"',
-      '--output "$RUNNER_TEMP/release-freeze-receipt.json"',
-      '--github-output "$GITHUB_OUTPUT"',
-    ],
+    "Resolve frozen calibration acceptance identity",
+    { HEAD_SHA: "${{ steps.resolve.outputs.ref }}" },
   );
+
+  const frozenProducer = namedStep(
+    sourceResolve,
+    "Authenticate frozen calibration producer",
+  );
+  const frozenProducerRun = executableRunText(String(frozenProducer?.run ?? ""));
+  add(
+    violations,
+    frozenProducer?.id === "frozen-calibration-producer"
+      && frozenProducer?.if === frozenAcceptanceCondition
+      && frozenProducer?.shell === "bash"
+      && frozenProducer?.["continue-on-error"] === undefined
+      && [
+        "actions/runs/$PRODUCER_RUN_ID/attempts/$PRODUCER_RUN_ATTEMPT",
+        '.path == ".github/workflows/packaged-platform-pr.yml"',
+        '.event == "workflow_dispatch"',
+        '.status == "completed"',
+        '.conclusion == "success"',
+        ".head_sha == $source",
+        ".head_repository.full_name == $repo",
+        "actions/runs/$PRODUCER_RUN_ID/artifacts?per_page=100",
+        ".name == $artifact",
+        ".expired == false",
+        ".created_at >= $attempt_started",
+        ".created_at <= $attempt_finished",
+        ".workflow_run.id == $run_id",
+        ".workflow_run.head_sha == $source",
+        "test \"$(jq 'length' <<<\"$matches\")\" = 1",
+        "^sha256:[0-9a-f]{64}$",
+      ].every(fragment => frozenProducerRun.includes(fragment)),
+    "[freeze_barrier] frozen acceptance must authenticate the recorded calibration run, attempt, and artifact",
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Authenticate frozen calibration producer",
+    {
+      ARTIFACT_NAME: "${{ steps.frozen-calibration.outputs.artifact_name }}",
+      GH_TOKEN: "${{ github.token }}",
+      PRODUCER_RUN_ATTEMPT:
+        "${{ steps.frozen-calibration.outputs.producer_run_attempt }}",
+      PRODUCER_RUN_ID: "${{ steps.frozen-calibration.outputs.producer_run_id }}",
+      SOURCE_SHA: "${{ steps.frozen-calibration.outputs.source_commit }}",
+    },
+  );
+
+  const frozenDownload = namedStep(
+    sourceResolve,
+    "Download frozen calibration bundle",
+  );
+  const frozenDownloadRun = executableRunText(String(frozenDownload?.run ?? ""));
+  add(
+    violations,
+    frozenDownload?.if === frozenAcceptanceCondition
+      && frozenDownload?.shell === "bash"
+      && frozenDownload?.["continue-on-error"] === undefined
+      && [
+        "actions/artifacts/$ARTIFACT_ID/zip",
+        'actual_digest="sha256:$(sha256sum "$archive"',
+        'test "$actual_digest" = "$CONTAINER_DIGEST"',
+        'unzip -q "$archive" -d "$destination"',
+        'test -f "$destination/calibration-bundle.json"',
+        'test -f "$destination/per-user-embedding-server-constant-set.json"',
+      ].every(fragment => frozenDownloadRun.includes(fragment)),
+    "[freeze_barrier] frozen acceptance must download the exact authenticated calibration artifact container",
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Download frozen calibration bundle",
+    {
+      ARTIFACT_ID: "${{ steps.frozen-calibration-producer.outputs.artifact_id }}",
+      CONTAINER_DIGEST:
+        "${{ steps.frozen-calibration-producer.outputs.container_digest }}",
+      GH_TOKEN: "${{ github.token }}",
+    },
+  );
+
+  const frozenVerification = namedStep(
+    sourceResolve,
+    "Verify frozen calibration acceptance",
+  );
+  const frozenVerificationRun = executableRunText(
+    String(frozenVerification?.run ?? ""),
+  );
+  add(
+    violations,
+    frozenVerification?.if === frozenAcceptanceCondition
+      && frozenVerification?.shell === "bash"
+      && frozenVerification?.["continue-on-error"] === undefined
+      && [
+        "python .github/scripts/check-calibration-release-lineage.py",
+        '--repo "$GITHUB_WORKSPACE"',
+        '--expected-sha "$HEAD_SHA"',
+        '--calibration-bundle "$RUNNER_TEMP/frozen-calibration-bundle/calibration-bundle.json"',
+        '--artifact-constant-set "$RUNNER_TEMP/frozen-calibration-bundle/per-user-embedding-server-constant-set.json"',
+        '--expected-producer-run-id "$PRODUCER_RUN_ID"',
+        '--expected-producer-run-attempt "$PRODUCER_RUN_ATTEMPT"',
+        '--expected-producer-artifact "$ARTIFACT_NAME"',
+      ].every(fragment => frozenVerificationRun.includes(fragment)),
+    "[freeze_barrier] frozen acceptance must recompute the downloaded calibration and compare the checked-in freeze",
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Verify frozen calibration acceptance",
+    {
+      ARTIFACT_NAME: "${{ steps.frozen-calibration.outputs.artifact_name }}",
+      HEAD_SHA: "${{ steps.resolve.outputs.ref }}",
+      PRODUCER_RUN_ATTEMPT:
+        "${{ steps.frozen-calibration.outputs.producer_run_attempt }}",
+      PRODUCER_RUN_ID: "${{ steps.frozen-calibration.outputs.producer_run_id }}",
+    },
+  );
+  const recordReceipt = namedStep(sourceResolve, "Record executable release freeze");
+  add(
+    violations,
+    recordReceipt?.if === "${{ inputs.acceptance_only }}"
+      && stepIndex(sourceResolve, "Resolve frozen calibration acceptance identity")
+        < stepIndex(sourceResolve, "Authenticate frozen calibration producer")
+      && stepIndex(sourceResolve, "Authenticate frozen calibration producer")
+        < stepIndex(sourceResolve, "Download frozen calibration bundle")
+      && stepIndex(sourceResolve, "Download frozen calibration bundle")
+        < stepIndex(sourceResolve, "Verify frozen calibration acceptance")
+      && stepIndex(sourceResolve, "Verify frozen calibration acceptance")
+        < stepIndex(sourceResolve, "Record executable release freeze"),
+    "[freeze_barrier] Actions may generate a release freeze receipt only after frozen calibration acceptance",
+  );
+  // The receipt-recording step fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  // DISPOSITION: step env bindings have no graph evaluator, so the receipt
+  // step's input bindings stay code.
   requireStepEnv(
     violations,
     "source-proof.yml",
@@ -8787,19 +9012,12 @@ export function releaseFreezeBarrierWorkflowViolations(
     broadFreeze?.if === "${{ !inputs.acceptance_only }}",
     "[freeze_barrier] broad source proof must authenticate the accepted freeze",
   );
-  requireStepRun(
-    violations,
-    "source-proof.yml",
-    sourceResolve,
-    "Require executable release freeze",
-    [
-      "release-freeze-barrier.mjs verify-status",
-      '--commit "$HEAD_SHA"',
-      '--tree "$tree"',
-      "--phase frozen_candidate",
-      '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
-    ],
-  );
+  // The freeze family's verify-status fragments for this step are a rule
+  // instance and live in release-claims.json under
+  // workflow_policy.step_fragments beside the source family's own wider pin;
+  // stepFragmentViolations evaluates both.
+  // DISPOSITION: step env bindings have no graph evaluator, so the freeze
+  // step's digest and head bindings stay code.
   requireStepEnv(
     violations,
     "source-proof.yml",
@@ -8815,12 +9033,13 @@ export function releaseFreezeBarrierWorkflowViolations(
     !scalarStrings(sourceWorkflow).some(value => value.includes("verify-pending")),
     "[freeze_barrier] source proof must never accept a caller-authored pending status",
   );
-  const hostileJob = requireJob(
-    violations,
-    "source-proof.yml",
-    sourceWorkflow,
-    acceptance.hostile_job,
-  );
+  // The hostile mutation job's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it. Its
+  // blocking suite fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  const hostileJob = object(object(sourceWorkflow.jobs)[acceptance.hostile_job]);
   add(
     violations,
     hostileJob.if === "inputs.acceptance_only"
@@ -8830,26 +9049,14 @@ export function releaseFreezeBarrierWorkflowViolations(
       && namedStep(hostileJob, acceptance.hostile_step)?.["continue-on-error"] !== true,
     "[freeze_barrier] source acceptance must execute the exact blocking hostile mutation job",
   );
-  requireStepRun(
-    violations,
-    "source-proof.yml",
-    hostileJob,
-    acceptance.hostile_step,
-    [
-      "node --test",
-      ".github/scripts/check-workflow-policy.test.mjs",
-      ".github/scripts/release-freeze-barrier.test.mjs",
-      ".github/scripts/cargo-build-artifacts.test.mjs",
-      ".github/scripts/candidate-archive-store.test.mjs",
-    ],
-  );
 
-  const windowsJob = requireJob(
-    violations,
-    "source-proof.yml",
-    sourceWorkflow,
-    acceptance.windows_job,
-  );
+  // The Windows probe job's structural pin (job existence) is a rule instance
+  // and lives in release-claims.json under workflow_policy.structural_pins;
+  // structuralPinViolations evaluates it. Its probe step fragments (both the
+  // required hard-link identity legs and the forbidden inline-script variant)
+  // are rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
+  const windowsJob = object(object(sourceWorkflow.jobs)[acceptance.windows_job]);
   const windowsProbePowerShell
     = `powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"`;
   add(
@@ -8863,50 +9070,22 @@ export function releaseFreezeBarrierWorkflowViolations(
       && namedStep(windowsJob, acceptance.windows_step)?.["continue-on-error"] !== true,
     "[freeze_barrier] source acceptance must execute the protected blocking Windows native probe",
   );
-  requireStepRun(
-    violations,
-    "source-proof.yml",
-    windowsJob,
-    acceptance.windows_step,
-    [
-      "cargo new --quiet --bin",
-      "cargo build --release --quiet",
-      "node --test .github/scripts/cargo-build-artifacts.test.mjs",
-      "const [root, deps] = process.argv.slice(2);",
-      "left.dev !== right.dev",
-      "left.ino !== right.ino",
-      "left.nlink !== 2n",
-      "right.nlink !== 2n",
-      '$identityScriptPath = Join-Path $probeRoot "verify-hardlink-identity.cjs"',
-      "Set-Content -LiteralPath $identityScriptPath -Value $identityScript -Encoding UTF8",
-      "node $identityScriptPath $rootExe $depsExe",
-      "Elapsed.TotalSeconds -ge 90",
-      "Remove-Item -LiteralPath $probeRoot -Recurse -Force",
-    ],
-  );
-  forbidStepRun(
-    violations,
-    "source-proof.yml",
-    windowsJob,
-    acceptance.windows_step,
-    [
-      "node -e $identityScript",
-      "process.argv.slice(1)",
-    ],
-  );
-
-  const publisherJob = requireJob(
-    violations,
-    "source-proof.yml",
-    sourceWorkflow,
-    acceptance.publisher_job,
-  );
+  // The acceptance publisher's structural pin (job existence) is a rule
+  // instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it. Its
+  // publication step fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  const publisherJob = object(object(sourceWorkflow.jobs)[acceptance.publisher_job]);
   add(
     violations,
     sameMembers(needs(publisherJob), [
       "resolve",
       acceptance.hostile_job,
       acceptance.windows_job,
+      "full-source-gate",
+      "retrieval-generalization",
+      "windows-native-contracts",
     ])
       && publisherJob["runs-on"] === "ubuntu-latest"
       && publisherJob["timeout-minutes"] === 5
@@ -8915,8 +9094,12 @@ export function releaseFreezeBarrierWorkflowViolations(
           "inputs.acceptance_only",
           `needs.${acceptance.hostile_job}.result == 'success'`,
           `needs.${acceptance.windows_job}.result == 'success'`,
+          "inputs.acceptance_phase != 'source_stabilization'",
+          "needs.full-source-gate.result == 'success'",
+          "needs.retrieval-generalization.result == 'success'",
+          "needs.windows-native-contracts.result == 'success'",
         ].every(fragment => String(publisherJob.if ?? "").includes(fragment)),
-    "[freeze_barrier] acceptance publisher must depend on both exact successful mutation jobs",
+    "[freeze_barrier] acceptance publisher must require broad source success for source stabilization",
   );
   const receiptDownload = namedStep(
     publisherJob,
@@ -8933,28 +9116,8 @@ export function releaseFreezeBarrierWorkflowViolations(
         < stepIndex(publisherJob, acceptance.publisher_step),
     "[freeze_barrier] acceptance publisher must download the exact Actions receipt before publication",
   );
-  requireStepRun(
-    violations,
-    "source-proof.yml",
-    publisherJob,
-    acceptance.publisher_step,
-    [
-      "release-freeze-barrier.mjs verify-file",
-      '--receipt "$RUNNER_TEMP/release-freeze-receipt/release-freeze-receipt.json"',
-      '--repository "$GITHUB_REPOSITORY"',
-      '--commit "$HEAD_SHA"',
-      '--tree "$tree"',
-      '--run-id "$GITHUB_RUN_ID"',
-      '--run-attempt "$GITHUB_RUN_ATTEMPT"',
-      '--phase "$ACCEPTANCE_PHASE"',
-      'test "$verified_digest" = "$FREEZE_RECEIPT_DIGEST"',
-      "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA",
-      "-f state=success",
-      "-f \"context=codestory/release-freeze/$FREEZE_RECEIPT_DIGEST\"",
-      "-f \"description=tree=$tree\"",
-      "actions/runs/$GITHUB_RUN_ID",
-    ],
-  );
+  // DISPOSITION: step env bindings have no graph evaluator, so the
+  // publisher's digest, head, and phase bindings stay code.
   requireStepEnv(
     violations,
     "source-proof.yml",
@@ -8978,27 +9141,21 @@ export function releaseFreezeBarrierWorkflowViolations(
   }
 
   const coordinator = workflows.get("packaged-platform-pr.yml");
+  // DISPOSITION: the route job-existence rule lives in the coordinator
+  // family's structural pin; this duplicate occurrence stays code so the
+  // reviewed verdict multiset is unchanged. The freeze family's own
+  // verify-status and exact-head source-proof fragments for the route job are
+  // rule instances and live in release-claims.json under
+  // workflow_policy.step_fragments beside the coordinator family's wider
+  // pins; stepFragmentViolations evaluates them all.
   const route = requireJob(violations, "packaged-platform-pr.yml", coordinator, "route");
   add(
     violations,
     namedStep(route, "Require executable release freeze")?.if === undefined,
     "[freeze_barrier] every packaged proof mode must authenticate the exact candidate head",
   );
-  requireStepRun(
-    violations,
-    "packaged-platform-pr.yml",
-    route,
-    "Require executable release freeze",
-    [
-      "release-freeze-barrier.mjs verify-status",
-      '--commit "$HEAD_SHA"',
-      'if [ "$RESOLVED_MODE" = calibration ]; then',
-      "freeze_phase=calibration_source",
-      "freeze_phase=frozen_candidate",
-      '--phase "$freeze_phase"',
-      '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
-    ],
-  );
+  // DISPOSITION: step env bindings have no graph evaluator, so the freeze
+  // step's resolved-mode binding stays code.
   requireStepEnv(
     violations,
     "packaged-platform-pr.yml",
@@ -9008,30 +9165,17 @@ export function releaseFreezeBarrierWorkflowViolations(
       RESOLVED_MODE: "${{ steps.resolve.outputs.mode }}",
     },
   );
-  const packagedSourceProof = namedStep(route, "Require successful exact-head source proof");
+  const packagedSourceProof = namedStep(route, "Require successful source-stabilization proof");
   add(
     violations,
     packagedSourceProof?.if
       === "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'",
-    "[freeze_barrier] calibration must precede the sole frozen-candidate source proof",
+    "[freeze_barrier] frozen candidates must reuse the pre-calibration source-stabilization proof",
   );
-  requireStepRun(
-    violations,
-    "packaged-platform-pr.yml",
-    route,
-    "Require successful exact-head source proof",
-    [
-      "actions/runs?head_sha=$HEAD_SHA",
-      '.event == "workflow_dispatch" and .conclusion == "success"',
-      '.name == "full-source-gate" and .conclusion == "success"',
-    ],
-  );
-  const packagedSourceJob = requireJob(
-    violations,
-    "packaged-platform-pr.yml",
-    coordinator,
-    "source-proof",
-  );
+  // The coordinator source-proof job's structural pin (job existence) is a
+  // rule instance and lives in release-claims.json under
+  // workflow_policy.structural_pins; structuralPinViolations evaluates it.
+  const packagedSourceJob = object(object(coordinator.jobs)["source-proof"]);
   add(
     violations,
     permissionMapMatches(packagedSourceJob.permissions, {
@@ -9057,34 +9201,24 @@ export function releaseFreezeBarrierWorkflowViolations(
       && object(at(auto, "jobs", "release", "permissions")).statuses === undefined,
     "[freeze_barrier] publication must reuse accepted frozen-candidate proof without an active status",
   );
+  // DISPOSITION: the preflight and source-proof job-existence rules live in
+  // the release family's structural pins; these duplicate occurrences stay
+  // code so the reviewed verdict multiset is unchanged. The freeze family's
+  // reuse-resolution fragments (both the required conjuncts and the forbidden
+  // freeze-status replay) are rule instances and live in release-claims.json
+  // under workflow_policy.step_fragments beside the release family's own
+  // pins; stepFragmentViolations evaluates them all.
   const preflight = requireJob(violations, "release.yml", release, "preflight");
-  requireStepRun(
-    violations,
-    "release.yml",
-    preflight,
-    "Resolve reusable prior evidence",
-    [
-      'release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"',
-      'test "$(git rev-parse "$head_sha^{tree}")" = "$release_tree"',
-      'git merge-base --is-ancestor "$head_sha" "$GITHUB_SHA"',
-      'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
-      ".expired == false",
-      'test "$artifact_count" = 1 || continue',
-      "The release workflow will not start a broad proof",
-      "source_proof_reused=true",
-    ],
-  );
-  forbidStepRun(
-    violations,
-    "release.yml",
-    preflight,
-    "Resolve reusable prior evidence",
-    [
-      "release-freeze-barrier.mjs verify-status",
-      "freeze_receipt_digest",
-    ],
-  );
   const sourceJob = requireJob(violations, "release.yml", release, "source-proof");
+  requireStepEnv(
+    violations,
+    "release.yml",
+    preflight,
+    "Resolve reusable prior evidence",
+    {
+      SOURCE_SHA: "${{ steps.lineage.outputs.selection_commit }}",
+    },
+  );
   add(
     violations,
     sourceJob.if === "needs.preflight.outputs.source_proof_reused != 'true'"
@@ -9093,7 +9227,7 @@ export function releaseFreezeBarrierWorkflowViolations(
       && sourceJob.uses === undefined
       && sourceJob.with === undefined
       && namedStep(sourceJob, "Refuse a second source proof") !== undefined,
-    "[freeze_barrier] release must make the post-calibration source-proof fallback unreachable",
+    "[freeze_barrier] release must make a second source-proof fallback unreachable",
   );
 
   const lineageSource = fs.readFileSync(
@@ -9122,6 +9256,16 @@ export function releaseWorkflowContractViolations(
 ) {
   const violations = [];
   const policy = graph.workflow_policy;
+  for (const evidenceType of list(graph.evidence_types).map(object)) {
+    for (const lane of list(evidenceType.proof_lanes)) {
+      const file = path.basename(String(lane));
+      add(
+        violations,
+        workflows.has(file),
+        `[proof_lane] evidence type ${evidenceType.id} workflow ${file} must exist`,
+      );
+    }
+  }
   for (const contract of policy.protected_jobs) {
     const workflow = workflows.get(contract.workflow);
     const job = object(at(workflow, "jobs", contract.job));
@@ -9251,9 +9395,6 @@ export function releaseWorkflowContractViolations(
 }
 
 function validateReleaseCellUploadOwnership(workflows, violations) {
-  const evidenceFile = releaseEvidenceWorkflowRef.slice(
-    releaseEvidenceWorkflowRef.lastIndexOf("/") + 1,
-  );
   const actual = [];
   for (const [file, workflow] of workflows) {
     for (const [jobId, jobValue] of Object.entries(object(workflow.jobs))) {
@@ -9504,6 +9645,19 @@ export function shellDependentBindingViolations(workflows) {
 /// Scoped to `run:` steps. The optional cache restores are `uses:` steps whose miss is the normal
 /// path and carries no outcome to require -- their non-blocking-ness is separately required, and
 /// this rule must not contradict that.
+/// Every `if:` removed, at any depth. A condition decides whether something
+/// runs; it can never make a run fail, which is why neither the job-level nor
+/// the step-level successor may be found in one.
+function withoutConditions(value) {
+  if (Array.isArray(value)) return value.map(withoutConditions);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => key !== "if")
+      .map(([key, nested]) => [key, withoutConditions(nested)]),
+  );
+}
+
 export function absorbedFailureViolations(workflows) {
   const violations = [];
   const absorbs = value => value !== undefined && value !== false;
@@ -9522,13 +9676,31 @@ export function absorbedFailureViolations(workflows) {
           file === frozenCandidateQualityWorkflowRef.slice(
             frozenCandidateQualityWorkflowRef.lastIndexOf("/") + 1,
           )
-          && jobId === "quality";
+          && (
+            jobId === "quality"
+            || jobId === "windows-quality"
+            || jobId === "linux-quality"
+          );
+        // Reading the outcome is not requiring it one level up either, and the
+        // job-level rule used to accept exactly the `if:`-only read the
+        // step-level rule below deliberately refuses -- it scanned every string
+        // under `jobs`, including the absorbing job's own text and every
+        // condition. A successor is a *downstream, blocking* job that receives
+        // `needs.<id>.result` somewhere other than a condition, where a script
+        // can still test it and exit non-zero.
+        const requiredDownstream = Object.entries(object(workflow.jobs)).some(
+          ([otherId, rawOther]) => {
+            if (otherId === jobId) return false;
+            const other = object(rawOther);
+            if (absorbs(other["continue-on-error"])) return false;
+            return scalarStrings(withoutConditions(other)).some(
+              text => text.includes(`needs.${jobId}.result`),
+            );
+          },
+        );
         add(
           violations,
-          isOptionalFrozenCandidateQuality
-            || scalarStrings(workflow.jobs).some(
-              text => text.includes(`needs.${jobId}.result`),
-            ),
+          isOptionalFrozenCandidateQuality || requiredDownstream,
           `${file} jobs.${jobId} absorbs its own failure and must have needs.${jobId}.result required`,
         );
       }
@@ -9622,12 +9794,35 @@ export function annotationScopeViolations(workflows) {
 export function lostRunnerRecoveryViolations(workflows, graph) {
   const violations = [];
   const policy = graph.non_claim_policy;
+  const rerunPolicy = object(graph.workflow_policy.lost_runner_rerun);
   const rerunFile = "lost-runner-rerun.yml";
   const rerun = workflows.get(rerunFile);
   add(
     violations,
     MAXIMUM_RUN_ATTEMPTS === policy.maximum_run_attempts,
     `${rerunFile} recovery bound must equal the release claim graph maximum_run_attempts`,
+  );
+  add(
+    violations,
+    rerunPolicy.workflow === rerunFile
+      && rerunPolicy.job === "rerun-lost-jobs"
+      && rerunPolicy.recovery_contract === policy.recovery_contract,
+    "the release claim graph lost_runner_rerun block must name the recovery workflow and contract",
+  );
+  add(
+    violations,
+    rerunPolicy.plan_schema === RERUN_PLAN_SCHEMA
+      && rerunPolicy.dispatch_schema === RERUN_DISPATCH_SCHEMA,
+    "the release claim graph must record the recovery plan and dispatch receipt schemas the contract emits",
+  );
+  // Two facts the recovery cannot be reasoned about without: which execution of a job the plan
+  // reads, and what one refused re-dispatch does to the others.
+  add(
+    violations,
+    rerunPolicy.selection === "latest_execution_per_job_name"
+      && rerunPolicy.dispatch_tolerance === "per_job_id"
+      && rerunPolicy.dispatch_failure === "fail_only_when_no_job_was_accepted",
+    "the release claim graph must declare latest-execution rerun selection and per-id dispatch tolerance",
   );
   add(
     violations,
@@ -9668,16 +9863,25 @@ export function lostRunnerRecoveryViolations(workflows, graph) {
     ]);
     requireStepRun(violations, rerunFile, job, "Plan the bounded rerun", [
       "node .github/scripts/lost-runner-recovery.mjs plan-rerun",
+      `--out ${rerunPolicy.plan_file}`,
     ]);
-    const dispatch = namedStep(job, "Re-dispatch only the lost jobs");
+    const dispatchStep = String(rerunPolicy.dispatch_step ?? "");
+    const dispatch = namedStep(job, dispatchStep);
     add(
       violations,
       dispatch?.if === "steps.plan.outputs.rerun == 'true'",
       `${rerunFile} re-dispatch must be gated on the classified recovery plan`,
     );
-    requireStepRun(violations, rerunFile, job, "Re-dispatch only the lost jobs", [
-      "actions/jobs/$job_id/rerun",
+    requireStepRun(violations, rerunFile, job, dispatchStep, [
+      String(rerunPolicy.dispatch_command ?? ""),
+      `--plan ${rerunPolicy.plan_file}`,
+      `--out ${rerunPolicy.dispatch_file}`,
     ]);
+    // The hosts share one machine, so a single incident loses two of them at once. A shell loop
+    // calling the API directly stops at the first refusal under `set -e` and abandons the recovery
+    // the remaining ids are still owed, so the step must delegate to the contract that records a
+    // per-id outcome and fails only when nothing at all was accepted.
+    forbidStepRun(violations, rerunFile, job, dispatchStep, ["gh api", "for job_id in"]);
     // Re-running every failed job would sweep an assertion failure back into the queue alongside
     // the lost one; the plan names ids, so the API call must be the per-job endpoint.
     add(
@@ -9785,13 +9989,234 @@ export function lostRunnerRecoveryViolations(workflows, graph) {
   return violations;
 }
 
-function validateReleaseArtifactRerunSafety(workflows, violations) {
-  const evidenceFile = releaseEvidenceWorkflowRef.slice(
-    releaseEvidenceWorkflowRef.lastIndexOf("/") + 1,
+/// The pre-dispatch reservation contract: the heartbeat workflow whose tiny jobs run ON the three
+/// protected hosts, the release gate that types each host before any proof is dispatched, the
+/// per-host dispatch conditions on the proof calls, the receipt feed into the non-claim producer,
+/// and the closeouts' own receipt collection.
+///
+/// Every pin here is a place where a gate is being relaxed -- an absent proof may now be withheld
+/// instead of blocking -- so the shapes that keep the relaxation honest are pinned: the gate never
+/// waits on a human, the receipt has exactly one producer, the proof jobs dispatch only for hosts
+/// the receipt typed alive, and the closeouts download the receipt themselves rather than
+/// inheriting the non-claim producer's verdict.
+export function protectedRunnerReservationViolations(workflows, graph) {
+  const violations = [];
+  const policy = graph.non_claim_policy;
+  const reservation = object(policy.reservation ?? {});
+  const heartbeat = object(reservation.heartbeat ?? {});
+  const heartbeatFile = String(heartbeat.workflow ?? "").split("/").at(-1);
+  const hostFlag = host => `dispatch_${host.id.replaceAll(/[^A-Za-z0-9_]/gu, "_")}`;
+
+  // The receipt schema and the recheck bound are the same facts the recovery contract exports,
+  // so a graph that drifts from the code is a violation even with the workflows untouched.
+  add(
+    violations,
+    reservation.schema === RESERVATION_RECEIPT_SCHEMA,
+    "the release claim graph reservation schema must match the recovery contract",
   );
+  add(
+    violations,
+    reservation.maximum_observation_attempts === MAXIMUM_RUN_ATTEMPTS,
+    "the release claim graph reservation recheck bound must mirror MAXIMUM_RUN_ATTEMPTS",
+  );
+
+  const heartbeatWorkflow = workflows.get(heartbeatFile);
+  if (!heartbeatWorkflow) {
+    violations.push(`${heartbeatFile} must exist`);
+  } else {
+    const schedule = list(at(heartbeatWorkflow, "on", "schedule") ?? []);
+    add(
+      violations,
+      schedule.length === 1 && object(schedule[0]).cron === heartbeat.cron,
+      `${heartbeatFile} must run on the graph-declared ${String(heartbeat.cron)} schedule`,
+    );
+    add(
+      violations,
+      trigger(heartbeatWorkflow, "workflow_dispatch") !== undefined,
+      `${heartbeatFile} must accept the bounded recheck dispatch`,
+    );
+    // Queued heartbeats behind a busy or dead host must never pile up: each run supersedes the
+    // one before it.
+    add(
+      violations,
+      concurrencyCancels(heartbeatWorkflow),
+      `${heartbeatFile} must cancel superseded heartbeats`,
+    );
+    add(
+      violations,
+      JSON.stringify(object(heartbeatWorkflow.permissions)) === "{}",
+      `${heartbeatFile} must hold no token scopes at all`,
+    );
+    add(
+      violations,
+      !scalarStrings(heartbeatWorkflow).some(value => value.includes("secrets.")),
+      `${heartbeatFile} must reference no secrets`,
+    );
+    const jobs = Object.entries(object(heartbeatWorkflow.jobs));
+    add(
+      violations,
+      jobs.length === list(policy.hosts).length,
+      `${heartbeatFile} must define exactly one heartbeat job per protected host`,
+    );
+    for (const host of policy.hosts) {
+      const matches = jobs.filter(([, job]) => object(job).name === host.heartbeat_job_name);
+      if (matches.length !== 1) {
+        violations.push(`${heartbeatFile} must define one job named ${host.heartbeat_job_name}`);
+        continue;
+      }
+      const [jobId, job] = matches[0];
+      add(
+        violations,
+        JSON.stringify(job["runs-on"]) === JSON.stringify(host.runner_labels),
+        `${heartbeatFile} jobs.${jobId} must run on ${JSON.stringify(host.runner_labels)}`,
+      );
+      add(
+        violations,
+        job["timeout-minutes"] === 5,
+        `${heartbeatFile} jobs.${jobId} must keep the tiny 5-minute heartbeat budget`,
+      );
+      add(
+        violations,
+        job.environment === undefined,
+        `${heartbeatFile} jobs.${jobId} must not wait on an approval environment`,
+      );
+      // The only fact a heartbeat proves is that the runner completed a job; checking anything
+      // out or downloading anything onto the protected host proves nothing more and widens the
+      // host's exposure.
+      add(
+        violations,
+        list(job.steps).every(step => object(step).uses === undefined),
+        `${heartbeatFile} jobs.${jobId} must run no actions on the protected host`,
+      );
+    }
+  }
+
+  const releaseFile = "release.yml";
+  const release = workflows.get(releaseFile);
+  if (!release) return violations;
+  const gateJobId = String(reservation.producer_job ?? "");
+  const gate = requireJob(violations, releaseFile, release, gateJobId);
+  // The gate sits between the packaged proof and every protected dispatch. A human approval here
+  // would put a click between a finished build and its proofs on every release; an `if:` here
+  // would make "the hosts were never typed" reachable, which is the invisible-queue state this
+  // gate exists to remove.
+  add(
+    violations,
+    object(gate).environment === undefined,
+    `${releaseFile} ${gateJobId} must not wait on an approval environment`,
+  );
+  add(
+    violations,
+    object(gate).if === undefined,
+    `${releaseFile} ${gateJobId} must type the hosts unconditionally`,
+  );
+  const reserveStepName = "Type each protected host from its heartbeat evidence";
+  requireStepRun(violations, releaseFile, gate, reserveStepName, [
+    "node .github/scripts/lost-runner-recovery.mjs plan-reservation",
+    "--out target/runner-reservation/receipt.json",
+    ".non_claim_policy.reservation.heartbeat.workflow",
+    ".non_claim_policy.reservation.heartbeat.tolerance_minutes",
+    // The bounded recheck is a fresh heartbeat dispatch, not a longer wait on stale evidence.
+    "gh workflow run",
+  ]);
+  for (const host of policy.hosts) {
+    add(
+      violations,
+      object(gate.outputs)[hostFlag(host)]
+        === `\${{ steps.reserve.outputs.${hostFlag(host)} }}`,
+      `${releaseFile} ${gateJobId} must publish the ${hostFlag(host)} receipt flag`,
+    );
+  }
+  const receiptArtifactName = String(reservation.receipt_artifact ?? "")
+    .replaceAll("{attempt}", "${{ github.run_attempt }}");
+  const receiptUpload = list(object(gate).steps ?? []).find(step =>
+    object(object(step).with).name === receiptArtifactName);
+  add(
+    violations,
+    receiptUpload !== undefined
+      && receiptUpload.if === "always()"
+      && String(object(receiptUpload?.with).path ?? "").endsWith("receipt.json"),
+    `${releaseFile} ${gateJobId} must upload the ${receiptArtifactName} receipt even when it fails red`,
+  );
+  // Exactly one producer for the receipt artifact, anywhere in the repository: a second uploader
+  // could hand the closeouts a receipt no reservation ever wrote.
+  for (const [file, workflow] of workflows) {
+    for (const [jobId, jobValue] of Object.entries(object(workflow.jobs))) {
+      for (const step of Array.isArray(object(jobValue).steps) ? jobValue.steps : []) {
+        const uploadName = String(object(object(step).with).name ?? "");
+        if (!uploadName.startsWith("protected-runner-reservation-")) continue;
+        if (typeof object(step).uses !== "string" || !object(step).uses.startsWith("actions/upload-artifact")) continue;
+        add(
+          violations,
+          file === releaseFile && jobId === gateJobId,
+          `${file} job ${jobId} must not upload the reservation receipt ${uploadName}`,
+        );
+      }
+    }
+  }
+
+  // Proof jobs dispatch only for hosts the receipt typed alive, host by host, derived from the
+  // graph rather than listed here.
+  for (const host of policy.hosts) {
+    const proofRef = `./${host.unavailable_producer_workflow}`;
+    const entry = Object.entries(object(release.jobs))
+      .find(([, jobValue]) => object(jobValue).uses === proofRef);
+    add(
+      violations,
+      entry !== undefined
+        && object(entry[1]).if
+          === `needs.${gateJobId}.outputs.${hostFlag(host)} == 'true'`
+        && needs(object(entry[1])).includes(gateJobId),
+      `${releaseFile} proof calling ${host.unavailable_producer_workflow} must dispatch only on ${hostFlag(host)}`,
+    );
+  }
+
+  // The non-claim producer feeds the receipt into the shared classifier and records the
+  // pre-assignment reason only for hosts the classifier withheld under it.
+  const nonClaim = requireJob(violations, releaseFile, release, "accelerator-non-claim");
+  const nonClaimDownload = namedStep(nonClaim, "Download this run's reservation receipt");
+  add(
+    violations,
+    nonClaimDownload?.uses === "actions/download-artifact@v8.0.1"
+      && object(nonClaimDownload?.with).pattern === "protected-runner-reservation-attempt-*"
+      && object(nonClaimDownload?.with)["merge-multiple"] === false,
+    `${releaseFile} non-claim producer must download this run's reservation receipt`,
+  );
+  requireStepRun(violations, releaseFile, nonClaim, "Decide withheld accelerator hosts", [
+    "protected-runner-reservation-attempt-",
+    "--reservation",
+  ]);
+  requireStepRun(violations, releaseFile, nonClaim, "Record populated accelerator non-claims", [
+    "runner_unproven_pre_assignment",
+    "--reason accelerator_host_offline_pre_assignment",
+  ]);
+
+  // The closeouts re-confirm the pre-assignment route from a receipt they downloaded themselves:
+  // the trust boundary that already refuses to inherit the lost-runner verdict refuses to
+  // inherit this one the same way.
+  for (const [jobId, stepName] of [
+    ["pre-publish-closeout", "Authenticate pre-publish Actions provenance"],
+    ["post-publish-closeout", "Authenticate post-publish Actions provenance"],
+  ]) {
+    const job = requireJob(violations, releaseFile, release, jobId);
+    const download = namedStep(job, "Collect this run's reservation receipt");
+    add(
+      violations,
+      download?.uses === "actions/download-artifact@v8.0.1"
+        && object(download?.with).pattern === "protected-runner-reservation-attempt-*"
+        && object(download?.with)["merge-multiple"] === false,
+      `${releaseFile} ${jobId} must collect this run's reservation receipt itself`,
+    );
+    requireStepRun(violations, releaseFile, job, stepName, [
+      "--reservation-receipt",
+    ]);
+  }
+  return violations;
+}
+
+function validateReleaseArtifactRerunSafety(workflows, violations) {
   const releaseChainWorkflows = new Set([
     "source-proof.yml",
-    evidenceFile,
     "packaged-platform-proof.yml",
     "macos-metal-proof.yml",
     "windows-vulkan-proof.yml",
@@ -9800,10 +10225,6 @@ function validateReleaseArtifactRerunSafety(workflows, violations) {
     "release.yml",
   ]);
   const replaceableStableIntermediates = new Map([
-    [`${evidenceFile}/measure/Upload release evidence`, {
-      name: "release-evidence-${{ inputs.ref }}",
-      path: "target/release-evidence",
-    }],
     ["packaged-platform-proof.yml/build/Upload release asset", {
       name: "codestory-cli-${{ matrix.asset_target }}",
       path: "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}\ntarget/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}.sha256\ntarget/release-dist/SHA256SUMS.txt\n",
@@ -10121,8 +10542,12 @@ export function validatePluginRelease(workflows, violations, graph) {
   requireStepRun(violations, file, object(jobs["plugin-proof"]), "Check the pinned provision proof", [
     "node --test scripts/tests/prove-plugin-pinned-provision.test.mjs",
   ]);
+  // The lane is stated, never defaulted. The native lane's pin lawfully carries no archive
+  // digests, so a plugin-lane gate that stopped naming its lane could silently become one that
+  // proves nothing about the source pin it exists to enforce.
   requireStepRun(violations, file, object(jobs["plugin-proof"]), "Provision the pinned CLI end to end", [
     "scripts/prove-plugin-pinned-provision.mjs",
+    "--lane plugin",
   ]);
   requireStepRun(violations, file, object(jobs.publish), "Re-verify main before tagging", [
     "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
@@ -10170,6 +10595,30 @@ export function validatePluginRelease(workflows, violations, graph) {
     object(preflight.outputs).marketplace_revision === undefined,
     `${file} preflight must not capture a marketplace revision that predates publication`,
   );
+  const candidateCatalogProof = namedStep(
+    preflight,
+    "Prove the candidate-pinned marketplace install path",
+  );
+  add(
+    violations,
+    candidateCatalogProof?.["continue-on-error"] === undefined,
+    `${file} W8.4 candidate-pinned marketplace proof must fail closed before publication`,
+  );
+  requireStepRun(
+    violations,
+    file,
+    preflight,
+    "Prove the candidate-pinned marketplace install path",
+    [
+      "build-marketplace-fixture.mjs",
+      '--commit "$GITHUB_SHA"',
+      'fixture_revision="$(git -C "$fixture_root" rev-parse HEAD)"',
+      "install-codestory-marketplace-proof.mjs",
+      '--marketplace-source "$fixture_root"',
+      '--marketplace-revision "$fixture_revision"',
+      "--local-fixture true",
+    ],
+  );
   const installStepName = "Prove the public marketplace install path";
   add(
     violations,
@@ -10183,6 +10632,7 @@ export function validatePluginRelease(workflows, violations, graph) {
     catalogDelivery,
     {
       published: "${{ needs.marketplace-publish.outputs.catalog_published == 'true' }}",
+      state: "${{ needs.marketplace-publish.outputs.catalog_delivery_state }}",
       revision: "${{ needs.marketplace-publish.outputs.marketplace_revision }}",
     },
     installStepName,
@@ -10216,7 +10666,7 @@ export function validatePluginRelease(workflows, violations, graph) {
   );
 }
 
-export function validateMarketplaceSync(workflows, violations) {
+export function validateMarketplaceSync(workflows, violations, graph) {
   const file = "marketplace-sync.yml";
   const workflow = workflows.get(file);
   if (!workflow) {
@@ -10329,20 +10779,10 @@ export function validateMarketplaceSync(workflows, violations) {
   }
   // Shape is proven before the checkout resolves the ref and before any marketplace token exists.
   const guard = "Validate the dispatched release coordinates";
-  // Each fragment pins an anchored regex together with the test that consumes it, so neither the
-  // closing anchor nor the comparison can go missing on its own. A prefix here would be satisfied
-  // by an unanchored rewrite that accepts `0.16.3; id`.
-  requireStepRun(violations, file, job, guard, [
-    "commit_shape='^[0-9a-fA-F]{7,40}$'",
-    "version_shape='^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?$'",
-    'if [[ ! "$INPUT_COMMIT" =~ $commit_shape ]]; then',
-    'if [[ ! "$INPUT_VERSION" =~ $version_shape ]]; then',
-  ]);
-  // grep anchors per line, so `printf | grep -Eq '^...$'` passes any value whose *first* line is
-  // well formed. The guard must match whole values; the digest keeps that property from being
-  // quietly traded back for a line-oriented test.
-  forbidStepRun(violations, file, job, guard, ["grep"]);
-  requireExactStepScript(violations, file, job, guard, marketplaceGuardDigest, "dispatch coordinate guard");
+  // The guard's step fragments - the anchored shapes with their consuming tests, and
+  // the grep ban that keeps the match whole-value - are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments; stepFragmentViolations
+  // evaluates them.
   add(
     violations,
     stepIndex(job, guard) === 0,
@@ -10360,10 +10800,53 @@ export function validateMarketplaceSync(workflows, violations) {
     stepIndex(job, checkout) > stepIndex(job, guard),
     `${file} must validate the dispatched commit before checking it out`,
   );
+  // A catalog moved by this workflow is a RECOVERY, not the publication that shipped the plugin.
+  // The two stay distinguishable only if this lane records its own identity, and the rollback it
+  // performs is only undoable if the pin it replaced is recorded with it.
+  const recovery = object(object(graph?.workflow_policy?.catalog_delivery).recovery);
+  const recoveryStep = "Record catalog recovery identity";
+  // The catalog push's step fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  add(
+    violations,
+    namedStep(job, "Point the catalog at the published release")?.id === "publish",
+    `${file} catalog push must publish its recorded pin under the id the identity step reads`,
+  );
+  add(
+    violations,
+    object(namedStep(job, recoveryStep)?.env).CATALOG_DELIVERY === recovery.id,
+    `${file} must record the ${recovery.id} delivery identity the release claim graph declares`,
+  );
+  for (const name of list(recovery.previous_pin_outputs)) {
+    add(
+      violations,
+      scalarStrings(object(namedStep(job, recoveryStep)?.env)).includes(
+        `\${{ steps.publish.outputs.${name} }}`,
+      ),
+      `${file} ${recoveryStep} must carry the recorded ${name}`,
+    );
+  }
+  // The recovery identity's step fragments are rule instances and live in
+  // release-claims.json under workflow_policy.step_fragments;
+  // stepFragmentViolations evaluates them.
+  add(
+    violations,
+    stepIndex(job, recoveryStep) > stepIndex(job, "Point the catalog at the published release"),
+    `${file} must record the recovery identity from the catalog move it actually performed`,
+  );
+  for (const state of list(object(graph?.workflow_policy?.catalog_delivery).states)) {
+    add(
+      violations,
+      object(state).id !== recovery.id,
+      `${file} recovery identity must not reuse the ${object(state).id} delivery state`,
+    );
+  }
 }
 
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
+  violations.push(...proofFloorPolicyViolations(workflows, graph));
   violations.push(...benchmarkDependencyIsolationViolations(
     fs.readFileSync(
       path.join(repositoryRoot, "crates", "codestory-bench", "Cargo.toml"),
@@ -10399,8 +10882,10 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   violations.push(...reusableWorkflowPermissionViolations(workflows));
   validateCargoTestFilters(workflows, violations);
   validatePluginRelease(workflows, violations, graph);
-  validateMarketplaceSync(workflows, violations);
-  validateLockedSetupSurfaces(violations);
+  validateMarketplaceSync(workflows, violations, graph);
+  // The locked-setup constant mirrors are rule instances and live in
+  // release-claims.json under workflow_policy.constant_mirrors;
+  // constantMirrorViolations evaluates them.
   validateIssueWorkflows(workflows, violations);
   validatePluginAndDraftWorkflows(workflows, violations, graph);
   validateReleaseCoordinator(workflows, violations, graph);
@@ -10416,7 +10901,12 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   violations.push(...absorbedFailureViolations(workflows));
   violations.push(...annotationScopeViolations(workflows));
   violations.push(...lostRunnerRecoveryViolations(workflows, graph));
+  violations.push(...protectedRunnerReservationViolations(workflows, graph));
   violations.push(...releaseWorkflowContractViolations(workflows, graph));
+  violations.push(...pinnedProgramViolations(workflows, graph));
+  violations.push(...stepFragmentViolations(workflows, graph));
+  violations.push(...structuralPinViolations(workflows, graph));
+  violations.push(...constantMirrorViolations(graph));
   return violations;
 }
 

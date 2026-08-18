@@ -83,7 +83,7 @@ and `retrieval_mode=full` does not replace live engine and publication checks.
 
 ## Workspace crates
 
-The workspace has nine crates: eight product layers and one measurement crate.
+The workspace has ten crates: nine product layers and one measurement crate.
 
 ```mermaid
 flowchart LR
@@ -93,6 +93,7 @@ flowchart LR
     Indexer["indexer"]
     Llama["llama-sys"]
     Retrieval["retrieval"]
+    Agent["agent"]
     Runtime["runtime"]
     CLI["cli"]
     Bench["bench"]
@@ -101,6 +102,7 @@ flowchart LR
     Contracts --> Store
     Contracts --> Indexer
     Contracts --> Retrieval
+    Contracts --> Agent
     Contracts --> Runtime
     Contracts --> CLI
     Workspace --> Indexer
@@ -111,8 +113,10 @@ flowchart LR
     Store --> Retrieval
     Store --> Runtime
     Llama --> Retrieval
+    Llama --> CLI
     Indexer --> Runtime
     Retrieval --> Runtime
+    Agent --> Runtime
     Retrieval --> CLI
     Runtime --> CLI
     Workspace -.-> Bench
@@ -130,15 +134,22 @@ flowchart LR
 - `codestory-indexer` parses and extracts graph projections, then resolves
   stored edges.
 - `codestory-llama-sys` compiles the pinned CodeRankEmbed Q8 model and
-  llama.cpp/ggml engine into the executable.
+  llama.cpp/ggml engine into the executable. Retrieval links it for embedding,
+  and the CLI links it directly so the internal embedding server binary carries
+  the same engine.
 - `codestory-retrieval` owns immutable lexical/vector/SCIP generations,
   manifests, engine integration, health, retention, and fail-closed queries.
+- `codestory-agent` owns packet planning: prompt terms, flow requirements,
+  evidence roles and carriers, citation scoring, and the deduplicated query
+  plan. It owns no activation, storage, retrieval execution, publication retry,
+  or mutable readiness authority, and it reads pinned runtime state only through
+  the `PinnedReader` trait the runtime implements.
 - `codestory-runtime` is the only product orchestration layer.
 - `codestory-cli` parses and renders CLI, HTTP, and stdio adapters.
 - `codestory-bench` measures product paths without defining product behavior.
 
 The intended direction is
-`contracts -> workspace/store/indexer/llama-sys/retrieval -> runtime -> cli`.
+`contracts -> workspace/store/indexer/llama-sys/retrieval/agent -> runtime -> cli`.
 The exact dependency edges are shown above; bench may depend on product crates
 for measurement.
 

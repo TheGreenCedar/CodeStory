@@ -1,5 +1,7 @@
 use anyhow::Result;
-use fs4::fs_std::FileExt;
+use codestory_contracts::bounded_locks::{
+    self, DEFAULT_LOCK_WAIT, FileLockKind, LockDeadline, acquire_with_deadline,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
@@ -10,11 +12,13 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use codestory_retrieval::{ProcessOwnerState, ProcessStartProbe};
+use codestory_runtime::{
+    ProcessOwnerState, ProcessStartProbe, process_owner_state, process_start_identity,
+};
 
-const LOCAL_REFRESH_STATUS_FILE: &str = "local-refresh-status.json";
-const LOCAL_REFRESH_LOCK_FILE: &str = "local-refresh.lock";
-const LOCAL_REFRESH_STATE_GUARD_FILE: &str = "local-refresh-state.guard";
+use codestory_contracts::owned_artifacts::{
+    LOCAL_REFRESH_LOCK_FILE, LOCAL_REFRESH_STATE_GUARD_FILE, LOCAL_REFRESH_STATUS_FILE,
+};
 const LOCAL_REFRESH_STATUS_SCHEMA_VERSION: u32 = 1;
 const LOCAL_REFRESH_STATUS_TTL: Duration = Duration::from_secs(30);
 const LOCAL_REFRESH_LOCK_STALE_TTL: Duration = Duration::from_secs(120);
@@ -91,7 +95,7 @@ struct LocalRefreshStateGuard {
 
 impl Drop for LocalRefreshStateGuard {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let _ = bounded_locks::release(&self.file);
     }
 }
 
@@ -547,7 +551,14 @@ fn acquire_local_refresh_state_guard(cache_root: &Path) -> Result<LocalRefreshSt
     fs::create_dir_all(cache_root)?;
     let path = cache_root.join(LOCAL_REFRESH_STATE_GUARD_FILE);
     let file = open_local_refresh_state_guard_file(&path)?;
-    FileExt::lock_exclusive(&file)?;
+    // The critical section is one read-modify-write of the state file, never a
+    // publication, so the foreground budget is the matching one.
+    acquire_with_deadline(
+        &file,
+        FileLockKind::Exclusive,
+        LockDeadline::after(DEFAULT_LOCK_WAIT),
+        None,
+    )?;
     anyhow::ensure!(
         locked_guard_path_matches(&file, &path),
         "local refresh state guard was replaced at {}",
@@ -687,15 +698,10 @@ fn path_fingerprint(path: &Path) -> String {
 }
 
 fn recorded_process_start_identity(pid: u32) -> Option<String> {
-    match codestory_retrieval::probe_process_start_identity(pid) {
+    match process_start_identity(pid) {
         ProcessStartProbe::Running { start_identity } => Some(start_identity),
         ProcessStartProbe::NotRunning | ProcessStartProbe::Unknown { .. } => None,
     }
-}
-
-fn process_owner_state(pid: u32, expected_start_identity: Option<&str>) -> ProcessOwnerState {
-    let probe = codestory_retrieval::probe_process_start_identity(pid);
-    codestory_retrieval::process_owner_state(&probe, expected_start_identity)
 }
 
 #[cfg(test)]
@@ -1044,10 +1050,19 @@ mod tests {
                 .send(())
                 .expect("announce replacement lock attempt");
             contention_tx
-                .send(FileExt::try_lock_exclusive(&guard_file).expect("try replacement guard"))
+                .send(
+                    bounded_locks::try_acquire(&guard_file, FileLockKind::Exclusive)
+                        .expect("try replacement guard"),
+                )
                 .expect("report replacement contention");
             retry_rx.recv().expect("retry replacement guard");
-            FileExt::lock_exclusive(&guard_file).expect("acquire replacement guard");
+            acquire_with_deadline(
+                &guard_file,
+                FileLockKind::Exclusive,
+                LockDeadline::after(DEFAULT_LOCK_WAIT),
+                None,
+            )
+            .expect("acquire replacement guard");
             let replacement_token = "replacement-owner".to_string();
             crate::file_state::write_json_atomic(
                 &local_refresh_lock_path(&replacement_cache),
@@ -1079,7 +1094,7 @@ mod tests {
                 },
             )
             .expect("replacement terminal status");
-            FileExt::unlock(&guard_file).expect("unlock replacement guard");
+            bounded_locks::release(&guard_file).expect("unlock replacement guard");
         });
         replacement_attempt_rx
             .recv()
@@ -1417,5 +1432,73 @@ mod tests {
         let project = parent.path().join("CaseSensitiveProject");
         fs::create_dir_all(&project).expect("project");
         assert!(clean_path_text(&project).ends_with("CaseSensitiveProject"));
+    }
+
+    #[test]
+    fn local_refresh_state_is_never_discovered_as_project_source() {
+        use codestory_workspace::{WorkspaceInventoryOutcome, WorkspaceManifest};
+
+        let temp = tempfile::tempdir().expect("project");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("root");
+        let user_source = root.join("main.py");
+        fs::write(&user_source, "print(\"hello\")\n").expect("user source");
+        // The in-project cache root is a supported configuration
+        // (`--cache-dir` / config `cache_dir`), and the storage file lives
+        // directly inside it, so refresh state files are storage siblings.
+        let cache_root = root.join(".cache");
+        let storage_path = cache_root.join("codestory.db");
+
+        let discovered = |label: &str| -> Vec<PathBuf> {
+            let manifest =
+                WorkspaceManifest::open_with_storage_owned_exclusions(root.clone(), &storage_path)
+                    .expect(label);
+            let inventory = manifest.source_inventory().expect(label);
+            assert_eq!(
+                inventory.outcome,
+                WorkspaceInventoryOutcome::Complete,
+                "{label}: inventory must stay complete"
+            );
+            inventory.files
+        };
+
+        let lock = match try_acquire_local_refresh_lock(&cache_root, &root).expect("acquire") {
+            LocalRefreshLockAttempt::Acquired(lock) => lock,
+            LocalRefreshLockAttempt::Busy(busy) => {
+                panic!("lock should be acquired, got busy at {:?}", busy.lock_path)
+            }
+        };
+        write_local_refresh_status(
+            &cache_root,
+            &root,
+            "running",
+            "index",
+            lock.started_at_epoch_ms(),
+            lock.pid(),
+            None,
+        )
+        .expect("status write");
+        assert!(cache_root.join(LOCAL_REFRESH_STATUS_FILE).is_file());
+        assert!(cache_root.join(LOCAL_REFRESH_LOCK_FILE).is_file());
+        assert!(cache_root.join(LOCAL_REFRESH_STATE_GUARD_FILE).is_file());
+        assert_eq!(discovered("during refresh"), vec![user_source.clone()]);
+
+        // A heartbeat rewrite replaces the status file while discovery runs.
+        write_local_refresh_status(
+            &cache_root,
+            &root,
+            "running",
+            "index",
+            lock.started_at_epoch_ms(),
+            lock.pid(),
+            None,
+        )
+        .expect("heartbeat rewrite");
+        assert_eq!(discovered("after heartbeat"), vec![user_source.clone()]);
+
+        // Releasing the lock keeps the persistent state guard on disk.
+        drop(lock);
+        assert!(cache_root.join(LOCAL_REFRESH_STATE_GUARD_FILE).is_file());
+        assert_eq!(discovered("after release"), vec![user_source]);
     }
 }

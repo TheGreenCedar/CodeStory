@@ -63,11 +63,18 @@ pub struct IndexPublicationDto {
     pub published_at_epoch_ms: i64,
 }
 
+/// Mode the served publication was produced by.
+///
+/// Emission stays `snake_case`. The PascalCase aliases accept the spelling the
+/// mirrored `IndexMode` request enum emits on the same wire surfaces.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexPublicationModeDto {
+    #[serde(alias = "Full")]
     Full,
+    #[serde(alias = "Incremental")]
     Incremental,
+    #[serde(alias = "SemanticProjection")]
     SemanticProjection,
 }
 
@@ -119,6 +126,23 @@ impl SearchHitOrigin {
             Self::TextMatch => "text_match",
         }
     }
+}
+
+/// The source object a search hit matched.
+///
+/// Byte offsets are zero-based, half-open UTF-8 byte offsets into the file contents.
+/// `File` records a path-only match when no source-text range was matched.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SearchTargetDto {
+    File {
+        file_path: String,
+    },
+    FileRange {
+        file_path: String,
+        start_byte: u32,
+        end_byte: u32,
+    },
 }
 
 /// Match-quality label for ranking and diagnostics.
@@ -561,6 +585,62 @@ pub enum IndexFreshnessNotCheckedCauseDto {
     InventoryUnavailable,
 }
 
+/// Why a consumer of a freshness observation must treat drift as unknown.
+///
+/// [`IndexFreshnessNotCheckedCauseDto`] describes what the *check* did. This describes what a
+/// consumer may conclude from it, and it exists because those are not the same judgement. A
+/// bounded check still leaves the publication complete and servable — the serving waiver in the
+/// runtime deliberately admits it — but it never establishes that the publication matches the
+/// working tree. Broad evidence assembled over an unknown-freshness publication therefore cannot
+/// be reported as proven, even while local navigation over that same publication stays available.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessUnknownCauseDto {
+    /// Discovery stopped at a deliberate inventory bound; drift past the bound was never compared.
+    BoundedInventory,
+    /// The freshness check could not run, so nothing about drift was established.
+    InventoryUnavailable,
+    /// The observation reported `NotChecked` without naming a cause.
+    CauseUnreported,
+    /// No freshness observation reached this consumer at all.
+    ObservationUnavailable,
+}
+
+impl FreshnessUnknownCauseDto {
+    /// Stable machine-readable identity for gap text and typed output fields.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::BoundedInventory => "bounded_inventory",
+            Self::InventoryUnavailable => "inventory_unavailable",
+            Self::CauseUnreported => "cause_unreported",
+            Self::ObservationUnavailable => "observation_unavailable",
+        }
+    }
+
+    /// The unknown cause an observation carries, or `None` when it reached a verdict.
+    ///
+    /// Both `Fresh` and `Stale` are verdicts: they say drift is absent or present. Everything
+    /// else — including the missing observation, which on the production path means the check
+    /// itself failed — is unknown, and defaulting a failed check to fresh is the exposure this
+    /// type exists to close. Readiness and packet sufficiency share this one mapping so an
+    /// operator never has to reconcile two different readings of the same observation.
+    pub fn for_observation(freshness: Option<&IndexFreshnessDto>) -> Option<Self> {
+        let Some(freshness) = freshness else {
+            return Some(Self::ObservationUnavailable);
+        };
+        match freshness.status {
+            IndexFreshnessStatusDto::Fresh | IndexFreshnessStatusDto::Stale => None,
+            IndexFreshnessStatusDto::NotChecked => Some(match freshness.not_checked_cause {
+                Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory) => Self::BoundedInventory,
+                Some(IndexFreshnessNotCheckedCauseDto::InventoryUnavailable) => {
+                    Self::InventoryUnavailable
+                }
+                None => Self::CauseUnreported,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexFreshnessChangeKindDto {
@@ -591,6 +671,126 @@ pub struct IndexFreshnessDto {
     pub not_checked_cause: Option<IndexFreshnessNotCheckedCauseDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<IndexFreshnessSampleDto>,
+}
+
+/// What the index knows about one source file it was asked about.
+///
+/// Deliberately inert, like [`IndexFreshnessDto`]: it carries no verdict about whether the file is
+/// usable and none about whether evidence over it is provable. Both are computed downstream by
+/// consumers reading this same observation.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct SourceCoverageObservationDto {
+    /// The path as the consumer asked about it, so a caller can match its own request.
+    pub path: String,
+    pub status: SourceCoverageStatusDto,
+    /// Set only when `status` is `Incomplete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<FileCoverageReason>,
+    /// Set only when `status` is `NotEstablished`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_established_cause: Option<SourceCoverageNotEstablishedCauseDto>,
+    /// Observed size and the cap that refused it, when the file was policy-excluded.
+    ///
+    /// Reported so a gap sentence can name numbers instead of a word. No verdict reads these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_cap: Option<u64>,
+}
+
+/// What the index established about one file.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCoverageStatusDto {
+    /// The file is in the published core with no recorded coverage defect.
+    Indexed,
+    /// A published policy exclusion refused the file before scheduling.
+    PolicyExcluded,
+    /// The file was indexed but a coverage reason was recorded against it.
+    Incomplete,
+    /// Coverage could not be determined; see `not_established_cause`.
+    NotEstablished,
+}
+
+/// Why a coverage lookup could not reach a verdict.
+///
+/// The same split [`IndexFreshnessNotCheckedCauseDto`] makes: `PublicationIncomplete` means there
+/// is no complete core to ask, which is a deliberate and recoverable state; `LookupUnavailable`
+/// means the query itself failed and proves nothing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCoverageNotEstablishedCauseDto {
+    PublicationIncomplete,
+    LookupUnavailable,
+}
+
+/// Why a consumer must treat evidence over one file as unprovable.
+///
+/// [`SourceCoverageStatusDto`] describes what the *index* did. This describes what a consumer may
+/// conclude, and as with freshness those are different judgements — so this carries variants the
+/// producer cannot emit.
+///
+/// One deliberate divergence from [`FreshnessUnknownCauseDto`], and it is the whole asymmetry:
+/// that mapping takes an `Option` because *no freshness observation at all* is itself unknown and
+/// must cap. Coverage's takes a value, because an empty observation list means no path was
+/// checked, which is legitimate and must cap nothing. A failed lookup is carried per path as
+/// `NotEstablished` rather than by absence.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCoverageUnprovableCauseDto {
+    /// A published policy exclusion refused the file, so the index never read it.
+    PolicyExcluded,
+    /// The file carries a recorded coverage defect.
+    IncompleteIndex,
+    /// There is no complete publication to ask about this file.
+    PublicationIncomplete,
+    /// The coverage lookup failed.
+    LookupUnavailable,
+    /// The observation reported `Incomplete` without naming a reason.
+    ReasonUnreported,
+    /// The observation reported `NotEstablished` without naming a cause.
+    CauseUnreported,
+}
+
+impl SourceCoverageUnprovableCauseDto {
+    /// Stable machine-readable identity for gap text and typed output fields.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::PolicyExcluded => "policy_excluded",
+            Self::IncompleteIndex => "incomplete_index",
+            Self::PublicationIncomplete => "publication_incomplete",
+            Self::LookupUnavailable => "lookup_unavailable",
+            Self::ReasonUnreported => "reason_unreported",
+            Self::CauseUnreported => "cause_unreported",
+        }
+    }
+
+    /// The unprovable cause an observation carries, or `None` when the file is covered.
+    ///
+    /// `Indexed` is the only verdict that establishes coverage. Everything else — including an
+    /// `Incomplete` that names no reason — is unprovable, because defaulting an unnamed defect to
+    /// covered is the exposure this type exists to close.
+    pub fn for_observation(observation: &SourceCoverageObservationDto) -> Option<Self> {
+        match observation.status {
+            SourceCoverageStatusDto::Indexed => None,
+            SourceCoverageStatusDto::PolicyExcluded => Some(Self::PolicyExcluded),
+            SourceCoverageStatusDto::Incomplete => Some(match observation.reason {
+                Some(_) => Self::IncompleteIndex,
+                None => Self::ReasonUnreported,
+            }),
+            SourceCoverageStatusDto::NotEstablished => {
+                Some(match observation.not_established_cause {
+                    Some(SourceCoverageNotEstablishedCauseDto::PublicationIncomplete) => {
+                        Self::PublicationIncomplete
+                    }
+                    Some(SourceCoverageNotEstablishedCauseDto::LookupUnavailable) => {
+                        Self::LookupUnavailable
+                    }
+                    None => Self::CauseUnreported,
+                })
+            }
+        }
+    }
 }
 
 /// Readiness goal being evaluated.
@@ -640,6 +840,15 @@ pub struct ReadinessIndexSnapshotDto {
     pub removed_file_count: u32,
     pub checked_file_count: u32,
     pub indexed_file_count: u32,
+    /// Whether drift against the working tree is unknown for this publication.
+    ///
+    /// This is read-only evidence, not a repair signal: a bounded check leaves the surface
+    /// available while making broad evidence unprovable, so the flag has to be visible even on a
+    /// `Ready` verdict. Callers that need the reason branch on `freshness_unknown_cause`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub freshness_unknown: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_unknown_cause: Option<FreshnessUnknownCauseDto>,
 }
 
 /// Sidecar state snapshot used inside readiness verdicts.
@@ -712,6 +921,8 @@ pub struct SearchHit {
     pub line: Option<u32>,
     pub score: f32,
     pub origin: SearchHitOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<SearchTargetDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_quality: Option<SearchMatchQualityDto>,
     pub resolvable: bool,
@@ -1620,12 +1831,20 @@ pub enum CanonicalRouteKind {
     Hierarchy,
 }
 
+/// Canonical member visibility.
+///
+/// Emission stays `snake_case`. The PascalCase aliases accept the spelling the
+/// mirrored `MemberAccess` enum emits on the same wire surfaces.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CanonicalMemberVisibility {
+    #[serde(alias = "Public")]
     Public,
+    #[serde(alias = "Protected")]
     Protected,
+    #[serde(alias = "Private")]
     Private,
+    #[serde(alias = "Default")]
     Default,
 }
 
@@ -2068,9 +2287,14 @@ pub struct AgentCitationDto {
     pub file_path: Option<String>,
     pub line: Option<u32>,
     pub score: f32,
-    #[serde(default = "default_search_hit_origin")]
+    // `origin` and `resolvable` are required on decode. An absent provenance or
+    // resolvability field once decoded to "indexed symbol" and "resolvable",
+    // which is the wrong direction for evidence: a truncated or older payload
+    // would have claimed parser-backed, followable evidence the producer never
+    // sent. A reader that did not receive the field must fail, not assume.
     pub origin: SearchHitOrigin,
-    #[serde(default = "default_citation_resolvable")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<SearchTargetDto>,
     pub resolvable: bool,
     #[serde(default)]
     pub subgraph_id: Option<String>,
@@ -2090,14 +2314,6 @@ pub struct AgentCitationDto {
     pub coverage_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligible_for_sufficiency: Option<bool>,
-}
-
-const fn default_search_hit_origin() -> SearchHitOrigin {
-    SearchHitOrigin::IndexedSymbol
-}
-
-const fn default_citation_resolvable() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -2205,12 +2421,10 @@ pub struct RetrievalStageTimingDto {
     pub degraded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stub_reason: Option<String>,
-    #[serde(default = "completed_stage_status")]
+    // Required on decode. Defaulting an absent status to "completed" claimed a
+    // finished stage beside a populated `cancel_reason`; a stage whose outcome
+    // was not transmitted has no known outcome.
     pub completion_status: String,
-}
-
-fn completed_stage_status() -> String {
-    "completed".into()
 }
 
 fn is_false(value: &bool) -> bool {
@@ -2293,6 +2507,8 @@ pub struct RetrievalShadowDto {
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct PacketSidecarQueryDiagnosticDto {
     pub query: String,
+    #[serde(default)]
+    pub completion: PacketQueryCompletionDto,
     pub retrieval_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_query_ms: Option<u32>,
@@ -2311,8 +2527,192 @@ pub struct PacketSidecarQueryDiagnosticDto {
     pub unresolved_candidate_count: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub blocking_unresolved_candidate_count: u32,
+    /// This query's semantic stage lost its budget and contributed no candidate.
+    ///
+    /// Kept per query rather than only as a total because a required query obligation is demoted
+    /// by *its own* dense lane going dark, not by some other query's.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub semantic_stage_timeout_zero_hits: bool,
+    /// This query's semantic stage declined to run, or returned only stub candidates.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub semantic_abstained: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
+}
+
+/// Which layer produced a packet claim.
+///
+/// Source-grounded profile claims and name-derived templates are different facts; counting
+/// them apart is what lets a field trace answer "did the fitted layer fire, or did this packet
+/// degrade to naming?".
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketClaimSourceDto {
+    /// Source-text-derived claims from the versioned product claim-profile registry.
+    SourceProfile,
+    /// Claims templated from a command/subcommand shape in the question.
+    CommandProfile,
+    /// Generic flow templates that are neither profile- nor role-derived.
+    FlowTemplate,
+    /// Name-and-path-derived evidence-role sentences.
+    RoleTemplate,
+    /// Test-only evaluation-probe flow templates.
+    EvalProbe,
+}
+
+/// Fire counts for one claim profile within one packet.
+///
+/// Every field is either a registry-static profile id or an integer count. No citation display
+/// name, file path, query, or source excerpt may appear here: this is retained field telemetry,
+/// not an evidence surface.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketClaimProfileFireRateDto {
+    /// Static profile id from the claim-profile registry.
+    pub profile_id: String,
+    /// Citations this profile was offered.
+    pub evaluated: u32,
+    /// Citations for which this profile emitted at least one claim.
+    pub fired: u32,
+    /// Claims this profile emitted.
+    pub claims: u32,
+    /// Citations where a runtime contract violation skipped this profile before it ran.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub skipped_invalid: u32,
+    /// Typed violation code that caused the skip, when there was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+}
+
+/// Claims attributed to one producing layer within one packet.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketClaimSourceCountDto {
+    pub source: PacketClaimSourceDto,
+    pub claims: u32,
+}
+
+/// Packet claim-profile fire-rate telemetry.
+///
+/// This travels on its own typed trace field rather than in
+/// [`AgentRetrievalTraceDto::annotations`] on purpose. Annotations are an evidence channel:
+/// consumers scan them for gap markers and downgrade packet confidence when one is found.
+/// Always-on telemetry pushed through that channel is read as a permanent evidence gap, so the
+/// counters are structurally separated from evidence text instead.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketClaimProfileTelemetryDto {
+    /// Version of the claim-profile contract these counters describe.
+    pub contract_version: u32,
+    /// Profiles present in the registry when the counters were taken.
+    pub registered_profiles: u32,
+    /// Registry profiles carrying a runtime-enforced contract.
+    pub contracted_profiles: u32,
+    /// Registry profiles still awaiting contract migration.
+    pub pending_profiles: u32,
+    /// Ratchet ceiling for `pending_profiles`.
+    pub pending_ratchet: u32,
+    /// Registry rows the versioned-data loader refused, and therefore never served claims from.
+    ///
+    /// The loader fails closed, so a refusal always shrinks the registry. Publishing the count
+    /// keeps a packet that answered from a partially loaded registry distinguishable from one
+    /// that answered from the whole registry and found nothing.
+    #[serde(default)]
+    pub rejected_profiles: u32,
+    /// Distinct static codes for the refused rows. A count says the registry shrank; these say
+    /// why, which is the difference between a document typo and a document written for another
+    /// binary. Static slugs only — no repository text ever enters this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_reasons: Vec<String>,
+    /// Static code of a whole-document refusal, present only when the registry loaded empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_error: Option<String>,
+    /// Citations offered to the profile layer while assembling the packet.
+    pub citations_considered: u32,
+    /// Distinct profiles that emitted at least one claim.
+    pub profiles_fired: u32,
+    /// Distinct profiles skipped by a runtime contract violation.
+    pub profiles_skipped_invalid: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<PacketClaimProfileFireRateDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claim_sources: Vec<PacketClaimSourceCountDto>,
+}
+
+/// Source-content work the public operation behind this response performed
+/// while deriving freshness verdicts.
+///
+/// Readiness verification hashes a stored file's content whenever its mtime
+/// still matches, and one operation derives freshness several times. These
+/// counters make that cost observable instead of invisible: on a warm,
+/// unchanged repository `content_hash_reads` is one pass over the indexed
+/// files and every later derivation shows up in `verdict_reuses`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct SourceFreshnessTelemetryDto {
+    /// Stored files whose content was read and hashed for a freshness verdict.
+    pub content_hash_reads: u32,
+    /// Freshness verdicts served from the ready-lease-scoped verdict memo.
+    pub verdict_reuses: u32,
+    /// Strict-readiness fingerprint passes. Each reads the repository's
+    /// lexical source live off disk and streams both projection tables. This
+    /// is a measurement, not a bound: the first warm packet on one ready lease
+    /// performs exactly one pass, and later operations reuse that fingerprint.
+    pub readiness_fingerprint_passes: u32,
+}
+
+/// How a retrieval annotation must be classified by packet consumers.
+///
+/// This discriminant — never the annotation prose — decides whether an annotation counts as an
+/// evidence gap. Classifying by wording made confidence depend on English word choice: a routine
+/// note containing `skipped`, `fallback`, or `weak` downgraded every packet that carried it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalAnnotationKindDto {
+    /// Evidence the packet needed is missing, capped, degraded, or unverified. Consumers treat
+    /// this as an evidence gap and downgrade reported confidence.
+    Gap,
+    /// A routine note about how retrieval ran. Never affects reported confidence, whatever
+    /// words the note happens to contain.
+    Observation,
+}
+
+/// One retrieval annotation carrying its own typed classification.
+///
+/// Producers state the kind at the push site; consumers read [`RetrievalAnnotationDto::kind`].
+/// No consumer may re-derive the classification from [`RetrievalAnnotationDto::text`].
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq, Hash)]
+pub struct RetrievalAnnotationDto {
+    /// Typed classification. The only input to gap decisions.
+    pub kind: RetrievalAnnotationKindDto,
+    /// Human-readable note. Diagnostic prose only — never classified.
+    pub text: String,
+}
+
+impl RetrievalAnnotationDto {
+    /// Build a gap annotation: evidence the packet needed is missing or degraded.
+    pub fn gap(text: impl Into<String>) -> Self {
+        Self {
+            kind: RetrievalAnnotationKindDto::Gap,
+            text: text.into(),
+        }
+    }
+
+    /// Build an observation annotation: a routine note that must not move confidence.
+    pub fn observation(text: impl Into<String>) -> Self {
+        Self {
+            kind: RetrievalAnnotationKindDto::Observation,
+            text: text.into(),
+        }
+    }
+
+    /// True when this annotation is an evidence gap.
+    pub fn is_gap(&self) -> bool {
+        self.kind == RetrievalAnnotationKindDto::Gap
+    }
+
+    /// Diagnostic text. Callers must not classify on it.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -2332,8 +2732,28 @@ pub struct AgentRetrievalTraceDto {
     pub semantic_fallback_count: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub semantic_fallbacks: Vec<SemanticFallbackRecordDto>,
+    /// Retrieval queries whose semantic stage ran out of budget and contributed no candidate.
+    ///
+    /// The dense lane silently returning nothing is indistinguishable, in the ranked output, from
+    /// a repository that genuinely has no semantic neighbours. Counting it keeps the difference
+    /// visible without pushing telemetry through the annotation evidence channel.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub semantic_stage_timeout_zero_hits: u32,
+    /// Retrieval queries whose semantic stage declined to run or returned only stub candidates.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub semantic_abstained_count: u32,
+    /// Retrieval notes, each carrying a typed [`RetrievalAnnotationKindDto`]. This is an
+    /// evidence channel: consumers count `Gap`-kind entries against reported confidence and
+    /// ignore `Observation`-kind entries entirely. Never publish always-on telemetry here —
+    /// use a typed field instead.
     #[serde(default)]
-    pub annotations: Vec<String>,
+    pub annotations: Vec<RetrievalAnnotationDto>,
+    /// Typed claim-profile fire-rate telemetry, kept out of `annotations` by design.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_claim_profile_telemetry: Option<PacketClaimProfileTelemetryDto>,
+    /// Typed source-freshness pass counters, kept out of `annotations` by design.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_freshness_telemetry: Option<SourceFreshnessTelemetryDto>,
     pub steps: Vec<AgentRetrievalStepDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packet_sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
@@ -2348,6 +2768,13 @@ pub struct AgentAnswerDto {
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness: Option<IndexFreshnessDto>,
+    /// Coverage for the files this answer actually touched.
+    ///
+    /// Empty means no path was checked, which is legitimate and caps nothing — the opposite of
+    /// `freshness`, where absence is itself an unknown. A failed lookup arrives here as a
+    /// `NotEstablished` observation rather than as an absent list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_coverage: Vec<SourceCoverageObservationDto>,
     pub sections: Vec<AgentResponseSectionDto>,
     pub citations: Vec<AgentCitationDto>,
     pub subgraph_ids: Vec<String>,
@@ -2360,8 +2787,8 @@ pub struct AgentAnswerDto {
 #[serde(rename_all = "snake_case")]
 pub enum PacketBudgetModeDto {
     Tiny,
-    #[default]
     Compact,
+    #[default]
     Standard,
     Deep,
 }
@@ -2387,6 +2814,115 @@ pub enum PacketTaskClassDto {
     SymbolOwnership,
     DataFlow,
     EditPlanning,
+}
+
+pub const PACKET_OBLIGATION_PLAN_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketClaimObligationKindDto {
+    Entrypoint,
+    Dispatch,
+    Orchestration,
+    StateWrite,
+    ExternalIo,
+    ExactProbe,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketQueryObligationKindDto {
+    RequiredFlow,
+    RequiredProbe,
+    RequiredPath,
+    Supplemental,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PacketQueryCompletionDto {
+    Completed,
+    Cancelled { reason: String },
+}
+
+impl Default for PacketQueryCompletionDto {
+    fn default() -> Self {
+        Self::Cancelled {
+            reason: "completion_missing".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketObligationProofStatusDto {
+    Planned,
+    Proven,
+    Reported,
+    Unsupported,
+    Contradicted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketObligationCarrierEdgeProofDto {
+    pub carrier_node_id: NodeId,
+    pub edge_id: EdgeId,
+    pub edge_kind: EdgeKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketClaimObligationDto {
+    pub id: String,
+    pub kind: PacketClaimObligationKindDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binding_terms: Vec<String>,
+    /// Exact typed-probe resolution bound to this material row. Kept structured so input identity,
+    /// requested path/symbol casing, resolved node/path, ambiguity, and rejection cannot be inferred
+    /// from an opaque obligation ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_binding: Option<PacketProbeResolutionDto>,
+    pub material: bool,
+    #[serde(default)]
+    pub allowed_node_kinds: Vec<NodeKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_edge_kind: Option<EdgeKind>,
+    #[serde(default)]
+    pub requires_complete_discovery: bool,
+    pub proof_status: PacketObligationProofStatusDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carrier_node_ids: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carrier_paths: Vec<String>,
+    /// Exact typed edge receipts that remain serialized with the carrier in the final packet.
+    /// Trimming the corresponding trail edge removes its receipt and demotes only that obligation;
+    /// a global omission marker never substitutes for the missing typed edge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carrier_edge_proofs: Vec<PacketObligationCarrierEdgeProofDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_next_candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketQueryObligationDto {
+    pub id: String,
+    pub kind: PacketQueryObligationKindDto,
+    pub query: String,
+    pub material: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<PacketQueryCompletionDto>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketObligationPlanDto {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binding_terms: Vec<String>,
+    #[serde(default)]
+    pub claim_obligations: Vec<PacketClaimObligationDto>,
+    #[serde(default)]
+    pub query_obligations: Vec<PacketQueryObligationDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -2557,6 +3093,8 @@ pub struct PacketPlanDto {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probe_resolutions: Vec<PacketProbeResolutionDto>,
     #[serde(default)]
+    pub obligations: PacketObligationPlanDto,
+    #[serde(default)]
     pub trace: Vec<String>,
 }
 
@@ -2575,6 +3113,16 @@ pub struct AgentPacketRequestDto {
     pub include_evidence: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_budget_ms: Option<u32>,
+    /// Parent packet identity for a generation-bound DrillOnce continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_packet_id: Option<String>,
+    /// Option ids from that parent's `disposition.drill.options`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub option_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_generation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_generation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -2606,19 +3154,255 @@ pub struct PacketBudgetDto {
     pub next_deeper_command: Option<String>,
 }
 
+/// Compiled evidence atom the agent judges. Compact text projects these first.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum PacketSufficiencyStatusDto {
-    Sufficient,
-    Partial,
-    #[serde(rename = "blocked", alias = "insufficient")]
-    Insufficient,
+pub enum SupportUnitKindDto {
+    SymbolLocation,
+    SourceRange,
+    TypedGraphEdge,
+    CompleteQueryNegative,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct SupportUnitDto {
+    pub id: String,
+    pub kind: SupportUnitKindDto,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+}
+
+/// Machine stop/drill classification. Runtime compile owns this; adapters must not
+/// re-run a budget fixpoint that can change it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketDispositionKindDto {
+    Supported,
+    DrillOnce,
+    NotEstablished,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DrillGapKindDto {
+    DeadlineLostCandidate,
+    OmittedMandatorySupport,
+    BoundedSourceRead,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct DrillOptionDto {
+    pub id: String,
+    pub gap_id: String,
+    pub kind: DrillGapKindDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+}
+
+pub const PACKET_DRILL_MAX_OPTIONS: usize = 8;
+pub const PACKET_DRILL_MAX_BYTES: u32 = 32 * 1024;
+pub const PACKET_DRILL_MAX_HITS: u32 = 8;
+pub const PACKET_DRILL_MAX_DEPTH: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct BoundedDrillPlanDto {
+    pub parent_packet_id: String,
+    pub core_generation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_generation: Option<String>,
+    #[serde(default)]
+    pub gap_ids: Vec<String>,
+    #[serde(default)]
+    pub options: Vec<DrillOptionDto>,
+    pub max_bytes: u32,
+    pub max_hits: u32,
+    pub max_depth: u32,
+    /// `1` when DrillOnce is first emitted; `0` after that drill executes. Merge
+    /// cannot emit another drill.
+    pub remaining_rounds: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketDispositionDto {
+    pub kind: PacketDispositionKindDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drill: Option<BoundedDrillPlanDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omission_receipts: Vec<String>,
+}
+
+impl PacketDispositionDto {
+    pub fn supported() -> Self {
+        Self {
+            kind: PacketDispositionKindDto::Supported,
+            reason: None,
+            drill: None,
+            omission_receipts: Vec::new(),
+        }
+    }
+
+    pub fn not_established(reason: impl Into<String>) -> Self {
+        Self {
+            kind: PacketDispositionKindDto::NotEstablished,
+            reason: Some(reason.into()),
+            drill: None,
+            omission_receipts: Vec::new(),
+        }
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            kind: PacketDispositionKindDto::Unavailable,
+            reason: Some(reason.into()),
+            drill: None,
+            omission_receipts: Vec::new(),
+        }
+    }
+
+    pub fn drill_once(reason: impl Into<String>, drill: BoundedDrillPlanDto) -> Self {
+        Self {
+            kind: PacketDispositionKindDto::DrillOnce,
+            reason: Some(reason.into()),
+            drill: Some(drill),
+            omission_receipts: Vec::new(),
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self.kind, PacketDispositionKindDto::DrillOnce)
+    }
+}
+
+impl DrillOptionDto {
+    pub fn bounded_source_read(gap_id: impl Into<String>, path: impl Into<String>) -> Self {
+        let path = path.into();
+        let gap_id = gap_id.into();
+        Self {
+            id: encode_drill_option_id(DrillGapKindDto::BoundedSourceRead, &path),
+            gap_id,
+            kind: DrillGapKindDto::BoundedSourceRead,
+            path: Some(path),
+            symbol_id: None,
+            query: None,
+        }
+    }
+
+    pub fn omitted_symbol(gap_id: impl Into<String>, symbol_id: impl Into<String>) -> Self {
+        let symbol_id = symbol_id.into();
+        let gap_id = gap_id.into();
+        Self {
+            id: encode_drill_option_id(
+                DrillGapKindDto::OmittedMandatorySupport,
+                &format!("symbol:{symbol_id}"),
+            ),
+            gap_id,
+            kind: DrillGapKindDto::OmittedMandatorySupport,
+            path: None,
+            symbol_id: Some(symbol_id),
+            query: None,
+        }
+    }
+
+    pub fn deadline_lost_query(gap_id: impl Into<String>, query: impl Into<String>) -> Self {
+        let query = query.into();
+        let gap_id = gap_id.into();
+        Self {
+            id: encode_drill_option_id(DrillGapKindDto::DeadlineLostCandidate, &query),
+            gap_id,
+            kind: DrillGapKindDto::DeadlineLostCandidate,
+            path: None,
+            symbol_id: None,
+            query: Some(query),
+        }
+    }
+}
+
+pub fn encode_drill_option_id(kind: DrillGapKindDto, target: &str) -> String {
+    let kind = match kind {
+        DrillGapKindDto::DeadlineLostCandidate => "deadline_lost_candidate",
+        DrillGapKindDto::OmittedMandatorySupport => "omitted_mandatory_support",
+        DrillGapKindDto::BoundedSourceRead => "bounded_source_read",
+    };
+    format!("{kind}:{}", percent_encode_drill_target(target))
+}
+
+pub fn decode_drill_option_id(id: &str) -> Option<(DrillGapKindDto, String)> {
+    let (kind, encoded) = id.split_once(':')?;
+    let kind = match kind {
+        "deadline_lost_candidate" => DrillGapKindDto::DeadlineLostCandidate,
+        "omitted_mandatory_support" => DrillGapKindDto::OmittedMandatorySupport,
+        "bounded_source_read" => DrillGapKindDto::BoundedSourceRead,
+        _ => return None,
+    };
+    Some((kind, percent_decode_drill_target(encoded)))
+}
+
+fn percent_encode_drill_target(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn percent_decode_drill_target(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""),
+                16,
+            )
+        {
+            decoded.push(byte);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PacketProofStatusDto {
     Proven,
+    /// A carrier reported a behavior, but did not satisfy the planned kind/edge obligation.
+    /// MCP consumers can detect this additive enum value through the publication schema stamp.
+    Reported,
     Likely,
     Diagnostic,
     Unsupported,
@@ -2627,6 +3411,14 @@ pub enum PacketProofStatusDto {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct PacketClaimDto {
     pub claim: String,
+    /// Exact obligation rows this claim asserts. Every listed row must be proven by one of this
+    /// claim's own citations before the claim can be promoted to proven.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_obligation_ids: Vec<String>,
+    /// Optional category constraints on the exact rows named by `required_obligation_ids`.
+    /// Categories never substitute for exact row identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_obligation_kinds: Vec<PacketClaimObligationKindDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof_status: Option<PacketProofStatusDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2657,23 +3449,13 @@ pub struct PacketCoverageReportDto {
     pub budget_omitted: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct PacketSufficiencyDto {
-    pub status: PacketSufficiencyStatusDto,
+/// One executable packet follow-up, in the same `{program, args}` shape the
+/// affected surface already publishes.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketFollowUpInvocationDto {
+    pub program: String,
     #[serde(default)]
-    pub covered_claims: Vec<PacketClaimDto>,
-    #[serde(default)]
-    pub open_next: Vec<String>,
-    #[serde(default)]
-    pub avoid_opening: Vec<String>,
-    #[serde(default)]
-    pub avoid_opening_paths: Vec<String>,
-    #[serde(default)]
-    pub gaps: Vec<String>,
-    #[serde(default)]
-    pub follow_up_commands: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coverage_report: Option<PacketCoverageReportDto>,
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -2686,9 +3468,8 @@ pub struct PacketRetrievalTraceSummaryDto {
 
 /// Packet response for source-grounded answer workflows.
 ///
-/// This is a compatibility surface for budget, sufficiency, answer, and
-/// retrieval-trace semantics. `sufficiency.status` is the primary readiness
-/// decision; budget truncation or diagnostic traces should not override it.
+/// `support` is the agent-facing evidence. `disposition` is the machine stop or
+/// one-round drill decision compiled by runtime from retained evidence.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentPacketDto {
     pub packet_id: String,
@@ -2697,8 +3478,10 @@ pub struct AgentPacketDto {
     pub task_class: Option<PacketTaskClassDto>,
     pub plan: PacketPlanDto,
     pub answer: AgentAnswerDto,
+    #[serde(default)]
+    pub support: Vec<SupportUnitDto>,
+    pub disposition: PacketDispositionDto,
     pub budget: PacketBudgetDto,
-    pub sufficiency: PacketSufficiencyDto,
     #[serde(alias = "benchmark_trace")]
     pub retrieval_trace_summary: PacketRetrievalTraceSummaryDto,
 }
@@ -2891,11 +3674,11 @@ mod packet_tests {
     }
 
     #[test]
-    fn packet_request_uses_compact_budget_by_default() {
+    fn packet_request_uses_standard_budget_by_default() {
         let request: AgentPacketRequestDto =
             serde_json::from_str(r#"{"question":"explain indexing"}"#).expect("deserialize");
 
-        assert_eq!(request.budget, PacketBudgetModeDto::Compact);
+        assert_eq!(request.budget, PacketBudgetModeDto::Standard);
         assert!(request.include_evidence);
     }
 
@@ -2968,6 +3751,30 @@ mod packet_tests {
             .is_err()
         );
         assert!(validate_packet_probe_request(&[], &["   ".to_string()]).is_err());
+    }
+
+    #[test]
+    fn absent_sidecar_query_completion_fails_closed() {
+        let diagnostic: PacketSidecarQueryDiagnosticDto =
+            serde_json::from_value(serde_json::json!({
+                "query": "dispatch",
+                "retrieval_mode": "full",
+                "candidate_count": 0,
+                "resolved_hit_count": 0,
+                "unresolved_candidate_count": 0
+            }))
+            .expect("legacy diagnostic");
+
+        assert_eq!(
+            diagnostic.completion,
+            PacketQueryCompletionDto::Cancelled {
+                reason: "completion_missing".to_string()
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(PacketProofStatusDto::Reported).expect("reported status"),
+            serde_json::json!("reported")
+        );
     }
 
     #[test]
@@ -3045,6 +3852,7 @@ mod packet_tests {
     fn packet_sidecar_query_diagnostic_serializes_timing_fields() {
         let diagnostic = PacketSidecarQueryDiagnosticDto {
             query: "StringUtils".to_string(),
+            completion: PacketQueryCompletionDto::Completed,
             retrieval_mode: "full".to_string(),
             sidecar_query_ms: Some(17),
             candidate_resolution_ms: Some(3),
@@ -3056,6 +3864,8 @@ mod packet_tests {
             resolved_hit_count: 4,
             unresolved_candidate_count: 1,
             blocking_unresolved_candidate_count: 1,
+            semantic_stage_timeout_zero_hits: false,
+            semantic_abstained: false,
             diagnostic: Some("sidecar candidates did not all resolve".to_string()),
         };
 
@@ -3092,7 +3902,11 @@ mod packet_tests {
             sla_missed: false,
             semantic_fallback_count: 0,
             semantic_fallbacks: Vec::new(),
+            semantic_stage_timeout_zero_hits: 0,
+            semantic_abstained_count: 0,
             annotations: Vec::new(),
+            packet_claim_profile_telemetry: None,
+            source_freshness_telemetry: None,
             steps: Vec::new(),
             packet_sidecar_diagnostics: Vec::new(),
             retrieval_shadow: Some(RetrievalShadowDto {
@@ -3137,6 +3951,165 @@ mod packet_tests {
     }
 
     #[test]
+    fn retrieval_annotations_serialize_their_kind_alongside_their_text() {
+        // EV-6b (#1746). Gap classification is a wire-visible property of each annotation, not
+        // something a consumer re-derives from the prose. Pin both the shape and the casing:
+        // external MCP clients read this to decide whether an answer has evidence gaps.
+        let trace = AgentRetrievalTraceDto {
+            request_id: "r3".to_string(),
+            retrieval_publication: None,
+            resolved_profile: AgentRetrievalPresetDto::Architecture,
+            policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+            total_latency_ms: 10,
+            sla_target_ms: None,
+            source_freshness_telemetry: None,
+            sla_missed: false,
+            semantic_fallback_count: 0,
+            semantic_fallbacks: Vec::new(),
+            semantic_stage_timeout_zero_hits: 0,
+            semantic_abstained_count: 0,
+            annotations: vec![
+                RetrievalAnnotationDto::observation("packet_anchor_probes reduced query_limit=2"),
+                RetrievalAnnotationDto::gap("Latency-first cutoff skipped source reads."),
+            ],
+            packet_claim_profile_telemetry: None,
+            steps: Vec::new(),
+            packet_sidecar_diagnostics: Vec::new(),
+            retrieval_shadow: None,
+        };
+
+        let value = serde_json::to_value(&trace).expect("serialize");
+        assert_eq!(
+            value["annotations"],
+            serde_json::json!([
+                {
+                    "kind": "observation",
+                    "text": "packet_anchor_probes reduced query_limit=2",
+                },
+                {
+                    "kind": "gap",
+                    "text": "Latency-first cutoff skipped source reads.",
+                },
+            ])
+        );
+
+        let parsed: AgentRetrievalTraceDto = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed.annotations, trace.annotations);
+        assert!(!parsed.annotations[0].is_gap());
+        assert!(parsed.annotations[1].is_gap());
+    }
+
+    #[test]
+    fn packet_claim_profile_telemetry_is_a_typed_trace_field_separate_from_annotations() {
+        // Annotations are the packet's evidence channel; `Gap`-kind entries downgrade reported
+        // confidence. Claim-profile counters are always present, so they get their own typed
+        // field and must never be published as annotations at all.
+        let telemetry = PacketClaimProfileTelemetryDto {
+            contract_version: 2,
+            registered_profiles: 20,
+            contracted_profiles: 7,
+            pending_profiles: 13,
+            pending_ratchet: 13,
+            rejected_profiles: 0,
+            rejected_reasons: Vec::new(),
+            registry_error: None,
+            citations_considered: 3,
+            profiles_fired: 2,
+            profiles_skipped_invalid: 1,
+            profiles: vec![PacketClaimProfileFireRateDto {
+                profile_id: "session-request-dispatch".to_string(),
+                evaluated: 3,
+                fired: 0,
+                claims: 0,
+                skipped_invalid: 1,
+                skip_reason: Some("no_allowed_proof_roles".to_string()),
+            }],
+            claim_sources: vec![PacketClaimSourceCountDto {
+                source: PacketClaimSourceDto::SourceProfile,
+                claims: 4,
+            }],
+        };
+        let trace = AgentRetrievalTraceDto {
+            request_id: "r2".to_string(),
+            retrieval_publication: None,
+            resolved_profile: AgentRetrievalPresetDto::Architecture,
+            policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+            total_latency_ms: 10,
+            sla_target_ms: None,
+            sla_missed: false,
+            semantic_fallback_count: 0,
+            semantic_fallbacks: Vec::new(),
+            semantic_stage_timeout_zero_hits: 0,
+            semantic_abstained_count: 0,
+            annotations: Vec::new(),
+            packet_claim_profile_telemetry: Some(telemetry.clone()),
+            source_freshness_telemetry: Some(SourceFreshnessTelemetryDto {
+                content_hash_reads: 3,
+                verdict_reuses: 9,
+                readiness_fingerprint_passes: 1,
+            }),
+            steps: Vec::new(),
+            packet_sidecar_diagnostics: Vec::new(),
+            retrieval_shadow: None,
+        };
+
+        let value = serde_json::to_value(&trace).expect("serialize");
+        assert_eq!(value["annotations"], serde_json::json!([]));
+        assert_eq!(
+            value["source_freshness_telemetry"],
+            serde_json::json!({
+                "content_hash_reads": 3,
+                "verdict_reuses": 9,
+                "readiness_fingerprint_passes": 1,
+            }),
+            "the pass counters are typed fields, never annotations"
+        );
+        assert_eq!(
+            value["packet_claim_profile_telemetry"]["profiles_skipped_invalid"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            value["packet_claim_profile_telemetry"]["claim_sources"][0]["source"],
+            serde_json::json!("source_profile")
+        );
+
+        let parsed: AgentRetrievalTraceDto = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed.packet_claim_profile_telemetry, Some(telemetry));
+
+        // Older payloads without the field stay readable and carry no telemetry.
+        let legacy = serde_json::json!({
+            "request_id": "r3",
+            "resolved_profile": "architecture",
+            "policy_mode": "latency_first",
+            "total_latency_ms": 4,
+            "candidate_count": 0,
+            "steps": [],
+        });
+        let parsed_legacy: AgentRetrievalTraceDto =
+            serde_json::from_value(legacy).expect("deserialize legacy trace");
+        assert!(parsed_legacy.packet_claim_profile_telemetry.is_none());
+
+        // A contract-version-1 telemetry payload predates the loader counters. It still reads,
+        // and it reads as "nothing refused" rather than as unknown, so a stored v1 trace keeps
+        // its meaning next to a v2 one.
+        let v1_shaped: PacketClaimProfileTelemetryDto = serde_json::from_value(serde_json::json!({
+            "contract_version": 1,
+            "registered_profiles": 20,
+            "contracted_profiles": 4,
+            "pending_profiles": 16,
+            "pending_ratchet": 16,
+            "citations_considered": 1,
+            "profiles_fired": 0,
+            "profiles_skipped_invalid": 0,
+        }))
+        .expect("deserialize a contract-version-1 telemetry payload");
+        assert_eq!(v1_shaped.contract_version, 1);
+        assert_eq!(v1_shaped.rejected_profiles, 0);
+        assert_eq!(v1_shaped.rejected_reasons, Vec::<String>::new());
+        assert_eq!(v1_shaped.registry_error, None);
+    }
+
+    #[test]
     fn framework_route_coverage_uses_product_evidence_field_with_legacy_alias() {
         let coverage = FrameworkRouteCoverageDto {
             framework: "express".to_string(),
@@ -3178,59 +4151,110 @@ mod packet_tests {
     }
 
     #[test]
-    fn packet_sufficiency_serializes_status_as_snake_case() {
-        let partial = serde_json::to_value(PacketSufficiencyDto {
-            status: PacketSufficiencyStatusDto::Partial,
-            covered_claims: Vec::new(),
-            open_next: vec!["codestory-cli search --query runtime".to_string()],
-            avoid_opening: Vec::new(),
-            avoid_opening_paths: Vec::new(),
-            gaps: vec!["No focused symbol selected.".to_string()],
-            follow_up_commands: Vec::new(),
-            coverage_report: None,
-        })
-        .expect("serialize");
-
-        assert_eq!(partial["status"], "partial");
-
-        let blocked = serde_json::to_value(PacketSufficiencyDto {
-            status: PacketSufficiencyStatusDto::Insufficient,
-            covered_claims: Vec::new(),
-            open_next: Vec::new(),
-            avoid_opening: Vec::new(),
-            avoid_opening_paths: vec!["crates/codestory-cli/src/main.rs".to_string()],
-            gaps: vec!["Sidecar readiness is not full.".to_string()],
-            follow_up_commands: Vec::new(),
-            coverage_report: None,
-        })
-        .expect("serialize");
-
-        assert_eq!(blocked["status"], "blocked");
-        assert_eq!(
-            blocked["avoid_opening_paths"],
-            serde_json::json!(["crates/codestory-cli/src/main.rs"])
+    fn packet_disposition_and_support_units_round_trip() {
+        let support = SupportUnitDto {
+            id: "sym-1".to_string(),
+            kind: SupportUnitKindDto::SymbolLocation,
+            summary: "AgentPacketDto at dto.rs:3251".to_string(),
+            path: Some("crates/codestory-contracts/src/api/dto.rs".to_string()),
+            symbol_id: Some("42".to_string()),
+            start_line: Some(3251),
+            end_line: None,
+            snippet: None,
+            edge_kind: None,
+            from_symbol: None,
+            to_symbol: None,
+            query: None,
+        };
+        let drill = BoundedDrillPlanDto {
+            parent_packet_id: "packet-1".to_string(),
+            core_generation_id: "core-1".to_string(),
+            retrieval_generation: Some("retrieval-1".to_string()),
+            gap_ids: vec!["named-path:src/main.rs".to_string()],
+            options: vec![DrillOptionDto::bounded_source_read(
+                "named-path:src/main.rs",
+                "src/main.rs",
+            )],
+            max_bytes: PACKET_DRILL_MAX_BYTES,
+            max_hits: PACKET_DRILL_MAX_HITS,
+            max_depth: PACKET_DRILL_MAX_DEPTH,
+            remaining_rounds: 1,
+        };
+        let disposition = PacketDispositionDto::drill_once(
+            "mandatory named path was not retained",
+            drill.clone(),
         );
-        let legacy: PacketSufficiencyDto = serde_json::from_str(
-            r#"{
-                "status": "partial",
-                "covered_claims": [],
-                "open_next": [],
-                "avoid_opening": ["crates/codestory-cli/src/main.rs because cited"],
-                "gaps": [],
-                "follow_up_commands": []
-            }"#,
-        )
-        .expect("deserialize legacy sufficiency without raw paths");
-        assert!(legacy.avoid_opening_paths.is_empty());
-        let legacy: PacketSufficiencyStatusDto =
-            serde_json::from_str("\"insufficient\"").expect("deserialize legacy status");
-        assert_eq!(legacy, PacketSufficiencyStatusDto::Insufficient);
+
+        let support_json = serde_json::to_value(&support).expect("serialize support");
+        assert_eq!(support_json["kind"], "symbol_location");
+        let decoded_support: SupportUnitDto =
+            serde_json::from_value(support_json).expect("deserialize support");
+        assert_eq!(decoded_support, support);
+
+        let disposition_json = serde_json::to_value(&disposition).expect("serialize disposition");
+        assert_eq!(disposition_json["kind"], "drill_once");
+        assert_eq!(disposition_json["drill"]["remaining_rounds"], 1);
+        assert!(disposition_json.get("status").is_none());
+        assert!(disposition_json.get("follow_up_commands").is_none());
+        assert!(disposition_json.get("unsafe_to_claim").is_none());
+        assert!(disposition_json.get("covered_claims").is_none());
+        let decoded: PacketDispositionDto =
+            serde_json::from_value(disposition_json).expect("deserialize disposition");
+        assert_eq!(decoded.kind, PacketDispositionKindDto::DrillOnce);
+        assert_eq!(
+            decoded.drill.as_ref().map(|plan| plan.remaining_rounds),
+            Some(1)
+        );
+        assert!(!decoded.is_terminal());
+
+        let after = PacketDispositionDto::supported();
+        assert!(after.is_terminal());
+        assert_eq!(
+            serde_json::to_value(PacketDispositionKindDto::NotEstablished).expect("kind"),
+            serde_json::json!("not_established")
+        );
+        assert_eq!(
+            serde_json::to_value(PacketDispositionKindDto::Unavailable).expect("kind"),
+            serde_json::json!("unavailable")
+        );
+
+        let option = drill.options.first().expect("option");
+        let (kind, target) = decode_drill_option_id(&option.id).expect("decode option id");
+        assert_eq!(kind, DrillGapKindDto::BoundedSourceRead);
+        assert_eq!(target, "src/main.rs");
+    }
+
+    #[test]
+    fn agent_packet_request_serializes_drill_continuation_fields() {
+        let request = AgentPacketRequestDto {
+            question: "How does packet compile support?".to_string(),
+            budget: PacketBudgetModeDto::Compact,
+            task_class: None,
+            probes: Vec::new(),
+            extra_probes: Vec::new(),
+            include_evidence: true,
+            latency_budget_ms: None,
+            parent_packet_id: Some("packet-1".to_string()),
+            option_ids: vec!["bounded_source_read:src%2Fmain.rs".to_string()],
+            core_generation_id: Some("core-1".to_string()),
+            retrieval_generation: Some("retrieval-1".to_string()),
+        };
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(value["parent_packet_id"], "packet-1");
+        assert_eq!(value["option_ids"][0], "bounded_source_read:src%2Fmain.rs");
+        assert_eq!(value["core_generation_id"], "core-1");
+        let decoded: AgentPacketRequestDto =
+            serde_json::from_value(value).expect("deserialize request");
+        assert_eq!(decoded.parent_packet_id.as_deref(), Some("packet-1"));
+        assert_eq!(decoded.option_ids.len(), 1);
     }
 
     #[test]
     fn packet_claim_serializes_machine_checkable_proof_metadata() {
         let value = serde_json::to_value(PacketClaimDto {
             claim: "Dense hits need backing source proof.".to_string(),
+            required_obligation_ids: Vec::new(),
+            required_obligation_kinds: Vec::new(),
             proof_status: Some(PacketProofStatusDto::Diagnostic),
             required_evidence_role: Some(PacketEvidenceTierDto::ExactSource),
             citations: Vec::new(),
@@ -3247,6 +4271,25 @@ mod packet_tests {
                 .expect("deserialize legacy packet claim");
         assert_eq!(legacy.proof_status, None);
         assert_eq!(legacy.required_evidence_role, None);
+        assert!(legacy.required_obligation_ids.is_empty());
+        assert!(legacy.required_obligation_kinds.is_empty());
+    }
+
+    #[test]
+    fn legacy_packet_obligation_defaults_missing_probe_binding() {
+        let legacy: PacketClaimObligationDto = serde_json::from_str(
+            r#"{
+                "id":"legacy",
+                "kind":"orchestration",
+                "material":true,
+                "proof_status":"planned"
+            }"#,
+        )
+        .expect("deserialize obligation written before exact probe bindings");
+
+        assert_eq!(legacy.probe_binding, None);
+        assert!(legacy.binding_terms.is_empty());
+        assert!(legacy.carrier_node_ids.is_empty());
     }
 
     #[test]
@@ -3303,6 +4346,116 @@ mod packet_tests {
             serde_json::to_value(updated).expect("serialize updated comment")["comment"],
             "note"
         );
+        // CR-054: an omitted comment must stay omitted on the way out, or the
+        // serialize half spells "clear the comment".
+        let omitted = serde_json::to_value(omitted).expect("serialize omitted comment");
+        assert!(omitted.get("comment").is_none());
+        assert!(omitted.get("category_id").is_none());
+    }
+
+    fn citation_json() -> serde_json::Value {
+        serde_json::json!({
+            "node_id": "node-1",
+            "display_name": "handle_request",
+            "kind": "FUNCTION",
+            "file_path": "src/lib.rs",
+            "line": 10,
+            "score": 1.0,
+            "origin": "text_match",
+            "resolvable": false
+        })
+    }
+
+    #[test]
+    fn absent_citation_provenance_and_resolvability_fail_closed() {
+        // CR-055: the previous defaults decoded an absent field to
+        // "indexed symbol" and "resolvable", inventing parser-backed,
+        // followable evidence the producer never sent.
+        let complete: AgentCitationDto =
+            serde_json::from_value(citation_json()).expect("complete citation decodes");
+        assert_eq!(complete.origin, SearchHitOrigin::TextMatch);
+        assert!(!complete.resolvable);
+
+        for field in ["origin", "resolvable"] {
+            let mut partial = citation_json();
+            partial
+                .as_object_mut()
+                .expect("citation object")
+                .remove(field);
+            let error = serde_json::from_value::<AgentCitationDto>(partial)
+                .expect_err("an absent evidence field must not decode to a permissive default");
+            assert!(
+                error.to_string().contains(field),
+                "the decode failure must name the absent field: {error}"
+            );
+        }
+    }
+
+    fn stage_timing_json() -> serde_json::Value {
+        serde_json::json!({
+            "stage": "stage2_semantic",
+            "elapsed_ms": 40,
+            "cancel_reason": "deadline_exceeded",
+            "completion_status": "cancelled"
+        })
+    }
+
+    #[test]
+    fn absent_stage_completion_status_fails_closed() {
+        // CR-055: defaulting to "completed" claimed a finished stage beside a
+        // populated cancel_reason.
+        let complete: RetrievalStageTimingDto =
+            serde_json::from_value(stage_timing_json()).expect("complete stage decodes");
+        assert_eq!(complete.completion_status, "cancelled");
+
+        let mut partial = stage_timing_json();
+        partial
+            .as_object_mut()
+            .expect("stage object")
+            .remove("completion_status");
+        let error = serde_json::from_value::<RetrievalStageTimingDto>(partial)
+            .expect_err("an absent stage completion status must not decode as completed");
+        assert!(
+            error.to_string().contains("completion_status"),
+            "the decode failure must name the absent field: {error}"
+        );
+    }
+
+    #[test]
+    fn mirrored_publication_mode_accepts_both_casings_and_emits_one() {
+        // CR-032: the same vocabulary is spelled two ways across mirrored wire
+        // fields. Deserialize accepts both; emission is unchanged.
+        for spelling in ["semantic_projection", "SemanticProjection"] {
+            let parsed: IndexPublicationModeDto =
+                serde_json::from_value(serde_json::json!(spelling))
+                    .unwrap_or_else(|error| panic!("decode {spelling}: {error}"));
+            assert_eq!(parsed, IndexPublicationModeDto::SemanticProjection);
+        }
+        assert_eq!(
+            serde_json::to_value(IndexPublicationModeDto::SemanticProjection)
+                .expect("serialize publication mode"),
+            serde_json::json!("semantic_projection"),
+            "emission must stay snake_case"
+        );
+
+        for spelling in ["protected", "Protected"] {
+            let parsed: CanonicalMemberVisibility =
+                serde_json::from_value(serde_json::json!(spelling))
+                    .unwrap_or_else(|error| panic!("decode {spelling}: {error}"));
+            assert_eq!(parsed, CanonicalMemberVisibility::Protected);
+        }
+        assert_eq!(
+            serde_json::to_value(CanonicalMemberVisibility::Protected)
+                .expect("serialize member visibility"),
+            serde_json::json!("protected"),
+            "emission must stay snake_case"
+        );
+
+        assert!(
+            serde_json::from_value::<IndexPublicationModeDto>(serde_json::json!("SEMANTIC"))
+                .is_err(),
+            "aliases add the mirrored spelling only, not arbitrary casing"
+        );
     }
 }
 
@@ -3316,6 +4469,34 @@ pub struct UpdateBookmarkCategoryRequest {
     pub name: String,
 }
 
+/// Whether an annotation currently resolves to a symbol in the live core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum BookmarkResolutionStatusDto {
+    Bound,
+    Orphaned,
+}
+
+/// Why an annotation is not currently bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum BookmarkOrphanReasonDto {
+    TargetDeleted,
+    AmbiguousMatch,
+    GenerationGap,
+    SignatureChanged,
+    UnresolvableAnchor,
+}
+
+/// Evidence recorded at an annotation's last successful bind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct BookmarkEvidenceDto {
+    pub generation: Option<i64>,
+    pub file_path: Option<String>,
+    pub qualified_name: Option<String>,
+    pub start_line: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct BookmarkDto {
     pub id: String,
@@ -3325,6 +4506,11 @@ pub struct BookmarkDto {
     pub node_label: String,
     pub node_kind: NodeKind,
     pub file_path: Option<String>,
+    pub resolution_status: BookmarkResolutionStatusDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_reason: Option<BookmarkOrphanReasonDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_known_evidence: Option<BookmarkEvidenceDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -3337,9 +4523,16 @@ pub struct CreateBookmarkRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct UpdateBookmarkRequest {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category_id: Option<String>,
-    #[serde(default, with = "::serde_with::rust::double_option")]
+    // CR-054: without `skip_serializing_if` the serialize half cannot express
+    // "leave untouched" — an omitted comment emitted `null`, which round-trips
+    // as "clear the comment".
+    #[serde(
+        default,
+        with = "::serde_with::rust::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub comment: Option<Option<String>>,
 }
 

@@ -66,10 +66,12 @@ jobs:
         run: >-
           node --test
           .github/scripts/build-marketplace-fixture.test.mjs
+          .github/scripts/publish-marketplace-catalog.test.mjs
           scripts/tests/codestory-release-claims.test.mjs
           scripts/tests/codestory-release-cell-manifest.test.mjs
           scripts/tests/codestory-release-closeout.test.mjs
           scripts/tests/codestory-release-evidence-gate.test.mjs
+          scripts/tests/prove-plugin-pinned-provision.test.mjs
 
       - name: Enforce workflow policy
         run: |
@@ -210,46 +212,49 @@ jobs:
         id: reuse
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.lineage.outputs.selection_commit }}
         shell: bash
         run: |
           set -euo pipefail
           entries=()
 
-          # The one source proof belongs to the frozen candidate. A tree-preserving promotion
-          # may reuse it, but a calibration-source proof cannot stand in for the generated
-          # constant-set child.
-          release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"
+          # The authoritative source proof belongs to the stabilized calibration source.
+          # Calibration lineage has already proved that the release differs only by the
+          # generated constant set (plus an optional tree-preserving promotion commit).
           while IFS= read -r run_id; do
             head_sha="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq .head_sha)"
-            git cat-file -e "$head_sha^{commit}" 2>/dev/null || continue
-            test "$(git rev-parse "$head_sha^{tree}")" = "$release_tree" || continue
-            git merge-base --is-ancestor "$head_sha" "$GITHUB_SHA" || continue
-            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
-              --jq '.jobs[] | select(.name == "full-source-gate" and .conclusion == "success") | .id' \
-              | grep -q . || continue
+            test "$head_sha" = "$SOURCE_SHA" || continue
+            jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100")"
+            jq -e '
+              any(.jobs[]; .name == "full-source-gate" and .conclusion == "success")
+              and any(.jobs[]; .name == "freeze-acceptance" and .conclusion == "success")
+            ' <<<"$jobs" >/dev/null || continue
             run_attempt="$(
               gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.run_attempt'
             )"
             artifact_name="release-cell-prepublish-source-attempt-$run_attempt"
-            artifact_count="$(
-              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
-                | jq --arg name "$artifact_name" \
-                  '[.artifacts[] | select(.name == $name and .expired == false)] | length'
+            artifacts="$(
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100"
             )"
-            test "$artifact_count" = 1 || continue
+            jq -e \
+              --arg receipt "release-freeze-receipt-attempt-$run_attempt" \
+              --arg source "$artifact_name" \
+              '([.artifacts[] | select(.name == $receipt and .expired == false)] | length) == 1
+               and ([.artifacts[] | select(.name == $source and .expired == false)] | length) == 1' \
+              <<<"$artifacts" >/dev/null || continue
             entries+=("source_behavior=$run_id:$head_sha")
-            echo "Reusing frozen-candidate source proof and $artifact_name from run $run_id (tree $release_tree)."
+            echo "Reusing source-stabilization proof and $artifact_name from run $run_id ($SOURCE_SHA)."
             break
           done < <(
             gh api --paginate \
-              "repos/$GITHUB_REPOSITORY/actions/runs?status=completed&per_page=100" \
+              "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SOURCE_SHA&status=completed&per_page=100" \
               | jq -r --arg repo "$GITHUB_REPOSITORY" \
                 '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .event == "workflow_dispatch" and .conclusion == "success") | .id'
           )
 
           reuse="$(IFS=,; echo "${entries[*]:-}")"
           test -n "$reuse" || {
-            echo "::error::The frozen candidate has no reusable full-source-gate. The release workflow will not start a broad proof."
+            echo "::error::The calibrated source has no reusable source-stabilization proof."
             exit 1
           }
 
@@ -311,7 +316,7 @@ jobs:
 
   source-proof:
     needs: preflight
-    # Preflight fails unless the one frozen-candidate source proof is reusable. Keep this
+    # Preflight fails unless the one source-stabilization proof is reusable. Keep this
     # structural DAG placeholder fail-closed without calling the broad source workflow again.
     if: needs.preflight.outputs.source_proof_reused != 'true'
     runs-on: ubuntu-latest
@@ -325,7 +330,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$SOURCE_SHA" = "$GITHUB_SHA"
-          echo "::error::Preflight did not resolve reusable exact-head source proof; refusing to start a second broad proof."
+          echo "::error::Preflight did not resolve reusable source-stabilization proof; refusing to start a second broad proof."
           exit 1
 
   packaged-proof:
@@ -350,10 +355,157 @@ jobs:
       APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
       APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
 
-  macos-metal-proof:
+  # A protected host that is offline at dispatch produces a proof job that queues invisibly for
+  # ~24h and then classifies as an ordinary blocked failure. This gate types each protected host
+  # BEFORE any proof is dispatched, from the scheduled heartbeat jobs that run ON the hosts:
+  # `alive` hosts get their proof dispatched, a host `held_by_active_run` fails the release red
+  # (a busy host is provably alive, so withholding it would overstate unavailability), and a host
+  # still `unproven` after the one recorded recheck has its proof withheld from dispatch so the
+  # non-claim producer can record the typed pre-assignment non-claim. The heartbeat shape exists
+  # because GITHUB_TOKEN cannot list self-hosted runners: the runner-administration endpoints
+  # need an `administration` scope that workflow `permissions:` blocks cannot grant.
+  reserve-protected-runners:
+    name: Reserve protected accelerator runners
     needs:
       - preflight
       - packaged-proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      dispatch_macos_arm64_metal: ${{ steps.reserve.outputs.dispatch_macos_arm64_metal }}
+      dispatch_windows_x64_vulkan: ${{ steps.reserve.outputs.dispatch_windows_x64_vulkan }}
+      dispatch_linux_x64_vulkan: ${{ steps.reserve.outputs.dispatch_linux_x64_vulkan }}
+    steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Type each protected host from its heartbeat evidence
+        id: reserve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/runner-reservation
+          heartbeat_workflow="$(jq -r '.non_claim_policy.reservation.heartbeat.workflow' release-claims.json)"
+          heartbeat_file="${heartbeat_workflow##*/}"
+          tolerance_minutes="$(jq -r '.non_claim_policy.reservation.heartbeat.tolerance_minutes' release-claims.json)"
+          jq -c '[.non_claim_policy.hosts[] | {id, heartbeat_job_name, runner_labels}]' \
+            release-claims.json > target/runner-reservation/hosts.json
+
+          # The newest completed heartbeat jobs, host-tagged by the graph-declared job names.
+          collect_heartbeats() {
+            : > target/runner-reservation/heartbeat-jobs.ndjson
+            while IFS= read -r heartbeat_run_id; do
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$heartbeat_run_id/jobs?per_page=100" \
+                --jq '.jobs[] | {name, status, conclusion, completed_at}' \
+                >> target/runner-reservation/heartbeat-jobs.ndjson
+            done < <(
+              gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$heartbeat_file/runs?status=completed&per_page=5" \
+                --jq '.workflow_runs[].id'
+            )
+            jq -s '.' target/runner-reservation/heartbeat-jobs.ndjson \
+              > target/runner-reservation/heartbeat-jobs.json
+            jq -n \
+              --arg observed_at "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+              --slurpfile hosts target/runner-reservation/hosts.json \
+              --slurpfile jobs target/runner-reservation/heartbeat-jobs.json \
+              '{observed_at: $observed_at,
+                jobs: [$jobs[0][] as $job
+                  | ($hosts[0][] | select(.heartbeat_job_name == ($job.name | split(" / ") | last))) as $host
+                  | {host: $host.id, status: $job.status, conclusion: $job.conclusion,
+                     completed_at: $job.completed_at}]}'
+          }
+
+          # Which protected host is executing someone else's job right now. Runner labels come
+          # from the in-progress jobs themselves, matched against the graph-declared label sets.
+          collect_holders() {
+            : > target/runner-reservation/active-jobs.ndjson
+            while IFS= read -r active_run_id; do
+              if [ "$active_run_id" = "$GITHUB_RUN_ID" ]; then continue; fi
+              gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$active_run_id/jobs?per_page=100" \
+                --jq '.jobs[] | select(.status == "in_progress")
+                  | {run_id, workflow_name, name, labels}' \
+                >> target/runner-reservation/active-jobs.ndjson
+            done < <(
+              gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?status=in_progress&per_page=100" \
+                --jq '.workflow_runs[].id'
+            )
+            jq -s \
+              --slurpfile hosts target/runner-reservation/hosts.json \
+              '[.[] as $job
+                | ($hosts[0][] | select((.runner_labels | sort) == (($job.labels // []) | sort))) as $host
+                | {host: $host.id, run_id: ($job.run_id | tostring),
+                   workflow: $job.workflow_name, job_name: $job.name}]' \
+              target/runner-reservation/active-jobs.ndjson \
+              > target/runner-reservation/holders.json
+          }
+
+          build_input() {
+            jq -s \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+              --arg now "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+              --arg tolerance "$tolerance_minutes" \
+              --slurpfile hosts target/runner-reservation/hosts.json \
+              --slurpfile holders target/runner-reservation/holders.json \
+              '{run_id: $run_id, run_attempt: $run_attempt, now: $now,
+                tolerance_minutes: $tolerance,
+                hosts: [$hosts[0][] | {id}],
+                observations: .,
+                active_holders: $holders[0]}' "$@"
+          }
+
+          collect_heartbeats > target/runner-reservation/observation-1.json
+          collect_holders
+          build_input target/runner-reservation/observation-1.json \
+            > target/runner-reservation/input.json
+          node .github/scripts/lost-runner-recovery.mjs plan-reservation \
+            --input target/runner-reservation/input.json \
+            --out target/runner-reservation/receipt.json
+
+          if [ "$(jq -r '.recheck' target/runner-reservation/receipt.json)" = true ]; then
+            # The one bounded recheck, mirroring the one automatic rerun a lost runner is owed:
+            # dispatch a fresh heartbeat and give it a bounded window. A host that stays silent
+            # simply produces no completed job, so the second observation records that fact; the
+            # heartbeat's cancel-in-progress concurrency keeps a stuck dispatch from piling up.
+            dispatched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            gh workflow run "$heartbeat_file" --ref "$GITHUB_REF_NAME"
+            for _ in $(seq 1 24); do
+              sleep 10
+              recheck_status="$(gh api \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/$heartbeat_file/runs?event=workflow_dispatch&per_page=5" \
+                --jq "[.workflow_runs[] | select(.created_at >= \"$dispatched_at\") | .status] | first // \"absent\"")"
+              if [ "$recheck_status" = completed ]; then break; fi
+            done
+            collect_heartbeats > target/runner-reservation/observation-2.json
+            collect_holders
+            build_input \
+              target/runner-reservation/observation-1.json \
+              target/runner-reservation/observation-2.json \
+              > target/runner-reservation/input.json
+            node .github/scripts/lost-runner-recovery.mjs plan-reservation \
+              --input target/runner-reservation/input.json \
+              --out target/runner-reservation/receipt.json
+          fi
+
+      - name: Upload the reservation receipt
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: protected-runner-reservation-attempt-${{ github.run_attempt }}
+          path: target/runner-reservation/receipt.json
+          if-no-files-found: error
+          retention-days: 30
+
+  macos-metal-proof:
+    if: needs.reserve-protected-runners.outputs.dispatch_macos_arm64_metal == 'true'
+    needs:
+      - preflight
+      - packaged-proof
+      - reserve-protected-runners
     uses: ./.github/workflows/macos-metal-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
@@ -366,9 +518,11 @@ jobs:
       emit_release_cells: true
 
   windows-vulkan-proof:
+    if: needs.reserve-protected-runners.outputs.dispatch_windows_x64_vulkan == 'true'
     needs:
       - preflight
       - packaged-proof
+      - reserve-protected-runners
     uses: ./.github/workflows/windows-vulkan-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
@@ -381,9 +535,11 @@ jobs:
       emit_release_cells: true
 
   linux-vulkan-proof:
+    if: needs.reserve-protected-runners.outputs.dispatch_linux_x64_vulkan == 'true'
     needs:
       - preflight
       - packaged-proof
+      - reserve-protected-runners
     uses: ./.github/workflows/linux-vulkan-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
@@ -397,14 +553,18 @@ jobs:
   # The repository owns one host per accelerator. When a host drops its connection instead of
   # reporting, .github/scripts/lost-runner-rerun.yml re-dispatches it once; if the second attempt is
   # lost the same way, this job records a populated non-claim for that host so the closeout has a
-  # visible withheld claim to accept instead of an unexplained gap. It refuses -- and fails the run
-  # -- for every other shape of failure, so a proof that ran and disagreed can never be withheld.
+  # visible withheld claim to accept instead of an unexplained gap. A host whose proof was never
+  # dispatched -- reserve-protected-runners typed it `unproven` before assignment -- is withheld
+  # the same way under its own typed reason, vouched for by this run's reservation receipt. It
+  # refuses -- and fails the run -- for every other shape of failure, so a proof that ran and
+  # disagreed can never be withheld.
   accelerator-non-claim:
     name: Withhold unproven accelerator claims
     if: always() && needs.preflight.result == 'success' && needs.packaged-proof.result == 'success'
     needs:
       - preflight
       - packaged-proof
+      - reserve-protected-runners
       - macos-metal-proof
       - windows-vulkan-proof
       - linux-vulkan-proof
@@ -416,6 +576,13 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+
+      - name: Download this run's reservation receipt
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: protected-runner-reservation-attempt-*
+          path: target/release-non-claim/reservation
+          merge-multiple: false
 
       - name: Collect protected accelerator job evidence
         env:
@@ -441,9 +608,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # This run's own receipt, at the newest attempt at or below the current one: a re-run of
+          # failed jobs does not re-run the succeeded reservation gate, so its receipt stays the
+          # attempt-1 artifact.
+          receipt=""
+          for attempt in $(seq "$GITHUB_RUN_ATTEMPT" -1 1); do
+            candidate="target/release-non-claim/reservation/protected-runner-reservation-attempt-$attempt/receipt.json"
+            if [ -f "$candidate" ]; then receipt="$candidate"; break; fi
+          done
+          reservation_args=()
+          if [ -n "$receipt" ]; then
+            reservation_args+=(--reservation "$receipt")
+          fi
+          echo "receipt=$receipt" >> "$GITHUB_OUTPUT"
           node .github/scripts/lost-runner-recovery.mjs plan-non-claim \
             --input target/release-non-claim/plan-input.json \
-            --out target/release-non-claim/plan.json
+            --out target/release-non-claim/plan.json \
+            "${reservation_args[@]}"
 
       - name: Download authenticated candidate records for withheld identity
         if: steps.non-claim.outputs.withheld_hosts != ''
@@ -457,6 +638,7 @@ jobs:
         if: steps.non-claim.outputs.withheld_hosts != ''
         env:
           WITHHELD_HOSTS: ${{ steps.non-claim.outputs.withheld_hosts }}
+          RESERVATION_RECEIPT: ${{ steps.non-claim.outputs.receipt }}
           VERSION: ${{ needs.preflight.outputs.version }}
         shell: bash
         run: |
@@ -474,6 +656,17 @@ jobs:
               linux-x64-vulkan) target=linux-x64 ;;
               *) echo "::error::unknown non-claim host $host"; exit 1 ;;
             esac
+            # The classifier's own plan says WHICH typed reason withheld the host; the recorded
+            # manifest carries that reason, with the reservation receipt vouching the
+            # pre-assignment route.
+            detail="$(jq -r --arg host "$host" \
+              '.hosts[] | select(.host == $host) | .detail' \
+              target/release-non-claim/plan.json)"
+            reason_args=()
+            if [ "$detail" = runner_unproven_pre_assignment ]; then
+              reason_args+=(--reason accelerator_host_offline_pre_assignment)
+              reason_args+=(--reservation "$RESERVATION_RECEIPT")
+            fi
             node scripts/codestory-release-cell-manifest.mjs withhold \
               --repo "$GITHUB_WORKSPACE" \
               --expected-sha "$GITHUB_SHA" \
@@ -483,7 +676,8 @@ jobs:
               --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
               --identity target/release-non-claim/identity.json \
               --candidate-record "target/release-non-claim/candidate-records/codestory-candidate-archive-record-$target/candidate-archive-record.json" \
-              --out-dir "target/release-non-claim/cells/$host"
+              --out-dir "target/release-non-claim/cells/$host" \
+              "${reason_args[@]}"
           done
 
       - name: Upload withheld pre-publish macOS accelerator cells
@@ -560,6 +754,13 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
+      - name: Collect this run's reservation receipt
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: protected-runner-reservation-attempt-*
+          path: target/release-closeout/reservation
+          merge-multiple: false
+
       - name: Authenticate pre-publish Actions provenance
         env:
           GH_TOKEN: ${{ github.token }}
@@ -568,9 +769,21 @@ jobs:
         run: |
           set -euo pipefail
           # The closeout reads the lost-runner signature itself rather than trusting the non-claim
-          # producer's verdict, so it collects the same Actions evidence independently.
+          # producer's verdict, so it collects the same Actions evidence independently. The
+          # reservation receipt is collected the same way -- downloaded from this run's artifacts
+          # by this job, never handed over by the non-claim producer -- so the pre-assignment
+          # route is re-confirmed from evidence the closeout gathered itself.
           bash .github/scripts/collect-actions-job-evidence.sh \
             "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" target/release-closeout/job-evidence.json
+          receipt=""
+          for attempt in $(seq "$GITHUB_RUN_ATTEMPT" -1 1); do
+            candidate="target/release-closeout/reservation/protected-runner-reservation-attempt-$attempt/receipt.json"
+            if [ -f "$candidate" ]; then receipt="$candidate"; break; fi
+          done
+          receipt_args=()
+          if [ -n "$receipt" ]; then
+            receipt_args+=(--reservation-receipt "$receipt")
+          fi
           node scripts/codestory-release-cell-manifest.mjs producer-map \
             --repo "$GITHUB_WORKSPACE" \
             --expected-sha "$GITHUB_SHA" \
@@ -579,6 +792,7 @@ jobs:
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --reuse "$REUSE_SELECTION" \
             --job-evidence target/release-closeout/job-evidence.json \
+            "${receipt_args[@]}" \
             --out target/release-closeout/trusted-pre-publish-producers.json
 
       - name: Download and verify selected pre-publish release cells
@@ -688,6 +902,25 @@ jobs:
           test -s target/release-assets/SHA256SUMS.txt
           (cd target/release-assets && sha256sum -c SHA256SUMS.txt)
 
+      # The native lane's archive digests. They cannot live in the frozen source tree -- these
+      # archives are built FROM that tree -- so they are generated here, from the bytes this
+      # release actually produced, and shipped as a release asset. Every digest is read off the
+      # archive file and cross-checked against SHA256SUMS.txt, so a checksum file that drifted
+      # from its archives stops the release instead of pinning the wrong bytes. Until the
+      # signature arms this is corruption detection over the release channel, not authentication.
+      - name: Generate the release manifest
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/build-release-manifest.mjs \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --commit "$GITHUB_SHA" \
+            --assets target/release-assets \
+            --output target/release-assets/codestory-release-manifest.json
+
       - name: Ship the accepted closeout summary with the release
         run: |
           set -euo pipefail
@@ -750,7 +983,8 @@ jobs:
           printf '%s\n' "${expected_names[@]}" | sort > "$expected_file"
           find target/release-assets -maxdepth 1 -type f \
             \( -name 'codestory-cli-v*.tar.gz' -o -name 'codestory-cli-v*.zip' \
-               -o -name 'SHA256SUMS.txt' -o -name 'release-closeout-summary.json' \) \
+               -o -name 'SHA256SUMS.txt' -o -name 'release-closeout-summary.json' \
+               -o -name 'codestory-release-manifest.json' \) \
             -exec basename {} \; | sort > "$actual_file"
           if ! diff -u "$expected_file" "$actual_file"; then
             echo "::error::Release assets differ from the release claim graph."
@@ -784,12 +1018,19 @@ jobs:
     environment: marketplace-publish
     outputs:
       catalog_published: ${{ steps.delivery.outputs.catalog_published }}
+      catalog_delivery_state: ${{ steps.delivery.outputs.catalog_delivery_state }}
       marketplace_revision: ${{ steps.delivery.outputs.marketplace_revision }}
+      # What the catalog served before this run moved it. A catalog move with no recorded
+      # predecessor is a move nobody can undo, so the rollback target travels with the state.
+      previous_marketplace_revision: ${{ steps.delivery.outputs.previous_marketplace_revision }}
+      previous_plugin_sha: ${{ steps.delivery.outputs.previous_plugin_sha }}
+      previous_plugin_version: ${{ steps.delivery.outputs.previous_plugin_version }}
     steps:
       - name: Checkout exact release source
         uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
 
       - name: Mint a scoped marketplace token
         id: token
@@ -819,6 +1060,56 @@ jobs:
             --version "$RELEASE_VERSION" \
             --github-output "$GITHUB_OUTPUT"
 
+      # Probe the exact live revision before the release records `published`. The scoped token is
+      # not exposed to this step. A failure is data for the restore step, not a release failure.
+      - name: Smoke the published live catalog
+        id: live-catalog-smoke
+        if: steps.publish.outcome == 'success'
+        continue-on-error: true
+        env:
+          CODEX_CLI_VERSION: "0.144.5"
+          MARKETPLACE_REVISION: ${{ steps.publish.outputs.marketplace_revision }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/codestory-live-catalog-smoke"
+          codex_package_root="$RUNNER_TEMP/codex-cli-${CODEX_CLI_VERSION}"
+          rm -rf "$install_root"
+          npm install --prefix "$codex_package_root" --no-audit --no-fund "@openai/codex@$CODEX_CLI_VERSION"
+          node .github/scripts/install-codestory-marketplace-proof.mjs \
+            --codex-package-root "$codex_package_root" \
+            --codex-home "$install_root/codex-home" \
+            --plugin-data "$install_root/codex-home/plugin-data" \
+            --marketplace-source TheGreenCedar/AgentPluginMarketplace \
+            --marketplace-name TheGreenCedar \
+            --marketplace-revision "$MARKETPLACE_REVISION" \
+            --local-fixture false \
+            --expected-version "$RELEASE_VERSION" \
+            --source-repository "$GITHUB_WORKSPACE" \
+            --attestation "$install_root/install-attestation-v2.json"
+
+      - name: Restore the previous catalog pin
+        id: restore
+        if: steps.publish.outcome == 'success' && steps.publish.outputs.catalog_changed == 'true' && steps.live-catalog-smoke.outcome == 'failure'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          PUBLISHED_REVISION: ${{ steps.publish.outputs.marketplace_revision }}
+          PUBLISHED_PLUGIN_SHA: ${{ github.sha }}
+          PUBLISHED_PLUGIN_VERSION: ${{ needs.preflight.outputs.version }}
+          PREVIOUS_PLUGIN_SHA: ${{ steps.publish.outputs.previous_plugin_sha }}
+          PREVIOUS_PLUGIN_VERSION: ${{ steps.publish.outputs.previous_plugin_version }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/publish-marketplace-catalog.mjs \
+            --source-repository "$GITHUB_WORKSPACE" \
+            --commit "$PREVIOUS_PLUGIN_SHA" \
+            --version "$PREVIOUS_PLUGIN_VERSION" \
+            --expected-current-revision "$PUBLISHED_REVISION" \
+            --expected-current-plugin-sha "$PUBLISHED_PLUGIN_SHA" \
+            --expected-current-plugin-version "$PUBLISHED_PLUGIN_VERSION" \
+            --github-output "$GITHUB_OUTPUT"
+
       # The only place the "catalog was updated" claim is ever minted. It requires the token, the
       # push, AND an immutable revision to have all landed; anything else records deferred, so an
       # unknown or half-finished state can never read as published.
@@ -828,22 +1119,58 @@ jobs:
         env:
           TOKEN_OUTCOME: ${{ steps.token.outcome }}
           PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          LIVE_SMOKE_OUTCOME: ${{ steps.live-catalog-smoke.outcome }}
+          RESTORE_OUTCOME: ${{ steps.restore.outcome }}
+          RESTORED_REVISION: ${{ steps.restore.outputs.marketplace_revision }}
           PUBLISHED_REVISION: ${{ steps.publish.outputs.marketplace_revision }}
+          PREVIOUS_REVISION: ${{ steps.publish.outputs.previous_marketplace_revision }}
+          PREVIOUS_PLUGIN_SHA: ${{ steps.publish.outputs.previous_plugin_sha }}
+          PREVIOUS_PLUGIN_VERSION: ${{ steps.publish.outputs.previous_plugin_version }}
           RECOVERY_WORKFLOW: marketplace-sync.yml
         run: |
           set -euo pipefail
           catalog_published=false
+          catalog_delivery_state=deferred
           marketplace_revision=""
           if [ "$TOKEN_OUTCOME" = "success" ] \
             && [ "$PUBLISH_OUTCOME" = "success" ] \
+            && [ "$LIVE_SMOKE_OUTCOME" = "success" ] \
             && printf '%s' "$PUBLISHED_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
             catalog_published=true
+            catalog_delivery_state=published
             marketplace_revision="$PUBLISHED_REVISION"
+          elif [ "$PUBLISH_OUTCOME" = "success" ] \
+            && [ "$LIVE_SMOKE_OUTCOME" = "failure" ] \
+            && [ "$RESTORE_OUTCOME" = "success" ] \
+            && printf '%s' "$RESTORED_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+            catalog_delivery_state=restored
+          elif [ "$PUBLISH_OUTCOME" = "success" ]; then
+            catalog_delivery_state=unresolved
           fi
-          echo "catalog_published=$catalog_published" >> "$GITHUB_OUTPUT"
-          echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"
+          # The rollback target is recorded whatever happened. On a published run it names the
+          # release a restore would return to; on a deferred run it names the release the catalog
+          # is still serving.
+          {
+            echo "catalog_published=$catalog_published"
+            echo "catalog_delivery_state=$catalog_delivery_state"
+            echo "marketplace_revision=$marketplace_revision"
+            echo "previous_marketplace_revision=$PREVIOUS_REVISION"
+            echo "previous_plugin_sha=$PREVIOUS_PLUGIN_SHA"
+            echo "previous_plugin_version=$PREVIOUS_PLUGIN_VERSION"
+          } >> "$GITHUB_OUTPUT"
           if [ "$catalog_published" = "true" ]; then
             echo "Catalog delivery: published at $marketplace_revision." >> "$GITHUB_STEP_SUMMARY"
+            echo "Rollback target: codestory $PREVIOUS_PLUGIN_VERSION at $PREVIOUS_PLUGIN_SHA (catalog $PREVIOUS_REVISION), restorable with $RECOVERY_WORKFLOW." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$catalog_delivery_state" = "restored" ]; then
+            echo "::warning::The live-catalog smoke failed after publication. Automatic restore returned the public catalog to codestory $PREVIOUS_PLUGIN_VERSION at $PREVIOUS_PLUGIN_SHA (catalog $RESTORED_REVISION); the release stands."
+            echo "Catalog delivery: RESTORED after a failed live-catalog smoke. The release is published; the public catalog serves the previous release." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$catalog_delivery_state" = "unresolved" ]; then
+            echo "::error::The live-catalog smoke failed and automatic restore did not complete. The release stands, but catalog delivery is unresolved."
+            echo "Catalog delivery: UNRESOLVED. The release remains published; automatic restore did not complete." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           # $RECOVERY_WORKFLOW mints the SAME credential from the SAME environment, so it recovers a
@@ -870,6 +1197,7 @@ jobs:
     with:
       version: ${{ needs.preflight.outputs.version }}
       catalog_published: ${{ needs.marketplace-publish.outputs.catalog_published == 'true' }}
+      catalog_delivery_state: ${{ needs.marketplace-publish.outputs.catalog_delivery_state }}
       marketplace_revision: ${{ needs.marketplace-publish.outputs.marketplace_revision }}
       pre_publish_closeout_artifact: release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
       emit_release_cells: true
@@ -893,53 +1221,74 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
+      - name: Collect this run's reservation receipt
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: protected-runner-reservation-attempt-*
+          path: target/release-closeout/reservation
+          merge-multiple: false
+
       - name: Authenticate post-publish Actions provenance
         id: post-publish-provenance
         env:
           GH_TOKEN: ${{ github.token }}
+          REUSE_SELECTION: ${{ needs.preflight.outputs.reuse }}
         shell: bash
         run: |
           set -euo pipefail
           bash .github/scripts/collect-actions-job-evidence.sh \
             "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" target/release-closeout/job-evidence.json
+          receipt=""
+          for attempt in $(seq "$GITHUB_RUN_ATTEMPT" -1 1); do
+            candidate="target/release-closeout/reservation/protected-runner-reservation-attempt-$attempt/receipt.json"
+            if [ -f "$candidate" ]; then receipt="$candidate"; break; fi
+          done
+          receipt_args=()
+          if [ -n "$receipt" ]; then
+            receipt_args+=(--reservation-receipt "$receipt")
+          fi
           node scripts/codestory-release-cell-manifest.mjs producer-map \
             --repo "$GITHUB_WORKSPACE" \
             --expected-sha "$GITHUB_SHA" \
             --phase post_publish \
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --reuse "$REUSE_SELECTION" \
             --job-evidence target/release-closeout/job-evidence.json \
+            "${receipt_args[@]}" \
             --out target/release-closeout/trusted-post-publish-producers.json
-          artifact_ids="$(jq -r '[.artifacts[].id] | join(",")' target/release-closeout/trusted-post-publish-producers.json)"
-          test -n "$artifact_ids"
-          echo "artifact_ids=$artifact_ids" >> "$GITHUB_OUTPUT"
-
-      - name: Download selected release cells without flattening
-        uses: actions/download-artifact@v8.0.1
-        with:
-          artifact-ids: ${{ steps.post-publish-provenance.outputs.artifact_ids }}
-          path: target/release-cell-manifests
-          merge-multiple: false
-
-      - name: Verify selected post-publish artifact container digests
+      # Post-publish is cumulative: its producer map includes the source-proof container selected
+      # by preflight, which may belong to an earlier run. Downloading by this run alone would
+      # silently omit that cell, so every selected container is fetched by its authenticated
+      # Actions artifact id, checked byte-for-byte against the API digest, then extracted under
+      # the exact artifact name the producer map authenticated.
+      - name: Download and verify selected cumulative release cells
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target/release-cell-containers
-          jq -r '.artifacts[] | [.id, .digest] | @tsv' target/release-closeout/trusted-post-publish-producers.json |
-            while IFS=$'\t' read -r artifact_id expected_digest; do
-              archive="target/release-cell-containers/$artifact_id.zip"
-              curl --fail --location --silent --show-error \
-                --header "Accept: application/vnd.github+json" \
-                --header "Authorization: Bearer $GH_TOKEN" \
-                --header "X-GitHub-Api-Version: 2022-11-28" \
-                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" \
-                --output "$archive"
-              actual_digest="sha256:$(sha256sum "$archive" | awk '{print $1}')"
-              test "$actual_digest" = "$expected_digest"
-            done
+          producer_map=target/release-closeout/trusted-post-publish-producers.json
+          test "$(jq -r '.artifacts | length' "$producer_map")" -gt 0
+          mkdir -p target/release-cell-containers target/release-cell-manifests
+          while IFS=$'\t' read -r artifact_id artifact_name expected_digest; do
+            archive="target/release-cell-containers/$artifact_id.zip"
+            destination="target/release-cell-manifests/$artifact_name"
+            test ! -e "$destination"
+            curl --fail --location --silent --show-error \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" \
+              --output "$archive"
+            actual_digest="sha256:$(sha256sum "$archive" | awk '{print $1}')"
+            test "$actual_digest" = "$expected_digest"
+            mkdir "$destination"
+            unzip -q "$archive" -d "$destination"
+          done < <(jq -r '.artifacts[] | [.id, .name, .digest] | @tsv' "$producer_map")
+          while IFS= read -r artifact_name; do
+            test -d "target/release-cell-manifests/$artifact_name"
+          done < <(jq -r '.artifacts[].name' "$producer_map")
 
       - name: Download accepted pre-publish closeout
         uses: actions/download-artifact@v8.0.1

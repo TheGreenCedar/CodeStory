@@ -2148,10 +2148,10 @@ fn assert_packet_builds_broad_task_contract(workspace: &Path, cache_dir: &Path) 
     );
     assert!(
         packet
-            .pointer("/sufficiency/status")
+            .pointer("/disposition/kind")
             .and_then(Value::as_str)
             .is_some(),
-        "packet should expose sufficiency status: {packet:#}"
+        "packet should expose disposition kind: {packet:#}"
     );
     assert!(
         array_is_non_empty(&packet, &["answer", "retrieval_trace", "steps"]),
@@ -2290,12 +2290,18 @@ fn bookmarks_degrade_gracefully_after_reindex_removes_target() {
         &["bookmark", "list", "--format", "json"],
     );
     let listed = bookmarks["bookmarks"].as_array().expect("bookmarks");
+    assert_eq!(
+        listed.len(),
+        1,
+        "a removed target must leave the annotation visible and user-owned: {bookmarks:#}"
+    );
     assert!(
-        listed.is_empty()
-            || listed
-                .iter()
-                .all(|bookmark| bookmark["stale"].as_bool() == Some(true)),
-        "bookmark list should prune removed nodes or mark stale rows without crashing: {bookmarks:#}"
+        listed
+            .iter()
+            .all(|bookmark| bookmark["stale"].as_bool() == Some(true)
+                && bookmark["bookmark"]["resolution_status"] == "orphaned"
+                && bookmark["bookmark"]["orphan_reason"] == "target_deleted"),
+        "bookmark list should report a typed orphan reason: {bookmarks:#}"
     );
 
     let context = run_cli(
@@ -2321,8 +2327,8 @@ fn bookmarks_degrade_gracefully_after_reindex_removes_target() {
         String::from_utf8_lossy(&context.stderr)
     );
     assert!(
-        failure.contains("Bookmark not found") || failure.contains("is stale"),
-        "context --bookmark should explain stale or missing bookmark focus, got: {failure}"
+        failure.contains("Bookmark not found") || failure.contains("is an orphan"),
+        "context --bookmark should explain orphaned or missing bookmark focus, got: {failure}"
     );
 }
 

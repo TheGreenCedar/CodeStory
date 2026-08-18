@@ -1,9 +1,7 @@
 use super::super::artifacts::{ensure_dot_only_for_trail, preflight_output_file};
 use super::super::lifecycle::{OpenedAgentSurface, open_agent_surface};
-use super::super::resolution::{quote_command_path, quote_command_value};
 use super::packet::{
-    packet_budget_mode_label, packet_budget_omitted_sections, packet_operator_status,
-    packet_sufficiency_label,
+    packet_budget_omitted_sections, packet_disposition_label, packet_operator_status,
 };
 use crate::args;
 use crate::args::{TaskAction, TaskBriefCommand, TaskCommand};
@@ -11,7 +9,10 @@ use crate::display;
 use crate::output::{RenderedPublicOutput, emit_public_operation};
 use crate::runtime::map_api_error;
 use anyhow::Result;
-use codestory_contracts::api::{AgentPacketDto, AgentPacketRequestDto, PacketTaskClassDto};
+use codestory_contracts::api::{
+    AgentPacketDto, AgentPacketRequestDto, BoundedDrillPlanDto, PacketDispositionKindDto,
+    PacketTaskClassDto,
+};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
@@ -40,9 +41,13 @@ fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
                 extra_probes: cmd.extra_probes.clone(),
                 include_evidence: !cmd.no_evidence,
                 latency_budget_ms: cmd.latency_budget_ms,
+                parent_packet_id: None,
+                option_ids: Vec::new(),
+                core_generation_id: None,
+                retrieval_generation: None,
             })
             .map_err(map_api_error)?;
-        let brief = build_task_brief_output(&runtime.project_root, &packet);
+        let brief = build_task_brief_output(&packet);
         let markdown = render_task_brief_markdown(&brief);
         RenderedPublicOutput::structured(&brief, markdown)
     })?;
@@ -55,13 +60,13 @@ pub(in crate::app) struct TaskBriefOutput {
     pub(in crate::app) prompt: String,
     pub(in crate::app) status: String,
     pub(in crate::app) source_packet_id: String,
-    pub(in crate::app) source_packet_sufficiency: String,
+    pub(in crate::app) source_packet_disposition: String,
     pub(in crate::app) first_files: Vec<TaskBriefFileOutput>,
     pub(in crate::app) relevant_symbols: Vec<TaskBriefSymbolOutput>,
     pub(in crate::app) likely_tests: Vec<TaskBriefFileOutput>,
     pub(in crate::app) impacted_surfaces: Vec<String>,
     pub(in crate::app) risks_unknowns: Vec<String>,
-    pub(in crate::app) follow_up_codestory_commands: Vec<String>,
+    pub(in crate::app) packet_continuation: Option<BoundedDrillPlanDto>,
     pub(in crate::app) future_sections: Vec<String>,
 }
 
@@ -81,31 +86,26 @@ pub(in crate::app) struct TaskBriefSymbolOutput {
     pub(in crate::app) reason: String,
 }
 
-pub(in crate::app) fn build_task_brief_output(
-    project_root: &std::path::Path,
-    packet: &AgentPacketDto,
-) -> TaskBriefOutput {
+pub(in crate::app) fn build_task_brief_output(packet: &AgentPacketDto) -> TaskBriefOutput {
     let citations = packet_task_brief_citations(packet);
     let first_files = task_brief_first_files(&citations);
     let relevant_symbols = task_brief_relevant_symbols(&citations);
     let likely_tests = task_brief_likely_tests(&citations);
     let impacted_surfaces = task_brief_impacted_surfaces(&first_files, &relevant_symbols);
     let risks_unknowns = task_brief_risks_unknowns(packet, &likely_tests);
-    let follow_up_codestory_commands =
-        task_brief_follow_up_commands(project_root, packet, &first_files, &relevant_symbols);
 
     TaskBriefOutput {
-        task_brief_version: 1,
+        task_brief_version: 2,
         prompt: packet.question.clone(),
-        status: packet_operator_status(packet.sufficiency.status).to_string(),
+        status: packet_operator_status(packet.disposition.kind).to_string(),
         source_packet_id: packet.packet_id.clone(),
-        source_packet_sufficiency: packet_sufficiency_label(packet.sufficiency.status).to_string(),
+        source_packet_disposition: packet_disposition_label(packet.disposition.kind).to_string(),
         first_files,
         relevant_symbols,
         likely_tests,
         impacted_surfaces,
         risks_unknowns,
-        follow_up_codestory_commands,
+        packet_continuation: packet.disposition.drill.clone(),
         future_sections: vec![
             "scout".to_string(),
             "where".to_string(),
@@ -118,9 +118,6 @@ fn packet_task_brief_citations(
     packet: &AgentPacketDto,
 ) -> Vec<&codestory_contracts::api::AgentCitationDto> {
     let mut citations = Vec::new();
-    for claim in &packet.sufficiency.covered_claims {
-        citations.extend(claim.citations.iter());
-    }
     citations.extend(packet.answer.citations.iter());
     citations
 }
@@ -240,7 +237,7 @@ fn task_brief_risks_unknowns(
     packet: &AgentPacketDto,
     likely_tests: &[TaskBriefFileOutput],
 ) -> Vec<String> {
-    let mut risks = packet.sufficiency.gaps.clone();
+    let mut risks = packet.disposition.omission_receipts.clone();
     if packet.budget.truncated {
         risks.push(format!(
             "source packet was budget-truncated; omitted sections: {}",
@@ -250,40 +247,13 @@ fn task_brief_risks_unknowns(
     if likely_tests.is_empty() {
         risks.push("no test files were cited by the source packet".to_string());
     }
+    if packet.disposition.kind == PacketDispositionKindDto::Supported && risks.is_empty() {
+        risks.push("verify `changed` files after editing".to_string());
+    }
     if risks.is_empty() {
-        risks.push("none from packet sufficiency; verify cited files before editing".to_string());
+        risks.push("none from packet disposition; verify cited files before editing".to_string());
     }
     risks
-}
-
-fn task_brief_follow_up_commands(
-    project_root: &std::path::Path,
-    packet: &AgentPacketDto,
-    first_files: &[TaskBriefFileOutput],
-    symbols: &[TaskBriefSymbolOutput],
-) -> Vec<String> {
-    let project = quote_command_path(project_root);
-    let prompt = quote_command_value(&packet.question);
-    let mut commands = Vec::new();
-    commands.push(format!(
-        "codestory-cli packet --project {project} --question {prompt} --task-class edit-planning --budget {}",
-        packet_budget_mode_label(packet.budget.requested)
-    ));
-    if let Some(file) = first_files.first() {
-        commands.push(format!(
-            "codestory-cli snippet --project {project} --query {}",
-            quote_command_value(&file.path)
-        ));
-    }
-    if let Some(symbol) = symbols.first() {
-        commands.push(format!(
-            "codestory-cli trail --project {project} --query {} --story --hide-speculative",
-            quote_command_value(&symbol.name)
-        ));
-    }
-    commands.push(format!("codestory-cli affected --project {project} <path>"));
-    commands.extend(packet.sufficiency.follow_up_commands.iter().cloned());
-    commands
 }
 
 pub(in crate::app) fn render_task_brief_markdown(brief: &TaskBriefOutput) -> String {
@@ -302,8 +272,8 @@ pub(in crate::app) fn render_task_brief_markdown(brief: &TaskBriefOutput) -> Str
     );
     let _ = writeln!(
         markdown,
-        "source_packet_sufficiency: {}",
-        task_brief_inline_code(&brief.source_packet_sufficiency)
+        "source_packet_disposition: {}",
+        task_brief_inline_code(&brief.source_packet_disposition)
     );
     let _ = writeln!(
         markdown,
@@ -315,11 +285,7 @@ pub(in crate::app) fn render_task_brief_markdown(brief: &TaskBriefOutput) -> Str
     append_task_brief_files(&mut markdown, "Likely Tests", &brief.likely_tests);
     append_task_brief_strings(&mut markdown, "Impacted Surfaces", &brief.impacted_surfaces);
     append_task_brief_strings(&mut markdown, "Risks And Unknowns", &brief.risks_unknowns);
-    append_task_brief_commands(
-        &mut markdown,
-        "Follow Up CodeStory Commands",
-        &brief.follow_up_codestory_commands,
-    );
+    append_task_brief_continuation(&mut markdown, brief.packet_continuation.as_ref());
     append_task_brief_strings(&mut markdown, "Future Sections", &brief.future_sections);
     markdown
 }
@@ -394,10 +360,46 @@ fn append_task_brief_strings(markdown: &mut String, title: &str, values: &[Strin
     }
 }
 
-fn append_task_brief_commands(markdown: &mut String, title: &str, values: &[String]) {
-    let _ = writeln!(markdown, "\n## {title}");
-    for value in values {
-        let _ = writeln!(markdown, "- command:");
-        let _ = writeln!(markdown, "    {}", value.replace(['\r', '\n'], " "));
+fn append_task_brief_continuation(
+    markdown: &mut String,
+    continuation: Option<&BoundedDrillPlanDto>,
+) {
+    let _ = writeln!(markdown, "\n## Packet Continuation");
+    let Some(continuation) = continuation else {
+        let _ = writeln!(markdown, "- none; source packet disposition is terminal");
+        return;
+    };
+    let _ = writeln!(
+        markdown,
+        "- parent_packet_id: {}",
+        task_brief_inline_code(&continuation.parent_packet_id)
+    );
+    let _ = writeln!(
+        markdown,
+        "- core_generation_id: {}",
+        task_brief_inline_code(&continuation.core_generation_id)
+    );
+    if let Some(retrieval_generation) = continuation.retrieval_generation.as_deref() {
+        let _ = writeln!(
+            markdown,
+            "- retrieval_generation: {}",
+            task_brief_inline_code(retrieval_generation)
+        );
     }
+    let _ = writeln!(
+        markdown,
+        "- remaining_rounds: {}",
+        continuation.remaining_rounds
+    );
+    let option_ids = continuation
+        .options
+        .iter()
+        .map(|option| option.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        markdown,
+        "- option_ids: {}",
+        task_brief_inline_code(&option_ids)
+    );
 }

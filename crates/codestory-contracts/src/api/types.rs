@@ -21,9 +21,16 @@ macro_rules! impl_mirrored_enum_conversions {
     };
 }
 
+/// Requested indexing mode.
+///
+/// Emission stays PascalCase. The `snake_case` aliases accept the spelling the
+/// mirrored `IndexPublicationModeDto` emits on the same wire surfaces, so a
+/// caller that read one vocabulary can write the other without a rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 pub enum IndexMode {
+    #[serde(alias = "full")]
     Full,
+    #[serde(alias = "incremental")]
     Incremental,
 }
 
@@ -184,12 +191,20 @@ impl_mirrored_enum_conversions!(
     [Horizontal, Vertical,]
 );
 
+/// Declared member access.
+///
+/// Emission stays PascalCase. The `snake_case` aliases accept the spelling the
+/// mirrored `CanonicalMemberVisibility` emits on the same wire surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type, Default)]
 pub enum MemberAccess {
     #[default]
+    #[serde(alias = "public")]
     Public,
+    #[serde(alias = "protected")]
     Protected,
+    #[serde(alias = "private")]
     Private,
+    #[serde(alias = "default")]
     Default,
 }
 
@@ -198,3 +213,45 @@ impl_mirrored_enum_conversions!(
     crate::graph::AccessKind,
     [Public, Protected, Private, Default,]
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mirrored_request_enums_accept_both_casings_and_emit_one() {
+        // CR-032: `IndexMode` and `MemberAccess` emit PascalCase while their
+        // mirrored response enums emit snake_case for the same vocabulary. The
+        // aliases let a caller write back what it read; emission is unchanged.
+        for spelling in ["Incremental", "incremental"] {
+            let parsed: IndexMode = serde_json::from_value(serde_json::json!(spelling))
+                .unwrap_or_else(|error| panic!("decode {spelling}: {error}"));
+            assert_eq!(parsed, IndexMode::Incremental);
+        }
+        assert_eq!(
+            serde_json::to_value(IndexMode::Incremental).expect("serialize index mode"),
+            serde_json::json!("Incremental"),
+            "emission must stay PascalCase"
+        );
+
+        let request: crate::api::StartIndexingRequest =
+            serde_json::from_str(r#"{"mode":"full"}"#).expect("snake_case request mode decodes");
+        assert_eq!(request.mode, IndexMode::Full);
+
+        for spelling in ["Private", "private"] {
+            let parsed: MemberAccess = serde_json::from_value(serde_json::json!(spelling))
+                .unwrap_or_else(|error| panic!("decode {spelling}: {error}"));
+            assert_eq!(parsed, MemberAccess::Private);
+        }
+        assert_eq!(
+            serde_json::to_value(MemberAccess::Private).expect("serialize member access"),
+            serde_json::json!("Private"),
+            "emission must stay PascalCase"
+        );
+
+        assert!(
+            serde_json::from_value::<IndexMode>(serde_json::json!("INCREMENTAL")).is_err(),
+            "aliases add the mirrored spelling only, not arbitrary casing"
+        );
+    }
+}

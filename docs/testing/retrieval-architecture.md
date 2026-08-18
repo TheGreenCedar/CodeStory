@@ -103,6 +103,11 @@ throughput, latency, or memory regression blocks promotion. The checked-in
 constant set and qualification protocol, not prose on this page, own the
 candidate-specific values.
 
+Qualification thresholds are global unless the checked-in constant set names a
+protected-hardware matrix override. Windows spawn convergence uses the selected
+slow-host connect bound because its measured window includes a mandatory fresh
+SHA-256 of the embedded runtime; macOS and Linux retain the global threshold.
+
 ## Focused failure boundaries
 
 Tests cover exact model/build identity, corrupt materialization, prohibited CPU

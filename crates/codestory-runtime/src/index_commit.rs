@@ -11,6 +11,7 @@ use crate::{
     current_epoch_ms, publish_source_policy_exclusions, revalidate_source_policy_exclusions,
 };
 use codestory_contracts::api::{ApiError, IndexPublicationDto, IndexPublicationModeDto};
+use codestory_contracts::bounded_locks;
 use codestory_indexer::CancellationToken;
 use codestory_store::{
     IndexPublicationMode, IndexPublicationRecord, StagedSnapshot, StagedSnapshotPublishStats,
@@ -18,7 +19,6 @@ use codestory_store::{
 use codestory_workspace::{
     OversizedSourceExclusionCandidate, SourceIndexPolicy, WorkspaceManifest,
 };
-use fs4::fs_std::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -63,7 +63,8 @@ pub(super) struct IndexWriterGuard {
 
 impl IndexWriterGuard {
     pub(super) fn try_acquire(storage_path: &Path) -> Result<Self, ApiError> {
-        let path = storage_path.with_extension("index-writer.lock");
+        let path = storage_path
+            .with_extension(codestory_contracts::owned_artifacts::INDEX_WRITER_LOCK_EXTENSION);
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -87,12 +88,14 @@ impl IndexWriterGuard {
                     path.display()
                 ))
             })?;
-        if !FileExt::try_lock_exclusive(&file).map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to acquire index writer lock {}: {error}",
-                path.display()
-            ))
-        })? {
+        if !codestory_workspace::locking::try_lock_exclusive_outliving_spawn_ghosts(&file).map_err(
+            |error| {
+                ApiError::internal(format!(
+                    "Failed to acquire index writer lock {}: {error}",
+                    path.display()
+                ))
+            },
+        )? {
             return Err(ApiError::new(
                 "cache_busy",
                 format!(
@@ -107,7 +110,7 @@ impl IndexWriterGuard {
 
 impl Drop for IndexWriterGuard {
     fn drop(&mut self) {
-        if let Err(error) = FileExt::unlock(&self.file) {
+        if let Err(error) = bounded_locks::release(&self.file) {
             tracing::warn!(
                 path = %self.path.display(),
                 "Failed to unlock index writer lock: {error}"

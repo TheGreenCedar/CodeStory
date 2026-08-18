@@ -1,0 +1,170 @@
+{
+  "schema": "codestory.vector-backend-bakeoff/v1",
+  "host": "macos-arm64",
+  "host_detail": "macos aarch64 / debug_assertions=true / built by: CARGO_PROFILE_DEV_OPT_LEVEL=3 CARGO_PROFILE_DEV_DEBUG=0 cargo build -p codestory-bench --example codestory_vector_backend_bakeoff",
+  "recorded_at": "2026-08-03",
+  "embedding_dim": 768,
+  "corpus_provenance": "synthetic",
+  "corpus_detail": "deterministic pseudo-random unit vectors",
+  "gates": {
+    "top_k": 40,
+    "minimum_top_k_agreement": 1.0,
+    "maximum_stage_timeout_rate": 0.01,
+    "semantic_stage_budget_ms": 250,
+    "maximum_resident_bytes": 402653184,
+    "workload_ladder": [
+      1000,
+      10000,
+      25000,
+      75000
+    ],
+    "required_platforms": [
+      "linux-x64",
+      "macos-arm64",
+      "windows-x64"
+    ]
+  },
+  "outcomes": {
+    "exact_resident_matrix": {
+      "state": "measured",
+      "corpus_provenance": "synthetic",
+      "platforms": [
+        "macos-arm64"
+      ],
+      "workloads": [
+        {
+          "vectors": 1000,
+          "queries": 600,
+          "top_k_agreement": 1.0,
+          "stage_timeout_rate": 0.0,
+          "resident_bytes": 3097000,
+          "resident_bytes_basis": "contiguous f32 matrix, per-row norms, and node identities held for the generation",
+          "build_millis": 45.082417,
+          "p50_scan_micros": 348.91700000000003,
+          "p95_scan_micros": 442.334,
+          "max_scan_micros": 647.833
+        },
+        {
+          "vectors": 10000,
+          "queries": 600,
+          "top_k_agreement": 1.0,
+          "stage_timeout_rate": 0.0,
+          "resident_bytes": 30970000,
+          "resident_bytes_basis": "contiguous f32 matrix, per-row norms, and node identities held for the generation",
+          "build_millis": 419.88866600000006,
+          "p50_scan_micros": 3710.292,
+          "p95_scan_micros": 4464.5,
+          "max_scan_micros": 18806.959000000003
+        },
+        {
+          "vectors": 25000,
+          "queries": 600,
+          "top_k_agreement": 1.0,
+          "stage_timeout_rate": 0.0,
+          "resident_bytes": 77425000,
+          "resident_bytes_basis": "contiguous f32 matrix, per-row norms, and node identities held for the generation",
+          "build_millis": 1024.21475,
+          "p50_scan_micros": 8621.125,
+          "p95_scan_micros": 10154.166,
+          "max_scan_micros": 21512.125
+        },
+        {
+          "vectors": 75000,
+          "queries": 600,
+          "top_k_agreement": 1.0,
+          "stage_timeout_rate": 0.005,
+          "resident_bytes": 232275000,
+          "resident_bytes_basis": "contiguous f32 matrix, per-row norms, and node identities held for the generation",
+          "build_millis": 2711.9254990000004,
+          "p50_scan_micros": 27424.667,
+          "p95_scan_micros": 72686.084,
+          "max_scan_micros": 343128.25
+        }
+      ]
+    },
+    "incumbent_sqlite_row_scan": {
+      "state": "measured",
+      "corpus_provenance": "synthetic",
+      "platforms": [
+        "macos-arm64"
+      ],
+      "workloads": [
+        {
+          "vectors": 1000,
+          "queries": 600,
+          "top_k_agreement": 1.0,
+          "stage_timeout_rate": 0.0,
+          "resident_bytes": 0,
+          "resident_bytes_basis": "streaming scan; no vector data held resident between queries",
+          "build_millis": 42.6775,
+          "p50_scan_micros": 1440.0839999999998,
+          "p95_scan_micros": 1786.208,
+          "max_scan_micros": 2142.584
+        },
+        {
+          "vectors": 10000,
+          "queries": 600,
+          "top_k_agreement": 1.0,
+          "stage_timeout_rate": 0.0,
+          "resident_bytes": 0,
+          "resident_bytes_basis": "streaming scan; no vector data held resident between queries",
+          "build_millis": 368.752083,
+          "p50_scan_micros": 15045.167,
+          "p95_scan_micros": 18290.083,
+          "max_scan_micros": 43754.666
+        },
+        {
+          "vectors": 25000,
+          "queries": 600,
+          "top_k_agreement": 1.0,
+          "stage_timeout_rate": 0.0,
+          "resident_bytes": 0,
+          "resident_bytes_basis": "streaming scan; no vector data held resident between queries",
+          "build_millis": 966.683125,
+          "p50_scan_micros": 33357.5,
+          "p95_scan_micros": 40129.834,
+          "max_scan_micros": 71842.75
+        },
+        {
+          "vectors": 75000,
+          "queries": 600,
+          "top_k_agreement": 1.0,
+          "stage_timeout_rate": 0.03333333333333333,
+          "resident_bytes": 0,
+          "resident_bytes_basis": "streaming scan; no vector data held resident between queries",
+          "build_millis": 2558.2360830000002,
+          "p50_scan_micros": 106747.667,
+          "p95_scan_micros": 209548.667,
+          "max_scan_micros": 544602.625
+        }
+      ]
+    },
+    "sqlite_vec": {
+      "state": "not_measured",
+      "reason": "dependency_not_vendored",
+      "detail": "sqlite-vec is not a workspace dependency and is not present under vendor/; the offline build contract forbids fetching it during a proof run, so no build, load, query, memory, or corruption number exists for it"
+    },
+    "usearch": {
+      "state": "not_measured",
+      "reason": "dependency_not_vendored",
+      "detail": "usearch is not a workspace dependency and is not present under vendor/; the offline build contract forbids fetching it during a proof run, so no build, load, query, memory, or corruption number exists for it"
+    }
+  },
+  "disposition": {
+    "kind": "retain_incumbent",
+    "non_claim": "This bake-off selects no vector index backend. The shipped exact SQLite dense scan is retained unchanged, no recall, latency, or memory improvement is claimed from it, and the semantic stage degradation counters remain the only field signal for reconsidering the question.",
+    "blocking_reasons": [
+      "exact_resident_matrix: measured over a synthetic corpus, which carries no answer-quality signal",
+      "sqlite_vec: not measured (dependency_not_vendored): sqlite-vec is not a workspace dependency and is not present under vendor/; the offline build contract forbids fetching it during a proof run, so no build, load, query, memory, or corruption number exists for it",
+      "usearch: not measured (dependency_not_vendored): usearch is not a workspace dependency and is not present under vendor/; the offline build contract forbids fetching it during a proof run, so no build, load, query, memory, or corruption number exists for it"
+    ]
+  },
+  "limitations": [
+    "Measured with debug assertions on. The shipping profile requires the embedded model source, which this host does not have, so a true release-profile build was not available. Absolute latencies are therefore pessimistic; they are recorded for the cost model, not as a product latency claim.",
+    "Vectors are deterministic pseudo-random unit vectors, not embeddings of a real repository. They exercise the scan's cost model at the declared widths and counts and carry no answer-quality signal, so no recall claim from this run is decision-grade.",
+    "Only macos-arm64 was exercised. Cross-platform immutable-generation behaviour on the other shipped packages is unmeasured by this run.",
+    "sqlite-vec and USearch were not built. Neither is a workspace dependency nor vendored, and the offline build contract forbids fetching a native dependency during a proof run.",
+    "Absolute latencies carry the host's own noise. A run on a shared developer workstation competes with whatever else that machine is doing; read the ordering and the scaling with corpus size, and treat a rung that is faster than a smaller rung as evidence the host was contended rather than as a property of the backend.",
+    "Scan latency excludes query embedding. The semantic stage budget read from the retrieval planner covers embedding plus scan, so the timeout rate reported here is a lower bound on the stage's real timeout rate."
+  ]
+}

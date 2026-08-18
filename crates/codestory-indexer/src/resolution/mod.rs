@@ -41,6 +41,11 @@ type UnresolvedEdgeRow = (
     i64,
     Option<String>,
     Option<String>,
+    // Caller node kind discriminant. The C# same-root-namespace arm needs it
+    // to read a root off the caller's qualified name: a type-like caller's
+    // namespace is everything but the last segment, a member's everything
+    // but the last two.
+    Option<i64>,
 );
 
 struct SemanticEdgeLookup<'a> {
@@ -59,7 +64,7 @@ type SameModuleCacheKey = (String, String, String);
 type NameCacheKey = (String, String);
 type RelativeImportCacheKey = (String, String, String, String);
 /// Version for cached resolution-support snapshots.
-pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 4;
+pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SemanticResolutionRequestKey {
@@ -110,6 +115,7 @@ struct CandidateIndex {
     nodes: Vec<CandidateNode>,
     relative_import_nodes: Vec<CandidateNode>,
     import_binding_node_ids: HashSet<i64>,
+    context_manager_self_returning_method_ids: HashSet<i64>,
     node_offset_by_id: HashMap<i64, usize>,
     exact_map: HashMap<String, Vec<usize>>,
     suffix_map_ascii_lower: HashMap<String, Vec<usize>>,
@@ -186,6 +192,8 @@ struct ResolutionSupportSnapshot {
     call_candidates: Vec<CandidateNodeSnapshot>,
     #[serde(default)]
     call_import_binding_node_ids: Vec<i64>,
+    #[serde(default)]
+    call_context_manager_self_returning_method_ids: Vec<i64>,
     import_candidates: Vec<CandidateNodeSnapshot>,
     #[serde(default)]
     relative_import_candidates: Vec<CandidateNodeSnapshot>,
@@ -820,6 +828,17 @@ impl ResolutionPass {
                 cancel_token,
             )?;
             Self::check_cancelled(cancel_token)?;
+            // Structural CSS placeholder references (stage 3c): import-ref
+            // canonical-file-id stamping and var-ref/keyframes-ref import-
+            // closure resolution. Runs after the generic jobs, whose worklist
+            // excludes these placeholder targets (sql.rs).
+            let _resolved_structural_css_references =
+                pipeline::resolve_structural_css_references_on_conn(
+                    conn,
+                    &scope_context,
+                    cancel_token,
+                )?;
+            Self::check_cancelled(cancel_token)?;
 
             let counts_finished = Instant::now();
             let unresolved_calls =
@@ -1243,6 +1262,7 @@ fn semantic_lookup_from_row<'a>(
         _target_node_id,
         caller_file_path,
         callsite_identity,
+        _caller_kind,
     ) = row;
     SemanticEdgeLookup {
         edge_kind,
@@ -1268,6 +1288,7 @@ fn semantic_request_key(lookup: &SemanticEdgeLookup<'_>) -> Option<SemanticResol
         || is_csharp_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
         || is_ruby_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
         || is_php_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_php_new_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
         || is_imported_receiver_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
         || should_skip_semantic_candidates(lookup)
     {
@@ -1309,7 +1330,7 @@ fn is_python_dotted_call_placeholder(edge_kind: EdgeKind, callsite_identity: Opt
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::PYTHON_ATTRIBUTE_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::python::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1321,7 +1342,19 @@ fn is_cpp_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::CPP_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::cpp::MEMBER_CALLSITE_MARKER)
+    })
+}
+
+fn is_rust_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::languages::rust::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1333,7 +1366,7 @@ fn is_js_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::JS_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::javascript::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1345,7 +1378,7 @@ fn is_ts_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::TS_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::typescript::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1357,7 +1390,7 @@ fn is_kotlin_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Opt
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::KOTLIN_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::kotlin::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1369,7 +1402,7 @@ fn is_dart_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Optio
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::DART_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::dart::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1381,7 +1414,7 @@ fn is_swift_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Opti
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::SWIFT_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::swift::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1393,7 +1426,7 @@ fn is_go_selector_call_placeholder(edge_kind: EdgeKind, callsite_identity: Optio
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::GO_SELECTOR_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::go::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1405,7 +1438,7 @@ fn is_java_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Optio
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::JAVA_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::java::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1417,7 +1450,7 @@ fn is_csharp_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Opt
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::CSHARP_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::csharp::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1429,7 +1462,7 @@ fn is_ruby_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Optio
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::RUBY_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::ruby::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1441,7 +1474,19 @@ fn is_php_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::PHP_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::php::MEMBER_CALLSITE_MARKER)
+    })
+}
+
+fn is_php_new_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::languages::php::NEW_CALLSITE_MARKER)
     })
 }
 
@@ -1472,6 +1517,31 @@ fn receiver_module_from_callsite(callsite_identity: Option<&str>) -> Option<&str
             part.strip_prefix(crate::RECEIVER_MODULE_CALLSITE_PREFIX)
                 .filter(|module| !module.is_empty())
         })
+}
+
+fn requires_python_context_manager_self_return(callsite_identity: Option<&str>) -> bool {
+    callsite_identity.is_some_and(|identity| {
+        identity.split('|').any(|part| {
+            part == crate::languages::python::CONTEXT_MANAGER_SELF_RETURN_REQUIRED_MARKER
+        })
+    })
+}
+
+fn dart_unprefixed_import_modules(module_marker: &str) -> Option<Vec<&str>> {
+    let mut encoded =
+        module_marker.strip_prefix(crate::languages::dart::UNPREFIXED_IMPORT_SET_PREFIX)?;
+    let mut modules = Vec::new();
+    while !encoded.is_empty() {
+        let (length, remainder) = encoded.split_once(':')?;
+        let length = length.parse::<usize>().ok()?;
+        if length == 0 || remainder.len() < length || !remainder.is_char_boundary(length) {
+            return None;
+        }
+        let (module, rest) = remainder.split_at(length);
+        modules.push(module);
+        encoded = rest;
+    }
+    (!modules.is_empty()).then_some(modules)
 }
 
 pub(super) fn semantic_candidate_kinds(edge_kind: EdgeKind) -> &'static [i32] {
@@ -1619,6 +1689,7 @@ impl PreparedResolutionState {
             call_candidate_index: CandidateIndex::from_snapshot_nodes_with_import_bindings(
                 snapshot.call_candidates,
                 snapshot.call_import_binding_node_ids,
+                snapshot.call_context_manager_self_returning_method_ids,
             ),
             import_candidate_index: CandidateIndex::from_snapshot_nodes_with_relative(
                 snapshot.import_candidates,
@@ -1643,6 +1714,9 @@ impl PreparedResolutionState {
             enable_semantic: flags.enable_semantic,
             call_candidates: self.call_candidate_index.snapshot_nodes(),
             call_import_binding_node_ids: self.call_candidate_index.import_binding_node_ids(),
+            call_context_manager_self_returning_method_ids: self
+                .call_candidate_index
+                .context_manager_self_returning_method_ids(),
             import_candidates: self.import_candidate_index.snapshot_nodes(),
             relative_import_candidates: self
                 .import_candidate_index
@@ -1666,11 +1740,14 @@ impl CandidateIndex {
     fn load_with_import_bindings(conn: &rusqlite::Connection, kinds: &[i32]) -> Result<Self> {
         let nodes = Self::load_nodes(conn, kinds)?;
         let import_binding_node_ids = Self::load_import_binding_node_ids(conn)?;
-        Ok(Self::from_primary_relative_and_import_bindings(
+        let mut index = Self::from_primary_relative_and_import_bindings(
             nodes,
             Vec::new(),
             import_binding_node_ids,
-        ))
+        );
+        index.context_manager_self_returning_method_ids =
+            Self::load_context_manager_self_returning_method_ids(conn)?;
+        Ok(index)
     }
 
     fn load_with_relative_import_kinds(
@@ -1697,6 +1774,29 @@ impl CandidateIndex {
              WHERE kind = ?1",
         )?;
         let rows = stmt.query_map(params![EdgeKind::IMPORT as i32], |row| row.get::<_, i64>(0))?;
+        Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
+    }
+
+    fn load_context_manager_self_returning_method_ids(
+        conn: &rusqlite::Connection,
+    ) -> Result<HashSet<i64>> {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT member.target_node_id
+             FROM edge AS contract
+             JOIN node AS enter_method ON enter_method.id = contract.target_node_id
+             JOIN edge AS member ON member.source_node_id = contract.source_node_id
+             WHERE contract.kind = ?1
+               AND contract.callsite_identity = ?2
+               AND member.kind = ?1
+               AND member.target_node_id != contract.target_node_id",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                EdgeKind::MEMBER as i32,
+                crate::languages::python::CONTEXT_MANAGER_SELF_RETURN_MEMBER_MARKER,
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
         Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
     }
 
@@ -1736,12 +1836,17 @@ impl CandidateIndex {
     fn from_snapshot_nodes_with_import_bindings(
         nodes: Vec<CandidateNodeSnapshot>,
         import_binding_node_ids: Vec<i64>,
+        context_manager_self_returning_method_ids: Vec<i64>,
     ) -> Self {
-        Self::from_primary_relative_and_import_bindings(
+        let mut index = Self::from_primary_relative_and_import_bindings(
             Self::candidate_nodes_from_snapshots(nodes),
             Vec::new(),
             import_binding_node_ids.into_iter().collect(),
-        )
+        );
+        index.context_manager_self_returning_method_ids = context_manager_self_returning_method_ids
+            .into_iter()
+            .collect();
+        index
     }
 
     fn from_snapshot_nodes_with_relative(
@@ -1778,6 +1883,21 @@ impl CandidateIndex {
                 qualified_name: node.qualified_name.clone(),
             })
             .collect()
+    }
+
+    fn context_manager_self_returning_method_ids(&self) -> Vec<i64> {
+        let mut ids = self
+            .context_manager_self_returning_method_ids
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn has_context_manager_self_return_contract(&self, candidate_id: i64) -> bool {
+        self.context_manager_self_returning_method_ids
+            .contains(&candidate_id)
     }
 
     fn candidate_nodes_from_snapshots(nodes: Vec<CandidateNodeSnapshot>) -> Vec<CandidateNode> {
@@ -2013,6 +2133,89 @@ impl CandidateIndex {
                 owner_name,
                 method_name,
             ),
+            _ => None,
+        }
+    }
+
+    fn find_same_directory_owner_member_readonly(
+        &self,
+        caller_file_path: Option<&str>,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let caller_file_path = normalize_resolution_path(caller_file_path?)?;
+        let caller_directory = resolution_path_directory(&caller_file_path);
+        let mut matches = self
+            .owner_member_candidate_offsets(owner_name, method_name)
+            .into_iter()
+            .filter_map(|offset| self.nodes.get(offset))
+            .filter(|node| owner_member_candidate_matches(node, owner_name, method_name))
+            .filter(|node| {
+                node.normalized_file_path
+                    .as_deref()
+                    .is_some_and(|path| resolution_path_directory(path) == caller_directory)
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        match matches.as_slice() {
+            [candidate] => Some(*candidate),
+            _ => None,
+        }
+    }
+
+    /// Owner member unique under one root namespace (C# same-root arm).
+    ///
+    /// Resolves `Owner.Method` when EXACTLY ONE method candidate whose
+    /// qualified name starts with `caller_root.` matches — the engine-side
+    /// equivalent of C#'s parent-namespace visibility and csproj-level
+    /// global usings, which no per-file using table can see. Candidates
+    /// without a namespace (fewer than three qualified segments) never
+    /// participate; ambiguity fails closed.
+    fn find_same_root_owner_member_readonly(
+        &self,
+        caller_root: &str,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let mut matches = self
+            .owner_member_candidate_offsets(owner_name, method_name)
+            .into_iter()
+            .filter_map(|offset| self.nodes.get(offset))
+            .filter(|node| owner_member_candidate_matches(node, owner_name, method_name))
+            .filter(|node| {
+                node.qualified_name.as_deref().is_some_and(|qualified| {
+                    qualified.split('.').count() >= 3
+                        && qualified.split('.').next() == Some(caller_root)
+                })
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        match matches.as_slice() {
+            [candidate] => Some(*candidate),
+            _ => None,
+        }
+    }
+
+    fn find_global_unique_owner_member_readonly(
+        &self,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let mut matches = self
+            .owner_member_candidate_offsets(owner_name, method_name)
+            .into_iter()
+            .filter_map(|offset| self.nodes.get(offset))
+            .filter(|node| owner_member_candidate_matches(node, owner_name, method_name))
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        match matches.as_slice() {
+            [candidate] => Some(*candidate),
             _ => None,
         }
     }
@@ -2652,6 +2855,12 @@ fn normalize_resolution_path(path: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
+fn resolution_path_directory(path: &str) -> &str {
+    path.rsplit_once('/')
+        .map(|(directory, _)| directory)
+        .unwrap_or_default()
+}
+
 fn relative_import_path_candidates(caller_file_path: &str, module_name: &str) -> Vec<String> {
     let Some(module_name) = normalize_import_module_name(module_name) else {
         return Vec::new();
@@ -2978,6 +3187,31 @@ fn import_name_candidates(target_name: &str, legacy_mode: bool) -> Vec<String> {
     }
 
     candidates
+}
+
+/// Root namespace of a C# caller's qualified name, kind-aware.
+///
+/// A type-like caller (`Ns.Sub.Class`) needs at least two dotted segments
+/// for a namespace to exist; a member caller (`Ns.Sub.Class.Method`) needs
+/// at least three. Global-namespace callers yield `None`, so the same-root
+/// arm never runs for them.
+fn csharp_caller_root_namespace(
+    caller_qualified: Option<&str>,
+    caller_kind: Option<i64>,
+) -> Option<&str> {
+    let qualified = caller_qualified?;
+    let caller_is_type_like = matches!(
+        caller_kind,
+        Some(kind) if kind == NodeKind::CLASS as i64
+            || kind == NodeKind::STRUCT as i64
+            || kind == NodeKind::INTERFACE as i64
+            || kind == NodeKind::ENUM as i64
+    );
+    let min_segments = if caller_is_type_like { 2 } else { 3 };
+    if qualified.split('.').count() < min_segments {
+        return None;
+    }
+    qualified.split('.').next().filter(|root| !root.is_empty())
 }
 
 fn module_prefix(qualified: &str) -> Option<(String, &'static str)> {
@@ -3443,6 +3677,7 @@ mod tests {
             enable_semantic: false,
             call_candidates: Vec::new(),
             call_import_binding_node_ids: Vec::new(),
+            call_context_manager_self_returning_method_ids: Vec::new(),
             import_candidates: Vec::new(),
             relative_import_candidates: Vec::new(),
             call_semantic_nodes: Vec::new(),
@@ -3725,6 +3960,7 @@ mod tests {
                 0,
                 Some("/repo/lib.rs".to_string()),
                 Some("1:2:3:4".to_string()),
+                None,
             ),
             (
                 2_i64,
@@ -3735,6 +3971,7 @@ mod tests {
                 0,
                 Some("/repo/lib.rs".to_string()),
                 Some("2:2:3:4".to_string()),
+                None,
             ),
         ];
 
@@ -3771,6 +4008,7 @@ mod tests {
             "clone".to_string(),
             0,
             Some("/repo/lib.rs".to_string()),
+            None,
             None,
         )];
 
@@ -3822,6 +4060,7 @@ mod tests {
             0,
             Some("/repo/lib.rs".to_string()),
             Some("1:2:3:4".to_string()),
+            None,
         );
 
         let computed = candidate_selection::compute_call_resolution(&pass, &index, &row, &[])?;
@@ -3862,6 +4101,7 @@ mod tests {
             0,
             Some("/repo/lib.rs".to_string()),
             Some("1:2:3:4".to_string()),
+            None,
         );
         let semantic_candidates = vec![SemanticResolutionCandidate {
             target_node_id: 77_i64,
@@ -3939,7 +4179,10 @@ mod tests {
 
     #[test]
     fn test_python_dotted_placeholders_do_not_create_semantic_request_keys() {
-        let dotted_identity = format!("2:10:2:14|{}", crate::PYTHON_ATTRIBUTE_CALLSITE_MARKER);
+        let dotted_identity = format!(
+            "2:10:2:14|{}",
+            crate::languages::python::MEMBER_CALLSITE_MARKER
+        );
         let dotted_lookup = SemanticEdgeLookup {
             edge_kind: EdgeKind::CALL,
             file_id: Some(1),

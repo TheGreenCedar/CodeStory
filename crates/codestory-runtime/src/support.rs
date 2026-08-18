@@ -8,23 +8,23 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 
-pub(crate) const HYBRID_RETRIEVAL_ENABLED_ENV: &str = "CODESTORY_HYBRID_RETRIEVAL_ENABLED";
-pub(crate) const SEMANTIC_FILE_TEXT_MAX_BYTES: u64 = 1_000_000;
+pub(crate) use codestory_contracts::config_registry::HYBRID_RETRIEVAL_ENABLED_ENV;
+/// Default semantic file-text cap. Product projections use the active
+/// source-index policy retained by the runtime.
+pub(crate) const SEMANTIC_FILE_TEXT_MAX_BYTES: u64 =
+    codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP;
 pub(crate) const SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES: usize = 64 * 1_024 * 1_024;
 
+/// Whether hybrid lexical/semantic ranking is on for this process.
+///
+/// `CODESTORY_HYBRID_RETRIEVAL_ENABLED` is declared to
+/// `codestory-retrieval/src/config.rs`, which is where the value is read and
+/// interpreted; the runtime asks rather than parsing the variable a second
+/// time. Query paths that already hold a `SidecarRuntimeConfig` should prefer
+/// `runtime.retrieval.hybrid_enabled`, which additionally honours the
+/// `.codestory.toml` override.
 pub(crate) fn hybrid_retrieval_enabled() -> bool {
-    env_flag_enabled(HYBRID_RETRIEVAL_ENABLED_ENV, true)
-}
-
-fn env_flag_enabled(var_name: &str, default: bool) -> bool {
-    match std::env::var(var_name) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => default,
-        },
-        Err(_) => default,
-    }
+    codestory_retrieval::hybrid_retrieval_enabled_from_process_env()
 }
 
 #[cfg(test)]
@@ -102,6 +102,23 @@ pub(crate) fn clamp_u128_to_u32(v: u128) -> u32 {
 
 pub(crate) fn clamp_usize_to_u32(v: usize) -> u32 {
     v.min(u32::MAX as usize) as u32
+}
+
+/// Publish the source-freshness counters for the public operation currently
+/// running on this thread.
+///
+/// Returns `None` when no public operation armed a scope, so a response built
+/// outside the runtime's operation boundary reports nothing rather than a
+/// misleading zero.
+pub(crate) fn source_freshness_telemetry_for_operation()
+-> Option<codestory_contracts::api::SourceFreshnessTelemetryDto> {
+    codestory_workspace::source_freshness_counts().map(|counts| {
+        codestory_contracts::api::SourceFreshnessTelemetryDto {
+            content_hash_reads: clamp_u64_to_u32(counts.content_hash_reads),
+            verdict_reuses: clamp_u64_to_u32(counts.verdict_reuses),
+            readiness_fingerprint_passes: clamp_u64_to_u32(counts.readiness_fingerprint_passes),
+        }
+    })
 }
 
 const NL_STOPWORDS: &[&str] = &[
@@ -346,40 +363,101 @@ fn is_high_signal_literal_token(token: &str) -> bool {
         && token.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
-pub(crate) fn read_searchable_file_contents(path: &str) -> Option<String> {
-    if let Ok(contents) = std::fs::read_to_string(path) {
-        return Some(contents);
-    }
-
-    #[cfg(windows)]
-    {
-        if let Some(stripped) = path.strip_prefix(r"\\?\")
-            && let Ok(contents) = std::fs::read_to_string(stripped)
-        {
-            return Some(contents);
-        }
-    }
-
-    None
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoundedTextRead {
+    Contents { contents: String, bytes_read: u64 },
+    LimitExceeded { bytes_read: u64 },
+    Unreadable { bytes_read: u64 },
 }
 
-pub(crate) fn read_file_text_limited(
-    path: &Path,
+impl BoundedTextRead {
+    pub(crate) fn bytes_read(&self) -> u64 {
+        match self {
+            Self::Contents { bytes_read, .. }
+            | Self::LimitExceeded { bytes_read }
+            | Self::Unreadable { bytes_read } => *bytes_read,
+        }
+    }
+}
+
+pub(crate) fn read_searchable_file_contents_limited(path: &str, max_bytes: u64) -> BoundedTextRead {
+    #[cfg(windows)]
+    let fallback_path = path.strip_prefix(r"\\?\");
+    #[cfg(not(windows))]
+    let fallback_path = None;
+
+    read_searchable_file_contents_limited_with(
+        path,
+        fallback_path,
+        max_bytes,
+        |read_path, read_limit| read_file_text_limited(Path::new(read_path), read_limit),
+    )
+}
+
+fn read_searchable_file_contents_limited_with(
+    path: &str,
+    fallback_path: Option<&str>,
     max_bytes: u64,
-) -> std::io::Result<Option<String>> {
-    let metadata = std::fs::metadata(path)?;
+    mut read: impl FnMut(&str, u64) -> BoundedTextRead,
+) -> BoundedTextRead {
+    let primary = read(path, max_bytes);
+    if matches!(primary, BoundedTextRead::Unreadable { bytes_read: 0 })
+        && let Some(fallback_path) = fallback_path
+    {
+        return read(fallback_path, max_bytes);
+    }
+    primary
+}
+
+pub(crate) fn read_file_text_limited(path: &Path, max_bytes: u64) -> BoundedTextRead {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return BoundedTextRead::Unreadable { bytes_read: 0 };
+    };
     if metadata.len() > max_bytes {
-        return Ok(None);
+        return BoundedTextRead::LimitExceeded { bytes_read: 0 };
     }
 
-    let file = std::fs::File::open(path)?;
-    let mut reader = file.take(max_bytes.saturating_add(1));
-    let mut contents = String::new();
-    reader.read_to_string(&mut contents)?;
-    if contents.len() as u64 > max_bytes {
-        return Ok(None);
+    let Ok(file) = std::fs::File::open(path) else {
+        return BoundedTextRead::Unreadable { bytes_read: 0 };
+    };
+    read_text_limited(file, max_bytes)
+}
+
+pub(crate) fn read_text_limited(mut reader: impl Read, max_bytes: u64) -> BoundedTextRead {
+    let mut bytes = Vec::new();
+    let mut bytes_read = 0_u64;
+    let read_limit = max_bytes.saturating_add(1);
+    let mut buffer = [0_u8; 8 * 1_024];
+    while (bytes.len() as u64) < read_limit {
+        let remaining = read_limit.saturating_sub(bytes.len() as u64);
+        let chunk_len = buffer
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(buffer.len()));
+        match reader.read(&mut buffer[..chunk_len]) {
+            Ok(0) => break,
+            Ok(count) => {
+                bytes_read = bytes_read.saturating_add(count as u64);
+                if bytes.try_reserve_exact(count).is_err() {
+                    return BoundedTextRead::Unreadable { bytes_read };
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                return BoundedTextRead::Unreadable { bytes_read };
+            }
+        }
     }
-    Ok(Some(contents))
+    if bytes_read > max_bytes {
+        return BoundedTextRead::LimitExceeded { bytes_read };
+    }
+    match String::from_utf8(bytes) {
+        Ok(contents) => BoundedTextRead::Contents {
+            contents,
+            bytes_read,
+        },
+        Err(_) => BoundedTextRead::Unreadable { bytes_read },
+    }
 }
 
 pub(crate) fn aggregate_symbol_matches(
@@ -441,6 +519,74 @@ mod tests {
     use codestory_contracts::graph::{
         NodeId as CoreNodeId, Occurrence, OccurrenceKind, SourceLocation,
     };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct CountingReader {
+        remaining: usize,
+        byte: u8,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = buffer.len().min(self.remaining);
+            buffer[..count].fill(self.byte);
+            self.remaining -= count;
+            self.bytes_read.fetch_add(count, Ordering::SeqCst);
+            Ok(count)
+        }
+    }
+
+    struct FailingReader {
+        remaining_before_error: usize,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    struct InterruptingReader {
+        contents: &'static [u8],
+        position: usize,
+        interrupt_at: usize,
+        interrupted: bool,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl Read for InterruptingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted && self.position == self.interrupt_at {
+                self.interrupted = true;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            let phase_end = if self.interrupted {
+                self.contents.len()
+            } else {
+                self.interrupt_at
+            };
+            let count = buffer.len().min(phase_end.saturating_sub(self.position));
+            if count == 0 {
+                return Ok(0);
+            }
+            buffer[..count].copy_from_slice(&self.contents[self.position..self.position + count]);
+            self.position += count;
+            self.bytes_read.fetch_add(count, Ordering::SeqCst);
+            Ok(count)
+        }
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining_before_error == 0 {
+                return Err(std::io::Error::other("hostile read failure"));
+            }
+            let count = buffer.len().min(self.remaining_before_error);
+            buffer[..count].fill(b'x');
+            self.remaining_before_error -= count;
+            self.bytes_read.fetch_add(count, Ordering::SeqCst);
+            Ok(count)
+        }
+    }
 
     fn occurrence(kind: OccurrenceKind, line: u32) -> Occurrence {
         Occurrence {
@@ -468,5 +614,116 @@ mod tests {
 
         assert_eq!(preferred.kind, OccurrenceKind::DEFINITION);
         assert_eq!(preferred.location.start_line, 20);
+    }
+
+    #[test]
+    fn limited_text_reader_stops_after_cap_overflow_sentinel() {
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let reader = CountingReader {
+            remaining: 4_096,
+            byte: b'x',
+            bytes_read: Arc::clone(&bytes_read),
+        };
+
+        let outcome = read_text_limited(reader, 32);
+
+        assert_eq!(outcome, BoundedTextRead::LimitExceeded { bytes_read: 33 });
+        assert_eq!(bytes_read.load(Ordering::SeqCst), 33);
+    }
+
+    #[test]
+    fn limited_text_reader_charges_invalid_utf8_and_partial_errors() {
+        let invalid_bytes_read = Arc::new(AtomicUsize::new(0));
+        let invalid = read_text_limited(
+            CountingReader {
+                remaining: 31,
+                byte: 0xff,
+                bytes_read: Arc::clone(&invalid_bytes_read),
+            },
+            64,
+        );
+        assert_eq!(invalid, BoundedTextRead::Unreadable { bytes_read: 31 });
+        assert_eq!(invalid_bytes_read.load(Ordering::SeqCst), 31);
+
+        let failed_bytes_read = Arc::new(AtomicUsize::new(0));
+        let failed = read_text_limited(
+            FailingReader {
+                remaining_before_error: 19,
+                bytes_read: Arc::clone(&failed_bytes_read),
+            },
+            64,
+        );
+        assert_eq!(failed, BoundedTextRead::Unreadable { bytes_read: 19 });
+        assert_eq!(failed_bytes_read.load(Ordering::SeqCst), 19);
+    }
+
+    #[test]
+    fn limited_text_reader_retries_interrupted_reads_without_double_charging() {
+        for interrupt_at in [0, 3] {
+            let bytes_read = Arc::new(AtomicUsize::new(0));
+            let outcome = read_text_limited(
+                InterruptingReader {
+                    contents: b"valid text",
+                    position: 0,
+                    interrupt_at,
+                    interrupted: false,
+                    bytes_read: Arc::clone(&bytes_read),
+                },
+                64,
+            );
+
+            assert_eq!(
+                outcome,
+                BoundedTextRead::Contents {
+                    contents: "valid text".to_string(),
+                    bytes_read: 10,
+                }
+            );
+            assert_eq!(bytes_read.load(Ordering::SeqCst), 10);
+        }
+    }
+
+    #[test]
+    fn searchable_file_fallback_never_retries_after_consuming_bytes() {
+        let mut calls = Vec::new();
+        let outcome = read_searchable_file_contents_limited_with(
+            r"\\?\C:\source.rs",
+            Some(r"C:\source.rs"),
+            64,
+            |path, _| {
+                calls.push(path.to_string());
+                BoundedTextRead::Unreadable { bytes_read: 19 }
+            },
+        );
+
+        assert_eq!(outcome, BoundedTextRead::Unreadable { bytes_read: 19 });
+        assert_eq!(calls, vec![r"\\?\C:\source.rs"]);
+
+        let mut calls = Vec::new();
+        let outcome = read_searchable_file_contents_limited_with(
+            r"\\?\C:\source.rs",
+            Some(r"C:\source.rs"),
+            64,
+            |path, _| {
+                calls.push(path.to_string());
+                if calls.len() == 1 {
+                    BoundedTextRead::Unreadable { bytes_read: 0 }
+                } else {
+                    BoundedTextRead::Contents {
+                        contents: "fallback".to_string(),
+                        bytes_read: 8,
+                    }
+                }
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            BoundedTextRead::Contents {
+                contents: "fallback".to_string(),
+                bytes_read: 8,
+            }
+        );
+        assert_eq!(calls, vec![r"\\?\C:\source.rs", r"C:\source.rs"]);
     }
 }

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "codestory",
+  "version": "0.17.0",
+  "description": "CodeStory grounding for coding agents over a local managed runtime.",
+  "author": {
+    "name": "The Green Cedar",
+    "url": "https://github.com/TheGreenCedar"
+  },
+  "homepage": "https://github.com/TheGreenCedar/CodeStory/tree/main/plugins/codestory",
+  "repository": "https://github.com/TheGreenCedar/CodeStory",
+  "license": "Apache-2.0",
+  "keywords": ["codestory", "grounding", "mcp", "local"]
+}

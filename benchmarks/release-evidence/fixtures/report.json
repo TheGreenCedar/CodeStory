@@ -7,11 +7,11 @@
   "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
   "baseline_sha256": "0bbbe6dd8b4000151edf7b1270959d08e94e08db876e7f2372b25613e0f237c1",
   "candidate_path": "benchmarks/release-evidence/fixtures/candidate.json",
-  "candidate_sha256": "35837d94ed1f96016acfc82ad4dfcf7003ba7b840736de06001fc16138b518ab",
+  "candidate_sha256": "d25ad5ee5cf71e2482c98e4430191bf97390de0282c47b85fefc79e15fdf2eb7",
   "artifact_paths": [
     {
       "path": "candidate-stats.json",
-      "sha256": "e30621e112169f65eaae05e1f5b3720f90399a8399f6cf457108645ac47b1e8a",
+      "sha256": "f77378f6e630a9818be4201fc9e369049c05e1aca1aba5fa8b6bfd2dd959e7fd",
       "bytes": 1088
     },
     {
@@ -26,9 +26,9 @@
       "type": "performance",
       "tier": "live_behavior",
       "status": "pass",
-      "graph_sha256": "269b011b112506297d565d734baa2a08e0f31a2bce79037c6c61708abf9a52c9",
-      "observed_at": "2026-07-21T02:13:20.738Z",
-      "expires_at": "2026-07-22T02:13:20.738Z",
+      "graph_sha256": "d3263fef491c5c98462b6be30ba450dbcd73aaa078983c7f657acbb853a1517e",
+      "observed_at": "2026-08-09T12:50:08.593Z",
+      "expires_at": "2026-08-10T12:50:08.593Z",
       "identity": {
         "repository": "TheGreenCedar/CodeStory",
         "commit": "2222222222222222222222222222222222222222",
@@ -47,9 +47,9 @@
       "type": "answer_quality",
       "tier": "answer_quality",
       "status": "pass",
-      "graph_sha256": "269b011b112506297d565d734baa2a08e0f31a2bce79037c6c61708abf9a52c9",
-      "observed_at": "2026-07-21T02:13:20.738Z",
-      "expires_at": "2026-07-22T02:13:20.738Z",
+      "graph_sha256": "d3263fef491c5c98462b6be30ba450dbcd73aaa078983c7f657acbb853a1517e",
+      "observed_at": "2026-08-09T12:50:08.593Z",
+      "expires_at": "2026-08-10T12:50:08.593Z",
       "identity": {
         "repository": "TheGreenCedar/CodeStory",
         "commit": "2222222222222222222222222222222222222222",
@@ -69,10 +69,10 @@
     "schema": "codestory.release-claim-evaluation/v1",
     "status": "pass",
     "graph_schema": "codestory.release-claims/v1",
-    "graph_sha256": "269b011b112506297d565d734baa2a08e0f31a2bce79037c6c61708abf9a52c9",
+    "graph_sha256": "d3263fef491c5c98462b6be30ba450dbcd73aaa078983c7f657acbb853a1517e",
     "evidence_selection": "all_matching_rows_must_pass",
     "expected_commit": "2222222222222222222222222222222222222222",
-    "evaluated_at": "2026-07-21T02:13:20.738Z",
+    "evaluated_at": "2026-08-09T12:50:08.593Z",
     "claims": [
       {
         "id": "answer_quality",

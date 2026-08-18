@@ -11,6 +11,10 @@ on:
         description: Whether marketplace-publish actually updated the public catalog for this release.
         required: true
         type: boolean
+      catalog_delivery_state:
+        description: "Recorded catalog outcome: published, deferred, or restored."
+        required: true
+        type: string
       marketplace_revision:
         description: Immutable published catalog revision. Empty exactly when publication was deferred.
         required: false
@@ -36,6 +40,14 @@ on:
         description: Whether marketplace-publish actually updated the public catalog for this release.
         required: true
         type: boolean
+      catalog_delivery_state:
+        description: "Recorded catalog outcome: published, deferred, or restored."
+        required: true
+        type: choice
+        options:
+          - published
+          - deferred
+          - restored
       marketplace_revision:
         description: Immutable published catalog revision. Empty exactly when publication was deferred.
         required: false
@@ -504,6 +516,7 @@ jobs:
         shell: bash
         env:
           CATALOG_PUBLISHED: ${{ inputs.catalog_published }}
+          CATALOG_DELIVERY_STATE: ${{ inputs.catalog_delivery_state }}
           INPUT_MARKETPLACE_REVISION: ${{ inputs.marketplace_revision }}
           PUBLISHED_COMMIT: ${{ steps.published.outputs.commit }}
         run: |
@@ -513,18 +526,19 @@ jobs:
           printf '%s' "$published_commit" | grep -Eq '^[0-9a-f]{40}$'
           fixture_root="$RUNNER_TEMP/codestory-marketplace-delivery/fixture"
           rm -rf "$fixture_root"
-          if [ "$CATALOG_PUBLISHED" = "true" ]; then
+          if [ "$CATALOG_DELIVERY_STATE" = "published" ] && [ "$CATALOG_PUBLISHED" = "true" ]; then
             marketplace_source=TheGreenCedar/AgentPluginMarketplace
             marketplace_revision="$INPUT_MARKETPLACE_REVISION"
             local_fixture=false
             installer=codex_marketplace_install
             state=published
-          elif [ "$CATALOG_PUBLISHED" = "false" ]; then
+          elif { [ "$CATALOG_DELIVERY_STATE" = "deferred" ] || [ "$CATALOG_DELIVERY_STATE" = "restored" ]; } \
+            && [ "$CATALOG_PUBLISHED" = "false" ]; then
             # The public catalog still points at the previous release, so resolving against it would
             # prove the PREVIOUS release. Pin a catalog to this exact published commit instead: same
             # resolver, same pinned git-subdir source, only the catalog host differs.
             if [ -n "$INPUT_MARKETPLACE_REVISION" ]; then
-              echo "::error::Deferred catalog publication must not carry a live catalog revision."
+              echo "::error::$CATALOG_DELIVERY_STATE catalog delivery must not carry the failed live catalog revision."
               exit 1
             fi
             node .github/scripts/build-marketplace-fixture.mjs \
@@ -534,10 +548,14 @@ jobs:
             marketplace_source="$fixture_root"
             marketplace_revision="$(git -C "$fixture_root" rev-parse HEAD)"
             local_fixture=true
-            installer=codex_marketplace_deferred_fixture
-            state=deferred
+            if [ "$CATALOG_DELIVERY_STATE" = "restored" ]; then
+              installer=codex_marketplace_restored_fixture
+            else
+              installer=codex_marketplace_deferred_fixture
+            fi
+            state="$CATALOG_DELIVERY_STATE"
           else
-            echo "::error::catalog_published must be true or false, not '$CATALOG_PUBLISHED'."
+            echo "::error::catalog delivery handoff is inconsistent: state=$CATALOG_DELIVERY_STATE published=$CATALOG_PUBLISHED."
             exit 1
           fi
           printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'
@@ -550,6 +568,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           if [ "$state" = "deferred" ]; then
             echo "::warning::Catalog publication was deferred for this release. This smoke proves the published assets against a candidate-pinned catalog fixture and records installer $installer; recover the public catalog with marketplace-sync.yml."
+          elif [ "$state" = "restored" ]; then
+            echo "::warning::The public catalog was automatically restored after its live smoke failed. This smoke proves the published assets against a candidate-pinned catalog fixture and records installer $installer."
           fi
           echo "Catalog delivery state: $state (installer $installer, catalog revision $marketplace_revision)." >> "$GITHUB_STEP_SUMMARY"
 
@@ -560,6 +580,7 @@ jobs:
           MARKETPLACE_REVISION: ${{ steps.delivery.outputs.marketplace_revision }}
           MARKETPLACE_SOURCE: ${{ steps.delivery.outputs.marketplace_source }}
           LOCAL_FIXTURE: ${{ steps.delivery.outputs.local_fixture }}
+          INSTALLATION_SOURCE: ${{ steps.delivery.outputs.installer }}
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
@@ -583,6 +604,7 @@ jobs:
             --marketplace-name TheGreenCedar \
             --marketplace-revision "$marketplace_revision" \
             --local-fixture "$LOCAL_FIXTURE" \
+            --installation-source "$INSTALLATION_SOURCE" \
             --expected-version "$RELEASE_VERSION" \
             --source-repository "$GITHUB_WORKSPACE" \
             --attestation "$install_root/install-attestation-v2.json" \
@@ -597,12 +619,19 @@ jobs:
           INSTALLED_PLUGIN_ROOT: ${{ steps.installed.outputs.plugin_root }}
           INSTALLED_ATTESTATION: ${{ steps.installed.outputs.attestation }}
           INSTALLED_PLUGIN_DATA: ${{ steps.installed.outputs.plugin_data }}
+          CATALOG_DELIVERY_STATE: ${{ steps.delivery.outputs.state }}
+          DELIVERED_INSTALLER: ${{ steps.delivery.outputs.installer }}
+          EXPECTED_BACKEND: ${{ matrix.backend }}
         shell: bash
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
-          python .github/scripts/check-packaged-agent-proof.py \
+          proof_root=target/post-publish-installed-proof
+          rm -rf "$proof_root"
+          mkdir -p "$proof_root"
+          common=(
+            python .github/scripts/check-packaged-agent-proof.py
             --archive "$ASSET_ARCHIVE" \
             --checksum-file "$ASSET_CHECKSUM" \
             --expected-version "$RELEASE_VERSION" \
@@ -610,15 +639,49 @@ jobs:
             --plugin-root "$INSTALLED_PLUGIN_ROOT" \
             --plugin-handoff \
             --engine-policy accelerated \
-            --expected-backend "${{ matrix.backend }}" \
+            --expected-backend "$EXPECTED_BACKEND" \
             --proof-tier installed_runtime \
             --server-behavior-only \
             --installed-plugin-attestation "$INSTALLED_ATTESTATION" \
             --installed-plugin-data "$INSTALLED_PLUGIN_DATA" \
             --expected-source-sha "$source_sha" \
             --expected-source-tree "$source_tree" \
-            --timeout-secs 3600 \
-            --out-dir target/post-publish-installed-proof
+            --timeout-secs 3600
+          )
+          now_ms() {
+            python -c 'import time; print(time.time_ns() // 1_000_000)'
+          }
+          session_1_started_ms="$(now_ms)"
+          "${common[@]}" --out-dir "$proof_root/session-1"
+          session_1_finished_ms="$(now_ms)"
+          session_2_started_ms="$(now_ms)"
+          "${common[@]}" --out-dir "$proof_root/session-2"
+          session_2_finished_ms="$(now_ms)"
+          archive_sha256="$(python - "$ASSET_ARCHIVE" <<'PY'
+          import hashlib
+          import sys
+          with open(sys.argv[1], "rb") as source:
+              print(hashlib.file_digest(source, "sha256").hexdigest())
+          PY
+          )"
+          binary_sha256="$(jq -er '.package_contract.manifest.binary.sha256' "$proof_root/session-1/summary.json")"
+          node .github/scripts/restart-survival-receipt.mjs \
+            --session-1-summary "$proof_root/session-1/summary.json" \
+            --session-2-summary "$proof_root/session-2/summary.json" \
+            --install-attestation "$INSTALLED_ATTESTATION" \
+            --catalog-delivery-state "$CATALOG_DELIVERY_STATE" \
+            --expected-installer-identity "$DELIVERED_INSTALLER" \
+            --expected-source-commit "$source_sha" \
+            --expected-source-tree "$source_tree" \
+            --expected-version "$RELEASE_VERSION" \
+            --expected-archive-sha256 "$archive_sha256" \
+            --expected-binary-sha256 "$binary_sha256" \
+            --expected-backend "$EXPECTED_BACKEND" \
+            --session-1-start-ms "$session_1_started_ms" \
+            --session-1-finished-ms "$session_1_finished_ms" \
+            --session-2-start-ms "$session_2_started_ms" \
+            --session-2-finished-ms "$session_2_finished_ms" \
+            --out "$proof_root/restart-survival.json"
 
       - name: Emit authenticated post-publish release cells
         if: inputs.emit_release_cells

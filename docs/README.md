@@ -24,7 +24,7 @@ with portable prompts.
 | Pick a host and install | [User guides](users/README.md) |
 | When to trust agent output | [Trust and readiness](users/trust-and-readiness.md) |
 | Codex plugin path | [Codex guide](users/codex.md) |
-| Cursor rule and MCP | [Cursor guide](users/cursor.md) |
+| Cursor plugin | [Cursor guide](users/cursor.md) |
 | Claude Code hooks | [Claude Code guide](users/claude-code.md) |
 | GitHub Copilot | [Copilot guide](users/copilot.md) |
 | Session blocked or stale output | [Troubleshooting](users/troubleshooting.md) |
@@ -40,6 +40,7 @@ evidence.
 | --- | --- |
 | Local dev setup and verification lanes | [Contributor setup](contributors/getting-started.md) |
 | Which test proves a claim | [Testing matrix](contributors/testing-matrix.md) |
+| Freeze, promote, publish, and close out a release | [Release runbook](contributors/release-runbook.md) |
 | How CodeStory works internally | [Architecture overview](architecture/overview.md) |
 | How the installed plugin reaches native CodeStory | [Host integration](architecture/host-integration.md) |
 | How a request activates and reads a project | [Runtime execution path](architecture/runtime-execution-path.md) |
@@ -49,6 +50,7 @@ evidence.
 | Language support claims | [Language support](architecture/language-support.md) |
 | Timing and benchmark records | [E2E stats log](testing/codestory-e2e-stats-log.md), [language-expansion holdout stats](testing/language-expansion-holdout-stats.md) |
 | Research comparisons | [Research handbook](research.md) |
+| Dated architecture and code-review evidence | [August 2026 architecture review](testing/architecture-review-2026-08.md), [August 2026 code review](testing/code-review-2026-08.md) |
 | Docs maintenance | [Documentation checklist](contributors/documentation-maintenance-checklist.md), [templates](templates/) |
 
 ## Common paths
@@ -73,6 +75,7 @@ evidence.
 | Coverage expectations | [users/what-to-expect.md](users/what-to-expect.md) |
 | Terminology | [glossary.md](glossary.md) |
 | CLI commands and repair transcripts | [users/cli-reference.md](users/cli-reference.md) |
+| Every configuration key and environment variable | [users/configuration-reference.md](users/configuration-reference.md) |
 | Verification lanes and proof tiers | [contributors/testing-matrix.md](contributors/testing-matrix.md) |
 | Host/plugin/native process boundary | [architecture/host-integration.md](architecture/host-integration.md) |
 | Core and retrieval publication | [architecture/retrieval-design.md](architecture/retrieval-design.md) |

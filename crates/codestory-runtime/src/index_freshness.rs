@@ -7,6 +7,9 @@ use super::{
     clamp_usize_to_u32, runtime_relative_path, source_policy_exclusion_candidate,
     validate_source_policy_exclusions, validate_structural_text_units,
 };
+use codestory_workspace::filesystem_observer::{
+    FilesystemObserverCoverage, FilesystemObserverSession, ProvenCoverage,
+};
 #[cfg(test)]
 use std::cell::RefCell;
 use std::io;
@@ -23,6 +26,8 @@ pub(super) const EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP: usize = 80;
 thread_local! {
     static AFTER_INDEX_FRESHNESS_FENCE_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
         const { RefCell::new(None) };
+    static INDEX_FRESHNESS_CAPS_TEST_OVERRIDE: RefCell<Option<(usize, usize)>> =
+        const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -36,6 +41,56 @@ fn run_after_index_freshness_fence_test_hook() {
     if let Some(hook) = hook {
         hook();
     }
+}
+
+fn index_freshness_caps() -> (usize, usize) {
+    #[cfg(test)]
+    if let Some(caps) = INDEX_FRESHNESS_CAPS_TEST_OVERRIDE.with(|slot| *slot.borrow()) {
+        return caps;
+    }
+    (
+        INDEX_FRESHNESS_INDEXED_FILE_CAP,
+        INDEX_FRESHNESS_CURRENT_FILE_CAP,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn with_index_freshness_caps_for_test<T>(
+    indexed_file_cap: usize,
+    current_file_cap: usize,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct ResetCaps(Option<(usize, usize)>);
+
+    impl Drop for ResetCaps {
+        fn drop(&mut self) {
+            INDEX_FRESHNESS_CAPS_TEST_OVERRIDE.with(|slot| *slot.borrow_mut() = self.0);
+        }
+    }
+
+    let previous = INDEX_FRESHNESS_CAPS_TEST_OVERRIDE
+        .with(|slot| slot.replace(Some((indexed_file_cap, current_file_cap))));
+    let _reset = ResetCaps(previous);
+    run()
+}
+
+/// Whether a freshness read may arm a filesystem observer around its discovery scan.
+///
+/// Observational surfaces — `status`, `doctor`, dry-run inventory — read what already exists and
+/// never create observers, so they pass [`Self::Unobserved`]. Reads that authorise serving arm
+/// one, because their verdict is the thing an observer can keep honest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FreshnessObservationPolicy {
+    Unobserved,
+    ObserveSourceRoot,
+}
+
+/// The observation a single freshness check runs inside.
+pub(super) enum FreshnessObservation<'a> {
+    /// No observer. The scan verdict is exactly what EV-7 computed, with its existing bounds.
+    Unobserved,
+    /// An armed session over the project root, sealed around the discovery scan.
+    Observed(&'a FilesystemObserverSession),
 }
 
 /// A freshness check that produced no verdict, carrying why.
@@ -134,6 +189,7 @@ pub(super) fn index_freshness_observation_from_storage(
     workspace: &WorkspaceManifest,
     storage: &Storage,
     policy: &SourceIndexPolicy,
+    observation: FreshnessObservation<'_>,
 ) -> IndexFreshnessObservation {
     let mut identities = AffectedOperationIdentityIndex::native();
     index_freshness_observation_from_storage_with_identities(
@@ -142,6 +198,7 @@ pub(super) fn index_freshness_observation_from_storage(
         storage,
         policy,
         &mut identities,
+        observation,
     )
 }
 
@@ -160,6 +217,13 @@ struct IndexFreshnessInventory {
 struct IndexFreshnessPlan {
     plan: codestory_contracts::workspace::RefreshPlan,
     current_policy_exclusions: Vec<codestory_workspace::OversizedSourceExclusionCandidate>,
+    admitted_file_count: usize,
+}
+
+#[derive(Clone, Copy)]
+enum IndexFreshnessInventoryBound {
+    Bounded,
+    Complete,
 }
 
 struct IndexFreshnessChanges {
@@ -215,6 +279,7 @@ fn validate_index_freshness_publication(
 
 fn load_index_freshness_inventory(
     storage: &Storage,
+    bound: IndexFreshnessInventoryBound,
 ) -> Result<IndexFreshnessInventory, (NotCheckedReason, u32)> {
     let files = storage.get_files().map_err(|error| {
         (
@@ -231,12 +296,13 @@ fn load_index_freshness_inventory(
             indexed_file_count,
         ));
     }
-    if files.len() > INDEX_FRESHNESS_INDEXED_FILE_CAP {
+    let (indexed_file_cap, _) = index_freshness_caps();
+    if matches!(bound, IndexFreshnessInventoryBound::Bounded) && files.len() > indexed_file_cap {
         return Err((
             NotCheckedReason::bounded(format!(
                 "indexed file inventory exceeds bounded freshness cap ({} > {})",
                 files.len(),
-                INDEX_FRESHNESS_INDEXED_FILE_CAP,
+                indexed_file_cap,
             )),
             indexed_file_count,
         ));
@@ -281,16 +347,23 @@ fn plan_index_freshness(
     workspace: &WorkspaceManifest,
     inventory: &IndexFreshnessInventory,
     policy: &SourceIndexPolicy,
+    bound: IndexFreshnessInventoryBound,
 ) -> Result<IndexFreshnessPlan, NotCheckedReason> {
-    let refresh = workspace
-        .build_execution_outcome_bounded_with_policy(
-            &inventory.refresh_inputs,
-            INDEX_FRESHNESS_CURRENT_FILE_CAP,
-            policy,
-        )
-        .map_err(|error| {
-            NotCheckedReason::unavailable(format!("failed to check workspace inventory: {error}"))
-        })?;
+    let (_, current_file_cap) = index_freshness_caps();
+    let refresh = match bound {
+        IndexFreshnessInventoryBound::Bounded => workspace
+            .build_execution_outcome_bounded_with_policy(
+                &inventory.refresh_inputs,
+                current_file_cap,
+                policy,
+            ),
+        IndexFreshnessInventoryBound::Complete => {
+            workspace.build_execution_outcome_with_policy(&inventory.refresh_inputs, policy)
+        }
+    }
+    .map_err(|error| {
+        NotCheckedReason::unavailable(format!("failed to check workspace inventory: {error}"))
+    })?;
     if refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
         let detail = refresh
             .refresh
@@ -305,7 +378,7 @@ fn plan_index_freshness(
             )),
             None => NotCheckedReason::bounded(format!(
                 "current workspace inventory is {:?} (>{})",
-                refresh.refresh.inventory_outcome, INDEX_FRESHNESS_CURRENT_FILE_CAP
+                refresh.refresh.inventory_outcome, current_file_cap
             )),
         });
     }
@@ -313,7 +386,29 @@ fn plan_index_freshness(
     Ok(IndexFreshnessPlan {
         plan: refresh.refresh.plan,
         current_policy_exclusions: refresh.policy_exclusions,
+        admitted_file_count: refresh.admitted_file_count,
     })
+}
+
+fn complete_scan_within_bounded_caps(
+    inventory: &IndexFreshnessInventory,
+    planned: &IndexFreshnessPlan,
+) -> Result<(), NotCheckedReason> {
+    let (indexed_file_cap, current_file_cap) = index_freshness_caps();
+    let indexed_file_count = inventory.removed_paths.len();
+    if indexed_file_count > indexed_file_cap {
+        return Err(NotCheckedReason::bounded(format!(
+            "indexed file inventory exceeds bounded freshness cap ({indexed_file_count} > {indexed_file_cap})"
+        )));
+    }
+    if planned.admitted_file_count > current_file_cap {
+        return Err(NotCheckedReason::bounded(format!(
+            "current workspace inventory is {:?} (>{})",
+            WorkspaceInventoryOutcome::Bounded,
+            current_file_cap
+        )));
+    }
+    Ok(())
 }
 
 fn classify_index_freshness_changes(
@@ -472,6 +567,7 @@ pub(super) fn index_freshness_observation_from_storage_with_identities<R>(
     storage: &Storage,
     policy: &SourceIndexPolicy,
     identities: &mut AffectedOperationIdentityIndex<R>,
+    observation: FreshnessObservation<'_>,
 ) -> IndexFreshnessObservation
 where
     R: FnMut(&Path) -> io::Result<WorkspacePathIdentity>,
@@ -507,8 +603,52 @@ where
     #[cfg(test)]
     run_after_index_freshness_fence_test_hook();
 
-    let inventory = match load_index_freshness_inventory(storage) {
-        Ok(inventory) => inventory,
+    // The observer is armed before the scan and sealed after it, so its window is exactly the
+    // stretch during which the scan's answer could go out of date underneath it.
+    let (scan, coverage) = match observation {
+        FreshnessObservation::Unobserved => (
+            load_index_freshness_inventory(storage, IndexFreshnessInventoryBound::Bounded)
+                .and_then(|inventory| {
+                    let indexed_file_count = inventory.indexed_file_count;
+                    match plan_index_freshness(
+                        workspace,
+                        &inventory,
+                        policy,
+                        IndexFreshnessInventoryBound::Bounded,
+                    ) {
+                        Ok(planned) => Ok((inventory, planned)),
+                        Err(reason) => Err((reason, indexed_file_count)),
+                    }
+                }),
+            None,
+        ),
+        FreshnessObservation::Observed(session) => {
+            let (mut scan, coverage) = session.observe_window(|| {
+                load_index_freshness_inventory(storage, IndexFreshnessInventoryBound::Complete)
+                    .and_then(|inventory| {
+                        let indexed_file_count = inventory.indexed_file_count;
+                        match plan_index_freshness(
+                            workspace,
+                            &inventory,
+                            policy,
+                            IndexFreshnessInventoryBound::Complete,
+                        ) {
+                            Ok(planned) => Ok((inventory, planned)),
+                            Err(reason) => Err((reason, indexed_file_count)),
+                        }
+                    })
+            });
+            if coverage.proven().is_none()
+                && let Ok((inventory, planned)) = &scan
+                && let Err(reason) = complete_scan_within_bounded_caps(inventory, planned)
+            {
+                scan = Err((reason, inventory.indexed_file_count));
+            }
+            (scan, Some(coverage))
+        }
+    };
+    let (inventory, planned) = match scan {
+        Ok(scan) => scan,
         Err((reason, indexed_file_count)) => {
             return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
                 reason,
@@ -517,20 +657,10 @@ where
             ));
         }
     };
-    let planned = match plan_index_freshness(workspace, &inventory, policy) {
-        Ok(planned) => planned,
-        Err(reason) => {
-            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
-                reason,
-                inventory.indexed_file_count,
-                started_at,
-            ));
-        }
-    };
     let changes = classify_index_freshness_changes(root, &inventory, &planned);
     let identity =
         account_index_freshness_identities(&planned, &inventory.removed_paths, identities);
-    let status = if changes.changed_file_count == 0
+    let mut status = if changes.changed_file_count == 0
         && changes.new_file_count == 0
         && changes.removed_file_count == 0
     {
@@ -543,18 +673,47 @@ where
         .saturating_sub(changes.removed_file_count)
         .saturating_add(changes.new_file_count);
 
+    let mut changed_file_count = changes.changed_file_count;
+    let mut samples = changes.samples;
+    let mut reason = None;
+    if let Some(gap) = coverage.as_ref().and_then(FilesystemObserverCoverage::gap) {
+        // The only symptom of a self-disabling observer is that reads keep saying `Fresh`. An
+        // operator asking why a repository is never observed needs the gap id to answer it.
+        tracing::debug!(
+            root = %root.display(),
+            gap = gap.id(),
+            detail = %gap.detail(),
+            "freshness observation sealed indeterminate; the scan verdict stands unchanged"
+        );
+    }
+    if status == IndexFreshnessStatusDto::Fresh
+        && let Some(escalation) = observer_escalation(
+            root,
+            &inventory,
+            &planned,
+            coverage
+                .as_ref()
+                .and_then(FilesystemObserverCoverage::proven),
+        )
+    {
+        status = IndexFreshnessStatusDto::Stale;
+        changed_file_count = escalation.changed_file_count;
+        samples = escalation.samples;
+        reason = Some(escalation.reason);
+    }
+
     IndexFreshnessObservation {
         freshness: IndexFreshnessDto {
             status,
-            changed_file_count: changes.changed_file_count,
+            changed_file_count,
             new_file_count: changes.new_file_count,
             removed_file_count: changes.removed_file_count,
             checked_file_count,
             indexed_file_count: inventory.indexed_file_count,
             duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
-            reason: None,
+            reason,
             not_checked_cause: None,
-            samples: changes.samples,
+            samples,
         },
         inventory_complete: identity.gap_count == 0,
         admitted_identities: identity.admitted_identities,
@@ -564,13 +723,140 @@ where
     }
 }
 
+/// A `Fresh` verdict the observer proved was answered about a tree that moved.
+struct ObserverEscalation {
+    reason: String,
+    samples: Vec<IndexFreshnessSampleDto>,
+    changed_file_count: u32,
+}
+
+/// Decide what a sealed observation window adds to a `Fresh` scan verdict.
+///
+/// The observer may only ever move the verdict toward less certainty, so this returns `Some`
+/// exactly when the window proves the scan raced a change it cannot have accounted for, and
+/// `None` in every other case — including every case where the observer knows nothing. An
+/// indeterminate window (no observer, unsupported filesystem, dropped events, exhausted budget)
+/// leaves the EV-7 verdict standing untouched; that fallback is the floor, not a degraded mode.
+///
+/// Only paths discovery itself admitted are considered. A repository builds, checks out branches,
+/// and writes caches while a scan runs, and treating `target/` or `.git/` churn as source drift
+/// would leave freshness permanently escalated for no reason a caller could act on.
+fn observer_escalation(
+    root: &Path,
+    inventory: &IndexFreshnessInventory,
+    planned: &IndexFreshnessPlan,
+    coverage: Option<&ProvenCoverage>,
+) -> Option<ObserverEscalation> {
+    let coverage = coverage?;
+    if coverage.is_quiet() {
+        return None;
+    }
+
+    let mut admitted_files = HashMap::<PathBuf, &Path>::new();
+    let mut admitted_directories = HashSet::<PathBuf>::new();
+    for path in planned
+        .plan
+        .existing_file_ids
+        .keys()
+        .chain(planned.plan.files_to_index.iter())
+    {
+        let Some(relative) = codestory_workspace::workspace_relative_path(root, path) else {
+            continue;
+        };
+        for ancestor in relative.ancestors().skip(1) {
+            if !admitted_directories.insert(ancestor.to_path_buf()) {
+                break;
+            }
+        }
+        admitted_files.insert(relative, path.as_path());
+    }
+    let stored_by_relative_path = inventory
+        .refresh_inputs
+        .stored_files
+        .iter()
+        .filter_map(|file| {
+            codestory_workspace::workspace_relative_path(root, &file.path)
+                .map(|relative| (relative, file))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut escalating = Vec::new();
+    // A file-scoped mutation names one path, so rehashing it settles whether the scan's answer
+    // for that path is still true.
+    let mut contested = Vec::new();
+    for observed in coverage.dirty_paths() {
+        let Some(relative) = codestory_workspace::workspace_relative_path(root, observed) else {
+            continue;
+        };
+        let Some(indexed_path) = admitted_files.get(&relative) else {
+            continue;
+        };
+        contested.push((relative, *indexed_path));
+    }
+    if !contested.is_empty() {
+        // The operation-scoped verdict memo already holds an answer for these paths: the scan
+        // this window just sealed recorded one, taken *before* the mutation the observer is
+        // reporting. Letting the memo answer here would have the escalation agree with the very
+        // verdict it exists to falsify, and same-mtime same-length drift — the one shape only a
+        // content read sees — would pass. Drop it so the re-check below re-reads content, on the
+        // same terms as the post-build refusal. Nothing is dropped on a quiet window, so the
+        // memo still spans an operation whose observer saw no admitted path move.
+        codestory_workspace::reverify_source_freshness_from_content();
+    }
+    for (relative, indexed_path) in contested {
+        let drifted = match stored_by_relative_path.get(&relative) {
+            Some(stored) => codestory_workspace::stored_file_requires_reindex(indexed_path, stored),
+            // Discovery admitted a path it has no stored record for, which is drift by itself.
+            None => true,
+        };
+        if drifted {
+            escalating.push((IndexFreshnessChangeKindDto::Changed, relative));
+        }
+    }
+    // A directory-scoped mutation names no file, so nothing short of rescanning that scope can
+    // settle it. Escalating is the only answer that stays correct without a hidden broad pass.
+    for observed in coverage.rescan_roots() {
+        let Some(relative) = codestory_workspace::workspace_relative_path(root, observed) else {
+            continue;
+        };
+        if admitted_directories.contains(&relative) {
+            escalating.push((IndexFreshnessChangeKindDto::Changed, relative));
+        }
+    }
+    if escalating.is_empty() {
+        return None;
+    }
+
+    escalating.sort_by(|left, right| left.1.cmp(&right.1));
+    escalating.dedup_by(|left, right| left.1 == right.1);
+    let changed_file_count = clamp_usize_to_u32(escalating.len());
+    let samples = escalating
+        .into_iter()
+        .take(INDEX_FRESHNESS_SAMPLE_LIMIT)
+        .map(|(kind, relative)| IndexFreshnessSampleDto {
+            kind,
+            path: relative.to_string_lossy().replace('\\', "/"),
+        })
+        .collect();
+    Some(ObserverEscalation {
+        reason: format!(
+            "source_changed_during_freshness_scan_observed_by_{}",
+            coverage.identity().backend().id()
+        ),
+        samples,
+        changed_file_count,
+    })
+}
+
 pub(super) fn index_freshness_from_storage_with_policy(
     root: &Path,
     workspace: &WorkspaceManifest,
     storage: &Storage,
     policy: &SourceIndexPolicy,
+    observation: FreshnessObservation<'_>,
 ) -> IndexFreshnessDto {
-    index_freshness_observation_from_storage(root, workspace, storage, policy).freshness
+    index_freshness_observation_from_storage(root, workspace, storage, policy, observation)
+        .freshness
 }
 
 #[cfg(test)]
@@ -584,6 +870,7 @@ pub(super) fn index_freshness_from_storage(
         workspace,
         storage,
         &SourceIndexPolicy::default(),
+        FreshnessObservation::Unobserved,
     )
 }
 

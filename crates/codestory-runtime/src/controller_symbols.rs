@@ -1,3 +1,4 @@
+use crate::agent::packet_evidence::decorate_lexical_search_hit_evidence;
 use crate::route_coverage::{
     RouteHandlerCandidate, compare_route_handler_candidates,
     route_endpoint_metadata_from_canonical, route_endpoint_metadata_from_openapi_label,
@@ -17,6 +18,22 @@ use codestory_contracts::api::{
 use codestory_contracts::graph::Node as GraphNode;
 use std::collections::{HashMap, HashSet};
 
+/// Copy only the cached display names the caller can still read back.
+///
+/// Consumers look names up by candidate ID, so the copy is bounded by the
+/// candidate set instead of by the size of the indexed symbol table.
+pub(crate) fn node_names_for_ids<I>(
+    node_names: &HashMap<codestory_contracts::graph::NodeId, String>,
+    ids: I,
+) -> HashMap<codestory_contracts::graph::NodeId, String>
+where
+    I: IntoIterator<Item = codestory_contracts::graph::NodeId>,
+{
+    ids.into_iter()
+        .filter_map(|id| node_names.get(&id).map(|name| (id, name.clone())))
+        .collect()
+}
+
 impl AppController {
     pub(crate) fn cached_labels<I>(
         &self,
@@ -26,9 +43,7 @@ impl AppController {
         I: IntoIterator<Item = codestory_contracts::graph::NodeId>,
     {
         let s = self.state.lock();
-        ids.into_iter()
-            .filter_map(|id| s.node_names.get(&id).cloned().map(|name| (id, name)))
-            .collect()
+        node_names_for_ids(&s.node_names, ids)
     }
 
     pub(crate) fn file_path_for_node(
@@ -81,16 +96,12 @@ impl AppController {
         }))
     }
 
-    pub(crate) fn symbol_summary_for_node(
+    fn symbol_summary_for_node(
         storage: &Storage,
         labels_by_id: &HashMap<codestory_contracts::graph::NodeId, String>,
         node: codestory_contracts::graph::Node,
+        has_children: bool,
     ) -> Result<SymbolSummaryDto, ApiError> {
-        let has_children = !storage
-            .get_children_symbols(node.id)
-            .map_err(|e| ApiError::internal(format!("Failed to load child symbols: {e}")))?
-            .is_empty();
-
         let label = labels_by_id
             .get(&node.id)
             .cloned()
@@ -103,6 +114,29 @@ impl AppController {
             file_path: Self::file_path_for_node(storage, &node)?,
             has_children,
         })
+    }
+
+    /// Render symbol summaries for an already sorted, deduped, truncated list.
+    ///
+    /// Child presence is one batched lookup for the whole rendered window, so
+    /// the batch is bounded by what the response actually carries.
+    pub(crate) fn symbol_summaries_for_nodes(
+        storage: &Storage,
+        labels_by_id: &HashMap<codestory_contracts::graph::NodeId, String>,
+        nodes: Vec<codestory_contracts::graph::Node>,
+    ) -> Result<Vec<SymbolSummaryDto>, ApiError> {
+        let node_ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+        let node_ids_with_children = storage
+            .node_ids_with_child_symbols(&node_ids)
+            .map_err(|e| ApiError::internal(format!("Failed to load child symbols: {e}")))?;
+
+        nodes
+            .into_iter()
+            .map(|node| {
+                let has_children = node_ids_with_children.contains(&node.id);
+                Self::symbol_summary_for_node(storage, labels_by_id, node, has_children)
+            })
+            .collect()
     }
 
     pub(crate) fn dedupe_symbol_nodes(
@@ -144,10 +178,9 @@ impl AppController {
             let engine = s.search_engine.as_mut().ok_or_else(|| {
                 ApiError::invalid_argument("Search engine not initialized. Open a project first.")
             })?;
-            (
-                engine.search_symbol_with_scores(query),
-                s.node_names.clone(),
-            )
+            let matches = engine.search_symbol_with_scores(query);
+            let node_names = node_names_for_ids(&s.node_names, matches.iter().map(|(id, _)| *id));
+            (matches, node_names)
         };
 
         let mut hits = matches
@@ -156,6 +189,10 @@ impl AppController {
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
+            .map(|mut hit| {
+                decorate_lexical_search_hit_evidence(&mut hit);
+                hit
+            })
             .collect::<Vec<_>>();
         let project_root = self.require_project_root().ok();
         hits.sort_by(|left, right| {
@@ -185,10 +222,7 @@ impl AppController {
             roots.truncate(limit);
         }
 
-        roots
-            .into_iter()
-            .map(|node| Self::symbol_summary_for_node(&storage, &labels_by_id, node))
-            .collect()
+        Self::symbol_summaries_for_nodes(&storage, &labels_by_id, roots)
     }
 
     pub fn list_children_symbols(
@@ -206,10 +240,7 @@ impl AppController {
 
         let labels_by_id = self.cached_labels(children.iter().map(|node| node.id));
         children = Self::dedupe_symbol_nodes(children, &labels_by_id);
-        children
-            .into_iter()
-            .map(|node| Self::symbol_summary_for_node(&storage, &labels_by_id, node))
-            .collect()
+        Self::symbol_summaries_for_nodes(&storage, &labels_by_id, children)
     }
 
     /// Build an answer from indexed source and sidecar-primary retrieval.
@@ -390,13 +421,11 @@ impl AppController {
         storage: &Storage,
         route_node: &GraphNode,
     ) -> Option<RouteEndpointHandlerDto> {
-        let edges = storage.get_edges().ok()?;
+        let edges = storage
+            .get_raw_call_edges_by_effective_source(route_node.id)
+            .ok()?;
         let mut candidates = edges
             .into_iter()
-            .filter(|edge| {
-                edge.kind == codestory_contracts::graph::EdgeKind::CALL
-                    && edge.effective_source() == route_node.id
-            })
             .filter_map(|edge| {
                 let target = storage.get_node(edge.effective_target()).ok().flatten()?;
                 let terminal = target

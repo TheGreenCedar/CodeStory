@@ -17,7 +17,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,10 @@ const VECTOR_GENERATION_MANIFEST_FILE: &str = "vector-generation-manifest.json";
 const VECTOR_GENERATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const VECTOR_DIGEST_DOMAIN: &[u8] = b"codestory-vector-digest-v1\0";
 const VECTOR_NORM_TOLERANCE: f64 = 1.0e-3;
+/// Minimum cosine supported by the source-backed development calibration.
+const DENSE_ABSTENTION_ABSOLUTE_FLOOR: f32 = 0.30;
+/// Maximum distance from the lane's best cosine supported by that calibration.
+const DENSE_ABSTENTION_ADDITIVE_MARGIN: f32 = 0.10;
 type ScoredHit = (
     f32,
     String,
@@ -707,6 +711,65 @@ impl EmbeddedVectorIndex {
         Ok(manifest)
     }
 
+    /// Load vectors from one immutable predecessor only after its complete
+    /// database and producer contract have been revalidated. Callers still
+    /// match by both node and document hash before admitting a reused row.
+    pub(crate) fn load_reusable_vectors(
+        layout: &SidecarLayout,
+        collection: &str,
+        expected_evidence: &EmbeddingVectorProducerEvidenceDto,
+        contract: &VectorEvidenceContract,
+    ) -> Result<HashMap<(String, String), Vec<f32>>> {
+        let manifest = Self::load_generation_manifest(layout, collection)?;
+        let mismatches = producer_evidence_mismatches(expected_evidence, &manifest.evidence);
+        if !mismatches.is_empty() {
+            bail!(
+                "reusable vector producer evidence is incompatible: {}",
+                mismatches.join(", ")
+            );
+        }
+        let path = index_path(layout, collection);
+        let connection = open_read_only(&path)?;
+        let mut statement = connection
+            .prepare("SELECT node_id, document_hash, vector FROM vectors ORDER BY node_id")?;
+        let mut rows = statement.query([])?;
+        let mut expected_anchors = BTreeMap::new();
+        let mut vectors = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let node_id = row.get::<_, String>(0)?;
+            let document_hash = row.get::<_, String>(1)?;
+            let bytes = row.get::<_, Vec<u8>>(2)?;
+            validate_vector_bytes(&node_id, &bytes, contract.embedding_dim)?;
+            if expected_anchors
+                .insert(node_id.clone(), document_hash.clone())
+                .is_some()
+            {
+                bail!("duplicate reusable embedded vector anchor {node_id}");
+            }
+            let vector = bytes
+                .chunks_exact(4)
+                .map(|chunk| {
+                    f32::from_bits(u32::from_le_bytes(
+                        chunk.try_into().expect("four-byte vector chunk"),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            vectors.insert((node_id, document_hash), vector);
+        }
+        drop(rows);
+        drop(statement);
+        drop(connection);
+        validate_database(
+            &path,
+            &manifest.vectors.generation,
+            &manifest.vectors.input_hash,
+            contract,
+            &expected_anchors,
+            Some(&manifest.vectors),
+        )?;
+        Ok(vectors)
+    }
+
     pub(crate) fn health(
         layout: &SidecarLayout,
         collection: &str,
@@ -767,6 +830,48 @@ impl EmbeddedVectorIndex {
             &vector,
             limit,
             move || context.is_cancelled(),
+        )
+    }
+
+    pub(crate) fn search_batch(
+        &self,
+        queries: &[String],
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<Vec<CandidateHit>>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut vectors = Vec::with_capacity(queries.len());
+        for query_batch in
+            queries.chunks(crate::per_user_embedding::PER_USER_EMBEDDING_QUERY_BATCH_MAX)
+        {
+            let timeout = context.timeout(std::time::Duration::from_secs(2))?;
+            let batch_vectors =
+                self.embedding
+                    .embed_queries_with_control(query_batch, Some(timeout), &|| {
+                        context.is_cancelled()
+                    })?;
+            if batch_vectors.len() != query_batch.len() {
+                bail!(
+                    "embedding_vector_row_count_mismatch: expected={} observed={}",
+                    query_batch.len(),
+                    batch_vectors.len()
+                );
+            }
+            vectors.extend(batch_vectors);
+        }
+        context.check_cancelled()?;
+        let vector_queries = vectors
+            .iter()
+            .map(|vector| (vector.as_slice(), limit))
+            .collect::<Vec<_>>();
+        search_database_batch(
+            &self.path,
+            &self.generation,
+            &self.input_hash,
+            &vector_queries,
+            || context.is_cancelled(),
         )
     }
 }
@@ -999,7 +1104,7 @@ fn write_database(
     Ok(actual_anchors)
 }
 
-fn validate_database(
+pub(crate) fn validate_database(
     path: &Path,
     generation: &str,
     input_hash: &str,
@@ -1328,7 +1433,41 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
         .collect()
 }
 
-fn search_database(
+/// Read every published vector back out of a generation.
+///
+/// The bake-off builds candidate backends from exactly the bytes the shipped
+/// scan reads, so a candidate cannot be measured against a friendlier copy of
+/// the corpus than the incumbent gets.
+#[cfg(feature = "benchmark-support")]
+pub(crate) fn read_published_vectors_for_benchmark(
+    path: &Path,
+    embedding_dim: usize,
+) -> Result<Vec<(String, Vec<f32>)>> {
+    let connection = open_read_only(path)?;
+    let mut statement =
+        connection.prepare("SELECT node_id, vector FROM vectors ORDER BY node_id ASC")?;
+    let mut rows = statement.query([])?;
+    let mut vectors = Vec::new();
+    while let Some(row) = rows.next()? {
+        let node_id: String = row.get(0)?;
+        let bytes: Vec<u8> = row.get(1)?;
+        validate_vector_bytes(&node_id, &bytes, embedding_dim)?;
+        vectors.push((
+            node_id,
+            bytes
+                .chunks_exact(4)
+                .map(|chunk| {
+                    f32::from_bits(u32::from_le_bytes(
+                        chunk.try_into().expect("four-byte vector chunk"),
+                    ))
+                })
+                .collect(),
+        ));
+    }
+    Ok(vectors)
+}
+
+pub(crate) fn search_database(
     path: &Path,
     generation: &str,
     input_hash: &str,
@@ -1336,8 +1475,52 @@ fn search_database(
     limit: usize,
     cancelled: impl Fn() -> bool,
 ) -> Result<Vec<CandidateHit>> {
-    if limit == 0 {
+    search_database_with_abstention(path, generation, input_hash, query, limit, cancelled, true)
+}
+
+fn search_database_with_abstention(
+    path: &Path,
+    generation: &str,
+    input_hash: &str,
+    query: &[f32],
+    limit: usize,
+    cancelled: impl Fn() -> bool,
+    apply_abstention: bool,
+) -> Result<Vec<CandidateHit>> {
+    let mut results = search_database_batch_with_abstention(
+        path,
+        generation,
+        input_hash,
+        &[(query, limit)],
+        cancelled,
+        apply_abstention,
+    )?;
+    Ok(results.pop().unwrap_or_default())
+}
+
+pub(crate) fn search_database_batch(
+    path: &Path,
+    generation: &str,
+    input_hash: &str,
+    queries: &[(&[f32], usize)],
+    cancelled: impl Fn() -> bool,
+) -> Result<Vec<Vec<CandidateHit>>> {
+    search_database_batch_with_abstention(path, generation, input_hash, queries, cancelled, true)
+}
+
+fn search_database_batch_with_abstention(
+    path: &Path,
+    generation: &str,
+    input_hash: &str,
+    queries: &[(&[f32], usize)],
+    cancelled: impl Fn() -> bool,
+    apply_abstention: bool,
+) -> Result<Vec<Vec<CandidateHit>>> {
+    if queries.is_empty() {
         return Ok(Vec::new());
+    }
+    if queries.iter().all(|(_, limit)| *limit == 0) {
+        return Ok(vec![Vec::new(); queries.len()]);
     }
     let connection = open_read_only(path)?;
     let (stored_generation, stored_hash, stored_dim): (String, String, i64) = connection
@@ -1348,55 +1531,94 @@ fn search_database(
         )?;
     if stored_generation != generation
         || stored_hash != input_hash
-        || stored_dim != query.len() as i64
+        || queries
+            .iter()
+            .any(|(query, limit)| *limit != 0 && stored_dim != query.len() as i64)
     {
         bail!("embedded vector index publication identity changed");
     }
-    if query.is_empty() || query.iter().any(|value| !value.is_finite()) {
-        bail!("embedded vector query is empty or contains a non-finite value");
-    }
-    let query_norm = query
+    let query_norms = queries
         .iter()
-        .map(|value| f64::from(*value) * f64::from(*value))
-        .sum::<f64>()
-        .sqrt();
-    if !query_norm.is_finite() || query_norm <= f64::EPSILON {
-        bail!("embedded vector query has zero or invalid norm");
-    }
+        .map(|(query, limit)| {
+            if *limit == 0 {
+                return Ok(0.0);
+            }
+            if query.is_empty() || query.iter().any(|value| !value.is_finite()) {
+                bail!("embedded vector query is empty or contains a non-finite value");
+            }
+            let query_norm = query
+                .iter()
+                .map(|value| f64::from(*value) * f64::from(*value))
+                .sum::<f64>()
+                .sqrt();
+            if !query_norm.is_finite() || query_norm <= f64::EPSILON {
+                bail!("embedded vector query has zero or invalid norm");
+            }
+            Ok(query_norm)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut statement = connection.prepare(
         "SELECT node_id, display_name, file_path, file_role, dense_reason, vector FROM vectors",
     )?;
     let mut rows = statement.query([])?;
-    let mut scored = Vec::with_capacity(limit);
+    let mut scored = queries
+        .iter()
+        .map(|(_, limit)| Vec::with_capacity(*limit))
+        .collect::<Vec<Vec<ScoredHit>>>();
     while let Some(row) = rows.next()? {
         if cancelled() {
             bail!("embedded vector search cancelled");
         }
         let bytes: Vec<u8> = row.get(5)?;
-        let score = cosine_similarity_bytes(query, query_norm, &bytes)?;
-        let candidate = (
-            score,
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<String>>(4)?,
-        );
-        if scored.len() < limit {
-            scored.push(candidate);
-            continue;
-        }
-        let (worst_index, worst) = scored
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| compare_scored_hits(left, right))
-            .expect("non-empty bounded score set");
-        if compare_scored_hits(&candidate, worst) == Ordering::Less {
-            scored[worst_index] = candidate;
+        let node_id = row.get::<_, String>(0)?;
+        let display_name = row.get::<_, String>(1)?;
+        let file_path = row.get::<_, Option<String>>(2)?;
+        let file_role = row.get::<_, Option<String>>(3)?;
+        let dense_reason = row.get::<_, Option<String>>(4)?;
+        for (query_index, ((query, limit), query_norm)) in
+            queries.iter().zip(&query_norms).enumerate()
+        {
+            if *limit == 0 {
+                continue;
+            }
+            let score = cosine_similarity_bytes(query, *query_norm, &bytes)?;
+            let candidate = (
+                score,
+                node_id.clone(),
+                display_name.clone(),
+                file_path.clone(),
+                file_role.clone(),
+                dense_reason.clone(),
+            );
+            let query_scored = &mut scored[query_index];
+            if query_scored.len() < *limit {
+                query_scored.push(candidate);
+                continue;
+            }
+            let (worst_index, worst) = query_scored
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| compare_scored_hits(left, right))
+                .expect("non-empty bounded score set");
+            if compare_scored_hits(&candidate, worst) == Ordering::Less {
+                query_scored[worst_index] = candidate;
+            }
         }
     }
-    scored.sort_unstable_by(compare_scored_hits);
-    Ok(scored
+    scored
+        .into_iter()
+        .map(|mut scored| {
+            scored.sort_unstable_by(compare_scored_hits);
+            if apply_abstention {
+                retain_dense_evidence(&mut scored);
+            }
+            Ok(scored_hits_to_candidates(scored))
+        })
+        .collect()
+}
+
+fn scored_hits_to_candidates(scored: Vec<ScoredHit>) -> Vec<CandidateHit> {
+    scored
         .into_iter()
         .map(
             |(score, node_id, display_name, file_path, file_role, dense_reason)| {
@@ -1419,7 +1641,36 @@ fn search_database(
                 hit
             },
         )
-        .collect())
+        .collect()
+}
+
+/// Drop the neighbours this lane cannot claim are related, leaving the whole
+/// stage empty when none survive.
+///
+/// A bounded scan always fills its window: without this the top `limit`
+/// vectors are reported even at zero or negative cosine, so a query with no
+/// dense evidence still emits a full set of confident-looking anchors.
+/// Requires `scored` sorted by descending similarity.
+fn retain_dense_evidence(scored: &mut Vec<ScoredHit>) {
+    let Some(best) = scored.first().map(|hit| hit.0) else {
+        return;
+    };
+    scored.retain(|hit| {
+        hit.0.is_finite()
+            && hit.0 >= DENSE_ABSTENTION_ABSOLUTE_FLOOR
+            && hit.0 >= best - DENSE_ABSTENTION_ADDITIVE_MARGIN
+    });
+}
+
+#[cfg(feature = "semantic-calibration-support")]
+pub(crate) fn search_database_for_semantic_calibration(
+    path: &Path,
+    generation: &str,
+    input_hash: &str,
+    query: &[f32],
+    limit: usize,
+) -> Result<Vec<CandidateHit>> {
+    search_database_with_abstention(path, generation, input_hash, query, limit, || false, false)
 }
 
 fn compare_scored_hits(left: &ScoredHit, right: &ScoredHit) -> Ordering {
@@ -1429,7 +1680,7 @@ fn compare_scored_hits(left: &ScoredHit, right: &ScoredHit) -> Ordering {
         .then_with(|| left.1.cmp(&right.1))
 }
 
-fn open_read_only(path: &Path) -> Result<Connection> {
+pub(crate) fn open_read_only(path: &Path) -> Result<Connection> {
     Connection::open_with_flags(
         sqlite_open_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1794,6 +2045,138 @@ mod tests {
             )
             .ready
         );
+    }
+
+    #[test]
+    fn batch_scan_is_serial_equivalent_for_scores_ties_and_abstention() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let points = [
+            point("a", vec![1.0, 0.0]),
+            point("b", vec![1.0, 0.0]),
+            point("c", vec![0.0, 1.0]),
+        ];
+        EmbeddedVectorIndex::build_with_points(
+            &layout,
+            "codestory_test_batch",
+            "test-batch",
+            "input",
+            "backend",
+            2,
+            |visit| {
+                for point in points {
+                    visit(point)?;
+                }
+                Ok(())
+            },
+        )
+        .expect("build");
+
+        let path = index_path(&layout, "codestory_test_batch");
+        let queries = [vec![0.9, 0.1], vec![0.1, 0.9], vec![-1.0, 0.0]];
+        let serial = queries
+            .iter()
+            .map(|query| search_database(&path, "test-batch", "input", query, 2, || false))
+            .collect::<Result<Vec<_>>>()
+            .expect("serial scans");
+        let batch_queries = queries
+            .iter()
+            .map(|query| (query.as_slice(), 2))
+            .collect::<Vec<_>>();
+        let batch = search_database_batch(&path, "test-batch", "input", &batch_queries, || false)
+            .expect("batch scan");
+
+        assert_eq!(batch, serial);
+    }
+
+    #[test]
+    fn dense_search_abstains_instead_of_filling_its_window_with_unrelated_vectors() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let points = [
+            point("related", vec![1.0, 0.0]),
+            point("near", vec![0.707_106_77, 0.707_106_77]),
+            point("distant", vec![0.258_819_04, 0.965_925_8]),
+            point("opposed", vec![-1.0, 0.0]),
+        ];
+        EmbeddedVectorIndex::build_with_points(
+            &layout,
+            "codestory_abstention_deadbeefdeadbeef",
+            "abstention-deadbeefdeadbeef",
+            "input",
+            "backend",
+            2,
+            |visit| {
+                for point in points {
+                    visit(point)?;
+                }
+                Ok(())
+            },
+        )
+        .expect("build");
+        let path = index_path(&layout, "codestory_abstention_deadbeefdeadbeef");
+
+        let hits = search_database(
+            &path,
+            "abstention-deadbeefdeadbeef",
+            "input",
+            &[1.0, 0.0],
+            4,
+            || false,
+        )
+        .expect("search");
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.node_id.as_deref().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["related"],
+            "the window must not be padded with vectors the lane cannot claim"
+        );
+
+        let abstained = search_database(
+            &path,
+            "abstention-deadbeefdeadbeef",
+            "input",
+            &[0.0, -1.0],
+            4,
+            || false,
+        )
+        .expect("search");
+        assert!(
+            abstained.is_empty(),
+            "no positively related vector must yield no dense evidence: {abstained:?}"
+        );
+    }
+
+    #[test]
+    fn dense_abstention_requires_absolute_and_additive_evidence() {
+        let hit = |score: f32, id: &str| {
+            (
+                score,
+                id.to_string(),
+                id.to_string(),
+                Some(format!("{id}.rs")),
+                None,
+                None,
+            )
+        };
+        let mut scored = vec![
+            hit(0.42, "best"),
+            hit(0.35, "near"),
+            hit(0.29, "below-floor"),
+        ];
+        retain_dense_evidence(&mut scored);
+        assert_eq!(
+            scored
+                .iter()
+                .map(|candidate| candidate.1.as_str())
+                .collect::<Vec<_>>(),
+            vec!["best", "near"]
+        );
+
+        let mut unsupported = vec![hit(0.29, "best"), hit(0.28, "near")];
+        retain_dense_evidence(&mut unsupported);
+        assert!(unsupported.is_empty());
     }
 
     #[test]
@@ -2322,6 +2705,62 @@ mod tests {
         let detail = format!("{error:#}");
         assert!(detail.contains("producer evidence is incompatible"));
         assert!(detail.contains("engine"));
+    }
+
+    #[test]
+    fn reusable_vectors_require_exact_documents_and_compatible_producer_evidence() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let runtime = reader_runtime(root.path(), &layout);
+        let publication = reader_publication();
+        let storage = seed_reader_store(&root.path().join("core.sqlite3"), &publication);
+        let device = accelerated_device();
+        let identity = accelerated_identity();
+        let manifest = reader_manifest(&crate::embeddings::embedding_runtime_id_for_runtime(
+            &runtime,
+        ));
+        let published = publish_reader_generation(
+            &layout,
+            &storage,
+            &manifest,
+            &publication,
+            &device,
+            &identity,
+            |_| {},
+        );
+        let contract = VectorEvidenceContract::new(
+            manifest.embedding_backend.clone().expect("backend"),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            vector_compatibility_identity(&published.evidence).expect("compatibility identity"),
+        );
+
+        let reusable = EmbeddedVectorIndex::load_reusable_vectors(
+            &layout,
+            &manifest.semantic_generation,
+            &published.evidence,
+            &contract,
+        )
+        .expect("load compatible vectors");
+        assert_eq!(
+            reusable
+                .get(&("1".to_string(), "reader-document-v1".to_string()))
+                .expect("exact reusable document")[0],
+            1.0
+        );
+        assert!(!reusable.contains_key(&("1".to_string(), "changed-document".to_string())));
+
+        let mut incompatible = published.evidence.clone();
+        incompatible.model.model_sha256 = "changed-model".into();
+        assert!(
+            EmbeddedVectorIndex::load_reusable_vectors(
+                &layout,
+                &manifest.semantic_generation,
+                &incompatible,
+                &contract,
+            )
+            .is_err()
+        );
     }
 
     #[test]

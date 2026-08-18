@@ -5,6 +5,9 @@
 //! annotations, and safety metadata stable because clients discover behavior
 //! from these responses before calling into the transport.
 
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
 use anyhow::Result;
 use codestory_contracts::api::{PACKET_PROBE_MAX_COUNT, PACKET_PROBE_MAX_TEXT_LENGTH};
 use serde_json::{Map, Value, json};
@@ -31,7 +34,7 @@ impl SafetyMetadata {
     fn to_json(self) -> Value {
         json!({
             "effect": if self.activates_managed_state { "managed_activation" } else { "read_only" },
-            "readOnly": !self.activates_managed_state,
+            "readOnly": true,
             "sideEffects": self.activates_managed_state,
             "activatesProject": self.activates_managed_state,
             "writesRepository": false,
@@ -43,11 +46,32 @@ impl SafetyMetadata {
         })
     }
 
+    /// MCP annotations describe the tool's effect on the *caller's* world.
+    ///
+    /// `readOnlyHint` is deliberately `true` for every tool, including those that activate
+    /// managed state. None of them modify the repository — the sibling `writesRepository:
+    /// false` below has always asserted exactly that, and it is true: activation writes
+    /// only to a per-user cache outside the checkout. Reporting `false` conflated "may
+    /// build an index" with "may change your code", and MCP has no hint for the former.
+    ///
+    /// That conflation was not cosmetic. Non-interactive clients auto-cancel approval
+    /// elicitations, so a non-read-only tool is silently killed: 19 of these 20 tools were
+    /// unusable in any headless `codex exec` session, and measurably so — MCP completion
+    /// went from 8% to 77% in a controlled benchmark run when this single field flipped,
+    /// with `openWorldHint` held constant to prove it was the gate.
+    ///
+    /// Managed activation is still disclosed, in `effect`, `sideEffects`, and
+    /// `activatesProject` below, which is where a "this may be slow / may build state"
+    /// signal belongs.
     fn annotations_json(self) -> Value {
         json!({
-            "readOnlyHint": !self.activates_managed_state,
+            "readOnlyHint": true,
             "destructiveHint": false,
             "idempotentHint": true,
+            // Left driven by managed activation: it can provision the embedding model over
+            // the network, which is exactly what openWorld is for. Verified by experiment
+            // not to gate approval, so correcting it buys nothing and would hide a real
+            // disclosure.
             "openWorldHint": self.activates_managed_state
         })
     }
@@ -844,6 +868,23 @@ static RESOURCE_LINK_SCHEMA: SchemaObject = SchemaObject::object(
     &["rel", "uri"],
 );
 
+static SEARCH_TARGET_SCHEMA: SchemaObject = SchemaObject::object(
+    "Explicit file or half-open UTF-8 byte range matched by whole-file lexical retrieval.",
+    &[
+        SchemaProperty::string("kind", "Target kind.").with_enum(&["file", "file_range"]),
+        SchemaProperty::string("file_path", "Project-relative file path."),
+        SchemaProperty::integer(
+            "start_byte",
+            "Zero-based inclusive UTF-8 byte offset for file_range targets.",
+        ),
+        SchemaProperty::integer(
+            "end_byte",
+            "Zero-based exclusive UTF-8 byte offset for file_range targets.",
+        ),
+    ],
+    &["kind", "file_path"],
+);
+
 static SEARCH_HIT_SCHEMA: SchemaObject = SchemaObject::object(
     "CodeStory search hit DTO.",
     &[
@@ -854,6 +895,11 @@ static SEARCH_HIT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("line", "One-based line number.").nullable(),
         SchemaProperty::number("score", "Ranking score."),
         SchemaProperty::string("origin", "Hit source.").with_enum(TEXT_HIT_ORIGINS),
+        SchemaProperty::object(
+            "target",
+            "Typed file or file-range target for a whole-file text match.",
+        )
+        .with_object_schema(&SEARCH_TARGET_SCHEMA),
         SchemaProperty::string(
             "match_quality",
             "How exactly the hit matched the query: exact, normalized_exact, prefix, fuzzy, semantic_suggestion, or repo_text.",
@@ -1489,6 +1535,11 @@ static AGENT_CITATION_SCHEMA: SchemaObject = SchemaObject::object(
             "Citation origin, such as indexed_symbol or text_match.",
         )
         .with_enum(TEXT_HIT_ORIGINS),
+        SchemaProperty::object(
+            "target",
+            "Typed file or file-range target for a whole-file text match.",
+        )
+        .with_object_schema(&SEARCH_TARGET_SCHEMA),
         SchemaProperty::boolean(
             "resolvable",
             "Whether the citation can be resolved as a symbol.",
@@ -1541,6 +1592,19 @@ static CONTEXT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("retrieval_version", "Retrieval version."),
         SchemaProperty::array("graphs", "Graph artifacts.", &GENERIC_OBJECT_SCHEMA),
         SchemaProperty::object("retrieval_trace", "Retrieval trace and summary."),
+        // Both are optional on the wire and both were already being emitted:
+        // this schema is `additionalProperties: false`, so leaving them
+        // undeclared published a contract the tool itself violates. `freshness`
+        // has been emitted undeclared since EV-78.
+        SchemaProperty::object(
+            "freshness",
+            "Index freshness observation, when one was made.",
+        ),
+        SchemaProperty::array(
+            "source_coverage",
+            "Coverage for the files this packet rested on, when any were checked.",
+            &GENERIC_OBJECT_SCHEMA,
+        ),
     ],
     &[
         "packet_id",
@@ -1556,7 +1620,7 @@ static CONTEXT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
 );
 
 static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
-    "CodeStory broad task packet DTO with graph/sidecar evidence, budget truncation, unsafe-to-claim gaps, and follow-up commands.",
+    "CodeStory broad task packet DTO with compiled support units and a machine stop or one-round drill disposition.",
     &[
         SchemaProperty::string("packet_id", "Stable packet id."),
         SchemaProperty::string("question", "Packet question."),
@@ -1567,8 +1631,12 @@ static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::object("answer", "Underlying DB-first answer packet."),
         SchemaProperty::object("budget", "Budget limits, usage, and truncation metadata."),
         SchemaProperty::object(
-            "sufficiency",
-            "Covered claims, gaps, and follow-up contract.",
+            "support",
+            "Compiled evidence atoms: symbol locations, source ranges, typed graph edges, and complete-query negatives.",
+        ),
+        SchemaProperty::object(
+            "disposition",
+            "Machine stop or one-round drill decision: supported, drill_once, not_established, or unavailable.",
         ),
         SchemaProperty::object(
             "retrieval_trace_summary",
@@ -1581,7 +1649,8 @@ static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
         "plan",
         "answer",
         "budget",
-        "sufficiency",
+        "support",
+        "disposition",
         "retrieval_trace_summary",
     ],
 );
@@ -1632,7 +1701,7 @@ static TRAIL_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static LOCAL_GRAPH_ALIAS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Return a bounded local graph alias around one node.",
@@ -1653,7 +1722,7 @@ static LOCAL_GRAPH_ALIAS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static TRACE_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Return a readable trace around a symbol id or query.",
@@ -1679,7 +1748,7 @@ static TRACE_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Resolve a symbol by query or stable node id.",
@@ -1694,13 +1763,81 @@ static TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
+
+static SOURCE_RANGE_SCHEMA: SchemaObject = SchemaObject::object(
+    "One file range to read. Paste `file_path` and `line` straight from a search, trail, or packet hit.",
+    &[
+        SchemaProperty::string(
+            "path",
+            "Repository-relative file path, as returned in `file_path`.",
+        )
+        .with_min_length(1),
+        SchemaProperty::string(
+            "file_path",
+            "Alias for `path`. Hits report this field name.",
+        )
+        .with_min_length(1),
+        SchemaProperty::integer(
+            "line",
+            "Line of interest, 1-based, as returned in `line`. A window is returned around it.",
+        )
+        .with_bounds(1, 1_000_000),
+        SchemaProperty::integer(
+            "start_line",
+            "First line to return, 1-based. Alternative to `line`.",
+        )
+        .with_bounds(1, 1_000_000),
+        SchemaProperty::integer(
+            "end_line",
+            "Last line to return, 1-based. Defaults to a bounded window after the start.",
+        )
+        .with_bounds(1, 1_000_000),
+    ],
+    &[],
+)
+.with_one_of_required(&[&["path"], &["file_path"]]);
 
 static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Resolve a symbol and return bounded line or function-body source context.",
+    "Return bounded source: either resolve one symbol, or read line ranges from files named by earlier evidence.",
     &[
+        SchemaProperty::array(
+            "paths",
+            "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+            &SOURCE_RANGE_SCHEMA,
+        ),
+        SchemaProperty::string(
+            "path",
+            "Single-file alias for `paths`: repository-relative path as returned in `file_path`. Combine with `line`.",
+        )
+        .with_min_length(1),
+        SchemaProperty::string(
+            "file_path",
+            "Alias for `path`. Hits report this field name.",
+        )
+        .with_min_length(1),
+        SchemaProperty::integer(
+            "line",
+            "1-based line from a search, trail, or packet hit. Used with `path`.",
+        )
+        .with_bounds(1, 1_000_000),
+        SchemaProperty::integer(
+            "start_line",
+            "First line to return with top-level `path`. Alternative to `line`.",
+        )
+        .with_bounds(1, 1_000_000),
+        SchemaProperty::integer(
+            "end_line",
+            "Last line to return with top-level `path`. Defaults to a bounded window after the start.",
+        )
+        .with_bounds(1, 1_000_000),
         SchemaProperty::string("query", "Symbol query.").with_min_length(1),
         SchemaProperty::string("id", "Stable node id.").with_min_length(1),
+        SchemaProperty::string(
+            "symbol_id",
+            "Alias for `id`. Hits report this field name.",
+        )
+        .with_min_length(1),
         SchemaProperty::integer(
             "choose",
             "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -1727,7 +1864,7 @@ static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"], &["paths"], &["path"], &["file_path"], &["symbol_id"]]);
 
 static GRAPH_TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Resolve a single indexed graph node by stable id or query.",
@@ -1742,7 +1879,7 @@ static GRAPH_TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static GRAPH_NEIGHBORS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Return a bounded graph neighborhood around one node.",
@@ -1766,7 +1903,7 @@ static GRAPH_NEIGHBORS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static SHORTEST_PATH_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Return a bounded forward path graph between two stable node ids.",
@@ -1805,7 +1942,7 @@ static QUERY_SUBGRAPH_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static SYMBOLS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Browse root symbols or children for a parent id.",
@@ -1887,7 +2024,7 @@ static CONTEXT_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"], &["bookmark"]]);
+.with_one_of_required(&[&["query"], &["id"], &["bookmark"]]);
 
 static PACKET_EXACT_PATH_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
     "Exact project-relative path probe.",
@@ -1989,13 +2126,16 @@ static PACKET_PROBE_SCHEMAS: &[&SchemaObject] = &[
 ];
 
 static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Build a broad task packet with budget and sufficiency metadata.",
+    "Build a broad task packet with compiled support units and a machine stop or one-round drill disposition.",
     &[
-        SchemaProperty::string_required("question", "Broad repository question or task.")
-            .with_min_length(1),
+        SchemaProperty::string_required(
+            "question",
+            "Broad repository question or task. Repeat it unchanged for a DrillOnce continuation.",
+        )
+        .with_min_length(1),
         SchemaProperty::string("budget", "Packet budget.")
             .with_enum(PACKET_BUDGETS)
-            .with_default(ValueLiteral::String("compact")),
+            .with_default(ValueLiteral::String("standard")),
         SchemaProperty::string("task_class", "Optional task class.")
             .with_enum(PACKET_TASK_CLASSES)
             .nullable(),
@@ -2019,10 +2159,28 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         .with_default(ValueLiteral::Boolean(true)),
         SchemaProperty::integer(
             "latency_budget_ms",
-            "Optional retrieval latency budget in milliseconds.",
+            "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted.",
         )
         .with_bounds(1000, 120000)
         .nullable(),
+        SchemaProperty::string(
+            "parent_packet_id",
+            "Parent packet id for a generation-bound DrillOnce continuation; repeat the original question unchanged.",
+        ),
+        SchemaProperty::string_array(
+            "option_ids",
+            "Drill option ids from the parent packet disposition. Execute them once; do not invent a second search.",
+        )
+        .with_item_bounds(1, 8)
+        .with_item_min_length(1),
+        SchemaProperty::string(
+            "core_generation_id",
+            "Pinned core publication generation for a DrillOnce continuation.",
+        ),
+        SchemaProperty::string(
+            "retrieval_generation",
+            "Pinned retrieval generation for a DrillOnce continuation.",
+        ),
     ],
     &["question"],
 )
@@ -2041,7 +2199,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "packet",
-        description: "Answer broad structural questions with repository evidence, sufficiency, truncation, and follow-up commands before source snippets. CodeStory prepares managed retrieval automatically.",
+        description: "Answer broad structural questions with compiled support units and a machine stop or one-round drill. Supported, NotEstablished, and Unavailable are terminal. DrillOnce means call packet again once with the exact original question, parent_packet_id, and the listed option_ids. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
         input_schema: PACKET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(AGENT_PACKET_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
@@ -2160,7 +2318,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "snippet",
-        description: "Return a focused source snippet after packet, search, or graph evidence selects a concrete target.",
+        description: "Return line-numbered source after packet, search, or graph evidence selects targets: one symbol, or many file ranges in a single call via `paths` rather than one file at a time.",
         input_schema: SNIPPET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SNIPPET_CONTEXT_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
@@ -2244,6 +2402,38 @@ static PROMPTS: &[PromptSpec] = &[
 /// Return whether a name is a registered stdio tool.
 pub(crate) fn is_tool_name(name: &str) -> bool {
     TOOLS.iter().any(|tool| tool.name == name)
+}
+
+/// Return the registered stdio tool names in catalog order.
+#[cfg(test)]
+pub(crate) fn tool_names() -> impl Iterator<Item = &'static str> {
+    TOOLS.iter().map(|tool| tool.name)
+}
+
+/// Return the input schema published for `name`, byte-identical to the one
+/// `tools/list` emits.
+///
+/// Argument validation reads the published declaration rather than a parallel
+/// hand-written rule set, so the generated catalog and the enforced contract
+/// are the same bytes and cannot drift.
+pub(crate) fn tool_input_schema(name: &str) -> Option<&'static Value> {
+    static SCHEMAS: OnceLock<BTreeMap<&'static str, Value>> = OnceLock::new();
+    SCHEMAS
+        .get_or_init(|| {
+            TOOLS
+                .iter()
+                .map(|tool| {
+                    let name = tool.name;
+                    let schema = tool
+                        .to_json()
+                        .as_object_mut()
+                        .and_then(|tool| tool.remove("inputSchema"))
+                        .expect("stdio tool json carries an input schema");
+                    (name, schema)
+                })
+                .collect()
+        })
+        .get(name)
 }
 
 /// Build the `tools/list` response.
@@ -2396,6 +2586,81 @@ mod tests {
         assert_eq!(
             packet["inputSchema"]["allOf"].as_array().map(Vec::len),
             Some(PACKET_PROBE_MAX_COUNT)
+        );
+    }
+
+    #[test]
+    fn packet_latency_budget_schema_matches_runtime_default_and_bounds() {
+        let catalog = tools_list_json();
+        let packet = catalog["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "packet")
+            .expect("packet tool");
+        let budget = &packet["inputSchema"]["properties"]["latency_budget_ms"];
+
+        assert_eq!(
+            budget["description"],
+            "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted."
+        );
+        assert_eq!(budget["minimum"], 1_000);
+        assert_eq!(budget["maximum"], 120_000);
+    }
+
+    /// The context packet must not emit a field its own published schema
+    /// forbids.
+    ///
+    /// `CONTEXT_PACKET_SCHEMA` is `additionalProperties: false`, and
+    /// `context_packet_json` serializes the whole `AgentAnswerDto`, so every
+    /// optional field added to that DTO silently becomes a schema violation. It
+    /// happened twice before anyone noticed — `freshness` since EV-78 and
+    /// `source_coverage` — because nothing compared the two.
+    #[test]
+    fn the_context_packet_emits_only_fields_its_schema_declares() {
+        let declared = CONTEXT_PACKET_SCHEMA.declared_property_names();
+        let mut answer = codestory_contracts::api::AgentAnswerDto {
+            answer_id: "packet".to_string(),
+            prompt: "question".to_string(),
+            summary: "summary".to_string(),
+            freshness: None,
+            source_coverage: Vec::new(),
+            sections: Vec::new(),
+            citations: Vec::new(),
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: serde_json::from_value(serde_json::json!({
+                "request_id": "r",
+                "resolved_profile": "architecture",
+                "policy_mode": "latency_first",
+                "total_latency_ms": 0,
+                "steps": [],
+            }))
+            .expect("minimal retrieval trace"),
+        };
+        // Populate the optional fields: they are `skip_serializing_if`, so an
+        // empty fixture would pass while a real packet failed.
+        answer.source_coverage = vec![codestory_contracts::api::SourceCoverageObservationDto {
+            path: "data/big.json".to_string(),
+            status: codestory_contracts::api::SourceCoverageStatusDto::PolicyExcluded,
+            reason: None,
+            not_established_cause: None,
+            observed_size: Some(2),
+            byte_cap: Some(1),
+        }];
+
+        let packet = crate::output::context_packet_json(&answer);
+        let emitted = packet.as_object().expect("packet object");
+        let undeclared = emitted
+            .keys()
+            .filter(|key| !declared.contains(&key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            undeclared.is_empty(),
+            "the packet emits {undeclared:?}, which its published output schema \
+             forbids: declared = {declared:?}"
         );
     }
 }

@@ -17,6 +17,7 @@ pub use codestory_contracts::workspace::{
     RefreshMode, RefreshPlan, SourceIndexPolicy, StoredFileRecord, StoredFileState,
     WorkspaceInventory,
 };
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
@@ -24,18 +25,45 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 pub mod atomic_file;
+pub mod filesystem_observer;
+pub mod locking;
 pub mod owned_deletion;
 pub mod paths;
+pub mod source_freshness;
+pub use source_freshness::{
+    SourceFreshnessCounts, SourceFreshnessMemo, SourceFreshnessScope,
+    invalidate_lease_memoized_values, record_readiness_fingerprint_pass,
+    reverify_from_content as reverify_source_freshness_from_content, source_freshness_counts,
+    with_lease_memoized_value,
+};
+mod repo_metadata;
+mod repository_hooks;
 mod repository_identity;
+pub use repo_metadata::{
+    RepositoryChange, RepositoryChangeKind, RepositoryChangeScope, RepositoryMetadata,
+    RepositoryMetadataIssue, read_repository_changes, read_repository_metadata,
+};
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use repo_metadata::{
+    with_repository_metadata_observation_limit_for_test,
+    with_repository_metadata_tree_traversal_count_for_test,
+};
+pub use repository_hooks::{
+    RepositoryHookAction, RepositoryHookReport, RepositoryHookRequest, RepositoryHookTargetReport,
+    manage_repository_hooks,
+};
 pub use repository_identity::{
-    PROJECT_IDENTITY_V3_SCHEMA_VERSION, ProjectIdentityV3, REPOSITORY_IDENTITY_V2_SCHEMA_VERSION,
-    RepositoryIdentityV2, WorkspacePathIdentity, WorkspacePathLexicalIdentity,
-    cached_project_identity_v3, inspect_repository_identity_v2, project_identity_v3,
-    project_identity_v3_from_repository, same_workspace_path, workspace_file_identity,
-    workspace_id_v3_for_root, workspace_path_identity, workspace_path_lexical_identity,
+    LogicalProjectIdentityV3, PROJECT_IDENTITY_V3_SCHEMA_VERSION, ProjectIdentityV3,
+    REPOSITORY_IDENTITY_V2_SCHEMA_VERSION, RepositoryIdentityV2, RepositoryInstanceIdentity,
+    WorkspacePathIdentity, WorkspacePathLexicalIdentity, inspect_repository_identity_v2,
+    observe_logical_project_identity_v3, project_identity_v3, project_identity_v3_from_repository,
+    same_workspace_path, workspace_file_identity, workspace_id_v3_for_root,
+    workspace_path_identity, workspace_path_identity_token, workspace_path_lexical_identity,
 };
 
 /// Source-group language selector used during workspace discovery.
@@ -163,8 +191,77 @@ pub struct WorkspaceManifest {
     members: Vec<PathBuf>,
     discovery_excluded_files: Vec<PathBuf>,
     discovery_excluded_directory_roots: Vec<PathBuf>,
+    discovery_owned_storage_paths: Vec<PathBuf>,
     #[cfg(test)]
     discovery_exclusion_observation_count: Cell<usize>,
+    #[cfg(test)]
+    discovery_walk_count: Cell<usize>,
+}
+
+fn default_source_exclude_patterns() -> Vec<String> {
+    [
+        "**/node_modules/**",
+        "**/target/**",
+        "**/.git/**",
+        "**/dist/**",
+        "**/build/**",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+#[cfg(test)]
+fn path_with_native_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut suffixed = path.as_os_str().to_os_string();
+    suffixed.push(suffix);
+    PathBuf::from(suffixed)
+}
+
+fn storage_parent_for_observation(storage_path: &Path) -> &Path {
+    storage_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn storage_owned_discovery_files(storage_path: &Path) -> Vec<PathBuf> {
+    codestory_contracts::owned_artifacts::storage_owned_file_identities(storage_path)
+}
+
+/// Owned directory trees discovery must never walk into as user source.
+///
+/// The quarantine tree belongs here for the same reason the search trees do:
+/// the guided derived-cache reset moves owned artifacts into it rather than
+/// deleting them, so every one of those files stays on disk inside the cache
+/// root under a name discovery has never seen.
+fn storage_owned_discovery_directory_roots(storage_path: &Path) -> Vec<PathBuf> {
+    vec![
+        legacy_search_directory_for_storage(storage_path),
+        search_generation_directory_for_storage(storage_path),
+        codestory_contracts::owned_artifacts::derived_reset_quarantine_root(storage_path),
+    ]
+}
+
+fn storage_owned_staged_discovery_files(storage_path: &Path) -> io::Result<Vec<PathBuf>> {
+    let parent = storage_parent_for_observation(storage_path);
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut owned = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if codestory_contracts::owned_artifacts::is_staged_snapshot_name(storage_path, &name) {
+            owned.push(entry.path());
+        }
+    }
+    owned.sort();
+    Ok(owned)
 }
 
 /// Multi-member workspace manifest.
@@ -207,11 +304,17 @@ pub struct WorkspaceInventoryIssue {
 }
 
 /// Current source candidates plus proof of inventory completeness.
+///
+/// `issues` record inputs discovery could not account for and demote
+/// `outcome`. `warnings` record inputs that are present and indexed but whose
+/// discovery took a degraded route, so a warned inventory stays distinguishable
+/// from a pristine one without refusing service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceFileInventory {
     pub files: Vec<PathBuf>,
     pub outcome: WorkspaceInventoryOutcome,
     pub issues: Vec<WorkspaceInventoryIssue>,
+    pub warnings: Vec<WorkspaceInventoryIssue>,
 }
 
 /// Complete discovery split into parser candidates and verified policy exclusions.
@@ -221,6 +324,7 @@ pub struct WorkspacePolicyFileInventory {
     pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
     pub outcome: WorkspaceInventoryOutcome,
     pub issues: Vec<WorkspaceInventoryIssue>,
+    pub warnings: Vec<WorkspaceInventoryIssue>,
 }
 
 /// Refresh plan paired with the inventory outcome that made deletion safe or unsafe.
@@ -229,6 +333,7 @@ pub struct WorkspaceRefreshOutcome {
     pub plan: RefreshPlan,
     pub inventory_outcome: WorkspaceInventoryOutcome,
     pub inventory_issues: Vec<WorkspaceInventoryIssue>,
+    pub inventory_warnings: Vec<WorkspaceInventoryIssue>,
 }
 
 /// Refresh plan paired with the complete exclusion set for the same discovery pass.
@@ -236,6 +341,8 @@ pub struct WorkspaceRefreshOutcome {
 pub struct WorkspacePolicyRefreshOutcome {
     pub refresh: WorkspaceRefreshOutcome,
     pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
+    /// Files admitted by discovery before source-route and policy classification.
+    pub admitted_file_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +373,29 @@ struct DiscoveryPathFilter<'a> {
     discovery_exclusions: &'a ObservedDiscoveryExclusions,
 }
 
+#[derive(Debug, Clone)]
+struct DiscoveryRoute {
+    path: PathBuf,
+    source_root: PathBuf,
+    filter_by_language: bool,
+    language: Language,
+    exclude_patterns: Vec<CompiledExcludePattern>,
+}
+
+#[derive(Debug)]
+struct CoalescedDiscoveryWalk {
+    path: PathBuf,
+    routes: Vec<DiscoveryRoute>,
+}
+
+struct ObservedDiscoveryPath {
+    normalized: PathBuf,
+    canonical: Option<PathBuf>,
+    exclusion_lexical: WorkspacePathLexicalIdentity,
+    exclusion_canonical: Option<WorkspacePathLexicalIdentity>,
+    is_dir: bool,
+}
+
 #[derive(Debug)]
 struct DiscoveryExclusionObservationError {
     path: PathBuf,
@@ -286,8 +416,11 @@ impl WorkspaceManifest {
             members: Vec::new(),
             discovery_excluded_files: Vec::new(),
             discovery_excluded_directory_roots: Vec::new(),
+            discovery_owned_storage_paths: Vec::new(),
             #[cfg(test)]
             discovery_exclusion_observation_count: Cell::new(0),
+            #[cfg(test)]
+            discovery_walk_count: Cell::new(0),
         }
     }
 
@@ -303,8 +436,11 @@ impl WorkspaceManifest {
             members: Vec::new(),
             discovery_excluded_files: Vec::new(),
             discovery_excluded_directory_roots: Vec::new(),
+            discovery_owned_storage_paths: Vec::new(),
             #[cfg(test)]
             discovery_exclusion_observation_count: Cell::new(0),
+            #[cfg(test)]
+            discovery_walk_count: Cell::new(0),
         })
     }
 
@@ -333,8 +469,11 @@ impl WorkspaceManifest {
             members: Vec::new(),
             discovery_excluded_files: Vec::new(),
             discovery_excluded_directory_roots: Vec::new(),
+            discovery_owned_storage_paths: Vec::new(),
             #[cfg(test)]
             discovery_exclusion_observation_count: Cell::new(0),
+            #[cfg(test)]
+            discovery_walk_count: Cell::new(0),
         }
     }
 
@@ -366,13 +505,7 @@ impl WorkspaceManifest {
                 language: Language::Rust,
                 standard: LanguageStandard::Default,
                 source_paths: vec![root_path],
-                exclude_patterns: vec![
-                    "**/node_modules/**".to_string(),
-                    "**/target/**".to_string(),
-                    "**/.git/**".to_string(),
-                    "**/dist/**".to_string(),
-                    "**/build/**".to_string(),
-                ],
+                exclude_patterns: default_source_exclude_patterns(),
                 include_paths: Vec::new(),
                 defines: HashMap::new(),
                 language_specific: LanguageSpecificSettings::Other,
@@ -383,22 +516,20 @@ impl WorkspaceManifest {
         }
     }
 
-    /// Open a workspace while excluding the exact CodeStory core/search
-    /// artifacts owned by `storage_path`.
+    /// Open a workspace while excluding the exact CodeStory core, search, and
+    /// quarantined-reset artifacts owned by `storage_path`.
     pub fn open_with_storage_owned_exclusions(
         root_path: PathBuf,
         storage_path: &Path,
     ) -> Result<Self> {
         let mut manifest = Self::open(root_path)?;
-        manifest.exclude_discovery_files([
-            storage_path.to_path_buf(),
-            storage_path.with_extension("db-wal"),
-            storage_path.with_extension("db-shm"),
-        ]);
-        manifest.exclude_discovery_directory_roots([
-            legacy_search_directory_for_storage(storage_path),
-            search_generation_directory_for_storage(storage_path),
-        ]);
+        manifest.exclude_discovery_files(storage_owned_discovery_files(storage_path));
+        manifest
+            .discovery_owned_storage_paths
+            .push(storage_path.to_path_buf());
+        manifest.exclude_discovery_directory_roots(storage_owned_discovery_directory_roots(
+            storage_path,
+        ));
         Ok(manifest)
     }
 
@@ -423,13 +554,7 @@ impl WorkspaceManifest {
                 language: Language::Rust,
                 standard: LanguageStandard::Default,
                 source_paths: vec![member.clone()],
-                exclude_patterns: vec![
-                    "**/node_modules/**".to_string(),
-                    "**/target/**".to_string(),
-                    "**/.git/**".to_string(),
-                    "**/dist/**".to_string(),
-                    "**/build/**".to_string(),
-                ],
+                exclude_patterns: default_source_exclude_patterns(),
                 include_paths: Vec::new(),
                 defines: HashMap::new(),
                 language_specific: LanguageSpecificSettings::Other,
@@ -463,6 +588,11 @@ impl WorkspaceManifest {
     #[cfg(test)]
     fn discovery_exclusion_observation_count(&self) -> usize {
         self.discovery_exclusion_observation_count.get()
+    }
+
+    #[cfg(test)]
+    fn discovery_walk_count(&self) -> usize {
+        self.discovery_walk_count.get()
     }
 
     /// Return the manifest path that defines the workspace root.
@@ -518,13 +648,9 @@ impl WorkspaceManifest {
         &self,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyFileInventory> {
-        WorkspaceDiscovery.source_inventory_with_policy_inner(
-            self,
-            policy.byte_cap,
-            &policy.policy_version,
-            policy.structural_unit_cap,
-            None,
-        )
+        WorkspaceDiscovery
+            .source_inventory_with_policy_inner(self, policy, None)
+            .map(|(inventory, _)| inventory)
     }
 
     /// Re-read every classified exclusion at the publication fence.
@@ -638,21 +764,30 @@ impl WorkspaceManifest {
 
 /// Legacy mutable search directory associated with one core database.
 pub fn legacy_search_directory_for_storage(storage_path: &Path) -> PathBuf {
-    storage_owned_sibling_path(storage_path, "search")
+    codestory_contracts::owned_artifacts::search_directory_for_storage(
+        storage_path,
+        codestory_contracts::owned_artifacts::SEARCH_DIRECTORY_SUFFIXES[0],
+    )
 }
 
 /// Immutable search-generation directory associated with one core database.
 pub fn search_generation_directory_for_storage(storage_path: &Path) -> PathBuf {
-    storage_owned_sibling_path(storage_path, "search-generations")
+    codestory_contracts::owned_artifacts::search_directory_for_storage(
+        storage_path,
+        codestory_contracts::owned_artifacts::SEARCH_DIRECTORY_SUFFIXES[1],
+    )
 }
 
-fn storage_owned_sibling_path(storage_path: &Path, suffix: &str) -> PathBuf {
-    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = storage_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("codestory");
-    parent.join(format!("{stem}.{suffix}"))
+/// Build a policy for the two legacy entry points that still take a bare
+/// `(byte_cap, policy_version)` pair. They predate the per-kind structural
+/// bound and carry the defaults for it.
+fn legacy_positional_policy(byte_cap: u64, policy_version: &str) -> SourceIndexPolicy {
+    SourceIndexPolicy {
+        policy_version: policy_version.to_string(),
+        byte_cap,
+        structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
+        structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+    }
 }
 
 impl WorkspaceDiscovery {
@@ -695,11 +830,10 @@ impl WorkspaceDiscovery {
     ) -> Result<WorkspacePolicyFileInventory> {
         self.source_inventory_with_policy_inner(
             manifest,
-            byte_cap,
-            policy_version,
-            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            &legacy_positional_policy(byte_cap, policy_version),
             None,
         )
+        .map(|(inventory, _)| inventory)
     }
 
     /// Verify that classified exclusions still name the same stable bytes at publication time.
@@ -710,6 +844,7 @@ impl WorkspaceDiscovery {
         policy: &SourceIndexPolicy,
     ) -> Result<Vec<OversizedSourceExclusionCandidate>> {
         if policy.byte_cap == 0
+            || policy.structural_byte_cap == 0
             || policy.structural_unit_cap == 0
             || policy.policy_version.trim().is_empty()
         {
@@ -720,8 +855,10 @@ impl WorkspaceDiscovery {
         verified.sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
         let mut previous_path: Option<&str> = None;
         for candidate in &verified {
+            // Strict, unlike the store's `<=`: this fence has the path, so it
+            // can assert the exact per-kind cap the candidate must name.
             if candidate.policy_version != policy.policy_version
-                || candidate.byte_cap != policy.byte_cap
+                || candidate.byte_cap != policy.effective_byte_cap(&candidate.normalized_path)
                 || candidate.structural_unit_cap != policy.structural_unit_cap
                 || previous_path == Some(candidate.normalized_path.as_str())
             {
@@ -740,9 +877,10 @@ impl WorkspaceDiscovery {
                 );
             }
             let (content_hash, observed_size) = current_content_identity(&path)?;
-            let byte_bound = observed_size > policy.byte_cap && candidate.observed_unit_count == 0;
+            let effective_cap = policy.effective_byte_cap(&candidate.normalized_path);
+            let byte_bound = observed_size > effective_cap && candidate.observed_unit_count == 0;
             let unit_bound = candidate.observed_unit_count > policy.structural_unit_cap
-                && observed_size <= policy.byte_cap;
+                && observed_size <= effective_cap;
             if content_hash != candidate.content_hash
                 || observed_size != candidate.observed_size
                 || !(byte_bound || unit_bound)
@@ -759,29 +897,43 @@ impl WorkspaceDiscovery {
     fn source_inventory_with_policy_inner(
         &self,
         manifest: &WorkspaceManifest,
-        byte_cap: u64,
-        policy_version: &str,
-        structural_unit_cap: u64,
+        policy: &SourceIndexPolicy,
         max_files: Option<usize>,
-    ) -> Result<WorkspacePolicyFileInventory> {
-        if byte_cap == 0 || structural_unit_cap == 0 || policy_version.trim().is_empty() {
+    ) -> Result<(WorkspacePolicyFileInventory, usize)> {
+        if policy.byte_cap == 0
+            || policy.structural_byte_cap == 0
+            || policy.structural_unit_cap == 0
+            || policy.policy_version.trim().is_empty()
+        {
             bail!("bounded source policy requires non-zero caps and a non-empty version");
         }
         let inventory = self.source_inventory_inner(manifest, max_files)?;
+        let admitted_file_count = inventory.files.len();
         if !inventory.outcome.is_complete() {
-            return Ok(WorkspacePolicyFileInventory {
-                files: inventory.files,
-                policy_exclusions: Vec::new(),
-                outcome: inventory.outcome,
-                issues: inventory.issues,
-            });
+            return Ok((
+                WorkspacePolicyFileInventory {
+                    files: inventory.files,
+                    policy_exclusions: Vec::new(),
+                    outcome: inventory.outcome,
+                    issues: inventory.issues,
+                    warnings: inventory.warnings,
+                },
+                admitted_file_count,
+            ));
         }
 
         let root = workspace_root(manifest);
         let mut files = Vec::with_capacity(inventory.files.len());
         let mut policy_exclusions = Vec::new();
         let mut issues = inventory.issues;
+        let warnings = inventory.warnings;
         for path in inventory.files {
+            // Synthetic discovery walks mixed-language repositories without a
+            // source-group filter. Classify the path before its size so an
+            // unsupported binary cannot become an oversized-source record.
+            if !has_supported_source_route(&path) {
+                continue;
+            }
             let metadata = match fs::metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(error) => {
@@ -793,7 +945,9 @@ impl WorkspaceDiscovery {
                     continue;
                 }
             };
-            if metadata.len() <= byte_cap {
+            // Nothing is excluded below the smaller of the two caps, so a file
+            // under it never pays for path normalization.
+            if metadata.len() <= policy.minimum_byte_cap() {
                 files.push(path);
                 continue;
             }
@@ -808,6 +962,14 @@ impl WorkspaceDiscovery {
                     continue;
                 }
             };
+            // Classified from the workspace-relative path: the structural
+            // classifier is path-shape sensitive, so repository ancestors must
+            // not influence admission.
+            let effective_cap = policy.effective_byte_cap(&normalized_path);
+            if metadata.len() <= effective_cap {
+                files.push(path);
+                continue;
+            }
             let (content_hash, observed_size) = match current_content_identity(&path) {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -819,7 +981,7 @@ impl WorkspaceDiscovery {
                     continue;
                 }
             };
-            if observed_size <= byte_cap {
+            if observed_size <= effective_cap {
                 files.push(path);
                 continue;
             }
@@ -828,9 +990,10 @@ impl WorkspaceDiscovery {
                 content_hash,
                 observed_size,
                 observed_unit_count: 0,
-                policy_version: policy_version.to_string(),
-                byte_cap,
-                structural_unit_cap,
+                policy_version: policy.policy_version.clone(),
+                // The cap that refused *this* source, not the policy headroom.
+                byte_cap: effective_cap,
+                structural_unit_cap: policy.structural_unit_cap,
             });
         }
         policy_exclusions.sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
@@ -839,12 +1002,16 @@ impl WorkspaceDiscovery {
         } else {
             WorkspaceInventoryOutcome::Partial
         };
-        Ok(WorkspacePolicyFileInventory {
-            files,
-            policy_exclusions,
-            outcome,
-            issues,
-        })
+        Ok((
+            WorkspacePolicyFileInventory {
+                files,
+                policy_exclusions,
+                outcome,
+                issues,
+                warnings,
+            },
+            admitted_file_count,
+        ))
     }
 
     fn source_inventory_inner(
@@ -853,10 +1020,15 @@ impl WorkspaceDiscovery {
         max_files: Option<usize>,
     ) -> Result<WorkspaceFileInventory> {
         let workspace_root = workspace_root(manifest);
+        let (repository_tracked_paths, repository_metadata_issues) =
+            repository_tracked_paths(&manifest.root_dir());
         let mut all_files = Vec::new();
         let mut seen = HashSet::new();
-        let mut issues = Vec::new();
+        let mut issues = repository_metadata_issues;
+        let mut warnings: Vec<WorkspaceInventoryIssue> = Vec::new();
         let mut inspected_source_roots = 0usize;
+        #[cfg(test)]
+        manifest.discovery_walk_count.set(0);
         let discovery_exclusions = match observe_discovery_exclusions(manifest) {
             Ok(exclusions) => exclusions,
             Err(error) => {
@@ -870,9 +1042,11 @@ impl WorkspaceDiscovery {
                             error.error
                         ),
                     }],
+                    warnings: Vec::new(),
                 });
             }
         };
+        let mut directory_routes = Vec::new();
 
         for group in &manifest.settings.source_groups {
             let exclude_patterns = compile_exclude_patterns(&group.exclude_patterns)?;
@@ -943,73 +1117,143 @@ impl WorkspaceDiscovery {
                             files: all_files,
                             outcome: WorkspaceInventoryOutcome::Bounded,
                             issues,
+                            warnings,
                         });
                     }
                     continue;
                 }
-                if metadata.is_dir() {
-                    let mut builder = ignore::WalkBuilder::new(&full_path);
-                    builder.follow_links(true);
-                    builder.require_git(false);
-                    let workspace_root_for_filter = workspace_root.clone();
-                    let source_root_for_filter = source_root.clone();
-                    let exclude_patterns = exclude_patterns.clone();
-                    let filter_discovery_exclusions = discovery_exclusions.clone();
-                    let language = group.language.clone();
-                    builder.filter_entry(move |entry| {
-                        let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-                        let path_filter = DiscoveryPathFilter {
-                            workspace_root: &workspace_root_for_filter,
-                            source_root: &source_root_for_filter,
-                            filter_by_language,
-                            language: &language,
-                            exclude_patterns: &exclude_patterns,
-                            discovery_exclusions: &filter_discovery_exclusions,
-                        };
-                        should_include_discovered_path(entry.path(), is_dir, &path_filter)
-                    });
-                    for entry in builder.build() {
-                        let entry = match entry {
-                            Ok(entry) => entry,
-                            Err(error) => {
-                                record_walk_error(&mut issues, &full_path, &error);
-                                continue;
-                            }
-                        };
-                        if let Some(error) = entry.error() {
-                            record_walk_error(&mut issues, entry.path(), error);
-                        }
-                        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-                            continue;
-                        }
-                        match discovery_exclusions.file_is_excluded(entry.path()) {
-                            Ok(true) => continue,
-                            Ok(false) => {}
-                            Err(error) => {
-                                issues.push(WorkspaceInventoryIssue {
-                                    path: entry.path().to_path_buf(),
-                                    message: format!(
-                                        "failed to observe source identity against caller-owned exclusions: {error}"
-                                    ),
-                                });
-                                continue;
-                            }
-                        }
-                        if !push_discovered_file_within_limit(
-                            &mut all_files,
-                            &mut seen,
-                            entry.into_path(),
-                            &workspace_root,
-                            max_files,
-                        ) {
-                            all_files.sort();
-                            return Ok(WorkspaceFileInventory {
-                                files: all_files,
-                                outcome: WorkspaceInventoryOutcome::Bounded,
-                                issues,
-                            });
-                        }
+                directory_routes.push(DiscoveryRoute {
+                    path: full_path,
+                    source_root,
+                    filter_by_language,
+                    language: group.language.clone(),
+                    exclude_patterns: exclude_patterns.clone(),
+                });
+            }
+        }
+
+        for walk in coalesce_discovery_walks(directory_routes) {
+            let mut builder = ignore::WalkBuilder::new(&walk.path);
+            builder.follow_links(true);
+            builder.require_git(false);
+            builder.parents(false);
+            builder.git_global(false);
+            // Hidden source trees such as .github are product input. The
+            // manifest's explicit excludes still prune repository metadata.
+            builder.hidden(false);
+            let workspace_root_for_filter = workspace_root.clone();
+            let routes_for_filter = walk.routes.clone();
+            let filter_discovery_exclusions = discovery_exclusions.clone();
+            builder.filter_entry(move |entry| {
+                let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+                should_include_discovered_path_for_routes(
+                    entry.path(),
+                    is_dir,
+                    &workspace_root_for_filter,
+                    &routes_for_filter,
+                    &filter_discovery_exclusions,
+                )
+            });
+            let issue_count_before_walk = issues.len();
+            #[cfg(test)]
+            manifest
+                .discovery_walk_count
+                .set(manifest.discovery_walk_count.get() + 1);
+            for entry in builder.build() {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        record_walk_error(&mut issues, &walk.path, &error);
+                        continue;
                     }
+                };
+                if let Some(error) = entry.error() {
+                    record_walk_error(&mut issues, entry.path(), error);
+                }
+                if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    continue;
+                }
+                match discovery_exclusions.file_is_excluded(entry.path()) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        issues.push(WorkspaceInventoryIssue {
+                            path: entry.path().to_path_buf(),
+                            message: format!(
+                                "failed to observe source identity against caller-owned exclusions: {error}"
+                            ),
+                        });
+                        continue;
+                    }
+                }
+                if !push_discovered_file_within_limit(
+                    &mut all_files,
+                    &mut seen,
+                    entry.into_path(),
+                    &workspace_root,
+                    max_files,
+                ) {
+                    all_files.sort();
+                    return Ok(WorkspaceFileInventory {
+                        files: all_files,
+                        outcome: WorkspaceInventoryOutcome::Bounded,
+                        issues,
+                        warnings,
+                    });
+                }
+            }
+            let walk_had_errors = issues.len() != issue_count_before_walk;
+            for tracked_path in &repository_tracked_paths {
+                if seen.contains(&normalized_compare_key(&workspace_root, tracked_path))
+                    || !fs::metadata(tracked_path).is_ok_and(|metadata| metadata.is_file())
+                    || !should_include_discovered_path_for_routes(
+                        tracked_path,
+                        false,
+                        &workspace_root,
+                        &walk.routes,
+                        &discovery_exclusions,
+                    )
+                {
+                    continue;
+                }
+                match discovery_exclusions.file_is_excluded(tracked_path) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        issues.push(WorkspaceInventoryIssue {
+                            path: tracked_path.clone(),
+                            message: format!(
+                                "failed to observe tracked source identity against caller-owned exclusions: {error}"
+                            ),
+                        });
+                        continue;
+                    }
+                }
+                if !push_discovered_file_within_limit(
+                    &mut all_files,
+                    &mut seen,
+                    tracked_path.clone(),
+                    &workspace_root,
+                    max_files,
+                ) {
+                    all_files.sort();
+                    return Ok(WorkspaceFileInventory {
+                        files: all_files,
+                        outcome: WorkspaceInventoryOutcome::Bounded,
+                        issues,
+                        warnings,
+                    });
+                }
+                if !walk_had_errors {
+                    // The file is present and indexed; only its discovery
+                    // route was degraded. Recording this as a warning keeps
+                    // the inventory complete while leaving the degradation
+                    // visible to every inventory consumer.
+                    warnings.push(WorkspaceInventoryIssue {
+                        path: tracked_path.clone(),
+                        message: "repository ignore rules excluded a tracked source; the repository index restored it"
+                            .to_string(),
+                    });
                 }
             }
         }
@@ -1026,6 +1270,7 @@ impl WorkspaceDiscovery {
             files: all_files,
             outcome,
             issues,
+            warnings,
         })
     }
 
@@ -1056,17 +1301,23 @@ impl WorkspaceDiscovery {
         byte_cap: u64,
         policy_version: &str,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        let inventory = self.source_inventory_with_policy(manifest, byte_cap, policy_version)?;
+        let (inventory, admitted_file_count) = self.source_inventory_with_policy_inner(
+            manifest,
+            &legacy_positional_policy(byte_cap, policy_version),
+            None,
+        )?;
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
             inputs,
             inventory.files,
             inventory.outcome,
             inventory.issues,
+            inventory.warnings,
         )?;
         Ok(WorkspacePolicyRefreshOutcome {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
+            admitted_file_count,
         })
     }
 
@@ -1077,13 +1328,8 @@ impl WorkspaceDiscovery {
         inputs: &RefreshInputs,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        let mut inventory = self.source_inventory_with_policy_inner(
-            manifest,
-            policy.byte_cap,
-            &policy.policy_version,
-            policy.structural_unit_cap,
-            None,
-        )?;
+        let (mut inventory, admitted_file_count) =
+            self.source_inventory_with_policy_inner(manifest, policy, None)?;
         self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
@@ -1091,10 +1337,12 @@ impl WorkspaceDiscovery {
             inventory.files,
             inventory.outcome,
             inventory.issues,
+            inventory.warnings,
         )?;
         Ok(WorkspacePolicyRefreshOutcome {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
+            admitted_file_count,
         })
     }
 
@@ -1107,11 +1355,9 @@ impl WorkspaceDiscovery {
         byte_cap: u64,
         policy_version: &str,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        let inventory = self.source_inventory_with_policy_inner(
+        let (inventory, admitted_file_count) = self.source_inventory_with_policy_inner(
             manifest,
-            byte_cap,
-            policy_version,
-            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            &legacy_positional_policy(byte_cap, policy_version),
             Some(max_current_files),
         )?;
         let refresh = build_refresh_outcome_from_inventory(
@@ -1120,10 +1366,12 @@ impl WorkspaceDiscovery {
             inventory.files,
             inventory.outcome,
             inventory.issues,
+            inventory.warnings,
         )?;
         Ok(WorkspacePolicyRefreshOutcome {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
+            admitted_file_count,
         })
     }
 
@@ -1135,13 +1383,8 @@ impl WorkspaceDiscovery {
         max_current_files: usize,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        let mut inventory = self.source_inventory_with_policy_inner(
-            manifest,
-            policy.byte_cap,
-            &policy.policy_version,
-            policy.structural_unit_cap,
-            Some(max_current_files),
-        )?;
+        let (mut inventory, admitted_file_count) =
+            self.source_inventory_with_policy_inner(manifest, policy, Some(max_current_files))?;
         self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
@@ -1149,10 +1392,12 @@ impl WorkspaceDiscovery {
             inventory.files,
             inventory.outcome,
             inventory.issues,
+            inventory.warnings,
         )?;
         Ok(WorkspacePolicyRefreshOutcome {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
+            admitted_file_count,
         })
     }
 
@@ -1236,6 +1481,7 @@ impl WorkspaceDiscovery {
             inventory.files,
             inventory.outcome,
             inventory.issues,
+            inventory.warnings,
         )
     }
 }
@@ -1246,6 +1492,7 @@ fn build_refresh_outcome_from_inventory(
     current_files: Vec<PathBuf>,
     inventory_outcome: WorkspaceInventoryOutcome,
     inventory_issues: Vec<WorkspaceInventoryIssue>,
+    inventory_warnings: Vec<WorkspaceInventoryIssue>,
 ) -> Result<WorkspaceRefreshOutcome> {
     let workspace_root = manifest.root_dir();
     let stored_map = inputs.inventory_map();
@@ -1258,20 +1505,32 @@ fn build_refresh_outcome_from_inventory(
     let mut files_to_remove = Vec::new();
     let mut existing_file_ids = HashMap::new();
     let mut current_file_keys = HashSet::with_capacity(current_files.len());
+    let mut stored_files = Vec::with_capacity(current_files.len());
 
-    for path in current_files {
-        let normalized_key = normalized_compare_key(&workspace_root, &path);
+    for path in &current_files {
+        let normalized_key = normalized_compare_key(&workspace_root, path);
         current_file_keys.insert(normalized_key.clone());
-        let needs_index = match normalized_stored_map.get(&normalized_key) {
-            Some(file) => {
-                existing_file_ids.insert(path.clone(), file.id);
-                stored_file_needs_index(&path, file)
-            }
-            None => true,
-        };
+        let stored = normalized_stored_map.get(&normalized_key);
+        if let Some(file) = stored {
+            existing_file_ids.insert(path.clone(), file.id);
+        }
+        stored_files.push(stored);
+    }
 
-        if needs_index {
-            files_to_index.push(path);
+    if let Some(decisions) = parallel_stored_file_decisions(&current_files, &stored_files) {
+        for (path, decision) in current_files.iter().zip(decisions) {
+            if decision.needs_index {
+                files_to_index.push(path.clone());
+            }
+        }
+    } else {
+        for (path, stored) in current_files.iter().zip(stored_files) {
+            let needs_index = stored
+                .map(|file| stored_file_needs_index(path, file))
+                .unwrap_or(true);
+            if needs_index {
+                files_to_index.push(path.clone());
+            }
         }
     }
 
@@ -1294,6 +1553,118 @@ fn build_refresh_outcome_from_inventory(
         },
         inventory_outcome,
         inventory_issues,
+        inventory_warnings,
+    })
+}
+
+const PARALLEL_STORED_FILE_MINIMUM: usize = 16;
+const PARALLEL_STORED_FILE_MAX_THREADS: usize = 8;
+
+#[derive(Debug, Clone, Copy)]
+struct StoredFileDecision {
+    needs_index: bool,
+    content_hash_read: bool,
+    memo_reused: bool,
+    memo_record: Option<StoredFileMemoRecord>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StoredFileMemoRecord {
+    modified_ms: i64,
+    len: u64,
+}
+
+fn freshness_hash_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .min(PARALLEL_STORED_FILE_MAX_THREADS);
+        (threads > 1)
+            .then(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .ok()
+            })
+            .flatten()
+    })
+    .as_ref()
+}
+
+fn parallel_stored_file_decisions(
+    paths: &[PathBuf],
+    stored_files: &[Option<&StoredFileState>],
+) -> Option<Vec<StoredFileDecision>> {
+    if paths.len() < PARALLEL_STORED_FILE_MINIMUM || paths.len() != stored_files.len() {
+        return None;
+    }
+    let pool = freshness_hash_pool()?;
+    let batch = source_freshness::source_freshness_batch();
+    let decisions = stored_file_decisions_in_pool(pool, paths, stored_files, batch.as_ref());
+    account_parallel_stored_file_decisions(paths, stored_files, &decisions, batch.as_ref());
+    Some(decisions)
+}
+
+fn account_parallel_stored_file_decisions(
+    paths: &[PathBuf],
+    stored_files: &[Option<&StoredFileState>],
+    decisions: &[StoredFileDecision],
+    batch: Option<&source_freshness::SourceFreshnessBatch>,
+) {
+    for decision in decisions {
+        if decision.content_hash_read {
+            // Worker threads deliberately never enter the caller's thread-local
+            // scope. Account for completed reads here so telemetry remains
+            // deterministic and attached to the public operation.
+            source_freshness::record_content_hash_read();
+        }
+        if decision.memo_reused {
+            source_freshness::record_verdict_reuse();
+        }
+    }
+    if let Some(batch) = batch {
+        source_freshness::record_batch_verdicts(
+            batch,
+            paths.iter().zip(stored_files).zip(decisions).filter_map(
+                |((path, stored), decision)| {
+                    let record = decision.memo_record?;
+                    let expected_hash = stored.as_ref()?.content_hash.as_deref()?;
+                    Some((
+                        path.as_path(),
+                        record.modified_ms,
+                        record.len,
+                        expected_hash,
+                        decision.needs_index,
+                    ))
+                },
+            ),
+        );
+    }
+}
+
+fn stored_file_decisions_in_pool(
+    pool: &rayon::ThreadPool,
+    paths: &[PathBuf],
+    stored_files: &[Option<&StoredFileState>],
+    batch: Option<&source_freshness::SourceFreshnessBatch>,
+) -> Vec<StoredFileDecision> {
+    pool.install(|| {
+        paths
+            .par_iter()
+            .zip(stored_files.par_iter())
+            .map(|(path, stored)| {
+                stored
+                    .map(|file| stored_file_needs_index_direct(path, file, batch))
+                    .unwrap_or(StoredFileDecision {
+                        needs_index: true,
+                        content_hash_read: false,
+                        memo_reused: false,
+                        memo_record: None,
+                    })
+            })
+            .collect()
     })
 }
 
@@ -1351,37 +1722,290 @@ fn push_discovered_file_within_limit(
     !source_file_limit_exceeded(files, max_files)
 }
 
-fn modification_time_millis(path: &Path) -> Result<i64> {
+fn repository_tracked_paths(
+    repository_root: &Path,
+) -> (Vec<PathBuf>, Vec<WorkspaceInventoryIssue>) {
+    let dot_git = repository_root.join(".git");
+    let dot_git_metadata = match fs::symlink_metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), Vec::new());
+        }
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![WorkspaceInventoryIssue {
+                    path: dot_git,
+                    message: format!("repository metadata boundary could not be observed: {error}"),
+                }],
+            );
+        }
+    };
+    if dot_git_metadata.is_dir() {
+        let mut has_repository_marker = false;
+        for marker in ["HEAD", "config", "index"] {
+            match fs::symlink_metadata(dot_git.join(marker)) {
+                Ok(_) => has_repository_marker = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return (
+                        Vec::new(),
+                        vec![WorkspaceInventoryIssue {
+                            path: dot_git.join(marker),
+                            message: format!(
+                                "repository metadata marker could not be observed: {error}"
+                            ),
+                        }],
+                    );
+                }
+            }
+        }
+        if !has_repository_marker {
+            return (Vec::new(), Vec::new());
+        }
+    }
+    let metadata = read_repository_metadata(repository_root);
+    let mut issues = metadata
+        .issues
+        .into_iter()
+        .filter(|issue| {
+            matches!(
+                issue.code.as_str(),
+                "repository_open_failed" | "index_unavailable" | "repository_metadata_changed"
+            )
+        })
+        .map(|issue| WorkspaceInventoryIssue {
+            path: issue.path,
+            message: format!(
+                "repository metadata observation {} was incomplete: {}",
+                issue.code, issue.message
+            ),
+        })
+        .collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    for encoded_path in metadata.tracked_paths {
+        let path = match repo_metadata::bytes_to_path(&encoded_path) {
+            Ok(path) => path,
+            Err(error) => {
+                issues.push(WorkspaceInventoryIssue {
+                    path: repository_root.to_path_buf(),
+                    message: format!("repository index path could not be decoded: {error}"),
+                });
+                continue;
+            }
+        };
+        if path.is_absolute()
+            || !path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            issues.push(WorkspaceInventoryIssue {
+                path: repository_root.to_path_buf(),
+                message: "repository index contained a path outside the workspace boundary"
+                    .to_string(),
+            });
+            continue;
+        }
+        paths.push(repository_root.join(path));
+    }
+    paths.sort();
+    paths.dedup();
+    (paths, issues)
+}
+
+/// Clamp one filesystem timestamp to CodeStory's signed Unix-millisecond contract.
+///
+/// Filesystems that can represent pre-epoch timestamps map them to zero. Large
+/// future timestamps saturate instead of wrapping the persisted `i64` value.
+pub fn clamp_system_time_to_epoch_millis(time: std::time::SystemTime) -> i64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+/// The mtime and length one freshness observation was taken at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedFileMetadata {
+    modified_ms: i64,
+    len: u64,
+}
+
+fn observed_file_metadata(path: &Path) -> Result<ObservedFileMetadata> {
     let metadata = fs::metadata(path)?;
     let modified = metadata.modified()?;
-    let duration = modified.duration_since(std::time::UNIX_EPOCH)?;
-    Ok(duration.as_millis().min(i64::MAX as u128) as i64)
+    Ok(ObservedFileMetadata {
+        modified_ms: clamp_system_time_to_epoch_millis(modified),
+        len: metadata.len(),
+    })
+}
+
+/// Re-verify one stored file against the bytes on disk right now.
+///
+/// This is the exact predicate refresh planning applies during discovery, exposed so a caller
+/// that learned a specific path was written *after* the plan was built can settle that path
+/// without re-walking the tree. Sharing the predicate is the point: a second, similar-looking
+/// comparison would be free to disagree with the planner about what counts as drift.
+pub fn stored_file_requires_reindex(path: &Path, file: &StoredFileState) -> bool {
+    stored_file_needs_index(path, file)
 }
 
 fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
     if !file.indexed || file.retry_required {
         return true;
     }
-    let Ok(mtime) = modification_time_millis(path) else {
+    let Ok(observed) = observed_file_metadata(path) else {
         return true;
     };
-    if mtime != file.modification_time {
+    if observed.modified_ms != file.modification_time {
         return true;
     }
     let Some(expected_hash) = file.content_hash.as_deref() else {
         return false;
     };
-    match current_content_hash(path) {
-        Ok(actual_hash) => actual_hash != expected_hash,
-        Err(_) => true,
+    let batch = source_freshness::source_freshness_batch();
+    // The hash below is the verification, never a redundant double-check: an
+    // mtime mismatch already short-circuited, so this is the only mechanism
+    // that sees same-mtime drift. The memo caches that verdict for one armed
+    // operation scope; it never substitutes metadata for content, and any
+    // check whose job is to detect drift *since* an earlier derivation calls
+    // `source_freshness::reverify_from_content` first, which drops the memo so
+    // this hash runs again.
+    if let Some(verdict) =
+        source_freshness::memoized_verdict(path, observed.modified_ms, observed.len, expected_hash)
+    {
+        return verdict;
+    }
+    source_freshness::record_content_hash_read();
+    let Ok(identity) = read_content_identity(path) else {
+        return true;
+    };
+    let verdict = identity.content_hash != expected_hash;
+    // Only a torn-read-clean observation whose metadata still agrees with the
+    // metadata the key was built from may be memoized. Anything that raced a
+    // writer is recomputed next time.
+    if identity.modified_ms == observed.modified_ms
+        && identity.len == observed.len
+        && let Some(batch) = batch.as_ref()
+    {
+        source_freshness::record_batch_verdicts(
+            batch,
+            [(
+                path,
+                observed.modified_ms,
+                observed.len,
+                expected_hash,
+                verdict,
+            )],
+        );
+    }
+    verdict
+}
+
+/// The parallel planner's exact predicate.
+///
+/// Unlike [`stored_file_needs_index`], this never consults or publishes the
+/// operation-scoped memo: worker-thread TLS must not create a second cache
+/// lifetime. Every same-mtime file is read directly, with the same before/read/
+/// after torn-read guard, and the caller records the returned work counters in
+/// deterministic input order.
+fn stored_file_needs_index_direct(
+    path: &Path,
+    file: &StoredFileState,
+    batch: Option<&source_freshness::SourceFreshnessBatch>,
+) -> StoredFileDecision {
+    if !file.indexed || file.retry_required {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: false,
+            memo_reused: false,
+            memo_record: None,
+        };
+    }
+    let Ok(observed) = observed_file_metadata(path) else {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: false,
+            memo_reused: false,
+            memo_record: None,
+        };
+    };
+    if observed.modified_ms != file.modification_time {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: false,
+            memo_reused: false,
+            memo_record: None,
+        };
+    }
+    let Some(expected_hash) = file.content_hash.as_deref() else {
+        return StoredFileDecision {
+            needs_index: false,
+            content_hash_read: false,
+            memo_reused: false,
+            memo_record: None,
+        };
+    };
+    if let Some(verdict) = batch.and_then(|batch| {
+        source_freshness::batch_memoized_verdict(
+            batch,
+            path,
+            observed.modified_ms,
+            observed.len,
+            expected_hash,
+        )
+    }) {
+        return StoredFileDecision {
+            needs_index: verdict,
+            content_hash_read: false,
+            memo_reused: true,
+            memo_record: None,
+        };
+    }
+    let Ok(identity) = read_content_identity(path) else {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: true,
+            memo_reused: false,
+            memo_record: None,
+        };
+    };
+    if identity.modified_ms != observed.modified_ms || identity.len != observed.len {
+        return StoredFileDecision {
+            needs_index: true,
+            content_hash_read: true,
+            memo_reused: false,
+            memo_record: None,
+        };
+    }
+    StoredFileDecision {
+        needs_index: identity.content_hash != expected_hash,
+        content_hash_read: true,
+        memo_reused: false,
+        memo_record: Some(StoredFileMemoRecord {
+            modified_ms: observed.modified_ms,
+            len: observed.len,
+        }),
     }
 }
 
+#[cfg(test)]
 fn current_content_hash(path: &Path) -> Result<String> {
     current_content_identity(path).map(|(content_hash, _)| content_hash)
 }
 
 fn current_content_identity(path: &Path) -> Result<(String, u64)> {
+    let identity = read_content_identity(path)?;
+    Ok((identity.content_hash, identity.len))
+}
+
+/// A content hash plus the metadata it was verified against.
+struct ContentIdentity {
+    content_hash: String,
+    len: u64,
+    modified_ms: i64,
+}
+
+fn read_content_identity(path: &Path) -> Result<ContentIdentity> {
     let mut file = fs::File::open(path)?;
     let before = file.metadata()?;
     let mut hasher = Sha256::new();
@@ -1393,11 +2017,42 @@ fn current_content_identity(path: &Path) -> Result<(String, u64)> {
         }
         hasher.update(&buffer[..read]);
     }
+    #[cfg(test)]
+    run_torn_read_mutation_for_test(path)?;
     let after = file.metadata()?;
     if before.len() != after.len() || before.modified()? != after.modified()? {
         bail!("source metadata changed while hashing {}", path.display());
     }
-    Ok((format!("{:x}", hasher.finalize()), before.len()))
+    Ok(ContentIdentity {
+        content_hash: format!("{:x}", hasher.finalize()),
+        len: before.len(),
+        modified_ms: clamp_system_time_to_epoch_millis(before.modified()?),
+    })
+}
+
+#[cfg(test)]
+fn torn_read_mutations_for_test() -> &'static std::sync::Mutex<HashMap<PathBuf, Vec<u8>>> {
+    static MUTATIONS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Vec<u8>>>> = OnceLock::new();
+    MUTATIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn arm_torn_read_mutation_for_test(path: PathBuf, contents: Vec<u8>) {
+    torn_read_mutations_for_test()
+        .lock()
+        .expect("torn-read mutation hook poisoned")
+        .insert(path, contents);
+}
+
+#[cfg(test)]
+fn run_torn_read_mutation_for_test(path: &Path) -> Result<()> {
+    let contents = torn_read_mutations_for_test()
+        .lock()
+        .expect("torn-read mutation hook poisoned")
+        .remove(path);
+    contents.map_or(Ok(()), |contents| {
+        fs::write(path, contents).map_err(Into::into)
+    })
 }
 
 fn workspace_root(manifest: &WorkspaceManifest) -> PathBuf {
@@ -1492,7 +2147,16 @@ fn observe_discovery_exclusions(
     manifest.discovery_exclusion_observation_count.set(0);
 
     let mut observed = ObservedDiscoveryExclusions::default();
-    for path in &manifest.discovery_excluded_files {
+    let mut excluded_files = manifest.discovery_excluded_files.clone();
+    for storage_path in &manifest.discovery_owned_storage_paths {
+        excluded_files.extend(storage_owned_staged_discovery_files(storage_path).map_err(
+            |error| DiscoveryExclusionObservationError {
+                path: storage_parent_for_observation(storage_path).to_path_buf(),
+                error,
+            },
+        )?);
+    }
+    for path in &excluded_files {
         #[cfg(test)]
         manifest
             .discovery_exclusion_observation_count
@@ -1556,6 +2220,21 @@ fn observe_discovery_exclusions(
     Ok(observed)
 }
 
+fn coalesce_discovery_walks(routes: Vec<DiscoveryRoute>) -> Vec<CoalescedDiscoveryWalk> {
+    let mut walks: Vec<CoalescedDiscoveryWalk> = Vec::new();
+    for route in routes {
+        if let Some(walk) = walks.iter_mut().find(|walk| walk.path == route.path) {
+            walk.routes.push(route);
+        } else {
+            walks.push(CoalescedDiscoveryWalk {
+                path: route.path.clone(),
+                routes: vec![route],
+            });
+        }
+    }
+    walks
+}
+
 impl ObservedDiscoveryExclusions {
     fn file_is_excluded(&self, path: &Path) -> std::io::Result<bool> {
         if self.file_identities.is_empty() {
@@ -1598,45 +2277,111 @@ impl ObservedDiscoveryExclusions {
     }
 }
 
-fn should_include_discovered_path(
-    path: &Path,
-    is_dir: bool,
+impl ObservedDiscoveryPath {
+    fn observe(path: &Path, is_dir: bool) -> Option<Self> {
+        let normalized = normalize_lexical_path(path);
+        let canonical = normalized.canonicalize().ok();
+        let exclusion_lexical = workspace_path_lexical_identity(&normalized).ok()?;
+        let exclusion_canonical = canonical
+            .as_deref()
+            .and_then(|path| workspace_path_lexical_identity(path).ok());
+        Some(Self {
+            normalized,
+            canonical,
+            exclusion_lexical,
+            exclusion_canonical,
+            is_dir,
+        })
+    }
+}
+
+fn should_include_observed_discovery_path_globally(
+    observed: &ObservedDiscoveryPath,
+    workspace_root: &Path,
+    discovery_exclusions: &ObservedDiscoveryExclusions,
+) -> bool {
+    if discovery_exclusions.directory_contains_observed(
+        &observed.exclusion_lexical,
+        observed.exclusion_canonical.as_ref(),
+    ) {
+        return false;
+    }
+    observed.is_dir
+        || workspace_structural_source_exclusion(workspace_root, &observed.normalized).is_none()
+}
+
+fn should_include_observed_discovery_path(
+    observed: &ObservedDiscoveryPath,
     filter: &DiscoveryPathFilter<'_>,
 ) -> bool {
-    let normalized = normalize_lexical_path(path);
-    let canonical = normalized.canonicalize().ok();
-    let Ok(exclusion_lexical) = workspace_path_lexical_identity(&normalized) else {
-        return false;
-    };
-    let exclusion_canonical = canonical
+    if observed
+        .canonical
         .as_deref()
-        .and_then(|path| workspace_path_lexical_identity(path).ok());
-    if filter
-        .discovery_exclusions
-        .directory_contains_observed(&exclusion_lexical, exclusion_canonical.as_ref())
+        .is_some_and(|path| !path.starts_with(filter.source_root))
     {
-        return false;
-    }
-    if !is_dir
-        && workspace_structural_source_exclusion(filter.workspace_root, &normalized).is_some()
-    {
-        return false;
-    }
-    if canonical.is_some_and(|canonical| !canonical.starts_with(filter.source_root)) {
         return false;
     }
     if is_excluded_path(
-        &normalized,
+        &observed.normalized,
         filter.workspace_root,
         filter.source_root,
         filter.exclude_patterns,
     ) {
         return false;
     }
-    if is_dir {
-        return true;
+    observed.is_dir
+        || !filter.filter_by_language
+        || matches_source_group_language(&observed.normalized, filter.language)
+}
+
+fn should_include_discovered_path_for_routes(
+    path: &Path,
+    is_dir: bool,
+    workspace_root: &Path,
+    routes: &[DiscoveryRoute],
+    discovery_exclusions: &ObservedDiscoveryExclusions,
+) -> bool {
+    let Some(observed) = ObservedDiscoveryPath::observe(path, is_dir) else {
+        return false;
+    };
+    if !should_include_observed_discovery_path_globally(
+        &observed,
+        workspace_root,
+        discovery_exclusions,
+    ) {
+        return false;
     }
-    !filter.filter_by_language || matches_source_group_language(&normalized, filter.language)
+    routes.iter().any(|route| {
+        should_include_observed_discovery_path(
+            &observed,
+            &DiscoveryPathFilter {
+                workspace_root,
+                source_root: &route.source_root,
+                filter_by_language: route.filter_by_language,
+                language: &route.language,
+                exclude_patterns: &route.exclude_patterns,
+                discovery_exclusions,
+            },
+        )
+    })
+}
+
+fn should_include_discovered_path(
+    path: &Path,
+    is_dir: bool,
+    filter: &DiscoveryPathFilter<'_>,
+) -> bool {
+    let Some(observed) = ObservedDiscoveryPath::observe(path, is_dir) else {
+        return false;
+    };
+    if !should_include_observed_discovery_path_globally(
+        &observed,
+        filter.workspace_root,
+        filter.discovery_exclusions,
+    ) {
+        return false;
+    }
+    should_include_observed_discovery_path(&observed, filter)
 }
 
 fn workspace_structural_source_exclusion(
@@ -1741,6 +2486,15 @@ fn matches_source_group_language(path: &Path, language: &Language) -> bool {
         || compatibility_extension_matches_source_group(&extension, language)
 }
 
+fn has_supported_source_route(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+    let extension = codestory_contracts::language_support::normalize_extension(extension);
+    codestory_contracts::language_support::language_support_profile_for_ext(&extension).is_some()
+        || codestory_contracts::language_support::companion_extension_profile(&extension).is_some()
+}
+
 fn registry_extension_matches_source_group(extension: &str, language: &Language) -> bool {
     codestory_contracts::language_support::language_support_profile_for_ext(extension).is_some_and(
         |profile| source_group_accepts_registry_language(language, profile.language_name),
@@ -1763,6 +2517,14 @@ fn source_group_accepts_registry_language(language: &Language, registry_language
             | (&Language::Kotlin, "kotlin")
             | (&Language::Swift, "swift")
             | (&Language::Dart, "dart")
+            // Companion-extension source groups. These names never come back
+            // from `language_support_profile_for_ext`, so they cannot widen
+            // `registry_extension_matches_source_group`; they exist so the
+            // companion table can name a source group by language name.
+            | (&Language::Lua, "lua")
+            | (&Language::Svelte, "svelte")
+            | (&Language::Vue, "vue")
+            | (&Language::Astro, "astro")
             | (&Language::Sql, "sql")
             | (&Language::Html, "html")
             | (&Language::Css, "css")
@@ -1776,17 +2538,20 @@ fn source_group_accepts_registry_language(language: &Language, registry_language
     )
 }
 
+/// Template and style extensions that a registered language's source group
+/// accepts without being a public claim of their own.
+///
+/// The (language, extension) cross product used to be spelled out here and
+/// repeated in the indexer and the CLI (ARCH-012); the extension table now
+/// lives in `codestory_contracts::language_support`.
 fn compatibility_extension_matches_source_group(extension: &str, language: &Language) -> bool {
-    matches!(
-        (language, extension),
-        (&Language::JavaScript, "svelte" | "vue" | "astro")
-            | (&Language::TypeScript, "svelte" | "vue" | "astro")
-            | (&Language::CSharp, "cshtml")
-            | (&Language::Lua, "lua")
-            | (&Language::Css, "scss" | "sass" | "less")
-            | (&Language::Svelte, "svelte")
-            | (&Language::Vue, "vue")
-            | (&Language::Astro, "astro")
+    codestory_contracts::language_support::companion_extension_profile(extension).is_some_and(
+        |profile| {
+            profile
+                .source_group_languages
+                .iter()
+                .any(|group| source_group_accepts_registry_language(language, group))
+        },
     )
 }
 
@@ -1972,6 +2737,58 @@ mod tests {
     use std::io;
     use std::path::Path;
     use tempfile::tempdir;
+
+    fn test_source_group(
+        language: Language,
+        source_path: PathBuf,
+        exclude_patterns: &[&str],
+    ) -> SourceGroupSettings {
+        SourceGroupSettings {
+            id: Uuid::new_v4(),
+            language,
+            standard: LanguageStandard::Default,
+            source_paths: vec![source_path],
+            exclude_patterns: exclude_patterns
+                .iter()
+                .map(|pattern| (*pattern).to_string())
+                .collect(),
+            include_paths: Vec::new(),
+            defines: HashMap::new(),
+            language_specific: LanguageSpecificSettings::Other,
+        }
+    }
+
+    fn every_source_group_language() -> Vec<Language> {
+        vec![
+            Language::Cxx,
+            Language::Java,
+            Language::Python,
+            Language::Rust,
+            Language::JavaScript,
+            Language::TypeScript,
+            Language::Go,
+            Language::Ruby,
+            Language::Php,
+            Language::CSharp,
+            Language::Kotlin,
+            Language::Swift,
+            Language::Dart,
+            Language::Lua,
+            Language::Sql,
+            Language::Html,
+            Language::Css,
+            Language::Bash,
+            Language::Shell,
+            Language::PowerShell,
+            Language::Markdown,
+            Language::Yaml,
+            Language::Toml,
+            Language::Json,
+            Language::Svelte,
+            Language::Vue,
+            Language::Astro,
+        ]
+    }
 
     #[test]
     fn exact_project_path_resolution_distinguishes_existing_missing_and_outside() -> Result<()> {
@@ -2205,6 +3022,92 @@ mod tests {
     }
 
     #[test]
+    fn controlled_negative_structural_fixtures_are_omitted_without_hiding_real_sources()
+    -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let controlled_fixture = root
+            .join(".github")
+            .join("scripts")
+            .join("fixtures")
+            .join("actionlint-invalid.yml");
+        let valid_fixture = root.join("tests/fixtures/valid.yml");
+        let parser_fixture = root.join("tests/fixtures/actionlint-invalid.rs");
+        let production_structural = root.join("src/actionlint-invalid.yml");
+        let workflow = root.join(".github/workflows/ci.yml");
+        for path in [
+            &controlled_fixture,
+            &valid_fixture,
+            &parser_fixture,
+            &production_structural,
+            &workflow,
+        ] {
+            fs::create_dir_all(path.parent().expect("source parent"))?;
+        }
+        fs::write(&controlled_fixture, "jobs: [\n")?;
+        fs::write(&valid_fixture, "enabled: true\n")?;
+        fs::write(&parser_fixture, "pub fn fixture() {}\n")?;
+        fs::write(&production_structural, "enabled: true\n")?;
+        fs::write(
+            &workflow,
+            "name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n",
+        )?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(!inventory.files.contains(&controlled_fixture));
+        for admitted in [
+            valid_fixture,
+            parser_fixture,
+            production_structural,
+            workflow,
+        ] {
+            assert!(inventory.files.contains(&admitted), "{admitted:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_negative_fixture_schedules_pre_policy_row_removal() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let excluded = root.join("tests/fixtures/schema.malformed.json");
+        fs::create_dir_all(excluded.parent().expect("excluded parent"))?;
+        fs::write(&excluded, "{\"legacy\":")?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let outcome = WorkspaceDiscovery.build_refresh_outcome(
+            &manifest,
+            &RefreshInputs {
+                stored_files: Vec::new(),
+                policy_exclusions: Vec::new(),
+                inventory: WorkspaceInventory::from_records([(
+                    excluded,
+                    IndexedFileRecord {
+                        file_id: 45,
+                        modification_time: 0,
+                        content_hash: Some("b".repeat(64)),
+                        indexed: true,
+                        complete: false,
+                        retry_required: true,
+                    },
+                )]),
+            },
+        )?;
+
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert_eq!(outcome.plan.mode, RefreshMode::Incremental);
+        assert!(outcome.plan.files_to_index.is_empty());
+        assert_eq!(outcome.plan.files_to_remove, vec![45]);
+        assert!(outcome.plan.existing_file_ids.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn declared_json_lockfiles_are_excluded_without_hiding_ordinary_json() -> Result<()> {
         let temp = tempdir()?;
         let root = temp.path().join("repo");
@@ -2264,6 +3167,93 @@ mod tests {
     }
 
     #[test]
+    fn filters_unsupported_paths_before_oversized_source_classification() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src"))?;
+        let oversized_source = root.join("src/large.rs");
+        let oversized_binary = root.join("large.png");
+        let small_binary = root.join("small.png");
+        let companion_source = root.join("App.svelte");
+        fs::write(&oversized_source, vec![b's'; 65])?;
+        fs::write(&oversized_binary, vec![0; 96])?;
+        fs::write(&small_binary, vec![0; 8])?;
+        fs::write(&companion_source, b"<script>let value = 1;</script>\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v1")?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert_eq!(inventory.files, vec![companion_source]);
+        assert_eq!(inventory.policy_exclusions.len(), 1);
+        assert_eq!(
+            inventory.policy_exclusions[0].normalized_path,
+            "src/large.rs"
+        );
+        assert_eq!(inventory.policy_exclusions[0].observed_size, 65);
+        assert_eq!(inventory.policy_exclusions[0].byte_cap, 64);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_inventory_keeps_supported_source_beneath_non_utf8_ancestor() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let source_dir = root.join(std::ffi::OsString::from_vec(b"source-\xff".to_vec()));
+        let source = source_dir.join("main.rs");
+        assert!(has_supported_source_route(&source));
+
+        // Apple filesystems reject invalid-UTF-8 names with EILSEQ. The pure
+        // classifier assertion above still covers the defect there; Unix
+        // filesystems that admit the name exercise inventory and refresh too.
+        #[cfg(target_vendor = "apple")]
+        return Ok(());
+
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            fs::create_dir_all(&source_dir)?;
+            fs::write(&source, "fn main() {}\n")?;
+
+            let manifest = WorkspaceManifest::open(root)?;
+            let policy = SourceIndexPolicy::oversized(64);
+            let inventory = manifest.source_inventory_with_policy(&policy)?;
+
+            assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+            assert_eq!(inventory.files, vec![source.clone()]);
+            assert!(inventory.policy_exclusions.is_empty());
+
+            let outcome = manifest.build_execution_outcome_with_policy(
+                &RefreshInputs {
+                    stored_files: vec![StoredFileState {
+                        id: 7,
+                        path: source.clone(),
+                        modification_time: modification_time_millis(&source)?,
+                        content_hash: Some(current_content_hash(&source)?),
+                        indexed: true,
+                        complete: true,
+                        retry_required: false,
+                    }],
+                    policy_exclusions: Vec::new(),
+                    inventory: WorkspaceInventory::default(),
+                },
+                &policy,
+            )?;
+
+            assert!(outcome.refresh.plan.files_to_index.is_empty());
+            assert!(outcome.refresh.plan.files_to_remove.is_empty());
+            assert_eq!(
+                outcome.refresh.plan.existing_file_ids.get(&source),
+                Some(&7)
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
     fn changed_oversized_content_produces_a_new_verified_identity() -> Result<()> {
         let temp = tempdir()?;
         let root = temp.path().join("repo");
@@ -2305,6 +3295,7 @@ mod tests {
         let policy = SourceIndexPolicy {
             policy_version: "test-structural-policy-v1".to_string(),
             byte_cap: 1_000,
+            structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
             structural_unit_cap: 2,
         };
         let (content_hash, observed_size) = current_content_identity(&path)?;
@@ -2332,6 +3323,68 @@ mod tests {
         let changed = manifest.build_execution_outcome_with_policy(&inputs, &policy)?;
         assert_eq!(changed.refresh.plan.files_to_index, vec![path]);
         assert!(changed.policy_exclusions.is_empty());
+        Ok(())
+    }
+
+    /// The whole point of the split cap: raising the parser headroom must not
+    /// drag structural formats up with it.
+    ///
+    /// Before this, a 1.5 MB JSON under a 2 MB headroom was *admitted* by
+    /// planning, then refused by the collector's hardcoded 1 MiB limit, and
+    /// `FileCoverageReason::Oversized` is refresh-fatal — so the whole index
+    /// failed, permanently, on every run. Planning has to refuse it first, and
+    /// the record has to name the cap that actually refused it.
+    #[test]
+    fn the_structural_bound_holds_when_the_parser_headroom_is_raised() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src"))?;
+        let oversized_structural = root.join("data.json");
+        fs::write(&oversized_structural, vec![b'x'; 1_500_000])?;
+        let big_source = root.join("src").join("big.rs");
+        fs::write(&big_source, vec![b'x'; 1_500_000])?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let policy = SourceIndexPolicy::default();
+        let inventory = manifest.source_inventory_with_policy(&policy)?;
+
+        assert!(
+            inventory.files.iter().any(|path| path == &big_source),
+            "a 1.5 MB Rust source is inside the 2 MB headroom and must be indexed"
+        );
+        assert!(
+            !inventory
+                .files
+                .iter()
+                .any(|path| path == &oversized_structural),
+            "a 1.5 MB JSON is past the structural bound and must not be scheduled"
+        );
+
+        let excluded: Vec<_> = inventory
+            .policy_exclusions
+            .iter()
+            .filter(|candidate| candidate.normalized_path.ends_with("data.json"))
+            .collect();
+        assert_eq!(excluded.len(), 1, "the JSON must be a published exclusion");
+        assert_eq!(
+            excluded[0].byte_cap,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
+            "the record must name the cap that refused it, not the headroom"
+        );
+        assert_eq!(
+            excluded[0].observed_unit_count, 0,
+            "a structural file over the byte bound is byte-bound, not unit-bound"
+        );
+
+        // Revalidation runs at the publication fence on every commit and
+        // recomputes the same classification. If it disagreed, no core would
+        // ever publish.
+        let verified = WorkspaceDiscovery.revalidate_source_policy_exclusions(
+            &manifest,
+            &inventory.policy_exclusions,
+            &policy,
+        )?;
+        assert_eq!(verified.len(), inventory.policy_exclusions.len());
         Ok(())
     }
 
@@ -2417,6 +3470,371 @@ mod tests {
         )?;
 
         assert_eq!(plan.files_to_index, vec![file]);
+        Ok(())
+    }
+
+    fn indexed_inputs_for(files: &[PathBuf]) -> Result<RefreshInputs> {
+        let mut stored_files = Vec::new();
+        for (index, file) in files.iter().enumerate() {
+            stored_files.push(StoredFileState {
+                id: index as i64 + 1,
+                path: file.clone(),
+                modification_time: modification_time_millis(file)?,
+                content_hash: Some(current_content_hash(file)?),
+                indexed: true,
+                complete: true,
+                retry_required: false,
+            });
+        }
+        Ok(RefreshInputs {
+            stored_files,
+            policy_exclusions: Vec::new(),
+            inventory: WorkspaceInventory::default(),
+        })
+    }
+
+    fn parallel_refresh_fixture(
+        root: &Path,
+        count: usize,
+    ) -> Result<(Vec<PathBuf>, RefreshInputs)> {
+        let mut files = Vec::with_capacity(count);
+        for index in 0..count {
+            let path = root.join(format!("file_{index:02}.rs"));
+            fs::write(&path, format!("fn file_{index:02}() {{}}\n"))?;
+            files.push(path);
+        }
+        let inputs = indexed_inputs_for(&files)?;
+        Ok((files, inputs))
+    }
+
+    #[test]
+    fn parallel_stored_file_decisions_are_exact_ordered_and_memo_aware() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let (mut files, mut inputs) = parallel_refresh_fixture(&root, 20)?;
+
+        let same_mtime = fs::metadata(&files[3])?.modified()?;
+        let mut same_length_drift = fs::read(&files[3])?;
+        same_length_drift[3] ^= 1;
+        fs::write(&files[3], same_length_drift)?;
+        fs::File::open(&files[3])?.set_modified(same_mtime)?;
+
+        let changed_mtime = fs::metadata(&files[7])?
+            .modified()?
+            .checked_add(std::time::Duration::from_secs(2))
+            .expect("fixture timestamp can advance");
+        fs::File::open(&files[7])?.set_modified(changed_mtime)?;
+        fs::remove_file(&files[11])?;
+        inputs.stored_files[15].retry_required = true;
+
+        let new_file = root.join("new_file.rs");
+        fs::write(&new_file, "fn newly_discovered() {}\n")?;
+        files.push(new_file);
+        let mut stored_files = inputs.stored_files.iter().map(Some).collect::<Vec<_>>();
+        stored_files.push(None);
+
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+        let _scope = SourceFreshnessScope::enter();
+        let batch = source_freshness::source_freshness_batch();
+        let decisions = stored_file_decisions_in_pool(&pool, &files, &stored_files, batch.as_ref());
+        account_parallel_stored_file_decisions(&files, &stored_files, &decisions, batch.as_ref());
+        let repeated_batch = source_freshness::source_freshness_batch();
+        let repeated =
+            stored_file_decisions_in_pool(&pool, &files, &stored_files, repeated_batch.as_ref());
+        account_parallel_stored_file_decisions(
+            &files,
+            &stored_files,
+            &repeated,
+            repeated_batch.as_ref(),
+        );
+        assert_eq!(
+            decisions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, decision)| decision.needs_index.then_some(index))
+                .collect::<Vec<_>>(),
+            vec![3, 7, 11, 15, 20]
+        );
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|decision| decision.needs_index)
+                .collect::<Vec<_>>(),
+            repeated
+                .iter()
+                .map(|decision| decision.needs_index)
+                .collect::<Vec<_>>(),
+            "indexed parallel collection must preserve deterministic input order"
+        );
+        assert_eq!(
+            source_freshness_counts().expect("armed scope"),
+            SourceFreshnessCounts {
+                content_hash_reads: 17,
+                verdict_reuses: 17,
+                readiness_fingerprint_passes: 0,
+            },
+            "the first batch must hash each eligible file once and the second must reuse it"
+        );
+
+        source_freshness::reverify_from_content();
+        let torn_target = files[5].clone();
+        arm_torn_read_mutation_for_test(
+            torn_target,
+            b"fn file_05() { let write_raced_the_reader = true; }\n".to_vec(),
+        );
+        let torn_batch = source_freshness::source_freshness_batch();
+        let torn = stored_file_decisions_in_pool(&pool, &files, &stored_files, torn_batch.as_ref());
+        account_parallel_stored_file_decisions(&files, &stored_files, &torn, torn_batch.as_ref());
+        assert!(torn[5].needs_index, "a torn content read must fail closed");
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_refresh_plan_preserves_stale_and_removal_order() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let (files, inputs) = parallel_refresh_fixture(&root, 20)?;
+        let same_mtime = fs::metadata(&files[3])?.modified()?;
+        let mut same_length_drift = fs::read(&files[3])?;
+        same_length_drift[3] ^= 1;
+        fs::write(&files[3], same_length_drift)?;
+        fs::File::open(&files[3])?.set_modified(same_mtime)?;
+        let changed_mtime = fs::metadata(&files[7])?
+            .modified()?
+            .checked_add(std::time::Duration::from_secs(2))
+            .expect("fixture timestamp can advance");
+        fs::File::open(&files[7])?.set_modified(changed_mtime)?;
+        fs::remove_file(&files[11])?;
+        let new_file = root.join("file_21.rs");
+        fs::write(&new_file, "fn file_21() {}\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let plan = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert_eq!(
+            plan.files_to_index,
+            vec![files[3].clone(), files[7].clone(), new_file],
+            "parallel decisions must be assembled in discovery order"
+        );
+        assert_eq!(plan.files_to_remove, vec![12]);
+        Ok(())
+    }
+
+    /// One public operation derives source freshness several times (before and
+    /// after the build, again for the second public-operation wrapper, again
+    /// for strict retrieval readiness). Without the operation-scoped verdict
+    /// memo each pass re-hashes every unchanged file.
+    #[test]
+    fn repeated_refresh_planning_in_one_scope_hashes_each_file_once() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let files = ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .map(|name| {
+                let path = root.join(name);
+                fs::write(
+                    &path,
+                    format!("fn {}() {{}}\n", name.trim_end_matches(".rs")),
+                )?;
+                Ok(path)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let inputs = indexed_inputs_for(&files)?;
+        let manifest = WorkspaceManifest::open(root)?;
+
+        let scope = SourceFreshnessScope::enter();
+        for _ in 0..4 {
+            let plan = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+            assert!(
+                plan.files_to_index.is_empty(),
+                "unchanged files must stay clean across every pass"
+            );
+        }
+        let counts = source_freshness_counts().expect("an armed scope reports counts");
+        assert_eq!(
+            counts.content_hash_reads, 3,
+            "four freshness passes over three unchanged files must read content exactly once per file"
+        );
+        assert_eq!(counts.verdict_reuses, 9);
+        drop(scope);
+
+        Ok(())
+    }
+
+    /// Replacement for the pre-change operation-lifetime oracle: a ready
+    /// lease carries the verdict across scopes, while a new lease starts with
+    /// no observations and re-verifies from content.
+    #[test]
+    fn a_ready_lease_reuses_verdicts_and_a_new_lease_reverifies_content() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}\n")?;
+        let inputs = indexed_inputs_for(std::slice::from_ref(&file))?;
+        let manifest = WorkspaceManifest::open(root)?;
+
+        let first_lease = SourceFreshnessMemo::default();
+        {
+            let _first = SourceFreshnessScope::enter_with_memo(first_lease.clone());
+            WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+            assert_eq!(
+                source_freshness_counts()
+                    .expect("armed scope")
+                    .content_hash_reads,
+                1
+            );
+        }
+        {
+            let _same_lease = SourceFreshnessScope::enter_with_memo(first_lease);
+            WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+            let counts = source_freshness_counts().expect("armed scope");
+            assert_eq!(
+                counts.content_hash_reads, 0,
+                "the same ready lease must not hash the file again"
+            );
+            assert_eq!(counts.verdict_reuses, 1);
+        }
+        {
+            let _new_lease = SourceFreshnessScope::enter_with_memo(SourceFreshnessMemo::default());
+            WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+            let counts = source_freshness_counts().expect("armed scope");
+            assert_eq!(
+                counts.content_hash_reads, 1,
+                "a new ready lease must hash the file again"
+            );
+            assert_eq!(counts.verdict_reuses, 0);
+        }
+        Ok(())
+    }
+
+    /// Same-mtime drift that changes the file's length is caught even inside a
+    /// single armed scope, because the observed length is part of the memo key.
+    #[test]
+    fn same_mtime_drift_that_changes_length_is_detected_inside_one_scope() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}\n")?;
+        let inputs = indexed_inputs_for(std::slice::from_ref(&file))?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let original_mtime = fs::metadata(&file)?.modified()?;
+
+        let _scope = SourceFreshnessScope::enter();
+        let clean = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert!(clean.files_to_index.is_empty());
+
+        fs::write(&file, "fn main() { let drifted = 1; }\n")?;
+        fs::File::open(&file)?.set_modified(original_mtime)?;
+        assert_eq!(
+            fs::metadata(&file)?.modified()?,
+            original_mtime,
+            "the drift must preserve the modification time to exercise the guard"
+        );
+
+        let drifted = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert_eq!(
+            drifted.files_to_index,
+            vec![file],
+            "a length change is a positive drift signal the memo key must not absorb"
+        );
+        Ok(())
+    }
+
+    /// Drift that preserves BOTH the modification time and the byte length is
+    /// invisible to metadata, so the content hash is the only mechanism that
+    /// sees it. A memoized verdict describes the instant it was taken at, so a
+    /// derivation that must see drift *since* then reverifies from content
+    /// first — and after that call the plan must name the drifted file again.
+    #[test]
+    fn same_mtime_same_length_drift_is_detected_after_reverification() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}\n")?;
+        let inputs = indexed_inputs_for(std::slice::from_ref(&file))?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let original_mtime = fs::metadata(&file)?.modified()?;
+        let original_len = fs::metadata(&file)?.len();
+
+        let _scope = SourceFreshnessScope::enter();
+        let clean = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert!(clean.files_to_index.is_empty());
+
+        // Same length, same mtime, different bytes: exactly the coarse-mtime /
+        // mtime-preserving-tool case the content hash exists to catch.
+        fs::write(&file, "fn maim() {}\n")?;
+        fs::File::open(&file)?.set_modified(original_mtime)?;
+        let observed = fs::metadata(&file)?;
+        assert_eq!(
+            observed.len(),
+            original_len,
+            "the drift must preserve the byte length to exercise the guard"
+        );
+        assert_eq!(
+            observed.modified()?,
+            original_mtime,
+            "the drift must preserve the modification time to exercise the guard"
+        );
+
+        source_freshness::reverify_from_content();
+
+        let drifted = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert_eq!(
+            drifted.files_to_index,
+            vec![file],
+            "reverification must re-read content, which is the only thing that \
+             sees same-mtime same-length drift"
+        );
+        Ok(())
+    }
+
+    /// Oracle for the torn-read guard: a write between the content read and
+    /// the closing metadata sample refuses the observation and must not leave
+    /// a reusable verdict behind.
+    #[test]
+    fn a_torn_read_is_refused_and_not_memoized() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}\n")?;
+        let inputs = indexed_inputs_for(std::slice::from_ref(&file))?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let original_mtime = fs::metadata(&file)?.modified()?;
+
+        let _scope = SourceFreshnessScope::enter();
+        arm_torn_read_mutation_for_test(
+            file.clone(),
+            b"fn main() { let write_raced_the_reader = true; }\n".to_vec(),
+        );
+        let refused = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert_eq!(refused.files_to_index, vec![file.clone()]);
+        assert_eq!(
+            source_freshness_counts().expect("armed scope"),
+            SourceFreshnessCounts {
+                content_hash_reads: 1,
+                verdict_reuses: 0,
+                readiness_fingerprint_passes: 0,
+            },
+            "the raced read must be counted but must not publish a reusable verdict"
+        );
+
+        fs::write(&file, "fn maim() {}\n")?;
+        fs::File::open(&file)?.set_modified(original_mtime)?;
+        let retried = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert_eq!(retried.files_to_index, vec![file]);
+        assert_eq!(
+            source_freshness_counts()
+                .expect("armed scope")
+                .content_hash_reads,
+            2,
+            "the next derivation must read content again after a torn read"
+        );
         Ok(())
     }
 
@@ -2904,7 +4322,129 @@ mod tests {
         let files = manifest.source_files()?;
 
         assert_eq!(files.len(), 256);
-        assert_eq!(manifest.discovery_exclusion_observation_count(), 5);
+        assert_eq!(
+            manifest.discovery_exclusion_observation_count(),
+            storage_owned_discovery_files(&storage_path).len()
+                + storage_owned_discovery_directory_roots(&storage_path).len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn storage_owned_artifacts_stay_excluded_while_hidden_user_sources_remain_visible() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let storage_path = root.join(".cache/custom-core.db");
+        let hidden_source = root.join(".github/workflows/ci.yml");
+        fs::create_dir_all(storage_path.parent().expect("storage parent"))?;
+        fs::create_dir_all(hidden_source.parent().expect("hidden source parent"))?;
+        fs::write(&hidden_source, "name: CI\non: push\njobs: {}\n")?;
+
+        let owned_files = storage_owned_discovery_files(&storage_path);
+        for path in &owned_files {
+            fs::write(path, b"codestory-owned\n")?;
+        }
+        let staged_files = [
+            root.join(".cache/custom-core.staged.123-456.db"),
+            root.join(".cache/custom-core.staged.123-456.db-wal"),
+            root.join(".cache/custom-core.staged.123-456.db-shm"),
+            root.join(".cache/custom-core.staged.123-456.db-journal"),
+        ];
+        for path in &staged_files {
+            fs::write(path, b"codestory-owned stage\n")?;
+        }
+        let staged_near_miss = root.join(".cache/custom-core.staged.notes.db");
+        fs::write(&staged_near_miss, b"user-owned\n")?;
+
+        let manifest = WorkspaceManifest::open_with_storage_owned_exclusions(root, &storage_path)?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&hidden_source));
+        assert!(inventory.files.contains(&staged_near_miss));
+        assert!(
+            owned_files
+                .iter()
+                .all(|owned| !inventory.files.contains(owned))
+        );
+        assert!(
+            staged_files
+                .iter()
+                .all(|owned| !inventory.files.contains(owned))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn quarantined_derived_reset_state_stays_out_of_source_discovery() -> Result<()> {
+        // The guided derived-cache reset moves owned artifacts into a
+        // quarantine tree inside the cache root instead of deleting them, so
+        // every file it reclaimed is still on disk under a name discovery has
+        // never seen. Unless the quarantine root is an owned directory
+        // identity, the next inventory adopts the whole reclaimed cache as
+        // user source.
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let storage_path = root.join(".cache/custom-core.db");
+        let quarantine =
+            codestory_contracts::owned_artifacts::derived_reset_quarantine_root(&storage_path)
+                .join("0001700000000");
+        fs::create_dir_all(quarantine.join("custom-core.search"))?;
+        let quarantined = [
+            quarantine.join("custom-core.db"),
+            quarantine.join("custom-core.db-wal"),
+            quarantine.join("local-refresh-status.json"),
+            quarantine.join("custom-core.search").join("meta.json"),
+        ];
+        for path in &quarantined {
+            fs::write(path, b"quarantined derived state\n")?;
+        }
+        let user_source = root.join("src/lib.rs");
+        fs::create_dir_all(user_source.parent().expect("user source parent"))?;
+        fs::write(&user_source, "pub fn keep() {}\n")?;
+
+        let manifest = WorkspaceManifest::open_with_storage_owned_exclusions(root, &storage_path)?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&user_source));
+        for path in &quarantined {
+            assert!(
+                !inventory.files.contains(path),
+                "{} was quarantined by the derived-cache reset and must never be discovered as user source",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bare_storage_path_observes_staged_siblings_from_current_directory() {
+        assert_eq!(
+            storage_parent_for_observation(Path::new("codestory.db")),
+            Path::new(".")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_owned_sqlite_sidecars_preserve_non_utf8_path_bytes() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let storage_path = root.join(std::ffi::OsString::from_vec(b"core-\xff.db".to_vec()));
+        let native_wal = path_with_native_suffix(&storage_path, "-wal");
+        let lossy_user_file = root.join("core-�.db-wal");
+
+        let manifest = WorkspaceManifest::open_with_storage_owned_exclusions(root, &storage_path)?;
+        let exclusions =
+            observe_discovery_exclusions(&manifest).expect("observe storage-owned exclusions");
+
+        assert!(exclusions.file_is_excluded(&native_wal)?);
+        assert!(!exclusions.file_is_excluded(&lossy_user_file)?);
         Ok(())
     }
 
@@ -2996,6 +4536,197 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_manifest_discovers_hidden_sources_but_excludes_git_metadata() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let workflow = root.join(".github/workflows/ci.yml");
+        let git_source = root.join(".git/objects/should-not-index.rs");
+        fs::create_dir_all(workflow.parent().expect("workflow parent"))?;
+        fs::create_dir_all(git_source.parent().expect("git source parent"))?;
+        fs::write(&workflow, "name: CI\non: push\njobs: {}\n")?;
+        fs::write(&git_source, "pub fn repository_metadata() {}\n")?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&workflow));
+        assert!(!inventory.files.contains(&git_source));
+        Ok(())
+    }
+
+    #[test]
+    fn identical_language_roots_share_one_walk_and_preserve_group_union() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("excluded"))?;
+        fs::create_dir_all(root.join("ui"))?;
+        for (relative, contents) in [
+            ("main.rs", "pub fn main_source() {}\n"),
+            ("app.ts", "export const app = true;\n"),
+            ("ui/App.svelte", "<script>export let app;</script>\n"),
+            ("README.md", "# repository\n"),
+            ("config.yaml", "enabled: true\n"),
+            ("excluded/skip.rs", "pub fn excluded() {}\n"),
+        ] {
+            fs::write(root.join(relative), contents)?;
+        }
+
+        let groups = every_source_group_language()
+            .into_iter()
+            .map(|language| {
+                let excludes = if language == Language::Rust {
+                    vec!["**/excluded/**"]
+                } else if language == Language::Svelte {
+                    vec!["**/ui/**"]
+                } else {
+                    Vec::new()
+                };
+                test_source_group(language, root.clone(), &excludes)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(groups.len(), 27);
+
+        let manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "coalesced".to_string(),
+                version: 1,
+                source_groups: groups.clone(),
+            },
+            root.join("codestory_project.json"),
+        );
+        let inventory = manifest.source_inventory()?;
+
+        let mut reference_files = Vec::new();
+        for group in groups {
+            let reference = WorkspaceManifest::from_parts(
+                WorkspaceSettings {
+                    name: "reference".to_string(),
+                    version: 1,
+                    source_groups: vec![group],
+                },
+                root.join("codestory_project.json"),
+            )
+            .source_inventory()?;
+            assert_eq!(reference.outcome, WorkspaceInventoryOutcome::Complete);
+            reference_files.extend(reference.files);
+        }
+        reference_files.sort();
+        reference_files.dedup();
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert_eq!(inventory.files, reference_files);
+        assert_eq!(manifest.discovery_walk_count(), 1);
+        assert!(inventory.files.contains(&root.join("ui/App.svelte")));
+        assert!(!inventory.files.contains(&root.join("excluded/skip.rs")));
+
+        let changed = root.join("main.rs");
+        let indexed_hash = current_content_hash(&changed)?;
+        fs::write(&changed, "pub fn next_source() {}\n")?;
+        let outcome = manifest.build_execution_outcome(&RefreshInputs {
+            stored_files: vec![StoredFileState {
+                id: 7,
+                path: changed.clone(),
+                modification_time: modification_time_millis(&changed)?,
+                content_hash: Some(indexed_hash),
+                indexed: true,
+                complete: true,
+                retry_required: false,
+            }],
+            policy_exclusions: Vec::new(),
+            inventory: WorkspaceInventory::default(),
+        })?;
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert_eq!(manifest.discovery_walk_count(), 1);
+        assert!(outcome.plan.files_to_index.contains(&changed));
+        assert!(outcome.plan.files_to_remove.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_overlapping_roots_preserve_root_specific_ignore_contexts() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested)?;
+        let outer = root.join("outer.rs");
+        let nested_source = nested.join("lib.rs");
+        fs::write(root.join(".ignore"), "nested/\n")?;
+        fs::write(&outer, "pub fn outer() {}\n")?;
+        fs::write(&nested_source, "pub fn nested() {}\n")?;
+
+        let manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "overlapping".to_string(),
+                version: 1,
+                source_groups: vec![
+                    test_source_group(Language::Rust, root.clone(), &[]),
+                    test_source_group(Language::Rust, nested, &[]),
+                ],
+            },
+            root.join("codestory_project.json"),
+        );
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert_eq!(manifest.discovery_walk_count(), 2);
+        assert!(inventory.files.contains(&outer));
+        assert!(inventory.files.contains(&nested_source));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_alias_roots_preserve_route_lexical_excludes() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let actual = root.join("actual");
+        let alias_a = root.join("alias-a");
+        let alias_b = root.join("alias-b");
+        fs::create_dir_all(&actual)?;
+        symlink(&actual, &alias_a)?;
+        symlink(&actual, &alias_b)?;
+        let actual_source = actual.join("lib.rs");
+        let alias_a_source = alias_a.join("lib.rs");
+        let alias_b_source = alias_b.join("lib.rs");
+        fs::write(&actual_source, "pub fn through_alias() {}\n")?;
+        let alias_a_absolute_exclude = alias_a_source.to_string_lossy().into_owned();
+
+        let manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "aliases".to_string(),
+                version: 1,
+                source_groups: vec![
+                    test_source_group(Language::TypeScript, alias_a, &[]),
+                    test_source_group(
+                        Language::Rust,
+                        alias_b,
+                        &[alias_a_absolute_exclude.as_str()],
+                    ),
+                ],
+            },
+            root.join("codestory_project.json"),
+        );
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert_eq!(manifest.discovery_walk_count(), 2);
+        assert!(inventory.files.contains(&alias_b_source));
+        assert!(
+            inventory
+                .files
+                .iter()
+                .any(|path| same_workspace_path(path, &actual_source))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn workspace_supported_source_extensions_have_registry_profiles() {
         let source_group_languages = [
             Language::Rust,
@@ -3070,6 +4801,98 @@ mod tests {
                 matches_source_group_language(Path::new(&file_name), &language),
                 "compatibility-only source extension should stay accepted by workspace discovery: {extension}"
             );
+        }
+    }
+
+    /// The registry-driven companion match must accept exactly the pairs the
+    /// hand-written cross product accepted — no more, no fewer.
+    ///
+    /// The positive direction alone is not enough: routing this through a
+    /// registry could widen discovery (a `.scss` file entering the JavaScript
+    /// source group, say), and discovery admission decides what gets indexed.
+    /// The expected set below is the pre-move table restated literally.
+    #[test]
+    fn companion_extension_source_groups_match_the_hand_written_cross_product() {
+        const EXPECTED: &[(&str, &[&str])] = &[
+            ("vue", &["JavaScript", "TypeScript", "Vue"]),
+            ("svelte", &["JavaScript", "TypeScript", "Svelte"]),
+            ("astro", &["JavaScript", "TypeScript", "Astro"]),
+            ("cshtml", &["CSharp"]),
+            ("lua", &["Lua"]),
+            ("scss", &["Css"]),
+            ("sass", &["Css"]),
+            ("less", &["Css"]),
+        ];
+        let all_languages = [
+            ("Cxx", Language::Cxx),
+            ("Java", Language::Java),
+            ("Python", Language::Python),
+            ("Rust", Language::Rust),
+            ("JavaScript", Language::JavaScript),
+            ("TypeScript", Language::TypeScript),
+            ("Go", Language::Go),
+            ("Ruby", Language::Ruby),
+            ("Php", Language::Php),
+            ("CSharp", Language::CSharp),
+            ("Kotlin", Language::Kotlin),
+            ("Swift", Language::Swift),
+            ("Dart", Language::Dart),
+            ("Lua", Language::Lua),
+            ("Sql", Language::Sql),
+            ("Html", Language::Html),
+            ("Css", Language::Css),
+            ("Bash", Language::Bash),
+            ("Shell", Language::Shell),
+            ("PowerShell", Language::PowerShell),
+            ("Markdown", Language::Markdown),
+            ("Yaml", Language::Yaml),
+            ("Toml", Language::Toml),
+            ("Json", Language::Json),
+            ("Svelte", Language::Svelte),
+            ("Vue", Language::Vue),
+            ("Astro", Language::Astro),
+        ];
+
+        let declared = codestory_contracts::language_support::COMPANION_EXTENSION_PROFILES
+            .iter()
+            .map(|profile| profile.extension)
+            .collect::<Vec<_>>();
+        let expected_extensions = EXPECTED
+            .iter()
+            .map(|(extension, _)| *extension)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declared, expected_extensions,
+            "the companion registry gained or lost an extension"
+        );
+
+        for (extension, accepted) in EXPECTED {
+            for (name, language) in &all_languages {
+                let expected = accepted.contains(name);
+                assert_eq!(
+                    compatibility_extension_matches_source_group(extension, language),
+                    expected,
+                    "`{extension}` in the {name} source group"
+                );
+                // The same answer must hold through the public entry point, so
+                // the registry cannot leak in via the other branch either.
+                let file_name = format!("main.{extension}");
+                assert_eq!(
+                    matches_source_group_language(Path::new(&file_name), language),
+                    expected,
+                    "`main.{extension}` discovered for {name}"
+                );
+            }
+        }
+
+        // Extensions outside the companion table stay outside it.
+        for extension in ["kt", "rs", "txt", "cshtmlx", ""] {
+            for (_, language) in &all_languages {
+                assert!(
+                    !compatibility_extension_matches_source_group(extension, language),
+                    "`{extension}` must not be a companion extension"
+                );
+            }
         }
     }
 
@@ -3364,5 +5187,19 @@ mod tests {
         let modified = metadata.modified()?;
         let duration = modified.duration_since(std::time::UNIX_EPOCH)?;
         Ok(duration.as_millis().min(i64::MAX as u128) as i64)
+    }
+
+    #[test]
+    fn filesystem_epoch_millis_clamps_pre_epoch_and_saturates() {
+        let before_epoch = std::time::UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("represent pre-epoch timestamp");
+        assert_eq!(clamp_system_time_to_epoch_millis(before_epoch), 0);
+        assert_eq!(
+            clamp_system_time_to_epoch_millis(
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_234),
+            ),
+            1_234
+        );
     }
 }

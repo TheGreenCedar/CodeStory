@@ -369,6 +369,192 @@ pub const LANGUAGE_SUPPORT_PROFILES: &[LanguageSupportProfile] = &[
     structural_profile("cargo_manifest", &[]),
 ];
 
+/// Extension that rides along with a registered language without being a claim
+/// of its own.
+///
+/// Template dialects (`.vue`, `.svelte`, `.astro`, `.cshtml`) and style
+/// preprocessor extensions (`.scss`, `.sass`, `.less`) used to be hand-repeated
+/// at every call site that cared: the workspace's source-group compatibility
+/// map, the indexer's template blanking pipeline, the indexer's text-only
+/// language projection, and the CLI's snippet highlighter (ARCH-012). They live
+/// here instead so those sites agree.
+///
+/// This is deliberately a sibling table, not more rows in
+/// [`LANGUAGE_SUPPORT_PROFILES`]. Adding `.vue` there would silently widen
+/// [`supported_extensions`], [`language_name_for_path`] and
+/// [`is_structural_source_path`], which decide what the product indexes and
+/// what claim tier it advertises. A companion extension makes no claim: it only
+/// records which registered languages already accept it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompanionExtensionProfile {
+    /// Extension without a leading dot, lowercase.
+    pub extension: &'static str,
+    /// Surface language reported for the file, when the extension names a
+    /// dialect of its own. `None` means the file is only ever attributed to the
+    /// language that owns it (Razor is C#, SCSS is CSS).
+    pub surface_language: Option<&'static str>,
+    /// Language source groups whose discovery accepts this extension.
+    ///
+    /// Entries are language names, either from [`LANGUAGE_SUPPORT_PROFILES`] or
+    /// from `surface_language` itself. They are not claim tiers.
+    pub source_group_languages: &'static [&'static str],
+}
+
+pub const COMPANION_EXTENSION_PROFILES: &[CompanionExtensionProfile] = &[
+    CompanionExtensionProfile {
+        extension: "vue",
+        surface_language: Some("vue"),
+        source_group_languages: &["javascript", "typescript", "vue"],
+    },
+    CompanionExtensionProfile {
+        extension: "svelte",
+        surface_language: Some("svelte"),
+        source_group_languages: &["javascript", "typescript", "svelte"],
+    },
+    CompanionExtensionProfile {
+        extension: "astro",
+        surface_language: Some("astro"),
+        source_group_languages: &["javascript", "typescript", "astro"],
+    },
+    CompanionExtensionProfile {
+        extension: "cshtml",
+        surface_language: None,
+        source_group_languages: &["csharp"],
+    },
+    CompanionExtensionProfile {
+        extension: "lua",
+        surface_language: None,
+        source_group_languages: &["lua"],
+    },
+    CompanionExtensionProfile {
+        extension: "scss",
+        surface_language: None,
+        source_group_languages: &["css"],
+    },
+    CompanionExtensionProfile {
+        extension: "sass",
+        surface_language: None,
+        source_group_languages: &["css"],
+    },
+    CompanionExtensionProfile {
+        extension: "less",
+        surface_language: None,
+        source_group_languages: &["css"],
+    },
+];
+
+/// Look up a companion extension profile.
+pub fn companion_extension_profile(ext: &str) -> Option<&'static CompanionExtensionProfile> {
+    let ext = ext.trim().trim_start_matches('.');
+    COMPANION_EXTENSION_PROFILES
+        .iter()
+        .find(|profile| profile.extension.eq_ignore_ascii_case(ext))
+}
+
+/// Surface language for a companion extension, when it names its own dialect.
+pub fn companion_surface_language(ext: &str) -> Option<&'static str> {
+    companion_extension_profile(ext).and_then(|profile| profile.surface_language)
+}
+
+/// Line-comment marker for a language whose extraction rules have been
+/// registered.
+///
+/// Comment syntax is presentation, not evidence, which is why it is a sibling
+/// table rather than a field on [`LanguageSupportProfile`] — every field there
+/// is a claim-tier fact and must not be diluted by a rendering detail.
+///
+/// A language appears here only once its per-language extraction package has
+/// landed (S3, #1676 onward). Until then the consumer's own match arm owns it,
+/// and consumers therefore read this table first and fall back to that arm.
+/// Populating the table ahead of the migration would change rendering for
+/// languages whose consumer roster deliberately differs from their real syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageCommentProfile {
+    /// The name consumers actually spell. Usually a registry language name,
+    /// but a dialect that only the indexer and the highlighter distinguish
+    /// (`tsx`) is keyed by that dialect, because that is the string the
+    /// consumer roster held.
+    pub language_name: &'static str,
+    pub line_comment: &'static str,
+}
+
+pub const LANGUAGE_COMMENT_PROFILES: &[LanguageCommentProfile] = &[
+    LanguageCommentProfile {
+        language_name: "kotlin",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "java",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "cpp",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "javascript",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "typescript",
+        line_comment: "//",
+    },
+    // `tsx` is not a registry language — the registry routes `.tsx` to
+    // `typescript` — but it is the indexer's dispatch name for the JSX-aware
+    // TypeScript config and the CLI highlighter's own dialect string. The row
+    // covers that dialect only; `typescript` itself stays with the consumer
+    // roster until #1681.
+    LanguageCommentProfile {
+        language_name: "tsx",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "python",
+        line_comment: "#",
+    },
+    LanguageCommentProfile {
+        language_name: "rust",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "go",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "ruby",
+        line_comment: "#",
+    },
+    LanguageCommentProfile {
+        language_name: "php",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "csharp",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "swift",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "dart",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "bash",
+        line_comment: "#",
+    },
+];
+
+/// Line-comment marker for a registered language name.
+pub fn line_comment_for_language(language_name: &str) -> Option<&'static str> {
+    let language_name = language_name.trim();
+    LANGUAGE_COMMENT_PROFILES
+        .iter()
+        .find(|profile| profile.language_name.eq_ignore_ascii_case(language_name))
+        .map(|profile| profile.line_comment)
+}
+
 const fn parser_profile(
     language_name: &'static str,
     extensions: &'static [&'static str],
@@ -576,6 +762,27 @@ pub fn structural_source_path_exclusion(path: &str) -> Option<&'static str> {
         return None;
     }
     let file_name = components.last().copied().unwrap_or_default();
+    let controlled_negative_fixture = is_structural_source_path(&normalized)
+        && components
+            .get(..components.len().saturating_sub(1))
+            .is_some_and(|parents| parents.contains(&"fixtures"))
+        && file_name
+            .rsplit_once('.')
+            .map(|(stem, _)| stem)
+            .is_some_and(|stem| {
+                ["invalid", "malformed"].iter().any(|marker| {
+                    stem == *marker
+                        || stem.strip_suffix(marker).is_some_and(|prefix| {
+                            prefix
+                                .as_bytes()
+                                .last()
+                                .is_some_and(|byte| matches!(byte, b'-' | b'_' | b'.'))
+                        })
+                })
+            });
+    if controlled_negative_fixture {
+        return Some("controlled_negative_fixture");
+    }
     if components.iter().any(|component| {
         matches!(
             *component,
@@ -1025,6 +1232,195 @@ mod tests {
         assert!(profile.extensions.is_empty());
     }
 
+    /// Companion extensions must stay out of the claim registry.
+    ///
+    /// The whole reason this is a sibling table is that a companion extension
+    /// must not widen what the product indexes or what tier it advertises. If a
+    /// future edit moved `.vue` or `.scss` into `LANGUAGE_SUPPORT_PROFILES`,
+    /// `supported_extensions`, `language_name_for_path` and
+    /// `is_structural_source_path` would all start answering for it.
+    #[test]
+    fn companion_extensions_make_no_public_language_claim() {
+        for profile in COMPANION_EXTENSION_PROFILES {
+            assert_eq!(
+                language_support_profile_for_ext(profile.extension),
+                None,
+                "companion extension `{}` must not carry a public claim tier",
+                profile.extension
+            );
+            assert!(
+                !is_structural_source_path(&format!("src/file.{}", profile.extension)),
+                "companion extension `{}` must not be a structural source path",
+                profile.extension
+            );
+            assert!(
+                !profile.source_group_languages.is_empty(),
+                "companion extension `{}` needs at least one source group",
+                profile.extension
+            );
+        }
+
+        let mut seen = HashSet::new();
+        for profile in COMPANION_EXTENSION_PROFILES {
+            assert!(
+                seen.insert(profile.extension),
+                "companion extension `{}` is declared twice",
+                profile.extension
+            );
+            assert_eq!(
+                profile.extension.to_ascii_lowercase(),
+                profile.extension,
+                "companion extensions are stored lowercase"
+            );
+        }
+    }
+
+    /// Only the three blanked component dialects report a surface language.
+    ///
+    /// `template_surface_language` in the indexer routes on exactly this set,
+    /// and `semantic::detect_language` reports whatever it returns. Giving
+    /// Razor or SCSS a surface here would start attributing those files to a
+    /// language that has no parser behind it.
+    #[test]
+    fn only_component_dialects_carry_a_surface_language() {
+        let surfaces = COMPANION_EXTENSION_PROFILES
+            .iter()
+            .filter_map(|profile| {
+                profile
+                    .surface_language
+                    .map(|surface| (profile.extension, surface))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            surfaces,
+            vec![("vue", "vue"), ("svelte", "svelte"), ("astro", "astro")]
+        );
+        assert_eq!(companion_surface_language(".VUE"), Some("vue"));
+        assert_eq!(companion_surface_language("cshtml"), None);
+        assert_eq!(companion_surface_language("scss"), None);
+        assert_eq!(companion_surface_language("kt"), None);
+    }
+
+    /// Every source group a companion extension names must be a real language.
+    ///
+    /// A typo here would silently drop the extension out of discovery for that
+    /// source group rather than fail.
+    #[test]
+    fn companion_source_groups_name_real_languages() {
+        let surface_names = COMPANION_EXTENSION_PROFILES
+            .iter()
+            .filter_map(|profile| profile.surface_language)
+            .collect::<HashSet<_>>();
+        for profile in COMPANION_EXTENSION_PROFILES {
+            for language in profile.source_group_languages {
+                assert!(
+                    language_support_profile_for_language_name(
+                        language
+                    ).is_some(
+                    )
+                    || surface_names.contains(
+                        language
+                    )
+                    // `lua` has no registered profile at all; it exists
+                    // only as a workspace source-group compatibility name.
+                    || *language == "lua",
+                    "`{}` names unknown source group `{language}`",
+                    profile.extension
+                );
+            }
+        }
+    }
+
+    /// Comment rows exist only for languages whose extraction package landed.
+    #[test]
+    fn comment_profiles_cover_only_migrated_languages() {
+        let names = LANGUAGE_COMMENT_PROFILES
+            .iter()
+            .map(|profile| profile.language_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "kotlin",
+                "java",
+                "cpp",
+                "javascript",
+                "typescript",
+                "tsx",
+                "python",
+                "rust",
+                "go",
+                "ruby",
+                "php",
+                "csharp",
+                "swift",
+                "dart",
+                "bash"
+            ]
+        );
+        for profile in LANGUAGE_COMMENT_PROFILES {
+            assert!(
+                language_support_profile_for_language_name(
+                    profile.language_name
+                ).is_some(
+                )
+                // `tsx` is a dialect, not a registered surface: the registry
+                // routes `.tsx` to `typescript`. It is keyed here under its
+                // own name because that is the string the indexer dispatches
+                // on and the CLI highlighter renders, and because
+                // `typescript` itself has not migrated.
+                || profile.language_name == "tsx",
+                "`{}` has no public language profile",
+                profile.language_name
+            );
+            assert!(
+                !profile.line_comment.is_empty(),
+                "`{}` needs a line-comment marker",
+                profile.language_name
+            );
+        }
+        // Every migrated language answers from this registry, and the marker
+        // has to be the language's own: `#` for the shell-comment family, `//`
+        // for the C-descended one. A wrong marker here dims the wrong span in
+        // every surface that renders a comment.
+        for (language, marker) in [
+            ("kotlin", "//"),
+            ("java", "//"),
+            ("cpp", "//"),
+            ("javascript", "//"),
+            ("typescript", "//"),
+            ("tsx", "//"),
+            ("python", "#"),
+            ("rust", "//"),
+            ("go", "//"),
+            ("ruby", "#"),
+            ("php", "//"),
+            ("csharp", "//"),
+            ("swift", "//"),
+            ("dart", "//"),
+            ("bash", "#"),
+        ] {
+            assert_eq!(
+                line_comment_for_language(language),
+                Some(marker),
+                "`{language}` must answer from the comment registry"
+            );
+        }
+
+        // `.tsx` routes to `typescript` as a public surface while keeping its
+        // own comment row under the dialect name the indexer dispatches on.
+        assert_eq!(
+            language_support_profile_for_ext("tsx").map(|profile| profile.language_name),
+            Some("typescript")
+        );
+
+        // `jsx` is a CLI highlighter dialect, not a registered language, so it
+        // has no row here and must keep answering from the CLI's own roster.
+        // `c` has no comment row either; its highlighting is the CLI's.
+        assert_eq!(line_comment_for_language("jsx"), None);
+        assert_eq!(line_comment_for_language("c"), None);
+    }
+
     #[test]
     fn structural_exclusion_requires_a_workspace_relative_structural_path() {
         for relative in [
@@ -1070,5 +1466,47 @@ mod tests {
             );
         }
         assert!(!is_structural_source_path("config.jsonc"));
+    }
+
+    #[test]
+    fn structural_exclusion_classifies_only_controlled_negative_structural_fixtures() {
+        for path in [
+            "fixtures/invalid.yml",
+            ".github/scripts/fixtures/actionlint-invalid.yml",
+            "tests/fixtures/schema.malformed.json",
+            "tests/fixtures/settings_invalid.yaml",
+            r"TESTS\FIXTURES\SCHEMA.MALFORMED.JSON",
+        ] {
+            assert!(is_structural_source_path(path), "{path}");
+            assert_eq!(
+                structural_source_path_exclusion(path),
+                Some("controlled_negative_fixture"),
+                "{path}"
+            );
+        }
+
+        for path in [
+            "src/actionlint-invalid.yml",
+            ".github/workflows/actionlint-invalid.yml",
+            "fixtures/valid.yml",
+            "fixtures/invalidity.yml",
+            "fixtures/preinvalid.yml",
+            "fixtures/notmalformed.yml",
+            "myfixtures/actionlint-invalid.yml",
+            "tests/fixtures/actionlint-invalid.rs",
+            "tests/fixtures/actionlint-invalid.ts",
+        ] {
+            assert_eq!(structural_source_path_exclusion(path), None, "{path}");
+        }
+
+        for path in [
+            "/tmp/fixtures/invalid.yml",
+            r"C:\fixtures\invalid.yml",
+            r"\\server\fixtures\invalid.yml",
+            "../fixtures/invalid.yml",
+            "fixtures/../invalid.yml",
+        ] {
+            assert_eq!(structural_source_path_exclusion(path), None, "{path}");
+        }
     }
 }

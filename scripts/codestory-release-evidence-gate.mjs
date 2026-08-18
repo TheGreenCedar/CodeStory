@@ -42,12 +42,20 @@ const SELECTED_REF_PRODUCERS = new Set([
 ]);
 const RELEASE_CORPUS_CONTRACTS = new Map([
   [
+    "codestory-release-corpus-v0.16-axios-ripgrep-rust-v1",
+    "benchmarks/release-evidence/corpus-contracts/v0.16-axios-ripgrep-rust-v1.json",
+  ],
+  [
     "codestory-release-corpus-v0.16-axios-js-ts-v1",
     "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v1.json",
   ],
   [
     "codestory-release-corpus-v0.16-axios-js-ts-v2",
     "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json",
+  ],
+  [
+    "codestory-release-corpus-v0.17-ripgrep-rust-v2",
+    "benchmarks/release-evidence/corpus-contracts/v0.17-ripgrep-rust-v2.json",
   ],
 ]);
 
@@ -641,7 +649,7 @@ function validateRawProvenance(
       || !(stats.retrieval_manifest?.symbol_doc_count > 0)
       || !(stats.retrieval_manifest?.dense_projection_count > 0)
       || stats.retrieval_manifest?.dense_projection_count !== stats.retrieval_manifest?.projection_count
-      || stats.retrieval_manifest?.semantic_policy_version !== "graph_first_v2"
+      || stats.retrieval_manifest?.semantic_policy_version !== "graph_first_v3"
       || stats.retrieval_manifest?.graph_artifact_hash_present !== true
       || stats.retrieval_manifest?.dense_reason_count_total !== stats.retrieval_manifest?.dense_projection_count
       || stats.repeat_semantic_docs_embedded !== 0) {

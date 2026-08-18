@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "evidence": {
+    "schema_version": 2,
+    "producer": {
+      "name": "codestory-llama-sys",
+      "version": "0.17.0"
+    },
+    "model": {
+      "model_id": "coderankembed.Q8_0.gguf",
+      "model_sha256": "666db8df27c88570cdc07adca28646260038b8ca65354911d57b936ebf56efaa",
+      "model_size_bytes": 146029792,
+      "tokenizer_sha256": "7465b93c945b7a266481e6785aa13e505c625562c1c046c4b762bb4da4d46082",
+      "config_sha256": "2fe6b6821386499c65d436bfff2994008c1aa358dfce05c1c08fec2d2b05d4e5"
+    },
+    "semantics": {
+      "dimension": 768,
+      "query_prefix": "Represent this query for searching relevant code: ",
+      "document_prefix": "",
+      "pooling": "cls",
+      "normalization": "l2",
+      "element_type": "f32_le",
+      "vector_schema_version": 2
+    },
+    "engine": {
+      "engine": "llama.cpp",
+      "engine_build_id": "codestory-native-engine-v1|target=aarch64-apple-darwin|os=macos|arch=aarch64|linkage=static|backend_loading=builtin|backends=cpu,metal|llama_cpp_crate=0.1.151|llama_cpp_commit=9e3b928fd8c9d14dbf15a8768b9fdd7e5c721d66|model_sha256=666db8df27c88570cdc07adca28646260038b8ca65354911d57b936ebf56efaa|embedding_contract_sha256=af8f5a21c62367cb1e96b31bf4d3a23e11bd79531247f7bfe847a58d6eb9b6fa|model_embedded=true|producer=codestory-llama-sys@0.16.1|end",
+      "backend": "MTL",
+      "device_id": "MTL0",
+      "device_class": "Apple M5",
+      "accelerator_kind": "MTL"
+    },
+    "execution": {
+      "eligibility": "accelerator_required",
+      "observed_state": "accelerated",
+      "observation_source": "per_user_server",
+      "smoke_elapsed_ms": 19,
+      "observed_at_epoch_ms": 1786396632721
+    },
+    "publication": {
+      "core_generation_id": "f444483a-ddba-45e6-a085-589dd98ec234",
+      "core_run_id": "faf91902-ca80-4050-b06c-3116aa0f6fa6",
+      "retrieval_generation": "db5811bc674e7313-c34dc3142b899a74",
+      "retrieval_input_hash": "c34dc3142b899a74f615577d7b4d925a1add3a6507e28b17e8a49b0a40b6d541",
+      "semantic_generation": "codestory_db5811bc674e7313_c34dc3142b899a74"
+    }
+  },
+  "evidence_sha256": "b66a4e2c18fedcc4c12a77bba35ed962a44c65b4c411e76d9223abd2fb297180",
+  "compatibility_sha256": "9eabf3e6eda653cbc94ca1343921a9e7c1489a83f40e886ae0693cfb3b797942",
+  "vectors": {
+    "schema_version": 2,
+    "generation": "db5811bc674e7313-c34dc3142b899a74",
+    "input_hash": "c34dc3142b899a74f615577d7b4d925a1add3a6507e28b17e8a49b0a40b6d541",
+    "embedding_backend": "per-user-server:coderank-embed:q8_0:sha256-666db8df27c88570cdc07adca28646260038b8ca65354911d57b936ebf56efaa:llama.cpp-9e3b928fd8c9d14dbf15a8768b9fdd7e5c721d66:producer-codestory-llama-sys@0.16.1",
+    "embedding_dim": 768,
+    "point_count": 7,
+    "producer_identity": "per-user-server:coderank-embed:q8_0:sha256-666db8df27c88570cdc07adca28646260038b8ca65354911d57b936ebf56efaa:llama.cpp-9e3b928fd8c9d14dbf15a8768b9fdd7e5c721d66:producer-codestory-llama-sys@0.16.1",
+    "evidence_contract_identity": "9eabf3e6eda653cbc94ca1343921a9e7c1489a83f40e886ae0693cfb3b797942",
+    "vector_digest": "84a1360caf0591958cdffb5f57c01a16135afbf922bfb7113c8b2fb302b9dbd6",
+    "database_sha256": "6b0a60e3a4af5e44cdae214b110c80c054afdf46f082754e4efc9a8684fdb826"
+  }
+}

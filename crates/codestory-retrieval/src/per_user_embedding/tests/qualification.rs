@@ -1,6 +1,7 @@
 use super::super::{
-    CommandAbsence, MAX_DENIED_COMMAND_TICKS, absent_command, read_server_qualification_command,
-    server_qualification_control_from_values,
+    AwakeMonotonicClock, CommandAbsence, EmbeddingServerBindOutcome, EmbeddingServerTransport,
+    EmbeddingTransportFailure, MAX_DENIED_COMMAND_TICKS, absent_command, hex_sha256,
+    read_server_qualification_command, server_qualification_control_from_values,
 };
 // Only the platform-gated tests below use these, so importing them
 // unconditionally would warn on whichever platform is not running them.
@@ -9,11 +10,12 @@ use super::super::native_path_identity;
 #[cfg(unix)]
 use super::super::{
     SERVER_QUALIFICATION_MAX_COMMAND_BYTES, SERVER_QUALIFICATION_MAX_EVENT_BYTES,
-    SERVER_QUALIFICATION_MAX_EVENT_RECORDS, hex_sha256,
+    SERVER_QUALIFICATION_MAX_EVENT_RECORDS,
 };
-use super::{test_qualification_control, test_qualification_event};
+use super::{TestClock, test_qualification_control, test_qualification_event, test_server_state};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
@@ -26,6 +28,89 @@ fn write_private_command(path: &Path, bytes: &[u8]) {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .expect("private qualification command");
     }
+}
+
+struct CrashReceiptTransport {
+    clock: Arc<TestClock>,
+    event_path: PathBuf,
+    observed_durable_receipt: AtomicBool,
+}
+
+impl EmbeddingServerTransport for CrashReceiptTransport {
+    fn bind(&self) -> std::result::Result<EmbeddingServerBindOutcome, EmbeddingTransportFailure> {
+        Err(EmbeddingTransportFailure {
+            code: "test".into(),
+            message: "not used".into(),
+        })
+    }
+
+    fn clock(&self) -> Arc<dyn AwakeMonotonicClock> {
+        self.clock.clone()
+    }
+
+    fn fail_stop(&self, reason_code: &str) {
+        assert_eq!(reason_code, "embedding_qualification_crash");
+        let raw = fs::read_to_string(&self.event_path)
+            .expect("accepted crash receipt is durable before fail-stop");
+        let event: serde_json::Value =
+            serde_json::from_str(raw.lines().last().expect("accepted crash receipt record"))
+                .expect("accepted crash receipt JSON");
+        assert_eq!(event["action"], "crash_server");
+        assert_eq!(event["status"], "accepted");
+        assert_eq!(event["snapshot"]["process"]["pid"], 42);
+        assert_eq!(
+            event["snapshot"]["process"]["process_start_id"],
+            "server-start"
+        );
+        self.observed_durable_receipt.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn accepted_crash_receipt_pins_the_exact_server_before_fail_stop() {
+    let (_temporary, control) = test_qualification_control();
+    let command_path = control
+        .directory
+        .join(format!("{}.command.json", control.nonce));
+    let event_path = control
+        .directory
+        .join(format!("{}.events.jsonl", control.nonce));
+    let command = serde_json::json!({
+        "schema_version": 1,
+        "sequence": 1,
+        "nonce_sha256": hex_sha256(control.nonce.as_bytes()),
+        "action": "crash_server",
+        "parameters": {"class": null},
+    });
+    write_private_command(
+        &command_path,
+        serde_json::to_string(&command)
+            .expect("encode crash command")
+            .as_bytes(),
+    );
+
+    let mut state = test_server_state();
+    Arc::get_mut(&mut state)
+        .expect("new test server state is uniquely held")
+        .qualification = Some(control);
+    let transport = CrashReceiptTransport {
+        clock: TestClock::new(),
+        event_path,
+        observed_durable_receipt: AtomicBool::new(false),
+    };
+
+    super::super::qualification_control::poll_server_qualification_command(&state, &transport)
+        .expect("accepted crash control");
+
+    assert!(
+        transport.observed_durable_receipt.load(Ordering::Acquire),
+        "fail-stop ran before the exact accepted crash receipt was durable"
+    );
+    assert!(
+        state.draining.load(Ordering::Acquire),
+        "an accepted crash control did not drain the server"
+    );
 }
 
 /// A command the proof harness takes back mid-consume must read as "no command

@@ -251,6 +251,7 @@ fn prepare_full_refresh_snapshots(
     source_identity: &str,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
 ) -> Result<PreparedFullRefreshSnapshots, ApiError> {
     let semantic_started = Instant::now();
     let semantic_stats = finalize_staged_semantic_docs_for_runtime(
@@ -260,7 +261,9 @@ fn prepare_full_refresh_snapshots(
         source_identity,
         cancel_token,
         runtime,
-        SemanticProjectionDocumentSource::SourceFiles,
+        SemanticProjectionDocumentSource::SourceFiles {
+            max_file_bytes: source_index_policy.byte_cap,
+        },
     )?;
     ensure_indexing_active(cancel_token)?;
     let semantic_duration = semantic_started.elapsed();
@@ -451,6 +454,7 @@ fn prepare_full_refresh(
         &live_state.dense_anchor_source_identity,
         cancel_token,
         runtime,
+        source_index_policy,
     )?;
     wall_durations.semantic_stage = snapshots.semantic_duration;
     wall_durations.snapshot_stage = snapshots.snapshot_duration;
@@ -466,6 +470,12 @@ fn prepare_full_refresh(
     })
 }
 
+/// Build and publish a from-scratch core database.
+///
+/// `_annotations_owned` is unused at runtime and load-bearing at compile time:
+/// the published database never carried the retained legacy annotation tables,
+/// so this function may only be reached from a path that already moved user
+/// annotations into the sidecar.
 pub(super) fn index_full_for_runtime(
     root: &Path,
     storage_path: &Path,
@@ -473,6 +483,7 @@ pub(super) fn index_full_for_runtime(
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
+    _annotations_owned: &crate::controller_bookmarks::AnnotationsOwned,
 ) -> Result<IndexingRunSummary, ApiError> {
     let PreparedFullRefresh {
         mut staged,
@@ -564,5 +575,6 @@ pub(super) fn index_full_for_runtime(
         #[cfg(test)]
         publication: publication.clone(),
         prepared_search_state: Some(prepared_search_state),
+        unchanged_publication: false,
     })
 }

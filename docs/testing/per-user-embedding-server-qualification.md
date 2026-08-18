@@ -95,6 +95,17 @@ endpoint namespace and enables deterministic fault controls; it is absent from
 public help and ordinary product APIs. Raw nonce values and project paths are
 not retained.
 
+A server reads that directory once, at start, and polls only that directory for
+the rest of its life. Moving the variable while a server is resident therefore
+moves the writers alone and strands every control the harness writes afterwards,
+so the harness binds it through
+`packaged_agent_proof.qualification_directory_binding`: the publication-fault
+phase's server is replaced before the measurement producer moves to the artifact
+directory, and the move then proves by exact process identity that a different
+server answers there. A surviving parent-directory server fails as
+`embedding_qualification_control_directory_mismatch` rather than as a control
+event timeout.
+
 Each passing record contains:
 
 - exact source/tree, archive, executable, package target, protocol, constants,

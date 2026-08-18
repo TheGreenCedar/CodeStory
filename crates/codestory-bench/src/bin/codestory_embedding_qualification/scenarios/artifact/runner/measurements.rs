@@ -18,14 +18,41 @@ use super::{
 use crate::qualification::request::REQUIRED_METRICS;
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
-    EmbeddingCapacityPressureWire, EmbeddingEngineIdentity, EmbeddingQualificationParameters,
+    EMBEDDING_BUSY_RETRY_QUEUE_CLASS, EmbeddingCapacityPressureWire, EmbeddingEngineIdentity,
+    EmbeddingQualificationParameters,
     EmbeddingQualificationWorkerMeasurementSpan as WorkerMeasurementSpan, EmbeddingServerSnapshot,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const WINDOWS_VULKAN_MATRIX_CELL: &str = "protected_windows_x64_vulkan";
+const WINDOWS_WARM_CONNECT_METRIC: &str = "existing_owner_connect";
+
+fn windows_warm_connect_probe_rule() -> Result<(u32, Duration)> {
+    let protocol: Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../codestory-llama-sys/per-user-embedding-server-measurement-protocol.json"
+    )))
+    .context("parse embedded measurement protocol for Windows warm-connect probe")?;
+    let rule = &protocol["qualification_threshold_override_probes"][WINDOWS_VULKAN_MATRIX_CELL]
+        [WINDOWS_WARM_CONNECT_METRIC];
+    let sample_count = rule["sample_count"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow::anyhow!("embedding_windows_warm_connect_probe_count_invalid"))?;
+    let maximum_duration_ms = rule["maximum_probe_duration_ms"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow::anyhow!("embedding_windows_warm_connect_probe_timeout_invalid"))?;
+    if rule["aggregation"] != "maximum" {
+        bail!("embedding_windows_warm_connect_probe_rule_invalid");
+    }
+    Ok((sample_count, Duration::from_millis(maximum_duration_ms)))
+}
 
 pub(super) const CONSTANT_CALIBRATION_METRICS: &[&str] = &[
     "spawn_convergence",
@@ -381,23 +408,66 @@ impl<'a> ScenarioRunner<'a> {
             )?;
         }
 
-        for repeat in 1..=3 {
-            let measured = self.run_measure_worker(
-                "measure_hello",
-                "existing_owner_connect",
-                repeat,
-                query_parameters(1),
-            )?;
+        let windows_warm_connect_probe =
+            self.context.qualification_runtime.matrix_cell_id == WINDOWS_VULKAN_MATRIX_CELL;
+        let (warm_connect_sample_count, warm_connect_maximum_duration) =
+            if windows_warm_connect_probe {
+                windows_warm_connect_probe_rule()?
+            } else {
+                (3, Duration::MAX)
+            };
+        let warm_connect_started = Instant::now();
+        let warm_connect_deadline = if windows_warm_connect_probe {
+            Some(
+                warm_connect_started
+                    .checked_add(warm_connect_maximum_duration)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("embedding_windows_warm_connect_probe_timeout")
+                    })?,
+            )
+        } else {
+            None
+        };
+        let mut warm_connect_identities = BTreeSet::new();
+        for repeat in 1..=warm_connect_sample_count {
+            let measured = if windows_warm_connect_probe {
+                self.run_measure_worker_before_deadline(
+                    "measure_hello",
+                    WINDOWS_WARM_CONNECT_METRIC,
+                    repeat,
+                    query_parameters(1),
+                    warm_connect_deadline.ok_or_else(|| {
+                        anyhow::anyhow!("embedding_windows_warm_connect_probe_timeout")
+                    })?,
+                )?
+            } else {
+                self.run_measure_worker(
+                    "measure_hello",
+                    WINDOWS_WARM_CONNECT_METRIC,
+                    repeat,
+                    query_parameters(1),
+                )?
+            };
             let identity = raw_server_identity(&measured.snapshot)?;
+            warm_connect_identities.insert(identity.clone());
             self.record_metric(
                 &mut metrics,
-                "existing_owner_connect",
+                WINDOWS_WARM_CONNECT_METRIC,
                 repeat,
                 &measured.interval,
                 identity,
                 BTreeMap::new(),
             )?;
         }
+        let windows_warm_connect_probe_elapsed_wall_ns = if windows_warm_connect_probe {
+            let elapsed = warm_connect_started.elapsed();
+            if elapsed >= warm_connect_maximum_duration || warm_connect_identities.len() != 1 {
+                bail!("embedding_windows_warm_connect_probe_contract_failed");
+            }
+            Some(elapsed.as_nanos().try_into().unwrap_or(u64::MAX))
+        } else {
+            None
+        };
 
         for repeat in 1..=3 {
             self.reset_owner(&format!("measure_cold_no_owner_{repeat}"))?;
@@ -584,10 +654,11 @@ impl<'a> ScenarioRunner<'a> {
             bail!("embedding_qualification_measurement_set_incomplete");
         }
         Ok(MeasurementArtifact {
-            schema_version: 2,
+            schema_version: 3,
             contracts: self.context.contracts.clone(),
             external_metrics: vec!["total_codestory_process_memory".into()],
             metrics,
+            windows_warm_connect_probe_elapsed_wall_ns,
         })
     }
 
@@ -601,6 +672,31 @@ impl<'a> ScenarioRunner<'a> {
         let workload_id = declared_workload_id(metric)?;
         let worker = self.spawn_measure_worker(operation, parameters, workload_id, repeat, None)?;
         let output = self.finish_worker(worker, measurement_worker_timeout(operation))?;
+        self.measured_worker(operation, &output)
+    }
+
+    fn run_measure_worker_before_deadline(
+        &mut self,
+        operation: &str,
+        metric: &str,
+        repeat: u32,
+        parameters: EmbeddingQualificationParameters,
+        deadline: Instant,
+    ) -> Result<MeasuredWorker> {
+        if Instant::now() >= deadline {
+            bail!("embedding_windows_warm_connect_probe_timeout");
+        }
+        let workload_id = declared_workload_id(metric)?;
+        let worker = self.spawn_measure_worker(operation, parameters, workload_id, repeat, None)?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| anyhow::anyhow!("embedding_windows_warm_connect_probe_timeout"))?;
+        let output =
+            self.finish_worker(worker, remaining.min(measurement_worker_timeout(operation)))?;
+        if Instant::now() >= deadline {
+            bail!("embedding_windows_warm_connect_probe_timeout");
+        }
         self.measured_worker(operation, &output)
     }
 
@@ -637,13 +733,12 @@ impl<'a> ScenarioRunner<'a> {
     }
 
     /// The single-process saturated-65th-retry experiment: the driver holds
-    /// the bulk and query classes, spawns the busy-retry worker, releases the
-    /// classes once the worker's typed-retry marker appears, and validates
-    /// the returned pressure evidence.
+    /// the query class, spawns the busy-retry worker, releases that class once
+    /// the worker's typed-retry marker appears, and validates the returned
+    /// pressure evidence.
     fn measure_busy_retry(&mut self, repeat: u32) -> Result<MeasuredWorker> {
         self.ensure_owner("measurement_busy_owner")?;
-        self.control("hold_class", Some("bulk"))?;
-        self.control("hold_class", Some("query"))?;
+        self.control("hold_class", Some(EMBEDDING_BUSY_RETRY_QUEUE_CLASS))?;
         let marker = self
             .context
             .output_directory
@@ -658,8 +753,7 @@ impl<'a> ScenarioRunner<'a> {
         let marker_present =
             self.wait_for_retry_marker(&mut worker, &marker, busy_retry_marker_timeout())?;
         if marker_present {
-            self.control("release_class", Some("bulk"))?;
-            self.control("release_class", Some("query"))?;
+            self.control("release_class", Some(EMBEDDING_BUSY_RETRY_QUEUE_CLASS))?;
         }
         let output = self.finish_worker(worker, busy_retry_worker_timeout())?;
         self.cleanup_gate(&marker);
@@ -674,7 +768,7 @@ impl<'a> ScenarioRunner<'a> {
             anyhow::anyhow!("embedding_qualification_busy_retry_pressure_missing")
         })?;
         if pressure.reason != "queue_full"
-            || pressure.queue_class != "query"
+            || pressure.queue_class != EMBEDDING_BUSY_RETRY_QUEUE_CLASS
             || pressure.capacity != QUALIFICATION_QUEUE_CAPACITY
             || pressure.depth != pressure.capacity
             || pressure.retry_condition.trim().is_empty()
@@ -1001,9 +1095,19 @@ mod constant_calibration_tests {
         declared_phase_boundaries, expected_materialization_reuse,
         opaque_constant_calibration_sample_id, require_one_run_server_identity,
         retain_fresh_server_identities, validate_constant_engine_evidence,
+        windows_warm_connect_probe_rule,
     };
     use codestory_retrieval::EmbeddingEngineIdentity;
     use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    #[test]
+    fn windows_warm_connect_probe_uses_the_checked_in_rule() {
+        let (sample_count, maximum_duration) =
+            windows_warm_connect_probe_rule().expect("Windows warm-connect probe rule");
+        assert_eq!(sample_count, 30);
+        assert_eq!(maximum_duration, Duration::from_secs(90));
+    }
 
     fn server_identity(name: &str) -> RawServerIdentity {
         RawServerIdentity {

@@ -8,6 +8,7 @@ use super::{
 };
 use crate::config::SidecarRuntimeConfig;
 use anyhow::{Context, Result, anyhow, bail};
+use codestory_contracts::config_registry;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,6 +31,44 @@ pub(super) use server::{
     sync_qualification_directory, validate_private_qualification_file_metadata,
     write_server_qualification_event,
 };
+
+/// The qualification gate credentials, exactly as the process environment
+/// carries them.
+///
+/// The gate spans four processes — the CLI that spawns a qualification run, the
+/// worker it spawns, the embedding server, and this control path — and each
+/// applies its own admission rules to the same pair. Those rules differ on
+/// purpose (the worker demands an absolute existing directory; the server
+/// pins it by native identity), but the *reading* is one act, and this is where
+/// it happens: `CODESTORY_EMBED_QUALIFICATION_DIR` and
+/// `CODESTORY_EMBED_QUALIFICATION_NONCE` are declared to this file and read
+/// nowhere else. Values are returned unvalidated and untrimmed so every
+/// consumer keeps the validation it already had.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QualificationGateEnvironment {
+    /// Raw `CODESTORY_EMBED_QUALIFICATION_DIR`.
+    pub directory: Option<std::ffi::OsString>,
+    /// Raw `CODESTORY_EMBED_QUALIFICATION_NONCE`.
+    pub nonce: Option<std::ffi::OsString>,
+}
+
+impl QualificationGateEnvironment {
+    /// The nonce as `std::env::var` would have produced it: absent when unset
+    /// or not valid Unicode.
+    pub fn nonce_string(&self) -> Option<String> {
+        self.nonce
+            .as_ref()
+            .and_then(|nonce| nonce.clone().into_string().ok())
+    }
+}
+
+/// Read the qualification gate credentials from the process environment.
+pub fn qualification_gate_environment() -> QualificationGateEnvironment {
+    QualificationGateEnvironment {
+        directory: std::env::var_os(config_registry::EMBED_QUALIFICATION_DIR_ENV),
+        nonce: std::env::var_os(config_registry::EMBED_QUALIFICATION_NONCE_ENV),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -238,11 +277,13 @@ fn qualification_operation(
 }
 
 fn validate_qualification_gate(request: &EmbeddingQualificationRequest) -> Result<()> {
-    let directory = std::env::var_os("CODESTORY_EMBED_QUALIFICATION_DIR")
+    let gate = qualification_gate_environment();
+    let raw_nonce = gate.nonce_string();
+    let directory = gate
+        .directory
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("embedding_qualification_gate_closed"))?;
-    let nonce = std::env::var("CODESTORY_EMBED_QUALIFICATION_NONCE")
-        .ok()
+    let nonce = raw_nonce
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("embedding_qualification_gate_closed"))?;
     if !PathBuf::from(directory).is_dir() || request.nonce_sha256 != hex_sha256(nonce.as_bytes()) {

@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -18,6 +25,7 @@ import {
   validateReleaseClaimGraph,
   verifyReuseBinding,
 } from "../codestory-release-claims.mjs";
+import { workspaceMemberManifests } from "../lib/workspace-members.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const fixtureRoot = path.join(root, "scripts/tests/fixtures/release-claims");
@@ -180,18 +188,17 @@ test("versioned claim graph has one deterministic digest and all declared contro
       status_creator: "github-actions[bot]",
       job_manifest: ".github/scripts/release-freeze-acceptance-jobs.json",
       job_manifest_sha256:
-        "bb0a23ed7f74528fc3d4e4962c1b34f98758a628f48dd943b9d1356149e453c5",
+        "b1ae13eabcbda9c99f7d0ba17cae97ca292d11fa4b010f87c534f9b7938843c7",
       phases: {
-        calibration_source: {
+        source_stabilization: {
           known_future_source_changes: [
             "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
           ],
           planned_actions: [
-            "calibration-source-acceptance",
+            "source-stabilization",
             "calibration",
             "generated-constant-freeze",
             "frozen-candidate-acceptance",
-            "source-proof",
             "qualification",
             "release",
           ],
@@ -202,7 +209,6 @@ test("versioned claim graph has one deterministic digest and all declared contro
           known_future_source_changes: [],
           planned_actions: [
             "frozen-candidate-acceptance",
-            "source-proof",
             "qualification",
             "release",
           ],
@@ -244,6 +250,22 @@ test("claim graph freezes one exact Windows release graph and protected content-
       "packaging",
       "artifact_transfer",
     ],
+    link_timing: {
+      phase: "msvc_link",
+      selector: ".github/scripts/windows-link-timing.mjs",
+      record_schema: "codestory.windows-link-timing/v1",
+      record_file: "windows-link-timing.json",
+      evidence: "explicit_link_time_boundary",
+      substring_match: false,
+      observational: true,
+      unavailable_reasons: [
+        "incoherent-linker-report",
+        "link-exceeds-build-interval",
+        "linker-log-empty",
+        "linker-log-missing",
+        "no-explicit-linker-report",
+      ],
+    },
   });
   assert.deepEqual(graph.workflow_policy.candidate_archive_cache.key_fields, [
     "source.commit",
@@ -297,6 +319,30 @@ test("claim graph freezes one exact Windows release graph and protected content-
       draft.workflow_policy.windows_package_graph.production_feature_probes.pop();
     }, /production_feature_probes must be exactly/u],
     [draft => {
+      delete draft.workflow_policy.windows_package_graph.link_timing;
+    }, /link_timing must be an object/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.link_timing.substring_match = true;
+    }, /link_timing\.substring_match must be false/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.link_timing.evidence = "build_log_substring";
+    }, /link_timing must bind the explicit linker boundary selector/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.link_timing.selector =
+        ".github/scripts/cargo-cache-contract.mjs";
+    }, /link_timing must bind the explicit linker boundary selector/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.link_timing.record_schema =
+        "codestory.windows-link-timing/v2";
+    }, /link_timing must bind the explicit linker boundary selector/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.link_timing.observational = false;
+    }, /missing timing cannot invalidate a package/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.link_timing.unavailable_reasons
+        = ["no-explicit-linker-report"];
+    }, /link_timing\.unavailable_reasons must be exactly/u],
+    [draft => {
       draft.workflow_policy.candidate_archive_cache.key_fields.shift();
     }, /key_fields must be exactly/u],
     [draft => {
@@ -335,6 +381,71 @@ test("claim graph freezes one exact Windows release graph and protected content-
   }
 });
 
+test("claim graph owns the universal architecture and path-scoped durability floor", () => {
+  const floor = graph.workflow_policy.proof_floor;
+  assert.deepEqual(floor.architecture_contract, {
+    workflow: "retrieval-engine-smoke.yml",
+    job: "linux-contracts",
+    command: "cargo test --locked -p codestory-cli --test architecture_contracts",
+  });
+  assert.equal(floor.crate_durability.workflow, "crate-durability.yml");
+  assert.equal(floor.crate_durability.job, "linux-durability");
+  assert.equal(floor.crate_durability.artifact_free, true);
+  assert.deepEqual(floor.crate_durability.commands, [
+    "cargo test --locked -p codestory-store",
+    "cargo test --locked -p codestory-indexer --test fidelity_regression",
+    "cargo test --locked -p codestory-indexer --test tictactoe_language_coverage",
+    "cargo test --locked -p codestory-agent",
+  ]);
+  assert.deepEqual(floor.crate_durability.paths.slice(0, 3), [
+    "Cargo.toml",
+    "Cargo.lock",
+    "vendor/**",
+  ]);
+  assert.ok(!floor.crate_durability.paths.includes("crates/**"));
+
+  const mutations = [
+    [draft => {
+      draft.workflow_policy.proof_floor.schema = 2;
+    }, /exact schema 1 contract/u],
+    [draft => {
+      draft.workflow_policy.proof_floor.architecture_contract.job = "optional-contracts";
+    }, /universal linux-contracts lane/u],
+    [draft => {
+      draft.workflow_policy.proof_floor.architecture_contract.workflow = "";
+    }, /architecture_contract\.workflow must be a non-empty string/u],
+    [draft => {
+      draft.workflow_policy.proof_floor.crate_durability.artifact_free = false;
+    }, /source-only identity and bound/u],
+    [draft => {
+      draft.workflow_policy.proof_floor.crate_durability.paths.push(
+        "crates/codestory-runtime/**",
+      );
+    }, /paths must be exactly/u],
+    [draft => {
+      draft.workflow_policy.proof_floor.crate_durability.commands.reverse();
+    }, /commands must be exactly/u],
+    [draft => {
+      draft.workflow_policy.proof_floor.crate_durability.cache_namespace = "draft-v2";
+    }, /source-only identity and bound/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+  for (const requiredPath of ["Cargo.toml", "Cargo.lock", "vendor/**"]) {
+    const draft = structuredClone(graph);
+    draft.workflow_policy.proof_floor.crate_durability.paths =
+      draft.workflow_policy.proof_floor.crate_durability.paths
+        .filter(triggerPath => triggerPath !== requiredPath);
+    assert.throws(
+      () => validateReleaseClaimGraph(draft),
+      /crate_durability\.paths must be exactly/u,
+    );
+  }
+});
+
 test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => {
   const calibration = graph.workflow_policy.calibration;
   assert.deepEqual(calibration.required_cells.map(({ id }) => id), [
@@ -347,10 +458,10 @@ test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => 
   assert.equal(calibration.optional_cells[0].feeds_constant_selection, false);
   assert.equal(calibration.runs_per_required_cell, 3);
   assert.equal(calibration.samples_per_metric_per_run, 1);
-  assert.equal(calibration.pre_collection_source_proof_required, false);
+  assert.equal(calibration.pre_collection_source_proof_required, true);
   assert.equal(
     calibration.source_proof_stage,
-    "frozen_candidate_before_qualification",
+    "source_stabilization_before_calibration",
   );
   assert.deepEqual(calibration.forbidden_environment, [
     "CODESTORY_EMBED_ALLOW_CPU=1",
@@ -376,11 +487,11 @@ test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => 
       draft.workflow_policy.calibration.samples_per_metric_per_run = 3;
     }, /exactly one sample per metric per run/u],
     [draft => {
-      draft.workflow_policy.calibration.pre_collection_source_proof_required = true;
-    }, /sole frozen-candidate source proof/u],
+      draft.workflow_policy.calibration.pre_collection_source_proof_required = false;
+    }, /require source stabilization/u],
     [draft => {
       draft.workflow_policy.calibration.source_proof_stage = "before_calibration";
-    }, /sole frozen-candidate source proof/u],
+    }, /require source stabilization/u],
     [draft => {
       draft.workflow_policy.calibration.forbidden_environment = [
         "CODESTORY_EMBED_ALLOW_CPU=0",
@@ -454,7 +565,7 @@ test("claim graph freezes one GPU-only qualification run per available platform"
     archive_transfer: "authenticated_miss_only",
     evaluation_owner: "isolated_reusable_workflow",
     evaluation_owner_sha256:
-      "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173",
+      "5b97ee71393c5f72ef106d0d1e238cb1323e930204a06a4557f8e63725b0f8cd",
     evaluation_contract: "publishable-three-repeat-packet/v1",
     task_count: 1,
     repeats_per_task: 3,
@@ -556,6 +667,383 @@ test("claim graph freezes one GPU-only qualification run per available platform"
   }
 });
 
+test("pinned programs are an exact fail-closed membership with graph-owned digests", () => {
+  const programs = graph.workflow_policy.pinned_programs;
+  assert.equal(Object.keys(programs).length, 17);
+  for (const row of Object.values(programs)) {
+    assert.match(row.sha256, /^[0-9a-f]{64}$/u);
+  }
+  assert.equal(
+    graph.workflow_policy.qualification.quality_contract.evaluation_owner_sha256,
+    programs.frozen_candidate_quality_workflow.sha256,
+  );
+  const mutations = [
+    [draft => {
+      delete draft.workflow_policy.pinned_programs.packaged_linux_build;
+    }, /pinned_programs must declare packaged_linux_build/u],
+    [draft => {
+      draft.workflow_policy.pinned_programs.unpinned_extra = structuredClone(
+        draft.workflow_policy.pinned_programs.packaged_linux_build,
+      );
+    }, /names unknown pinned program unpinned_extra/u],
+    [draft => {
+      draft.workflow_policy.pinned_programs.marketplace_sync_dispatch_guard.sha256 = "not-a-digest";
+    }, /marketplace_sync_dispatch_guard\.sha256 must be a 64-hex sha256 digest/u],
+    [draft => {
+      draft.workflow_policy.pinned_programs.packaged_platform_proof_workflow.subject =
+        "step_script_raw_text";
+    }, /packaged_platform_proof_workflow\.subject must be parsed_workflow_json/u],
+    [draft => {
+      delete draft.workflow_policy.pinned_programs.source_proof_resolver.step;
+    }, /source_proof_resolver must carry exactly subject, file, job, step, sha256, reason/u],
+    [draft => {
+      draft.workflow_policy.pinned_programs.release_source_proof_sentinel.reason = "";
+    }, /release_source_proof_sentinel\.reason must be a non-empty string/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.evaluation_owner_sha256 =
+        "0".repeat(64);
+    }, /quality contract must bind the optional isolated exact-package adjunct/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
+test("step fragments are an exact fail-closed membership with graph-owned rule data", () => {
+  const rules = graph.workflow_policy.step_fragments;
+  assert.equal(Object.keys(rules).length, 133);
+  for (const row of Object.values(rules)) {
+    assert.ok(row.kind === "require" || row.kind === "forbid");
+    assert.ok(row.fragments.length > 0);
+  }
+  assert.equal(rules.marketplace_sync_dispatch_guard_line_tests.kind, "forbid");
+  assert.deepEqual(rules.release_post_publish_closeout_provenance.fragments, [
+    "producer-map",
+    "--phase post_publish",
+    "--reuse \"$REUSE_SELECTION\"",
+    "bash .github/scripts/collect-actions-job-evidence.sh",
+    "--job-evidence target/release-closeout/job-evidence.json",
+  ]);
+  assert.equal(
+    rules.release_post_publish_container_digests.step,
+    "Download and verify selected cumulative release cells",
+  );
+  assert.deepEqual(rules.release_post_publish_container_digests.fragments, [
+    "/actions/artifacts/$artifact_id/zip",
+    "sha256sum",
+    "test \"$actual_digest\" = \"$expected_digest\"",
+  ]);
+  assert.ok(!JSON.stringify([
+    rules.release_post_publish_closeout_provenance,
+    rules.release_post_publish_container_digests,
+  ]).includes("artifact_ids"));
+  assert.notEqual(
+    rules.release_post_publish_container_digests.step,
+    "Verify selected post-publish artifact container digests",
+  );
+  const mutations = [
+    [draft => {
+      delete draft.workflow_policy.step_fragments.close_dev_issues;
+    }, /step_fragments must declare close_dev_issues/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.unowned_extra = structuredClone(
+        draft.workflow_policy.step_fragments.close_dev_issues,
+      );
+    }, /names unknown step fragment rule unowned_extra/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.saga_issue_link_guard.kind = "forbid";
+    }, /saga_issue_link_guard\.kind must be require/u],
+    [draft => {
+      delete draft.workflow_policy.step_fragments.saga_issue_link_guard.step;
+    }, /saga_issue_link_guard must carry exactly kind, file, job, step, fragments, reason/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.close_dev_issues.fragments = [];
+    }, /close_dev_issues\.fragments must be a non-empty array/u],
+    [draft => {
+      const fragments = draft.workflow_policy.step_fragments.close_dev_issues.fragments;
+      fragments.push(fragments[0]);
+    }, /close_dev_issues\.fragments must not contain duplicates/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.saga_issue_link_guard.reason = "";
+    }, /saga_issue_link_guard\.reason must be a non-empty string/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.marketplace_sync_dispatch_guard_line_tests.kind =
+        "require";
+    }, /marketplace_sync_dispatch_guard_line_tests\.kind must be forbid/u],
+    [draft => {
+      delete draft.workflow_policy.step_fragments.plugin_static_workflow_policy;
+    }, /step_fragments must declare plugin_static_workflow_policy/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.source_proof_full_gate_workspace_tests.fragments = [];
+    }, /source_proof_full_gate_workspace_tests\.fragments must be a non-empty array/u],
+    [draft => {
+      delete draft.workflow_policy.step_fragments.macos_metal_protected_runtime_proof;
+    }, /step_fragments must declare macos_metal_protected_runtime_proof/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.linux_vulkan_release_cells_no_calibration.kind =
+        "require";
+    }, /linux_vulkan_release_cells_no_calibration\.kind must be forbid/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.windows_vulkan_candidate_installed_proof.fragments = [];
+    }, /windows_vulkan_candidate_installed_proof\.fragments must be a non-empty array/u],
+    [draft => {
+      delete draft.workflow_policy.step_fragments.release_publish_create_release;
+    }, /step_fragments must declare release_publish_create_release/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.release_preflight_resolve_no_freeze_replay.kind =
+        "require";
+    }, /release_preflight_resolve_no_freeze_replay\.kind must be forbid/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.release_preflight_release_authority.fragments = [];
+    }, /release_preflight_release_authority\.fragments must be a non-empty array/u],
+    [draft => {
+      delete draft.workflow_policy.step_fragments.linux_vulkan_release_cell_ids;
+    }, /step_fragments must declare linux_vulkan_release_cell_ids/u],
+    [draft => {
+      delete draft.workflow_policy.step_fragments.packaged_platform_pr_route_release_freeze;
+    }, /step_fragments must declare packaged_platform_pr_route_release_freeze/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.freeze_invalidation_no_pending_reuse.kind =
+        "require";
+    }, /freeze_invalidation_no_pending_reuse\.kind must be forbid/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.packaged_platform_pr_closeout_proof.fragments = [];
+    }, /packaged_platform_pr_closeout_proof\.fragments must be a non-empty array/u],
+    [draft => {
+      delete draft.workflow_policy.step_fragments.source_proof_freeze_acceptance_publication;
+    }, /step_fragments must declare source_proof_freeze_acceptance_publication/u],
+    [draft => {
+      draft.workflow_policy.step_fragments.freeze_barrier_release_no_freeze_replay.kind =
+        "require";
+    }, /freeze_barrier_release_no_freeze_replay\.kind must be forbid/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
+test("structural pins are an exact fail-closed membership with graph-owned rule data", () => {
+  const pins = graph.workflow_policy.structural_pins;
+  assert.equal(Object.keys(pins).length, 67);
+  for (const row of Object.values(pins)) {
+    assert.ok(
+      row.kind === "job" || row.kind === "permission" || row.kind === "needs"
+      || row.kind === "job_permission",
+    );
+    if (row.kind === "permission" || row.kind === "job_permission") {
+      assert.ok(row.access === "read" || row.access === "write");
+    }
+    if (row.kind === "job_permission") {
+      assert.ok(typeof row.job === "string" && row.job.length > 0);
+    }
+    if (row.kind === "needs") {
+      assert.ok(row.needs.length > 0);
+    }
+  }
+  assert.equal(pins.source_proof_full_source_gate_needs_resolve.kind, "needs");
+  assert.equal(pins.auto_release_release_needs_detect_version.kind, "needs");
+  assert.equal(pins.auto_release_release_contents_write.kind, "job_permission");
+  const mutations = [
+    [draft => {
+      delete draft.workflow_policy.structural_pins.close_dev_issues_job;
+    }, /structural_pins must declare close_dev_issues_job/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.unowned_extra = structuredClone(
+        draft.workflow_policy.structural_pins.close_dev_issues_job,
+      );
+    }, /names unknown structural pin unowned_extra/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.saga_issue_link_guard_job.kind = "permission";
+    }, /saga_issue_link_guard_job\.kind must be job/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.saga_issue_link_guard_job.job;
+    }, /saga_issue_link_guard_job must carry exactly kind, file, job, reason/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.close_dev_issues_issues_write.scope;
+    }, /close_dev_issues_issues_write must carry exactly kind, file, scope, access, reason/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.close_dev_issues_issues_write.access = "admin";
+    }, /close_dev_issues_issues_write\.access must be read or write/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.saga_issue_link_guard_pull_requests_read.access = "";
+    }, /saga_issue_link_guard_pull_requests_read\.access must be read or write/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.close_dev_issues_pull_requests_read.reason = "";
+    }, /close_dev_issues_pull_requests_read\.reason must be a non-empty string/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.post_publish_smoke_actions_read;
+    }, /structural_pins must declare post_publish_smoke_actions_read/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.post_publish_smoke_job.kind = "permission";
+    }, /post_publish_smoke_job\.kind must be job/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.post_publish_smoke_actions_read.kind = "job";
+    }, /post_publish_smoke_actions_read\.kind must be permission/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.plugin_static_job;
+    }, /structural_pins must declare plugin_static_job/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.source_proof_full_source_gate_needs_resolve.kind =
+        "job";
+    }, /source_proof_full_source_gate_needs_resolve\.kind must be needs/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.source_proof_full_source_gate_needs_resolve
+        .needs;
+    }, /source_proof_full_source_gate_needs_resolve must carry exactly kind, file, job, needs, reason/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.source_proof_full_source_gate_needs_resolve.needs = [];
+    }, /source_proof_full_source_gate_needs_resolve\.needs must be a non-empty array/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.macos_metal_packaged_metal_job;
+    }, /structural_pins must declare macos_metal_packaged_metal_job/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.auto_release_release_contents_write.kind =
+        "permission";
+    }, /auto_release_release_contents_write\.kind must be job_permission/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.auto_release_release_contents_write.job;
+    }, /auto_release_release_contents_write must carry exactly kind, file, job, scope, access, reason/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.auto_release_release_actions_write.access = "admin";
+    }, /auto_release_release_actions_write\.access must be read or write/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.release_preflight_job;
+    }, /structural_pins must declare release_preflight_job/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.release_actions_write.kind = "job_permission";
+    }, /release_actions_write\.kind must be permission/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.release_pull_requests_read.access = "admin";
+    }, /release_pull_requests_read\.access must be read or write/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.release_publish_job;
+    }, /structural_pins must declare release_publish_job/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.packaged_platform_pr_route_job;
+    }, /structural_pins must declare packaged_platform_pr_route_job/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.packaged_platform_pr_closeout_needs.kind = "job";
+    }, /packaged_platform_pr_closeout_needs\.kind must be needs/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.freeze_barrier_source_proof_statuses_write.access =
+        "admin";
+    }, /freeze_barrier_source_proof_statuses_write\.access must be read or write/u],
+    [draft => {
+      delete draft.workflow_policy.structural_pins.release_freeze_invalidation_invalidate_job;
+    }, /structural_pins must declare release_freeze_invalidation_invalidate_job/u],
+    [draft => {
+      draft.workflow_policy.structural_pins.freeze_barrier_packaged_platform_pr_statuses_read
+        .kind = "job_permission";
+    }, /freeze_barrier_packaged_platform_pr_statuses_read\.kind must be permission/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
+test("constant mirrors are an exact fail-closed membership with graph-owned rule data", () => {
+  const mirrors = graph.workflow_policy.constant_mirrors;
+  assert.equal(Object.keys(mirrors).length, 4);
+  for (const row of Object.values(mirrors)) {
+    assert.ok(typeof row.file === "string" && row.file.length > 0);
+    assert.ok(Array.isArray(row.fragments) && row.fragments.length > 0);
+  }
+  const mutations = [
+    [draft => {
+      delete draft.workflow_policy.constant_mirrors.codex_worktree_setup;
+    }, /constant_mirrors must declare codex_worktree_setup/u],
+    [draft => {
+      draft.workflow_policy.constant_mirrors.unowned_extra = structuredClone(
+        draft.workflow_policy.constant_mirrors.codex_worktree_setup,
+      );
+    }, /names unknown constant mirror unowned_extra/u],
+    [draft => {
+      delete draft.workflow_policy.constant_mirrors.cargo_config_retrieval_aliases.fragments;
+    }, /cargo_config_retrieval_aliases must carry exactly file, fragments, reason/u],
+    [draft => {
+      draft.workflow_policy.constant_mirrors.grounding_setup_sh.job = "setup";
+    }, /grounding_setup_sh must carry exactly file, fragments, reason/u],
+    [draft => {
+      draft.workflow_policy.constant_mirrors.grounding_setup_sh.fragments = [];
+    }, /grounding_setup_sh\.fragments must be a non-empty array/u],
+    [draft => {
+      draft.workflow_policy.constant_mirrors.grounding_setup_ps1.fragments = [
+        "prepare-embedded-model.mjs",
+        "prepare-embedded-model.mjs",
+      ];
+    }, /grounding_setup_ps1\.fragments must not contain duplicates/u],
+    [draft => {
+      draft.workflow_policy.constant_mirrors.cargo_config_retrieval_aliases.file = "";
+    }, /cargo_config_retrieval_aliases\.file must be a non-empty string/u],
+    [draft => {
+      draft.workflow_policy.constant_mirrors.grounding_setup_ps1.reason = "";
+    }, /grounding_setup_ps1\.reason must be a non-empty string/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
+test("command lists are an exact fail-closed membership with graph-owned rule data", () => {
+  const lists = graph.workflow_policy.command_lists;
+  assert.equal(Object.keys(lists).length, 2);
+  for (const row of Object.values(lists)) {
+    assert.ok(typeof row.file === "string" && row.file.length > 0);
+    assert.ok(typeof row.job === "string" && row.job.length > 0);
+    assert.ok(typeof row.step === "string" && row.step.length > 0);
+    assert.ok(Array.isArray(row.commands) && row.commands.length > 0);
+  }
+  assert.equal(lists.draft_proof_commands.commands.length, 6);
+  assert.equal(lists.draft_seed_commands.commands.length, 5);
+  const mutations = [
+    [draft => {
+      delete draft.workflow_policy.command_lists.draft_seed_commands;
+    }, /command_lists must declare draft_seed_commands/u],
+    [draft => {
+      draft.workflow_policy.command_lists.unowned_extra = structuredClone(
+        draft.workflow_policy.command_lists.draft_proof_commands,
+      );
+    }, /names unknown command list unowned_extra/u],
+    [draft => {
+      delete draft.workflow_policy.command_lists.draft_proof_commands.commands;
+    }, /draft_proof_commands must carry exactly file, job, step, commands, reason/u],
+    [draft => {
+      draft.workflow_policy.command_lists.draft_seed_commands.kind = "require";
+    }, /draft_seed_commands must carry exactly file, job, step, commands, reason/u],
+    [draft => {
+      draft.workflow_policy.command_lists.draft_seed_commands.commands = [];
+    }, /draft_seed_commands\.commands must be a non-empty array/u],
+    [draft => {
+      draft.workflow_policy.command_lists.draft_proof_commands.commands = [
+        "cargo test --locked -p codestory-llama-sys --test native_staging",
+        "cargo test --locked -p codestory-llama-sys --test native_staging",
+      ];
+    }, /draft_proof_commands\.commands must not contain duplicates/u],
+    [draft => {
+      draft.workflow_policy.command_lists.draft_proof_commands.file = "";
+    }, /draft_proof_commands\.file must be a non-empty string/u],
+    [draft => {
+      draft.workflow_policy.command_lists.draft_seed_commands.step = "";
+    }, /draft_seed_commands\.step must be a non-empty string/u],
+    [draft => {
+      draft.workflow_policy.command_lists.draft_seed_commands.reason = "";
+    }, /draft_seed_commands\.reason must be a non-empty string/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
 test("benchmark leakage names only the one-process Node contract", () => {
   const benchmarkLeakage = graph.failure_controls
     .find(({ id }) => id === "benchmark_leakage");
@@ -597,6 +1085,9 @@ test("public support, assets, and release notes derive from the package and clos
       "codestory-cli-v0.16.0-macos-arm64.tar.gz",
       "codestory-cli-v0.16.0-linux-x64.tar.gz",
       "SHA256SUMS.txt",
+      // A native release cannot pin its own archive digests in source, so the release generates
+      // them from the archives it built and ships them as an asset the launcher can fetch.
+      "codestory-release-manifest.json",
       // The README tells a reader to consult the ledger rather than the platform table, so the
       // machine-readable closeout summary has to ship with the release itself.
       "release-closeout-summary.json",
@@ -736,19 +1227,19 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
     /release_freeze_barrier\.acceptance/u,
   );
 
-  const preCalibrationSourceProof = structuredClone(graph);
-  preCalibrationSourceProof.workflow_policy.release_freeze_barrier
-    .acceptance.phases.calibration_source.planned_actions = [
-      "calibration-source-acceptance",
-      "source-proof",
+  const sourceProofAfterCalibration = structuredClone(graph);
+  sourceProofAfterCalibration.workflow_policy.release_freeze_barrier
+    .acceptance.phases.source_stabilization.planned_actions = [
+      "source-stabilization",
       "calibration",
       "generated-constant-freeze",
+      "source-proof",
       "qualification",
       "release",
     ];
   assert.throws(
-    () => validateReleaseClaimGraph(preCalibrationSourceProof),
-    /calibration_source.*calibration.*generated constant-set freeze before source proof/u,
+    () => validateReleaseClaimGraph(sourceProofAfterCalibration),
+    /source_stabilization.*finish source proof before/u,
   );
 
   const mutableFrozenCandidate = structuredClone(graph);
@@ -841,6 +1332,74 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
     /must name exactly the protected accelerator instances/u,
   );
 
+  // The pre-assignment reason is a second TYPED reason, not a synonym: collapsing it into the
+  // mid-job reason would let one route borrow the other's evidence rules.
+  const collapsedReason = structuredClone(graph);
+  collapsedReason.non_claim_policy.pre_assignment_reason =
+    collapsedReason.non_claim_policy.reason;
+  assert.throws(
+    () => validateReleaseClaimGraph(collapsedReason),
+    /pre_assignment_reason must be a distinct typed reason/u,
+  );
+
+  const unscopedAnnotation = structuredClone(graph);
+  unscopedAnnotation.non_claim_policy.annotation_reason =
+    unscopedAnnotation.non_claim_policy.pre_assignment_reason;
+  assert.throws(
+    () => validateReleaseClaimGraph(unscopedAnnotation),
+    /annotation_reason must scope the annotation/u,
+  );
+
+  // The reservation recheck bound mirrors the rerun bound: two observations, one automatic
+  // recheck. A drifted bound would let the receipt vouch on cheaper evidence than the contract.
+  const driftedRecheckBound = structuredClone(graph);
+  driftedRecheckBound.non_claim_policy.reservation.maximum_observation_attempts = 5;
+  assert.throws(
+    () => validateReleaseClaimGraph(driftedRecheckBound),
+    /maximum_observation_attempts must mirror maximum_run_attempts/u,
+  );
+
+  const unqualifiedReceipt = structuredClone(graph);
+  unqualifiedReceipt.non_claim_policy.reservation.receipt_artifact =
+    "protected-runner-reservation";
+  assert.throws(
+    () => validateReleaseClaimGraph(unqualifiedReceipt),
+    /receipt_artifact must be attempt-qualified/u,
+  );
+
+  const staleReceiptSchema = structuredClone(graph);
+  staleReceiptSchema.non_claim_policy.reservation.schema =
+    "codestory.protected-runner-reservation/v0";
+  assert.throws(
+    () => validateReleaseClaimGraph(staleReceiptSchema),
+    /reservation\.schema must be/u,
+  );
+
+  // The heartbeat's labels are the proof's labels: a heartbeat proving some other machine alive
+  // vouches for nothing, so the host copy is held to the protected_jobs row.
+  const driftedLabels = structuredClone(graph);
+  driftedLabels.non_claim_policy.hosts
+    .find(({ id }) => id === "linux-x64-vulkan").runner_labels = [
+      "self-hosted",
+      "Linux",
+      "X64",
+      "some-other-runner",
+    ];
+  assert.throws(
+    () => validateReleaseClaimGraph(driftedLabels),
+    /runner_labels must equal the protected_jobs runner labels/u,
+  );
+
+  const duplicateHeartbeatJobs = structuredClone(graph);
+  duplicateHeartbeatJobs.non_claim_policy.hosts
+    .find(({ id }) => id === "linux-x64-vulkan").heartbeat_job_name =
+    duplicateHeartbeatJobs.non_claim_policy.hosts
+      .find(({ id }) => id === "macos-arm64-metal").heartbeat_job_name;
+  assert.throws(
+    () => validateReleaseClaimGraph(duplicateHeartbeatJobs),
+    /duplicates heartbeat job name/u,
+  );
+
   const mismatchedSupport = structuredClone(graph);
   mismatchedSupport.public_support.packages[0].target = "macos-x64";
   assert.throws(
@@ -891,11 +1450,11 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
 // deleting it, reinstating the gate, or collapsing the two installer identities onto one -- which
 // is exactly how a deferred run would come to read as a published one -- must be refusals here,
 // not merely in the workflow policy that consumes them.
-test("catalog delivery declares two distinguishable states and no release gate", () => {
+test("catalog delivery declares three distinguishable states and no release gate", () => {
   const delivery = graph.workflow_policy.catalog_delivery;
   assert.equal(delivery.release_gate, false);
-  assert.deepEqual(delivery.states.map(({ id }) => id).sort(), ["deferred", "published"]);
-  assert.equal(new Set(delivery.states.map(({ installer }) => installer)).size, 2);
+  assert.deepEqual(delivery.states.map(({ id }) => id).sort(), ["deferred", "published", "restored"]);
+  assert.equal(new Set(delivery.states.map(({ installer }) => installer)).size, 3);
 
   const missing = structuredClone(graph);
   delete missing.workflow_policy.catalog_delivery;
@@ -955,6 +1514,60 @@ test("catalog delivery declares two distinguishable states and no release gate",
   assert.throws(
     () => validateReleaseClaimGraph(unrecoverable),
     /workflow_policy\.catalog_delivery\.recovery_workflow/u,
+  );
+});
+
+// Publication and recovery are different events. Folding recovery into the published identity is
+// how a catalog restored days later would read as the catalog the release itself delivered, and a
+// rollback with no recorded target is a rollback nobody can perform.
+test("catalog recovery is a distinguishable identity with a recorded rollback target", () => {
+  const recovery = graph.workflow_policy.catalog_delivery.recovery;
+  assert.equal(recovery.id, "recovered");
+  assert.equal(
+    graph.workflow_policy.catalog_delivery.states.some(({ id }) => id === recovery.id),
+    false,
+  );
+  assert.deepEqual(recovery.previous_pin_outputs, [
+    "previous_marketplace_revision",
+    "previous_plugin_sha",
+    "previous_plugin_version",
+  ]);
+  assert.equal(recovery.automatic_restore, true);
+  assert.equal(recovery.restored_state, "restored");
+
+  const missing = structuredClone(graph);
+  delete missing.workflow_policy.catalog_delivery.recovery;
+  assert.throws(
+    () => validateReleaseClaimGraph(missing),
+    /workflow_policy\.catalog_delivery\.recovery must be an object/u,
+  );
+
+  const collided = structuredClone(graph);
+  collided.workflow_policy.catalog_delivery.recovery.id = "published";
+  assert.throws(
+    () => validateReleaseClaimGraph(collided),
+    /recovery\.id published must be distinct from the delivery states/u,
+  );
+
+  const untargeted = structuredClone(graph);
+  untargeted.workflow_policy.catalog_delivery.recovery.previous_pin_outputs = [];
+  assert.throws(
+    () => validateReleaseClaimGraph(untargeted),
+    /previous_pin_outputs must name the recorded rollback target/u,
+  );
+
+  const disabled = structuredClone(graph);
+  disabled.workflow_policy.catalog_delivery.recovery.automatic_restore = false;
+  assert.throws(
+    () => validateReleaseClaimGraph(disabled),
+    /automatic_restore must be true with executable prior-pin restore/u,
+  );
+
+  const unrecorded = structuredClone(graph);
+  unrecorded.workflow_policy.catalog_delivery.recovery.restored_state = "deferred";
+  assert.throws(
+    () => validateReleaseClaimGraph(unrecorded),
+    /restored_state must name the declared restored state/u,
   );
 });
 
@@ -1299,6 +1912,41 @@ test("reuse bindings verify tree identity and fingerprint equality against real 
     reusedCommit: releaseTag,
   });
   assert.match(tree, /^[0-9a-f]{40}$/u);
+  const lineageRepository = mkdtempSync(path.join(os.tmpdir(), "codestory-calibration-lineage-"));
+  try {
+    gitIn(lineageRepository, ["init", "--quiet", "--initial-branch", "main"]);
+    gitIn(lineageRepository, ["config", "user.name", "CodeStory Test"]);
+    gitIn(lineageRepository, ["config", "user.email", "codestory-test@example.invalid"]);
+    const constantPath = path.join(
+      lineageRepository,
+      "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+    );
+    mkdirSync(path.dirname(constantPath), { recursive: true });
+    writeFileSync(constantPath, `${JSON.stringify({ status: "unfrozen", freeze_record: null })}\n`);
+    gitIn(lineageRepository, ["add", "."]);
+    gitIn(lineageRepository, ["commit", "--quiet", "-m", "source"]);
+    const sourceCommit = gitIn(lineageRepository, ["rev-parse", "HEAD"]);
+    const sourceTree = gitIn(lineageRepository, ["rev-parse", "HEAD^{tree}"]);
+    writeFileSync(constantPath, `${JSON.stringify({
+      status: "frozen",
+      freeze_record: {
+        selection_source_commit: sourceCommit,
+        selection_source_tree: sourceTree,
+      },
+    })}\n`);
+    gitIn(lineageRepository, ["add", "."]);
+    gitIn(lineageRepository, ["commit", "--quiet", "-m", "freeze constants"]);
+    const frozenCommit = gitIn(lineageRepository, ["rev-parse", "HEAD"]);
+    const calibratedSourceTree = verifyReuseBinding({
+      binding: "calibration_source_lineage",
+      repository: lineageRepository,
+      releaseCommit: frozenCommit,
+      reusedCommit: sourceCommit,
+    });
+    assert.equal(calibratedSourceTree, sourceTree);
+  } finally {
+    rmSync(lineageRepository, { recursive: true, force: true });
+  }
   // A binding name the claim graph never declared proves nothing.
   assert.throws(
     () => verifyReuseBinding({
@@ -1323,13 +1971,226 @@ test("reuse bindings verify tree identity and fingerprint equality against real 
   );
 });
 
+/// The unstamped native input the fingerprint must keep hashing byte-for-byte.
+const UNSTAMPED_NATIVE_CONTROL = ".cargo/config.toml";
+
+function gitIn(repository, args) {
+  const result = spawnSync("git", args, { cwd: repository, encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout.trim();
+}
+
+/// Materialize this repository's release version surfaces at `ref` into a throwaway git repository.
+///
+/// Built from the real tree rather than a stand-in workspace on purpose: the whole failure mode
+/// under test is a crate the fingerprint's stamped set never heard of, so the crates have to be
+/// whichever crates this commit actually declares. The two scripts are copied in because each
+/// resolves its repository from its own location.
+function versionSurfaceRepository(ref) {
+  const repository = mkdtempSync(path.join(os.tmpdir(), "codestory-fingerprint-"));
+  const show = (relative) =>
+    gitIn(root, ["--no-pager", "show", `${ref}:${relative}`]) + "\n";
+  const surfaces = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "CHANGELOG.md",
+    UNSTAMPED_NATIVE_CONTROL,
+    "crates/codestory-llama-sys/model-contract.json",
+    "plugins/codestory/cli-version.json",
+    "plugins/codestory/plugin.json",
+    "plugins/codestory/.codex-plugin/plugin.json",
+    "plugins/codestory/.cursor-plugin/plugin.json",
+    "plugins/codestory/.claude-plugin/plugin.json",
+    "plugins/codestory/.github/plugin/plugin.json",
+    ...workspaceMemberManifests(show("Cargo.toml")),
+  ];
+  for (const relative of surfaces) {
+    const absolute = path.join(repository, relative);
+    mkdirSync(path.dirname(absolute), { recursive: true });
+    writeFileSync(absolute, show(relative));
+  }
+  mkdirSync(path.join(repository, "scripts/lib"), { recursive: true });
+  for (const script of [
+    "bump-version.mjs",
+    "native-fingerprint.mjs",
+    "lib/pinned-archive-digests.mjs",
+    "lib/workspace-members.mjs",
+  ]) {
+    cpSync(path.join(root, "scripts", script), path.join(repository, "scripts", script));
+  }
+  gitIn(repository, ["init", "--quiet", "--initial-branch", "main"]);
+  gitIn(repository, ["config", "user.email", "fingerprint@codestory.test"]);
+  gitIn(repository, ["config", "user.name", "fingerprint test"]);
+  gitIn(repository, ["config", "commit.gpgsign", "false"]);
+  return repository;
+}
+
+function commitEverything(repository, message) {
+  gitIn(repository, ["add", "--all"]);
+  gitIn(repository, ["commit", "--quiet", "--allow-empty", "--message", message]);
+  return gitIn(repository, ["rev-parse", "HEAD"]);
+}
+
+function nativeFingerprint(repository, ref) {
+  const result = spawnSync(
+    process.execPath,
+    [path.join(repository, "scripts/native-fingerprint.mjs"), "--ref", ref],
+    { cwd: repository, encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, `native fingerprint failed: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+function runBump(repository, args) {
+  return spawnSync(
+    process.execPath,
+    [path.join(repository, "scripts/bump-version.mjs"), ...args],
+    { cwd: repository, encoding: "utf8" },
+  );
+}
+
+function nextPatchVersion(repository) {
+  const currentVersion = JSON.parse(readFileSync(
+    path.join(repository, "plugins/codestory/cli-version.json"),
+    "utf8",
+  )).cli_version;
+  const [major, minor, patch] = currentVersion.split(".").map(Number);
+  return `${major}.${minor}.${patch + 1}`;
+}
+
+test("a version-only release bump leaves the native fingerprint unchanged", () => {
+  // release-claims.json binds `native_fingerprint` admissibility to this equality, and
+  // `evidence_policy.native_reuse = "version_only_delta"` is the whole justification for
+  // inheriting the previous release's accelerator evidence. Nothing fails loudly when the
+  // equality stops holding -- the reuse claim simply stops matching and the native proof
+  // silently reruns from scratch -- so it is proved here, on the real crate set, in the suite
+  // pull requests run (#1673).
+  const repository = versionSurfaceRepository("HEAD");
+  try {
+    const nextVersion = nextPatchVersion(repository);
+    const members = workspaceMemberManifests(
+      readFileSync(path.join(repository, "Cargo.toml"), "utf8"),
+    );
+    assert.ok(members.length > 0, "the workspace must declare crates to prove anything about");
+    const before = commitEverything(repository, "release surfaces before the bump");
+    const beforePrint = nativeFingerprint(repository, before);
+    assert.match(beforePrint, /^[0-9a-f]{64}$/u);
+
+    // The real version owner writes every text surface and then stops at `cargo update`, which
+    // cannot run against a manifest-only checkout. Cargo's own effect on the lock -- the recorded
+    // version of each workspace crate -- is applied here in its place, and the owner's own
+    // `--check` then certifies that the result is a complete release bump and nothing more.
+    runBump(repository, ["--version", nextVersion]);
+    const lockPath = path.join(repository, "Cargo.lock");
+    writeFileSync(
+      lockPath,
+      readFileSync(lockPath, "utf8").replace(
+        /(name = "codestory-[a-z-]+"\nversion = ")[^"]+(")/gu,
+        `$1${nextVersion}$2`,
+      ),
+    );
+    const certified = runBump(repository, ["--version", nextVersion, "--check"]);
+    assert.equal(
+      certified.status,
+      0,
+      `the bump left a surface behind: ${certified.stdout}${certified.stderr}`,
+    );
+
+    const after = commitEverything(repository, "version-only release bump");
+    assert.notEqual(
+      gitIn(repository, ["rev-parse", `${after}^{tree}`]),
+      gitIn(repository, ["rev-parse", `${before}^{tree}`]),
+      "the bump must actually have changed the tree",
+    );
+    assert.equal(
+      nativeFingerprint(repository, after),
+      beforePrint,
+      "a version-only bump moved the native fingerprint, voiding accelerator evidence reuse",
+    );
+  } finally {
+    rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("every workspace crate is version-normalized and content-bound by the fingerprint", () => {
+  // Per crate, so the failure names the crate that drifted: bumping only its `[package] version`
+  // must be invisible to the fingerprint. Two counter-probes keep that from being satisfied by a
+  // fingerprint that had stopped looking -- a manifest's non-version content and an unstamped
+  // native input both still have to move it.
+  const repository = versionSurfaceRepository("HEAD");
+  try {
+    const base = commitEverything(repository, "release surfaces");
+    const basePrint = nativeFingerprint(repository, base);
+    const probe = (relative, edit, message) => {
+      const absolute = path.join(repository, relative);
+      const before = readFileSync(absolute, "utf8");
+      const after = edit(before);
+      assert.notEqual(after, before, `${message} must change the probe input`);
+      writeFileSync(absolute, after);
+      const commit = commitEverything(repository, message);
+      const print = nativeFingerprint(repository, commit);
+      gitIn(repository, ["reset", "--hard", "--quiet", base]);
+      return print;
+    };
+    const nextVersion = nextPatchVersion(repository);
+    const members = workspaceMemberManifests(
+      readFileSync(path.join(repository, "Cargo.toml"), "utf8"),
+    );
+
+    for (const manifest of members) {
+      assert.equal(
+        probe(
+          manifest,
+          (source) =>
+            source.replace(
+              /(^\[package\][\s\S]*?^version\s*=\s*")[^"]+(")/mu,
+              `$1${nextVersion}$2`,
+            ),
+          `bump ${manifest}`,
+        ),
+        basePrint,
+        `${manifest} is not version-normalized, so a version bump voids accelerator reuse`,
+      );
+    }
+
+    // Normalization is a line, not a licence to stop hashing the file.
+    const counterProbe = members.at(-1);
+    assert.notEqual(
+      probe(
+        counterProbe,
+        (source) => `${source}\n[package.metadata.probe]\nseen = true\n`,
+        `edit ${counterProbe}`,
+      ),
+      basePrint,
+      `${counterProbe} does not bind its own content into the fingerprint`,
+    );
+    assert.notEqual(
+      probe(UNSTAMPED_NATIVE_CONTROL, (source) => `${source}\n# probe\n`, "edit cargo config"),
+      basePrint,
+      `${UNSTAMPED_NATIVE_CONTROL} does not bind its content into the fingerprint`,
+    );
+  } finally {
+    rmSync(repository, { recursive: true, force: true });
+  }
+});
+
 test("a reuse binding may equate only identities its own construction determines", () => {
   // What a reused row is allowed to differ from this release in is declared per binding, in the
   // graph, with a reason -- never per cell group, and never by narrowing a group's
   // required_identity, which would drop the check for fresh evidence too (#1567).
   const declared = graph.evidence_policy.reuse.bindings;
-  assert.deepEqual(Object.keys(declared).sort(), ["native_fingerprint", "source_tree"]);
+  assert.deepEqual(Object.keys(declared).sort(), [
+    "calibration_source_lineage",
+    "native_fingerprint",
+    "source_tree",
+  ]);
   assert.deepEqual(declared.source_tree.equates, []);
+  assert.deepEqual(
+    declared.calibration_source_lineage.equates.map(({ identity }) => identity),
+    ["source_tree"],
+  );
   assert.deepEqual(declared.native_fingerprint.equates.map(({ identity }) => identity), ["source_tree"]);
   assert.ok(declared.native_fingerprint.equates[0].justification.length > 0);
 
@@ -1380,7 +2241,7 @@ test("a reuse binding may equate only identities its own construction determines
   delete undeclaredBinding.evidence_policy.reuse.bindings.native_fingerprint;
   assert.throws(
     () => validateReleaseClaimGraph(undeclaredBinding),
-    /reuse bindings must declare exactly native_fingerprint, source_tree/u,
+    /reuse bindings must declare exactly calibration_source_lineage, native_fingerprint, source_tree/u,
   );
 
   // And a cell group admits cross-run evidence only under a binding the policy declares.

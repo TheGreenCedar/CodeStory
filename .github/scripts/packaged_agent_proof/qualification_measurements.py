@@ -27,6 +27,11 @@ from .qualification_documents import (
     PrivateJsonMessages,
     _private_json_artifact,
 )
+from .qualification_thresholds import (
+    WINDOWS_VULKAN_MATRIX_CELL,
+    qualification_metric_sample_policy,
+    windows_warm_connect_probe_rule,
+)
 
 
 @dataclass(frozen=True)
@@ -146,11 +151,17 @@ def _qualification_measurement_document(
     payload = document.payload
     require_exact_keys(
         payload,
-        {"schema_version", "contracts", "external_metrics", "metrics"},
+        {
+            "schema_version",
+            "contracts",
+            "external_metrics",
+            "metrics",
+            "windows_warm_connect_probe_elapsed_wall_ns",
+        },
         "qualification measurement artifact",
     )
     require(
-        payload["schema_version"] == 2,
+        payload["schema_version"] == 3,
         "qualification measurement schema is unsupported",
     )
     require(
@@ -313,7 +324,11 @@ def _qualification_metric_measurement(
         f"qualification measurement {metric} used the wrong unit",
     )
     samples = record["samples"]
-    sample_policy = validation.protocol["metric_sampling"][metric]
+    sample_policy = qualification_metric_sample_policy(
+        validation.protocol,
+        metric,
+        validation.matrix_cell_id,
+    )
     require(
         isinstance(samples, list) and len(samples) == sample_policy["sample_count"],
         f"qualification measurement {metric} sample count changed",
@@ -362,13 +377,38 @@ def _qualification_measurements(
         isinstance(metrics, dict) and set(metrics) == validation.raw_metric_names,
         "qualification measurements did not contain exactly the 12 product-path metrics",
     )
-    return tuple(
+    normalized = tuple(
         _qualification_metric_measurement(
             metric,
             metrics[metric],
             validation=validation,
         )
         for metric in sorted(validation.raw_metric_names)
+    )
+    _verify_windows_warm_connect_probe_elapsed(payload, validation=validation)
+    return normalized
+
+
+def _verify_windows_warm_connect_probe_elapsed(
+    payload: dict,
+    *,
+    validation: MeasurementValidationContract,
+) -> None:
+    elapsed = payload["windows_warm_connect_probe_elapsed_wall_ns"]
+    if validation.matrix_cell_id != WINDOWS_VULKAN_MATRIX_CELL:
+        require(
+            elapsed is None,
+            "Windows warm-connect probe leaked into another matrix cell",
+        )
+        return
+    rule = windows_warm_connect_probe_rule(validation.protocol)
+    elapsed_wall_ns = require_nonnegative_int(
+        elapsed,
+        "Windows warm-connect probe elapsed wall time",
+    )
+    require(
+        elapsed_wall_ns < rule["maximum_probe_duration_ms"] * 1_000_000,
+        "Windows warm-connect probe exceeded its declared wall-time bound",
     )
 
 

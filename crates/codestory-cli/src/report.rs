@@ -97,6 +97,7 @@ fn render_report_markdown(output: &RepoReport, profile: ReportProfile) -> String
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct ReportSidecarStatus {
     retrieval_mode: String,
     degraded_reason: Option<String>,
@@ -111,55 +112,86 @@ struct ReportSidecarStatus {
     embedding_cpu_allowed: bool,
     manifest_generation: Option<String>,
     manifest_input_hash: Option<String>,
+    #[cfg_attr(test, serde(flatten))]
+    ready_lease: codestory_runtime::ReadyLeaseEvidence,
 }
 
 fn report_sidecar_status(runtime: &RuntimeContext) -> ReportSidecarStatus {
-    match codestory_retrieval::strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        runtime.sidecar.clone(),
-    ) {
-        Ok(report) => {
-            let manifest_generation = report
-                .manifest
-                .as_ref()
-                .and_then(|manifest| manifest.sidecar_generation.clone());
-            let manifest_input_hash = report
-                .manifest
-                .as_ref()
-                .and_then(|manifest| manifest.sidecar_input_hash.clone());
-            ReportSidecarStatus {
-                retrieval_mode: report.retrieval_mode,
-                degraded_reason: report.degraded_reason,
-                embedding_device_policy: report.embedding_device_policy,
-                embedding_device_state: report.embedding_device_state,
-                embedding_device_observation_source: report.embedding_device_observation_source,
-                embedding_detected_provider: report.embedding_detected_provider,
-                embedding_detected_gpu: report.embedding_detected_gpu,
-                embedding_accelerator_requested: report.embedding_accelerator_requested,
-                embedding_accelerator_request_provider: report
-                    .embedding_accelerator_request_provider,
-                embedding_accelerator_request_device: report.embedding_accelerator_request_device,
-                embedding_cpu_allowed: report.embedding_cpu_allowed,
-                manifest_generation,
-                manifest_input_hash,
-            }
+    match runtime
+        .activation
+        .retrieval_status(&runtime.project_root, &runtime.storage_path)
+    {
+        Ok(observation) => {
+            let ready_lease = observation.ready_lease().clone();
+            report_sidecar_status_from_report(observation.into_parts().1, ready_lease)
         }
-        Err(error) => ReportSidecarStatus {
-            retrieval_mode: "unavailable".to_string(),
-            degraded_reason: Some(format!("retrieval_status_error: {error}")),
-            embedding_device_policy: "accelerator_required".to_string(),
-            embedding_device_state: "unknown".to_string(),
-            embedding_device_observation_source: "retrieval_unobserved".to_string(),
-            embedding_detected_provider: None,
-            embedding_detected_gpu: None,
-            embedding_accelerator_requested: false,
-            embedding_accelerator_request_provider: None,
-            embedding_accelerator_request_device: None,
-            embedding_cpu_allowed: false,
-            manifest_generation: None,
-            manifest_input_hash: None,
-        },
+        Err(error) => {
+            let ready_lease = error.ready_lease().clone();
+            report_sidecar_status_from_error(error, ready_lease)
+        }
+    }
+}
+
+#[cfg(test)]
+fn report_sidecar_status_from_result(
+    result: anyhow::Result<codestory_runtime::RetrievalStatusReport>,
+    ready_lease: codestory_runtime::ReadyLeaseEvidence,
+) -> ReportSidecarStatus {
+    match result {
+        Ok(report) => report_sidecar_status_from_report(report, ready_lease),
+        Err(error) => report_sidecar_status_from_error(error, ready_lease),
+    }
+}
+
+fn report_sidecar_status_from_report(
+    report: codestory_runtime::RetrievalStatusReport,
+    ready_lease: codestory_runtime::ReadyLeaseEvidence,
+) -> ReportSidecarStatus {
+    let manifest_generation = report
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.sidecar_generation.clone());
+    let manifest_input_hash = report
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.sidecar_input_hash.clone());
+    ReportSidecarStatus {
+        retrieval_mode: report.retrieval_mode,
+        degraded_reason: report.degraded_reason,
+        embedding_device_policy: report.embedding_device_policy,
+        embedding_device_state: report.embedding_device_state,
+        embedding_device_observation_source: report.embedding_device_observation_source,
+        embedding_detected_provider: report.embedding_detected_provider,
+        embedding_detected_gpu: report.embedding_detected_gpu,
+        embedding_accelerator_requested: report.embedding_accelerator_requested,
+        embedding_accelerator_request_provider: report.embedding_accelerator_request_provider,
+        embedding_accelerator_request_device: report.embedding_accelerator_request_device,
+        embedding_cpu_allowed: report.embedding_cpu_allowed,
+        manifest_generation,
+        manifest_input_hash,
+        ready_lease,
+    }
+}
+
+fn report_sidecar_status_from_error(
+    error: impl std::fmt::Display,
+    ready_lease: codestory_runtime::ReadyLeaseEvidence,
+) -> ReportSidecarStatus {
+    ReportSidecarStatus {
+        retrieval_mode: "unavailable".to_string(),
+        degraded_reason: Some(format!("retrieval_status_error: {error}")),
+        embedding_device_policy: "accelerator_required".to_string(),
+        embedding_device_state: "unknown".to_string(),
+        embedding_device_observation_source: "retrieval_unobserved".to_string(),
+        embedding_detected_provider: None,
+        embedding_detected_gpu: None,
+        embedding_accelerator_requested: false,
+        embedding_accelerator_request_provider: None,
+        embedding_accelerator_request_device: None,
+        embedding_cpu_allowed: false,
+        manifest_generation: None,
+        manifest_input_hash: None,
+        ready_lease,
     }
 }
 
@@ -221,6 +253,7 @@ fn attach_report_handoff(
         top_entry_point: output.entry_points.first().map(report_node_label),
         top_risk: output.hotspots.first().map(report_node_label),
         next_command,
+        ready_lease: sidecar.ready_lease.clone(),
     });
 }
 
@@ -279,6 +312,14 @@ fn append_handoff_header(markdown: &mut String, output: &RepoReport) {
     if let Some(command) = handoff.next_command.as_deref() {
         let _ = writeln!(markdown, "- next_command: `{}`", markdown_escape(command));
     }
+    let _ = writeln!(
+        markdown,
+        "- ready_lease: present={} admission_basis=`{}` observer_epoch_coherence=`{}` memo_holds_observations={}",
+        handoff.ready_lease.ready_lease_present,
+        handoff.ready_lease.ready_lease_admission_basis,
+        handoff.ready_lease.ready_lease_observer_epoch_coherence,
+        handoff.ready_lease.ready_lease_memo_holds_observations,
+    );
     let _ = writeln!(markdown);
 }
 
@@ -400,4 +441,100 @@ fn report_node_label(node: &ReportNodeSummary) -> String {
 
 fn markdown_escape(value: &str) -> String {
     value.replace('|', "\\|").replace('\n', " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::status_wire_test_support as wire;
+    use codestory_contracts::api::{ProjectSummary, StorageStatsDto};
+    use codestory_runtime::graph_analysis::{RepoReportSummary, ReportGenerationMetadata};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+
+    fn empty_report() -> RepoReport {
+        RepoReport {
+            metadata: ReportGenerationMetadata {
+                format_version: 1,
+                artifact_role: "derived".to_string(),
+                source: "golden".to_string(),
+                project_root: "/golden/project".to_string(),
+                storage_path: "/golden/store.db".to_string(),
+                generated_at_epoch_ms: 1_725_000_000_000,
+                note: "golden".to_string(),
+                handoff: None,
+            },
+            summary: RepoReportSummary {
+                node_count: 1,
+                edge_count: 1,
+                file_count: 1,
+                error_count: 0,
+                exported_node_count: 1,
+                exported_edge_count: 1,
+                node_kinds: BTreeMap::new(),
+                edge_kinds: BTreeMap::new(),
+            },
+            hotspots: Vec::new(),
+            entry_points: Vec::new(),
+            bridge_nodes: Vec::new(),
+            follow_up_queries: Vec::new(),
+        }
+    }
+
+    fn summary() -> ProjectSummary {
+        ProjectSummary {
+            root: "/golden/project".to_string(),
+            stats: StorageStatsDto {
+                node_count: 1,
+                edge_count: 1,
+                file_count: 1,
+                error_count: 0,
+                fatal_error_count: 0,
+            },
+            members: Vec::new(),
+            retrieval: None,
+            freshness: None,
+            publication: None,
+        }
+    }
+
+    fn observed_case(
+        result: anyhow::Result<codestory_runtime::RetrievalStatusReport>,
+        ready_lease: codestory_runtime::ReadyLeaseEvidence,
+    ) -> Value {
+        let status = report_sidecar_status_from_result(result, ready_lease);
+        let projection = serde_json::to_value(&status).expect("report status projection");
+        let mut report = empty_report();
+        attach_report_handoff(&mut report, &summary(), &status);
+        json!({
+            "projection": projection,
+            "handoff": report.metadata.handoff,
+        })
+    }
+
+    #[test]
+    fn pre_change_status_wire_report_and_handoff_surfaces_are_non_vacuous() {
+        let cases = json!({
+            "healthy": observed_case(Ok(wire::healthy_status_report()), wire::ready_lease_evidence()),
+            "degraded": observed_case(Ok(wire::degraded_status_report()), wire::stale_ready_lease_evidence()),
+            "unavailable": observed_case(Ok(wire::unavailable_status_report()), codestory_runtime::ReadyLeaseEvidence::default()),
+            "probe_error": observed_case(Err(wire::probe_error()), wire::unproven_ready_lease_evidence()),
+        });
+        let projections = cases
+            .as_object()
+            .expect("report cases")
+            .values()
+            .map(|case| case["projection"].clone())
+            .collect::<Vec<_>>();
+        for (name, case) in cases.as_object().expect("report cases") {
+            wire::assert_exact_fields(
+                &case["projection"],
+                &wire::REPORT_STATUS_FIELDS,
+                &format!("report {name}"),
+            );
+            assert!(case["handoff"].is_object(), "report {name} handoff missing");
+        }
+        wire::assert_non_null_coverage(&projections, &wire::REPORT_STATUS_FIELDS, "report status");
+        wire::assert_json_golden(&cases, wire::REPORT_GOLDEN, "report status and handoff");
+    }
 }

@@ -20,10 +20,40 @@ use crate::{display, drill_targeting, retrieval};
 use anyhow::{Context, Result};
 use codestory_contracts::api::{
     AgentCitationDto, AgentPacketDto, AgentPacketRequestDto, ApiError, IndexingPhaseTimings,
-    NodeKind, PacketBudgetModeDto, PacketProofStatusDto, SearchMatchQualityDto, StorageStatsDto,
+    NodeKind, PacketBudgetModeDto, SearchMatchQualityDto, StorageStatsDto,
 };
 use std::collections::HashSet;
 use std::time::Instant;
+
+/// The deprecation notice `drill --jobs` carries for its final release.
+///
+/// The flag never scheduled anything — the evidence packet owns drill batching
+/// — so the honest statement is that it is ignored, said once, on the error
+/// stream, without changing the report or the exit status.
+pub(super) const DEPRECATED_DRILL_JOBS_WARNING: &str = "[drill] --jobs is deprecated and ignored: the evidence packet owns drill scheduling. \
+     It is removed next release; drop it from pinned invocations. \
+     `drill-suite --jobs` is unaffected.";
+
+fn warn_on_deprecated_drill_jobs(jobs: Option<usize>) {
+    if jobs.is_some() {
+        eprintln!("{DEPRECATED_DRILL_JOBS_WARNING}");
+    }
+}
+
+pub(in crate::app) fn packet_drill_option_ids(packet: &AgentPacketDto) -> Vec<String> {
+    packet
+        .disposition
+        .drill
+        .as_ref()
+        .map(|drill| {
+            drill
+                .options
+                .iter()
+                .map(|option| option.id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 pub(in crate::app) fn run_drill(cmd: DrillCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "drill")?;
@@ -88,6 +118,10 @@ fn prepare_drill(cmd: &DrillCommand) -> Result<PreparedDrill> {
             extra_probes: anchors.clone(),
             include_evidence: true,
             latency_budget_ms: None,
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
         },
         anchors,
     })
@@ -96,7 +130,7 @@ fn prepare_drill(cmd: &DrillCommand) -> Result<PreparedDrill> {
 pub(super) fn execute_drill(
     cmd: &DrillCommand,
 ) -> Result<codestory_runtime::PublicOperation<DrillOutput>> {
-    let _ = cmd.jobs; // retained CLI compatibility; packet owns internal batch scheduling
+    warn_on_deprecated_drill_jobs(cmd.jobs);
     let total_timer = Instant::now();
     let PreparedDrill {
         runtime,
@@ -131,10 +165,10 @@ pub(super) fn execute_drill(
         let mut all_verification_targets =
             drill_packet_verification_targets(&runtime.project_root, &citations);
         dedupe_verification_targets(&mut all_verification_targets);
-        let next_commands = evidence_packet.sufficiency.follow_up_commands.clone();
+        let next_commands = packet_drill_option_ids(&evidence_packet);
         let question_search = Some(DrillCommandStatusOutput {
             command: "packet".to_string(),
-            status: packet_sufficiency_label(evidence_packet.sufficiency.status).to_string(),
+            status: packet_sufficiency_label(evidence_packet.disposition.kind).to_string(),
             duration_ms: u64::from(evidence_packet.answer.retrieval_trace.total_latency_ms),
             artifact: None,
             error: None,
@@ -208,9 +242,6 @@ pub(in crate::app) fn execute_drill_packet(
 
 pub(in crate::app) fn drill_packet_citations(packet: &AgentPacketDto) -> Vec<AgentCitationDto> {
     let mut citations = packet.answer.citations.clone();
-    for claim in &packet.sufficiency.covered_claims {
-        citations.extend(claim.citations.iter().cloned());
-    }
     let mut seen = HashSet::new();
     citations.retain(|citation| {
         seen.insert((
@@ -295,6 +326,7 @@ pub(in crate::app) fn drill_search_hit_from_packet_citation(
         line: citation.line,
         score: citation.score,
         origin: citation.origin,
+        target: citation.target.clone(),
         match_quality,
         resolvable: citation.resolvable,
         evidence_tier: citation.evidence_tier,
@@ -361,71 +393,69 @@ pub(in crate::app) fn drill_packet_bridges(
     project_root: &std::path::Path,
     packet: &AgentPacketDto,
 ) -> Vec<DrillBridgeOutput> {
-    packet
-        .sufficiency
-        .covered_claims
+    let citations = drill_packet_citations(packet);
+    let resolvable = citations
         .iter()
-        .filter_map(|claim| {
-            let from = claim
-                .citations
+        .filter(|citation| drill_packet_citation_is_typed_resolvable(citation))
+        .collect::<Vec<_>>();
+    let Some(from) = resolvable.first() else {
+        return Vec::new();
+    };
+    let Some(to) = resolvable
+        .iter()
+        .find(|citation| citation.node_id != from.node_id)
+    else {
+        return Vec::new();
+    };
+    let graph_backed = drill_packet_citations_share_graph_evidence(from, to);
+    let mut endpoint_files = [from.file_path.clone(), to.file_path.clone()]
+        .into_iter()
+        .flatten()
+        .map(|path| display::relative_path(project_root, &path))
+        .collect::<Vec<_>>();
+    endpoint_files.sort();
+    endpoint_files.dedup();
+    vec![DrillBridgeOutput {
+        evidence: DrillBridgeEvidenceOutput {
+            from_anchor: from.display_name.clone(),
+            to_anchor: to.display_name.clone(),
+            status: if graph_backed {
+                "graph_path".to_string()
+            } else {
+                "source_truth_only".to_string()
+            },
+            strategy: "packet_claim".to_string(),
+            confidence: if graph_backed { "high" } else { "medium" }.to_string(),
+            evidence_kind: "packet_citations".to_string(),
+            from_node: Some(drill_search_hit_from_packet_citation(
+                project_root,
+                &from.display_name,
+                from,
+            )),
+            to_node: Some(drill_search_hit_from_packet_citation(
+                project_root,
+                &to.display_name,
+                to,
+            )),
+            graph_path: None,
+            shared_files: Vec::new(),
+            endpoint_files: endpoint_files.clone(),
+            evidence_files: endpoint_files,
+            next_commands: packet_drill_option_ids(packet),
+            notes: packet
+                .support
                 .iter()
-                .find(|citation| drill_packet_citation_is_typed_resolvable(citation))?;
-            let to = claim.citations.iter().find(|citation| {
-                citation.node_id != from.node_id
-                    && drill_packet_citation_is_typed_resolvable(citation)
-            })?;
-            let graph_backed = drill_packet_citations_share_graph_evidence(from, to);
-            let mut endpoint_files = [from.file_path.clone(), to.file_path.clone()]
-                .into_iter()
-                .flatten()
-                .map(|path| display::relative_path(project_root, &path))
-                .collect::<Vec<_>>();
-            endpoint_files.sort();
-            endpoint_files.dedup();
-            Some(DrillBridgeOutput {
-                evidence: DrillBridgeEvidenceOutput {
-                    from_anchor: from.display_name.clone(),
-                    to_anchor: to.display_name.clone(),
-                    status: if graph_backed {
-                        "graph_path".to_string()
-                    } else {
-                        "source_truth_only".to_string()
-                    },
-                    strategy: "packet_claim".to_string(),
-                    confidence: match claim.proof_status {
-                        Some(PacketProofStatusDto::Proven) => "high",
-                        Some(PacketProofStatusDto::Likely) => "medium",
-                        _ => "low",
-                    }
-                    .to_string(),
-                    evidence_kind: "packet_citations".to_string(),
-                    from_node: Some(drill_search_hit_from_packet_citation(
-                        project_root,
-                        &from.display_name,
-                        from,
-                    )),
-                    to_node: Some(drill_search_hit_from_packet_citation(
-                        project_root,
-                        &to.display_name,
-                        to,
-                    )),
-                    graph_path: None,
-                    shared_files: Vec::new(),
-                    endpoint_files: endpoint_files.clone(),
-                    evidence_files: endpoint_files,
-                    next_commands: packet.sufficiency.follow_up_commands.clone(),
-                    notes: vec![claim.claim.clone()],
-                },
-                command: DrillCommandStatusOutput {
-                    command: "packet".to_string(),
-                    status: packet_sufficiency_label(packet.sufficiency.status).to_string(),
-                    duration_ms: 0,
-                    artifact: None,
-                    error: None,
-                },
-            })
-        })
-        .collect()
+                .map(|unit| unit.summary.clone())
+                .collect(),
+        },
+        command: DrillCommandStatusOutput {
+            command: "packet".to_string(),
+            status: packet_sufficiency_label(packet.disposition.kind).to_string(),
+            duration_ms: 0,
+            artifact: None,
+            error: None,
+        },
+    }]
 }
 
 pub(super) fn drill_packet_citations_share_graph_evidence(

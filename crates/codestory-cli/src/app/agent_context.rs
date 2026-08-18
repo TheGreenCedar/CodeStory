@@ -8,6 +8,9 @@ pub(super) use packet::run_packet;
 pub(super) use task::run_task;
 
 #[cfg(test)]
+pub(in crate::app) use packet::enforce_packet_cli_json_output_budget;
+
+#[cfg(test)]
 pub(super) use packet::{
     packet_budget_mode_label, packet_task_class_label, render_packet_markdown,
 };

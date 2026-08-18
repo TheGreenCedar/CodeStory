@@ -15,8 +15,7 @@
     "/question_search/command": "packet",
     "/anchors/0/anchor": "WorkspaceIndexer",
     "/anchors/0/typed_hit_count": 1,
-    "/execution_boundaries/0/command": "packet",
-    "/next_commands/0": "codestory-cli snippet --query WorkspaceIndexer --project ."
+    "/execution_boundaries/0/command": "packet"
   },
   "summary": {
     "/summary_version": 1,
@@ -31,8 +30,8 @@
     "/mechanical/after/files": 2,
     "/anchors/requested": 1,
     "/anchors/resolved": 1,
-    "/open_gaps/answer_quality_status": "partial",
-    "/open_gaps/next_command_count": 1
+    "/open_gaps/answer_quality_status": "supported",
+    "/open_gaps/next_command_count": 0
   },
   "markdown_contains": [
     "# Drill",
@@ -42,10 +41,9 @@
     "output_dir: `artifacts/drill`",
     "index_before: files=2 nodes=4 edges=2 errors=0",
     "index_after: files=2 nodes=4 edges=2 errors=0 refresh=none",
-    "question_search: packet [partial duration_ms=1]",
+    "question_search: packet [supported duration_ms=1]",
     "anchors:",
     "execution_boundaries:",
-    "evidence_packet: id=packet-task-brief sufficiency=partial citations=2",
-    "next_commands:"
+    "evidence_packet: id=packet-task-brief sufficiency=supported citations=2"
   ]
 }

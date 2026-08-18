@@ -82,6 +82,7 @@ mod agent_context;
 pub(crate) mod artifacts;
 mod bookmarks;
 pub(crate) mod diagnostics;
+mod dirty_hooks;
 mod drill;
 mod ground_smoke;
 mod index_command;
@@ -118,16 +119,19 @@ use runtime::map_api_error;
 
 #[tokio::main]
 pub async fn run() -> ExitCode {
+    crate::diagnostics::install_process_diagnostics();
     let raw_args = std::env::args_os().collect::<Vec<_>>();
     let json = json_output_requested(&raw_args);
-    if std::env::var_os("CODESTORY_EMBED_ALLOW_CPU")
+    if std::env::var_os(codestory_contracts::config_registry::EMBED_ALLOW_CPU_ENV)
         .is_some_and(|value| !value.is_empty() && value != "0")
     {
         let envelope = command_failure_envelope(
             "unsupported_embedding_policy",
             "embedding_backend",
             "CPU embeddings are unsupported; CodeStory requires Metal or Vulkan acceleration",
-            serde_json::json!({"environment": "CODESTORY_EMBED_ALLOW_CPU"}),
+            serde_json::json!({
+                "environment": codestory_contracts::config_registry::EMBED_ALLOW_CPU_ENV
+            }),
         );
         if json {
             emit_command_failure(&envelope, requested_output_file(&raw_args));
@@ -164,6 +168,7 @@ pub async fn run() -> ExitCode {
     match run_cli(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            crate::diagnostics::record_command_failure(&error);
             let structured = error.downcast_ref::<StructuredCommandFailure>();
             if json {
                 let envelope = structured
@@ -236,6 +241,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::GenerateCompletions(cmd) => server::run_generate_completions(cmd),
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
         Command::InternalOwnedDelete(cmd) => lifecycle::run_internal_owned_delete(cmd),
+        Command::InternalDirtyHook(cmd) => dirty_hooks::run_internal_dirty_hook(cmd),
         Command::InternalEmbeddingServer => {
             embedding_server_transport::run_internal_embedding_server()
         }
