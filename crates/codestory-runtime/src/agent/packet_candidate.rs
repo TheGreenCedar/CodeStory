@@ -2767,6 +2767,23 @@ mod tests {
                 .all(|pattern| pattern.requirement == "mapper_config"),
             "the A promotion pattern belongs to the requirement retirement retires"
         );
+        assert!(
+            a.promotion_patterns
+                .iter()
+                .all(|pattern| pattern.kind != EdgeKind::MEMBER),
+            "membership never drives admission (rev 5.4), so the configuration \
+             requirement's membership constraint adds no need-set member"
+        );
+        assert!(
+            a.role_scoring_patterns
+                .iter()
+                .any(|pattern| pattern.kind == EdgeKind::MEMBER
+                    && pattern.requirement == "mapper_config"
+                    && pattern.source_roles == vec![ProofRole::Builder]
+                    && pattern.target_roles.is_empty()),
+            "it does count toward the Builder's multiplicity score, and its \
+             Any target names no role at all"
+        );
 
         let c = packet_atom_hydration_spec(&packet_flow_requirements_for_terms(
             &packet_probe_terms(

@@ -3840,9 +3840,10 @@ pub(super) mod tests {
     }
 
     /// A packet whose live state proves `mapper_config` through the atom
-    /// matcher: a certain TYPE_USAGE receipt (A1) in `answer.graphs` plus a
-    /// reread source range for the configuration type (A2) in
-    /// `packet.support`, owned by a retained sufficiency-eligible citation.
+    /// matcher: a certain TYPE_USAGE receipt (A1) and the builder's own
+    /// MEMBER-onto-METHOD receipt (A5) in `answer.graphs`, plus a reread
+    /// source range for the configuration type (A2) in `packet.support`,
+    /// owned by a retained sufficiency-eligible citation.
     pub(in crate::agent) fn mapper_proof_packet() -> AgentPacketDto {
         let builder =
             eligible_proof_citation("PlanBuilder", "src/plan_builder.cs", NodeKind::CLASS);
@@ -3860,6 +3861,10 @@ pub(super) mod tests {
             &[],
         );
         packet.answer.citations = vec![builder.clone(), config.clone()];
+        let mut builder_method = mapper_proof_graph_node(&builder);
+        builder_method.id = NodeId("PlanBuilder.Build".to_string());
+        builder_method.label = "Build".to_string();
+        builder_method.kind = NodeKind::METHOD;
         packet.answer.graphs = vec![GraphArtifactDto::Uml {
             id: "mapper-plan".to_string(),
             title: "Mapper plan".to_string(),
@@ -3868,17 +3873,30 @@ pub(super) mod tests {
                 nodes: vec![
                     mapper_proof_graph_node(&builder),
                     mapper_proof_graph_node(&config),
+                    builder_method.clone(),
                 ],
-                edges: vec![GraphEdgeDto {
-                    id: EdgeId("builder-uses-config".to_string()),
-                    source: builder.node_id.clone(),
-                    target: config.node_id.clone(),
-                    kind: EdgeKind::TYPE_USAGE,
-                    confidence: Some(1.0),
-                    certainty: Some("certain".to_string()),
-                    callsite_identity: None,
-                    candidate_targets: Vec::new(),
-                }],
+                edges: vec![
+                    GraphEdgeDto {
+                        id: EdgeId("builder-uses-config".to_string()),
+                        source: builder.node_id.clone(),
+                        target: config.node_id.clone(),
+                        kind: EdgeKind::TYPE_USAGE,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: None,
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: EdgeId("builder-owns-method".to_string()),
+                        source: builder.node_id.clone(),
+                        target: builder_method.id.clone(),
+                        kind: EdgeKind::MEMBER,
+                        confidence: Some(1.0),
+                        certainty: None,
+                        callsite_identity: None,
+                        candidate_targets: Vec::new(),
+                    },
+                ],
                 truncated: false,
                 omitted_edge_count: 0,
                 canonical_layout: None,

@@ -1211,8 +1211,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Finalizes the mapper fixture so `mapper_config` is formula-proven
-    /// through its atom receipts (a certain TYPE_USAGE edge plus a reread
-    /// configuration source range).
+    /// through its atom receipts (a certain TYPE_USAGE edge, the builder's
+    /// MEMBER-onto-METHOD edge, and a reread configuration source range).
     fn finalized_mapper_proof_packet() -> AgentPacketDto {
         let mut packet = crate::agent::packet_budget::tests::mapper_proof_packet();
         codestory_agent::packet_obligations::finalize_packet_obligation_plan(

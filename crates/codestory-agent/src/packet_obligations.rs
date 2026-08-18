@@ -8364,26 +8364,49 @@ mod tests {
         }
     }
 
+    /// The builder's TYPE_USAGE edge onto the configuration type PLUS the
+    /// membership edge A5 requires: `mapper_config` is only satisfiable by a
+    /// source type that owns a method, so the fixture carries one.
     fn mapper_type_usage_graph(
         builder: &AgentCitationDto,
         config: &AgentCitationDto,
     ) -> GraphArtifactDto {
+        let mut builder_method = graph_node(builder);
+        builder_method.id = NodeId("PlanBuilder.Build".to_string());
+        builder_method.label = "Build".to_string();
+        builder_method.kind = NodeKind::METHOD;
         GraphArtifactDto::Uml {
             id: "mapper-plan".to_string(),
             title: "Mapper plan".to_string(),
             graph: GraphResponse {
                 center_id: builder.node_id.clone(),
-                nodes: vec![graph_node(builder), graph_node(config)],
-                edges: vec![GraphEdgeDto {
-                    id: EdgeId("builder-uses-config".to_string()),
-                    source: builder.node_id.clone(),
-                    target: config.node_id.clone(),
-                    kind: EdgeKind::TYPE_USAGE,
-                    confidence: Some(1.0),
-                    certainty: Some("certain".to_string()),
-                    callsite_identity: None,
-                    candidate_targets: Vec::new(),
-                }],
+                nodes: vec![
+                    graph_node(builder),
+                    graph_node(config),
+                    builder_method.clone(),
+                ],
+                edges: vec![
+                    GraphEdgeDto {
+                        id: EdgeId("builder-uses-config".to_string()),
+                        source: builder.node_id.clone(),
+                        target: config.node_id.clone(),
+                        kind: EdgeKind::TYPE_USAGE,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: None,
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: EdgeId("builder-owns-method".to_string()),
+                        source: builder.node_id.clone(),
+                        target: builder_method.id.clone(),
+                        kind: EdgeKind::MEMBER,
+                        confidence: Some(1.0),
+                        certainty: None,
+                        callsite_identity: None,
+                        candidate_targets: Vec::new(),
+                    },
+                ],
                 truncated: false,
                 omitted_edge_count: 0,
                 canonical_layout: None,
@@ -8549,11 +8572,20 @@ mod tests {
         );
         assert_eq!(
             config_obligation.carrier_edge_proofs,
-            vec![PacketObligationCarrierEdgeProofDto {
-                carrier_node_id: NodeId("PlanBuilder".to_string()),
-                edge_id: EdgeId("builder-uses-config".to_string()),
-                edge_kind: EdgeKind::TYPE_USAGE,
-            }],
+            vec![
+                PacketObligationCarrierEdgeProofDto {
+                    carrier_node_id: NodeId("PlanBuilder".to_string()),
+                    edge_id: EdgeId("builder-uses-config".to_string()),
+                    edge_kind: EdgeKind::TYPE_USAGE,
+                },
+                // A5's membership receipt is part of the same requirement, so
+                // the manifest carries it and survival re-checks it too.
+                PacketObligationCarrierEdgeProofDto {
+                    carrier_node_id: NodeId("PlanBuilder".to_string()),
+                    edge_id: EdgeId("builder-owns-method".to_string()),
+                    edge_kind: EdgeKind::MEMBER,
+                },
+            ],
             "the complete edge-receipt manifest rides carrier_edge_proofs (R7(c))"
         );
         let execution_obligation = mapper_obligation(&plan, "mapper_execution");

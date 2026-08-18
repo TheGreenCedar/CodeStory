@@ -21,21 +21,24 @@ old or new publication.
 | --- | --- |
 | Resolved symbol, caller, trail, or snippet from a ready map | Source-navigation evidence |
 | `affected` output | A bounded change-planning aid, never proof that a test ran or that every impact was found |
-| Packet with `sufficient` status and resolvable citations | Evidence for the covered claims |
-| Packet with `partial` status | A useful lead; run its requested follow-up before claiming completeness |
+| Packet with `supported` disposition and resolvable citations | Evidence for the covered claims |
+| Packet with `drill_once` disposition | A useful lead; run the one requested follow-up packet before claiming completeness |
+| Packet with `not_established` disposition | Answer only what the compiled support establishes, then name what stayed unproven |
+| Packet with `unavailable` disposition | Broad search could not run; fall back to focused source inspection and state the gap |
 | Repo-text or semantic suggestion without a resolved symbol | Navigation hint to verify in source |
-| `working_locally` | Use local graph tools; broad search is still preparing |
-| `unavailable` | Fall back to focused source inspection and state the gap |
+| `working_locally` state | Use local graph tools; broad search is still preparing |
+| `unavailable` state | Fall back to focused source inspection and state the gap |
 
 `retrieval_mode=full` proves that the retrieval infrastructure is coherent. It
-does not guarantee that a particular answer found enough evidence. The result's
-sufficiency and citations still matter.
+does not guarantee that a particular answer found enough evidence. The packet's
+disposition and citations still matter.
 
 ## When to stop trusting a CodeStory claim
 
 - Paths or symbols do not match the checkout.
 - The answer came from an old host session that does not expose CodeStory MCP.
-- A broad tool is still preparing, unavailable, or returned partial evidence.
+- A broad tool is still preparing, unavailable, or returned a packet whose
+  disposition is `drill_once` or `not_established`.
 - Citations cannot be resolved to the files they name.
 - The agent substituted a generic tree search without reporting the CodeStory
   gap.

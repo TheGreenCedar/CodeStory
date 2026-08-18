@@ -72,6 +72,10 @@ pub enum ProofAtomId {
     A3,
     /// A4 — carrier range for the builder (`mapper_execution`).
     A4,
+    /// A5 — plan-builder admissibility of the configuration source
+    /// (`mapper_config`): the Builder role must bind a type that OWNS a
+    /// method.
+    A5,
     /// C1 — verified import-bearing entrypoint (`css_animation_entrypoint`).
     C1,
     /// C2 — imported variable declaration (`css_animation_structure`).
@@ -92,7 +96,8 @@ pub enum ProofRole {
     FlowOwner,
     /// A — the plan owner whose dispatch CALL A3 binds.
     PlanOwner,
-    /// A — the builder joined across A1, A3's MEMBER edge, and A4.
+    /// A — the builder joined across A1, A5's membership constraint, A3's
+    /// MEMBER edge, and A4.
     Builder,
     /// A — the builder method (`Mb` in the formulas contract): A3's CALL
     /// target and MEMBER target.
@@ -1422,8 +1427,48 @@ pub const LOG_HANDLER_FLOW_PROOF: FlowProofFormula = FlowProofFormula {
 };
 
 /// A — mapping flow (`MAPPER_PLAN_FLOW`) proof formula. All joins are node-id
-/// joins: `Builder` spans A1's source, A3's MEMBER edge, and A4's carrier
-/// range; `ConfigType` spans A1's target and A2's carrier range.
+/// joins: `Builder` spans A1's source, A5's membership constraint, A3's
+/// MEMBER edge, and A4's carrier range; `ConfigType` spans A1's target and
+/// A2's carrier range.
+///
+/// A5 states STRUCTURALLY what the `Builder` role means, so `mapper_config`
+/// cannot be satisfied by an arbitrary type-usage pair. A1 alone admits ANY
+/// certain TYPE_USAGE edge, and on a large index that is thousands of equally
+/// admissible pairs — a lone parameter type is as good a "builder" as the
+/// type whose plan methods actually run, so the requirement proves on
+/// whichever pair retrieval surfaced first and the bounded carrier slots then
+/// protect that pair. A plan builder is not "a type that appears as the
+/// source of a type-usage edge"; it is a type whose OWN methods get called.
+/// A5 requires exactly the owning half of that shape — a MEMBER edge from
+/// `Builder` onto a METHOD — with an `Any` target, so it constrains the role
+/// without joining anything: it never binds a second role, never names a
+/// method identity, and adds no vocabulary, name, path, or count.
+///
+/// SEPARATE ATOM, NOT A SECOND FACT INSIDE A1 (deliberate). Discharge is
+/// identical either way — both are conjuncts of `mapper_config`, and a
+/// missing MEMBER receipt fails the requirement closed in both shapes — so
+/// the choice is decided by what the ATOM is the unit of everywhere else:
+///
+/// * The pre-cap carrier protection runs a weighted set cover over the atoms
+///   a partial match verified, and a carrier's weight is the SET OF ATOMS it
+///   covers. As its own atom, the member-bearing type covers {A1, A5} while
+///   the configuration type covers {A1, A2}, so the type that carries the
+///   builder shape competes for a bounded slot on equal footing instead of
+///   trailing a config type by one atom. Folded into A1 it would cover {A1}
+///   exactly as it does today, which would tighten what PROVES while leaving
+///   what gets PROTECTED unchanged — and protection is the stage where the
+///   defect actually reaches the answer.
+/// * Per-requirement atom reporting and the R4 anchor planner both read atom
+///   specs, so a distinct id makes "the builder is member-bearing" a
+///   separately reported obligation rather than a silent extra clause on the
+///   configuration edge.
+/// * A1 stays a single-receipt atom, which keeps the candidate-level
+///   single-receipt mirror a one-pattern-per-atom parity with this matcher
+///   for the whole A family.
+///
+/// Fail-closed either way, and this is the safer direction: with no MEMBER
+/// receipt retained for the bound `Builder`, `mapper_config` reports
+/// Unproven instead of reporting a proof off an unrelated pair.
 pub const MAPPER_PLAN_FLOW_PROOF: FlowProofFormula = FlowProofFormula {
     atoms: &[
         ProofAtomSpec {
@@ -1440,6 +1485,16 @@ pub const MAPPER_PLAN_FLOW_PROOF: FlowProofFormula = FlowProofFormula {
             id: ProofAtomId::A2,
             requirement: "mapper_config",
             facts: &[carrier_range_fact(ProofRole::ConfigType, false)],
+        },
+        ProofAtomSpec {
+            id: ProofAtomId::A5,
+            requirement: "mapper_config",
+            facts: &[edge_fact(
+                EdgeKind::MEMBER,
+                role(ProofRole::Builder),
+                ProofEndpointPattern::Any,
+                Some(NodeKind::METHOD),
+            )],
         },
         ProofAtomSpec {
             id: ProofAtomId::A3,
@@ -2115,6 +2170,138 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_type_usage_pair_without_an_owned_method_no_longer_proves_the_config() {
+        // The measured defect, reduced: one certain TYPE_USAGE edge and a
+        // reread range for its target. That is everything A1 and A2 ask for,
+        // and on a real index thousands of pairs have exactly this shape.
+        // A5 refuses it because the source owns no method.
+        let mut lone_usage = certain_call(
+            "edge:lone-usage",
+            "node:parameter-owner",
+            "node:parameter-type",
+            None,
+        );
+        lone_usage.kind = EdgeKind::TYPE_USAGE;
+        lone_usage.target_kind = Some(NodeKind::CLASS);
+        let evidence = PacketProofEvidence {
+            source_aspects: vec![aspect(
+                "cite:param",
+                Some("node:parameter-type"),
+                2,
+                4,
+                None,
+            )],
+            typed_relations: vec![lone_usage],
+            trail_scans: Vec::new(),
+        };
+        assert_eq!(
+            match_required_atoms(
+                &MAPPER_PLAN_FLOW_PROOF,
+                &MAPPER_PLAN_FLOW_PROOF.atoms_for("mapper_config"),
+                &evidence
+            ),
+            FlowProofOutcome::Unproven
+        );
+        // The failure is A5's and nothing else's: the pre-fix atom pair over
+        // the identical receipts still discharges.
+        proved(match_required_atoms(
+            &MAPPER_PLAN_FLOW_PROOF,
+            &[ProofAtomId::A1, ProofAtomId::A2],
+            &evidence,
+        ));
+    }
+
+    #[test]
+    fn a_plan_builder_shaped_source_still_proves_the_config_requirement() {
+        // Same two receipts as above plus the one membership fact that makes
+        // the source a plan builder: a MEMBER edge onto a method it owns.
+        // No name, path, count, or second join is involved — the method
+        // identity is never bound.
+        let mut usage = certain_call(
+            "edge:builder-usage",
+            "node:owning-type",
+            "node:config-type",
+            None,
+        );
+        usage.kind = EdgeKind::TYPE_USAGE;
+        usage.target_kind = Some(NodeKind::CLASS);
+        let evidence = PacketProofEvidence {
+            source_aspects: vec![aspect("cite:config", Some("node:config-type"), 2, 4, None)],
+            typed_relations: vec![
+                usage,
+                structural(
+                    "edge:owned-method",
+                    EdgeKind::MEMBER,
+                    "node:owning-type",
+                    "node:owned-method",
+                    Some(NodeKind::METHOD),
+                ),
+            ],
+            trail_scans: Vec::new(),
+        };
+        let proof = proved(match_required_atoms(
+            &MAPPER_PLAN_FLOW_PROOF,
+            &MAPPER_PLAN_FLOW_PROOF.atoms_for("mapper_config"),
+            &evidence,
+        ));
+        assert_eq!(
+            proof.bindings.get(&ProofRole::Builder),
+            Some(&node("node:owning-type"))
+        );
+        assert_eq!(
+            proof.bindings.get(&ProofRole::BuilderMethod),
+            None,
+            "A5's Any target must never bind the method role"
+        );
+    }
+
+    #[test]
+    fn a5_rejects_a_member_edge_onto_a_non_method_and_onto_another_type() {
+        // Two ways the shape can be counterfeited: a member that is not a
+        // method, and a method owned by some OTHER type. Both fail closed.
+        let mut usage = certain_call(
+            "edge:builder-usage",
+            "node:owning-type",
+            "node:config-type",
+            None,
+        );
+        usage.kind = EdgeKind::TYPE_USAGE;
+        usage.target_kind = Some(NodeKind::CLASS);
+        let base = PacketProofEvidence {
+            source_aspects: vec![aspect("cite:config", Some("node:config-type"), 2, 4, None)],
+            typed_relations: vec![usage],
+            trail_scans: Vec::new(),
+        };
+        let config_atoms = MAPPER_PLAN_FLOW_PROOF.atoms_for("mapper_config");
+
+        let mut field_member = base.clone();
+        field_member.typed_relations.push(structural(
+            "edge:owned-field",
+            EdgeKind::MEMBER,
+            "node:owning-type",
+            "node:owned-field",
+            Some(NodeKind::FIELD),
+        ));
+        assert_eq!(
+            match_required_atoms(&MAPPER_PLAN_FLOW_PROOF, &config_atoms, &field_member),
+            FlowProofOutcome::Unproven
+        );
+
+        let mut foreign_member = base;
+        foreign_member.typed_relations.push(structural(
+            "edge:foreign-method",
+            EdgeKind::MEMBER,
+            "node:unrelated-type",
+            "node:owned-method",
+            Some(NodeKind::METHOD),
+        ));
+        assert_eq!(
+            match_required_atoms(&MAPPER_PLAN_FLOW_PROOF, &config_atoms, &foreign_member),
+            FlowProofOutcome::Unproven
+        );
+    }
+
+    #[test]
     fn a3_fails_without_the_member_edge() {
         let mut evidence = a_evidence();
         evidence.typed_relations.remove(2);
@@ -2126,8 +2313,13 @@ mod tests {
 
     #[test]
     fn removing_any_single_a_receipt_leaves_its_requirement_unproven() {
-        let config_atoms = [ProofAtomId::A1, ProofAtomId::A2];
-        let execution_atoms = [ProofAtomId::A3, ProofAtomId::A4];
+        let config_atoms = MAPPER_PLAN_FLOW_PROOF.atoms_for("mapper_config");
+        let execution_atoms = MAPPER_PLAN_FLOW_PROOF.atoms_for("mapper_execution");
+        assert_eq!(
+            config_atoms,
+            vec![ProofAtomId::A1, ProofAtomId::A2, ProofAtomId::A5]
+        );
+        assert_eq!(execution_atoms, vec![ProofAtomId::A3, ProofAtomId::A4]);
 
         let mut without_type_usage = a_evidence();
         without_type_usage.typed_relations.remove(0);
@@ -2143,6 +2335,20 @@ mod tests {
                 &MAPPER_PLAN_FLOW_PROOF,
                 &config_atoms,
                 &without_config_range
+            ),
+            FlowProofOutcome::Unproven
+        );
+
+        // A5's membership receipt: without it the Builder role has no
+        // owned method, so mapper_config fails closed even though its
+        // TYPE_USAGE pair and configuration range are both intact.
+        let mut without_builder_member = a_evidence();
+        without_builder_member.typed_relations.remove(2);
+        assert_eq!(
+            match_required_atoms(
+                &MAPPER_PLAN_FLOW_PROOF,
+                &config_atoms,
+                &without_builder_member
             ),
             FlowProofOutcome::Unproven
         );
@@ -2633,13 +2839,28 @@ mod tests {
             Some(&node("node:build-method"))
         );
         assert_eq!(
-            proof.atoms[2].facts[1],
-            DischargedFact::TypedRelation {
-                edge_id: EdgeId("edge:builder-member".to_string()),
-                source: node("node:builder-type"),
-                target: node("node:build-method"),
-            }
+            proof
+                .atoms
+                .iter()
+                .map(|atom| (atom.atom, atom.requirement))
+                .collect::<Vec<_>>(),
+            vec![
+                (ProofAtomId::A1, "mapper_config"),
+                (ProofAtomId::A2, "mapper_config"),
+                (ProofAtomId::A5, "mapper_config"),
+                (ProofAtomId::A3, "mapper_execution"),
+                (ProofAtomId::A4, "mapper_execution"),
+            ]
         );
+        let builder_member = DischargedFact::TypedRelation {
+            edge_id: EdgeId("edge:builder-member".to_string()),
+            source: node("node:builder-type"),
+            target: node("node:build-method"),
+        };
+        // Rule 8: the one membership receipt discharges A5's admissibility
+        // fact and A3's join, each against its own fully matched pattern.
+        assert_eq!(proof.atoms[2].facts, vec![builder_member.clone()]);
+        assert_eq!(proof.atoms[3].facts[1], builder_member);
     }
 
     #[test]
@@ -2823,12 +3044,13 @@ mod tests {
             vec![ProofAtomId::A3, ProofAtomId::A4]
         );
         let mut evidence = a_evidence();
-        // Remove the A3 MEMBER edge: mapper_execution — which constraint
-        // strength runs FIRST — fails, and because a failed subset carries
-        // nothing forward, mapper_config still proves on its own bindings
-        // even though its sibling bound PlanOwner and BuilderMethod on the
-        // way to failing.
-        evidence.typed_relations.remove(2);
+        // Remove A4's builder carrier range: mapper_execution — which
+        // constraint strength runs FIRST — fails, and because a failed
+        // subset carries nothing forward, mapper_config still proves on its
+        // own bindings even though its sibling bound PlanOwner, Builder and
+        // BuilderMethod on the way to failing. (Removing the MEMBER receipt
+        // instead would now fail BOTH requirements, since A5 reads it too.)
+        evidence.source_aspects.remove(1);
         let outcomes = match_flow_requirements(&MAPPER_PLAN_FLOW_PROOF, &evidence);
         assert_eq!(outcomes[0].0, "mapper_config");
         let config = proved(outcomes[0].1.clone());
@@ -2964,8 +3186,9 @@ mod tests {
         );
 
         // A: mapper_execution carries A3's CALL plus its MEMBER join and
-        // binds three roles; mapper_config carries one weakly constrained
-        // TYPE_USAGE plus a carrier range.
+        // binds three roles; mapper_config carries the same number of typed
+        // relations (A1's TYPE_USAGE and A5's membership constraint) but
+        // binds one role fewer, so execution still leads.
         assert_eq!(
             MAPPER_PLAN_FLOW_PROOF.requirements(),
             vec!["mapper_config", "mapper_execution"]
@@ -2986,9 +3209,9 @@ mod tests {
         assert_eq!(
             MAPPER_PLAN_FLOW_PROOF.constraint_strength("mapper_config"),
             RequirementConstraintStrength {
-                typed_relation_facts: 1,
+                typed_relation_facts: 2,
                 bound_role_positions: 2,
-                total_facts: 2,
+                total_facts: 3,
                 declaration_index: 0,
             }
         );
@@ -3103,8 +3326,9 @@ mod tests {
             FlowProofOutcome::Unproven
         );
 
-        // Declaration order let mapper_config win the shared Builder role on
-        // the decoy pair, which then starved its sibling.
+        // The pre-fix ATOM PAIR still matches the decoy — the ordering fix
+        // never made A1/A2 discriminate — and the bindings it produces
+        // starve the sibling.
         let decoy_first = proved(match_required_atoms(
             &MAPPER_PLAN_FLOW_PROOF,
             &[ProofAtomId::A1, ProofAtomId::A2],
@@ -3123,13 +3347,22 @@ mod tests {
             ),
             FlowProofOutcome::Unproven
         );
+        // A5 is what removes the decoy from the requirement's reach: the
+        // decoy source owns no method, so even the pre-fix DECLARATION order
+        // — which evaluates mapper_config first, with no sibling bindings to
+        // constrain it — now fails it closed and leaves the true chain free.
+        let declaration_order = declaration_order_requirements(&MAPPER_PLAN_FLOW_PROOF, &evidence);
         assert_eq!(
-            declaration_order_requirements(&MAPPER_PLAN_FLOW_PROOF, &evidence),
-            vec![
-                ("mapper_config", FlowProofOutcome::Proved(decoy_first)),
-                ("mapper_execution", FlowProofOutcome::Unproven),
-            ],
-            "the pre-fix behavior: the weak requirement proves off the decoy"
+            declaration_order[0],
+            ("mapper_config", FlowProofOutcome::Unproven),
+            "the decoy pair must no longer satisfy the configuration requirement"
+        );
+        assert_eq!(declaration_order[1].0, "mapper_execution");
+        assert_eq!(
+            proved(declaration_order[1].1.clone())
+                .bindings
+                .get(&ProofRole::Builder),
+            Some(&node("node:plan-builder"))
         );
 
         // Most-constrained-first runs mapper_execution instead, and its
