@@ -34,7 +34,10 @@ use std::sync::OnceLock;
 
 use tree_sitter::{Language, Tree};
 
-use crate::{CompiledLanguageRules, LanguageRuleset, ManualMemberEdgeSpec, ManualReceiverCallSpec};
+use crate::{
+    CompiledLanguageRules, LanguageRuleset, ManualMemberEdgeSpec, ManualReceiverCallSpec,
+    ManualTypeUsageSpec,
+};
 
 /// Everything the indexer knows about one migrated language.
 ///
@@ -67,10 +70,18 @@ pub(crate) struct LanguageExtraction {
     pub(crate) member_edge_specs: Option<fn(&Tree, &str) -> Vec<ManualMemberEdgeSpec>>,
     /// Manual receiver-call collector, when the language has one.
     pub(crate) receiver_call_specs: Option<fn(&Tree, &str) -> Vec<ManualReceiverCallSpec>>,
-    /// Callsite marker for edges produced from member-call syntax.
-    pub(crate) member_callsite_marker: Option<&'static str>,
-    /// `call_syntax` value the rule file emits for that marker.
-    pub(crate) graph_call_syntax: Option<&'static str>,
+    /// Manual type-usage collector, when the language has one (C# today).
+    /// A collector may emit a spec only for a type it resolved against its
+    /// own binding tables — the engine stamps the resulting TYPE_USAGE edge
+    /// `certainty = Certain` at emit on the strength of that gate (P2a).
+    pub(crate) type_usage_specs: Option<fn(&Tree, &str) -> Vec<ManualTypeUsageSpec>>,
+    /// `(call_syntax, marker)` families for callsite markers: every
+    /// `call_syntax` value this row's rule file emits, paired with the marker
+    /// written onto edges that carry it. Most languages own at most one family
+    /// (their member-call syntax); PHP owns two (`php_member` member calls and
+    /// `php_new` construction). Empty when the rule file emits no
+    /// `call_syntax`, which is exactly what the old `None`/`None` pair meant.
+    pub(crate) callsite_marker_families: &'static [(&'static str, &'static str)],
     /// Member functions of a type-like owner project as METHOD, not FUNCTION.
     pub(crate) promotes_type_member_functions_to_methods: bool,
     /// Separator between an owner and its member in qualified names.
@@ -131,10 +142,13 @@ pub(crate) fn extraction_for_ruleset(
 
 /// Callsite marker for a `call_syntax` value emitted by a migrated rule file.
 pub(crate) fn member_callsite_marker_for_call_syntax(call_syntax: &str) -> Option<&'static str> {
-    EXTRACTIONS
-        .iter()
-        .find(|extraction| extraction.graph_call_syntax == Some(call_syntax))
-        .and_then(|extraction| extraction.member_callsite_marker)
+    EXTRACTIONS.iter().find_map(|extraction| {
+        extraction
+            .callsite_marker_families
+            .iter()
+            .find(|(family_call_syntax, _)| *family_call_syntax == call_syntax)
+            .map(|(_, marker)| *marker)
+    })
 }
 
 #[cfg(test)]
@@ -190,12 +204,13 @@ mod tests {
                     extraction.language_name
                 );
             }
-            assert_eq!(
-                extraction.member_callsite_marker.is_some(),
-                extraction.graph_call_syntax.is_some(),
-                "{} must pair its callsite marker with the rule file's call_syntax",
-                extraction.language_name
-            );
+            for (call_syntax, marker) in extraction.callsite_marker_families {
+                assert!(
+                    !call_syntax.trim().is_empty() && !marker.trim().is_empty(),
+                    "{} must pair a non-empty call_syntax with a non-empty marker",
+                    extraction.language_name
+                );
+            }
         }
     }
 
@@ -231,9 +246,9 @@ mod tests {
                 extraction.ruleset
             );
             rulesets.push(extraction.ruleset);
-            if let Some(call_syntax) = extraction.graph_call_syntax {
+            for (call_syntax, _) in extraction.callsite_marker_families {
                 assert!(
-                    call_syntaxes.insert(call_syntax),
+                    call_syntaxes.insert(*call_syntax),
                     "call_syntax `{call_syntax}` is claimed twice"
                 );
             }
@@ -253,8 +268,8 @@ mod tests {
         assert_eq!(kotlin.semantic_family, "kotlin");
         assert!(kotlin.uses_generic_semantic_resolver);
         assert_eq!(
-            kotlin.member_callsite_marker,
-            Some("syntax:kotlin-member-call")
+            kotlin.callsite_marker_families,
+            &[("kotlin_member", "syntax:kotlin-member-call")]
         );
         assert_eq!(
             member_callsite_marker_for_call_syntax("kotlin_member"),
@@ -290,8 +305,7 @@ mod tests {
         assert!(!c.route_comments_are_c_style);
         assert_eq!(c.semantic_family, "native");
         assert!(!c.uses_generic_semantic_resolver);
-        assert_eq!(c.member_callsite_marker, None);
-        assert_eq!(c.graph_call_syntax, None);
+        assert!(c.callsite_marker_families.is_empty());
         assert!(c.receiver_call_specs.is_none());
         assert!(c.tags_query.is_none());
         assert_eq!(
@@ -353,11 +367,10 @@ mod tests {
 
         // `rules/tsx.graph.scm` emits TypeScript's `ts_member` call syntax and
         // shares its marker constant rather than declaring its own. The TSX row
-        // therefore leaves both fields empty on purpose, and the lookup is
-        // answered by the TypeScript row — claiming the syntax here as well
-        // would give one `call_syntax` two owners.
-        assert_eq!(tsx.member_callsite_marker, None);
-        assert_eq!(tsx.graph_call_syntax, None);
+        // therefore leaves its marker-family table empty on purpose, and the
+        // lookup is answered by the TypeScript row — claiming the syntax here
+        // as well would give one `call_syntax` two owners.
+        assert!(tsx.callsite_marker_families.is_empty());
         assert_eq!(
             member_callsite_marker_for_call_syntax("ts_member"),
             Some(typescript::MEMBER_CALLSITE_MARKER)
@@ -386,8 +399,8 @@ mod tests {
         assert_eq!(python.semantic_family, "python");
         assert!(!python.uses_generic_semantic_resolver);
         assert_eq!(
-            python.member_callsite_marker,
-            Some("syntax:python-attribute-call")
+            python.callsite_marker_families,
+            &[("python_attribute", "syntax:python-attribute-call")]
         );
         assert_eq!(
             member_callsite_marker_for_call_syntax("python_attribute"),
@@ -422,8 +435,10 @@ mod tests {
         // Rust resolves through `semantic::RustSemanticResolver`, not the shared
         // name-only resolver; the generic flag must stay off.
         assert!(!rust.uses_generic_semantic_resolver);
-        assert_eq!(rust.member_callsite_marker, Some("syntax:rust-method-call"));
-        assert_eq!(rust.graph_call_syntax, Some("rust_method"));
+        assert_eq!(
+            rust.callsite_marker_families,
+            &[("rust_method", "syntax:rust-method-call")]
+        );
         assert_eq!(
             member_callsite_marker_for_call_syntax("rust_method"),
             Some("syntax:rust-method-call")
@@ -453,7 +468,10 @@ mod tests {
         assert!(go.route_comments_are_c_style);
         assert_eq!(go.semantic_family, "go");
         assert!(!go.uses_generic_semantic_resolver);
-        assert_eq!(go.member_callsite_marker, Some("syntax:go-selector-call"));
+        assert_eq!(
+            go.callsite_marker_families,
+            &[("go_selector", "syntax:go-selector-call")]
+        );
         assert_eq!(
             member_callsite_marker_for_call_syntax("go_selector"),
             Some("syntax:go-selector-call")
@@ -479,7 +497,10 @@ mod tests {
         assert!(dart.route_comments_are_c_style);
         assert_eq!(dart.semantic_family, "dart");
         assert!(dart.uses_generic_semantic_resolver);
-        assert_eq!(dart.member_callsite_marker, Some("syntax:dart-member-call"));
+        assert_eq!(
+            dart.callsite_marker_families,
+            &[("dart_member", "syntax:dart-member-call")]
+        );
         assert_eq!(
             member_callsite_marker_for_call_syntax("dart_member"),
             Some("syntax:dart-member-call")
@@ -521,8 +542,7 @@ mod tests {
         assert!(bash.uses_generic_semantic_resolver);
         // Shell has no member-call syntax and no manual receiver-call engine.
         assert!(bash.receiver_call_specs.is_none());
-        assert!(bash.member_callsite_marker.is_none());
-        assert!(bash.graph_call_syntax.is_none());
+        assert!(bash.callsite_marker_families.is_empty());
         assert!(bash.tags_query.is_none());
         assert_eq!(
             extraction_for_ext("sh").map(|row| row.language_name),
@@ -532,6 +552,32 @@ mod tests {
             extraction_for_ext("bash").map(|row| row.language_name),
             Some("bash")
         );
+    }
+
+    /// The PHP row is the reason the registry's marker fields became a
+    /// list-valued family table: member calls and `new` construction are two
+    /// distinct callsite syntaxes, and the old single-valued pair could only
+    /// ever route one of them. Both families must resolve, and the migration
+    /// must have preserved the member-call family exactly.
+    #[test]
+    fn php_row_carries_both_member_and_construction_marker_families() {
+        let php = extraction_for_language("php").expect("php row");
+        assert_eq!(
+            php.callsite_marker_families,
+            &[
+                ("php_member", "syntax:php-member-call"),
+                ("php_new", "syntax:php-new"),
+            ]
+        );
+        assert_eq!(
+            member_callsite_marker_for_call_syntax("php_member"),
+            Some(php::MEMBER_CALLSITE_MARKER)
+        );
+        assert_eq!(
+            member_callsite_marker_for_call_syntax("php_new"),
+            Some(php::NEW_CALLSITE_MARKER)
+        );
+        assert!(php.graph_query.contains("php_new"));
     }
 }
 pub(crate) mod python;

@@ -63,8 +63,8 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     compiled_rules: &RULES,
     member_edge_specs: None,
     receiver_call_specs: Some(receiver_call_specs),
-    member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
-    graph_call_syntax: Some("java_member"),
+    type_usage_specs: None,
+    callsite_marker_families: &[("java_member", MEMBER_CALLSITE_MARKER)],
     // Java spells a method `method_declaration`, so the rule file already emits
     // METHOD and there is nothing to promote — its only FUNCTION rule is a
     // lambda bound to a `local_variable_declaration`, whose owner is a method
@@ -193,6 +193,10 @@ fn collect_java_local_receiver_call_specs(
                 method_col,
                 line: Some(node.start_position().row as u32 + 1),
                 allow_global_fallback: false,
+                binding_marker: None,
+                required_callsite_marker: None,
+                class_anchored: false,
+                owner_is_syntactic: false,
             });
         }
     });

@@ -33,6 +33,7 @@ pub mod packet_obligations;
 pub mod packet_plan;
 pub mod packet_probes;
 pub mod packet_profile_telemetry;
+pub mod packet_proof_atoms;
 pub mod packet_required_probes;
 pub mod packet_scoring;
 pub mod packet_terms;

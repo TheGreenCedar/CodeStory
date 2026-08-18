@@ -4,8 +4,8 @@ use crate::agent::packet_claims::{
     packet_flow_claims_markdown, packet_supported_claims_with_telemetry,
 };
 use crate::agent::packet_obligations::{
-    bind_claims_to_packet_obligations, finalize_packet_obligation_plan,
-    packet_claims_with_obligation_receipts,
+    bind_claims_to_packet_obligations, packet_claims_with_obligation_receipts,
+    refinalize_packet_obligation_plan_after_rebuild,
 };
 use crate::agent::packet_plan::{packet_explicit_request_probe_queries, push_unique_term};
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries_with_extra;
@@ -620,10 +620,39 @@ fn trim_one_optional_graph_unit(packet: &mut AgentPacketDto) -> bool {
     if total_edges <= protected_present {
         return false;
     }
+
+    // ATOM-AWARE SHAVE ORDER (gate 9). This trimmer removes exactly one edge
+    // to fit `max_output_bytes`, and `cap_graph_edges` fills its selection
+    // from the passed ids first and then by LEXICOGRAPHIC EDGE-ID STRING, so
+    // the victim used to be whichever edge id happened to sort last —
+    // arbitrary with respect to atom need. Ranking atom-required edges into
+    // the selection order makes the victim a non-atom edge whenever one
+    // exists, and falls back to an atom-required edge only when nothing else
+    // is left (the selection stops one short of the total, so exactly one
+    // edge is always dropped).
+    //
+    // TRIMMABILITY IS UNCHANGED, deliberately: the `total_edges <=
+    // protected_present` check above still counts ONLY the obligation ids, so
+    // the trimmer can never answer "cannot trim" because of atom need. Atom
+    // need is a selection input, never a protection guarantee at a byte
+    // budget — `max_output_bytes` is a publication invariant and does not
+    // bend for it.
+    let mut shave_order = protected;
+    let atom_required = atom_required_graph_edge_ids(&packet.answer);
+    for artifact in &packet.answer.graphs {
+        let GraphArtifactDto::Uml { graph, .. } = artifact else {
+            continue;
+        };
+        for edge in &graph.edges {
+            if atom_required.contains(&edge.id) && !protected_set.contains(&edge.id) {
+                shave_order.push(edge.id.clone());
+            }
+        }
+    }
     cap_graph_edges(
         &mut packet.answer,
         total_edges.saturating_sub(1).try_into().unwrap_or(u32::MAX),
-        &protected,
+        &shave_order,
     )
 }
 
@@ -752,12 +781,19 @@ fn rebuild_packet_budget_dependents(
     let task_class = packet
         .task_class
         .unwrap_or(PacketTaskClassDto::ArchitectureExplanation);
-    finalize_packet_obligation_plan(
+    // R7(d): the budget fixpoint is a REBUILD site, not a proving site. Legacy
+    // obligations get today's full re-finalization bit-identically; formula
+    // obligations are re-verified by receipt survival only against the
+    // survivors at rebuild time (retained citations/support, current graphs) —
+    // never re-proven, never promoted. Proving happened once, at the primary
+    // finalize with the caller's evidence extras.
+    refinalize_packet_obligation_plan_after_rebuild(
         &packet.question,
         task_class,
         &mut packet.plan.obligations,
         &packet.answer,
         &packet.budget,
+        &packet.support,
     );
     refresh_packet_claim_markdown(packet);
     let trim_trace_summary = packet
@@ -864,12 +900,55 @@ fn remove_omitted_section(budget: &mut PacketBudgetDto, section: &str) -> bool {
 }
 
 /// Edges the compact graph cap must keep so a later reader can still name what
-/// a cited carrier does. Obligation proofs come first; then CALL/INHERITANCE edges
-/// whose both endpoints are cited; then any remaining incident CALL/INHERITANCE and
-/// already-attached citation evidence ids. Compact used to pick the first 20
-/// edges by id, drop the rest, and strip `evidence_edge_ids` that no longer
-/// appeared in `answer.graphs` — which is how a packet that had resolved a CALL
-/// shipped a pointer receipt instead of the relation.
+/// a cited carrier does. Obligation proofs come first; then protected-kind
+/// edges whose both endpoints are cited; then any remaining incident
+/// protected-kind and already-attached citation evidence ids. Compact used to
+/// pick the first 20 edges by id, drop the rest, and strip
+/// `evidence_edge_ids` that no longer appeared in `answer.graphs` — which is
+/// how a packet that had resolved a CALL shipped a pointer receipt instead of
+/// the relation. R2 widens the protected kinds from CALL|INHERITANCE to every
+/// atom-required kind (TYPE_USAGE, USAGE, MEMBER, IMPORT), so retained atom
+/// receipts survive the cap the same way CALL proof does.
+/// The graph edges an atom receipt requires, read from the active proof
+/// session: an edge in a recorded scan's narrowed coverage set (a rule-7
+/// completeness claim is void the moment one of its enumerated edges leaves
+/// the evidence), or an edge with an endpoint the formulas' typed patterns
+/// put in the need-set.
+///
+/// This is a SELECTION input and never a PROOF input (contract rule 4), and
+/// it is never a protection GUARANTEE at a byte-budget boundary — see
+/// [`trim_one_optional_graph_unit`], which uses it to choose a victim, not to
+/// refuse to trim. Empty without an active session and for every packet with
+/// no formula-bearing requirement, which keeps Legacy behavior identical.
+fn atom_required_graph_edge_ids(answer: &AgentAnswerDto) -> HashSet<EdgeId> {
+    let Some(session) = crate::agent::packet_candidate::active_packet_proof_session() else {
+        return HashSet::new();
+    };
+    let mut required = session
+        .artifact_scans()
+        .into_iter()
+        .flat_map(|(_, scans)| scans)
+        .flat_map(|scan| scan.coverage_edge_ids)
+        .collect::<HashSet<_>>();
+    let endpoint_is_atom_needed = |node_id: &codestory_contracts::api::NodeId| {
+        node_id
+            .0
+            .parse::<i64>()
+            .is_ok_and(|identity| session.identity_is_atom_needed(identity))
+    };
+    for artifact in &answer.graphs {
+        let GraphArtifactDto::Uml { graph, .. } = artifact else {
+            continue;
+        };
+        for edge in &graph.edges {
+            if endpoint_is_atom_needed(&edge.source) || endpoint_is_atom_needed(&edge.target) {
+                required.insert(edge.id.clone());
+            }
+        }
+    }
+    required
+}
+
 fn protected_graph_edge_ids_for_budget(
     answer: &AgentAnswerDto,
     obligation_edge_ids: &[EdgeId],
@@ -879,7 +958,31 @@ fn protected_graph_edge_ids_for_budget(
         .iter()
         .map(|citation| citation.node_id.clone())
         .collect::<HashSet<_>>();
+    // ATOM-NEED PROTECTION (gate 9, contract R2 "protects atom-required
+    // edges of any kind"). Everything the graph cap does not protect is
+    // selected by LEXICOGRAPHIC EDGE-ID STRING (see `cap_graph_edges`), which
+    // is arbitrary with respect to atom need: on a real CSS packet the
+    // post-pass built fourteen honest hydration artifacts and the cap kept
+    // thirteen edges of one of them, deleting every artifact that lost all
+    // its edges — taking the MEMBER receipts C2/C3/C4 need with it.
+    //
+    // Two things make an edge atom-required, both read from the active proof
+    // session and neither of them a proof input (contract rule 4 — atom need
+    // selects which receipts survive a bounded stage; receipts alone
+    // discharge): the edge is in a recorded scan's narrowed coverage set (a
+    // rule-7 completeness claim is void the moment one of those edges leaves
+    // the evidence), or one of its endpoints is an identity the formulas'
+    // typed patterns put in the need-set.
+    //
+    // Legacy and M-shard packets install no promotion patterns, so the
+    // session yields no coverage sets and an empty need-set, this tier stays
+    // empty, and the protection order is exactly what it was. Out-of-process
+    // rebuilds have no session either and likewise keep today's behavior —
+    // their protection rides the obligation edge ids the DTO carries.
+    let atom_required_ids = atom_required_graph_edge_ids(answer);
+
     let mut both_endpoints = Vec::new();
+    let mut atom_required = Vec::new();
     let mut one_endpoint = Vec::new();
     let mut seen_incident = HashSet::new();
     for artifact in &answer.graphs {
@@ -887,7 +990,15 @@ fn protected_graph_edge_ids_for_budget(
             continue;
         };
         for edge in &graph.edges {
-            if !matches!(edge.kind, EdgeKind::CALL | EdgeKind::INHERITANCE) {
+            if !matches!(
+                edge.kind,
+                EdgeKind::CALL
+                    | EdgeKind::INHERITANCE
+                    | EdgeKind::TYPE_USAGE
+                    | EdgeKind::USAGE
+                    | EdgeKind::MEMBER
+                    | EdgeKind::IMPORT
+            ) {
                 continue;
             }
             if !seen_incident.insert(edge.id.clone()) {
@@ -897,6 +1008,8 @@ fn protected_graph_edge_ids_for_budget(
             let target_cited = cited.contains(&edge.target);
             if source_cited && target_cited {
                 both_endpoints.push(edge.id.clone());
+            } else if atom_required_ids.contains(&edge.id) {
+                atom_required.push(edge.id.clone());
             } else if source_cited || target_cited {
                 one_endpoint.push(edge.id.clone());
             }
@@ -920,6 +1033,9 @@ fn protected_graph_edge_ids_for_budget(
         for id in &citation.evidence_edge_ids {
             push(id.clone(), &mut protected, &mut seen);
         }
+    }
+    for id in atom_required {
+        push(id, &mut protected, &mut seen);
     }
     for id in one_endpoint {
         push(id, &mut protected, &mut seen);
@@ -1348,7 +1464,9 @@ pub(crate) fn packet_budget_usage(answer: &AgentAnswerDto) -> PacketBudgetUsageD
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::agent::packet_obligations::build_packet_obligation_plan;
+    use crate::agent::packet_obligations::{
+        PacketProofEvidenceExtras, build_packet_obligation_plan, finalize_packet_obligation_plan,
+    };
     use crate::agent::trace_export::packet_step_trace_json;
     use codestory_contracts::api::{
         AgentCitationDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
@@ -1429,6 +1547,341 @@ pub(super) mod tests {
         graph.truncated = omitted_edge_count > 0;
         graph.omitted_edge_count = omitted_edge_count;
         artifact
+    }
+
+    /// A hydration-shaped artifact with NUMERIC endpoint ids, so the
+    /// atom-need protection tier can key on them.
+    fn atom_hydration_artifact(artifact_id: &str, edges: &[(&str, i64, i64)]) -> GraphArtifactDto {
+        let mut nodes = Vec::new();
+        let mut dtos = Vec::new();
+        for (edge_id, source, target) in edges {
+            for endpoint in [source, target] {
+                if !nodes
+                    .iter()
+                    .any(|node: &GraphNodeDto| node.id.0 == endpoint.to_string())
+                {
+                    nodes.push(GraphNodeDto {
+                        id: NodeId(endpoint.to_string()),
+                        label: endpoint.to_string(),
+                        kind: NodeKind::FILE,
+                        depth: 1,
+                        label_policy: None,
+                        badge_visible_members: None,
+                        badge_total_members: None,
+                        merged_symbol_examples: Vec::new(),
+                        file_path: None,
+                        qualified_name: None,
+                        member_access: None,
+                    });
+                }
+            }
+            dtos.push(GraphEdgeDto {
+                id: EdgeId((*edge_id).to_string()),
+                source: NodeId(source.to_string()),
+                target: NodeId(target.to_string()),
+                kind: EdgeKind::MEMBER,
+                confidence: None,
+                certainty: None,
+                callsite_identity: None,
+                candidate_targets: Vec::new(),
+            });
+        }
+        GraphArtifactDto::Uml {
+            id: artifact_id.to_string(),
+            title: artifact_id.to_string(),
+            graph: GraphResponse {
+                center_id: NodeId(edges[0].1.to_string()),
+                nodes,
+                edges: dtos,
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        }
+    }
+
+    /// A C-family session whose need-set carries `needed`.
+    fn atom_session_needing(
+        needed: &[i64],
+    ) -> std::rc::Rc<crate::agent::packet_candidate::PacketProofSession> {
+        let requirements =
+            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
+                &codestory_agent::packet_terms::packet_probe_terms(
+                    "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
+                ),
+                PacketTaskClassDto::ArchitectureExplanation,
+            );
+        let session = std::rc::Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
+            crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
+        ));
+        let node = |id: i64| GraphNodeDto {
+            id: NodeId(id.to_string()),
+            label: id.to_string(),
+            kind: NodeKind::FILE,
+            depth: 1,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: None,
+            qualified_name: None,
+            member_access: None,
+        };
+        for (index, identity) in needed.iter().enumerate() {
+            let partner = 900_000 + index as i64;
+            session.record_atom_needed_identities(&GraphResponse {
+                center_id: NodeId(identity.to_string()),
+                nodes: vec![node(*identity), node(partner)],
+                edges: vec![GraphEdgeDto {
+                    id: EdgeId(format!("need-{identity}")),
+                    source: NodeId(partner.to_string()),
+                    target: NodeId(identity.to_string()),
+                    kind: EdgeKind::IMPORT,
+                    confidence: None,
+                    certainty: None,
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            });
+            assert!(session.identity_is_atom_needed(*identity));
+        }
+        session
+    }
+
+    /// FIX B: the graph cap's unprotected fill order is lexicographic by edge
+    /// id, which is arbitrary with respect to atom need — on a real CSS
+    /// packet it kept thirteen edges of one hydration artifact and deleted
+    /// the other thirteen artifacts outright. An edge an atom receipt
+    /// requires now outranks that lexicographic order, and a non-atom edge is
+    /// dropped in its place. The cap size itself is untouched.
+    #[test]
+    fn atom_required_edges_outrank_lexicographic_order_under_the_graph_cap() {
+        // "aaa" sorts first and is needed by nothing; "zzz" is a MEMBER
+        // receipt whose target identity the formulas require.
+        let artifact = atom_hydration_artifact(
+            "packet-atom-hydration-77",
+            &[("aaa-unrelated", 10, 11), ("zzz-atom-required", 20, 21)],
+        );
+        let mut answer = test_packet("Trace the animation structure.", 96 * 1024).answer;
+        answer.citations.clear();
+        answer.graphs = vec![artifact];
+
+        let surviving = |answer: &AgentAnswerDto| {
+            let mut capped = answer.clone();
+            let protected = protected_graph_edge_ids_for_budget(&capped, &[]);
+            cap_graph_edges(&mut capped, 1, &protected);
+            capped
+                .graphs
+                .iter()
+                .filter_map(|artifact| match artifact {
+                    GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.iter()),
+                    GraphArtifactDto::Mermaid { .. } => None,
+                })
+                .flatten()
+                .map(|edge| edge.id.0.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            surviving(&answer),
+            vec!["aaa-unrelated".to_string()],
+            "without a session the cap keeps whichever edge id sorts first"
+        );
+
+        let session = atom_session_needing(&[21]);
+        let _guard = crate::agent::packet_candidate::install_packet_proof_session(
+            std::rc::Rc::clone(&session),
+        );
+        assert_eq!(
+            surviving(&answer),
+            vec!["zzz-atom-required".to_string()],
+            "the atom-required edge survives and the unrelated edge is dropped in its place"
+        );
+    }
+
+    /// FIX B: a recorded scan's narrowed COVERAGE set is protected too — a
+    /// rule-7 completeness claim is void the moment one of its enumerated
+    /// edges leaves the evidence, so the cap must not be the thing that
+    /// voids it.
+    #[test]
+    fn recorded_coverage_edges_are_protected_from_the_graph_cap() {
+        let artifact = atom_hydration_artifact(
+            "packet-atom-hydration-88",
+            &[("aaa-unrelated", 30, 31), ("zzz-covered", 40, 41)],
+        );
+        let mut answer = test_packet("Trace the animation structure.", 96 * 1024).answer;
+        answer.citations.clear();
+        answer.graphs = vec![artifact];
+
+        // A session that needs no identity at all, but recorded a scan whose
+        // coverage claim enumerates the late-sorting edge.
+        let session = atom_session_needing(&[]);
+        session.record_artifact_scans(
+            "packet-atom-hydration-88",
+            &[crate::agent::packet_candidate::PacketCandidateTrailScan {
+                root: "40".into(),
+                direction: crate::agent::packet_candidate::PacketGraphDirection::Outgoing,
+                depth: 2,
+                edge_kinds: vec![EdgeKind::MEMBER, EdgeKind::USAGE, EdgeKind::IMPORT],
+                truncated: false,
+                coverage_edge_ids: vec![EdgeId("zzz-covered".into())],
+            }],
+        );
+        let _guard = crate::agent::packet_candidate::install_packet_proof_session(
+            std::rc::Rc::clone(&session),
+        );
+
+        let protected = protected_graph_edge_ids_for_budget(&answer, &[]);
+        assert!(
+            protected.contains(&EdgeId("zzz-covered".into())),
+            "the coverage set is protected: {protected:?}"
+        );
+        cap_graph_edges(&mut answer, 1, &protected);
+        let surviving = answer
+            .graphs
+            .iter()
+            .filter_map(|artifact| match artifact {
+                GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.iter()),
+                GraphArtifactDto::Mermaid { .. } => None,
+            })
+            .flatten()
+            .map(|edge| edge.id.0.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(surviving, vec!["zzz-covered".to_string()]);
+    }
+
+    /// Gate 9 item 1: the byte-budget trimmer removes exactly one edge, and
+    /// its victim used to be whichever edge id sorted last. It now shaves a
+    /// NON-atom edge first — while remaining just as trimmable, because the
+    /// trimmability check still counts only obligation ids. `max_output_bytes`
+    /// is a publication invariant and atom need never blocks it.
+    #[test]
+    fn the_byte_budget_trimmer_shaves_a_non_atom_edge_first() {
+        let build = || {
+            let mut packet = test_packet("Trace the animation structure.", 96 * 1024);
+            packet.answer.citations.clear();
+            packet.answer.graphs = vec![atom_hydration_artifact(
+                "packet-atom-hydration-101",
+                &[("aaa-unrelated", 70, 71), ("zzz-atom-required", 80, 81)],
+            )];
+            packet
+        };
+        let surviving = |packet: &AgentPacketDto| {
+            packet
+                .answer
+                .graphs
+                .iter()
+                .filter_map(|artifact| match artifact {
+                    GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.iter()),
+                    GraphArtifactDto::Mermaid { .. } => None,
+                })
+                .flatten()
+                .map(|edge| edge.id.0.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut baseline = build();
+        assert!(trim_one_optional_graph_unit(&mut baseline));
+        assert_eq!(
+            surviving(&baseline),
+            vec!["aaa-unrelated".to_string()],
+            "without a session the lexicographically-last edge is the victim"
+        );
+
+        let session = atom_session_needing(&[81]);
+        let _guard = crate::agent::packet_candidate::install_packet_proof_session(
+            std::rc::Rc::clone(&session),
+        );
+        let mut atom_aware = build();
+        assert!(
+            trim_one_optional_graph_unit(&mut atom_aware),
+            "trimmability is unchanged — one edge is still removable"
+        );
+        assert_eq!(
+            surviving(&atom_aware),
+            vec!["zzz-atom-required".to_string()],
+            "the atom-required edge survives and the unrelated edge is shaved"
+        );
+    }
+
+    /// Gate 9 item 1, the fallback: when EVERY edge is atom-required the
+    /// trimmer still trims one. Atom need chooses the victim; it never
+    /// refuses to produce one.
+    #[test]
+    fn the_trimmer_still_shaves_when_every_edge_is_atom_required() {
+        let session = atom_session_needing(&[91, 93]);
+        let _guard = crate::agent::packet_candidate::install_packet_proof_session(
+            std::rc::Rc::clone(&session),
+        );
+        let mut packet = test_packet("Trace the animation structure.", 96 * 1024);
+        packet.answer.citations.clear();
+        packet.answer.graphs = vec![atom_hydration_artifact(
+            "packet-atom-hydration-102",
+            &[("aaa-atom", 90, 91), ("zzz-atom", 92, 93)],
+        )];
+        let before = packet
+            .answer
+            .graphs
+            .iter()
+            .filter_map(|artifact| match artifact {
+                GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.len()),
+                GraphArtifactDto::Mermaid { .. } => None,
+            })
+            .sum::<usize>();
+        assert_eq!(before, 2);
+        assert!(
+            trim_one_optional_graph_unit(&mut packet),
+            "an all-atom graph must still be trimmable — the byte budget cannot bend"
+        );
+        let after = packet
+            .answer
+            .graphs
+            .iter()
+            .filter_map(|artifact| match artifact {
+                GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.len()),
+                GraphArtifactDto::Mermaid { .. } => None,
+            })
+            .sum::<usize>();
+        assert_eq!(after, 1, "exactly one edge is removed, as before");
+    }
+
+    /// FIX B non-regression: an all-Legacy packet installs no promotion
+    /// pattern, so the session yields no coverage sets and an empty
+    /// need-set — the protection order, and therefore the cap outcome, is
+    /// exactly what it was before the tier existed.
+    #[test]
+    fn legacy_packets_keep_their_existing_graph_cap_protection_order() {
+        let artifact = atom_hydration_artifact(
+            "packet-atom-hydration-99",
+            &[("aaa-unrelated", 50, 51), ("zzz-other", 60, 61)],
+        );
+        let mut answer = test_packet("Trace the request flow.", 96 * 1024).answer;
+        answer.citations.clear();
+        answer.graphs = vec![artifact];
+        let baseline = protected_graph_edge_ids_for_budget(&answer, &[]);
+
+        let legacy_requirements =
+            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
+                &codestory_agent::packet_terms::packet_probe_terms(
+                    "Trace how a server application registers middleware, handles a request, and sends the response.",
+                ),
+                PacketTaskClassDto::RouteTracing,
+            );
+        let session = std::rc::Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
+            crate::agent::packet_candidate::packet_atom_hydration_spec(&legacy_requirements),
+        ));
+        let _guard = crate::agent::packet_candidate::install_packet_proof_session(
+            std::rc::Rc::clone(&session),
+        );
+        assert!(!session.has_atom_needed_identities());
+        assert_eq!(
+            protected_graph_edge_ids_for_budget(&answer, &[]),
+            baseline,
+            "Legacy protection is bit-identical with a session installed"
+        );
     }
 
     #[test]
@@ -2022,6 +2475,8 @@ pub(super) mod tests {
             &mut packet.plan.obligations,
             &packet.answer,
             &packet.budget,
+            &[],
+            &PacketProofEvidenceExtras::default(),
         );
         let supported_claims_with_telemetry =
             packet_supported_claims_with_telemetry(&packet.answer);
@@ -2062,6 +2517,8 @@ pub(super) mod tests {
             &mut packet.plan.obligations,
             &packet.answer,
             &packet.budget,
+            &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         refresh_packet_claim_markdown(&mut packet);
@@ -3334,5 +3791,365 @@ pub(super) mod tests {
 
     fn test_project_root() -> &'static Path {
         Path::new("C:/workspace/project root")
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 2: byte-budget rebuild agreement for typed-proof obligations
+    // -----------------------------------------------------------------------
+
+    pub(in crate::agent) const MAPPER_PROOF_QUESTION: &str =
+        "How does the mapper build its configuration and execution plan?";
+
+    fn eligible_proof_citation(name: &str, path: &str, kind: NodeKind) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(name.to_string()),
+            display_name: name.to_string(),
+            kind,
+            file_path: Some(path.to_string()),
+            line: Some(10),
+            score: 0.9,
+            origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: Some(PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(PacketEvidenceResolutionDto::Resolved),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
+        }
+    }
+
+    fn mapper_proof_graph_node(citation: &AgentCitationDto) -> GraphNodeDto {
+        GraphNodeDto {
+            id: citation.node_id.clone(),
+            label: citation.display_name.clone(),
+            kind: citation.kind,
+            depth: 1,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: citation.file_path.clone(),
+            qualified_name: None,
+            member_access: None,
+        }
+    }
+
+    /// A packet whose live state proves `mapper_config` through the atom
+    /// matcher: a certain TYPE_USAGE receipt (A1) and the builder's own
+    /// MEMBER-onto-METHOD receipt (A5) in `answer.graphs`, plus a reread
+    /// source range for the configuration type (A2) in `packet.support`,
+    /// owned by a retained sufficiency-eligible citation.
+    pub(in crate::agent) fn mapper_proof_packet() -> AgentPacketDto {
+        let builder =
+            eligible_proof_citation("PlanBuilder", "src/plan_builder.cs", NodeKind::CLASS);
+        let config = eligible_proof_citation(
+            "MapperConfiguration",
+            "src/mapper_configuration.cs",
+            NodeKind::CLASS,
+        );
+        let mut packet = test_packet(MAPPER_PROOF_QUESTION, 98_304);
+        packet.task_class = Some(PacketTaskClassDto::ArchitectureExplanation);
+        packet.plan.task_class = PacketTaskClassDto::ArchitectureExplanation;
+        packet.plan.obligations = build_packet_obligation_plan(
+            MAPPER_PROOF_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        packet.answer.citations = vec![builder.clone(), config.clone()];
+        let mut builder_method = mapper_proof_graph_node(&builder);
+        builder_method.id = NodeId("PlanBuilder.Build".to_string());
+        builder_method.label = "Build".to_string();
+        builder_method.kind = NodeKind::METHOD;
+        packet.answer.graphs = vec![GraphArtifactDto::Uml {
+            id: "mapper-plan".to_string(),
+            title: "Mapper plan".to_string(),
+            graph: GraphResponse {
+                center_id: builder.node_id.clone(),
+                nodes: vec![
+                    mapper_proof_graph_node(&builder),
+                    mapper_proof_graph_node(&config),
+                    builder_method.clone(),
+                ],
+                edges: vec![
+                    GraphEdgeDto {
+                        id: EdgeId("builder-uses-config".to_string()),
+                        source: builder.node_id.clone(),
+                        target: config.node_id.clone(),
+                        kind: EdgeKind::TYPE_USAGE,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: None,
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: EdgeId("builder-owns-method".to_string()),
+                        source: builder.node_id.clone(),
+                        target: builder_method.id.clone(),
+                        kind: EdgeKind::MEMBER,
+                        confidence: Some(1.0),
+                        certainty: None,
+                        callsite_identity: None,
+                        candidate_targets: Vec::new(),
+                    },
+                ],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        }];
+        packet.support = mapper_proof_raw_source_support();
+        packet
+    }
+
+    /// The reread source units exactly as the orchestrator holds them in its
+    /// `source_support` local — constructed independently of any packet, so
+    /// the agreement test below exercises the production asymmetry (raw units
+    /// at site A, `packet.support` at site B), not one vector compared with
+    /// itself.
+    fn mapper_proof_raw_source_support() -> Vec<codestory_contracts::api::SupportUnitDto> {
+        vec![codestory_contracts::api::SupportUnitDto {
+            id: "range:MapperConfiguration".to_string(),
+            kind: codestory_contracts::api::SupportUnitKindDto::SourceRange,
+            summary: "MapperConfiguration source".to_string(),
+            path: Some("src/mapper_configuration.cs".to_string()),
+            symbol_id: Some("MapperConfiguration".to_string()),
+            start_line: Some(10),
+            end_line: Some(30),
+            snippet: Some("public class MapperConfiguration {}".to_string()),
+            edge_kind: None,
+            from_symbol: None,
+            to_symbol: None,
+            query: None,
+        }]
+    }
+
+    /// The round-1 review's central hazard, restated for R7: the primary
+    /// finalize (site A, WITH extras — the one proving site) and the budget
+    /// rebuild (site B, receipt SURVIVAL — never re-proves) must agree on
+    /// `proof_status` when every recorded receipt is present at rebuild time.
+    ///
+    /// The two sites' support inputs are genuinely different expressions in
+    /// production: the orchestrator feeds its raw `source_support` local
+    /// (which only later becomes `packet.support` — the move happens before
+    /// compile rewrites it), while the rebuild feeds the current
+    /// `packet.support`. Site A therefore gets independently constructed raw
+    /// units here, not `packet.support` itself.
+    #[test]
+    fn primary_finalize_and_budget_rebuild_survival_agree_on_proof_status() {
+        let mut packet = mapper_proof_packet();
+        let raw_source_support = mapper_proof_raw_source_support();
+        assert_eq!(
+            raw_source_support, packet.support,
+            "fixture invariant: the packet carries exactly the raw reread units"
+        );
+
+        // Site A: the primary orchestrator-style finalize over the raw units,
+        // with the (empty-default) proving extras. This is the state the
+        // packet ships with.
+        finalize_packet_obligation_plan(
+            &packet.question,
+            packet.plan.task_class,
+            &mut packet.plan.obligations,
+            &packet.answer,
+            &packet.budget,
+            &raw_source_support,
+            &PacketProofEvidenceExtras::default(),
+        );
+        let primary_plan = packet.plan.obligations.clone();
+        // The agreement must bite on a formula-proven obligation, not only on
+        // trivially unproven ones — and the manifest must be recorded.
+        let proven = primary_plan
+            .claim_obligations
+            .iter()
+            .find(|obligation| obligation.id == "mapper_config")
+            .expect("mapper_config obligation");
+        assert_eq!(
+            proven.proof_status,
+            PacketObligationProofStatusDto::Proven,
+            "fixture must prove mapper_config through receipts: {proven:?}"
+        );
+        assert!(
+            !proven.carrier_edge_proofs.is_empty(),
+            "the primary finalize must record the edge-receipt manifest: {proven:?}"
+        );
+
+        // Site B: the byte-budget rebuild — receipt survival. Every recorded
+        // receipt is present, so every proof_status is retained and the two
+        // sites agree.
+        let mut rebuilt = packet.clone();
+        rebuild_packet_budget_dependents(test_project_root(), &mut rebuilt, &[]);
+        let statuses = |plan: &codestory_contracts::api::PacketObligationPlanDto| {
+            plan.claim_obligations
+                .iter()
+                .map(|obligation| (obligation.id.clone(), obligation.proof_status))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            statuses(&primary_plan),
+            statuses(&rebuilt.plan.obligations),
+            "survival must retain every status when all recorded receipts survive"
+        );
+
+        // Removing a recorded edge receipt from the live graphs demotes at the
+        // next rebuild — fail-closed, with the rebuild reason (distinguishable
+        // from the R5 compile reason).
+        let recorded_edge_id = proven.carrier_edge_proofs[0].edge_id.clone();
+        let mut cut = packet.clone();
+        for artifact in &mut cut.answer.graphs {
+            if let GraphArtifactDto::Uml { graph, .. } = artifact {
+                graph.edges.retain(|edge| edge.id != recorded_edge_id);
+            }
+        }
+        rebuild_packet_budget_dependents(test_project_root(), &mut cut, &[]);
+        let demoted = cut
+            .plan
+            .obligations
+            .claim_obligations
+            .iter()
+            .find(|obligation| obligation.id == "mapper_config")
+            .expect("mapper_config obligation");
+        assert_eq!(
+            demoted.proof_status,
+            PacketObligationProofStatusDto::Unsupported,
+            "{demoted:?}"
+        );
+        assert_eq!(
+            demoted.reason.as_deref(),
+            Some("flow_proof_receipts_missing_after_rebuild")
+        );
+    }
+
+    /// R2 protection widening (landed together with the compiler allow-list
+    /// widening): the graph-cap protection buckets consider every
+    /// atom-required edge kind, so cited TYPE_USAGE/USAGE/MEMBER/IMPORT
+    /// receipts outrank unrelated CALL context that sorts earlier by id.
+    #[test]
+    fn widened_atom_kind_edges_with_cited_endpoints_survive_the_graph_cap() {
+        let mut packet = test_packet("Trace the widened protection.", 96 * 1024);
+        let builder =
+            eligible_proof_citation("PlanBuilder", "src/plan_builder.cs", NodeKind::CLASS);
+        let config = eligible_proof_citation(
+            "MapperConfiguration",
+            "src/mapper_configuration.cs",
+            NodeKind::CLASS,
+        );
+        packet.answer.citations = vec![builder.clone(), config.clone()];
+        let structural_kinds = [
+            ("zz-type-usage", EdgeKind::TYPE_USAGE),
+            ("zz-usage", EdgeKind::USAGE),
+            ("zz-member", EdgeKind::MEMBER),
+            ("zz-import", EdgeKind::IMPORT),
+        ];
+        let mut nodes = vec![
+            mapper_proof_graph_node(&builder),
+            mapper_proof_graph_node(&config),
+            budget_graph_node("uncited-center"),
+        ];
+        let mut edges = Vec::new();
+        for index in 0..4 {
+            let target = format!("uncited-target-{index}");
+            nodes.push(budget_graph_node(&target));
+            edges.push(GraphEdgeDto {
+                id: EdgeId(format!("aa-context-{index}")),
+                source: NodeId("uncited-center".to_string()),
+                target: NodeId(target),
+                kind: EdgeKind::CALL,
+                confidence: Some(1.0),
+                certainty: Some("certain".to_string()),
+                callsite_identity: None,
+                candidate_targets: Vec::new(),
+            });
+        }
+        for (edge_id, kind) in structural_kinds {
+            edges.push(GraphEdgeDto {
+                id: EdgeId(edge_id.to_string()),
+                source: builder.node_id.clone(),
+                target: config.node_id.clone(),
+                kind,
+                confidence: None,
+                certainty: None,
+                callsite_identity: None,
+                candidate_targets: Vec::new(),
+            });
+        }
+        packet.answer.graphs = vec![GraphArtifactDto::Uml {
+            id: "widened".to_string(),
+            title: "Widened".to_string(),
+            graph: GraphResponse {
+                center_id: builder.node_id.clone(),
+                nodes,
+                edges,
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        }];
+
+        let protected = protected_graph_edge_ids_for_budget(&packet.answer, &[]);
+        for (edge_id, _) in structural_kinds {
+            assert!(
+                protected.contains(&EdgeId(edge_id.to_string())),
+                "{edge_id} must be protected: {protected:?}"
+            );
+        }
+        assert!(cap_graph_edges(&mut packet.answer, 4, &protected));
+        let retained = packet
+            .answer
+            .graphs
+            .iter()
+            .filter_map(|artifact| match artifact {
+                GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.iter()),
+                GraphArtifactDto::Mermaid { .. } => None,
+            })
+            .flatten()
+            .map(|edge| edge.id.0.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 4);
+        for (edge_id, _) in structural_kinds {
+            assert!(
+                retained.contains(&edge_id.to_string()),
+                "cited {edge_id} must survive over earlier-id uncited CALL context: {retained:?}"
+            );
+        }
+    }
+
+    /// The budget fixpoint's rebuild pass is remove-and-demote only: running
+    /// it twice from the same state changes nothing (monotone idempotent
+    /// steps are what the loop-convergence argument and the marker-shape
+    /// revert rely on), and no evidence collection ever grows.
+    #[test]
+    fn budget_rebuild_dependents_pass_is_remove_only_and_idempotent() {
+        let mut packet = mapper_proof_packet();
+        finalize_packet_obligation_plan(
+            &packet.question,
+            packet.plan.task_class,
+            &mut packet.plan.obligations,
+            &packet.answer,
+            &packet.budget,
+            &packet.support.clone(),
+            &PacketProofEvidenceExtras::default(),
+        );
+        let citations_before = packet.answer.citations.len();
+        let edges_before = packet_budget_usage(&packet.answer).trail_edges;
+        let support_before = packet.support.len();
+
+        let mut first = packet.clone();
+        rebuild_packet_budget_dependents(test_project_root(), &mut first, &[]);
+        assert!(first.answer.citations.len() <= citations_before);
+        assert!(packet_budget_usage(&first.answer).trail_edges <= edges_before);
+        assert!(first.support.len() <= support_before);
+
+        let mut second = first.clone();
+        rebuild_packet_budget_dependents(test_project_root(), &mut second, &[]);
+        assert_eq!(
+            serde_json::to_value(&first).expect("first rebuild"),
+            serde_json::to_value(&second).expect("second rebuild"),
+            "a second rebuild from the same state must be a no-op"
+        );
     }
 }

@@ -75,8 +75,8 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     compiled_rules: &RULES,
     member_edge_specs: None,
     receiver_call_specs: Some(receiver_call_specs),
-    member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
-    graph_call_syntax: Some("js_member"),
+    type_usage_specs: None,
+    callsite_marker_families: &[("js_member", MEMBER_CALLSITE_MARKER)],
     // `method_definition` already projects as METHOD straight out of the rule
     // file, so JavaScript never asked for the FUNCTION -> METHOD promotion;
     // `swift` and `dart` are the only languages that did.
@@ -256,6 +256,10 @@ fn collect_javascript_property_assigned_this_receiver_call_specs(
             method_col: member_call_method_col(call, source, &method_name),
             line: Some(call.start_position().row as u32 + 1),
             allow_global_fallback: false,
+            binding_marker: None,
+            required_callsite_marker: None,
+            class_anchored: false,
+            owner_is_syntactic: false,
         });
     });
 }
@@ -309,6 +313,10 @@ fn collect_javascript_property_assigned_alias_receiver_call_specs(
             method_col: member_call_method_col(call, source, &method_name),
             line: Some(call.start_position().row as u32 + 1),
             allow_global_fallback: false,
+            binding_marker: None,
+            required_callsite_marker: None,
+            class_anchored: false,
+            owner_is_syntactic: false,
         });
     });
 }
@@ -512,6 +520,10 @@ fn collect_javascript_constructor_receiver_call_specs(
                 method_col,
                 line: Some(node.start_position().row as u32 + 1),
                 allow_global_fallback: false,
+                binding_marker: None,
+                required_callsite_marker: None,
+                class_anchored: false,
+                owner_is_syntactic: false,
             });
         }
     });

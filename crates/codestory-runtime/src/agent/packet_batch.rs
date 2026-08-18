@@ -20,7 +20,9 @@ use super::packet_trace::{
 use super::trace::field;
 use crate::{AppController, clamp_u128_to_u32};
 use codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms;
-use codestory_agent::packet_obligations::preview_packet_obligation_plan_before_budget;
+use codestory_agent::packet_obligations::{
+    PacketProofEvidenceExtras, preview_packet_obligation_plan_before_budget,
+};
 use codestory_agent::packet_plan::packet_owner_member_probe_queries;
 pub(crate) use codestory_agent::packet_scoring::packet_file_stem_matches_query;
 use codestory_agent::planning::{
@@ -388,11 +390,14 @@ fn packet_adaptive_material_queries(
     answer: &AgentAnswerDto,
     limit: usize,
 ) -> Vec<PacketPlanQueryDto> {
+    // Pre-cap preview proving; stage 4 threads the runtime's real evidence
+    // extras here alongside the other proving sites.
     let preview = preview_packet_obligation_plan_before_budget(
         question,
         plan.task_class,
         &plan.obligations,
         answer,
+        &PacketProofEvidenceExtras::default(),
     );
     let mut queries = Vec::new();
     let mut seen = HashSet::<String>::new();

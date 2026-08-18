@@ -57,10 +57,10 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     // never had a `"c"` arm, so member calls come from the rule file alone.
     member_edge_specs: None,
     receiver_call_specs: None,
+    type_usage_specs: None,
     // ...and therefore no member-call syntax marker either. `rules/c.scm`
     // emits no `call_syntax`, so there is nothing for the marker match to key.
-    member_callsite_marker: None,
-    graph_call_syntax: None,
+    callsite_marker_families: &[],
     // C struct members are fields, including function pointers; nothing in C
     // projects a FUNCTION under a type-like owner, so the promotion that Kotlin
     // and Swift need was never enabled for C.

@@ -28,7 +28,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const STRICT_BATCH_WORKER_CAP: usize = 4;
+// One packet can issue many subqueries while other agents share the same per-user engine. Keep
+// local fan-out below the engine's global capacity so concurrent packets do not turn queue time
+// into stage-deadline losses.
+const STRICT_BATCH_WORKER_CAP: usize = 2;
 const STRICT_BATCH_PREFETCH_MAX_MS: u64 = 100;
 pub const RETRIEVAL_PUBLICATION_CHANGED_CODE: &str = "publication_changed";
 
@@ -918,7 +921,13 @@ fn strict_batch_worker_limit(query_count: usize) -> usize {
     let available = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
-    // Cap sidecar fan-out; make this configurable only if telemetry needs it.
+    strict_batch_worker_limit_for_available_parallelism(query_count, available)
+}
+
+fn strict_batch_worker_limit_for_available_parallelism(
+    query_count: usize,
+    available: usize,
+) -> usize {
     query_count.min(available).clamp(1, STRICT_BATCH_WORKER_CAP)
 }
 
@@ -991,6 +1000,22 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn strict_batch_fanout_stays_bounded_when_the_host_has_many_cores() {
+        assert_eq!(
+            strict_batch_worker_limit_for_available_parallelism(20, 20),
+            2
+        );
+        assert_eq!(
+            strict_batch_worker_limit_for_available_parallelism(1, 20),
+            1
+        );
+        assert_eq!(
+            strict_batch_worker_limit_for_available_parallelism(20, 1),
+            1
+        );
+    }
 
     fn manifest_for(
         project_id: &str,

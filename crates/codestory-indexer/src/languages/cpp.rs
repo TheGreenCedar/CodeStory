@@ -67,8 +67,8 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     compiled_rules: &RULES,
     member_edge_specs: None,
     receiver_call_specs: Some(receiver_call_specs),
-    member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
-    graph_call_syntax: Some("cpp_member"),
+    type_usage_specs: None,
+    callsite_marker_families: &[("cpp_member", MEMBER_CALLSITE_MARKER)],
     // C++ member functions project as FUNCTION, not METHOD: the rule file
     // already names them `Owner::member`, and the promotion roster held only
     // `kotlin`, `swift`, and `dart` before this move.
@@ -180,6 +180,10 @@ fn collect_cpp_precise_receiver_call_specs(
                     method_col,
                     line: Some(node.start_position().row as u32 + 1),
                     allow_global_fallback: false,
+                    binding_marker: None,
+                    required_callsite_marker: None,
+                    class_anchored: false,
+                    owner_is_syntactic: false,
                 });
             }
             return;
@@ -205,6 +209,10 @@ fn collect_cpp_precise_receiver_call_specs(
                 method_col,
                 line: Some(node.start_position().row as u32 + 1),
                 allow_global_fallback: false,
+                binding_marker: None,
+                required_callsite_marker: None,
+                class_anchored: false,
+                owner_is_syntactic: false,
             });
         }
     });

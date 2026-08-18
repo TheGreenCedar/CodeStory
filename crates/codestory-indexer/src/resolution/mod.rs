@@ -41,6 +41,11 @@ type UnresolvedEdgeRow = (
     i64,
     Option<String>,
     Option<String>,
+    // Caller node kind discriminant. The C# same-root-namespace arm needs it
+    // to read a root off the caller's qualified name: a type-like caller's
+    // namespace is everything but the last segment, a member's everything
+    // but the last two.
+    Option<i64>,
 );
 
 struct SemanticEdgeLookup<'a> {
@@ -823,6 +828,17 @@ impl ResolutionPass {
                 cancel_token,
             )?;
             Self::check_cancelled(cancel_token)?;
+            // Structural CSS placeholder references (stage 3c): import-ref
+            // canonical-file-id stamping and var-ref/keyframes-ref import-
+            // closure resolution. Runs after the generic jobs, whose worklist
+            // excludes these placeholder targets (sql.rs).
+            let _resolved_structural_css_references =
+                pipeline::resolve_structural_css_references_on_conn(
+                    conn,
+                    &scope_context,
+                    cancel_token,
+                )?;
+            Self::check_cancelled(cancel_token)?;
 
             let counts_finished = Instant::now();
             let unresolved_calls =
@@ -1246,6 +1262,7 @@ fn semantic_lookup_from_row<'a>(
         _target_node_id,
         caller_file_path,
         callsite_identity,
+        _caller_kind,
     ) = row;
     SemanticEdgeLookup {
         edge_kind,
@@ -1271,6 +1288,7 @@ fn semantic_request_key(lookup: &SemanticEdgeLookup<'_>) -> Option<SemanticResol
         || is_csharp_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
         || is_ruby_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
         || is_php_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_php_new_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
         || is_imported_receiver_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
         || should_skip_semantic_candidates(lookup)
     {
@@ -1457,6 +1475,18 @@ fn is_php_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option
         identity
             .split('|')
             .any(|part| part == crate::languages::php::MEMBER_CALLSITE_MARKER)
+    })
+}
+
+fn is_php_new_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::languages::php::NEW_CALLSITE_MARKER)
     })
 }
 
@@ -2124,6 +2154,41 @@ impl CandidateIndex {
                 node.normalized_file_path
                     .as_deref()
                     .is_some_and(|path| resolution_path_directory(path) == caller_directory)
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        match matches.as_slice() {
+            [candidate] => Some(*candidate),
+            _ => None,
+        }
+    }
+
+    /// Owner member unique under one root namespace (C# same-root arm).
+    ///
+    /// Resolves `Owner.Method` when EXACTLY ONE method candidate whose
+    /// qualified name starts with `caller_root.` matches — the engine-side
+    /// equivalent of C#'s parent-namespace visibility and csproj-level
+    /// global usings, which no per-file using table can see. Candidates
+    /// without a namespace (fewer than three qualified segments) never
+    /// participate; ambiguity fails closed.
+    fn find_same_root_owner_member_readonly(
+        &self,
+        caller_root: &str,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let mut matches = self
+            .owner_member_candidate_offsets(owner_name, method_name)
+            .into_iter()
+            .filter_map(|offset| self.nodes.get(offset))
+            .filter(|node| owner_member_candidate_matches(node, owner_name, method_name))
+            .filter(|node| {
+                node.qualified_name.as_deref().is_some_and(|qualified| {
+                    qualified.split('.').count() >= 3
+                        && qualified.split('.').next() == Some(caller_root)
+                })
             })
             .map(|node| node.id)
             .collect::<Vec<_>>();
@@ -3124,6 +3189,31 @@ fn import_name_candidates(target_name: &str, legacy_mode: bool) -> Vec<String> {
     candidates
 }
 
+/// Root namespace of a C# caller's qualified name, kind-aware.
+///
+/// A type-like caller (`Ns.Sub.Class`) needs at least two dotted segments
+/// for a namespace to exist; a member caller (`Ns.Sub.Class.Method`) needs
+/// at least three. Global-namespace callers yield `None`, so the same-root
+/// arm never runs for them.
+fn csharp_caller_root_namespace(
+    caller_qualified: Option<&str>,
+    caller_kind: Option<i64>,
+) -> Option<&str> {
+    let qualified = caller_qualified?;
+    let caller_is_type_like = matches!(
+        caller_kind,
+        Some(kind) if kind == NodeKind::CLASS as i64
+            || kind == NodeKind::STRUCT as i64
+            || kind == NodeKind::INTERFACE as i64
+            || kind == NodeKind::ENUM as i64
+    );
+    let min_segments = if caller_is_type_like { 2 } else { 3 };
+    if qualified.split('.').count() < min_segments {
+        return None;
+    }
+    qualified.split('.').next().filter(|root| !root.is_empty())
+}
+
 fn module_prefix(qualified: &str) -> Option<(String, &'static str)> {
     if let Some(idx) = qualified.rfind("::") {
         return Some((qualified[..idx].to_string(), "::"));
@@ -3870,6 +3960,7 @@ mod tests {
                 0,
                 Some("/repo/lib.rs".to_string()),
                 Some("1:2:3:4".to_string()),
+                None,
             ),
             (
                 2_i64,
@@ -3880,6 +3971,7 @@ mod tests {
                 0,
                 Some("/repo/lib.rs".to_string()),
                 Some("2:2:3:4".to_string()),
+                None,
             ),
         ];
 
@@ -3916,6 +4008,7 @@ mod tests {
             "clone".to_string(),
             0,
             Some("/repo/lib.rs".to_string()),
+            None,
             None,
         )];
 
@@ -3967,6 +4060,7 @@ mod tests {
             0,
             Some("/repo/lib.rs".to_string()),
             Some("1:2:3:4".to_string()),
+            None,
         );
 
         let computed = candidate_selection::compute_call_resolution(&pass, &index, &row, &[])?;
@@ -4007,6 +4101,7 @@ mod tests {
             0,
             Some("/repo/lib.rs".to_string()),
             Some("1:2:3:4".to_string()),
+            None,
         );
         let semantic_candidates = vec![SemanticResolutionCandidate {
             target_node_id: 77_i64,

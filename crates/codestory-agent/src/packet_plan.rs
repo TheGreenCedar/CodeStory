@@ -9,7 +9,7 @@ use crate::packet_flow_requirements::{
 use crate::packet_obligations::build_packet_obligation_plan;
 use crate::packet_required_probes::{
     packet_concrete_file_probe_queries_from_required, packet_named_schema_entity_symbol_queries,
-    packet_prompt_exact_symbol_probe_queries,
+    packet_prompt_exact_symbol_probe_queries, packet_prompt_explicit_source_path_queries,
 };
 use crate::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_query_stop_term,
@@ -63,6 +63,9 @@ pub fn build_packet_plan_with_extra(
             question,
             "original task phrasing for sidecar-primary source-backed retrieval",
         );
+    }
+    for path in packet_prompt_explicit_source_path_queries(question) {
+        push_packet_query(&mut queries, &path, PACKET_CONCRETE_FILE_QUERY_PURPOSE);
     }
     for term in exact_symbol_query_terms(question) {
         push_exact_symbol_packet_query(&mut queries, &term);
@@ -179,14 +182,9 @@ pub fn packet_owner_member_probe_queries(
         .iter()
         .map(|term| normalize_identifier(term))
         .collect::<std::collections::HashSet<_>>();
-    let anchor_labels = anchor_citations
+    let anchor_owners = anchor_citations
         .iter()
-        .filter(|citation| {
-            citation.origin == SearchHitOrigin::IndexedSymbol
-                && citation.resolvable
-                && !matches!(citation.kind, NodeKind::FILE | NodeKind::UNKNOWN)
-        })
-        .map(|citation| citation.display_name.as_str())
+        .filter_map(packet_owner_member_anchor_owner)
         .collect::<Vec<_>>();
     let mut owners = Vec::<(usize, String)>::new();
     let mut seen_owners = std::collections::HashSet::<String>::new();
@@ -204,27 +202,23 @@ pub fn packet_owner_member_probe_queries(
         let position = normalized_question.rfind(&key).unwrap_or_default();
         owners.push((position, candidate.clone()));
     }
-    for label in anchor_labels {
-        let segments = label
-            .split(['.', ':', '#', '/', '\\'])
-            .map(|segment| {
-                segment.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-            })
-            .filter(|segment| segment.len() >= 3)
-            .collect::<Vec<_>>();
-        let Some(owner) = segments.get(segments.len().saturating_sub(2)) else {
+    for owner in anchor_owners {
+        let owner_key = normalize_identifier(&owner);
+        if owner_key.len() < 3 || seen_owners.contains(&owner_key) {
             continue;
-        };
-        let mut candidates = vec![(*owner).to_string()];
-        candidates.extend(packet_camel_identifier_words(owner));
-        for candidate in candidates {
-            let key = normalize_identifier(&candidate);
-            if key.len() < 3 || !prompt_term_keys.contains(&key) || !seen_owners.insert(key.clone())
-            {
-                continue;
-            }
-            let position = normalized_question.rfind(&key).unwrap_or_default();
-            owners.push((position, candidate));
+        }
+        let position = prompt_term_keys
+            .iter()
+            .filter(|term_key| packet_owner_identity_matches_prompt_term(&owner_key, term_key))
+            .filter_map(|term_key| normalized_question.rfind(term_key))
+            .max();
+        if let Some(position) = position
+            && seen_owners.insert(owner_key)
+        {
+            // A component word can establish that the typed owner is relevant, but it is never a
+            // replacement identity. Turning `Logger` into `Log` or `SourceObject` into `Source`
+            // fabricates owner/member probes that cannot resolve to the indexed symbol.
+            owners.push((position, owner));
         }
     }
     owners.sort_by(|left, right| {
@@ -295,6 +289,47 @@ pub fn packet_owner_member_probe_queries(
         })
         .take(limit)
         .collect()
+}
+
+fn packet_owner_member_anchor_owner(citation: &AgentCitationDto) -> Option<String> {
+    if citation.origin != SearchHitOrigin::IndexedSymbol || !citation.resolvable {
+        return None;
+    }
+    if matches!(
+        citation.evidence_tier,
+        Some(codestory_contracts::api::PacketEvidenceTierDto::ComponentReport)
+    ) || citation.evidence_producer.as_deref() == Some("component_report")
+    {
+        return None;
+    }
+    let segments = citation
+        .display_name
+        .split(['.', ':', '#', '/', '\\'])
+        .map(|segment| segment.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')))
+        .filter(|segment| segment.len() >= 3)
+        .collect::<Vec<_>>();
+    let owner = match citation.kind {
+        NodeKind::FUNCTION | NodeKind::METHOD => segments.get(segments.len().checked_sub(2)?)?,
+        NodeKind::MODULE
+        | NodeKind::NAMESPACE
+        | NodeKind::PACKAGE
+        | NodeKind::STRUCT
+        | NodeKind::CLASS
+        | NodeKind::INTERFACE
+        | NodeKind::UNION
+        | NodeKind::ENUM
+        | NodeKind::TYPEDEF => segments.last()?,
+        _ => return None,
+    };
+    Some((*owner).to_string())
+}
+
+fn packet_owner_identity_matches_prompt_term(owner_key: &str, term_key: &str) -> bool {
+    if owner_key == term_key {
+        return true;
+    }
+    owner_key.len().abs_diff(term_key.len()) <= 4
+        && (owner_key.starts_with(term_key) || term_key.starts_with(owner_key))
 }
 
 fn packet_owner_member_term_is_noise(term: &str) -> bool {
@@ -884,7 +919,9 @@ fn prompt_mentions_indexing_flow(lower: &str) -> bool {
 #[cfg(test)]
 mod owner_member_probe_tests {
     use super::packet_owner_member_probe_queries;
-    use codestory_contracts::api::{AgentCitationDto, NodeId, NodeKind, SearchHitOrigin};
+    use codestory_contracts::api::{
+        AgentCitationDto, NodeId, NodeKind, PacketEvidenceTierDto, SearchHitOrigin,
+    };
 
     fn citation(
         display_name: &str,
@@ -990,6 +1027,23 @@ mod owner_member_probe_tests {
                 SearchHitOrigin::IndexedSymbol,
                 true,
             ),
+            citation(
+                "validation.enabled",
+                NodeKind::CONSTANT,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            {
+                let mut citation = citation(
+                    "codestory::component_report::dir:validation",
+                    NodeKind::MODULE,
+                    SearchHitOrigin::IndexedSymbol,
+                    true,
+                );
+                citation.evidence_tier = Some(PacketEvidenceTierDto::DenseSemantic);
+                citation.evidence_producer = Some("component_report".to_string());
+                citation
+            },
         ];
         let queries = packet_owner_member_probe_queries(
             "Explain how validation handles checks.",
@@ -1000,6 +1054,68 @@ mod owner_member_probe_tests {
         assert!(
             queries.is_empty(),
             "untyped citation authorized owner/member probes: {queries:?}"
+        );
+    }
+
+    #[test]
+    fn owner_member_probes_use_types_but_not_value_symbols_as_owners() {
+        let citations = vec![
+            citation(
+                "AutoMapper.Mapper",
+                NodeKind::CLASS,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            citation(
+                "animate__fast.animate",
+                NodeKind::CONSTANT,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+        ];
+
+        let mapper_queries = packet_owner_member_probe_queries(
+            "Explain how the mapper maps source objects.",
+            &citations,
+            8,
+        );
+        assert!(mapper_queries.iter().any(|query| query == "Mapper.map"));
+
+        let animation_queries = packet_owner_member_probe_queries(
+            "Explain how animate constants define shared base behavior.",
+            &citations[1..],
+            8,
+        );
+        assert!(
+            animation_queries.is_empty(),
+            "value symbols must not mint owner/member probes: {animation_queries:?}"
+        );
+    }
+
+    #[test]
+    fn owner_member_probes_preserve_the_typed_owner_instead_of_prompt_fragments() {
+        let queries = packet_owner_member_probe_queries(
+            "Explain how Monolog turns a log call into a LogRecord and passes it through handlers.",
+            &symbols(&[
+                "Monolog.Logger.addRecord",
+                "SourceObject.map",
+                "ReplaceName.map",
+                "Monolog\\Handler.HandlerInterface.handle",
+            ]),
+            8,
+        );
+
+        assert!(
+            queries.iter().any(|query| query == "Logger.log"),
+            "typed Logger owner was not retained: {queries:?}"
+        );
+        assert!(
+            !queries.iter().any(|query| {
+                query.starts_with("Log.")
+                    || query.starts_with("Source.")
+                    || query.starts_with("Name.")
+            }),
+            "prompt fragments became fabricated owners: {queries:?}"
         );
     }
 }

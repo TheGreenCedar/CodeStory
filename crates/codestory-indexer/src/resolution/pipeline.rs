@@ -276,6 +276,223 @@ pub(super) fn resolve_overrides_on_conn(
     Ok(resolved)
 }
 
+/// Resolve structural CSS reference placeholders (stage 3c, P3.i/P3.v).
+///
+/// The CSS collector mints three placeholder families it cannot resolve at
+/// emit time, all `NodeKind::UNKNOWN` synthetic nodes:
+///
+/// - `css:import-ref:{resolved path}` — the raw target of a file→file IMPORT
+///   edge. This job stamps `resolved_target_node_id` with the canonical file
+///   node id derived from that importer-directory-resolved path — identity
+///   derivation plus an existence check against a real FILE node, never name
+///   matching. The raw target deliberately is not a locally minted FILE node
+///   carrying the canonical id: store nodes upsert last-write-wins by id, so
+///   a placeholder FILE row could clobber the real file node's projection.
+/// - `css:var-ref:{--name}` / `css:keyframes-ref:{name}` — targets of
+///   selector USAGE edges whose declaration is not in the same file. These
+///   resolve against `css:var:` VARIABLE / `css:keyframes:` FUNCTION
+///   declarations in the referencing file's IMPORT-GRAPH COMPONENT: the BFS
+///   traverses file→file IMPORT effective endpoints in BOTH directions
+///   (imports and importers, transitively). Custom properties resolve
+///   through the page cascade — a `var()` in one sheet is satisfied by a
+///   declaration in any sheet loaded with it — and structurally that is the
+///   connected component, not the downstream closure: in animate.css,
+///   `_base.css` imports nothing and reaches `_vars.css` only through their
+///   shared importer (`_base.css` ← `animate.css` → `_vars.css`). A name
+///   declared in zero or in more than one component file stays unresolved.
+///
+/// Bounded and deterministic: the worklist is exactly the unresolved
+/// placeholder-target edges ordered by edge id; the component walk is a
+/// plain BFS with a visited set over a finite file graph; ambiguity and
+/// misses fail closed, leaving the UNKNOWN-kind placeholder as the effective
+/// target, which can never satisfy a matcher that requires a VARIABLE /
+/// FUNCTION / FILE effective target.
+///
+/// Deliberately unscoped (beyond the empty-scope early return): a FullReplace
+/// of a declaration file NULLs the resolutions of surviving edges in OTHER
+/// files (`delete_file_projection`), and those files are outside the
+/// incremental caller scope; re-attempting the tiny placeholder worklist each
+/// pass is what keeps cross-file references fresh.
+pub(super) fn resolve_structural_css_references_on_conn(
+    conn: &rusqlite::Connection,
+    scope_context: &ScopeCallerContext,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<usize> {
+    ResolutionPass::check_cancelled(cancel_token)?;
+    if scope_context.is_empty() {
+        return Ok(0);
+    }
+
+    let mut resolved = 0usize;
+    let mut update = conn.prepare(
+        "UPDATE edge
+         SET resolved_source_node_id = source_node_id,
+             resolved_target_node_id = ?2,
+             confidence = 1.0,
+             certainty = ?3
+         WHERE id = ?1",
+    )?;
+    let certain = ResolutionCertainty::Certain.as_str();
+
+    // Import placeholders: canonical-file-id derivation + FILE existence.
+    let import_rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT e.id, COALESCE(target.qualified_name, target.serialized_name)
+             FROM edge e
+             JOIN node target ON target.id = e.target_node_id
+             WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL
+               AND target.canonical_id LIKE 'css:import-ref:%'
+             ORDER BY e.id",
+        )?;
+        let rows = stmt.query_map(params![EdgeKind::IMPORT as i32], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut file_exists = conn.prepare("SELECT COUNT(*) FROM node WHERE id = ?1 AND kind = ?2")?;
+    for (edge_id, resolved_path) in import_rows {
+        ResolutionPass::check_cancelled(cancel_token)?;
+        let candidate_id = crate::WorkspaceIndexer::canonical_file_node_id_for_path(
+            std::path::Path::new(&resolved_path),
+        );
+        let exists: i64 = file_exists
+            .query_row(params![candidate_id, NodeKind::FILE as i32], |row| {
+                row.get(0)
+            })?;
+        if exists == 0 {
+            continue;
+        }
+        update.execute(params![edge_id, candidate_id, certain])?;
+        resolved += 1;
+    }
+
+    // Selector USAGE placeholders: declarations in the import-graph
+    // component (cascade semantics — see the function doc).
+    let usage_rows: Vec<(i64, Option<i64>, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.file_node_id, target.canonical_id
+             FROM edge e
+             JOIN node target ON target.id = e.target_node_id
+             WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL
+               AND (target.canonical_id LIKE 'css:var-ref:%'
+                    OR target.canonical_id LIKE 'css:keyframes-ref:%')
+             ORDER BY e.id",
+        )?;
+        let rows = stmt.query_map(params![EdgeKind::USAGE as i32], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if usage_rows.is_empty() {
+        return Ok(resolved);
+    }
+
+    let mut import_adjacency: HashMap<i64, Vec<i64>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT e.source_node_id,
+                    COALESCE(e.resolved_target_node_id, e.target_node_id)
+             FROM edge e
+             JOIN node s ON s.id = e.source_node_id AND s.kind = ?2
+             JOIN node t ON t.id = COALESCE(e.resolved_target_node_id, e.target_node_id)
+                        AND t.kind = ?2
+             WHERE e.kind = ?1
+             ORDER BY e.source_node_id, t.id",
+        )?;
+        let rows = stmt.query_map(
+            params![EdgeKind::IMPORT as i32, NodeKind::FILE as i32],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        for row in rows {
+            let (source, target) = row?;
+            // Undirected on purpose: sibling sheets under a shared importer
+            // are loaded into the same cascade, so the walk must reach a
+            // declaration through the importer as well as through imports.
+            import_adjacency.entry(source).or_default().push(target);
+            import_adjacency.entry(target).or_default().push(source);
+        }
+    }
+
+    // Declarations keyed by (reference canonical) so the lookup is a direct
+    // string-identity join between `css:var-ref:X` and `css:var:X`.
+    let mut declarations: HashMap<String, Vec<(i64, u32, i64)>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT n.id, n.file_node_id, n.canonical_id, COALESCE(n.start_line, 0)
+             FROM node n
+             WHERE (n.kind = ?1 AND n.canonical_id LIKE 'css:var:%')
+                OR (n.kind = ?2 AND n.canonical_id LIKE 'css:keyframes:%')
+             ORDER BY n.id",
+        )?;
+        let rows = stmt.query_map(
+            params![NodeKind::VARIABLE as i32, NodeKind::FUNCTION as i32],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u32>(3)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (node_id, file_id, canonical, start_line) = row?;
+            let Some(file_id) = file_id else { continue };
+            let reference_canonical = if let Some(name) = canonical.strip_prefix("css:var:") {
+                format!("css:var-ref:{name}")
+            } else if let Some(name) = canonical.strip_prefix("css:keyframes:") {
+                format!("css:keyframes-ref:{name}")
+            } else {
+                continue;
+            };
+            declarations
+                .entry(reference_canonical)
+                .or_default()
+                .push((file_id, start_line, node_id));
+        }
+    }
+
+    for (edge_id, file_id, reference_canonical) in usage_rows {
+        ResolutionPass::check_cancelled(cancel_token)?;
+        let Some(file_id) = file_id else { continue };
+        let Some(candidates) = declarations.get(&reference_canonical) else {
+            continue;
+        };
+        let mut component = HashSet::from([file_id]);
+        let mut pending = std::collections::VecDeque::from([file_id]);
+        while let Some(current) = pending.pop_front() {
+            for neighbor in import_adjacency.get(&current).into_iter().flatten() {
+                if component.insert(*neighbor) {
+                    pending.push_back(*neighbor);
+                }
+            }
+        }
+        let mut in_component: Vec<&(i64, u32, i64)> = candidates
+            .iter()
+            .filter(|(declaring_file, _, _)| component.contains(declaring_file))
+            .collect();
+        let declaring_files: HashSet<i64> = in_component
+            .iter()
+            .map(|(declaring_file, _, _)| *declaring_file)
+            .collect();
+        if declaring_files.len() != 1 {
+            // Zero or ambiguous declarations: the edge stays unresolved and
+            // its UNKNOWN placeholder target keeps it un-dischargeable.
+            continue;
+        }
+        in_component.sort_by_key(|(_, start_line, node_id)| (*start_line, *node_id));
+        let (_, _, declaration_node_id) = in_component[0];
+        update.execute(params![edge_id, declaration_node_id, certain])?;
+        resolved += 1;
+    }
+
+    Ok(resolved)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_edges_after_prepare<F>(
     pass: &ResolutionPass,
@@ -566,6 +783,419 @@ fn short_member_name(name: &str) -> &str {
 mod tests {
     use super::*;
     use rusqlite::{Connection, params};
+
+    fn css_reference_schema() -> Result<Connection> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE node (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                serialized_name TEXT NOT NULL,
+                qualified_name TEXT,
+                canonical_id TEXT,
+                file_node_id INTEGER,
+                start_line INTEGER
+            );
+            CREATE TABLE edge (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                source_node_id INTEGER NOT NULL,
+                target_node_id INTEGER NOT NULL,
+                file_node_id INTEGER,
+                resolved_source_node_id INTEGER,
+                resolved_target_node_id INTEGER,
+                confidence REAL,
+                certainty TEXT,
+                candidate_target_node_ids TEXT,
+                callsite_identity TEXT
+            );",
+        )?;
+        Ok(conn)
+    }
+
+    fn insert_node(
+        conn: &Connection,
+        id: i64,
+        kind: NodeKind,
+        name: &str,
+        canonical: Option<&str>,
+        file_node_id: Option<i64>,
+        start_line: Option<i64>,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6)",
+            params![id, kind as i32, name, canonical, file_node_id, start_line],
+        )?;
+        Ok(())
+    }
+
+    fn insert_edge(
+        conn: &Connection,
+        id: i64,
+        kind: EdgeKind,
+        source: i64,
+        target: i64,
+        file_node_id: Option<i64>,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO edge (id, kind, source_node_id, target_node_id, file_node_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, kind as i32, source, target, file_node_id],
+        )?;
+        Ok(())
+    }
+
+    fn resolved_target(conn: &Connection, edge_id: i64) -> Result<Option<i64>> {
+        Ok(conn.query_row(
+            "SELECT resolved_target_node_id FROM edge WHERE id = ?1",
+            params![edge_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    #[test]
+    fn css_var_references_resolve_only_through_an_unambiguous_import_closure() -> Result<()> {
+        let conn = css_reference_schema()?;
+        // Files: 10 imports 20 and 30; 40 stays outside the closure.
+        for file_id in [10_i64, 20, 30, 40] {
+            insert_node(&conn, file_id, NodeKind::FILE, "file", None, None, Some(1))?;
+        }
+        insert_edge(&conn, 100, EdgeKind::IMPORT, 10, 20, Some(10))?;
+        conn.execute(
+            "UPDATE edge SET resolved_target_node_id = 20 WHERE id = 100",
+            [],
+        )?;
+        insert_edge(&conn, 101, EdgeKind::IMPORT, 10, 30, Some(10))?;
+        conn.execute(
+            "UPDATE edge SET resolved_target_node_id = 30 WHERE id = 101",
+            [],
+        )?;
+
+        // Selector + placeholders in file 10.
+        insert_node(
+            &conn,
+            1,
+            NodeKind::CONSTANT,
+            "app",
+            Some("css:class:app"),
+            Some(10),
+            Some(3),
+        )?;
+        insert_node(
+            &conn,
+            2,
+            NodeKind::UNKNOWN,
+            "--unique",
+            Some("css:var-ref:--unique"),
+            Some(10),
+            None,
+        )?;
+        insert_node(
+            &conn,
+            3,
+            NodeKind::UNKNOWN,
+            "--ambiguous",
+            Some("css:var-ref:--ambiguous"),
+            Some(10),
+            None,
+        )?;
+        insert_node(
+            &conn,
+            4,
+            NodeKind::UNKNOWN,
+            "--outside",
+            Some("css:var-ref:--outside"),
+            Some(10),
+            None,
+        )?;
+        insert_node(
+            &conn,
+            5,
+            NodeKind::UNKNOWN,
+            "spin",
+            Some("css:keyframes-ref:spin"),
+            Some(10),
+            None,
+        )?;
+
+        // Declarations: --unique only in 20; --ambiguous in 20 AND 30;
+        // --outside only in the non-imported 40; keyframes spin in 30.
+        insert_node(
+            &conn,
+            6,
+            NodeKind::VARIABLE,
+            "--unique",
+            Some("css:var:--unique"),
+            Some(20),
+            Some(2),
+        )?;
+        insert_node(
+            &conn,
+            7,
+            NodeKind::VARIABLE,
+            "--ambiguous",
+            Some("css:var:--ambiguous"),
+            Some(20),
+            Some(3),
+        )?;
+        insert_node(
+            &conn,
+            8,
+            NodeKind::VARIABLE,
+            "--ambiguous",
+            Some("css:var:--ambiguous"),
+            Some(30),
+            Some(1),
+        )?;
+        insert_node(
+            &conn,
+            9,
+            NodeKind::VARIABLE,
+            "--outside",
+            Some("css:var:--outside"),
+            Some(40),
+            Some(1),
+        )?;
+        insert_node(
+            &conn,
+            11,
+            NodeKind::FUNCTION,
+            "spin",
+            Some("css:keyframes:spin"),
+            Some(30),
+            Some(4),
+        )?;
+
+        insert_edge(&conn, 200, EdgeKind::USAGE, 1, 2, Some(10))?;
+        insert_edge(&conn, 201, EdgeKind::USAGE, 1, 3, Some(10))?;
+        insert_edge(&conn, 202, EdgeKind::USAGE, 1, 4, Some(10))?;
+        insert_edge(&conn, 203, EdgeKind::USAGE, 1, 5, Some(10))?;
+
+        let scope_context = ScopeCallerContext::prepare(&conn, None)?;
+        let resolved = resolve_structural_css_references_on_conn(&conn, &scope_context, None)?;
+        assert_eq!(resolved, 2, "only the unambiguous in-closure references");
+
+        assert_eq!(resolved_target(&conn, 200)?, Some(6));
+        assert_eq!(
+            resolved_target(&conn, 201)?,
+            None,
+            "a name declared in two closure files stays unresolved"
+        );
+        assert_eq!(
+            resolved_target(&conn, 202)?,
+            None,
+            "a declaration outside the import closure never resolves"
+        );
+        assert_eq!(resolved_target(&conn, 203)?, Some(11));
+
+        // Re-running is idempotent: the worklist is already drained.
+        let resolved_again =
+            resolve_structural_css_references_on_conn(&conn, &scope_context, None)?;
+        assert_eq!(resolved_again, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn css_sibling_sheets_resolve_only_unambiguous_component_declarations() -> Result<()> {
+        let conn = css_reference_schema()?;
+        // Cascade component: parent 10 imports siblings 20, 30, and 40. The
+        // references live in 30, which imports NOTHING itself — every
+        // declaration is reachable only through the shared importer. File 50
+        // is disconnected from the component entirely.
+        for file_id in [10_i64, 20, 30, 40, 50] {
+            insert_node(&conn, file_id, NodeKind::FILE, "file", None, None, Some(1))?;
+        }
+        insert_edge(&conn, 100, EdgeKind::IMPORT, 10, 20, Some(10))?;
+        insert_edge(&conn, 101, EdgeKind::IMPORT, 10, 30, Some(10))?;
+        insert_edge(&conn, 102, EdgeKind::IMPORT, 10, 40, Some(10))?;
+
+        // Selector + placeholders in the import-less sibling 30.
+        insert_node(
+            &conn,
+            1,
+            NodeKind::CONSTANT,
+            "animated",
+            Some("css:class:animated"),
+            Some(30),
+            Some(1),
+        )?;
+        insert_node(
+            &conn,
+            2,
+            NodeKind::UNKNOWN,
+            "--sibling",
+            Some("css:var-ref:--sibling"),
+            Some(30),
+            None,
+        )?;
+        insert_node(
+            &conn,
+            3,
+            NodeKind::UNKNOWN,
+            "--twice",
+            Some("css:var-ref:--twice"),
+            Some(30),
+            None,
+        )?;
+        insert_node(
+            &conn,
+            4,
+            NodeKind::UNKNOWN,
+            "--disconnected",
+            Some("css:var-ref:--disconnected"),
+            Some(30),
+            None,
+        )?;
+        insert_node(
+            &conn,
+            5,
+            NodeKind::UNKNOWN,
+            "wobble",
+            Some("css:keyframes-ref:wobble"),
+            Some(30),
+            None,
+        )?;
+
+        // Declarations: --sibling and keyframes wobble only in sibling 20;
+        // --twice in TWO sibling files (20 and 40); --disconnected only in
+        // the unconnected 50.
+        insert_node(
+            &conn,
+            6,
+            NodeKind::VARIABLE,
+            "--sibling",
+            Some("css:var:--sibling"),
+            Some(20),
+            Some(2),
+        )?;
+        insert_node(
+            &conn,
+            7,
+            NodeKind::FUNCTION,
+            "wobble",
+            Some("css:keyframes:wobble"),
+            Some(20),
+            Some(5),
+        )?;
+        insert_node(
+            &conn,
+            8,
+            NodeKind::VARIABLE,
+            "--twice",
+            Some("css:var:--twice"),
+            Some(20),
+            Some(3),
+        )?;
+        insert_node(
+            &conn,
+            9,
+            NodeKind::VARIABLE,
+            "--twice",
+            Some("css:var:--twice"),
+            Some(40),
+            Some(1),
+        )?;
+        insert_node(
+            &conn,
+            11,
+            NodeKind::VARIABLE,
+            "--disconnected",
+            Some("css:var:--disconnected"),
+            Some(50),
+            Some(1),
+        )?;
+
+        insert_edge(&conn, 200, EdgeKind::USAGE, 1, 2, Some(30))?;
+        insert_edge(&conn, 201, EdgeKind::USAGE, 1, 3, Some(30))?;
+        insert_edge(&conn, 202, EdgeKind::USAGE, 1, 4, Some(30))?;
+        insert_edge(&conn, 203, EdgeKind::USAGE, 1, 5, Some(30))?;
+
+        let scope_context = ScopeCallerContext::prepare(&conn, None)?;
+        let resolved = resolve_structural_css_references_on_conn(&conn, &scope_context, None)?;
+        assert_eq!(resolved, 2, "only the unambiguous in-component references");
+
+        assert_eq!(
+            resolved_target(&conn, 200)?,
+            Some(6),
+            "a sibling declaration resolves through the shared importer"
+        );
+        assert_eq!(
+            resolved_target(&conn, 203)?,
+            Some(7),
+            "a sibling keyframe declaration resolves through the shared importer"
+        );
+        assert_eq!(
+            resolved_target(&conn, 201)?,
+            None,
+            "a name declared in two sibling files is ambiguous and stays unresolved"
+        );
+        assert_eq!(
+            resolved_target(&conn, 202)?,
+            None,
+            "a declaration outside the import-graph component never resolves"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn css_import_references_stamp_only_existing_canonical_file_nodes() -> Result<()> {
+        let conn = css_reference_schema()?;
+        insert_node(&conn, 10, NodeKind::FILE, "entry", None, None, Some(1))?;
+        let vars_path = "/repo/theme/vars.css";
+        let vars_file_id = crate::WorkspaceIndexer::canonical_file_node_id_for_path(
+            std::path::Path::new(vars_path),
+        );
+        insert_node(
+            &conn,
+            vars_file_id,
+            NodeKind::FILE,
+            vars_path,
+            None,
+            None,
+            Some(1),
+        )?;
+        insert_node(
+            &conn,
+            2,
+            NodeKind::UNKNOWN,
+            vars_path,
+            Some("css:import-ref:/repo/theme/vars.css"),
+            Some(10),
+            None,
+        )?;
+        insert_node(
+            &conn,
+            3,
+            NodeKind::UNKNOWN,
+            "/repo/theme/missing.css",
+            Some("css:import-ref:/repo/theme/missing.css"),
+            Some(10),
+            None,
+        )?;
+        insert_edge(&conn, 100, EdgeKind::IMPORT, 10, 2, Some(10))?;
+        insert_edge(&conn, 101, EdgeKind::IMPORT, 10, 3, Some(10))?;
+
+        let scope_context = ScopeCallerContext::prepare(&conn, None)?;
+        let resolved = resolve_structural_css_references_on_conn(&conn, &scope_context, None)?;
+        assert_eq!(resolved, 1);
+        assert_eq!(
+            resolved_target(&conn, 100)?,
+            Some(vars_file_id),
+            "the canonical file id of the resolved path, by identity"
+        );
+        assert_eq!(
+            resolved_target(&conn, 101)?,
+            None,
+            "an import whose target file is not indexed stays unresolved"
+        );
+        let certainty: Option<String> =
+            conn.query_row("SELECT certainty FROM edge WHERE id = 100", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(certainty.as_deref(), Some("certain"));
+        Ok(())
+    }
 
     #[test]
     fn cancellation_after_compute_stops_before_apply() -> Result<()> {

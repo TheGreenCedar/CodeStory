@@ -40,9 +40,9 @@ use tree_sitter::{Node as TsNode, Tree};
 
 use super::LanguageExtraction;
 use crate::{
-    CompiledLanguageRules, ImportedTypeBinding, LanguageRuleset, ManualMemberEdgeSpec,
-    ManualReceiverCallSpec, ManualReceiverSource, OptionalReceiverOwnerBinding,
-    ReceiverCallSiteKey, collect_enclosing_type_member_edges,
+    CompiledLanguageRules, GraphNodeSpan, ImportedTypeBinding, LanguageRuleset,
+    ManualMemberEdgeSpec, ManualReceiverCallSpec, ManualReceiverSource, ManualTypeUsageSpec,
+    OptionalReceiverOwnerBinding, ReceiverCallSiteKey, collect_enclosing_type_member_edges,
     collect_receiver_call_specs_in_callable, declaration_name, descendant_by_field_name,
     enclosing_node_with_kind, first_descendant_with_kind, member_call_method_col,
     node_is_same_or_ancestor, normalize_parameter_name, normalize_type_surface,
@@ -71,8 +71,8 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     compiled_rules: &RULES,
     member_edge_specs: Some(member_edge_specs),
     receiver_call_specs: Some(receiver_call_specs),
-    member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
-    graph_call_syntax: Some("csharp_member"),
+    type_usage_specs: Some(type_usage_specs),
+    callsite_marker_families: &[("csharp_member", MEMBER_CALLSITE_MARKER)],
     // C# spells a method `method_declaration`, so the rule file already emits
     // METHOD and there is nothing to promote; only Kotlin, Swift and Dart need
     // the promotion, because their member functions share
@@ -93,17 +93,49 @@ fn csharp_language() -> tree_sitter::Language {
 
 /// Manual receiver-call edges for one parsed C# file.
 ///
-/// Was `lib.rs::collect_csharp_receiver_call_edges`.
+/// Was `lib.rs::collect_csharp_receiver_call_edges`. P2b extends the walk to
+/// `constructor_declaration` bodies: C# emits no constructor node, so those
+/// specs are CLASS-anchored — their source is the enclosing class node — and
+/// carry the `class_anchored` flag the engine's source resolution reads.
 pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
     let root = tree.root_node();
     walk_tree_nodes(tree.root_node(), &mut |callable| {
-        if callable.kind() != "method_declaration" {
-            return;
-        }
-        let Some(source_name) = declaration_name(callable, source) else {
-            return;
+        let (source_name, source_span, class_anchored, precise_only) = match callable.kind() {
+            "method_declaration" => {
+                let Some(name) = declaration_name(callable, source) else {
+                    return;
+                };
+                (name, ts_node_graph_span(callable), false, false)
+            }
+            "constructor_declaration" => {
+                let Some(class_node) = enclosing_node_with_kind(
+                    callable,
+                    &["class_declaration", "struct_declaration"],
+                ) else {
+                    return;
+                };
+                let Some(name) = declaration_name(class_node, source) else {
+                    return;
+                };
+                (name, ts_node_graph_span(class_node), true, false)
+            }
+            // Field and property initializers run in constructor context;
+            // their receiver calls (chiefly `new X(args).Method()` chains)
+            // anchor at the type itself. Only the precise pass applies — a
+            // type body has no parameter receivers — and the
+            // belongs-to-callable filter keeps exactly the calls whose
+            // nearest boundary is this type, so method and constructor
+            // bodies are never double-collected.
+            "class_declaration" | "struct_declaration" => {
+                let Some(name) = declaration_name(callable, source) else {
+                    return;
+                };
+                (name, ts_node_graph_span(callable), true, true)
+            }
+            _ => return,
         };
+        let callable_start = edges.len();
         let visible_type_names = collect_csharp_visible_type_binding_names(root, callable, source);
         let imported_type_bindings = collect_csharp_visible_imported_type_bindings(
             root,
@@ -115,7 +147,7 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
         let receiver_types = collect_csharp_parameter_types(callable, source);
         let call_source = ManualReceiverSource {
             name: &source_name,
-            span: ts_node_graph_span(callable),
+            span: source_span,
         };
         let mut precise_receiver_callsites = HashSet::new();
         let receiver_context = CsharpReceiverContext {
@@ -135,39 +167,441 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             &mut precise_receiver_callsites,
             &mut edges,
         );
-        if receiver_types.is_empty() {
-            return;
+        if !precise_only && !receiver_types.is_empty() {
+            let start = edges.len();
+            collect_receiver_call_specs_in_callable(
+                callable,
+                source,
+                ManualReceiverSource {
+                    name: call_source.name,
+                    span: call_source.span,
+                },
+                &receiver_types,
+                member_call,
+                false,
+                &mut edges,
+            );
+            let mut parameter_specs = edges.split_off(start);
+            parameter_specs
+                .retain(|spec| !precise_receiver_callsites.contains(&receiver_callsite_key(spec)));
+            for spec in &mut parameter_specs {
+                if let Some(binding) = imported_type_bindings.get(&spec.owner_name) {
+                    spec.owner_name = binding.owner_name.clone();
+                    spec.owner_module = Some(binding.module_name.clone());
+                } else if !visible_type_names.contains(&spec.owner_name)
+                    && let Some(module_name) = csharp_plain_namespace_import_type_module(
+                        &spec.owner_name,
+                        &namespace_imports,
+                    )
+                {
+                    spec.owner_module = Some(module_name);
+                }
+            }
+            edges.extend(parameter_specs);
         }
-        let start = edges.len();
-        collect_receiver_call_specs_in_callable(
-            callable,
-            source,
-            ManualReceiverSource {
-                name: call_source.name,
-                span: call_source.span,
-            },
-            &receiver_types,
-            member_call,
-            false,
-            &mut edges,
-        );
-        let mut parameter_specs = edges.split_off(start);
-        parameter_specs
-            .retain(|spec| !precise_receiver_callsites.contains(&receiver_callsite_key(spec)));
-        for spec in &mut parameter_specs {
-            if let Some(binding) = imported_type_bindings.get(&spec.owner_name) {
-                spec.owner_name = binding.owner_name.clone();
-                spec.owner_module = Some(binding.module_name.clone());
-            } else if !visible_type_names.contains(&spec.owner_name)
-                && let Some(module_name) =
-                    csharp_plain_namespace_import_type_module(&spec.owner_name, &namespace_imports)
-            {
-                spec.owner_module = Some(module_name);
+        if class_anchored {
+            for spec in &mut edges[callable_start..] {
+                spec.class_anchored = true;
             }
         }
-        edges.extend(parameter_specs);
     });
     edges
+}
+
+/// Manual type-usage facts for one parsed C# file (P2a).
+///
+/// Three families feed the channel: field declarations (CLASS-anchored),
+/// method and constructor parameter types (METHOD- and CLASS-anchored
+/// respectively), and object creations (anchored at the enclosing method, or
+/// at the enclosing class for constructor bodies and field initializers).
+///
+/// The emit gate is the whole point: a spec exists ONLY when the type surface
+/// resolved against this file's binding tables — same-file type declarations,
+/// the `using`-alias table, or the single plain namespace import. The
+/// unknown-type fallthrough that `csharp_receiver_owner_from_type` keeps for
+/// CALL annotation (it returns `Some((owner_name, None))` for ANY surface)
+/// deliberately does not exist here: an unresolved type produces no spec, so
+/// the engine's emit-time `certainty = Certain` stamp is justified for every
+/// edge this collector produces.
+pub(crate) fn type_usage_specs(tree: &Tree, source: &str) -> Vec<ManualTypeUsageSpec> {
+    let mut specs = Vec::new();
+    let root = tree.root_node();
+    walk_tree_nodes(root, &mut |node| match node.kind() {
+        "field_declaration" => {
+            let Some(class_node) =
+                enclosing_node_with_kind(node, &["class_declaration", "struct_declaration"])
+            else {
+                return;
+            };
+            let Some(variable_declaration) =
+                first_descendant_with_kind(node, "variable_declaration")
+            else {
+                return;
+            };
+            let Some(type_node) = variable_declaration.child_by_field_name("type") else {
+                return;
+            };
+            push_csharp_type_usage_spec(
+                root,
+                source,
+                CsharpTypeUsageAnchor {
+                    node: class_node,
+                    class_anchored: true,
+                },
+                type_node,
+                &mut specs,
+            );
+        }
+        "parameter" => {
+            // Method, constructor, and PRIMARY-constructor parameters feed
+            // the channel (a C#12 primary constructor hangs its
+            // parameter_list directly off the type declaration); lambda and
+            // delegate parameters stay out of it.
+            let Some(owner) = node.parent().and_then(|list| list.parent()) else {
+                return;
+            };
+            let anchor = match owner.kind() {
+                "method_declaration" => CsharpTypeUsageAnchor {
+                    node: owner,
+                    class_anchored: false,
+                },
+                "constructor_declaration" => {
+                    let Some(class_node) = enclosing_node_with_kind(
+                        owner,
+                        &["class_declaration", "struct_declaration"],
+                    ) else {
+                        return;
+                    };
+                    CsharpTypeUsageAnchor {
+                        node: class_node,
+                        class_anchored: true,
+                    }
+                }
+                // Primary constructor: the parameter list's owner IS the
+                // type declaration — anchor there (P2's written rule for
+                // constructor-context facts).
+                "class_declaration" | "struct_declaration" => CsharpTypeUsageAnchor {
+                    node: owner,
+                    class_anchored: true,
+                },
+                _ => return,
+            };
+            let Some(type_node) = node.child_by_field_name("type") else {
+                return;
+            };
+            push_csharp_type_usage_spec(root, source, anchor, type_node, &mut specs);
+        }
+        "object_creation_expression" => {
+            // `new()` (implicit_object_creation_expression) has no type child
+            // and never reaches this arm.
+            let Some(type_node) = node.child_by_field_name("type") else {
+                return;
+            };
+            let Some(anchor_node) = enclosing_node_with_kind(
+                node,
+                &[
+                    "method_declaration",
+                    "constructor_declaration",
+                    "class_declaration",
+                    "struct_declaration",
+                ],
+            ) else {
+                return;
+            };
+            let anchor = match anchor_node.kind() {
+                "method_declaration" => CsharpTypeUsageAnchor {
+                    node: anchor_node,
+                    class_anchored: false,
+                },
+                // Constructor bodies and field/property initializers are both
+                // class-context facts (P2: class anchoring is the written rule
+                // for constructor-context facts).
+                "constructor_declaration" => {
+                    let Some(class_node) = enclosing_node_with_kind(
+                        anchor_node,
+                        &["class_declaration", "struct_declaration"],
+                    ) else {
+                        return;
+                    };
+                    CsharpTypeUsageAnchor {
+                        node: class_node,
+                        class_anchored: true,
+                    }
+                }
+                _ => CsharpTypeUsageAnchor {
+                    node: anchor_node,
+                    class_anchored: true,
+                },
+            };
+            push_csharp_type_usage_spec(root, source, anchor, type_node, &mut specs);
+        }
+        _ => {}
+    });
+    specs
+}
+
+struct CsharpTypeUsageAnchor<'tree> {
+    node: TsNode<'tree>,
+    class_anchored: bool,
+}
+
+fn push_csharp_type_usage_spec(
+    root: TsNode<'_>,
+    source: &str,
+    anchor: CsharpTypeUsageAnchor<'_>,
+    type_node: TsNode<'_>,
+    specs: &mut Vec<ManualTypeUsageSpec>,
+) {
+    let Some(source_name) = declaration_name(anchor.node, source) else {
+        return;
+    };
+    let Some(raw_type) = trimmed_node_text(type_node, source) else {
+        return;
+    };
+    let generic_type_parameters = csharp_generic_type_parameters_in_scope(type_node, source);
+    let visible_type_spans = collect_csharp_visible_type_declaration_spans(root, type_node, source);
+    let visible_type_names = visible_type_spans.keys().cloned().collect::<HashSet<_>>();
+    let imported_type_bindings =
+        collect_csharp_visible_imported_type_bindings(root, type_node, source, &visible_type_names);
+    let namespace_imports = collect_csharp_visible_namespace_imports(root, type_node, source);
+    let Some(target) = csharp_type_usage_target(
+        &raw_type,
+        CsharpTypeUsageTables {
+            root,
+            type_node,
+            source,
+            generic_type_parameters: &generic_type_parameters,
+            visible_type_spans: &visible_type_spans,
+            imported_type_bindings: &imported_type_bindings,
+            namespace_imports: &namespace_imports,
+        },
+    ) else {
+        return;
+    };
+    let (target_name, target_module, target_declaration_span, pending_namespace) = match target {
+        CsharpTypeUsageTarget::SameFile {
+            name,
+            declaration_span,
+        } => (name, None, Some(declaration_span), None),
+        CsharpTypeUsageTarget::Imported { name, module } => (name, Some(module), None, None),
+        CsharpTypeUsageTarget::SameRootPending {
+            name,
+            referencing_namespace,
+        } => (name, None, None, Some(referencing_namespace)),
+    };
+    specs.push(ManualTypeUsageSpec {
+        source_name,
+        source_span: ts_node_graph_span(anchor.node),
+        class_anchored: anchor.class_anchored,
+        target_name,
+        target_module,
+        target_declaration_span,
+        reference_span: ts_node_graph_span(type_node),
+        line: Some(type_node.start_position().row as u32 + 1),
+        pending_namespace,
+    });
+}
+
+/// Predefined C# type keywords. They can never name a project declaration,
+/// so the pending same-root channel refuses them outright instead of minting
+/// pending facts that every finalize pass would re-check and delete.
+const CSHARP_PREDEFINED_TYPE_KEYWORDS: &[&str] = &[
+    "bool", "byte", "char", "decimal", "double", "float", "int", "long", "nint", "nuint", "object",
+    "sbyte", "short", "string", "uint", "ulong", "ushort", "void",
+];
+
+enum CsharpTypeUsageTarget {
+    /// Declared in this file; the edge binds the declaration node exactly.
+    SameFile {
+        name: String,
+        declaration_span: GraphNodeSpan,
+    },
+    /// Resolved through an import table; the edge lands on a module-qualified
+    /// reference node.
+    Imported { name: String, module: String },
+    /// A bare name no per-file table resolves, inside a namespaced file: the
+    /// edge is emitted PENDING (uncertain) and the post-flush finalize pass
+    /// proves or deletes it against the project's declarations under the
+    /// same root namespace.
+    SameRootPending {
+        name: String,
+        referencing_namespace: String,
+    },
+}
+
+struct CsharpTypeUsageTables<'a, 'tree> {
+    root: TsNode<'tree>,
+    type_node: TsNode<'tree>,
+    source: &'a str,
+    generic_type_parameters: &'a HashSet<String>,
+    visible_type_spans: &'a HashMap<String, GraphNodeSpan>,
+    imported_type_bindings: &'a HashMap<String, ImportedTypeBinding>,
+    namespace_imports: &'a CsharpNamespaceImports,
+}
+
+/// Resolve a type surface for the TYPE_USAGE channel, tables-first.
+///
+/// Fails closed on: generic type parameters in scope, `var`/`dynamic`,
+/// predefined type keywords, qualified surfaces (they name a namespace
+/// inline instead of resolving through a table), and — in files without a
+/// namespace — any name none of the binding tables knows. The
+/// `csharp_receiver_owner_from_type` unknown-type fallthrough is deliberately
+/// absent here. The one non-table outcome is `SameRootPending`: a bare name
+/// in a namespaced file defers to the post-flush declaration lookup, and the
+/// edge it produces stays uncertain until that lookup proves it.
+fn csharp_type_usage_target(
+    raw_type: &str,
+    tables: CsharpTypeUsageTables<'_, '_>,
+) -> Option<CsharpTypeUsageTarget> {
+    let trimmed = raw_type.trim();
+    let base = trimmed
+        .split(['<', '[', '?'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    if base.contains('.') {
+        return None;
+    }
+    let owner_name = normalize_type_surface(raw_type)?;
+    if owner_name == "var"
+        || owner_name == "dynamic"
+        || CSHARP_PREDEFINED_TYPE_KEYWORDS.contains(&owner_name.as_str())
+        || tables.generic_type_parameters.contains(&owner_name)
+    {
+        return None;
+    }
+    if let Some(span) = tables.visible_type_spans.get(&owner_name) {
+        return Some(CsharpTypeUsageTarget::SameFile {
+            name: owner_name,
+            declaration_span: *span,
+        });
+    }
+    if let Some(binding) = tables.imported_type_bindings.get(&owner_name) {
+        return Some(CsharpTypeUsageTarget::Imported {
+            name: binding.owner_name.clone(),
+            module: binding.module_name.clone(),
+        });
+    }
+    if let Some(module_name) =
+        csharp_plain_namespace_import_type_module(&owner_name, tables.namespace_imports)
+    {
+        return Some(CsharpTypeUsageTarget::Imported {
+            name: owner_name,
+            module: module_name,
+        });
+    }
+    let referencing_namespace =
+        csharp_enclosing_namespace_path(tables.root, tables.type_node, tables.source)?;
+    Some(CsharpTypeUsageTarget::SameRootPending {
+        name: owner_name,
+        referencing_namespace,
+    })
+}
+
+/// Full namespace path enclosing a node: the file-scoped namespace (a SIBLING
+/// of the declarations it governs, so the enclosing-ancestor walk never sees
+/// it) followed by any block namespaces from outermost to innermost.
+fn csharp_enclosing_namespace_path(
+    root: TsNode<'_>,
+    node: TsNode<'_>,
+    source: &str,
+) -> Option<String> {
+    let mut segments = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() == "file_scoped_namespace_declaration"
+            && let Some(name) = declaration_name(child, source)
+        {
+            segments.push(name);
+            break;
+        }
+    }
+    let mut block_segments = Vec::new();
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "namespace_declaration"
+            && let Some(name) = declaration_name(candidate, source)
+        {
+            block_segments.push(name);
+        }
+        current = candidate.parent();
+    }
+    segments.extend(block_segments.into_iter().rev());
+    let path = segments.join(".");
+    (!path.is_empty()).then_some(path)
+}
+
+/// Generic type parameters visible at a use site.
+///
+/// Walks the ancestor chain and collects every `type_parameter_list` declared
+/// by an enclosing type or method, so `T` in `class Box<T> { private T item; }`
+/// can never resolve through a namespace-import table.
+fn csharp_generic_type_parameters_in_scope(node: TsNode<'_>, source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if matches!(
+            candidate.kind(),
+            "class_declaration"
+                | "struct_declaration"
+                | "interface_declaration"
+                | "record_declaration"
+                | "method_declaration"
+                | "local_function_statement"
+        ) {
+            let mut cursor = candidate.walk();
+            for child in candidate.named_children(&mut cursor) {
+                if child.kind() != "type_parameter_list" {
+                    continue;
+                }
+                let mut parameters = child.walk();
+                for parameter in child.named_children(&mut parameters) {
+                    if parameter.kind() == "type_parameter"
+                        && let Some(name) = declaration_name(parameter, source)
+                    {
+                        names.insert(name);
+                    }
+                }
+            }
+        }
+        current = candidate.parent();
+    }
+    names
+}
+
+/// Same shape as `collect_csharp_visible_type_binding_names`, but keeping the
+/// declaration spans so a same-file TYPE_USAGE target binds the declaration
+/// node exactly (name+span) instead of racing same-named reference nodes.
+fn collect_csharp_visible_type_declaration_spans(
+    root: TsNode<'_>,
+    anchor: TsNode<'_>,
+    source: &str,
+) -> HashMap<String, GraphNodeSpan> {
+    let mut spans = HashMap::new();
+    collect_csharp_type_declaration_spans_in_scope(root, source, &mut spans);
+    if let Some(namespace) = enclosing_node_with_kind(anchor, &["namespace_declaration"])
+        && let Some(body) = namespace.child_by_field_name("body")
+    {
+        collect_csharp_type_declaration_spans_in_scope(body, source, &mut spans);
+    }
+    spans
+}
+
+fn collect_csharp_type_declaration_spans_in_scope(
+    scope: TsNode<'_>,
+    source: &str,
+    spans: &mut HashMap<String, GraphNodeSpan>,
+) {
+    let mut cursor = scope.walk();
+    for child in scope.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "class_declaration" | "interface_declaration" | "struct_declaration"
+        ) && let Some(name) = declaration_name(child, source)
+        {
+            spans.insert(name, ts_node_graph_span(child));
+        }
+    }
 }
 
 struct CsharpReceiverContext<'a> {
@@ -205,6 +639,13 @@ fn collect_csharp_precise_receiver_call_specs(
             method_col,
         });
         if let Some((owner_name, owner_module)) = owner {
+            // A `new X(args).Method()` chain names its owner in the call
+            // syntax itself; the flag lets the engine annotate the callsite
+            // even when no module is known, so the resolution pass's
+            // same-root-namespace arm can finish cross-file shapes that no
+            // per-file using table can see (csproj-level usings,
+            // parent-namespace visibility).
+            let owner_is_syntactic = receiver_name.starts_with("new ");
             edges.push(ManualReceiverCallSpec {
                 source_name: call_source.name.to_string(),
                 source_span: call_source.span,
@@ -215,6 +656,10 @@ fn collect_csharp_precise_receiver_call_specs(
                 method_col,
                 line: Some(node.start_position().row as u32 + 1),
                 allow_global_fallback: false,
+                binding_marker: None,
+                required_callsite_marker: None,
+                class_anchored: false,
+                owner_is_syntactic,
             });
         }
     });

@@ -8,9 +8,9 @@
 //! [`super::EXTRACTIONS`] rather than by spelling `"bash"`.
 //!
 //! Bash has no manual receiver-call engine and no member-call syntax, so
-//! `receiver_call_specs`, `member_callsite_marker` and `graph_call_syntax` are
-//! all `None`: shell has no receiver-qualified call form for the resolver to
-//! aim at, and the rule file emits no `call_syntax` attribute.
+//! `receiver_call_specs` is `None` and `callsite_marker_families` is empty:
+//! shell has no receiver-qualified call form for the resolver to aim at, and
+//! the rule file emits no `call_syntax` attribute.
 //!
 //! Two Bash surfaces are deliberately *not* here, and both are shared seams
 //! rather than Bash content:
@@ -51,8 +51,8 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     compiled_rules: &RULES,
     member_edge_specs: None,
     receiver_call_specs: None,
-    member_callsite_marker: None,
-    graph_call_syntax: None,
+    type_usage_specs: None,
+    callsite_marker_families: &[],
     // Shell has no type-like owners, so a `function_definition` never projects
     // as METHOD; Bash was absent from the promotion roster in `lib.rs`.
     promotes_type_member_functions_to_methods: false,

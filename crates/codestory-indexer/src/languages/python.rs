@@ -86,8 +86,8 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     compiled_rules: &RULES,
     member_edge_specs: None,
     receiver_call_specs: Some(receiver_call_specs),
-    member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
-    graph_call_syntax: Some("python_attribute"),
+    type_usage_specs: None,
+    callsite_marker_families: &[("python_attribute", MEMBER_CALLSITE_MARKER)],
     // A Python `function_definition` under a `class_definition` is already
     // projected as a METHOD by the rule file, so the projection must not
     // promote it a second time.
@@ -413,6 +413,10 @@ fn collect_python_with_item_receiver_call_specs(
             method_col,
             line: Some(node.start_position().row as u32 + 1),
             allow_global_fallback: false,
+            binding_marker: None,
+            required_callsite_marker: None,
+            class_anchored: false,
+            owner_is_syntactic: false,
         });
     });
 }
@@ -670,6 +674,10 @@ fn collect_python_annotated_factory_receiver_call_specs(
                 method_col,
                 line: Some(node.start_position().row as u32 + 1),
                 allow_global_fallback: false,
+                binding_marker: None,
+                required_callsite_marker: None,
+                class_anchored: false,
+                owner_is_syntactic: false,
             });
         }
     });
@@ -832,6 +840,10 @@ fn collect_python_instance_property_receiver_call_specs(
                 method_col: member_call_method_col(node, source, &method_name),
                 line: Some(node.start_position().row as u32 + 1),
                 allow_global_fallback: false,
+                binding_marker: None,
+                required_callsite_marker: None,
+                class_anchored: false,
+                owner_is_syntactic: false,
             });
         }
     });
@@ -1061,6 +1073,10 @@ fn collect_python_constructor_receiver_call_specs(
                 method_col,
                 line: Some(node.start_position().row as u32 + 1),
                 allow_global_fallback: false,
+                binding_marker: None,
+                required_callsite_marker: None,
+                class_anchored: false,
+                owner_is_syntactic: false,
             });
         }
     });
