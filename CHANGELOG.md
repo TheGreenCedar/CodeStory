@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Packets keep cited stylesheet imports that define keyframes or custom properties, surface SQL `CREATE TABLE` names for retained catalog tables, and rank mapper, session, and form-validation evidence ahead of docs, generated bundles, and test assemblies.
+- Packets keep cited stylesheet imports that define keyframes or custom properties, surface SQL `CREATE TABLE` names for retained catalog tables without dropping common sqlite/mysql/postgres dialect scripts, and rank mapper, session, and form-validation evidence ahead of docs, generated bundles, and test assemblies.
 
 ## 0.17.0
 
