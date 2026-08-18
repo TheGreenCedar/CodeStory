@@ -9,7 +9,9 @@ use crate::agent::packet_evidence::citation_sufficiency_eligible;
 use crate::agent::packet_freshness::PacketFreshnessInput;
 use crate::agent::packet_probe::exact_packet_probe_paths;
 use crate::agent::packet_scoring::packet_display_path;
-use codestory_agent::packet_obligations::reconcile_packet_proof_obligations_after_compile;
+use codestory_agent::packet_obligations::{
+    PacketProofEvidenceExtras, reconcile_packet_proof_obligations_after_compile,
+};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, AgentPacketRequestDto, BoundedDrillPlanDto, DrillOptionDto,
     EdgeKind, EmbeddingVectorPublicationIdentityDto, GraphArtifactDto, GraphResponse,
@@ -159,9 +161,16 @@ fn typed_edge_support_units(
         .collect::<std::collections::HashMap<_, _>>();
     let mut units = Vec::new();
     for edge in &graph.edges {
+        // R2 visibility: TYPE_USAGE and USAGE join the public typed-support
+        // allow-list so retained atom receipts appear in the scored payload
+        // (landed in the same change as the budget-cap protection widening).
         if !matches!(
             edge.kind,
-            EdgeKind::CALL | EdgeKind::INHERITANCE | EdgeKind::IMPORT
+            EdgeKind::CALL
+                | EdgeKind::INHERITANCE
+                | EdgeKind::IMPORT
+                | EdgeKind::TYPE_USAGE
+                | EdgeKind::USAGE
         ) {
             continue;
         }
@@ -181,6 +190,8 @@ fn typed_edge_support_units(
             EdgeKind::CALL => "CALL",
             EdgeKind::INHERITANCE => "INHERITANCE",
             EdgeKind::IMPORT => "IMPORT",
+            EdgeKind::TYPE_USAGE => "TYPE_USAGE",
+            EdgeKind::USAGE => "USAGE",
             _ => continue,
         };
         units.push(SupportUnitDto {
@@ -577,6 +588,7 @@ pub fn apply_compiled_evidence(
 pub fn apply_compiled_evidence_with_proof_reconciliation(
     packet: &mut AgentPacketDto,
     request: Option<&AgentPacketRequestDto>,
+    proof_evidence_extras: &PacketProofEvidenceExtras,
 ) {
     apply_compiled_evidence(packet, request);
     let demoted = reconcile_packet_proof_obligations_after_compile(
@@ -585,6 +597,7 @@ pub fn apply_compiled_evidence_with_proof_reconciliation(
         &mut packet.plan.obligations,
         &packet.answer,
         &packet.support,
+        proof_evidence_extras,
     );
     if demoted {
         apply_compiled_evidence(packet, request);
@@ -1209,6 +1222,7 @@ mod tests {
             &packet.answer,
             &packet.budget,
             &packet.support.clone(),
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             mapper_config_obligation(&packet).proof_status,
@@ -1234,7 +1248,11 @@ mod tests {
     fn reconciliation_keeps_formula_proof_whose_receipts_survive_compile() {
         let mut packet = finalized_mapper_proof_packet();
 
-        apply_compiled_evidence_with_proof_reconciliation(&mut packet, None);
+        apply_compiled_evidence_with_proof_reconciliation(
+            &mut packet,
+            None,
+            &PacketProofEvidenceExtras::default(),
+        );
 
         let obligation = mapper_config_obligation(&packet);
         assert_eq!(
@@ -1265,7 +1283,11 @@ mod tests {
             .citations
             .retain(|citation| citation.node_id.0 != "MapperConfiguration");
 
-        apply_compiled_evidence_with_proof_reconciliation(&mut packet, None);
+        apply_compiled_evidence_with_proof_reconciliation(
+            &mut packet,
+            None,
+            &PacketProofEvidenceExtras::default(),
+        );
 
         let obligation = mapper_config_obligation(&packet);
         assert_ne!(
@@ -1323,5 +1345,65 @@ mod tests {
             second, first,
             "compiling support must be idempotent on its own output"
         );
+    }
+
+    /// R2 visibility (landed together with the budget-cap protection
+    /// widening): retained TYPE_USAGE and USAGE atom receipts appear in the
+    /// scored typed-support payload, while kinds outside the allow-list stay
+    /// excluded.
+    #[test]
+    fn typed_support_allow_list_carries_type_usage_and_usage_edges() {
+        let mut seen = std::collections::BTreeSet::new();
+        let node = |id: &str| codestory_contracts::api::GraphNodeDto {
+            id: codestory_contracts::api::NodeId(id.to_string()),
+            label: id.to_string(),
+            kind: codestory_contracts::api::NodeKind::CLASS,
+            depth: 1,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: None,
+            qualified_name: None,
+            member_access: None,
+        };
+        let edge = |id: &str, kind: EdgeKind| codestory_contracts::api::GraphEdgeDto {
+            id: codestory_contracts::api::EdgeId(id.to_string()),
+            source: codestory_contracts::api::NodeId("builder".to_string()),
+            target: codestory_contracts::api::NodeId("config".to_string()),
+            kind,
+            confidence: None,
+            certainty: Some("certain".to_string()),
+            callsite_identity: None,
+            candidate_targets: Vec::new(),
+        };
+        let graph = GraphResponse {
+            center_id: codestory_contracts::api::NodeId("builder".to_string()),
+            nodes: vec![node("builder"), node("config")],
+            edges: vec![
+                edge("uses-config", EdgeKind::TYPE_USAGE),
+                edge("uses-var", EdgeKind::USAGE),
+                edge("overrides", EdgeKind::OVERRIDE),
+            ],
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: None,
+        };
+        let units = typed_edge_support_units(&graph, &mut seen);
+        let kinds = units
+            .iter()
+            .filter_map(|unit| unit.edge_kind.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            ["TYPE_USAGE", "USAGE"],
+            "atom receipt kinds must be visible and OVERRIDE must stay excluded"
+        );
+        assert!(
+            units
+                .iter()
+                .all(|unit| unit.kind == SupportUnitKindDto::TypedGraphEdge)
+        );
+        assert_eq!(units[0].summary, "`builder` TYPE_USAGE `config`");
     }
 }

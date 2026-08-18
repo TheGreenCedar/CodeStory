@@ -22,6 +22,7 @@ use codestory_contracts::api::{
     AgentCitationDto, EdgeId, EdgeKind, GraphEdgeDto, NodeId, NodeKind, SupportUnitDto,
     SupportUnitKindDto,
 };
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
 /// The certainty value the rule-6 gate requires on CALL and TYPE_USAGE
@@ -287,6 +288,126 @@ impl FlowProofFormula {
             .filter(|atom| atom.requirement == requirement)
             .map(|atom| atom.id)
             .collect()
+    }
+
+    /// The [`RequirementConstraintStrength`] of `requirement`.
+    ///
+    /// A pure function of the FORMULA: it reads atom specs only and never
+    /// touches an evidence set, so the fallback order it induces is
+    /// derivation-time knowledge and is identical on every packet.
+    fn constraint_strength(&self, requirement: &str) -> RequirementConstraintStrength {
+        let declaration_index = self
+            .requirements()
+            .iter()
+            .position(|id| *id == requirement)
+            .unwrap_or(usize::MAX);
+        let mut typed_relation_facts = 0;
+        let mut total_facts = 0;
+        let mut bound_roles: Vec<ProofRole> = Vec::new();
+        for atom in self
+            .atoms
+            .iter()
+            .filter(|atom| atom.requirement == requirement)
+        {
+            for fact in atom.facts {
+                total_facts += 1;
+                match fact {
+                    ProofFactPattern::TypedRelation(pattern) => {
+                        typed_relation_facts += 1;
+                        note_bound_role(&mut bound_roles, pattern.source);
+                        note_bound_role(&mut bound_roles, pattern.target);
+                    }
+                    ProofFactPattern::SourceAspect(pattern) => {
+                        note_bound_role(&mut bound_roles, pattern.symbol);
+                    }
+                    // Absence and containment facts read roles that other
+                    // facts already bound and never bind one themselves, so
+                    // they count toward the total only.
+                    ProofFactPattern::AbsentTypedRelation(_)
+                    | ProofFactPattern::AnchoredLineContainment(_) => {}
+                }
+            }
+        }
+        RequirementConstraintStrength {
+            typed_relation_facts,
+            bound_role_positions: bound_roles.len(),
+            total_facts,
+            declaration_index,
+        }
+    }
+
+    /// The formula's requirement ids ordered most-constrained-first — the
+    /// evaluation order of the per-requirement fallback in
+    /// [`match_flow_requirements`]. Total and stable by construction: see
+    /// [`RequirementConstraintStrength`].
+    fn requirements_by_constraint_strength(&self) -> Vec<&'static str> {
+        let mut requirements = self.requirements();
+        requirements
+            .sort_by_key(|requirement| self.constraint_strength(requirement).ordering_key());
+        requirements
+    }
+}
+
+/// How strongly one requirement's atoms constrain the group's role
+/// assignment, as a property of the formula alone.
+///
+/// The per-requirement fallback in [`match_flow_requirements`] evaluates
+/// requirements in decreasing strength — the most-constrained-variable
+/// heuristic of constraint solving — instead of declaration order: the
+/// requirement whose atoms discriminate hardest binds the roles it shares
+/// with its siblings first, so a weakly constrained sibling inherits correct
+/// bindings instead of dictating arbitrary ones from the first shape that
+/// happens to match.
+///
+/// The components, in decreasing precedence:
+/// 1. `typed_relation_facts` — required typed-relation facts. One typed
+///    relation pins an edge kind, its certainty gate, up to two endpoints and
+///    (where the formula names one) a target node kind against the live
+///    graph; a carrier range only pins a symbol id to some reread receipt.
+/// 2. `bound_role_positions` — distinct roles the requirement's atoms can
+///    BIND. [`ProofEndpointPattern::AnyOfRoles`] endpoints, absence sources
+///    and containment roles never bind, so they never inflate this.
+/// 3. `total_facts` — every required fact, which is where absence and
+///    containment guards count.
+/// 4. `declaration_index` — position in [`FlowProofFormula::requirements`],
+///    the final tie-break that makes the ordering total and stable.
+///
+/// Nothing here reads the evidence set: the same formula orders its
+/// requirements identically on every packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequirementConstraintStrength {
+    /// Count of [`ProofFactPattern::TypedRelation`] facts.
+    typed_relation_facts: usize,
+    /// Count of distinct roles the requirement's facts can bind.
+    bound_role_positions: usize,
+    /// Count of all required facts.
+    total_facts: usize,
+    /// Position among the formula's requirements in declaration order.
+    declaration_index: usize,
+}
+
+impl RequirementConstraintStrength {
+    /// Sort key: ascending in this key is decreasing in constraint strength,
+    /// with declaration order breaking every remaining tie, so the induced
+    /// ordering of a formula's requirements is total and stable.
+    fn ordering_key(self) -> (Reverse<usize>, Reverse<usize>, Reverse<usize>, usize) {
+        (
+            Reverse(self.typed_relation_facts),
+            Reverse(self.bound_role_positions),
+            Reverse(self.total_facts),
+            self.declaration_index,
+        )
+    }
+}
+
+/// Records the role an endpoint pattern can bind, if any. Only
+/// [`ProofEndpointPattern::Role`] ever binds — `AnyOfRoles` requires an
+/// already-bound role and `Any` constrains nothing.
+fn note_bound_role(roles: &mut Vec<ProofRole>, endpoint: ProofEndpointPattern) {
+    if let ProofEndpointPattern::Role(role) = endpoint {
+        if !roles.contains(&role) {
+            roles.push(role);
+        }
     }
 }
 
@@ -620,10 +741,25 @@ pub fn match_required_atoms(
 /// The full group is tried first: when it matches, every requirement is
 /// proven under that single assignment and reported with its own atoms and
 /// the shared bindings. Otherwise each requirement's atom subset is matched
-/// in declaration order, with role bindings required to stay consistent with
-/// every earlier successful subset — a role one requirement bound constrains
-/// its siblings, so per-requirement verdicts never fork the assignment. A
-/// full-group abort falls through to the per-requirement pass, where any
+/// on its own, MOST-CONSTRAINED-FIRST — ordered by how many typed-relation
+/// facts it requires, then by how many distinct roles its atoms can bind,
+/// then by its total fact count, with declaration order as the final
+/// tie-break — and with role bindings required to stay consistent with every
+/// earlier successful subset: a role one requirement bound constrains its
+/// siblings, so per-requirement verdicts never fork the assignment.
+///
+/// Evaluating in constraint-strength order rather than declaration order is
+/// what keeps a weakly constrained requirement from capturing a shared role
+/// on an arbitrary match and starving its stronger sibling; the ordering is a
+/// property of the formula alone, so it is the same on every packet. It never
+/// manufactures a verdict: each Proved verdict is still a real discharge of
+/// that requirement's own atoms, under bindings that some subset actually
+/// proved, and a failed or aborted subset still carries nothing forward.
+/// Verdicts are REPORTED in declaration order regardless of the order they
+/// were evaluated in — the evaluation order is a solving strategy, not part
+/// of the result contract.
+///
+/// A full-group abort falls through to the per-requirement pass, where any
 /// abort is reported on the requirement that hit it.
 pub fn match_flow_requirements(
     formula: &FlowProofFormula,
@@ -651,8 +787,8 @@ pub fn match_flow_requirements(
             .collect();
     }
     let mut carried = BTreeMap::new();
-    let mut outcomes = Vec::new();
-    for requirement in requirements {
+    let mut by_declaration: Vec<Option<FlowProofOutcome>> = vec![None; requirements.len()];
+    for requirement in formula.requirements_by_constraint_strength() {
         let outcome = match_atoms_with_bindings(
             formula,
             &formula.atoms_for(requirement),
@@ -662,9 +798,21 @@ pub fn match_flow_requirements(
         if let FlowProofOutcome::Proved(proof) = &outcome {
             carried = proof.bindings.clone();
         }
-        outcomes.push((requirement, outcome));
+        if let Some(slot) = requirements
+            .iter()
+            .position(|id| *id == requirement)
+            .and_then(|index| by_declaration.get_mut(index))
+        {
+            *slot = Some(outcome);
+        }
     }
-    outcomes
+    requirements
+        .into_iter()
+        .zip(by_declaration)
+        // Unreachable: the strength ordering is a permutation of the
+        // declaration order, so every slot is filled. Fail closed anyway.
+        .map(|(requirement, outcome)| (requirement, outcome.unwrap_or(FlowProofOutcome::Unproven)))
+        .collect()
 }
 
 /// Shared engine: matches the listed atoms in formula order with the role
@@ -2370,6 +2518,20 @@ mod tests {
             ),
             FlowProofOutcome::Aborted
         );
+        // The per-requirement pass reports the abort on the requirement that
+        // hit it, retires and propagates nothing from it, and is unchanged by
+        // the constraint-strength evaluation order.
+        assert_eq!(
+            match_flow_requirements(&LOG_HANDLER_FLOW_PROOF, &flooded),
+            vec![
+                ("logger_event", FlowProofOutcome::Aborted),
+                ("handler_processing", FlowProofOutcome::Unproven),
+            ]
+        );
+        assert_eq!(
+            match_flow_requirements(&LOG_HANDLER_FLOW_PROOF, &flooded),
+            declaration_order_requirements(&LOG_HANDLER_FLOW_PROOF, &flooded)
+        );
 
         // The same shape below the bound discharges, so the failure above is
         // the cap, not the formula.
@@ -2568,31 +2730,50 @@ mod tests {
             ],
             trail_scans: Vec::new(),
         };
-        // Standalone, handler_processing would prove with FlowOwner bound to
-        // the other node...
-        proved(match_required_atoms(
+        assert_eq!(
+            match_flow_proof(&LOG_HANDLER_FLOW_PROOF, &evidence),
+            FlowProofOutcome::Unproven
+        );
+        // Standalone, logger_event would prove with FlowOwner bound to its
+        // own owner...
+        let standalone = proved(match_required_atoms(
             &LOG_HANDLER_FLOW_PROOF,
-            &[ProofAtomId::M2, ProofAtomId::M3],
+            &[ProofAtomId::M1a, ProofAtomId::M1b],
             &evidence,
         ));
-        // ...but the per-requirement pass carries logger_event's FlowOwner
-        // binding into the sibling subset, which then fails: verdicts never
-        // fork the assignment.
-        let outcomes = match_flow_requirements(&LOG_HANDLER_FLOW_PROOF, &evidence);
-        assert_eq!(outcomes[0].0, "logger_event");
-        let logger = proved(outcomes[0].1.clone());
         assert_eq!(
-            logger.bindings.get(&ProofRole::FlowOwner),
+            standalone.bindings.get(&ProofRole::FlowOwner),
             Some(&node("node:owner-x"))
         );
+        // ...but handler_processing is the more constrained requirement, so
+        // the fallback runs it first and carries ITS FlowOwner binding into
+        // the sibling subset, which then fails: verdicts never fork the
+        // assignment.
         assert_eq!(
-            outcomes[1],
-            ("handler_processing", FlowProofOutcome::Unproven)
+            LOG_HANDLER_FLOW_PROOF.requirements_by_constraint_strength(),
+            vec!["handler_processing", "logger_event"]
+        );
+        let outcomes = match_flow_requirements(&LOG_HANDLER_FLOW_PROOF, &evidence);
+        assert_eq!(outcomes[0], ("logger_event", FlowProofOutcome::Unproven));
+        assert_eq!(outcomes[1].0, "handler_processing");
+        let handler = proved(outcomes[1].1.clone());
+        assert_eq!(
+            handler.bindings.get(&ProofRole::FlowOwner),
+            Some(&node("node:owner-y"))
         );
     }
 
     #[test]
     fn css_entrypoint_follows_the_structure_closure_through_the_per_requirement_split() {
+        // C1's bound-roles-only IMPORT guard is only a guard while structure
+        // is evaluated FIRST. Constraint strength must keep it there: nine
+        // typed relations across C2-C4 against C1's two.
+        assert_eq!(
+            CSS_ANIMATION_FLOW_PROOF.requirements_by_constraint_strength(),
+            vec!["css_animation_structure", "css_animation_entrypoint"],
+            "the entrypoint guard fails closed only when structure binds the source roles first"
+        );
+
         // Structure succeeds: css_animation_entrypoint is proven under the
         // same assignment and reports the carried Entrypoint binding.
         let outcomes = match_flow_requirements(&CSS_ANIMATION_FLOW_PROOF, &c_evidence());
@@ -2642,16 +2823,409 @@ mod tests {
             vec![ProofAtomId::A3, ProofAtomId::A4]
         );
         let mut evidence = a_evidence();
-        // Remove the A3 MEMBER edge: mapper_execution fails, mapper_config
-        // still proves.
+        // Remove the A3 MEMBER edge: mapper_execution — which constraint
+        // strength runs FIRST — fails, and because a failed subset carries
+        // nothing forward, mapper_config still proves on its own bindings
+        // even though its sibling bound PlanOwner and BuilderMethod on the
+        // way to failing.
         evidence.typed_relations.remove(2);
         let outcomes = match_flow_requirements(&MAPPER_PLAN_FLOW_PROOF, &evidence);
         assert_eq!(outcomes[0].0, "mapper_config");
-        proved(outcomes[0].1.clone());
+        let config = proved(outcomes[0].1.clone());
+        assert_eq!(
+            config.bindings.get(&ProofRole::Builder),
+            Some(&node("node:builder-type"))
+        );
+        assert_eq!(
+            config.bindings.get(&ProofRole::ConfigType),
+            Some(&node("node:config-type"))
+        );
+        assert_eq!(
+            config.bindings.get(&ProofRole::PlanOwner),
+            None,
+            "the failed sibling's partial bindings must not leak into the proof"
+        );
         assert_eq!(
             outcomes[1],
             ("mapper_execution", FlowProofOutcome::Unproven)
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Constraint-strength ordering of the per-requirement fallback.
+    // ------------------------------------------------------------------
+
+    /// The pre-fix fallback, reproduced verbatim as an equivalence oracle:
+    /// full group first, then each requirement's subset in DECLARATION order
+    /// with bindings carried from every earlier successful subset.
+    fn declaration_order_requirements(
+        formula: &FlowProofFormula,
+        evidence: &PacketProofEvidence,
+    ) -> Vec<(&'static str, FlowProofOutcome)> {
+        let requirements = formula.requirements();
+        if let FlowProofOutcome::Proved(proof) = match_flow_proof(formula, evidence) {
+            return requirements
+                .into_iter()
+                .map(|requirement| {
+                    let atoms = proof
+                        .atoms
+                        .iter()
+                        .filter(|atom| atom.requirement == requirement)
+                        .cloned()
+                        .collect();
+                    (
+                        requirement,
+                        FlowProofOutcome::Proved(VerifiedFlowProof {
+                            bindings: proof.bindings.clone(),
+                            atoms,
+                        }),
+                    )
+                })
+                .collect();
+        }
+        let mut carried = BTreeMap::new();
+        let mut outcomes = Vec::new();
+        for requirement in requirements {
+            let outcome = match_atoms_with_bindings(
+                formula,
+                &formula.atoms_for(requirement),
+                evidence,
+                carried.clone(),
+            );
+            if let FlowProofOutcome::Proved(proof) = &outcome {
+                carried = proof.bindings.clone();
+            }
+            outcomes.push((requirement, outcome));
+        }
+        outcomes
+    }
+
+    /// Two requirements over DISJOINT roles, declared weakest-first so the
+    /// strength ordering really does reorder them. With no role shared,
+    /// neither subset can constrain the other, so order cannot matter.
+    const DISJOINT_ROLE_FORMULA: FlowProofFormula = FlowProofFormula {
+        atoms: &[
+            ProofAtomSpec {
+                id: ProofAtomId::M1a,
+                requirement: "logger_event",
+                facts: &[carrier_range_fact(ProofRole::FlowOwner, false)],
+            },
+            ProofAtomSpec {
+                id: ProofAtomId::A3,
+                requirement: "mapper_execution",
+                facts: &[
+                    edge_fact(
+                        EdgeKind::CALL,
+                        role(ProofRole::PlanOwner),
+                        role(ProofRole::BuilderMethod),
+                        Some(NodeKind::METHOD),
+                    ),
+                    edge_fact(
+                        EdgeKind::MEMBER,
+                        role(ProofRole::Builder),
+                        role(ProofRole::BuilderMethod),
+                        Some(NodeKind::METHOD),
+                    ),
+                ],
+            },
+        ],
+        distinct_roles: &[],
+    };
+
+    #[test]
+    fn constraint_strength_orders_every_shipped_formula_most_constrained_first() {
+        // M: handler_processing carries two typed relations (M2, M3);
+        // logger_event carries one plus a carrier range.
+        assert_eq!(
+            LOG_HANDLER_FLOW_PROOF.requirements(),
+            vec!["logger_event", "handler_processing"]
+        );
+        assert_eq!(
+            LOG_HANDLER_FLOW_PROOF.requirements_by_constraint_strength(),
+            vec!["handler_processing", "logger_event"]
+        );
+        assert_eq!(
+            LOG_HANDLER_FLOW_PROOF.constraint_strength("handler_processing"),
+            RequirementConstraintStrength {
+                typed_relation_facts: 2,
+                bound_role_positions: 1,
+                total_facts: 2,
+                declaration_index: 1,
+            }
+        );
+        assert_eq!(
+            LOG_HANDLER_FLOW_PROOF.constraint_strength("logger_event"),
+            RequirementConstraintStrength {
+                typed_relation_facts: 1,
+                bound_role_positions: 1,
+                total_facts: 2,
+                declaration_index: 0,
+            }
+        );
+
+        // A: mapper_execution carries A3's CALL plus its MEMBER join and
+        // binds three roles; mapper_config carries one weakly constrained
+        // TYPE_USAGE plus a carrier range.
+        assert_eq!(
+            MAPPER_PLAN_FLOW_PROOF.requirements(),
+            vec!["mapper_config", "mapper_execution"]
+        );
+        assert_eq!(
+            MAPPER_PLAN_FLOW_PROOF.requirements_by_constraint_strength(),
+            vec!["mapper_execution", "mapper_config"]
+        );
+        assert_eq!(
+            MAPPER_PLAN_FLOW_PROOF.constraint_strength("mapper_execution"),
+            RequirementConstraintStrength {
+                typed_relation_facts: 2,
+                bound_role_positions: 3,
+                total_facts: 3,
+                declaration_index: 1,
+            }
+        );
+        assert_eq!(
+            MAPPER_PLAN_FLOW_PROOF.constraint_strength("mapper_config"),
+            RequirementConstraintStrength {
+                typed_relation_facts: 1,
+                bound_role_positions: 2,
+                total_facts: 2,
+                declaration_index: 0,
+            }
+        );
+
+        // C: structure keeps its declared lead, which is what makes C1's
+        // bound-roles-only IMPORT endpoint a guard.
+        assert_eq!(
+            CSS_ANIMATION_FLOW_PROOF.requirements(),
+            vec!["css_animation_structure", "css_animation_entrypoint"]
+        );
+        assert_eq!(
+            CSS_ANIMATION_FLOW_PROOF.requirements_by_constraint_strength(),
+            vec!["css_animation_structure", "css_animation_entrypoint"]
+        );
+        assert_eq!(
+            CSS_ANIMATION_FLOW_PROOF.constraint_strength("css_animation_structure"),
+            RequirementConstraintStrength {
+                typed_relation_facts: 9,
+                bound_role_positions: 8,
+                total_facts: 12,
+                declaration_index: 0,
+            }
+        );
+        assert_eq!(
+            CSS_ANIMATION_FLOW_PROOF.constraint_strength("css_animation_entrypoint"),
+            RequirementConstraintStrength {
+                // C1's AnyOfRoles IMPORT endpoint is a typed relation but
+                // binds nothing, and its containment fact counts only in the
+                // total.
+                typed_relation_facts: 2,
+                bound_role_positions: 2,
+                total_facts: 3,
+                declaration_index: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn constraint_strength_ordering_is_total_stable_and_evidence_independent() {
+        for formula in [
+            &LOG_HANDLER_FLOW_PROOF,
+            &MAPPER_PLAN_FLOW_PROOF,
+            &CSS_ANIMATION_FLOW_PROOF,
+            &DISJOINT_ROLE_FORMULA,
+        ] {
+            let order = formula.requirements_by_constraint_strength();
+            // A permutation of the declaration order: nothing is dropped or
+            // duplicated.
+            let mut sorted_declaration = formula.requirements();
+            sorted_declaration.sort_unstable();
+            let mut sorted_order = order.clone();
+            sorted_order.sort_unstable();
+            assert_eq!(sorted_declaration, sorted_order);
+            // Stable: recomputing yields the identical sequence. The
+            // computation takes no evidence argument at all, which is the
+            // structural proof that it cannot vary per packet.
+            assert_eq!(order, formula.requirements_by_constraint_strength());
+            // Total: no two requirements tie on the full key, and the keys
+            // are strictly increasing along the evaluation order.
+            let keys = order
+                .iter()
+                .map(|requirement| formula.constraint_strength(requirement).ordering_key())
+                .collect::<Vec<_>>();
+            assert!(
+                keys.windows(2).all(|pair| pair[0] < pair[1]),
+                "{formula:?} ordering is not strict: {keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_weakly_constrained_requirement_no_longer_captures_a_shared_role() {
+        // The live defect's shape: a lone TYPE_USAGE pair unrelated to the
+        // plan chain (a bare parameter type, of which a real index has
+        // thousands) sits beside the true plan-builder chain. Both A1 and A2
+        // match it, and Builder/ConfigType are shared with mapper_execution.
+        let mut decoy_usage = certain_call(
+            "edge:decoy-usage",
+            "node:decoy-owner",
+            "node:decoy-config",
+            None,
+        );
+        decoy_usage.kind = EdgeKind::TYPE_USAGE;
+        decoy_usage.target_kind = Some(NodeKind::CLASS);
+        let evidence = PacketProofEvidence {
+            source_aspects: vec![
+                aspect("cite:decoy", Some("node:decoy-config"), 2, 4, None),
+                aspect("cite:builder", Some("node:plan-builder"), 40, 90, None),
+            ],
+            typed_relations: vec![
+                decoy_usage,
+                certain_call(
+                    "edge:plan-call",
+                    "node:plan-owner",
+                    "node:build-method",
+                    None,
+                ),
+                structural(
+                    "edge:builder-member",
+                    EdgeKind::MEMBER,
+                    "node:plan-builder",
+                    "node:build-method",
+                    Some(NodeKind::METHOD),
+                ),
+            ],
+            trail_scans: Vec::new(),
+        };
+        // Nothing carries a TYPE_USAGE out of the real plan builder, so the
+        // full group cannot close and the per-requirement fallback runs.
+        assert_eq!(
+            match_flow_proof(&MAPPER_PLAN_FLOW_PROOF, &evidence),
+            FlowProofOutcome::Unproven
+        );
+
+        // Declaration order let mapper_config win the shared Builder role on
+        // the decoy pair, which then starved its sibling.
+        let decoy_first = proved(match_required_atoms(
+            &MAPPER_PLAN_FLOW_PROOF,
+            &[ProofAtomId::A1, ProofAtomId::A2],
+            &evidence,
+        ));
+        assert_eq!(
+            decoy_first.bindings.get(&ProofRole::Builder),
+            Some(&node("node:decoy-owner"))
+        );
+        assert_eq!(
+            match_atoms_with_bindings(
+                &MAPPER_PLAN_FLOW_PROOF,
+                &[ProofAtomId::A3, ProofAtomId::A4],
+                &evidence,
+                decoy_first.bindings.clone(),
+            ),
+            FlowProofOutcome::Unproven
+        );
+        assert_eq!(
+            declaration_order_requirements(&MAPPER_PLAN_FLOW_PROOF, &evidence),
+            vec![
+                ("mapper_config", FlowProofOutcome::Proved(decoy_first)),
+                ("mapper_execution", FlowProofOutcome::Unproven),
+            ],
+            "the pre-fix behavior: the weak requirement proves off the decoy"
+        );
+
+        // Most-constrained-first runs mapper_execution instead, and its
+        // MEMBER join binds Builder to the real plan builder.
+        let outcomes = match_flow_requirements(&MAPPER_PLAN_FLOW_PROOF, &evidence);
+        assert_eq!(outcomes[0].0, "mapper_config");
+        assert_eq!(outcomes[1].0, "mapper_execution");
+        let execution = proved(outcomes[1].1.clone());
+        assert_eq!(
+            execution.bindings.get(&ProofRole::Builder),
+            Some(&node("node:plan-builder"))
+        );
+        assert_eq!(
+            execution
+                .atoms
+                .iter()
+                .map(|atom| atom.atom)
+                .collect::<Vec<_>>(),
+            vec![ProofAtomId::A3, ProofAtomId::A4]
+        );
+        // mapper_config, evaluated second, now fails closed on the true
+        // bindings instead of reporting a proof off the unrelated pair.
+        assert_eq!(outcomes[0].1, FlowProofOutcome::Unproven);
+    }
+
+    #[test]
+    fn reordering_changes_nothing_for_a_formula_whose_requirements_share_no_roles() {
+        assert_eq!(
+            DISJOINT_ROLE_FORMULA.requirements(),
+            vec!["logger_event", "mapper_execution"]
+        );
+        assert_eq!(
+            DISJOINT_ROLE_FORMULA.requirements_by_constraint_strength(),
+            vec!["mapper_execution", "logger_event"],
+            "the evaluation order must actually differ, or the check is vacuous"
+        );
+
+        let mut combined = a_evidence();
+        combined.source_aspects.extend(m_evidence().source_aspects);
+        combined
+            .typed_relations
+            .extend(m_evidence().typed_relations);
+        let mut config_only = a_evidence();
+        config_only.typed_relations.remove(2);
+        let mut owner_only = m_evidence();
+        owner_only.typed_relations.clear();
+        for evidence in [
+            PacketProofEvidence::default(),
+            m_evidence(),
+            a_evidence(),
+            c_evidence(),
+            combined,
+            config_only,
+            owner_only,
+        ] {
+            assert_eq!(
+                match_flow_requirements(&DISJOINT_ROLE_FORMULA, &evidence),
+                declaration_order_requirements(&DISJOINT_ROLE_FORMULA, &evidence),
+                "disjoint roles: every verdict must match declaration-order behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn the_full_group_path_is_untouched_by_the_fallback_ordering() {
+        for (formula, evidence) in [
+            (&LOG_HANDLER_FLOW_PROOF, m_evidence()),
+            (&MAPPER_PLAN_FLOW_PROOF, a_evidence()),
+            (&CSS_ANIMATION_FLOW_PROOF, c_evidence()),
+        ] {
+            let group = proved(match_flow_proof(formula, &evidence));
+            let outcomes = match_flow_requirements(formula, &evidence);
+            assert_eq!(
+                outcomes,
+                declaration_order_requirements(formula, &evidence),
+                "the full-group path never reaches the reordered fallback"
+            );
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .map(|(requirement, _)| *requirement)
+                    .collect::<Vec<_>>(),
+                formula.requirements()
+            );
+            for (requirement, outcome) in &outcomes {
+                let proof = proved(outcome.clone());
+                assert_eq!(
+                    proof.bindings, group.bindings,
+                    "{requirement} must report the one group-wide assignment"
+                );
+                assert_eq!(
+                    proof.atoms.iter().map(|atom| atom.atom).collect::<Vec<_>>(),
+                    formula.atoms_for(requirement)
+                );
+            }
+        }
     }
 
     // ------------------------------------------------------------------

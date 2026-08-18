@@ -4,8 +4,8 @@ use crate::agent::packet_claims::{
     packet_flow_claims_markdown, packet_supported_claims_with_telemetry,
 };
 use crate::agent::packet_obligations::{
-    bind_claims_to_packet_obligations, finalize_packet_obligation_plan,
-    packet_claims_with_obligation_receipts,
+    bind_claims_to_packet_obligations, packet_claims_with_obligation_receipts,
+    refinalize_packet_obligation_plan_after_rebuild,
 };
 use crate::agent::packet_plan::{packet_explicit_request_probe_queries, push_unique_term};
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries_with_extra;
@@ -752,16 +752,18 @@ fn rebuild_packet_budget_dependents(
     let task_class = packet
         .task_class
         .unwrap_or(PacketTaskClassDto::ArchitectureExplanation);
-    finalize_packet_obligation_plan(
+    // R7(d): the budget fixpoint is a REBUILD site, not a proving site. Legacy
+    // obligations get today's full re-finalization bit-identically; formula
+    // obligations are re-verified by receipt survival only against the
+    // survivors at rebuild time (retained citations/support, current graphs) —
+    // never re-proven, never promoted. Proving happened once, at the primary
+    // finalize with the caller's evidence extras.
+    refinalize_packet_obligation_plan_after_rebuild(
         &packet.question,
         task_class,
         &mut packet.plan.obligations,
         &packet.answer,
         &packet.budget,
-        // The receipts view at the rebuild site is the SAME shared function of
-        // (support units, answer) the orchestrator finalize uses — here fed
-        // with the survivors at rebuild time, so identical state yields
-        // identical proof_status at both sites.
         &packet.support,
     );
     refresh_packet_claim_markdown(packet);
@@ -869,12 +871,15 @@ fn remove_omitted_section(budget: &mut PacketBudgetDto, section: &str) -> bool {
 }
 
 /// Edges the compact graph cap must keep so a later reader can still name what
-/// a cited carrier does. Obligation proofs come first; then CALL/INHERITANCE edges
-/// whose both endpoints are cited; then any remaining incident CALL/INHERITANCE and
-/// already-attached citation evidence ids. Compact used to pick the first 20
-/// edges by id, drop the rest, and strip `evidence_edge_ids` that no longer
-/// appeared in `answer.graphs` — which is how a packet that had resolved a CALL
-/// shipped a pointer receipt instead of the relation.
+/// a cited carrier does. Obligation proofs come first; then protected-kind
+/// edges whose both endpoints are cited; then any remaining incident
+/// protected-kind and already-attached citation evidence ids. Compact used to
+/// pick the first 20 edges by id, drop the rest, and strip
+/// `evidence_edge_ids` that no longer appeared in `answer.graphs` — which is
+/// how a packet that had resolved a CALL shipped a pointer receipt instead of
+/// the relation. R2 widens the protected kinds from CALL|INHERITANCE to every
+/// atom-required kind (TYPE_USAGE, USAGE, MEMBER, IMPORT), so retained atom
+/// receipts survive the cap the same way CALL proof does.
 fn protected_graph_edge_ids_for_budget(
     answer: &AgentAnswerDto,
     obligation_edge_ids: &[EdgeId],
@@ -892,7 +897,15 @@ fn protected_graph_edge_ids_for_budget(
             continue;
         };
         for edge in &graph.edges {
-            if !matches!(edge.kind, EdgeKind::CALL | EdgeKind::INHERITANCE) {
+            if !matches!(
+                edge.kind,
+                EdgeKind::CALL
+                    | EdgeKind::INHERITANCE
+                    | EdgeKind::TYPE_USAGE
+                    | EdgeKind::USAGE
+                    | EdgeKind::MEMBER
+                    | EdgeKind::IMPORT
+            ) {
                 continue;
             }
             if !seen_incident.insert(edge.id.clone()) {
@@ -1353,7 +1366,9 @@ pub(crate) fn packet_budget_usage(answer: &AgentAnswerDto) -> PacketBudgetUsageD
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::agent::packet_obligations::build_packet_obligation_plan;
+    use crate::agent::packet_obligations::{
+        PacketProofEvidenceExtras, build_packet_obligation_plan, finalize_packet_obligation_plan,
+    };
     use crate::agent::trace_export::packet_step_trace_json;
     use codestory_contracts::api::{
         AgentCitationDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
@@ -2028,6 +2043,7 @@ pub(super) mod tests {
             &packet.answer,
             &packet.budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         let supported_claims_with_telemetry =
             packet_supported_claims_with_telemetry(&packet.answer);
@@ -2069,6 +2085,7 @@ pub(super) mod tests {
             &packet.answer,
             &packet.budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         refresh_packet_claim_markdown(&mut packet);
@@ -3460,11 +3477,10 @@ pub(super) mod tests {
         }]
     }
 
-    /// The round-1 review's central hazard: the orchestrator finalize and the
-    /// byte-budget rebuild finalize see different budgets, and finalize is
-    /// destructive. Given identical state the two sites must produce identical
-    /// `proof_status` on every claim obligation, because both build the
-    /// receipts view through the same shared function of (support, answer).
+    /// The round-1 review's central hazard, restated for R7: the primary
+    /// finalize (site A, WITH extras — the one proving site) and the budget
+    /// rebuild (site B, receipt SURVIVAL — never re-proves) must agree on
+    /// `proof_status` when every recorded receipt is present at rebuild time.
     ///
     /// The two sites' support inputs are genuinely different expressions in
     /// production: the orchestrator feeds its raw `source_support` local
@@ -3473,43 +3489,30 @@ pub(super) mod tests {
     /// `packet.support`. Site A therefore gets independently constructed raw
     /// units here, not `packet.support` itself.
     #[test]
-    fn orchestrator_and_budget_rebuild_finalize_agree_on_proof_status() {
-        let packet = mapper_proof_packet();
+    fn primary_finalize_and_budget_rebuild_survival_agree_on_proof_status() {
+        let mut packet = mapper_proof_packet();
         let raw_source_support = mapper_proof_raw_source_support();
         assert_eq!(
             raw_source_support, packet.support,
             "fixture invariant: the packet carries exactly the raw reread units"
         );
 
-        // Site A: the orchestrator-style finalize over the raw units.
-        let mut orchestrator_plan = packet.plan.obligations.clone();
+        // Site A: the primary orchestrator-style finalize over the raw units,
+        // with the (empty-default) proving extras. This is the state the
+        // packet ships with.
         finalize_packet_obligation_plan(
             &packet.question,
             packet.plan.task_class,
-            &mut orchestrator_plan,
+            &mut packet.plan.obligations,
             &packet.answer,
             &packet.budget,
             &raw_source_support,
+            &PacketProofEvidenceExtras::default(),
         );
-
-        // Site B: the byte-budget rebuild finalize inside the dependents pass.
-        let mut rebuilt = packet.clone();
-        rebuild_packet_budget_dependents(test_project_root(), &mut rebuilt, &[]);
-
-        let statuses = |plan: &codestory_contracts::api::PacketObligationPlanDto| {
-            plan.claim_obligations
-                .iter()
-                .map(|obligation| (obligation.id.clone(), obligation.proof_status))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            statuses(&orchestrator_plan),
-            statuses(&rebuilt.plan.obligations),
-            "the two finalize sites disagreed on proof_status for identical state"
-        );
+        let primary_plan = packet.plan.obligations.clone();
         // The agreement must bite on a formula-proven obligation, not only on
-        // trivially unproven ones.
-        let proven = orchestrator_plan
+        // trivially unproven ones — and the manifest must be recorded.
+        let proven = primary_plan
             .claim_obligations
             .iter()
             .find(|obligation| obligation.id == "mapper_config")
@@ -3518,6 +3521,184 @@ pub(super) mod tests {
             proven.proof_status,
             PacketObligationProofStatusDto::Proven,
             "fixture must prove mapper_config through receipts: {proven:?}"
+        );
+        assert!(
+            !proven.carrier_edge_proofs.is_empty(),
+            "the primary finalize must record the edge-receipt manifest: {proven:?}"
+        );
+
+        // Site B: the byte-budget rebuild — receipt survival. Every recorded
+        // receipt is present, so every proof_status is retained and the two
+        // sites agree.
+        let mut rebuilt = packet.clone();
+        rebuild_packet_budget_dependents(test_project_root(), &mut rebuilt, &[]);
+        let statuses = |plan: &codestory_contracts::api::PacketObligationPlanDto| {
+            plan.claim_obligations
+                .iter()
+                .map(|obligation| (obligation.id.clone(), obligation.proof_status))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            statuses(&primary_plan),
+            statuses(&rebuilt.plan.obligations),
+            "survival must retain every status when all recorded receipts survive"
+        );
+
+        // Removing a recorded edge receipt from the live graphs demotes at the
+        // next rebuild — fail-closed, with the rebuild reason (distinguishable
+        // from the R5 compile reason).
+        let recorded_edge_id = proven.carrier_edge_proofs[0].edge_id.clone();
+        let mut cut = packet.clone();
+        for artifact in &mut cut.answer.graphs {
+            if let GraphArtifactDto::Uml { graph, .. } = artifact {
+                graph.edges.retain(|edge| edge.id != recorded_edge_id);
+            }
+        }
+        rebuild_packet_budget_dependents(test_project_root(), &mut cut, &[]);
+        let demoted = cut
+            .plan
+            .obligations
+            .claim_obligations
+            .iter()
+            .find(|obligation| obligation.id == "mapper_config")
+            .expect("mapper_config obligation");
+        assert_eq!(
+            demoted.proof_status,
+            PacketObligationProofStatusDto::Unsupported,
+            "{demoted:?}"
+        );
+        assert_eq!(
+            demoted.reason.as_deref(),
+            Some("flow_proof_receipts_missing_after_rebuild")
+        );
+    }
+
+    /// R2 protection widening (landed together with the compiler allow-list
+    /// widening): the graph-cap protection buckets consider every
+    /// atom-required edge kind, so cited TYPE_USAGE/USAGE/MEMBER/IMPORT
+    /// receipts outrank unrelated CALL context that sorts earlier by id.
+    #[test]
+    fn widened_atom_kind_edges_with_cited_endpoints_survive_the_graph_cap() {
+        let mut packet = test_packet("Trace the widened protection.", 96 * 1024);
+        let builder =
+            eligible_proof_citation("PlanBuilder", "src/plan_builder.cs", NodeKind::CLASS);
+        let config = eligible_proof_citation(
+            "MapperConfiguration",
+            "src/mapper_configuration.cs",
+            NodeKind::CLASS,
+        );
+        packet.answer.citations = vec![builder.clone(), config.clone()];
+        let structural_kinds = [
+            ("zz-type-usage", EdgeKind::TYPE_USAGE),
+            ("zz-usage", EdgeKind::USAGE),
+            ("zz-member", EdgeKind::MEMBER),
+            ("zz-import", EdgeKind::IMPORT),
+        ];
+        let mut nodes = vec![
+            mapper_proof_graph_node(&builder),
+            mapper_proof_graph_node(&config),
+            budget_graph_node("uncited-center"),
+        ];
+        let mut edges = Vec::new();
+        for index in 0..4 {
+            let target = format!("uncited-target-{index}");
+            nodes.push(budget_graph_node(&target));
+            edges.push(GraphEdgeDto {
+                id: EdgeId(format!("aa-context-{index}")),
+                source: NodeId("uncited-center".to_string()),
+                target: NodeId(target),
+                kind: EdgeKind::CALL,
+                confidence: Some(1.0),
+                certainty: Some("certain".to_string()),
+                callsite_identity: None,
+                candidate_targets: Vec::new(),
+            });
+        }
+        for (edge_id, kind) in structural_kinds {
+            edges.push(GraphEdgeDto {
+                id: EdgeId(edge_id.to_string()),
+                source: builder.node_id.clone(),
+                target: config.node_id.clone(),
+                kind,
+                confidence: None,
+                certainty: None,
+                callsite_identity: None,
+                candidate_targets: Vec::new(),
+            });
+        }
+        packet.answer.graphs = vec![GraphArtifactDto::Uml {
+            id: "widened".to_string(),
+            title: "Widened".to_string(),
+            graph: GraphResponse {
+                center_id: builder.node_id.clone(),
+                nodes,
+                edges,
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        }];
+
+        let protected = protected_graph_edge_ids_for_budget(&packet.answer, &[]);
+        for (edge_id, _) in structural_kinds {
+            assert!(
+                protected.contains(&EdgeId(edge_id.to_string())),
+                "{edge_id} must be protected: {protected:?}"
+            );
+        }
+        assert!(cap_graph_edges(&mut packet.answer, 4, &protected));
+        let retained = packet
+            .answer
+            .graphs
+            .iter()
+            .filter_map(|artifact| match artifact {
+                GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.iter()),
+                GraphArtifactDto::Mermaid { .. } => None,
+            })
+            .flatten()
+            .map(|edge| edge.id.0.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 4);
+        for (edge_id, _) in structural_kinds {
+            assert!(
+                retained.contains(&edge_id.to_string()),
+                "cited {edge_id} must survive over earlier-id uncited CALL context: {retained:?}"
+            );
+        }
+    }
+
+    /// The budget fixpoint's rebuild pass is remove-and-demote only: running
+    /// it twice from the same state changes nothing (monotone idempotent
+    /// steps are what the loop-convergence argument and the marker-shape
+    /// revert rely on), and no evidence collection ever grows.
+    #[test]
+    fn budget_rebuild_dependents_pass_is_remove_only_and_idempotent() {
+        let mut packet = mapper_proof_packet();
+        finalize_packet_obligation_plan(
+            &packet.question,
+            packet.plan.task_class,
+            &mut packet.plan.obligations,
+            &packet.answer,
+            &packet.budget,
+            &packet.support.clone(),
+            &PacketProofEvidenceExtras::default(),
+        );
+        let citations_before = packet.answer.citations.len();
+        let edges_before = packet_budget_usage(&packet.answer).trail_edges;
+        let support_before = packet.support.len();
+
+        let mut first = packet.clone();
+        rebuild_packet_budget_dependents(test_project_root(), &mut first, &[]);
+        assert!(first.answer.citations.len() <= citations_before);
+        assert!(packet_budget_usage(&first.answer).trail_edges <= edges_before);
+        assert!(first.support.len() <= support_before);
+
+        let mut second = first.clone();
+        rebuild_packet_budget_dependents(test_project_root(), &mut second, &[]);
+        assert_eq!(
+            serde_json::to_value(&first).expect("first rebuild"),
+            serde_json::to_value(&second).expect("second rebuild"),
+            "a second rebuild from the same state must be a no-op"
         );
     }
 }

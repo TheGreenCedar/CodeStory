@@ -489,6 +489,7 @@ mod golden_tests {
         let center_id = NodeId(center_id.into());
         let target_id = NodeId(target_id.into());
         PacketSearchHit {
+            trail_scans: Vec::new(),
             hit: SearchHit {
                 node_id: center_id.clone(),
                 display_name: display_name.into(),
@@ -688,6 +689,7 @@ mod golden_tests {
         let session_request = NodeId("5296498989960597280".into());
         let prepare_request = NodeId("9192115447235681128".into());
         let mut hit = PacketSearchHit {
+            trail_scans: Vec::new(),
             hit: SearchHit {
                 node_id: session_request.clone(),
                 display_name: "Session.request".into(),
@@ -913,6 +915,7 @@ mod golden_tests {
 
         let carrier_id = NodeId("session-send".into());
         let carrier = PacketSearchHit {
+            trail_scans: Vec::new(),
             hit: SearchHit {
                 node_id: carrier_id.clone(),
                 display_name: "Session.send".into(),
@@ -1239,6 +1242,7 @@ mod golden_tests {
             task_class,
             &obligation_plan,
             &answer,
+            &codestory_agent::packet_obligations::PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             protected_packet_obligation_carrier_node_ids(&snapshot),
@@ -1290,6 +1294,7 @@ mod golden_tests {
             &answer,
             &budget,
             &[],
+            &codestory_agent::packet_obligations::PacketProofEvidenceExtras::default(),
         );
         let obligation = obligation_plan
             .claim_obligations
@@ -1491,6 +1496,7 @@ mod golden_tests {
             &answer,
             &complete_packet_budget(&answer),
             &[],
+            &codestory_agent::packet_obligations::PacketProofEvidenceExtras::default(),
         );
         for requirement_id in ["request_entrypoint", "request_dispatch", "request_terminal"] {
             let obligation = obligation_plan
@@ -1628,6 +1634,7 @@ mod golden_tests {
             &answer,
             &complete_packet_budget(&answer),
             &[],
+            &codestory_agent::packet_obligations::PacketProofEvidenceExtras::default(),
         );
         for requirement_id in ["request_entrypoint", "request_dispatch", "request_terminal"] {
             let obligation = obligation_plan
@@ -1702,6 +1709,7 @@ mod golden_tests {
                 &answer,
                 &budget,
                 &[],
+                &codestory_agent::packet_obligations::PacketProofEvidenceExtras::default(),
             );
             let obligation = plan
                 .claim_obligations
@@ -1867,6 +1875,7 @@ mod golden_tests {
                 &answer,
                 &complete_packet_budget(&answer),
                 &[],
+                &codestory_agent::packet_obligations::PacketProofEvidenceExtras::default(),
             );
             let obligation = plan
                 .claim_obligations
@@ -1919,6 +1928,7 @@ mod golden_tests {
                 &answer,
                 &complete_packet_budget(&answer),
                 &[],
+                &codestory_agent::packet_obligations::PacketProofEvidenceExtras::default(),
             );
             let obligation = plan
                 .claim_obligations

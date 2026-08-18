@@ -8,8 +8,9 @@ use super::packet_flow_requirements::{
     packet_flow_requirement_context_queries_for_prompt, packet_flow_requirements_for_terms,
 };
 use super::packet_proof_atoms::{
-    DischargedFact, FlowProofFormula, FlowProofOutcome, PacketProofEvidence, VerifiedFlowProof,
-    VerifiedSourceAspectReceipt, VerifiedTypedRelationReceipt, match_flow_requirements,
+    DischargedFact, FlowProofFormula, FlowProofOutcome, PacketProofEvidence, TrailCoverage,
+    VerifiedFlowProof, VerifiedSourceAspectReceipt, VerifiedTypedRelationReceipt,
+    match_flow_requirements,
 };
 use super::packet_required_probes::{
     packet_named_schema_entity_queries, packet_named_schema_entity_symbol_queries,
@@ -33,7 +34,7 @@ use codestory_contracts::api::{
     PacketProofStatusDto, PacketQueryCompletionDto, PacketQueryObligationDto,
     PacketQueryObligationKindDto, PacketTaskClassDto, SupportUnitDto, SupportUnitKindDto,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 const PACKET_OBLIGATION_BINDING_TERM_LIMIT: usize = 8;
 const PACKET_OBLIGATION_BINDING_TERM_CHAR_LIMIT: usize = 160;
@@ -52,6 +53,13 @@ const FLOW_PROOF_ABORTED_REASON: &str = "flow_proof_atoms_aborted";
 /// Recorded by the R5 reconciliation when a formula-proven obligation's
 /// receipts no longer verify against the compiled support and live graphs.
 const FLOW_PROOF_RECEIPTS_MISSING_REASON: &str = "flow_proof_receipts_missing_after_compile";
+/// Recorded by receipt-survival re-verification (R7(d)) when a rebuild — the
+/// budget fixpoint, the CLI's cross-process representation pass, anything
+/// downstream of the primary finalize — finds a recorded receipt missing from
+/// the current answer/support. Distinguishable from the R5 reason so telemetry
+/// can tell "compile dropped it" from "a later rebuild dropped it".
+const FLOW_PROOF_RECEIPTS_MISSING_AFTER_REBUILD_REASON: &str =
+    "flow_proof_receipts_missing_after_rebuild";
 pub const PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE: &str = "obligation receipt";
 
 pub fn build_packet_obligation_plan(
@@ -782,19 +790,60 @@ pub fn packet_proof_source_range_owner<'a>(
         .find(|citation| citation.node_id.0 == symbol_id && citation_sufficiency_eligible(citation))
 }
 
+/// Caller-supplied verified evidence the built receipts view cannot mint
+/// itself (R7(a)): R2 trail-coverage records and R4 anchored window receipts.
+/// The runtime constructs one of these at the primary finalize; the SAME value
+/// must be passed to the R5 reconcile (R7(b): proving happens exactly once —
+/// every later rebuild re-verifies by receipt survival and never re-proves,
+/// so extras never need to cross a process boundary).
+///
+/// Evidence-completeness obligation (binding rule 7, runtime-side caller
+/// obligation): a [`TrailCoverage::Scanned`] record — whether listed in
+/// `trail_scans` or attached to an edge via `edge_coverage` — may be supplied
+/// only when EVERY edge that scan enumerated is present in the evidence (i.e.
+/// in the live `answer.graphs` the view is built from). Attaching a scan whose
+/// enumerated edges were partially dropped would let an absence fact certify
+/// over receipts the matcher cannot see. The default is empty and
+/// byte-identical to the stage-2 fail-closed behavior: every receipt keeps
+/// `TrailCoverage::Unknown`, no anchors exist, and absence/anchored facts fail
+/// closed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PacketProofEvidenceExtras {
+    /// Coverage records of every bounded scan run for this packet, including
+    /// scans that produced no edges (absence facts need those). Populates
+    /// [`PacketProofEvidence::trail_scans`].
+    pub trail_scans: Vec<TrailCoverage>,
+    /// Per-edge coverage attachment, keyed by the live graph edge id: replaces
+    /// the mandatory `TrailCoverage::Unknown` conversion default on exactly
+    /// that edge's receipt (rule 7's explicit opt-in, e.g. the MEMBER witness
+    /// of the deeper-rooted absence arm). Ids absent from the live graphs are
+    /// ignored — coverage can never mint a receipt.
+    pub edge_coverage: BTreeMap<EdgeId, TrailCoverage>,
+    /// Pre-built anchored source-aspect receipts (R4). The runtime constructs
+    /// these directly: an R4 window receipt's owner is a role-bound node
+    /// carrying an atom-anchor mark — a shape `packet_proof_source_range_owner`
+    /// deliberately cannot build from support units. Appended after the built
+    /// source-aspect receipts.
+    pub anchored_receipts: Vec<VerifiedSourceAspectReceipt>,
+}
+
 /// Builds the receipts view the proof-atom matcher consumes, as a pure
-/// function of the reread support units and the live answer — so the two
-/// production finalize sites (orchestrator finalize and the budget rebuild)
-/// agree byte-for-byte given identical state, and the pre-cap paths (preview,
+/// function of the reread support units, the live answer, and the
+/// caller-supplied extras — so the primary finalize and the R5 reconcile
+/// (same extras) agree given identical state, and the pre-cap paths (preview,
 /// pre-budget capture) pass an empty source view explicitly.
 ///
-/// Stage-2 honesty: typed-relation receipts keep the mandatory
+/// Fail-closed honesty: with empty extras this is byte-identical to the
+/// stage-2 view — typed-relation receipts keep the mandatory
 /// `TrailCoverage::Unknown` conversion default and no trail scans are listed,
-/// so absence facts fail closed until stage 4 lands real coverage metadata
-/// (binding rule 7); no coverage is fabricated here.
+/// so absence facts fail closed (binding rule 7); no coverage is fabricated
+/// here. Extras merge INTO the built view: attached coverage replaces Unknown
+/// per edge id, anchored receipts append, trail scans populate
+/// [`PacketProofEvidence::trail_scans`].
 pub fn packet_proof_receipts_view(
     source_support: &[SupportUnitDto],
     answer: &AgentAnswerDto,
+    extras: &PacketProofEvidenceExtras,
 ) -> PacketProofEvidence {
     let mut evidence = PacketProofEvidence::default();
     for unit in source_support {
@@ -807,6 +856,9 @@ pub fn packet_proof_receipts_view(
             evidence.source_aspects.push(receipt);
         }
     }
+    evidence
+        .source_aspects
+        .extend(extras.anchored_receipts.iter().cloned());
     for artifact in &answer.graphs {
         let GraphArtifactDto::Uml { graph, .. } = artifact else {
             continue;
@@ -818,18 +870,54 @@ pub fn packet_proof_receipts_view(
             .collect::<HashMap<_, _>>();
         for edge in &graph.edges {
             let target_kind = node_kinds.get(edge.target.0.as_str()).copied();
-            evidence
-                .typed_relations
-                .push(VerifiedTypedRelationReceipt::from_graph_edge(
-                    edge,
-                    target_kind,
-                ));
+            let mut receipt = VerifiedTypedRelationReceipt::from_graph_edge(edge, target_kind);
+            if let Some(coverage) = extras.edge_coverage.get(&edge.id) {
+                receipt = receipt.with_coverage(coverage.clone());
+            }
+            evidence.typed_relations.push(receipt);
         }
     }
+    evidence.trail_scans = extras.trail_scans.clone();
     evidence
 }
 
+/// The primary finalize — the ONE place formula proving happens (R7(b)),
+/// against the receipts view built from (support, answer, extras). The same
+/// `extras` value must be passed to
+/// [`reconcile_packet_proof_obligations_after_compile`]; every later rebuild
+/// goes through [`refinalize_packet_obligation_plan_after_rebuild`] instead
+/// and never re-proves.
 pub fn finalize_packet_obligation_plan(
+    question: &str,
+    task_class: PacketTaskClassDto,
+    plan: &mut PacketObligationPlanDto,
+    answer: &AgentAnswerDto,
+    budget: &PacketBudgetDto,
+    source_support: &[SupportUnitDto],
+    extras: &PacketProofEvidenceExtras,
+) {
+    let receipts = packet_proof_receipts_view(source_support, answer, extras);
+    finalize_packet_claim_obligations(
+        question,
+        task_class,
+        plan,
+        answer,
+        PacketObligationEvidenceView::from_budget(budget),
+        FormulaProofMode::Prove(&receipts),
+    );
+    finalize_query_obligations(plan, answer, budget);
+}
+
+/// Rebuild-time re-finalization (R7(d)): Legacy obligations get today's full
+/// re-finalization bit-identically, while formula-bearing obligations are
+/// re-verified by RECEIPT SURVIVAL ONLY — `proof_status` is retained iff every
+/// recorded `carrier_node_id` resolves among the retained citations/support
+/// and every recorded `carrier_edge_proof` id is present in the current
+/// `answer.graphs`; otherwise demoted fail-closed
+/// (`flow_proof_receipts_missing_after_rebuild`). Rebuilds never re-prove and
+/// never promote, which is what makes the proof portable across processes:
+/// the manifest rides the packet, the extras do not have to.
+pub fn refinalize_packet_obligation_plan_after_rebuild(
     question: &str,
     task_class: PacketTaskClassDto,
     plan: &mut PacketObligationPlanDto,
@@ -843,7 +931,9 @@ pub fn finalize_packet_obligation_plan(
         plan,
         answer,
         PacketObligationEvidenceView::from_budget(budget),
-        &packet_proof_receipts_view(source_support, answer),
+        FormulaProofMode::Survive {
+            support: source_support,
+        },
     );
     finalize_query_obligations(plan, answer, budget);
 }
@@ -862,6 +952,7 @@ pub fn reconcile_packet_proof_obligations_after_compile(
     plan: &mut PacketObligationPlanDto,
     answer: &AgentAnswerDto,
     compiled_support: &[SupportUnitDto],
+    extras: &PacketProofEvidenceExtras,
 ) -> bool {
     let requirements =
         packet_flow_requirements_for_terms(&packet_probe_terms(question), task_class)
@@ -872,7 +963,7 @@ pub fn reconcile_packet_proof_obligations_after_compile(
     if requirements.is_empty() {
         return false;
     }
-    let receipts = packet_proof_receipts_view(compiled_support, answer);
+    let receipts = packet_proof_receipts_view(compiled_support, answer, extras);
     let mut demoted = false;
     for obligation in &mut plan.claim_obligations {
         if obligation.proof_status != PacketObligationProofStatusDto::Proven
@@ -886,26 +977,33 @@ pub fn reconcile_packet_proof_obligations_after_compile(
         let Some(formula) = requirement.proof.formula() else {
             continue;
         };
-        let still_proven = matches!(
-            flow_requirement_proof_outcome(formula, requirement.id, &receipts),
-            FlowProofOutcome::Proved(_)
-        );
-        if still_proven {
-            continue;
+        match flow_requirement_proof_outcome(formula, requirement.id, &receipts) {
+            FlowProofOutcome::Proved(proof) => {
+                // The manifest must always describe a proof that is valid
+                // against the state the packet ships with: re-record it from
+                // the post-compile proof so a later receipt-survival pass
+                // (R7(d)) checks receipts that actually exist. The carrier cap
+                // never grows past what the primary finalize recorded.
+                let carrier_cap = obligation.carrier_node_ids.len().max(1);
+                record_flow_proof_carriers(obligation, &proof, answer, &receipts, carrier_cap);
+            }
+            FlowProofOutcome::Unproven | FlowProofOutcome::Aborted => {
+                // Status purity (R1(a), F2 review): demoted formula
+                // obligations are always Unsupported — carriers recorded from
+                // the now-unverifiable proof stay as display decoration and
+                // never soften the status.
+                obligation.proof_status = PacketObligationProofStatusDto::Unsupported;
+                obligation.reason = Some(FLOW_PROOF_RECEIPTS_MISSING_REASON.to_string());
+                demoted = true;
+            }
         }
-        // Status purity (R1(a), F2 review): demoted formula obligations are
-        // always Unsupported — carriers recorded from the now-unverifiable
-        // proof stay as display decoration and never soften the status.
-        obligation.proof_status = PacketObligationProofStatusDto::Unsupported;
-        obligation.reason = Some(FLOW_PROOF_RECEIPTS_MISSING_REASON.to_string());
-        demoted = true;
     }
     demoted
 }
 
 /// The per-requirement verdict for one formula-bearing requirement, taken from
 /// the group-wide per-requirement matching pass (full group first, then
-/// declaration-order subsets with carried bindings). Never calls the all-atoms
+/// constraint-strength-ordered subsets with carried bindings). Never calls the all-atoms
 /// matcher on a single requirement's subset in isolation, which would fork the
 /// group's unification (F1 obligation).
 fn flow_requirement_proof_outcome(
@@ -927,17 +1025,19 @@ pub fn preview_packet_obligation_plan_before_budget(
     task_class: PacketTaskClassDto,
     plan: &PacketObligationPlanDto,
     answer: &AgentAnswerDto,
+    extras: &PacketProofEvidenceExtras,
 ) -> PacketObligationPlanDto {
     let mut preview = plan.clone();
+    // Explicit pre-cap receipts view: the uncapped `answer.graphs`, and no
+    // source receipts — none exist before the budget's source reread.
+    let receipts = packet_proof_receipts_view(&[], answer, extras);
     finalize_packet_claim_obligations(
         question,
         task_class,
         &mut preview,
         answer,
         PacketObligationEvidenceView::complete(answer.citations.len()),
-        // Explicit pre-cap receipts view: the uncapped `answer.graphs`, and no
-        // source receipts — none exist before the budget's source reread.
-        &packet_proof_receipts_view(&[], answer),
+        FormulaProofMode::Prove(&receipts),
     );
     preview
 }
@@ -972,17 +1072,19 @@ pub fn capture_packet_obligation_edge_proofs_before_budget(
     task_class: PacketTaskClassDto,
     plan: &PacketObligationPlanDto,
     answer: &AgentAnswerDto,
+    extras: &PacketProofEvidenceExtras,
 ) -> PacketObligationEdgeProofSnapshot {
     let mut proof_plan = plan.clone();
+    // Explicit pre-cap receipts view: the uncapped `answer.graphs`, and no
+    // source receipts — none exist before the budget's source reread.
+    let receipts = packet_proof_receipts_view(&[], answer, extras);
     finalize_packet_claim_obligations(
         question,
         task_class,
         &mut proof_plan,
         answer,
         PacketObligationEvidenceView::complete(answer.citations.len()),
-        // Explicit pre-cap receipts view: the uncapped `answer.graphs`, and no
-        // source receipts — none exist before the budget's source reread.
-        &packet_proof_receipts_view(&[], answer),
+        FormulaProofMode::Prove(&receipts),
     );
     let mut protected_carrier_node_ids = Vec::new();
     let mut protected_carrier_node_id_set = HashSet::new();
@@ -1372,13 +1474,29 @@ fn obligation_evidence_was_removed_by_budget(
     })
 }
 
+/// How formula-bearing obligations are handled by one claim-finalization
+/// pass (R7(b,d)). Legacy obligations take the same full path under either
+/// mode.
+#[derive(Clone, Copy)]
+enum FormulaProofMode<'a> {
+    /// Prove through the atom matcher against the receipts view — the primary
+    /// finalize (and the pre-cap preview/capture passes).
+    Prove(&'a PacketProofEvidence),
+    /// Re-verify by receipt survival only: retain a recorded Proven iff every
+    /// recorded receipt survives in the current answer/support, demote
+    /// fail-closed otherwise, and never promote. Rebuild sites (budget
+    /// fixpoint, cross-process representation pass) use this — no extras, no
+    /// matcher.
+    Survive { support: &'a [SupportUnitDto] },
+}
+
 fn finalize_packet_claim_obligations(
     question: &str,
     task_class: PacketTaskClassDto,
     plan: &mut PacketObligationPlanDto,
     answer: &AgentAnswerDto,
     evidence_view: PacketObligationEvidenceView,
-    proof_receipts: &PacketProofEvidence,
+    formula_mode: FormulaProofMode<'_>,
 ) {
     let requirements =
         packet_flow_requirements_for_terms(&packet_probe_terms(question), task_class)
@@ -1392,8 +1510,30 @@ fn finalize_packet_claim_obligations(
         &packet_probe_terms(question),
         task_class,
     );
+    // In survival mode formula-bearing obligations never reach the prove
+    // dispatch below; if one ever did (impossible — the intercept uses the
+    // same requirements map), an empty view fails it closed rather than
+    // re-proving.
+    let empty_receipts = PacketProofEvidence::default();
+    let proof_receipts = match formula_mode {
+        FormulaProofMode::Prove(receipts) => receipts,
+        FormulaProofMode::Survive { .. } => &empty_receipts,
+    };
     for obligation in &mut plan.claim_obligations {
         if obligation.proof_status == PacketObligationProofStatusDto::Contradicted {
+            continue;
+        }
+        // R7(d): survival intercepts BEFORE the budget-truncation marker and
+        // the carrier clearing — the recorded manifest IS the thing being
+        // re-verified, and survival needs no truncation heuristic because it
+        // checks receipt presence directly.
+        if let FormulaProofMode::Survive { support } = formula_mode
+            && obligation.probe_binding.is_none()
+            && requirements
+                .get(obligation.id.as_str())
+                .is_some_and(|requirement| requirement.proof.formula().is_some())
+        {
+            survive_formula_claim_obligation(obligation, answer, support);
             continue;
         }
         if obligation_evidence_was_removed_by_budget(obligation, answer, evidence_view) {
@@ -1808,8 +1948,15 @@ fn finalize_formula_claim_obligation(
     match flow_requirement_proof_outcome(formula, requirement.id, proof_receipts) {
         FlowProofOutcome::Proved(proof) => {
             // Carrier node ids come from the proof's receipts, never from
-            // `rank_obligation_citations_by_context`.
-            record_flow_proof_carriers(obligation, &proof, answer, evidence_view.max_carriers);
+            // `rank_obligation_citations_by_context`; the edge-proof manifest
+            // (R7(c)) rides the same recording.
+            record_flow_proof_carriers(
+                obligation,
+                &proof,
+                answer,
+                proof_receipts,
+                evidence_view.max_carriers,
+            );
             obligation.proof_status = PacketObligationProofStatusDto::Proven;
             obligation.reason = None;
         }
@@ -1820,6 +1967,64 @@ fn finalize_formula_claim_obligation(
             fail_formula_obligation_closed(obligation, FLOW_PROOF_ABORTED_REASON);
         }
     }
+}
+
+/// R7(d) receipt-survival re-verification for one formula-bearing obligation
+/// at a rebuild site. Never proves, never promotes:
+/// - a non-Proven obligation is left entirely untouched (status, reason, and
+///   carriers stay — an unproven obligation with every receipt present stays
+///   unproven);
+/// - a Proven obligation is retained untouched iff every recorded
+///   `carrier_node_id` resolves among the retained citations or support units
+///   AND every recorded `carrier_edge_proof` id is present in the current
+///   `answer.graphs`;
+/// - otherwise it is demoted fail-closed (always Unsupported — status purity)
+///   with `flow_proof_receipts_missing_after_rebuild` recorded. An empty
+///   manifest on a Proven obligation also demotes: every real formula proof
+///   records at least one receipt, so an empty manifest is unverifiable.
+fn survive_formula_claim_obligation(
+    obligation: &mut PacketClaimObligationDto,
+    answer: &AgentAnswerDto,
+    support: &[SupportUnitDto],
+) {
+    if obligation.proof_status != PacketObligationProofStatusDto::Proven {
+        return;
+    }
+    if obligation.carrier_node_ids.is_empty() && obligation.carrier_edge_proofs.is_empty() {
+        fail_formula_obligation_closed(
+            obligation,
+            FLOW_PROOF_RECEIPTS_MISSING_AFTER_REBUILD_REASON,
+        );
+        return;
+    }
+    let node_survives = |node_id: &NodeId| {
+        answer
+            .citations
+            .iter()
+            .any(|citation| citation.node_id == *node_id)
+            || support
+                .iter()
+                .any(|unit| unit.symbol_id.as_deref() == Some(node_id.0.as_str()))
+    };
+    let retained_edge_ids = answer
+        .graphs
+        .iter()
+        .filter_map(|artifact| match artifact {
+            GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.iter()),
+            GraphArtifactDto::Mermaid { .. } => None,
+        })
+        .flatten()
+        .map(|edge| &edge.id)
+        .collect::<HashSet<_>>();
+    let receipts_survive = obligation.carrier_node_ids.iter().all(node_survives)
+        && obligation
+            .carrier_edge_proofs
+            .iter()
+            .all(|proof| retained_edge_ids.contains(&proof.edge_id));
+    if receipts_survive {
+        return;
+    }
+    fail_formula_obligation_closed(obligation, FLOW_PROOF_RECEIPTS_MISSING_AFTER_REBUILD_REASON);
 }
 
 /// Fail-closed terminal state for a formula-bearing obligation whose atoms did
@@ -1843,6 +2048,7 @@ fn record_flow_proof_carriers(
     obligation: &mut PacketClaimObligationDto,
     proof: &VerifiedFlowProof,
     answer: &AgentAnswerDto,
+    proof_receipts: &PacketProofEvidence,
     max_carriers: usize,
 ) {
     let mut receipt_node_ids: Vec<NodeId> = Vec::new();
@@ -1878,6 +2084,46 @@ fn record_flow_proof_carriers(
         })
         .collect::<Vec<_>>();
     record_obligation_carriers(obligation, carriers, max_carriers);
+    // R7(c): the complete edge-receipt manifest — every typed-relation receipt
+    // the proof discharged, deduplicated by edge id in fact order. Receipt
+    // survival at rebuild sites checks exactly these ids against the current
+    // `answer.graphs`. The edge kind comes from the discharging receipt; the
+    // carrier anchor prefers the endpoint that is a recorded carrier.
+    let mut edge_proofs: Vec<PacketObligationCarrierEdgeProofDto> = Vec::new();
+    let mut seen_edge_ids = HashSet::new();
+    for atom in &proof.atoms {
+        for fact in &atom.facts {
+            let DischargedFact::TypedRelation {
+                edge_id,
+                source,
+                target,
+            } = fact
+            else {
+                continue;
+            };
+            if !seen_edge_ids.insert(edge_id.clone()) {
+                continue;
+            }
+            let Some(receipt) = proof_receipts
+                .typed_relations
+                .iter()
+                .find(|receipt| receipt.edge_id == *edge_id)
+            else {
+                continue;
+            };
+            let carrier_node_id = if obligation.carrier_node_ids.contains(source) {
+                source.clone()
+            } else {
+                target.clone()
+            };
+            edge_proofs.push(PacketObligationCarrierEdgeProofDto {
+                carrier_node_id,
+                edge_id: edge_id.clone(),
+                edge_kind: receipt.kind,
+            });
+        }
+    }
+    obligation.carrier_edge_proofs = edge_proofs;
 }
 
 fn rank_obligation_citations_by_context(
@@ -3405,6 +3651,7 @@ mod tests {
             case.task_class,
             &plan,
             &carried_answer,
+            &PacketProofEvidenceExtras::default(),
         );
         let protected_carriers = protected_packet_obligation_carrier_node_ids(&snapshot).to_vec();
         let protected_edges = protected_packet_obligation_edge_ids(&snapshot).to_vec();
@@ -3415,6 +3662,7 @@ mod tests {
             &carried_answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         let obligation = &plan.claim_obligations[0];
         (
@@ -3549,6 +3797,7 @@ mod tests {
             PacketTaskClassDto::RouteTracing,
             &plan,
             answer,
+            &PacketProofEvidenceExtras::default(),
         );
         finalize_packet_obligation_plan(
             question,
@@ -3557,6 +3806,7 @@ mod tests {
             answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         let obligation = &plan.claim_obligations[0];
         (
@@ -3584,6 +3834,7 @@ mod tests {
             answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         let claims = packet_claims_with_obligation_receipts(
             answer,
@@ -3898,6 +4149,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         let overflow = nine_plan
             .claim_obligations
@@ -4120,6 +4372,7 @@ mod tests {
             &answer(vec![carrier]),
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         let foo = plan
@@ -4177,6 +4430,7 @@ mod tests {
             &answer(vec![diagnostic.clone()]),
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             plan.claim_obligations[0].proof_status,
@@ -4197,6 +4451,7 @@ mod tests {
             &answer(vec![diagnostic.clone(), synthetic_carrier]),
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             plan.claim_obligations[0].proof_status,
@@ -4215,6 +4470,7 @@ mod tests {
             &answer(vec![diagnostic.clone(), non_behavioral]),
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             plan.claim_obligations[0].proof_status,
@@ -4234,6 +4490,7 @@ mod tests {
             &carried_answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             plan.claim_obligations[0].proof_status,
@@ -4837,6 +5094,7 @@ mod tests {
             &carried_answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         let supported =
             crate::packet_claims::packet_supported_claims_with_telemetry(&carried_answer);
@@ -4938,6 +5196,7 @@ mod tests {
                 &answer,
                 &budget(),
                 &[],
+                &PacketProofEvidenceExtras::default(),
             );
             let obligation = plan
                 .claim_obligations
@@ -4997,6 +5256,7 @@ mod tests {
             &partial_answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         let table = plan
             .claim_obligations
@@ -5020,6 +5280,7 @@ mod tests {
             &complete_answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         let table = plan
             .claim_obligations
@@ -5045,6 +5306,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         let obligation = plan
             .claim_obligations
@@ -5296,6 +5558,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         let requested = plan
@@ -5331,6 +5594,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         let runtime = plan
@@ -5406,6 +5670,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert!(plan.claim_obligations.iter().any(|obligation| {
             obligation.id == "indexing_entrypoint"
@@ -5463,6 +5728,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         assert_eq!(
@@ -5508,6 +5774,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         let mut claims = false_carriers
             .iter()
@@ -5610,6 +5877,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         assert_eq!(
@@ -5632,6 +5900,7 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
             &plan,
             &answer,
+            &PacketProofEvidenceExtras::default(),
         );
         let receipt = snapshot
             .entries
@@ -5680,6 +5949,7 @@ mod tests {
             &answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             plan.claim_obligations[0].proof_status,
@@ -5699,6 +5969,7 @@ mod tests {
             &answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert!(plan.claim_obligations[0].carrier_edge_proofs.is_empty());
     }
@@ -5846,6 +6117,7 @@ mod tests {
             PacketTaskClassDto::RouteTracing,
             &plan,
             &answer,
+            &PacketProofEvidenceExtras::default(),
         );
 
         assert_eq!(
@@ -6752,6 +7024,7 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
             &plan,
             &carried_answer,
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             protected_packet_obligation_carrier_node_ids(&snapshot),
@@ -6782,6 +7055,7 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
             &plan,
             &wrong_target_answer,
+            &PacketProofEvidenceExtras::default(),
         );
         assert!(
             !protected_packet_obligation_edge_ids(&wrong_target_snapshot)
@@ -6876,6 +7150,7 @@ mod tests {
             &carried_answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         assert_eq!(plan.claim_obligations.len(), 1);
@@ -6931,6 +7206,7 @@ mod tests {
             &incoming_answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             incoming_plan.claim_obligations[0].proof_status,
@@ -6980,6 +7256,7 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
             &plan,
             &answer,
+            &PacketProofEvidenceExtras::default(),
         );
         assert!(
             snapshot
@@ -7020,6 +7297,7 @@ mod tests {
             &answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             plan.claim_obligations[0].carrier_node_ids,
@@ -7078,6 +7356,7 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
             &plan,
             &answer,
+            &PacketProofEvidenceExtras::default(),
         );
         assert!(snapshot.entries.is_empty());
 
@@ -7104,6 +7383,7 @@ mod tests {
             &answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         assert_eq!(
@@ -7126,6 +7406,7 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
             &base_plan,
             &answer,
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(snapshot.entries.len(), 1);
 
@@ -7155,6 +7436,7 @@ mod tests {
             &missing_carrier_answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             missing_carrier_plan.claim_obligations[0].proof_status,
@@ -7187,6 +7469,7 @@ mod tests {
             &wrong_kind_answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             wrong_kind_plan.claim_obligations[0].proof_status,
@@ -7218,6 +7501,7 @@ mod tests {
             &changed_edge_answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             changed_edge_plan.claim_obligations[0].proof_status,
@@ -7249,6 +7533,7 @@ mod tests {
             &speculative_edge_answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             speculative_edge_plan.claim_obligations[0].proof_status,
@@ -7303,6 +7588,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         assert_eq!(
@@ -7367,6 +7653,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         assert_eq!(
@@ -7427,6 +7714,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         assert_eq!(
@@ -7449,6 +7737,7 @@ mod tests {
             &answer(Vec::new()),
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         assert!(plan.query_obligations.iter().any(|obligation| {
@@ -7494,6 +7783,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         let obligation = plan
@@ -7518,6 +7808,7 @@ mod tests {
             &answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             plan.query_obligations
@@ -7573,6 +7864,7 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
             &plan,
             &answer,
+            &PacketProofEvidenceExtras::default(),
         );
         answer.citations.clear();
         let mut truncated_budget = budget();
@@ -7593,6 +7885,7 @@ mod tests {
             &answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         assert_eq!(plan.claim_obligations.len(), 1);
@@ -7627,6 +7920,7 @@ mod tests {
             &missing_edge_answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             missing_edge_plan.claim_obligations[0].reason.as_deref(),
@@ -7657,6 +7951,7 @@ mod tests {
             &wrong_role_answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             wrong_role_plan.claim_obligations[0].reason.as_deref(),
@@ -7680,6 +7975,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             plan.claim_obligations[0].proof_status,
@@ -7700,6 +7996,7 @@ mod tests {
             &answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             plan.claim_obligations[0].proof_status,
@@ -7741,6 +8038,7 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
             &request_plan,
             &request_answer,
+            &PacketProofEvidenceExtras::default(),
         );
         assert!(!request_snapshot.entries.is_empty());
         request_answer.citations =
@@ -7760,6 +8058,7 @@ mod tests {
             &request_answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             request_plan.claim_obligations[0].reason.as_deref(),
@@ -7799,6 +8098,7 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
             &profile_plan,
             &profile_answer,
+            &PacketProofEvidenceExtras::default(),
         );
         assert!(!profile_snapshot.entries.is_empty());
         profile_answer.citations =
@@ -7818,6 +8118,7 @@ mod tests {
             &profile_answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             profile_plan.claim_obligations[0].reason.as_deref(),
@@ -7873,6 +8174,7 @@ mod tests {
             &answer,
             &truncated_budget,
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         assert_eq!(
@@ -7997,6 +8299,7 @@ mod tests {
             &answer(Vec::new()),
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
 
         assert_eq!(
@@ -8027,6 +8330,7 @@ mod tests {
                 &answer,
                 &budget(),
                 &[],
+                &PacketProofEvidenceExtras::default(),
             );
             assert_ne!(
                 plan.claim_obligations[0].proof_status,
@@ -8143,6 +8447,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         let config_obligation = mapper_obligation(&plan, "mapper_config");
         assert_eq!(
@@ -8180,6 +8485,7 @@ mod tests {
             &answer,
             &budget(),
             &[],
+            &PacketProofEvidenceExtras::default(),
         );
         for id in ["mapper_config", "mapper_execution"] {
             let obligation = mapper_obligation(&plan, id);
@@ -8224,6 +8530,7 @@ mod tests {
             &answer,
             &budget(),
             &support,
+            &PacketProofEvidenceExtras::default(),
         );
         let config_obligation = mapper_obligation(&plan, "mapper_config");
         assert_eq!(
@@ -8239,6 +8546,15 @@ mod tests {
                 NodeId("MapperConfiguration".to_string()),
             ],
             "carriers come from the VerifiedFlowProof receipts, in fact order"
+        );
+        assert_eq!(
+            config_obligation.carrier_edge_proofs,
+            vec![PacketObligationCarrierEdgeProofDto {
+                carrier_node_id: NodeId("PlanBuilder".to_string()),
+                edge_id: EdgeId("builder-uses-config".to_string()),
+                edge_kind: EdgeKind::TYPE_USAGE,
+            }],
+            "the complete edge-receipt manifest rides carrier_edge_proofs (R7(c))"
         );
         let execution_obligation = mapper_obligation(&plan, "mapper_execution");
         assert_ne!(
@@ -8287,6 +8603,7 @@ mod tests {
             &answer,
             &budget(),
             &support,
+            &PacketProofEvidenceExtras::default(),
         );
         let config_obligation = mapper_obligation(&plan, "mapper_config");
         assert_ne!(
@@ -8319,6 +8636,7 @@ mod tests {
                 "public class PlanBuilder {}",
             )],
             &answer,
+            &PacketProofEvidenceExtras::default(),
         );
         assert!(
             !rich_view.typed_relations.is_empty(),
@@ -8336,7 +8654,7 @@ mod tests {
                 &mut plan,
                 &answer,
                 PacketObligationEvidenceView::from_budget(&budget()),
-                proof_receipts,
+                FormulaProofMode::Prove(proof_receipts),
             );
             plan
         };
@@ -8407,6 +8725,7 @@ mod tests {
                 "public class MapperConfiguration {}",
             )],
             &answer,
+            &PacketProofEvidenceExtras::default(),
         );
 
         let finalize = |proof_receipts: &PacketProofEvidence| {
@@ -8417,7 +8736,7 @@ mod tests {
                 &mut plan,
                 &answer,
                 PacketObligationEvidenceView::from_budget(&budget()),
-                proof_receipts,
+                FormulaProofMode::Prove(proof_receipts),
             );
             plan
         };
@@ -8481,6 +8800,7 @@ mod tests {
             PacketTaskClassDto::ArchitectureExplanation,
             &plan,
             &answer,
+            &PacketProofEvidenceExtras::default(),
         );
         let config_obligation = mapper_obligation(&preview, "mapper_config");
         assert_ne!(
@@ -8521,6 +8841,7 @@ mod tests {
             &answer,
             &budget(),
             &support,
+            &PacketProofEvidenceExtras::default(),
         );
         assert_eq!(
             mapper_obligation(&plan, "mapper_config").proof_status,
@@ -8535,6 +8856,7 @@ mod tests {
             &mut untouched,
             &answer,
             &support,
+            &PacketProofEvidenceExtras::default(),
         ));
         assert_eq!(untouched, plan);
 
@@ -8545,6 +8867,7 @@ mod tests {
             &mut plan,
             &answer,
             &[],
+            &PacketProofEvidenceExtras::default(),
         ));
         let demoted = mapper_obligation(&plan, "mapper_config");
         assert_eq!(
@@ -8593,5 +8916,449 @@ mod tests {
         let mut ineligible = citations.clone();
         ineligible[0].eligible_for_sufficiency = Some(false);
         assert!(packet_proof_source_range_owner(&unit, &ineligible).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 4a: the evidence-extras seam and receipt-survival rebuilds (R7)
+    // -----------------------------------------------------------------------
+
+    use crate::packet_proof_atoms::{
+        CSS_ANIMATION_FLOW_PROOF, ProofAtomId, SourceAspectKind, TrailDirection,
+        match_required_atoms,
+    };
+
+    /// A CSS structural graph for the C-formula extras tests: the entrypoint
+    /// imports the vars and base files; the base selector uses the variable.
+    /// Node kinds ride the graph nodes so the built view can classify targets.
+    fn css_structure_graph() -> GraphArtifactDto {
+        let node = |id: &str, kind: NodeKind| GraphNodeDto {
+            id: NodeId(id.to_string()),
+            label: id.to_string(),
+            kind,
+            depth: 1,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: None,
+            qualified_name: None,
+            member_access: None,
+        };
+        let edge = |id: &str, source: &str, target: &str, kind: EdgeKind| GraphEdgeDto {
+            id: EdgeId(id.to_string()),
+            source: NodeId(source.to_string()),
+            target: NodeId(target.to_string()),
+            kind,
+            confidence: None,
+            certainty: None,
+            callsite_identity: None,
+            candidate_targets: Vec::new(),
+        };
+        GraphArtifactDto::Uml {
+            id: "css-structure".to_string(),
+            title: "CSS structure".to_string(),
+            graph: GraphResponse {
+                center_id: NodeId("entry.css".to_string()),
+                nodes: vec![
+                    node("entry.css", NodeKind::FILE),
+                    node("vars.css", NodeKind::FILE),
+                    node("base.css", NodeKind::FILE),
+                    node("base-selector", NodeKind::CONSTANT),
+                    node("--speed", NodeKind::VARIABLE),
+                ],
+                edges: vec![
+                    edge("import-vars", "entry.css", "vars.css", EdgeKind::IMPORT),
+                    edge("import-base", "entry.css", "base.css", EdgeKind::IMPORT),
+                    edge("member-var", "vars.css", "--speed", EdgeKind::MEMBER),
+                    edge(
+                        "member-selector",
+                        "base.css",
+                        "base-selector",
+                        EdgeKind::MEMBER,
+                    ),
+                    edge("usage-var", "base-selector", "--speed", EdgeKind::USAGE),
+                ],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        }
+    }
+
+    fn css_answer() -> AgentAnswerDto {
+        let mut answer = answer(Vec::new());
+        answer.graphs.push(css_structure_graph());
+        answer
+    }
+
+    /// The empty-extras view is byte-identical to the stage-2 fail-closed
+    /// view: Unknown coverage everywhere, no trail scans, no anchor marks.
+    #[test]
+    fn empty_extras_keep_the_stage_two_fail_closed_view() {
+        let config = citation(
+            "MapperConfiguration",
+            "src/mapper_configuration.cs",
+            NodeKind::CLASS,
+        );
+        let mut answer = answer(vec![config.clone()]);
+        answer.graphs.push(css_structure_graph());
+        let support = vec![config_source_range_unit(
+            "MapperConfiguration",
+            "public class MapperConfiguration {}",
+        )];
+        let view =
+            packet_proof_receipts_view(&support, &answer, &PacketProofEvidenceExtras::default());
+        assert!(view.trail_scans.is_empty());
+        assert!(!view.typed_relations.is_empty());
+        assert!(
+            view.typed_relations
+                .iter()
+                .all(|receipt| receipt.coverage == TrailCoverage::Unknown),
+            "empty extras must leave every receipt at the Unknown conversion default"
+        );
+        assert!(
+            view.source_aspects
+                .iter()
+                .all(|receipt| receipt.atom_anchor.is_none()),
+            "the built view can never mint an anchor mark"
+        );
+    }
+
+    /// Attached trail scans enable C3's absence fact, which the Unknown
+    /// default correctly failed closed (rule 7): the scan roots at the base
+    /// selector's own outgoing USAGE set, untruncated.
+    #[test]
+    fn attached_trail_scan_enables_the_absence_fact_unknown_failed() {
+        let answer = css_answer();
+        let unproven = match_required_atoms(
+            &CSS_ANIMATION_FLOW_PROOF,
+            &[ProofAtomId::C3],
+            &packet_proof_receipts_view(&[], &answer, &PacketProofEvidenceExtras::default()),
+        );
+        assert!(
+            matches!(unproven, FlowProofOutcome::Unproven),
+            "with no coverage the absence fact must fail closed: {unproven:?}"
+        );
+
+        let extras = PacketProofEvidenceExtras {
+            trail_scans: vec![TrailCoverage::Scanned {
+                root: NodeId("base-selector".to_string()),
+                traversal_kinds: vec![EdgeKind::USAGE],
+                direction: TrailDirection::Outgoing,
+                depth: 1,
+                truncated: false,
+            }],
+            ..Default::default()
+        };
+        let proved = match_required_atoms(
+            &CSS_ANIMATION_FLOW_PROOF,
+            &[ProofAtomId::C3],
+            &packet_proof_receipts_view(&[], &answer, &extras),
+        );
+        assert!(
+            matches!(proved, FlowProofOutcome::Proved(_)),
+            "an untruncated selector-rooted USAGE scan discharges the absence: {proved:?}"
+        );
+    }
+
+    /// Per-edge coverage attachment replaces Unknown on exactly the keyed
+    /// edge: the deeper-rooted absence arm needs the MEMBER witness receipt to
+    /// carry its own Scanned coverage rooted at the scan root, which only
+    /// `edge_coverage` can supply.
+    #[test]
+    fn attached_edge_coverage_enables_the_deeper_rooted_absence_arm() {
+        let answer = css_answer();
+        let file_rooted_scan = TrailCoverage::Scanned {
+            root: NodeId("base.css".to_string()),
+            traversal_kinds: vec![EdgeKind::MEMBER, EdgeKind::USAGE],
+            direction: TrailDirection::Outgoing,
+            depth: 2,
+            truncated: false,
+        };
+        let scans_only = PacketProofEvidenceExtras {
+            trail_scans: vec![file_rooted_scan.clone()],
+            ..Default::default()
+        };
+        let unproven = match_required_atoms(
+            &CSS_ANIMATION_FLOW_PROOF,
+            &[ProofAtomId::C3],
+            &packet_proof_receipts_view(&[], &answer, &scans_only),
+        );
+        assert!(
+            matches!(unproven, FlowProofOutcome::Unproven),
+            "without the MEMBER witness's own coverage the deeper-rooted arm fails: {unproven:?}"
+        );
+
+        let mut with_witness = scans_only.clone();
+        with_witness.edge_coverage.insert(
+            EdgeId("member-selector".to_string()),
+            file_rooted_scan.clone(),
+        );
+        let proved = match_required_atoms(
+            &CSS_ANIMATION_FLOW_PROOF,
+            &[ProofAtomId::C3],
+            &packet_proof_receipts_view(&[], &answer, &with_witness),
+        );
+        assert!(
+            matches!(proved, FlowProofOutcome::Proved(_)),
+            "the covered MEMBER witness completes the deeper-rooted absence arm: {proved:?}"
+        );
+    }
+
+    /// A pre-built anchored extras receipt discharges C2's
+    /// `require_atom_anchor` fact, which the built view structurally cannot:
+    /// `packet_proof_source_range_owner` mints receipts with no anchor mark.
+    #[test]
+    fn anchored_extras_receipt_discharges_what_the_built_view_cannot() {
+        let owner = citation("vars.css", "styles/vars.css", NodeKind::FILE);
+        let mut answer = css_answer();
+        answer.citations.push(owner.clone());
+        // The built view CAN see a reread range for the variable — but it is
+        // unanchored, so C2 still fails closed.
+        let mut var_range = config_source_range_unit("--speed", "--speed: 200ms;");
+        var_range.symbol_id = Some("--speed".to_string());
+        let support = vec![var_range];
+        let unproven = match_required_atoms(
+            &CSS_ANIMATION_FLOW_PROOF,
+            &[ProofAtomId::C2],
+            &packet_proof_receipts_view(&support, &answer, &PacketProofEvidenceExtras::default()),
+        );
+        assert!(
+            matches!(unproven, FlowProofOutcome::Unproven),
+            "an unanchored range must not satisfy require_atom_anchor: {unproven:?}"
+        );
+
+        let extras = PacketProofEvidenceExtras {
+            anchored_receipts: vec![VerifiedSourceAspectReceipt {
+                kind: SourceAspectKind::VerifiedCarrierRange,
+                owner: owner.node_id.clone(),
+                symbol_id: Some(NodeId("--speed".to_string())),
+                start_line: Some(3),
+                end_line: Some(3),
+                atom_anchor: Some(ProofAtomId::C2),
+            }],
+            ..Default::default()
+        };
+        let proved = match_required_atoms(
+            &CSS_ANIMATION_FLOW_PROOF,
+            &[ProofAtomId::C2],
+            &packet_proof_receipts_view(&support, &answer, &extras),
+        );
+        assert!(
+            matches!(proved, FlowProofOutcome::Proved(_)),
+            "the anchored extras receipt discharges C2: {proved:?}"
+        );
+    }
+
+    /// A finalized-and-proven mapper plan for the survival tests: receipts are
+    /// the certain TYPE_USAGE edge plus the configuration source range.
+    fn proven_mapper_state() -> (PacketObligationPlanDto, AgentAnswerDto, Vec<SupportUnitDto>) {
+        let builder = citation("PlanBuilder", "src/plan_builder.cs", NodeKind::CLASS);
+        let config = citation(
+            "MapperConfiguration",
+            "src/mapper_configuration.cs",
+            NodeKind::CLASS,
+        );
+        let mut answer = answer(vec![builder.clone(), config.clone()]);
+        answer
+            .graphs
+            .push(mapper_type_usage_graph(&builder, &config));
+        let support = vec![config_source_range_unit(
+            "MapperConfiguration",
+            "public class MapperConfiguration {}",
+        )];
+        let mut plan = mapper_obligation_plan();
+        finalize_packet_obligation_plan(
+            MAPPER_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer,
+            &budget(),
+            &support,
+            &PacketProofEvidenceExtras::default(),
+        );
+        assert_eq!(
+            mapper_obligation(&plan, "mapper_config").proof_status,
+            PacketObligationProofStatusDto::Proven
+        );
+        (plan, answer, support)
+    }
+
+    /// Survival demotes when a recorded edge receipt is missing from the
+    /// current graphs — fail-closed with the rebuild reason, distinguishable
+    /// from the R5 compile reason.
+    #[test]
+    fn survival_demotes_on_a_missing_edge_receipt() {
+        let (mut plan, mut answer, support) = proven_mapper_state();
+        answer.graphs.clear();
+        refinalize_packet_obligation_plan_after_rebuild(
+            MAPPER_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer,
+            &budget(),
+            &support,
+        );
+        let demoted = mapper_obligation(&plan, "mapper_config");
+        assert_eq!(
+            demoted.proof_status,
+            PacketObligationProofStatusDto::Unsupported,
+            "{demoted:?}"
+        );
+        assert_eq!(
+            demoted.reason.as_deref(),
+            Some(FLOW_PROOF_RECEIPTS_MISSING_AFTER_REBUILD_REASON)
+        );
+    }
+
+    /// Survival demotes when a recorded carrier node resolves in neither the
+    /// retained citations nor the support units; when either still carries the
+    /// node id, the receipt survives.
+    #[test]
+    fn survival_demotes_on_a_missing_node_receipt() {
+        // The node survives through support alone: citation dropped, support
+        // unit retained.
+        let (mut plan, mut answer, support) = proven_mapper_state();
+        answer
+            .citations
+            .retain(|citation| citation.node_id.0 != "MapperConfiguration");
+        refinalize_packet_obligation_plan_after_rebuild(
+            MAPPER_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer,
+            &budget(),
+            &support,
+        );
+        assert_eq!(
+            mapper_obligation(&plan, "mapper_config").proof_status,
+            PacketObligationProofStatusDto::Proven,
+            "a node resolvable through support units survives"
+        );
+
+        // Citation AND support both gone: demote fail-closed.
+        let (mut plan, mut answer, _support) = proven_mapper_state();
+        answer
+            .citations
+            .retain(|citation| citation.node_id.0 != "MapperConfiguration");
+        refinalize_packet_obligation_plan_after_rebuild(
+            MAPPER_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer,
+            &budget(),
+            &[],
+        );
+        let demoted = mapper_obligation(&plan, "mapper_config");
+        assert_eq!(
+            demoted.proof_status,
+            PacketObligationProofStatusDto::Unsupported,
+            "{demoted:?}"
+        );
+        assert_eq!(
+            demoted.reason.as_deref(),
+            Some(FLOW_PROOF_RECEIPTS_MISSING_AFTER_REBUILD_REASON)
+        );
+    }
+
+    /// Survival never promotes: an unproven formula obligation stays unproven
+    /// at a rebuild even when every receipt that WOULD prove it is present —
+    /// rebuilds re-verify, they never re-prove (R7(d)).
+    #[test]
+    fn survival_never_promotes_an_unproven_obligation() {
+        let builder = citation("PlanBuilder", "src/plan_builder.cs", NodeKind::CLASS);
+        let config = citation(
+            "MapperConfiguration",
+            "src/mapper_configuration.cs",
+            NodeKind::CLASS,
+        );
+        let mut answer = answer(vec![builder.clone(), config.clone()]);
+        // Primary finalize WITHOUT receipts: unproven, fail-closed.
+        let mut plan = mapper_obligation_plan();
+        finalize_packet_obligation_plan(
+            MAPPER_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer,
+            &budget(),
+            &[],
+            &PacketProofEvidenceExtras::default(),
+        );
+        let unproven = mapper_obligation(&plan, "mapper_config").clone();
+        assert_ne!(
+            unproven.proof_status,
+            PacketObligationProofStatusDto::Proven
+        );
+
+        // Every proving receipt is now present — the rebuild must not care.
+        answer
+            .graphs
+            .push(mapper_type_usage_graph(&builder, &config));
+        let support = vec![config_source_range_unit(
+            "MapperConfiguration",
+            "public class MapperConfiguration {}",
+        )];
+        refinalize_packet_obligation_plan_after_rebuild(
+            MAPPER_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer,
+            &budget(),
+            &support,
+        );
+        let after = mapper_obligation(&plan, "mapper_config");
+        assert_eq!(
+            after.proof_status, unproven.proof_status,
+            "survival must never promote: {after:?}"
+        );
+        assert_eq!(after.reason, unproven.reason);
+    }
+
+    /// Legacy obligations keep FULL re-finalization at rebuild sites,
+    /// bit-identical to the primary finalize on the same state.
+    #[test]
+    fn legacy_rebuild_refinalization_is_bit_identical_to_finalize() {
+        let carrier = citation(
+            "IndexStore.persist",
+            "src/indexer/store.rs",
+            NodeKind::METHOD,
+        );
+        let answer = answer(vec![carrier]);
+        let build = || {
+            build_packet_obligation_plan(
+                INDEXING_QUESTION,
+                PacketTaskClassDto::ArchitectureExplanation,
+                &[],
+            )
+        };
+        let mut finalized = build();
+        finalize_packet_obligation_plan(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut finalized,
+            &answer,
+            &budget(),
+            &[],
+            &PacketProofEvidenceExtras::default(),
+        );
+        let mut rebuilt = build();
+        refinalize_packet_obligation_plan_after_rebuild(
+            INDEXING_QUESTION,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut rebuilt,
+            &answer,
+            &budget(),
+            &[],
+        );
+        assert!(
+            finalized.claim_obligations.iter().any(
+                |obligation| obligation.proof_status != PacketObligationProofStatusDto::Planned
+            ),
+            "the indexing question must actually finalize obligations"
+        );
+        assert_eq!(
+            finalized, rebuilt,
+            "Legacy rebuild re-finalization must be bit-identical to the primary finalize"
+        );
     }
 }
