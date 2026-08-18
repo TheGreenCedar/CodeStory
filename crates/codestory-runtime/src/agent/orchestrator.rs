@@ -968,9 +968,8 @@ fn sql_schema_dialect_rank(path: &str) -> f32 {
     let lower = packet_display_path(path).to_ascii_lowercase();
     if lower.contains("sqlite") {
         4.0
-    } else if lower.contains("mysql") {
-        3.0
-    } else if lower.contains("postgres") || lower.contains("postgresql") {
+    } else if lower.contains("mysql") || lower.contains("postgres") || lower.contains("postgresql")
+    {
         3.0
     } else if lower.contains("sqlserver") {
         1.0
@@ -1245,7 +1244,7 @@ fn packet_first_css_class_display(source: &str) -> Option<(String, u32)> {
             continue;
         }
         let name = trimmed
-            .split(|ch: char| matches!(ch, '{' | ',' | ':' | ' ' | '\t'))
+            .split(['{', ',', ':', ' ', '\t'])
             .next()
             .unwrap_or(trimmed)
             .trim();
