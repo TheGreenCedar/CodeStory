@@ -151,7 +151,7 @@ Full routing: [docs/README.md](docs/README.md).
 
 ### Language expansion holdout (18 tasks)
 
-Broader public-repo evidence uses the [`language-support-ab`](benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json) manifest across 18 pinned OSS packages. There is no current public 18-task claim. The latest recorded paired run is the 2026-08-10 0.17 rerun, which completed 108 agent processes but failed the publication bar. See the [language-expansion holdout evidence record](docs/testing/language-expansion-holdout-stats.md) for the exact run and rejection details.
+Broader public-repo evidence uses the [`language-support-ab`](benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json) manifest across 18 pinned OSS packages. There is no current public 18-task claim: no 18×3 nested `summary.json` has passed the publication bar, so this page has no savings headline and no 18-row quality table. See the [language-expansion holdout evidence record](docs/testing/language-expansion-holdout-stats.md) for the 2026-08-18 packet-gate census, the nested A/B attempt that did not produce a sheet, and the rejected 2026-08-10 rerun.
 
 ## License
 
