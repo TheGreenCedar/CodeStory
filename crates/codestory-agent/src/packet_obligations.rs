@@ -767,9 +767,9 @@ fn push_query_obligation(
 /// what compile retains — a receipt must never be minted from a unit compile
 /// would drop, or R5's post-compile re-verification could not trust the
 /// compiled support. One divergence is deliberate and safe in that direction:
-/// this filter rejects whitespace-only snippets (`trim().is_empty()`) where
-/// compile only rejects empty ones (`is_empty()`), making the filter strictly
-/// stricter. Never loosen this side past compile's predicate.
+/// this filter rejects whitespace-only snippets where compile rejects only
+/// snippets with no bytes at all, making the filter strictly stricter.
+/// Never loosen this side past compile's predicate.
 pub fn packet_proof_source_range_owner<'a>(
     unit: &SupportUnitDto,
     citations: &'a [AgentCitationDto],

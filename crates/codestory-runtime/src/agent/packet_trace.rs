@@ -240,10 +240,10 @@ fn select_packet_candidate_indices(
     // ATOM-NEED TIER (gate 9). Atom-needed evidence has to survive three
     // successive bounded selections — the resolution window, this
     // resolved-hit → citation carry, and the graph cap — and R6 only made
-    // the first of them atom-aware. TypeMap and TypeMapPlanBuilder were
-    // admitted and resolved (one of them through an R6 promotion) and then
-    // dropped HERE, by pure rank order, while five of the packet's sixteen
-    // citation slots went unused: nothing downstream could recover them,
+    // the first of them atom-aware. Atom-needed types were admitted and
+    // resolved (some through an R6 promotion) and then dropped HERE, by pure
+    // rank order, while several of the packet's citation slots went unused:
+    // nothing downstream could recover them,
     // because the post-pass roots at citations and the obligations prove on
     // support built from citations.
     //
