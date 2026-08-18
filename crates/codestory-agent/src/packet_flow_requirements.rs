@@ -1945,6 +1945,80 @@ mod tests {
     }
 
     #[test]
+    fn http_handle_owner_proves_server_request_dispatch() {
+        let requirement =
+            packet_flow_requirements_for_terms(
+                &packet_probe_terms(
+                    "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.",
+                ),
+                PacketTaskClassDto::RouteTracing,
+            )
+            .into_iter()
+            .find(|requirement| requirement.id == "request_dispatch")
+            .expect("server request flow should require dispatch");
+
+        assert!(requirement.evidence.citation_proves(&witness(
+            "ServerEngine.handleHTTPRequest",
+            "src/http/server.go",
+            NodeKind::METHOD,
+        )));
+        assert!(requirement.evidence.citation_proves(&witness(
+            "app.handle",
+            "lib/application.js",
+            NodeKind::FUNCTION,
+        )));
+        for negative in [
+            "IRouter.Group",
+            "Telemetry.handleHTTPRequest",
+            "HttpClient.handleHTTPRequest",
+            "handleHTTPRequest",
+        ] {
+            assert!(
+                !requirement.evidence.citation_proves(&witness(
+                    negative,
+                    "src/http/server.go",
+                    NodeKind::METHOD,
+                )),
+                "{negative} must not prove server request dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn named_client_send_proves_client_transport_send() {
+        let requirement = packet_flow_requirements_for_terms(
+            &packet_probe_terms(
+                "Explain how an HTTP client exposes top-level helpers, provides client convenience methods, finalizes requests before transport send, and materializes responses.",
+            ),
+            PacketTaskClassDto::DataFlow,
+        )
+        .into_iter()
+        .find(|requirement| requirement.id == "client_transport_send")
+        .expect("client send flow should require transport send");
+
+        for positive in ["BaseClient.send", "IOClient.send", "HttpTransport.send"] {
+            assert!(
+                requirement.evidence.citation_proves(&witness(
+                    positive,
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                )),
+                "{positive} should prove client transport send"
+            );
+        }
+        for negative in ["Session.send", "DatabaseClient.send", "HookClient.send"] {
+            assert!(
+                !requirement.evidence.citation_proves(&witness(
+                    negative,
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                )),
+                "{negative} must not prove client transport send"
+            );
+        }
+    }
+
+    #[test]
     fn server_route_flow_requires_registration_and_dispatch_without_response_terminal() {
         let requirements = packet_flow_requirements_for_terms(
             &packet_probe_terms(

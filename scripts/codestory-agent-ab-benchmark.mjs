@@ -2959,6 +2959,32 @@ function packetCommandArgs(repoConfig, task, opts = {}) {
   return args;
 }
 
+function drillPacketCommandArgs(repoConfig, task, opts, packet) {
+  const drill = packet?.disposition?.drill;
+  const parentPacketId = String(drill?.parent_packet_id ?? "").trim();
+  const options = Array.isArray(drill?.options) ? drill.options : [];
+  const optionIds = options
+    .map((option) => String(option?.id ?? "").trim())
+    .filter(Boolean);
+  if (!parentPacketId || optionIds.length === 0) {
+    return null;
+  }
+  const args = packetCommandArgs(repoConfig, task, opts);
+  args.push("--parent-packet-id", parentPacketId);
+  for (const optionId of optionIds) {
+    args.push("--option-id", optionId);
+  }
+  const coreGenerationId = String(drill.core_generation_id ?? "").trim();
+  if (coreGenerationId) {
+    args.push("--core-generation-id", coreGenerationId);
+  }
+  const retrievalGeneration = String(drill.retrieval_generation ?? "").trim();
+  if (retrievalGeneration) {
+    args.push("--retrieval-generation", retrievalGeneration);
+  }
+  return args;
+}
+
 function displayShellArg(value) {
   const text = String(value ?? "");
   if (!/[\s'"&|<>^]/.test(text)) {
@@ -3002,6 +3028,7 @@ function preludePublicFields(prelude) {
     packet_contract_runtime: prelude.packet_contract_runtime ?? null,
     packet_extra_probe_count: prelude.packet_extra_probe_count ?? null,
     packet_extra_probe_strategy: prelude.packet_extra_probe_strategy ?? null,
+    packet_drill_continuation: prelude.packet_drill_continuation === true,
   };
 }
 
@@ -3776,18 +3803,18 @@ function packetPreludeContractBlockers(packet, stdout, options = {}) {
 async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, codestoryCli, env) {
   const args = packetCommandArgs(repoConfig, run.task, opts);
   const extraProbes = packetCommandExtraProbes(run.task, opts);
-  const command = displayCommand(codestoryCli, args);
+  let command = displayCommand(codestoryCli, args);
+  let activeArgs = args;
   const stdoutPath = path.join(outDir, `${runId}.codestory-packet.stdout.json`);
   const stderrPath = path.join(outDir, `${runId}.codestory-packet.stderr.txt`);
   const started = performance.now();
-  const result = await runProcess(codestoryCli, args, {
+  let result = await runProcess(codestoryCli, args, {
     cwd: repoConfig.path,
     env,
     signal: opts.signal,
     timeoutMs: opts.timeoutMs,
     timeoutMessage: `CodeStory packet prelude timed out after ${opts.timeoutMs}ms.`,
   });
-  const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
   await writeFile(stdoutPath, result.stdout, "utf8");
   await writeFile(stderrPath, result.stderr, "utf8");
 
@@ -3800,6 +3827,46 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
       parseError = error.message;
     }
   }
+
+  let activeStdoutPath = stdoutPath;
+  let activeStderrPath = stderrPath;
+  let drillContinuation = false;
+  if (
+    result.status === "pass" &&
+    !parseError &&
+    packet?.disposition?.kind === "drill_once"
+  ) {
+    const drillArgs = drillPacketCommandArgs(repoConfig, run.task, opts, packet);
+    if (drillArgs) {
+      const drillStdoutPath = path.join(outDir, `${runId}.codestory-packet-drill.stdout.json`);
+      const drillStderrPath = path.join(outDir, `${runId}.codestory-packet-drill.stderr.txt`);
+      const drillResult = await runProcess(codestoryCli, drillArgs, {
+        cwd: repoConfig.path,
+        env,
+        signal: opts.signal,
+        timeoutMs: opts.timeoutMs,
+        timeoutMessage: `CodeStory packet drill continuation timed out after ${opts.timeoutMs}ms.`,
+      });
+      await writeFile(drillStdoutPath, drillResult.stdout, "utf8");
+      await writeFile(drillStderrPath, drillResult.stderr, "utf8");
+      if (drillResult.status === "pass") {
+        try {
+          packet = JSON.parse(drillResult.stdout);
+          result = drillResult;
+          activeArgs = drillArgs;
+          command = displayCommand(codestoryCli, drillArgs);
+          activeStdoutPath = drillStdoutPath;
+          activeStderrPath = drillStderrPath;
+          drillContinuation = true;
+          parseError = null;
+        } catch (error) {
+          parseError = error.message;
+        }
+      }
+    }
+  }
+
+  const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
   const manifestQuality = packetManifestQualitySummary(packet, run.task);
   const contractBlockers = parseError
     ? [`packet JSON parse failed: ${parseError}`]
@@ -3810,15 +3877,15 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   const dispositionTelemetry = packetDispositionTelemetry(packet, manifestQuality);
   const publicPrelude = preludePublicFields({
     command,
-    args,
+    args: activeArgs,
     status: result.status === "pass" && !parseError && !contractBlockers.length ? "pass" : "fail",
     process_status: result.status,
     exit_code: result.exitCode,
     signal: result.signal,
     error: result.error ?? parseError ?? contractBlockers[0] ?? null,
     wall_ms: wallMs,
-    stdout_path: stdoutPath,
-    stderr_path: stderrPath,
+    stdout_path: activeStdoutPath,
+    stderr_path: activeStderrPath,
     stdout_bytes: Buffer.byteLength(result.stdout, "utf8"),
     stderr_bytes: Buffer.byteLength(result.stderr, "utf8"),
     packet_parse_error: parseError,
@@ -3836,6 +3903,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     packet_contract_runtime: packet?._meta?.codestory_publication?.contract_runtime ?? null,
     packet_extra_probe_count: extraProbes.length,
     packet_extra_probe_strategy: packetExtraProbeStrategy(extraProbes),
+    packet_drill_continuation: drillContinuation,
     packet_contract_blockers: contractBlockers,
   });
   return {
@@ -10241,6 +10309,7 @@ export {
   retrievalStatusCommandArgs,
   packetComposition,
   packetCommandArgs,
+  drillPacketCommandArgs,
   packetForAgentPrompt,
   packetManifestExtraProbes,
   packetManifestQualitySummary,

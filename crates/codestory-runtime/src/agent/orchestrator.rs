@@ -924,9 +924,7 @@ fn promote_retained_schema_entity_probes(question: &str, answer: &mut AgentAnswe
                 .trim()
                 .to_string()
         };
-        if table_token.is_empty()
-            || normalize_identifier(&table_token).contains("createtable")
-        {
+        if table_token.is_empty() || normalize_identifier(&table_token).contains("createtable") {
             continue;
         }
         let alias_name = format!("CREATE TABLE {table_token}");
@@ -1214,10 +1212,7 @@ fn packet_first_css_at_rule_display(source: &str, rule: &str) -> Option<(String,
                 .unwrap_or(trimmed)
                 .trim()
                 .to_string();
-            return Some((
-                name,
-                index.saturating_add(1).try_into().unwrap_or(u32::MAX),
-            ));
+            return Some((name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)));
         }
     }
     None
@@ -9654,7 +9649,9 @@ mod tests {
         let protected_paths = answer
             .citations
             .iter()
-            .filter(|citation| citation.coverage_role.as_deref() == Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE))
+            .filter(|citation| {
+                citation.coverage_role.as_deref() == Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE)
+            })
             .filter_map(|citation| citation.file_path.as_deref())
             .map(packet_display_path)
             .collect::<Vec<_>>();
@@ -9667,7 +9664,9 @@ mod tests {
             "mysql dialect should be retained: {protected_paths:?}"
         );
         assert!(
-            protected_paths.iter().any(|path| path.contains("PostgreSql")),
+            protected_paths
+                .iter()
+                .any(|path| path.contains("PostgreSql")),
             "postgres dialect should be retained: {protected_paths:?}"
         );
         assert!(
@@ -9703,23 +9702,19 @@ mod tests {
             "styles/motion/spin.css",
             "@keyframes spin {\n  from { transform: rotate(0deg); }\n}\n.spin {\n  animation-name: spin;\n}\n",
         );
-        write_packet_fixture_file(
-            &root,
-            "bundle.min.css",
-            ".unused { color: red; }\n",
-        );
+        write_packet_fixture_file(&root, "bundle.min.css", ".unused { color: red; }\n");
 
         let mut answer = packet_answer_fixture(
             "Explain how the stylesheet defines shared animation variables and base classes and connects named animation classes to keyframes.",
-            vec![test_packet_citation(
-                "entry",
-                "styles/entry.css",
-                0.4,
-            )],
+            vec![test_packet_citation("entry", "styles/entry.css", 0.4)],
         );
         answer.citations[0].file_path = Some(root.join("styles/entry.css").display().to_string());
 
-        maybe_append_cited_stylesheet_import_citations(&root, "Explain how the stylesheet defines shared animation variables and base classes and connects named animation classes to keyframes.", &mut answer);
+        maybe_append_cited_stylesheet_import_citations(
+            &root,
+            "Explain how the stylesheet defines shared animation variables and base classes and connects named animation classes to keyframes.",
+            &mut answer,
+        );
 
         let displays = answer
             .citations
@@ -10986,6 +10981,39 @@ mod tests {
 
         rank_packet_evidence(question, &mut answer);
         assert_eq!(answer.citations[0].display_name, "DocsRouteHandler");
+    }
+
+    #[test]
+    fn packet_ranking_prefers_primary_format_header_over_wide_char_sibling() {
+        let question = "Explain how formatting arguments reach vformat and format_to output paths.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("vformat_to", "include/tool/xchar.h", 0.9),
+                test_packet_citation("vformat", "include/tool/format.h", 0.5),
+                test_packet_citation("format_to", "include/tool/base.h", 0.4),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut answer);
+
+        let paths = answer
+            .citations
+            .iter()
+            .filter_map(|citation| citation.file_path.as_deref())
+            .collect::<Vec<_>>();
+        let format_rank = paths
+            .iter()
+            .position(|path| *path == "include/tool/format.h")
+            .expect("primary format header should remain cited");
+        let wide_rank = paths
+            .iter()
+            .position(|path| *path == "include/tool/xchar.h")
+            .expect("wide-char sibling should remain cited");
+        assert!(
+            format_rank < wide_rank,
+            "primary format header should outrank the wide-char sibling: {paths:?}"
+        );
     }
 
     #[test]

@@ -175,13 +175,7 @@ pub fn packet_citation_rank(
         score -= 8.0;
     }
 
-    score += packet_flow_shape_rank_bonus(
-        citation,
-        &display,
-        &normalized_display,
-        &path,
-        terms,
-    );
+    score += packet_flow_shape_rank_bonus(citation, &display, &normalized_display, &path, terms);
 
     score
 }
@@ -461,7 +455,7 @@ fn packet_flow_shape_rank_bonus(
         bonus += packet_client_send_rank_bonus(normalized_display, path, terms);
     }
     if packet_terms_indicate_runtime_formatting_flow(terms) {
-        bonus += packet_runtime_formatting_rank_bonus(normalized_display, path);
+        bonus += packet_runtime_formatting_rank_bonus(normalized_display, path, terms);
     }
     if let Some(role) = citation.coverage_role.as_deref() {
         bonus += packet_coverage_role_rank_bonus(role);
@@ -743,7 +737,21 @@ fn packet_sql_schema_rank_bonus(normalized_display: &str, path: &str, terms: &[S
     bonus
 }
 
-fn packet_runtime_formatting_rank_bonus(normalized_display: &str, path: &str) -> f32 {
+fn packet_runtime_formatting_question_wants_wide_char(terms: &[String]) -> bool {
+    terms.iter().any(|term| {
+        let normalized = normalize_identifier(term);
+        normalized.contains("wchar")
+            || normalized.contains("wide")
+            || normalized == "xchar"
+            || normalized.contains("wchar_t")
+    })
+}
+
+fn packet_runtime_formatting_rank_bonus(
+    normalized_display: &str,
+    path: &str,
+    terms: &[String],
+) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
     let path_stem = packet_path_file_stem(path);
@@ -786,6 +794,16 @@ fn packet_runtime_formatting_rank_bonus(normalized_display: &str, path: &str) ->
         || display_or_path.contains("support")
     {
         bonus -= 5.0;
+    }
+    if !packet_runtime_formatting_question_wants_wide_char(terms) {
+        let normalized_path = normalize_identifier(path);
+        if path_stem == "xchar"
+            || normalized_path.contains("xchar")
+            || normalized_display.contains("wchar")
+            || normalized_path.contains("wchar")
+        {
+            bonus -= 8.0;
+        }
     }
 
     bonus
@@ -1143,8 +1161,7 @@ mod tests {
         let generated = test_rank_citation("bundle", "bundle.min.css", 1.0);
 
         assert!(
-            packet_citation_rank(&source, &terms, true)
-                > packet_citation_rank(&docs, &terms, true)
+            packet_citation_rank(&source, &terms, true) > packet_citation_rank(&docs, &terms, true)
         );
         assert!(
             packet_citation_rank(&source, &terms, true)
@@ -1366,13 +1383,11 @@ mod tests {
             )
         );
         assert!(
-            packet_form_validation_rank_bonus(
-                "pattern",
-                "html/forms/form-validation/min-max.html"
-            ) > packet_form_validation_rank_bonus(
-                "validate",
-                "javascript/building-blocks/events/preventdefault-validation.js"
-            )
+            packet_form_validation_rank_bonus("pattern", "html/forms/form-validation/min-max.html")
+                > packet_form_validation_rank_bonus(
+                    "validate",
+                    "javascript/building-blocks/events/preventdefault-validation.js"
+                )
         );
     }
 
@@ -1431,14 +1446,45 @@ mod tests {
     #[test]
     fn runtime_formatting_rank_bonus_prefers_output_and_error_source_files() {
         assert!(
-            packet_runtime_formatting_rank_bonus("bufferappend", "src/format.cc")
-                > packet_runtime_formatting_rank_bonus("duration", "include/fmt/chrono.h")
+            packet_runtime_formatting_rank_bonus("bufferappend", "src/format.cc", &[])
+                > packet_runtime_formatting_rank_bonus("duration", "include/fmt/chrono.h", &[])
         );
         assert!(
-            packet_runtime_formatting_rank_bonus("formaterrorcode", "src/os.cc")
-                > packet_runtime_formatting_rank_bonus("formaterrorcode", "include/fmt/format.h")
+            packet_runtime_formatting_rank_bonus("formaterrorcode", "src/os.cc", &[])
+                > packet_runtime_formatting_rank_bonus(
+                    "formaterrorcode",
+                    "include/fmt/format.h",
+                    &[]
+                )
         );
-        assert!(packet_runtime_formatting_rank_bonus("formatto", "include/fmt/format.h") > 0.0);
+        assert!(
+            packet_runtime_formatting_rank_bonus("formatto", "include/fmt/format.h", &[]) > 0.0
+        );
+    }
+
+    #[test]
+    fn runtime_formatting_rank_bonus_demotes_wide_char_siblings_unless_asked() {
+        let default_terms = ["format".to_string(), "vformat".to_string()];
+        assert!(
+            packet_runtime_formatting_rank_bonus(
+                "vformat",
+                "include/tool/format.h",
+                &default_terms,
+            ) > packet_runtime_formatting_rank_bonus(
+                "vformatto",
+                "include/tool/xchar.h",
+                &default_terms,
+            )
+        );
+        let wide_terms = ["format".to_string(), "wchar".to_string()];
+        assert!(
+            packet_runtime_formatting_rank_bonus("vformatto", "include/tool/xchar.h", &wide_terms)
+                >= packet_runtime_formatting_rank_bonus(
+                    "vformatto",
+                    "include/tool/xchar.h",
+                    &default_terms,
+                )
+        );
     }
 
     #[test]

@@ -631,11 +631,12 @@ mod tests {
     use super::*;
     use crate::agent::packet_budget::tests::test_packet;
     use crate::agent::packet_freshness::fresh_index_observation;
+    use codestory_agent::packet_command::packet_follow_up_argv;
     use codestory_contracts::api::{
         AgentCitationDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
-        AgentRetrievalStepStatusDto, NodeId, NodeKind, PacketPlanDto, PacketProbeDto,
-        PacketProbeResolutionDto, PacketProbeResolutionStatusDto, PacketTaskClassDto,
-        SearchHitOrigin, SourceCoverageObservationDto,
+        AgentRetrievalStepStatusDto, NodeId, NodeKind, PacketBudgetModeDto, PacketPlanDto,
+        PacketProbeDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto,
+        PacketTaskClassDto, SearchHitOrigin, SourceCoverageObservationDto,
     };
     use std::path::Path;
 
@@ -756,6 +757,86 @@ mod tests {
                 .iter()
                 .any(|option| { option.symbol_id.as_deref() == Some("Router.use") })
         );
+    }
+
+    #[test]
+    fn typed_drill_continuation_proves_omitted_http_handle_after_one_round() {
+        let mut packet = test_packet(
+            "Trace how an HTTP server dispatches an incoming request to a handler.",
+            98_304,
+        );
+        packet.answer.freshness = Some(fresh_index_observation());
+        packet.answer.citations = vec![eligible_citation("Router.use", "src/router.rs")];
+        let mut obligation = claim_obligation(
+            PacketClaimObligationKindDto::Dispatch,
+            PacketObligationProofStatusDto::Reported,
+        );
+        obligation.id = "request_dispatch".to_string();
+        obligation.carrier_node_ids = vec![NodeId("Router.use".to_string())];
+        packet.plan = empty_plan();
+        packet.plan.obligations.claim_obligations = vec![obligation];
+
+        let (_support, first) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            None,
+        );
+        assert_eq!(first.kind, PacketDispositionKindDto::DrillOnce);
+        let drill = first.drill.expect("bounded drill");
+        let argv = packet_follow_up_argv(
+            Path::new("/tmp/project"),
+            &packet.question,
+            PacketBudgetModeDto::Standard,
+            Some(&drill),
+        )
+        .expect("drill_once must publish a typed continuation");
+        assert!(argv.contains(&"--parent-packet-id".to_string()));
+        assert!(argv.contains(&packet.packet_id));
+        assert!(argv.contains(&"--option-id".to_string()));
+        assert!(argv.iter().any(|argument| argument.contains("Router.use")));
+        assert!(!argv.iter().any(|argument| argument == "deep"));
+        assert!(
+            !argv.contains(&"--core-generation-id".to_string()),
+            "empty generation pins must not be forwarded"
+        );
+
+        packet.answer.citations.push(eligible_citation(
+            "ServerEngine.handleHTTPRequest",
+            "src/router.rs",
+        ));
+        packet.plan.obligations.claim_obligations[0].proof_status =
+            PacketObligationProofStatusDto::Proven;
+        packet.plan.obligations.claim_obligations[0]
+            .carrier_node_ids
+            .push(NodeId("ServerEngine.handleHTTPRequest".to_string()));
+        let request = AgentPacketRequestDto {
+            question: packet.question.clone(),
+            budget: Default::default(),
+            task_class: None,
+            probes: Vec::new(),
+            extra_probes: Vec::new(),
+            include_evidence: true,
+            latency_budget_ms: None,
+            parent_packet_id: Some(packet.packet_id.clone()),
+            option_ids: drill
+                .options
+                .iter()
+                .map(|option| option.id.clone())
+                .collect(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let (_support, continuation) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            Some(&request),
+        );
+        assert_eq!(continuation.kind, PacketDispositionKindDto::Supported);
+        assert!(continuation.is_terminal());
     }
 
     #[test]

@@ -31,19 +31,7 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
     let mut operation = runtime.run_public_operation("packet", || {
         runtime
             .browser
-            .packet(AgentPacketRequestDto {
-                question: cmd.question.clone(),
-                budget: cmd.budget.into(),
-                task_class: cmd.task_class.map(Into::into),
-                probes: cmd.probes.clone(),
-                extra_probes: cmd.extra_probes.clone(),
-                include_evidence: !cmd.no_evidence,
-                latency_budget_ms: cmd.latency_budget_ms,
-                parent_packet_id: None,
-                option_ids: Vec::new(),
-                core_generation_id: None,
-                retrieval_generation: None,
-            })
+            .packet(packet_request_from_command(&cmd))
             .map_err(map_api_error)
     })?;
     let executable = std::env::current_exe()?;
@@ -70,6 +58,22 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
     let rendered = RenderedPublicOutput::structured(&operation.value, markdown)?;
     let operation = runtime::map_public_operation(operation, |_| rendered);
     emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
+}
+
+pub(in crate::app) fn packet_request_from_command(cmd: &PacketCommand) -> AgentPacketRequestDto {
+    AgentPacketRequestDto {
+        question: cmd.question.clone(),
+        budget: cmd.budget.into(),
+        task_class: cmd.task_class.map(Into::into),
+        probes: cmd.probes.clone(),
+        extra_probes: cmd.extra_probes.clone(),
+        include_evidence: !cmd.no_evidence,
+        latency_budget_ms: cmd.latency_budget_ms,
+        parent_packet_id: cmd.parent_packet_id.clone(),
+        option_ids: cmd.option_ids.clone(),
+        core_generation_id: cmd.core_generation_id.clone(),
+        retrieval_generation: cmd.retrieval_generation.clone(),
+    }
 }
 
 pub(in crate::app) fn enforce_packet_cli_json_output_budget(
@@ -261,4 +265,44 @@ pub(crate) fn packet_disposition_label(kind: PacketDispositionKindDto) -> &'stat
 
 pub(crate) fn packet_sufficiency_label(kind: PacketDispositionKindDto) -> &'static str {
     packet_disposition_label(kind)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::packet_request_from_command;
+    use crate::args::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn packet_request_forwards_typed_drill_flags() {
+        let cli = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--project",
+            "/tmp/project",
+            "--question",
+            "explain indexing",
+            "--parent-packet-id",
+            "packet-1",
+            "--option-id",
+            "omitted_mandatory_support:symbol%3A42",
+            "--core-generation-id",
+            "core-1",
+            "--retrieval-generation",
+            "retrieval-1",
+        ])
+        .expect("parse packet drill flags");
+        let Command::Packet(cmd) = cli.command else {
+            panic!("expected packet command");
+        };
+        let request = packet_request_from_command(&cmd);
+        assert_eq!(request.parent_packet_id.as_deref(), Some("packet-1"));
+        assert_eq!(
+            request.option_ids,
+            vec!["omitted_mandatory_support:symbol%3A42".to_string()]
+        );
+        assert_eq!(request.core_generation_id.as_deref(), Some("core-1"));
+        assert_eq!(request.retrieval_generation.as_deref(), Some("retrieval-1"));
+        assert_eq!(request.question, "explain indexing");
+    }
 }

@@ -23,13 +23,50 @@ This is a packet-manifest census, not a nested agent A/B and not a README table.
 
 The two remaining packet-manifest misses, after two ranking-shaped tries on each, were `swift-alamofire-request-flow` (files 100%, symbols 0.50: `Session.request`, `Request.resume`, `DataRequest.validate`) and `html-mdn-form-validation` (files 50%: `full-example.html`, `min-max.html`). The other 16 tasks, including Requests, AutoMapper, animate.css, Redis, and Chinook, passed their packet-manifest thresholds. That 16/18 score is the promotion floor for attempting a nested A/B. It is not answer quality and not a public claim.
 
-## 2026-08-18 nested A/B attempt (no sheet)
+## 2026-08-18 nested A/B (diagnostic, no public claim)
 
-The Requests canary packet on the same head was `supported`, under the compact 98,304-byte cap (about 91,631 bytes), with Metal `embedding_accelerator_execution_verified: true`. A launcher-provisioned explicit package of that CLI stamped managed 0.17.0 identity (`cli_source=managed`, pinned plugin/CLI pair, `known_override_skew_channel=false`). Direct `--codestory-cli target/release/codestory-cli` is `direct_cli_launch` and fails `--publishable`.
+This nested 18×3 sheet exists. It is **not** a README claim: CodeStory answer quality is behind the no-CodeStory arm on the same sheet.
 
-The nested Codex runner did not start in the Cursor private-worker sandbox: `codex exec` stayed in `dyld_start` at about 112 KB RSS with empty stdout, so there is no `summary.json` / `runs.jsonl` for an 18×3 sheet. Stopped rather than letting 107 more agents run on a rejected or empty sheet.
+| Field | Value |
+| --- | --- |
+| Artifact | `target/agent-benchmark/language-support-ab-60431e79-full` |
+| Source head | `60431e79` |
+| CodeStory CLI | managed 0.17.0, SHA-256 `b6abd4e0414f16a97b4b6b45e312c6bf7c5366567664929e538e9d0cfa228158` |
+| Runner | ChatGPT Codex 0.148 (`/Applications/ChatGPT.app/Contents/Resources/codex`) |
+| Host | Alberts-MacBook-Air.local, Apple M5 |
+| Date | 2026-08-18 |
+| Repeats | 3 per arm; 54/54 process completions each |
+| Quality | **with 30/54**, without **44/54** |
+| After-packet source reads | 0 on the with arm |
 
-Finish the nested run from an unsandboxed Apple Silicon login session (Terminal, not a Cursor cloud/private-worker shell) after provisioning the same CLI through the plugin launcher:
+Do not headline the token, tool, or source-read reductions. Quality is behind, so the sheet cannot support a savings claim.
+
+The nested Codex session had no CodeStory MCP `packet` tool. The harness supplied one CLI packet prelude. `drill_once` packets then dead-ended: CLI `packet` did not forward `parent_packet_id` / `option_ids`, and the nested prompt forbade substituting shell/CLI for MCP. Packet JSON and transcripts, not the summary table, are the evidence for those clusters.
+
+| Task | With quality | Without quality | First disposition (with) | Notes from packet JSON / transcripts |
+| --- | ---: | ---: | --- | --- |
+| python-requests-session-flow | 3/3 | 3/3 | `supported` | |
+| java-commons-lang-string-utils | 3/3 | 3/3 | `supported` | |
+| rust-ripgrep-search-pipeline | 3/3 | 3/3 | `supported` | |
+| javascript-express-routing-flow | 3/3 | 3/3 | `supported` | |
+| typescript-swr-hook-flow | 3/3 | 3/3 | `not_established` | Quality still passed |
+| cpp-fmt-formatting-flow | 0/3 | 3/3 | `supported` | Packet ranked wchar `vformat_to` over the char format path |
+| c-redis-command-loop | 3/3 | 3/3 | `supported` | |
+| go-gin-route-dispatch | 0/3 | 3/3 | `drill_once` | `omitted-edge:request_dispatch`; agent could not continue |
+| ruby-jekyll-site-build | 3/3 | 2/3 | `supported` | |
+| php-monolog-record-flow | 3/3 | 3/3 | `supported` | |
+| csharp-automapper-map-flow | 0/3 | 2/3 | `drill_once` | `omitted-material:mapper_config` / `mapper_execution` |
+| kotlin-okio-buffer-flow | 0/3 | 0/3 | `supported` | Both arms fail; not the CodeStory-vs-baseline gap |
+| swift-alamofire-request-flow | 2/3 | 3/3 | `not_established` | Packet-manifest 0/3 after two ranking-shaped tries |
+| dart-http-client-flow | 0/3 | 3/3 | `drill_once` | `omitted-material:client_transport_send`; `IOClient.send` was already cited |
+| bash-nvm-install-dispatch | 3/3 | 3/3 | `not_established` | Quality still passed |
+| html-mdn-form-validation | 0/3 | 1/3 | `not_established` | Packet-manifest 0/3 after two ranking-shaped tries |
+| css-animate-base-and-keyframes | 1/3 | 3/3 | `drill_once` | `omitted-material:css_animation_structure` (proof atoms, not the dispatch/send carrier idiom) |
+| sql-chinook-schema-relations | 0/3 | 0/3 | `supported` | Both arms fail; not the CodeStory-vs-baseline gap |
+
+A Homebrew Cask `codex` 0.146 install hung in `dyld_start` in a Cursor private-worker sandbox; this sheet used the ChatGPT.app binary from an unsandboxed login session. Direct `--codestory-cli target/release/codestory-cli` is `direct_cli_launch` and fails `--publishable`.
+
+`--publishable` still requires a `supported` first packet and managed 0.17.0 identity. This sheet is diagnostic. Replace the README Evaluation table only from a later `summary.json` in which CodeStory quality is at least the no-CodeStory arm.
 
 ```zsh
 source target/agent-benchmark/managed-local-0.17.0/managed-env.sh
@@ -54,8 +91,6 @@ node scripts/codestory-agent-ab-benchmark.mjs \
   --out-dir "$PWD/target/agent-benchmark/language-support-ab-$(git rev-parse --short HEAD)" \
   --canary-task-id python-requests-session-flow
 ```
-
-If the first CodeStory packet is `partial` with cap or obligation failures, stop the suite. Replace the README Evaluation table only from that run's `summary.json` / `runs.jsonl`. Headline a savings claim only if CodeStory quality is at least the no-CodeStory arm on that sheet.
 
 ## Rejected 2026-08-10 nested rerun
 

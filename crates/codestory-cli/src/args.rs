@@ -565,6 +565,32 @@ pub(crate) struct PacketCommand {
     pub(crate) latency_budget_ms: Option<u32>,
     #[arg(
         long,
+        value_name = "ID",
+        requires = "option_ids",
+        help = "Parent packet id for a one-round DrillOnce continuation. Requires --option-id."
+    )]
+    pub(crate) parent_packet_id: Option<String>,
+    #[arg(
+        long = "option-id",
+        value_name = "ID",
+        requires = "parent_packet_id",
+        help = "Drill option id from the parent packet's disposition. Repeatable. Requires --parent-packet-id."
+    )]
+    pub(crate) option_ids: Vec<String>,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Pin the continuation to this core generation id from the parent packet."
+    )]
+    pub(crate) core_generation_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Pin the continuation to this retrieval generation from the parent packet."
+    )]
+    pub(crate) retrieval_generation: Option<String>,
+    #[arg(
+        long,
         value_name = "PATH",
         help = "Write per-step packet retrieval trace JSON for golden scoring."
     )]
@@ -2934,6 +2960,75 @@ mod tests {
         let help = render_subcommand_help("packet");
         assert!(help.contains("--profile <PROFILE>"));
         assert!(help.contains("--run-id <ID>"));
+        assert!(help.contains("--parent-packet-id <ID>"));
+        assert!(help.contains("--option-id <ID>"));
+        assert!(help.contains("--core-generation-id <ID>"));
+        assert!(help.contains("--retrieval-generation <ID>"));
+    }
+
+    #[test]
+    fn packet_parses_typed_drill_continuation_flags() {
+        let packet = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--project",
+            "/tmp/project",
+            "--question",
+            "explain indexing",
+            "--parent-packet-id",
+            "packet-1",
+            "--option-id",
+            "omitted_mandatory_support:symbol%3A42",
+            "--core-generation-id",
+            "core-1",
+            "--retrieval-generation",
+            "retrieval-1",
+        ])
+        .expect("packet should parse drill continuation flags");
+        match packet.command {
+            Command::Packet(cmd) => {
+                assert_eq!(cmd.parent_packet_id.as_deref(), Some("packet-1"));
+                assert_eq!(
+                    cmd.option_ids,
+                    vec!["omitted_mandatory_support:symbol%3A42".to_string()]
+                );
+                assert_eq!(cmd.core_generation_id.as_deref(), Some("core-1"));
+                assert_eq!(cmd.retrieval_generation.as_deref(), Some("retrieval-1"));
+            }
+            _ => panic!("expected packet command"),
+        }
+    }
+
+    #[test]
+    fn packet_rejects_parent_packet_id_without_option_id() {
+        let error = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--project",
+            "/tmp/project",
+            "--question",
+            "explain indexing",
+            "--parent-packet-id",
+            "packet-1",
+        ])
+        .expect_err("parent packet id requires an option id");
+        assert!(error.to_string().contains("--option-id"));
+    }
+
+    #[test]
+    fn packet_rejects_option_id_without_parent_packet_id() {
+        let error = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--project",
+            "/tmp/project",
+            "--question",
+            "explain indexing",
+            "--option-id",
+            "omitted_mandatory_support:symbol%3A42",
+        ])
+        .expect_err("option id requires a parent packet id");
+        assert!(error.to_string().contains("--parent-packet-id"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Packets keep cited stylesheet imports that define keyframes or custom properties, surface SQL `CREATE TABLE` names for retained catalog tables without dropping common sqlite/mysql/postgres dialect scripts, and rank mapper, session, and form-validation evidence ahead of docs, generated bundles, and test assemblies.
+- A packet that still needs one drill round now tells `packet` how to continue: `--parent-packet-id`, `--option-id`, and the generation pins from that packet. Client libraries that name `Client.send` (not an adapter) count as the transport send step, and a server method whose name is `handle` plus `HTTP` counts as request dispatch. Formatting packets prefer the primary format header over wide-character sibling overloads unless the question asks for wide characters.
 
 ## 0.17.0
 

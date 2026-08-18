@@ -49,6 +49,7 @@ import {
   parseJsonLines,
   packetComposition,
   packetCommandArgs,
+  drillPacketCommandArgs,
   packetRuntimeCacheObservations,
   agentPacketPreludeCacheObservations,
   packetEmbeddingExecutionProof,
@@ -3002,6 +3003,31 @@ test("packet and cache preparation share one explicit agent retrieval namespace"
   assert.equal(args.filter((arg) => arg === "--extra-probe").length, 0);
   assert.deepEqual(benchmarkAgentScopeArgs(), ["--profile", "agent", "--run-id", "shared-agent"]);
   assert.deepEqual(args.slice(3, 7), benchmarkAgentScopeArgs());
+
+  const drillArgs = drillPacketCommandArgs({ path: "/tmp/repo" }, task, {}, {
+    disposition: {
+      kind: "drill_once",
+      drill: {
+        parent_packet_id: "packet-1",
+        core_generation_id: "core-1",
+        retrieval_generation: "retrieval-1",
+        options: [{ id: "omitted_mandatory_support:symbol%3A42" }],
+      },
+    },
+  });
+  assert.ok(drillArgs);
+  assert.deepEqual(drillArgs.slice(0, args.length), packetCommandArgs({ path: "/tmp/repo" }, task));
+  assert.equal(drillArgs.at(-8), "--parent-packet-id");
+  assert.equal(drillArgs.at(-7), "packet-1");
+  assert.equal(drillArgs.at(-6), "--option-id");
+  assert.equal(drillArgs.at(-5), "omitted_mandatory_support:symbol%3A42");
+  assert.equal(drillArgs.at(-4), "--core-generation-id");
+  assert.equal(drillArgs.at(-3), "core-1");
+  assert.equal(drillArgs.at(-2), "--retrieval-generation");
+  assert.equal(drillArgs.at(-1), "retrieval-1");
+  assert.equal(drillPacketCommandArgs({ path: "/tmp/repo" }, task, {}, {
+    disposition: { kind: "supported" },
+  }), null);
   assert.deepEqual(retrievalIndexCommandArgs("C:\\repo"), [
     "retrieval",
     "index",
