@@ -90,7 +90,8 @@ use crate::agent::packet_scoring::{
     packet_drop_unrequested_named_client_adapter_siblings,
     packet_drop_unrequested_non_primary_flow_siblings,
     packet_drop_unrequested_non_stylesheet_animation_siblings,
-    packet_drop_unrequested_python_siblings, packet_drop_unrequested_single_letter_displays,
+    packet_drop_unrequested_python_siblings, packet_drop_unrequested_repo_root_stylesheet_siblings,
+    packet_drop_unrequested_single_letter_displays,
     packet_drop_unrequested_system_format_failure_siblings, packet_drop_unrequested_test_siblings,
     packet_drop_unrequested_wide_char_siblings,
     packet_drop_unrequested_windows_formatting_siblings, packet_stage_citation_carry_limit,
@@ -2030,6 +2031,7 @@ fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
     packet_drop_unrequested_animation_file_aliases(&mut answer.citations, &terms);
     packet_drop_unrequested_animation_file_only_sheets(&mut answer.citations, &terms);
     packet_drop_unrequested_non_stylesheet_animation_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_repo_root_stylesheet_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_markdown_siblings(&mut answer.citations, &terms);
 }
 

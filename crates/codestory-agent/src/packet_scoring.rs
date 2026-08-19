@@ -573,6 +573,36 @@ pub fn packet_drop_unrequested_non_stylesheet_animation_siblings(
     }
 }
 
+/// Drop repo-root stylesheets once nested source keyframes remain. Compiled
+/// bundles at the checkout root otherwise keep prefixed class names in the
+/// compact window.
+pub fn packet_drop_unrequested_repo_root_stylesheet_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_stylesheet_animation_flow(terms) {
+        return;
+    }
+    if !citations.iter().any(packet_citation_is_keyframe_rule) {
+        return;
+    }
+    if !citations.iter().any(|citation| {
+        packet_citation_is_primary_stylesheet(citation)
+            && packet_stylesheet_path_is_nested(&packet_citation_display_path(citation))
+    }) {
+        return;
+    }
+    citations.retain(|citation| {
+        !packet_citation_is_primary_stylesheet(citation)
+            || packet_stylesheet_path_is_nested(&packet_citation_display_path(citation))
+    });
+}
+
+fn packet_stylesheet_path_is_nested(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized.contains('/')
+}
+
 /// Drop docs/generated/test extras from formatting, client, and animation
 /// packets when a primary source hit remains.
 pub fn packet_drop_unrequested_non_primary_flow_siblings(
@@ -2791,6 +2821,38 @@ mod tests {
         packet_drop_unrequested_non_stylesheet_animation_siblings(&mut citations, &terms);
         assert_eq!(citations.len(), 1);
         assert_eq!(citations[0].display_name, "@keyframes spin");
+    }
+
+    #[test]
+    fn unrequested_repo_root_stylesheets_drop_when_nested_keyframes_remain() {
+        let terms = vec![
+            "css".to_string(),
+            "animation".to_string(),
+            "keyframes".to_string(),
+            "base".to_string(),
+            "variables".to_string(),
+        ];
+        let mut citations = vec![
+            test_rank_citation("@keyframes spin", "styles/motion/spin.css", 0.9),
+            test_rank_citation(".base", "styles/_base.css", 0.8),
+            test_rank_citation("prefixed", "bundle.css", 0.7),
+        ];
+        packet_drop_unrequested_repo_root_stylesheet_siblings(&mut citations, &terms);
+        assert!(
+            citations
+                .iter()
+                .any(|citation| citation.display_name == "@keyframes spin")
+        );
+        assert!(
+            citations
+                .iter()
+                .any(|citation| citation.display_name == ".base")
+        );
+        assert!(
+            citations
+                .iter()
+                .all(|citation| citation.display_name != "prefixed")
+        );
     }
 
     #[test]
