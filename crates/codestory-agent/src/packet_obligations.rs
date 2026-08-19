@@ -2475,28 +2475,10 @@ fn citation_satisfies_required_flow_edge(
     requirement: &FlowRequirement,
     answer: &AgentAnswerDto,
 ) -> bool {
-    if citation_edge_proof_for_flow_requirement(citation, required_edge_kind, requirement, answer)
+    citation_edge_proof_for_flow_requirement(citation, required_edge_kind, requirement, answer)
         .is_some()
-    {
-        return true;
-    }
-    required_edge_kind == EdgeKind::CALL
-        && !citation_has_incident_call_edge(citation, answer)
-        && citation_is_declared_call_boundary(requirement, citation)
-}
-
-fn citation_has_incident_call_edge(citation: &AgentCitationDto, answer: &AgentAnswerDto) -> bool {
-    let cited_edge_ids = citation.evidence_edge_ids.iter().collect::<HashSet<_>>();
-    answer.graphs.iter().any(|artifact| {
-        let GraphArtifactDto::Uml { graph, .. } = artifact else {
-            return false;
-        };
-        graph.edges.iter().any(|edge| {
-            edge.kind == EdgeKind::CALL
-                && cited_edge_ids.contains(&edge.id)
-                && (edge.source == citation.node_id || edge.target == citation.node_id)
-        })
-    })
+        || (required_edge_kind == EdgeKind::CALL
+            && citation_is_declared_call_boundary(requirement, citation))
 }
 
 /// A cited inbound handle-plus-HTTP callable already *is* the dispatch
@@ -6917,6 +6899,35 @@ mod tests {
             edges.is_empty(),
             "the cited dispatch callable is the boundary; it must not invent a neighbor CALL"
         );
+
+        let mut with_probable = engine.clone();
+        let engine_id = with_probable.citations[0].node_id.clone();
+        with_probable.citations[0].evidence_edge_ids =
+            vec![EdgeId("probable-dispatch".to_string())];
+        with_probable.graphs.push(GraphArtifactDto::Uml {
+            id: "probable-dispatch".to_string(),
+            title: "Probable dispatch".to_string(),
+            graph: GraphResponse {
+                center_id: engine_id.clone(),
+                nodes: Vec::new(),
+                edges: vec![GraphEdgeDto {
+                    id: EdgeId("probable-dispatch".to_string()),
+                    source: engine_id,
+                    target: NodeId("Worker.run".to_string()),
+                    kind: EdgeKind::CALL,
+                    confidence: Some(0.4),
+                    certainty: Some("probable".to_string()),
+                    callsite_identity: Some("src/http/server.go:1".to_string()),
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        });
+        let (status, reason, ..) = finalize_server_dispatch_answer(&with_probable);
+        assert_eq!(status, PacketObligationProofStatusDto::Proven);
+        assert_eq!(reason, None);
 
         let mut group = answer(vec![citation(
             "RequestRouter.Group",
