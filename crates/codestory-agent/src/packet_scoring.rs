@@ -490,7 +490,8 @@ pub fn packet_drop_unrequested_animation_file_aliases(
         })
         .filter_map(|citation| citation.file_path.as_deref().map(packet_display_path))
         .collect::<Vec<_>>();
-    if kept_paths.is_empty() {
+    let entry_parents = packet_animation_base_parent_dirs(citations);
+    if kept_paths.is_empty() && entry_parents.is_empty() {
         return;
     }
     citations.retain(|citation| {
@@ -500,6 +501,7 @@ pub fn packet_drop_unrequested_animation_file_aliases(
         citation.file_path.as_deref().is_some_and(|path| {
             let display = packet_display_path(path);
             kept_paths.iter().any(|kept| kept == &display)
+                || packet_path_is_animation_entry_parent(&display, &entry_parents)
         })
     });
 }
@@ -519,7 +521,8 @@ pub fn packet_drop_unrequested_animation_file_only_sheets(
         .filter(|citation| citation.kind != NodeKind::FILE)
         .filter_map(|citation| citation.file_path.as_deref().map(packet_display_path))
         .collect::<Vec<_>>();
-    if sibling_paths.is_empty() {
+    let entry_parents = packet_animation_base_parent_dirs(citations);
+    if sibling_paths.is_empty() && entry_parents.is_empty() {
         return;
     }
     citations.retain(|citation| {
@@ -529,8 +532,29 @@ pub fn packet_drop_unrequested_animation_file_only_sheets(
         citation.file_path.as_deref().is_some_and(|path| {
             let display = packet_display_path(path);
             sibling_paths.iter().any(|kept| kept == &display)
+                || packet_path_is_animation_entry_parent(&display, &entry_parents)
         })
     });
+}
+
+fn packet_animation_base_parent_dirs(citations: &[AgentCitationDto]) -> Vec<String> {
+    citations
+        .iter()
+        .filter(|citation| packet_citation_is_animation_base_source(citation))
+        .filter_map(|citation| {
+            citation
+                .file_path
+                .as_deref()
+                .map(packet_display_path)
+                .map(|path| packet_path_parent_dir(&path))
+        })
+        .filter(|parent| !parent.is_empty())
+        .collect()
+}
+
+fn packet_path_is_animation_entry_parent(path: &str, entry_parents: &[String]) -> bool {
+    let parent = packet_path_parent_dir(path);
+    !parent.is_empty() && entry_parents.iter().any(|kept| kept == &parent)
 }
 
 /// Drop docs/scripts/HTML extras once a primary stylesheet keyframe remains.
@@ -1504,6 +1528,15 @@ fn packet_path_file_stem(path: &str) -> String {
         .map(|(stem, _)| stem)
         .unwrap_or(file_name);
     normalize_identifier(stem)
+}
+
+fn packet_path_parent_dir(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    trimmed
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -2650,6 +2683,38 @@ mod tests {
     }
 
     #[test]
+    fn unrequested_animation_file_aliases_keep_entry_beside_base_and_vars() {
+        let terms = vec![
+            "css".to_string(),
+            "animation".to_string(),
+            "keyframes".to_string(),
+            "base".to_string(),
+            "variables".to_string(),
+        ];
+        let vars = test_rank_citation("--theme-delay", "source/_vars.css", 0.95);
+        let base = test_rank_citation(".base", "source/_base.css", 0.94);
+        let mut entry = test_rank_citation("source/entry.css", "source/entry.css", 0.93);
+        entry.coverage_role = Some("css animation source file".to_string());
+        entry.kind = NodeKind::FILE;
+        let mut unused =
+            test_rank_citation("source/motion/slide.css", "source/motion/slide.css", 0.92);
+        unused.coverage_role = Some("css animation source file".to_string());
+        unused.kind = NodeKind::FILE;
+        let mut citations = vec![vars, base, entry, unused];
+        packet_drop_unrequested_animation_file_aliases(&mut citations, &terms);
+        assert!(
+            citations
+                .iter()
+                .any(|citation| citation.display_name == "source/entry.css")
+        );
+        assert!(
+            citations
+                .iter()
+                .all(|citation| citation.display_name != "source/motion/slide.css")
+        );
+    }
+
+    #[test]
     fn unrequested_animation_file_only_sheets_drop_without_a_non_file_sibling() {
         let terms = vec![
             "css".to_string(),
@@ -2671,6 +2736,36 @@ mod tests {
             citations
                 .iter()
                 .any(|citation| citation.display_name == "source/motion/spin.css")
+        );
+        assert!(
+            citations
+                .iter()
+                .all(|citation| citation.display_name != "source/motion/slide.css")
+        );
+    }
+
+    #[test]
+    fn unrequested_animation_file_only_sheets_keep_entry_beside_base_and_vars() {
+        let terms = vec![
+            "css".to_string(),
+            "animation".to_string(),
+            "keyframes".to_string(),
+            "base".to_string(),
+            "variables".to_string(),
+        ];
+        let vars = test_rank_citation("--theme-delay", "source/_vars.css", 0.95);
+        let base = test_rank_citation(".base", "source/_base.css", 0.94);
+        let mut entry = test_rank_citation("source/entry.css", "source/entry.css", 0.93);
+        entry.kind = NodeKind::FILE;
+        let mut unused =
+            test_rank_citation("source/motion/slide.css", "source/motion/slide.css", 0.92);
+        unused.kind = NodeKind::FILE;
+        let mut citations = vec![vars, base, entry, unused];
+        packet_drop_unrequested_animation_file_only_sheets(&mut citations, &terms);
+        assert!(
+            citations
+                .iter()
+                .any(|citation| citation.display_name == "source/entry.css")
         );
         assert!(
             citations

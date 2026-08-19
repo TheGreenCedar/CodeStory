@@ -1250,6 +1250,132 @@ fn maybe_append_cited_stylesheet_import_citations(
             appended = appended.saturating_add(1);
         }
     }
+    maybe_append_cited_stylesheet_entry_sheets(project_root, answer);
+}
+
+fn packet_stylesheet_path_is_animation_base(path: &Path) -> bool {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("");
+    let normalized = normalize_identifier(stem);
+    normalized == "base"
+        || normalized.ends_with("base")
+        || normalized == "vars"
+        || normalized.ends_with("vars")
+}
+
+fn maybe_append_cited_stylesheet_entry_sheets(project_root: &Path, answer: &mut AgentAnswerDto) {
+    let mut cited_names = Vec::new();
+    let mut parent_dirs = Vec::new();
+    for citation in &answer.citations {
+        let Some(path) = citation.file_path.as_deref() else {
+            continue;
+        };
+        if !packet_display_path(path)
+            .to_ascii_lowercase()
+            .ends_with(".css")
+        {
+            continue;
+        }
+        let source_path = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            project_root.join(path)
+        };
+        if !packet_stylesheet_path_is_animation_base(&source_path) {
+            continue;
+        }
+        if let Some(name) = source_path.file_name().and_then(|name| name.to_str())
+            && !cited_names.iter().any(|existing| existing == name)
+        {
+            cited_names.push(name.to_string());
+        }
+        if let Some(parent) = source_path.parent()
+            && !parent_dirs.iter().any(|existing| existing == parent)
+        {
+            parent_dirs.push(parent.to_path_buf());
+        }
+    }
+    if cited_names.is_empty() {
+        return;
+    }
+
+    let mut appended = 0usize;
+    for parent in parent_dirs {
+        if appended >= 2 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&parent) else {
+            continue;
+        };
+        let mut css_files = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("css"))
+            })
+            .collect::<Vec<_>>();
+        css_files.sort();
+        css_files.truncate(32);
+        for candidate in css_files {
+            if appended >= 2 {
+                break;
+            }
+            let relative = candidate
+                .strip_prefix(project_root)
+                .unwrap_or(&candidate)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if crate::retrieval_file_role_from_path(&relative).is_non_primary() {
+                continue;
+            }
+            if answer.citations.iter().any(|existing| {
+                existing.file_path.as_deref().is_some_and(|existing_path| {
+                    packet_display_path(existing_path) == packet_display_path(&relative)
+                })
+            }) {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&candidate) else {
+                continue;
+            };
+            if source.len() > 1_500_000 {
+                continue;
+            }
+            if source.to_ascii_lowercase().contains("@keyframes") {
+                continue;
+            }
+            let imports = packet_css_relative_imports(&source);
+            if imports.len() < 2 {
+                continue;
+            }
+            let imports_cited = imports.iter().any(|spec| {
+                let spec_name = spec.rsplit(['/', '\\']).next().unwrap_or(spec);
+                cited_names.iter().any(|cited| cited == spec_name)
+            });
+            if !imports_cited {
+                continue;
+            }
+            if push_cited_source_shape_citation(
+                answer,
+                project_root,
+                CitedSourceShapeCitation {
+                    path: &candidate,
+                    display_name: &relative,
+                    kind: NodeKind::FILE,
+                    line: 1,
+                    score: 45.0,
+                    coverage_role: "css animation source file",
+                    producer: "packet_cited_stylesheet_entry",
+                },
+            ) {
+                appended = appended.saturating_add(1);
+            }
+        }
+    }
 }
 
 fn packet_css_relative_imports(source: &str) -> Vec<String> {
@@ -10414,6 +10540,81 @@ mod tests {
                 .as_deref()
                 .is_some_and(|path| packet_display_path(path).ends_with("bundle.min.css"))),
             "generated bundles should stay out of cited stylesheet imports: {:?}",
+            answer.citations
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cited_stylesheet_entry_sheet_promotes_import_barrel_beside_base_and_vars() {
+        let root = packet_temp_root("css-entry-barrel");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "styles/_tokens.css",
+            ":root {\n  --motion-duration: 1s;\n}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "styles/_base.css",
+            ".base {\n  animation-duration: var(--motion-duration);\n}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "styles/entry.css",
+            "@import '_tokens.css';\n@import '_base.css';\n@import 'motion/spin.css';\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "styles/motion/spin.css",
+            "@keyframes spin {\n  from { transform: rotate(0deg); }\n}\n.spin {\n  animation-name: spin;\n}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "styles/motion/slide.css",
+            "@keyframes slide {\n  from { transform: translateX(0); }\n}\n",
+        );
+
+        let question = "Explain how the stylesheet defines shared animation variables and base classes and connects named animation classes to keyframes.";
+        let mut tokens = test_packet_citation("--motion-duration", "styles/_tokens.css", 0.9);
+        tokens.file_path = Some(root.join("styles/_tokens.css").display().to_string());
+        let mut base = test_packet_citation(".base", "styles/_base.css", 0.8);
+        base.file_path = Some(root.join("styles/_base.css").display().to_string());
+        let mut spin = test_packet_citation("@keyframes spin", "styles/motion/spin.css", 0.7);
+        spin.file_path = Some(root.join("styles/motion/spin.css").display().to_string());
+        let mut answer = packet_answer_fixture(question, vec![tokens, base, spin]);
+
+        maybe_append_cited_stylesheet_import_citations(&root, question, &mut answer);
+        rank_packet_evidence(question, &mut answer);
+
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.kind == NodeKind::FILE
+                    && citation
+                        .display_name
+                        .replace('\\', "/")
+                        .ends_with("styles/entry.css")
+            }),
+            "import barrel beside cited base/vars should be copyable: {:?}",
+            answer
+                .citations
+                .iter()
+                .map(|citation| {
+                    (
+                        &citation.display_name,
+                        citation.kind,
+                        citation.file_path.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            answer.citations.iter().all(|citation| {
+                !citation.file_path.as_deref().is_some_and(|path| {
+                    packet_display_path(path).ends_with("styles/motion/slide.css")
+                })
+            }),
+            "unimported motion sheets must stay out of the entry promotion: {:?}",
             answer.citations
         );
         let _ = std::fs::remove_dir_all(&root);
