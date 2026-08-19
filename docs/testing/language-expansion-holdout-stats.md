@@ -4,7 +4,7 @@
 
 This is the evidence behind the [README evaluation section](../../README.md#evaluation). The [`language-support-ab.task.json`](../../benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json) manifest covers 18 pinned public OSS packages with one architecture question per package.
 
-The latest nested 18×3 sheet (`language-support-ab-window6`) meets the quality bar: CodeStory **45/54** versus no-CodeStory **44/54**, with token and tool reductions and zero post-packet source reads. It has no `summary.json` because attestation requires a clean tracked checkout, and it was not run with `--publishable`. The README Evaluation section headlines those savings from `runs.jsonl`. Do not quote the 2026-08-10 token line, the packet-gate 16/18 score, or any four-task excerpt as that claim.
+The latest nested 18×3 sheet (`language-support-ab-window6`) is the measured run behind the [README evaluation table](../../README.md#evaluation): CodeStory **45/54** versus no-CodeStory **44/54**, with token and tool reductions and zero post-packet source reads. It has no `summary.json` because attestation requires a clean tracked checkout, and it was not run with `--publishable`. Do not quote the 2026-08-10 token line, the packet-gate 16/18 score, or any four-task excerpt as that claim.
 
 ## 2026-08-19 nested A/B (quality bar met)
 
@@ -117,7 +117,7 @@ The nested Codex session had no CodeStory MCP `packet` tool. The harness supplie
 
 A Homebrew Cask `codex` 0.146 install hung in `dyld_start` in a Cursor private-worker sandbox; this sheet used the ChatGPT.app binary from an unsandboxed login session. Direct `--codestory-cli target/release/codestory-cli` is `direct_cli_launch` and fails `--publishable`.
 
-`--publishable` still requires a `supported` first packet and managed 0.17.0 identity. This 2026-08-18 nested sheet is historical diagnostic evidence. The current README Evaluation headline uses the 2026-08-19 `language-support-ab-window6` `runs.jsonl` sheet above.
+`--publishable` still requires a `supported` first packet and managed 0.17.0 identity. This 2026-08-18 nested sheet is historical diagnostic evidence. The README evaluation table uses the 2026-08-19 `language-support-ab-window6` `runs.jsonl` sheet above.
 
 ```zsh
 source target/agent-benchmark/managed-local-0.17.0/managed-env.sh
@@ -186,4 +186,4 @@ All-in wall time includes the 762-second CodeStory cache preparation and packet 
 
 ## Boundary
 
-The superseded 2026-06-17 numbers measured the pre-0.16 retrieval path and are no longer used in the README. The current README Evaluation headline uses the 2026-08-19 `language-support-ab-window6` nested 18×3 `runs.jsonl` sheet. A later `--publishable` `summary.json` with managed 0.17.0 identity can replace that headline. Packet-gate rows cannot substitute for a nested quality sheet.
+The superseded 2026-06-17 numbers measured the pre-0.16 retrieval path and are no longer used in the README. The README evaluation table uses the 2026-08-19 `language-support-ab-window6` nested 18×3 `runs.jsonl` sheet. A later `--publishable` `summary.json` with managed 0.17.0 identity can replace that table. Packet-gate rows cannot substitute for a nested quality sheet.

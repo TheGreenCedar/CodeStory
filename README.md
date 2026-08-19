@@ -147,11 +147,40 @@ Full routing: [docs/README.md](docs/README.md).
 
 ## Evaluation
 
-> **Scope:** The language-expansion holdout compares agents on 18 pinned public OSS tasks with and without CodeStory. On the latest nested 18×3 sheet, CodeStory matched or beat the no-CodeStory arm on answer quality while using fewer tokens and tools. For day-to-day limits, see [What to expect](docs/users/what-to-expect.md).
+The same agent answered one architecture question in each of 18 pinned public
+repositories, three times with CodeStory and three times without. Passing
+answers stayed even or better. Tokens and tool calls dropped sharply.
 
-### Language expansion holdout (18 tasks)
+| | Without CodeStory | With CodeStory |
+| --- | ---: | ---: |
+| Passing answers | 44 of 54 | 45 of 54 |
+| Tokens | 19.8 million | 1.7 million (−91%) |
+| Tool calls | 834 | 54 (−94%) |
 
-Broader public-repo evidence uses the [`language-support-ab`](benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json) manifest across 18 pinned OSS packages. The latest nested 18×3 (`language-support-ab-window6`) scored **45/54** with CodeStory versus **44/54** without, with post-packet source reads at zero. Tokens dropped from 19,819,661 to 1,723,654 (−91%) and tool calls from 834 to 54 (−94%). That sheet has no `summary.json` (dirty-tree attestation) and is not `--publishable`. Full task rows, CLI SHA, and accelerator identity: [language-expansion holdout evidence record](docs/testing/language-expansion-holdout-stats.md).
+| Language | Asked about | Without | With |
+| --- | --- | ---: | ---: |
+| Python | Requests session send | 3 of 3 | 3 of 3 |
+| Java | Commons Lang string checks | 3 of 3 | 3 of 3 |
+| Rust | ripgrep search pipeline | 3 of 3 | 3 of 3 |
+| JavaScript | Express routing | 3 of 3 | 3 of 3 |
+| TypeScript | SWR hooks | 3 of 3 | 3 of 3 |
+| C++ | fmt formatting | 3 of 3 | 2 of 3 |
+| C | Redis command loop | 3 of 3 | 3 of 3 |
+| Go | Gin route dispatch | 3 of 3 | 3 of 3 |
+| Ruby | Jekyll site build | 3 of 3 | 3 of 3 |
+| PHP | Monolog records | 3 of 3 | 3 of 3 |
+| C# | AutoMapper maps | 2 of 3 | 2 of 3 |
+| Kotlin | Okio buffers | 0 of 3 | 3 of 3 |
+| Swift | Alamofire requests | 3 of 3 | 3 of 3 |
+| Dart | HTTP client | 3 of 3 | 3 of 3 |
+| Bash | nvm install | 3 of 3 | 2 of 3 |
+| HTML | MDN form validation | 0 of 3 | 0 of 3 |
+| CSS | animate.css keyframes | 3 of 3 | 3 of 3 |
+| SQL | Chinook schema relations | 0 of 3 | 0 of 3 |
+
+HTML forms and the Chinook schema failed in both arms. These numbers describe
+this suite, not your checkout. Day-to-day limits: [What to expect](docs/users/what-to-expect.md).
+How this was measured: [holdout evidence](docs/testing/language-expansion-holdout-stats.md).
 
 ## License
 
