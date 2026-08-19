@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.17.1
+
 - Compact answer packets keep production flow evidence in the 16-hit window. Pascal `*Test` files, multiplatform test source sets, `/samples/`, and `.github` paths no longer crowd out cited Buffer, SQL, CSS, and HTTP client sources. SQL packets keep sqlite/mysql/postgres `CREATE TABLE` names and relationship constraints, drop AutoIncrement extras when those dialects remain, and still keep cited stylesheet imports that define keyframes or custom properties.
 - On the nested 18-task holdout, CodeStory matched or beat the no-CodeStory arm on answer quality while using far fewer tokens and tools.
 - A packet that still needs one drill round now tells `packet` how to continue: `--parent-packet-id`, `--option-id`, and the generation pins from that packet. Client libraries that name `Client.send` (not an adapter) count as the transport send step, and a server method whose name is `handle` plus `HTTP` counts as request dispatch. Formatting packets prefer the primary format header over wide-character sibling overloads unless the question asks for wide characters.
