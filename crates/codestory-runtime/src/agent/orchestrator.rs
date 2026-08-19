@@ -79,7 +79,9 @@ use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path,
     packet_drop_excess_unrequested_animation_class_siblings,
     packet_drop_excess_unrequested_keyframe_siblings,
+    packet_drop_unrequested_animation_file_aliases,
     packet_drop_unrequested_example_and_binding_siblings,
+    packet_drop_unrequested_formatter_specialization_siblings,
     packet_drop_unrequested_formatting_extension_siblings,
     packet_drop_unrequested_mapper_annotation_siblings, packet_drop_unrequested_markdown_siblings,
     packet_drop_unrequested_named_client_adapter_siblings, packet_drop_unrequested_python_siblings,
@@ -1835,6 +1837,7 @@ fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
     packet_drop_unrequested_python_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_windows_formatting_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_formatting_extension_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_formatter_specialization_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_single_letter_displays(&mut answer.citations, &terms);
     packet_drop_unrequested_named_client_adapter_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_example_and_binding_siblings(&mut answer.citations, &terms);
@@ -1842,6 +1845,7 @@ fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
     packet_drop_unrequested_test_siblings(&mut answer.citations, &terms);
     packet_drop_excess_unrequested_keyframe_siblings(&mut answer.citations, &terms);
     packet_drop_excess_unrequested_animation_class_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_animation_file_aliases(&mut answer.citations, &terms);
     packet_drop_unrequested_markdown_siblings(&mut answer.citations, &terms);
 }
 

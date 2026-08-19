@@ -284,6 +284,38 @@ pub fn packet_drop_unrequested_formatting_extension_siblings(
     }
 }
 
+/// Drop `formatter<...>` specializations when an argument-store type is already
+/// in the window. Those templates occupy the same header as the store type and
+/// the file cap then evicts the store.
+pub fn packet_drop_unrequested_formatter_specialization_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_runtime_formatting_flow(terms) {
+        return;
+    }
+    if !citations
+        .iter()
+        .any(packet_citation_is_formatting_argument_store)
+    {
+        return;
+    }
+    citations.retain(|citation| !packet_citation_is_formatter_specialization(citation));
+}
+
+fn packet_citation_is_formatting_argument_store(citation: &AgentCitationDto) -> bool {
+    let normalized = normalize_identifier(&citation.display_name);
+    normalized.contains("format")
+        && (normalized.contains("arg") || normalized.contains("argument"))
+        && normalized.contains("store")
+}
+
+fn packet_citation_is_formatter_specialization(citation: &AgentCitationDto) -> bool {
+    let display = citation.display_name.trim();
+    let normalized = normalize_identifier(display);
+    normalized == "formatter" || (display.contains('<') && normalized.starts_with("formatter"))
+}
+
 /// Drop one-letter template-parameter display names when a named hit remains.
 pub fn packet_drop_unrequested_single_letter_displays(
     citations: &mut Vec<AgentCitationDto>,
@@ -436,6 +468,45 @@ pub fn packet_drop_excess_unrequested_animation_class_siblings(
             || named_stems.iter().any(|named| named == &stem)
             || keyframe_stems.iter().any(|keyframe| keyframe == &stem)
     });
+}
+
+/// Keep stylesheet file aliases only when a remaining keyframe or class from
+/// that file survived sibling caps. Import expansion otherwise fills the window
+/// with unused animation sheets.
+pub fn packet_drop_unrequested_animation_file_aliases(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_stylesheet_animation_flow(terms) {
+        return;
+    }
+    let kept_paths = citations
+        .iter()
+        .filter(|citation| {
+            packet_citation_is_keyframe_rule(citation)
+                || packet_citation_is_animation_class_selector(citation)
+        })
+        .filter_map(|citation| citation.file_path.as_deref().map(packet_display_path))
+        .collect::<Vec<_>>();
+    if kept_paths.is_empty() {
+        return;
+    }
+    citations.retain(|citation| {
+        if !packet_citation_is_animation_file_alias(citation) {
+            return true;
+        }
+        citation.file_path.as_deref().is_some_and(|path| {
+            let display = packet_display_path(path);
+            kept_paths.iter().any(|kept| kept == &display)
+        })
+    });
+}
+
+fn packet_citation_is_animation_file_alias(citation: &AgentCitationDto) -> bool {
+    citation
+        .coverage_role
+        .as_deref()
+        .is_some_and(|role| role == "css animation source file")
 }
 
 fn packet_citation_is_animation_class_selector(citation: &AgentCitationDto) -> bool {
@@ -2196,6 +2267,31 @@ mod tests {
     }
 
     #[test]
+    fn unrequested_formatter_specializations_drop_when_an_argument_store_remains() {
+        let terms = vec!["format".to_string(), "arguments".to_string()];
+        let mut citations = vec![
+            test_rank_citation(
+                "formatter<T, Char, enable_if_t<detail::type_constant<T, Char>::value != detail::type::custom_type>>",
+                "include/tool/base.h",
+                0.9,
+            ),
+            test_rank_citation("runtime_format_arg_store", "include/tool/base.h", 0.6),
+            test_rank_citation("format_to", "include/tool/format.h", 0.7),
+        ];
+        packet_drop_unrequested_formatter_specialization_siblings(&mut citations, &terms);
+        assert!(
+            citations
+                .iter()
+                .all(|citation| !citation.display_name.starts_with("formatter<"))
+        );
+        assert!(
+            citations
+                .iter()
+                .any(|citation| citation.display_name == "runtime_format_arg_store")
+        );
+    }
+
+    #[test]
     fn unrequested_single_letter_displays_drop_when_a_named_hit_remains() {
         let terms = vec!["format".to_string(), "arguments".to_string()];
         let mut citations = vec![
@@ -2312,6 +2408,39 @@ mod tests {
             citations
                 .iter()
                 .all(|citation| citation.display_name != ".pulse")
+        );
+    }
+
+    #[test]
+    fn unrequested_animation_file_aliases_keep_remaining_keyframe_sheets() {
+        let terms = vec![
+            "css".to_string(),
+            "animation".to_string(),
+            "keyframes".to_string(),
+            "base".to_string(),
+            "variables".to_string(),
+        ];
+        let mut bounce = test_rank_citation("@keyframes bounce", "source/motion/bounce.css", 0.9);
+        bounce.coverage_role = Some("css keyframes".to_string());
+        let mut bounce_file =
+            test_rank_citation("source/motion/bounce.css", "source/motion/bounce.css", 0.8);
+        bounce_file.coverage_role = Some("css animation source file".to_string());
+        bounce_file.kind = NodeKind::FILE;
+        let mut pulse_file =
+            test_rank_citation("source/motion/pulse.css", "source/motion/pulse.css", 0.7);
+        pulse_file.coverage_role = Some("css animation source file".to_string());
+        pulse_file.kind = NodeKind::FILE;
+        let mut citations = vec![bounce, bounce_file, pulse_file];
+        packet_drop_unrequested_animation_file_aliases(&mut citations, &terms);
+        assert!(
+            citations
+                .iter()
+                .any(|citation| { citation.display_name == "source/motion/bounce.css" })
+        );
+        assert!(
+            citations
+                .iter()
+                .all(|citation| citation.display_name != "source/motion/pulse.css")
         );
     }
 
