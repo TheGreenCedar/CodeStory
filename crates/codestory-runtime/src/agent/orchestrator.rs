@@ -125,11 +125,11 @@ use codestory_contracts::api::{
     AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError, EdgeId, EdgeKind,
     GraphArtifactDto, GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto,
     IndexFreshnessDto, IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId,
-    NodeKind, NodeOccurrencesRequest, PACKET_DRILL_MAX_BYTES, PACKET_DRILL_MAX_DEPTH,
-    PACKET_DRILL_MAX_HITS, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto,
-    PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketObligationPlanDto, PacketPlanDto,
-    PacketProbeDto, PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
-    SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, SnippetScopeDto,
+    NodeKind, NodeOccurrencesRequest, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS,
+    PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto, PacketEvidenceResolutionDto,
+    PacketEvidenceTierDto, PacketObligationPlanDto, PacketPlanDto, PacketProbeDto,
+    PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto, SearchHit,
+    SearchHitOrigin, SearchRepoTextMode, SearchRequest, SnippetScopeDto,
     SourceCoverageObservationDto, SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto,
     TrailConfigDto, TrailFilterOptionsDto,
 };
@@ -796,20 +796,12 @@ pub(crate) fn agent_packet(
 
 fn packet_budget_limits_for_request(
     budget: PacketBudgetModeDto,
-    is_drill_continuation: bool,
+    _is_drill_continuation: bool,
 ) -> PacketBudgetLimitsDto {
-    let mut limits = packet_budget_limits(budget);
-    if !is_drill_continuation {
-        return limits;
-    }
-    limits.max_anchors = limits.max_anchors.min(PACKET_DRILL_MAX_HITS);
-    limits.max_files = limits.max_files.min(PACKET_DRILL_MAX_HITS);
-    limits.max_snippets = limits.max_snippets.min(PACKET_DRILL_MAX_HITS);
-    limits.max_trail_edges = limits
-        .max_trail_edges
-        .min(PACKET_DRILL_MAX_HITS.saturating_mul(PACKET_DRILL_MAX_DEPTH));
-    limits.max_output_bytes = limits.max_output_bytes.min(PACKET_DRILL_MAX_BYTES);
-    limits
+    // Drill retrieval stays depth-bounded in `packet_retrieval_profile`. The
+    // compiled packet still advertises the requested budget's public caps so
+    // nested and MCP clients can consume a DrillOnce continuation.
+    packet_budget_limits(budget)
 }
 
 fn append_packet_non_trace_phase(answer: &mut AgentAnswerDto, label: &str, started_at: Instant) {
@@ -5853,7 +5845,13 @@ fn packet_retrieval_profile(
                 } else {
                     2
                 },
-                max_nodes: limits.max_trail_edges.clamp(10, 2_000),
+                max_nodes: if is_drill_continuation {
+                    PACKET_DRILL_MAX_HITS
+                        .saturating_mul(PACKET_DRILL_MAX_DEPTH)
+                        .clamp(10, 2_000)
+                } else {
+                    limits.max_trail_edges.clamp(10, 2_000)
+                },
                 include_edge_occurrences: matches!(
                     task_class,
                     Some(PacketTaskClassDto::ChangeImpact | PacketTaskClassDto::RouteTracing)
@@ -11148,7 +11146,7 @@ mod tests {
     }
 
     #[test]
-    fn drill_continuation_uses_the_declared_bounded_packet_limits() {
+    fn drill_continuation_keeps_public_packet_limits_and_bounds_retrieval_depth() {
         let ordinary = packet_budget_limits_for_request(PacketBudgetModeDto::Standard, false);
         let drill = packet_budget_limits_for_request(PacketBudgetModeDto::Standard, true);
 
@@ -11158,14 +11156,11 @@ mod tests {
         assert_eq!(ordinary.max_snippets, expected.max_snippets);
         assert_eq!(ordinary.max_trail_edges, expected.max_trail_edges);
         assert_eq!(ordinary.max_output_bytes, expected.max_output_bytes);
-        assert_eq!(drill.max_anchors, PACKET_DRILL_MAX_HITS);
-        assert_eq!(drill.max_files, PACKET_DRILL_MAX_HITS);
-        assert_eq!(drill.max_snippets, PACKET_DRILL_MAX_HITS);
-        assert_eq!(
-            drill.max_trail_edges,
-            PACKET_DRILL_MAX_HITS * PACKET_DRILL_MAX_DEPTH
-        );
-        assert_eq!(drill.max_output_bytes, PACKET_DRILL_MAX_BYTES);
+        assert_eq!(drill.max_anchors, expected.max_anchors);
+        assert_eq!(drill.max_files, expected.max_files);
+        assert_eq!(drill.max_snippets, expected.max_snippets);
+        assert_eq!(drill.max_trail_edges, expected.max_trail_edges);
+        assert_eq!(drill.max_output_bytes, expected.max_output_bytes);
 
         let profile = packet_retrieval_profile(
             Some(PacketTaskClassDto::ArchitectureExplanation),

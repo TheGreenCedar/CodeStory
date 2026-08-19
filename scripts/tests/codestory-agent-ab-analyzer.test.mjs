@@ -60,6 +60,7 @@ import {
   packetObligationAccounting,
   packetDispositionTelemetry,
   packetPreludeContractBlockers,
+  publicPacketPreludeContractPasses,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetFirstCommandForPrompt,
@@ -439,6 +440,47 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
     requireSupported: true,
     requireManagedRuntime: true,
   }), []);
+});
+
+test("drill continuation packets are public only when they keep the advertised budget caps", () => {
+  const packet = {
+    packet_id: "packet-1",
+    plan: { obligations: { claim_obligations: [] } },
+    answer: {
+      citations: [{ node_id: "carrier", file_path: "src/lib.rs" }],
+      graphs: [],
+      retrieval_trace: {
+        steps: [{ kind: "source_read", status: "ok" }],
+        retrieval_shadow: { retrieval_mode: "full" },
+      },
+    },
+    support: [{ id: "support-1", kind: "symbol_location", summary: "carrier", path: "src/lib.rs" }],
+    disposition: { kind: "not_established", omission_receipts: [] },
+    budget: {
+      limits: {
+        max_anchors: 16,
+        max_files: 16,
+        max_output_bytes: 128 * 1024,
+        max_snippets: 24,
+        max_trail_edges: 60,
+      },
+      used: { anchors: 1, files: 1, output_bytes: 0, snippets: 1, trail_edges: 0 },
+    },
+  };
+  const stdout = exactPacketStdout(packet);
+  assert.equal(publicPacketPreludeContractPasses(packet, stdout), true);
+
+  packet.budget.limits.max_anchors = 8;
+  packet.budget.limits.max_files = 8;
+  packet.budget.limits.max_snippets = 8;
+  packet.budget.limits.max_trail_edges = 16;
+  packet.budget.limits.max_output_bytes = 32 * 1024;
+  const shrunk = exactPacketStdout(packet);
+  assert.equal(publicPacketPreludeContractPasses(packet, shrunk), false);
+  assert.match(
+    packetPreludeContractBlockers(packet, shrunk).join("\n"),
+    /max_anchors=8 does not equal public cap=16/,
+  );
 });
 
 test("packet obligation accounting preserves the historical material split", () => {

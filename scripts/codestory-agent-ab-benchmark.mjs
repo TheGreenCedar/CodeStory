@@ -3661,6 +3661,13 @@ function summarizePacketObligationAccounting(results, label) {
   return aggregate;
 }
 
+function publicPacketPreludeContractPasses(packet, stdout) {
+  return packetPreludeContractBlockers(packet, stdout, {
+    requireSupported: false,
+    requireManagedRuntime: false,
+  }).length === 0;
+}
+
 function packetPreludeContractBlockers(packet, stdout, options = {}) {
   if (!packet || typeof packet !== "object") {
     return ["packet JSON is missing"];
@@ -3851,14 +3858,17 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
       await writeFile(drillStderrPath, drillResult.stderr, "utf8");
       if (drillResult.status === "pass") {
         try {
-          packet = JSON.parse(drillResult.stdout);
-          result = drillResult;
-          activeArgs = drillArgs;
-          command = displayCommand(codestoryCli, drillArgs);
-          activeStdoutPath = drillStdoutPath;
-          activeStderrPath = drillStderrPath;
-          drillContinuation = true;
-          parseError = null;
+          const continuationPacket = JSON.parse(drillResult.stdout);
+          if (publicPacketPreludeContractPasses(continuationPacket, drillResult.stdout)) {
+            packet = continuationPacket;
+            result = drillResult;
+            activeArgs = drillArgs;
+            command = displayCommand(codestoryCli, drillArgs);
+            activeStdoutPath = drillStdoutPath;
+            activeStderrPath = drillStderrPath;
+            drillContinuation = true;
+            parseError = null;
+          }
         } catch (error) {
           parseError = error.message;
         }
@@ -10316,6 +10326,7 @@ export {
   packetObligationAccounting,
   packetDispositionTelemetry,
   packetPreludeContractBlockers,
+  publicPacketPreludeContractPasses,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetRuntimeCacheObservations,
