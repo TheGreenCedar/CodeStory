@@ -1050,6 +1050,9 @@ pub fn packet_citation_satisfies_required_probe(query: &str, citation: &AgentCit
     if packet_citation_matches_create_table_probe(query, citation) {
         return true;
     }
+    if packet_citation_matches_sql_catalog_table_probe(query, citation) {
+        return true;
+    }
     if packet_citation_matches_route_registration_probe(query, citation) {
         return true;
     }
@@ -1379,6 +1382,39 @@ fn packet_citation_matches_create_table_probe(query: &str, citation: &AgentCitat
         return false;
     };
     expected_table == cited_table
+}
+
+fn packet_citation_matches_sql_catalog_table_probe(
+    query: &str,
+    citation: &AgentCitationDto,
+) -> bool {
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !path.ends_with(".sql") {
+        return false;
+    }
+    let Some(expected_table) = packet_public_catalog_probe_table(query) else {
+        return false;
+    };
+    let Some(cited_table) = packet_sql_table_identity(&citation.display_name) else {
+        return false;
+    };
+    expected_table == cited_table
+}
+
+fn packet_public_catalog_probe_table(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    let remainder = trimmed
+        .strip_prefix("public.")
+        .or_else(|| trimmed.strip_prefix("PUBLIC."))?;
+    if remainder.is_empty() {
+        return None;
+    }
+    packet_sql_table_identity(remainder)
 }
 
 fn packet_create_table_probe_table(query: &str) -> Option<String> {
@@ -2992,6 +3028,20 @@ mod tests {
         assert!(!packet_citation_satisfies_required_probe(
             "CREATE TABLE Track",
             &catalog_playlist
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "public.Track",
+            &create_track
+        ));
+        assert!(!packet_citation_satisfies_required_probe(
+            "public.Track",
+            &create_playlist_track
+        ));
+        let rewritten_publisher =
+            test_packet_citation("CREATE TABLE Publisher", "schema/Catalog_Sqlite.sql", 0.9);
+        assert!(packet_citation_satisfies_required_probe(
+            "public.publisher",
+            &rewritten_publisher
         ));
 
         let log_record = test_packet_citation("LogRecord", "src/Monolog/LogRecord.php", 0.9);

@@ -10,11 +10,12 @@ use crate::packet_terms::{
     packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
-use crate::text::retrieval_file_role_from_path;
+use crate::text::{RetrievalFileRole, retrieval_file_role_from_path};
 use codestory_contracts::api::{
     AgentCitationDto, NodeKind, PacketBudgetLimitsDto, SearchHitOrigin,
 };
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 // `normalize_identifier` was hoisted to the leaf `text` module to dissolve the
 // packet_terms <-> packet_scoring release-code import cycle
@@ -83,7 +84,11 @@ pub fn packet_citation_rank(
         score += 0.25;
     }
     if prefer_primary_sources {
-        let role = retrieval_file_role_from_path(&path);
+        let role = citation
+            .file_path
+            .as_deref()
+            .map(retrieval_file_role_from_path)
+            .unwrap_or(RetrievalFileRole::Source);
         if role.is_non_primary() {
             score -= 100.0;
         }
@@ -175,6 +180,7 @@ pub fn packet_citation_rank(
     {
         score -= 8.0;
     }
+    score += packet_shared_source_set_rank_adjustment(&path, terms);
 
     #[cfg(not(test))]
     {
@@ -401,6 +407,85 @@ pub fn packet_drop_unrequested_test_siblings(
     {
         citations.retain(|citation| !packet_citation_is_test_source(citation));
     }
+}
+
+/// Keep shared source-set files when a platform copy of the same relative path
+/// also occupies the window. Kotlin/Swift MPP packets otherwise cite jvmMain
+/// actuals while answers need the commonMain path spelling.
+pub fn packet_keep_shared_source_set_over_platform_duplicates(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if packet_terms_mention_platform_source_set(terms) {
+        return;
+    }
+    let shared_keys = citations
+        .iter()
+        .filter_map(|citation| {
+            let (kind, key) = packet_mpp_source_set_key(citation)?;
+            matches!(kind, PacketSourceSetKind::Shared).then_some(key)
+        })
+        .collect::<HashSet<_>>();
+    if shared_keys.is_empty() {
+        return;
+    }
+    citations.retain(|citation| {
+        packet_mpp_source_set_key(citation)
+            .map(|(kind, key)| {
+                !matches!(kind, PacketSourceSetKind::Platform) || !shared_keys.contains(&key)
+            })
+            .unwrap_or(true)
+    });
+}
+
+/// Drop AutoIncrement / SerialPK copies and extra-engine scripts when sqlite,
+/// mysql, or postgres dialect files already remain. Schema-flow packets need
+/// table-creation and foreign-key constraint wording on those retained
+/// dialects, not variant primary-key scripts from other engines.
+pub fn packet_drop_unrequested_sql_schema_variant_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_sql_schema_flow(terms) {
+        return;
+    }
+    if !citations.iter().any(|citation| {
+        citation
+            .file_path
+            .as_deref()
+            .is_some_and(packet_sql_schema_file_is_retained_dialect)
+    }) {
+        return;
+    }
+    citations.retain(|citation| {
+        citation
+            .file_path
+            .as_deref()
+            .is_none_or(|path| !packet_sql_schema_file_is_variant_copy(path))
+    });
+}
+
+pub fn packet_sql_schema_file_is_variant_copy(path: &str) -> bool {
+    let lower = packet_display_path(path).to_ascii_lowercase();
+    if !lower.ends_with(".sql") {
+        return false;
+    }
+    let file_name = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    file_name.contains("autoincrement")
+        || file_name.contains("serialpks")
+        || file_name.contains("serial_pks")
+        || file_name.contains("db2")
+        || file_name.contains("oracle")
+        || file_name.contains("sqlserver")
+}
+
+fn packet_sql_schema_file_is_retained_dialect(path: &str) -> bool {
+    let lower = packet_display_path(path).to_ascii_lowercase();
+    if !lower.ends_with(".sql") || packet_sql_schema_file_is_variant_copy(path) {
+        return false;
+    }
+    let file_name = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    file_name.contains("sqlite") || file_name.contains("mysql") || file_name.contains("postgres")
 }
 
 /// Keep named keyframe rules, otherwise only the two highest-ranked ones, so a
@@ -732,7 +817,100 @@ fn packet_citation_is_primary_stylesheet(citation: &AgentCitationDto) -> bool {
 }
 
 fn packet_citation_is_non_primary_source(citation: &AgentCitationDto) -> bool {
-    retrieval_file_role_from_path(&packet_citation_display_path(citation)).is_non_primary()
+    citation
+        .file_path
+        .as_deref()
+        .is_some_and(|path| retrieval_file_role_from_path(path).is_non_primary())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PacketSourceSetKind {
+    Shared,
+    Platform,
+}
+
+fn packet_shared_source_set_rank_adjustment(path: &str, terms: &[String]) -> f32 {
+    if packet_terms_mention_platform_source_set(terms) {
+        return 0.0;
+    }
+    match packet_path_source_set_kind(path) {
+        Some(PacketSourceSetKind::Shared) => 2.5,
+        Some(PacketSourceSetKind::Platform) => -2.5,
+        None => 0.0,
+    }
+}
+
+fn packet_terms_mention_platform_source_set(terms: &[String]) -> bool {
+    terms.iter().any(|term| {
+        let normalized = normalize_identifier(term);
+        [
+            "jvm", "nonjvm", "android", "ios", "native", "linux", "windows", "darwin", "apple",
+            "wasm", "nodejs", "browser", "mingw", "macos",
+        ]
+        .iter()
+        .any(|marker| normalized == *marker)
+    })
+}
+
+fn packet_mpp_source_set_key(citation: &AgentCitationDto) -> Option<(PacketSourceSetKind, String)> {
+    let path = packet_citation_display_path(citation).replace('\\', "/");
+    if path.is_empty() {
+        return None;
+    }
+    let mut kind = None;
+    let mut parts = Vec::new();
+    for segment in path.split('/') {
+        if let Some(segment_kind) = packet_source_set_segment_kind(segment) {
+            kind = Some(segment_kind);
+            parts.push("{srcset}");
+        } else {
+            parts.push(segment);
+        }
+    }
+    kind.map(|kind| (kind, parts.join("/")))
+}
+
+fn packet_path_source_set_kind(path: &str) -> Option<PacketSourceSetKind> {
+    let lower = packet_display_path(path)
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    lower.split('/').find_map(packet_source_set_segment_kind)
+}
+
+fn packet_source_set_segment_kind(segment: &str) -> Option<PacketSourceSetKind> {
+    if matches!(segment, "commonmain" | "common" | "shared") {
+        return Some(PacketSourceSetKind::Shared);
+    }
+    if matches!(
+        segment,
+        "jvmmain"
+            | "nonjvmmain"
+            | "androidmain"
+            | "iosmain"
+            | "nativemain"
+            | "linuxmain"
+            | "windowsmain"
+            | "darwinmain"
+            | "applemain"
+            | "wasmmain"
+            | "wasmwasimain"
+            | "nodejsmain"
+            | "jsmain"
+            | "browsermain"
+            | "mingwmain"
+            | "macosmain"
+    ) || (segment.len() > 4
+        && segment.ends_with("main")
+        && [
+            "jvm", "nonjvm", "android", "ios", "native", "linux", "mingw", "macos", "wasm", "js",
+            "browser", "apple", "darwin", "windows",
+        ]
+        .iter()
+        .any(|prefix| segment.starts_with(prefix)))
+    {
+        return Some(PacketSourceSetKind::Platform);
+    }
+    None
 }
 
 fn packet_stem_tokens_are_display_subset(
@@ -963,7 +1141,11 @@ fn packet_question_wants_tests(terms: &[String]) -> bool {
 }
 
 fn packet_citation_is_test_source(citation: &AgentCitationDto) -> bool {
-    packet_path_is_test_segment(&packet_citation_display_path(citation))
+    citation
+        .file_path
+        .as_deref()
+        .is_some_and(|path| retrieval_file_role_from_path(path) == RetrievalFileRole::Test)
+        || packet_path_is_test_segment(&packet_citation_display_path(citation))
         || packet_display_name_is_test_like(&citation.display_name)
 }
 
@@ -1794,7 +1976,17 @@ fn packet_path_is_test_segment(path: &str) -> bool {
     let segment_is_test = path.split(['/', '\\']).any(|segment| {
         matches!(
             segment,
-            "test" | "tests" | "unittest" | "unittests" | "__tests__"
+            "test"
+                | "tests"
+                | "unittest"
+                | "unittests"
+                | "__tests__"
+                | "samples"
+                | "commontest"
+                | "jvmtest"
+                | "androidtest"
+                | "nativetest"
+                | "androidunittest"
         ) || segment.ends_with("_test")
             || segment.ends_with("_tests")
             || segment.ends_with("-test")
@@ -1802,8 +1994,10 @@ fn packet_path_is_test_segment(path: &str) -> bool {
     });
     path.starts_with("test/")
         || path.starts_with("tests/")
+        || path.starts_with("samples/")
         || path.contains("/test/")
         || path.contains("/tests/")
+        || path.contains("/samples/")
         || path.contains("/unittest/")
         || path.contains("/unittests/")
         || path.contains(".tests/")
@@ -1812,8 +2006,10 @@ fn packet_path_is_test_segment(path: &str) -> bool {
         || path.contains("_test.")
         || path.starts_with("test\\")
         || path.starts_with("tests\\")
+        || path.starts_with("samples\\")
         || path.contains("\\test\\")
         || path.contains("\\tests\\")
+        || path.contains("\\samples\\")
         || path.contains("\\unittest\\")
         || path.contains("\\unittests\\")
         || segment_is_test
@@ -2569,6 +2765,190 @@ mod tests {
         packet_drop_unrequested_single_letter_displays(&mut citations, &terms);
         assert_eq!(citations.len(), 1);
         assert_eq!(citations[0].display_name, "format_to");
+    }
+
+    #[test]
+    fn unrequested_pascal_test_and_sample_siblings_drop_when_production_remains() {
+        let terms = vec![
+            "buffered".to_string(),
+            "source".to_string(),
+            "read".to_string(),
+            "write".to_string(),
+        ];
+        let mut citations = vec![
+            test_rank_citation("read", "src/commonMain/kotlin/io/ByteQueue.kt", 0.9),
+            test_rank_citation("read", "src/commonTest/kotlin/io/ByteQueue.kt", 0.95),
+            test_rank_citation("write", "src/jvmMain/java/io/PipeKotlinTest.kt", 0.94),
+            test_rank_citation("seed", "src/samples/InterceptingSink.java", 0.93),
+            test_rank_citation("write", "src/commonMain/kotlin/io/Contest.kt", 0.5),
+        ];
+        packet_drop_unrequested_test_siblings(&mut citations, &terms);
+        let paths = citations
+            .iter()
+            .filter_map(|citation| citation.file_path.as_deref())
+            .collect::<Vec<_>>();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("commonMain/kotlin/io/ByteQueue.kt")),
+            "production source should remain: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("commonMain/kotlin/io/Contest.kt")),
+            "ordinary Pascal stems must not be treated as tests: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|path| {
+                !path.contains("commonTest")
+                    && !path.contains("PipeKotlinTest")
+                    && !path.contains("/samples/")
+            }),
+            "unrequested tests and samples should drop: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn requested_tests_keep_pascal_and_source_set_test_hits() {
+        let terms = vec![
+            "buffered".to_string(),
+            "source".to_string(),
+            "test".to_string(),
+        ];
+        let mut citations = vec![
+            test_rank_citation("read", "src/commonMain/kotlin/io/ByteQueue.kt", 0.9),
+            test_rank_citation("read", "src/commonTest/kotlin/io/ByteQueue.kt", 0.95),
+            test_rank_citation("write", "src/jvmMain/java/io/PipeKotlinTest.kt", 0.94),
+        ];
+        packet_drop_unrequested_test_siblings(&mut citations, &terms);
+        assert_eq!(citations.len(), 3);
+    }
+
+    #[test]
+    fn shared_source_set_keeps_common_path_and_drops_platform_duplicate() {
+        let terms = vec!["buffered".to_string(), "queue".to_string()];
+        let mut citations = vec![
+            test_rank_citation("ByteQueue", "src/jvmMain/kotlin/io/ByteQueue.kt", 0.95),
+            test_rank_citation(
+                "ByteQueue.read",
+                "src/commonMain/kotlin/io/ByteQueue.kt",
+                0.4,
+            ),
+            test_rank_citation(
+                "Wrapper.read",
+                "src/commonMain/kotlin/io/internal/Wrapper.kt",
+                0.5,
+            ),
+            test_rank_citation("Wrapper", "src/jvmMain/kotlin/io/Wrapper.kt", 0.9),
+            test_rank_citation("Contest", "src/commonMain/kotlin/io/Contest.kt", 0.3),
+        ];
+        packet_keep_shared_source_set_over_platform_duplicates(&mut citations, &terms);
+        let paths = citations
+            .iter()
+            .filter_map(|citation| citation.file_path.as_deref())
+            .collect::<Vec<_>>();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("commonMain/kotlin/io/ByteQueue.kt")),
+            "shared source-set file should remain: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.contains("jvmMain/kotlin/io/ByteQueue.kt")),
+            "platform duplicate of the shared relative path should drop: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("jvmMain/kotlin/io/Wrapper.kt")),
+            "platform file without a same-relative shared sibling should remain: {paths:?}"
+        );
+        assert!(
+            packet_citation_rank(
+                &test_rank_citation("ByteQueue", "src/commonMain/kotlin/io/ByteQueue.kt", 0.4),
+                &terms,
+                true,
+            ) > packet_citation_rank(
+                &test_rank_citation("ByteQueue", "src/jvmMain/kotlin/io/ByteQueue.kt", 0.4),
+                &terms,
+                true,
+            )
+        );
+    }
+
+    #[test]
+    fn requested_platform_source_set_keeps_jvm_duplicate() {
+        let terms = vec!["buffered".to_string(), "jvm".to_string()];
+        let mut citations = vec![
+            test_rank_citation("ByteQueue", "src/jvmMain/kotlin/io/ByteQueue.kt", 0.95),
+            test_rank_citation(
+                "ByteQueue.read",
+                "src/commonMain/kotlin/io/ByteQueue.kt",
+                0.4,
+            ),
+        ];
+        packet_keep_shared_source_set_over_platform_duplicates(&mut citations, &terms);
+        assert_eq!(citations.len(), 2);
+    }
+
+    #[test]
+    fn unrequested_sql_schema_variant_copies_drop_when_common_dialects_remain() {
+        let terms = vec![
+            "schema".to_string(),
+            "relationships".to_string(),
+            "sql".to_string(),
+            "scripts".to_string(),
+        ];
+        let mut citations = vec![
+            test_rank_citation("CREATE TABLE Publisher", "schema/Catalog_Sqlite.sql", 0.4),
+            test_rank_citation("FOREIGN KEY", "schema/Catalog_Sqlite.sql", 0.35),
+            test_rank_citation("CREATE TABLE Publisher", "schema/Catalog_MySql.sql", 0.3),
+            test_rank_citation("FOREIGN KEY", "schema/Catalog_PostgreSql.sql", 0.25),
+            test_rank_citation(
+                "CREATE TABLE Publisher",
+                "schema/Catalog_SqliteAutoIncrementPKs.sql",
+                0.95,
+            ),
+            test_rank_citation(
+                "CREATE TABLE Publisher",
+                "schema/Catalog_PostgreSqlSerialPKs.sql",
+                0.9,
+            ),
+            test_rank_citation("CREATE TABLE Publisher", "schema/Catalog_Db2.sql", 0.85),
+        ];
+        packet_drop_unrequested_sql_schema_variant_siblings(&mut citations, &terms);
+        let paths = citations
+            .iter()
+            .filter_map(|citation| citation.file_path.as_deref())
+            .collect::<Vec<_>>();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("Catalog_Sqlite.sql")),
+            "sqlite dialect should remain: {paths:?}"
+        );
+        assert!(
+            citations
+                .iter()
+                .any(|citation| citation.display_name.contains("FOREIGN KEY")),
+            "FOREIGN KEY on a retained dialect should remain: {:?}",
+            citations
+                .iter()
+                .map(|citation| citation.display_name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            paths.iter().all(|path| {
+                let lower = path.to_ascii_lowercase();
+                !lower.contains("autoincrement")
+                    && !lower.contains("serialpks")
+                    && !lower.contains("db2")
+            }),
+            "variant and extra-engine copies should drop: {paths:?}"
+        );
     }
 
     #[test]

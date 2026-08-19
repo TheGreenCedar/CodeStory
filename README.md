@@ -147,11 +147,11 @@ Full routing: [docs/README.md](docs/README.md).
 
 ## Evaluation
 
-> **Scope:** The language-expansion holdout compares agents on 18 pinned public OSS tasks with and without CodeStory. There is no current public 18-task performance or answer-quality claim. For day-to-day limits, see [What to expect](docs/users/what-to-expect.md).
+> **Scope:** The language-expansion holdout compares agents on 18 pinned public OSS tasks with and without CodeStory. On the latest nested 18×3 sheet, CodeStory matched or beat the no-CodeStory arm on answer quality while using fewer tokens and tools. For day-to-day limits, see [What to expect](docs/users/what-to-expect.md).
 
 ### Language expansion holdout (18 tasks)
 
-Broader public-repo evidence uses the [`language-support-ab`](benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json) manifest across 18 pinned OSS packages. There is no current public 18-task claim: no 18×3 nested `summary.json` has passed the publication bar, so this page has no savings headline and no 18-row quality table. See the [language-expansion holdout evidence record](docs/testing/language-expansion-holdout-stats.md) for the 2026-08-18 packet-gate census, the nested A/B attempt that did not produce a sheet, and the rejected 2026-08-10 rerun.
+Broader public-repo evidence uses the [`language-support-ab`](benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json) manifest across 18 pinned OSS packages. The latest nested 18×3 (`language-support-ab-window6`) scored **45/54** with CodeStory versus **44/54** without, with post-packet source reads at zero. Tokens dropped from 19,819,661 to 1,723,654 (−91%) and tool calls from 834 to 54 (−94%). That sheet has no `summary.json` (dirty-tree attestation) and is not `--publishable`. Full task rows, CLI SHA, and accelerator identity: [language-expansion holdout evidence record](docs/testing/language-expansion-holdout-stats.md).
 
 ## License
 

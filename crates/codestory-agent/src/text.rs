@@ -330,12 +330,15 @@ pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
             "/fixture/",
             "/examples/",
             "/example/",
+            "/samples/",
             "/__tests__/",
             "/__test__/",
             "-test-client/",
             "_test_client/",
         ],
     ) || path_has_dotted_test_directory(&marked)
+        || path_has_multiplatform_test_source_set(&marked)
+        || file_stem_is_pascal_test_class(original_path_file_stem(path))
         || file_name.contains(".test.")
         || file_name.contains(".spec.")
         || file_name.ends_with("_test.rs")
@@ -360,6 +363,7 @@ pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
             "/docssource/",
             "/docs-source/",
             "/docs_source/",
+            "/.github/",
         ],
     ) || matches!(file_name, "readme.md" | "changelog.md" | "contributing.md")
     {
@@ -405,6 +409,41 @@ fn path_contains_any(path: &str, markers: &[&str]) -> bool {
 fn path_has_dotted_test_directory(path: &str) -> bool {
     path.split('/')
         .any(|segment| segment.ends_with(".tests") || segment.ends_with(".test"))
+}
+
+fn path_has_multiplatform_test_source_set(path: &str) -> bool {
+    path.split(['/', '\\']).any(|segment| {
+        matches!(
+            segment,
+            "commontest" | "jvmtest" | "androidtest" | "nativetest" | "androidunittest"
+        )
+    })
+}
+
+fn original_path_file_stem(path: &str) -> &str {
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    file_name
+        .rsplit_once('.')
+        .map(|(stem, _extension)| stem)
+        .unwrap_or(file_name)
+}
+
+fn file_stem_is_pascal_test_class(stem: &str) -> bool {
+    let suffix = if stem.ends_with("Tests") {
+        "Tests"
+    } else if stem.ends_with("Test") {
+        "Test"
+    } else {
+        return false;
+    };
+    let prefix = &stem[..stem.len() - suffix.len()];
+    // `Contest.kt` / `latest.kt` must stay source: require a real type-name
+    // prefix (length >= 4) immediately before the Pascal `Test` / `Tests` suffix.
+    prefix.len() >= 4
+        && prefix
+            .chars()
+            .last()
+            .is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
 }
 
 fn benchmark_file_name(file_name: &str) -> bool {
@@ -555,6 +594,69 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn classifies_pascal_test_filenames_and_multiplatform_test_source_sets() {
+        for path in [
+            "src/commonMain/kotlin/io/ByteQueueTest.kt",
+            "src/jvmMain/java/io/PipeKotlinTest.kt",
+            "src/commonTest/kotlin/io/ByteQueue.kt",
+            "src/jvmTest/kotlin/io/Sink.kt",
+            "src/androidTest/java/io/Sink.java",
+            "src/nativeTest/kotlin/io/Sink.kt",
+            "src/androidUnitTest/kotlin/io/Sink.kt",
+        ] {
+            assert_eq!(
+                retrieval_file_role_from_path(path),
+                RetrievalFileRole::Test,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_classify_ordinary_pascal_or_lowercase_stems_as_test_files() {
+        for path in [
+            "src/commonMain/kotlin/io/Contest.kt",
+            "src/commonMain/kotlin/io/latest.kt",
+            "src/commonMain/kotlin/io/Buffer.kt",
+            "src/commonMain/kotlin/io/ByteQueue.kt",
+        ] {
+            assert_eq!(
+                retrieval_file_role_from_path(path),
+                RetrievalFileRole::Source,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_sample_trees_like_example_trees() {
+        assert_eq!(
+            retrieval_file_role_from_path("src/samples/InterceptingSink.java"),
+            RetrievalFileRole::Test
+        );
+        assert_eq!(
+            retrieval_file_role_from_path("samples/GoldenValue.kt"),
+            RetrievalFileRole::Test
+        );
+        assert_eq!(
+            retrieval_file_role_from_path("src/commonMain/kotlin/io/Buffer.kt"),
+            RetrievalFileRole::Source
+        );
+    }
+
+    #[test]
+    fn classifies_github_workflow_paths_as_docs() {
+        assert_eq!(
+            retrieval_file_role_from_path(".github/labeler.yml"),
+            RetrievalFileRole::Docs
+        );
+        assert_eq!(
+            retrieval_file_role_from_path("pkgs/http/.github/workflows/ci.yml"),
+            RetrievalFileRole::Docs
+        );
     }
 
     #[test]

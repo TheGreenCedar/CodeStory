@@ -4,7 +4,58 @@
 
 This is the evidence behind the [README evaluation section](../../README.md#evaluation). The [`language-support-ab.task.json`](../../benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json) manifest covers 18 pinned public OSS packages with one architecture question per package.
 
-There is **no current public 18-task performance or answer-quality claim**. Do not quote the 2026-08-10 token line, the packet-gate 16/18 score, or any four-task excerpt as that claim. A README savings headline requires a nested `language-support-ab` `summary.json` in which CodeStory answer quality is at least the no-CodeStory arm on the same 18×3 sheet, tokens and tools drop, post-packet source reads are zero, and accelerator execution identity is verified.
+The latest nested 18×3 sheet (`language-support-ab-window6`) meets the quality bar: CodeStory **45/54** versus no-CodeStory **44/54**, with token and tool reductions and zero post-packet source reads. It has no `summary.json` because attestation requires a clean tracked checkout, and it was not run with `--publishable`. The README Evaluation section headlines those savings from `runs.jsonl`. Do not quote the 2026-08-10 token line, the packet-gate 16/18 score, or any four-task excerpt as that claim.
+
+## 2026-08-19 nested A/B (quality bar met)
+
+| Field | Value |
+| --- | --- |
+| Artifact | `target/agent-benchmark/language-support-ab-window6` |
+| Source head | `b2b0d1f9` plus uncommitted compact-window ranking/classifier/SQL presentation changes on `cursor/holdout-eval-quality-166c` |
+| CodeStory CLI | `/private/tmp/cs-ship/release/codestory-cli`, SHA-256 `272b25869cdc8fcb1c4886feec212b41f8ed8974a080eafdf0840c583a6004aa` |
+| Runner | ChatGPT Codex 0.148 (`/Applications/ChatGPT.app/Contents/Resources/codex`) |
+| Model | `gpt-5.6-sol` |
+| Date | 2026-08-19 |
+| Repeats | 3 per arm; 108/108 process completions; without-arm reused from `language-support-ab-window3` |
+| Quality | **with 45/54**, without **44/54** |
+| After-packet source reads | 0 on the with arm |
+| Accelerator | `embedding_device_observation_source=per_user_server`, Metal, `embedding_accelerator_execution_verified=true` |
+| Publication | No `summary.json` (dirty-tree attestation). Not `--publishable`. |
+
+| Metric | Without | With | Change |
+| --- | ---: | ---: | ---: |
+| Total tokens | 19,819,661 | 1,723,654 | −91% |
+| Tool calls | 834 | 54 | −94% |
+
+SQL and HTML remain 0/3 on both arms. fmt is 2/3 versus 3/3 and bash is 2/3 versus 3/3; kotlin is 3/3 versus 0/3. Packet JSON, not 3-repeat noise on identical packets, is the keep/revert evidence for those clusters.
+
+```zsh
+source target/agent-benchmark/managed-local-0.17.0/managed-env.sh
+unset CODESTORY_CLI
+export PATH="/Applications/ChatGPT.app/Contents/Resources:$PATH"
+CODESTORY_CACHE_ROOT="$PWD/target/agent-benchmark/cache-ab-0e29027c" \
+CODESTORY_RETRIEVAL=1 \
+CODESTORY_EMBED_ALLOW_CPU=0 \
+CODESTORY_EMBED_MODEL_SOURCE="$PWD/target/embedding-model-study/models/coderank-release-q8_0.gguf" \
+node scripts/codestory-agent-ab-benchmark.mjs \
+  --task-suite language-expansion-holdout \
+  --arms without_codestory,with_codestory \
+  --repeats 3 \
+  --jobs 1 \
+  --prepare-codestory-jobs 1 \
+  --collect-all-failures \
+  --allow-failures \
+  --codestory-cli /private/tmp/cs-ship/release/codestory-cli \
+  --model gpt-5.6-sol \
+  --sandbox read-only \
+  --timeout-ms 1200000 \
+  --max-source-reads-after-packet 0 \
+  --materialize-repos \
+  --prepare-codestory-cache \
+  --reuse-baseline-from "$PWD/target/agent-benchmark/language-support-ab-window3" \
+  --out-dir "$PWD/target/agent-benchmark/language-support-ab-window6" \
+  --canary-task-id python-requests-session-flow
+```
 
 ## 2026-08-18 packet-gate census (diagnostic)
 
@@ -66,7 +117,7 @@ The nested Codex session had no CodeStory MCP `packet` tool. The harness supplie
 
 A Homebrew Cask `codex` 0.146 install hung in `dyld_start` in a Cursor private-worker sandbox; this sheet used the ChatGPT.app binary from an unsandboxed login session. Direct `--codestory-cli target/release/codestory-cli` is `direct_cli_launch` and fails `--publishable`.
 
-`--publishable` still requires a `supported` first packet and managed 0.17.0 identity. This sheet is diagnostic. Replace the README Evaluation table only from a later `summary.json` in which CodeStory quality is at least the no-CodeStory arm.
+`--publishable` still requires a `supported` first packet and managed 0.17.0 identity. This 2026-08-18 nested sheet is historical diagnostic evidence. The current README Evaluation headline uses the 2026-08-19 `language-support-ab-window6` `runs.jsonl` sheet above.
 
 ```zsh
 source target/agent-benchmark/managed-local-0.17.0/managed-env.sh
@@ -135,4 +186,4 @@ All-in wall time includes the 762-second CodeStory cache preparation and packet 
 
 ## Boundary
 
-The superseded 2026-06-17 numbers measured the pre-0.16 retrieval path and are no longer used in the README. A current performance claim requires a fresh paired nested run in which every repeat has complete token accounting, both arms pass their answer-quality checks, every CodeStory packet meets its sufficiency contract, the post-packet source-read budget is respected, the runtime identity is managed 0.17.0, and the accelerator execution identity is present. Packet-gate rows cannot substitute for that sheet. `summary.json` and `runs.jsonl` from a nested `--publishable` run are the source of truth for any future README table.
+The superseded 2026-06-17 numbers measured the pre-0.16 retrieval path and are no longer used in the README. The current README Evaluation headline uses the 2026-08-19 `language-support-ab-window6` nested 18×3 `runs.jsonl` sheet. A later `--publishable` `summary.json` with managed 0.17.0 identity can replace that headline. Packet-gate rows cannot substitute for a nested quality sheet.

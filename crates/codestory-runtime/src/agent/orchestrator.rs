@@ -92,10 +92,12 @@ use crate::agent::packet_scoring::{
     packet_drop_unrequested_non_stylesheet_animation_siblings,
     packet_drop_unrequested_python_siblings, packet_drop_unrequested_repo_root_stylesheet_siblings,
     packet_drop_unrequested_single_letter_displays,
+    packet_drop_unrequested_sql_schema_variant_siblings,
     packet_drop_unrequested_system_format_failure_siblings, packet_drop_unrequested_test_siblings,
     packet_drop_unrequested_wide_char_siblings,
-    packet_drop_unrequested_windows_formatting_siblings, packet_stage_citation_carry_limit,
-    sort_by_cached_rank_desc,
+    packet_drop_unrequested_windows_formatting_siblings,
+    packet_keep_shared_source_set_over_platform_duplicates, packet_sql_schema_file_is_variant_copy,
+    packet_stage_citation_carry_limit, sort_by_cached_rank_desc,
 };
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_client_send_flow,
@@ -892,14 +894,13 @@ fn promote_retained_schema_entity_probes(question: &str, answer: &mut AgentAnswe
     if entities.is_empty() {
         return;
     }
-    let mut aliases = Vec::new();
     for entity in &entities {
         let table_key = normalize_identifier(&entity.replace(' ', ""));
         if table_key.len() < 4 {
             continue;
         }
         let catalog_key = normalize_identifier(&format!("public.{entity}").replace(' ', ""));
-        let best = answer
+        let matching = answer
             .citations
             .iter()
             .enumerate()
@@ -915,66 +916,43 @@ fn promote_retained_schema_entity_probes(question: &str, answer: &mut AgentAnswe
                         display == catalog_key || sql_catalog_table_key(&display) == table_key
                     }
             })
-            .max_by(|(_, left), (_, right)| {
-                sql_schema_dialect_rank(left.file_path.as_deref().unwrap_or_default())
-                    .total_cmp(&sql_schema_dialect_rank(
-                        right.file_path.as_deref().unwrap_or_default(),
-                    ))
-                    .then_with(|| left.score.total_cmp(&right.score))
-            })
-            .map(|(index, _)| index);
-        let Some(index) = best else {
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let Some(&best_index) = matching.iter().max_by(|left, right| {
+            let left = &answer.citations[**left];
+            let right = &answer.citations[**right];
+            sql_schema_dialect_rank(left.file_path.as_deref().unwrap_or_default())
+                .total_cmp(&sql_schema_dialect_rank(
+                    right.file_path.as_deref().unwrap_or_default(),
+                ))
+                .then_with(|| left.score.total_cmp(&right.score))
+        }) else {
             continue;
         };
-        answer.citations[index].coverage_role =
+        answer.citations[best_index].coverage_role =
             Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
-        let table_token = {
-            let display = &answer.citations[index].display_name;
-            display
-                .rsplit(['.', ' ', '/', '\\'])
-                .next()
-                .unwrap_or(display)
-                .trim()
-                .to_string()
-        };
-        if table_token.is_empty() || normalize_identifier(&table_token).contains("createtable") {
-            continue;
+        for index in matching {
+            let table_token = {
+                let display = &answer.citations[index].display_name;
+                display
+                    .rsplit(['.', ' ', '/', '\\'])
+                    .next()
+                    .unwrap_or(display)
+                    .trim()
+                    .to_string()
+            };
+            if table_token.is_empty() || normalize_identifier(&table_token).contains("createtable")
+            {
+                continue;
+            }
+            let alias_name = format!("CREATE TABLE {table_token}");
+            if answer.citations[index].display_name != alias_name {
+                answer.citations[index].display_name = alias_name;
+            }
         }
-        let alias_name = format!("CREATE TABLE {table_token}");
-        if answer
-            .citations
-            .iter()
-            .any(|existing| existing.display_name == alias_name)
-        {
-            continue;
-        }
-        let source = &answer.citations[index];
-        aliases.push(AgentCitationDto {
-            node_id: NodeId(format!(
-                "packet::sql_schema_alias::{}::{}",
-                source.node_id.0, alias_name
-            )),
-            display_name: alias_name,
-            kind: NodeKind::ANNOTATION,
-            file_path: source.file_path.clone(),
-            line: source.line,
-            score: source.score.max(20.0),
-            origin: SearchHitOrigin::TextMatch,
-            target: None,
-            resolvable: false,
-            subgraph_id: source.subgraph_id.clone(),
-            evidence_edge_ids: Vec::new(),
-            retrieval_score_breakdown: source.retrieval_score_breakdown.clone(),
-            evidence_tier: source.evidence_tier,
-            evidence_producer: Some("packet_sql_schema_ddl_alias".to_string()),
-            resolution_status: source.resolution_status,
-            loss_reason: None,
-            coverage_role: None,
-            eligible_for_sufficiency: Some(false),
-        });
     }
-    answer.citations.extend(aliases);
     promote_sql_schema_dialect_files(answer);
+    promote_sql_schema_relationship_constraints(answer);
 }
 
 fn sql_schema_dialect_rank(path: &str) -> f32 {
@@ -992,6 +970,7 @@ fn sql_schema_dialect_rank(path: &str) -> f32 {
 }
 
 fn promote_sql_schema_dialect_files(answer: &mut AgentAnswerDto) {
+    let mut file_identities = Vec::new();
     for marker in ["sqlite", "mysql", "postgres"] {
         let best = answer
             .citations
@@ -1000,7 +979,9 @@ fn promote_sql_schema_dialect_files(answer: &mut AgentAnswerDto) {
             .filter(|(_, citation)| {
                 citation.file_path.as_deref().is_some_and(|path| {
                     let display = packet_display_path(path).to_ascii_lowercase();
-                    display.ends_with(".sql") && display.contains(marker)
+                    display.ends_with(".sql")
+                        && display.contains(marker)
+                        && !packet_sql_schema_file_is_variant_copy(path)
                 })
             })
             .max_by(|(_, left), (_, right)| left.score.total_cmp(&right.score))
@@ -1012,6 +993,77 @@ fn promote_sql_schema_dialect_files(answer: &mut AgentAnswerDto) {
             answer.citations[index].coverage_role =
                 Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
         }
+        let Some(path) = answer.citations[index].file_path.as_deref() else {
+            continue;
+        };
+        let relative = packet_display_path(path);
+        if relative.is_empty()
+            || answer
+                .citations
+                .iter()
+                .any(|citation| citation.display_name == relative)
+            || file_identities
+                .iter()
+                .any(|citation: &AgentCitationDto| citation.display_name == relative)
+        {
+            continue;
+        }
+        let source = &answer.citations[index];
+        file_identities.push(AgentCitationDto {
+            node_id: NodeId(format!(
+                "packet::sql_schema_dialect_file::{}::{relative}",
+                source.node_id.0
+            )),
+            display_name: relative,
+            kind: NodeKind::FILE,
+            file_path: source.file_path.clone(),
+            line: source.line,
+            score: source.score.max(20.0),
+            origin: SearchHitOrigin::TextMatch,
+            target: None,
+            resolvable: false,
+            subgraph_id: source.subgraph_id.clone(),
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: source.retrieval_score_breakdown.clone(),
+            evidence_tier: source.evidence_tier,
+            evidence_producer: Some("packet_sql_schema_dialect_file".to_string()),
+            resolution_status: source.resolution_status,
+            loss_reason: None,
+            coverage_role: Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string()),
+            eligible_for_sufficiency: Some(false),
+        });
+    }
+    answer.citations.extend(file_identities);
+}
+
+fn citation_path_is_retained_sql_dialect(path: &str) -> bool {
+    let display = packet_display_path(path).to_ascii_lowercase();
+    display.ends_with(".sql")
+        && (display.contains("sqlite") || display.contains("mysql") || display.contains("postgres"))
+        && !packet_sql_schema_file_is_variant_copy(path)
+}
+
+fn promote_sql_schema_relationship_constraints(answer: &mut AgentAnswerDto) {
+    let retains_common_dialects = answer.citations.iter().any(|citation| {
+        citation
+            .file_path
+            .as_deref()
+            .is_some_and(citation_path_is_retained_sql_dialect)
+    });
+    if !retains_common_dialects {
+        return;
+    }
+    for citation in &mut answer.citations {
+        if citation.coverage_role.is_some()
+            || packet_evidence_role(citation) != Some(PacketEvidenceRole::SqlRelationshipConstraint)
+            || citation
+                .file_path
+                .as_deref()
+                .is_some_and(packet_sql_schema_file_is_variant_copy)
+        {
+            continue;
+        }
+        citation.coverage_role = Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
     }
 }
 
@@ -2025,6 +2077,8 @@ fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
     packet_drop_unrequested_example_and_binding_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_mapper_annotation_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_test_siblings(&mut answer.citations, &terms);
+    packet_keep_shared_source_set_over_platform_duplicates(&mut answer.citations, &terms);
+    packet_drop_unrequested_sql_schema_variant_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_non_primary_flow_siblings(&mut answer.citations, &terms);
     packet_drop_excess_unrequested_keyframe_siblings(&mut answer.citations, &terms);
     packet_drop_excess_unrequested_animation_class_siblings(&mut answer.citations, &terms);
@@ -10420,6 +10474,17 @@ mod tests {
         assert!(alias_names.contains(&"CREATE TABLE Artist"));
         assert!(alias_names.contains(&"CREATE TABLE InvoiceLine"));
         assert!(!alias_names.contains(&"CREATE TABLE Customer"));
+        assert_eq!(
+            answer.citations.len(),
+            4,
+            "DDL spelling should rewrite the catalog citation instead of adding a duplicate alias"
+        );
+        assert_eq!(answer.citations[0].display_name, "CREATE TABLE Artist");
+        assert_eq!(answer.citations[2].display_name, "CREATE TABLE InvoiceLine");
+        assert_eq!(
+            answer.citations[1].display_name, "CREATE TABLE Artist",
+            "every matching catalog hit should use the DDL spelling, not only the preferred dialect"
+        );
     }
 
     #[test]
@@ -10476,6 +10541,232 @@ mod tests {
                         .as_deref()
                         .is_some_and(|path| packet_display_path(path).contains("Sqlite"))),
             "CREATE TABLE alias should follow the preferred dialect file: {:?}",
+            answer.citations
+        );
+        let file_identity_names = answer
+            .citations
+            .iter()
+            .filter(|citation| citation.kind == NodeKind::FILE)
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            file_identity_names
+                .iter()
+                .any(|name| *name == "db/Chinook_Sqlite.sql"),
+            "retained dialect files should keep a repo-relative file identity: {file_identity_names:?}"
+        );
+        assert!(
+            file_identity_names
+                .iter()
+                .any(|name| *name == "db/Chinook_MySql.sql"),
+            "retained dialect files should keep a repo-relative file identity: {file_identity_names:?}"
+        );
+        assert!(
+            file_identity_names
+                .iter()
+                .any(|name| *name == "db/Chinook_PostgreSql.sql"),
+            "retained dialect files should keep a repo-relative file identity: {file_identity_names:?}"
+        );
+    }
+
+    #[test]
+    fn schema_entity_promotion_keeps_named_constraint_anchor_on_retained_dialect() {
+        let question =
+            "Explain schema relationships between publishers and titles across SQL scripts.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("public.Publisher", "schema/Catalog_Sqlite.sql", 0.4),
+                test_packet_citation("IFK_TitlePublisherId", "schema/Catalog_MySql.sql", 0.35),
+                test_packet_citation("public.title", "schema/Catalog_PostgreSql.sql", 0.2),
+            ],
+        );
+        for citation in &mut answer.citations {
+            citation.evidence_producer = Some("structural_sql_collector".to_string());
+            citation.origin = SearchHitOrigin::IndexedSymbol;
+            citation.kind = NodeKind::CLASS;
+            citation.resolvable = true;
+            citation.eligible_for_sufficiency = Some(true);
+        }
+
+        promote_retained_schema_entity_probes(question, &mut answer);
+        rank_packet_evidence(question, &mut answer);
+
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "IFK_TitlePublisherId"
+                    && citation
+                        .file_path
+                        .as_deref()
+                        .is_some_and(|path| packet_display_path(path).contains("MySql"))
+            }),
+            "named referential constraints on retained dialects should remain: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "IFK_TitlePublisherId"
+                    && citation.coverage_role.as_deref() == Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE)
+            }),
+            "relationship constraints on retained dialects should keep a protected schema role: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name.contains("CREATE TABLE")
+                    && citation.file_path.as_deref().is_some_and(|path| {
+                        let display = packet_display_path(path);
+                        display.contains("Sqlite")
+                            || display.contains("MySql")
+                            || display.contains("PostgreSql")
+                    })
+            }),
+            "retained dialects should keep a table-creation anchor: {:?}",
+            answer.citations
+        );
+    }
+
+    #[test]
+    fn schema_file_identities_keep_relationship_constraints_on_the_same_dialect() {
+        let question =
+            "Explain schema relationships between publishers and titles across SQL scripts.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("public.Publisher", "schema/Catalog_Sqlite.sql", 0.4),
+                test_packet_citation("public.Title", "schema/Catalog_Sqlite.sql", 0.38),
+                test_packet_citation("IFK_TitlePublisherId", "schema/Catalog_Sqlite.sql", 0.2),
+                test_packet_citation("public.Publisher", "schema/Catalog_MySql.sql", 0.3),
+                test_packet_citation("public.Publisher", "schema/Catalog_PostgreSql.sql", 0.25),
+                test_packet_citation("unrelated helper", "src/unrelated.rs", 0.9),
+            ],
+        );
+        for citation in &mut answer.citations {
+            if citation.display_name.starts_with("public.")
+                || citation.display_name.starts_with("IFK_")
+            {
+                citation.evidence_producer = Some("structural_sql_collector".to_string());
+                citation.origin = SearchHitOrigin::IndexedSymbol;
+                citation.kind = NodeKind::CLASS;
+                citation.resolvable = true;
+                citation.eligible_for_sufficiency = Some(true);
+            }
+        }
+
+        promote_retained_schema_entity_probes(question, &mut answer);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 8,
+            max_files: 8,
+            max_snippets: 8,
+            max_trail_edges: 8,
+            max_output_bytes: 16 * 1024,
+        };
+        assert!(cap_citations(&mut answer, &limits));
+
+        let names = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            names.iter().any(|name| *name == "IFK_TitlePublisherId"),
+            "dialect file identities must not evict relationship constraints: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| *name == "schema/Catalog_Sqlite.sql"),
+            "retained dialect files should keep a repo-relative file identity: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.contains("CREATE TABLE")),
+            "retained dialects should keep a table-creation anchor: {names:?}"
+        );
+    }
+
+    #[test]
+    fn packet_ranking_drops_sql_schema_variant_copies_when_common_dialects_remain() {
+        let question =
+            "Explain schema relationships between publishers and titles across SQL scripts.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("CREATE TABLE Publisher", "schema/Catalog_Sqlite.sql", 0.4),
+                test_packet_citation("FOREIGN KEY", "schema/Catalog_Sqlite.sql", 0.35),
+                test_packet_citation("CREATE TABLE Publisher", "schema/Catalog_MySql.sql", 0.3),
+                test_packet_citation("FOREIGN KEY", "schema/Catalog_PostgreSql.sql", 0.25),
+                test_packet_citation(
+                    "CREATE TABLE Publisher",
+                    "schema/Catalog_SqliteAutoIncrementPKs.sql",
+                    0.95,
+                ),
+                test_packet_citation(
+                    "CREATE TABLE Publisher",
+                    "schema/Catalog_PostgreSqlSerialPKs.sql",
+                    0.9,
+                ),
+                test_packet_citation("CREATE TABLE Publisher", "schema/Catalog_Db2.sql", 0.85),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut answer);
+
+        let paths = answer
+            .citations
+            .iter()
+            .filter_map(|citation| citation.file_path.as_deref())
+            .map(packet_display_path)
+            .collect::<Vec<_>>();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("schema/Catalog_Sqlite.sql")),
+            "sqlite dialect should remain: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("schema/Catalog_MySql.sql")),
+            "mysql dialect should remain: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("schema/Catalog_PostgreSql.sql")),
+            "postgres dialect should remain: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|path| {
+                !path.to_ascii_lowercase().contains("autoincrement")
+                    && !path.to_ascii_lowercase().contains("serialpks")
+                    && !path.contains("Db2")
+            }),
+            "variant and extra-engine copies should drop: {paths:?}"
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name.contains("FOREIGN KEY")
+                    && citation.file_path.as_deref().is_some_and(|path| {
+                        let display = packet_display_path(path);
+                        display.contains("Sqlite")
+                            || display.contains("MySql")
+                            || display.contains("PostgreSql")
+                    })
+            }),
+            "FOREIGN KEY on a retained dialect should remain: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name.contains("CREATE TABLE")
+                    && citation.file_path.as_deref().is_some_and(|path| {
+                        let display = packet_display_path(path);
+                        display.contains("Sqlite")
+                            || display.contains("MySql")
+                            || display.contains("PostgreSql")
+                    })
+            }),
+            "CREATE TABLE on a retained dialect should remain: {:?}",
             answer.citations
         );
     }
