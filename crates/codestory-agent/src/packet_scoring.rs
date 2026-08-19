@@ -193,6 +193,35 @@ pub fn packet_citation_rank(
     score
 }
 
+/// Drop wide-char overloads when the question did not ask for them and a
+/// non-wide sibling is already in the window. Rank demotion alone cannot
+/// evict a hit from a full-size candidate set.
+pub fn packet_drop_unrequested_wide_char_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if packet_runtime_formatting_question_wants_wide_char(terms) {
+        return;
+    }
+    if citations
+        .iter()
+        .any(|citation| !packet_citation_is_wide_char_sibling(citation))
+    {
+        citations.retain(|citation| !packet_citation_is_wide_char_sibling(citation));
+    }
+}
+
+fn packet_citation_is_wide_char_sibling(citation: &AgentCitationDto) -> bool {
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let normalized_display = normalize_identifier(&citation.display_name);
+    path.contains("xchar") || path.contains("wchar") || normalized_display.contains("wchar")
+}
+
 fn packet_facade_module_citation(kind: NodeKind, normalized_display: &str, path: &str) -> bool {
     if kind != NodeKind::MODULE {
         return false;
@@ -1521,6 +1550,26 @@ mod tests {
                     &default_terms,
                 )
         );
+    }
+
+    #[test]
+    fn unrequested_wide_char_siblings_drop_when_a_narrow_hit_remains() {
+        let terms = vec!["format".to_string(), "vformat".to_string()];
+        let mut citations = vec![
+            test_rank_citation("vformat_to", "include/tool/xchar.h", 0.9),
+            test_rank_citation("format_to", "include/tool/format.h", 0.7),
+        ];
+        packet_drop_unrequested_wide_char_siblings(&mut citations, &terms);
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].display_name, "format_to");
+
+        let wide_terms = vec!["format".to_string(), "wchar".to_string()];
+        let mut kept = vec![
+            test_rank_citation("vformat_to", "include/tool/xchar.h", 0.9),
+            test_rank_citation("format_to", "include/tool/format.h", 0.7),
+        ];
+        packet_drop_unrequested_wide_char_siblings(&mut kept, &wide_terms);
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]

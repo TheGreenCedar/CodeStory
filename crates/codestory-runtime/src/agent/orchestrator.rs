@@ -39,6 +39,7 @@ use crate::agent::packet_compiler::{
 };
 use crate::agent::packet_degradation::apply_packet_semantic_degradation_counters;
 use crate::agent::packet_evidence::decorate_citation_from_hit;
+use crate::agent::packet_evidence_carriers::packet_server_dispatch_callable_rank_bonus;
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
 };
@@ -76,7 +77,8 @@ use crate::agent::packet_required_probes::{
 use crate::agent::packet_scoring::packet_citation_key;
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path,
-    packet_stage_citation_carry_limit, sort_by_cached_rank_desc,
+    packet_drop_unrequested_wide_char_siblings, packet_stage_citation_carry_limit,
+    sort_by_cached_rank_desc,
 };
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_search_execution_flow,
@@ -1361,7 +1363,9 @@ fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
     let prefer_primary_sources = !query_mentions_non_primary_source(question);
     sort_by_cached_rank_desc(&mut answer.citations, |citation| {
         packet_citation_rank(citation, &terms, prefer_primary_sources)
+            + packet_server_dispatch_callable_rank_bonus(citation, &terms)
     });
+    packet_drop_unrequested_wide_char_siblings(&mut answer.citations, &terms);
 }
 
 fn maybe_annotate_packet_candidate_window(
@@ -8336,6 +8340,54 @@ mod tests {
             !top.contains(&"thread_start_params_include_user_thread_source"),
             "test-only symbols should not dominate exec/json ranking: {top:?}"
         );
+    }
+
+    #[test]
+    fn packet_ranking_prefers_inbound_dispatch_callable_over_route_group() {
+        let question = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("RouteGroup.Group", "src/http/group.go", 0.95),
+                test_packet_citation("ServerEngine.handleHTTPRequest", "src/http/server.go", 0.40),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut answer);
+
+        assert_eq!(
+            answer.citations[0].display_name,
+            "ServerEngine.handleHTTPRequest"
+        );
+    }
+
+    #[test]
+    fn packet_ranking_drops_unrequested_wide_char_siblings() {
+        let question = "Explain how a formatter turns arguments into type-erased format args and reaches format_to output paths.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("vformat_to", "include/tool/xchar.h", 0.90),
+                test_packet_citation("format_to", "include/tool/format.h", 0.70),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut answer);
+
+        assert!(
+            answer.citations.iter().all(|citation| !citation
+                .file_path
+                .as_deref()
+                .unwrap_or_default()
+                .contains("xchar")),
+            "wide-char siblings should leave the window when the question did not ask for them: {:?}",
+            answer
+                .citations
+                .iter()
+                .map(|citation| citation.file_path.as_deref())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(answer.citations[0].display_name, "format_to");
     }
 
     #[test]

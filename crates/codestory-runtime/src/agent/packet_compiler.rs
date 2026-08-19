@@ -407,12 +407,20 @@ fn packet_has_unmet_blocking_material(plan: &PacketPlanDto) -> bool {
         material_claim_blocks_supported(obligation)
             && obligation.proof_status != PacketObligationProofStatusDto::Proven
     }) || plan.obligations.query_obligations.iter().any(|obligation| {
-        obligation.material
-            && !matches!(
-                obligation.completion,
-                Some(PacketQueryCompletionDto::Completed)
-            )
+        obligation.material && !material_query_obligation_is_satisfied(obligation)
     })
+}
+
+/// Bounded retrieval often skips sibling seeds once a flow step is already
+/// carried. `not_dispatched` records that skip; it is not a missing search.
+fn material_query_obligation_is_satisfied(
+    obligation: &codestory_contracts::api::PacketQueryObligationDto,
+) -> bool {
+    match obligation.completion.as_ref() {
+        Some(PacketQueryCompletionDto::Completed) => true,
+        Some(PacketQueryCompletionDto::Cancelled { reason }) if reason == "not_dispatched" => true,
+        _ => false,
+    }
 }
 
 fn first_ambiguous_probe(plan: &PacketPlanDto) -> Option<String> {
@@ -636,7 +644,8 @@ mod tests {
         AgentCitationDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
         AgentRetrievalStepStatusDto, NodeId, NodeKind, PacketBudgetModeDto, PacketPlanDto,
         PacketProbeDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto,
-        PacketTaskClassDto, SearchHitOrigin, SourceCoverageObservationDto,
+        PacketQueryObligationDto, PacketQueryObligationKindDto, PacketTaskClassDto,
+        SearchHitOrigin, SourceCoverageObservationDto,
     };
     use std::path::Path;
 
@@ -948,6 +957,68 @@ mod tests {
         );
 
         assert_eq!(disposition.kind, PacketDispositionKindDto::Supported);
+    }
+
+    #[test]
+    fn skipped_sibling_queries_do_not_block_a_proven_material_flow() {
+        let mut packet = test_packet("explain routing", 98_304);
+        packet.answer.freshness = Some(fresh_index_observation());
+        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.rs")];
+        packet.plan = empty_plan();
+        packet.plan.obligations.claim_obligations = vec![claim_obligation(
+            PacketClaimObligationKindDto::Dispatch,
+            PacketObligationProofStatusDto::Proven,
+        )];
+        packet.plan.obligations.query_obligations = vec![PacketQueryObligationDto {
+            id: "query:0".to_string(),
+            kind: PacketQueryObligationKindDto::RequiredFlow,
+            query: "transport send".to_string(),
+            material: true,
+            completion: Some(PacketQueryCompletionDto::Cancelled {
+                reason: "not_dispatched".to_string(),
+            }),
+        }];
+
+        let (_support, disposition) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            None,
+        );
+
+        assert_eq!(disposition.kind, PacketDispositionKindDto::Supported);
+    }
+
+    #[test]
+    fn a_hard_cancelled_material_query_still_blocks_supported() {
+        let mut packet = test_packet("explain routing", 98_304);
+        packet.answer.freshness = Some(fresh_index_observation());
+        packet.answer.citations = vec![eligible_citation("Router.dispatch", "src/router.rs")];
+        packet.plan = empty_plan();
+        packet.plan.obligations.claim_obligations = vec![claim_obligation(
+            PacketClaimObligationKindDto::Dispatch,
+            PacketObligationProofStatusDto::Proven,
+        )];
+        packet.plan.obligations.query_obligations = vec![PacketQueryObligationDto {
+            id: "query:0".to_string(),
+            kind: PacketQueryObligationKindDto::RequiredFlow,
+            query: "transport send".to_string(),
+            material: true,
+            completion: Some(PacketQueryCompletionDto::Cancelled {
+                reason: "stage_deadline".to_string(),
+            }),
+        }];
+
+        let (_support, disposition) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            None,
+        );
+
+        assert_eq!(disposition.kind, PacketDispositionKindDto::NotEstablished);
     }
 
     #[test]

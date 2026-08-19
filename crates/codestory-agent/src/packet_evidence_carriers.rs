@@ -54,6 +54,10 @@
 //! every other carrier here reads it.
 
 use crate::packet_scoring::{normalize_identifier, packet_display_path};
+use crate::packet_terms::{
+    packet_terms_indicate_server_request_dispatch_flow,
+    packet_terms_indicate_server_route_dispatch_flow,
+};
 use codestory_contracts::api::{AgentCitationDto, NodeKind};
 
 fn terminal(citation: &AgentCitationDto) -> String {
@@ -266,7 +270,7 @@ const HTTP_HANDLE_EXCLUDED_SUBJECTS: &[&str] = &[
 /// `router` remain the primary dispatch carriers; this admits engines that put HTTP on the
 /// method rather than the type. The owner segment is required so a bare handle-plus-HTTP
 /// identifier cannot close the step without naming a receiver.
-fn citation_owns_http_request_handle(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_http_request_handle(citation: &AgentCitationDto) -> bool {
     if !owns_callable_behavior(citation) {
         return false;
     }
@@ -490,6 +494,25 @@ pub fn citation_owns_server_request_dispatch(citation: &AgentCitationDto) -> boo
             ],
         )
         || citation_owns_http_request_handle(citation)
+}
+
+/// Prefer a cited inbound dispatch callable when the question is about routing
+/// a request through handlers. Route-group helpers often outscore that
+/// callable on raw lexical overlap.
+pub fn packet_server_dispatch_callable_rank_bonus(
+    citation: &AgentCitationDto,
+    terms: &[String],
+) -> f32 {
+    if !(packet_terms_indicate_server_route_dispatch_flow(terms)
+        || packet_terms_indicate_server_request_dispatch_flow(terms))
+    {
+        return 0.0;
+    }
+    if citation_owns_server_request_dispatch(citation) {
+        6.0
+    } else {
+        0.0
+    }
 }
 
 /// The response-side callable that leaves a server handler for its writer or transport.
@@ -2429,6 +2452,26 @@ mod tests {
             "lib/application.js",
             NodeKind::FUNCTION,
         )));
+        let dispatch_terms = crate::packet_terms::packet_probe_terms(
+            "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.",
+        );
+        assert!(
+            packet_server_dispatch_callable_rank_bonus(
+                &citation(
+                    "ServerEngine.handleHTTPRequest",
+                    "src/http/server.go",
+                    NodeKind::METHOD,
+                ),
+                &dispatch_terms,
+            ) > 0.0
+        );
+        assert_eq!(
+            packet_server_dispatch_callable_rank_bonus(
+                &citation("RouteGroup.Group", "src/http/group.go", NodeKind::METHOD),
+                &dispatch_terms,
+            ),
+            0.0
+        );
         for negative in [
             "EventProcessor.handle",
             "EventHandler.handle",
