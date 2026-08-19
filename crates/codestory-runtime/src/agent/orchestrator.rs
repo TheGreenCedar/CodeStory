@@ -77,6 +77,7 @@ use crate::agent::packet_required_probes::{
 use crate::agent::packet_scoring::packet_citation_key;
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path,
+    packet_drop_excess_unrequested_animation_class_siblings,
     packet_drop_excess_unrequested_keyframe_siblings,
     packet_drop_unrequested_example_and_binding_siblings,
     packet_drop_unrequested_formatting_extension_siblings,
@@ -88,18 +89,17 @@ use crate::agent::packet_scoring::{
     sort_by_cached_rank_desc,
 };
 use crate::agent::packet_terms::{
-    packet_probe_terms, packet_terms_indicate_search_execution_flow,
+    packet_probe_terms, packet_terms_indicate_client_send_flow,
+    packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
     packet_terms_indicate_stylesheet_animation_flow, prompt_search_terms,
 };
 #[cfg(test)]
 use crate::agent::packet_terms::{
     packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
-    packet_terms_indicate_client_send_flow, packet_terms_indicate_event_loop_command_flow,
-    packet_terms_indicate_form_validation_flow, packet_terms_indicate_hook_cache_flow,
-    packet_terms_indicate_mapper_configuration_plan_flow,
-    packet_terms_indicate_runtime_formatting_flow,
-    packet_terms_indicate_server_route_dispatch_flow, packet_terms_indicate_sql_schema_flow,
-    packet_terms_indicate_url_session_request_flow,
+    packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_form_validation_flow,
+    packet_terms_indicate_hook_cache_flow, packet_terms_indicate_server_route_dispatch_flow,
+    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_url_session_request_flow,
 };
 use crate::agent::packet_trace::merge_packet_initial_search_hits;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
@@ -564,6 +564,9 @@ pub(crate) fn agent_packet(
 
     let phase_started = Instant::now();
     maybe_append_cited_stylesheet_import_citations(&project_root, &question, &mut answer);
+    maybe_append_cited_formatting_type_citations(&project_root, &question, &mut answer);
+    maybe_append_cited_mapper_interface_citations(&project_root, &question, &mut answer);
+    maybe_append_cited_client_relative_imports(&project_root, &question, &mut answer);
     rank_packet_evidence(&question, &mut answer);
     maybe_annotate_packet_candidate_window(&question, &limits, &mut answer);
     append_packet_non_trace_phase(&mut answer, "rank_and_window", phase_started);
@@ -1013,6 +1016,66 @@ fn sql_catalog_table_key(normalized_display: &str) -> String {
         .to_string()
 }
 
+struct CitedSourceShapeCitation<'a> {
+    path: &'a Path,
+    display_name: &'a str,
+    kind: NodeKind,
+    line: u32,
+    score: f32,
+    coverage_role: &'a str,
+    producer: &'a str,
+}
+
+fn push_cited_source_shape_citation(
+    answer: &mut AgentAnswerDto,
+    project_root: &Path,
+    citation: CitedSourceShapeCitation<'_>,
+) -> bool {
+    let display_name = citation.display_name.trim();
+    if display_name.is_empty() {
+        return false;
+    }
+    let path_string = citation.path.to_string_lossy().to_string();
+    let relative = citation
+        .path
+        .strip_prefix(project_root)
+        .map(|stripped| packet_display_path(&stripped.to_string_lossy()))
+        .unwrap_or_else(|_| packet_display_path(&path_string));
+    if answer.citations.iter().any(|existing| {
+        existing.display_name == display_name
+            && existing.file_path.as_deref().is_some_and(|existing_path| {
+                packet_display_path(existing_path) == packet_display_path(&path_string)
+                    || packet_display_path(existing_path) == relative
+            })
+    }) {
+        return false;
+    }
+    answer.citations.push(AgentCitationDto {
+        node_id: NodeId(format!(
+            "packet::cited_source::{}::{relative}::{display_name}",
+            citation.producer
+        )),
+        display_name: display_name.to_string(),
+        kind: citation.kind,
+        file_path: Some(path_string),
+        line: Some(citation.line),
+        score: citation.score,
+        origin: SearchHitOrigin::TextMatch,
+        target: None,
+        resolvable: false,
+        subgraph_id: None,
+        evidence_edge_ids: Vec::new(),
+        retrieval_score_breakdown: None,
+        evidence_tier: Some(PacketEvidenceTierDto::SyntheticSourceScan),
+        evidence_producer: Some(citation.producer.to_string()),
+        resolution_status: Some(PacketEvidenceResolutionDto::SourceRangeOnly),
+        loss_reason: None,
+        coverage_role: Some(citation.coverage_role.to_string()),
+        eligible_for_sufficiency: Some(true),
+    });
+    true
+}
+
 fn maybe_append_cited_stylesheet_import_citations(
     project_root: &Path,
     question: &str,
@@ -1124,6 +1187,21 @@ fn maybe_append_cited_stylesheet_import_citations(
                 }),
                 eligible_for_sufficiency: Some(true),
             });
+            if is_keyframe {
+                push_cited_source_shape_citation(
+                    answer,
+                    project_root,
+                    CitedSourceShapeCitation {
+                        path: &imported,
+                        display_name: &relative,
+                        kind: NodeKind::FILE,
+                        line,
+                        score: 47.0,
+                        coverage_role: "css animation source file",
+                        producer: "packet_cited_stylesheet_import",
+                    },
+                );
+            }
             if let Some((class_name, class_line)) = class_anchor {
                 let already = answer.citations.iter().any(|existing| {
                     existing.display_name == class_name
@@ -1259,6 +1337,395 @@ fn packet_first_css_class_display(source: &str) -> Option<(String, u32)> {
     None
 }
 
+fn maybe_append_cited_formatting_type_citations(
+    project_root: &Path,
+    question: &str,
+    answer: &mut AgentAnswerDto,
+) {
+    let terms = packet_probe_terms(question);
+    if !packet_terms_indicate_runtime_formatting_flow(&terms) {
+        return;
+    }
+    let cited_paths = cited_source_paths_with_extensions(
+        answer,
+        project_root,
+        &["h", "hpp", "hh", "cc", "cpp", "cxx"],
+    );
+    let mut appended = 0usize;
+    for path in cited_paths {
+        if appended >= 6 {
+            break;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if source.len() > 1_500_000 {
+            continue;
+        }
+        for (name, kind, line, argument_store) in packet_cited_formatting_types(&source) {
+            if appended >= 6 {
+                break;
+            }
+            let coverage_role = if argument_store {
+                "runtime format argument store"
+            } else {
+                "runtime formatting failure type"
+            };
+            if push_cited_source_shape_citation(
+                answer,
+                project_root,
+                CitedSourceShapeCitation {
+                    path: &path,
+                    display_name: &name,
+                    kind,
+                    line,
+                    score: if argument_store { 46.0 } else { 44.0 },
+                    coverage_role,
+                    producer: "packet_cited_formatting_type",
+                },
+            ) {
+                appended = appended.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn maybe_append_cited_mapper_interface_citations(
+    project_root: &Path,
+    question: &str,
+    answer: &mut AgentAnswerDto,
+) {
+    let terms = packet_probe_terms(question);
+    if !packet_terms_indicate_mapper_configuration_plan_flow(&terms) {
+        return;
+    }
+    let cited_paths = cited_source_paths_with_extensions(answer, project_root, &["cs"]);
+    let mut appended = 0usize;
+    for path in cited_paths {
+        if appended >= 4 {
+            break;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if source.len() > 1_500_000 {
+            continue;
+        }
+        for (name, line) in packet_cited_mapper_interface_names(&source) {
+            if appended >= 4 {
+                break;
+            }
+            if push_cited_source_shape_citation(
+                answer,
+                project_root,
+                CitedSourceShapeCitation {
+                    path: &path,
+                    display_name: &name,
+                    kind: NodeKind::INTERFACE,
+                    line,
+                    score: 45.0,
+                    coverage_role: "mapper public api",
+                    producer: "packet_cited_mapper_interface",
+                },
+            ) {
+                appended = appended.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn maybe_append_cited_client_relative_imports(
+    project_root: &Path,
+    question: &str,
+    answer: &mut AgentAnswerDto,
+) {
+    let terms = packet_probe_terms(question);
+    if !packet_terms_indicate_client_send_flow(&terms) {
+        return;
+    }
+    let cited_paths = cited_source_paths_with_extensions(answer, project_root, &["dart"]);
+    let mut appended = 0usize;
+    for cited in cited_paths {
+        if appended >= 6 {
+            break;
+        }
+        let Ok(source) = std::fs::read_to_string(&cited) else {
+            continue;
+        };
+        if source.len() > 1_500_000 {
+            continue;
+        }
+        let parent = cited.parent().unwrap_or(project_root);
+        for import in packet_dart_relative_imports(&source) {
+            if appended >= 6 {
+                break;
+            }
+            if !packet_client_relative_import_stem(&import) {
+                continue;
+            }
+            let imported = parent.join(&import);
+            if !imported.is_file() {
+                continue;
+            }
+            let relative = imported
+                .strip_prefix(project_root)
+                .unwrap_or(&imported)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if crate::retrieval_file_role_from_path(&relative).is_non_primary() {
+                continue;
+            }
+            let Ok(imported_source) = std::fs::read_to_string(&imported) else {
+                continue;
+            };
+            let Some((display_name, line)) = packet_dart_declared_type_name(&imported_source)
+            else {
+                continue;
+            };
+            if push_cited_source_shape_citation(
+                answer,
+                project_root,
+                CitedSourceShapeCitation {
+                    path: &imported,
+                    display_name: &display_name,
+                    kind: NodeKind::CLASS,
+                    line,
+                    score: 42.0,
+                    coverage_role: "client imported type",
+                    producer: "packet_cited_client_import",
+                },
+            ) {
+                appended = appended.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn cited_source_paths_with_extensions(
+    answer: &AgentAnswerDto,
+    project_root: &Path,
+    extensions: &[&str],
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for citation in &answer.citations {
+        let Some(raw) = citation.file_path.as_deref() else {
+            continue;
+        };
+        let path = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            project_root.join(raw)
+        };
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !extensions.iter().any(|expected| extension == *expected) {
+            continue;
+        }
+        if paths.iter().any(|existing| existing == &path) {
+            continue;
+        }
+        paths.push(path);
+    }
+    paths
+}
+
+fn packet_cited_formatting_types(source: &str) -> Vec<(String, NodeKind, u32, bool)> {
+    let mut types = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        if packet_source_line_is_comment(line) {
+            continue;
+        }
+        let Some((name, kind)) = packet_cpp_declared_type_name(line) else {
+            continue;
+        };
+        let normalized = normalize_identifier(&name);
+        let argument_store = normalized.contains("format")
+            && (normalized.contains("arg") || normalized.contains("argument"))
+            && normalized.contains("store");
+        let failure_type = normalized.contains("format")
+            && (normalized.contains("error")
+                || normalized.contains("failure")
+                || normalized.contains("exception"))
+            && !normalized.contains("windows")
+            && !normalized.contains("system")
+            && !normalized.contains("duration");
+        if !argument_store && !failure_type {
+            continue;
+        }
+        types.push((
+            name,
+            kind,
+            index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            argument_store,
+        ));
+    }
+    types
+}
+
+fn packet_cpp_declared_type_name(line: &str) -> Option<(String, NodeKind)> {
+    for (keyword, kind) in [
+        ("class", NodeKind::CLASS),
+        ("struct", NodeKind::STRUCT),
+        ("using", NodeKind::TYPEDEF),
+    ] {
+        let Some(after) = packet_text_after_keyword(line, keyword) else {
+            continue;
+        };
+        for token in packet_identifier_tokens(after) {
+            let normalized = normalize_identifier(&token);
+            if normalized.is_empty()
+                || matches!(
+                    normalized.as_str(),
+                    "typename" | "template" | "public" | "private" | "protected" | "default"
+                )
+                || token.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
+            {
+                continue;
+            }
+            return Some((token, kind));
+        }
+    }
+    None
+}
+
+fn packet_text_after_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+    let lower = line.to_ascii_lowercase();
+    let index = lower.find(keyword)?;
+    let before = lower[..index].chars().last();
+    let after_index = index + keyword.len();
+    let after = lower[after_index..].chars().next();
+    if before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        || after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some(&line[after_index..])
+}
+
+fn packet_identifier_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    for ch in input.chars() {
+        if ch == '_' || ch.is_ascii_alphanumeric() {
+            token.push(ch);
+        } else if !token.is_empty() {
+            tokens.push(std::mem::take(&mut token));
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn packet_source_line_is_comment(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*')
+}
+
+fn packet_cited_mapper_interface_names(source: &str) -> Vec<(String, u32)> {
+    let mut names = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        if packet_source_line_is_comment(line) {
+            continue;
+        }
+        let Some(after) = packet_text_after_keyword(line, "interface") else {
+            continue;
+        };
+        for token in packet_identifier_tokens(after) {
+            let normalized = normalize_identifier(&token);
+            if normalized.is_empty()
+                || matches!(
+                    normalized.as_str(),
+                    "public" | "private" | "protected" | "internal" | "partial"
+                )
+                || !normalized.contains("mapper")
+            {
+                continue;
+            }
+            names.push((
+                token,
+                index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            ));
+            break;
+        }
+    }
+    names
+}
+
+fn packet_dart_relative_imports(source: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("import ") {
+            continue;
+        }
+        let Some(start) = trimmed.find(['\'', '"']) else {
+            continue;
+        };
+        let quote = trimmed.as_bytes()[start];
+        let rest = &trimmed[start + 1..];
+        let Some(end) = rest.as_bytes().iter().position(|ch| *ch == quote) else {
+            continue;
+        };
+        let spec = &rest[..end];
+        if spec.is_empty() || spec.contains(':') || spec.starts_with('/') {
+            continue;
+        }
+        if !spec.to_ascii_lowercase().ends_with(".dart") {
+            continue;
+        }
+        if !imports.iter().any(|existing| existing == spec) {
+            imports.push(spec.to_string());
+        }
+    }
+    imports
+}
+
+fn packet_client_relative_import_stem(spec: &str) -> bool {
+    let file_name = spec.rsplit(['/', '\\']).next().unwrap_or(spec);
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    let normalized = normalize_identifier(stem);
+    (normalized.contains("client")
+        || normalized.contains("request")
+        || normalized.contains("response"))
+        && !normalized.contains("stub")
+        && !normalized.contains("test")
+}
+
+fn packet_dart_declared_type_name(source: &str) -> Option<(String, u32)> {
+    for (index, line) in source.lines().enumerate() {
+        if packet_source_line_is_comment(line) {
+            continue;
+        }
+        let Some(after) = packet_text_after_keyword(line, "class") else {
+            continue;
+        };
+        for token in packet_identifier_tokens(after) {
+            let normalized = normalize_identifier(&token);
+            if normalized.is_empty()
+                || matches!(
+                    normalized.as_str(),
+                    "abstract" | "interface" | "base" | "final" | "sealed" | "mixin"
+                )
+            {
+                continue;
+            }
+            return Some((
+                token,
+                index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            ));
+        }
+    }
+    None
+}
+
 fn packet_plan_query_can_gate_sufficiency(query: &str) -> bool {
     packet_probe_terms(query)
         .iter()
@@ -1374,6 +1841,7 @@ fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
     packet_drop_unrequested_mapper_annotation_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_test_siblings(&mut answer.citations, &terms);
     packet_drop_excess_unrequested_keyframe_siblings(&mut answer.citations, &terms);
+    packet_drop_excess_unrequested_animation_class_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_markdown_siblings(&mut answer.citations, &terms);
 }
 
@@ -9873,12 +10341,240 @@ mod tests {
             "imported custom properties should be cited: {displays:?}"
         );
         assert!(
+            displays
+                .iter()
+                .any(|name| packet_display_path(name).ends_with("styles/motion/spin.css")),
+            "keyframe sheet path should be copyable from the citation list: {displays:?}"
+        );
+        assert!(
             !answer.citations.iter().any(|citation| citation
                 .file_path
                 .as_deref()
                 .is_some_and(|path| packet_display_path(path).ends_with("bundle.min.css"))),
             "generated bundles should stay out of cited stylesheet imports: {:?}",
             answer.citations
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cited_formatting_files_promote_argument_store_and_failure_types() {
+        let root = packet_temp_root("cited-formatting-types");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "include/tool/base.hpp",
+            r#"
+            template <typename Context, int NUM_ARGS>
+            struct runtime_format_arg_store {
+              void push_back();
+            };
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "include/tool/args.hpp",
+            r#"
+            FMT_EXPORT template <typename Context>
+            class dynamic_format_argument_store {
+            public:
+              void push_back();
+            };
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "include/tool/errors.hpp",
+            r#"
+            class TOOL_EXPORT format_failure : public std::runtime_error {
+            };
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "include/tool/uncited.hpp",
+            r#"
+            struct leftover_format_arg_store {};
+            "#,
+        );
+
+        let prompt = "Explain how a formatting runtime turns arguments into type-erased format argument stores and reports formatting failure types.";
+        let mut answer = packet_answer_fixture(
+            prompt,
+            vec![
+                test_packet_citation("format_to", "include/tool/base.hpp", 0.7),
+                test_packet_citation("named_arg", "include/tool/args.hpp", 0.6),
+                test_packet_citation("report_error", "include/tool/errors.hpp", 0.5),
+            ],
+        );
+        answer.citations[0].file_path =
+            Some(root.join("include/tool/base.hpp").display().to_string());
+        answer.citations[1].file_path =
+            Some(root.join("include/tool/args.hpp").display().to_string());
+        answer.citations[2].file_path =
+            Some(root.join("include/tool/errors.hpp").display().to_string());
+
+        maybe_append_cited_formatting_type_citations(&root, prompt, &mut answer);
+
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "runtime_format_arg_store",
+            "dynamic_format_argument_store",
+            "format_failure",
+        ] {
+            assert!(
+                displays.contains(&expected),
+                "expected cited formatting type {expected}; got {displays:?}"
+            );
+        }
+        assert!(
+            !displays.contains(&"leftover_format_arg_store"),
+            "uncited files must not be scanned: {displays:?}"
+        );
+
+        let mut other = packet_answer_fixture(
+            "Explain how a session sends HTTP requests.",
+            vec![test_packet_citation(
+                "format_to",
+                "include/tool/base.hpp",
+                0.7,
+            )],
+        );
+        other.citations[0].file_path =
+            Some(root.join("include/tool/base.hpp").display().to_string());
+        maybe_append_cited_formatting_type_citations(
+            &root,
+            "Explain how a session sends HTTP requests.",
+            &mut other,
+        );
+        assert!(
+            other
+                .citations
+                .iter()
+                .all(|citation| citation.display_name != "runtime_format_arg_store"),
+            "non-formatting questions should not lift formatting types: {:?}",
+            other.citations
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cited_mapper_files_promote_mapper_interfaces() {
+        let root = packet_temp_root("cited-mapper-interfaces");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/ObjectMapping/RuntimeMapper.cs",
+            r#"
+            namespace ObjectMapping;
+            public interface IRuntimeMapperBase
+            {
+              TDestination Map<TSource, TDestination>(TSource source);
+            }
+            public interface IRuntimeMapper : IRuntimeMapperBase
+            {
+              IConfigurationProvider ConfigurationProvider { get; }
+            }
+            public sealed class RuntimeMapper : IRuntimeMapper
+            {
+              public TDestination Map<TSource, TDestination>(TSource source) => default!;
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/ObjectMapping/UncitedMapper.cs",
+            "public interface ILeftoverMapper {}",
+        );
+
+        let prompt = "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects.";
+        let mut answer = packet_answer_fixture(
+            prompt,
+            vec![test_packet_citation(
+                "RuntimeMapper.Map",
+                "src/ObjectMapping/RuntimeMapper.cs",
+                0.7,
+            )],
+        );
+        answer.citations[0].file_path = Some(
+            root.join("src/ObjectMapping/RuntimeMapper.cs")
+                .display()
+                .to_string(),
+        );
+        maybe_append_cited_mapper_interface_citations(&root, prompt, &mut answer);
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            displays.contains(&"IRuntimeMapperBase") && displays.contains(&"IRuntimeMapper"),
+            "cited mapper file should promote mapper interfaces: {displays:?}"
+        );
+        assert!(
+            !displays.contains(&"ILeftoverMapper"),
+            "uncited mapper files must not be scanned: {displays:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cited_client_files_follow_response_and_request_imports() {
+        let root = packet_temp_root("cited-client-imports");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/http/client.dart",
+            r#"
+            import 'base_request.dart';
+            import 'response.dart';
+            import 'ignore_me.dart';
+            abstract interface class Client {
+              Future<Response> get(Uri url);
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/http/response.dart",
+            "class Response {\n  final int statusCode;\n}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/http/base_request.dart",
+            "abstract class BaseRequest {\n  void finalize();\n}\n",
+        );
+        write_packet_fixture_file(&root, "src/http/ignore_me.dart", "class IgnoreMe {}\n");
+
+        let prompt = "Explain how an HTTP client exposes helpers, BaseClient convenience methods, and IOClient send behavior.";
+        let mut answer = packet_answer_fixture(
+            prompt,
+            vec![test_packet_citation(
+                "Client.get",
+                "src/http/client.dart",
+                0.7,
+            )],
+        );
+        answer.citations[0].file_path =
+            Some(root.join("src/http/client.dart").display().to_string());
+        maybe_append_cited_client_relative_imports(&root, prompt, &mut answer);
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            displays.contains(&"Response") && displays.contains(&"BaseRequest"),
+            "cited client file should follow response/request imports: {displays:?}"
+        );
+        assert!(
+            !displays.contains(&"IgnoreMe"),
+            "unrelated dart imports should stay out: {displays:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -407,6 +407,59 @@ pub fn packet_drop_excess_unrequested_keyframe_siblings(
     });
 }
 
+/// Keep animation class selectors that match a remaining keyframe or the shared
+/// base class. Rank demotion cannot evict sibling `.pulse`-style selectors from
+/// a full window once keyframe files are already present.
+pub fn packet_drop_excess_unrequested_animation_class_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_stylesheet_animation_flow(terms) {
+        return;
+    }
+    if !citations.iter().any(packet_citation_is_keyframe_rule) {
+        return;
+    }
+    let named_stems = packet_keyframe_stems_named_in_question(terms);
+    let keyframe_stems = citations
+        .iter()
+        .filter(|citation| packet_citation_is_keyframe_rule(citation))
+        .map(packet_keyframe_rule_stem)
+        .filter(|stem| !stem.is_empty())
+        .collect::<Vec<_>>();
+    citations.retain(|citation| {
+        if !packet_citation_is_animation_class_selector(citation) {
+            return true;
+        }
+        let stem = packet_animation_class_stem(citation);
+        packet_citation_is_animation_base_source(citation)
+            || named_stems.iter().any(|named| named == &stem)
+            || keyframe_stems.iter().any(|keyframe| keyframe == &stem)
+    });
+}
+
+fn packet_citation_is_animation_class_selector(citation: &AgentCitationDto) -> bool {
+    if citation
+        .coverage_role
+        .as_deref()
+        .is_some_and(|role| role == "css animation selector")
+    {
+        return true;
+    }
+    citation.display_name.trim_start().starts_with('.')
+}
+
+fn packet_citation_is_animation_base_source(citation: &AgentCitationDto) -> bool {
+    let stem = packet_path_file_stem(&packet_citation_display_path(citation));
+    stem == "base" || stem.ends_with("base") || stem == "vars" || stem.ends_with("vars")
+}
+
+fn packet_animation_class_stem(citation: &AgentCitationDto) -> String {
+    let trimmed = citation.display_name.trim_start().trim_start_matches('.');
+    let token = trimmed.rsplit(['-', '_']).next().unwrap_or(trimmed);
+    normalize_identifier(token)
+}
+
 /// Drop markdown extras from formatting and animation packets when source hits remain.
 pub fn packet_drop_unrequested_markdown_siblings(
     citations: &mut Vec<AgentCitationDto>,
@@ -2224,6 +2277,41 @@ mod tests {
             citations
                 .iter()
                 .any(|citation| citation.display_name == "animated")
+        );
+    }
+
+    #[test]
+    fn excess_unrequested_animation_class_siblings_keep_keyframe_matches() {
+        let terms = vec![
+            "css".to_string(),
+            "animation".to_string(),
+            "keyframes".to_string(),
+            "base".to_string(),
+            "variables".to_string(),
+        ];
+        let mut citations = vec![
+            test_rank_citation("@keyframes bounce", "source/motion/bounce.css", 0.9),
+            test_rank_citation("@keyframes flash", "source/motion/flash.css", 0.8),
+            test_rank_citation(".bounce", "source/motion/bounce.css", 0.7),
+            test_rank_citation(".pulse", "source/motion/pulse.css", 0.6),
+            test_rank_citation("animate__animated", "source/_base.css", 0.5),
+        ];
+        packet_drop_excess_unrequested_keyframe_siblings(&mut citations, &terms);
+        packet_drop_excess_unrequested_animation_class_siblings(&mut citations, &terms);
+        assert!(
+            citations
+                .iter()
+                .any(|citation| citation.display_name == ".bounce")
+        );
+        assert!(
+            citations
+                .iter()
+                .any(|citation| citation.display_name == "animate__animated")
+        );
+        assert!(
+            citations
+                .iter()
+                .all(|citation| citation.display_name != ".pulse")
         );
     }
 
