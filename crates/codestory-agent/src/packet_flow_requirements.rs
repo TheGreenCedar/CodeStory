@@ -1050,7 +1050,11 @@ fn flow_belongs_to_public_client_factory(citation: &AgentCitationDto) -> bool {
 const CLIENT_INTERFACE_HELPERS_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "client_interface_helpers",
     role: FlowRole::Entrypoint,
-    query_seeds: &["client convenience method", "client interface helper"],
+    query_seeds: &[
+        "client convenience method",
+        "client interface helper",
+        "client type declaration",
+    ],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(citation_owns_client_request_method),
@@ -1077,7 +1081,11 @@ const CLIENT_TRANSPORT_SEND_REQUIREMENT: FlowRequirement = FlowRequirement {
 const CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "client_response_materialization",
     role: FlowRole::TerminalBoundary,
-    query_seeds: &["request response", "response stream boundary"],
+    query_seeds: &[
+        "request response",
+        "response stream boundary",
+        "response class",
+    ],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(citation_owns_client_response_materialization),
@@ -1369,6 +1377,7 @@ const MAPPER_PLAN_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Configuration,
         query_seeds: &[
             "mapper runtime api",
+            "mapper interface",
             "mapping configuration",
             "type map plan",
         ],
@@ -1390,7 +1399,13 @@ const RUNTIME_FORMATTING_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "format_arguments",
         role: FlowRole::TransformOrValidate,
-        query_seeds: &["format arguments", "format output"],
+        query_seeds: &[
+            "format arguments",
+            "format output",
+            "type erased argument store",
+            "dynamic argument collection",
+            "stored format arguments",
+        ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
         proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_format_arguments),
@@ -1398,7 +1413,11 @@ const RUNTIME_FORMATTING_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "formatter_fallback",
         role: FlowRole::ErrorOrFallback,
-        query_seeds: &["formatting failure", "formatter fallback"],
+        query_seeds: &[
+            "formatting failure",
+            "formatter fallback",
+            "formatter exception type",
+        ],
         coverage_mode: CoverageMode::AllowsSourceRange,
         proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_formatter_fallback),
@@ -1788,6 +1807,28 @@ mod tests {
     }
 
     #[test]
+    fn runtime_formatting_queries_include_argument_store_and_exception_seeds() {
+        let queries = packet_flow_requirement_queries_for_terms(
+            &packet_probe_terms(
+                "Explain how formatting arguments become type-erased format args and reach vformat output.",
+            ),
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        for expected in [
+            "format arguments",
+            "type erased argument store",
+            "dynamic argument collection",
+            "stored format arguments",
+            "formatter exception type",
+        ] {
+            assert!(
+                queries.iter().any(|query| query == expected),
+                "expected {expected:?} in {queries:?}"
+            );
+        }
+    }
+
+    #[test]
     fn search_evidence_handoff_adds_classification_and_output_obligations() {
         let full_flow = packet_flow_requirements_for_terms(
             &packet_probe_terms(
@@ -1940,6 +1981,80 @@ mod tests {
             assert!(
                 !queries.contains(&client_only),
                 "server request flow should not probe {client_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_handle_owner_proves_server_request_dispatch() {
+        let requirement =
+            packet_flow_requirements_for_terms(
+                &packet_probe_terms(
+                    "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.",
+                ),
+                PacketTaskClassDto::RouteTracing,
+            )
+            .into_iter()
+            .find(|requirement| requirement.id == "request_dispatch")
+            .expect("server request flow should require dispatch");
+
+        assert!(requirement.evidence.citation_proves(&witness(
+            "ServerEngine.handleHTTPRequest",
+            "src/http/server.go",
+            NodeKind::METHOD,
+        )));
+        assert!(requirement.evidence.citation_proves(&witness(
+            "app.handle",
+            "lib/application.js",
+            NodeKind::FUNCTION,
+        )));
+        for negative in [
+            "IRouter.Group",
+            "Telemetry.handleHTTPRequest",
+            "HttpClient.handleHTTPRequest",
+            "handleHTTPRequest",
+        ] {
+            assert!(
+                !requirement.evidence.citation_proves(&witness(
+                    negative,
+                    "src/http/server.go",
+                    NodeKind::METHOD,
+                )),
+                "{negative} must not prove server request dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn named_client_send_proves_client_transport_send() {
+        let requirement = packet_flow_requirements_for_terms(
+            &packet_probe_terms(
+                "Explain how an HTTP client exposes top-level helpers, provides client convenience methods, finalizes requests before transport send, and materializes responses.",
+            ),
+            PacketTaskClassDto::DataFlow,
+        )
+        .into_iter()
+        .find(|requirement| requirement.id == "client_transport_send")
+        .expect("client send flow should require transport send");
+
+        for positive in ["BaseClient.send", "IOClient.send", "HttpTransport.send"] {
+            assert!(
+                requirement.evidence.citation_proves(&witness(
+                    positive,
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                )),
+                "{positive} should prove client transport send"
+            );
+        }
+        for negative in ["Session.send", "DatabaseClient.send", "HookClient.send"] {
+            assert!(
+                !requirement.evidence.citation_proves(&witness(
+                    negative,
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                )),
+                "{negative} must not prove client transport send"
             );
         }
     }

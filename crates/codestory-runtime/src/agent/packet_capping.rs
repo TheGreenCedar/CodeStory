@@ -118,6 +118,11 @@ fn cap_citations_with_priorities(
             && kept.len() < limits.max_anchors as usize
             && packet_file_fits_limit(file.as_deref(), &files, limits.max_files)
         {
+            if let Some(ref claim_key) = claim_key
+                && claim_keys.contains(claim_key)
+            {
+                continue;
+            }
             if let Some(path) = file {
                 files.insert(path);
             }
@@ -1776,6 +1781,58 @@ mod tests {
         assert!(cap_citations(&mut answer, &limits));
         assert_eq!(answer.citations.len(), 1);
         assert_eq!(answer.citations[0].display_name, "public.Invoice");
+    }
+
+    #[test]
+    fn protected_duplicate_claim_keys_keep_a_single_display() {
+        let mut first = citation("IFK_TitlePublisherId", "schema/Catalog_Sqlite.sql", 0.4);
+        first.coverage_role = Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
+        first.kind = NodeKind::ANNOTATION;
+        first.node_id = NodeId("constraint-sqlite".to_string());
+        let mut duplicate = citation("IFK_TitlePublisherId", "schema/Catalog_MySql.sql", 0.3);
+        duplicate.coverage_role = Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
+        duplicate.kind = NodeKind::ANNOTATION;
+        duplicate.node_id = NodeId("constraint-mysql".to_string());
+        let mut table = citation("CREATE TABLE Publisher", "schema/Catalog_Sqlite.sql", 0.35);
+        table.coverage_role = Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
+        table.kind = NodeKind::CLASS;
+        let mut file_identity =
+            citation("schema/Catalog_MySql.sql", "schema/Catalog_MySql.sql", 20.0);
+        file_identity.coverage_role = Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
+        file_identity.kind = NodeKind::FILE;
+        file_identity.origin = SearchHitOrigin::TextMatch;
+        file_identity.eligible_for_sufficiency = Some(false);
+        let mut answer = answer_fixture(vec![first, duplicate, table, file_identity]);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 8,
+            max_files: 8,
+            max_snippets: 8,
+            max_trail_edges: 8,
+            max_output_bytes: 16 * 1024,
+        };
+
+        assert!(cap_citations(&mut answer, &limits));
+        let names = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == "IFK_TitlePublisherId")
+                .count(),
+            1,
+            "duplicate protected relationship displays should collapse: {names:?}"
+        );
+        assert!(
+            names.contains(&"CREATE TABLE Publisher"),
+            "table-creation anchors should remain: {names:?}"
+        );
+        assert!(
+            names.contains(&"schema/Catalog_MySql.sql"),
+            "distinct dialect file identities should remain: {names:?}"
+        );
     }
 
     #[test]

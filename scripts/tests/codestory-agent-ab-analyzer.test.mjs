@@ -49,6 +49,7 @@ import {
   parseJsonLines,
   packetComposition,
   packetCommandArgs,
+  drillPacketCommandArgs,
   packetRuntimeCacheObservations,
   agentPacketPreludeCacheObservations,
   packetEmbeddingExecutionProof,
@@ -59,6 +60,7 @@ import {
   packetObligationAccounting,
   packetDispositionTelemetry,
   packetPreludeContractBlockers,
+  publicPacketPreludeContractPasses,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetFirstCommandForPrompt,
@@ -438,6 +440,47 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
     requireSupported: true,
     requireManagedRuntime: true,
   }), []);
+});
+
+test("drill continuation packets are public only when they keep the advertised budget caps", () => {
+  const packet = {
+    packet_id: "packet-1",
+    plan: { obligations: { claim_obligations: [] } },
+    answer: {
+      citations: [{ node_id: "carrier", file_path: "src/lib.rs" }],
+      graphs: [],
+      retrieval_trace: {
+        steps: [{ kind: "source_read", status: "ok" }],
+        retrieval_shadow: { retrieval_mode: "full" },
+      },
+    },
+    support: [{ id: "support-1", kind: "symbol_location", summary: "carrier", path: "src/lib.rs" }],
+    disposition: { kind: "not_established", omission_receipts: [] },
+    budget: {
+      limits: {
+        max_anchors: 16,
+        max_files: 16,
+        max_output_bytes: 128 * 1024,
+        max_snippets: 24,
+        max_trail_edges: 60,
+      },
+      used: { anchors: 1, files: 1, output_bytes: 0, snippets: 1, trail_edges: 0 },
+    },
+  };
+  const stdout = exactPacketStdout(packet);
+  assert.equal(publicPacketPreludeContractPasses(packet, stdout), true);
+
+  packet.budget.limits.max_anchors = 8;
+  packet.budget.limits.max_files = 8;
+  packet.budget.limits.max_snippets = 8;
+  packet.budget.limits.max_trail_edges = 16;
+  packet.budget.limits.max_output_bytes = 32 * 1024;
+  const shrunk = exactPacketStdout(packet);
+  assert.equal(publicPacketPreludeContractPasses(packet, shrunk), false);
+  assert.match(
+    packetPreludeContractBlockers(packet, shrunk).join("\n"),
+    /max_anchors=8 does not equal public cap=16/,
+  );
 });
 
 test("packet obligation accounting preserves the historical material split", () => {
@@ -3002,6 +3045,31 @@ test("packet and cache preparation share one explicit agent retrieval namespace"
   assert.equal(args.filter((arg) => arg === "--extra-probe").length, 0);
   assert.deepEqual(benchmarkAgentScopeArgs(), ["--profile", "agent", "--run-id", "shared-agent"]);
   assert.deepEqual(args.slice(3, 7), benchmarkAgentScopeArgs());
+
+  const drillArgs = drillPacketCommandArgs({ path: "/tmp/repo" }, task, {}, {
+    disposition: {
+      kind: "drill_once",
+      drill: {
+        parent_packet_id: "packet-1",
+        core_generation_id: "core-1",
+        retrieval_generation: "retrieval-1",
+        options: [{ id: "omitted_mandatory_support:symbol%3A42" }],
+      },
+    },
+  });
+  assert.ok(drillArgs);
+  assert.deepEqual(drillArgs.slice(0, args.length), packetCommandArgs({ path: "/tmp/repo" }, task));
+  assert.equal(drillArgs.at(-8), "--parent-packet-id");
+  assert.equal(drillArgs.at(-7), "packet-1");
+  assert.equal(drillArgs.at(-6), "--option-id");
+  assert.equal(drillArgs.at(-5), "omitted_mandatory_support:symbol%3A42");
+  assert.equal(drillArgs.at(-4), "--core-generation-id");
+  assert.equal(drillArgs.at(-3), "core-1");
+  assert.equal(drillArgs.at(-2), "--retrieval-generation");
+  assert.equal(drillArgs.at(-1), "retrieval-1");
+  assert.equal(drillPacketCommandArgs({ path: "/tmp/repo" }, task, {}, {
+    disposition: { kind: "supported" },
+  }), null);
   assert.deepEqual(retrievalIndexCommandArgs("C:\\repo"), [
     "retrieval",
     "index",

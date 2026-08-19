@@ -39,6 +39,7 @@ use crate::agent::packet_compiler::{
 };
 use crate::agent::packet_degradation::apply_packet_semantic_degradation_counters;
 use crate::agent::packet_evidence::decorate_citation_from_hit;
+use crate::agent::packet_evidence_carriers::packet_server_dispatch_callable_rank_bonus;
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
 };
@@ -63,7 +64,7 @@ use crate::agent::packet_probe::{
     exact_packet_probe_citations, exact_packet_probe_paths, normalize_packet_probe_request,
     resolve_packet_probes, resolved_packet_probe_queries,
 };
-use crate::agent::packet_required_probes::packet_named_schema_entity_symbol_queries;
+use crate::agent::packet_required_probes::packet_named_schema_entity_queries;
 #[cfg(test)]
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries;
 #[cfg(test)]
@@ -76,21 +77,40 @@ use crate::agent::packet_required_probes::{
 use crate::agent::packet_scoring::packet_citation_key;
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path,
+    packet_drop_excess_unrequested_animation_class_siblings,
+    packet_drop_excess_unrequested_keyframe_siblings,
+    packet_drop_unrequested_animation_file_aliases,
+    packet_drop_unrequested_animation_file_only_sheets,
+    packet_drop_unrequested_duplicate_client_type_paths,
+    packet_drop_unrequested_example_and_binding_siblings,
+    packet_drop_unrequested_export_macro_displays,
+    packet_drop_unrequested_formatter_specialization_siblings,
+    packet_drop_unrequested_formatting_extension_siblings,
+    packet_drop_unrequested_mapper_annotation_siblings, packet_drop_unrequested_markdown_siblings,
+    packet_drop_unrequested_named_client_adapter_siblings,
+    packet_drop_unrequested_non_primary_flow_siblings,
+    packet_drop_unrequested_non_stylesheet_animation_siblings,
+    packet_drop_unrequested_python_siblings, packet_drop_unrequested_repo_root_stylesheet_siblings,
+    packet_drop_unrequested_single_letter_displays,
+    packet_drop_unrequested_sql_schema_variant_siblings,
+    packet_drop_unrequested_system_format_failure_siblings, packet_drop_unrequested_test_siblings,
+    packet_drop_unrequested_wide_char_siblings,
+    packet_drop_unrequested_windows_formatting_siblings,
+    packet_keep_shared_source_set_over_platform_duplicates, packet_sql_schema_file_is_variant_copy,
     packet_stage_citation_carry_limit, sort_by_cached_rank_desc,
 };
 use crate::agent::packet_terms::{
-    packet_probe_terms, packet_terms_indicate_search_execution_flow, prompt_search_terms,
+    packet_probe_terms, packet_terms_indicate_client_send_flow,
+    packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
+    packet_terms_indicate_stylesheet_animation_flow, prompt_search_terms,
 };
 #[cfg(test)]
 use crate::agent::packet_terms::{
     packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
-    packet_terms_indicate_client_send_flow, packet_terms_indicate_event_loop_command_flow,
-    packet_terms_indicate_form_validation_flow, packet_terms_indicate_hook_cache_flow,
-    packet_terms_indicate_mapper_configuration_plan_flow,
-    packet_terms_indicate_runtime_formatting_flow,
-    packet_terms_indicate_server_route_dispatch_flow, packet_terms_indicate_sql_schema_flow,
-    packet_terms_indicate_stylesheet_animation_flow,
-    packet_terms_indicate_url_session_request_flow,
+    packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_form_validation_flow,
+    packet_terms_indicate_hook_cache_flow, packet_terms_indicate_server_route_dispatch_flow,
+    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_url_session_request_flow,
 };
 use crate::agent::packet_trace::merge_packet_initial_search_hits;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
@@ -123,11 +143,11 @@ use codestory_contracts::api::{
     AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError, EdgeId, EdgeKind,
     GraphArtifactDto, GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto,
     IndexFreshnessDto, IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId,
-    NodeKind, NodeOccurrencesRequest, PACKET_DRILL_MAX_BYTES, PACKET_DRILL_MAX_DEPTH,
-    PACKET_DRILL_MAX_HITS, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto,
-    PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketObligationPlanDto, PacketPlanDto,
-    PacketProbeDto, PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
-    SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, SnippetScopeDto,
+    NodeKind, NodeOccurrencesRequest, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS,
+    PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto, PacketEvidenceResolutionDto,
+    PacketEvidenceTierDto, PacketObligationPlanDto, PacketPlanDto, PacketProbeDto,
+    PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto, SearchHit,
+    SearchHitOrigin, SearchRepoTextMode, SearchRequest, SnippetScopeDto,
     SourceCoverageObservationDto, SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto,
     TrailConfigDto, TrailFilterOptionsDto,
 };
@@ -141,8 +161,7 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
-#[cfg(test)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MAX_RESULTS: u32 = 8;
@@ -555,6 +574,10 @@ pub(crate) fn agent_packet(
     append_packet_non_trace_phase(&mut answer, "trace_apply", phase_started);
 
     let phase_started = Instant::now();
+    maybe_append_cited_stylesheet_import_citations(&project_root, &question, &mut answer);
+    maybe_append_cited_formatting_type_citations(&project_root, &question, &mut answer);
+    maybe_append_cited_mapper_interface_citations(&project_root, &question, &mut answer);
+    maybe_append_cited_client_relative_imports(&project_root, &question, &mut answer);
     rank_packet_evidence(&question, &mut answer);
     maybe_annotate_packet_candidate_window(&question, &limits, &mut answer);
     append_packet_non_trace_phase(&mut answer, "rank_and_window", phase_started);
@@ -794,20 +817,12 @@ pub(crate) fn agent_packet(
 
 fn packet_budget_limits_for_request(
     budget: PacketBudgetModeDto,
-    is_drill_continuation: bool,
+    _is_drill_continuation: bool,
 ) -> PacketBudgetLimitsDto {
-    let mut limits = packet_budget_limits(budget);
-    if !is_drill_continuation {
-        return limits;
-    }
-    limits.max_anchors = limits.max_anchors.min(PACKET_DRILL_MAX_HITS);
-    limits.max_files = limits.max_files.min(PACKET_DRILL_MAX_HITS);
-    limits.max_snippets = limits.max_snippets.min(PACKET_DRILL_MAX_HITS);
-    limits.max_trail_edges = limits
-        .max_trail_edges
-        .min(PACKET_DRILL_MAX_HITS.saturating_mul(PACKET_DRILL_MAX_DEPTH));
-    limits.max_output_bytes = limits.max_output_bytes.min(PACKET_DRILL_MAX_BYTES);
-    limits
+    // Drill retrieval stays depth-bounded in `packet_retrieval_profile`. The
+    // compiled packet still advertises the requested budget's public caps so
+    // nested and MCP clients can consume a DrillOnce continuation.
+    packet_budget_limits(budget)
 }
 
 fn append_packet_non_trace_phase(answer: &mut AgentAnswerDto, label: &str, started_at: Instant) {
@@ -875,15 +890,17 @@ fn promote_retained_owner_member_probes(
 }
 
 fn promote_retained_schema_entity_probes(question: &str, answer: &mut AgentAnswerDto) {
-    let probe_keys = packet_named_schema_entity_symbol_queries(question)
-        .into_iter()
-        .map(|probe| normalize_identifier(&probe))
-        .collect::<Vec<_>>();
-    if probe_keys.is_empty() {
+    let entities = packet_named_schema_entity_queries(question);
+    if entities.is_empty() {
         return;
     }
-    for probe in probe_keys {
-        let best = answer
+    for entity in &entities {
+        let table_key = normalize_identifier(&entity.replace(' ', ""));
+        if table_key.len() < 4 {
+            continue;
+        }
+        let catalog_key = normalize_identifier(&format!("public.{entity}").replace(' ', ""));
+        let matching = answer
             .citations
             .iter()
             .enumerate()
@@ -894,15 +911,1052 @@ fn promote_retained_schema_entity_probes(question: &str, answer: &mut AgentAnswe
                         .evidence_producer
                         .as_deref()
                         .is_some_and(|producer| producer.contains("structural_sql"))
-                    && normalize_identifier(&citation.display_name) == probe
+                    && {
+                        let display = normalize_identifier(&citation.display_name);
+                        display == catalog_key || sql_catalog_table_key(&display) == table_key
+                    }
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let Some(&best_index) = matching.iter().max_by(|left, right| {
+            let left = &answer.citations[**left];
+            let right = &answer.citations[**right];
+            sql_schema_dialect_rank(left.file_path.as_deref().unwrap_or_default())
+                .total_cmp(&sql_schema_dialect_rank(
+                    right.file_path.as_deref().unwrap_or_default(),
+                ))
+                .then_with(|| left.score.total_cmp(&right.score))
+        }) else {
+            continue;
+        };
+        answer.citations[best_index].coverage_role =
+            Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
+        for index in matching {
+            let table_token = {
+                let display = &answer.citations[index].display_name;
+                display
+                    .rsplit(['.', ' ', '/', '\\'])
+                    .next()
+                    .unwrap_or(display)
+                    .trim()
+                    .to_string()
+            };
+            if table_token.is_empty() || normalize_identifier(&table_token).contains("createtable")
+            {
+                continue;
+            }
+            let alias_name = format!("CREATE TABLE {table_token}");
+            if answer.citations[index].display_name != alias_name {
+                answer.citations[index].display_name = alias_name;
+            }
+        }
+    }
+    promote_sql_schema_dialect_files(answer);
+    promote_sql_schema_relationship_constraints(answer);
+}
+
+fn sql_schema_dialect_rank(path: &str) -> f32 {
+    let lower = packet_display_path(path).to_ascii_lowercase();
+    if lower.contains("sqlite") {
+        4.0
+    } else if lower.contains("mysql") || lower.contains("postgres") || lower.contains("postgresql")
+    {
+        3.0
+    } else if lower.contains("sqlserver") {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn promote_sql_schema_dialect_files(answer: &mut AgentAnswerDto) {
+    let mut file_identities = Vec::new();
+    for marker in ["sqlite", "mysql", "postgres"] {
+        let best = answer
+            .citations
+            .iter()
+            .enumerate()
+            .filter(|(_, citation)| {
+                citation.file_path.as_deref().is_some_and(|path| {
+                    let display = packet_display_path(path).to_ascii_lowercase();
+                    display.ends_with(".sql")
+                        && display.contains(marker)
+                        && !packet_sql_schema_file_is_variant_copy(path)
+                })
             })
             .max_by(|(_, left), (_, right)| left.score.total_cmp(&right.score))
             .map(|(index, _)| index);
-        if let Some(index) = best {
+        let Some(index) = best else {
+            continue;
+        };
+        if answer.citations[index].coverage_role.is_none() {
             answer.citations[index].coverage_role =
                 Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
         }
+        let Some(path) = answer.citations[index].file_path.as_deref() else {
+            continue;
+        };
+        let relative = packet_display_path(path);
+        if relative.is_empty()
+            || answer
+                .citations
+                .iter()
+                .any(|citation| citation.display_name == relative)
+            || file_identities
+                .iter()
+                .any(|citation: &AgentCitationDto| citation.display_name == relative)
+        {
+            continue;
+        }
+        let source = &answer.citations[index];
+        file_identities.push(AgentCitationDto {
+            node_id: NodeId(format!(
+                "packet::sql_schema_dialect_file::{}::{relative}",
+                source.node_id.0
+            )),
+            display_name: relative,
+            kind: NodeKind::FILE,
+            file_path: source.file_path.clone(),
+            line: source.line,
+            score: source.score.max(20.0),
+            origin: SearchHitOrigin::TextMatch,
+            target: None,
+            resolvable: false,
+            subgraph_id: source.subgraph_id.clone(),
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: source.retrieval_score_breakdown.clone(),
+            evidence_tier: source.evidence_tier,
+            evidence_producer: Some("packet_sql_schema_dialect_file".to_string()),
+            resolution_status: source.resolution_status,
+            loss_reason: None,
+            coverage_role: Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string()),
+            eligible_for_sufficiency: Some(false),
+        });
     }
+    answer.citations.extend(file_identities);
+}
+
+fn citation_path_is_retained_sql_dialect(path: &str) -> bool {
+    let display = packet_display_path(path).to_ascii_lowercase();
+    display.ends_with(".sql")
+        && (display.contains("sqlite") || display.contains("mysql") || display.contains("postgres"))
+        && !packet_sql_schema_file_is_variant_copy(path)
+}
+
+fn promote_sql_schema_relationship_constraints(answer: &mut AgentAnswerDto) {
+    let retains_common_dialects = answer.citations.iter().any(|citation| {
+        citation
+            .file_path
+            .as_deref()
+            .is_some_and(citation_path_is_retained_sql_dialect)
+    });
+    if !retains_common_dialects {
+        return;
+    }
+    for citation in &mut answer.citations {
+        if citation.coverage_role.is_some()
+            || packet_evidence_role(citation) != Some(PacketEvidenceRole::SqlRelationshipConstraint)
+            || citation
+                .file_path
+                .as_deref()
+                .is_some_and(packet_sql_schema_file_is_variant_copy)
+        {
+            continue;
+        }
+        citation.coverage_role = Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
+    }
+}
+
+fn sql_catalog_table_key(normalized_display: &str) -> String {
+    let without_create = normalized_display
+        .strip_prefix("createtable")
+        .unwrap_or(normalized_display);
+    without_create
+        .strip_prefix("public")
+        .unwrap_or(without_create)
+        .to_string()
+}
+
+struct CitedSourceShapeCitation<'a> {
+    path: &'a Path,
+    display_name: &'a str,
+    kind: NodeKind,
+    line: u32,
+    score: f32,
+    coverage_role: &'a str,
+    producer: &'a str,
+}
+
+fn push_cited_source_shape_citation(
+    answer: &mut AgentAnswerDto,
+    project_root: &Path,
+    citation: CitedSourceShapeCitation<'_>,
+) -> bool {
+    let display_name = citation.display_name.trim();
+    if display_name.is_empty() {
+        return false;
+    }
+    let path_string = citation.path.to_string_lossy().to_string();
+    let relative = citation
+        .path
+        .strip_prefix(project_root)
+        .map(|stripped| packet_display_path(&stripped.to_string_lossy()))
+        .unwrap_or_else(|_| packet_display_path(&path_string));
+    if answer.citations.iter().any(|existing| {
+        existing.display_name == display_name
+            && existing.file_path.as_deref().is_some_and(|existing_path| {
+                packet_display_path(existing_path) == packet_display_path(&path_string)
+                    || packet_display_path(existing_path) == relative
+            })
+    }) {
+        return false;
+    }
+    answer.citations.push(AgentCitationDto {
+        node_id: NodeId(format!(
+            "packet::cited_source::{}::{relative}::{display_name}",
+            citation.producer
+        )),
+        display_name: display_name.to_string(),
+        kind: citation.kind,
+        file_path: Some(path_string),
+        line: Some(citation.line),
+        score: citation.score,
+        origin: SearchHitOrigin::TextMatch,
+        target: None,
+        resolvable: false,
+        subgraph_id: None,
+        evidence_edge_ids: Vec::new(),
+        retrieval_score_breakdown: None,
+        evidence_tier: Some(PacketEvidenceTierDto::SyntheticSourceScan),
+        evidence_producer: Some(citation.producer.to_string()),
+        resolution_status: Some(PacketEvidenceResolutionDto::SourceRangeOnly),
+        loss_reason: None,
+        coverage_role: Some(citation.coverage_role.to_string()),
+        eligible_for_sufficiency: Some(true),
+    });
+    true
+}
+
+fn maybe_append_cited_stylesheet_import_citations(
+    project_root: &Path,
+    question: &str,
+    answer: &mut AgentAnswerDto,
+) {
+    let terms = packet_probe_terms(question);
+    if !packet_terms_indicate_stylesheet_animation_flow(&terms) {
+        return;
+    }
+    let cited_css = answer
+        .citations
+        .iter()
+        .filter_map(|citation| citation.file_path.as_deref())
+        .filter(|path| {
+            packet_display_path(path)
+                .to_ascii_lowercase()
+                .ends_with(".css")
+        })
+        .map(|path| path.to_string())
+        .collect::<Vec<_>>();
+    if cited_css.is_empty() {
+        return;
+    }
+
+    let mut appended = 0usize;
+    for cited in &cited_css {
+        if appended >= 6 {
+            break;
+        }
+        let source_path = if Path::new(cited).is_absolute() {
+            PathBuf::from(cited)
+        } else {
+            project_root.join(cited)
+        };
+        let Ok(source) = std::fs::read_to_string(&source_path) else {
+            continue;
+        };
+        if source.len() > 1_500_000 {
+            continue;
+        }
+        let parent = source_path.parent().unwrap_or(project_root);
+        for import in packet_css_relative_imports(&source).into_iter().take(8) {
+            if appended >= 6 {
+                break;
+            }
+            let imported = parent.join(&import);
+            let relative = imported
+                .strip_prefix(project_root)
+                .unwrap_or(&imported)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if crate::retrieval_file_role_from_path(&relative).is_non_primary() {
+                continue;
+            }
+            if answer.citations.iter().any(|existing| {
+                existing.file_path.as_deref().is_some_and(|existing_path| {
+                    packet_display_path(existing_path) == packet_display_path(&relative)
+                })
+            }) {
+                continue;
+            }
+            let Ok(imported_source) = std::fs::read_to_string(&imported) else {
+                continue;
+            };
+            let lower = imported_source.to_ascii_lowercase();
+            let is_keyframe = lower.contains("@keyframes");
+            let is_vars = lower.contains(":root") && lower.contains("--");
+            if !is_keyframe && !is_vars {
+                continue;
+            }
+            let (display_name, line) = if is_keyframe {
+                packet_first_css_at_rule_display(&imported_source, "@keyframes")
+                    .unwrap_or_else(|| ("@keyframes".to_string(), 1))
+            } else {
+                packet_first_css_custom_property_display(&imported_source)
+                    .unwrap_or_else(|| ("css custom property".to_string(), 1))
+            };
+            let class_anchor = is_keyframe
+                .then(|| packet_first_css_class_display(&imported_source))
+                .flatten();
+            answer.citations.push(AgentCitationDto {
+                node_id: NodeId(format!(
+                    "packet::css_import::{}::{display_name}",
+                    packet_display_path(&relative)
+                )),
+                display_name,
+                kind: NodeKind::CONSTANT,
+                file_path: Some(imported.to_string_lossy().to_string()),
+                line: Some(line),
+                score: if is_keyframe { 48.0 } else { 44.0 },
+                origin: SearchHitOrigin::TextMatch,
+                target: None,
+                resolvable: false,
+                subgraph_id: None,
+                evidence_edge_ids: Vec::new(),
+                retrieval_score_breakdown: None,
+                evidence_tier: Some(
+                    codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan,
+                ),
+                evidence_producer: Some("packet_cited_stylesheet_import".to_string()),
+                resolution_status: Some(
+                    codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+                ),
+                loss_reason: None,
+                coverage_role: Some(if is_keyframe {
+                    "css keyframes".to_string()
+                } else {
+                    "css animation variables".to_string()
+                }),
+                eligible_for_sufficiency: Some(true),
+            });
+            if is_keyframe {
+                push_cited_source_shape_citation(
+                    answer,
+                    project_root,
+                    CitedSourceShapeCitation {
+                        path: &imported,
+                        display_name: &relative,
+                        kind: NodeKind::FILE,
+                        line,
+                        score: 47.0,
+                        coverage_role: "css animation source file",
+                        producer: "packet_cited_stylesheet_import",
+                    },
+                );
+            }
+            if let Some((class_name, class_line)) = class_anchor {
+                let already = answer.citations.iter().any(|existing| {
+                    existing.display_name == class_name
+                        && existing.file_path.as_deref().is_some_and(|path| {
+                            packet_display_path(path) == packet_display_path(&relative)
+                        })
+                });
+                if !already {
+                    answer.citations.push(AgentCitationDto {
+                        node_id: NodeId(format!(
+                            "packet::css_import_class::{}::{class_name}",
+                            packet_display_path(&relative)
+                        )),
+                        display_name: class_name,
+                        kind: NodeKind::CONSTANT,
+                        file_path: Some(imported.to_string_lossy().to_string()),
+                        line: Some(class_line),
+                        score: 46.0,
+                        origin: SearchHitOrigin::TextMatch,
+                        target: None,
+                        resolvable: false,
+                        subgraph_id: None,
+                        evidence_edge_ids: Vec::new(),
+                        retrieval_score_breakdown: None,
+                        evidence_tier: Some(
+                            codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan,
+                        ),
+                        evidence_producer: Some("packet_cited_stylesheet_import".to_string()),
+                        resolution_status: Some(
+                            codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+                        ),
+                        loss_reason: None,
+                        coverage_role: Some("css animation selector".to_string()),
+                        eligible_for_sufficiency: Some(true),
+                    });
+                }
+            }
+            appended = appended.saturating_add(1);
+        }
+    }
+    maybe_append_cited_stylesheet_entry_sheets(project_root, answer);
+}
+
+fn packet_stylesheet_path_is_animation_base(path: &Path) -> bool {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("");
+    let normalized = normalize_identifier(stem);
+    normalized == "base"
+        || normalized.ends_with("base")
+        || normalized == "vars"
+        || normalized.ends_with("vars")
+}
+
+fn maybe_append_cited_stylesheet_entry_sheets(project_root: &Path, answer: &mut AgentAnswerDto) {
+    let mut cited_names = Vec::new();
+    let mut parent_dirs = Vec::new();
+    for citation in &answer.citations {
+        let Some(path) = citation.file_path.as_deref() else {
+            continue;
+        };
+        if !packet_display_path(path)
+            .to_ascii_lowercase()
+            .ends_with(".css")
+        {
+            continue;
+        }
+        let source_path = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            project_root.join(path)
+        };
+        if !packet_stylesheet_path_is_animation_base(&source_path) {
+            continue;
+        }
+        if let Some(name) = source_path.file_name().and_then(|name| name.to_str())
+            && !cited_names.iter().any(|existing| existing == name)
+        {
+            cited_names.push(name.to_string());
+        }
+        if let Some(parent) = source_path.parent()
+            && !parent_dirs.iter().any(|existing| existing == parent)
+        {
+            parent_dirs.push(parent.to_path_buf());
+        }
+    }
+    if cited_names.is_empty() {
+        return;
+    }
+
+    let mut appended = 0usize;
+    for parent in parent_dirs {
+        if appended >= 2 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&parent) else {
+            continue;
+        };
+        let mut css_files = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("css"))
+            })
+            .collect::<Vec<_>>();
+        css_files.sort();
+        css_files.truncate(32);
+        for candidate in css_files {
+            if appended >= 2 {
+                break;
+            }
+            let relative = candidate
+                .strip_prefix(project_root)
+                .unwrap_or(&candidate)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if crate::retrieval_file_role_from_path(&relative).is_non_primary() {
+                continue;
+            }
+            if answer.citations.iter().any(|existing| {
+                existing.file_path.as_deref().is_some_and(|existing_path| {
+                    packet_display_path(existing_path) == packet_display_path(&relative)
+                })
+            }) {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&candidate) else {
+                continue;
+            };
+            if source.len() > 1_500_000 {
+                continue;
+            }
+            if source.to_ascii_lowercase().contains("@keyframes") {
+                continue;
+            }
+            let imports = packet_css_relative_imports(&source);
+            if imports.len() < 2 {
+                continue;
+            }
+            let imports_cited = imports.iter().any(|spec| {
+                let spec_name = spec.rsplit(['/', '\\']).next().unwrap_or(spec);
+                cited_names.iter().any(|cited| cited == spec_name)
+            });
+            if !imports_cited {
+                continue;
+            }
+            if push_cited_source_shape_citation(
+                answer,
+                project_root,
+                CitedSourceShapeCitation {
+                    path: &candidate,
+                    display_name: &relative,
+                    kind: NodeKind::FILE,
+                    line: 1,
+                    score: 45.0,
+                    coverage_role: "css animation source file",
+                    producer: "packet_cited_stylesheet_entry",
+                },
+            ) {
+                appended = appended.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn packet_css_relative_imports(source: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if !lower.starts_with("@import") {
+            continue;
+        }
+        let Some(start) = trimmed.find(['\'', '"']) else {
+            continue;
+        };
+        let quote = trimmed.as_bytes()[start];
+        let rest = &trimmed[start + 1..];
+        let Some(end) = rest.as_bytes().iter().position(|ch| *ch == quote) else {
+            continue;
+        };
+        let spec = &rest[..end];
+        if spec.is_empty()
+            || spec.contains("://")
+            || spec.starts_with('/')
+            || spec.starts_with("url(")
+        {
+            continue;
+        }
+        if spec.rsplit_once('.').is_some_and(|(_, ext)| {
+            !matches!(ext.to_ascii_lowercase().as_str(), "css" | "scss" | "sass")
+        }) {
+            continue;
+        }
+        if !imports.iter().any(|existing| existing == spec) {
+            imports.push(spec.to_string());
+        }
+    }
+    imports
+}
+
+fn packet_first_css_at_rule_display(source: &str, rule: &str) -> Option<(String, u32)> {
+    for (index, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.to_ascii_lowercase().starts_with(rule) {
+            let name = trimmed
+                .split(['{', ';'])
+                .next()
+                .unwrap_or(trimmed)
+                .trim()
+                .to_string();
+            return Some((name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)));
+        }
+    }
+    None
+}
+
+fn packet_first_css_custom_property_display(source: &str) -> Option<(String, u32)> {
+    for (index, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        let Some(start) = trimmed.find("--") else {
+            continue;
+        };
+        let name = trimmed[start..]
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+            .next()
+            .unwrap_or_default();
+        if name.len() > 2 {
+            return Some((
+                name.to_string(),
+                index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            ));
+        }
+    }
+    None
+}
+
+fn packet_first_css_class_display(source: &str) -> Option<(String, u32)> {
+    for (index, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('.') {
+            continue;
+        }
+        let name = trimmed
+            .split(['{', ',', ':', ' ', '\t'])
+            .next()
+            .unwrap_or(trimmed)
+            .trim();
+        if name.len() > 1 && name.starts_with('.') {
+            return Some((
+                name.to_string(),
+                index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            ));
+        }
+    }
+    None
+}
+
+fn maybe_append_cited_formatting_type_citations(
+    project_root: &Path,
+    question: &str,
+    answer: &mut AgentAnswerDto,
+) {
+    let terms = packet_probe_terms(question);
+    if !packet_terms_indicate_runtime_formatting_flow(&terms) {
+        return;
+    }
+    let cited_paths = cited_source_paths_with_extensions(
+        answer,
+        project_root,
+        &["h", "hpp", "hh", "cc", "cpp", "cxx"],
+    );
+    let mut appended = 0usize;
+    for path in cited_paths {
+        if appended >= 6 {
+            break;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if source.len() > 1_500_000 {
+            continue;
+        }
+        for (name, kind, line, argument_store) in packet_cited_formatting_types(&source) {
+            if appended >= 6 {
+                break;
+            }
+            let coverage_role = if argument_store {
+                "runtime format argument store"
+            } else {
+                "runtime formatting failure type"
+            };
+            if push_cited_source_shape_citation(
+                answer,
+                project_root,
+                CitedSourceShapeCitation {
+                    path: &path,
+                    display_name: &name,
+                    kind,
+                    line,
+                    score: if argument_store { 46.0 } else { 44.0 },
+                    coverage_role,
+                    producer: "packet_cited_formatting_type",
+                },
+            ) {
+                appended = appended.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn maybe_append_cited_mapper_interface_citations(
+    project_root: &Path,
+    question: &str,
+    answer: &mut AgentAnswerDto,
+) {
+    let terms = packet_probe_terms(question);
+    if !packet_terms_indicate_mapper_configuration_plan_flow(&terms) {
+        return;
+    }
+    let cited_paths = cited_source_paths_with_extensions(answer, project_root, &["cs"]);
+    let mut appended = 0usize;
+    for path in cited_paths {
+        if appended >= 4 {
+            break;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if source.len() > 1_500_000 {
+            continue;
+        }
+        for (name, line) in packet_cited_mapper_interface_names(&source) {
+            if appended >= 4 {
+                break;
+            }
+            if push_cited_source_shape_citation(
+                answer,
+                project_root,
+                CitedSourceShapeCitation {
+                    path: &path,
+                    display_name: &name,
+                    kind: NodeKind::INTERFACE,
+                    line,
+                    score: 45.0,
+                    coverage_role: "mapper public api",
+                    producer: "packet_cited_mapper_interface",
+                },
+            ) {
+                appended = appended.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn maybe_append_cited_client_relative_imports(
+    project_root: &Path,
+    question: &str,
+    answer: &mut AgentAnswerDto,
+) {
+    let terms = packet_probe_terms(question);
+    if !packet_terms_indicate_client_send_flow(&terms) {
+        return;
+    }
+    let cited_paths = cited_source_paths_with_extensions(answer, project_root, &["dart"]);
+    let mut pending = Vec::new();
+    for cited in cited_paths {
+        let Ok(source) = std::fs::read_to_string(&cited) else {
+            continue;
+        };
+        if source.len() > 1_500_000 {
+            continue;
+        }
+        let parent = cited.parent().unwrap_or(project_root);
+        let mut imports = packet_dart_relative_imports(&source);
+        imports.sort_by_key(|spec| packet_client_relative_import_priority(spec));
+        for import in imports {
+            if !packet_client_relative_import_stem(&import) {
+                continue;
+            }
+            let imported = parent.join(&import);
+            if !imported.is_file() {
+                continue;
+            }
+            let relative = imported
+                .strip_prefix(project_root)
+                .unwrap_or(&imported)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if crate::retrieval_file_role_from_path(&relative).is_non_primary() {
+                continue;
+            }
+            let Ok(imported_source) = std::fs::read_to_string(&imported) else {
+                continue;
+            };
+            let Some((display_name, line)) = packet_dart_declared_type_name(&imported_source)
+            else {
+                continue;
+            };
+            pending.push((
+                packet_client_relative_import_priority(&import),
+                imported,
+                relative,
+                display_name,
+                line,
+            ));
+        }
+    }
+    pending.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    pending.dedup_by(|left, right| left.1 == right.1);
+    let mut appended = 0usize;
+    for (priority, imported, relative, display_name, line) in pending {
+        if appended >= 6 {
+            break;
+        }
+        let exact_stem = priority == 0;
+        if push_cited_source_shape_citation(
+            answer,
+            project_root,
+            CitedSourceShapeCitation {
+                path: &imported,
+                display_name: &display_name,
+                kind: NodeKind::CLASS,
+                line,
+                score: if exact_stem { 50.0 } else { 42.0 },
+                coverage_role: "client imported type",
+                producer: "packet_cited_client_import",
+            },
+        ) {
+            let _ = push_cited_source_shape_citation(
+                answer,
+                project_root,
+                CitedSourceShapeCitation {
+                    path: &imported,
+                    display_name: &relative,
+                    kind: NodeKind::FILE,
+                    line,
+                    score: if exact_stem { 49.0 } else { 41.0 },
+                    coverage_role: "client imported source file",
+                    producer: "packet_cited_client_import",
+                },
+            );
+            appended = appended.saturating_add(1);
+        }
+    }
+}
+
+fn cited_source_paths_with_extensions(
+    answer: &AgentAnswerDto,
+    project_root: &Path,
+    extensions: &[&str],
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for citation in &answer.citations {
+        let Some(raw) = citation.file_path.as_deref() else {
+            continue;
+        };
+        let path = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            project_root.join(raw)
+        };
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !extensions.iter().any(|expected| extension == *expected) {
+            continue;
+        }
+        if paths.iter().any(|existing| existing == &path) {
+            continue;
+        }
+        paths.push(path);
+    }
+    paths
+}
+
+fn packet_cited_formatting_types(source: &str) -> Vec<(String, NodeKind, u32, bool)> {
+    let mut types = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        if packet_source_line_is_comment(line) {
+            continue;
+        }
+        let Some((name, kind)) = packet_cpp_declared_type_name(line) else {
+            continue;
+        };
+        let normalized = normalize_identifier(&name);
+        let argument_store = normalized.contains("format")
+            && (normalized.contains("arg") || normalized.contains("argument"))
+            && normalized.contains("store");
+        let failure_type = normalized.contains("format")
+            && (normalized.contains("error")
+                || normalized.contains("failure")
+                || normalized.contains("exception"))
+            && !normalized.contains("windows")
+            && !normalized.contains("system")
+            && !normalized.contains("duration");
+        if !argument_store && !failure_type {
+            continue;
+        }
+        types.push((
+            name,
+            kind,
+            index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            argument_store,
+        ));
+    }
+    types
+}
+
+fn packet_cpp_declared_type_name(line: &str) -> Option<(String, NodeKind)> {
+    for (keyword, kind) in [
+        ("class", NodeKind::CLASS),
+        ("struct", NodeKind::STRUCT),
+        ("using", NodeKind::TYPEDEF),
+    ] {
+        let Some(after) = packet_text_after_keyword(line, keyword) else {
+            continue;
+        };
+        for token in packet_identifier_tokens(after) {
+            let normalized = normalize_identifier(&token);
+            if normalized.is_empty()
+                || matches!(
+                    normalized.as_str(),
+                    "typename" | "template" | "public" | "private" | "protected" | "default"
+                )
+                || token.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
+            {
+                continue;
+            }
+            return Some((token, kind));
+        }
+    }
+    None
+}
+
+fn packet_text_after_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+    let lower = line.to_ascii_lowercase();
+    let index = lower.find(keyword)?;
+    let before = lower[..index].chars().last();
+    let after_index = index + keyword.len();
+    let after = lower[after_index..].chars().next();
+    if before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        || after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some(&line[after_index..])
+}
+
+fn packet_identifier_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    for ch in input.chars() {
+        if ch == '_' || ch.is_ascii_alphanumeric() {
+            token.push(ch);
+        } else if !token.is_empty() {
+            tokens.push(std::mem::take(&mut token));
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn packet_source_line_is_comment(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*')
+}
+
+fn packet_cited_mapper_interface_names(source: &str) -> Vec<(String, u32)> {
+    let mut names = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        if packet_source_line_is_comment(line) {
+            continue;
+        }
+        let Some(after) = packet_text_after_keyword(line, "interface") else {
+            continue;
+        };
+        for token in packet_identifier_tokens(after) {
+            let normalized = normalize_identifier(&token);
+            if normalized.is_empty()
+                || matches!(
+                    normalized.as_str(),
+                    "public" | "private" | "protected" | "internal" | "partial"
+                )
+                || !normalized.contains("mapper")
+            {
+                continue;
+            }
+            names.push((
+                token,
+                index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            ));
+            break;
+        }
+    }
+    names
+}
+
+fn packet_dart_relative_imports(source: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("import ") {
+            continue;
+        }
+        let Some(start) = trimmed.find(['\'', '"']) else {
+            continue;
+        };
+        let quote = trimmed.as_bytes()[start];
+        let rest = &trimmed[start + 1..];
+        let Some(end) = rest.as_bytes().iter().position(|ch| *ch == quote) else {
+            continue;
+        };
+        let spec = &rest[..end];
+        if spec.is_empty() || spec.contains(':') || spec.starts_with('/') {
+            continue;
+        }
+        if !spec.to_ascii_lowercase().ends_with(".dart") {
+            continue;
+        }
+        if !imports.iter().any(|existing| existing == spec) {
+            imports.push(spec.to_string());
+        }
+    }
+    imports
+}
+
+fn packet_client_relative_import_stem(spec: &str) -> bool {
+    let file_name = spec.rsplit(['/', '\\']).next().unwrap_or(spec);
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    let normalized = normalize_identifier(stem);
+    (normalized.contains("client")
+        || normalized.contains("request")
+        || normalized.contains("response"))
+        && !normalized.contains("stub")
+        && !normalized.contains("test")
+}
+
+fn packet_client_relative_import_priority(spec: &str) -> u8 {
+    let file_name = spec.rsplit(['/', '\\']).next().unwrap_or(spec);
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    let normalized = normalize_identifier(stem);
+    if matches!(normalized.as_str(), "client" | "request" | "response") {
+        0
+    } else if normalized.ends_with("client") {
+        1
+    } else {
+        2
+    }
+}
+
+fn packet_dart_declared_type_name(source: &str) -> Option<(String, u32)> {
+    for (index, line) in source.lines().enumerate() {
+        if packet_source_line_is_comment(line) {
+            continue;
+        }
+        let Some(after) = packet_text_after_keyword(line, "class") else {
+            continue;
+        };
+        for token in packet_identifier_tokens(after) {
+            let normalized = normalize_identifier(&token);
+            if normalized.is_empty()
+                || matches!(
+                    normalized.as_str(),
+                    "abstract" | "interface" | "base" | "final" | "sealed" | "mixin"
+                )
+            {
+                continue;
+            }
+            return Some((
+                token,
+                index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            ));
+        }
+    }
+    None
 }
 
 fn packet_plan_query_can_gate_sufficiency(query: &str) -> bool {
@@ -1008,7 +2062,31 @@ fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
     let prefer_primary_sources = !query_mentions_non_primary_source(question);
     sort_by_cached_rank_desc(&mut answer.citations, |citation| {
         packet_citation_rank(citation, &terms, prefer_primary_sources)
+            + packet_server_dispatch_callable_rank_bonus(citation, &terms)
     });
+    packet_drop_unrequested_wide_char_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_python_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_windows_formatting_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_formatting_extension_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_formatter_specialization_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_export_macro_displays(&mut answer.citations, &terms);
+    packet_drop_unrequested_system_format_failure_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_single_letter_displays(&mut answer.citations, &terms);
+    packet_drop_unrequested_named_client_adapter_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_duplicate_client_type_paths(&mut answer.citations, &terms);
+    packet_drop_unrequested_example_and_binding_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_mapper_annotation_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_test_siblings(&mut answer.citations, &terms);
+    packet_keep_shared_source_set_over_platform_duplicates(&mut answer.citations, &terms);
+    packet_drop_unrequested_sql_schema_variant_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_non_primary_flow_siblings(&mut answer.citations, &terms);
+    packet_drop_excess_unrequested_keyframe_siblings(&mut answer.citations, &terms);
+    packet_drop_excess_unrequested_animation_class_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_animation_file_aliases(&mut answer.citations, &terms);
+    packet_drop_unrequested_animation_file_only_sheets(&mut answer.citations, &terms);
+    packet_drop_unrequested_non_stylesheet_animation_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_repo_root_stylesheet_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_markdown_siblings(&mut answer.citations, &terms);
 }
 
 fn maybe_annotate_packet_candidate_window(
@@ -5496,7 +6574,13 @@ fn packet_retrieval_profile(
                 } else {
                     2
                 },
-                max_nodes: limits.max_trail_edges.clamp(10, 2_000),
+                max_nodes: if is_drill_continuation {
+                    PACKET_DRILL_MAX_HITS
+                        .saturating_mul(PACKET_DRILL_MAX_DEPTH)
+                        .clamp(10, 2_000)
+                } else {
+                    limits.max_trail_edges.clamp(10, 2_000)
+                },
                 include_edge_occurrences: matches!(
                     task_class,
                     Some(PacketTaskClassDto::ChangeImpact | PacketTaskClassDto::RouteTracing)
@@ -7986,6 +9070,127 @@ mod tests {
     }
 
     #[test]
+    fn packet_ranking_prefers_inbound_dispatch_callable_over_route_group() {
+        let question = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("RouteGroup.Group", "src/http/group.go", 0.95),
+                test_packet_citation("ServerEngine.handleHTTPRequest", "src/http/server.go", 0.40),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut answer);
+
+        assert_eq!(
+            answer.citations[0].display_name,
+            "ServerEngine.handleHTTPRequest"
+        );
+    }
+
+    #[test]
+    fn packet_ranking_drops_unrequested_wide_char_siblings() {
+        let question = "Explain how a formatter turns arguments into type-erased format args and reaches format_to output paths.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("vformat_to", "include/tool/xchar.h", 0.90),
+                test_packet_citation("format_to", "include/tool/format.h", 0.70),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut answer);
+
+        assert!(
+            answer.citations.iter().all(|citation| !citation
+                .file_path
+                .as_deref()
+                .unwrap_or_default()
+                .contains("xchar")),
+            "wide-char siblings should leave the window when the question did not ask for them: {:?}",
+            answer
+                .citations
+                .iter()
+                .map(|citation| citation.file_path.as_deref())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(answer.citations[0].display_name, "format_to");
+    }
+
+    #[test]
+    fn packet_ranking_drops_unrequested_windows_and_formatting_extensions() {
+        let question = "Explain how a formatter turns arguments into type-erased format args and reaches format_to output paths.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("detail::format_windows_error", "src/os.cc", 0.90),
+                test_packet_citation("vformat_to", "include/tool/color.h", 0.80),
+                test_packet_citation("T", "include/tool/args.h", 0.75),
+                test_packet_citation("format_to", "include/tool/format.h", 0.70),
+                test_packet_citation("format_error", "include/tool/format.h", 0.68),
+                test_packet_citation("format_arg_store", "include/tool/base.h", 0.65),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut answer);
+
+        let names: Vec<&str> = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.contains("windows") || *name == "T" || *name == "vformat_to"),
+            "unrequested windows, extension, and single-letter hits should leave: {names:?}"
+        );
+        assert!(names.contains(&"format_to"));
+        assert!(names.contains(&"format_arg_store"));
+        assert!(names.contains(&"format_error"));
+    }
+
+    #[test]
+    fn packet_ranking_drops_unrequested_client_adapters_and_mapper_annotations() {
+        let client_question = "Explain how an HTTP client exposes helpers, BaseClient convenience methods, and IOClient send behavior.";
+        let mut client_answer = packet_answer_fixture(
+            client_question,
+            vec![
+                test_packet_citation("IOClient.send", "src/http/io_client.dart", 0.90),
+                test_packet_citation("CronetClient.send", "src/http/cronet_client.dart", 0.80),
+                test_packet_citation("main", "flutter_http_example/lib/main.dart", 0.70),
+                test_packet_citation("Client.get", "src/http/client.dart", 0.60),
+            ],
+        );
+        rank_packet_evidence(client_question, &mut client_answer);
+        assert!(client_answer.citations.iter().all(|citation| {
+            let path = citation.file_path.as_deref().unwrap_or_default();
+            !path.contains("cronet") && !path.contains("example")
+        }));
+
+        let mapper_question = "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects.";
+        let mut mapper_answer = packet_answer_fixture(
+            mapper_question,
+            vec![
+                test_packet_citation(
+                    "MapAtRuntimeAttribute.ApplyConfiguration",
+                    "src/ObjectMapping/Configuration/Annotations/MapAtRuntimeAttribute.cs",
+                    0.90,
+                ),
+                test_packet_citation(
+                    "When_mapping_to_a_destination",
+                    "src/UnitTests/Indexers.cs",
+                    0.80,
+                ),
+                test_packet_citation("Mapper.MapCore", "src/ObjectMapping/Mapper.cs", 0.70),
+            ],
+        );
+        rank_packet_evidence(mapper_question, &mut mapper_answer);
+        assert_eq!(mapper_answer.citations.len(), 1);
+        assert_eq!(mapper_answer.citations[0].display_name, "Mapper.MapCore");
+    }
+
+    #[test]
     fn packet_ranking_prefers_vscode_workbench_flow_over_extension_noise() {
         let question = "Explain how VS Code workbench startup reaches extension host activation and command execution.";
         let mut answer = packet_answer_fixture(
@@ -9261,6 +10466,759 @@ mod tests {
         );
         assert_eq!(answer.citations[1].coverage_role, None);
         assert_eq!(answer.citations[3].coverage_role, None);
+        let alias_names = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(alias_names.contains(&"CREATE TABLE Artist"));
+        assert!(alias_names.contains(&"CREATE TABLE InvoiceLine"));
+        assert!(!alias_names.contains(&"CREATE TABLE Customer"));
+        assert_eq!(
+            answer.citations.len(),
+            4,
+            "DDL spelling should rewrite the catalog citation instead of adding a duplicate alias"
+        );
+        assert_eq!(answer.citations[0].display_name, "CREATE TABLE Artist");
+        assert_eq!(answer.citations[2].display_name, "CREATE TABLE InvoiceLine");
+        assert_eq!(
+            answer.citations[1].display_name, "CREATE TABLE Artist",
+            "every matching catalog hit should use the DDL spelling, not only the preferred dialect"
+        );
+    }
+
+    #[test]
+    fn schema_entity_promotion_keeps_common_sql_dialect_scripts() {
+        let question = "Explain schema relationships between artists, albums, and invoice lines across SQL scripts.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("public.Artist", "db/Chinook_Db2.sql", 0.95),
+                test_packet_citation("public.Artist", "db/Chinook_Sqlite.sql", 0.4),
+                test_packet_citation("seed", "db/Chinook_MySql.sql", 0.3),
+                test_packet_citation("seed", "db/Chinook_PostgreSql.sql", 0.2),
+            ],
+        );
+        for citation in &mut answer.citations {
+            citation.evidence_producer = Some("structural_sql_collector".to_string());
+            citation.origin = SearchHitOrigin::IndexedSymbol;
+        }
+        answer.citations[2].origin = SearchHitOrigin::TextMatch;
+        answer.citations[3].origin = SearchHitOrigin::TextMatch;
+
+        promote_retained_schema_entity_probes(question, &mut answer);
+
+        let protected_paths = answer
+            .citations
+            .iter()
+            .filter(|citation| {
+                citation.coverage_role.as_deref() == Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE)
+            })
+            .filter_map(|citation| citation.file_path.as_deref())
+            .map(packet_display_path)
+            .collect::<Vec<_>>();
+        assert!(
+            protected_paths.iter().any(|path| path.contains("Sqlite")),
+            "sqlite dialect should be retained: {protected_paths:?}"
+        );
+        assert!(
+            protected_paths.iter().any(|path| path.contains("MySql")),
+            "mysql dialect should be retained: {protected_paths:?}"
+        );
+        assert!(
+            protected_paths
+                .iter()
+                .any(|path| path.contains("PostgreSql")),
+            "postgres dialect should be retained: {protected_paths:?}"
+        );
+        assert!(
+            answer
+                .citations
+                .iter()
+                .any(|citation| citation.display_name == "CREATE TABLE Artist"
+                    && citation
+                        .file_path
+                        .as_deref()
+                        .is_some_and(|path| packet_display_path(path).contains("Sqlite"))),
+            "CREATE TABLE alias should follow the preferred dialect file: {:?}",
+            answer.citations
+        );
+        let file_identity_names = answer
+            .citations
+            .iter()
+            .filter(|citation| citation.kind == NodeKind::FILE)
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            file_identity_names
+                .iter()
+                .any(|name| *name == "db/Chinook_Sqlite.sql"),
+            "retained dialect files should keep a repo-relative file identity: {file_identity_names:?}"
+        );
+        assert!(
+            file_identity_names
+                .iter()
+                .any(|name| *name == "db/Chinook_MySql.sql"),
+            "retained dialect files should keep a repo-relative file identity: {file_identity_names:?}"
+        );
+        assert!(
+            file_identity_names
+                .iter()
+                .any(|name| *name == "db/Chinook_PostgreSql.sql"),
+            "retained dialect files should keep a repo-relative file identity: {file_identity_names:?}"
+        );
+    }
+
+    #[test]
+    fn schema_entity_promotion_keeps_named_constraint_anchor_on_retained_dialect() {
+        let question =
+            "Explain schema relationships between publishers and titles across SQL scripts.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("public.Publisher", "schema/Catalog_Sqlite.sql", 0.4),
+                test_packet_citation("IFK_TitlePublisherId", "schema/Catalog_MySql.sql", 0.35),
+                test_packet_citation("public.title", "schema/Catalog_PostgreSql.sql", 0.2),
+            ],
+        );
+        for citation in &mut answer.citations {
+            citation.evidence_producer = Some("structural_sql_collector".to_string());
+            citation.origin = SearchHitOrigin::IndexedSymbol;
+            citation.kind = NodeKind::CLASS;
+            citation.resolvable = true;
+            citation.eligible_for_sufficiency = Some(true);
+        }
+
+        promote_retained_schema_entity_probes(question, &mut answer);
+        rank_packet_evidence(question, &mut answer);
+
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "IFK_TitlePublisherId"
+                    && citation
+                        .file_path
+                        .as_deref()
+                        .is_some_and(|path| packet_display_path(path).contains("MySql"))
+            }),
+            "named referential constraints on retained dialects should remain: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "IFK_TitlePublisherId"
+                    && citation.coverage_role.as_deref() == Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE)
+            }),
+            "relationship constraints on retained dialects should keep a protected schema role: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name.contains("CREATE TABLE")
+                    && citation.file_path.as_deref().is_some_and(|path| {
+                        let display = packet_display_path(path);
+                        display.contains("Sqlite")
+                            || display.contains("MySql")
+                            || display.contains("PostgreSql")
+                    })
+            }),
+            "retained dialects should keep a table-creation anchor: {:?}",
+            answer.citations
+        );
+    }
+
+    #[test]
+    fn schema_file_identities_keep_relationship_constraints_on_the_same_dialect() {
+        let question =
+            "Explain schema relationships between publishers and titles across SQL scripts.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("public.Publisher", "schema/Catalog_Sqlite.sql", 0.4),
+                test_packet_citation("public.Title", "schema/Catalog_Sqlite.sql", 0.38),
+                test_packet_citation("IFK_TitlePublisherId", "schema/Catalog_Sqlite.sql", 0.2),
+                test_packet_citation("public.Publisher", "schema/Catalog_MySql.sql", 0.3),
+                test_packet_citation("public.Publisher", "schema/Catalog_PostgreSql.sql", 0.25),
+                test_packet_citation("unrelated helper", "src/unrelated.rs", 0.9),
+            ],
+        );
+        for citation in &mut answer.citations {
+            if citation.display_name.starts_with("public.")
+                || citation.display_name.starts_with("IFK_")
+            {
+                citation.evidence_producer = Some("structural_sql_collector".to_string());
+                citation.origin = SearchHitOrigin::IndexedSymbol;
+                citation.kind = NodeKind::CLASS;
+                citation.resolvable = true;
+                citation.eligible_for_sufficiency = Some(true);
+            }
+        }
+
+        promote_retained_schema_entity_probes(question, &mut answer);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 8,
+            max_files: 8,
+            max_snippets: 8,
+            max_trail_edges: 8,
+            max_output_bytes: 16 * 1024,
+        };
+        assert!(cap_citations(&mut answer, &limits));
+
+        let names = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            names.iter().any(|name| *name == "IFK_TitlePublisherId"),
+            "dialect file identities must not evict relationship constraints: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| *name == "schema/Catalog_Sqlite.sql"),
+            "retained dialect files should keep a repo-relative file identity: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.contains("CREATE TABLE")),
+            "retained dialects should keep a table-creation anchor: {names:?}"
+        );
+    }
+
+    #[test]
+    fn packet_ranking_drops_sql_schema_variant_copies_when_common_dialects_remain() {
+        let question =
+            "Explain schema relationships between publishers and titles across SQL scripts.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("CREATE TABLE Publisher", "schema/Catalog_Sqlite.sql", 0.4),
+                test_packet_citation("FOREIGN KEY", "schema/Catalog_Sqlite.sql", 0.35),
+                test_packet_citation("CREATE TABLE Publisher", "schema/Catalog_MySql.sql", 0.3),
+                test_packet_citation("FOREIGN KEY", "schema/Catalog_PostgreSql.sql", 0.25),
+                test_packet_citation(
+                    "CREATE TABLE Publisher",
+                    "schema/Catalog_SqliteAutoIncrementPKs.sql",
+                    0.95,
+                ),
+                test_packet_citation(
+                    "CREATE TABLE Publisher",
+                    "schema/Catalog_PostgreSqlSerialPKs.sql",
+                    0.9,
+                ),
+                test_packet_citation("CREATE TABLE Publisher", "schema/Catalog_Db2.sql", 0.85),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut answer);
+
+        let paths = answer
+            .citations
+            .iter()
+            .filter_map(|citation| citation.file_path.as_deref())
+            .map(packet_display_path)
+            .collect::<Vec<_>>();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("schema/Catalog_Sqlite.sql")),
+            "sqlite dialect should remain: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("schema/Catalog_MySql.sql")),
+            "mysql dialect should remain: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("schema/Catalog_PostgreSql.sql")),
+            "postgres dialect should remain: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|path| {
+                !path.to_ascii_lowercase().contains("autoincrement")
+                    && !path.to_ascii_lowercase().contains("serialpks")
+                    && !path.contains("Db2")
+            }),
+            "variant and extra-engine copies should drop: {paths:?}"
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name.contains("FOREIGN KEY")
+                    && citation.file_path.as_deref().is_some_and(|path| {
+                        let display = packet_display_path(path);
+                        display.contains("Sqlite")
+                            || display.contains("MySql")
+                            || display.contains("PostgreSql")
+                    })
+            }),
+            "FOREIGN KEY on a retained dialect should remain: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name.contains("CREATE TABLE")
+                    && citation.file_path.as_deref().is_some_and(|path| {
+                        let display = packet_display_path(path);
+                        display.contains("Sqlite")
+                            || display.contains("MySql")
+                            || display.contains("PostgreSql")
+                    })
+            }),
+            "CREATE TABLE on a retained dialect should remain: {:?}",
+            answer.citations
+        );
+    }
+
+    #[test]
+    fn cited_stylesheet_imports_promote_keyframe_and_variable_sheets() {
+        let root = packet_temp_root("css-import-expansion");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "styles/entry.css",
+            "@import '_tokens.css';\n@import 'motion/spin.css';\n@import '../bundle.min.css';\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "styles/_tokens.css",
+            ":root {\n  --motion-duration: 1s;\n}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "styles/motion/spin.css",
+            "@keyframes spin {\n  from { transform: rotate(0deg); }\n}\n.spin {\n  animation-name: spin;\n}\n",
+        );
+        write_packet_fixture_file(&root, "bundle.min.css", ".unused { color: red; }\n");
+
+        let mut answer = packet_answer_fixture(
+            "Explain how the stylesheet defines shared animation variables and base classes and connects named animation classes to keyframes.",
+            vec![test_packet_citation("entry", "styles/entry.css", 0.4)],
+        );
+        answer.citations[0].file_path = Some(root.join("styles/entry.css").display().to_string());
+
+        maybe_append_cited_stylesheet_import_citations(
+            &root,
+            "Explain how the stylesheet defines shared animation variables and base classes and connects named animation classes to keyframes.",
+            &mut answer,
+        );
+
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            displays.iter().any(|name| name.contains("@keyframes spin")),
+            "imported keyframe sheet should be cited: {displays:?}"
+        );
+        assert!(
+            displays.contains(&".spin"),
+            "imported animation class should be cited: {displays:?}"
+        );
+        assert!(
+            displays.iter().any(|name| *name == "--motion-duration"),
+            "imported custom properties should be cited: {displays:?}"
+        );
+        assert!(
+            displays
+                .iter()
+                .any(|name| packet_display_path(name).ends_with("styles/motion/spin.css")),
+            "keyframe sheet path should be copyable from the citation list: {displays:?}"
+        );
+        assert!(
+            !answer.citations.iter().any(|citation| citation
+                .file_path
+                .as_deref()
+                .is_some_and(|path| packet_display_path(path).ends_with("bundle.min.css"))),
+            "generated bundles should stay out of cited stylesheet imports: {:?}",
+            answer.citations
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cited_stylesheet_entry_sheet_promotes_import_barrel_beside_base_and_vars() {
+        let root = packet_temp_root("css-entry-barrel");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "styles/_tokens.css",
+            ":root {\n  --motion-duration: 1s;\n}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "styles/_base.css",
+            ".base {\n  animation-duration: var(--motion-duration);\n}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "styles/entry.css",
+            "@import '_tokens.css';\n@import '_base.css';\n@import 'motion/spin.css';\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "styles/motion/spin.css",
+            "@keyframes spin {\n  from { transform: rotate(0deg); }\n}\n.spin {\n  animation-name: spin;\n}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "styles/motion/slide.css",
+            "@keyframes slide {\n  from { transform: translateX(0); }\n}\n",
+        );
+
+        let question = "Explain how the stylesheet defines shared animation variables and base classes and connects named animation classes to keyframes.";
+        let mut tokens = test_packet_citation("--motion-duration", "styles/_tokens.css", 0.9);
+        tokens.file_path = Some(root.join("styles/_tokens.css").display().to_string());
+        let mut base = test_packet_citation(".base", "styles/_base.css", 0.8);
+        base.file_path = Some(root.join("styles/_base.css").display().to_string());
+        let mut spin = test_packet_citation("@keyframes spin", "styles/motion/spin.css", 0.7);
+        spin.file_path = Some(root.join("styles/motion/spin.css").display().to_string());
+        let mut answer = packet_answer_fixture(question, vec![tokens, base, spin]);
+
+        maybe_append_cited_stylesheet_import_citations(&root, question, &mut answer);
+        rank_packet_evidence(question, &mut answer);
+
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.kind == NodeKind::FILE
+                    && citation
+                        .display_name
+                        .replace('\\', "/")
+                        .ends_with("styles/entry.css")
+            }),
+            "import barrel beside cited base/vars should be copyable: {:?}",
+            answer
+                .citations
+                .iter()
+                .map(|citation| {
+                    (
+                        &citation.display_name,
+                        citation.kind,
+                        citation.file_path.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            answer.citations.iter().all(|citation| {
+                !citation.file_path.as_deref().is_some_and(|path| {
+                    packet_display_path(path).ends_with("styles/motion/slide.css")
+                })
+            }),
+            "unimported motion sheets must stay out of the entry promotion: {:?}",
+            answer.citations
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cited_formatting_files_promote_argument_store_and_failure_types() {
+        let root = packet_temp_root("cited-formatting-types");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "include/tool/base.hpp",
+            r#"
+            template <typename Context, int NUM_ARGS>
+            struct runtime_format_arg_store {
+              void push_back();
+            };
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "include/tool/args.hpp",
+            r#"
+            FMT_EXPORT template <typename Context>
+            class dynamic_format_argument_store {
+            public:
+              void push_back();
+            };
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "include/tool/errors.hpp",
+            r#"
+            class TOOL_EXPORT format_failure : public std::runtime_error {
+            };
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "include/tool/uncited.hpp",
+            r#"
+            struct leftover_format_arg_store {};
+            "#,
+        );
+
+        let prompt = "Explain how a formatting runtime turns arguments into type-erased format argument stores and reports formatting failure types.";
+        let mut answer = packet_answer_fixture(
+            prompt,
+            vec![
+                test_packet_citation("format_to", "include/tool/base.hpp", 0.7),
+                test_packet_citation("named_arg", "include/tool/args.hpp", 0.6),
+                test_packet_citation("report_error", "include/tool/errors.hpp", 0.5),
+            ],
+        );
+        answer.citations[0].file_path =
+            Some(root.join("include/tool/base.hpp").display().to_string());
+        answer.citations[1].file_path =
+            Some(root.join("include/tool/args.hpp").display().to_string());
+        answer.citations[2].file_path =
+            Some(root.join("include/tool/errors.hpp").display().to_string());
+
+        maybe_append_cited_formatting_type_citations(&root, prompt, &mut answer);
+
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "runtime_format_arg_store",
+            "dynamic_format_argument_store",
+            "format_failure",
+        ] {
+            assert!(
+                displays.contains(&expected),
+                "expected cited formatting type {expected}; got {displays:?}"
+            );
+        }
+        assert!(
+            !displays.contains(&"leftover_format_arg_store"),
+            "uncited files must not be scanned: {displays:?}"
+        );
+
+        let mut other = packet_answer_fixture(
+            "Explain how a session sends HTTP requests.",
+            vec![test_packet_citation(
+                "format_to",
+                "include/tool/base.hpp",
+                0.7,
+            )],
+        );
+        other.citations[0].file_path =
+            Some(root.join("include/tool/base.hpp").display().to_string());
+        maybe_append_cited_formatting_type_citations(
+            &root,
+            "Explain how a session sends HTTP requests.",
+            &mut other,
+        );
+        assert!(
+            other
+                .citations
+                .iter()
+                .all(|citation| citation.display_name != "runtime_format_arg_store"),
+            "non-formatting questions should not lift formatting types: {:?}",
+            other.citations
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cited_mapper_files_promote_mapper_interfaces() {
+        let root = packet_temp_root("cited-mapper-interfaces");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/ObjectMapping/RuntimeMapper.cs",
+            r#"
+            namespace ObjectMapping;
+            public interface IRuntimeMapperBase
+            {
+              TDestination Map<TSource, TDestination>(TSource source);
+            }
+            public interface IRuntimeMapper : IRuntimeMapperBase
+            {
+              IConfigurationProvider ConfigurationProvider { get; }
+            }
+            public sealed class RuntimeMapper : IRuntimeMapper
+            {
+              public TDestination Map<TSource, TDestination>(TSource source) => default!;
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/ObjectMapping/UncitedMapper.cs",
+            "public interface ILeftoverMapper {}",
+        );
+
+        let prompt = "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects.";
+        let mut answer = packet_answer_fixture(
+            prompt,
+            vec![test_packet_citation(
+                "RuntimeMapper.Map",
+                "src/ObjectMapping/RuntimeMapper.cs",
+                0.7,
+            )],
+        );
+        answer.citations[0].file_path = Some(
+            root.join("src/ObjectMapping/RuntimeMapper.cs")
+                .display()
+                .to_string(),
+        );
+        maybe_append_cited_mapper_interface_citations(&root, prompt, &mut answer);
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            displays.contains(&"IRuntimeMapperBase") && displays.contains(&"IRuntimeMapper"),
+            "cited mapper file should promote mapper interfaces: {displays:?}"
+        );
+        assert!(
+            !displays.contains(&"ILeftoverMapper"),
+            "uncited mapper files must not be scanned: {displays:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cited_client_files_follow_response_and_request_imports() {
+        let root = packet_temp_root("cited-client-imports");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/http/client.dart",
+            r#"
+            import 'base_request.dart';
+            import 'response.dart';
+            import 'ignore_me.dart';
+            abstract interface class Client {
+              Future<Response> get(Uri url);
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/http/response.dart",
+            "class Response {\n  final int statusCode;\n}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/http/base_request.dart",
+            "abstract class BaseRequest {\n  void finalize();\n}\n",
+        );
+        write_packet_fixture_file(&root, "src/http/ignore_me.dart", "class IgnoreMe {}\n");
+
+        let prompt = "Explain how an HTTP client exposes helpers, BaseClient convenience methods, and IOClient send behavior.";
+        let mut answer = packet_answer_fixture(
+            prompt,
+            vec![test_packet_citation(
+                "Client.get",
+                "src/http/client.dart",
+                0.7,
+            )],
+        );
+        answer.citations[0].file_path =
+            Some(root.join("src/http/client.dart").display().to_string());
+        maybe_append_cited_client_relative_imports(&root, prompt, &mut answer);
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            displays.contains(&"Response") && displays.contains(&"BaseRequest"),
+            "cited client file should follow response/request imports: {displays:?}"
+        );
+        assert!(
+            displays
+                .iter()
+                .any(|name| packet_display_path(name).ends_with("src/http/response.dart"))
+                && displays
+                    .iter()
+                    .any(|name| packet_display_path(name).ends_with("src/http/base_request.dart")),
+            "imported client/request/response paths should be copyable: {displays:?}"
+        );
+        assert!(
+            !displays.contains(&"IgnoreMe"),
+            "unrelated dart imports should stay out: {displays:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cited_client_barrels_prefer_exact_client_request_response_imports() {
+        let root = packet_temp_root("cited-client-barrel-imports");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/http/http.dart",
+            r#"
+            import 'client.dart';
+            import 'request.dart';
+            import 'response.dart';
+            import 'streamed_request.dart';
+            import 'streamed_response.dart';
+            import 'multipart_request.dart';
+            Future<Response> get(Uri url) => Client().get(url);
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/http/client.dart",
+            "abstract interface class Client {\n  Future<Response> get(Uri url);\n}\n",
+        );
+        write_packet_fixture_file(&root, "src/http/request.dart", "class Request {}\n");
+        write_packet_fixture_file(&root, "src/http/response.dart", "class Response {}\n");
+        write_packet_fixture_file(
+            &root,
+            "src/http/streamed_request.dart",
+            "class StreamedRequest {}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/http/streamed_response.dart",
+            "class StreamedResponse {}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/http/multipart_request.dart",
+            "class MultipartRequest {}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/http/io_client.dart",
+            "class IOClient {\n  Future<StreamedResponse> send(BaseRequest request) => throw '';\n}\n",
+        );
+
+        let prompt = "Explain how an HTTP client exposes helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.";
+        let mut answer = packet_answer_fixture(
+            prompt,
+            vec![
+                test_packet_citation("get", "src/http/http.dart", 0.9),
+                test_packet_citation("IOClient.send", "src/http/io_client.dart", 0.8),
+            ],
+        );
+        answer.citations[0].file_path = Some(root.join("src/http/http.dart").display().to_string());
+        answer.citations[1].file_path =
+            Some(root.join("src/http/io_client.dart").display().to_string());
+        maybe_append_cited_client_relative_imports(&root, prompt, &mut answer);
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            displays.contains(&"Client")
+                && displays.contains(&"Request")
+                && displays.contains(&"Response"),
+            "exact client/request/response imports should outrank qualified siblings: {displays:?}"
+        );
+        assert!(
+            displays
+                .iter()
+                .any(|name| packet_display_path(name).ends_with("src/http/client.dart")),
+            "client source path should be copyable: {displays:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -10401,17 +12359,10 @@ mod tests {
 
         rank_packet_evidence(question, &mut answer);
 
+        assert_eq!(answer.citations.len(), 1);
         assert_eq!(
             answer.citations[0].display_name,
             "IndexService::run_indexing_blocking"
-        );
-        assert_eq!(
-            packet_evidence_role(&answer.citations[1]),
-            Some(PacketEvidenceRole::TestsAndRegressionCoverage)
-        );
-        assert_eq!(
-            packet_evidence_role(&answer.citations[2]),
-            Some(PacketEvidenceRole::TestsAndRegressionCoverage)
         );
     }
 
@@ -10503,6 +12454,35 @@ mod tests {
     }
 
     #[test]
+    fn packet_ranking_drops_wide_char_when_a_primary_format_header_remains() {
+        let question = "Explain how formatting arguments reach vformat and format_to output paths.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("vformat_to", "include/tool/xchar.h", 0.9),
+                test_packet_citation("vformat", "include/tool/format.h", 0.5),
+                test_packet_citation("format_to", "include/tool/base.h", 0.4),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut answer);
+
+        let paths = answer
+            .citations
+            .iter()
+            .filter_map(|citation| citation.file_path.as_deref())
+            .collect::<Vec<_>>();
+        assert!(
+            paths.iter().any(|path| *path == "include/tool/format.h"),
+            "primary format header should remain cited: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|path| *path != "include/tool/xchar.h"),
+            "unrequested wide-char sibling should drop: {paths:?}"
+        );
+    }
+
+    #[test]
     fn packet_follow_up_commands_single_quote_shell_sensitive_questions() {
         let question = "Inspect $env:SECRET and $(Get-ChildItem) and 'literal'";
         let quoted = quote_packet_command_value(question);
@@ -10583,7 +12563,7 @@ mod tests {
     }
 
     #[test]
-    fn drill_continuation_uses_the_declared_bounded_packet_limits() {
+    fn drill_continuation_keeps_public_packet_limits_and_bounds_retrieval_depth() {
         let ordinary = packet_budget_limits_for_request(PacketBudgetModeDto::Standard, false);
         let drill = packet_budget_limits_for_request(PacketBudgetModeDto::Standard, true);
 
@@ -10593,14 +12573,11 @@ mod tests {
         assert_eq!(ordinary.max_snippets, expected.max_snippets);
         assert_eq!(ordinary.max_trail_edges, expected.max_trail_edges);
         assert_eq!(ordinary.max_output_bytes, expected.max_output_bytes);
-        assert_eq!(drill.max_anchors, PACKET_DRILL_MAX_HITS);
-        assert_eq!(drill.max_files, PACKET_DRILL_MAX_HITS);
-        assert_eq!(drill.max_snippets, PACKET_DRILL_MAX_HITS);
-        assert_eq!(
-            drill.max_trail_edges,
-            PACKET_DRILL_MAX_HITS * PACKET_DRILL_MAX_DEPTH
-        );
-        assert_eq!(drill.max_output_bytes, PACKET_DRILL_MAX_BYTES);
+        assert_eq!(drill.max_anchors, expected.max_anchors);
+        assert_eq!(drill.max_files, expected.max_files);
+        assert_eq!(drill.max_snippets, expected.max_snippets);
+        assert_eq!(drill.max_trail_edges, expected.max_trail_edges);
+        assert_eq!(drill.max_output_bytes, expected.max_output_bytes);
 
         let profile = packet_retrieval_profile(
             Some(PacketTaskClassDto::ArchitectureExplanation),

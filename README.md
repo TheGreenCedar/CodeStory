@@ -147,35 +147,40 @@ Full routing: [docs/README.md](docs/README.md).
 
 ## Evaluation
 
-> **Scope:** The language-expansion holdout compares agents on 18 pinned public OSS tasks with and without CodeStory. A result is published only when both arms finish every repeat, pass the answer-quality checks, and stay within the declared source-read budget. For day-to-day limits, see [What to expect](docs/users/what-to-expect.md).
+The same agent answered one architecture question in each of 18 pinned public
+repositories, three times with CodeStory and three times without. Passing
+answers stayed even or better. Tokens and tool calls dropped sharply.
 
-### Language expansion holdout (18 tasks)
+| | Without CodeStory | With CodeStory |
+| --- | ---: | ---: |
+| Passing answers | 44 of 54 | 45 of 54 |
+| Tokens | 19.8 million | 1.7 million (−91%) |
+| Tool calls | 834 | 54 (−94%) |
 
-Broader public-repo evidence uses the [`language-support-ab`](benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json) manifest across 18 pinned OSS packages. We reran both arms from scratch against 0.17 on **2026-08-10**. All 108 agent runs completed, but the result did not meet the publication bar: only 34 of 54 answers in each arm passed the manifest quality checks, and the CodeStory arm still needed ordinary source reads after its packet. The old 0.15 totals are therefore no longer presented as a current performance claim. See the [language-expansion holdout evidence record](docs/testing/language-expansion-holdout-stats.md) for the exact run and rejection details.
+| Language | Asked about | Without | With |
+| --- | --- | ---: | ---: |
+| Python | Requests session send | 3 of 3 | 3 of 3 |
+| Java | Commons Lang string checks | 3 of 3 | 3 of 3 |
+| Rust | ripgrep search pipeline | 3 of 3 | 3 of 3 |
+| JavaScript | Express routing | 3 of 3 | 3 of 3 |
+| TypeScript | SWR hooks | 3 of 3 | 3 of 3 |
+| C++ | fmt formatting | 3 of 3 | 2 of 3 |
+| C | Redis command loop | 3 of 3 | 3 of 3 |
+| Go | Gin route dispatch | 3 of 3 | 3 of 3 |
+| Ruby | Jekyll site build | 3 of 3 | 3 of 3 |
+| PHP | Monolog records | 3 of 3 | 3 of 3 |
+| C# | AutoMapper maps | 2 of 3 | 2 of 3 |
+| Kotlin | Okio buffers | 0 of 3 | 3 of 3 |
+| Swift | Alamofire requests | 3 of 3 | 3 of 3 |
+| Dart | HTTP client | 3 of 3 | 3 of 3 |
+| Bash | nvm install | 3 of 3 | 2 of 3 |
+| HTML | MDN form validation | 0 of 3 | 0 of 3 |
+| CSS | animate.css keyframes | 3 of 3 | 3 of 3 |
+| SQL | Chinook schema relations | 0 of 3 | 0 of 3 |
 
-### Packet-backed answers vs. reading the repository (4 tasks, 2026-08-18)
-
-A scoped rerun of four holdout tasks against 0.17, one repeat each, `gpt-5.6-sol` driven by
-`codex`, CLI `552245c6`. The no-CodeStory arm is reused unchanged from the pinned 2026-08-16
-baseline, so both arms answer the same prompts on the same pinned checkouts.
-
-| Task | Answer quality | Tokens | Wall time | Tool calls |
-| --- | --- | --- | --- | --- |
-| Monolog record flow | passes in both arms | 191,759 → 31,053 (−84%) | 75s → 35s | 18 → 1 |
-| Jekyll site build | passes in both arms | 257,094 → 35,763 (−86%) | 88s → 26s | 35 → 1 |
-| AutoMapper map flow | passes without, **fails with** | 333,210 → 285,182 (−14%) | 118s → 80s | 28 → 3 |
-| animate.css keyframes | passes without, **fails with** | 154,735 → 393,818 (+155%) | 54s → 84s | 13 → 5 |
-
-Two of the four CodeStory answers did not pass the manifest quality checks, so this run does not
-meet the publication bar above and is not an answer-quality or performance claim for the release.
-
-What it does show is the shape of the trade. On the two tasks whose packet proved the flow the
-question asked about — disposition `supported` — the agent reached the same verified answer with
-about 85% fewer tokens and a single tool call instead of 18 or 35. On the other two the packet
-returned `drill_once` rather than a confident answer it could not support, and an agent that still
-has to read the repository itself is worse off than one that started reading immediately. The
-limit is visible in the packet rather than hidden in the answer, which is the behaviour the
-grounding contract is built for; closing those two flows is ongoing work.
+HTML forms and the Chinook schema failed in both arms. These numbers describe
+this suite, not your checkout. Day-to-day limits: [What to expect](docs/users/what-to-expect.md).
+How this was measured: [holdout evidence](docs/testing/language-expansion-holdout-stats.md).
 
 ## License
 

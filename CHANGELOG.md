@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.17.1
+
+- Compact answer packets keep production flow evidence in the 16-hit window. Test files, sample trees, and `.github` paths no longer crowd out cited Buffer, SQL, CSS, and HTTP client sources. SQL packets keep sqlite, MySQL, and PostgreSQL `CREATE TABLE` names and relationship constraints, drop extra-engine copies when those dialects remain, and still keep cited stylesheet imports that define keyframes or custom properties.
+- On the nested 18-task holdout, CodeStory matched or beat the no-CodeStory arm on answer quality while using far fewer tokens and tools.
+- A packet that still needs one drill round now tells `packet` how to continue: `--parent-packet-id`, `--option-id`, and the generation pins from that packet. Client libraries that name `Client.send` (not an adapter) count as the transport send step, and a server method whose name is `handle` plus `HTTP` counts as request dispatch. Formatting packets prefer the primary format header over wide-character sibling overloads unless the question asks for wide characters.
+
 ## 0.17.0
 
 CodeStory 0.17 changes what an answer packet carries, and when it stops instead of answering. Questions can now combine names, files, concepts, relationships, and ordered flows, and search keeps exact, semantic, and graph evidence in separate lanes while ranking them together. Exact definitions stay easy to find, related callers and routes stay attached to the result, and a semantic lane with no close match abstains rather than filling its window with unrelated vectors.

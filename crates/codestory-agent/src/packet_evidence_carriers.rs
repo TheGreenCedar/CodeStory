@@ -54,6 +54,10 @@
 //! every other carrier here reads it.
 
 use crate::packet_scoring::{normalize_identifier, packet_display_path};
+use crate::packet_terms::{
+    packet_terms_indicate_server_request_dispatch_flow,
+    packet_terms_indicate_server_route_dispatch_flow,
+};
 use codestory_contracts::api::{AgentCitationDto, NodeKind};
 
 fn terminal(citation: &AgentCitationDto) -> String {
@@ -237,6 +241,85 @@ fn callable_has_exact_owner_and_terminal_action(
         && has_token(&identifier_tokens(terminal), actions)
 }
 
+fn exact_terminal_identity(citation: &AgentCitationDto) -> String {
+    normalize_identifier(terminal_segment_raw(&citation.display_name))
+}
+
+fn callable_has_exact_terminal(citation: &AgentCitationDto, terminals: &[&str]) -> bool {
+    owns_callable_behavior(citation)
+        && terminals
+            .iter()
+            .any(|expected| exact_terminal_identity(citation) == *expected)
+}
+
+/// Subjects that put HTTP on a method name without being an inbound server engine.
+const HTTP_HANDLE_EXCLUDED_SUBJECTS: &[&str] = &[
+    "telemetry",
+    "metrics",
+    "monitoring",
+    "observability",
+    "cache",
+    "caches",
+    "client",
+    "clients",
+    "session",
+    "sessions",
+];
+
+/// A callable whose terminal names both the handle step and HTTP. Owner `app` and subject
+/// `router` remain the primary dispatch carriers; this admits engines that put HTTP on the
+/// method rather than the type. The owner segment is required so a bare handle-plus-HTTP
+/// identifier cannot close the step without naming a receiver.
+pub fn citation_owns_http_request_handle(citation: &AgentCitationDto) -> bool {
+    if !owns_callable_behavior(citation) {
+        return false;
+    }
+    let mut segments = citation
+        .display_name
+        .rsplit(['.', ':', '#', '/', '\\'])
+        .filter(|segment| !segment.is_empty());
+    let Some(terminal) = segments.next() else {
+        return false;
+    };
+    if segments.next().is_none() {
+        return false;
+    }
+    !has_token(&name_tokens(citation), HTTP_HANDLE_EXCLUDED_SUBJECTS)
+        && terminal_names_http_request_handle(terminal)
+}
+
+fn terminal_names_http_request_handle(terminal: &str) -> bool {
+    let terminal_tokens = identifier_tokens(terminal);
+    has_token(&terminal_tokens, &["handle"]) && has_token(&terminal_tokens, &["http"])
+}
+
+/// A client type's own `send` method. Session send is the preceding dispatch stage, and a
+/// cache `send` is not a transport.
+fn citation_owns_named_client_send(citation: &AgentCitationDto) -> bool {
+    if !callable_has_exact_terminal(citation, &["send"]) {
+        return false;
+    }
+    let tokens = name_tokens(citation);
+    has_token(&tokens, &["client", "clients"])
+        && !has_token(
+            &tokens,
+            &[
+                "session",
+                "sessions",
+                "cache",
+                "caches",
+                "database",
+                "db",
+                "hook",
+                "hooks",
+                "metrics",
+                "telemetry",
+                "monitoring",
+                "observability",
+            ],
+        )
+}
+
 fn callable_owns_terminal_action_for_two_subjects(
     citation: &AgentCitationDto,
     actions: &[&str],
@@ -375,13 +458,14 @@ pub fn citation_owns_client_adapter_selection(citation: &AgentCitationDto) -> bo
 }
 
 /// The declared adapter/transport send boundary. This excludes the session's own `send` method,
-/// which is the preceding dispatch stage.
+/// which is the preceding dispatch stage. A client type whose terminal is exactly `send` is the
+/// same boundary when the library names the client instead of an adapter.
 pub fn citation_owns_client_transport_send(citation: &AgentCitationDto) -> bool {
     callable_owns_terminal_action_for_subject(
         citation,
         &["send"],
         &["adapter", "adapters", "transport", "transports"],
-    )
+    ) || citation_owns_named_client_send(citation)
 }
 
 /// Registration of an inbound server request surface.
@@ -409,6 +493,26 @@ pub fn citation_owns_server_request_dispatch(citation: &AgentCitationDto) -> boo
                 "servlet",
             ],
         )
+        || citation_owns_http_request_handle(citation)
+}
+
+/// Prefer a cited inbound dispatch callable when the question is about routing
+/// a request through handlers. Route-group helpers often outscore that
+/// callable on raw lexical overlap.
+pub fn packet_server_dispatch_callable_rank_bonus(
+    citation: &AgentCitationDto,
+    terms: &[String],
+) -> f32 {
+    if !(packet_terms_indicate_server_route_dispatch_flow(terms)
+        || packet_terms_indicate_server_request_dispatch_flow(terms))
+    {
+        return 0.0;
+    }
+    if citation_owns_server_request_dispatch(citation) {
+        6.0
+    } else {
+        0.0
+    }
 }
 
 /// The response-side callable that leaves a server handler for its writer or transport.
@@ -533,6 +637,8 @@ pub fn server_request_dispatch_call_target(display_name: &str) -> bool {
             ],
             &["dispatch", "handle", "invoke"],
         )
+        || (terminal_names_http_request_handle(terminal_segment_raw(display_name))
+            && !has_token(&tokens, HTTP_HANDLE_EXCLUDED_SUBJECTS))
 }
 
 /// Typed CALL targets that perform the response write or flush.
@@ -2269,19 +2375,37 @@ mod tests {
             )));
         }
 
-        for positive in ["BaseAdapter.send", "HttpTransport.send"] {
-            assert!(citation_owns_client_transport_send(&citation(
-                positive,
-                "src/client.rs",
-                NodeKind::METHOD,
-            )));
+        for positive in [
+            "BaseAdapter.send",
+            "HttpTransport.send",
+            "BaseClient.send",
+            "IOClient.send",
+            "Client.send",
+        ] {
+            assert!(
+                citation_owns_client_transport_send(&citation(
+                    positive,
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                )),
+                "{positive} should prove client transport send"
+            );
         }
-        for negative in ["dispatch_hook", "Session.send", "HttpCache.send"] {
-            assert!(!citation_owns_client_transport_send(&citation(
-                negative,
-                "src/client.rs",
-                NodeKind::METHOD,
-            )));
+        for negative in [
+            "dispatch_hook",
+            "Session.send",
+            "HttpCache.send",
+            "DatabaseClient.send",
+            "HookClient.send",
+        ] {
+            assert!(
+                !citation_owns_client_transport_send(&citation(
+                    negative,
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                )),
+                "{negative} must not prove client transport send"
+            );
         }
 
         for positive in ["app.route", "RequestRouter.route"] {
@@ -2304,23 +2428,66 @@ mod tests {
             )));
         }
 
-        for positive in ["app.handle", "RequestRouter.dispatch"] {
-            assert!(citation_owns_server_request_dispatch(&citation(
-                positive,
-                "lib/application.js",
-                NodeKind::FUNCTION,
-            )));
+        for positive in [
+            "app.handle",
+            "RequestRouter.dispatch",
+            "Engine.handleHTTPRequest",
+        ] {
+            assert!(
+                citation_owns_server_request_dispatch(&citation(
+                    positive,
+                    "lib/application.js",
+                    NodeKind::FUNCTION,
+                )),
+                "{positive} should prove server request dispatch"
+            );
+            assert!(
+                server_request_dispatch_call_target(positive),
+                "{positive} should be a lawful dispatch CALL target"
+            );
         }
+        assert!(server_request_dispatch_call_target("handleHTTPRequest"));
+        assert!(!citation_owns_server_request_dispatch(&citation(
+            "handleHTTPRequest",
+            "lib/application.js",
+            NodeKind::FUNCTION,
+        )));
+        let dispatch_terms = crate::packet_terms::packet_probe_terms(
+            "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.",
+        );
+        assert!(
+            packet_server_dispatch_callable_rank_bonus(
+                &citation(
+                    "ServerEngine.handleHTTPRequest",
+                    "src/http/server.go",
+                    NodeKind::METHOD,
+                ),
+                &dispatch_terms,
+            ) > 0.0
+        );
+        assert_eq!(
+            packet_server_dispatch_callable_rank_bonus(
+                &citation("RouteGroup.Group", "src/http/group.go", NodeKind::METHOD),
+                &dispatch_terms,
+            ),
+            0.0
+        );
         for negative in [
             "EventProcessor.handle",
             "EventHandler.handle",
             "HttpClient.dispatch",
+            "HttpClient.handleHTTPRequest",
+            "Telemetry.handleHTTPRequest",
+            "IRouter.Group",
         ] {
-            assert!(!citation_owns_server_request_dispatch(&citation(
-                negative,
-                "lib/application.js",
-                NodeKind::FUNCTION,
-            )));
+            assert!(
+                !citation_owns_server_request_dispatch(&citation(
+                    negative,
+                    "lib/application.js",
+                    NodeKind::FUNCTION,
+                )),
+                "{negative} must not prove server request dispatch"
+            );
         }
 
         for positive in ["res.send", "ResponseWriter.flush"] {
@@ -2439,7 +2606,13 @@ mod tests {
         assert!(!server_request_entrypoint_call_target("Metrics.use"));
         assert!(!server_request_entrypoint_call_target("MetricsRouter.use"));
         assert!(!server_request_dispatch_call_target("HttpClient.dispatch"));
+        assert!(!server_request_dispatch_call_target(
+            "HttpClient.handleHTTPRequest"
+        ));
         assert!(!server_request_dispatch_call_target("Telemetry.handle"));
+        assert!(!server_request_dispatch_call_target(
+            "Telemetry.handleHTTPRequest"
+        ));
         assert!(!server_request_dispatch_call_target(
             "TelemetryRouter.handle"
         ));

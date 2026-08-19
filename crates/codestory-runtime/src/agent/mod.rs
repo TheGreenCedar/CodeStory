@@ -56,10 +56,10 @@ pub(crate) use codestory_agent::eval_probes;
 #[allow(unused_imports)]
 pub(crate) use codestory_agent::{
     citation, packet_citations, packet_claim_profile_registry, packet_claim_profiles,
-    packet_claims, packet_coverage, packet_degradation, packet_evidence, packet_evidence_roles,
-    packet_flow_requirements, packet_freshness, packet_obligations, packet_plan,
-    packet_profile_telemetry, packet_required_probes, packet_scoring, packet_terms, planning,
-    profiles,
+    packet_claims, packet_coverage, packet_degradation, packet_evidence, packet_evidence_carriers,
+    packet_evidence_roles, packet_flow_requirements, packet_freshness, packet_obligations,
+    packet_plan, packet_profile_telemetry, packet_required_probes, packet_scoring, packet_terms,
+    planning, profiles,
 };
 
 pub(crate) use orchestrator::{agent_ask, agent_packet};
