@@ -236,6 +236,182 @@ pub fn packet_drop_unrequested_python_siblings(
     }
 }
 
+/// Drop Windows formatting helpers when the question did not ask for them.
+pub fn packet_drop_unrequested_windows_formatting_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_runtime_formatting_flow(terms)
+        || packet_question_wants_windows(terms)
+    {
+        return;
+    }
+    if citations
+        .iter()
+        .any(|citation| !packet_citation_is_windows_formatting_sibling(citation))
+    {
+        citations.retain(|citation| !packet_citation_is_windows_formatting_sibling(citation));
+    }
+}
+
+/// Drop color/chrono/printf-style formatting extras when a core format/args/base
+/// hit remains. Rank demotion cannot evict them from a full 16-hit window.
+pub fn packet_drop_unrequested_formatting_extension_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_runtime_formatting_flow(terms) {
+        return;
+    }
+    if citations
+        .iter()
+        .any(packet_citation_is_runtime_formatting_core_source)
+    {
+        citations.retain(packet_citation_is_runtime_formatting_core_source);
+    }
+}
+
+/// Drop one-letter template-parameter display names when a named hit remains.
+pub fn packet_drop_unrequested_single_letter_displays(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    let _ = terms;
+    if citations
+        .iter()
+        .any(|citation| !packet_citation_is_single_letter_display(citation))
+    {
+        citations.retain(|citation| !packet_citation_is_single_letter_display(citation));
+    }
+}
+
+/// Drop sibling `*_client` adapters the question did not name, when it did name
+/// a different client and a non-adapter hit remains.
+pub fn packet_drop_unrequested_named_client_adapter_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_client_send_flow(terms) {
+        return;
+    }
+    if !packet_question_names_any_client_adapter(terms, citations) {
+        return;
+    }
+    if citations
+        .iter()
+        .any(|citation| !packet_citation_is_unrequested_client_adapter(citation, terms))
+    {
+        citations
+            .retain(|citation| !packet_citation_is_unrequested_client_adapter(citation, terms));
+    }
+}
+
+/// Drop example trees and generated JNI bindings when a primary client hit remains.
+pub fn packet_drop_unrequested_example_and_binding_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_client_send_flow(terms) {
+        return;
+    }
+    if citations
+        .iter()
+        .any(|citation| !packet_citation_is_example_or_generated_binding(citation))
+    {
+        citations.retain(|citation| !packet_citation_is_example_or_generated_binding(citation));
+    }
+}
+
+/// Drop mapper annotation/attribute extras when the question is about runtime
+/// mapping APIs and a non-annotation mapper hit remains.
+pub fn packet_drop_unrequested_mapper_annotation_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_mapper_configuration_plan_flow(terms)
+        || packet_question_wants_annotations(terms)
+    {
+        return;
+    }
+    if citations
+        .iter()
+        .any(|citation| !packet_citation_is_mapper_annotation_sibling(citation))
+    {
+        citations.retain(|citation| !packet_citation_is_mapper_annotation_sibling(citation));
+    }
+}
+
+/// Drop test-tree hits when the question did not ask for tests and a non-test
+/// hit remains. Rank demotion is not enough against a full window.
+pub fn packet_drop_unrequested_test_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if packet_question_wants_tests(terms) {
+        return;
+    }
+    if citations
+        .iter()
+        .any(|citation| !packet_citation_is_test_source(citation))
+    {
+        citations.retain(|citation| !packet_citation_is_test_source(citation));
+    }
+}
+
+/// Keep named keyframe rules, otherwise only the two highest-ranked ones, so a
+/// structure packet is not drowned in sibling animations.
+pub fn packet_drop_excess_unrequested_keyframe_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_stylesheet_animation_flow(terms) {
+        return;
+    }
+    let named_stems = packet_keyframe_stems_named_in_question(terms);
+    let named_present = !named_stems.is_empty()
+        && citations.iter().any(|citation| {
+            packet_citation_is_keyframe_rule(citation)
+                && packet_keyframe_stem_is_named(citation, &named_stems)
+        });
+    if named_present {
+        citations.retain(|citation| {
+            !packet_citation_is_keyframe_rule(citation)
+                || packet_keyframe_stem_is_named(citation, &named_stems)
+        });
+        return;
+    }
+    let mut kept_unnamed = 0usize;
+    citations.retain(|citation| {
+        if !packet_citation_is_keyframe_rule(citation) {
+            return true;
+        }
+        if kept_unnamed < 2 {
+            kept_unnamed += 1;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// Drop markdown extras from formatting and animation packets when source hits remain.
+pub fn packet_drop_unrequested_markdown_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    let formatting = crate::packet_terms::packet_terms_indicate_runtime_formatting_flow(terms);
+    let animation = crate::packet_terms::packet_terms_indicate_stylesheet_animation_flow(terms);
+    if !formatting && !animation {
+        return;
+    }
+    if citations
+        .iter()
+        .any(|citation| !packet_citation_is_markdown_source(citation))
+    {
+        citations.retain(|citation| !packet_citation_is_markdown_source(citation));
+    }
+}
+
 fn packet_citation_is_wide_char_sibling(citation: &AgentCitationDto) -> bool {
     let path = citation
         .file_path
@@ -262,6 +438,164 @@ fn packet_question_wants_python(terms: &[String]) -> bool {
         let normalized = normalize_identifier(term);
         normalized == "py" || normalized == "python" || normalized.contains("python")
     })
+}
+
+fn packet_citation_display_path(citation: &AgentCitationDto) -> String {
+    citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn packet_question_wants_windows(terms: &[String]) -> bool {
+    terms.iter().any(|term| {
+        let normalized = normalize_identifier(term);
+        normalized.contains("windows") || normalized.contains("win32") || normalized == "win"
+    })
+}
+
+fn packet_citation_is_windows_formatting_sibling(citation: &AgentCitationDto) -> bool {
+    let path = packet_citation_display_path(citation);
+    let normalized_display = normalize_identifier(&citation.display_name);
+    let normalized_path = normalize_identifier(&path);
+    normalized_display.contains("windows")
+        || normalized_display.contains("win32")
+        || normalized_path.contains("windows")
+        || normalized_path.contains("win32")
+}
+
+fn packet_citation_is_runtime_formatting_core_source(citation: &AgentCitationDto) -> bool {
+    let path = packet_citation_display_path(citation);
+    let stem = packet_path_file_stem(&path);
+    stem.contains("format") || stem == "args" || stem == "base" || stem == "os" || stem == "fmt"
+}
+
+fn packet_citation_is_single_letter_display(citation: &AgentCitationDto) -> bool {
+    citation
+        .display_name
+        .rsplit([':', '.', '#'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(citation.display_name.as_str())
+        .chars()
+        .count()
+        <= 1
+}
+
+fn packet_named_client_adapter_prefix(path: &str) -> Option<String> {
+    let stem = packet_path_file_stem(path);
+    stem.strip_suffix("_client")
+        .or_else(|| stem.strip_suffix("client"))
+        .filter(|prefix| !prefix.is_empty() && prefix.chars().count() >= 2)
+        .map(normalize_identifier)
+}
+
+fn packet_question_names_client_prefix(terms: &[String], prefix: &str) -> bool {
+    terms.iter().any(|term| {
+        let normalized = normalize_identifier(term);
+        normalized.contains(prefix) && normalized.contains("client")
+    })
+}
+
+fn packet_question_names_any_client_adapter(
+    terms: &[String],
+    citations: &[AgentCitationDto],
+) -> bool {
+    citations.iter().any(|citation| {
+        let path = packet_citation_display_path(citation);
+        packet_named_client_adapter_prefix(&path)
+            .is_some_and(|prefix| packet_question_names_client_prefix(terms, &prefix))
+    })
+}
+
+fn packet_citation_is_unrequested_client_adapter(
+    citation: &AgentCitationDto,
+    terms: &[String],
+) -> bool {
+    let path = packet_citation_display_path(citation);
+    packet_named_client_adapter_prefix(&path)
+        .is_some_and(|prefix| !packet_question_names_client_prefix(terms, &prefix))
+}
+
+fn packet_citation_is_example_or_generated_binding(citation: &AgentCitationDto) -> bool {
+    let path = packet_citation_display_path(citation);
+    let stem = packet_path_file_stem(&path);
+    path.contains("/example")
+        || path.contains("\\example")
+        || path.contains("_example")
+        || path.contains("-example")
+        || path.contains("/jni/")
+        || path.contains("\\jni\\")
+        || stem == "bindings"
+        || stem == "binding"
+}
+
+fn packet_question_wants_annotations(terms: &[String]) -> bool {
+    terms.iter().any(|term| {
+        let normalized = normalize_identifier(term);
+        normalized.contains("annotation") || normalized.contains("attribute")
+    })
+}
+
+fn packet_citation_is_mapper_annotation_sibling(citation: &AgentCitationDto) -> bool {
+    let path = packet_citation_display_path(citation);
+    let normalized_display = normalize_identifier(&citation.display_name);
+    path.contains("/annotations/")
+        || path.contains("\\annotations\\")
+        || path.contains("/annotation/")
+        || normalized_display.contains("attribute")
+}
+
+fn packet_question_wants_tests(terms: &[String]) -> bool {
+    terms.iter().any(|term| {
+        let normalized = normalize_identifier(term);
+        normalized == "test"
+            || normalized == "tests"
+            || normalized.starts_with("test")
+            || normalized.contains("unittest")
+    })
+}
+
+fn packet_citation_is_test_source(citation: &AgentCitationDto) -> bool {
+    packet_path_is_test_segment(&packet_citation_display_path(citation))
+        || packet_display_name_is_test_like(&citation.display_name)
+}
+
+fn packet_citation_is_keyframe_rule(citation: &AgentCitationDto) -> bool {
+    citation
+        .display_name
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("@keyframes")
+}
+
+fn packet_keyframe_rule_stem(citation: &AgentCitationDto) -> String {
+    citation
+        .display_name
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '@')
+        .split_whitespace()
+        .nth(1)
+        .map(normalize_identifier)
+        .unwrap_or_default()
+}
+
+fn packet_keyframe_stems_named_in_question(terms: &[String]) -> Vec<String> {
+    terms
+        .iter()
+        .map(|term| normalize_identifier(term))
+        .filter(|term| term.len() >= 3 && !packet_query_stop_term(term))
+        .collect()
+}
+
+fn packet_keyframe_stem_is_named(citation: &AgentCitationDto, named_stems: &[String]) -> bool {
+    let stem = packet_keyframe_rule_stem(citation);
+    !stem.is_empty() && named_stems.iter().any(|named| named == &stem)
+}
+
+fn packet_citation_is_markdown_source(citation: &AgentCitationDto) -> bool {
+    let path = packet_citation_display_path(citation);
+    path.ends_with(".md") || path.ends_with(".markdown") || path.ends_with(".mdx")
 }
 
 fn packet_unrequested_python_source_rank_bonus(path: &str, terms: &[String]) -> f32 {
@@ -1042,10 +1376,13 @@ fn packet_string_predicate_rank_bonus(normalized_display: &str, path: &str) -> f
 }
 
 fn packet_path_is_test_segment(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
     path.starts_with("test/")
         || path.starts_with("tests/")
         || path.contains("/test/")
         || path.contains("/tests/")
+        || path.contains("/unittest/")
+        || path.contains("/unittests/")
         || path.contains(".tests/")
         || path.contains(".test/")
         || path.contains("-test-")
@@ -1054,6 +1391,8 @@ fn packet_path_is_test_segment(path: &str) -> bool {
         || path.starts_with("tests\\")
         || path.contains("\\test\\")
         || path.contains("\\tests\\")
+        || path.contains("\\unittest\\")
+        || path.contains("\\unittests\\")
 }
 
 const PACKET_QUERY_STOP_TERMS: &[&str] = &[
@@ -1716,6 +2055,128 @@ mod tests {
         ];
         packet_drop_unrequested_python_siblings(&mut kept, &python_terms);
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn unrequested_windows_formatting_siblings_drop_when_a_core_hit_remains() {
+        let terms = vec!["format".to_string(), "arguments".to_string()];
+        let mut citations = vec![
+            test_rank_citation("detail::format_windows_error", "src/os.cc", 0.9),
+            test_rank_citation("format_to", "include/tool/format.h", 0.7),
+        ];
+        packet_drop_unrequested_windows_formatting_siblings(&mut citations, &terms);
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].display_name, "format_to");
+
+        let windows_terms = vec!["format".to_string(), "windows".to_string()];
+        let mut kept = vec![
+            test_rank_citation("detail::format_windows_error", "src/os.cc", 0.9),
+            test_rank_citation("format_to", "include/tool/format.h", 0.7),
+        ];
+        packet_drop_unrequested_windows_formatting_siblings(&mut kept, &windows_terms);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn unrequested_formatting_extensions_drop_when_a_core_hit_remains() {
+        let terms = vec!["format".to_string(), "arguments".to_string()];
+        let mut citations = vec![
+            test_rank_citation("vformat_to", "include/tool/color.h", 0.9),
+            test_rank_citation("format_to", "include/tool/format.h", 0.7),
+            test_rank_citation("dynamic_store", "include/tool/args.h", 0.6),
+        ];
+        packet_drop_unrequested_formatting_extension_siblings(&mut citations, &terms);
+        assert_eq!(citations.len(), 2);
+        assert!(
+            citations
+                .iter()
+                .all(|citation| citation.display_name != "vformat_to")
+        );
+    }
+
+    #[test]
+    fn unrequested_single_letter_displays_drop_when_a_named_hit_remains() {
+        let terms = vec!["format".to_string(), "arguments".to_string()];
+        let mut citations = vec![
+            test_rank_citation("T", "include/tool/args.h", 0.9),
+            test_rank_citation("format_to", "include/tool/format.h", 0.7),
+        ];
+        packet_drop_unrequested_single_letter_displays(&mut citations, &terms);
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].display_name, "format_to");
+    }
+
+    #[test]
+    fn unrequested_named_client_adapters_drop_when_another_client_is_named() {
+        let terms = vec![
+            "ioclient".to_string(),
+            "send".to_string(),
+            "http".to_string(),
+        ];
+        let mut citations = vec![
+            test_rank_citation("IOClient.send", "src/http/io_client.dart", 0.9),
+            test_rank_citation("CronetClient.send", "src/http/cronet_client.dart", 0.8),
+            test_rank_citation("Client.get", "src/http/client.dart", 0.7),
+        ];
+        packet_drop_unrequested_named_client_adapter_siblings(&mut citations, &terms);
+        assert_eq!(citations.len(), 2);
+        assert!(citations.iter().all(|citation| {
+            !citation
+                .file_path
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cronet")
+        }));
+    }
+
+    #[test]
+    fn unrequested_mapper_annotations_drop_when_a_runtime_hit_remains() {
+        let terms = vec![
+            "mapper".to_string(),
+            "configuration".to_string(),
+            "runtime".to_string(),
+            "api".to_string(),
+        ];
+        let mut citations = vec![
+            test_rank_citation(
+                "MapAtRuntimeAttribute.ApplyConfiguration",
+                "src/ObjectMapping/Configuration/Annotations/MapAtRuntimeAttribute.cs",
+                0.9,
+            ),
+            test_rank_citation("Mapper.MapCore", "src/ObjectMapping/Mapper.cs", 0.7),
+        ];
+        packet_drop_unrequested_mapper_annotation_siblings(&mut citations, &terms);
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].display_name, "Mapper.MapCore");
+    }
+
+    #[test]
+    fn excess_unrequested_keyframe_siblings_keep_the_two_highest_ranked() {
+        let terms = vec![
+            "css".to_string(),
+            "animation".to_string(),
+            "keyframes".to_string(),
+            "base".to_string(),
+            "variables".to_string(),
+        ];
+        let mut citations = vec![
+            test_rank_citation("@keyframes bounce", "source/motion/bounce.css", 0.9),
+            test_rank_citation("@keyframes flash", "source/motion/flash.css", 0.8),
+            test_rank_citation("@keyframes pulse", "source/motion/pulse.css", 0.7),
+            test_rank_citation("animated", "source/_base.css", 0.6),
+        ];
+        packet_drop_excess_unrequested_keyframe_siblings(&mut citations, &terms);
+        assert_eq!(citations.len(), 3);
+        assert!(
+            citations
+                .iter()
+                .all(|citation| citation.display_name != "@keyframes pulse")
+        );
+        assert!(
+            citations
+                .iter()
+                .any(|citation| citation.display_name == "animated")
+        );
     }
 
     #[test]

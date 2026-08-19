@@ -1050,7 +1050,11 @@ fn flow_belongs_to_public_client_factory(citation: &AgentCitationDto) -> bool {
 const CLIENT_INTERFACE_HELPERS_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "client_interface_helpers",
     role: FlowRole::Entrypoint,
-    query_seeds: &["client convenience method", "client interface helper"],
+    query_seeds: &[
+        "client convenience method",
+        "client interface helper",
+        "client type declaration",
+    ],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(citation_owns_client_request_method),
@@ -1077,7 +1081,11 @@ const CLIENT_TRANSPORT_SEND_REQUIREMENT: FlowRequirement = FlowRequirement {
 const CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "client_response_materialization",
     role: FlowRole::TerminalBoundary,
-    query_seeds: &["request response", "response stream boundary"],
+    query_seeds: &[
+        "request response",
+        "response stream boundary",
+        "response class",
+    ],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(citation_owns_client_response_materialization),
@@ -1369,6 +1377,7 @@ const MAPPER_PLAN_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Configuration,
         query_seeds: &[
             "mapper runtime api",
+            "mapper interface",
             "mapping configuration",
             "type map plan",
         ],
@@ -1390,7 +1399,12 @@ const RUNTIME_FORMATTING_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "format_arguments",
         role: FlowRole::TransformOrValidate,
-        query_seeds: &["format arguments", "format output"],
+        query_seeds: &[
+            "format arguments",
+            "format output",
+            "type erased argument store",
+            "dynamic argument collection",
+        ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
         proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_format_arguments),
@@ -1398,7 +1412,11 @@ const RUNTIME_FORMATTING_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "formatter_fallback",
         role: FlowRole::ErrorOrFallback,
-        query_seeds: &["formatting failure", "formatter fallback"],
+        query_seeds: &[
+            "formatting failure",
+            "formatter fallback",
+            "formatter exception type",
+        ],
         coverage_mode: CoverageMode::AllowsSourceRange,
         proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_formatter_fallback),
@@ -1785,6 +1803,27 @@ mod tests {
             client_requirement_ids("Explain how an HTTP client performs transport send."),
             vec!["client_transport_send"]
         );
+    }
+
+    #[test]
+    fn runtime_formatting_queries_include_argument_store_and_exception_seeds() {
+        let queries = packet_flow_requirement_queries_for_terms(
+            &packet_probe_terms(
+                "Explain how formatting arguments become type-erased format args and reach vformat output.",
+            ),
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        for expected in [
+            "format arguments",
+            "type erased argument store",
+            "dynamic argument collection",
+            "formatter exception type",
+        ] {
+            assert!(
+                queries.iter().any(|query| query == expected),
+                "expected {expected:?} in {queries:?}"
+            );
+        }
     }
 
     #[test]

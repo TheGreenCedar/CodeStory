@@ -77,8 +77,15 @@ use crate::agent::packet_required_probes::{
 use crate::agent::packet_scoring::packet_citation_key;
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path,
-    packet_drop_unrequested_python_siblings, packet_drop_unrequested_wide_char_siblings,
-    packet_stage_citation_carry_limit, sort_by_cached_rank_desc,
+    packet_drop_excess_unrequested_keyframe_siblings,
+    packet_drop_unrequested_example_and_binding_siblings,
+    packet_drop_unrequested_formatting_extension_siblings,
+    packet_drop_unrequested_mapper_annotation_siblings, packet_drop_unrequested_markdown_siblings,
+    packet_drop_unrequested_named_client_adapter_siblings, packet_drop_unrequested_python_siblings,
+    packet_drop_unrequested_single_letter_displays, packet_drop_unrequested_test_siblings,
+    packet_drop_unrequested_wide_char_siblings,
+    packet_drop_unrequested_windows_formatting_siblings, packet_stage_citation_carry_limit,
+    sort_by_cached_rank_desc,
 };
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_search_execution_flow,
@@ -1359,6 +1366,15 @@ fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
     });
     packet_drop_unrequested_wide_char_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_python_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_windows_formatting_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_formatting_extension_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_single_letter_displays(&mut answer.citations, &terms);
+    packet_drop_unrequested_named_client_adapter_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_example_and_binding_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_mapper_annotation_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_test_siblings(&mut answer.citations, &terms);
+    packet_drop_excess_unrequested_keyframe_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_markdown_siblings(&mut answer.citations, &terms);
 }
 
 fn maybe_annotate_packet_candidate_window(
@@ -8387,6 +8403,77 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(answer.citations[0].display_name, "format_to");
+    }
+
+    #[test]
+    fn packet_ranking_drops_unrequested_windows_and_formatting_extensions() {
+        let question = "Explain how a formatter turns arguments into type-erased format args and reaches format_to output paths.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("detail::format_windows_error", "src/os.cc", 0.90),
+                test_packet_citation("vformat_to", "include/tool/color.h", 0.80),
+                test_packet_citation("T", "include/tool/args.h", 0.75),
+                test_packet_citation("format_to", "include/tool/format.h", 0.70),
+                test_packet_citation("format_arg_store", "include/tool/base.h", 0.65),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut answer);
+
+        let names: Vec<&str> = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.contains("windows") || *name == "T" || *name == "vformat_to"),
+            "unrequested windows, extension, and single-letter hits should leave: {names:?}"
+        );
+        assert!(names.contains(&"format_to"));
+        assert!(names.contains(&"format_arg_store"));
+    }
+
+    #[test]
+    fn packet_ranking_drops_unrequested_client_adapters_and_mapper_annotations() {
+        let client_question = "Explain how an HTTP client exposes helpers, BaseClient convenience methods, and IOClient send behavior.";
+        let mut client_answer = packet_answer_fixture(
+            client_question,
+            vec![
+                test_packet_citation("IOClient.send", "src/http/io_client.dart", 0.90),
+                test_packet_citation("CronetClient.send", "src/http/cronet_client.dart", 0.80),
+                test_packet_citation("main", "flutter_http_example/lib/main.dart", 0.70),
+                test_packet_citation("Client.get", "src/http/client.dart", 0.60),
+            ],
+        );
+        rank_packet_evidence(client_question, &mut client_answer);
+        assert!(client_answer.citations.iter().all(|citation| {
+            let path = citation.file_path.as_deref().unwrap_or_default();
+            !path.contains("cronet") && !path.contains("example")
+        }));
+
+        let mapper_question = "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects.";
+        let mut mapper_answer = packet_answer_fixture(
+            mapper_question,
+            vec![
+                test_packet_citation(
+                    "MapAtRuntimeAttribute.ApplyConfiguration",
+                    "src/ObjectMapping/Configuration/Annotations/MapAtRuntimeAttribute.cs",
+                    0.90,
+                ),
+                test_packet_citation(
+                    "When_mapping_to_a_destination",
+                    "src/UnitTests/Indexers.cs",
+                    0.80,
+                ),
+                test_packet_citation("Mapper.MapCore", "src/ObjectMapping/Mapper.cs", 0.70),
+            ],
+        );
+        rank_packet_evidence(mapper_question, &mut mapper_answer);
+        assert_eq!(mapper_answer.citations.len(), 1);
+        assert_eq!(mapper_answer.citations[0].display_name, "Mapper.MapCore");
     }
 
     #[test]
