@@ -1404,6 +1404,7 @@ const RUNTIME_FORMATTING_FLOW: &[FlowRequirement] = &[
             "format output",
             "type erased argument store",
             "dynamic argument collection",
+            "stored format arguments",
         ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
         proof: FlowProofSpec::Legacy,
@@ -1817,6 +1818,7 @@ mod tests {
             "format arguments",
             "type erased argument store",
             "dynamic argument collection",
+            "stored format arguments",
             "formatter exception type",
         ] {
             assert!(

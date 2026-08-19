@@ -219,13 +219,16 @@ pub fn packet_drop_unrequested_wide_char_siblings(
     }
 }
 
-/// Drop Python files when the question did not ask for Python and a non-Python
-/// hit remains. Rank demotion alone cannot evict a hit from a full window.
+/// Drop Python files from a runtime-formatting packet when the question did not
+/// ask for Python and a non-Python hit remains. Without the formatting gate this
+/// would empty a Python repository's packet.
 pub fn packet_drop_unrequested_python_siblings(
     citations: &mut Vec<AgentCitationDto>,
     terms: &[String],
 ) {
-    if packet_question_wants_python(terms) {
+    if !crate::packet_terms::packet_terms_indicate_runtime_formatting_flow(terms)
+        || packet_question_wants_python(terms)
+    {
         return;
     }
     if citations
@@ -236,7 +239,10 @@ pub fn packet_drop_unrequested_python_siblings(
     }
 }
 
-/// Drop Windows formatting helpers when the question did not ask for them.
+/// Drop Windows formatting helpers when the question did not ask for them and a
+/// non-Windows formatter-failure carrier remains. Platform helpers are often the
+/// only sufficiency-eligible fallback, so dropping them without a replacement
+/// reopens that obligation.
 pub fn packet_drop_unrequested_windows_formatting_siblings(
     citations: &mut Vec<AgentCitationDto>,
     terms: &[String],
@@ -244,6 +250,13 @@ pub fn packet_drop_unrequested_windows_formatting_siblings(
     if !crate::packet_terms::packet_terms_indicate_runtime_formatting_flow(terms)
         || packet_question_wants_windows(terms)
     {
+        return;
+    }
+    let has_non_windows_formatter_failure = citations.iter().any(|citation| {
+        !packet_citation_is_windows_formatting_sibling(citation)
+            && packet_citation_is_non_windows_formatter_failure(citation)
+    });
+    if !has_non_windows_formatter_failure {
         return;
     }
     if citations
@@ -464,6 +477,15 @@ fn packet_citation_is_windows_formatting_sibling(citation: &AgentCitationDto) ->
         || normalized_display.contains("win32")
         || normalized_path.contains("windows")
         || normalized_path.contains("win32")
+}
+
+fn packet_citation_is_non_windows_formatter_failure(citation: &AgentCitationDto) -> bool {
+    let normalized_display = normalize_identifier(&citation.display_name);
+    normalized_display.starts_with("format")
+        && normalized_display.ends_with("error")
+        && !normalized_display.contains("windows")
+        && !normalized_display.contains("system")
+        && !normalized_display.contains("duration")
 }
 
 fn packet_citation_is_runtime_formatting_core_source(citation: &AgentCitationDto) -> bool {
@@ -1377,6 +1399,15 @@ fn packet_string_predicate_rank_bonus(normalized_display: &str, path: &str) -> f
 
 fn packet_path_is_test_segment(path: &str) -> bool {
     let path = path.to_ascii_lowercase();
+    let segment_is_test = path.split(['/', '\\']).any(|segment| {
+        matches!(
+            segment,
+            "test" | "tests" | "unittest" | "unittests" | "__tests__"
+        ) || segment.ends_with("_test")
+            || segment.ends_with("_tests")
+            || segment.ends_with("-test")
+            || segment.ends_with("-tests")
+    });
     path.starts_with("test/")
         || path.starts_with("tests/")
         || path.contains("/test/")
@@ -1393,6 +1424,7 @@ fn packet_path_is_test_segment(path: &str) -> bool {
         || path.contains("\\tests\\")
         || path.contains("\\unittest\\")
         || path.contains("\\unittests\\")
+        || segment_is_test
 }
 
 const PACKET_QUERY_STOP_TERMS: &[&str] = &[
@@ -2055,26 +2087,42 @@ mod tests {
         ];
         packet_drop_unrequested_python_siblings(&mut kept, &python_terms);
         assert_eq!(kept.len(), 2);
+
+        let session_terms = vec!["session".to_string(), "request".to_string()];
+        let mut python_repo = vec![
+            test_rank_citation("Session.request", "src/requests/sessions.py", 0.9),
+            test_rank_citation("HISTORY", "HISTORY.md", 0.2),
+        ];
+        packet_drop_unrequested_python_siblings(&mut python_repo, &session_terms);
+        assert_eq!(python_repo.len(), 2);
     }
 
     #[test]
-    fn unrequested_windows_formatting_siblings_drop_when_a_core_hit_remains() {
+    fn unrequested_windows_formatting_siblings_drop_when_a_format_error_remains() {
         let terms = vec!["format".to_string(), "arguments".to_string()];
+        let mut without_error = vec![
+            test_rank_citation("detail::format_windows_error", "src/os.cc", 0.9),
+            test_rank_citation("format_to", "include/tool/format.h", 0.7),
+        ];
+        packet_drop_unrequested_windows_formatting_siblings(&mut without_error, &terms);
+        assert_eq!(without_error.len(), 2);
+
         let mut citations = vec![
             test_rank_citation("detail::format_windows_error", "src/os.cc", 0.9),
+            test_rank_citation("format_error", "include/tool/format.h", 0.8),
             test_rank_citation("format_to", "include/tool/format.h", 0.7),
         ];
         packet_drop_unrequested_windows_formatting_siblings(&mut citations, &terms);
-        assert_eq!(citations.len(), 1);
-        assert_eq!(citations[0].display_name, "format_to");
-
-        let windows_terms = vec!["format".to_string(), "windows".to_string()];
-        let mut kept = vec![
-            test_rank_citation("detail::format_windows_error", "src/os.cc", 0.9),
-            test_rank_citation("format_to", "include/tool/format.h", 0.7),
-        ];
-        packet_drop_unrequested_windows_formatting_siblings(&mut kept, &windows_terms);
-        assert_eq!(kept.len(), 2);
+        assert!(
+            citations
+                .iter()
+                .all(|citation| !citation.display_name.contains("windows"))
+        );
+        assert!(
+            citations
+                .iter()
+                .any(|citation| citation.display_name == "format_error")
+        );
     }
 
     #[test]

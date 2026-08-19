@@ -8415,6 +8415,7 @@ mod tests {
                 test_packet_citation("vformat_to", "include/tool/color.h", 0.80),
                 test_packet_citation("T", "include/tool/args.h", 0.75),
                 test_packet_citation("format_to", "include/tool/format.h", 0.70),
+                test_packet_citation("format_error", "include/tool/format.h", 0.68),
                 test_packet_citation("format_arg_store", "include/tool/base.h", 0.65),
             ],
         );
@@ -8434,6 +8435,7 @@ mod tests {
         );
         assert!(names.contains(&"format_to"));
         assert!(names.contains(&"format_arg_store"));
+        assert!(names.contains(&"format_error"));
     }
 
     #[test]
