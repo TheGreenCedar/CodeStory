@@ -77,8 +77,8 @@ use crate::agent::packet_required_probes::{
 use crate::agent::packet_scoring::packet_citation_key;
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path,
-    packet_drop_unrequested_wide_char_siblings, packet_stage_citation_carry_limit,
-    sort_by_cached_rank_desc,
+    packet_drop_unrequested_python_siblings, packet_drop_unrequested_wide_char_siblings,
+    packet_stage_citation_carry_limit, sort_by_cached_rank_desc,
 };
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_search_execution_flow,
@@ -1358,6 +1358,7 @@ fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
             + packet_server_dispatch_callable_rank_bonus(citation, &terms)
     });
     packet_drop_unrequested_wide_char_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_python_siblings(&mut answer.citations, &terms);
 }
 
 fn maybe_annotate_packet_candidate_window(

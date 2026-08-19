@@ -183,6 +183,14 @@ pub fn packet_citation_rank(
             &path,
             terms,
         );
+        score += packet_runtime_formatting_core_symbol_rank_bonus(&normalized_display, terms);
+        score += packet_unrequested_python_source_rank_bonus(&path, terms);
+        score +=
+            packet_unrequested_windows_formatting_rank_bonus(&normalized_display, &path, terms);
+        score += packet_unrequested_client_adapter_rank_bonus(&path, terms);
+        if normalized_display.chars().count() <= 1 {
+            score -= 16.0;
+        }
     }
     #[cfg(test)]
     {
@@ -211,6 +219,23 @@ pub fn packet_drop_unrequested_wide_char_siblings(
     }
 }
 
+/// Drop Python files when the question did not ask for Python and a non-Python
+/// hit remains. Rank demotion alone cannot evict a hit from a full window.
+pub fn packet_drop_unrequested_python_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if packet_question_wants_python(terms) {
+        return;
+    }
+    if citations
+        .iter()
+        .any(|citation| !packet_citation_is_python_source(citation))
+    {
+        citations.retain(|citation| !packet_citation_is_python_source(citation));
+    }
+}
+
 fn packet_citation_is_wide_char_sibling(citation: &AgentCitationDto) -> bool {
     let path = citation
         .file_path
@@ -220,6 +245,108 @@ fn packet_citation_is_wide_char_sibling(citation: &AgentCitationDto) -> bool {
         .to_ascii_lowercase();
     let normalized_display = normalize_identifier(&citation.display_name);
     path.contains("xchar") || path.contains("wchar") || normalized_display.contains("wchar")
+}
+
+fn packet_citation_is_python_source(citation: &AgentCitationDto) -> bool {
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    path.ends_with(".py") || path.ends_with(".pyi") || path.ends_with(".pyx")
+}
+
+fn packet_question_wants_python(terms: &[String]) -> bool {
+    terms.iter().any(|term| {
+        let normalized = normalize_identifier(term);
+        normalized == "py" || normalized == "python" || normalized.contains("python")
+    })
+}
+
+fn packet_unrequested_python_source_rank_bonus(path: &str, terms: &[String]) -> f32 {
+    if packet_question_wants_python(terms) {
+        return 0.0;
+    }
+    if path.ends_with(".py") || path.ends_with(".pyi") || path.ends_with(".pyx") {
+        -100.0
+    } else {
+        0.0
+    }
+}
+
+fn packet_runtime_formatting_core_symbol_rank_bonus(
+    normalized_display: &str,
+    terms: &[String],
+) -> f32 {
+    if !crate::packet_terms::packet_terms_indicate_runtime_formatting_flow(terms) {
+        return 0.0;
+    }
+    let mut bonus = 0.0;
+    if normalized_display.contains("format")
+        && normalized_display.contains("arg")
+        && normalized_display.contains("store")
+    {
+        bonus += 10.0;
+    }
+    if normalized_display.starts_with("format")
+        && normalized_display.ends_with("error")
+        && !normalized_display.contains("windows")
+        && !normalized_display.contains("system")
+        && !normalized_display.contains("duration")
+    {
+        bonus += 10.0;
+    }
+    bonus
+}
+
+fn packet_unrequested_windows_formatting_rank_bonus(
+    normalized_display: &str,
+    path: &str,
+    terms: &[String],
+) -> f32 {
+    if !crate::packet_terms::packet_terms_indicate_runtime_formatting_flow(terms) {
+        return 0.0;
+    }
+    if terms.iter().any(|term| {
+        let normalized = normalize_identifier(term);
+        normalized.contains("windows") || normalized.contains("win32") || normalized == "win"
+    }) {
+        return 0.0;
+    }
+    let normalized_path = normalize_identifier(path);
+    if normalized_display.contains("windows")
+        || normalized_display.contains("win32")
+        || normalized_path.contains("windows")
+        || normalized_path.contains("win32")
+    {
+        -12.0
+    } else {
+        0.0
+    }
+}
+
+fn packet_unrequested_client_adapter_rank_bonus(path: &str, terms: &[String]) -> f32 {
+    if !crate::packet_terms::packet_terms_indicate_client_send_flow(terms) {
+        return 0.0;
+    }
+    let stem = packet_path_file_stem(path);
+    let Some(prefix) = stem
+        .strip_suffix("_client")
+        .or_else(|| stem.strip_suffix("client"))
+        .filter(|prefix| !prefix.is_empty())
+    else {
+        return 0.0;
+    };
+    if prefix.chars().count() < 2 {
+        return 0.0;
+    }
+    let normalized_prefix = normalize_identifier(prefix);
+    let question_names_adapter = terms.iter().any(|term| {
+        let normalized = normalize_identifier(term);
+        normalized.contains(&normalized_prefix) && normalized.contains("client")
+    });
+    if question_names_adapter { 0.0 } else { -18.0 }
 }
 
 fn packet_facade_module_citation(kind: NodeKind, normalized_display: &str, path: &str) -> bool {
@@ -685,7 +812,6 @@ fn packet_path_has_prompt_package_segment(path: &str, terms: &[String]) -> bool 
     })
 }
 
-#[cfg(test)]
 fn packet_path_file_stem(path: &str) -> String {
     let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path).trim();
     let stem = file_name
@@ -1570,6 +1696,68 @@ mod tests {
         ];
         packet_drop_unrequested_wide_char_siblings(&mut kept, &wide_terms);
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn unrequested_python_siblings_drop_when_a_native_hit_remains() {
+        let terms = vec!["format".to_string(), "arguments".to_string()];
+        let mut citations = vec![
+            test_rank_citation("fix_repeating_arguments", "docs/cli/docopt.py", 0.9),
+            test_rank_citation("format_to", "include/tool/format.h", 0.7),
+        ];
+        packet_drop_unrequested_python_siblings(&mut citations, &terms);
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].display_name, "format_to");
+
+        let python_terms = vec!["python".to_string(), "format".to_string()];
+        let mut kept = vec![
+            test_rank_citation("fix_repeating_arguments", "docs/cli/docopt.py", 0.9),
+            test_rank_citation("format_to", "include/tool/format.h", 0.7),
+        ];
+        packet_drop_unrequested_python_siblings(&mut kept, &python_terms);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn formatting_core_symbols_outrank_windows_helpers_when_windows_is_unrequested() {
+        let terms = vec![
+            "format".to_string(),
+            "arguments".to_string(),
+            "vformat".to_string(),
+        ];
+        assert!(packet_runtime_formatting_core_symbol_rank_bonus("formatargstore", &terms) > 0.0);
+        assert_eq!(
+            packet_runtime_formatting_core_symbol_rank_bonus("formaterror", &terms),
+            10.0
+        );
+        assert!(
+            packet_unrequested_windows_formatting_rank_bonus(
+                "formatwindowserror",
+                "src/os.cc",
+                &terms,
+            ) < 0.0
+        );
+        assert!(packet_unrequested_python_source_rank_bonus("docs/cli/docopt.py", &terms) < 0.0);
+    }
+
+    #[test]
+    fn unrequested_client_adapters_lose_to_the_named_client_file() {
+        let terms = vec![
+            "ioclient".to_string(),
+            "send".to_string(),
+            "http".to_string(),
+        ];
+        assert!(
+            packet_unrequested_client_adapter_rank_bonus("src/http/io_client.dart", &terms)
+                > packet_unrequested_client_adapter_rank_bonus(
+                    "src/http/cronet_client.dart",
+                    &terms,
+                )
+        );
+        assert_eq!(
+            packet_unrequested_client_adapter_rank_bonus("src/http/client.dart", &terms),
+            0.0
+        );
     }
 
     #[test]
