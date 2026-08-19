@@ -162,7 +162,9 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
         NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
     );
 
-    if path.ends_with(".sql")
+    if path.ends_with(".sql") && display_is_sql_relationship_constraint(&citation.display_name) {
+        Some(PacketEvidenceRole::SqlRelationshipConstraint)
+    } else if path.ends_with(".sql")
         && (normalized_display.starts_with("createtable")
             || (citation.kind == NodeKind::CLASS
                 && citation
@@ -171,10 +173,6 @@ pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenc
                     .is_some_and(|producer| producer.contains("structural_sql"))))
     {
         Some(PacketEvidenceRole::SqlTableDefinition)
-    } else if path.ends_with(".sql")
-        && display_is_sql_relationship_constraint(&citation.display_name)
-    {
-        Some(PacketEvidenceRole::SqlRelationshipConstraint)
     } else if path.ends_with(".sql") {
         Some(PacketEvidenceRole::SqlSchemaFile)
     } else if path_contains_test_segment(&path)
@@ -511,10 +509,13 @@ fn packet_display_is_runtime_formatting_arg_store(display: &str) -> bool {
 fn display_is_sql_relationship_constraint(display: &str) -> bool {
     let tokens = crate::text::symbol_query_tokens(display);
     let has = |needle: &str| tokens.iter().any(|token| token == needle);
+    let compact = normalize_identifier(display);
     (has("foreign") && has("key"))
         || has("reference")
         || has("references")
         || (has("constraint") && (has("foreign") || has("referential")))
+        || compact.starts_with("fk")
+        || compact.starts_with("ifk")
 }
 
 fn packet_display_or_path_is_route_dispatch(normalized_display: &str, path: &str) -> bool {
@@ -928,6 +929,8 @@ mod tests {
             "REFERENCES",
             "CONSTRAINT fk_child_parent FOREIGN KEY",
             "fk_order_customer references",
+            "IFK_TitlePublisherId",
+            "FkChildParent",
         ] {
             assert_eq!(
                 packet_evidence_role(&citation(display_name, "db/schema.sql")),
@@ -948,6 +951,16 @@ mod tests {
         assert_eq!(
             packet_evidence_role(&structural_table),
             Some(PacketEvidenceRole::SqlTableDefinition)
+        );
+
+        let mut structural_constraint = citation("IFK_TitlePublisherId", "db/schema.sql");
+        structural_constraint.kind = NodeKind::CLASS;
+        structural_constraint.evidence_producer =
+            Some("verified_structural_sql_collector_source_read".to_string());
+        assert_eq!(
+            packet_evidence_role(&structural_constraint),
+            Some(PacketEvidenceRole::SqlRelationshipConstraint),
+            "structural SQL collectors must not relabel named relationship constraints as tables"
         );
     }
 

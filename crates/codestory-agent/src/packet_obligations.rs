@@ -1868,13 +1868,12 @@ fn finalize_claim_obligation(
             obligation
                 .required_edge_kind
                 .is_none_or(|required_edge_kind| {
-                    citation_edge_proof_for_flow_requirement(
+                    citation_satisfies_required_flow_edge(
                         citation,
                         required_edge_kind,
                         requirement,
                         answer,
                     )
-                    .is_some()
                 })
         })
         .collect::<Vec<_>>();
@@ -2331,21 +2330,29 @@ fn citation_display_matches_requested_identity_with_case(
     if exact_case {
         return citation_display_matches_exact_requested_identity(display_name, requested);
     }
-    let display_segments = symbol_identity_segments(display_name);
-    let requested_segments = symbol_identity_segments(requested);
-    !requested_segments.is_empty()
-        && display_segments.len() >= requested_segments.len()
-        && display_segments[display_segments.len() - requested_segments.len()..]
-            == requested_segments
+    identity_segments_cover(
+        &symbol_identity_segments(display_name),
+        &symbol_identity_segments(requested),
+    )
 }
 
 fn citation_display_matches_exact_requested_identity(display_name: &str, requested: &str) -> bool {
-    let display_segments = exact_symbol_identity_segments(display_name);
-    let requested_segments = exact_symbol_identity_segments(requested);
-    !requested_segments.is_empty()
-        && display_segments.len() >= requested_segments.len()
-        && display_segments[display_segments.len() - requested_segments.len()..]
-            == requested_segments
+    identity_segments_cover(
+        &exact_symbol_identity_segments(display_name),
+        &exact_symbol_identity_segments(requested),
+    )
+}
+
+/// A requested identity matches as a suffix (`Type.method` covers `method`) or
+/// as an owner prefix (`Type.method` covers `Type`). Suffix-only matching left
+/// a cited method unable to carry the type the question named.
+fn identity_segments_cover(display_segments: &[String], requested_segments: &[String]) -> bool {
+    if requested_segments.is_empty() || display_segments.len() < requested_segments.len() {
+        return false;
+    }
+    let suffix_start = display_segments.len() - requested_segments.len();
+    display_segments[suffix_start..] == requested_segments[..]
+        || display_segments[..requested_segments.len()] == requested_segments[..]
 }
 
 fn exact_symbol_identity_segments(value: &str) -> Vec<String> {
@@ -2460,6 +2467,31 @@ fn citation_edge_proof(
             edge_id: edge.id.clone(),
             edge_kind: edge.kind,
         })
+}
+
+fn citation_satisfies_required_flow_edge(
+    citation: &AgentCitationDto,
+    required_edge_kind: EdgeKind,
+    requirement: &FlowRequirement,
+    answer: &AgentAnswerDto,
+) -> bool {
+    citation_edge_proof_for_flow_requirement(citation, required_edge_kind, requirement, answer)
+        .is_some()
+        || (required_edge_kind == EdgeKind::CALL
+            && citation_is_declared_call_boundary(requirement, citation))
+}
+
+/// A cited inbound handle-plus-HTTP callable already *is* the dispatch
+/// boundary. Other hybrid carriers still need the declared outgoing CALL.
+fn citation_is_declared_call_boundary(
+    requirement: &FlowRequirement,
+    citation: &AgentCitationDto,
+) -> bool {
+    crate::packet_evidence_carriers::citation_owns_http_request_handle(citation)
+        && requirement
+            .evidence
+            .call_boundary_target(citation)
+            .is_some_and(|predicate| predicate(&citation.display_name))
 }
 
 fn citation_edge_proof_for_flow_requirement(
@@ -5485,6 +5517,18 @@ mod tests {
             "pkg.Foo.run",
             "Foo.run"
         ));
+        assert!(citation_display_matches_requested_identity(
+            "TransportClient.send",
+            "TransportClient"
+        ));
+        assert!(citation_display_matches_requested_identity(
+            "RuntimeService::run",
+            "RuntimeService"
+        ));
+        assert!(!citation_display_matches_requested_identity(
+            "OtherRuntimeService::run",
+            "RuntimeService"
+        ));
         assert!(!citation_display_matches_requested_identity(
             "pkg.foo.run",
             "Foo.run"
@@ -6837,6 +6881,66 @@ mod tests {
             assert_eq!(!protected_carriers.is_empty(), expected_proven, "{label}");
             assert_eq!(!protected_edges.is_empty(), expected_proven, "{label}");
         }
+    }
+
+    #[test]
+    fn cited_inbound_dispatch_callable_proves_without_an_extra_call() {
+        let mut engine = answer(vec![citation(
+            "ServerEngine.handleHTTPRequest",
+            "src/http/server.go",
+            NodeKind::METHOD,
+        )]);
+        engine.prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.".to_string();
+        let (status, reason, carriers, edges) = finalize_server_dispatch_answer(&engine);
+        assert_eq!(status, PacketObligationProofStatusDto::Proven);
+        assert_eq!(reason, None);
+        assert!(!carriers.is_empty());
+        assert!(
+            edges.is_empty(),
+            "the cited dispatch callable is the boundary; it must not invent a neighbor CALL"
+        );
+
+        let mut with_probable = engine.clone();
+        let engine_id = with_probable.citations[0].node_id.clone();
+        with_probable.citations[0].evidence_edge_ids =
+            vec![EdgeId("probable-dispatch".to_string())];
+        with_probable.graphs.push(GraphArtifactDto::Uml {
+            id: "probable-dispatch".to_string(),
+            title: "Probable dispatch".to_string(),
+            graph: GraphResponse {
+                center_id: engine_id.clone(),
+                nodes: Vec::new(),
+                edges: vec![GraphEdgeDto {
+                    id: EdgeId("probable-dispatch".to_string()),
+                    source: engine_id,
+                    target: NodeId("Worker.run".to_string()),
+                    kind: EdgeKind::CALL,
+                    confidence: Some(0.4),
+                    certainty: Some("probable".to_string()),
+                    callsite_identity: Some("src/http/server.go:1".to_string()),
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        });
+        let (status, reason, ..) = finalize_server_dispatch_answer(&with_probable);
+        assert_eq!(status, PacketObligationProofStatusDto::Proven);
+        assert_eq!(reason, None);
+
+        let mut group = answer(vec![citation(
+            "RequestRouter.Group",
+            "src/http/group.go",
+            NodeKind::METHOD,
+        )]);
+        group.prompt = engine.prompt.clone();
+        let (status, reason, ..) = finalize_server_dispatch_answer(&group);
+        assert_eq!(status, PacketObligationProofStatusDto::Reported);
+        assert_eq!(
+            reason.as_deref(),
+            Some("carrier_does_not_satisfy_role_contract")
+        );
     }
 
     #[test]
