@@ -80,12 +80,18 @@ use crate::agent::packet_scoring::{
     packet_drop_excess_unrequested_animation_class_siblings,
     packet_drop_excess_unrequested_keyframe_siblings,
     packet_drop_unrequested_animation_file_aliases,
+    packet_drop_unrequested_animation_file_only_sheets,
+    packet_drop_unrequested_duplicate_client_type_paths,
     packet_drop_unrequested_example_and_binding_siblings,
+    packet_drop_unrequested_export_macro_displays,
     packet_drop_unrequested_formatter_specialization_siblings,
     packet_drop_unrequested_formatting_extension_siblings,
     packet_drop_unrequested_mapper_annotation_siblings, packet_drop_unrequested_markdown_siblings,
-    packet_drop_unrequested_named_client_adapter_siblings, packet_drop_unrequested_python_siblings,
-    packet_drop_unrequested_single_letter_displays, packet_drop_unrequested_test_siblings,
+    packet_drop_unrequested_named_client_adapter_siblings,
+    packet_drop_unrequested_non_primary_flow_siblings,
+    packet_drop_unrequested_non_stylesheet_animation_siblings,
+    packet_drop_unrequested_python_siblings, packet_drop_unrequested_single_letter_displays,
+    packet_drop_unrequested_system_format_failure_siblings, packet_drop_unrequested_test_siblings,
     packet_drop_unrequested_wide_char_siblings,
     packet_drop_unrequested_windows_formatting_siblings, packet_stage_citation_carry_limit,
     sort_by_cached_rank_desc,
@@ -1446,11 +1452,8 @@ fn maybe_append_cited_client_relative_imports(
         return;
     }
     let cited_paths = cited_source_paths_with_extensions(answer, project_root, &["dart"]);
-    let mut appended = 0usize;
+    let mut pending = Vec::new();
     for cited in cited_paths {
-        if appended >= 6 {
-            break;
-        }
         let Ok(source) = std::fs::read_to_string(&cited) else {
             continue;
         };
@@ -1458,10 +1461,9 @@ fn maybe_append_cited_client_relative_imports(
             continue;
         }
         let parent = cited.parent().unwrap_or(project_root);
-        for import in packet_dart_relative_imports(&source) {
-            if appended >= 6 {
-                break;
-            }
+        let mut imports = packet_dart_relative_imports(&source);
+        imports.sort_by_key(|spec| packet_client_relative_import_priority(spec));
+        for import in imports {
             if !packet_client_relative_import_stem(&import) {
                 continue;
             }
@@ -1484,21 +1486,55 @@ fn maybe_append_cited_client_relative_imports(
             else {
                 continue;
             };
-            if push_cited_source_shape_citation(
+            pending.push((
+                packet_client_relative_import_priority(&import),
+                imported,
+                relative,
+                display_name,
+                line,
+            ));
+        }
+    }
+    pending.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    pending.dedup_by(|left, right| left.1 == right.1);
+    let mut appended = 0usize;
+    for (priority, imported, relative, display_name, line) in pending {
+        if appended >= 6 {
+            break;
+        }
+        let exact_stem = priority == 0;
+        if push_cited_source_shape_citation(
+            answer,
+            project_root,
+            CitedSourceShapeCitation {
+                path: &imported,
+                display_name: &display_name,
+                kind: NodeKind::CLASS,
+                line,
+                score: if exact_stem { 50.0 } else { 42.0 },
+                coverage_role: "client imported type",
+                producer: "packet_cited_client_import",
+            },
+        ) {
+            let _ = push_cited_source_shape_citation(
                 answer,
                 project_root,
                 CitedSourceShapeCitation {
                     path: &imported,
-                    display_name: &display_name,
-                    kind: NodeKind::CLASS,
+                    display_name: &relative,
+                    kind: NodeKind::FILE,
                     line,
-                    score: 42.0,
-                    coverage_role: "client imported type",
+                    score: if exact_stem { 49.0 } else { 41.0 },
+                    coverage_role: "client imported source file",
                     producer: "packet_cited_client_import",
                 },
-            ) {
-                appended = appended.saturating_add(1);
-            }
+            );
+            appended = appended.saturating_add(1);
         }
     }
 }
@@ -1701,6 +1737,22 @@ fn packet_client_relative_import_stem(spec: &str) -> bool {
         && !normalized.contains("test")
 }
 
+fn packet_client_relative_import_priority(spec: &str) -> u8 {
+    let file_name = spec.rsplit(['/', '\\']).next().unwrap_or(spec);
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    let normalized = normalize_identifier(stem);
+    if matches!(normalized.as_str(), "client" | "request" | "response") {
+        0
+    } else if normalized.ends_with("client") {
+        1
+    } else {
+        2
+    }
+}
+
 fn packet_dart_declared_type_name(source: &str) -> Option<(String, u32)> {
     for (index, line) in source.lines().enumerate() {
         if packet_source_line_is_comment(line) {
@@ -1838,14 +1890,20 @@ fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
     packet_drop_unrequested_windows_formatting_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_formatting_extension_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_formatter_specialization_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_export_macro_displays(&mut answer.citations, &terms);
+    packet_drop_unrequested_system_format_failure_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_single_letter_displays(&mut answer.citations, &terms);
     packet_drop_unrequested_named_client_adapter_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_duplicate_client_type_paths(&mut answer.citations, &terms);
     packet_drop_unrequested_example_and_binding_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_mapper_annotation_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_test_siblings(&mut answer.citations, &terms);
+    packet_drop_unrequested_non_primary_flow_siblings(&mut answer.citations, &terms);
     packet_drop_excess_unrequested_keyframe_siblings(&mut answer.citations, &terms);
     packet_drop_excess_unrequested_animation_class_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_animation_file_aliases(&mut answer.citations, &terms);
+    packet_drop_unrequested_animation_file_only_sheets(&mut answer.citations, &terms);
+    packet_drop_unrequested_non_stylesheet_animation_siblings(&mut answer.citations, &terms);
     packet_drop_unrequested_markdown_siblings(&mut answer.citations, &terms);
 }
 
@@ -10577,8 +10635,94 @@ mod tests {
             "cited client file should follow response/request imports: {displays:?}"
         );
         assert!(
+            displays
+                .iter()
+                .any(|name| packet_display_path(name).ends_with("src/http/response.dart"))
+                && displays
+                    .iter()
+                    .any(|name| packet_display_path(name).ends_with("src/http/base_request.dart")),
+            "imported client/request/response paths should be copyable: {displays:?}"
+        );
+        assert!(
             !displays.contains(&"IgnoreMe"),
             "unrelated dart imports should stay out: {displays:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cited_client_barrels_prefer_exact_client_request_response_imports() {
+        let root = packet_temp_root("cited-client-barrel-imports");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/http/http.dart",
+            r#"
+            import 'client.dart';
+            import 'request.dart';
+            import 'response.dart';
+            import 'streamed_request.dart';
+            import 'streamed_response.dart';
+            import 'multipart_request.dart';
+            Future<Response> get(Uri url) => Client().get(url);
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/http/client.dart",
+            "abstract interface class Client {\n  Future<Response> get(Uri url);\n}\n",
+        );
+        write_packet_fixture_file(&root, "src/http/request.dart", "class Request {}\n");
+        write_packet_fixture_file(&root, "src/http/response.dart", "class Response {}\n");
+        write_packet_fixture_file(
+            &root,
+            "src/http/streamed_request.dart",
+            "class StreamedRequest {}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/http/streamed_response.dart",
+            "class StreamedResponse {}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/http/multipart_request.dart",
+            "class MultipartRequest {}\n",
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/http/io_client.dart",
+            "class IOClient {\n  Future<StreamedResponse> send(BaseRequest request) => throw '';\n}\n",
+        );
+
+        let prompt = "Explain how an HTTP client exposes helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.";
+        let mut answer = packet_answer_fixture(
+            prompt,
+            vec![
+                test_packet_citation("get", "src/http/http.dart", 0.9),
+                test_packet_citation("IOClient.send", "src/http/io_client.dart", 0.8),
+            ],
+        );
+        answer.citations[0].file_path = Some(root.join("src/http/http.dart").display().to_string());
+        answer.citations[1].file_path =
+            Some(root.join("src/http/io_client.dart").display().to_string());
+        maybe_append_cited_client_relative_imports(&root, prompt, &mut answer);
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            displays.contains(&"Client")
+                && displays.contains(&"Request")
+                && displays.contains(&"Response"),
+            "exact client/request/response imports should outrank qualified siblings: {displays:?}"
+        );
+        assert!(
+            displays
+                .iter()
+                .any(|name| packet_display_path(name).ends_with("src/http/client.dart")),
+            "client source path should be copyable: {displays:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -11721,17 +11865,10 @@ mod tests {
 
         rank_packet_evidence(question, &mut answer);
 
+        assert_eq!(answer.citations.len(), 1);
         assert_eq!(
             answer.citations[0].display_name,
             "IndexService::run_indexing_blocking"
-        );
-        assert_eq!(
-            packet_evidence_role(&answer.citations[1]),
-            Some(PacketEvidenceRole::TestsAndRegressionCoverage)
-        );
-        assert_eq!(
-            packet_evidence_role(&answer.citations[2]),
-            Some(PacketEvidenceRole::TestsAndRegressionCoverage)
         );
     }
 
@@ -11823,7 +11960,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_ranking_prefers_primary_format_header_over_wide_char_sibling() {
+    fn packet_ranking_drops_wide_char_when_a_primary_format_header_remains() {
         let question = "Explain how formatting arguments reach vformat and format_to output paths.";
         let mut answer = packet_answer_fixture(
             question,
@@ -11841,17 +11978,13 @@ mod tests {
             .iter()
             .filter_map(|citation| citation.file_path.as_deref())
             .collect::<Vec<_>>();
-        let format_rank = paths
-            .iter()
-            .position(|path| *path == "include/tool/format.h")
-            .expect("primary format header should remain cited");
-        let wide_rank = paths
-            .iter()
-            .position(|path| *path == "include/tool/xchar.h")
-            .expect("wide-char sibling should remain cited");
         assert!(
-            format_rank < wide_rank,
-            "primary format header should outrank the wide-char sibling: {paths:?}"
+            paths.iter().any(|path| *path == "include/tool/format.h"),
+            "primary format header should remain cited: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|path| *path != "include/tool/xchar.h"),
+            "unrequested wide-char sibling should drop: {paths:?}"
         );
     }
 

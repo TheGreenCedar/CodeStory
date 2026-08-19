@@ -485,6 +485,8 @@ pub fn packet_drop_unrequested_animation_file_aliases(
         .filter(|citation| {
             packet_citation_is_keyframe_rule(citation)
                 || packet_citation_is_animation_class_selector(citation)
+                || packet_citation_is_animation_custom_property(citation)
+                || packet_citation_is_animation_base_source(citation)
         })
         .filter_map(|citation| citation.file_path.as_deref().map(packet_display_path))
         .collect::<Vec<_>>();
@@ -502,11 +504,214 @@ pub fn packet_drop_unrequested_animation_file_aliases(
     });
 }
 
+/// Drop indexer FILE hits that do not share a path with a remaining non-FILE
+/// animation citation. Rank demotion cannot evict a full window of unused
+/// animation sheets whose display names are absolute paths.
+pub fn packet_drop_unrequested_animation_file_only_sheets(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_stylesheet_animation_flow(terms) {
+        return;
+    }
+    let sibling_paths = citations
+        .iter()
+        .filter(|citation| citation.kind != NodeKind::FILE)
+        .filter_map(|citation| citation.file_path.as_deref().map(packet_display_path))
+        .collect::<Vec<_>>();
+    if sibling_paths.is_empty() {
+        return;
+    }
+    citations.retain(|citation| {
+        if citation.kind != NodeKind::FILE {
+            return true;
+        }
+        citation.file_path.as_deref().is_some_and(|path| {
+            let display = packet_display_path(path);
+            sibling_paths.iter().any(|kept| kept == &display)
+        })
+    });
+}
+
+/// Drop docs/scripts/HTML extras once a primary stylesheet keyframe remains.
+pub fn packet_drop_unrequested_non_stylesheet_animation_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_stylesheet_animation_flow(terms) {
+        return;
+    }
+    if !citations.iter().any(packet_citation_is_keyframe_rule) {
+        return;
+    }
+    if citations.iter().any(packet_citation_is_primary_stylesheet) {
+        citations.retain(packet_citation_is_primary_stylesheet);
+    }
+}
+
+/// Drop docs/generated/test extras from formatting, client, and animation
+/// packets when a primary source hit remains.
+pub fn packet_drop_unrequested_non_primary_flow_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    let relevant = crate::packet_terms::packet_terms_indicate_stylesheet_animation_flow(terms)
+        || crate::packet_terms::packet_terms_indicate_client_send_flow(terms)
+        || crate::packet_terms::packet_terms_indicate_runtime_formatting_flow(terms);
+    if !relevant {
+        return;
+    }
+    if citations
+        .iter()
+        .any(|citation| !packet_citation_is_non_primary_source(citation))
+    {
+        citations.retain(|citation| !packet_citation_is_non_primary_source(citation));
+    }
+}
+
+/// Keep one path per client type display name: the file whose stem tokens are
+/// already in the type name. Barrel re-exports otherwise repeat the same type
+/// from abortable/multipart/streamed adapters and crowd out `client`/`request`.
+pub fn packet_drop_unrequested_duplicate_client_type_paths(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_client_send_flow(terms) {
+        return;
+    }
+    let mut drop_keys = std::collections::HashSet::new();
+    let mut grouped: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for citation in citations.iter() {
+        let display = normalize_identifier(&citation.display_name);
+        if display.is_empty() {
+            continue;
+        }
+        grouped
+            .entry(display)
+            .or_default()
+            .push(packet_citation_key(citation));
+    }
+    for keys in grouped.into_values() {
+        if keys.len() < 2 {
+            continue;
+        }
+        let Some(sample) = citations
+            .iter()
+            .find(|citation| keys.iter().any(|key| packet_citation_key(citation) == *key))
+        else {
+            continue;
+        };
+        let display_tokens = crate::text::symbol_query_tokens(&sample.display_name);
+        let matching = citations
+            .iter()
+            .filter(|citation| keys.iter().any(|key| packet_citation_key(citation) == *key))
+            .filter(|citation| packet_stem_tokens_are_display_subset(citation, &display_tokens))
+            .map(packet_citation_key)
+            .collect::<std::collections::HashSet<_>>();
+        if matching.is_empty() {
+            continue;
+        }
+        for key in keys {
+            if !matching.contains(&key) {
+                drop_keys.insert(key);
+            }
+        }
+    }
+    if drop_keys.is_empty() {
+        return;
+    }
+    citations.retain(|citation| !drop_keys.contains(&packet_citation_key(citation)));
+}
+
+/// Drop ALL_CAPS export macros when a mixed-case formatting symbol remains.
+pub fn packet_drop_unrequested_export_macro_displays(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_runtime_formatting_flow(terms) {
+        return;
+    }
+    if citations
+        .iter()
+        .any(|citation| !packet_citation_is_export_macro_display(citation))
+    {
+        citations.retain(|citation| !packet_citation_is_export_macro_display(citation));
+    }
+}
+
+/// Drop `format*system*error` helpers when a non-system format failure type
+/// remains. Those extras occupy the same header as the failure type.
+pub fn packet_drop_unrequested_system_format_failure_siblings(
+    citations: &mut Vec<AgentCitationDto>,
+    terms: &[String],
+) {
+    if !crate::packet_terms::packet_terms_indicate_runtime_formatting_flow(terms) {
+        return;
+    }
+    if citations
+        .iter()
+        .any(packet_citation_is_non_windows_formatter_failure)
+    {
+        citations.retain(|citation| !packet_citation_is_system_format_failure(citation));
+    }
+}
+
 fn packet_citation_is_animation_file_alias(citation: &AgentCitationDto) -> bool {
     citation
         .coverage_role
         .as_deref()
         .is_some_and(|role| role == "css animation source file")
+}
+
+fn packet_citation_is_animation_custom_property(citation: &AgentCitationDto) -> bool {
+    citation.display_name.trim_start().starts_with("--")
+        || citation
+            .coverage_role
+            .as_deref()
+            .is_some_and(|role| role == "css animation variables")
+}
+
+fn packet_citation_is_primary_stylesheet(citation: &AgentCitationDto) -> bool {
+    let path = packet_citation_display_path(citation);
+    path.ends_with(".css") && !packet_citation_is_non_primary_source(citation)
+}
+
+fn packet_citation_is_non_primary_source(citation: &AgentCitationDto) -> bool {
+    retrieval_file_role_from_path(&packet_citation_display_path(citation)).is_non_primary()
+}
+
+fn packet_stem_tokens_are_display_subset(
+    citation: &AgentCitationDto,
+    display_tokens: &[String],
+) -> bool {
+    let stem = packet_path_file_stem(&packet_citation_display_path(citation));
+    let stem_tokens = crate::text::symbol_query_tokens(&stem);
+    !stem_tokens.is_empty()
+        && stem_tokens
+            .iter()
+            .all(|token| display_tokens.iter().any(|display| display == token))
+}
+
+fn packet_citation_is_export_macro_display(citation: &AgentCitationDto) -> bool {
+    let name = citation.display_name.trim();
+    !name.is_empty()
+        && name.contains('_')
+        && name
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
+        && name.chars().all(|character| {
+            character.is_ascii_uppercase() || character == '_' || character.is_ascii_digit()
+        })
+}
+
+fn packet_citation_is_system_format_failure(citation: &AgentCitationDto) -> bool {
+    let normalized = normalize_identifier(&citation.display_name);
+    normalized.contains("format")
+        && normalized.contains("system")
+        && (normalized.contains("error")
+            || normalized.contains("failure")
+            || normalized.contains("exception"))
 }
 
 fn packet_citation_is_animation_class_selector(citation: &AgentCitationDto) -> bool {
@@ -2442,6 +2647,108 @@ mod tests {
                 .iter()
                 .all(|citation| citation.display_name != "source/motion/pulse.css")
         );
+    }
+
+    #[test]
+    fn unrequested_animation_file_only_sheets_drop_without_a_non_file_sibling() {
+        let terms = vec![
+            "css".to_string(),
+            "animation".to_string(),
+            "keyframes".to_string(),
+            "base".to_string(),
+            "variables".to_string(),
+        ];
+        let keyframe = test_rank_citation("@keyframes spin", "source/motion/spin.css", 0.9);
+        let mut spin_file =
+            test_rank_citation("source/motion/spin.css", "source/motion/spin.css", 0.8);
+        spin_file.kind = NodeKind::FILE;
+        let mut unused_file =
+            test_rank_citation("source/motion/slide.css", "source/motion/slide.css", 0.7);
+        unused_file.kind = NodeKind::FILE;
+        let mut citations = vec![keyframe, spin_file, unused_file];
+        packet_drop_unrequested_animation_file_only_sheets(&mut citations, &terms);
+        assert!(
+            citations
+                .iter()
+                .any(|citation| citation.display_name == "source/motion/spin.css")
+        );
+        assert!(
+            citations
+                .iter()
+                .all(|citation| citation.display_name != "source/motion/slide.css")
+        );
+    }
+
+    #[test]
+    fn unrequested_non_stylesheet_animation_siblings_drop_when_a_keyframe_remains() {
+        let terms = vec![
+            "css".to_string(),
+            "animation".to_string(),
+            "keyframes".to_string(),
+            "base".to_string(),
+            "variables".to_string(),
+        ];
+        let mut citations = vec![
+            test_rank_citation("@keyframes spin", "source/motion/spin.css", 0.9),
+            test_rank_citation("compileList", "docsSource/compileList.js", 0.8),
+            test_rank_citation("index", "docs/index.html", 0.7),
+        ];
+        packet_drop_unrequested_non_stylesheet_animation_siblings(&mut citations, &terms);
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].display_name, "@keyframes spin");
+    }
+
+    #[test]
+    fn unrequested_duplicate_client_type_paths_keep_stem_matched_files() {
+        let terms = vec![
+            "client".to_string(),
+            "send".to_string(),
+            "request".to_string(),
+        ];
+        let mut citations = vec![
+            test_rank_citation("BaseRequest", "src/http/abortable.dart", 0.9),
+            test_rank_citation("BaseRequest", "src/http/multipart_request.dart", 0.8),
+            test_rank_citation("BaseRequest", "src/http/request.dart", 0.7),
+            test_rank_citation("IOClient.send", "src/http/io_client.dart", 0.6),
+        ];
+        packet_drop_unrequested_duplicate_client_type_paths(&mut citations, &terms);
+        assert!(citations.iter().any(|citation| {
+            citation.display_name == "BaseRequest"
+                && citation.file_path.as_deref().is_some_and(|path| {
+                    path.ends_with("request.dart") && !path.contains("multipart")
+                })
+        }));
+        assert!(citations.iter().all(|citation| {
+            citation
+                .file_path
+                .as_deref()
+                .is_none_or(|path| !path.contains("abortable") && !path.contains("multipart"))
+        }));
+        assert!(
+            citations
+                .iter()
+                .any(|citation| citation.display_name == "IOClient.send")
+        );
+    }
+
+    #[test]
+    fn unrequested_export_macros_and_system_format_failures_drop() {
+        let terms = vec!["format".to_string(), "arguments".to_string()];
+        let mut macros = vec![
+            test_rank_citation("TOOL_EXPORT", "include/tool/base.h", 0.9),
+            test_rank_citation("format_to", "include/tool/format.h", 0.7),
+        ];
+        packet_drop_unrequested_export_macro_displays(&mut macros, &terms);
+        assert_eq!(macros.len(), 1);
+        assert_eq!(macros[0].display_name, "format_to");
+
+        let mut failures = vec![
+            test_rank_citation("format_system_error", "include/tool/format-inl.h", 0.9),
+            test_rank_citation("format_error", "include/tool/format.h", 0.7),
+        ];
+        packet_drop_unrequested_system_format_failure_siblings(&mut failures, &terms);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].display_name, "format_error");
     }
 
     #[test]
