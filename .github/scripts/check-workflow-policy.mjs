@@ -3439,8 +3439,8 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(
     violations,
     publish.if
-      === "always() && inputs.publish_release && needs.preflight.result == 'success' && needs.pre-publish-closeout.result == 'success'",
-    `${releaseFile} publish must remain schedulable after accepted reuse while requiring trusted publication authority and successful direct dependencies`,
+      === "${{ !cancelled() && inputs.publish_release && needs.preflight.result == 'success' && needs.pre-publish-closeout.result == 'success' }}",
+    `${releaseFile} publish must remain schedulable after accepted reuse and cancellable while requiring trusted publication authority and successful direct dependencies`,
   );
   add(violations, sameMembers(needs(publish), releaseChain.dependencies.publish), `${releaseFile} publish dependencies must match the release claim graph`);
   // The published platform table is a claim about this release, so it is rendered from the accepted
@@ -3488,8 +3488,8 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(
     violations,
     marketplacePublish.if
-      === "always() && inputs.publish_release && needs.preflight.result == 'success' && needs.publish.result == 'success'",
-    `${releaseFile} marketplace publication must remain schedulable after accepted reuse while requiring trusted publication authority and a successful publish`,
+      === "${{ !cancelled() && inputs.publish_release && needs.preflight.result == 'success' && needs.publish.result == 'success' }}",
+    `${releaseFile} marketplace publication must remain schedulable after accepted reuse and cancellable while requiring trusted publication authority and a successful publish`,
   );
   add(
     violations,
@@ -3581,8 +3581,8 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(
     violations,
     postCloseout.if
-      === "always() && inputs.publish_release && needs.preflight.result == 'success' && needs.pre-publish-closeout.result == 'success' && needs.post-publish-smoke.result == 'success'",
-    `${releaseFile} post-publish closeout must remain schedulable after accepted reuse while requiring trusted publication authority and successful direct dependencies`,
+      === "${{ !cancelled() && inputs.publish_release && needs.preflight.result == 'success' && needs.pre-publish-closeout.result == 'success' && needs.post-publish-smoke.result == 'success' }}",
+    `${releaseFile} post-publish closeout must remain schedulable after accepted reuse and cancellable while requiring trusted publication authority and successful direct dependencies`,
   );
   add(violations, sameMembers(needs(postCloseout), releaseChain.dependencies["post-publish-closeout"]), `${releaseFile} post-publish closeout dependencies must match the release claim graph`);
   // The closeout reached marketplace-publish only through the smoke, so removing the smoke's gate
