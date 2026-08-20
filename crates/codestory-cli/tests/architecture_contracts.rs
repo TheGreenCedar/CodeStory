@@ -646,6 +646,25 @@ fn agent_planning_crate_owns_planning_and_depends_on_contracts_only() {
             "codestory-agent must not spell {forbidden}: planning owns no persisted state"
         );
     }
+
+    // Planning modules (not eval-only `eval_probes.rs`) never open the live
+    // tree. Citation source comes from a pinned excerpt or snapshot.
+    let planning_source = production_source(
+        &AGENT_PLANNING_MODULES
+            .iter()
+            .map(|module| {
+                fs::read_to_string(repo_root().join("crates/codestory-agent/src").join(module))
+                    .unwrap_or_else(|error| panic!("read planning module {module}: {error}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    for forbidden in ["fs::read_to_string", "std::fs::"] {
+        assert!(
+            !planning_source.contains(forbidden),
+            "codestory-agent planning must not spell {forbidden}: live filesystem reads belong to the runtime pin"
+        );
+    }
 }
 
 /// A list that must stay in sync with a directory cannot be trusted to drift

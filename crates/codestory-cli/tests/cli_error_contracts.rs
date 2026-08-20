@@ -359,6 +359,77 @@ fn deprecated_drill_jobs_warns_when_supplied_and_stays_silent_otherwise() {
 }
 
 #[test]
+fn cli_refuses_home_as_project_unless_process_opt_in() {
+    let home = tempdir().expect("captured home");
+    write_tiny_rust_workspace(home.path());
+    let cache_dir = tempdir().expect("cache dir");
+
+    let denied = test_support::cli_command()
+        .args(["doctor", "--format", "json", "--project"])
+        .arg(home.path())
+        .arg("--cache-dir")
+        .arg(cache_dir.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT")
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")
+        .output()
+        .expect("doctor against home");
+    assert_fails_with(
+        denied,
+        &[
+            "project_forbidden",
+            "CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT",
+        ],
+    );
+
+    let allowed = test_support::cli_command()
+        .args(["doctor", "--format", "json", "--project"])
+        .arg(home.path())
+        .arg("--cache-dir")
+        .arg(cache_dir.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT", "1")
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")
+        .output()
+        .expect("doctor against opted-in home");
+    assert_success(
+        &allowed,
+        "process-start opt-in should allow home as --project",
+    );
+}
+
+#[test]
+fn cli_refuses_secrets_directory_used_as_project_root() {
+    let home = tempdir().expect("captured home");
+    let parent = tempdir().expect("parent");
+    let secrets = parent.path().join("secrets");
+    fs::create_dir(&secrets).expect("create secrets root");
+    write_tiny_rust_workspace(&secrets);
+    let cache_dir = tempdir().expect("cache dir");
+
+    let denied = test_support::cli_command()
+        .args(["doctor", "--format", "json", "--project"])
+        .arg(&secrets)
+        .arg("--cache-dir")
+        .arg(cache_dir.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT")
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")
+        .output()
+        .expect("doctor against secrets root");
+    assert_fails_with(
+        denied,
+        &[
+            "project_forbidden",
+            "CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT",
+        ],
+    );
+}
+
+#[test]
 fn product_cli_rejects_the_removed_cpu_embedding_selector() {
     let output = test_support::cli_command()
         .args(["doctor", "--format", "json"])

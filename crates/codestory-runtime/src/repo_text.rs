@@ -369,7 +369,7 @@ impl AppController {
             ),
             loss_reason: None,
             coverage_role: None,
-            eligible_for_sufficiency: Some(true),
+            eligible_for_sufficiency: Some(false),
             source_excerpt,
             verification_targets: Vec::new(),
             score_breakdown: None,
@@ -396,3 +396,24 @@ const _: () = assert!(
         >= codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
     "semantic document text must admit every file the indexer does"
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_contracts::api::SearchHitOrigin;
+
+    #[test]
+    fn repo_text_hits_are_not_packet_proof() {
+        let hit = AppController::repo_text_search_hit(
+            NodeId::from(codestory_contracts::graph::NodeId(1)),
+            "lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+            1,
+            12.0,
+            Some("pub fn example() {}".to_string()),
+        );
+        assert_eq!(hit.origin, SearchHitOrigin::TextMatch);
+        assert_eq!(hit.evidence_producer.as_deref(), Some("repo_text_fallback"));
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+    }
+}

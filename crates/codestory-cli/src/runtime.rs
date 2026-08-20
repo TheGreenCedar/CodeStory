@@ -107,6 +107,10 @@ impl RuntimeContextConfiguration {
         retained_logical_identity: Option<&codestory_workspace::LogicalProjectIdentityV3>,
     ) -> Result<Self> {
         let project_root = canonicalize_project_root(&args.project)?;
+        if let Some(message) = crate::config::sensitive_project_root_message(&project_root, startup)
+        {
+            return Err(map_api_error(ApiError::new("project_forbidden", message)));
+        }
         let project_identity = retained_project_identity.cloned().unwrap_or_else(|| {
             let repository_identity =
                 codestory_workspace::inspect_repository_identity_v2(&project_root);
@@ -1489,6 +1493,7 @@ mod tests {
         assert_ne!(first_cache, second_cache);
         let startup = |cache_root: &Path| crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: true,
             stdio_cache_root: Some(cache_root.to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -1574,6 +1579,7 @@ mod tests {
         fs::create_dir_all(&project).expect("create project");
         let startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.clone()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -1617,6 +1623,7 @@ mod tests {
         );
         let startup = |byte_cap| crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.clone()),
             sidecar_defaults: defaults.clone(),
@@ -1655,6 +1662,7 @@ mod tests {
         fs::create_dir_all(&cache).expect("create cache");
         let startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: true,
             stdio_cache_root: Some(temp.path().join("process-cache")),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -2077,6 +2085,7 @@ mod tests {
         symlink(&project, &alias).expect("create project alias");
         let startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: true,
             stdio_cache_root: Some(cache.clone()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(

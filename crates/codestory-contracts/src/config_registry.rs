@@ -38,6 +38,7 @@ use crate::api::ApiError;
 pub const AGENT_PREFLIGHT_LOCAL_REFRESH_TIMEOUT_MS_ENV: &str =
     "CODESTORY_AGENT_PREFLIGHT_LOCAL_REFRESH_TIMEOUT_MS";
 pub const ALLOW_PROJECT_NETWORK_CONFIG_ENV: &str = "CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG";
+pub const ALLOW_SENSITIVE_PROJECT_ROOT_ENV: &str = "CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT";
 pub const CACHE_ROOT_ENV: &str = "CODESTORY_CACHE_ROOT";
 pub const CLI_ENV: &str = "CODESTORY_CLI";
 pub const DISABLE_INSTALLED_CLI_PROBE_ENV: &str = "CODESTORY_DISABLE_INSTALLED_CLI_PROBE";
@@ -287,6 +288,13 @@ pub const ENV_SETTINGS: &[EnvSetting] = &[
         SettingKind::Boolean,
         SettingAudience::Product,
         "Process-wide opt-in that lets project `.codestory.toml` files set summary network keys.",
+    ),
+    setting(
+        ALLOW_SENSITIVE_PROJECT_ROOT_ENV,
+        CLI_CONFIG,
+        SettingKind::Boolean,
+        SettingAudience::Product,
+        "Process-start opt-in that allows `$HOME`, `~/.ssh`, `~/.gnupg`, or a `secrets/` directory as a project root. Tool arguments cannot set this.",
     ),
     setting(
         CACHE_ROOT_ENV,

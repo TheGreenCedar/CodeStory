@@ -324,29 +324,32 @@ class McpProcess:
                 isinstance(state, dict),
                 f"MCP {name} attempt {attempt} returned non-object structuredContent: {result!r}",
             )
-            is_error = result.get("isError")
-            if "isError" not in result or is_error is False:
-                return response, attempt
-            self._wait_for_readiness_retry(
-                name,
-                attempt,
-                state,
-                is_error,
-                deadline,
+            retryable = (state.get("code"), state.get("state")) in (
+                ("codestory_preparing", "preparing"),
+                ("codestory_updating", "updating"),
             )
+            if retryable:
+                self._wait_for_readiness_retry(
+                    name,
+                    attempt,
+                    state,
+                    deadline,
+                )
+                continue
+            if result.get("isError") is True:
+                require(
+                    False,
+                    f"MCP {name} attempt {attempt} returned a terminal or malformed error envelope: {state!r}",
+                )
+            return response, attempt
 
     def _wait_for_readiness_retry(
         self,
         name: str,
         attempt: int,
         state: dict,
-        is_error: object,
         deadline: float,
     ) -> None:
-        require(
-            is_error is True,
-            f"MCP {name} attempt {attempt} returned invalid isError={is_error!r}: {state!r}",
-        )
         require(
             (state.get("code"), state.get("state"))
             in (

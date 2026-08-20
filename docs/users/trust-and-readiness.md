@@ -31,7 +31,10 @@ old or new publication.
 
 `retrieval_mode=full` proves that the retrieval infrastructure is coherent. It
 does not guarantee that a particular answer found enough evidence. The packet's
-disposition and citations still matter.
+disposition and citations still matter. Compact and MCP status also report
+`degraded_reason` and `live_ready`, so `retrieval_mode=full` with
+`live_ready=false` means the publication class is full but packet and search
+must not run yet.
 
 ## When to stop trusting a CodeStory claim
 

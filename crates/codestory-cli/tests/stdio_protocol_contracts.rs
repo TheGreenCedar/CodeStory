@@ -361,7 +361,16 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
 }
 
 fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
-    let mut child = test_support::cli_command()
+    spawn_multi_project_stdio_server_with_home(cache_root, None, false)
+}
+
+fn spawn_multi_project_stdio_server_with_home(
+    cache_root: &Path,
+    home: Option<&Path>,
+    allow_sensitive_project_root: bool,
+) -> StdioServer {
+    let mut command = test_support::cli_command();
+    command
         .arg("serve")
         .arg("--stdio")
         .arg("--multi-project")
@@ -372,9 +381,16 @@ fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
         .stderr(Stdio::piped())
         .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")
         .env("CODESTORY_STDIO_CACHE_ROOT", cache_root)
-        .env("CODESTORY_PLUGIN_MULTI_PROJECT", "1")
-        .spawn()
-        .expect("spawn multi-project stdio server");
+        .env("CODESTORY_PLUGIN_MULTI_PROJECT", "1");
+    if let Some(home) = home {
+        command.env("HOME", home).env("USERPROFILE", home);
+    }
+    if allow_sensitive_project_root {
+        command.env("CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT", "1");
+    } else {
+        command.env_remove("CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT");
+    }
+    let mut child = command.spawn().expect("spawn multi-project stdio server");
     let stdin = child.stdin.take().expect("multi-project stdio stdin");
     let stdout = BufReader::new(child.stdout.take().expect("multi-project stdio stdout"));
     StdioServer {
@@ -382,6 +398,18 @@ fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
         stdin,
         stdout,
     }
+}
+
+fn stdio_status_request(id: &str, project: &Path) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "status",
+            "arguments": {"project": project}
+        }
+    })
 }
 
 fn send_json(server: &mut StdioServer, request: Value) -> Value {
@@ -454,6 +482,35 @@ fn assert_tool_error(response: &Value, id: Value) -> &Value {
     result
         .get("structuredContent")
         .expect("tools/call error should include structuredContent")
+}
+
+fn tool_result_code(response: &Value) -> Option<&str> {
+    response
+        .pointer("/result/structuredContent/code")
+        .and_then(Value::as_str)
+}
+
+fn assert_tool_preparing(response: &Value, id: Value) -> &Value {
+    let result = assert_success_envelope(response, id);
+    assert!(
+        result.get("isError").and_then(Value::as_bool) != Some(true),
+        "preparing tools/call should be a successful structured result: {response}"
+    );
+    assert_tool_text_content(result, response);
+    let content = result
+        .get("structuredContent")
+        .expect("preparing tools/call should include structuredContent");
+    assert_eq!(content["code"], json!("codestory_preparing"));
+    assert_eq!(content["state"], json!("preparing"));
+    content
+}
+
+fn assert_tool_preparing_or_unavailable(response: &Value, id: Value) -> &Value {
+    if tool_result_code(response) == Some("codestory_preparing") {
+        assert_tool_preparing(response, id)
+    } else {
+        assert_tool_error(response, id)
+    }
 }
 
 fn assert_error_envelope(response: &Value, id: Value) -> &Value {
@@ -1352,6 +1409,88 @@ fn notification_messages_do_not_produce_responses() {
 }
 
 #[test]
+fn multi_project_stdio_refuses_home_as_project() {
+    let home = tempfile::tempdir().expect("captured home");
+    write_tiny_rust_workspace(home.path());
+    let cache_root = tempfile::tempdir().expect("sensitive-root cache");
+    let mut server =
+        spawn_multi_project_stdio_server_with_home(cache_root.path(), Some(home.path()), false);
+    let denied = send_json(
+        &mut server,
+        stdio_status_request("home-denied", home.path()),
+    );
+    let error = assert_tool_error(&denied, json!("home-denied"));
+    assert_eq!(error["code"], json!("project_forbidden"));
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT"),
+        "refusal should name the process-start opt-in: {error}"
+    );
+}
+
+#[test]
+fn multi_project_stdio_allows_nested_repo_under_home() {
+    let home = tempfile::tempdir().expect("captured home");
+    let nested = home.path().join("nested-repo");
+    fs::create_dir(&nested).expect("create nested repo");
+    write_tiny_rust_workspace(&nested);
+    fs::write(&nested.join("secrets"), "not a project root\n").expect("file named secrets");
+    let cache_root = tempfile::tempdir().expect("nested-home cache");
+    let mut server =
+        spawn_multi_project_stdio_server_with_home(cache_root.path(), Some(home.path()), false);
+    let response = send_json(&mut server, stdio_status_request("nested-home-ok", &nested));
+    let result = assert_tool_success(&response, json!("nested-home-ok"));
+    assert_ne!(
+        result.get("code"),
+        Some(&json!("project_forbidden")),
+        "a nested repo under home must not inherit the home denylist: {result}"
+    );
+}
+
+#[test]
+fn multi_project_stdio_opt_in_allows_home_as_project() {
+    let home = tempfile::tempdir().expect("captured home");
+    write_tiny_rust_workspace(home.path());
+    let cache_root = tempfile::tempdir().expect("opt-in cache");
+    let mut server =
+        spawn_multi_project_stdio_server_with_home(cache_root.path(), Some(home.path()), true);
+    let response = send_json(
+        &mut server,
+        stdio_status_request("home-opt-in", home.path()),
+    );
+    assert_tool_success(&response, json!("home-opt-in"));
+}
+
+#[test]
+fn multi_project_stdio_refuses_ssh_gnupg_and_secrets_roots() {
+    let home = tempfile::tempdir().expect("captured home");
+    write_tiny_rust_workspace(home.path());
+    let ssh = home.path().join(".ssh");
+    let gnupg = home.path().join(".gnupg");
+    let secrets = home.path().join("secrets");
+    for root in [&ssh, &gnupg, &secrets] {
+        fs::create_dir(root).expect("create denylisted root");
+        write_tiny_rust_workspace(root);
+    }
+    let cache_root = tempfile::tempdir().expect("denylist cache");
+    let mut server =
+        spawn_multi_project_stdio_server_with_home(cache_root.path(), Some(home.path()), false);
+    for (id, project) in [
+        ("ssh-denied", ssh.as_path()),
+        ("gnupg-denied", gnupg.as_path()),
+        ("secrets-denied", secrets.as_path()),
+    ] {
+        let denied = send_json(&mut server, stdio_status_request(id, project));
+        let error = assert_tool_error(&denied, json!(id));
+        assert_eq!(
+            error["code"],
+            json!("project_forbidden"),
+            "{id} should fail closed: {error}"
+        );
+    }
+}
+
+#[test]
 fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
     let first = tempfile::tempdir().expect("first workspace");
     let second = tempfile::tempdir().expect("second workspace");
@@ -1693,11 +1832,26 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
     for (index, project) in projects.iter().enumerate() {
         let id = format!("multi-packet-{index}");
         let response = send_json(&mut server, packet_request(&id, project.path()));
-        let error = assert_tool_error(&response, json!(id));
-        assert_eq!(error["code"], json!("codestory_preparing"));
+        let error = assert_tool_preparing(&response, json!(id));
         assert_eq!(error["cause_code"], json!("cache_busy"));
         assert_eq!(error["retry_tool"], json!("packet"));
         assert!(error["retry_after_ms"].as_u64().is_some());
+        assert!(
+            error["recommended_next_calls"]
+                .as_array()
+                .is_some_and(|calls| {
+                    calls.iter().any(|call| {
+                        call["method"] == "tools/call"
+                            && call["tool"] == "packet"
+                            && call["arguments"]["project"] == json!(project.path())
+                    }) && !calls.iter().any(|call| {
+                        call["tool"] == "affected"
+                            || call["tool"] == "status"
+                            || call["method"] == "resources/read"
+                    })
+                }),
+            "preparing packet must retry the same tool without status or placeholder affected: {error}"
+        );
         operation_ids.push(
             error["operation"]["operation_id"]
                 .as_str()
@@ -1715,7 +1869,7 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
         &mut server,
         packet_request("multi-packet-first-retry", projects[0].path()),
     );
-    let retry_error = assert_tool_error(&retry, json!("multi-packet-first-retry"));
+    let retry_error = assert_tool_preparing(&retry, json!("multi-packet-first-retry"));
     assert_eq!(
         retry_error["operation"]["operation_id"],
         json!(operation_ids[0]),
@@ -3888,6 +4042,19 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "{compact}"
     );
     assert!(
+        compact.get("retrieval_mode").is_some(),
+        "compact status should keep retrieval_mode as the publication class: {compact}"
+    );
+    assert!(
+        compact.get("degraded_reason").is_some(),
+        "compact status should surface degraded_reason next to retrieval_mode: {compact}"
+    );
+    assert_eq!(
+        compact["live_ready"],
+        json!(compact["retrieval_mode"] == json!("full") && compact["degraded_reason"].is_null()),
+        "compact live_ready must not treat full as packet-ready when degraded: {compact}"
+    );
+    assert!(
         compact["diagnostics_uri"]
             .as_str()
             .is_some_and(|uri| uri.starts_with("codestory://status?project=")),
@@ -3904,6 +4071,8 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     assert!(compact_text.contains("state: working_locally"));
     assert!(compact_text.contains("capability.local_navigation: ready"));
     assert!(compact_text.contains("next_action:"));
+    assert!(compact_text.contains("retrieval_mode:"));
+    assert!(compact_text.contains("live_ready:"));
     let local_summary = "Local repository navigation is ready.";
     assert_eq!(
         status.to_string().matches(local_summary).count(),
@@ -3999,6 +4168,15 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "an explicit-CPU fixture without a compatible semantic publication must not report retrieval as full: {status}"
     );
     assert_eq!(
+        status["live_ready"],
+        json!(false),
+        "status must not report live-ready when retrieval_mode is not a live full publication: {status}"
+    );
+    assert!(
+        status.get("degraded_reason").is_some(),
+        "MCP status should surface degraded_reason next to retrieval_mode: {status}"
+    );
+    assert_eq!(
         status["local_refresh"]["state"],
         json!("refreshed"),
         "fresh local graph state should be explicit even when sidecar retrieval is unavailable: {status}"
@@ -4042,7 +4220,9 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "local/default lane should report retrieval mode: {status}"
     );
     assert_eq!(local_default["status"], json!("unavailable"));
-    assert_eq!(local_default.as_object().map(serde_json::Map::len), Some(2));
+    assert!(local_default.get("degraded_reason").is_some());
+    assert_eq!(local_default["live_ready"], json!(false));
+    assert_eq!(local_default.as_object().map(serde_json::Map::len), Some(4));
     let agent_lane = readiness_lanes
         .get("agent_packet_search")
         .unwrap_or_else(|| panic!("status should include agent_packet_search lane: {status}"));
@@ -4052,7 +4232,9 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "agent lane should report broad retrieval capability: {status}"
     );
     assert!(agent_lane["retrieval_mode"].is_string());
-    assert_eq!(agent_lane.as_object().map(serde_json::Map::len), Some(2));
+    assert!(agent_lane.get("degraded_reason").is_some());
+    assert_eq!(agent_lane["live_ready"], json!(false));
+    assert_eq!(agent_lane.as_object().map(serde_json::Map::len), Some(4));
     assert_eq!(
         status["runtime_truth"]["readiness_refs"]["local_graph"],
         json!("readiness[goal=local_navigation]"),
@@ -5354,8 +5536,10 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
             }
         }),
     );
-    let search_error =
-        assert_tool_error(&search_response, json!("tool-refresh-search-still-blocked"));
+    let search_error = assert_tool_preparing_or_unavailable(
+        &search_response,
+        json!("tool-refresh-search-still-blocked"),
+    );
     assert!(
         matches!(
             search_error.pointer("/code").and_then(Value::as_str),
@@ -5382,22 +5566,27 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
 
     let result = assert_success_envelope(&response, json!("agent-guide-resource"));
     let guide = json_resource_content(result, "codestory://agent-guide");
+    let sequence = guide
+        .get("recommended_call_sequence")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("agent guide should include recommended_call_sequence: {guide}"));
     assert!(
-        guide
-            .get("default_browser_loop")
-            .or_else(|| guide.get("recommended_call_sequence"))
-            .or_else(|| guide.get("recommended_next_calls"))
-            .and_then(Value::as_array)
-            .is_some_and(|calls| {
-                calls.iter().any(|call| {
-                    call["tool"] == json!("ground") && call.pointer("/arguments/project").is_some()
-                })
+        sequence
+            .iter()
+            .any(|step| step["action"] == json!("call_matching_tool")
+                && step.pointer("/arguments/project").is_some())
+            && sequence
+                .iter()
+                .any(|step| step["action"] == json!("retry_same_tool"))
+            && sequence.first().is_some_and(|step| {
+                step["action"] == json!("resolve_project_root")
+                    && step.get("tool") != Some(&json!("ground"))
             })
             && guide
                 .get("readiness_lanes")
                 .and_then(Value::as_array)
                 .is_some_and(|lanes| lanes.len() >= 2),
-        "agent guide should include a concise default browser loop or call sequence: {guide}"
+        "agent guide should publish the matching-tool loop, not ground-first: {guide}"
     );
     let local_lane = guide["readiness_lanes"]
         .as_array()
@@ -5454,6 +5643,17 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
             "agent lane should include {expected}: {guide}"
         );
     }
+    let packet_example = agent_lane["calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|call| call["tool"] == json!("packet"))
+        .unwrap_or_else(|| panic!("agent lane should include a packet example: {guide}"));
+    assert_eq!(
+        packet_example["arguments"]["budget"],
+        json!("standard"),
+        "packet example budget must be standard, not compact: {guide}"
+    );
     let mut strings = Vec::new();
     string_values_recursive(&guide, &mut strings);
     for expected in [
@@ -5479,6 +5679,10 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
         !unconditional_sequence_text.contains("\"tool\":\"packet\"")
             && !unconditional_sequence_text.contains("\"tool\":\"search\""),
         "packet/search should not be unconditional normal next steps: {guide}"
+    );
+    assert!(
+        guide_text.contains("matching tool") && !guide_text.contains("use ground first"),
+        "agent guide should follow the matching-tool loop instead of requiring ground first: {guide}"
     );
     assert!(
         guide_text.contains("preparing")
@@ -5565,7 +5769,7 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
             "params": {"name": "search", "arguments": {"query": "AppController"}}
         }),
     );
-    let error = assert_tool_error(&search, json!("cold-search-unavailable"));
+    let error = assert_tool_preparing_or_unavailable(&search, json!("cold-search-unavailable"));
     assert_eq!(error["tool"], json!("search"));
     assert!(
         error["diagnostics_uri"]
@@ -5635,7 +5839,8 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
             }
         }),
     );
-    let error = assert_tool_error(&response, json!("migration-search-preparing"));
+    let error =
+        assert_tool_preparing_or_unavailable(&response, json!("migration-search-preparing"));
     if activation_terminated(error) {
         assert_eq!(error["code"], json!("codestory_unavailable"));
         assert!(
@@ -5678,20 +5883,24 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
     };
 
     let first = send_json(&mut server, packet_request("packet-search-repair-first"));
-    if first.pointer("/result/isError") != Some(&json!(true)) {
+    let first_error = if tool_result_code(&first) == Some("codestory_preparing") {
+        assert_tool_preparing(&first, json!("packet-search-repair-first"))
+    } else if first.pointer("/result/isError") != Some(&json!(true)) {
         assert_tool_success(&first, json!("packet-search-repair-first"));
         return;
-    }
-    let first_error = assert_tool_error(&first, json!("packet-search-repair-first"));
-    if activation_terminated(first_error) {
-        assert_search_repaired_before_terminal_activation(
-            &mut server,
-            first_error,
-            &search_generations,
-            "packet-search-repair-first",
-        );
-        return;
-    }
+    } else {
+        let first_error = assert_tool_error(&first, json!("packet-search-repair-first"));
+        if activation_terminated(first_error) {
+            assert_search_repaired_before_terminal_activation(
+                &mut server,
+                first_error,
+                &search_generations,
+                "packet-search-repair-first",
+            );
+            return;
+        }
+        first_error
+    };
     assert_eq!(first_error["code"], json!("codestory_preparing"));
     assert_eq!(first_error["retry_tool"], json!("packet"));
     assert!(first_error["retry_after_ms"].as_u64().is_some());
@@ -5707,6 +5916,18 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
         thread::sleep(Duration::from_millis(retry_after_ms.min(1_000)));
         let id = format!("packet-search-repair-retry-{attempt}");
         let response = send_json(&mut server, packet_request(&id));
+        if tool_result_code(&response) == Some("codestory_preparing") {
+            let error = assert_tool_preparing(&response, json!(id));
+            assert_eq!(error["retry_tool"], json!("packet"));
+            assert_eq!(
+                error["operation"]["operation_id"],
+                json!(operation_id),
+                "same-project retry must retain the repair operation id"
+            );
+            retry_after_ms = error["retry_after_ms"].as_u64().unwrap_or(250);
+            last_error = error.clone();
+            continue;
+        }
         if response.pointer("/result/isError") != Some(&json!(true)) {
             assert_tool_success(&response, json!(id));
             assert!(
@@ -5725,15 +5946,7 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
             );
             return;
         }
-        assert_eq!(error["code"], json!("codestory_preparing"));
-        assert_eq!(error["retry_tool"], json!("packet"));
-        assert_eq!(
-            error["operation"]["operation_id"],
-            json!(operation_id),
-            "same-project retry must retain the repair operation id"
-        );
-        retry_after_ms = error["retry_after_ms"].as_u64().unwrap_or(250);
-        last_error = error.clone();
+        panic!("packet retry returned an unexpected error: {error}");
     }
     panic!("packet did not converge after the bounded same-tool retry sequence: {last_error}");
 }
@@ -5830,18 +6043,23 @@ fn failed_replacement_retries_keep_identity_and_offer_retained_local_analysis() 
         first_error["recommended_next_calls"]
             .as_array()
             .is_some_and(|calls| {
-                calls.iter().any(|call| {
-                    call["method"] == "tools/call"
-                        && call["tool"] == "affected"
+                !calls.iter().any(|call| {
+                    call["tool"] == "affected"
                         && call["arguments"]["paths"] == json!(["<changed-project-path>"])
-                }) && calls.iter().any(|call| {
+                }) && !calls.iter().any(|call| {
                     call["method"] == "resources/read"
                         && call["uri"]
                             .as_str()
-                            .is_some_and(|uri| uri.starts_with("codestory://status?project="))
-                })
+                            .is_some_and(|uri| uri.starts_with("codestory://status"))
+                }) && !calls.iter().any(|call| call["tool"] == "status")
             }),
-        "terminal MCP response must provide useful native follow-ups: {first_error}"
+        "terminal MCP response must not invent affected paths or require status: {first_error}"
+    );
+    assert!(
+        first_error["diagnostics_uri"]
+            .as_str()
+            .is_some_and(|uri| uri.starts_with("codestory://status?project=")),
+        "diagnostics remain available without becoming a next-call prerequisite: {first_error}"
     );
 
     let first_operation = first_error["operation"].clone();

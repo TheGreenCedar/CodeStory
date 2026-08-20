@@ -25,10 +25,12 @@ analysis after a replacement fails. It never upgrades broad search without the
 matching retrieval publication and runtime proof.
 
 When no complete publication exists yet, `ground`, `packet`, `search`, and
-`context` return `codestory_preparing` with `retry_tool` and
-`retry_after_ms`. Broad tools use the same response while managed search is
-coming up. Retry that same tool. Do not ask the user to enable, repair,
-approve, or configure an internal service.
+`context` return a successful structured result with `code=codestory_preparing`,
+`state=preparing`, `retry_tool`, and `retry_after_ms`. That result is not
+`isError: true`; hosts that stop on errors would never honor the delay.
+`unavailable` remains an error. Broad tools use the same preparing response
+while managed search is coming up. Retry that same tool. Do not ask the user to
+enable, repair, approve, or configure an internal service.
 
 While the plugin launcher is still provisioning the managed runtime itself,
 `retry_after_ms` derives from the observed runtime-download progress: the
@@ -62,7 +64,8 @@ The most useful fields are:
 | `index_publication` | Complete core database generation currently being served. |
 | `local_refresh` | Local map state and the complete publication retained during refresh. |
 | `state`, `capabilities`, `current_operation`, `retry_after_ms`, `failure` | Uncached activation progress layered onto the observational status read, including one stable operation id, stage, attempt, retry delay, and terminal failure. |
-| `retrieval_mode` | Persisted broad-search classification; `full` is required for trustworthy broad results. |
+| `retrieval_mode` | Persisted broad-search publication class; `full` is required infrastructure for trustworthy broad results, not proof that packet may run now. |
+| `degraded_reason`, `live_ready` | Live readiness beside `retrieval_mode`. `live_ready` is true only when `retrieval_mode=full` and `degraded_reason` is absent. |
 | `embedding_server` in maintainer diagnostics | Endpoint authority, listener, server process, query/bulk capacity and depth, opaque active request/phase, engine owner/native worker, load generation, and model-load identity. Project paths and request text are never included. |
 | `readiness_lanes.agent_packet_search` | Current broad-search capability state. |
 | `runtime_update` | Non-blocking installed-runtime update advisory. |

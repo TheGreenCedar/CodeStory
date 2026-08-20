@@ -1236,6 +1236,11 @@ impl StdioServerSession {
         }
         let project_root = crate::runtime::canonicalize_project_root(Path::new(project))
             .map_err(|error| anyhow::anyhow!("project_unavailable: {error}"))?;
+        if let Some(message) =
+            crate::config::sensitive_project_root_message(&project_root, &self.startup)
+        {
+            bail!("project_forbidden: {message}");
+        }
         let active_same_root = self.active_project.as_ref().filter(|active| {
             codestory_workspace::same_workspace_path(&active.runtime.project_root, &project_root)
         });
@@ -1637,6 +1642,8 @@ fn handle_stdio_message(
                 let message = error.to_string();
                 let code = if message.starts_with("project_required:") {
                     "project_required"
+                } else if message.starts_with("project_forbidden:") {
+                    "project_forbidden"
                 } else {
                     "project_unavailable"
                 };
@@ -1726,23 +1733,6 @@ fn handle_stdio_message(
                                     .unwrap_or(250),
                             }));
                         }
-                        if retained_local {
-                            recommended_next_calls.push(serde_json::json!({
-                                "method": "tools/call",
-                                "tool": "affected",
-                                "arguments": {
-                                    "project": crate::display::clean_path_string(
-                                        &runtime.project_root.to_string_lossy()
-                                    ),
-                                    "paths": ["<changed-project-path>"]
-                                },
-                                "evidence_scope": "retained_core_publication",
-                            }));
-                        }
-                        recommended_next_calls.push(serde_json::json!({
-                            "method": "resources/read",
-                            "uri": diagnostics_uri.clone(),
-                        }));
                         let error = serde_json::json!({
                             "code": if error.code == "cancelled" {
                                 "cancelled"
@@ -1906,6 +1896,20 @@ fn stdio_jsonrpc_from_legacy(
 }
 
 fn compact_stdio_status(runtime: &RuntimeContext, status: &serde_json::Value) -> serde_json::Value {
+    let retrieval_mode = status
+        .get("retrieval_mode")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let degraded_reason = status
+        .get("degraded_reason")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let live_ready = status.get("live_ready").cloned().unwrap_or_else(|| {
+        serde_json::json!(stdio_status_is_live_ready(
+            retrieval_mode.as_str(),
+            degraded_reason.as_str(),
+        ))
+    });
     serde_json::json!({
         "project": status.get("project_root"),
         "state": status.get("state"),
@@ -1914,11 +1918,18 @@ fn compact_stdio_status(runtime: &RuntimeContext, status: &serde_json::Value) ->
         "next_action": status.get("next_action"),
         "retry_after_ms": status.get("retry_after_ms"),
         "failure": status.get("failure"),
+        "retrieval_mode": retrieval_mode,
+        "degraded_reason": degraded_reason,
+        "live_ready": live_ready,
         "diagnostics_uri": stdio_resource_uri_for_project(
             &StdioResource::Status,
             &runtime.project_root,
         )
     })
+}
+
+fn stdio_status_is_live_ready(retrieval_mode: Option<&str>, degraded_reason: Option<&str>) -> bool {
+    retrieval_mode == Some("full") && degraded_reason.is_none()
 }
 
 /// Render one `tools/call` outcome.
@@ -2192,6 +2203,9 @@ fn stdio_compact_tool_text(tool_name: &str, value: &serde_json::Value) -> String
         ("scope", "/scope"),
         ("snippet_truncated", "/snippet_truncated"),
         ("diagnostics_uri", "/diagnostics_uri"),
+        ("retrieval_mode", "/retrieval_mode"),
+        ("degraded_reason", "/degraded_reason"),
+        ("live_ready", "/live_ready"),
     ] {
         if let Some(rendered) = value.pointer(pointer).and_then(stdio_text_scalar) {
             lines.push(format!("{label}: {rendered}"));
@@ -2770,16 +2784,26 @@ fn stdio_tool_call_error(error: &serde_json::Value) -> serde_json::Value {
     } else {
         serde_json::json!({ "message": message.clone() })
     };
-    serde_json::json!({
+    let preparing = structured_content
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        == Some("codestory_preparing");
+    let mut result = serde_json::json!({
         "content": [
             {
                 "type": "text",
                 "text": message
             }
         ],
-        "structuredContent": structured_content,
-        "isError": true
-    })
+        "structuredContent": structured_content
+    });
+    if !preparing {
+        result
+            .as_object_mut()
+            .expect("tools/call result is an object")
+            .insert("isError".to_string(), serde_json::json!(true));
+    }
+    result
 }
 
 fn stdio_legacy_error_message(error: &serde_json::Value) -> String {
@@ -5532,6 +5556,7 @@ fn stdio_workspace_mismatch_status(mismatch: &StdioWorkspaceMismatch) -> serde_j
             "message": "The live CodeStory MCP child is serving a different workspace than the active plugin state. Restart/reload the host so MCP relaunches for the active workspace, then reread the project-bound status resource."
         },
         "degraded_reason": "workspace_mismatch",
+        "live_ready": false,
         "project_root": diagnostic["served_root"].clone(),
         "workspace_mismatch": diagnostic,
         "local_refresh": local_refresh,
@@ -5730,6 +5755,11 @@ fn read_stdio_status_resource(
         "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
         "storage_exists": runtime.storage_path.exists(),
         "retrieval_mode": retrieval_status.retrieval_mode,
+        "degraded_reason": retrieval_status.degraded_reason,
+        "live_ready": stdio_status_is_live_ready(
+            Some(retrieval_status.retrieval_mode.as_str()),
+            retrieval_status.degraded_reason.as_deref(),
+        ),
         "dirty_marker": stdio_dirty_marker_json(&readiness.dirty_marker),
         "index_freshness": summary.freshness,
         "effective_index_freshness": readiness.effective_freshness,
@@ -5787,11 +5817,23 @@ fn stdio_public_readiness_lanes(lanes: &serde_json::Value) -> serde_json::Value 
                 Some("repairing" | "preparing" | "updating") => "preparing",
                 _ => "unavailable",
             };
+            let retrieval_mode = lane
+                .get("retrieval_mode")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("unavailable"));
+            let degraded_reason = lane
+                .get("degraded_reason")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let live_ready =
+                stdio_status_is_live_ready(retrieval_mode.as_str(), degraded_reason.as_str());
             public.insert(
                 name.clone(),
                 serde_json::json!({
                     "status": status,
-                    "retrieval_mode": lane.get("retrieval_mode").cloned().unwrap_or_else(|| serde_json::json!("unavailable")),
+                    "retrieval_mode": retrieval_mode,
+                    "degraded_reason": degraded_reason,
+                    "live_ready": live_ready,
                 }),
             );
         }
@@ -6218,22 +6260,15 @@ fn stdio_status_recommended_next_calls(
                 }
             ]);
         }
-        return serde_json::json!([
-            stdio_recommended_next_call(
-                non_ready
-                    .full_repair
-                    .first()
-                    .or_else(|| non_ready.minimum_next.first())
-                    .map(String::as_str)
-                    .unwrap_or("Retry the requested CodeStory tool."),
-                project
-            ),
-            {
-                "method": "tools/call",
-                "tool": "status",
-                "arguments": {"project": project}
-            }
-        ]);
+        return serde_json::json!([stdio_recommended_next_call(
+            non_ready
+                .full_repair
+                .first()
+                .or_else(|| non_ready.minimum_next.first())
+                .map(String::as_str)
+                .unwrap_or("Retry the requested CodeStory tool."),
+            project
+        )]);
     }
 
     serde_json::json!([
@@ -6278,7 +6313,7 @@ fn stdio_status_recommended_next_calls(
     ])
 }
 
-fn stdio_recommended_next_call(command: &str, project: &serde_json::Value) -> serde_json::Value {
+fn stdio_recommended_next_call(command: &str, _project: &serde_json::Value) -> serde_json::Value {
     if command.starts_with("Restart/reload the Codex host/app") {
         return serde_json::json!({
             "method": "host/restart",
@@ -6287,10 +6322,8 @@ fn stdio_recommended_next_call(command: &str, project: &serde_json::Value) -> se
     }
     if command.contains("ready --goal local") || command.contains("codestory-cli doctor") {
         return serde_json::json!({
-            "method": "tools/call",
-            "tool": "status",
-            "arguments": {"project": project},
-            "instruction": "Read status again after the MCP-managed local freshness check. Use the debug_command only for maintainer transcripts.",
+            "method": "host/instruction",
+            "instruction": "Retry the matching CodeStory tool. Status is an optional diagnostic, not a product prerequisite. Use the debug_command only for maintainer transcripts.",
             "debug_command": command
         });
     }
@@ -6500,9 +6533,27 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
         "purpose": "Direct CodeStory tools for repository orientation, navigation, and broad search.",
         "recommended_call_sequence": [
             {
-                "method": "tools/call",
-                "tool": "ground",
-                "arguments": {"project": project, "budget": "balanced"}
+                "step": 1,
+                "action": "resolve_project_root",
+                "note": "Pass the exact absolute repository root as project on every CodeStory call."
+            },
+            {
+                "step": 2,
+                "action": "call_matching_tool",
+                "arguments": {"project": project},
+                "note": "Call the tool that matches the task. Do not call status first. Orientation may use ground; it is not the first required call."
+            },
+            {
+                "step": 3,
+                "action": "retry_same_tool",
+                "when": ["preparing", "updating"],
+                "after_field": "retry_after_ms",
+                "note": "Wait retry_after_ms and retry the same tool with the same arguments. Do not poll status."
+            },
+            {
+                "step": 4,
+                "action": "read_focused_source_for_remaining_gaps",
+                "note": "Preserve cited anchors. Read focused source only for remaining evidence gaps."
             }
         ],
         "readiness_lanes": [
@@ -6588,7 +6639,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                         "arguments": {
                             "project": project,
                             "question": "<broad-task-question>",
-                            "budget": "compact"
+                            "budget": "standard"
                         }
                     },
                     {
@@ -6615,7 +6666,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
             {
                 "surface": "ground",
                 "kind": "tool and codestory://grounding resource",
-                "when": "Use first for compact repository orientation."
+                "when": "Use for repository orientation. It is not a required first call."
             },
             {
                 "surface": "packet",
@@ -6646,7 +6697,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
         "safety_notes": [
             "CodeStory tools never edit repository source. Product calls refresh local managed state and initialize the packaged retrieval engine automatically; all are non-destructive, idempotent, and require no confirmation.",
             "Pass the same absolute project path to every tool call.",
-            "Use ground first for compact repository orientation.",
+            "Call the matching tool first. Orientation may use ground; it is not required first.",
             "Use packet for broad task questions and context after selecting a concrete target.",
             "When a tool reports preparing, wait retry_after_ms and retry that same tool. Do not ask the user to repair CodeStory.",
             "Treat Supported, NotEstablished, and Unavailable packets as terminal. DrillOnce means repeat the exact original question and execute the listed option_ids once against the pinned generation, then answer. Do not search to close English flow families.",
@@ -7595,6 +7646,7 @@ mod tests {
     fn stdio_multi_project_startup(cache: &Path) -> crate::config::CliStartupConfig {
         crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -8054,6 +8106,7 @@ mod tests {
         let status = stdio_workspace_mismatch_status(&mismatch);
         assert_eq!(status["status"], json!("workspace_mismatch"));
         assert_eq!(status["degraded_reason"], json!("workspace_mismatch"));
+        assert_eq!(status["live_ready"], json!(false));
         assert_eq!(status["readiness"][0]["minimum_next"], json!([]));
         assert_eq!(status["readiness"][0]["full_repair"], json!([]));
         assert!(
@@ -8085,9 +8138,103 @@ mod tests {
 
         assert_eq!(calls[0]["method"], json!("host/restart"));
         assert_eq!(calls[0]["instruction"], json!(restart));
+        assert_eq!(calls[1]["method"], json!("tools/call"));
+        assert_eq!(calls[1]["tool"], json!("status"));
         assert!(
             calls[0].get("command").is_none(),
             "restart boundary should not be exposed as a CLI command: {calls}"
+        );
+    }
+
+    #[test]
+    fn stdio_status_next_calls_keep_ground_for_local_repair_and_empty_packet_lane() {
+        let project = json!("/absolute/project");
+        let local_repair = stdio_status_recommended_next_calls(
+            &[ReadinessVerdictDto {
+                goal: ReadinessGoalDto::LocalNavigation,
+                status: ReadinessStatusDto::RepairIndex,
+                summary: "Local map needs a product refresh.".to_string(),
+                minimum_next: vec![
+                    "codestory-cli ready --goal local --project /absolute/project".to_string(),
+                ],
+                full_repair: vec![],
+                setup: None,
+                index: None,
+                sidecar: None,
+            }],
+            &project,
+        );
+        assert_eq!(local_repair[0]["tool"], json!("ground"));
+        assert_eq!(local_repair[0]["activation_required"], json!(true));
+        assert!(
+            local_repair
+                .as_array()
+                .is_some_and(|calls| calls.iter().all(|call| call["tool"] != json!("status"))),
+            "local map repair should activate with ground, not status: {local_repair}"
+        );
+
+        let packet_blocked = stdio_status_recommended_next_calls(
+            &[ReadinessVerdictDto {
+                goal: ReadinessGoalDto::AgentPacketSearch,
+                status: ReadinessStatusDto::Blocked,
+                summary: "Packet waits on full retrieval.".to_string(),
+                minimum_next: vec!["Retry the requested CodeStory tool.".to_string()],
+                full_repair: vec![],
+                setup: None,
+                index: None,
+                sidecar: None,
+            }],
+            &project,
+        );
+        assert_eq!(packet_blocked, json!([]));
+
+        let other_repair = stdio_status_recommended_next_calls(
+            &[ReadinessVerdictDto {
+                goal: ReadinessGoalDto::LocalNavigation,
+                status: ReadinessStatusDto::Blocked,
+                summary: "Local navigation is blocked.".to_string(),
+                minimum_next: vec!["codestory-cli doctor --project /absolute/project".to_string()],
+                full_repair: vec![],
+                setup: None,
+                index: None,
+                sidecar: None,
+            }],
+            &project,
+        );
+        assert!(
+            other_repair
+                .as_array()
+                .is_some_and(|calls| calls.iter().all(|call| call["tool"] != json!("status"))),
+            "status is not a product next call outside host-reload: {other_repair}"
+        );
+    }
+
+    #[test]
+    fn agent_guide_sequence_matches_skill_matching_tool_loop() {
+        let guide = read_stdio_agent_guide_resource();
+        let sequence = guide["recommended_call_sequence"]
+            .as_array()
+            .expect("agent guide publishes a call sequence");
+        assert_eq!(sequence[0]["action"], json!("resolve_project_root"));
+        assert_eq!(sequence[1]["action"], json!("call_matching_tool"));
+        assert_eq!(sequence[2]["action"], json!("retry_same_tool"));
+        assert_ne!(sequence[0].get("tool"), Some(&json!("ground")));
+        assert_ne!(sequence[1].get("tool"), Some(&json!("ground")));
+        let packet = guide["readiness_lanes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|lane| lane["readiness_goal"] == json!("agent_packet_search"))
+            .and_then(|lane| lane["calls"].as_array().cloned())
+            .into_iter()
+            .flatten()
+            .find(|call| call["tool"] == json!("packet"))
+            .expect("packet example");
+        assert_eq!(packet["arguments"]["budget"], json!("standard"));
+        let guide_text = guide.to_string();
+        assert!(
+            !guide_text.contains("Use ground first"),
+            "agent guide must not teach ground as the first required call: {guide}"
         );
     }
 
@@ -8701,6 +8848,90 @@ version = "0.11.20"
         });
         let ground = compact_stdio_ground_result(snapshot);
         assert_eq!(ground, json!({"notes": ["keep"]}));
+    }
+
+    #[test]
+    fn preparing_tool_result_is_successful_structured_content() {
+        let preparing = json!({
+            "code": "codestory_preparing",
+            "message": "CodeStory is preparing managed search.",
+            "state": "preparing",
+            "retry_after_ms": 1500,
+        });
+        let result = stdio_tool_call_error(&preparing);
+        assert_ne!(result.get("isError"), Some(&json!(true)), "{result}");
+        assert_eq!(
+            result["structuredContent"]["code"],
+            json!("codestory_preparing")
+        );
+        assert_eq!(result["structuredContent"]["state"], json!("preparing"));
+        assert_eq!(result["structuredContent"]["retry_after_ms"], json!(1500));
+
+        let unavailable = json!({
+            "code": "codestory_unavailable",
+            "message": "CodeStory is unavailable.",
+            "state": "unavailable",
+        });
+        let error = stdio_tool_call_error(&unavailable);
+        assert_eq!(error.get("isError"), Some(&json!(true)), "{error}");
+        assert_eq!(
+            error["structuredContent"]["code"],
+            json!("codestory_unavailable")
+        );
+    }
+
+    #[test]
+    fn compact_stdio_status_keeps_full_publication_class_when_live_not_ready() {
+        let (_project, _cache, runtime) = stdio_inspect_only_runtime();
+        let status = json!({
+            "project_root": "/repo",
+            "state": "working_locally",
+            "capabilities": {
+                "local_navigation": "ready",
+                "broad_search": "unavailable"
+            },
+            "current_operation": null,
+            "next_action": "continue_with_local_navigation",
+            "retry_after_ms": null,
+            "failure": null,
+            "retrieval_mode": "full",
+            "degraded_reason": "semantic_store_degraded",
+            "live_ready": false,
+        });
+        let compact = compact_stdio_status(&runtime, &status);
+        assert_eq!(compact["retrieval_mode"], json!("full"));
+        assert_eq!(compact["degraded_reason"], json!("semantic_store_degraded"));
+        assert_eq!(compact["live_ready"], json!(false));
+        assert_ne!(
+            compact["live_ready"],
+            json!(true),
+            "full publication class must not read as packet-ready when degraded: {compact}"
+        );
+    }
+
+    #[test]
+    fn public_readiness_lanes_keep_full_mode_when_live_not_ready() {
+        let lanes = json!({
+            "agent_packet_search": {
+                "status": "repair_retrieval",
+                "retrieval_mode": "full",
+                "degraded_reason": "semantic_store_degraded"
+            }
+        });
+        let public = stdio_public_readiness_lanes(&lanes);
+        assert_eq!(
+            public["agent_packet_search"]["retrieval_mode"],
+            json!("full")
+        );
+        assert_eq!(
+            public["agent_packet_search"]["degraded_reason"],
+            json!("semantic_store_degraded")
+        );
+        assert_eq!(public["agent_packet_search"]["live_ready"], json!(false));
+        assert_eq!(
+            public["agent_packet_search"]["status"],
+            json!("unavailable")
+        );
     }
 
     #[test]
@@ -9404,6 +9635,7 @@ version = "0.11.20"
         let cache = tempfile::tempdir().expect("cache");
         let startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -9456,6 +9688,7 @@ version = "0.11.20"
         let cache = tempfile::tempdir().expect("cache");
         let startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -9592,6 +9825,7 @@ version = "0.11.20"
         let cache = tempfile::tempdir().expect("cache");
         let startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -9976,6 +10210,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10077,6 +10312,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10236,6 +10472,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10344,6 +10581,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10437,6 +10675,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10538,6 +10777,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10622,6 +10862,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10708,23 +10949,24 @@ version = "0.11.20"
                     &Arc::new(AtomicBool::new(false)),
                 )
                 .expect("tool response");
-                if response.pointer("/result/isError") != Some(&json!(true)) {
-                    assert!(response.pointer("/result/structuredContent").is_some());
-                    return response;
+                let content = &response["result"]["structuredContent"];
+                if content.get("code") == Some(&json!("codestory_preparing")) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "broad call did not become ready: {content}"
+                    );
+                    std::thread::sleep(Duration::from_millis(
+                        content["retry_after_ms"].as_u64().unwrap_or(50).min(500),
+                    ));
+                    continue;
                 }
-                let error = &response["result"]["structuredContent"];
-                assert_eq!(
-                    error["code"],
-                    json!("codestory_preparing"),
-                    "ready-lease fixture must converge instead of becoming unavailable: {response}"
-                );
-                assert!(
-                    Instant::now() < deadline,
-                    "broad call did not become ready: {error}"
-                );
-                std::thread::sleep(Duration::from_millis(
-                    error["retry_after_ms"].as_u64().unwrap_or(50).min(500),
-                ));
+                if response.pointer("/result/isError") == Some(&json!(true)) {
+                    panic!(
+                        "ready-lease fixture must converge instead of becoming unavailable: {response}"
+                    );
+                }
+                assert!(response.pointer("/result/structuredContent").is_some());
+                return response;
             }
             panic!("broad call did not converge within the bounded retry count")
         }
@@ -10753,6 +10995,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().join("stdio-cache")),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10921,6 +11164,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -11036,6 +11280,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cold_cache_root.clone()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(

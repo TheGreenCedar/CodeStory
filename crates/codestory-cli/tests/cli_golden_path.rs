@@ -1895,7 +1895,7 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
 }
 
 #[test]
-fn affected_git_fallback_distinguishes_stale_observation_from_explicit_refresh() {
+fn affected_without_explicit_paths_fails_closed_instead_of_discovering_git() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
     write_tiny_rust_workspace(workspace.path());
@@ -1935,37 +1935,82 @@ pub fn changed_after_index() -> bool {
 }
 "#,
     )
-    .expect("modify runtime fixture for git diff fallback");
+    .expect("modify runtime fixture after index");
 
-    let affected_git = run_cli_json(
+    let missing_paths = run_cli(
         workspace.path(),
         cache_dir.path(),
         &["affected", "--refresh", "none", "--format", "json"],
     );
-
     assert!(
-        affected_git["changed_paths"]
+        !missing_paths.status.success(),
+        "affected without paths must fail closed: {}",
+        String::from_utf8_lossy(&missing_paths.stderr)
+    );
+    let missing_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&missing_paths.stdout),
+        String::from_utf8_lossy(&missing_paths.stderr)
+    );
+    assert!(
+        missing_output.contains("never discovers git") && missing_output.contains("affected.paths"),
+        "CLI affected must require an explicit path source like MCP: {missing_output}"
+    );
+
+    let changes_only = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "affected",
+            "--changes",
+            "head",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !changes_only.status.success(),
+        "--changes without PATH or --stdin must error: {}",
+        String::from_utf8_lossy(&changes_only.stderr)
+    );
+
+    let affected = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "affected",
+            "src/runtime.rs",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        affected["changed_paths"]
             .as_array()
             .expect("changed paths")
             .iter()
             .any(|path| path == "src/runtime.rs"),
-        "affected should default to git diff --name-only HEAD: {affected_git:#}"
+        "explicit path analysis should keep the supplied path: {affected:#}"
     );
     assert_eq!(
-        affected_git["completeness"]["complete"], false,
-        "a source change after publication must not produce a complete impact claim: {affected_git:#}"
+        affected["completeness"]["complete"], false,
+        "a source change after publication must not produce a complete impact claim: {affected:#}"
     );
     assert!(
-        affected_git["uncovered_inputs"]
+        affected["uncovered_inputs"]
             .as_array()
             .is_some_and(|inputs| inputs.iter().any(|input| {
                 input["path"] == "src/runtime.rs" && input["classification"] == "stale_index"
             })),
-        "the exact modified source should carry a stale-index classification: {affected_git:#}"
+        "the exact modified source should carry a stale-index classification: {affected:#}"
     );
-    assert!(affected_git.get("next_commands").is_none());
+    assert!(affected.get("next_commands").is_none());
     assert!(
-        affected_git["follow_ups"]
+        affected["follow_ups"]
             .as_array()
             .is_some_and(|follow_ups| follow_ups.iter().any(|follow_up| {
                 follow_up["action"] == "refresh_stale_index"
@@ -1977,12 +2022,12 @@ pub fn changed_after_index() -> bool {
                                 .any(|pair| pair[0] == "--refresh" && pair[1] == "incremental")
                         })
             })),
-        "positive stale evidence should recommend the focused structured incremental repair: {affected_git:#}"
+        "positive stale evidence should recommend the focused structured incremental repair: {affected:#}"
     );
     assert!(
-        !affected_git.to_string().contains("--refresh full")
-            && !affected_git.to_string().contains("doctor --project"),
-        "proven source drift should not emit generic full-refresh or doctor advice: {affected_git:#}"
+        !affected.to_string().contains("--refresh full")
+            && !affected.to_string().contains("doctor --project"),
+        "proven source drift should not emit generic full-refresh or doctor advice: {affected:#}"
     );
 
     let query = run_cli(
@@ -2014,7 +2059,14 @@ pub fn changed_after_index() -> bool {
     let refreshed = run_cli_json(
         workspace.path(),
         cache_dir.path(),
-        &["affected", "--refresh", "incremental", "--format", "json"],
+        &[
+            "affected",
+            "src/runtime.rs",
+            "--refresh",
+            "incremental",
+            "--format",
+            "json",
+        ],
     );
     assert!(
         refreshed["changed_paths"]
@@ -2022,7 +2074,7 @@ pub fn changed_after_index() -> bool {
             .expect("changed paths")
             .iter()
             .any(|path| path == "src/runtime.rs"),
-        "explicit incremental refresh should preserve git-diff input: {refreshed:#}"
+        "explicit incremental refresh should keep the supplied path: {refreshed:#}"
     );
     assert_eq!(refreshed["matched_file_count"], 1, "{refreshed:#}");
 }
@@ -2181,10 +2233,6 @@ fn assert_stdio_context_id_fails_closed_without_full_sidecars(
     })
     .to_string();
     let stdio = run_stdio_request(workspace, cache_dir, &request);
-    assert_eq!(
-        stdio["result"]["isError"], true,
-        "stdio context --id should return a tool error without full retrieval: {stdio:#}"
-    );
     let structured = &stdio["result"]["structuredContent"];
     let code = structured["code"].as_str();
     assert!(
@@ -2194,6 +2242,18 @@ fn assert_stdio_context_id_fails_closed_without_full_sidecars(
         ),
         "stdio context --id should fail closed with a typed retrieval error: {stdio:#}"
     );
+    if code == Some("codestory_preparing") {
+        assert_ne!(
+            stdio["result"].get("isError"),
+            Some(&serde_json::json!(true)),
+            "preparing should be a successful structured result: {stdio:#}"
+        );
+    } else {
+        assert_eq!(
+            stdio["result"]["isError"], true,
+            "stdio context --id should return a tool error without full retrieval: {stdio:#}"
+        );
+    }
     if code == Some("codestory_tool_blocked") {
         let status = structured["status"].as_str();
         assert!(

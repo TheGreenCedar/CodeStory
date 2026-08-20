@@ -210,6 +210,7 @@ fn cli_search_and_resolution_keep_structural_evidence_metadata() {
         loss_reason: None,
         coverage_role: None,
         eligible_for_sufficiency: workflow.eligible_for_sufficiency,
+        source_excerpt: None,
     };
     let drill_hit = drill_search_hit_from_packet_citation(root, "test", &citation);
     assert_eq!(
