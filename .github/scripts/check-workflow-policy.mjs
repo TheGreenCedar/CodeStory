@@ -10583,13 +10583,42 @@ export function validatePluginRelease(workflows, violations, graph) {
   requireStepRun(violations, file, preflight, "Refuse a changed tool surface", [
     "generated-mcp-catalog.json",
   ]);
-  requireStepRun(violations, file, object(jobs["plugin-proof"]), "Check the pinned provision proof", [
+  const pluginProof = object(jobs["plugin-proof"]);
+  const pluginProofSteps = Array.isArray(pluginProof.steps) ? pluginProof.steps : [];
+  const pluginProofHosts = at(pluginProof, "strategy", "matrix", "include");
+  const fullStaticSuite = namedStep(pluginProof, "Run the plugin static suite");
+  const windowsRootProof = namedStep(pluginProof, "Prove plugin root activation on Windows");
+  const pinnedProvisionSelfTest = namedStep(pluginProof, "Check the pinned provision proof");
+  const pinnedProvision = namedStep(pluginProof, "Provision the pinned CLI end to end");
+  const expectedWindowsRootRun = "node --test --test-name-pattern \"^portable plugin core and thin host adapters preserve their own contracts$\" plugins/codestory/tests/plugin-static.test.mjs";
+  const requiredProofHosts = ["ubuntu-latest", "macos-15", "windows-latest"];
+  add(
+    violations,
+    Array.isArray(pluginProofHosts)
+      && pluginProofHosts.every(row => hasExactKeys(object(row), ["os"]))
+      && sameMembers(pluginProofHosts.map(row => object(row).os), requiredProofHosts)
+      && fullStaticSuite?.if === "runner.os != 'Windows'"
+      && fullStaticSuite?.run === "node --test plugins/codestory/tests/plugin-static.test.mjs"
+      && fullStaticSuite?.["continue-on-error"] === undefined
+      && windowsRootProof?.if === "runner.os == 'Windows'"
+      && windowsRootProof?.run === expectedWindowsRootRun
+      && windowsRootProof?.["continue-on-error"] === undefined
+      && pinnedProvisionSelfTest?.if === undefined
+      && pinnedProvisionSelfTest?.["continue-on-error"] === undefined
+      && pinnedProvision?.if === undefined
+      && pinnedProvision?.["continue-on-error"] === undefined
+      && pluginProofSteps.indexOf(fullStaticSuite) < pluginProofSteps.indexOf(windowsRootProof)
+      && pluginProofSteps.indexOf(windowsRootProof) < pluginProofSteps.indexOf(pinnedProvisionSelfTest)
+      && pluginProofSteps.indexOf(pinnedProvisionSelfTest) < pluginProofSteps.indexOf(pinnedProvision),
+    `${file} plugin proof must run the full static suite off Windows, the portable root contract on Windows, and pinned provisioning on every host`,
+  );
+  requireStepRun(violations, file, pluginProof, "Check the pinned provision proof", [
     "node --test scripts/tests/prove-plugin-pinned-provision.test.mjs",
   ]);
   // The lane is stated, never defaulted. The native lane's pin lawfully carries no archive
   // digests, so a plugin-lane gate that stopped naming its lane could silently become one that
   // proves nothing about the source pin it exists to enforce.
-  requireStepRun(violations, file, object(jobs["plugin-proof"]), "Provision the pinned CLI end to end", [
+  requireStepRun(violations, file, pluginProof, "Provision the pinned CLI end to end", [
     "scripts/prove-plugin-pinned-provision.mjs",
     "--lane plugin",
   ]);
