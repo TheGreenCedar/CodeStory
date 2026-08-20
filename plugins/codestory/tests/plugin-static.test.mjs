@@ -1146,6 +1146,7 @@ test("skill teaches MCP catalog arguments, not Clap flags", async () => {
     assert.match(text, /generated-mcp-syntax\.md/u, name);
     assert.doesNotMatch(text, /See \[generated CLI syntax\]/u, name);
     assert.doesNotMatch(text, /<codestory-cli>/u, name);
+    assert.doesNotMatch(text, /--probe\b/u, name);
     assert.doesNotMatch(text, / --(?:why|mode|file|refresh|plan-details)\b/u, name);
   }
 });

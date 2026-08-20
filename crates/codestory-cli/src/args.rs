@@ -1502,7 +1502,7 @@ pub(crate) struct AffectedCommand {
     pub(crate) project: ProjectArgs,
     #[arg(
         value_name = "PATH",
-        help = "Changed repo-relative path. If omitted, CodeStory reads git diff --name-status HEAD."
+        help = "Changed repo-relative path. Required unless --stdin supplies the path source. Never discovers git changes."
     )]
     pub(crate) paths: Vec<String>,
     #[arg(long, help = "Read changed paths from stdin, one path per line.")]
@@ -1518,7 +1518,7 @@ pub(crate) struct AffectedCommand {
         long,
         value_enum,
         default_value_t = AffectedChangeSource::Head,
-        help = "Default git source when no paths/stdin are supplied."
+        help = "Not a path source. Without PATH or --stdin this flag errors; it never discovers git changes."
     )]
     pub(crate) changes: AffectedChangeSource,
     #[arg(long, default_value_t = 2)]

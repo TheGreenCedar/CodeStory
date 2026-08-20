@@ -1,7 +1,7 @@
 use super::super::artifacts::{ensure_dot_only_for_trail, preflight_output_file};
 use super::super::resolution::{StructuredCommandFailure, command_failure_envelope};
 use super::affected_rendering::render_affected_markdown;
-use crate::args::{AffectedChangeSource, AffectedCommand, AffectedStdinFormat};
+use crate::args::{AffectedCommand, AffectedStdinFormat};
 use crate::output::{RenderedPublicOutput, emit_public_operation};
 use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error};
 #[cfg(test)]
@@ -10,9 +10,6 @@ use anyhow::{Context, Result};
 use codestory_contracts::api::{
     AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
     CommandFailureEnvelope,
-};
-use codestory_workspace::{
-    RepositoryChange, RepositoryChangeKind, RepositoryChangeScope, read_repository_changes,
 };
 use std::io::Read;
 
@@ -64,46 +61,14 @@ pub(super) fn affected_change_records(
             }
         }
     }
-    if !records.is_empty() {
-        dedupe_affected_change_records(&mut records);
-        return Ok(records);
+    if records.is_empty() {
+        let _ = cmd.changes;
+        anyhow::bail!(
+            "affected.paths, affected.changed_paths, or affected.change_records is required; CLI affected never discovers git changes"
+        );
     }
-    let scope = match cmd.changes {
-        AffectedChangeSource::Head => RepositoryChangeScope::Head,
-        AffectedChangeSource::Staged => RepositoryChangeScope::Staged,
-        AffectedChangeSource::Unstaged => RepositoryChangeScope::Unstaged,
-        AffectedChangeSource::Untracked => RepositoryChangeScope::Untracked,
-    };
-    let mut records = read_repository_changes(&cmd.project.project, scope)
-        .context("Failed to read repository changes")?
-        .into_iter()
-        .map(affected_repository_change_record)
-        .collect::<Result<Vec<_>>>()?;
     dedupe_affected_change_records(&mut records);
     Ok(records)
-}
-
-fn affected_repository_change_record(change: RepositoryChange) -> Result<AffectedChangeRecordDto> {
-    let (kind, status) = match change.kind {
-        RepositoryChangeKind::Added => (AffectedChangeKindDto::Added, "A"),
-        RepositoryChangeKind::Copied => (AffectedChangeKindDto::Copied, "C"),
-        RepositoryChangeKind::Deleted => (AffectedChangeKindDto::Deleted, "D"),
-        RepositoryChangeKind::Modified => (AffectedChangeKindDto::Modified, "M"),
-        RepositoryChangeKind::Renamed => (AffectedChangeKindDto::Renamed, "R"),
-        RepositoryChangeKind::TypeChanged => (AffectedChangeKindDto::Modified, "T"),
-        RepositoryChangeKind::Unmerged => (AffectedChangeKindDto::Modified, "U"),
-        RepositoryChangeKind::Untracked => (AffectedChangeKindDto::Untracked, "??"),
-    };
-    Ok(AffectedChangeRecordDto {
-        path: path_text_from_bytes(&change.path, "repository_metadata")?,
-        kind,
-        status: status.to_string(),
-        previous_path: change
-            .previous_path
-            .as_deref()
-            .map(|path| path_text_from_bytes(path, "repository_metadata"))
-            .transpose()?,
-    })
 }
 
 #[derive(Debug)]

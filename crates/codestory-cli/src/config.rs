@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const PROJECT_NETWORK_CONFIG_OPT_IN_ENV: &str = config_registry::ALLOW_PROJECT_NETWORK_CONFIG_ENV;
+const ALLOW_SENSITIVE_PROJECT_ROOT_ENV: &str = config_registry::ALLOW_SENSITIVE_PROJECT_ROOT_ENV;
 const SOURCE_FILE_BYTE_CAP_ENV: &str = config_registry::INDEX_SOURCE_FILE_BYTE_CAP_ENV;
 
 /// Configuration failure carrying the typed API code callers surface.
@@ -45,6 +46,7 @@ type ConfigResult<T> = std::result::Result<T, ConfigError>;
 #[derive(Debug, Clone)]
 pub(crate) struct CliStartupConfig {
     pub(crate) user_home: Option<PathBuf>,
+    pub(crate) allow_sensitive_project_root: bool,
     pub(crate) project_network_config_allowed: bool,
     pub(crate) stdio_cache_root: Option<PathBuf>,
     pub(crate) sidecar_defaults: codestory_runtime::RetrievalProcessDefaults,
@@ -58,6 +60,9 @@ impl CliStartupConfig {
             user_home: std::env::var_os("USERPROFILE")
                 .or_else(|| std::env::var_os("HOME"))
                 .map(PathBuf::from),
+            allow_sensitive_project_root: std::env::var(ALLOW_SENSITIVE_PROJECT_ROOT_ENV)
+                .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                .unwrap_or(false),
             project_network_config_allowed: std::env::var(PROJECT_NETWORK_CONFIG_OPT_IN_ENV)
                 .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
                 .unwrap_or(false),
@@ -150,6 +155,56 @@ pub(crate) fn process_startup_config() -> CliStartupConfig {
         STARTUP
             .get_or_init(CliStartupConfig::from_process_env)
             .clone()
+    }
+}
+
+/// Refuse well-known secret trees used as a project root unless process-start opt-in is set.
+///
+/// Compares native filesystem identity, not path spelling. A nested repository
+/// under home is allowed. A file named `secrets` inside a real repository is
+/// not a project root and is not refused here.
+pub(crate) fn sensitive_project_root_message(
+    project_root: &Path,
+    startup: &CliStartupConfig,
+) -> Option<String> {
+    if startup.allow_sensitive_project_root {
+        return None;
+    }
+    let denied = if startup
+        .user_home
+        .as_ref()
+        .is_some_and(|home| codestory_workspace::same_workspace_path(project_root, home))
+    {
+        "the user home directory"
+    } else if startup.user_home.as_ref().is_some_and(|home| {
+        codestory_workspace::same_workspace_path(project_root, &home.join(".ssh"))
+    }) {
+        "~/.ssh"
+    } else if startup.user_home.as_ref().is_some_and(|home| {
+        codestory_workspace::same_workspace_path(project_root, &home.join(".gnupg"))
+    }) {
+        "~/.gnupg"
+    } else if is_secrets_directory_root(project_root) {
+        "a secrets/ directory"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "refusing to use {denied} as a project root; set {ALLOW_SENSITIVE_PROJECT_ROOT_ENV}=1 at process start to override"
+    ))
+}
+
+fn is_secrets_directory_root(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        name.eq_ignore_ascii_case("secrets")
+    }
+    #[cfg(not(windows))]
+    {
+        name == "secrets"
     }
 }
 
@@ -541,6 +596,7 @@ summary_model = "trusted/model"
     fn isolated_startup() -> CliStartupConfig {
         CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: None,
             sidecar_defaults: crate::sidecar_runtime::process_defaults(),
@@ -679,6 +735,34 @@ summary_model = "trusted/model"
             "registered keys must not be reported as unknown: {warnings:?}"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn sensitive_roots_match_native_identity_and_ignore_nested_repos() -> Result<()> {
+        let home = tempdir()?;
+        let ssh = home.path().join(".ssh");
+        let gnupg = home.path().join(".gnupg");
+        let secrets = home.path().join("secrets");
+        let nested = home.path().join("code").join("repo");
+        std::fs::create_dir_all(&ssh)?;
+        std::fs::create_dir_all(&gnupg)?;
+        std::fs::create_dir_all(&secrets)?;
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(nested.join("secrets"), "not a project root")?;
+
+        let mut startup = isolated_startup();
+        startup.user_home = Some(home.path().to_path_buf());
+
+        assert!(sensitive_project_root_message(home.path(), &startup).is_some());
+        assert!(sensitive_project_root_message(&ssh, &startup).is_some());
+        assert!(sensitive_project_root_message(&gnupg, &startup).is_some());
+        assert!(sensitive_project_root_message(&secrets, &startup).is_some());
+        assert!(sensitive_project_root_message(&nested, &startup).is_none());
+
+        startup.allow_sensitive_project_root = true;
+        assert!(sensitive_project_root_message(home.path(), &startup).is_none());
+        assert!(sensitive_project_root_message(&secrets, &startup).is_none());
         Ok(())
     }
 }

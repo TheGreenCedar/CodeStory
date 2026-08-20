@@ -584,7 +584,20 @@ pub(crate) fn sidecar_retrieval_blocks_nucleo_supplement(
     controller: &AppController,
     served_hit_count: usize,
 ) -> bool {
-    served_hit_count > 0 && sidecar_retrieval_primary_enabled(controller)
+    sidecar_primary_blocks_nucleo_supplement(
+        sidecar_retrieval_primary_enabled(controller),
+        served_hit_count,
+    )
+}
+
+pub(crate) fn sidecar_primary_blocks_nucleo_supplement(
+    sidecar_primary_enabled: bool,
+    _served_hit_count: usize,
+) -> bool {
+    // Sidecar-primary packets never mix in-process Nucleo, including when the
+    // sidecar returned zero hits. Nucleo on an empty sidecar would otherwise
+    // become product evidence on a retrieval-claimed path.
+    sidecar_primary_enabled
 }
 
 fn retrieval_manifest_exists(storage_path: &Path, project_root: &Path) -> bool {
@@ -6859,6 +6872,7 @@ mod tests {
                 loss_reason: None,
                 coverage_role: None,
                 eligible_for_sufficiency: Some(true),
+                source_excerpt: None,
             }],
             subgraph_ids: Vec::new(),
             retrieval_version: "sidecar".into(),
@@ -9014,6 +9028,22 @@ mod tests {
         assert!(
             !session.identity_is_atom_needed(1_098),
             "identities beyond the retained prefix are not established (fail closed)"
+        );
+    }
+
+    #[test]
+    fn empty_sidecar_primary_does_not_admit_nucleo_as_product_evidence() {
+        assert!(
+            sidecar_primary_blocks_nucleo_supplement(true, 0),
+            "zero sidecar hits must not open the Nucleo supplement"
+        );
+        assert!(
+            sidecar_primary_blocks_nucleo_supplement(true, 4),
+            "sidecar-primary packets never mix in-process Nucleo"
+        );
+        assert!(
+            !sidecar_primary_blocks_nucleo_supplement(false, 0),
+            "Nucleo remains available when sidecar-primary is off"
         );
     }
 }

@@ -114,7 +114,9 @@ not the standard desktop release. `release.yml` does not call it or wait for
 its protected Linux ARM64 runner.
 
 The former Linux ARM64 guest runner is retired and is not a measurement
-authority. Optional quality lanes live in
+authority. Linux ARM64 CPU-backed rows in the stats log (issue #956, commit
+`9c3d5a9`) are telemetry, not release evidence. CPU embeddings stay
+unsupported. Optional quality lanes live in
 `.github/workflows/frozen-candidate-quality.yml`. Packet-quality floors for
 the current Ripgrep contract are in the
 [release-evidence quality contract](../contributors/release-evidence-runner.md).
