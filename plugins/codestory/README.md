@@ -88,22 +88,19 @@ installed plugin, and a fresh host session loads that replacement. See the
 
 ## Cursor install
 
-Open **Customize → Plugins**, install **codestory**, enable its MCP server once,
-and reload the Cursor window. The package supplies the rule, grounding skill,
-session-start context, and managed CLI launcher. On the first MCP call, the
-launcher fetches the matching managed runtime if it is not already installed.
-The MCP toggle is a Cursor platform setting, so installing the plugin cannot
-enable it on your behalf.
+CodeStory is not listed on the public Cursor Marketplace. In **Customize**,
+select **+ Add Marketplace**, then **Import from Github**
+([TheGreenCedar/CodeStory](https://github.com/TheGreenCedar/CodeStory)) or
+**Import from Disk** (a local clone). Install **codestory** from that
+marketplace, enable its MCP server once, and reload the Cursor window. The
+[Cursor guide](../../docs/users/cursor.md) owns that path.
 
-For Teams or Enterprise distribution, an administrator uses **Dashboard →
-Plugins → Team Marketplaces → Add Marketplace → Import from Repo** and selects
-this repository. Cursor's access settings must grant the workspace access to
-the repository, including the required organization or repository permission
-for a private repository. The import reads
+The import reads
 [`.cursor-plugin/marketplace.json`](../../.cursor-plugin/marketplace.json).
-Enable **Auto Refresh** or use **Refresh** from the Team Marketplaces dashboard
-after an update. That refresh updates the team catalog; each user still refreshes
-the installed plugin from Customize and reloads Cursor.
+The package supplies the rule, grounding skill, session-start context, and
+managed CLI launcher. On the first MCP call, the launcher fetches the matching
+managed runtime if it is not already installed. The MCP toggle is a Cursor
+platform setting, so installing the plugin cannot enable it on your behalf.
 
 ## CodeStoryDev / Cursor refresh
 

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The Cursor install guide now starts from Customize: add this repository with
+  **+ Add Marketplace** (GitHub or a local clone), install **codestory**, then
+  enable its MCP server. CodeStory is not listed on the public Cursor
+  Marketplace, so searching that catalog is not an install path.
+
 ## 0.17.1
 
 - Compact answer packets keep production flow evidence in the 16-hit window. Test files, sample trees, and `.github` paths no longer crowd out cited Buffer, SQL, CSS, and HTTP client sources. SQL packets keep sqlite, MySQL, and PostgreSQL `CREATE TABLE` names and relationship constraints, drop extra-engine copies when those dialects remain, and still keep cited stylesheet imports that define keyframes or custom properties.
