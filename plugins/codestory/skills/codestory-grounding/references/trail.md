@@ -36,58 +36,11 @@ Markdown trail output renders edge certainty directly in the arrow shape:
 |-----------|-------|---------|
 | `certain` / `definite` | `-call->` | Verified or high-confidence edge |
 | `probable` | `~call~>` | Likely edge inferred from available evidence |
-| `uncertain` / `speculative` | `?call?>` | Low-confidence edge; hide with `--hide-speculative` |
+| `uncertain` / `speculative` | `?call?>` | Low-confidence edge |
 | missing certainty | `-call-> [unresolved]` | Legacy or unresolved certainty metadata |
 
-## Story Mode
-
-`--story` turns the trail graph into a text-first narrative for handoff to an
-LLM or reviewer. Markdown output starts with `# Trail Story`; JSON output keeps
-the normal trail context and adds its optional `story` object inside that shared
-context. Story mode is explicit and does not apply to `--mermaid` or
-`--format dot`.
-
-Story sections:
-
-| Section | What it makes explicit |
-|---------|------------------------|
-| Entry Points | The focus symbol and any rendered source nodes with no incoming edge. |
-| Runtime Flow | Call/macro edges that look like runtime execution flow. |
-| Data And Interface Flow | Usage/import/include-style edges that show wiring and consumers. |
-| Type And Member Structure | Member, inheritance, type-usage, override, and generic/template structure. |
-| Utility Calls | Helper calls when `--show-utility-calls` is enabled; otherwise hidden from the main story. |
-| Side Effects | Likely mutating/runtime-effect calls inferred from edge kinds and labels. |
-| Uncertainty | Probable, uncertain, speculative, or missing-certainty edges in words. |
-| Tests | Whether tests/benches were included or excluded, plus visible test-like nodes. |
-| Gaps And Limits | Truncation, omitted edges, empty trails, and applied filters. |
-
-## Examples
-
-```bash
-# Neighborhood trail (default)
-<codestory-cli> trail --project <target-workspace> --query AppController
-
-# Follow all outgoing references, deeper
-<codestory-cli> trail --project <target-workspace> --query "run_indexing" --mode referenced --depth 3
-
-# Incoming callers only, include tests
-<codestory-cli> trail --project <target-workspace> --query Storage::open --mode referencing --include-tests
-
-# Larger trail, vertical layout, JSON
-<codestory-cli> trail --project <target-workspace> --query EventBus --max-nodes 50 --layout vertical --format json
-
-# Hide low-confidence edges in Markdown or JSON output
-<codestory-cli> trail --project <target-workspace> --query ResolutionPass --hide-speculative
-
-# Narrative handoff for a reviewer or LLM
-<codestory-cli> trail --project <target-workspace> --query ResolutionPass --story
-
-# Export a Graphviz DOT graph
-<codestory-cli> trail --project <target-workspace> --query ResolutionPass --format dot --output-file trail.dot
-
-# Export a Mermaid flowchart
-<codestory-cli> trail --project <target-workspace> --query ResolutionPass --mermaid --output-file trail.mmd
-```
+MCP `trail` optional `story: true` includes a readable trail story DTO. There
+is no `mode`, `include_tests`, `mermaid`, or `output_file` field.
 
 ## Interpreting Trail Noise
 

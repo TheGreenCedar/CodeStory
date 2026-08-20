@@ -9,10 +9,13 @@ CLI flags. Every call requires `project` (absolute repository root).
 
 ## Target Resolution
 
-When using `--query`, the CLI:
+When using MCP `query`, the tool:
 1. Runs a hybrid search across the index
 2. Ranks results by exact/terminal/structural match quality
 3. Selects the top-ranked hit, or errors if the top two are equally ranked (ambiguous)
+
+Use `id` when you already have a stable node id. Use `choose` to pick a
+1-based alternative from an ambiguity error. There is no MCP `file` field.
 
 ## Output
 
@@ -27,20 +30,4 @@ incoming: 3
 - [CALL] from main [FUNCTION] `src/main.rs`:15
 outgoing: 2
 - [CALL] to Storage::open [FUNCTION] `src/storage.rs`:20
-```
-
-## Examples
-
-```bash
-# Inspect by query
-<codestory-cli> symbol --project <target-workspace> --query AppController
-
-# Inspect by node ID
-<codestory-cli> symbol --project <target-workspace> --id abc123def456
-
-# Disambiguate a repeated symbol name by file
-<codestory-cli> symbol --project <target-workspace> --query TicTacToe --file rust_tictactoe.rs
-
-# JSON output
-<codestory-cli> symbol --project <target-workspace> --query "WorkspaceIndexer" --format json
 ```

@@ -51,11 +51,11 @@ installed plugin, not a CodeStory checkout path:
 }
 ```
 
-If Claude does not expand `${PLUGIN_ROOT}`, set `cwd` to `CLAUDE_PLUGIN_ROOT`
-(the installed plugin directory). Use a persistent per-user plugin-data
-directory outside the repository. This server block is host-neutral; the Claude
-plugin's `.mcp.json` keeps the legacy auto-discovery shape for Claude and Codex
-clients that still require it.
+If Claude does not expand `${PLUGIN_ROOT}`, set `cwd` to
+`${CLAUDE_PLUGIN_ROOT}` (the installed plugin directory). Use a persistent
+per-user plugin-data directory outside the repository. This server block is
+host-neutral; the Claude plugin's `.mcp.json` keeps the legacy auto-discovery
+shape for Claude and Codex clients that still require it.
 
 ## Verify the install
 

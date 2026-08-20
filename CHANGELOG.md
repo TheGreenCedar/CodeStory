@@ -6,13 +6,6 @@
   **+ Add Marketplace** (GitHub or a local clone), install **codestory**, then
   enable its MCP server. CodeStory is not listed on the public Cursor
   Marketplace, so searching that catalog is not an install path.
-- The README evaluation table now names the C++ and Bash regressions and that
-  the holdout sheet is a development comparison, not a publishable promotion
-  run.
-- Copilot and Claude MCP setup uses the installed plugin adapter
-  (`${PLUGIN_ROOT}`), not a path inside a CodeStory checkout.
-- The grounding skill teaches MCP tool arguments from the live catalog instead
-  of Clap `--help`.
 
 ## 0.17.1
 

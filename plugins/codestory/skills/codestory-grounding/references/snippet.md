@@ -11,15 +11,19 @@ CLI flags. Every call requires `project` (absolute repository root).
 
 ## Output
 
-Markdown output includes `context: scope=<line_context|function_body> requested_lines=<n> max_snippet_bytes=<bytes>`. JSON includes the same `scope`, `requested_context`, `snippet_truncated`, and `max_snippet_bytes` fields, plus `range_source`, `fallback_reason`, and `truncation_guidance` when applicable. If `snippet_truncated` is true, the byte cap stopped the output; follow `truncation_guidance` rather than assuming more `--context` will reveal the omitted code.
+Markdown output includes `context: scope=<line_context|function_body> requested_lines=<n> max_snippet_bytes=<bytes>`. JSON includes the same `scope`, `requested_context`, `snippet_truncated`, and `max_snippet_bytes` fields, plus `range_source`, `fallback_reason`, and `truncation_guidance` when applicable. If `snippet_truncated` is true, the byte cap stopped the output; follow `truncation_guidance` rather than assuming a larger `context` will reveal the omitted code.
 
-When `--function-body` is set, snippet prefers an implementation/body-looking function or method hit over a declaration-looking hit when possible. If indexed source ranges are missing or suspicious, supported brace languages attempt a bounded brace-balanced fallback before degrading. If fallback fails, output keeps `scope=line_context` and reports the fallback reason explicitly.
+When MCP `scope` is `function_body` (or `function_body: true`), snippet prefers
+an implementation/body-looking function or method hit over a declaration-looking
+hit when possible. If indexed source ranges are missing or suspicious, supported
+brace languages attempt a bounded brace-balanced fallback before degrading. If
+fallback fails, output keeps `scope=line_context` and reports the fallback
+reason explicitly.
 
-The MCP `snippet` tool exposes the same behavior with
-`scope=line_context|function_body` and `context=0..200`. `lines` aliases
-`context`, and the CLI-compatible `function_body` boolean aliases `scope`.
-Pass only one member of each alias pair; unknown or conflicting fields fail
-instead of being ignored.
+The MCP `snippet` tool exposes `scope=line_context|function_body` and
+`context=0..200`. `lines` aliases `context`, and `function_body` boolean aliases
+`scope`. Pass only one member of each alias pair; unknown or conflicting fields
+fail instead of being ignored.
 
 ```
 # Snippet
@@ -42,24 +46,5 @@ context: requested_lines=4 max_snippet_bytes=20000
    108:     pub fn open_project(&mut self, root: PathBuf) -> Result<()> {
 ```
 
-## Examples
-
-```bash
-# Snippet with default 4 lines of context
-<codestory-cli> snippet --project <target-workspace> --query "AppController::new"
-
-# More context
-<codestory-cli> snippet --project <target-workspace> --query run_indexing --context 10
-
-# Agent-friendly alias for the same context setting
-<codestory-cli> snippet --project <target-workspace> --query run_indexing --lines 40
-
-# Prefer the full implementation body when available
-<codestory-cli> snippet --project <target-workspace> --query run_indexing --function-body --lines 8
-
-# Disambiguate by file and write stable Markdown
-<codestory-cli> snippet --project <target-workspace> --query TicTacToe --file rust_tictactoe.rs --output-file tictactoe.md
-
-# By node ID, JSON output
-<codestory-cli> snippet --project <target-workspace> --id abc123def456 --format json
-```
+Pass `query` or `id` (or `paths` / `path` / `file_path` / `symbol_id`). There is
+no `file` or `output_file` field.

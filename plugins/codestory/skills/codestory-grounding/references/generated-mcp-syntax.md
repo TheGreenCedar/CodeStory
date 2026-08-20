@@ -1,4 +1,4 @@
-<!-- Generated projection of plugins/codestory/generated-mcp-catalog.json. Keep in sync; plugin-static checks tool names. -->
+<!-- Compact projection of plugins/codestory/generated-mcp-catalog.json. plugin-static checks tool names. -->
 # Generated CodeStory MCP syntax
 
 This is the agent option source of truth for the packaged plugin. Every tool

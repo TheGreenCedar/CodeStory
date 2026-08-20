@@ -1,7 +1,8 @@
 # Runtime Execution Path
 
 CodeStory routes CLI, HTTP, and MCP calls through the same product boundaries.
-The adapter validates and renders; `codestory-agent` plans packet evidence;
+The adapter validates and renders;
+[`codestory-agent`](subsystems/agent.md) plans packet evidence;
 `codestory-runtime` orchestrates and executes; the owning workspace, store,
 indexer, and retrieval crates enforce their state contracts.
 

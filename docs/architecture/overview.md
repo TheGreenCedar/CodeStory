@@ -140,11 +140,11 @@ flowchart LR
   the same engine.
 - `codestory-retrieval` owns immutable lexical/vector/SCIP generations,
   manifests, engine integration, health, retention, and fail-closed queries.
-- `codestory-agent` owns packet planning: prompt terms, flow requirements,
-  evidence roles and carriers, citation scoring, and the deduplicated query
-  plan. It owns no activation, storage, retrieval execution, publication retry,
-  or mutable readiness authority, and it reads pinned runtime state only through
-  the `PinnedReader` trait the runtime implements.
+- [`codestory-agent`](subsystems/agent.md) owns packet planning: prompt terms,
+  flow requirements, evidence roles and carriers, citation scoring, and the
+  deduplicated query plan. It owns no activation, storage, retrieval execution,
+  publication retry, or mutable readiness authority, and it reads pinned runtime
+  state only through the `PinnedReader` trait the runtime implements.
 - `codestory-runtime` is the only product orchestration layer.
 - `codestory-cli` parses and renders CLI, HTTP, and stdio adapters.
 - `codestory-bench` measures product paths without defining product behavior.

@@ -1136,17 +1136,17 @@ test("skill teaches MCP catalog arguments, not Clap flags", async () => {
     "files.md",
     "affected.md",
     "packet.md",
+    "snippet.md",
+    "symbol.md",
   ]) {
     const text = await readFile(
       join(pluginRoot, "skills", "codestory-grounding", "references", name),
       "utf8",
     );
     assert.match(text, /generated-mcp-syntax\.md/u, name);
-    assert.doesNotMatch(
-      text,
-      /See \[generated CLI syntax\]/u,
-      name,
-    );
+    assert.doesNotMatch(text, /See \[generated CLI syntax\]/u, name);
+    assert.doesNotMatch(text, /<codestory-cli>/u, name);
+    assert.doesNotMatch(text, / --(?:why|mode|file|refresh|plan-details)\b/u, name);
   }
 });
 
