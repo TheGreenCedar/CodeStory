@@ -1236,6 +1236,11 @@ impl StdioServerSession {
         }
         let project_root = crate::runtime::canonicalize_project_root(Path::new(project))
             .map_err(|error| anyhow::anyhow!("project_unavailable: {error}"))?;
+        if let Some(message) =
+            crate::config::sensitive_project_root_message(&project_root, &self.startup)
+        {
+            bail!("project_forbidden: {message}");
+        }
         let active_same_root = self.active_project.as_ref().filter(|active| {
             codestory_workspace::same_workspace_path(&active.runtime.project_root, &project_root)
         });
@@ -1637,6 +1642,8 @@ fn handle_stdio_message(
                 let message = error.to_string();
                 let code = if message.starts_with("project_required:") {
                     "project_required"
+                } else if message.starts_with("project_forbidden:") {
+                    "project_forbidden"
                 } else {
                     "project_unavailable"
                 };
@@ -7587,6 +7594,7 @@ mod tests {
     fn stdio_multi_project_startup(cache: &Path) -> crate::config::CliStartupConfig {
         crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -9490,6 +9498,7 @@ version = "0.11.20"
         let cache = tempfile::tempdir().expect("cache");
         let startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -9542,6 +9551,7 @@ version = "0.11.20"
         let cache = tempfile::tempdir().expect("cache");
         let startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -9678,6 +9688,7 @@ version = "0.11.20"
         let cache = tempfile::tempdir().expect("cache");
         let startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10062,6 +10073,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10163,6 +10175,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10322,6 +10335,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10430,6 +10444,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10523,6 +10538,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10624,6 +10640,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10708,6 +10725,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -10839,6 +10857,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().join("stdio-cache")),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -11007,6 +11026,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cache.path().to_path_buf()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
@@ -11122,6 +11142,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
             user_home: None,
+            allow_sensitive_project_root: false,
             project_network_config_allowed: false,
             stdio_cache_root: Some(cold_cache_root.clone()),
             sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(

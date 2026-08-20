@@ -361,7 +361,16 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
 }
 
 fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
-    let mut child = test_support::cli_command()
+    spawn_multi_project_stdio_server_with_home(cache_root, None, false)
+}
+
+fn spawn_multi_project_stdio_server_with_home(
+    cache_root: &Path,
+    home: Option<&Path>,
+    allow_sensitive_project_root: bool,
+) -> StdioServer {
+    let mut command = test_support::cli_command();
+    command
         .arg("serve")
         .arg("--stdio")
         .arg("--multi-project")
@@ -372,9 +381,16 @@ fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
         .stderr(Stdio::piped())
         .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")
         .env("CODESTORY_STDIO_CACHE_ROOT", cache_root)
-        .env("CODESTORY_PLUGIN_MULTI_PROJECT", "1")
-        .spawn()
-        .expect("spawn multi-project stdio server");
+        .env("CODESTORY_PLUGIN_MULTI_PROJECT", "1");
+    if let Some(home) = home {
+        command.env("HOME", home).env("USERPROFILE", home);
+    }
+    if allow_sensitive_project_root {
+        command.env("CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT", "1");
+    } else {
+        command.env_remove("CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT");
+    }
+    let mut child = command.spawn().expect("spawn multi-project stdio server");
     let stdin = child.stdin.take().expect("multi-project stdio stdin");
     let stdout = BufReader::new(child.stdout.take().expect("multi-project stdio stdout"));
     StdioServer {
@@ -382,6 +398,18 @@ fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
         stdin,
         stdout,
     }
+}
+
+fn stdio_status_request(id: &str, project: &Path) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "status",
+            "arguments": {"project": project}
+        }
+    })
 }
 
 fn send_json(server: &mut StdioServer, request: Value) -> Value {
@@ -1349,6 +1377,88 @@ fn notification_messages_do_not_produce_responses() {
             .is_some_and(|tools| !tools.is_empty()),
         "the next request should receive the first response after a notification: {response}"
     );
+}
+
+#[test]
+fn multi_project_stdio_refuses_home_as_project() {
+    let home = tempfile::tempdir().expect("captured home");
+    write_tiny_rust_workspace(home.path());
+    let cache_root = tempfile::tempdir().expect("sensitive-root cache");
+    let mut server =
+        spawn_multi_project_stdio_server_with_home(cache_root.path(), Some(home.path()), false);
+    let denied = send_json(
+        &mut server,
+        stdio_status_request("home-denied", home.path()),
+    );
+    let error = assert_tool_error(&denied, json!("home-denied"));
+    assert_eq!(error["code"], json!("project_forbidden"));
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT"),
+        "refusal should name the process-start opt-in: {error}"
+    );
+}
+
+#[test]
+fn multi_project_stdio_allows_nested_repo_under_home() {
+    let home = tempfile::tempdir().expect("captured home");
+    let nested = home.path().join("nested-repo");
+    fs::create_dir(&nested).expect("create nested repo");
+    write_tiny_rust_workspace(&nested);
+    fs::write(&nested.join("secrets"), "not a project root\n").expect("file named secrets");
+    let cache_root = tempfile::tempdir().expect("nested-home cache");
+    let mut server =
+        spawn_multi_project_stdio_server_with_home(cache_root.path(), Some(home.path()), false);
+    let response = send_json(&mut server, stdio_status_request("nested-home-ok", &nested));
+    let result = assert_tool_success(&response, json!("nested-home-ok"));
+    assert_ne!(
+        result.get("code"),
+        Some(&json!("project_forbidden")),
+        "a nested repo under home must not inherit the home denylist: {result}"
+    );
+}
+
+#[test]
+fn multi_project_stdio_opt_in_allows_home_as_project() {
+    let home = tempfile::tempdir().expect("captured home");
+    write_tiny_rust_workspace(home.path());
+    let cache_root = tempfile::tempdir().expect("opt-in cache");
+    let mut server =
+        spawn_multi_project_stdio_server_with_home(cache_root.path(), Some(home.path()), true);
+    let response = send_json(
+        &mut server,
+        stdio_status_request("home-opt-in", home.path()),
+    );
+    assert_tool_success(&response, json!("home-opt-in"));
+}
+
+#[test]
+fn multi_project_stdio_refuses_ssh_gnupg_and_secrets_roots() {
+    let home = tempfile::tempdir().expect("captured home");
+    write_tiny_rust_workspace(home.path());
+    let ssh = home.path().join(".ssh");
+    let gnupg = home.path().join(".gnupg");
+    let secrets = home.path().join("secrets");
+    for root in [&ssh, &gnupg, &secrets] {
+        fs::create_dir(root).expect("create denylisted root");
+        write_tiny_rust_workspace(root);
+    }
+    let cache_root = tempfile::tempdir().expect("denylist cache");
+    let mut server =
+        spawn_multi_project_stdio_server_with_home(cache_root.path(), Some(home.path()), false);
+    for (id, project) in [
+        ("ssh-denied", ssh.as_path()),
+        ("gnupg-denied", gnupg.as_path()),
+        ("secrets-denied", secrets.as_path()),
+    ] {
+        let denied = send_json(&mut server, stdio_status_request(id, project));
+        let error = assert_tool_error(&denied, json!(id));
+        assert_eq!(
+            error["code"],
+            json!("project_forbidden"),
+            "{id} should fail closed: {error}"
+        );
+    }
 }
 
 #[test]

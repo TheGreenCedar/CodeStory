@@ -8,6 +8,10 @@ MCP now tells agents to call the tool that matches the task and retry that same 
 
 - CLI `affected` requires explicit paths or stdin, matching MCP. It no longer invents a git diff when those are omitted.
 - Repo-text matches are leads only. They no longer count as packet proof.
+- MCP `project` and CLI `--project` refuse the user home directory, `~/.ssh`,
+  `~/.gnupg`, and a `secrets/` directory used as the repository root. Set
+  `CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT=1` at process start to override. Nested
+  repositories under home are unchanged.
 
 ## 0.17.1
 
