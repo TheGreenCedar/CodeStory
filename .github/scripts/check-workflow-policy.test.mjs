@@ -6711,8 +6711,29 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
       step.run = step.run.replace("main moved from publishable head", "main changed");
     }],
     ["publish authority", workflows => { delete workflows.get("release.yml").jobs.publish.if; }],
+    ["publish inherits a skipped reuse ancestor", workflows => {
+      workflows.get("release.yml").jobs.publish.if = "inputs.publish_release";
+    }],
+    ["publish loses its cancellation guard", workflows => {
+      workflows.get("release.yml").jobs.publish.if
+        = "always() && inputs.publish_release && needs.preflight.result == 'success' && needs.pre-publish-closeout.result == 'success'";
+    }],
+    ["marketplace publication inherits a skipped reuse ancestor", workflows => {
+      workflows.get("release.yml").jobs["marketplace-publish"].if = "inputs.publish_release";
+    }],
+    ["marketplace publication loses its cancellation guard", workflows => {
+      workflows.get("release.yml").jobs["marketplace-publish"].if
+        = "always() && inputs.publish_release && needs.preflight.result == 'success' && needs.publish.result == 'success'";
+    }],
     ["post-publish smoke authority", workflows => { delete workflows.get("release.yml").jobs["post-publish-smoke"].if; }],
     ["post-publish closeout authority", workflows => { delete workflows.get("release.yml").jobs["post-publish-closeout"].if; }],
+    ["post-publish closeout inherits a skipped reuse ancestor", workflows => {
+      workflows.get("release.yml").jobs["post-publish-closeout"].if = "inputs.publish_release";
+    }],
+    ["post-publish closeout loses its cancellation guard", workflows => {
+      workflows.get("release.yml").jobs["post-publish-closeout"].if
+        = "always() && inputs.publish_release && needs.preflight.result == 'success' && needs.pre-publish-closeout.result == 'success' && needs.post-publish-smoke.result == 'success'";
+    }],
     ["trusted caller opt-in", workflows => { delete workflows.get("auto-release.yml").jobs.release.with.publish_release; }],
     ["trusted caller secret handoff", workflows => { delete workflows.get("auto-release.yml").jobs.release.secrets; }],
     ["duplicate automatic policy gate", workflows => {

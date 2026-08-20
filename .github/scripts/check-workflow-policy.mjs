@@ -3436,7 +3436,12 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   // release-claims.json under workflow_policy.step_fragments;
   // stepFragmentViolations evaluates them.
   const publish = object(object(release.jobs).publish);
-  add(violations, publish.if === "inputs.publish_release", `${releaseFile} publish must require trusted publication authority`);
+  add(
+    violations,
+    publish.if
+      === "${{ !cancelled() && inputs.publish_release && needs.preflight.result == 'success' && needs.pre-publish-closeout.result == 'success' }}",
+    `${releaseFile} publish must remain schedulable after accepted reuse and cancellable while requiring trusted publication authority and successful direct dependencies`,
+  );
   add(violations, sameMembers(needs(publish), releaseChain.dependencies.publish), `${releaseFile} publish dependencies must match the release claim graph`);
   // The published platform table is a claim about this release, so it is rendered from the accepted
   // ledger. Rendering it from the static graph is how a release whose accelerator proof was
@@ -3482,8 +3487,9 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   const marketplacePublish = object(object(release.jobs)["marketplace-publish"]);
   add(
     violations,
-    marketplacePublish.if === "inputs.publish_release",
-    `${releaseFile} marketplace publication must require trusted publication authority`,
+    marketplacePublish.if
+      === "${{ !cancelled() && inputs.publish_release && needs.preflight.result == 'success' && needs.publish.result == 'success' }}",
+    `${releaseFile} marketplace publication must remain schedulable after accepted reuse and cancellable while requiring trusted publication authority and a successful publish`,
   );
   add(
     violations,
@@ -3572,7 +3578,12 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   // the evaluation - are rule instances and live in release-claims.json under
   // workflow_policy.step_fragments; stepFragmentViolations evaluates them.
   const postCloseout = object(object(release.jobs)["post-publish-closeout"]);
-  add(violations, postCloseout.if === "inputs.publish_release", `${releaseFile} post-publish closeout must require trusted publication authority`);
+  add(
+    violations,
+    postCloseout.if
+      === "${{ !cancelled() && inputs.publish_release && needs.preflight.result == 'success' && needs.pre-publish-closeout.result == 'success' && needs.post-publish-smoke.result == 'success' }}",
+    `${releaseFile} post-publish closeout must remain schedulable after accepted reuse and cancellable while requiring trusted publication authority and successful direct dependencies`,
+  );
   add(violations, sameMembers(needs(postCloseout), releaseChain.dependencies["post-publish-closeout"]), `${releaseFile} post-publish closeout dependencies must match the release claim graph`);
   // The closeout reached marketplace-publish only through the smoke, so removing the smoke's gate
   // removed the closeout's too. Keep it that way rather than leaving it to be reintroduced here.
