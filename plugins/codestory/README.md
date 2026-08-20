@@ -14,7 +14,7 @@ hooks, and compatibility wiring their clients require.
 | Host | Plugin surface | User guide |
 | --- | --- | --- |
 | Codex | `.codex-plugin/plugin.json`, legacy `.mcp.json`, hooks, skill | [Codex](../../docs/users/codex.md) |
-| Cursor | Portable core plus `.cursor-plugin/plugin.json`, `rules/`, and `hooks/cursor-hooks.json` | [Cursor](../../docs/users/cursor.md) |
+| Cursor | Portable core plus `.cursor-plugin/plugin.json`, `mcp.cursor.json`, `rules/`, and `hooks/cursor-hooks.json` | [Cursor](../../docs/users/cursor.md) |
 | Claude Code | `.claude-plugin/plugin.json`, legacy `.mcp.json`, session hooks | [Claude Code](../../docs/users/claude-code.md) |
 | Copilot CLI | `.github/plugin/plugin.json`, session hooks | [Copilot](../../docs/users/copilot.md#copilot-cli) |
 | Copilot editor | Repository instructions | [Copilot editor](../../docs/users/copilot.md#copilot-editor) |
@@ -27,6 +27,7 @@ live on the host pages in the table above.
 ## Package anatomy
 
 - `scripts/codestory-mcp.cjs` is the stdio adapter and managed CLI launcher.
+- `scripts/cursor-mcp-resolve.cjs` locates that launcher for Cursor when the host substitutes the open project for `${PLUGIN_ROOT}`.
 - `plugin.json`, `skills/`, and `mcp.json` are the portable plugin core.
 - `hooks/` records bounded lifecycle state for hosts that support hooks.
 - `rules/codestory.mdc` is Cursor's always-on grounding rule.
