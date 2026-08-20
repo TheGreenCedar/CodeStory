@@ -1082,8 +1082,11 @@ test("public support, assets, and release notes derive from the package and clos
     releaseAssetNames(graph, "0.16.0"),
     [
       "codestory-cli-v0.16.0-windows-x64.zip",
+      "codestory-cli-v0.16.0-windows-x64.zip.sha256",
       "codestory-cli-v0.16.0-macos-arm64.tar.gz",
+      "codestory-cli-v0.16.0-macos-arm64.tar.gz.sha256",
       "codestory-cli-v0.16.0-linux-x64.tar.gz",
+      "codestory-cli-v0.16.0-linux-x64.tar.gz.sha256",
       "SHA256SUMS.txt",
       // A native release cannot pin its own archive digests in source, so the release generates
       // them from the archives it built and ships them as an asset the launcher can fetch.

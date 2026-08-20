@@ -536,6 +536,14 @@ async function readPluginVersion() {
   return manifest.version;
 }
 
+async function readPinnedCliVersion() {
+  const pin = JSON.parse(
+    await readFile(join(pluginRoot, "cli-version.json"), "utf8"),
+  );
+  assert.match(pin.cli_version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
+  return pin.cli_version;
+}
+
 function releaseAssetForPlatform(version) {
   const target = process.platform === "win32" && process.arch === "x64"
     ? "windows-x64"
@@ -997,7 +1005,7 @@ test("fail-open status reads refresh the preparing retry hint from live download
   ]);
 });
 
-async function writeAttestedDevPluginFixture(root, version) {
+async function writeAttestedDevPluginFixture(root, pluginVersion, cliVersion = pluginVersion) {
   const { cp } = await import("node:fs/promises");
   const installRoot = join(
     root,
@@ -1006,7 +1014,7 @@ async function writeAttestedDevPluginFixture(root, version) {
     "cache",
     "CodeStoryDev",
     "codestory",
-    version,
+    pluginVersion,
   );
   await cp(pluginRoot, installRoot, { recursive: true });
   const sourcePackageSha256 = devCliContract.directoryContractSha256(installRoot);
@@ -1023,7 +1031,7 @@ async function writeAttestedDevPluginFixture(root, version) {
       purpose: devCliContract.receiptPurpose,
       plugin_id: devCliContract.receiptPluginId,
       plugin_name: devCliContract.receiptPluginName,
-      plugin_version: version,
+      plugin_version: pluginVersion,
       source_commit: "a".repeat(40),
       source_package_sha256: sourcePackageSha256,
       target: devCliContract.sourceBuildTarget(),
@@ -1032,7 +1040,7 @@ async function writeAttestedDevPluginFixture(root, version) {
         name: cliName,
         bytes: cliBytes.length,
         sha256: cliSha256,
-        version,
+        version: cliVersion,
       },
     }, null, 2)}\n`,
     "utf8",
@@ -1441,7 +1449,7 @@ test("production hook code neither duplicates Git config nor spawns Git", async 
 
 test("mcp launcher prefers a checksummed explicit package without PATH", async () => {
   const { spawnSync } = await import("node:child_process");
-  const version = await readPluginVersion();
+  const version = await readPinnedCliVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-cli-"));
   const outFile = join(dataDir, "env.json");
   const cliDir = join(dataDir, "codestory-cli", version);
@@ -1505,16 +1513,17 @@ test("mcp launcher uses an attested CodeStoryDev CLI from the installed cache wi
   const root = await mkdtemp(join(tmpdir(), "codestory-attested-dev-cli-"));
   const dataDir = join(root, "plugin-data");
   const outFile = join(root, "env.json");
-  const version = await readPluginVersion();
+  const pluginVersion = await readPluginVersion();
+  const cliVersion = await readPinnedCliVersion();
   try {
-    const fixture = await writeAttestedDevPluginFixture(root, version);
+    const fixture = await writeAttestedDevPluginFixture(root, pluginVersion, cliVersion);
     await mkdir(dataDir, { recursive: true });
     const result = spawnSync(process.execPath, [fixture.launcher], {
       env: {
         ...process.env,
         CODESTORY_CLI: "",
         PLUGIN_DATA: dataDir,
-        TEST_CODESTORY_VERSION: version,
+        TEST_CODESTORY_VERSION: cliVersion,
         TEST_OUT: outFile,
         PATH: "",
       },
@@ -1529,7 +1538,7 @@ test("mcp launcher uses an attested CodeStoryDev CLI from the installed cache wi
     assert.equal(observed.sha256, fixture.cliSha256);
     assert.equal(await realpath(observed.path), await realpath(fixture.cliPath));
     assert.equal(await realpath(observed.pluginRoot), await realpath(fixture.installRoot));
-    assert.equal(observed.pluginCacheVersion, version);
+    assert.equal(observed.pluginCacheVersion, pluginVersion);
     assert.match(observed.warnings, /codestory_dev_receipt:verified/u);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1538,21 +1547,22 @@ test("mcp launcher uses an attested CodeStoryDev CLI from the installed cache wi
 
 test("declared CodeStoryDev receipt failures never fall through to raw or managed CLI selection", async () => {
   if (process.platform === "win32") return;
-  const version = await readPluginVersion();
+  const pluginVersion = await readPluginVersion();
+  const cliVersion = await readPinnedCliVersion();
   for (const variant of ["invalid-receipt", "ambiguous-raw-override"]) {
     const root = await mkdtemp(join(tmpdir(), "codestory-dev-receipt-no-fallback-"));
     const dataDir = join(root, "plugin-data");
     const runtimeOut = join(root, "runtime.json");
     try {
-      const fixture = await writeAttestedDevPluginFixture(root, version);
-      const managedDir = join(dataDir, "codestory-cli", version);
+      const fixture = await writeAttestedDevPluginFixture(root, pluginVersion, cliVersion);
+      const managedDir = join(dataDir, "codestory-cli", cliVersion);
       const managedCli = join(managedDir, process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli");
       await mkdir(managedDir, { recursive: true });
       await writeFakeCli(managedCli);
       const managedSha256 = createHash("sha256").update(await readFile(managedCli)).digest("hex");
       await writeFile(
         join(managedDir, "manifest.json"),
-        JSON.stringify(managedReleaseManifest(version, managedCli.slice(managedDir.length + 1), managedSha256)),
+        JSON.stringify(managedReleaseManifest(cliVersion, managedCli.slice(managedDir.length + 1), managedSha256)),
         "utf8",
       );
       if (variant === "invalid-receipt") {
@@ -1570,7 +1580,7 @@ test("declared CodeStoryDev receipt failures never fall through to raw or manage
           CODESTORY_CLI: variant === "ambiguous-raw-override" ? fixture.cliPath : "",
           CODESTORY_PLUGIN_DISABLE_PROVISION: "1",
           PLUGIN_DATA: dataDir,
-          TEST_CODESTORY_VERSION: version,
+          TEST_CODESTORY_VERSION: cliVersion,
           TEST_OUT: runtimeOut,
           PATH: "",
         },
@@ -3775,7 +3785,7 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
 });
 
 test("mcp launcher preserves the managed CLI verification failure", async () => {
-  const version = await readPluginVersion();
+  const version = await readPinnedCliVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-invalid-managed-cli-"));
   const versionDir = join(dataDir, "codestory-cli", version);
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
@@ -4350,9 +4360,10 @@ test("mcp launcher fails open when CODESTORY_CLI override cannot spawn", async (
 });
 
 test("mcp launcher fails open when managed cli probe fails", async () => {
-  const version = await readPluginVersion();
+  const pluginVersion = await readPluginVersion();
+  const cliVersion = await readPinnedCliVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-managed-"));
-  const cliDir = join(dataDir, "codestory-cli", version);
+  const cliDir = join(dataDir, "codestory-cli", cliVersion);
   const cliPath = join(
     cliDir,
     process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
@@ -4380,7 +4391,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
     await writeFile(
       join(cliDir, "manifest.json"),
       JSON.stringify(explicitPackageManifest(
-        version,
+        cliVersion,
         process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
         sha256,
       )),
@@ -4433,7 +4444,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
     );
     assert.equal(
       status.plugin_runtime.plugin_version,
-      version,
+      pluginVersion,
     );
   } finally {
     await stopChildProcess(child);
@@ -4442,12 +4453,13 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
 });
 
 test("mcp launcher upgrades a verified prior managed cli to the checksummed release", async () => {
-  const version = await readPluginVersion();
+  const pluginVersion = await readPluginVersion();
+  const cliVersion = await readPinnedCliVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-provisioned-cli-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-release-"));
   const outFile = join(dataDir, "env.json");
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
-  const { archiveBase, archiveName } = releaseAssetForPlatform(version);
+  const { archiveBase, archiveName } = releaseAssetForPlatform(cliVersion);
   const stageDir = join(releaseDir, archiveBase);
   const cliName = process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli";
   const cliPath = join(stageDir, cliName);
@@ -4496,20 +4508,20 @@ test("mcp launcher upgrades a verified prior managed cli to the checksummed rele
       CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
       PLUGIN_DATA: dataDir,
       TEST_OUT: outFile,
-      TEST_CODESTORY_VERSION: version,
+      TEST_CODESTORY_VERSION: cliVersion,
     });
     const result = await launched.completed;
 
     assert.equal(result.status, 0, result.stderr);
     const observed = JSON.parse(await readFile(outFile, "utf8"));
     assert.equal(observed.source, "managed");
-    assert.equal(observed.version, version);
+    assert.equal(observed.version, cliVersion);
     assert.equal(observed.repoRef, "");
     assert.equal(observed.buildSource, "explicit_package");
     assert.equal(observed.archiveSha256, archiveSha256);
     assert.notEqual(observed.path, priorCli);
     const retention = JSON.parse(observed.retention);
-    assert.equal(retention.active_version, version);
+    assert.equal(retention.active_version, cliVersion);
     assert.equal(
       retention.retained.some((entry) => entry.version === priorVersion && entry.reason === "rollback"),
       true,
@@ -4517,14 +4529,14 @@ test("mcp launcher upgrades a verified prior managed cli to the checksummed rele
     );
     assert.match(
       observed.path,
-      new RegExp(String.raw`codestory-cli[\\/]+${version.replaceAll(".", String.raw`\.`)}[\\/]codestory-cli`, "u"),
+      new RegExp(String.raw`codestory-cli[\\/]+${cliVersion.replaceAll(".", String.raw`\.`)}[\\/]codestory-cli`, "u"),
     );
     assert.deepEqual(observed.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
 
     const manifest = JSON.parse(
-      await readFile(join(dataDir, "codestory-cli", version, "manifest.json"), "utf8"),
+      await readFile(join(dataDir, "codestory-cli", cliVersion, "manifest.json"), "utf8"),
     );
-    assert.equal(manifest.version, version);
+    assert.equal(manifest.version, cliVersion);
     assert.equal(manifest.repo_ref, null);
     assert.equal(manifest.build_source, "explicit_package");
     assert.equal(manifest.archive, archiveName);
@@ -4532,6 +4544,11 @@ test("mcp launcher upgrades a verified prior managed cli to the checksummed rele
     assert.equal(manifest.archive_sha256, archiveSha256);
     assert.equal(manifest.stdio_initialize_verified, true);
     assert.equal(typeof manifest.sha256, "string");
+    const runtime = JSON.parse(
+      await readFile(join(dataDir, ".codestory-mcp-runtime.json"), "utf8"),
+    );
+    assert.equal(runtime.pluginVersion, pluginVersion);
+    assert.equal(runtime.cliVersion, cliVersion);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     await rm(releaseDir, { recursive: true, force: true });
@@ -4540,7 +4557,8 @@ test("mcp launcher upgrades a verified prior managed cli to the checksummed rele
 
 test("mcp launcher serves diagnostics while managed provisioning runs, then hands off", { timeout: 30000 }, async () => {
   const { createServer } = await import("node:http");
-  const version = await readPluginVersion();
+  const pluginVersion = await readPluginVersion();
+  const cliVersion = await readPinnedCliVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-background-provision-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-background-release-"));
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
@@ -4549,7 +4567,7 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
   let server;
   let releaseAssets = () => {};
   try {
-    const fixture = await writeReleaseFixture(releaseDir, version, writeLifecycleCli);
+    const fixture = await writeReleaseFixture(releaseDir, cliVersion, writeLifecycleCli);
     const assets = new Map([
       ["/SHA256SUMS.txt", await readFile(fixture.sumsPath)],
       [`/${fixture.archiveName}`, await readFile(fixture.archivePath)],
@@ -4569,7 +4587,7 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
         CODESTORY_CLI: "",
         CODESTORY_PLUGIN_RELEASE_BASE_URL: `http://127.0.0.1:${server.address().port}`,
         PLUGIN_DATA: dataDir,
-        TEST_CODESTORY_VERSION: version,
+        TEST_CODESTORY_VERSION: cliVersion,
         CODESTORY_TEST_PROBE_DELAY_MS: "1500",
         TEST_OUT: outFile,
       },
@@ -4706,11 +4724,11 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     const probeDeadline = Date.now() + 5000;
     while (Date.now() < probeDeadline) {
       const entries = await readdir(managedRoot).catch(() => []);
-      if (entries.some((entry) => entry.startsWith(`.provisioning-${version}-`))) break;
+      if (entries.some((entry) => entry.startsWith(`.provisioning-${cliVersion}-`))) break;
       await delay(10);
     }
     assert.ok(
-      (await readdir(managedRoot)).some((entry) => entry.startsWith(`.provisioning-${version}-`)),
+      (await readdir(managedRoot)).some((entry) => entry.startsWith(`.provisioning-${cliVersion}-`)),
       "provisioning should reach its deliberately slow synchronous version probe",
     );
     const responsiveStartedAt = Date.now();
@@ -4735,6 +4753,8 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     }
     const publishedRuntime = JSON.parse(await readFile(runtimeMetadata, "utf8"));
     assert.equal(publishedRuntime.source, "managed", JSON.stringify(publishedRuntime));
+    assert.equal(publishedRuntime.pluginVersion, pluginVersion);
+    assert.equal(publishedRuntime.cliVersion, cliVersion);
     assert.equal(
       responses.some((response) => response.method === "notifications/tools/list_changed"),
       false,
@@ -4800,7 +4820,7 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
 
 test("managed publication waiter keeps diagnostic MCP responsive", { timeout: 15000 }, async () => {
   const { createServer } = await import("node:http");
-  const version = await readPluginVersion();
+  const version = await readPinnedCliVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-responsive-waiter-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-responsive-release-"));
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
@@ -4985,7 +5005,7 @@ test("fail-open status tool preserves primary runtime failures and no-project pr
 
 test("managed cli publication is single-flight and atomically visible across two processes", { timeout: 30000 }, async () => {
   const { createServer } = await import("node:http");
-  const version = await readPluginVersion();
+  const version = await readPinnedCliVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-publication-contention-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-publication-release-"));
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
@@ -5066,7 +5086,7 @@ test("managed cli publication is single-flight and atomically visible across two
 
 test("managed cli publication reclaims crashes after lock and before publication", { timeout: 45000 }, async () => {
   const { createServer } = await import("node:http");
-  const version = await readPluginVersion();
+  const version = await readPinnedCliVersion();
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-crash-release-"));
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   let server;
@@ -6975,10 +6995,26 @@ test("portable plugin core and thin host adapters preserve their own contracts",
   assert.deepEqual(portableMcp.mcpServers.codestory, {
     type: "stdio",
     command: "node",
-    args: ["./scripts/codestory-mcp.cjs"],
+    args: ["${PLUGIN_ROOT}/scripts/codestory-mcp.cjs"],
     cwd: "${PLUGIN_ROOT}",
     env: {},
   });
+  const arbitraryProject = await mkdtemp(join(tmpdir(), "codestory-cursor-project-"));
+  try {
+    const expandedLauncher = portableMcp.mcpServers.codestory.args[0]
+      .replaceAll("${PLUGIN_ROOT}", pluginRoot);
+    const check = spawnSync(process.execPath, ["--check", expandedLauncher], {
+      cwd: arbitraryProject,
+      encoding: "utf8",
+    });
+    assert.equal(
+      check.status,
+      0,
+      `portable MCP launcher must resolve outside the active project cwd:\n${check.stderr}`,
+    );
+  } finally {
+    await rm(arbitraryProject, { recursive: true, force: true });
+  }
   assert.doesNotMatch(
     portableMcpText,
     /CODESTORY_PLUGIN_DATA|CODESTORY_CURSOR_DOGFOOD|absolute\/path|tool_timeout_sec/iu,

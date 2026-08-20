@@ -2466,6 +2466,14 @@ test("post-publish candidate reuse authenticates release metadata and transfers 
         "true",
       );
     }, /Authenticate published candidate assets/u],
+    ["the post-publish consumer selects an unpublished checksum suffix", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        'checksum="$asset.sha256"',
+        'checksum="$asset.checksum"',
+      );
+    }, /published checksum companions must match the graph-declared release assets|Authenticate published candidate assets/u],
     ["published asset size provenance is not validated", workflow => {
       replaceRun(
         workflow,
@@ -6709,6 +6717,22 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
       const step = workflows.get("release.yml").jobs.publish.steps
         .find(({ name }) => name === "Create GitHub release");
       step.run = step.run.replace("main moved from publishable head", "main changed");
+    }],
+    ["publisher allowlist drops archive checksum companions", workflows => {
+      const step = workflows.get("release.yml").jobs.publish.steps
+        .find(({ name }) => name === "Create GitHub release");
+      step.run = step.run.replace(
+        "-name 'codestory-cli-v*.tar.gz.sha256'",
+        "-name 'unpublished-checksum'",
+      );
+    }],
+    ["publisher allowlist drops the global checksum manifest", workflows => {
+      const step = workflows.get("release.yml").jobs.publish.steps
+        .find(({ name }) => name === "Create GitHub release");
+      step.run = step.run.replace(
+        "-o -name 'SHA256SUMS.txt'",
+        "-o -name 'unpublished-global-checksum'",
+      );
     }],
     ["publish authority", workflows => { delete workflows.get("release.yml").jobs.publish.if; }],
     ["publish inherits a skipped reuse ancestor", workflows => {

@@ -15,10 +15,41 @@ import process from "node:process";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { commandPlan } from "./install-codestory-marketplace-proof.mjs";
+
 const scriptRoot = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptRoot, "..", "..");
 const helper = path.join(scriptRoot, "install-codestory-marketplace-proof.mjs");
 const codexVersion = "0.144.5";
+
+test("Windows invokes native executables directly and wraps only command shims", () => {
+  const comspec = "C:\\Windows\\System32\\cmd.exe";
+  assert.deepEqual(
+    commandPlan("git", ["-C", "C:\\source tree", "rev-parse", "HEAD^{tree}"], {
+      platform: "win32",
+      comspec,
+    }),
+    {
+      command: "git",
+      commandArgs: ["-C", "C:\\source tree", "rev-parse", "HEAD^{tree}"],
+    },
+  );
+  assert.deepEqual(
+    commandPlan("C:\\tools\\codex.cmd", ["plugin", "list", "--json"], {
+      platform: "win32",
+      comspec,
+    }),
+    {
+      command: comspec,
+      commandArgs: [
+        "/d",
+        "/s",
+        "/c",
+        '"C:\\tools\\codex.cmd" "plugin" "list" "--json"',
+      ],
+    },
+  );
+});
 
 function run(executable, args, options = {}) {
   const result = spawnSync(executable, args, {

@@ -987,6 +987,8 @@ jobs:
           printf '%s\n' "${expected_names[@]}" | sort > "$expected_file"
           find target/release-assets -maxdepth 1 -type f \
             \( -name 'codestory-cli-v*.tar.gz' -o -name 'codestory-cli-v*.zip' \
+               -o -name 'codestory-cli-v*.tar.gz.sha256' \
+               -o -name 'codestory-cli-v*.zip.sha256' \
                -o -name 'SHA256SUMS.txt' -o -name 'release-closeout-summary.json' \
                -o -name 'codestory-release-manifest.json' \) \
             -exec basename {} \; | sort > "$actual_file"

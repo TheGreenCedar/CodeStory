@@ -3475,6 +3475,9 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     violations,
     publishRun.includes("gh release create $TAG ${assets[@]}")
       && publishRun.includes("find target/release-assets -maxdepth 1 -type f")
+      && publishRun.includes("-name codestory-cli-v*.tar.gz.sha256")
+      && publishRun.includes("-name codestory-cli-v*.zip.sha256")
+      && publishRun.includes("-name SHA256SUMS.txt")
       && !publishRun.includes("qualification-driver")
       && !publishRun.includes("codestory_embedding_qualification"),
     `${releaseFile} must publish only graph-declared root assets and exclude the private qualification driver`,
@@ -4954,6 +4957,27 @@ function validatePostPublish(workflows, violations, graph) {
     JSON.stringify(at(job, "strategy", "matrix", "include")) === JSON.stringify(expected),
     `${file} must run the three supported release assets on protected accelerated hosts`,
   );
+  // The checker must keep aggregating violations when a hostile test mutates another graph
+  // contract, so derive this narrow publisher/consumer join from the already-loaded matrix instead
+  // of invoking the graph's fail-fast public validator a second time.
+  const graphReleaseAssets = new Set([
+    ...list(at(graph, "workflow_policy", "package_matrix")).flatMap(
+      ({ asset_target: target, extension }) => {
+        const archive = `codestory-cli-v0.0.0-${target}.${extension}`;
+        return [archive, `${archive}.sha256`];
+      },
+    ),
+    "SHA256SUMS.txt",
+  ]);
+  add(
+    violations,
+    expected.every(({ asset_target: target, extension }) => {
+      const archive = `codestory-cli-v0.0.0-${target}.${extension}`;
+      return graphReleaseAssets.has(archive)
+        && graphReleaseAssets.has(`${archive}.sha256`);
+    }) && graphReleaseAssets.has("SHA256SUMS.txt"),
+    `${file} published checksum companions must match the graph-declared release assets`,
+  );
   add(
     violations,
     job["runs-on"] === "${{ fromJSON(matrix.runs_on) }}"
@@ -5006,6 +5030,7 @@ function validatePostPublish(workflows, violations, graph) {
     'test "$(jq -r .draft <<<"$release")" = false',
     "expected one published release asset",
     'archive_asset="$(select_asset "$asset")"',
+    'checksum="$asset.sha256"',
     'checksum_asset="$(select_asset "$checksum")"',
     "manifest_asset=\"$(select_asset SHA256SUMS.txt)\"",
     '[[ "$(jq -r .id <<<"$value")" =~ ^[0-9]+$ ]]',
