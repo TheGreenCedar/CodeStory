@@ -4,6 +4,8 @@
 //! reader uses `gix` with isolated configuration permissions, refuses metadata
 //! redirects outside the resolved repository roots, never inspects nested
 //! submodule worktrees, and reports a conservative observation on failure.
+//! Gitdir timestamps, link counts, and ordinary files created during a status
+//! read (index cookies, Linux fsmonitor) are not treated as redirects.
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::fs::{self, File, OpenOptions};
@@ -802,25 +804,21 @@ struct MetadataBoundarySnapshot {
     alternates: Option<Vec<u8>>,
 }
 
+/// Native identity of a metadata directory, excluding mtime, ctime, and
+/// nlink. Those change when Git writes an index cookie or fsmonitor file
+/// during a confined status read; treating that as a redirect dropped the
+/// remote and made portable identity flip to the workspace hash.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct MetadataDirectoryFingerprint {
     path: PathBuf,
-    len: u64,
-    modified: Option<std::time::SystemTime>,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
-    #[cfg(unix)]
-    change_seconds: i64,
-    #[cfg(unix)]
-    change_nanoseconds: i64,
     #[cfg(windows)]
-    file_attributes: u32,
+    volume_serial_number: Option<u32>,
     #[cfg(windows)]
-    creation_time: u64,
-    #[cfg(windows)]
-    last_write_time: u64,
+    file_index: Option<u64>,
 }
 
 fn configured_origin_url(config: &gix::config::File) -> Option<String> {
@@ -1250,12 +1248,8 @@ fn metadata_directory_fingerprint(path: &Path) -> Result<MetadataDirectoryFinger
         use std::os::unix::fs::MetadataExt;
         Ok(MetadataDirectoryFingerprint {
             path: path.to_path_buf(),
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
             device: metadata.dev(),
             inode: metadata.ino(),
-            change_seconds: metadata.ctime(),
-            change_nanoseconds: metadata.ctime_nsec(),
         })
     }
     #[cfg(windows)]
@@ -1263,19 +1257,14 @@ fn metadata_directory_fingerprint(path: &Path) -> Result<MetadataDirectoryFinger
         use std::os::windows::fs::MetadataExt;
         Ok(MetadataDirectoryFingerprint {
             path: path.to_path_buf(),
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            file_attributes: metadata.file_attributes(),
-            creation_time: metadata.creation_time(),
-            last_write_time: metadata.last_write_time(),
+            volume_serial_number: metadata.volume_serial_number(),
+            file_index: metadata.file_index(),
         })
     }
     #[cfg(not(any(unix, windows)))]
     {
         Ok(MetadataDirectoryFingerprint {
             path: path.to_path_buf(),
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
         })
     }
 }
@@ -2016,6 +2005,35 @@ mod tests {
                 .contains(outside.path().to_string_lossy().as_ref()),
             "mutation failures must not expose an outside path"
         );
+    }
+
+    #[test]
+    fn ordinary_gitdir_file_churn_during_open_does_not_drop_identity() {
+        let Some(project) = git_project() else {
+            return;
+        };
+        let cookie_dir = project.path().join(".git/fsmonitor--daemon");
+        AFTER_BOUNDARY_VALIDATION_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::create_dir(&cookie_dir).expect("create volatile gitdir directory");
+                fs::write(cookie_dir.join("cookie"), b"1").expect("write volatile gitdir file");
+            }));
+        });
+
+        let metadata = read_repository_metadata(project.path());
+
+        assert!(
+            metadata.issues.is_empty(),
+            "gitdir timestamp or cookie churn must not fail closed: {:?}",
+            metadata.issues
+        );
+        assert_eq!(
+            metadata.remote_url.as_deref(),
+            Some("https://example.com/team/repo.git")
+        );
+        assert!(metadata.head_tree.is_some());
+        assert!(!metadata.dirty);
+        assert_eq!(metadata.tracked_paths, vec![b"lib.rs".to_vec()]);
     }
 
     #[cfg(unix)]
