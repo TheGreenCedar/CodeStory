@@ -20,7 +20,9 @@ hooks, and compatibility wiring their clients require.
 | Copilot editor | Repository instructions | [Copilot editor](../../docs/users/copilot.md#copilot-editor) |
 
 The [user guide](../../docs/users/README.md) owns shared first-use, platform,
-privacy, and readiness behavior.
+privacy, and readiness behavior, including the
+[platform summary](../../docs/users/README.md#platform-summary). Install steps
+live on the host pages in the table above.
 
 ## Package anatomy
 
@@ -61,46 +63,7 @@ model download, separate helper executable, TCP endpoint, port, or user
 approval. The same verified CLI automatically runs its hidden per-user server
 over private local IPC.
 
-<!-- codestory-public-support:start -->
-| Platform | Release support |
-| --- | --- |
-| macOS 15+ on Apple Silicon | Supported with Metal |
-| Windows x64 | Supported with Vulkan |
-| Linux x64 | Supported with Vulkan |
-| CPU-only Windows and Linux | Unsupported |
-| Intel Mac | Unsupported |
-| Windows ARM | Unsupported |
-<!-- codestory-public-support:end -->
-
-## Codex install
-
-1. Open `/plugins` in Codex.
-2. Install **TheGreenCedar -> codestory**.
-3. Start a fresh Codex host session.
-
-Marketplace catalog: `TheGreenCedar/AgentPluginMarketplace`. Refresh or remove
-the package from the same `/plugins` screen. Some Windows Codex builds also
-expose `codex.cmd plugin marketplace ...` and `codex.cmd plugin add ...`.
-
-Marketplace refresh updates the catalog only. Package refresh replaces the
-installed plugin, and a fresh host session loads that replacement. See the
-[Codex update guide](../../docs/users/codex.md#update).
-
-## Cursor install
-
-CodeStory is not listed on the public Cursor Marketplace. In **Customize**,
-select **+ Add Marketplace**, then **Import from Github**
-([TheGreenCedar/CodeStory](https://github.com/TheGreenCedar/CodeStory)) or
-**Import from Disk** (a local clone). Install **codestory** from that
-marketplace, enable its MCP server once, and reload the Cursor window. The
-[Cursor guide](../../docs/users/cursor.md) owns that path.
-
-The import reads
-[`.cursor-plugin/marketplace.json`](../../.cursor-plugin/marketplace.json).
-The package supplies the rule, grounding skill, session-start context, and
-managed CLI launcher. On the first MCP call, the launcher fetches the matching
-managed runtime if it is not already installed. The MCP toggle is a Cursor
-platform setting, so installing the plugin cannot enable it on your behalf.
+User install lives on the host guides. Maintainer dogfood is below.
 
 ## CodeStoryDev / Cursor refresh
 
@@ -162,9 +125,10 @@ node .github/scripts/check-doc-links.mjs
 git diff --check
 ```
 
-Build `codestory-cli` before checking generated syntax. When Clap syntax
-changes, run the generator with `--rewrite-references` to refresh the compact
-index and remove copied option matrices from the skill references.
+Build `codestory-cli` before checking generated syntax. `--rewrite-references`
+only refreshes maintainer CLI pages (`index`, `doctor`, `serve`, `drill`,
+`explore`, `query`, `bookmark`, `cache`, `retrieval-rollout`). MCP tool pages
+must match [generated MCP syntax](skills/codestory-grounding/references/generated-mcp-syntax.md).
 
 `plugin-static` checks adapter, manifest, skill, and runtime wiring. It does not
 assert prose.

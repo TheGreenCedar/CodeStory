@@ -90,8 +90,9 @@ Repository activation and engine initialization are separate:
 
 A cold request can return a bounded same-tool retry while these steps run. An
 existing complete publication remains readable during refresh. Concurrent
-publication drift returns `cache_busy` and permits one bounded retry rather
-than mixing generations.
+publication identity drift returns `publication_changed` and permits one
+bounded whole-operation retry rather than mixing generations. Lock or refresh
+contention returns `cache_busy`.
 
 The bounded response is `codestory_preparing` with one stable operation ID, a
 non-null retry delay, and the attempted tool as `retry_tool`. Terminal
@@ -124,10 +125,10 @@ branch.
 
 | Platform | Production path | Release claim |
 | --- | --- | --- |
-| macOS Apple Silicon | Metal | v0.16 package; physical Apple adapter, full layer offload, timed live smoke |
-| Windows x64 | Vulkan | v0.16 package; physical adapter, software-adapter rejection, full layer offload, timed live smoke |
-| Linux x64 | Vulkan | v0.16 package; physical adapter, software-adapter rejection, full layer offload, timed live smoke |
-| Other targets | No release path | No v0.16 package or runtime claim |
+| macOS Apple Silicon | Metal | current release package; physical Apple adapter, full layer offload, timed live smoke |
+| Windows x64 | Vulkan | current release package; physical adapter, software-adapter rejection, full layer offload, timed live smoke |
+| Linux x64 | Vulkan | current release package; physical adapter, software-adapter rejection, full layer offload, timed live smoke |
+| Other targets | No release path | No current-release package or runtime claim |
 
 Windows source and package proof builds pin `CMAKE_GENERATOR=Ninja`; hosted
 native-build caches include the selected generator and CMake/Ninja versions.
@@ -181,7 +182,8 @@ accelerator authorization.
 | Whole server is frozen | Client returns bounded `owner_unresponsive`; it does not unlink, kill, take over, or start a second engine | Restore or terminate the exact frozen process deliberately |
 | Model materialization mismatch | Engine fails closed before use | Preserve the path and digest evidence; let the next verified materialization replace only owned state |
 | Retrieval producer changed | Old semantic generation is not admitted | Run normal full retrieval publication and verify the new identity |
-| Core or retrieval publication changes during query | Query returns `cache_busy` | Retry once against the new complete publication |
+| Core or retrieval publication changes during query | Query returns `publication_changed` | Retry the whole operation once against the new complete publication |
+| Cache lock or refresh contention | Query returns `cache_busy` | Wait and retry |
 | Persisted generation is corrupt or incomplete | Broad search is blocked; prior complete generation remains eligible | Inspect status and rebuild only the named repository generation |
 
 Do not diagnose an acceleration failure by enabling CPU. Do not delete the

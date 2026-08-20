@@ -1,3 +1,6 @@
+Maintainer CLI only. There is no MCP tool with this name. Product
+tools own activation; do not call this from the grounding skill.
+
 # `serve` - Local Agent Integration Surface
 
 Serves a project over either a small HTTP JSON API or an MCP-style JSON-lines

@@ -1,26 +1,32 @@
 # `context` - Target Context For One Concrete Target
 
-Builds target context around one concrete retrieval target (`--query` must name a symbol, file, literal, API path, module, or behavior term — not a broad question). Runs through the Investigate agent path and fails closed unless full retrieval is full. For broad questions use `packet`; for discovery use `search`; for repeatable reports use `drill`.
+Builds target context around one concrete retrieval target (`query` must name a
+symbol, file, literal, API path, module, or behavior term, not a broad
+question). Fails closed unless full retrieval is ready. For broad questions use
+`packet`; for discovery use `search`.
 
 ## Syntax
 
-See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
-Use `<codestory-cli> <command> --help` for the complete option set.
+See [generated MCP syntax](generated-mcp-syntax.md) for live fields. Do not send
+CLI flags. Every call requires `project` (absolute repository root).
 
 ## Agent Paths
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Normal path | `<codestory-cli> context --project <target-workspace> --query AppController` | Markdown context packet with resolution metadata, retrieval trace, citations, gaps, and next commands when full retrieval is full. |
-| Failure path | If the target is ambiguous or missing, run `search --project <target-workspace> --query "<target>" --why`, choose a concrete `node_id`, then rerun `context --id <node_id>`. If `context` reports `preparing`, wait `retry_after_ms` and retry the same call; the tool owns activation and its bounded retry path. | Keeps target context tied to a resolvable target and avoids treating stale retrieval as strong evidence. |
-| Integration edge | Use `search --why`, `explore`, or `bookmark list` first, then pass the selected node via `--id <node_id>` or `--bookmark <bookmark_id>`; use `--bundle out/context-AppController` for reviewer handoff. | Converts candidate discovery into a deeper, shareable evidence packet. |
+| Normal path | MCP `context` with `query` or `id` | Context for that one target. |
+| Failure path | If the target is ambiguous, `search` then retry `context` with `id`. If `preparing`, wait `retry_after_ms` and retry. | Keeps context tied to a resolvable target. |
 
 ## Notes
 
-- Do not pass broad questions to `context`. Use `packet --question` for broad task questions, `search --why` for candidate discovery, `drill` for deterministic reports, and then `context --id <node_id>` for selected anchors.
-- Good `--query` values are symbol names, file names, string literals, API paths, module names, and specific behavior terms.
-- Use `symbol`, `trail`, `snippet`, or `explore` for cache-only local navigation when retrievals are degraded.
-- Treat `context` output as incomplete when it reports weak hits, semantic stale/partial/failed states, missing snippets, no citations, or unresolved graph edges.
-- `doctor` and manual retrieval indexing are maintainer diagnosis and proof
-  surfaces. Use them only after the intended tool stops converging or when an
-  explicit proof transcript is required.
+- Do not pass broad questions to `context`. Use `packet` with `question` for
+  broad tasks, `search` for candidate discovery, then `context` with `id` for
+  selected anchors.
+- Good `query` values are symbol names, file names, string literals, API paths,
+  module names, and specific behavior terms.
+- Use `symbol`, `trail`, or `snippet` for local navigation when retrieval is
+  degraded.
+- Treat `context` output as incomplete when it reports weak hits, semantic
+  stale/partial/failed states, missing snippets, no citations, or unresolved
+  graph edges.
+- `doctor` and manual retrieval indexing are maintainer diagnosis surfaces.

@@ -113,11 +113,11 @@ optional performance and answer-quality lane: failure rejects that evaluation,
 not the standard desktop release. `release.yml` does not call it or wait for
 its protected Linux ARM64 runner.
 
-Provision, verify, recover, and unregister the dedicated Linux host using the
-[release-evidence runner runbook](../contributors/release-evidence-runner.md).
-Its fingerprint combines a stable profile ID with the checked-in machine
-contract hash. The workflow accepts that fingerprint only after the live guest
-matches the current-boot host attestation and pinned package/toolchain state.
+The former Linux ARM64 guest runner is retired and is not a measurement
+authority. Optional quality lanes live in
+`.github/workflows/frozen-candidate-quality.yml`. Packet-quality floors for
+the current Ripgrep contract are in the
+[release-evidence quality contract](../contributors/release-evidence-runner.md).
 
 For maintainer reproduction, produce and evaluate from real raw artifacts:
 

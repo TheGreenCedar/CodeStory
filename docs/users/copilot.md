@@ -27,16 +27,19 @@ plugins.
 
 ### Connect MCP
 
-Configure an MCP server that runs
-`plugins/codestory/scripts/codestory-mcp.cjs`, with a persistent per-user data
-directory outside the repository:
+Neither Copilot adapter auto-starts MCP. After the plugin is installed, point
+the host at the adapter inside that installed plugin directory, not at a
+CodeStory git checkout.
+
+The portable plugin `mcp.json` uses `${PLUGIN_ROOT}`:
 
 ```json
 {
   "mcpServers": {
     "codestory": {
       "command": "node",
-      "args": ["/absolute/path/to/plugins/codestory/scripts/codestory-mcp.cjs"],
+      "args": ["./scripts/codestory-mcp.cjs"],
+      "cwd": "${PLUGIN_ROOT}",
       "env": {
         "CODESTORY_PLUGIN_DATA": "/absolute/path/to/codestory-plugin-data"
       }
@@ -44,6 +47,11 @@ directory outside the repository:
   }
 }
 ```
+
+If the host does not expand `${PLUGIN_ROOT}`, set `cwd` to the directory
+`copilot plugin list` reports for **codestory**, and keep `args` as
+`./scripts/codestory-mcp.cjs`. Use a persistent per-user data directory outside
+the repository you are grounding.
 
 The session hook is useful without MCP because it preserves the grounding
 contract, but it cannot query the CodeStory index. Without MCP, the agent should
@@ -79,8 +87,28 @@ available. They do not install the CLI, start MCP, or create an index.
 
 ### Install
 
-1. Copy `.github/copilot-instructions.md` from this repository into the target
-   repository.
+1. Add `.github/copilot-instructions.md` at the target repository root with
+   this contract:
+
+   ```markdown
+   # CodeStory Grounding
+
+   Use CodeStory proactively for repository questions. Do not wait for the user
+   to mention it by name.
+
+   Before making source claims, planning edits, choosing tests, or reviewing
+   changes in this repository:
+
+   1. Call the CodeStory tool that matches the task and pass the repository's
+      absolute root as `project`.
+   2. If it reports `preparing` or `updating`, retry that same tool after its
+      reported delay. Do not poll status.
+   3. Use `status` or `codestory://status` only to diagnose a failed or
+      unexpectedly slow call.
+   4. If MCP is missing, inspect source normally and report that CodeStory was
+      unavailable for the task.
+   ```
+
 2. If the editor supports MCP, configure the host-neutral CodeStory server
    block above.
 3. Open the repository root and start a fresh chat.

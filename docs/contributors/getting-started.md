@@ -75,9 +75,11 @@ flowchart LR
   contracts["contracts"] --> workspace["workspace"]
   contracts --> indexer["indexer"]
   contracts --> store["store"]
+  contracts --> agent["agent"]
   workspace --> runtime["runtime"]
   indexer --> runtime
   store --> runtime
+  agent --> runtime
   retrieval["retrieval + llama-sys"] --> runtime
   runtime --> cli["cli"]
   cli --> adapters["plugin and adapters"]
@@ -92,7 +94,8 @@ flowchart LR
 | `codestory-store` | SQLite source of truth, snapshots, projections, core publication |
 | `codestory-retrieval` | Lexical/vector/SCIP generations, manifests, query execution, and the per-user embedding protocol/server |
 | `codestory-llama-sys` | The small Rust-to-llama.cpp/ggml boundary and embedded-model build contract |
-| `codestory-runtime` | Product orchestration for indexing, grounding, search, packets, and agent flows |
+| `codestory-agent` | Packet planning only; depends on `codestory-contracts` alone |
+| `codestory-runtime` | Product orchestration for indexing, grounding, search, packets, and execution |
 | `codestory-cli` | Arguments, transports, rendering, process configuration, managed runtime boundary |
 | `plugins/codestory` | Host hooks, CLI provisioning, MCP routing, canonical grounding skill |
 | `codestory-bench` | Measurement support; no product contracts |
@@ -109,20 +112,16 @@ lanes are:
 | CLI or stdio | Named CLI contract suite; add runtime tests when orchestration changes |
 | Plugin adapter | `node --test plugins/codestory/tests/plugin-static.test.mjs` |
 | Indexer or language | Full fidelity and language-coverage binaries |
+| `codestory-agent` planning | `cargo test --locked -p codestory-agent` |
 | Retrieval or embeddings | Retrieval/runtime admission tests plus the named engine proof |
 | Release metadata | Release-version and workflow-policy scripts |
 
 Run Cargo build, check, test, and clippy commands serially because worktrees can
 share build locks. Never serialize a test suite to hide leaked global state.
 
-The accepted exact-head source gate runs once:
-
-```sh
-cargo fmt --all -- --check
-cargo check --workspace --locked
-cargo test --workspace --locked
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-```
+The accepted exact-head source gate is owned by the
+[testing matrix](testing-matrix.md#source-stabilization-gate). Draft work uses
+the focused commands above, not a workspace `cargo test`.
 
 ## Local CLI loop
 

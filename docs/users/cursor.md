@@ -10,20 +10,9 @@ from it.
 
 ## Requirements
 
-- One of the supported platform and accelerator combinations below;
+- One of the [supported platform and accelerator combinations](README.md#platform-summary);
 - Node.js on `PATH` for the plugin adapter; and
 - a Cursor reload after installing or replacing the plugin package.
-
-<!-- codestory-public-support:start -->
-| Platform | Release support |
-| --- | --- |
-| macOS 15+ on Apple Silicon | Supported with Metal |
-| Windows x64 | Supported with Vulkan |
-| Linux x64 | Supported with Vulkan |
-| CPU-only Windows and Linux | Unsupported |
-| Intel Mac | Unsupported |
-| Windows ARM | Unsupported |
-<!-- codestory-public-support:end -->
 
 The packaged CLI contains its model and embedding engine, so normal use needs
 no Docker, external embedding endpoint, model download, or Xcode toolchain.
@@ -92,20 +81,9 @@ and are not the primary CodeStory install path.
 
 ## Local plugin development
 
-The installer below is only for dogfooding a checkout with an optional local
-CLI. Normal installs use [Add Marketplace](#install).
-
-From a clean committed CodeStory checkout:
-
-```sh
-node scripts/install-codestory-cursor-plugin.mjs
-```
-
-Pass `--cli "$(pwd)/target/release/codestory-cli"` to use that exact binary
-instead of the managed download. The installer links `plugins/codestory` into
-`~/.cursor/plugins/local/codestory` and writes any CLI override only into
-Cursor's private CodeStory data directory. Reload Cursor, enable **codestory**
-MCP in Customize, and start a fresh agent session.
+Dogfood a CodeStory checkout from the
+[plugin README](../../plugins/codestory/README.md#cursor-local-package). Normal
+installs use [Add Marketplace](#install).
 
 ## Troubleshooting
 

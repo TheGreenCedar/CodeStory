@@ -7,20 +7,9 @@ tool call still names its repository explicitly.
 
 ## Requirements
 
-- One of the supported platform and accelerator combinations below;
+- One of the [supported platform and accelerator combinations](README.md#platform-summary);
 - Node.js available to the plugin adapter; and
 - a fresh Codex session after installing or replacing the plugin package.
-
-<!-- codestory-public-support:start -->
-| Platform | Release support |
-| --- | --- |
-| macOS 15+ on Apple Silicon | Supported with Metal |
-| Windows x64 | Supported with Vulkan |
-| Linux x64 | Supported with Vulkan |
-| CPU-only Windows and Linux | Unsupported |
-| Intel Mac | Unsupported |
-| Windows ARM | Unsupported |
-<!-- codestory-public-support:end -->
 
 The packaged CLI contains its model and embedding engine, so normal use needs
 no Docker, external embedding endpoint, model download, or Xcode toolchain.
@@ -92,8 +81,8 @@ later request to that CLI without another restart.
 | Windows update says `Access is denied` | Close stale Codex windows using the old plugin, replace the package, and start a fresh host |
 
 Use [shared troubleshooting](troubleshooting.md) when a tool still does not
-converge. Backend, model, and adapter evidence belongs in the
-[retrieval operations guide](../ops/retrieval-engine.md), not normal sessions.
+converge. Maintainer backend evidence is in the
+[CLI reference](cli-reference.md), not a normal session.
 
 ## Host boundary
 

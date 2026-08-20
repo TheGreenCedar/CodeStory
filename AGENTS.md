@@ -45,7 +45,8 @@ pages, runbooks, and workflows own detailed mechanics.
   `PinnedReader` trait, so it can never activate, store, execute retrieval,
   retry a publication, or move readiness.
 - `codestory-runtime`: the only product orchestration layer. Indexing,
-  grounding, search, packet construction, and agent flows belong here.
+  grounding, search, packet assembly, and retrieval execution belong here.
+  Packet planning belongs in `codestory-agent`.
 - `codestory-cli`: command and transport parsing, output rendering, process
   configuration capture, and managed sidecar lifecycle boundaries. Do not move
   product orchestration into adapters.
@@ -56,7 +57,7 @@ pages, runbooks, and workflows own detailed mechanics.
   product contracts.
 
 Dependency direction is
-`contracts -> workspace/store/indexer/retrieval -> runtime -> cli/adapters`.
+`contracts -> workspace/store/indexer/llama-sys/retrieval/agent -> runtime -> cli/adapters`.
 Change the owning source-of-truth layer first; do not patch a derived view or
 adapter to compensate for incorrect upstream state.
 
@@ -140,8 +141,8 @@ adapter to compensate for incorrect upstream state.
   `node --test plugins/codestory/tests/plugin-static.test.mjs`.
 - Indexer fidelity or language coverage requires the full binaries, not name
   filters:
-  - `cargo test -p codestory-indexer --test fidelity_regression`
-  - `cargo test -p codestory-indexer --test tictactoe_language_coverage`
+  - `cargo test --locked -p codestory-indexer --test fidelity_regression`
+  - `cargo test --locked -p codestory-indexer --test tictactoe_language_coverage`
 - Publication, identity, packaging, or platform changes require their named
   concurrency, fault, package, and native proof lanes from the testing matrix.
   Draft CI, exact-head source proof, platform proof, and integration proof are

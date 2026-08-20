@@ -2565,8 +2565,6 @@ const PUBLIC_SUPPORT_DOCUMENTS = [
   "README.md",
   "CHANGELOG.md",
   "docs/users/README.md",
-  "docs/users/codex.md",
-  "plugins/codestory/README.md",
 ];
 
 // Pages that hand-maintain their own platform table instead of embedding the generated block.

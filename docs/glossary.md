@@ -43,6 +43,17 @@ A managed operation exceeded its foreground budget but is making progress. The
 result names a delay and the same operation to retry. Local graph surfaces may
 remain available.
 
+### updating
+
+A newer publication is being written. The last complete repository map remains
+usable. Retry the same tool when current publication evidence is required.
+
+### working_locally
+
+Broad packet/search is not ready, but local graph navigation still is. Use
+`ground`, `files`, `symbol`, `trail`, and `snippet` while semantic search
+prepares.
+
 ## Identity and publication
 
 ### process scope
@@ -133,7 +144,8 @@ the native stdio process.
 
 ### runtime
 
-`codestory-runtime`, the only product orchestration layer.
+The product orchestration layer. It decides which owning service to call and
+assembles cited results. Packet planning is a separate crate.
 
 ### retrieval engine
 
@@ -143,7 +155,7 @@ embedding server and shared by compatible CodeStory client processes.
 ### workspace
 
 Repository identity, source discovery, refresh planning, and shared filesystem
-safety owned by `codestory-workspace`.
+safety.
 
 ### cache root
 
@@ -152,6 +164,9 @@ Trusted root containing project-isolated core and retrieval state. See the
 
 ### sidecar
 
-Legacy compatibility vocabulary still present in some stable fields and
-internal type names. In current architecture it refers to project-local
-retrieval publication state, not an external server, daemon, port, or container.
+Two current meanings:
+
+- Retrieval publication state (legacy field names). Not an external server,
+  daemon, port, or container.
+- The annotation file beside the cache that holds bookmarks across index
+  rebuilds. See the [CLI reference](users/cli-reference.md) recovery commands.
