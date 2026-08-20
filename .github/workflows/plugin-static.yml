@@ -242,5 +242,10 @@ jobs:
       - name: Check release version surfaces
         shell: bash
         run: |
-          version="$(python -c "import tomllib; print(tomllib.load(open('crates/codestory-cli/Cargo.toml', 'rb'))['package']['version'])")"
-          python .github/scripts/check-codestory-release.py --version "$version"
+          cli_version="$(python -c "import tomllib; print(tomllib.load(open('crates/codestory-cli/Cargo.toml', 'rb'))['package']['version'])")"
+          plugin_version="$(python -c "import json; print(json.load(open('plugins/codestory/plugin.json'))['version'])")"
+          if [ "$plugin_version" = "$cli_version" ]; then
+            python .github/scripts/check-codestory-release.py --version "$cli_version"
+          else
+            python .github/scripts/check-codestory-release.py --version "$plugin_version" --lane plugin
+          fi

@@ -77,6 +77,21 @@ function exact(value, expected, label) {
   return value;
 }
 
+function installedCodexCliVersion(value, label) {
+  nonEmpty(value, label);
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u.test(value)) {
+    fail(`${label} must be bare semver`);
+  }
+  return value;
+}
+
+function attestedCodexCliVersion(value, label) {
+  nonEmpty(value, label);
+  const match = /^codex-cli ([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)$/u.exec(value);
+  if (!match) fail(`${label} must use the exact codex-cli semver producer form`);
+  return match[1];
+}
+
 function commit(value, label) {
   if (typeof value !== "string" || !/^[0-9a-f]{40}$/u.test(value)) {
     fail(`${label} must be a full lowercase Git SHA`);
@@ -506,8 +521,14 @@ function validateCrossSessionIdentity(first, second, attestation, expected) {
       "installed catalog revision",
     );
     exact(
-      session.installedPlugin.codex_cli_version,
-      attestation.marketplace.codex_cli_version,
+      installedCodexCliVersion(
+        session.installedPlugin.codex_cli_version,
+        "installed Codex CLI version",
+      ),
+      attestedCodexCliVersion(
+        attestation.marketplace.codex_cli_version,
+        "attested Codex CLI version",
+      ),
       "installed Codex CLI version",
     );
     exact(

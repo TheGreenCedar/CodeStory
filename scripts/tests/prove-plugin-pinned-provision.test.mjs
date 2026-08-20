@@ -7,7 +7,10 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { requirePinnedArchiveDigest } from "../lib/pinned-archive-digests.mjs";
+import {
+  PINNED_ARCHIVE_TARGETS,
+  requirePinnedArchiveDigest,
+} from "../lib/pinned-archive-digests.mjs";
 import {
   assertProvisionedArchiveDigest,
   parseProvisionProofArguments,
@@ -40,6 +43,18 @@ function repositoryPin() {
   return JSON.parse(
     fs.readFileSync(path.join(repositoryRoot, "plugins/codestory/cli-version.json"), "utf8"),
   );
+}
+
+function repositoryPluginVersion() {
+  return JSON.parse(
+    fs.readFileSync(path.join(repositoryRoot, "plugins/codestory/plugin.json"), "utf8"),
+  ).version;
+}
+
+function archiveLessNativePin() {
+  const pin = repositoryPin();
+  delete pin.archives;
+  return pin;
 }
 
 function manifestFor(version, entries = {}) {
@@ -127,21 +142,30 @@ test("only the plugin lane may assert a source-pinned archive digest", () => {
   }
 });
 
-// The freeze-critical case, held against the pin this repository actually carries rather than a
-// hand-made one. The frozen native head's pin is lawfully archive-less -- bump-version.mjs deletes
-// `archives` on a native bump because the archives are built FROM this tree -- and the proof used
-// to run the source-pin assertion on it unconditionally, which can only fail.
-test("the frozen source carries no circular native archive digest", () => {
+// A native head is archive-less because it will build its own archives. A plugin-only head pins an
+// already-published older CLI and must carry all three digests. This test runs in both workflows,
+// so hold the repository's real pin to the contract for the lane its versions identify.
+test("the repository pin matches its native or plugin-only release lane", () => {
   const pin = repositoryPin();
-  assert.equal(
-    Object.hasOwn(pin, "archives"),
-    false,
-    "a native pin naming digests of archives built from its own tree is the circularity REL-MAN removes",
+  const pluginVersion = repositoryPluginVersion();
+  if (pluginVersion === pin.cli_version) {
+    assert.equal(
+      Object.hasOwn(pin, "archives"),
+      false,
+      "a native pin naming digests of archives built from its own tree is circular",
+    );
+    return;
+  }
+  assert.deepEqual(
+    Object.keys(pin.archives || {}).sort(),
+    Object.keys(PINNED_ARCHIVE_TARGETS).sort(),
+    "a plugin-only release must pin every published CLI archive",
   );
+  for (const digest of Object.values(pin.archives)) assert.match(digest, /^[0-9a-f]{64}$/u);
 });
 
 test("a lawful archive-less native pin fails the plugin lane and passes the native one", () => {
-  const pin = repositoryPin();
+  const pin = archiveLessNativePin();
   const target = "linux-x64";
   const provisioned = { sha256: VALID_DIGEST, bytes: 4096 };
 

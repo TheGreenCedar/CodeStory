@@ -2651,9 +2651,11 @@ export function releaseAssetNames(graph, version) {
     fail("release asset version must be semver");
   }
   return [
-    ...graph.workflow_policy.package_matrix.map(
-      ({ asset_target: target, extension }) =>
-        `codestory-cli-v${version}-${target}.${extension}`,
+    ...graph.workflow_policy.package_matrix.flatMap(
+      ({ asset_target: target, extension }) => {
+        const archive = `codestory-cli-v${version}-${target}.${extension}`;
+        return [archive, `${archive}.sha256`];
+      },
     ),
     "SHA256SUMS.txt",
     // The native lane's archive digests. They cannot be pinned in source -- the archives are built

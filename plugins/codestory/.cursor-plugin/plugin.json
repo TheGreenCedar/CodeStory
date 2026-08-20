@@ -1,6 +1,6 @@
 {
   "name": "codestory",
-  "version": "0.17.1",
+  "version": "0.17.2",
   "description": "CodeStory grounding for Cursor over the local codestory-cli runtime.",
   "author": {
     "name": "The Green Cedar"

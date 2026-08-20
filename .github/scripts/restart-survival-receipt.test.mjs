@@ -30,7 +30,9 @@ function installedPlugin() {
   return {
     schema_version: 2,
     installation_source: LIVE_INSTALLATION_SOURCE,
-    codex_cli_version: "codex-cli 1.2.3",
+    // The installed-runtime summary normalizes the pinned producer to semver,
+    // while the installation attestation retains `codex --version` verbatim.
+    codex_cli_version: "1.2.3",
     marketplace_repository: LIVE_MARKETPLACE_REPOSITORY,
     marketplace_commit: MARKETPLACE,
     plugin_id: "codestory",
@@ -248,6 +250,23 @@ test("CLI writes the reusable receipt through explicit paths and metadata", () =
 });
 
 const hostileCases = [
+  ["installed summary retains the Codex producer prefix", state => {
+    state.first.runtime.installed_plugin.codex_cli_version = "codex-cli 1.2.3";
+    state.second.runtime.installed_plugin.codex_cli_version = "codex-cli 1.2.3";
+  }, /installed Codex CLI version/u],
+  ["attestation drops the Codex producer prefix", state => {
+    state.attestation.marketplace.codex_cli_version = "1.2.3";
+  }, /attested Codex CLI version/u],
+  ["installed Codex CLI version changes", state => {
+    state.second.runtime.installed_plugin.codex_cli_version = "1.2.4";
+  }, /installed plugin identity changed|installed Codex CLI version/u],
+  ["both installed sessions name the wrong Codex CLI version", state => {
+    state.first.runtime.installed_plugin.codex_cli_version = "1.2.4";
+    state.second.runtime.installed_plugin.codex_cli_version = "1.2.4";
+  }, /installed Codex CLI version/u],
+  ["attested Codex CLI version has an unknown producer prefix", state => {
+    state.attestation.marketplace.codex_cli_version = "codex 1.2.3";
+  }, /Codex CLI version/u],
   ["catalog installer disagrees with state", state => {
     state.options.expectedInstallerIdentity = DEFERRED_INSTALLATION_SOURCE;
   }, /catalog installer identity/u],

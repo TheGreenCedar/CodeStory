@@ -35,8 +35,10 @@ jobs:
 
       - name: Install Rust stable
         run: |
-          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
-          rustup default stable
+          # Keep draft CI deterministic. The stable alias moved from 1.97.1 to 1.98.0 during
+          # this release and introduced a new deny-by-default Clippy warning on unchanged source.
+          rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+          rustup default 1.97.1
 
       - name: Install Linux Vulkan build dependencies
         run: bash .github/scripts/install-linux-vulkan-build-deps.sh
