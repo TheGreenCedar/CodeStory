@@ -7020,6 +7020,54 @@ test("plugin publish must actually wait on preflight and plugin proof", async (t
   });
 });
 
+test("plugin proof keeps the full static suite off Windows without dropping Windows release proof", async (t) => {
+  const file = "plugin-release.yml";
+  const fullSuiteName = "Run the plugin static suite";
+  const windowsRootName = "Prove plugin root activation on Windows";
+  const expected = /plugin-release\.yml plugin proof must run the full static suite off Windows, the portable root contract on Windows, and pinned provisioning on every host/u;
+
+  await t.test("the platform split retains both proof tiers", () => {
+    const workflows = loadWorkflows();
+    assert.deepEqual(validateWorkflows(workflows), []);
+  });
+
+  const mutations = [
+    ["the Windows proof host disappears", workflow => {
+      workflow.jobs["plugin-proof"].strategy.matrix.include =
+        workflow.jobs["plugin-proof"].strategy.matrix.include.filter(row => row.os !== "windows-latest");
+    }],
+    ["the full static suite runs on Windows again", workflow => {
+      delete draftStep(workflow.jobs["plugin-proof"], fullSuiteName).if;
+    }],
+    ["the focused Windows root proof disappears", workflow => {
+      const job = workflow.jobs["plugin-proof"];
+      job.steps = job.steps.filter(step => step.name !== windowsRootName);
+    }],
+    ["the focused root proof is routed away from Windows", workflow => {
+      draftStep(workflow.jobs["plugin-proof"], windowsRootName).if = "runner.os != 'Windows'";
+    }],
+    ["the focused Windows proof selects another test", workflow => {
+      draftStep(workflow.jobs["plugin-proof"], windowsRootName).run =
+        "node --test plugins/codestory/tests/plugin-static.test.mjs";
+    }],
+    ["the pinned provision self-test skips Windows", workflow => {
+      draftStep(workflow.jobs["plugin-proof"], "Check the pinned provision proof").if =
+        "runner.os != 'Windows'";
+    }],
+    ["the real pinned provision skips Windows", workflow => {
+      draftStep(workflow.jobs["plugin-proof"], "Provision the pinned CLI end to end").if =
+        "runner.os != 'Windows'";
+    }],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
 test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
   const file = "marketplace-sync.yml";
