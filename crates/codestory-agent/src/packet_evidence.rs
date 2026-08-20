@@ -2,7 +2,7 @@
 
 use codestory_contracts::api::{
     AgentCitationDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
-    RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
+    RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin, SearchMatchQualityDto,
 };
 const OPENAPI_ENDPOINT_SCHEMA_PRODUCER: &str = "openapi_endpoint_schema";
 
@@ -38,8 +38,11 @@ pub fn decorate_search_hit_evidence(hit: &mut SearchHit) {
     hit.evidence_tier = Some(tier);
     hit.evidence_producer = Some(producer);
     hit.resolution_status = Some(resolution);
-    hit.eligible_for_sufficiency =
-        Some(!diagnostic_source_proof && evidence_is_sufficiency_eligible(tier, resolution));
+    hit.eligible_for_sufficiency = Some(
+        !diagnostic_source_proof
+            && !hit_is_repo_text_or_text_match(hit)
+            && evidence_is_sufficiency_eligible(tier, resolution),
+    );
 }
 
 pub fn decorate_lexical_search_hit_evidence(hit: &mut SearchHit) {
@@ -59,6 +62,9 @@ pub fn decorate_lexical_search_hit_evidence(hit: &mut SearchHit) {
 
 pub fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &SearchHit) {
     citation.target = hit.target.clone();
+    if citation.source_excerpt.is_none() {
+        citation.source_excerpt = hit.source_excerpt.clone();
+    }
     citation.evidence_tier = hit
         .evidence_tier
         .or_else(|| Some(evidence_tier_for_hit(hit)));
@@ -83,14 +89,17 @@ pub fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &SearchH
         return;
     }
     citation.eligible_for_sufficiency = hit.eligible_for_sufficiency.or_else(|| {
-        Some(evidence_is_sufficiency_eligible(
-            citation
-                .evidence_tier
-                .unwrap_or(PacketEvidenceTier::GeneratedSummary),
-            citation
-                .resolution_status
-                .unwrap_or(PacketEvidenceResolution::Unresolved),
-        ))
+        Some(
+            !citation_is_repo_text_or_text_match(citation)
+                && evidence_is_sufficiency_eligible(
+                    citation
+                        .evidence_tier
+                        .unwrap_or(PacketEvidenceTier::GeneratedSummary),
+                    citation
+                        .resolution_status
+                        .unwrap_or(PacketEvidenceResolution::Unresolved),
+                ),
+        )
     });
 }
 
@@ -123,7 +132,9 @@ pub fn citation_sufficiency_eligible(citation: &AgentCitationDto) -> bool {
     if !evidence_is_sufficiency_eligible(tier, resolution) {
         return false;
     }
-    citation.eligible_for_sufficiency.unwrap_or(true)
+    citation
+        .eligible_for_sufficiency
+        .unwrap_or_else(|| !citation_is_repo_text_or_text_match(citation))
 }
 
 pub fn evidence_tier_for_hit(hit: &SearchHit) -> PacketEvidenceTier {
@@ -285,11 +296,27 @@ fn citation_is_openapi_endpoint_schema(citation: &AgentCitationDto) -> bool {
     citation.evidence_producer.as_deref() == Some(OPENAPI_ENDPOINT_SCHEMA_PRODUCER)
 }
 
+fn producer_is_repo_text_or_text_match(producer: Option<&str>) -> bool {
+    matches!(producer, Some("repo_text_fallback" | "text_match"))
+}
+
+fn hit_is_repo_text_or_text_match(hit: &SearchHit) -> bool {
+    hit.origin == SearchHitOrigin::TextMatch
+        || hit.match_quality == Some(SearchMatchQualityDto::RepoText)
+        || producer_is_repo_text_or_text_match(hit.evidence_producer.as_deref())
+}
+
+fn citation_is_repo_text_or_text_match(citation: &AgentCitationDto) -> bool {
+    citation.origin == SearchHitOrigin::TextMatch
+        || producer_is_repo_text_or_text_match(citation.evidence_producer.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use codestory_contracts::api::{
         AgentCitationDto, NodeId, NodeKind, RetrievalScoreBreakdownDto, SearchHitOrigin,
+        SearchMatchQualityDto,
     };
 
     fn workflow_hit() -> SearchHit {
@@ -502,6 +529,7 @@ mod tests {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
+            source_excerpt: None,
         };
 
         decorate_citation_from_hit(&mut citation, &hit);
@@ -558,6 +586,7 @@ mod tests {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
+            source_excerpt: None,
         };
 
         decorate_citation_from_hit(&mut citation, &hit);
@@ -576,5 +605,51 @@ mod tests {
         );
         assert_eq!(citation.eligible_for_sufficiency, Some(false));
         assert!(!citation_sufficiency_eligible(&citation));
+    }
+
+    #[test]
+    fn repo_text_and_text_match_hits_are_not_packet_proof() {
+        let mut hit = workflow_hit();
+        hit.origin = SearchHitOrigin::TextMatch;
+        hit.match_quality = Some(SearchMatchQualityDto::RepoText);
+        hit.evidence_tier = Some(PacketEvidenceTier::LexicalSource);
+        hit.evidence_producer = Some("repo_text_fallback".to_string());
+        hit.resolution_status = Some(PacketEvidenceResolution::SourceRangeOnly);
+        hit.eligible_for_sufficiency = None;
+        hit.score_breakdown = None;
+
+        decorate_search_hit_evidence(&mut hit);
+
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+
+        let mut citation = AgentCitationDto {
+            node_id: hit.node_id.clone(),
+            display_name: hit.display_name.clone(),
+            kind: hit.kind,
+            file_path: hit.file_path.clone(),
+            line: hit.line,
+            score: hit.score,
+            origin: hit.origin,
+            target: hit.target.clone(),
+            resolvable: hit.resolvable,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+            source_excerpt: None,
+        };
+        decorate_citation_from_hit(&mut citation, &hit);
+        assert_eq!(citation.eligible_for_sufficiency, Some(false));
+        assert!(!citation_sufficiency_eligible(&citation));
+        citation.eligible_for_sufficiency = None;
+        assert!(
+            !citation_sufficiency_eligible(&citation),
+            "missing eligibility must default closed for repo-text / TextMatch producers"
+        );
     }
 }

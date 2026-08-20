@@ -1600,6 +1600,7 @@ mod tests {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: Some(true),
+            source_excerpt: None,
         }
     }
 

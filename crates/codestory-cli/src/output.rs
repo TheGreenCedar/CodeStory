@@ -4964,6 +4964,7 @@ mod tests {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: Some(false),
+            source_excerpt: None,
         };
 
         let markdown = render_agent_citation(Path::new("C:/repo"), &citation, false);
@@ -5015,6 +5016,7 @@ mod tests {
                 loss_reason: None,
                 coverage_role: None,
                 eligible_for_sufficiency: None,
+                source_excerpt: None,
             }],
             subgraph_ids: Vec::new(),
             retrieval_version: "test".to_string(),
@@ -5167,6 +5169,7 @@ mod tests {
                 loss_reason: None,
                 coverage_role: None,
                 eligible_for_sufficiency: None,
+                source_excerpt: None,
             }],
             subgraph_ids: Vec::new(),
             retrieval_version: "test".to_string(),
@@ -5959,6 +5962,7 @@ mod tests {
                 loss_reason: None,
                 coverage_role: None,
                 eligible_for_sufficiency: None,
+                source_excerpt: None,
             }],
             subgraph_ids: Vec::new(),
             retrieval_version: "test".to_string(),

@@ -232,6 +232,7 @@ pub(super) fn sample_task_brief_citation(
         loss_reason: None,
         coverage_role: None,
         eligible_for_sufficiency: None,
+        source_excerpt: None,
     }
 }
 

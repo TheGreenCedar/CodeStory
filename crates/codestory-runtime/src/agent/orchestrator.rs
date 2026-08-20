@@ -1031,6 +1031,7 @@ fn promote_sql_schema_dialect_files(answer: &mut AgentAnswerDto) {
             loss_reason: None,
             coverage_role: Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string()),
             eligible_for_sufficiency: Some(false),
+            source_excerpt: None,
         });
     }
     answer.citations.extend(file_identities);
@@ -1133,6 +1134,7 @@ fn push_cited_source_shape_citation(
         loss_reason: None,
         coverage_role: Some(citation.coverage_role.to_string()),
         eligible_for_sufficiency: Some(true),
+        source_excerpt: None,
     });
     true
 }
@@ -1247,6 +1249,7 @@ fn maybe_append_cited_stylesheet_import_citations(
                     "css animation variables".to_string()
                 }),
                 eligible_for_sufficiency: Some(true),
+                source_excerpt: None,
             });
             if is_keyframe {
                 push_cited_source_shape_citation(
@@ -1297,6 +1300,7 @@ fn maybe_append_cited_stylesheet_import_citations(
                         loss_reason: None,
                         coverage_role: Some("css animation selector".to_string()),
                         eligible_for_sufficiency: Some(true),
+                        source_excerpt: None,
                     });
                 }
             }
@@ -4025,6 +4029,7 @@ mod legacy_source_scans {
                     loss_reason: None,
                     coverage_role: Some("sql schema scripts".to_string()),
                     eligible_for_sufficiency: Some(false),
+                    source_excerpt: None,
                 });
                 appended_files += 1;
             }
@@ -4081,6 +4086,7 @@ mod legacy_source_scans {
                     loss_reason: None,
                     coverage_role: Some("sql schema anchor".to_string()),
                     eligible_for_sufficiency: Some(false),
+                    source_excerpt: None,
                 });
                 appended_anchors += 1;
             }
@@ -4242,6 +4248,7 @@ mod legacy_source_scans {
                 loss_reason: None,
                 coverage_role: Some(candidate.coverage_role),
                 eligible_for_sufficiency: Some(candidate.eligible_for_sufficiency),
+                source_excerpt: None,
             });
             appended = appended.saturating_add(1);
         }
@@ -6111,6 +6118,7 @@ mod legacy_source_scans {
                     "required source probe".to_string()
                 }),
                 eligible_for_sufficiency: Some(!explicit),
+                source_excerpt: None,
             });
             appended += 1;
         }
@@ -7203,6 +7211,7 @@ fn to_citation(
         loss_reason: scored.hit.loss_reason.clone(),
         coverage_role: scored.hit.coverage_role.clone(),
         eligible_for_sufficiency: scored.hit.eligible_for_sufficiency,
+        source_excerpt: scored.hit.source_excerpt.clone(),
     };
     decorate_citation_from_hit(&mut citation, &scored.hit);
     citation
@@ -8405,6 +8414,7 @@ mod tests {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: Some(true),
+            source_excerpt: None,
         }
     }
 
@@ -15239,6 +15249,7 @@ mod tests {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: Some(true),
+            source_excerpt: None,
         };
 
         assert_eq!(
