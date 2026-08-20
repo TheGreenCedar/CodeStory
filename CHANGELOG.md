@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- MCP `project` and CLI `--project` refuse the user home directory, `~/.ssh`,
+  `~/.gnupg`, and a `secrets/` directory used as the repository root. Set
+  `CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT=1` at process start to override. Nested
+  repositories under home are unchanged.
+
 ## 0.17.1
 
 CodeStory 0.17.1 makes compact answers more accurate and more reliable. A packet keeps the production sources that implement the flow — the files an operator would actually change — instead of filling the answer with tests, samples, and workflow files that only share a name.

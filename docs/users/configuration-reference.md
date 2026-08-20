@@ -43,6 +43,7 @@ Operator-facing settings. Environment values win over `.codestory.toml`.
 | --- | --- | --- | --- |
 | `CODESTORY_AGENT_PREFLIGHT_LOCAL_REFRESH_TIMEOUT_MS` | integer | `crates/codestory-cli/src/app/readiness_commands/preflight.rs` | Milliseconds `agent preflight` waits for a local refresh before reporting. |
 | `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG` | boolean | `crates/codestory-cli/src/config.rs` | Process-wide opt-in that lets project `.codestory.toml` files set summary network keys. |
+| `CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT` | boolean | `crates/codestory-cli/src/config.rs` | Process-start opt-in that allows `$HOME`, `~/.ssh`, `~/.gnupg`, or a `secrets/` directory as a project root. Tool arguments cannot set this. |
 | `CODESTORY_CACHE_ROOT` | path | `crates/codestory-retrieval/src/config.rs` | Overrides the per-user cache root that holds every project cache. |
 | `CODESTORY_EMBED_ALLOW_CPU` | boolean | `crates/codestory-cli/src/app.rs` | Rejected at startup: CPU embedding is unsupported, so any non-empty value fails closed. |
 | `CODESTORY_HYBRID_RETRIEVAL_ENABLED` | boolean | `crates/codestory-retrieval/src/config.rs` | Enables hybrid lexical/semantic ranking (default on). |
