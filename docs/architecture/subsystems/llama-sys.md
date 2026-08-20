@@ -46,7 +46,9 @@ runtime set, and records every artifact and digest in
 - runtime loading of only the native backend modules shipped beside the
   executable on Windows and Linux;
 - one model worker with bounded query and bulk queues;
-- owner-thread residency with a 60-second idle unload and automatic wake;
+- owner-thread residency inside the embedding-server process (60-second idle
+  unload and automatic wake of that worker). Product idle still closes
+  admission and exits the server process; the next request respawns the CLI;
 - RAII residency leases for operations that must retain one load generation;
 - query priority between bulk batches;
 - timed smoke, initialization, adapter, and model-load diagnostics;

@@ -2,7 +2,9 @@
 
 `codestory-cli` is the adapter for command-line, loopback HTTP, and multi-project
 stdio/MCP surfaces. It captures process defaults, validates requests, selects a
-project, calls runtime or retrieval services, and renders stable DTOs.
+project, calls `codestory-runtime` for ordinary product operations, and renders
+stable DTOs. Direct `codestory_retrieval` use is limited to the CLI-owned
+embedding-server transport and qualification workers, not packet/search/index.
 
 ## Ownership
 
@@ -32,6 +34,7 @@ project's immutable config and never rereads or mutates process environment.
 - `src/config.rs` and `src/runtime.rs`: startup config and project contexts
 - `src/stdio_catalog.rs`: MCP schema and safety metadata
 - `src/stdio_transport.rs`: project routing, activation, resources, and tools
+- `src/output.rs`: rendering
 
 Multi-project stdio retains at most four hot contexts. A context key combines
 native workspace identity with a non-secret fingerprint of the immutable cache,
@@ -52,7 +55,6 @@ activation service and the runtime owns the single bounded retrieval-publication
 retry for a complete public response. The same whole-response service wraps
 ordinary CLI packet, search, context, drill, and graph-assisted reads, so stdio
 is not a stronger consistency boundary than the CLI.
-- `src/output.rs`: rendering
 
 Generated `--help` owns option syntax. User guides own workflows. This page owns
 the adapter boundary.

@@ -1,3 +1,6 @@
+Maintainer CLI only. There is no MCP tool with this name. Product
+tools own activation; do not call this from the grounding skill.
+
 # `drill-suite` - Run A Manifest-Defined Real-Repo Agent Drill Matrix
 
 Runs a repeatable agent-grounding drill suite from a manifest file. Use it to evaluate whether CodeStory helps an agent answer realistic architecture questions across real repositories.

@@ -238,36 +238,13 @@ Before adding a parser-backed language or widening a public claim:
    polymorphic behavior being claimed.
 4. Add or update the OSS corpus and A/B task manifest before making
    agent-facing savings or answer-quality claims.
-5. Run the full binaries, not filtered test names:
+5. Run the indexer proof lanes in the
+   [testing matrix](../contributors/testing-matrix.md): full
+   `fidelity_regression` and `tictactoe_language_coverage` binaries, not name
+   filters. Targeted resolution tests belong in the same crate lane.
 
-   ```sh
-   cargo test -p codestory-indexer --locked --test fidelity_regression
-   cargo test -p codestory-indexer --locked --test tictactoe_language_coverage
-   cargo test -p codestory-indexer --locked --test call_resolution_common_methods
-   cargo test -p codestory-indexer --locked --test import_resolution
-   cargo test -p codestory-indexer --locked --test query_rule_regressions
-   cargo test -p codestory-indexer --locked --test trait_interface_resolution
-   ```
+6. For broader real-project smoke evidence, use the OSS corpus commands on
+   [oss-language-corpus.md](../testing/oss-language-corpus.md).
 
-6. For broader real-project smoke evidence, run either the OSS corpus dry-run
-   manifest check or the relevant language subset:
-
-   ```sh
-   CODESTORY_OSS_CORPUS_DRY_RUN=1 cargo test -p codestory-indexer --locked --test oss_language_corpus -- --ignored --nocapture
-   CODESTORY_RUN_OSS_LANGUAGE_CORPUS=1 CODESTORY_OSS_CORPUS_LANGUAGES=python cargo test -p codestory-indexer --locked --test oss_language_corpus -- --ignored --nocapture
-   ```
-
-7. For agent-facing evidence, run at least the targeted language task from the
-   A/B suite. Reuse the fixed no-CodeStory control only when
-   `--reuse-baseline-from` accepts the baseline fingerprints; otherwise treat the
-   reused comparison as diagnostic or create a new approved control artifact:
-
-   ```sh
-   node scripts/codestory-agent-ab-benchmark.mjs \
-     --task-suite language-expansion-holdout \
-     --arms without_codestory,with_codestory \
-     --repeats 3 --materialize-repos --prepare-codestory-cache \
-     --reuse-baseline-from target/agent-benchmark/<compatible-baseline-run> \
-     --out-dir target/agent-benchmark/language-expansion-holdout \
-     --timeout-ms 600000
-   ```
+7. For agent-facing evidence, use the holdout commands on
+   [language-expansion-holdout-stats.md](../testing/language-expansion-holdout-stats.md).

@@ -7,7 +7,7 @@ decisions and points to the comparison matrix, not raw run output.
 
 | Area | Decision | Why it matters |
 | --- | --- | --- |
-| Real local embeddings | Use the linked CodeRankEmbed Q8 engine through one private per-user server. | Product packet/search evidence requires exact server and embedded-model producer identity plus `retrieval_mode=full`; CPU is explicit-only. |
+| Real local embeddings | Use the linked CodeRankEmbed Q8 engine through one private per-user server. | Product packet/search evidence requires exact server and embedded-model producer identity plus `retrieval_mode=full`. CPU embeddings are unsupported; there is no GPU-to-CPU fallback. |
 | Default doc shape | Graph-native `symbol_search_doc` for durable symbols plus `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant` for selected dense anchors. | Code recall is AST-first; compact aliases help the dense-anchor subset without returning to an all-code vector corpus. |
 | Dense policy | `graph_first_v3` with reasons `public_api`, `entrypoint`, `documented_nontrivial`, `central_graph_node`, `flow_neighbor`, `component_report`, and `unstructured_doc`. | Dense vectors cover structurally justified anchors and a bounded set of typed flow neighbors while private trivial code stays discoverable through symbol docs and graph/lexical recall. |
 | Current model decision | CodeRankEmbed Q8 replaces BGE after the #1164 same-machine Metal study: +36% dense-only MRR@10 and +55% Hit@1, with an accepted throughput and memory cost. | Quality is the primary product gate. Release evidence must now establish the CodeRank producer identity and new machine baseline. |
@@ -25,8 +25,9 @@ rows, discarded lanes, and what still needs proof.
 ### Repo-Scale E2E Performance
 
 Read [codestory-e2e-stats-log.md](testing/codestory-e2e-stats-log.md) for the
-rolling index/search timing history. This is the release-style sanity check for
-semantic indexing behavior and cache reuse.
+rolling index/search timing history. Those rows are telemetry only. Release
+decisions use [`approved-baselines.json`](../benchmarks/release-evidence/approved-baselines.json)
+and `scripts/codestory-release-evidence-gate.mjs`.
 
 ### Product Direction
 

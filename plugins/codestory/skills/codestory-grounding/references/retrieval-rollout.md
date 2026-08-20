@@ -1,3 +1,6 @@
+Maintainer CLI only. There is no MCP tool with this name. Product
+tools own activation; do not call this from the grounding skill.
+
 # Retrieval Rollout Verification
 
 Use this when a change touches retrieval, embedding execution, packet/search,

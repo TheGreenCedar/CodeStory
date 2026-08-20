@@ -15,7 +15,7 @@ reports progress while it runs, and resumes if it is interrupted. See
 | Host | Setup | What is automatic |
 | --- | --- | --- |
 | [Codex](codex.md) | Install from `/plugins` | MCP, hooks, skill, matching CLI |
-| [Cursor](cursor.md) | Install from Customize, then enable MCP once | Rule, hook, skill, and launcher; matching CLI fetched after the first MCP call |
+| [Cursor](cursor.md) | Add the marketplace in Customize, then enable MCP once | Rule, hook, skill, and launcher; matching CLI fetched after the first MCP call |
 | [Claude Code](claude-code.md) | Install the plugin and configure MCP | Hooks; preparation after MCP connects |
 | [Copilot CLI](copilot.md#copilot-cli) | Install hooks and configure MCP | Session instructions; preparation after MCP connects |
 | [Copilot editor](copilot.md#copilot-editor) | Add repository instructions and optionally MCP | CodeStory evidence only when MCP is connected |
@@ -101,4 +101,9 @@ blocked, use:
 - [Trust and readiness](trust-and-readiness.md) to decide what counts as proof;
 - [Troubleshooting](troubleshooting.md) for the shortest recovery path;
 - [What to expect](what-to-expect.md) for language and repository-size limits;
+- [Glossary](../glossary.md) for readiness terms;
 - [CLI reference](cli-reference.md) for maintainer diagnostics.
+
+Product configuration keys are in
+[configuration-reference](configuration-reference.md). `CODESTORY_TEST_*`
+variables on that page are harness switches, not product settings.

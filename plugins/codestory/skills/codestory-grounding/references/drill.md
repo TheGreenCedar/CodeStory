@@ -1,3 +1,6 @@
+Maintainer CLI only. There is no MCP tool with this name. Product
+tools own activation; do not call this from the grounding skill.
+
 # `drill` - Build a Repeatable Agent-Grounding Evidence Packet
 
 Runs a deterministic evidence collection pass for a realistic codebase question. The command does not answer the question; it writes the artifacts an agent should use before drafting and verifying an answer.

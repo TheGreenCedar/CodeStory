@@ -8,6 +8,7 @@ the linked page owns the concept.
 | Keyword | Canonical page |
 | --- | --- |
 | topology, crates, dependency direction, identity scopes | [Architecture overview](architecture/overview.md) |
+| packet planning, PinnedReader, evidence roles | [Agent subsystem](architecture/subsystems/agent.md) |
 | plugin launcher, fail-open, provisioning, handoff, project routing | [Host integration](architecture/host-integration.md) |
 | activation, tool classes, request lifecycle, bounded retry | [Runtime execution](architecture/runtime-execution-path.md) |
 | core index, refresh plan, parser, resolution, snapshots | [Indexing pipeline](architecture/indexing-pipeline.md) |
@@ -15,7 +16,7 @@ the linked page owns the concept.
 | Metal, Vulkan, embedded model, llama.cpp, engine queues | [Llama sys subsystem](architecture/subsystems/llama-sys.md) |
 | lexical, semantic, SCIP, generation leases, retention | [Retrieval subsystem](architecture/subsystems/retrieval.md) |
 | language tiers, parser-backed, structural source proof | [Language support](architecture/language-support.md) |
-| contracts, workspace, store, indexer, runtime, CLI | [Subsystem pages](architecture/subsystems/) |
+| contracts, workspace, store, indexer, agent, runtime, CLI | [Subsystem pages](architecture/subsystems/) |
 
 ## Users and operators
 

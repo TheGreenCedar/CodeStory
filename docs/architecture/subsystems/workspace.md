@@ -78,6 +78,8 @@ than validating a pathname and later recursing through it.
 - `src/source_freshness.rs`: operation-scoped freshness verdict memo and its
   pass counters
 - `src/repository_identity.rs`: repository/project/workspace identity
+- `src/repo_metadata.rs`: bounded identity inspection through isolated `gix`,
+  not an unconstrained `git` subprocess
 - `src/atomic_file.rs`: atomic file publication
 - `src/owned_deletion.rs`: trusted-root deletion
 

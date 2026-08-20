@@ -6,14 +6,8 @@ tracing, ownership discovery, or change-impact analysis.
 
 ## Syntax
 
-See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
-Use `<codestory-cli> <command> --help` for the complete option set.
-
-MCP `packet` arguments are the catalog fields (`question`, `budget`,
-`task_class`, `probes`, `extra_probes`, `include_evidence`,
-`latency_budget_ms`, and DrillOnce `parent_packet_id` / `option_ids` /
-generation pins). Do not send CLI flags such as `--file`, `mode`, or
-`max_snippet_bytes` as MCP arguments.
+See [generated MCP syntax](generated-mcp-syntax.md) for live fields. Do not send
+CLI flags. Every call requires `project` (absolute repository root).
 
 ## Agent Paths
 

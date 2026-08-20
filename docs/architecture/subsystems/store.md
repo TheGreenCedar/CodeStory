@@ -150,14 +150,10 @@ imported from the retained tables take a uuid derived from their legacy row id,
 so an id a pre-cutover read already handed out still addresses the same
 annotation afterwards.
 
-**Downgrade path.** Export annotations first
-(`AppController::export_annotations`, written to the retained
-`annotations.pre-migration.json` shape), then run EV-9's guided derived-cache
-reset to drop the schema-31 core. The exported file is re-importable with
-`AppController::import_annotations`. The same export/import pair is the only
-supported way to move annotations onto a clone or a cross-volume copy: the
-native-root location registry binds a same-filesystem move by filesystem
-identity and fails closed on any other root.
+**Downgrade path.** There is no bookmark export/import command. Recovery after
+a newer schema is `cache reset --derived-only` from a 0.17 binary, then
+`index --refresh full`. Internal controller export/import types are test
+helpers, not an operator workflow.
 
 ## Entry points
 

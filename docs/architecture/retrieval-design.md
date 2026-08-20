@@ -44,10 +44,10 @@ batching contract.
 
 | Environment | Backend policy |
 | --- | --- |
-| Apple Silicon macOS | v0.16 package with verified Metal acceleration |
-| Windows x64 | v0.16 package with verified Vulkan acceleration |
-| Linux x64 | v0.16 package with verified Vulkan acceleration |
-| Other targets | no v0.16 package or runtime claim |
+| Apple Silicon macOS | current release package with verified Metal acceleration |
+| Windows x64 | current release package with verified Vulkan acceleration |
+| Linux x64 | current release package with verified Vulkan acceleration |
+| Other targets | no release package or runtime claim |
 
 CPU embeddings are unsupported. There is no GPU-to-CPU fallback. Software
 adapters such as llvmpipe, lavapipe, WARP, and SwiftShader do not satisfy
@@ -167,7 +167,9 @@ typed `publication_changed` error and permits one whole-operation runtime retry.
 One pinned retrieval session covers sidecar query execution and numeric
 candidate resolution. Higher-level graph, source, packet, agent, CLI, and MCP
 assembly is not yet part of that proof boundary and must not describe the
-session identity as a complete-operation pin.
+session identity as a complete-operation pin. `PinnedQuerySession` is that
+retrieval session. `PublicOperationService` is the broader public-operation pin
+from planning through response assembly; they are different objects.
 
 ## Vector index backend
 
