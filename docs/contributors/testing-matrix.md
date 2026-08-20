@@ -461,6 +461,8 @@ cells supply the other platform evidence when those adapters change.
 
 Docs-only scope is `README.md`, `docs/**`, `plugins/codestory/README.md`,
 `plugins/codestory/docs/**`, and `plugins/codestory/skills/**`.
+`docs/contributors/testing-matrix.md` is not in this lane; it remains a
+crate-durability path pin.
 
 ```sh
 node .github/scripts/check-doc-links.mjs

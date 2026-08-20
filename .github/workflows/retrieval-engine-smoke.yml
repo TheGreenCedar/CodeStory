@@ -177,6 +177,9 @@ jobs:
       - name: Stdio protocol contract tests
         run: cargo test --locked -p codestory-cli --test stdio_protocol_contracts
 
+      - name: HTTP transport fail-closed contract tests
+        run: cargo test --locked -p codestory-cli --test http_transport_contracts
+
       - name: CLI search JSON fail-closed contract tests
         run: cargo test --locked -p codestory-cli --test search_json_output
 
