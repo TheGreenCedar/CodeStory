@@ -6711,8 +6711,17 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
       step.run = step.run.replace("main moved from publishable head", "main changed");
     }],
     ["publish authority", workflows => { delete workflows.get("release.yml").jobs.publish.if; }],
+    ["publish inherits a skipped reuse ancestor", workflows => {
+      workflows.get("release.yml").jobs.publish.if = "inputs.publish_release";
+    }],
+    ["marketplace publication inherits a skipped reuse ancestor", workflows => {
+      workflows.get("release.yml").jobs["marketplace-publish"].if = "inputs.publish_release";
+    }],
     ["post-publish smoke authority", workflows => { delete workflows.get("release.yml").jobs["post-publish-smoke"].if; }],
     ["post-publish closeout authority", workflows => { delete workflows.get("release.yml").jobs["post-publish-closeout"].if; }],
+    ["post-publish closeout inherits a skipped reuse ancestor", workflows => {
+      workflows.get("release.yml").jobs["post-publish-closeout"].if = "inputs.publish_release";
+    }],
     ["trusted caller opt-in", workflows => { delete workflows.get("auto-release.yml").jobs.release.with.publish_release; }],
     ["trusted caller secret handoff", workflows => { delete workflows.get("auto-release.yml").jobs.release.secrets; }],
     ["duplicate automatic policy gate", workflows => {
