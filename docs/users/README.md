@@ -33,6 +33,8 @@ project-scoped MCP runtime with the adapter setup described in their guides.
 | Copilot CLI | No | Session hook | Partial | Yes, after MCP connects |
 | Copilot editor | No | No | Repository instructions | Only when MCP is configured |
 
+Codex is the most automatic install, not the product ICP.
+
 ## First use
 
 1. Install the plugin or adapter for your host.
