@@ -1368,8 +1368,8 @@ const draftRunCommands = new Map([
     '} >> "$GITHUB_ENV"',
   ]],
   ["Install Rust stable", [
-    "rustup toolchain install stable --profile minimal --component clippy --component rustfmt",
-    "rustup default stable",
+    "rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt",
+    "rustup default 1.97.1",
   ]],
   ["Install Linux Vulkan build dependencies", [
     "bash .github/scripts/install-linux-vulkan-build-deps.sh",
@@ -2438,6 +2438,14 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       add(violations, includesAll(at(plugin, "on", event, "paths"), requiredPaths), `${pluginFile} ${event} paths must cover policy and release surfaces`);
     }
     add(violations, includesAll(at(plugin, "on", "push", "branches"), ["dev/codestory-next"]), `${pluginFile} must run on dev pushes`);
+    const job = object(object(plugin.jobs)["plugin-static"]);
+    requireStepRun(violations, pluginFile, job, "Check release version surfaces", [
+      'cli_version="$(python -c',
+      'plugin_version="$(python -c',
+      'if [ "$plugin_version" = "$cli_version" ]',
+      '--version "$cli_version"',
+      '--version "$plugin_version" --lane plugin',
+    ]);
     // The plugin lane's structural pin (job existence) is a rule instance and
     // lives in release-claims.json under workflow_policy.structural_pins;
     // structuralPinViolations evaluates it. The lane's step fragments - the

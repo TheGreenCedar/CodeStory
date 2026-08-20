@@ -2598,6 +2598,18 @@ test("release workflows retain the closeout coordinator contract test", () => {
   }
 });
 
+test("plugin static validates both native and plugin-only version surfaces", () => {
+  const workflows = loadWorkflows();
+  const step = workflows.get("plugin-static.yml").jobs["plugin-static"].steps.find(
+    ({ name }) => name === "Check release version surfaces",
+  );
+  step.run = step.run.replace('--version "$plugin_version" --lane plugin', '--version "$plugin_version"');
+  assert.match(
+    validateWorkflows(workflows).join("\n"),
+    /plugin-static\.yml.*Check release version surfaces/u,
+  );
+});
+
 test("workflow hygiene requires declared permissions and step-job timeouts", () => {
   const valid = parseWorkflow(`
 on: { workflow_dispatch: null }
@@ -5088,6 +5100,10 @@ test("draft source cache reuse preserves exact serial proof structure", async (t
   assert.deepEqual(draftSourcePolicyViolations(draftSourceJob(), retrievalSourceJob()), []);
 
   const mutations = [
+    ["rolling Rust toolchain", job => {
+      const step = draftStep(job, "Install Rust stable");
+      step.run = step.run.replaceAll("1.97.1", "stable");
+    }],
     ["unversioned primary", job => {
       const step = draftStep(job, "Restore Cargo inputs and output");
       step.with.key = step.with.key.replace("-draft-v2-", "-draft-");
