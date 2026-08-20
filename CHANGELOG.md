@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+MCP now tells agents to call the tool that matches the task and retry that same tool while CodeStory prepares. It no longer starts with `ground`, invents an `affected` path, or treats `status` as a required next step.
+
 ### Changed
 
 - CLI `affected` requires explicit paths or stdin, matching MCP. It no longer invents a git diff when those are omitted.

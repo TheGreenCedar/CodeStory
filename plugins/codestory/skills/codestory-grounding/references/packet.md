@@ -28,8 +28,7 @@ CLI flags. Every call requires `project` (absolute repository root).
 - `probes` uses tagged objects with `kind` equal to `exact_path`, `symbol_id`,
   `file_symbol`, `free_query`, or `continuation`. For example,
   `{"kind":"exact_path","path":"assets/desk.svg"}` selects that exact
-  project-relative file without fuzzy substitution. CLI accepts the same
-  object through repeatable `--probe '<json>'`. Typed and legacy probes share
+  project-relative file without fuzzy substitution. Typed and legacy probes share
   one combined 16-item limit; every string field is limited to 240 characters.
 - Exact path, symbol-ID, file-symbol, and symbol-bound continuation probes add
   exact citations keyed by path or stable node ID. They are not converted back
@@ -38,9 +37,9 @@ CLI flags. Every call requires `project` (absolute repository root).
   `core_generation_id`, optional `retrieval_generation`, optional exact
   `symbol_id`, and `query`; reuse fails closed when the selected evidence
   generation changes. Search and definition links emit this bound form.
-- `extra_probes` and CLI `--extra-probe` remain legacy compatibility inputs.
-  They enter the same runtime resolver. Neither typed nor legacy probes replace
-  the compiled disposition.
+- `extra_probes` remains a legacy compatibility input. It enters the same
+  runtime resolver. Neither typed nor legacy probes replace the compiled
+  disposition.
 - Judge the answer from compiled support units (symbol locations, source
   ranges, typed CALL/INHERITANCE/import edges, and complete-query negatives).
   `disposition.kind=supported` means that evidence is present. It does not mean

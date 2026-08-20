@@ -1698,6 +1698,22 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
         assert_eq!(error["cause_code"], json!("cache_busy"));
         assert_eq!(error["retry_tool"], json!("packet"));
         assert!(error["retry_after_ms"].as_u64().is_some());
+        assert!(
+            error["recommended_next_calls"]
+                .as_array()
+                .is_some_and(|calls| {
+                    calls.iter().any(|call| {
+                        call["method"] == "tools/call"
+                            && call["tool"] == "packet"
+                            && call["arguments"]["project"] == json!(project.path())
+                    }) && !calls.iter().any(|call| {
+                        call["tool"] == "affected"
+                            || call["tool"] == "status"
+                            || call["method"] == "resources/read"
+                    })
+                }),
+            "preparing packet must retry the same tool without status or placeholder affected: {error}"
+        );
         operation_ids.push(
             error["operation"]["operation_id"]
                 .as_str()
@@ -5382,22 +5398,27 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
 
     let result = assert_success_envelope(&response, json!("agent-guide-resource"));
     let guide = json_resource_content(result, "codestory://agent-guide");
+    let sequence = guide
+        .get("recommended_call_sequence")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("agent guide should include recommended_call_sequence: {guide}"));
     assert!(
-        guide
-            .get("default_browser_loop")
-            .or_else(|| guide.get("recommended_call_sequence"))
-            .or_else(|| guide.get("recommended_next_calls"))
-            .and_then(Value::as_array)
-            .is_some_and(|calls| {
-                calls.iter().any(|call| {
-                    call["tool"] == json!("ground") && call.pointer("/arguments/project").is_some()
-                })
+        sequence
+            .iter()
+            .any(|step| step["action"] == json!("call_matching_tool")
+                && step.pointer("/arguments/project").is_some())
+            && sequence
+                .iter()
+                .any(|step| step["action"] == json!("retry_same_tool"))
+            && sequence.first().is_some_and(|step| {
+                step["action"] == json!("resolve_project_root")
+                    && step.get("tool") != Some(&json!("ground"))
             })
             && guide
                 .get("readiness_lanes")
                 .and_then(Value::as_array)
                 .is_some_and(|lanes| lanes.len() >= 2),
-        "agent guide should include a concise default browser loop or call sequence: {guide}"
+        "agent guide should publish the matching-tool loop, not ground-first: {guide}"
     );
     let local_lane = guide["readiness_lanes"]
         .as_array()
@@ -5454,6 +5475,17 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
             "agent lane should include {expected}: {guide}"
         );
     }
+    let packet_example = agent_lane["calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|call| call["tool"] == json!("packet"))
+        .unwrap_or_else(|| panic!("agent lane should include a packet example: {guide}"));
+    assert_eq!(
+        packet_example["arguments"]["budget"],
+        json!("standard"),
+        "packet example budget must be standard, not compact: {guide}"
+    );
     let mut strings = Vec::new();
     string_values_recursive(&guide, &mut strings);
     for expected in [
@@ -5479,6 +5511,10 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
         !unconditional_sequence_text.contains("\"tool\":\"packet\"")
             && !unconditional_sequence_text.contains("\"tool\":\"search\""),
         "packet/search should not be unconditional normal next steps: {guide}"
+    );
+    assert!(
+        guide_text.contains("matching tool") && !guide_text.contains("use ground first"),
+        "agent guide should follow the matching-tool loop instead of requiring ground first: {guide}"
     );
     assert!(
         guide_text.contains("preparing")
@@ -5830,18 +5866,23 @@ fn failed_replacement_retries_keep_identity_and_offer_retained_local_analysis() 
         first_error["recommended_next_calls"]
             .as_array()
             .is_some_and(|calls| {
-                calls.iter().any(|call| {
-                    call["method"] == "tools/call"
-                        && call["tool"] == "affected"
+                !calls.iter().any(|call| {
+                    call["tool"] == "affected"
                         && call["arguments"]["paths"] == json!(["<changed-project-path>"])
-                }) && calls.iter().any(|call| {
+                }) && !calls.iter().any(|call| {
                     call["method"] == "resources/read"
                         && call["uri"]
                             .as_str()
-                            .is_some_and(|uri| uri.starts_with("codestory://status?project="))
-                })
+                            .is_some_and(|uri| uri.starts_with("codestory://status"))
+                }) && !calls.iter().any(|call| call["tool"] == "status")
             }),
-        "terminal MCP response must provide useful native follow-ups: {first_error}"
+        "terminal MCP response must not invent affected paths or require status: {first_error}"
+    );
+    assert!(
+        first_error["diagnostics_uri"]
+            .as_str()
+            .is_some_and(|uri| uri.starts_with("codestory://status?project=")),
+        "diagnostics remain available without becoming a next-call prerequisite: {first_error}"
     );
 
     let first_operation = first_error["operation"].clone();
