@@ -6,20 +6,21 @@ claims about what the graph can see.
 
 ## Syntax
 
-See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
-Use `<codestory-cli> <command> --help` for the complete option set.
+See [generated MCP syntax](generated-mcp-syntax.md) for live fields. Do not send
+CLI flags. Every call requires `project` (absolute repository root).
 
 ## Agent Paths
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Inventory | `<codestory-cli> files --project <target-workspace> --format markdown` | Language counts, framework route coverage matrix, usable/partial index notes, and a capped file list. |
-| Coverage check | `<codestory-cli> files --project <target-workspace> --language rust --format json` | Machine-readable file rows with `indexed`, `complete`, `role`, `error_count`, and `summary.framework_route_coverage`. |
-| Test discovery | `<codestory-cli> files --project <target-workspace> --role test` | Test-like files inferred from path/name conventions. |
+| Inventory | MCP `files` with `project` | Language counts and a capped file list. |
+| Coverage check | MCP `files` with `language` | File rows for that language. |
+| Test discovery | MCP `files` with `role=test` | Test-like files inferred from path/name conventions. |
 
 ## Notes
 
-- `files` reads persisted `FileInfo`; it does not scan the repo live unless `--refresh` asks for an index refresh.
+- MCP `files` has no `refresh` field. The catalog tool refreshes the local map
+  before dispatch and does not wait for broad search.
 - Treat `index usable` with incomplete or error counts as a partial-coverage signal, not a failure.
 - `summary.framework_route_coverage` is the support matrix for framework route extraction. It includes `status`, `coverage_evidence`, `confidence_floor`, `handler_link_support`, `unsupported_patterns`, `known_gaps`, and `promotable`. Treat `partial`, `heuristic`, text-only handler support, and `promotable=false` as review prompts, not proof of full framework parity.
 - Route coverage statuses:

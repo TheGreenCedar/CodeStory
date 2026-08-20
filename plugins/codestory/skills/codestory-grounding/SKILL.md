@@ -27,10 +27,11 @@ ceremony.
 
 1. Resolve the target repository root.
 2. Call the intended tool with `project=<absolute-root>`.
-3. If the result says `state=preparing`, wait for `retry_after_ms` and retry the
-   same tool with the same arguments. The delay tracks observed preparation
-   progress, so honor the reported value instead of a fixed poll interval. Do
-   not poll status or ask the user to set up CodeStory.
+3. If the result says `state=preparing` or `state=updating` and includes
+   `retry_after_ms`, wait for that delay and retry the same tool with the same
+   arguments. The delay tracks observed preparation progress, so honor the
+   reported value instead of a fixed poll interval. Do not poll status or ask
+   the user to set up CodeStory.
 4. Preserve cited anchors in source claims. Read focused source only for the
    remaining evidence gaps.
 
@@ -53,8 +54,9 @@ plugin result unless the user explicitly asks.
 | Repository orientation | `ground`; use `files` for language mix or coverage gaps. |
 | Exact named file, path, or static asset with file-local evidence | Inspect it directly. When adding it to a packet, use an `exact_path` tagged probe; do not run broad grounding merely to rediscover the path. If the task asks about relationships, ownership, or impact, use the corresponding narrow tool. |
 | Find a symbol | `symbol`, then `definition` or `snippet`. |
-| Follow a call path | `callers`, `callees`, `trace`, or `trail`. |
-| Review change impact | `affected` with explicit Git-changed paths, then focused symbol or trace evidence. |
+| Follow a call path | `callers`, `callees`, `trace`, or `trail`. Use `neighbors`, `shortest_path`, or `query_subgraph` only for a named node. |
+| Review change impact | `affected` with explicit Git-changed `paths` (or `changed_paths` / `change_records`). Never omit the path source. |
+| One graph node | `get_node`, `definition`, `references`, or `symbols`. |
 | Broad structural question | `packet`; stop on Supported, NotEstablished, or Unavailable. For DrillOnce, call `packet` again once with the exact original `question`, `parent_packet_id`, and the listed `option_ids`. Use `search` or `context` only for a user-named exact target, not as packet recovery. |
 
 ## Evidence Rules
@@ -101,14 +103,18 @@ contributors, not normal installation steps.
 
 ## References
 
-- [Generated CLI syntax](references/generated-cli-syntax.md) is produced from
-  Clap `--help`; use it instead of maintaining option matrices by hand.
-
+- [Generated MCP syntax](references/generated-mcp-syntax.md) is the agent
+  argument source of truth. Do not send CLI flags as MCP fields.
 - [status contract](references/status-contract.md)
 - [repository map](references/ground.md)
+- [files](references/files.md)
+- [affected](references/affected.md)
 - [packet](references/packet.md)
 - [search](references/search.md)
 - [context](references/context.md)
 - [symbols](references/symbol.md)
 - [trails](references/trail.md)
 - [snippets](references/snippet.md)
+
+Maintainer CLI `--help` lives in [generated CLI syntax](references/generated-cli-syntax.md)
+and is not an MCP calling convention.

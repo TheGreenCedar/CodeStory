@@ -1,3 +1,6 @@
+Maintainer CLI only. There is no MCP tool with this name. Product
+tools own activation; do not call this from the grounding skill.
+
 # `query` — Run Small Graph Query Pipelines
 
 Runs a compact pipeline over indexed CodeStory data. Use it when you want a short, scriptable answer without manually chaining `search`, `symbol`, and `trail` commands.

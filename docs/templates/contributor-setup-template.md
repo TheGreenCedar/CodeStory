@@ -31,7 +31,7 @@ This template is for documenting contributor setup and verification procedures.
 - Explanation of why the built binary should be used
 - Clear examples of verification commands
 
-### Hybrid Retrieval Setup
+### Full retrieval development
 - Explanation of when to use this lane
 - Required setup commands
 - Explanation of configuration options

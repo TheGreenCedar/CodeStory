@@ -135,7 +135,9 @@ Check:
 
 Recovery order:
 
-1. Run one measured cold E2E and append the headline numbers to `docs/testing/codestory-e2e-stats-log.md`.
+1. Run one measured cold E2E locally and compare headline numbers to the last
+   row in `docs/testing/codestory-e2e-stats-log.md`. Append a new row only on
+   the allowed repo-scale lane (final merge-ready head).
 2. Compare symbol-doc counts, dense skipped/reason counts, and dense embedded/reused counts before changing graph code.
 3. For reuse regressions, inspect semantic doc version, generated text hash, embedding profile/backend/model/dimension, document prefix, and semantic policy version.
 4. For cold-only regressions, inspect durable symbol scope, dense-anchor policy, length-bucket ordering, embedding batch size, model materialization, and engine initialization.

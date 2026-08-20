@@ -2,12 +2,13 @@
 
 **Audience:** Evidence record — not an install guide.
 
-Append one entry before each commit after running:
+Append a row only on the repo-scale CLI stats lane, once, on the promoted
+final merge-ready head. Intermediate commits do not append. Use `--locked`:
 
 ```sh
 export CODESTORY_EMBED_MODEL_SOURCE="$(node scripts/prepare-embedded-model.mjs)"
-cargo build --release -p codestory-cli
-cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
+cargo build --release --locked -p codestory-cli
+cargo test -p codestory-cli --locked --test codestory_repo_e2e_stats -- --ignored --nocapture
 ```
 
 Keep the full emitted JSON in the test output when reviewing locally, and add

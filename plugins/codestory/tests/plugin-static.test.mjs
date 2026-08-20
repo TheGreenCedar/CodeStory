@@ -1106,6 +1106,50 @@ test("agent-facing guidance keeps embedding lifecycle internal", async () => {
   }
 });
 
+test("skill teaches MCP catalog arguments, not Clap flags", async () => {
+  const skill = await readFile(
+    join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"),
+    "utf8",
+  );
+  assert.match(skill, /generated-mcp-syntax\.md/u);
+  const catalog = JSON.parse(
+    await readFile(join(pluginRoot, "generated-mcp-catalog.json"), "utf8"),
+  );
+  const syntax = await readFile(
+    join(
+      pluginRoot,
+      "skills",
+      "codestory-grounding",
+      "references",
+      "generated-mcp-syntax.md",
+    ),
+    "utf8",
+  );
+  for (const tool of catalog.tools) {
+    assert.match(syntax, new RegExp(`\`${tool.name}\``, "u"), tool.name);
+  }
+  for (const name of [
+    "search.md",
+    "ground.md",
+    "trail.md",
+    "context.md",
+    "files.md",
+    "affected.md",
+    "packet.md",
+    "snippet.md",
+    "symbol.md",
+  ]) {
+    const text = await readFile(
+      join(pluginRoot, "skills", "codestory-grounding", "references", name),
+      "utf8",
+    );
+    assert.match(text, /generated-mcp-syntax\.md/u, name);
+    assert.doesNotMatch(text, /See \[generated CLI syntax\]/u, name);
+    assert.doesNotMatch(text, /<codestory-cli>/u, name);
+    assert.doesNotMatch(text, / --(?:why|mode|file|refresh|plan-details)\b/u, name);
+  }
+});
+
 test("plugin package version tracks the codestory-cli release version", async () => {
   const cliManifest = await readFile(
     join(repoRoot, "crates", "codestory-cli", "Cargo.toml"),

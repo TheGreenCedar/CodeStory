@@ -26,10 +26,11 @@ installed plugin. It validates the archive, checksum, version, and stdio
 handshake, then hands requests to that executable. It does not provision a
 model or backend separately.
 
-Every MCP request carries an absolute project root. Each stdio process retains
-isolated project runtime contexts, while all compatible CodeStory clients for
-the current OS user connect to one stable private Unix-domain socket or Windows
-named pipe. The server owns the only query and bulk queues and the only native
+Every project-scoped tool and `{?project}` resource request includes an
+absolute project root. `codestory://agent-guide` is static and project-free.
+Each stdio process retains isolated project runtime contexts, while all
+compatible CodeStory clients for the current OS user connect to one stable
+private Unix-domain socket or Windows named pipe. The server owns the only query and bulk queues and the only native
 model worker. At 60 seconds with no queued, active, or leased work, the server
 closes admission and exits. The next product request spawns the exact current
 CLI automatically. Hook-written active-project files are diagnostics; they
@@ -47,7 +48,7 @@ flowchart LR
     RetrievalStage --> Lexical["lexical-index.sqlite3"]
     RetrievalStage --> Vectors["vectors.sqlite3"]
     RetrievalStage --> Scip["SCIP generation"]
-    RetrievalStage --> Manifest["retrieval manifest"]
+    Core --> Manifest["retrieval manifest in codestory.db"]
     Lexical --> Query["pinned packet/search read"]
     Vectors --> Query
     Scip --> Query
@@ -139,11 +140,11 @@ flowchart LR
   the same engine.
 - `codestory-retrieval` owns immutable lexical/vector/SCIP generations,
   manifests, engine integration, health, retention, and fail-closed queries.
-- `codestory-agent` owns packet planning: prompt terms, flow requirements,
-  evidence roles and carriers, citation scoring, and the deduplicated query
-  plan. It owns no activation, storage, retrieval execution, publication retry,
-  or mutable readiness authority, and it reads pinned runtime state only through
-  the `PinnedReader` trait the runtime implements.
+- [`codestory-agent`](subsystems/agent.md) owns packet planning: prompt terms,
+  flow requirements, evidence roles and carriers, citation scoring, and the
+  deduplicated query plan. It owns no activation, storage, retrieval execution,
+  publication retry, or mutable readiness authority, and it reads pinned runtime
+  state only through the `PinnedReader` trait the runtime implements.
 - `codestory-runtime` is the only product orchestration layer.
 - `codestory-cli` parses and renders CLI, HTTP, and stdio adapters.
 - `codestory-bench` measures product paths without defining product behavior.

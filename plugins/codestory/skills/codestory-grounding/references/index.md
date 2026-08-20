@@ -1,3 +1,6 @@
+Maintainer CLI only. There is no MCP tool with this name. Product
+tools own activation; do not call this from the grounding skill.
+
 # `index` - Build or Refresh the Symbol Index
 
 Discovers project files, extracts symbols and edges, persists graph/search state
@@ -18,10 +21,10 @@ Use `<codestory-cli> <command> --help` for the complete option set.
 | `incremental` | Reindex changed/new/unindexed files, remove disappeared files, and prune touched symbol docs or dense anchors. |
 | `none` | Inspect the existing cache without refreshing it. Use only after a known-good same-session index. |
 
-Keep the default `auto` refresh for ordinary agent setup. It performs the needed
-first build for an empty repository cache and incremental refreshes after that.
-Use explicit `--refresh full` only for diagnosed cache/schema uncertainty,
-historical indexing failures, moved roots, or user-requested rebuild evidence.
+Keep the default `auto` refresh for ordinary maintainer CLI setup. There is no
+MCP `index` tool; product tools own activation. Use explicit `--refresh full`
+only for diagnosed cache/schema uncertainty, historical indexing failures,
+moved roots, or user-requested rebuild evidence.
 Incremental runs can leave stale error rows when previously failing files are
 not touched.
 

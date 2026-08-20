@@ -14,6 +14,8 @@ Criterion targets.
 | --- | --- | --- |
 | Rust formatting or local logic | `cargo fmt --all -- --check`; owning crate tests | Workspace check/test/clippy |
 | Store/publication | Store tests plus named fault/concurrency cases | Workspace source gate |
+| Indexer or language | Full `fidelity_regression` and `tictactoe_language_coverage` binaries | Same binaries plus workspace source gate |
+| `codestory-agent` planning | `cargo test --locked -p codestory-agent` | Workspace source gate |
 | Retrieval/embedding | Retrieval tests, runtime admission tests, engine proof self-test | Same-run performance gate, optional exact-candidate quality report, and required hardware proof |
 | CLI/stdio | Named CLI contract suites | Workspace source gate and packaged proof when package behavior changed |
 | Plugin launcher or CodeStoryDev staging | Installer tests plus `plugin-static` | Packaged plugin handoff |
@@ -22,18 +24,20 @@ Criterion targets.
 | Release/version | Release and workflow policy scripts | Main-only signing, notarization, publish, install, and live runtime proof |
 
 `retrieval-engine-smoke.yml` runs the sub-second `architecture_contracts`
-binary in its universal `linux-contracts` job. Store, indexer, workspace, and
-contracts changes additionally run the path-scoped, artifact-free
+binary plus packet, retrieval, stdio, `packet_search_eval`, and agent tests in
+its universal `linux-contracts` job. Store, indexer, workspace, contracts, and
+agent changes additionally run the path-scoped, artifact-free
 `crate-durability.yml` lane with these serial commands:
 
 ```bash
 cargo test --locked -p codestory-store
 cargo test --locked -p codestory-indexer --test fidelity_regression
 cargo test --locked -p codestory-indexer --test tictactoe_language_coverage
+cargo test --locked -p codestory-agent
 ```
 
 That lane has its own exact-key Cargo cache, derives the key from the Rust host
-and manifests plus `Cargo.lock`, and saves only after all three commands pass.
+and manifests plus `Cargo.lock`, and saves only after all four commands pass.
 It does not emit artifacts or turn unrelated crate changes into durability
 work. Run source stabilization once on the final pre-calibration source head
 rather than using this focused durability lane as a second proof coordinator.
@@ -51,6 +55,7 @@ cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::
 cargo test --locked -p codestory-runtime --lib services::
 cargo test --locked -p codestory-cli --lib
 cargo test --locked -p codestory-workspace
+cargo test --locked -p codestory-agent
 ```
 
 ## Draft source checks
@@ -545,9 +550,9 @@ Optional evaluation may reject its
 own run, but it is not a dependency of packaging, hardware proof, closeout, or
 publication. Workflow policy enforces that separation.
 
-The same graph declares the exact release-closeout cells. For v0.16,
-`workflow_policy.package_matrix` contains `macos-arm64`, `windows-x64`, and
-`linux-x64`.
+The same graph declares the exact release-closeout cells. Current
+`release-claims.json` `workflow_policy.package_matrix` contains `macos-arm64`,
+`windows-x64`, and `linux-x64`.
 The coordinator retains canonical copies under `manifests/` and `evaluations/`
 beside `ledger.json` and `summary.json`. A pre-publish run accepts ten cells:
 exact source, three package identities, three accelerator-execution receipts,
@@ -596,7 +601,7 @@ downloads by name use explicit replacement from a policy-owned allowlist, so a
 retried producer cannot fail on an immutable same-name artifact before it emits
 its authenticated cell. Terminal evidence is never overwriteable.
 
-The v0.16 closeout consumes physical Metal and Vulkan execution evidence and
+The current closeout consumes physical Metal and Vulkan execution evidence and
 makes those accelerator claims for the released targets. Accuracy, latency,
 and throughput remain independent evaluator lanes and release non-claims.
 
@@ -730,9 +735,9 @@ one real project-bound `ground`, waits for same-project search readiness, and
 verifies the expected Metal or Vulkan engine and package identity. They do not
 replace the three marketplace-catalog-resolved post-publish receipts.
 
-For v0.16, `check-packaged-agent-proof.py --server-behavior-only` is the
-fail-closed receipt mode for that claim. It deliberately skips multi-host
-sharing, broader server lifecycle, accuracy, and performance claims.
+`check-packaged-agent-proof.py --server-behavior-only` is the fail-closed
+receipt mode for that claim. It deliberately skips multi-host sharing, broader
+server lifecycle, accuracy, and performance claims.
 `--ground-only` remains a lower-tier launcher and provenance check: it stops
 after the project-bound ground request and cannot claim search readiness,
 server identity, or accelerator execution.

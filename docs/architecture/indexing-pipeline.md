@@ -46,7 +46,8 @@ sequenceDiagram
 - `codestory-indexer` turns the plan into projection writes and post-flush resolution.
 - `codestory-store` persists rows, invalidates or refreshes snapshots, publishes staged builds, and stores symbol docs plus embedding-free dense-anchor inputs.
 - `codestory-runtime` owns the runtime search engine, deterministic symbol/dense input construction, retrieval readiness, and timing surface.
-- `codestory-retrieval` owns model execution, immutable vector generations, producer evidence, validation, and query generation leases.
+- `codestory-retrieval` owns immutable vector generations, producer evidence, validation, and query generation leases.
+- `codestory-llama-sys` owns the model worker, queues, and residency inside the embedding-server process.
 
 That split is intentional: the runtime orchestrates the run, the indexer performs indexing work, and the store owns persistence mechanics.
 
@@ -163,10 +164,11 @@ flowchart TD
 
 ### 2. Runtime chooses full or incremental indexing
 
-`crates/codestory-runtime/src/lib.rs` owns the orchestration split:
-
-- `index_full` opens a fresh stage with `SnapshotStore::open_disposable_full_refresh`, asks the workspace for a full refresh plan, runs the indexer against the staged store, finalizes every core/search identity, and then seals and publishes it to the live path
-- `index_incremental` clones the current live database into a durable staged store, collects refresh inputs from stored inventory, builds a diff-based execution plan, runs the same indexer against the clone, and publishes the completed replacement
+`crates/codestory-runtime/src/index_full.rs` and
+`crates/codestory-runtime/src/index_incremental.rs` own the orchestration split
+(`index_full_for_runtime` / `index_incremental_for_runtime`). Full indexing
+opens a fresh stage, runs the indexer, and publishes. Incremental clones the
+live database, diffs inventory, and publishes the replacement.
 
 Only the fresh full stage uses relaxed SQLite synchronization. It remains in
 WAL mode so a bounded cache reader is available when verified structural rows
@@ -726,12 +728,7 @@ remain the primary reference when you are learning the pipeline.
 
 ## Verification Targets
 
-If you change indexing behavior, review or run the suites that guard it:
-
-- `cargo test -p codestory-indexer --locked --test fidelity_regression`
-- `cargo test -p codestory-indexer --locked parser_result_changed_with_restored_mtime_is_incomplete_and_not_cached`
-- `cargo test -p codestory-indexer --locked artifact_cache_result_changed_with_restored_mtime_is_rejected`
-- `cargo test -p codestory-store --locked projection_batch_round_trips_and_clears_file_content_hash`
-- `cargo test -p codestory-indexer --locked --test tictactoe_language_coverage`
-- `cargo test -p codestory-indexer --locked --test integration`
-- targeted resolution suites under `crates/codestory-indexer/tests/`
+If you change indexing behavior, use the indexer and store lanes in the
+[testing matrix](../contributors/testing-matrix.md). Run the full
+`fidelity_regression` and `tictactoe_language_coverage` binaries, not name
+filters.
