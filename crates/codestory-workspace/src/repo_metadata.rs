@@ -816,9 +816,7 @@ struct MetadataDirectoryFingerprint {
     #[cfg(unix)]
     inode: u64,
     #[cfg(windows)]
-    volume_serial_number: Option<u32>,
-    #[cfg(windows)]
-    file_index: Option<u64>,
+    native_identity: String,
 }
 
 fn configured_origin_url(config: &gix::config::File) -> Option<String> {
@@ -1254,11 +1252,22 @@ fn metadata_directory_fingerprint(path: &Path) -> Result<MetadataDirectoryFinger
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
+        let native_identity = crate::repository_identity::workspace_path_identity_token(path)
+            .with_context(|| {
+                format!(
+                    "observe native identity for metadata directory {}",
+                    path.display()
+                )
+            })?
+            .with_context(|| {
+                format!(
+                    "metadata directory disappeared while fingerprinting {}",
+                    path.display()
+                )
+            })?;
         Ok(MetadataDirectoryFingerprint {
             path: path.to_path_buf(),
-            volume_serial_number: metadata.volume_serial_number(),
-            file_index: metadata.file_index(),
+            native_identity,
         })
     }
     #[cfg(not(any(unix, windows)))]
