@@ -228,12 +228,18 @@ Use this when you need to wipe state instead of debugging a clearly broken cache
 ./target/release/codestory-cli index --project . --refresh full
 ```
 
-If the cache directory itself needs to go:
+If derived cache state itself needs to be quarantined (schema too new, rollback
+onto a newer cache, or a cache you cannot debug in place):
 
 ```sh
-mv <cache-dir> <cache-dir>.bak
+./target/release/codestory-cli cache reset --project . --derived-only --dry-run
+./target/release/codestory-cli cache reset --project . --derived-only --confirm
 ./target/release/codestory-cli index --project . --refresh full
 ```
+
+`cache reset` requires `--derived-only` and exactly one of `--dry-run` or
+`--confirm`. It quarantines derived state in the same cache root and deletes
+nothing. Do not `mv` the cache directory.
 
 Keep the work serialized. Running multiple cargo or CLI indexing commands at once can hide the real failure behind lock contention and avoidable memory pressure.
 

@@ -136,16 +136,18 @@ Full routing: [docs/README.md](docs/README.md).
 
 ## Evaluation
 
-The same agent answered one architecture question in each of 18 pinned public
-repositories, three times with CodeStory and three times without. Overall
-passing answers were 45 of 54 with CodeStory and 44 of 54 without. Tokens and
-tool calls dropped sharply. C++ and Bash each fell from 3 of 3 without to 2 of
-3 with. HTML forms and the Chinook schema failed in both arms.
+ChatGPT Codex (`gpt-5.6-sol`) answered one architecture question in each of 18
+pinned public repositories, three times with CodeStory and three times without,
+with `--max-source-reads-after-packet 0`. Overall passing answers were 45 of 54
+with CodeStory and 44 of 54 without. Tokens and tool calls dropped sharply. C++
+and Bash each fell from 3 of 3 without to 2 of 3 with. HTML forms and the
+Chinook schema failed in both arms.
 
-This sheet is a development comparison, not a publishable promotion run: dirty
-tree, no `summary.json`, not `--publishable`, and the without-arm was reused
-from an earlier window. A later publishable `summary.json` can replace the
-table.
+This sheet is a Codex harness sample used as a quality budget, not the product
+ICP and not a host-agnostic result. Cursor and Claude sheets are not in yet. It
+is a development comparison, not a publishable promotion run: dirty tree, no
+`summary.json`, not `--publishable`, and the without-arm was reused from an
+earlier window. A later publishable `summary.json` can replace the table.
 
 | | Without CodeStory | With CodeStory |
 | --- | ---: | ---: |
