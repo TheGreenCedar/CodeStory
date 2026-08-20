@@ -3829,6 +3829,8 @@ test("mcp launcher preserves the managed CLI verification failure", async () => 
     assert.ok(status.warnings.includes(reason), JSON.stringify(status.warnings));
     assert.equal(status.readiness[0].reason, reason);
     assert.equal(responses[2].result.structuredContent.failure, reason);
+    assert.equal(responses[2].result.isError, true);
+    assert.equal(responses[2].result.structuredContent.code, "codestory_unavailable");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -4667,8 +4669,9 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       method: "tools/call",
       params: { name: "ground", arguments: { project: repoRoot } },
     });
-    assert.equal(coldGround.result.isError, true);
+    assert.equal(coldGround.result.isError, undefined);
     assert.equal(coldGround.result.structuredContent.code, "codestory_preparing");
+    assert.equal(coldGround.result.structuredContent.state, "preparing");
     assert.equal(coldGround.result.structuredContent.retry_tool, "ground");
     assert.equal(coldGround.result.structuredContent.project, repoRoot);
     const { progress, ...operationCore } = coldGround.result.structuredContent.operation;

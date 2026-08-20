@@ -456,6 +456,35 @@ fn assert_tool_error(response: &Value, id: Value) -> &Value {
         .expect("tools/call error should include structuredContent")
 }
 
+fn tool_result_code(response: &Value) -> Option<&str> {
+    response
+        .pointer("/result/structuredContent/code")
+        .and_then(Value::as_str)
+}
+
+fn assert_tool_preparing(response: &Value, id: Value) -> &Value {
+    let result = assert_success_envelope(response, id);
+    assert!(
+        result.get("isError").and_then(Value::as_bool) != Some(true),
+        "preparing tools/call should be a successful structured result: {response}"
+    );
+    assert_tool_text_content(result, response);
+    let content = result
+        .get("structuredContent")
+        .expect("preparing tools/call should include structuredContent");
+    assert_eq!(content["code"], json!("codestory_preparing"));
+    assert_eq!(content["state"], json!("preparing"));
+    content
+}
+
+fn assert_tool_preparing_or_unavailable(response: &Value, id: Value) -> &Value {
+    if tool_result_code(response) == Some("codestory_preparing") {
+        assert_tool_preparing(response, id)
+    } else {
+        assert_tool_error(response, id)
+    }
+}
+
 fn assert_error_envelope(response: &Value, id: Value) -> &Value {
     assert_eq!(response.get("jsonrpc"), Some(&json!("2.0")));
     assert_eq!(response.get("id"), Some(&id));
@@ -1693,8 +1722,7 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
     for (index, project) in projects.iter().enumerate() {
         let id = format!("multi-packet-{index}");
         let response = send_json(&mut server, packet_request(&id, project.path()));
-        let error = assert_tool_error(&response, json!(id));
-        assert_eq!(error["code"], json!("codestory_preparing"));
+        let error = assert_tool_preparing(&response, json!(id));
         assert_eq!(error["cause_code"], json!("cache_busy"));
         assert_eq!(error["retry_tool"], json!("packet"));
         assert!(error["retry_after_ms"].as_u64().is_some());
@@ -1715,7 +1743,7 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
         &mut server,
         packet_request("multi-packet-first-retry", projects[0].path()),
     );
-    let retry_error = assert_tool_error(&retry, json!("multi-packet-first-retry"));
+    let retry_error = assert_tool_preparing(&retry, json!("multi-packet-first-retry"));
     assert_eq!(
         retry_error["operation"]["operation_id"],
         json!(operation_ids[0]),
@@ -3888,6 +3916,19 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "{compact}"
     );
     assert!(
+        compact.get("retrieval_mode").is_some(),
+        "compact status should keep retrieval_mode as the publication class: {compact}"
+    );
+    assert!(
+        compact.get("degraded_reason").is_some(),
+        "compact status should surface degraded_reason next to retrieval_mode: {compact}"
+    );
+    assert_eq!(
+        compact["live_ready"],
+        json!(compact["retrieval_mode"] == json!("full") && compact["degraded_reason"].is_null()),
+        "compact live_ready must not treat full as packet-ready when degraded: {compact}"
+    );
+    assert!(
         compact["diagnostics_uri"]
             .as_str()
             .is_some_and(|uri| uri.starts_with("codestory://status?project=")),
@@ -3904,6 +3945,8 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     assert!(compact_text.contains("state: working_locally"));
     assert!(compact_text.contains("capability.local_navigation: ready"));
     assert!(compact_text.contains("next_action:"));
+    assert!(compact_text.contains("retrieval_mode:"));
+    assert!(compact_text.contains("live_ready:"));
     let local_summary = "Local repository navigation is ready.";
     assert_eq!(
         status.to_string().matches(local_summary).count(),
@@ -3999,6 +4042,15 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "an explicit-CPU fixture without a compatible semantic publication must not report retrieval as full: {status}"
     );
     assert_eq!(
+        status["live_ready"],
+        json!(false),
+        "status must not report live-ready when retrieval_mode is not a live full publication: {status}"
+    );
+    assert!(
+        status.get("degraded_reason").is_some(),
+        "MCP status should surface degraded_reason next to retrieval_mode: {status}"
+    );
+    assert_eq!(
         status["local_refresh"]["state"],
         json!("refreshed"),
         "fresh local graph state should be explicit even when sidecar retrieval is unavailable: {status}"
@@ -4042,7 +4094,9 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "local/default lane should report retrieval mode: {status}"
     );
     assert_eq!(local_default["status"], json!("unavailable"));
-    assert_eq!(local_default.as_object().map(serde_json::Map::len), Some(2));
+    assert!(local_default.get("degraded_reason").is_some());
+    assert_eq!(local_default["live_ready"], json!(false));
+    assert_eq!(local_default.as_object().map(serde_json::Map::len), Some(4));
     let agent_lane = readiness_lanes
         .get("agent_packet_search")
         .unwrap_or_else(|| panic!("status should include agent_packet_search lane: {status}"));
@@ -4052,7 +4106,9 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "agent lane should report broad retrieval capability: {status}"
     );
     assert!(agent_lane["retrieval_mode"].is_string());
-    assert_eq!(agent_lane.as_object().map(serde_json::Map::len), Some(2));
+    assert!(agent_lane.get("degraded_reason").is_some());
+    assert_eq!(agent_lane["live_ready"], json!(false));
+    assert_eq!(agent_lane.as_object().map(serde_json::Map::len), Some(4));
     assert_eq!(
         status["runtime_truth"]["readiness_refs"]["local_graph"],
         json!("readiness[goal=local_navigation]"),
@@ -5354,8 +5410,10 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
             }
         }),
     );
-    let search_error =
-        assert_tool_error(&search_response, json!("tool-refresh-search-still-blocked"));
+    let search_error = assert_tool_preparing_or_unavailable(
+        &search_response,
+        json!("tool-refresh-search-still-blocked"),
+    );
     assert!(
         matches!(
             search_error.pointer("/code").and_then(Value::as_str),
@@ -5565,7 +5623,7 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
             "params": {"name": "search", "arguments": {"query": "AppController"}}
         }),
     );
-    let error = assert_tool_error(&search, json!("cold-search-unavailable"));
+    let error = assert_tool_preparing_or_unavailable(&search, json!("cold-search-unavailable"));
     assert_eq!(error["tool"], json!("search"));
     assert!(
         error["diagnostics_uri"]
@@ -5635,7 +5693,8 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
             }
         }),
     );
-    let error = assert_tool_error(&response, json!("migration-search-preparing"));
+    let error =
+        assert_tool_preparing_or_unavailable(&response, json!("migration-search-preparing"));
     if activation_terminated(error) {
         assert_eq!(error["code"], json!("codestory_unavailable"));
         assert!(
@@ -5678,20 +5737,24 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
     };
 
     let first = send_json(&mut server, packet_request("packet-search-repair-first"));
-    if first.pointer("/result/isError") != Some(&json!(true)) {
+    let first_error = if tool_result_code(&first) == Some("codestory_preparing") {
+        assert_tool_preparing(&first, json!("packet-search-repair-first"))
+    } else if first.pointer("/result/isError") != Some(&json!(true)) {
         assert_tool_success(&first, json!("packet-search-repair-first"));
         return;
-    }
-    let first_error = assert_tool_error(&first, json!("packet-search-repair-first"));
-    if activation_terminated(first_error) {
-        assert_search_repaired_before_terminal_activation(
-            &mut server,
-            first_error,
-            &search_generations,
-            "packet-search-repair-first",
-        );
-        return;
-    }
+    } else {
+        let first_error = assert_tool_error(&first, json!("packet-search-repair-first"));
+        if activation_terminated(first_error) {
+            assert_search_repaired_before_terminal_activation(
+                &mut server,
+                first_error,
+                &search_generations,
+                "packet-search-repair-first",
+            );
+            return;
+        }
+        first_error
+    };
     assert_eq!(first_error["code"], json!("codestory_preparing"));
     assert_eq!(first_error["retry_tool"], json!("packet"));
     assert!(first_error["retry_after_ms"].as_u64().is_some());
@@ -5707,6 +5770,18 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
         thread::sleep(Duration::from_millis(retry_after_ms.min(1_000)));
         let id = format!("packet-search-repair-retry-{attempt}");
         let response = send_json(&mut server, packet_request(&id));
+        if tool_result_code(&response) == Some("codestory_preparing") {
+            let error = assert_tool_preparing(&response, json!(id));
+            assert_eq!(error["retry_tool"], json!("packet"));
+            assert_eq!(
+                error["operation"]["operation_id"],
+                json!(operation_id),
+                "same-project retry must retain the repair operation id"
+            );
+            retry_after_ms = error["retry_after_ms"].as_u64().unwrap_or(250);
+            last_error = error.clone();
+            continue;
+        }
         if response.pointer("/result/isError") != Some(&json!(true)) {
             assert_tool_success(&response, json!(id));
             assert!(
@@ -5725,15 +5800,7 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
             );
             return;
         }
-        assert_eq!(error["code"], json!("codestory_preparing"));
-        assert_eq!(error["retry_tool"], json!("packet"));
-        assert_eq!(
-            error["operation"]["operation_id"],
-            json!(operation_id),
-            "same-project retry must retain the repair operation id"
-        );
-        retry_after_ms = error["retry_after_ms"].as_u64().unwrap_or(250);
-        last_error = error.clone();
+        panic!("packet retry returned an unexpected error: {error}");
     }
     panic!("packet did not converge after the bounded same-tool retry sequence: {last_error}");
 }

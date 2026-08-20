@@ -2181,10 +2181,6 @@ fn assert_stdio_context_id_fails_closed_without_full_sidecars(
     })
     .to_string();
     let stdio = run_stdio_request(workspace, cache_dir, &request);
-    assert_eq!(
-        stdio["result"]["isError"], true,
-        "stdio context --id should return a tool error without full retrieval: {stdio:#}"
-    );
     let structured = &stdio["result"]["structuredContent"];
     let code = structured["code"].as_str();
     assert!(
@@ -2194,6 +2190,18 @@ fn assert_stdio_context_id_fails_closed_without_full_sidecars(
         ),
         "stdio context --id should fail closed with a typed retrieval error: {stdio:#}"
     );
+    if code == Some("codestory_preparing") {
+        assert_ne!(
+            stdio["result"].get("isError"),
+            Some(&serde_json::json!(true)),
+            "preparing should be a successful structured result: {stdio:#}"
+        );
+    } else {
+        assert_eq!(
+            stdio["result"]["isError"], true,
+            "stdio context --id should return a tool error without full retrieval: {stdio:#}"
+        );
+    }
     if code == Some("codestory_tool_blocked") {
         let status = structured["status"].as_str();
         assert!(

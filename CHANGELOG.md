@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- First-run MCP tool calls that are still preparing now return a successful
+  structured result with `retry_after_ms` instead of `isError: true`, so hosts
+  that stop on errors still retry. Compact and MCP status report `degraded_reason`
+  and `live_ready` beside `retrieval_mode`, so `full` is not readable as "packet
+  may run now."
+
 ## 0.17.1
 
 CodeStory 0.17.1 makes compact answers more accurate and more reliable. A packet keeps the production sources that implement the flow — the files an operator would actually change — instead of filling the answer with tests, samples, and workflow files that only share a name.
