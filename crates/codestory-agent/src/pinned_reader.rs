@@ -11,7 +11,9 @@
 //! right now", and every decision below treats that as a refusal. Losing a pin
 //! can never widen what a continuation is allowed to reuse.
 
-use codestory_contracts::api::{PACKET_PROBE_CONTRACT_VERSION, PacketProbeRejectionCodeDto};
+use codestory_contracts::api::{
+    AgentCitationDto, PACKET_PROBE_CONTRACT_VERSION, PacketProbeRejectionCodeDto,
+};
 
 /// Read-only view of the identities pinned by the public operation in flight.
 pub trait PinnedReader {
@@ -26,6 +28,11 @@ pub trait PinnedReader {
     /// Retrieval generation the current operation pinned, or `None` when no
     /// retrieval publication is selected.
     fn pinned_retrieval_generation(&self) -> Option<String>;
+
+    /// Source text captured for a citation while the current operation was
+    /// pinned. Runtime fills this from the citation excerpt or a pinned
+    /// snapshot; it never opens the live workspace from this crate.
+    fn pinned_source_text(&self, citation: &AgentCitationDto) -> Option<String>;
 }
 
 /// Why a continuation probe may not be reused against the pinned state.
@@ -174,6 +181,16 @@ mod tests {
         fn pinned_retrieval_generation(&self) -> Option<String> {
             self.reads.borrow_mut().push("retrieval");
             self.retrieval_generation.map(str::to_string)
+        }
+
+        fn pinned_source_text(&self, citation: &AgentCitationDto) -> Option<String> {
+            self.reads.borrow_mut().push("source");
+            citation
+                .source_excerpt
+                .as_ref()
+                .map(|excerpt| excerpt.trim())
+                .filter(|excerpt| !excerpt.is_empty())
+                .map(str::to_string)
         }
     }
 

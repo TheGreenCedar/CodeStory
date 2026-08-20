@@ -4,6 +4,11 @@
 
 MCP now tells agents to call the tool that matches the task and retry that same tool while CodeStory prepares. It no longer starts with `ground`, invents an `affected` path, or treats `status` as a required next step.
 
+### Changed
+
+- CLI `affected` requires explicit paths or stdin, matching MCP. It no longer invents a git diff when those are omitted.
+- Repo-text matches are leads only. They no longer count as packet proof.
+
 ## 0.17.1
 
 CodeStory 0.17.1 makes compact answers more accurate and more reliable. A packet keeps the production sources that implement the flow — the files an operator would actually change — instead of filling the answer with tests, samples, and workflow files that only share a name.

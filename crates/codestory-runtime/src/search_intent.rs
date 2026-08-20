@@ -419,7 +419,33 @@ pub(super) fn search_query_recommended_next_action(
             .to_string();
     }
     if repo_text_mode == SearchRepoTextMode::Off || !repo_text_enabled {
-        return "Run retrieval index to restore full sidecar mode, then rerun search --why with a shorter concrete symbol.".to_string();
+        return "Try a shorter symbol or packet query.".to_string();
     }
     "Try a shorter symbol, file name, or literal from ground output.".to_string()
+}
+
+#[cfg(test)]
+mod recommended_next_action_tests {
+    use super::*;
+
+    #[test]
+    fn full_mode_empty_or_off_repo_text_does_not_ask_to_restore_retrieval() {
+        for (mode, enabled) in [
+            (SearchRepoTextMode::Off, false),
+            (SearchRepoTextMode::Off, true),
+            (SearchRepoTextMode::On, false),
+            (SearchRepoTextMode::On, true),
+        ] {
+            let message =
+                search_query_recommended_next_action(0, false, None, &[], &[], mode, enabled);
+            assert!(
+                !message.contains("Run retrieval index"),
+                "repo-text {mode:?} enabled={enabled} must not restore retrieval: {message}"
+            );
+            assert!(
+                message.contains("shorter symbol") || message.contains("packet"),
+                "repo-text {mode:?} enabled={enabled} should point at a shorter symbol or packet: {message}"
+            );
+        }
+    }
 }
