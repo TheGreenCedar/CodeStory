@@ -12,6 +12,11 @@ MCP now tells agents to call the tool that matches the task and retry that same 
   `~/.gnupg`, and a `secrets/` directory used as the repository root. Set
   `CODESTORY_ALLOW_SENSITIVE_PROJECT_ROOT=1` at process start to override. Nested
   repositories under home are unchanged.
+- First-run MCP tool calls that are still preparing now return a successful
+  structured result with `retry_after_ms` instead of `isError: true`, so hosts
+  that stop on errors still retry. Compact and MCP status report `degraded_reason`
+  and `live_ready` beside `retrieval_mode`, so `full` is not readable as "packet
+  may run now."
 
 ## 0.17.1
 

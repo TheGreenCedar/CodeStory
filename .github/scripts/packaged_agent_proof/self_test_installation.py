@@ -56,7 +56,6 @@ def _ready_retrieval_fixture() -> dict:
 def _readiness_convergence_test(query: str, ready_retrieval: dict) -> None:
     preparing = {
         "result": {
-            "isError": True,
             "structuredContent": {
                 "code": "codestory_preparing",
                 "state": "preparing",

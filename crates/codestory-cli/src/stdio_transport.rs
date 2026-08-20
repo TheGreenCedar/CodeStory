@@ -1896,6 +1896,20 @@ fn stdio_jsonrpc_from_legacy(
 }
 
 fn compact_stdio_status(runtime: &RuntimeContext, status: &serde_json::Value) -> serde_json::Value {
+    let retrieval_mode = status
+        .get("retrieval_mode")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let degraded_reason = status
+        .get("degraded_reason")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let live_ready = status.get("live_ready").cloned().unwrap_or_else(|| {
+        serde_json::json!(stdio_status_is_live_ready(
+            retrieval_mode.as_str(),
+            degraded_reason.as_str(),
+        ))
+    });
     serde_json::json!({
         "project": status.get("project_root"),
         "state": status.get("state"),
@@ -1904,11 +1918,18 @@ fn compact_stdio_status(runtime: &RuntimeContext, status: &serde_json::Value) ->
         "next_action": status.get("next_action"),
         "retry_after_ms": status.get("retry_after_ms"),
         "failure": status.get("failure"),
+        "retrieval_mode": retrieval_mode,
+        "degraded_reason": degraded_reason,
+        "live_ready": live_ready,
         "diagnostics_uri": stdio_resource_uri_for_project(
             &StdioResource::Status,
             &runtime.project_root,
         )
     })
+}
+
+fn stdio_status_is_live_ready(retrieval_mode: Option<&str>, degraded_reason: Option<&str>) -> bool {
+    retrieval_mode == Some("full") && degraded_reason.is_none()
 }
 
 /// Render one `tools/call` outcome.
@@ -2182,6 +2203,9 @@ fn stdio_compact_tool_text(tool_name: &str, value: &serde_json::Value) -> String
         ("scope", "/scope"),
         ("snippet_truncated", "/snippet_truncated"),
         ("diagnostics_uri", "/diagnostics_uri"),
+        ("retrieval_mode", "/retrieval_mode"),
+        ("degraded_reason", "/degraded_reason"),
+        ("live_ready", "/live_ready"),
     ] {
         if let Some(rendered) = value.pointer(pointer).and_then(stdio_text_scalar) {
             lines.push(format!("{label}: {rendered}"));
@@ -2760,16 +2784,26 @@ fn stdio_tool_call_error(error: &serde_json::Value) -> serde_json::Value {
     } else {
         serde_json::json!({ "message": message.clone() })
     };
-    serde_json::json!({
+    let preparing = structured_content
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        == Some("codestory_preparing");
+    let mut result = serde_json::json!({
         "content": [
             {
                 "type": "text",
                 "text": message
             }
         ],
-        "structuredContent": structured_content,
-        "isError": true
-    })
+        "structuredContent": structured_content
+    });
+    if !preparing {
+        result
+            .as_object_mut()
+            .expect("tools/call result is an object")
+            .insert("isError".to_string(), serde_json::json!(true));
+    }
+    result
 }
 
 fn stdio_legacy_error_message(error: &serde_json::Value) -> String {
@@ -5522,6 +5556,7 @@ fn stdio_workspace_mismatch_status(mismatch: &StdioWorkspaceMismatch) -> serde_j
             "message": "The live CodeStory MCP child is serving a different workspace than the active plugin state. Restart/reload the host so MCP relaunches for the active workspace, then reread the project-bound status resource."
         },
         "degraded_reason": "workspace_mismatch",
+        "live_ready": false,
         "project_root": diagnostic["served_root"].clone(),
         "workspace_mismatch": diagnostic,
         "local_refresh": local_refresh,
@@ -5720,6 +5755,11 @@ fn read_stdio_status_resource(
         "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
         "storage_exists": runtime.storage_path.exists(),
         "retrieval_mode": retrieval_status.retrieval_mode,
+        "degraded_reason": retrieval_status.degraded_reason,
+        "live_ready": stdio_status_is_live_ready(
+            Some(retrieval_status.retrieval_mode.as_str()),
+            retrieval_status.degraded_reason.as_deref(),
+        ),
         "dirty_marker": stdio_dirty_marker_json(&readiness.dirty_marker),
         "index_freshness": summary.freshness,
         "effective_index_freshness": readiness.effective_freshness,
@@ -5777,11 +5817,23 @@ fn stdio_public_readiness_lanes(lanes: &serde_json::Value) -> serde_json::Value 
                 Some("repairing" | "preparing" | "updating") => "preparing",
                 _ => "unavailable",
             };
+            let retrieval_mode = lane
+                .get("retrieval_mode")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("unavailable"));
+            let degraded_reason = lane
+                .get("degraded_reason")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let live_ready =
+                stdio_status_is_live_ready(retrieval_mode.as_str(), degraded_reason.as_str());
             public.insert(
                 name.clone(),
                 serde_json::json!({
                     "status": status,
-                    "retrieval_mode": lane.get("retrieval_mode").cloned().unwrap_or_else(|| serde_json::json!("unavailable")),
+                    "retrieval_mode": retrieval_mode,
+                    "degraded_reason": degraded_reason,
+                    "live_ready": live_ready,
                 }),
             );
         }
@@ -8054,6 +8106,7 @@ mod tests {
         let status = stdio_workspace_mismatch_status(&mismatch);
         assert_eq!(status["status"], json!("workspace_mismatch"));
         assert_eq!(status["degraded_reason"], json!("workspace_mismatch"));
+        assert_eq!(status["live_ready"], json!(false));
         assert_eq!(status["readiness"][0]["minimum_next"], json!([]));
         assert_eq!(status["readiness"][0]["full_repair"], json!([]));
         assert!(
@@ -8795,6 +8848,90 @@ version = "0.11.20"
         });
         let ground = compact_stdio_ground_result(snapshot);
         assert_eq!(ground, json!({"notes": ["keep"]}));
+    }
+
+    #[test]
+    fn preparing_tool_result_is_successful_structured_content() {
+        let preparing = json!({
+            "code": "codestory_preparing",
+            "message": "CodeStory is preparing managed search.",
+            "state": "preparing",
+            "retry_after_ms": 1500,
+        });
+        let result = stdio_tool_call_error(&preparing);
+        assert_ne!(result.get("isError"), Some(&json!(true)), "{result}");
+        assert_eq!(
+            result["structuredContent"]["code"],
+            json!("codestory_preparing")
+        );
+        assert_eq!(result["structuredContent"]["state"], json!("preparing"));
+        assert_eq!(result["structuredContent"]["retry_after_ms"], json!(1500));
+
+        let unavailable = json!({
+            "code": "codestory_unavailable",
+            "message": "CodeStory is unavailable.",
+            "state": "unavailable",
+        });
+        let error = stdio_tool_call_error(&unavailable);
+        assert_eq!(error.get("isError"), Some(&json!(true)), "{error}");
+        assert_eq!(
+            error["structuredContent"]["code"],
+            json!("codestory_unavailable")
+        );
+    }
+
+    #[test]
+    fn compact_stdio_status_keeps_full_publication_class_when_live_not_ready() {
+        let (_project, _cache, runtime) = stdio_inspect_only_runtime();
+        let status = json!({
+            "project_root": "/repo",
+            "state": "working_locally",
+            "capabilities": {
+                "local_navigation": "ready",
+                "broad_search": "unavailable"
+            },
+            "current_operation": null,
+            "next_action": "continue_with_local_navigation",
+            "retry_after_ms": null,
+            "failure": null,
+            "retrieval_mode": "full",
+            "degraded_reason": "semantic_store_degraded",
+            "live_ready": false,
+        });
+        let compact = compact_stdio_status(&runtime, &status);
+        assert_eq!(compact["retrieval_mode"], json!("full"));
+        assert_eq!(compact["degraded_reason"], json!("semantic_store_degraded"));
+        assert_eq!(compact["live_ready"], json!(false));
+        assert_ne!(
+            compact["live_ready"],
+            json!(true),
+            "full publication class must not read as packet-ready when degraded: {compact}"
+        );
+    }
+
+    #[test]
+    fn public_readiness_lanes_keep_full_mode_when_live_not_ready() {
+        let lanes = json!({
+            "agent_packet_search": {
+                "status": "repair_retrieval",
+                "retrieval_mode": "full",
+                "degraded_reason": "semantic_store_degraded"
+            }
+        });
+        let public = stdio_public_readiness_lanes(&lanes);
+        assert_eq!(
+            public["agent_packet_search"]["retrieval_mode"],
+            json!("full")
+        );
+        assert_eq!(
+            public["agent_packet_search"]["degraded_reason"],
+            json!("semantic_store_degraded")
+        );
+        assert_eq!(public["agent_packet_search"]["live_ready"], json!(false));
+        assert_eq!(
+            public["agent_packet_search"]["status"],
+            json!("unavailable")
+        );
     }
 
     #[test]
@@ -10812,23 +10949,24 @@ version = "0.11.20"
                     &Arc::new(AtomicBool::new(false)),
                 )
                 .expect("tool response");
-                if response.pointer("/result/isError") != Some(&json!(true)) {
-                    assert!(response.pointer("/result/structuredContent").is_some());
-                    return response;
+                let content = &response["result"]["structuredContent"];
+                if content.get("code") == Some(&json!("codestory_preparing")) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "broad call did not become ready: {content}"
+                    );
+                    std::thread::sleep(Duration::from_millis(
+                        content["retry_after_ms"].as_u64().unwrap_or(50).min(500),
+                    ));
+                    continue;
                 }
-                let error = &response["result"]["structuredContent"];
-                assert_eq!(
-                    error["code"],
-                    json!("codestory_preparing"),
-                    "ready-lease fixture must converge instead of becoming unavailable: {response}"
-                );
-                assert!(
-                    Instant::now() < deadline,
-                    "broad call did not become ready: {error}"
-                );
-                std::thread::sleep(Duration::from_millis(
-                    error["retry_after_ms"].as_u64().unwrap_or(50).min(500),
-                ));
+                if response.pointer("/result/isError") == Some(&json!(true)) {
+                    panic!(
+                        "ready-lease fixture must converge instead of becoming unavailable: {response}"
+                    );
+                }
+                assert!(response.pointer("/result/structuredContent").is_some());
+                return response;
             }
             panic!("broad call did not converge within the bounded retry count")
         }

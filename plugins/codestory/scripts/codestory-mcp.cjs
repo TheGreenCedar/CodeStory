@@ -3940,11 +3940,14 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
     failure_context: managedFailure ? managedCliProvisionFailure.context : null,
     diagnostics_uri: diagnosticsUri,
   };
-  return {
+  const result = {
     content: [{ type: 'text', text: structuredContent.message }],
     structuredContent,
-    isError: true,
   };
+  if (!preparing) {
+    result.isError = true;
+  }
+  return result;
 }
 
 const shuttingDownHandoffs = new WeakSet();

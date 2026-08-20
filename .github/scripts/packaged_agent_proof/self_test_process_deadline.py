@@ -84,7 +84,6 @@ class _ScriptedHost(McpProcess):
                 "jsonrpc": "2.0",
                 "id": self.pending.get("id"),
                 "result": {
-                    "isError": True,
                     "structuredContent": {
                         "code": "codestory_preparing",
                         "state": "preparing",
