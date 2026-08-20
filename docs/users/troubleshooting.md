@@ -34,7 +34,7 @@ Trust boundaries: [Trust and readiness](trust-and-readiness.md).
 | Host | Check |
 | --- | --- |
 | Codex | Confirm **TheGreenCedar -> codestory** is installed, then start a fresh host session |
-| Cursor | Confirm the **codestory** plugin is installed, enable its MCP server in Customize, then reload Cursor; inspect `.cursor/mcp.json` only for the advanced repository-managed setup |
+| Cursor | Confirm this repository is added as a marketplace in Customize, **codestory** is installed from it, and its MCP server is enabled, then reload Cursor; inspect `.cursor/mcp.json` only for the advanced repository-managed setup |
 | Claude Code | Confirm the plugin hook and the separately configured MCP server |
 | Copilot | Hooks or instructions do not start MCP; configure it explicitly |
 

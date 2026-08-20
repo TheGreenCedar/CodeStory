@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The Cursor install guide now starts from Customize: add this repository with
+  **+ Add Marketplace** (GitHub or a local clone), install **codestory**, then
+  enable its MCP server. CodeStory is not listed on the public Cursor
+  Marketplace, so searching that catalog is not an install path.
+
 ## 0.17.1
 
 - Portable repository identity stays on the remote when Git writes cookies or timestamps under `.git` during a status read, including Git 2.55's Linux fsmonitor files. Those updates are not treated as a swapped gitdir.
