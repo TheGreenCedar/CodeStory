@@ -40,7 +40,7 @@ queries stay local by default.
 | Host | Start here |
 | --- | --- |
 | Codex | [Codex guide](docs/users/codex.md) — the recommended first install |
-| Cursor | [Cursor guide](docs/users/cursor.md) — local plugin or team marketplace |
+| Cursor | [Cursor guide](docs/users/cursor.md) — add the marketplace in Customize |
 | Claude Code | [Claude Code guide](docs/users/claude-code.md) |
 | GitHub Copilot | [Copilot guide](docs/users/copilot.md) |
 

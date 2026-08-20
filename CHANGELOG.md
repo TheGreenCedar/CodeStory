@@ -2,11 +2,10 @@
 
 ## Unreleased
 
-- The Cursor install guide now starts from how CodeStory becomes visible in
-  Customize: the local plugin installer, or a team marketplace that imported
-  this repository. It states that CodeStory is not listed on the public Cursor
-  Marketplace, so searching Customize's official catalog is not an install
-  path.
+- The Cursor install guide now starts from Customize: add this repository with
+  **+ Add Marketplace** (GitHub or a local clone), install **codestory**, then
+  enable its MCP server. CodeStory is not listed on the public Cursor
+  Marketplace, so searching that catalog is not an install path.
 
 ## 0.17.1
 

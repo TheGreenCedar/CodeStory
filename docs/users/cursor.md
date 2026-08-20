@@ -1,11 +1,12 @@
 # Cursor
 
 CodeStory is a Cursor plugin: grounding rule, skill, session-start hook, and
-managed runtime launcher. Cursor shows it in **Customize** only after you load
-that package onto the machine or your team imports this repository as a
-marketplace. It is not listed on the public [Cursor
-Marketplace](https://cursor.com/marketplace). Searching Customize's official
-catalog for **codestory** will not find it.
+managed runtime launcher. It is not listed on the public [Cursor
+Marketplace](https://cursor.com/marketplace). Searching that catalog for
+**codestory** will not find it.
+
+Add this repository as a marketplace in Customize, then install **codestory**
+from it.
 
 ## Requirements
 
@@ -29,81 +30,35 @@ no Docker, external embedding endpoint, model download, or Xcode toolchain.
 Building CodeStory from source has separate [contributor
 prerequisites](../contributors/getting-started.md#prerequisites).
 
-## Make CodeStory visible in Customize
+## Install
 
-Pick the path that matches how you get software.
+1. Open **Customize** in the Cursor sidebar.
+2. Select **+ Add Marketplace**.
+3. Import this repository:
+   - **Import from Github** —
+     [TheGreenCedar/CodeStory](https://github.com/TheGreenCedar/CodeStory); or
+   - **Import from Disk** — a local clone of the same repository.
+4. Install **codestory** from that marketplace, for your user or the current
+   project.
+5. Open the installed plugin and enable its **codestory** MCP server. Cursor
+   requires this one-time toggle; the plugin cannot enable MCP on your behalf.
+6. Reload the Cursor window if the server does not connect.
 
-### Personal install
-
-This is the path for an individual machine. It links the shipped plugin into
-Cursor's local plugin directory so **Customize** can list it.
-
-1. Clone [TheGreenCedar/CodeStory](https://github.com/TheGreenCedar/CodeStory)
-   and check out the release you want, or use a clone whose `plugins/codestory`
-   tree is clean and committed.
-2. From that repository root, run:
-
-   ```sh
-   node scripts/install-codestory-cursor-plugin.mjs
-   ```
-
-   The installer links `plugins/codestory` to
-   `~/.cursor/plugins/local/codestory` (on Windows,
-   `%USERPROFILE%\.cursor\plugins\local\codestory`) and uses
-   `~/.cursor/plugins/data/codestory` for plugin state. It refuses a dirty or
-   incomplete plugin tree.
-3. Reload the Cursor window (**Developer: Reload Window**).
-4. Open **Customize** in the sidebar. **codestory** should appear as a local
-   plugin.
-
-Without `--cli`, the first MCP call downloads the version-matched signed
-runtime. Use `--cli` only when dogfooding a local `codestory-cli` build; see
-[Local plugin development](#local-plugin-development).
-
-### Team marketplace
-
-This is the path that makes CodeStory **browsable** in Customize for everyone
-on a Teams or Enterprise workspace.
-
-An administrator opens **Dashboard → Plugins → Team Marketplaces → Add
-Marketplace → Import from Repo** and selects this repository. Cursor's
-repository access settings must grant the workspace access to the repository;
-private repositories also need the corresponding organization or repository
-permission. The import reads
+The import reads
 [`.cursor-plugin/marketplace.json`](../../.cursor-plugin/marketplace.json),
-which points at `plugins/codestory`.
+which points Cursor at `plugins/codestory`. Do not use **Create New**; that
+starts an empty marketplace instead of loading CodeStory.
 
-Enable **Auto Refresh** for automatic catalog updates, or use **Refresh** from
-the Team Marketplaces dashboard after a repository update. That refresh updates
-the catalog only.
+Open the repository you want to ground. The plugin is not limited to the
+CodeStory checkout; every CodeStory tool call still names that repository's
+absolute `project` root.
 
-After the import, each developer:
+Start a fresh agent chat. Cursor asks before running MCP tools by default;
+approve the CodeStory calls, then ask:
 
-1. Opens **Customize → Plugins**.
-2. Finds **codestory** from the team marketplace.
-3. Selects **Install** and chooses a user or project scope.
-
-Publication on cursor.com/marketplace is a separate maintainer step and is not
-an install path today.
-
-## Enable MCP and verify
-
-Cursor will not start CodeStory tools until you enable the plugin's MCP server.
-Plugins cannot flip that toggle for you.
-
-1. In **Customize**, open the installed **codestory** plugin and enable its
-   **codestory** MCP server.
-2. Reload the Cursor window if the server does not connect.
-3. Open the repository you want to ground. The plugin is not limited to the
-   CodeStory checkout; every CodeStory tool call still names that repository's
-   absolute `project` root.
-4. Start a fresh agent chat. Cursor asks before running MCP tools by default;
-   approve the CodeStory calls.
-5. Ask:
-
-   ```text
-   Where is request validation implemented, who calls it, and which tests cover it?
-   ```
+```text
+Where is request validation implemented, who calls it, and which tests cover it?
+```
 
 On the first call, the launcher fetches the matching CodeStory runtime if it is
 not already installed, then prepares the repository. The agent should retry the
@@ -115,17 +70,10 @@ Shared first-use behavior: [User guide](README.md#first-use).
 
 ## Update
 
-How you refresh depends on how the plugin was loaded:
-
-- **Personal install:** update the clone, keep `plugins/codestory` clean and
-  committed, re-run the installer if the local link is missing, then reload
-  Cursor.
-- **Team marketplace:** an administrator refreshes the team catalog, then each
-  user refreshes **codestory** in Customize and reloads Cursor.
-
-Start a fresh agent session after reload. The replacement covers the rule,
-skill, hook, and launcher; the launcher then selects the matching managed
-runtime.
+Refresh the CodeStory marketplace in Customize, then refresh or reinstall
+**codestory** from it and reload the Cursor window. Start a fresh agent
+session. The replacement covers the rule, skill, hook, and launcher; the
+launcher then selects the matching managed runtime.
 
 ## Advanced: repository-managed setup
 
@@ -144,25 +92,29 @@ and are not the primary CodeStory install path.
 
 ## Local plugin development
 
-From a clean committed CodeStory checkout, pass a local CLI only when you need
-that exact binary instead of the managed download:
+The installer below is only for dogfooding a checkout with an optional local
+CLI. Normal installs use [Add Marketplace](#install).
+
+From a clean committed CodeStory checkout:
 
 ```sh
-node scripts/install-codestory-cursor-plugin.mjs \
-  --cli "$(pwd)/target/release/codestory-cli"
+node scripts/install-codestory-cursor-plugin.mjs
 ```
 
-Without `--cli`, the plugin uses the version-matched managed runtime. Reload
-Cursor, enable **codestory** MCP in Customize, and start a fresh agent session.
+Pass `--cli "$(pwd)/target/release/codestory-cli"` to use that exact binary
+instead of the managed download. The installer links `plugins/codestory` into
+`~/.cursor/plugins/local/codestory` and writes any CLI override only into
+Cursor's private CodeStory data directory. Reload Cursor, enable **codestory**
+MCP in Customize, and start a fresh agent session.
 
 ## Troubleshooting
 
 | Symptom | Action |
 | --- | --- |
-| **codestory** is missing from Customize | It is not on the public marketplace. Run the [personal installer](#personal-install) or ask an admin to [import this repository](#team-marketplace) |
+| **codestory** is missing from Customize | It is not on the public marketplace. [Add this repository as a marketplace](#install), then install **codestory** from it |
 | Plugin is listed but tools are missing | Enable **codestory** MCP in Customize, approve the tool prompt, and reload the window |
 | MCP fails to start | Confirm `node` is on `PATH`, then reload. Inspect **MCP Logs** in the Output panel (**Cmd+Shift+U** / **Ctrl+Shift+U**) |
-| Runtime is stale after an update | Refresh the plugin the same way you installed it, reload Cursor, and start a fresh session |
+| Runtime is stale after an update | Refresh the marketplace and the plugin in Customize, reload Cursor, and start a fresh session |
 | A tool remains preparing | Retry that same tool after its returned delay |
 
 Readiness and cache recovery: [Troubleshooting](troubleshooting.md).
@@ -170,7 +122,6 @@ Readiness and cache recovery: [Troubleshooting](troubleshooting.md).
 ## Differences from Codex
 
 Codex installs from `/plugins` against the public **TheGreenCedar** catalog.
-Cursor has no equivalent public listing today: load the plugin locally, or
-install it from a team marketplace that imported this repository. Once MCP is
-connected, repository preparation and the per-user retrieval server behave the
-same as in Codex.
+Cursor has no equivalent public listing: add this repository with **+ Add
+Marketplace**, then install **codestory**. Once MCP is connected, repository
+preparation and the per-user retrieval server behave the same as in Codex.
