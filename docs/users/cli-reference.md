@@ -8,7 +8,9 @@ for first install — start with [user guides](README.md), then
 Plain-language readiness lanes: [Trust and readiness](trust-and-readiness.md).
 Runtime status field glossary (agents): [status-contract](../../plugins/codestory/skills/codestory-grounding/references/status-contract.md).
 
-Install: release binary from GitHub assets, or build from source:
+Install: download the release binary from GitHub release assets for your
+platform. Building from source is a [contributor
+setup](../contributors/getting-started.md) path:
 
 ```sh
 export CODESTORY_EMBED_MODEL_SOURCE="$(node scripts/prepare-embedded-model.mjs)"

@@ -82,8 +82,8 @@ a live publication fence and is not persisted as vector compatibility.
 
 - add artifact formats and identity fields here before teaching runtime about
   them;
-- keep packet sufficiency, evidence assembly, and bounded product retry in
-  `codestory-runtime`;
+- keep packet sufficiency *planning* in `codestory-agent`; keep assembly, pin,
+  and bounded product retry in `codestory-runtime`;
 - keep model execution mechanics and capability reporting in
   `codestory-llama-sys`, while keeping product model/vector/backend policy here;
 - preserve stable `sidecar_*` DTO fields only as compatibility vocabulary, not

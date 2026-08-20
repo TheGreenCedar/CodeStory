@@ -50,15 +50,23 @@ evidence.
 | Language support claims | [Language support](architecture/language-support.md) |
 | Timing and benchmark records | [E2E stats log](testing/codestory-e2e-stats-log.md), [language-expansion holdout stats](testing/language-expansion-holdout-stats.md) |
 | Research comparisons | [Research handbook](research.md) |
-| Dated architecture and code-review evidence | [August 2026 architecture review](testing/architecture-review-2026-08.md), [August 2026 code review](testing/code-review-2026-08.md) |
 | Docs maintenance | [Documentation checklist](contributors/documentation-maintenance-checklist.md), [templates](templates/) |
+
+## Historical evidence
+
+These pages pin SHA `78cc2539` and are snapshots, not current ownership.
+
+| Snapshot | Page |
+| --- | --- |
+| August 2026 architecture review | [architecture-review-2026-08.md](testing/architecture-review-2026-08.md) |
+| August 2026 code review | [code-review-2026-08.md](testing/code-review-2026-08.md) |
 
 ## Common paths
 
 | Question | Start here | Then read |
 | --- | --- | --- |
 | Where do I start as a user? | [User guides](users/README.md) | Your host page under `users/` |
-| How do I diagnose readiness? | [Troubleshooting](users/troubleshooting.md) | [Retrieval engine](ops/retrieval-engine.md) |
+| How do I diagnose readiness? | [Troubleshooting](users/troubleshooting.md) | [CLI reference](users/cli-reference.md) |
 | How does CodeStory work internally? | [Architecture overview](architecture/overview.md) | [Runtime execution path](architecture/runtime-execution-path.md) |
 | How does one process serve multiple repositories? | [Host integration](architecture/host-integration.md) | [Retrieval design](architecture/retrieval-design.md) |
 | Which test proves my docs change? | [Testing matrix - Docs-only fast path](contributors/testing-matrix.md#docs-only-fast-path) | [Contributor setup](contributors/getting-started.md) |
@@ -85,6 +93,7 @@ evidence.
 | Layer | Owner page |
 | --- | --- |
 | shared DTOs and domain contracts | [contracts](architecture/subsystems/contracts.md) |
+| packet planning | [agent](architecture/subsystems/agent.md) |
 | repository identity, discovery, and filesystem safety | [workspace](architecture/subsystems/workspace.md) |
 | SQLite and durable core publication | [store](architecture/subsystems/store.md) |
 | parsing, extraction, and resolution | [indexer](architecture/subsystems/indexer.md) |

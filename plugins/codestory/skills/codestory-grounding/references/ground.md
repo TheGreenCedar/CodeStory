@@ -4,8 +4,8 @@ Produces a budget-aware grounding snapshot of the entire indexed codebase: root 
 
 ## Syntax
 
-See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
-Use `<codestory-cli> <command> --help` for the complete option set.
+See [generated MCP syntax](generated-mcp-syntax.md) for live fields. Do not send
+CLI flags. Every call requires `project` (absolute repository root).
 
 ## Budget Modes
 
@@ -44,21 +44,7 @@ presentation compression, and two graph-coverage limits: `graph_signal_thin`
 when no evaluated candidate carried call-graph evidence, and
 `lexical_fallback` when the order rests on names and layout alone. Read either
 as a reason to verify structure with `trail` before making a structure claim,
-not as evidence about the repository. `ground --why` includes the same
-limitations in its confidence and gap notes.
+not as evidence about the repository.
 
-## Examples
-
-```bash
-# Default balanced grounding
-<codestory-cli> ground --project <target-workspace>
-
-# Strict grounding for quick context
-<codestory-cli> ground --project <target-workspace> --budget strict
-
-# Max depth, JSON output
-<codestory-cli> ground --project <target-workspace> --budget max --format json
-
-# Ground without refreshing the index
-<codestory-cli> ground --project <target-workspace> --refresh none
-```
+MCP `ground` arguments are `project` and optional `budget`. There is no
+`refresh` field; the first call may refresh the local map.

@@ -53,10 +53,13 @@ Capability comparison, day-1 checklist, and shared prompts: [User guides](docs/u
 2. Start a fresh agent session in the repository you want to understand.
 3. Ask an ordinary code question.
 
-That is the normal setup. The first relevant call builds the local map. The
-first broad question also initializes the embedded model and prepares semantic
-search. If it needs more than one foreground turn, the agent retries the same
-call; there is no separate setup or approval flow.
+That is the normal CodeStory setup. The first relevant call builds the local
+map. The first broad question also initializes the embedded model and prepares
+semantic search. If it needs more than one foreground turn, the agent retries
+the same call. CodeStory does not ask you to start a service or approve a
+retrieval helper. Some hosts still have their own steps: Cursor requires
+enabling the MCP server once, and Copilot and Claude Code need MCP connected
+before tools appear. Use the host page for those gestures.
 
 One host process can work across several repositories. Their indexes stay
 isolated while they share one warm embedding engine:
@@ -86,25 +89,11 @@ flowchart LR
 | Windows ARM | Unsupported |
 <!-- codestory-public-support:end -->
 
-"Supported with Metal" and "Supported with Vulkan" describe what the release
-line ships and intends to prove. Each individual release proves it on the
-protected hardware for that platform, and a release whose accelerator host was
-unreachable ships with that platform's accelerator claim **withheld** rather
-than assumed: the accelerator ran on that host in earlier releases, but this
-release did not observe it.
-
-You do not have to take the table's word for any single release. Every release
-ships `release-closeout-summary.json` as a release asset, and its platform
-section in the GitHub release notes is rendered from that release's ledger, so
-a platform whose accelerator was withheld says so in the notes instead of being
-listed as supported. In the summary, `withheld_cells` names every cell that did
-not run, `withheld_claims` names the claims nothing in that release proved, and
-`partially_withheld_claims` names the ones another host still proved. At most
-one platform's accelerator may be withheld
-(`non_claim_policy.withhold_policy.maximum_withheld_hosts`); a release that
-proved no accelerator anywhere is refused rather than published. See
-[the testing matrix](docs/contributors/testing-matrix.md) for how a claim
-becomes withheld.
+The table is what the release line ships and intends to prove. A given release
+may withhold one platform's accelerator claim when that host was unreachable;
+that release's GitHub notes and `release-closeout-summary.json` asset say so
+instead of listing the platform as proved. How a claim becomes withheld:
+[testing matrix](docs/contributors/testing-matrix.md).
 
 ## Example prompts
 
@@ -148,8 +137,15 @@ Full routing: [docs/README.md](docs/README.md).
 ## Evaluation
 
 The same agent answered one architecture question in each of 18 pinned public
-repositories, three times with CodeStory and three times without. Passing
-answers stayed even or better. Tokens and tool calls dropped sharply.
+repositories, three times with CodeStory and three times without. Overall
+passing answers were 45 of 54 with CodeStory and 44 of 54 without. Tokens and
+tool calls dropped sharply. C++ and Bash each fell from 3 of 3 without to 2 of
+3 with. HTML forms and the Chinook schema failed in both arms.
+
+This sheet is a development comparison, not a publishable promotion run: dirty
+tree, no `summary.json`, not `--publishable`, and the without-arm was reused
+from an earlier window. A later publishable `summary.json` can replace the
+table.
 
 | | Without CodeStory | With CodeStory |
 | --- | ---: | ---: |
@@ -178,9 +174,9 @@ answers stayed even or better. Tokens and tool calls dropped sharply.
 | CSS | animate.css keyframes | 3 of 3 | 3 of 3 |
 | SQL | Chinook schema relations | 0 of 3 | 0 of 3 |
 
-HTML forms and the Chinook schema failed in both arms. These numbers describe
-this suite, not your checkout. Day-to-day limits: [What to expect](docs/users/what-to-expect.md).
-How this was measured: [holdout evidence](docs/testing/language-expansion-holdout-stats.md).
+These numbers describe this suite, not your checkout. Day-to-day limits:
+[What to expect](docs/users/what-to-expect.md). How this was measured:
+[holdout evidence](docs/testing/language-expansion-holdout-stats.md).
 
 ## License
 

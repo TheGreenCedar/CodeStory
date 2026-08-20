@@ -105,9 +105,11 @@ comparison is the only detector that channel leaves available.
 
 ## Request routing
 
-Every tool and resource request includes an absolute `project` root. The
-launcher forwards it unchanged, and the stdio adapter selects or creates the
-matching project runtime. There is no process-global active project.
+Every project-scoped tool and `{?project}` resource request includes an
+absolute `project` root. `codestory://agent-guide` is project-free. The
+launcher forwards the project unchanged, and the stdio adapter selects or
+creates the matching project runtime. There is no process-global active
+project.
 
 One stdio process can therefore serve repositories A, B, then A again:
 

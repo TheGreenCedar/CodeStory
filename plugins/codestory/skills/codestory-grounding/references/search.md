@@ -7,8 +7,8 @@ fail-closed states.
 
 ## Syntax
 
-See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
-Use `<codestory-cli> <command> --help` for the complete option set.
+See [generated MCP syntax](generated-mcp-syntax.md) for live fields. Do not send
+CLI flags. Every call requires `project` (absolute repository root).
 
 ## Query Behavior
 
@@ -22,18 +22,16 @@ Use `<codestory-cli> <command> --help` for the complete option set.
   in `auto` mode. Treat this as an uncertainty signal, not as successful graph
   grounding.
 - When hybrid retrieval finds strong semantic matches but no lexical match, Markdown and JSON output include `did_you_mean` suggestions.
-- Broad architecture-style queries can include `search_plan` when `--why
-  --plan-details` is set. The plan reports extracted and dropped terms, bounded
-  subqueries, candidate windows, anchor groups, repo-text promotion status,
-  bridge evidence, next commands, and source-truth checks. It is a discovery
-  plan, not final answer prose.
+- Broad architecture-style queries should use `packet`, not `search`. Search
+  may include plan details in CLI `--why` output; MCP `search` has no `--why`
+  or `--plan-details` field.
 - Ranking boosts exact and terminal symbol names, CamelCase initials, compound terms, and path co-location. Test, fixture, vendor, and external hits are dampened unless the query asks for them.
 - Import/re-export-looking exact hits are ranked below definition-looking hits when source-line evidence is available.
 - Repo-text evidence remains explicit navigation evidence. Treat repo-text hits
   as clues to inspect, not as retrieval success.
 - For architecture questions, broad natural-language `search` is discovery
-  only. Use `packet` for the broad question; use `drill` only when a maintainer
-  explicitly needs a repeatable evaluation artifact.
+  only. Use `packet` for the broad question. Do not call `drill`; there is no
+  MCP `drill` tool.
 - `symbol`, `trail`, and `snippet` require a resolvable graph target. Semantic suggestions and repo-text hits can guide follow-up searches, but they are not promoted into graph targets by those commands.
 - **Hybrid weight overrides** are not public CLI options. `search --hybrid-*` flags are unknown arguments; use fixture-backed tests for ranking experiments instead.
 

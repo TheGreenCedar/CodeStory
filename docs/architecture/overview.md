@@ -26,10 +26,11 @@ installed plugin. It validates the archive, checksum, version, and stdio
 handshake, then hands requests to that executable. It does not provision a
 model or backend separately.
 
-Every MCP request carries an absolute project root. Each stdio process retains
-isolated project runtime contexts, while all compatible CodeStory clients for
-the current OS user connect to one stable private Unix-domain socket or Windows
-named pipe. The server owns the only query and bulk queues and the only native
+Every project-scoped tool and `{?project}` resource request includes an
+absolute project root. `codestory://agent-guide` is static and project-free.
+Each stdio process retains isolated project runtime contexts, while all
+compatible CodeStory clients for the current OS user connect to one stable
+private Unix-domain socket or Windows named pipe. The server owns the only query and bulk queues and the only native
 model worker. At 60 seconds with no queued, active, or leased work, the server
 closes admission and exits. The next product request spawns the exact current
 CLI automatically. Hook-written active-project files are diagnostics; they
@@ -47,7 +48,7 @@ flowchart LR
     RetrievalStage --> Lexical["lexical-index.sqlite3"]
     RetrievalStage --> Vectors["vectors.sqlite3"]
     RetrievalStage --> Scip["SCIP generation"]
-    RetrievalStage --> Manifest["retrieval manifest"]
+    Core --> Manifest["retrieval manifest in codestory.db"]
     Lexical --> Query["pinned packet/search read"]
     Vectors --> Query
     Scip --> Query

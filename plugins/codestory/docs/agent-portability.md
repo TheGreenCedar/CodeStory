@@ -1,7 +1,10 @@
 # Agent Portability
 
 Maintainer pointer for host adapters. Operator documentation lives in the
-[user guides hub](../../../docs/users/README.md).
+[user guides hub](../../../docs/users/README.md). Current hosts are Codex,
+Cursor, Claude Code, Copilot CLI, and Copilot editor. Keep adapters thin: point
+hook-capable hosts at `hooks/` and `skills/`; align rule-only hosts with the
+grounding skill contract.
 
 ## Operators
 
@@ -20,6 +23,3 @@ Adapter layout, MCP script, hooks, and plugin checks:
 | Plugin package and host surfaces | [Plugin README](../README.md) |
 | Optional dirty-marker Git hooks | [Contributor debugging](../../../docs/contributors/debugging.md#optional-dirty-marker-git-hooks) |
 | Status field contract (agent-only) | [status-contract.md](../skills/codestory-grounding/references/status-contract.md) |
-
-Keep adapters thin: point hook-capable hosts at `hooks/` and `skills/`; align
-rule-only hosts with the grounding skill contract.

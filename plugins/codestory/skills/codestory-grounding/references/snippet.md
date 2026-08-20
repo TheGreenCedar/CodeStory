@@ -6,8 +6,8 @@ Markdown output uses ANSI syntax highlighting when stdout is an interactive term
 
 ## Syntax
 
-See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
-Use `<codestory-cli> <command> --help` for the complete option set.
+See [generated MCP syntax](generated-mcp-syntax.md) for live fields. Do not send
+CLI flags. Every call requires `project` (absolute repository root).
 
 ## Output
 

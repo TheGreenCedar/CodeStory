@@ -6,20 +6,16 @@ repo gates.
 
 ## Syntax
 
-See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
-Use `<codestory-cli> <command> --help` for the complete option set.
+See [generated MCP syntax](generated-mcp-syntax.md) for live fields. Do not send
+CLI flags. Every call requires `project` (absolute repository root).
 
 ## Agent Paths
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Current diff | `<codestory-cli> affected --project <target-workspace> --format markdown` | Impact summary based on `git diff --name-status HEAD`. |
-| Explicit paths | `<codestory-cli> affected --project <target-workspace> src/lib.rs --depth 3 --format json` | Matched and typed uncovered inputs, direct and propagated impact, candidate tests, bounds, completeness, and evidence-derived follow-ups. |
-| MCP simple paths | `tools/call affected` with `paths` | Preferred MCP shape for one or more project-relative paths. |
-| MCP compatibility paths | `tools/call affected` with `changed_paths` | Compatibility alias for existing callers. Do not combine it with another input source. |
-| MCP status-rich input | `tools/call affected` with `change_records` | Preserves add/modify/delete/rename/copy status. Do not combine it with `paths` or `changed_paths`. |
-| Stdin paths | `git diff --name-only HEAD | <codestory-cli> affected --project <target-workspace> --stdin` | Same analysis using external path selection. |
-| Stdin status | `git diff --name-status HEAD | <codestory-cli> affected --project <target-workspace> --stdin --stdin-format name-status --format json` | Preserves add/modify/delete/rename/copy status in `change_records`. |
+| MCP simple paths | `affected` with `paths` | Preferred MCP shape for project-relative paths. |
+| MCP compatibility paths | `affected` with `changed_paths` | Compatibility alias. Do not combine with another input source. |
+| MCP status-rich input | `affected` with `change_records` | Preserves add/modify/delete/rename/copy status. |
 
 ## Notes
 

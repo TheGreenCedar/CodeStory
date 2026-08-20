@@ -147,7 +147,21 @@ if (check) {
   writeFileSync(catalogPath, generatedCatalog, "utf8");
   if (rewriteReferences) {
     const referencesRoot = dirname(outputPath);
-    for (const name of readdirSync(referencesRoot).filter((name) => name.endsWith(".md") && name !== "generated-cli-syntax.md")) {
+    const cliOnly = new Set([
+      "index.md",
+      "doctor.md",
+      "serve.md",
+      "drill.md",
+      "drill-suite.md",
+      "explore.md",
+      "query.md",
+      "bookmark.md",
+      "cache.md",
+      "retrieval-rollout.md",
+    ]);
+    for (const name of readdirSync(referencesRoot).filter(
+      (name) => name.endsWith(".md") && cliOnly.has(name),
+    )) {
       const path = join(referencesRoot, name);
       let text = readFileSync(path, "utf8").replaceAll("\r\n", "\n");
       text = text.replace(

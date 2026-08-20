@@ -4,16 +4,13 @@ Builds a directed graph trail starting from a target symbol. Supports neighborho
 
 ## Syntax
 
-See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
-Use `<codestory-cli> <command> --help` for the complete option set.
+See [generated MCP syntax](generated-mcp-syntax.md) for live fields. Do not send
+CLI flags. Every call requires `project` (absolute repository root).
 
-## Trail Modes
+## Trail direction
 
-| Mode | Behavior |
-|------|----------|
-| `neighborhood` | Explore the immediate call graph around the symbol (default depth 2) |
-| `referenced` | Follow all symbols that the target calls/references outward |
-| `referencing` | Follow all symbols that call/reference the target inward |
+MCP `trail` takes `direction`: `incoming`, `outgoing`, or `both` (default).
+There is no `mode` field. Depth defaults to 2.
 
 ## Output
 

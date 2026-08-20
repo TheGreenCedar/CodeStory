@@ -1,3 +1,6 @@
+Maintainer CLI only. There is no MCP tool with this name. Product
+tools own activation; do not call this from the grounding skill.
+
 # `explore` - Bundled Symbol Browser
 
 Resolves one target and returns a combined status, search, results, route

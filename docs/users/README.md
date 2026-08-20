@@ -101,4 +101,9 @@ blocked, use:
 - [Trust and readiness](trust-and-readiness.md) to decide what counts as proof;
 - [Troubleshooting](troubleshooting.md) for the shortest recovery path;
 - [What to expect](what-to-expect.md) for language and repository-size limits;
+- [Glossary](../glossary.md) for readiness terms;
 - [CLI reference](cli-reference.md) for maintainer diagnostics.
+
+Product configuration keys are in
+[configuration-reference](configuration-reference.md). `CODESTORY_TEST_*`
+variables on that page are harness switches, not product settings.

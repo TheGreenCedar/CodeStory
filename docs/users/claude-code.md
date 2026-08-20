@@ -32,14 +32,16 @@ caches installed plugins, so reinstall after changing plugin files.
 
 ## Configure MCP
 
-If the plugin does not register MCP for you, point a server at the adapter:
+If the plugin does not register MCP for you, use the portable adapter from the
+installed plugin, not a CodeStory checkout path:
 
 ```json
 {
   "mcpServers": {
     "codestory": {
       "command": "node",
-      "args": ["/absolute/path/to/plugins/codestory/scripts/codestory-mcp.cjs"],
+      "args": ["./scripts/codestory-mcp.cjs"],
+      "cwd": "${PLUGIN_ROOT}",
       "env": {
         "CODESTORY_PLUGIN_DATA": "/absolute/path/to/codestory-plugin-data"
       },
@@ -49,9 +51,11 @@ If the plugin does not register MCP for you, point a server at the adapter:
 }
 ```
 
-Use a persistent per-user plugin-data directory outside the repository. This
-server block is host-neutral; the Claude plugin's `.mcp.json` keeps the legacy
-auto-discovery shape for Claude and Codex clients that still require it.
+If Claude does not expand `${PLUGIN_ROOT}`, set `cwd` to `CLAUDE_PLUGIN_ROOT`
+(the installed plugin directory). Use a persistent per-user plugin-data
+directory outside the repository. This server block is host-neutral; the Claude
+plugin's `.mcp.json` keeps the legacy auto-discovery shape for Claude and Codex
+clients that still require it.
 
 ## Verify the install
 
