@@ -866,7 +866,10 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    if: inputs.publish_release
+    # source-proof may be intentionally skipped when preflight selected accepted reusable evidence.
+    # `always()` prevents that transitive skip from suppressing publication; the explicit direct
+    # dependency checks still fail closed on a rejected preflight or closeout.
+    if: always() && inputs.publish_release && needs.preflight.result == 'success' && needs.pre-publish-closeout.result == 'success'
     needs:
       - preflight
       - pre-publish-closeout
@@ -1009,7 +1012,7 @@ jobs:
   # explicit outcomes, and post-publish-smoke records that outcome in the release ledger.
   marketplace-publish:
     name: Publish the marketplace catalog
-    if: inputs.publish_release
+    if: always() && inputs.publish_release && needs.preflight.result == 'success' && needs.publish.result == 'success'
     needs:
       - preflight
       - publish
@@ -1207,7 +1210,7 @@ jobs:
 
   post-publish-closeout:
     name: Authenticate post-publish release cells
-    if: inputs.publish_release
+    if: always() && inputs.publish_release && needs.preflight.result == 'success' && needs.pre-publish-closeout.result == 'success' && needs.post-publish-smoke.result == 'success'
     needs:
       - preflight
       - pre-publish-closeout
