@@ -1,6 +1,6 @@
 {
   "name": "codestory",
-  "version": "0.17.2",
+  "version": "0.17.3",
   "description": "CodeStory grounding for Cursor over the local codestory-cli runtime.",
   "author": {
     "name": "The Green Cedar"
@@ -9,5 +9,6 @@
   "repository": "https://github.com/TheGreenCedar/CodeStory",
   "license": "Apache-2.0",
   "keywords": ["codestory", "cursor", "grounding", "mcp", "local"],
-  "hooks": "./hooks/cursor-hooks.json"
+  "hooks": "./hooks/cursor-hooks.json",
+  "mcpServers": "./mcp.cursor.json"
 }

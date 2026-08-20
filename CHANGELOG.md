@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.17.3
+
+Cursor marketplace installs start CodeStory's MCP server from the installed plugin package even when Cursor treats `${PLUGIN_ROOT}` as the open project. 0.17.2 still died with `Cannot find module <project>/scripts/codestory-mcp.cjs` before the server started.
+
 ## 0.17.2
 
 Cursor installations now start CodeStory's MCP server from the installed plugin package. The launcher previously resolved relative to the project open in Cursor, so enabling CodeStory could fail with `Cannot find module <project>/scripts/codestory-mcp.cjs` before the server started.

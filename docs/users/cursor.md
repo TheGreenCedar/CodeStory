@@ -92,6 +92,7 @@ installs use [Add Marketplace](#install).
 | **codestory** is missing from Customize | It is not on the public marketplace. [Add this repository as a marketplace](#install), then install **codestory** from it |
 | Plugin is listed but tools are missing | Enable **codestory** MCP in Customize, approve the tool prompt, and reload the window |
 | MCP fails to start | Confirm `node` is on `PATH`, then reload. Inspect **MCP Logs** in the Output panel (**Cmd+Shift+U** / **Ctrl+Shift+U**) |
+| MCP dies looking for `<project>/scripts/codestory-mcp.cjs` | Refresh **codestory** to 0.17.3 or later in Customize, then reload. Cursor expanded `${PLUGIN_ROOT}` to the open project, so 0.17.2 still launched from the wrong folder. In a CodeStory checkout, the project `.cursor/mcp.json` server remains a working fallback |
 | Runtime is stale after an update | Refresh the marketplace and the plugin in Customize, reload Cursor, and start a fresh session |
 | A tool remains preparing | Retry that same tool after its returned delay |
 

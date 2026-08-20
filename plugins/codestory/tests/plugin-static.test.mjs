@@ -6979,9 +6979,10 @@ test("portable plugin core and thin host adapters preserve their own contracts",
   );
   assert.equal(cursorManifest.name, "codestory");
   assert.equal(cursorManifest.hooks, "./hooks/cursor-hooks.json");
+  assert.equal(cursorManifest.mcpServers, "./mcp.cursor.json");
   assert.equal(cursorManifest.keywords.includes("cursor"), true);
   assert.deepEqual(cursorManifest.author, { name: "The Green Cedar" });
-  for (const discovered of ["skills", "rules", "mcpServers"]) {
+  for (const discovered of ["skills", "rules"]) {
     assert.equal(Object.hasOwn(cursorManifest, discovered), false, discovered);
   }
 
@@ -7053,6 +7054,8 @@ test("portable plugin core and thin host adapters preserve their own contracts",
   assert.equal(marketplace.name, "codestory");
   assert.deepEqual(marketplace.plugins.map(({ source }) => source), ["plugins/codestory"]);
   assert.equal(fs.existsSync(join(pluginRoot, ".mcp.json")), true);
+  assert.equal(fs.existsSync(join(pluginRoot, "mcp.cursor.json")), true);
+  assert.equal(fs.existsSync(join(pluginRoot, "scripts", "cursor-mcp-resolve.cjs")), true);
   assert.equal(fs.existsSync(join(pluginRoot, ".cursor", "mcp.json")), false);
   assert.equal(fs.existsSync(join(pluginRoot, ".cursor", "rules", "codestory.mdc")), false);
 });
