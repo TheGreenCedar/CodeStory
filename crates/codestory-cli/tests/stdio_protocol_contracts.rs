@@ -1434,7 +1434,7 @@ fn multi_project_stdio_allows_nested_repo_under_home() {
     let nested = home.path().join("nested-repo");
     fs::create_dir(&nested).expect("create nested repo");
     write_tiny_rust_workspace(&nested);
-    fs::write(&nested.join("secrets"), "not a project root\n").expect("file named secrets");
+    fs::write(nested.join("secrets"), "not a project root\n").expect("file named secrets");
     let cache_root = tempfile::tempdir().expect("nested-home cache");
     let mut server =
         spawn_multi_project_stdio_server_with_home(cache_root.path(), Some(home.path()), false);
