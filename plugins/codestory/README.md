@@ -27,7 +27,7 @@ live on the host pages in the table above.
 ## Package anatomy
 
 - `scripts/codestory-mcp.cjs` is the stdio adapter and managed CLI launcher.
-- `scripts/cursor-mcp-resolve.cjs` locates that launcher for Cursor when the host substitutes the open project for `${PLUGIN_ROOT}`.
+- `scripts/cursor-mcp-resolve.cjs` locates that launcher for Cursor when the host substitutes the open project for `${PLUGIN_ROOT}`, then runs it as the Node main module.
 - `plugin.json`, `skills/`, and `mcp.json` are the portable plugin core.
 - `hooks/` records bounded lifecycle state for hosts that support hooks.
 - `rules/codestory.mdc` is Cursor's always-on grounding rule.

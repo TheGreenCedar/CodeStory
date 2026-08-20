@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Cursor marketplace installs start CodeStory's MCP server. 0.17.3 found the installed launcher, then loaded it as a library, so the process exited immediately and Cursor reported `Connection closed`.
+
 ## 0.17.3
 
 Cursor marketplace installs start CodeStory's MCP server from the installed plugin package even when Cursor treats `${PLUGIN_ROOT}` as the open project. 0.17.2 still died with `Cannot find module <project>/scripts/codestory-mcp.cjs` before the server started.
