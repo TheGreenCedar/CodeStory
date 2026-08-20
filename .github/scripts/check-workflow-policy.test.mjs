@@ -2466,6 +2466,14 @@ test("post-publish candidate reuse authenticates release metadata and transfers 
         "true",
       );
     }, /Authenticate published candidate assets/u],
+    ["the post-publish consumer selects an unpublished checksum suffix", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        'checksum="$asset.sha256"',
+        'checksum="$asset.checksum"',
+      );
+    }, /published checksum companions must match the graph-declared release assets|Authenticate published candidate assets/u],
     ["published asset size provenance is not validated", workflow => {
       replaceRun(
         workflow,
@@ -2588,6 +2596,18 @@ test("release workflows retain the closeout coordinator contract test", () => {
           && message.includes("scripts/tests/codestory-release-closeout.test.mjs")),
     );
   }
+});
+
+test("plugin static validates both native and plugin-only version surfaces", () => {
+  const workflows = loadWorkflows();
+  const step = workflows.get("plugin-static.yml").jobs["plugin-static"].steps.find(
+    ({ name }) => name === "Check release version surfaces",
+  );
+  step.run = step.run.replace('--version "$plugin_version" --lane plugin', '--version "$plugin_version"');
+  assert.match(
+    validateWorkflows(workflows).join("\n"),
+    /plugin-static\.yml.*Check release version surfaces/u,
+  );
 });
 
 test("workflow hygiene requires declared permissions and step-job timeouts", () => {
@@ -5080,6 +5100,10 @@ test("draft source cache reuse preserves exact serial proof structure", async (t
   assert.deepEqual(draftSourcePolicyViolations(draftSourceJob(), retrievalSourceJob()), []);
 
   const mutations = [
+    ["rolling Rust toolchain", job => {
+      const step = draftStep(job, "Install Rust stable");
+      step.run = step.run.replaceAll("1.97.1", "stable");
+    }],
     ["unversioned primary", job => {
       const step = draftStep(job, "Restore Cargo inputs and output");
       step.with.key = step.with.key.replace("-draft-v2-", "-draft-");
@@ -6709,6 +6733,22 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
       const step = workflows.get("release.yml").jobs.publish.steps
         .find(({ name }) => name === "Create GitHub release");
       step.run = step.run.replace("main moved from publishable head", "main changed");
+    }],
+    ["publisher allowlist drops archive checksum companions", workflows => {
+      const step = workflows.get("release.yml").jobs.publish.steps
+        .find(({ name }) => name === "Create GitHub release");
+      step.run = step.run.replace(
+        "-name 'codestory-cli-v*.tar.gz.sha256'",
+        "-name 'unpublished-checksum'",
+      );
+    }],
+    ["publisher allowlist drops the global checksum manifest", workflows => {
+      const step = workflows.get("release.yml").jobs.publish.steps
+        .find(({ name }) => name === "Create GitHub release");
+      step.run = step.run.replace(
+        "-o -name 'SHA256SUMS.txt'",
+        "-o -name 'unpublished-global-checksum'",
+      );
     }],
     ["publish authority", workflows => { delete workflows.get("release.yml").jobs.publish.if; }],
     ["publish inherits a skipped reuse ancestor", workflows => {

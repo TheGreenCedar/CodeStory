@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.17.2
+
+Cursor installations now start CodeStory's MCP server from the installed plugin package. The launcher previously resolved relative to the project open in Cursor, so enabling CodeStory could fail with `Cannot find module <project>/scripts/codestory-mcp.cjs` before the server started.
+
 ## 0.17.1
 
 CodeStory 0.17.1 makes compact answers more accurate and more reliable. A packet keeps the production sources that implement the flow — the files an operator would actually change — instead of filling the answer with tests, samples, and workflow files that only share a name.

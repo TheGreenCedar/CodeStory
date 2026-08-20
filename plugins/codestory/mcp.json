@@ -4,7 +4,7 @@
     "codestory": {
       "type": "stdio",
       "command": "node",
-      "args": ["./scripts/codestory-mcp.cjs"],
+      "args": ["${PLUGIN_ROOT}/scripts/codestory-mcp.cjs"],
       "cwd": "${PLUGIN_ROOT}",
       "env": {}
     }

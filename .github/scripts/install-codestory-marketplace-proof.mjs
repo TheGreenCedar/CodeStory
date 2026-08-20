@@ -45,17 +45,26 @@ function required(values, key) {
   return value;
 }
 
-function run(executable, args, options = {}) {
-  let command = executable;
-  let commandArgs = args;
-  if (process.platform === "win32") {
+export function commandPlan(
+  executable,
+  args,
+  { platform = process.platform, comspec = process.env.ComSpec || "cmd.exe" } = {},
+) {
+  if (platform === "win32" && /\.(?:cmd|bat)$/iu.test(executable)) {
     const quote = (value) => {
       if (/[\r\n"]/u.test(value)) fail("Codex command arguments must be single-line");
       return `"${value.replaceAll("%", "%%")}"`;
     };
-    command = process.env.ComSpec || "cmd.exe";
-    commandArgs = ["/d", "/s", "/c", [executable, ...args].map(quote).join(" ")];
+    return {
+      command: comspec,
+      commandArgs: ["/d", "/s", "/c", [executable, ...args].map(quote).join(" ")],
+    };
   }
+  return { command: executable, commandArgs: args };
+}
+
+function run(executable, args, options = {}) {
+  const { command, commandArgs } = commandPlan(executable, args);
   const result = spawnSync(command, commandArgs, {
     ...options,
     encoding: "utf8",
