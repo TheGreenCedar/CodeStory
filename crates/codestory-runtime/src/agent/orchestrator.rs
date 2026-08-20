@@ -10550,21 +10550,15 @@ mod tests {
             .map(|citation| citation.display_name.as_str())
             .collect::<Vec<_>>();
         assert!(
-            file_identity_names
-                .iter()
-                .any(|name| *name == "db/Chinook_Sqlite.sql"),
+            file_identity_names.contains(&"db/Chinook_Sqlite.sql"),
             "retained dialect files should keep a repo-relative file identity: {file_identity_names:?}"
         );
         assert!(
-            file_identity_names
-                .iter()
-                .any(|name| *name == "db/Chinook_MySql.sql"),
+            file_identity_names.contains(&"db/Chinook_MySql.sql"),
             "retained dialect files should keep a repo-relative file identity: {file_identity_names:?}"
         );
         assert!(
-            file_identity_names
-                .iter()
-                .any(|name| *name == "db/Chinook_PostgreSql.sql"),
+            file_identity_names.contains(&"db/Chinook_PostgreSql.sql"),
             "retained dialect files should keep a repo-relative file identity: {file_identity_names:?}"
         );
     }
@@ -10669,13 +10663,11 @@ mod tests {
             .map(|citation| citation.display_name.as_str())
             .collect::<Vec<_>>();
         assert!(
-            names.iter().any(|name| *name == "IFK_TitlePublisherId"),
+            names.contains(&"IFK_TitlePublisherId"),
             "dialect file identities must not evict relationship constraints: {names:?}"
         );
         assert!(
-            names
-                .iter()
-                .any(|name| *name == "schema/Catalog_Sqlite.sql"),
+            names.contains(&"schema/Catalog_Sqlite.sql"),
             "retained dialect files should keep a repo-relative file identity: {names:?}"
         );
         assert!(
@@ -10818,7 +10810,7 @@ mod tests {
             "imported animation class should be cited: {displays:?}"
         );
         assert!(
-            displays.iter().any(|name| *name == "--motion-duration"),
+            displays.contains(&"--motion-duration"),
             "imported custom properties should be cited: {displays:?}"
         );
         assert!(
@@ -12473,7 +12465,7 @@ mod tests {
             .filter_map(|citation| citation.file_path.as_deref())
             .collect::<Vec<_>>();
         assert!(
-            paths.iter().any(|path| *path == "include/tool/format.h"),
+            paths.contains(&"include/tool/format.h"),
             "primary format header should remain cited: {paths:?}"
         );
         assert!(
