@@ -2314,6 +2314,12 @@ pub struct AgentCitationDto {
     pub coverage_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligible_for_sufficiency: Option<bool>,
+    /// Source text captured while the owning publication was pinned.
+    ///
+    /// Packet planning must read this excerpt (or a `PinnedReader` snapshot)
+    /// instead of opening the live workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

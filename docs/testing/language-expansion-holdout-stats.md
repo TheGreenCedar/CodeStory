@@ -4,7 +4,7 @@
 
 This is the evidence behind the [README evaluation section](../../README.md#evaluation). The [`language-support-ab.task.json`](../../benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json) manifest covers 18 pinned public OSS packages with one architecture question per package.
 
-The latest nested 18×3 sheet (`language-support-ab-window6`) is the measured run behind the [README evaluation table](../../README.md#evaluation): CodeStory **45/54** versus no-CodeStory **44/54**, with token and tool reductions and zero post-packet source reads. It has no `summary.json` because attestation requires a clean tracked checkout, and it was not run with `--publishable`. Do not quote the 2026-08-10 token line, the packet-gate 16/18 score, or any four-task excerpt as that claim.
+The latest nested 18×3 sheet (`language-support-ab-window6`) is the ChatGPT Codex / `gpt-5.6-sol` harness sample behind the [README evaluation table](../../README.md#evaluation): CodeStory **45/54** versus no-CodeStory **44/54**, with `--max-source-reads-after-packet 0`, token and tool reductions, and zero post-packet source reads. It is a quality budget, not the product ICP and not a host-agnostic result. Cursor and Claude sheets are not in yet. It has no `summary.json` because attestation requires a clean tracked checkout, and it was not run with `--publishable`. Do not quote the 2026-08-10 token line, the packet-gate 16/18 score, or any four-task excerpt as that claim.
 
 ## 2026-08-19 nested A/B (quality bar met)
 

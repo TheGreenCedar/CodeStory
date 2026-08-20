@@ -304,6 +304,7 @@ fn exact_path_probe_citation(
         loss_reason: None,
         coverage_role: Some("explicit exact probe".to_string()),
         eligible_for_sufficiency: Some(false),
+        source_excerpt: None,
     })
 }
 
@@ -646,6 +647,16 @@ impl PinnedReader for ControllerPinnedReader<'_> {
     fn pinned_retrieval_generation(&self) -> Option<String> {
         active_pinned_retrieval_publication(self.controller)
             .map(|publication| publication.retrieval_generation)
+    }
+
+    fn pinned_source_text(&self, citation: &AgentCitationDto) -> Option<String> {
+        let _ = self.controller;
+        citation
+            .source_excerpt
+            .as_deref()
+            .map(str::trim)
+            .filter(|excerpt| !excerpt.is_empty())
+            .map(str::to_string)
     }
 }
 

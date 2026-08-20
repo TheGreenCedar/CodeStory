@@ -34,6 +34,7 @@ pub fn to_citation_from_hit(
         loss_reason: None,
         coverage_role: None,
         eligible_for_sufficiency: None,
+        source_excerpt: hit.source_excerpt.clone(),
     };
     decorate_citation_from_hit(&mut citation, hit);
     citation
