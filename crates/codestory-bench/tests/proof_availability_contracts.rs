@@ -5,13 +5,13 @@ mod contracts;
 
 use clap::Parser;
 use contracts::{
-    ActivationDecisionV1, CandidateFailureV1, CandidateGateV1, ClauseClassificationV1,
-    CohortPathFileV1, CorpusV1, ExactScopeSelectorV1, ExactSymbolSelectorV1, FinalizationTraceV1,
-    FunnelOutcomeV1, MAX_CANDIDATE_EDGES_PER_STEP, MAX_OBSERVED_RECEIPTS_PER_CASE,
-    ObservedReceiptV1, ProofContractFieldV1, ProofQualificationTraceV1, QualificationSummaryV1,
-    ReceiptOracleComparisonV1, SchemaDocument, SelectorGateOutcomeV1, ThresholdsV1,
-    TransportEvidenceV1, canonical_cohort_path_file_sha256, canonical_corpus_sha256,
-    canonical_thresholds_sha256,
+    ActivationDecisionV1, ActualProductResultV1, CandidateFailureV1, CandidateGateV1,
+    ClauseClassificationV1, CohortPathFileV1, CorpusV1, ExactScopeSelectorV1,
+    ExactSymbolSelectorV1, FinalizationTraceV1, FunnelOutcomeV1, MAX_CANDIDATE_EDGES_PER_STEP,
+    MAX_OBSERVED_RECEIPTS_PER_CASE, ObservedReceiptV1, ProofContractFieldV1,
+    ProofQualificationTraceV1, QualificationSummaryV1, ReceiptOracleComparisonV1, SchemaDocument,
+    SelectorGateOutcomeV1, ThresholdsV1, TransportEvidenceV1, canonical_cohort_path_file_sha256,
+    canonical_corpus_sha256, canonical_thresholds_sha256,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1410,6 +1410,91 @@ fn closed_contracts_reject_hostile_nested_shapes() {
     transport_gate
         .validate()
         .expect("transport gate evidence is closed and representable");
+}
+
+#[test]
+fn summary_rejects_inventory_and_length_one_trail_equation_violations() {
+    let mut effective_mismatch = report();
+    effective_mismatch["inventory"][0]["effective_endpoint_rows"] = json!("9");
+    rebind_results_digest(&mut effective_mismatch);
+    QualificationSummaryV1::from_json(effective_mismatch)
+        .expect_err("effective endpoint rows must equal stored CALL rows");
+
+    let mut partition_mismatch = report();
+    partition_mismatch["inventory"][0]["unresolved_placeholder_rows"] = json!("1");
+    rebind_results_digest(&mut partition_mismatch);
+    QualificationSummaryV1::from_json(partition_mismatch)
+        .expect_err("exact and unresolved rows must partition stored CALL rows");
+
+    let mut admitted_above_exact = report();
+    admitted_above_exact["inventory"][0]["admitted_rows"] = json!("9");
+    rebind_results_digest(&mut admitted_above_exact);
+    QualificationSummaryV1::from_json(admitted_above_exact)
+        .expect_err("admitted rows cannot exceed exact resolved rows");
+
+    let mut length_one_mismatch = report();
+    length_one_mismatch["trails"][0]["lengths"][0]["strictly_admitted"] = json!("6");
+    rebind_results_digest(&mut length_one_mismatch);
+    QualificationSummaryV1::from_json(length_one_mismatch)
+        .expect_err("length-one trails must equal the inventory relation counts");
+
+    let mut overflowing_partition = report();
+    overflowing_partition["inventory"][0]["stored_call_rows"] = json!(u128::MAX.to_string());
+    overflowing_partition["inventory"][0]["effective_endpoint_rows"] = json!(u128::MAX.to_string());
+    overflowing_partition["inventory"][0]["exact_resolved_rows"] = json!(u128::MAX.to_string());
+    overflowing_partition["inventory"][0]["admitted_rows"] = json!("7");
+    overflowing_partition["inventory"][0]["unresolved_placeholder_rows"] = json!("1");
+    rebind_results_digest(&mut overflowing_partition);
+    QualificationSummaryV1::from_json(overflowing_partition)
+        .expect_err("inventory partition arithmetic must fail closed on overflow");
+}
+
+#[test]
+fn finalization_tool_failure_retains_trace_without_claiming_receipts() {
+    let mut value = report();
+    let case = &mut value["cases"][0];
+    let missing = case["receipt_evidence"]["observed_receipts"]
+        .as_array()
+        .expect("observed receipts")
+        .iter()
+        .map(|receipt| {
+            json!({
+                "step_index":receipt["step_index"],
+                "oracle_step":receipt["oracle_comparison"]["oracle_step"]
+            })
+        })
+        .collect::<Vec<_>>();
+    case["product_disposition"] = json!({
+        "kind":"invalid",
+        "gaps":[],
+        "authoritative_receipts":[],
+        "actual":{"kind":"invalid","failure":{"stage":"tool_execution","code":"internal"}}
+    });
+    case["actionable_exact_gap"] = Value::Null;
+    case["receipt_evidence"]["observed_receipts"] = json!([]);
+    case["receipt_evidence"]["missing_oracle_steps"] = Value::Array(missing);
+    case["proof_trace"]["finalization"] = json!({"kind":"failed","failure":"receipt_integration"});
+    case["complete_projection_bytes"] = json!(0);
+    case["transport"] = json!({
+        "kind":"error",
+        "error":{"kind":"invalid_projection","projection":"product_tool_failure"}
+    });
+    rebind_results_digest(&mut value);
+
+    let parsed = QualificationSummaryV1::from_json(value)
+        .expect("tool failure remains a valid immutable case row");
+    assert!(matches!(
+        parsed.cases[0].product_disposition.actual,
+        ActualProductResultV1::Invalid { .. }
+    ));
+    assert!(!parsed.cases[0].proof_trace.steps.is_empty());
+    assert!(
+        parsed.cases[0]
+            .receipt_evidence
+            .observed_receipts
+            .is_empty()
+    );
+    assert_eq!(parsed.cases[0].negative_mutations.len(), 2);
 }
 
 #[test]

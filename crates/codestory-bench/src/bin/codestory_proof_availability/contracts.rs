@@ -2772,26 +2772,55 @@ impl QualificationSummaryV1 {
             .iter()
             .map(|project| project.repository_id.as_str())
             .collect::<BTreeSet<_>>();
-        if !self
+        let inventory_by_repository = self
             .inventory
             .iter()
-            .all(|inventory| project_ids.contains(inventory.repository_id.as_str()))
-            || !self
-                .trails
-                .iter()
-                .all(|trail| project_ids.contains(trail.repository_id.as_str()))
+            .map(|inventory| (inventory.repository_id.as_str(), inventory))
+            .collect::<BTreeMap<_, _>>();
+        let trails_by_repository = self
+            .trails
+            .iter()
+            .map(|trail| (trail.repository_id.as_str(), trail))
+            .collect::<BTreeMap<_, _>>();
+        if inventory_by_repository
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != project_ids
+            || trails_by_repository
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                != project_ids
         {
             bail!("proof_availability_report_project_set_invalid")
         }
-        for t in &self.trails {
-            if t.lengths.len() != 6
-                || !t.lengths.iter().enumerate().all(|(i, v)| {
-                    v.length == i as u8 + 1
-                        && v.strictly_admitted <= v.exact_resolved
-                        && v.exact_resolved <= v.effective_endpoint
+        for repository_id in &project_ids {
+            let inventory = inventory_by_repository
+                .get(repository_id)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_inventory_missing"))?;
+            let trail = trails_by_repository
+                .get(repository_id)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_trails_missing"))?;
+            let partition_total = inventory
+                .exact_resolved_rows
+                .checked_add(inventory.unresolved_placeholder_rows);
+            if inventory.effective_endpoint_rows != inventory.stored_call_rows
+                || partition_total != Some(inventory.stored_call_rows)
+                || inventory.admitted_rows > inventory.exact_resolved_rows
+                || trail.lengths.len() != 6
+                || !trail.lengths.iter().enumerate().all(|(index, counts)| {
+                    usize::from(counts.length) == index + 1
+                        && counts.strictly_admitted <= counts.exact_resolved
+                        && counts.exact_resolved <= counts.effective_endpoint
+                })
+                || trail.lengths.first().is_none_or(|length_one| {
+                    length_one.effective_endpoint != inventory.effective_endpoint_rows
+                        || length_one.exact_resolved != inventory.exact_resolved_rows
+                        || length_one.strictly_admitted != inventory.admitted_rows
                 })
             {
-                bail!("proof_availability_trail_counts_invalid")
+                bail!("proof_availability_inventory_trail_counts_invalid")
             }
         }
         let mut cases_per_project = BTreeMap::<&str, usize>::new();
@@ -3442,7 +3471,24 @@ fn valid_case_finalization(case: &CaseReportV1) -> bool {
         FinalizationTraceV1::Complete { projection_bytes } => {
             case.complete_projection_bytes == projection_bytes && projection_bytes <= 65_536
         }
-        FinalizationTraceV1::Failed { .. } => case.complete_projection_bytes == 0,
+        FinalizationTraceV1::Failed { .. } => {
+            case.complete_projection_bytes == 0
+                && match &case.product_disposition.actual {
+                    ActualProductResultV1::Invalid {
+                        failure:
+                            ProductToolFailureV1 {
+                                stage: ProductFailureStageV1::ToolExecution,
+                                ..
+                            },
+                    } => matches!(
+                        &case.transport,
+                        TransportEvidenceV1::Error {
+                            error: TransportErrorV1::InvalidProjection { projection }
+                        } if projection == "product_tool_failure"
+                    ),
+                    _ => true,
+                }
+        }
     }
 }
 
@@ -3475,6 +3521,32 @@ fn valid_receipts(case: &CaseReportV1, project: Option<&ProjectMaterializationEv
         )
     {
         return false;
+    }
+    if matches!(
+        case.product_disposition.actual,
+        ActualProductResultV1::Invalid {
+            failure: ProductToolFailureV1 {
+                stage: ProductFailureStageV1::ToolExecution,
+                ..
+            }
+        }
+    ) && matches!(
+        case.proof_trace.finalization,
+        FinalizationTraceV1::Failed { .. }
+    ) {
+        let expected_missing = (0..case.attempted_step_count).collect::<BTreeSet<_>>();
+        let actual_missing = evidence
+            .missing_oracle_steps
+            .iter()
+            .map(|missing| missing.step_index)
+            .collect::<BTreeSet<_>>();
+        return case.product_disposition.authoritative_receipts.is_empty()
+            && evidence.observed_receipts.is_empty()
+            && actual_missing == expected_missing
+            && evidence.missing_oracle_steps.iter().all(|missing| {
+                missing.step_index < case.attempted_step_count
+                    && valid_oracle_step(&missing.oracle_step)
+            });
     }
     let mut admitted_edges = BTreeSet::new();
     for step in &case.proof_trace.steps {

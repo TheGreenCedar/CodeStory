@@ -3,7 +3,7 @@ use super::contracts::{
     FunnelOutcomeV1, MissingOracleStepV1, NegativeMutationResultV1, ObservedReceiptV1,
     ProjectMaterializationEvidenceV1, ProofQualificationTraceV1, ReceiptEvidenceBuildOutcomeV1,
     ReceiptEvidenceV1, ReceiptOracleComparisonV1, ReceiptOracleStepV1, StageDurationsV1,
-    StepQualificationOutcomeV1, ThresholdsV1, TransportEvidenceV1,
+    StepQualificationOutcomeV1, ThresholdsV1, TransportErrorV1, TransportEvidenceV1,
     negative_mutation_product_contract, observed_product_disposition_to_report,
     observed_receipt_from_task6, oracle_path_product_contract,
 };
@@ -152,17 +152,6 @@ fn run_case(
         bail!("proof_availability_publication_binding_invalid")
     }
     let observed = &operation.value;
-    let product_disposition = observed_product_disposition_to_report(observed)?;
-    let (root, complete_projection_bytes) = projected_root(observed)?;
-    let transport_started = Instant::now();
-    let transport = TransportEvidenceV1::try_from(
-        codestory_cli::proof_qualification_support::measure_revision_native_proof_result(root),
-    )?;
-    let transport_wall = transport_started.elapsed();
-    let proof_trace: ProofQualificationTraceV1 = observed.trace.clone().try_into()?;
-    let unclassified_step_indices = unclassified_steps(path, &proof_trace)?;
-    let receipt_evidence = receipt_evidence(path, observed)?;
-    let actionable_exact_gap = product_disposition.gaps.first().copied();
     let mut negative_mutations = Vec::with_capacity(path.negative_mutations.len());
     for mutation in &path.negative_mutations {
         let outcome = validate_contract(negative_mutation_product_contract(
@@ -212,10 +201,73 @@ fn run_case(
             ),
         });
     }
+    assemble_case_report(
+        &path_file.repository_id,
+        path,
+        observed,
+        validation_duration,
+        operation_duration,
+        negative_mutations,
+    )
+}
+
+fn assemble_case_report(
+    repository_id: &str,
+    path: &super::contracts::OraclePathV1,
+    observed: &ObservedIntegratedProjectedCallPathResult,
+    validation_duration: Duration,
+    operation_duration: Duration,
+    mut negative_mutations: Vec<NegativeMutationResultV1>,
+) -> Result<CaseReportV1> {
+    let product_disposition = observed_product_disposition_to_report(observed)?;
+    let proof_trace: ProofQualificationTraceV1 = observed.trace.clone().try_into()?;
+    let unclassified_step_indices = unclassified_steps(path, &proof_trace)?;
+    let (receipt_evidence, complete_projection_bytes, transport, transport_wall) = if observed
+        .result
+        .is_ok()
+    {
+        let (root, complete_projection_bytes) = projected_root(observed)?;
+        let transport_started = Instant::now();
+        let transport = TransportEvidenceV1::try_from(
+            codestory_cli::proof_qualification_support::measure_revision_native_proof_result(root),
+        )?;
+        (
+            receipt_evidence(path, observed)?,
+            complete_projection_bytes,
+            transport,
+            transport_started.elapsed(),
+        )
+    } else {
+        let missing_oracle_steps = path
+            .oracle_steps
+            .iter()
+            .enumerate()
+            .map(|(index, oracle)| {
+                Ok(MissingOracleStepV1 {
+                    step_index: u8::try_from(index)?,
+                    oracle_step: ReceiptOracleStepV1::from(oracle),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        (
+            ReceiptEvidenceV1 {
+                observed_receipts: Vec::new(),
+                missing_oracle_steps,
+            },
+            0,
+            TransportEvidenceV1::Error {
+                error: TransportErrorV1::InvalidProjection {
+                    projection: "product_tool_failure".to_owned(),
+                },
+            },
+            Duration::ZERO,
+        )
+    };
+    let actionable_exact_gap = product_disposition.gaps.first().copied();
     negative_mutations.sort_by(|left, right| left.mutation_id.cmp(&right.mutation_id));
     Ok(CaseReportV1 {
         case_id: path.case_id.clone(),
-        repository_id: path_file.repository_id.clone(),
+        repository_id: repository_id.to_owned(),
         product_disposition,
         actionable_exact_gap,
         warm_end_to_end_ms: duration_sum_millis([
@@ -561,5 +613,119 @@ mod tests {
             execute("fixture::absent_source".into(), callee).actual,
             ActualProductResultV1::ContractProven { .. }
         ));
+    }
+
+    #[test]
+    fn finalization_tool_failure_produces_a_complete_invalid_case_report() {
+        let path: super::super::contracts::OraclePathV1 = serde_json::from_value(
+            serde_json::json!({
+                "case_id":"fixture-case",
+                "language":"rust",
+                "source_text":"",
+                "clauses":[],
+                "spec":{
+                    "start":{"kind":"canonical_id","canonical_id":"fixture::caller"},
+                    "steps":[{"target":{"kind":"canonical_id","canonical_id":"fixture::callee"}}],
+                    "prohibit_traversal_through":[],
+                    "exclude_from_projection":[]
+                },
+                "oracle_steps":[{
+                    "caller":{"symbol":"fixture::caller","selector":{"kind":"canonical_id","canonical_id":"fixture::caller"},"range":{"path":"src/lib.rs","start_byte":0,"end_byte":1,"file_byte_length":2,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+                    "callsite_line":1,
+                    "callsite_expression":{"path":"src/lib.rs","start_byte":0,"end_byte":1,"file_byte_length":2,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                    "receipt_line_window":{"path":"src/lib.rs","start_byte":0,"end_byte":2,"file_byte_length":2,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                    "target":{"symbol":"fixture::callee","selector":{"kind":"canonical_id","canonical_id":"fixture::callee"},"range":{"path":"src/lib.rs","start_byte":1,"end_byte":2,"file_byte_length":2,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+                }],
+                "negative_mutations":[],
+                "audit":{"source_area":"fixture","curator":"fixture-a","reviewer":"fixture-b","review_date":"2026-08-21"}
+            }),
+        )
+        .expect("shaped fixture path");
+        let observed = ObservedIntegratedProjectedCallPathResult {
+            result: Err(codestory_contracts::api::ApiError::internal(
+                "fixture finalization failure",
+            )),
+            trace: codestory_runtime::proof_qualification_support::ProofQualificationTrace {
+                selectors: vec![
+                    codestory_runtime::proof_qualification_support::SelectorQualificationTrace {
+                        selector_index: 0,
+                        outcome: codestory_runtime::proof_qualification_support::SelectorGateOutcome::Resolved {
+                            node_id: codestory_contracts::graph::NodeId(1),
+                        },
+                    },
+                    codestory_runtime::proof_qualification_support::SelectorQualificationTrace {
+                        selector_index: 1,
+                        outcome: codestory_runtime::proof_qualification_support::SelectorGateOutcome::Resolved {
+                            node_id: codestory_contracts::graph::NodeId(2),
+                        },
+                    },
+                ],
+                selector_early_return: false,
+                steps: vec![codestory_runtime::proof_qualification_support::StepQualificationTrace {
+                    step_index: 0,
+                    candidate_edge_ids: vec![codestory_contracts::graph::EdgeId(7)],
+                    outcome: codestory_runtime::proof_qualification_support::StepQualificationOutcome::Admitted {
+                        edge_ids: vec![codestory_contracts::graph::EdgeId(7)],
+                    },
+                }],
+                finalization:
+                    codestory_runtime::proof_qualification_support::FinalizationTrace::Failed(
+                        codestory_runtime::proof_qualification_support::FinalizationFailure::ReceiptIntegration,
+                    ),
+            },
+        };
+        let negative_mutations = [
+            super::super::contracts::NegativeMutationKindV1::ReplaceStepTarget,
+            super::super::contracts::NegativeMutationKindV1::ReplaceStepSource,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| NegativeMutationResultV1 {
+            mutation_id: format!("fixture-mutation-{index}"),
+            path_id: path.case_id.clone(),
+            kind,
+            step_index: 0,
+            mutated_spec: path.spec.clone(),
+            contract_proven: false,
+        })
+        .collect();
+
+        let report = assemble_case_report(
+            "fixture-repository",
+            &path,
+            &observed,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            negative_mutations,
+        )
+        .expect("tool failure remains a case result");
+
+        assert!(matches!(
+            report.product_disposition.actual,
+            ActualProductResultV1::Invalid { ref failure }
+                if failure.stage == super::super::contracts::ProductFailureStageV1::ToolExecution
+                    && failure.code == "internal"
+        ));
+        assert_eq!(
+            report.product_disposition.kind,
+            super::super::contracts::ProductDispositionKindV1::Invalid
+        );
+        assert!(report.product_disposition.authoritative_receipts.is_empty());
+        assert!(report.receipt_evidence.observed_receipts.is_empty());
+        assert_eq!(report.receipt_evidence.missing_oracle_steps.len(), 1);
+        assert_eq!(report.complete_projection_bytes, 0);
+        assert!(matches!(
+            report.transport,
+            TransportEvidenceV1::Error {
+                error: super::super::contracts::TransportErrorV1::InvalidProjection { ref projection }
+            } if projection == "product_tool_failure"
+        ));
+        assert_eq!(report.negative_mutations.len(), 2);
+        assert!(
+            report
+                .evaluable_facts()
+                .expect("evaluable invalid case")
+                .product_disposition_matches_evidence
+        );
     }
 }
