@@ -27,11 +27,7 @@ where
             .map_or(FrameResponseV3::None, FrameResponseV3::Single);
     };
     if batch.is_empty() || revision.profile().batch_policy == BatchPolicyV3::Reject {
-        return FrameResponseV3::Single(jsonrpc_error_v3(
-            Value::Null,
-            -32600,
-            "Invalid request: batches are not supported by the negotiated revision",
-        ));
+        return FrameResponseV3::Single(jsonrpc_error_v3(Value::Null, -32600, "Invalid Request"));
     }
 
     let responses = batch
@@ -49,19 +45,34 @@ fn dispatch_one_v3<F>(request: &Value, handler: &mut F) -> Option<Value>
 where
     F: FnMut(&Value) -> Value,
 {
-    let valid = request.as_object().is_some_and(|request| {
-        request.get("jsonrpc") == Some(&json!("2.0"))
-            && request.get("method").and_then(Value::as_str).is_some()
+    let valid = request.as_object().is_some_and(|members| {
+        members
+            .keys()
+            .all(|field| matches!(field.as_str(), "jsonrpc" | "id" | "method" | "params"))
+            && members.get("jsonrpc") == Some(&json!("2.0"))
+            && members.get("method").and_then(Value::as_str).is_some()
+            && members.get("id").is_none_or(is_valid_jsonrpc_id_v3)
+            && members
+                .get("params")
+                .is_none_or(|params| params.is_object() || params.is_array())
     });
     if !valid {
         return Some(jsonrpc_error_v3(
-            Value::Null,
+            request
+                .get("id")
+                .filter(|id| is_valid_jsonrpc_id_v3(id))
+                .cloned()
+                .unwrap_or(Value::Null),
             -32600,
-            "Invalid request: expected a JSON-RPC 2.0 request object",
+            "Invalid Request",
         ));
     }
     let response = handler(request);
     request.get("id").map(|_| response)
+}
+
+fn is_valid_jsonrpc_id_v3(value: &Value) -> bool {
+    value.is_null() || value.is_string() || value.is_number()
 }
 
 fn jsonrpc_error_v3(id: Value, code: i64, message: &str) -> Value {
@@ -260,6 +271,63 @@ mod tests {
     }
 
     #[test]
+    fn legacy_batch_rejects_hostile_envelopes_and_preserves_valid_error_ids() {
+        let frame = json!([
+            {"jsonrpc":"2.0","id":"unknown-field","method":"tools/list","extra":true},
+            {"jsonrpc":"2.0","id":17,"method":"tools/call","params":null},
+            {"jsonrpc":"1.0","id":0,"method":"tools/list"},
+            {"jsonrpc":"2.0","id":"missing-method"},
+            {"jsonrpc":"2.0","id":false,"method":"tools/list"},
+            ["nested-batch"],
+            {"jsonrpc":"2.0","id":"array-params","method":"tools/call","params":[]},
+            {"jsonrpc":"2.0","method":"notifications/initialized","params":{}},
+            {"jsonrpc":"2.0","id":"object-params","method":"tools/call","params":{}}
+        ]);
+        for revision in [McpRevisionV3::November2024, McpRevisionV3::March2025] {
+            let mut called = Vec::new();
+            let response = process_jsonrpc_frame_v3(revision, &frame, |request| {
+                called.push(request["method"].as_str().unwrap().to_string());
+                json!({"jsonrpc":"2.0","id":request.get("id").cloned().unwrap_or(Value::Null),"result":{}})
+            });
+            assert_eq!(
+                called,
+                ["tools/call", "notifications/initialized", "tools/call"],
+                "only closed, valid JSON-RPC envelopes may reach dispatch"
+            );
+            let FrameResponseV3::Batch(responses) = response else {
+                panic!("legacy hostile batch must return every non-notification response")
+            };
+            assert_eq!(responses.len(), 8);
+            let expected_ids = json!([
+                "unknown-field",
+                17,
+                0,
+                "missing-method",
+                null,
+                null,
+                "array-params",
+                "object-params"
+            ]);
+            assert_eq!(
+                responses
+                    .iter()
+                    .map(|response| response["id"].clone())
+                    .collect::<Vec<_>>(),
+                expected_ids.as_array().unwrap().clone()
+            );
+            for response in &responses[..6] {
+                assert_eq!(response.pointer("/error/code"), Some(&json!(-32600)));
+                assert_eq!(
+                    response.pointer("/error/message"),
+                    Some(&json!("Invalid Request"))
+                );
+            }
+            assert!(responses[6].get("result").is_some());
+            assert!(responses[7].get("result").is_some());
+        }
+    }
+
+    #[test]
     fn result_profiles_are_revision_native_and_keep_typed_uncertainty_successful() {
         for disposition in ["unknown", "unavailable"] {
             let root = proof_root(disposition);
@@ -375,6 +443,41 @@ mod tests {
     }
 
     #[test]
+    fn every_activation_capable_tool_accepts_preparing_through_the_native_builder() {
+        let preparing = json!({
+            "kind": "preparing",
+            "state": "preparing",
+            "retry_after_ms": 250,
+            "operation": {"stage":"publication"}
+        });
+        let activation_tools = crate::stdio_catalog::v3_tool_source_json()
+            .into_iter()
+            .filter(|tool| tool.pointer("/safety/activatesProject") == Some(&json!(true)))
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(activation_tools.iter().any(|name| name == "ground"));
+
+        for revision in [McpRevisionV3::June2025, McpRevisionV3::November2025] {
+            for tool_name in &activation_tools {
+                let result = build_tool_result_v3(revision, tool_name, &preparing)
+                    .unwrap_or_else(|error| panic!("{revision:?} {tool_name}: {error:?}"));
+                assert_eq!(result["isError"], false);
+                assert_eq!(result["structuredContent"], preparing);
+                assert_eq!(
+                    serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap())
+                        .unwrap(),
+                    preparing
+                );
+            }
+            assert_eq!(
+                build_tool_result_v3(revision, "status", &preparing),
+                Err(StdioV3InternalError::OutputSchemaViolation),
+                "observational tools must not gain a preparing branch"
+            );
+        }
+    }
+
+    #[test]
     fn diagnostics_token_is_only_mirrored_inside_the_result_uri() {
         let now = std::time::Instant::now();
         let mut registry =
@@ -396,6 +499,20 @@ mod tests {
         let mut projection = json!({
             "kind": "complete",
             "schema_version": 3,
+            "identity": {
+                "packet_id":"b96ac0cc-e552-4c35-a0ba-c83b9ead67de",
+                "request_id":"request-1",
+                "question_sha256":"a".repeat(64)
+            },
+            "publication": {
+                "core":{"project_id":"project-1","generation_id":"core-1","run_id":"run-1"},
+                "retrieval":null
+            },
+            "status":"available",
+            "retrieval":{"state":"full","generation_id":null},
+            "evidence":[],
+            "gaps":[],
+            "continuation":null,
             "diagnostics": {
                 "availability": "available",
                 "reference": {

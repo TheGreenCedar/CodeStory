@@ -3,6 +3,8 @@ use serde_json::{Map, Value, json};
 use super::profile::McpRevisionV3;
 
 const VENDOR_SAFETY_KEY: &str = "com.thegreencedar.codestory/safety";
+const PROJECTION_ROWS_MAX_V3: usize = 256;
+const PROJECTION_REFERENCES_MAX_V3: usize = 256;
 
 pub(crate) fn tools_for_revision_v3(revision: McpRevisionV3) -> Vec<Value> {
     let mut sources = crate::stdio_catalog::v3_tool_source_json();
@@ -133,7 +135,7 @@ fn project_tool_v3(revision: McpRevisionV3, source: &Value) -> Value {
             projected.insert("title".to_string(), json!(title_v3(name)));
             projected.insert(
                 "outputSchema".to_string(),
-                output_schema_for_tool_v3(name, source),
+                output_schema_for_tool_v3(name, source, activates),
             );
             projected.insert(
                 "_meta".to_string(),
@@ -156,29 +158,335 @@ fn project_tool_v3(revision: McpRevisionV3, source: &Value) -> Value {
     Value::Object(projected)
 }
 
-fn output_schema_for_tool_v3(name: &str, source: &Value) -> Value {
-    match name {
+fn output_schema_for_tool_v3(name: &str, source: &Value, activates: bool) -> Value {
+    let success = match name {
         "prove_call_path" => proof_output_schema_v3(),
-        "packet" => tagged_evidence_schema_v3(&["complete", "budget_exceeded"]),
-        "context" | "search" => tagged_evidence_schema_v3(&["complete"]),
+        "packet" => packet_output_schema_v3(),
+        "context" => context_output_schema_v3(),
+        "search" => search_output_schema_v3(),
         _ => source
             .get("outputSchema")
             .cloned()
             .unwrap_or_else(|| json!({"type":"object"})),
+    };
+    if activates {
+        successful_with_preparing_schema_v3(success)
+    } else {
+        success
     }
 }
 
-fn tagged_evidence_schema_v3(kinds: &[&str]) -> Value {
+fn packet_output_schema_v3() -> Value {
+    json!({
+        "type": "object",
+        "oneOf": [packet_complete_schema_v3(), packet_budget_exceeded_schema_v3()]
+    })
+}
+
+fn packet_complete_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("kind", enum_schema_v3(&["complete"])),
+        ("schema_version", schema_version_v3()),
+        ("identity", packet_identity_schema_v3()),
+        ("publication", publication_schema_v3()),
+        ("status", evidence_availability_schema_v3()),
+        ("retrieval", retrieval_state_schema_v3()),
+        (
+            "evidence",
+            bounded_array_schema_v3(packet_evidence_schema_v3(), PROJECTION_ROWS_MAX_V3),
+        ),
+        (
+            "gaps",
+            bounded_array_schema_v3(projection_gap_schema_v3(), PROJECTION_ROWS_MAX_V3),
+        ),
+        ("continuation", nullable_schema_v3(continuation_schema_v3())),
+        ("diagnostics", diagnostics_capability_schema_v3()),
+    ])
+}
+
+fn packet_budget_exceeded_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("kind", enum_schema_v3(&["budget_exceeded"])),
+        ("schema_version", schema_version_v3()),
+        ("identity", packet_identity_schema_v3()),
+        ("publication", publication_schema_v3()),
+        ("status", evidence_availability_schema_v3()),
+        ("retrieval", retrieval_state_schema_v3()),
+        ("diagnostics", diagnostics_capability_schema_v3()),
+        ("maximum_bytes", unsigned_integer_schema_v3()),
+        ("required_complete_bytes", unsigned_integer_schema_v3()),
+    ])
+}
+
+fn context_output_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("kind", enum_schema_v3(&["complete"])),
+        ("schema_version", schema_version_v3()),
+        ("identity", packet_identity_schema_v3()),
+        ("publication", publication_schema_v3()),
+        ("status", evidence_availability_schema_v3()),
+        (
+            "target",
+            closed_object_schema_v3(vec![
+                ("path", nullable_schema_v3(string_schema_v3())),
+                ("symbol_id", nullable_schema_v3(string_schema_v3())),
+            ]),
+        ),
+        (
+            "evidence",
+            bounded_array_schema_v3(context_evidence_schema_v3(), PROJECTION_ROWS_MAX_V3),
+        ),
+        (
+            "gaps",
+            bounded_array_schema_v3(projection_gap_schema_v3(), PROJECTION_ROWS_MAX_V3),
+        ),
+        ("continuation", nullable_schema_v3(continuation_schema_v3())),
+        ("diagnostics", diagnostics_capability_schema_v3()),
+    ])
+}
+
+fn search_output_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("kind", enum_schema_v3(&["complete"])),
+        ("schema_version", schema_version_v3()),
+        ("identity", packet_identity_schema_v3()),
+        ("publication", publication_schema_v3()),
+        ("status", evidence_availability_schema_v3()),
+        (
+            "evidence",
+            bounded_array_schema_v3(search_evidence_schema_v3(), PROJECTION_ROWS_MAX_V3),
+        ),
+        (
+            "gaps",
+            bounded_array_schema_v3(projection_gap_schema_v3(), PROJECTION_ROWS_MAX_V3),
+        ),
+        ("continuation", nullable_schema_v3(continuation_schema_v3())),
+        ("retrieval", retrieval_state_schema_v3()),
+        ("diagnostics", diagnostics_capability_schema_v3()),
+    ])
+}
+
+fn packet_identity_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("packet_id", string_schema_v3()),
+        ("request_id", string_schema_v3()),
+        ("question_sha256", sha256_schema_v3()),
+    ])
+}
+
+fn publication_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        (
+            "core",
+            closed_object_schema_v3(vec![
+                ("project_id", string_schema_v3()),
+                ("generation_id", string_schema_v3()),
+                ("run_id", string_schema_v3()),
+            ]),
+        ),
+        (
+            "retrieval",
+            nullable_schema_v3(closed_object_schema_v3(vec![
+                ("core_generation_id", string_schema_v3()),
+                ("core_run_id", string_schema_v3()),
+                ("retrieval_generation", string_schema_v3()),
+                ("retrieval_input_sha256", sha256_schema_v3()),
+                ("semantic_generation", string_schema_v3()),
+            ])),
+        ),
+    ])
+}
+
+fn retrieval_state_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        (
+            "state",
+            enum_schema_v3(&["full", "degraded", "unavailable"]),
+        ),
+        ("generation_id", nullable_schema_v3(string_schema_v3())),
+    ])
+}
+
+fn evidence_availability_schema_v3() -> Value {
+    enum_schema_v3(&[
+        "available",
+        "continuation_available",
+        "no_useful_evidence",
+        "unavailable",
+    ])
+}
+
+fn evidence_identity_schema_v3() -> Value {
+    closed_object_schema_v3(vec![("evidence_id", string_schema_v3())])
+}
+
+fn gap_identity_schema_v3() -> Value {
+    closed_object_schema_v3(vec![("gap_id", string_schema_v3())])
+}
+
+fn packet_evidence_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("identity", evidence_identity_schema_v3()),
+        (
+            "kind",
+            enum_schema_v3(&[
+                "exact_source",
+                "structural_source",
+                "graph_relation",
+                "retrieval_excerpt",
+            ]),
+        ),
+        ("path", nullable_schema_v3(string_schema_v3())),
+        ("symbol_id", nullable_schema_v3(string_schema_v3())),
+        (
+            "start_line",
+            nullable_schema_v3(unsigned_integer_schema_v3()),
+        ),
+        ("end_line", nullable_schema_v3(unsigned_integer_schema_v3())),
+        ("summary", nullable_schema_v3(string_schema_v3())),
+    ])
+}
+
+fn context_evidence_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("identity", evidence_identity_schema_v3()),
+        ("path", string_schema_v3()),
+        ("symbol_id", nullable_schema_v3(string_schema_v3())),
+        ("start_line", unsigned_integer_schema_v3()),
+        ("end_line", unsigned_integer_schema_v3()),
+        ("excerpt", nullable_schema_v3(string_schema_v3())),
+    ])
+}
+
+fn search_evidence_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("identity", evidence_identity_schema_v3()),
+        ("path", string_schema_v3()),
+        ("symbol_id", nullable_schema_v3(string_schema_v3())),
+        (
+            "start_line",
+            nullable_schema_v3(unsigned_integer_schema_v3()),
+        ),
+        ("end_line", nullable_schema_v3(unsigned_integer_schema_v3())),
+        ("excerpt", nullable_schema_v3(string_schema_v3())),
+    ])
+}
+
+fn projection_gap_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("identity", gap_identity_schema_v3()),
+        (
+            "kind",
+            enum_schema_v3(&[
+                "evidence_missing",
+                "retrieval_unavailable",
+                "source_unavailable",
+                "continuation_required",
+                "output_budget_exceeded",
+            ]),
+        ),
+        ("message", nullable_schema_v3(string_schema_v3())),
+    ])
+}
+
+fn continuation_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("continuation_id", string_schema_v3()),
+        (
+            "remaining_rounds",
+            json!({"type":"integer","minimum":1,"maximum":65535}),
+        ),
+        (
+            "gap_ids",
+            bounded_array_schema_v3(gap_identity_schema_v3(), PROJECTION_REFERENCES_MAX_V3),
+        ),
+    ])
+}
+
+fn diagnostics_capability_schema_v3() -> Value {
+    json!({
+        "type":"object",
+        "oneOf":[
+            closed_object_schema_v3(vec![("availability", enum_schema_v3(&["unavailable"]))]),
+            closed_object_schema_v3(vec![
+                ("availability", enum_schema_v3(&["available"])),
+                ("reference", closed_object_schema_v3(vec![
+                    ("artifact_id", string_schema_v3()),
+                    ("sha256", sha256_schema_v3()),
+                    ("byte_length", unsigned_integer_schema_v3()),
+                    ("uri", string_schema_v3()),
+                ])),
+            ]),
+        ]
+    })
+}
+
+fn closed_object_schema_v3(properties: Vec<(&str, Value)>) -> Value {
+    let required = properties
+        .iter()
+        .map(|(name, _)| Value::String((*name).to_string()))
+        .collect::<Vec<_>>();
+    let properties = properties
+        .into_iter()
+        .map(|(name, schema)| (name.to_string(), schema))
+        .collect::<Map<_, _>>();
+    json!({
+        "type":"object",
+        "properties":properties,
+        "required":required,
+        "additionalProperties":false
+    })
+}
+
+fn bounded_array_schema_v3(items: Value, maximum: usize) -> Value {
+    json!({"type":"array","items":items,"maxItems":maximum})
+}
+
+fn nullable_schema_v3(mut schema: Value) -> Value {
+    let object = schema
+        .as_object_mut()
+        .expect("v3 nullable schema must be an object");
+    let declared = object
+        .remove("type")
+        .expect("v3 nullable schema must declare its type");
+    let mut types = declared
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| vec![declared]);
+    types.push(json!("null"));
+    object.insert("type".to_string(), Value::Array(types));
+    schema
+}
+
+fn enum_schema_v3(values: &[&str]) -> Value {
+    json!({"type":"string","enum":values})
+}
+
+fn string_schema_v3() -> Value {
+    json!({"type":"string"})
+}
+
+fn sha256_schema_v3() -> Value {
+    json!({"type":"string","minLength":64,"maxLength":64})
+}
+
+fn schema_version_v3() -> Value {
+    json!({"type":"integer","enum":[3]})
+}
+
+fn unsigned_integer_schema_v3() -> Value {
+    json!({"type":"integer","minimum":0})
+}
+
+fn successful_with_preparing_schema_v3(success: Value) -> Value {
     json!({
         "type": "object",
         "oneOf": [
             {
-                "type": "object",
-                "properties": {
-                    "kind": {"type":"string","enum":kinds},
-                    "schema_version": {"type":"integer"}
-                },
-                "required": ["kind", "schema_version"]
+                "allOf": [
+                    success,
+                    {"not":{"type":"object","properties":{"kind":{"enum":["preparing"]}},"required":["kind"]}}
+                ]
             },
             {
                 "type": "object",
@@ -447,5 +755,120 @@ mod tests {
         let mut invalid = complete;
         invalid["kind"] = json!("supported");
         assert!(crate::stdio_arguments::validate_structured_content(&schema, &invalid).is_err());
+    }
+
+    #[test]
+    fn packet_context_and_search_schemas_reject_open_or_malformed_dto_shapes() {
+        let identity = json!({
+            "packet_id":"b96ac0cc-e552-4c35-a0ba-c83b9ead67de",
+            "request_id":"request-1",
+            "question_sha256":"a".repeat(64)
+        });
+        let publication = json!({
+            "core":{"project_id":"project-1","generation_id":"core-1","run_id":"run-1"},
+            "retrieval":null
+        });
+        let diagnostics = json!({"availability":"unavailable"});
+        let packet_complete = json!({
+            "kind":"complete","schema_version":3,"identity":identity,"publication":publication,
+            "status":"available","retrieval":{"state":"full","generation_id":null},
+            "evidence":[{
+                "identity":{"evidence_id":"evidence-1"},"kind":"exact_source",
+                "path":"src/lib.rs","symbol_id":null,"start_line":4,"end_line":9,"summary":null
+            }],
+            "gaps":[],"continuation":null,"diagnostics":diagnostics
+        });
+        let packet_budget = json!({
+            "kind":"budget_exceeded","schema_version":3,"identity":identity,"publication":publication,
+            "status":"unavailable","retrieval":{"state":"degraded","generation_id":null},
+            "diagnostics":diagnostics,"maximum_bytes":16384,"required_complete_bytes":16385
+        });
+        let context = json!({
+            "kind":"complete","schema_version":3,"identity":identity,"publication":publication,
+            "status":"available","target":{"path":"src/lib.rs","symbol_id":null},
+            "evidence":[{
+                "identity":{"evidence_id":"evidence-1"},"path":"src/lib.rs","symbol_id":null,
+                "start_line":4,"end_line":9,"excerpt":null
+            }],
+            "gaps":[],"continuation":null,"diagnostics":diagnostics
+        });
+        let search = json!({
+            "kind":"complete","schema_version":3,"identity":identity,"publication":publication,
+            "status":"no_useful_evidence","evidence":[{
+                "identity":{"evidence_id":"evidence-1"},"path":"src/lib.rs","symbol_id":null,
+                "start_line":null,"end_line":null,"excerpt":null
+            }],
+            "gaps":[],"continuation":null,"retrieval":{"state":"unavailable","generation_id":null},
+            "diagnostics":diagnostics
+        });
+        let tools = tools_for_revision_v3(McpRevisionV3::June2025);
+        let cases = [
+            (
+                "packet",
+                packet_complete,
+                "/identity/request_id",
+                "/evidence/0/start_line",
+            ),
+            (
+                "packet",
+                packet_budget,
+                "/identity/request_id",
+                "/maximum_bytes",
+            ),
+            ("context", context, "/target/path", "/evidence/0/start_line"),
+            (
+                "search",
+                search,
+                "/retrieval/generation_id",
+                "/evidence/0/path",
+            ),
+        ];
+        for (name, valid, required_pointer, typed_pointer) in cases {
+            let schema = &tool(&tools, name)["outputSchema"];
+            assert!(
+                crate::stdio_arguments::validate_structured_content(schema, &valid).is_ok(),
+                "closed {name} schema rejected its explicit DTO variant: {valid}"
+            );
+
+            let mut missing = valid.clone();
+            let (parent, field) = required_pointer.rsplit_once('/').unwrap();
+            missing
+                .pointer_mut(parent)
+                .and_then(Value::as_object_mut)
+                .unwrap()
+                .remove(field);
+            assert!(
+                crate::stdio_arguments::validate_structured_content(schema, &missing).is_err(),
+                "{name} accepted missing DTO field {required_pointer}: {missing}"
+            );
+
+            let mut unknown = valid.clone();
+            unknown
+                .as_object_mut()
+                .unwrap()
+                .insert("undeclared".into(), json!(true));
+            assert!(
+                crate::stdio_arguments::validate_structured_content(schema, &unknown).is_err(),
+                "{name} accepted an unknown root field: {unknown}"
+            );
+
+            let mut nested_unknown = valid.clone();
+            nested_unknown["identity"]
+                .as_object_mut()
+                .unwrap()
+                .insert("undeclared".into(), json!(true));
+            assert!(
+                crate::stdio_arguments::validate_structured_content(schema, &nested_unknown)
+                    .is_err(),
+                "{name} accepted an unknown nested field: {nested_unknown}"
+            );
+
+            let mut mistyped = valid;
+            *mistyped.pointer_mut(typed_pointer).unwrap() = json!(false);
+            assert!(
+                crate::stdio_arguments::validate_structured_content(schema, &mistyped).is_err(),
+                "{name} accepted mistyped DTO field {typed_pointer}: {mistyped}"
+            );
+        }
     }
 }
