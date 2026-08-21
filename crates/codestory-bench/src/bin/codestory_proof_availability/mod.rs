@@ -33,6 +33,11 @@ pub fn execute(cli: cli::Cli) -> Result<()> {
             bail!("proof_availability_materialize_not_implemented")
         }
         cli::Command::Run(arguments) => {
+            let corpus = corpus::load(&arguments.corpus)?;
+            let thresholds = corpus::load_thresholds(&arguments.thresholds)?;
+            corpus
+                .validate_against_thresholds(&thresholds)
+                .context("validate proof availability corpus against thresholds")?;
             util::refuse_existing_output(&arguments.out)?;
             bail!("proof_availability_run_not_implemented")
         }

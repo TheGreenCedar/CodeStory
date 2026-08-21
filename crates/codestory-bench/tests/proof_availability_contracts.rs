@@ -2163,6 +2163,8 @@ fn cli_matches_frozen_materialize_run_and_verify_shapes() {
             "run",
             "--corpus",
             "/tmp/c",
+            "--thresholds",
+            "/tmp/t",
             "--environment",
             "/tmp/e",
             "--out",
@@ -2199,10 +2201,123 @@ fn cli_matches_frozen_materialize_run_and_verify_shapes() {
         .is_err(),
         "verify must receive the corpus whose identity it validates"
     );
+    for (missing, arguments) in [
+        (
+            "--corpus",
+            vec![
+                "bin",
+                "run",
+                "--thresholds",
+                "/tmp/t",
+                "--environment",
+                "/tmp/e",
+                "--out",
+                "/tmp/r",
+            ],
+        ),
+        (
+            "--thresholds",
+            vec![
+                "bin",
+                "run",
+                "--corpus",
+                "/tmp/c",
+                "--environment",
+                "/tmp/e",
+                "--out",
+                "/tmp/r",
+            ],
+        ),
+        (
+            "--environment",
+            vec![
+                "bin",
+                "run",
+                "--corpus",
+                "/tmp/c",
+                "--thresholds",
+                "/tmp/t",
+                "--out",
+                "/tmp/r",
+            ],
+        ),
+        (
+            "--out",
+            vec![
+                "bin",
+                "run",
+                "--corpus",
+                "/tmp/c",
+                "--thresholds",
+                "/tmp/t",
+                "--environment",
+                "/tmp/e",
+            ],
+        ),
+    ] {
+        assert!(
+            cli::Cli::try_parse_from(arguments).is_err(),
+            "run must require {missing}"
+        );
+    }
     assert!(
         cli::Cli::try_parse_from(["bin", "run", "--thresholds", "/tmp/t", "--output", "/tmp/o"])
             .is_err()
     );
+}
+
+#[test]
+fn run_rejects_thresholds_not_bound_to_the_corpus_before_creating_output() {
+    let Some(binary) = option_env!("CARGO_BIN_EXE_codestory-proof-availability") else {
+        // This file is also included by the binary's unit-test module to
+        // exercise private threshold evaluation. Cargo exposes the built
+        // binary only to this integration-test target.
+        return;
+    };
+    let root = tempfile::tempdir().expect("temporary run inputs");
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let corpus_path = repository_root.join("benchmarks/proof-availability/corpus-v1.json");
+    let mut stale_thresholds: Value = serde_json::from_slice(
+        &std::fs::read(repository_root.join("benchmarks/proof-availability/thresholds-v1.json"))
+            .expect("checked-in thresholds"),
+    )
+    .expect("thresholds JSON");
+    stale_thresholds["methodology_sha256"] =
+        json!("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    let thresholds_path = root.path().join("stale-thresholds.json");
+    std::fs::write(
+        &thresholds_path,
+        serde_json::to_vec(&stale_thresholds).expect("serialize stale thresholds"),
+    )
+    .expect("write stale thresholds");
+    let output_path = root.path().join("results");
+
+    let output = std::process::Command::new(binary)
+        .args([
+            "run",
+            "--corpus",
+            corpus_path.to_str().expect("UTF-8 corpus path"),
+            "--thresholds",
+            thresholds_path.to_str().expect("UTF-8 thresholds path"),
+            "--environment",
+            root.path()
+                .join("environment.json")
+                .to_str()
+                .expect("UTF-8 environment path"),
+            "--out",
+            output_path.to_str().expect("UTF-8 output path"),
+        ])
+        .output()
+        .expect("run proof availability command");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("proof_availability_corpus_threshold_binding_invalid"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output_path.exists(), "validation must not create output");
 }
 
 #[test]
