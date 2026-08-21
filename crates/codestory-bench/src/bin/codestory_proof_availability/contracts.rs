@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const CORPUS_SCHEMA: &str = "codestory.proof-availability-corpus/v1";
@@ -1044,6 +1045,25 @@ pub struct NegativeMutationResultV1 {
     pub contract_proven: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReceiptMatchResultV1 {
+    Exact,
+    Missing,
+    Mismatched,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptComparisonV1 {
+    pub oracle_step_index: u8,
+    pub caller: String,
+    pub edge_id: i64,
+    pub callsite_id: String,
+    pub exact_line: u64,
+    pub exact_window: OracleSourceRangeV1,
+    pub target: String,
+    pub result: ReceiptMatchResultV1,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CaseReportV1 {
     pub case_id: String,
@@ -1061,6 +1081,7 @@ pub struct CaseReportV1 {
     pub stage_durations_ms: StageDurationsV1,
     pub attempted_step_count: u8,
     pub unclassified_step_indices: Vec<u8>,
+    pub receipt_comparisons: Vec<ReceiptComparisonV1>,
     pub complete_projection_bytes: u64,
     pub transport: TransportEvidenceV1,
     pub negative_mutations: Vec<NegativeMutationResultV1>,
@@ -1078,9 +1099,6 @@ pub struct FailureBucketV1 {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FunnelOutcomeV1 {
     Admitted,
-    SelectorEarlyReturn {
-        outcome: SelectorGateOutcomeV1,
-    },
     FirstZeroSurvivor {
         gate: CandidateGateV1,
         histogram: Vec<CandidateFailureHistogramV1>,
@@ -1269,7 +1287,7 @@ impl QualificationSummaryV1 {
         }
         for project in &self.environment.projects {
             if !commit(&project.source_head)
-                || !commit(&project.source_tree)
+                || !hash(&project.source_tree)
                 || empty(&project.store_schema)
                 || !hash(&project.database_sha256)
                 || empty(&project.core_run_id)
@@ -1315,14 +1333,17 @@ impl QualificationSummaryV1 {
                 || c.proven_step_precision_milli > 1000
                 || c.proven_step_recall_milli > 1000
                 || c.attempted_step_count > 6
+                || c.proven_prefix_length > c.attempted_step_count
                 || usize::from(c.attempted_step_count)
                     != c.proof_trace.steps.len() + c.unclassified_step_indices.len()
+                || c.receipt_comparisons.len() != usize::from(c.attempted_step_count)
                 || !c
                     .proof_trace
                     .selectors
                     .iter()
                     .enumerate()
                     .all(|(index, selector)| selector.selector_index == index as u64)
+                || c.proof_trace.selectors.len() != usize::from(c.attempted_step_count) + 1
                 || !valid_selector_trace(&c.proof_trace)
                 || !c.proof_trace.steps.iter().all(|step| {
                     step.step_index < u64::from(c.attempted_step_count) && valid_step_trace(step)
@@ -1338,7 +1359,7 @@ impl QualificationSummaryV1 {
                 })
                 || !valid_finalization(&c.proof_trace.finalization)
                 || matches!(c.proof_trace.finalization, FinalizationTraceV1::NotRun)
-                || c.complete_projection_bytes > 65_536
+                || !valid_case_finalization(c)
                 || !valid_transport(&c.transport)
                 || !unique(
                     c.negative_mutations
@@ -1351,12 +1372,20 @@ impl QualificationSummaryV1 {
                         || empty(&mutation.caller)
                         || empty(&mutation.target)
                 })
+                || !valid_receipts(c)
+                || !valid_disposition(c)
             {
                 bail!("proof_availability_case_invalid")
             }
             *cases_per_project
                 .entry(c.repository_id.as_str())
                 .or_default() += 1;
+            let candidate_count = c.proof_trace.steps.iter().try_fold(0u64, |total, step| {
+                total.checked_add(u64::try_from(step.candidate_edge_ids.len()).ok()?)
+            });
+            if candidate_count != Some(c.diagnostic_candidate_count) {
+                bail!("proof_availability_candidate_count_invalid")
+            }
             attempted_total = attempted_total
                 .checked_add(u16::from(c.attempted_step_count))
                 .ok_or_else(|| anyhow::anyhow!("proof_availability_attempted_steps_overflow"))?;
@@ -1436,6 +1465,24 @@ impl QualificationSummaryV1 {
     pub fn validate_against_corpus(&self, corpus: &CorpusV1) -> Result<()> {
         self.validate()?;
         corpus.validate()?;
+        if self.provenance.corpus_sha256 != canonical_corpus_sha256(corpus)?
+            || self.provenance.binary_sha256 != self.environment.binary_sha256
+        {
+            bail!("proof_availability_provenance_corpus_binding_invalid")
+        }
+        let cohorts = corpus
+            .cohorts
+            .iter()
+            .map(|cohort| (cohort.repository_id.as_str(), cohort))
+            .collect::<BTreeMap<_, _>>();
+        if self.environment.projects.iter().any(|project| {
+            let Some(cohort) = cohorts.get(project.repository_id.as_str()) else {
+                return true;
+            };
+            project.source_head != cohort.commit || project.source_tree != cohort.source_tree_sha256
+        }) {
+            bail!("proof_availability_materialization_corpus_binding_invalid")
+        }
         let paths = corpus
             .paths
             .iter()
@@ -1450,6 +1497,21 @@ impl QualificationSummaryV1 {
                 || case.attempted_step_count != path.spec.expected_step_count
             {
                 bail!("proof_availability_case_oracle_mismatch")
+            }
+            for receipt in &case.receipt_comparisons {
+                let Some(step) = path
+                    .oracle_steps
+                    .get(usize::from(receipt.oracle_step_index))
+                else {
+                    bail!("proof_availability_receipt_oracle_missing")
+                };
+                if receipt.caller != step.caller.symbol
+                    || receipt.target != step.target.symbol
+                    || receipt.exact_window != step.callsite
+                    || receipt.callsite_id != callsite_identity(&step.callsite)
+                {
+                    bail!("proof_availability_receipt_oracle_mismatch")
+                }
             }
             let mutations = path
                 .negative_mutations
@@ -1478,22 +1540,44 @@ impl QualificationSummaryV1 {
     }
 }
 
+pub fn canonical_corpus_sha256(corpus: &CorpusV1) -> Result<String> {
+    let bytes = serde_json::to_vec(corpus)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn callsite_identity(range: &OracleSourceRangeV1) -> String {
+    format!("{}:{}:{}", range.path, range.start_byte, range.end_byte)
+}
+
 fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
     if !strictly_ascending(&trace.candidate_edge_ids) {
         return false;
     }
+    let candidates = trace
+        .candidate_edge_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
     match &trace.outcome {
         StepQualificationOutcomeV1::Admitted { edge_ids } => {
-            !edge_ids.is_empty() && strictly_ascending(edge_ids)
+            !edge_ids.is_empty()
+                && strictly_ascending(edge_ids)
+                && edge_ids.iter().all(|edge| candidates.contains(edge))
         }
         StepQualificationOutcomeV1::FirstZeroSurvivor { gate, histogram } => {
             (histogram.is_empty()
                 && matches!(gate, CandidateGateV1::RawAdmission)
                 && trace.candidate_edge_ids.is_empty())
                 || (!histogram.is_empty()
+                    && unique_i64(
+                        histogram
+                            .iter()
+                            .flat_map(|bucket| bucket.edge_ids.iter().copied()),
+                    )
                     && histogram.iter().all(|bucket| {
                         !bucket.edge_ids.is_empty()
                             && strictly_ascending(&bucket.edge_ids)
+                            && bucket.edge_ids.iter().all(|edge| candidates.contains(edge))
                             && matches!(
                                 (&gate, &bucket.reason),
                                 (
@@ -1547,13 +1631,16 @@ fn strictly_ascending(values: &[i64]) -> bool {
 fn valid_funnel_outcome(outcome: &FunnelOutcomeV1) -> bool {
     match outcome {
         FunnelOutcomeV1::Admitted => true,
-        FunnelOutcomeV1::SelectorEarlyReturn { outcome } => {
-            !matches!(outcome, SelectorGateOutcomeV1::Resolved { .. })
-        }
         FunnelOutcomeV1::FirstZeroSurvivor { gate, histogram } => {
+            let mut candidate_edge_ids = histogram
+                .iter()
+                .flat_map(|bucket| bucket.edge_ids.iter().copied())
+                .collect::<Vec<_>>();
+            candidate_edge_ids.sort_unstable();
+            candidate_edge_ids.dedup();
             valid_step_trace(&StepQualificationTraceV1 {
                 step_index: 0,
-                candidate_edge_ids: Vec::new(),
+                candidate_edge_ids,
                 outcome: StepQualificationOutcomeV1::FirstZeroSurvivor {
                     gate: gate.clone(),
                     histogram: histogram.clone(),
@@ -1598,6 +1685,64 @@ fn valid_finalization(finalization: &FinalizationTraceV1) -> bool {
         FinalizationTraceV1::NotRun => true,
         FinalizationTraceV1::Complete { projection_bytes } => *projection_bytes <= 65_536,
         FinalizationTraceV1::Failed { .. } => true,
+    }
+}
+
+fn valid_case_finalization(case: &CaseReportV1) -> bool {
+    match case.proof_trace.finalization {
+        FinalizationTraceV1::NotRun => false,
+        FinalizationTraceV1::Complete { projection_bytes } => {
+            case.complete_projection_bytes == projection_bytes && projection_bytes <= 65_536
+        }
+        FinalizationTraceV1::Failed { .. } => case.complete_projection_bytes == 0,
+    }
+}
+
+fn valid_receipts(case: &CaseReportV1) -> bool {
+    if !unique_u8(
+        case.receipt_comparisons
+            .iter()
+            .map(|receipt| receipt.oracle_step_index),
+    ) || case.receipt_comparisons.iter().any(|receipt| {
+        receipt.oracle_step_index >= case.attempted_step_count
+            || empty(&receipt.caller)
+            || empty(&receipt.callsite_id)
+            || receipt.exact_line == 0
+            || empty(&receipt.target)
+            || range(&receipt.exact_window).is_err()
+    }) {
+        return false;
+    }
+    let exact_count = case
+        .receipt_comparisons
+        .iter()
+        .filter(|receipt| matches!(receipt.result, ReceiptMatchResultV1::Exact))
+        .count();
+    u64::try_from(exact_count).ok() == Some(case.authoritative_receipt_count)
+        && u64::try_from(case.receipt_comparisons.len()).ok()
+            == Some(case.authoritative_receipt_evidence_count)
+        && case.oracle_receipts_exact == (exact_count == case.receipt_comparisons.len())
+}
+
+fn valid_disposition(case: &CaseReportV1) -> bool {
+    match case.product_disposition.kind {
+        ProductDispositionKindV1::ContractProven => {
+            case.product_disposition.gaps.is_empty()
+                && case.actionable_exact_gap.is_none()
+                && case.oracle_receipts_exact
+                && case.proven_prefix_length == case.attempted_step_count
+        }
+        ProductDispositionKindV1::Unknown => {
+            case.proven_prefix_length < case.attempted_step_count
+                && (!case.product_disposition.gaps.is_empty()
+                    || case.actionable_exact_gap.is_some())
+        }
+        ProductDispositionKindV1::CertifiedAbsence => {
+            case.authoritative_receipt_count == 0 && case.proven_prefix_length == 0
+        }
+        ProductDispositionKindV1::Invalid => {
+            !case.oracle_receipts_exact || case.proven_prefix_length < case.attempted_step_count
+        }
     }
 }
 
@@ -1688,7 +1833,7 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
         }
     }
     if let Some(definitions) = root.get_mut("$defs").and_then(Value::as_object_mut) {
-        for definition in definitions.values_mut() {
+        for (definition_name, definition) in definitions.iter_mut() {
             let Some(properties) = definition
                 .get_mut("properties")
                 .and_then(Value::as_object_mut)
@@ -1715,7 +1860,9 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
                 ) {
                     property.insert("pattern".into(), Value::String(SHA256.into()));
                 }
-                if matches!(
+                if name == "source_tree" && definition_name == "ProjectMaterializationEvidenceV1" {
+                    property.insert("pattern".into(), Value::String(SHA256.into()));
+                } else if matches!(
                     name.as_str(),
                     "commit" | "source_commit" | "source_tree" | "source_head"
                 ) {
@@ -1909,12 +2056,32 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 schema,
                 Some("CaseReportV1"),
                 "attempted_step_count",
-                Some(0),
+                Some(1),
                 Some(6),
             );
             for field in ["proven_step_precision_milli", "proven_step_recall_milli"] {
                 set_bounds(schema, Some("CaseReportV1"), field, Some(0), Some(1000));
             }
+            set_bounds(
+                schema,
+                Some("CaseReportV1"),
+                "proven_prefix_length",
+                Some(0),
+                Some(6),
+            );
+            for field in [
+                "authoritative_receipt_count",
+                "authoritative_receipt_evidence_count",
+            ] {
+                set_bounds(schema, Some("CaseReportV1"), field, Some(0), Some(6));
+            }
+            set_bounds(
+                schema,
+                Some("ReceiptComparisonV1"),
+                "exact_line",
+                Some(1),
+                None,
+            );
             set_bounds(
                 schema,
                 Some("ProofQualificationTraceV1"),
@@ -1926,7 +2093,7 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 schema,
                 Some("ProofQualificationTraceV1"),
                 "selectors",
-                Some(1),
+                Some(2),
                 Some(7),
             );
             set_bounds(
@@ -1959,10 +2126,10 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
             );
             set_bounds(
                 schema,
-                Some("ActivationDecisionV1"),
-                "failed_gates",
-                Some(0),
-                Some(12),
+                Some("CaseReportV1"),
+                "receipt_comparisons",
+                Some(1),
+                Some(6),
             );
             set_bounds(
                 schema,
@@ -2128,6 +2295,11 @@ fn unique_u64(mut values: impl Iterator<Item = u64>) -> bool {
 }
 
 fn unique_u8(mut values: impl Iterator<Item = u8>) -> bool {
+    let mut set = BTreeSet::new();
+    values.all(|value| set.insert(value))
+}
+
+fn unique_i64(mut values: impl Iterator<Item = i64>) -> bool {
     let mut set = BTreeSet::new();
     values.all(|value| set.insert(value))
 }

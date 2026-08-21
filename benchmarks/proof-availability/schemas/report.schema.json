@@ -13,8 +13,6 @@
           "items": {
             "$ref": "#/$defs/FailedGateV1"
           },
-          "maxItems": 12,
-          "minItems": 0,
           "type": "array"
         },
         "outcome": {
@@ -136,16 +134,18 @@
         "attempted_step_count": {
           "format": "uint8",
           "maximum": 6,
-          "minimum": 0,
+          "minimum": 1,
           "type": "integer"
         },
         "authoritative_receipt_count": {
           "format": "uint64",
+          "maximum": 6,
           "minimum": 0,
           "type": "integer"
         },
         "authoritative_receipt_evidence_count": {
           "format": "uint64",
+          "maximum": 6,
           "minimum": 0,
           "type": "integer"
         },
@@ -182,7 +182,7 @@
         },
         "proven_prefix_length": {
           "format": "uint8",
-          "maximum": 255,
+          "maximum": 6,
           "minimum": 0,
           "type": "integer"
         },
@@ -197,6 +197,14 @@
           "maximum": 1000,
           "minimum": 0,
           "type": "integer"
+        },
+        "receipt_comparisons": {
+          "items": {
+            "$ref": "#/$defs/ReceiptComparisonV1"
+          },
+          "maxItems": 6,
+          "minItems": 1,
+          "type": "array"
         },
         "repository_id": {
           "type": "string"
@@ -239,6 +247,7 @@
         "stage_durations_ms",
         "attempted_step_count",
         "unclassified_step_indices",
+        "receipt_comparisons",
         "complete_projection_bytes",
         "transport",
         "negative_mutations",
@@ -442,23 +451,6 @@
           },
           "required": [
             "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "selector_early_return",
-              "type": "string"
-            },
-            "outcome": {
-              "$ref": "#/$defs/SelectorGateOutcomeV1"
-            }
-          },
-          "required": [
-            "kind",
-            "outcome"
           ],
           "type": "object"
         },
@@ -809,7 +801,7 @@
           "type": "string"
         },
         "source_tree": {
-          "pattern": "^[0-9a-f]{40}$",
+          "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
         "store_schema": {
@@ -845,7 +837,7 @@
             "$ref": "#/$defs/SelectorQualificationTraceV1"
           },
           "maxItems": 7,
-          "minItems": 1,
+          "minItems": 2,
           "type": "array"
         },
         "steps": {
@@ -936,6 +928,60 @@
         "callsite_file_mismatch",
         "callsite_line_mismatch",
         "callsite_raw_target_mismatch"
+      ],
+      "type": "string"
+    },
+    "ReceiptComparisonV1": {
+      "additionalProperties": false,
+      "properties": {
+        "caller": {
+          "type": "string"
+        },
+        "callsite_id": {
+          "type": "string"
+        },
+        "edge_id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "exact_line": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "exact_window": {
+          "$ref": "#/$defs/OracleSourceRangeV1"
+        },
+        "oracle_step_index": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/ReceiptMatchResultV1"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "oracle_step_index",
+        "caller",
+        "edge_id",
+        "callsite_id",
+        "exact_line",
+        "exact_window",
+        "target",
+        "result"
+      ],
+      "type": "object"
+    },
+    "ReceiptMatchResultV1": {
+      "enum": [
+        "exact",
+        "missing",
+        "mismatched"
       ],
       "type": "string"
     },

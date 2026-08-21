@@ -36,6 +36,8 @@ pub struct MaterializeArgs {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
+    #[arg(long, value_name = "CORPUS_JSON")]
+    pub corpus: PathBuf,
     #[arg(long, value_name = "ENVIRONMENT_JSON")]
     pub environment: PathBuf,
     #[arg(long, value_name = "OUTPUT_DIR")]

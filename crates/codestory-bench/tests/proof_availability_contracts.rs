@@ -6,8 +6,8 @@ mod contracts;
 use clap::Parser;
 use contracts::{
     CandidateFailureV1, CandidateGateV1, CorpusV1, FinalizationTraceV1, FunnelOutcomeV1,
-    ProofQualificationTraceV1, QualificationSummaryV1, SchemaDocument, ThresholdsV1,
-    TransportEvidenceV1,
+    ProofQualificationTraceV1, QualificationSummaryV1, SchemaDocument, SelectorGateOutcomeV1,
+    ThresholdsV1, TransportEvidenceV1, canonical_corpus_sha256,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -102,6 +102,9 @@ fn thresholds() -> Value {
 
 fn report() -> Value {
     let frozen = corpus();
+    let corpus_hash =
+        canonical_corpus_sha256(&CorpusV1::from_json(frozen.clone()).expect("corpus"))
+            .expect("canonical corpus hash");
     let cohort_ids = frozen["cohorts"]
         .as_array()
         .expect("cohorts")
@@ -124,6 +127,30 @@ fn report() -> Value {
                     json!({"step_index":step_index,"candidate_edge_ids":[edge_id],"outcome":{"kind":"admitted","edge_ids":[edge_id]}})
                 })
                 .collect::<Vec<_>>();
+            let selectors = (0..=attempted)
+                .map(|selector_index| json!({"selector_index":selector_index,"outcome":{"kind":"resolved","node_id":-(selector_index as i64 + 1)}}))
+                .collect::<Vec<_>>();
+            let receipt_comparisons = path["oracle_steps"]
+                .as_array()
+                .expect("oracle steps")
+                .iter()
+                .enumerate()
+                .map(|(step_index, step)| {
+                    let callsite = &step["callsite"];
+                    let start = callsite["start_byte"].as_u64().expect("callsite start");
+                    let end = callsite["end_byte"].as_u64().expect("callsite end");
+                    json!({
+                        "oracle_step_index":step_index,
+                        "caller":step["caller"]["symbol"],
+                        "edge_id":-(step_index as i64 + 1),
+                        "callsite_id":format!("src/lib.rs:{start}:{end}"),
+                        "exact_line":step_index + 1,
+                        "exact_window":callsite,
+                        "target":step["target"]["symbol"],
+                        "result":"exact"
+                    })
+                })
+                .collect::<Vec<_>>();
             let negative_mutations = path["negative_mutations"]
                 .as_array()
                 .expect("mutations")
@@ -144,9 +171,10 @@ fn report() -> Value {
                 "authoritative_receipt_count":attempted,"oracle_receipts_exact":true,
                 "proven_step_precision_milli":1000,"proven_step_recall_milli":1000,
                 "proven_prefix_length":attempted,"actionable_exact_gap":null,
-                "diagnostic_candidate_count":0,"authoritative_receipt_evidence_count":attempted,
+                "diagnostic_candidate_count":attempted,"authoritative_receipt_evidence_count":attempted,
                 "warm_end_to_end_ms":12,"stage_durations_ms":{"validation":1,"operation":2},
                 "attempted_step_count":attempted,"unclassified_step_indices":[],
+                "receipt_comparisons":receipt_comparisons,
                 "complete_projection_bytes":128,
                 "transport":{"kind":"measurements","measurements":{"measurements":[
                     {"revision":"2024-11-05","actual_bytes":128},
@@ -155,14 +183,14 @@ fn report() -> Value {
                     {"revision":"2025-11-25","actual_bytes":128}
                 ]}},
                 "negative_mutations":negative_mutations,
-                "proof_trace":{"selectors":[{"selector_index":0,"outcome":{"kind":"resolved","node_id":-1}}],"selector_early_return":false,"steps":steps,"finalization":{"kind":"complete","projection_bytes":128}}
+                "proof_trace":{"selectors":selectors,"selector_early_return":false,"steps":steps,"finalization":{"kind":"complete","projection_bytes":128}}
             })
         })
         .collect::<Vec<_>>();
     json!({
       "schema":"codestory.proof-availability-report/v1","qualification_id":"20260821T000000Z-0123456789ab",
-      "provenance":{"source_commit":COMMIT,"source_tree":COMMIT,"binary_sha256":SHA,"corpus_sha256":SHA,"thresholds_sha256":SHA,"results_sha256":SHA},
-      "environment":{"environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"projects":cohort_ids.iter().map(|id|json!({"repository_id":id,"source_head":COMMIT,"source_tree":COMMIT,"store_schema":"codestory-store/v1","file_count":10,"node_count":20,"edge_count":30,"freshness":"fresh","database_sha256":SHA,"core_generation":1,"core_run_id":format!("run-{id}")})).collect::<Vec<_>>()},
+      "provenance":{"source_commit":COMMIT,"source_tree":COMMIT,"binary_sha256":SHA,"corpus_sha256":corpus_hash,"thresholds_sha256":SHA,"results_sha256":SHA},
+      "environment":{"environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"projects":cohort_ids.iter().map(|id|json!({"repository_id":id,"source_head":COMMIT,"source_tree":SHA,"store_schema":"codestory-store/v1","file_count":10,"node_count":20,"edge_count":30,"freshness":"fresh","database_sha256":SHA,"core_generation":1,"core_run_id":format!("run-{id}")})).collect::<Vec<_>>()},
       "inventory":cohort_ids.iter().map(|id|json!({"repository_id":id,"stored_call_rows":"10","effective_endpoint_rows":"10","exact_resolved_rows":"8","admitted_rows":"7","unresolved_placeholder_rows":"2"})).collect::<Vec<_>>(),
       "trails":cohort_ids.iter().map(|id|json!({"repository_id":id,"lengths":[{"length":1,"effective_endpoint":"10","exact_resolved":"8","strictly_admitted":"7"},{"length":2,"effective_endpoint":"9","exact_resolved":"7","strictly_admitted":"6"},{"length":3,"effective_endpoint":"8","exact_resolved":"6","strictly_admitted":"5"},{"length":4,"effective_endpoint":"7","exact_resolved":"5","strictly_admitted":"4"},{"length":5,"effective_endpoint":"6","exact_resolved":"4","strictly_admitted":"3"},{"length":6,"effective_endpoint":"5","exact_resolved":"3","strictly_admitted":"2"}]})).collect::<Vec<_>>(),
       "cases":cases,
@@ -249,6 +277,32 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
         .expect("summary retains mutation evidence before corpus binding")
         .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
         .expect_err("corpus binding rejects altered mutation evidence");
+    let mut wrong_corpus_hash = report();
+    wrong_corpus_hash["provenance"]["corpus_sha256"] = json!(SHA);
+    QualificationSummaryV1::from_json(wrong_corpus_hash)
+        .expect("shape remains valid")
+        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
+        .expect_err("provenance binds the supplied corpus bytes");
+    let mut wrong_project = report();
+    wrong_project["environment"]["projects"][0]["source_head"] =
+        json!("cccccccccccccccccccccccccccccccccccccccc");
+    QualificationSummaryV1::from_json(wrong_project)
+        .expect("shape remains valid")
+        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
+        .expect_err("project materialization binds cohort source identity");
+    let mut wrong_binary = report();
+    wrong_binary["environment"]["binary_sha256"] =
+        json!("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    QualificationSummaryV1::from_json(wrong_binary)
+        .expect("shape remains valid")
+        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
+        .expect_err("provenance and environment share one binary identity");
+    let mut wrong_receipt = report();
+    wrong_receipt["cases"][0]["receipt_comparisons"][0]["caller"] = json!("wrong");
+    QualificationSummaryV1::from_json(wrong_receipt)
+        .expect("shape remains valid")
+        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
+        .expect_err("receipt comparison binds oracle caller and callsite");
     let mut lengths = report();
     lengths["trails"][0]["lengths"]
         .as_array_mut()
@@ -267,6 +321,7 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
     let mut hard_failure = report();
     hard_failure["cases"][0]["proof_trace"]["steps"] = json!([]);
     hard_failure["cases"][0]["unclassified_step_indices"] = json!([0]);
+    hard_failure["cases"][0]["diagnostic_candidate_count"] = json!(0);
     hard_failure["cases"][0]["transport"] = json!({
         "kind":"error",
         "error":{"kind":"result_exceeds_budget","maximum_bytes":65536,"actual_bytes":65537}
@@ -288,6 +343,26 @@ fn closed_contracts_reject_hostile_nested_shapes() {
         "histogram":[{"reason":{"kind":"raw_admission","reason":"certainty_probable"},"edge_ids":[1]}]
     });
     assert!(QualificationSummaryV1::from_json(invalid_trace).is_err());
+
+    let mut missing_selector = report();
+    missing_selector["cases"][0]["proof_trace"]["selectors"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    assert!(QualificationSummaryV1::from_json(missing_selector).is_err());
+
+    let mut non_candidate_edge = report();
+    non_candidate_edge["cases"][0]["proof_trace"]["steps"][0]["outcome"]["edge_ids"] = json!([999]);
+    assert!(QualificationSummaryV1::from_json(non_candidate_edge).is_err());
+
+    let mut receipt_count_mismatch = report();
+    receipt_count_mismatch["cases"][0]["authoritative_receipt_count"] = json!(0);
+    assert!(QualificationSummaryV1::from_json(receipt_count_mismatch).is_err());
+
+    let mut failed_finalization_bytes = report();
+    failed_finalization_bytes["cases"][0]["proof_trace"]["finalization"] =
+        json!({"kind":"failed","failure":"receipt_budget"});
+    assert!(QualificationSummaryV1::from_json(failed_finalization_bytes).is_err());
 
     let mut invalid_transport = report();
     invalid_transport["cases"][0]["transport"] = json!({
@@ -416,6 +491,7 @@ fn invariant_table_exhausts_task4_task6_and_corpus_variants() {
         let mut value = report();
         value["cases"][0]["proof_trace"]["finalization"] =
             json!({"kind":"failed","failure":failure});
+        value["cases"][0]["complete_projection_bytes"] = json!(0);
         QualificationSummaryV1::from_json(value)
             .expect("every finalization failure maps losslessly");
     }
@@ -498,6 +574,21 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
     ] {
         let _: CandidateGateV1 = gate.into();
     }
+    for failure in [
+        SelectorFailure::Missing,
+        SelectorFailure::Ambiguous,
+        SelectorFailure::NonCallable,
+    ] {
+        let _: SelectorGateOutcomeV1 = SelectorGateOutcome::Failed(failure).into();
+    }
+    for unavailable in [
+        UnavailableReason::ValidatedContractHashMismatch,
+        UnavailableReason::PublicationPinMismatch,
+        UnavailableReason::SourceNotBoundToPublication,
+        UnavailableReason::ProofFactsUnavailable,
+    ] {
+        let _: SelectorGateOutcomeV1 = SelectorGateOutcome::Unavailable(unavailable).into();
+    }
     for reason in [
         codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongKind,
         codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyAbsent,
@@ -577,13 +668,33 @@ fn assert_valid_first_zero(gate: &str, kind: &str, reason: &str) {
     QualificationSummaryV1::from_json(value).expect("mapped first-zero outcome");
 }
 
+fn make_non_proven_case(value: &mut Value, disposition: &str, gap: Option<&str>) {
+    let case = &mut value["cases"][0];
+    case["receipt_comparisons"][0]["result"] = json!("missing");
+    case["authoritative_receipt_count"] = json!(0);
+    case["oracle_receipts_exact"] = json!(false);
+    case["proven_prefix_length"] = json!(0);
+    case["product_disposition"] =
+        json!({"kind":disposition,"gaps":gap.into_iter().collect::<Vec<_>>()});
+    case["actionable_exact_gap"] = gap.map(Value::from).unwrap_or(Value::Null);
+}
+
 #[test]
 fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
     for disposition in ["unknown", "certified_absence", "invalid"] {
         let mut value = report();
-        value["cases"][0]["product_disposition"] = json!({"kind":disposition,"gaps":[]});
+        make_non_proven_case(
+            &mut value,
+            disposition,
+            (disposition == "unknown").then_some("selector_missing"),
+        );
         QualificationSummaryV1::from_json(value).expect("closed product disposition");
     }
+    let mut mismatched_receipt = report();
+    make_non_proven_case(&mut mismatched_receipt, "invalid", None);
+    mismatched_receipt["cases"][0]["receipt_comparisons"][0]["result"] = json!("mismatched");
+    QualificationSummaryV1::from_json(mismatched_receipt)
+        .expect("closed mismatched receipt result");
     for gap in [
         "selector_missing",
         "selector_ambiguous",
@@ -593,7 +704,7 @@ fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
         "projection_budget",
     ] {
         let mut value = report();
-        value["cases"][0]["product_disposition"] = json!({"kind":"unknown","gaps":[gap]});
+        make_non_proven_case(&mut value, "unknown", Some(gap));
         QualificationSummaryV1::from_json(value).expect("closed actionable gap");
     }
     for gate in [
@@ -684,6 +795,15 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
             ["actual_bytes"]["maximum"],
         65536
     );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["CaseReportV1"]["properties"]["receipt_comparisons"]
+            ["minItems"],
+        1
+    );
+    assert!(contracts::schema_json(SchemaDocument::Report)["$defs"]["ActivationDecisionV1"]
+        ["properties"]["failed_gates"]
+        .get("maxItems")
+        .is_none());
 }
 
 #[test]
@@ -707,9 +827,18 @@ fn cli_matches_frozen_materialize_run_and_verify_shapes() {
         cli::Command::Materialize(_)
     ));
     assert!(matches!(
-        cli::Cli::try_parse_from(["bin", "run", "--environment", "/tmp/e", "--out", "/tmp/r"])
-            .expect("run")
-            .command,
+        cli::Cli::try_parse_from([
+            "bin",
+            "run",
+            "--corpus",
+            "/tmp/c",
+            "--environment",
+            "/tmp/e",
+            "--out",
+            "/tmp/r"
+        ])
+        .expect("run")
+        .command,
         cli::Command::Run(_)
     ));
     assert!(matches!(
