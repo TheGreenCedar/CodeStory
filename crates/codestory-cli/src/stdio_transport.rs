@@ -7011,6 +7011,108 @@ mod tests {
     use serde_json::json;
     use std::process::Command;
 
+    fn fixture_json_sha256(value: &serde_json::Value) -> String {
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(value).expect("serialize v2 fixture"))
+        )
+    }
+
+    #[test]
+    fn v2_packet_context_search_projection_bytes() {
+        let packet = stdio_packet_tool_call_success(
+            json!({
+                "packet_id": "packet-v2-fixture",
+                "question": "Explain dispatch.",
+                "answer": {"sections": [], "citations": [], "graphs": []},
+                "support": [],
+                "disposition": {"kind": "supported", "reason": "grounded"},
+                "budget": {
+                    "requested": "compact",
+                    "truncated": false,
+                    "omitted_sections": []
+                }
+            }),
+            &json!(["packet_stdio_phase label=fixture duration_ms=7"]),
+            &json!({
+                "operation": {"operation_id": "operation-v2-fixture"},
+                "core_publication": {
+                    "generation_id": "core-v2-fixture",
+                    "run_id": "run-v2-fixture"
+                }
+            }),
+        );
+
+        let context_answer = codestory_contracts::api::AgentAnswerDto {
+            answer_id: "context-v2-fixture".to_string(),
+            prompt: "AppController".to_string(),
+            summary: "Dispatch context.".to_string(),
+            freshness: None,
+            source_coverage: Vec::new(),
+            sections: Vec::new(),
+            citations: Vec::new(),
+            subgraph_ids: Vec::new(),
+            retrieval_version: "v2-fixture".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: serde_json::from_value(json!({
+                "request_id": "request-v2-fixture",
+                "resolved_profile": "architecture",
+                "policy_mode": "latency_first",
+                "total_latency_ms": 0,
+                "steps": []
+            }))
+            .expect("minimal context retrieval trace"),
+        };
+        let context = stdio_tool_call_success("context", context_packet_json(&context_answer));
+
+        let search_result = codestory_contracts::api::SearchResultsDto {
+            query: "AppController".to_string(),
+            retrieval_publication: None,
+            retrieval: codestory_contracts::api::RetrievalStateDto {
+                mode: codestory_contracts::api::RetrievalModeDto::Hybrid,
+                hybrid_configured: true,
+                semantic_ready: true,
+                semantic_mode: codestory_contracts::api::SemanticModeDto::Enabled,
+                semantic_doc_count: 1,
+                embedding_model: None,
+                current_embedding: None,
+                stored_embedding: None,
+                fallback_reason: None,
+                fallback_message: None,
+            },
+            retrieval_shadow: None,
+            freshness: None,
+            limit_per_source: 5,
+            repo_text_mode: SearchRepoTextMode::Off,
+            repo_text_enabled: false,
+            query_assessment: None,
+            search_plan: None,
+            repo_text_stats: None,
+            suggestions: Vec::new(),
+            indexed_symbol_hits: Vec::new(),
+            repo_text_hits: Vec::new(),
+            hits: Vec::new(),
+        };
+        let search = stdio_tool_call_success(
+            "search",
+            enrich_stdio_search_result(search_result, "project-v2-fixture", Path::new("/repo")),
+        );
+
+        let hashes = [
+            fixture_json_sha256(&packet),
+            fixture_json_sha256(&context),
+            fixture_json_sha256(&search),
+        ];
+        assert_eq!(
+            hashes,
+            [
+                "52f98c63f1a321bee9031cb7a990c58abf23859c73cde25c6948af1a4becdd5d".to_string(),
+                "b30f84585275d2423f7b3cca8350a7ed226bc5d8db2e647e2338cc1d7f711630".to_string(),
+                "07cf60cf7eed630b4d95b99ca1eec407ca025c64de76e219e9fcc2b061e1f4ee".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn published_guidance_calls_satisfy_the_generated_catalog() {
         fn walk(value: &serde_json::Value, checked: &mut usize) {
