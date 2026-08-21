@@ -47,9 +47,27 @@
               "null"
             ]
           },
+          "degraded_reason": {
+            "description": "Why a full publication is not live-ready, when that is known.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "diagnostics_uri": {
             "description": "Optional full diagnostic resource URI.",
             "type": "string"
+          },
+          "failure": {
+            "description": "Structured capability failure when the compact status is not live-ready.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "live_ready": {
+            "description": "Whether packet/search may use full retrieval without a degraded reason.",
+            "type": "boolean"
           },
           "next_action": {
             "description": "Direct next action for the caller.",
@@ -58,6 +76,13 @@
           "project": {
             "description": "Requested repository root.",
             "type": "string"
+          },
+          "retrieval_mode": {
+            "description": "Pinned retrieval publication class; full is eligibility, not live-ready.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "retry_after_ms": {
             "description": "Retry delay while preparing.",
@@ -672,7 +697,73 @@
           },
           "support": {
             "description": "Compiled evidence atoms: symbol locations, source ranges, typed graph edges, and complete-query negatives.",
-            "type": "object"
+            "items": {
+              "additionalProperties": false,
+              "description": "Compiled evidence atom the agent judges.",
+              "properties": {
+                "edge_kind": {
+                  "description": "Typed graph edge kind.",
+                  "type": "string"
+                },
+                "end_line": {
+                  "description": "1-based end line.",
+                  "type": "integer"
+                },
+                "from_symbol": {
+                  "description": "Edge source symbol.",
+                  "type": "string"
+                },
+                "id": {
+                  "description": "Stable support unit id.",
+                  "type": "string"
+                },
+                "kind": {
+                  "description": "Support unit kind.",
+                  "enum": [
+                    "symbol_location",
+                    "source_range",
+                    "typed_graph_edge",
+                    "complete_query_negative"
+                  ],
+                  "type": "string"
+                },
+                "path": {
+                  "description": "Project-relative file path.",
+                  "type": "string"
+                },
+                "query": {
+                  "description": "Complete-query negative text.",
+                  "type": "string"
+                },
+                "snippet": {
+                  "description": "Optional source excerpt.",
+                  "type": "string"
+                },
+                "start_line": {
+                  "description": "1-based start line.",
+                  "type": "integer"
+                },
+                "summary": {
+                  "description": "Evidence summary.",
+                  "type": "string"
+                },
+                "symbol_id": {
+                  "description": "Stable symbol id.",
+                  "type": "string"
+                },
+                "to_symbol": {
+                  "description": "Edge target symbol.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "summary"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           },
           "task_class": {
             "description": "Optional task class.",
@@ -1297,6 +1388,54 @@
           "code": {
             "description": "Typed API error code.",
             "type": "string"
+          },
+          "coverage_gaps": {
+            "description": "File-level coverage limitations or source-integrity failures.",
+            "items": {
+              "additionalProperties": false,
+              "description": "File-level coverage limitation or source-integrity failure.",
+              "properties": {
+                "path": {
+                  "description": "Project-relative file path.",
+                  "type": "string"
+                },
+                "projection_available": {
+                  "description": "Whether a usable projection remains.",
+                  "type": "boolean"
+                },
+                "reason": {
+                  "description": "Coverage limitation reason.",
+                  "enum": [
+                    "parser_partial",
+                    "source_changed",
+                    "unreadable",
+                    "malformed",
+                    "binary",
+                    "oversized",
+                    "discovery_incomplete",
+                    "collector_failure"
+                  ],
+                  "type": "string"
+                },
+                "retryable": {
+                  "description": "Whether a later index can recover this file.",
+                  "type": "boolean"
+                },
+                "verified_source": {
+                  "description": "Whether source bytes were verified.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "path",
+                "reason",
+                "retryable",
+                "verified_source",
+                "projection_available"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           },
           "details": {
             "description": "Structured API error repair guidance.",

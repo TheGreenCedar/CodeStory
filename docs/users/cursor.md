@@ -94,6 +94,7 @@ installs use [Add Marketplace](#install).
 | MCP fails to start | Confirm `node` is on `PATH`, then reload. Inspect **MCP Logs** in the Output panel (**Cmd+Shift+U** / **Ctrl+Shift+U**) |
 | MCP dies looking for `<project>/scripts/codestory-mcp.cjs` | Refresh **codestory** to 0.17.3 or later in Customize, then reload. Cursor expanded `${PLUGIN_ROOT}` to the open project, so 0.17.2 still launched from the wrong folder. In a CodeStory checkout, the project `.cursor/mcp.json` server remains a working fallback |
 | MCP reports `Connection closed` with no missing-module error | Refresh **codestory** to 0.17.4 or later, then reload. 0.17.3 found the installed launcher and then exited without starting the server. In a CodeStory checkout, the project `.cursor/mcp.json` server remains a working fallback |
+| MCP connects, then tools fail with `output schema` / `additional properties` | Cursor validates tool JSON against CodeStory's advertised schema. 0.17.1 still declares packet `support` as an object and omits compact status fields and `files.coverage_gaps`. Use a CLI that includes that schema fix, then reload |
 | Runtime is stale after an update | Refresh the marketplace and the plugin in Customize, reload Cursor, and start a fresh session |
 | A tool remains preparing | Retry that same tool after its returned delay |
 

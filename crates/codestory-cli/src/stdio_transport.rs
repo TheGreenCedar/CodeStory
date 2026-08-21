@@ -8907,6 +8907,28 @@ version = "0.11.20"
             json!(true),
             "full publication class must not read as packet-ready when degraded: {compact}"
         );
+        let schema = stdio_tools_list_json()["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "status")
+            .expect("status tool")["outputSchema"]
+            .clone();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("status outputSchema properties");
+        let undeclared = compact
+            .as_object()
+            .expect("compact status is an object")
+            .keys()
+            .filter(|key| !properties.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            undeclared.is_empty(),
+            "Cursor validates status structuredContent against additionalProperties: false, \
+             but compact status emits {undeclared:?}"
+        );
     }
 
     #[test]
