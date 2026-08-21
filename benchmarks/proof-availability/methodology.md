@@ -57,9 +57,9 @@ oracle files, and hashes the raw bytes from
 `git ls-tree -r -z --full-tree <commit>` as source-tree identity. It reads each
 tracked source file once, strictly decodes UTF-8, revalidates every declaration,
 expression, receipt-line, and negative-audit range, and repeats the HEAD/clean
-fence after reads. It atomically installs the workspace and a bounded source
-environment descriptor, refuses overwrite, and never creates a cache, index,
-database, result, or proof artifact.
+fence after reads. It publishes one complete workspace by atomic no-replace
+rename, then persists a bounded source environment descriptor by no-clobber
+rename. It never creates a cache, index, database, result, or proof artifact.
 
 Before any write, materialization resolves each destination through its real
 existing ancestor and native filesystem identity. It rejects non-root symlink
@@ -67,11 +67,23 @@ components and overlap between workspace, cache, and output even when different
 spellings traverse a platform root alias. The workspace and output parent
 identities are revalidated before output staging, workspace installation, and
 descriptor persistence. Workspace publication uses an atomic no-replace rename.
-If descriptor persistence fails, rollback atomically moves the workspace into
-the private staging root, verifies the moved directory's native identity, and
-deletes only that owned quarantine. A raced replacement is restored without
-deletion; if restoration also loses a no-replace race, staging cleanup is
-disabled so the quarantined state is preserved for recovery.
+The unique staging root carries a closed owner marker and automatic cleanup is
+disabled before any staged write. Output temporary files are also leave-safe.
+Every failure after staging begins returns a typed phase and explicit recovery
+paths. After workspace publication, later identity, parent, or descriptor
+failure never moves or deletes the public path; the complete published workspace
+is left in place when it still owns that path. If another actor moved it, both
+the replacement and displaced workspace remain untouched. The verifier performs
+no recursive recovery deletion.
+
+Each attempt may therefore retain one owner-marked staging directory and, after
+output staging, one bounded descriptor temporary file. A successful attempt's
+staging remainder contains only the owner marker and empty control directories;
+a failed pre-publication attempt may retain its fetched sources. This is an
+intentional non-destructive recovery artifact, not cache or product state.
+Task 10A provides the typed paths and marker but no cleanup command, retention
+schedule, automatic recovery, or bounded-total-disk claim; those require an
+explicit identity-bound recovery design before curation or Task 11 execution.
 
 Corpus validation bijects four references to four loaded cohort roots and
 reconciles repository declarations, source trees, canonical hashes, counts,

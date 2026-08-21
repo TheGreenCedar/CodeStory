@@ -1,7 +1,7 @@
 {
   "schema": "codestory.proof-availability-thresholds/v1",
   "thresholds_id": "proof-availability-v1",
-  "methodology_sha256": "2f625913f058f73977c59de2f1b4933666d364ca5332896aa523b1dc8545f5c9",
+  "methodology_sha256": "f2c82560b8c7c249f005a7895628640aa9d0bf16be985d425cfc25225f2f87e4",
   "wilson_z": 1.959963984540054,
   "expected_cohort_count": 4,
   "expected_positive_requests": 120,

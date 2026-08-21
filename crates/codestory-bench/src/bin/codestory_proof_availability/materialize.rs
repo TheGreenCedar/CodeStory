@@ -12,13 +12,88 @@ use codestory_workspace::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
 const SOURCE_ENVIRONMENT_SCHEMA: &str = "codestory.proof-availability-source-environment/v1";
+const SOURCE_STAGING_OWNER_SCHEMA: &str = "codestory.proof-availability-source-staging-owner/v1";
 const MAX_DESCRIPTOR_BYTES: usize = 65_536;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterializationFailurePhase {
+    BeforePublication,
+    AfterPublication,
+}
+
+impl fmt::Display for MaterializationFailurePhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::BeforePublication => "before_publication",
+            Self::AfterPublication => "after_publication",
+        })
+    }
+}
+
+#[derive(Debug)]
+struct MaterializationRecoveryError {
+    code: &'static str,
+    phase: MaterializationFailurePhase,
+    staging_recovery_path: PathBuf,
+    workspace_recovery_path: Option<PathBuf>,
+    output_recovery_path: Option<PathBuf>,
+    cause: String,
+}
+
+impl fmt::Display for MaterializationRecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} phase={} staging_recovery_path={} workspace_recovery_path={} output_recovery_path={} cause={}",
+            self.code,
+            self.phase,
+            self.staging_recovery_path.display(),
+            self.workspace_recovery_path
+                .as_deref()
+                .map_or_else(|| "none".into(), |path| path.display().to_string()),
+            self.output_recovery_path
+                .as_deref()
+                .map_or_else(|| "none".into(), |path| path.display().to_string()),
+            self.cause,
+        )
+    }
+}
+
+impl std::error::Error for MaterializationRecoveryError {}
+
+fn materialization_recovery_error(
+    code: &'static str,
+    phase: MaterializationFailurePhase,
+    staging_recovery_path: &Path,
+    workspace_recovery_path: Option<&Path>,
+    output_recovery_path: Option<&Path>,
+    cause: impl fmt::Display,
+) -> anyhow::Error {
+    MaterializationRecoveryError {
+        code,
+        phase,
+        staging_recovery_path: staging_recovery_path.to_path_buf(),
+        workspace_recovery_path: workspace_recovery_path.map(Path::to_path_buf),
+        output_recovery_path: output_recovery_path.map(Path::to_path_buf),
+        cause: cause.to_string(),
+    }
+    .into()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceStagingOwnerV1 {
+    schema: &'static str,
+    workspace: String,
+    output: String,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -135,125 +210,220 @@ fn verify_only_with_registry(
         .validate_with_path_files_and_registry(&loaded.path_files, registry)?;
     let destinations = DestinationPlan::observe(arguments)?;
 
-    let mut staging = tempfile::Builder::new()
+    let staging = tempfile::Builder::new()
         .prefix(".codestory-proof-source-")
+        .disable_cleanup(true)
         .tempdir_in(&destinations.workspace_parent.real_path)?;
-    let staged_workspaces = staging.path().join("workspaces");
-    fs::create_dir(&staged_workspaces)?;
-    let hooks = staging.path().join("empty-hooks");
-    fs::create_dir(&hooks)?;
-
-    let mut repositories = Vec::with_capacity(loaded.path_files.len());
-    for path_file in &loaded.path_files {
-        let cohort = loaded
-            .corpus
-            .cohorts
-            .iter()
-            .find(|cohort| cohort.repository_id == path_file.repository_id)
-            .ok_or_else(|| anyhow::anyhow!("proof_availability_materialize_cohort_missing"))?;
-        if !allow_local_repositories && !path_file.repository.starts_with("https://") {
-            bail!("proof_availability_repository_transport_invalid")
-        }
-        let checkout = staged_workspaces.join(&path_file.repository_id);
-        let (tree_digest, tree) =
-            stage_repository(&path_file.repository, &path_file.commit, &checkout, &hooks)?;
-        if tree_digest != path_file.source_tree_sha256 || tree_digest != cohort.source_tree_sha256 {
-            bail!("proof_availability_source_tree_mismatch")
-        }
-        let project_root = resolve_workspace(&checkout, &path_file.workspace)?;
-        let verified_file_count = verify_oracle_sources(path_file, &project_root, &tree)?;
-        require_head_and_clean(&checkout, &path_file.commit, &hooks)?;
-        repositories.push(VerifiedSourceRepositoryV1 {
-            repository_id: path_file.repository_id.clone(),
-            repository: path_file.repository.clone(),
-            commit: path_file.commit.clone(),
-            workspace: path_file.workspace.clone(),
-            checkout_root: destinations
-                .workspace
-                .real_path
-                .join(&path_file.repository_id)
-                .display()
-                .to_string(),
-            project_root: destinations
-                .workspace
-                .real_path
-                .join(&path_file.repository_id)
-                .join(workspace_suffix(&path_file.workspace)?)
-                .display()
-                .to_string(),
-            source_tree_sha256: tree_digest,
-            path_file_sha256: canonical_cohort_path_file_sha256(path_file)?,
-            verified_path_count: path_file.paths.len(),
-            verified_file_count,
-        });
-    }
-    repositories.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
-    let descriptor = SourceEnvironmentDescriptorV1 {
-        schema: SOURCE_ENVIRONMENT_SCHEMA,
-        corpus_sha256: canonical_corpus_sha256(&loaded.corpus)?,
-        workspace_root: destinations.workspace.real_path.display().to_string(),
-        repositories,
+    let staging_path = staging.path().to_path_buf();
+    let owner = SourceStagingOwnerV1 {
+        schema: SOURCE_STAGING_OWNER_SCHEMA,
+        workspace: destinations.workspace.real_path.display().to_string(),
+        output: destinations.out.real_path.display().to_string(),
     };
-    let bytes = serde_json::to_vec_pretty(&descriptor)?;
-    if bytes.len() > MAX_DESCRIPTOR_BYTES {
-        bail!("proof_availability_source_descriptor_too_large")
+    let owner_bytes = match serde_json::to_vec_pretty(&owner) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Err(materialization_recovery_error(
+                "proof_availability_materialize_prepublication_failed",
+                MaterializationFailurePhase::BeforePublication,
+                &staging_path,
+                None,
+                None,
+                error,
+            ));
+        }
+    };
+    if let Err(error) = fs::write(staging_path.join("owner.json"), owner_bytes) {
+        return Err(materialization_recovery_error(
+            "proof_availability_materialize_prepublication_failed",
+            MaterializationFailurePhase::BeforePublication,
+            &staging_path,
+            None,
+            None,
+            error,
+        ));
     }
-    destinations.revalidate(arguments)?;
-    let mut output = tempfile::NamedTempFile::new_in(&destinations.output_parent.real_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        output
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    output.write_all(&bytes)?;
-    output.write_all(b"\n")?;
-    output.as_file_mut().sync_all()?;
 
-    destinations.revalidate(arguments)?;
-    let installed_workspace_identity = workspace_path_identity(&staged_workspaces)?;
-    rename_directory_noreplace(&staged_workspaces, &destinations.workspace.real_path)?;
+    let preparation = (|| -> Result<(PathBuf, Vec<u8>)> {
+        let staged_workspaces = staging_path.join("workspaces");
+        fs::create_dir(&staged_workspaces)?;
+        let hooks = staging_path.join("empty-hooks");
+        fs::create_dir(&hooks)?;
+
+        let mut repositories = Vec::with_capacity(loaded.path_files.len());
+        for path_file in &loaded.path_files {
+            let cohort = loaded
+                .corpus
+                .cohorts
+                .iter()
+                .find(|cohort| cohort.repository_id == path_file.repository_id)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_materialize_cohort_missing"))?;
+            if !allow_local_repositories && !path_file.repository.starts_with("https://") {
+                bail!("proof_availability_repository_transport_invalid")
+            }
+            let checkout = staged_workspaces.join(&path_file.repository_id);
+            let (tree_digest, tree) =
+                stage_repository(&path_file.repository, &path_file.commit, &checkout, &hooks)?;
+            if tree_digest != path_file.source_tree_sha256
+                || tree_digest != cohort.source_tree_sha256
+            {
+                bail!("proof_availability_source_tree_mismatch")
+            }
+            let project_root = resolve_workspace(&checkout, &path_file.workspace)?;
+            let verified_file_count = verify_oracle_sources(path_file, &project_root, &tree)?;
+            require_head_and_clean(&checkout, &path_file.commit, &hooks)?;
+            repositories.push(VerifiedSourceRepositoryV1 {
+                repository_id: path_file.repository_id.clone(),
+                repository: path_file.repository.clone(),
+                commit: path_file.commit.clone(),
+                workspace: path_file.workspace.clone(),
+                checkout_root: destinations
+                    .workspace
+                    .real_path
+                    .join(&path_file.repository_id)
+                    .display()
+                    .to_string(),
+                project_root: destinations
+                    .workspace
+                    .real_path
+                    .join(&path_file.repository_id)
+                    .join(workspace_suffix(&path_file.workspace)?)
+                    .display()
+                    .to_string(),
+                source_tree_sha256: tree_digest,
+                path_file_sha256: canonical_cohort_path_file_sha256(path_file)?,
+                verified_path_count: path_file.paths.len(),
+                verified_file_count,
+            });
+        }
+        repositories.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
+        let descriptor = SourceEnvironmentDescriptorV1 {
+            schema: SOURCE_ENVIRONMENT_SCHEMA,
+            corpus_sha256: canonical_corpus_sha256(&loaded.corpus)?,
+            workspace_root: destinations.workspace.real_path.display().to_string(),
+            repositories,
+        };
+        let bytes = serde_json::to_vec_pretty(&descriptor)?;
+        if bytes.len() > MAX_DESCRIPTOR_BYTES {
+            bail!("proof_availability_source_descriptor_too_large")
+        }
+        destinations.revalidate(arguments)?;
+        Ok((staged_workspaces, bytes))
+    })();
+    let (staged_workspaces, bytes) = match preparation {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return Err(materialization_recovery_error(
+                "proof_availability_materialize_prepublication_failed",
+                MaterializationFailurePhase::BeforePublication,
+                &staging_path,
+                None,
+                None,
+                error,
+            ));
+        }
+    };
+
+    let mut output = match tempfile::Builder::new()
+        .prefix(".codestory-proof-source-descriptor-")
+        .disable_cleanup(true)
+        .tempfile_in(&destinations.output_parent.real_path)
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(materialization_recovery_error(
+                "proof_availability_materialize_prepublication_failed",
+                MaterializationFailurePhase::BeforePublication,
+                &staging_path,
+                None,
+                None,
+                error,
+            ));
+        }
+    };
+    let output_recovery_path = output.path().to_path_buf();
+    let prepare_output = (|| -> Result<WorkspacePathIdentity> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            output
+                .as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        output.write_all(&bytes)?;
+        output.write_all(b"\n")?;
+        output.as_file_mut().sync_all()?;
+
+        destinations.revalidate(arguments)?;
+        Ok(workspace_path_identity(&staged_workspaces)?)
+    })();
+    let installed_workspace_identity = match prepare_output {
+        Ok(identity) => identity,
+        Err(error) => {
+            return Err(materialization_recovery_error(
+                "proof_availability_materialize_prepublication_failed",
+                MaterializationFailurePhase::BeforePublication,
+                &staging_path,
+                None,
+                Some(&output_recovery_path),
+                error,
+            ));
+        }
+    };
+    if let Err(error) =
+        rename_directory_noreplace(&staged_workspaces, &destinations.workspace.real_path)
+    {
+        return Err(materialization_recovery_error(
+            "proof_availability_materialize_publication_failed",
+            MaterializationFailurePhase::BeforePublication,
+            &staging_path,
+            None,
+            Some(&output_recovery_path),
+            error,
+        ));
+    }
     match workspace_path_identity(&destinations.workspace.real_path) {
         Ok(identity) if identity == installed_workspace_identity => {}
         Ok(_) => {
-            rollback_owned_workspace(
-                &destinations.workspace.real_path,
-                &installed_workspace_identity,
-                &mut staging,
-            )?;
-            bail!("proof_availability_materialize_installed_identity_mismatch")
+            return Err(materialization_recovery_error(
+                "proof_availability_materialize_installed_identity_mismatch",
+                MaterializationFailurePhase::AfterPublication,
+                &staging_path,
+                Some(&destinations.workspace.real_path),
+                Some(&output_recovery_path),
+                "published workspace identity differs from the staged workspace",
+            ));
         }
         Err(error) => {
-            rollback_owned_workspace(
-                &destinations.workspace.real_path,
-                &installed_workspace_identity,
-                &mut staging,
-            )?;
-            return Err(error.into());
+            return Err(materialization_recovery_error(
+                "proof_availability_materialize_installed_identity_unavailable",
+                MaterializationFailurePhase::AfterPublication,
+                &staging_path,
+                Some(&destinations.workspace.real_path),
+                Some(&output_recovery_path),
+                error,
+            ));
         }
     }
     if let Err(error) = destinations.revalidate_output_parent() {
-        rollback_owned_workspace(
-            &destinations.workspace.real_path,
-            &installed_workspace_identity,
-            &mut staging,
-        )?;
-        return Err(error);
+        return Err(materialization_recovery_error(
+            "proof_availability_materialize_output_parent_changed",
+            MaterializationFailurePhase::AfterPublication,
+            &staging_path,
+            Some(&destinations.workspace.real_path),
+            Some(&output_recovery_path),
+            error,
+        ));
     }
     if let Err(error) = output.persist_noclobber(&destinations.out.real_path) {
-        rollback_owned_workspace(
-            &destinations.workspace.real_path,
-            &installed_workspace_identity,
-            &mut staging,
-        )
-        .with_context(|| {
-            format!(
-                "remove newly installed source workspace {} after output failure",
-                destinations.workspace.real_path.display()
-            )
-        })?;
-        return Err(error.error.into());
+        return Err(materialization_recovery_error(
+            "proof_availability_materialize_output_persist_failed",
+            MaterializationFailurePhase::AfterPublication,
+            &staging_path,
+            Some(&destinations.workspace.real_path),
+            Some(error.file.path()),
+            error.error,
+        ));
     }
     Ok(())
 }
@@ -416,52 +586,6 @@ fn rename_directory_noreplace(_: &Path, _: &Path) -> std::io::Result<()> {
         std::io::ErrorKind::Unsupported,
         "atomic no-replace directory rename is unsupported on this platform",
     ))
-}
-
-fn rollback_owned_workspace(
-    workspace: &Path,
-    expected_identity: &WorkspacePathIdentity,
-    staging: &mut tempfile::TempDir,
-) -> std::io::Result<()> {
-    rollback_owned_workspace_with_identity(
-        workspace,
-        expected_identity,
-        staging,
-        workspace_path_identity,
-    )
-}
-
-fn rollback_owned_workspace_with_identity(
-    workspace: &Path,
-    expected_identity: &WorkspacePathIdentity,
-    staging: &mut tempfile::TempDir,
-    observe_identity: impl FnOnce(&Path) -> std::io::Result<WorkspacePathIdentity>,
-) -> std::io::Result<()> {
-    let quarantine = staging.path().join("rollback-workspace");
-    rename_directory_noreplace(workspace, &quarantine)?;
-    let observed_identity = observe_identity(&quarantine);
-    let ownership_confirmed =
-        matches!(&observed_identity, Ok(identity) if identity == expected_identity);
-    if !ownership_confirmed {
-        if let Err(restore_error) = rename_directory_noreplace(&quarantine, workspace) {
-            // The quarantine may contain state another actor raced into the
-            // destination. Prevent TempDir drop from deleting it if restoring
-            // its original name also loses a no-replace race.
-            staging.disable_cleanup(true);
-            return Err(std::io::Error::other(format!(
-                "proof_availability_materialize_workspace_restore_failed: {restore_error}"
-            )));
-        }
-        return match observed_identity {
-            Ok(_) => Err(std::io::Error::other(
-                "proof_availability_materialize_workspace_ownership_lost",
-            )),
-            Err(error) => Err(std::io::Error::other(format!(
-                "proof_availability_materialize_workspace_identity_unavailable: {error}"
-            ))),
-        };
-    }
-    fs::remove_dir_all(quarantine)
 }
 
 fn stage_repository(
@@ -1108,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_only_materializes_four_local_sources_atomically_without_cache_or_product_artifacts() {
+    fn verify_only_materializes_sources_and_retains_typed_recovery_artifacts() {
         let (origin, commit, raw_tree) = cohort_repository();
         let tree_sha256 = sha256(&raw_tree);
         let (loaded, owned_registry) =
@@ -1137,6 +1261,20 @@ mod tests {
 
         assert!(!arguments.cache_root.exists());
         assert!(arguments.workspace.is_dir());
+        let retained_staging = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".codestory-proof-source-"))
+            })
+            .expect("successful run retains its bounded owner-marked staging record");
+        let owner: Value =
+            serde_json::from_slice(&fs::read(retained_staging.join("owner.json")).unwrap())
+                .unwrap();
+        assert_eq!(owner["schema"], SOURCE_STAGING_OWNER_SCHEMA);
+        assert!(owner["workspace"].as_str().unwrap().ends_with("/workspace"));
         let descriptor: Value = serde_json::from_slice(&fs::read(&arguments.out).unwrap()).unwrap();
         assert_eq!(descriptor["schema"], SOURCE_ENVIRONMENT_SCHEMA);
         assert_eq!(descriptor["repositories"].as_array().unwrap().len(), 4);
@@ -1205,7 +1343,20 @@ mod tests {
             out: failure_root.path().join("source-environment.json"),
             verify_only: true,
         };
-        assert!(verify_only_with_registry(&failed, &invalid, &registry, true).is_err());
+        let error = verify_only_with_registry(&failed, &invalid, &registry, true)
+            .expect_err("failed preparation must retain a typed recovery path");
+        let recovery = error
+            .downcast_ref::<MaterializationRecoveryError>()
+            .expect("typed preparation recovery error");
+        assert_eq!(
+            recovery.code,
+            "proof_availability_materialize_prepublication_failed"
+        );
+        assert_eq!(
+            recovery.phase,
+            MaterializationFailurePhase::BeforePublication
+        );
+        assert!(recovery.staging_recovery_path.join("owner.json").is_file());
         assert!(!failed.workspace.exists());
         assert!(!failed.out.exists());
         assert!(!failed.cache_root.exists());
@@ -1311,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_publish_is_no_replace_and_cleanup_is_identity_bound() {
+    fn workspace_publish_is_no_replace_and_leave_safe() {
         let root = tempfile::tempdir().unwrap();
         let staged = root.path().join("staged-workspace");
         let destination = root.path().join("workspace");
@@ -1324,76 +1475,50 @@ mod tests {
             .expect_err("workspace publication must not replace a raced destination");
         assert_eq!(fs::read(destination.join("raced")).unwrap(), b"raced");
         assert_eq!(fs::read(staged.join("owned")).unwrap(), b"owned");
+    }
 
-        fs::remove_dir_all(&destination).unwrap();
-        let owned_identity = workspace_path_identity(&staged).unwrap();
-        rename_directory_noreplace(&staged, &destination).unwrap();
-        let mut owned_rollback = tempfile::tempdir_in(root.path()).unwrap();
-        rollback_owned_workspace(&destination, &owned_identity, &mut owned_rollback).unwrap();
-        assert!(!destination.exists());
-
-        fs::create_dir(&staged).unwrap();
-        fs::write(staged.join("owned"), b"owned").unwrap();
-        let owned_identity = workspace_path_identity(&staged).unwrap();
-        rename_directory_noreplace(&staged, &destination).unwrap();
+    #[test]
+    fn post_publication_failure_preserves_replacement_and_owned_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = root.path().join("staged-workspace");
+        let published = root.path().join("workspace");
         let displaced = root.path().join("displaced-owned-workspace");
-        fs::rename(&destination, &displaced).unwrap();
-        fs::create_dir(&destination).unwrap();
-        fs::write(destination.join("unrelated"), b"unrelated").unwrap();
-        let mut rollback = tempfile::tempdir_in(root.path()).unwrap();
-
-        rollback_owned_workspace(&destination, &owned_identity, &mut rollback)
-            .expect_err("cleanup must refuse a replacement workspace");
-        assert_eq!(
-            fs::read(destination.join("unrelated")).unwrap(),
-            b"unrelated"
-        );
-        assert_eq!(fs::read(displaced.join("owned")).unwrap(), b"owned");
-
-        fs::remove_dir_all(&destination).unwrap();
+        let staging_recovery = root.path().join("staging-recovery");
         fs::create_dir(&staged).unwrap();
         fs::write(staged.join("owned"), b"owned").unwrap();
-        let owned_identity = workspace_path_identity(&staged).unwrap();
-        rename_directory_noreplace(&staged, &destination).unwrap();
-        let mut unavailable_rollback = tempfile::tempdir_in(root.path()).unwrap();
-        rollback_owned_workspace_with_identity(
-            &destination,
-            &owned_identity,
-            &mut unavailable_rollback,
-            |_| Err(std::io::Error::other("identity unavailable")),
-        )
-        .expect_err("identity failure must restore rather than delete quarantine");
-        assert_eq!(fs::read(destination.join("owned")).unwrap(), b"owned");
-        assert!(
-            !unavailable_rollback
-                .path()
-                .join("rollback-workspace")
-                .exists()
-        );
+        fs::create_dir(&staging_recovery).unwrap();
+        rename_directory_noreplace(&staged, &published).unwrap();
+        workspace_path_identity(&published).expect("successful post-publish observation");
 
-        let mut raced_rollback = tempfile::tempdir_in(root.path()).unwrap();
-        let raced_rollback_path = raced_rollback.path().to_path_buf();
-        rollback_owned_workspace_with_identity(
-            &destination,
-            &owned_identity,
-            &mut raced_rollback,
-            |_| {
-                fs::create_dir(&destination)?;
-                fs::write(destination.join("second-race"), b"second-race")?;
-                Err(std::io::Error::other("identity unavailable"))
-            },
-        )
-        .expect_err("failed restoration must preserve quarantined state");
+        fs::rename(&published, &displaced).unwrap();
+        fs::create_dir(&published).unwrap();
+        fs::write(published.join("unrelated"), b"unrelated").unwrap();
+
+        let error = materialization_recovery_error(
+            "proof_availability_materialize_output_persist_failed",
+            MaterializationFailurePhase::AfterPublication,
+            &staging_recovery,
+            Some(&published),
+            None,
+            std::io::Error::other("injected output failure"),
+        );
+        let recovery = error
+            .downcast_ref::<MaterializationRecoveryError>()
+            .expect("typed recovery failure");
         assert_eq!(
-            fs::read(destination.join("second-race")).unwrap(),
-            b"second-race"
+            recovery.code,
+            "proof_availability_materialize_output_persist_failed"
         );
         assert_eq!(
-            fs::read(raced_rollback_path.join("rollback-workspace/owned")).unwrap(),
-            b"owned"
+            recovery.phase,
+            MaterializationFailurePhase::AfterPublication
         );
-        fs::remove_dir_all(&destination).unwrap();
-        fs::remove_dir_all(&raced_rollback_path).unwrap();
+        assert_eq!(
+            recovery.workspace_recovery_path.as_deref(),
+            Some(published.as_path())
+        );
+        assert_eq!(fs::read(published.join("unrelated")).unwrap(), b"unrelated");
+        assert_eq!(fs::read(displaced.join("owned")).unwrap(), b"owned");
     }
 
     #[test]
@@ -1530,6 +1655,7 @@ mod tests {
             "execute_observed",
             "Store::",
             "Runtime::",
+            "remove_dir_all",
         ] {
             assert!(
                 !production.contains(forbidden),
