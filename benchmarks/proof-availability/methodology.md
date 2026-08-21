@@ -9,10 +9,57 @@ translation, installed-host latency, or production negative completeness.
 
 The corpus contains 120 positive requests, 30 in each of four repository
 cohorts, 312 audited positive call steps, and 240 negative mutations. Artifact
-identity is one-way: this methodology's raw SHA-256 is stored in the canonical
-threshold document; its domain-separated canonical SHA-256 is stored in the
-corpus; the canonical corpus and threshold identities are stored in the result.
-The evaluator validates all three inputs before calculating a decision.
+identity is one-way: this methodology's raw-byte SHA-256 is stored in both the
+threshold document and corpus; the RFC 8785 canonical threshold SHA-256 is
+stored in the corpus; the RFC 8785 canonical hash of each 30-path cohort file
+is also stored in the corpus; and the canonical corpus and threshold identities
+are stored in the result. The freeze order is methodology bytes, thresholds,
+four cohort path files, then corpus. The evaluator validates the available
+bindings before calculating a decision.
+
+## Source-only curation and materialization
+
+The four repository declarations are closed: CodeStory, Vite, Flask, and Gin
+use the exact HTTPS URLs, 40-hex commits, and workspaces recorded by this
+methodology's contract registry. Each cohort file owns exactly 30 paths with
+the length distribution 10/7/5/3/3/2 and 78 positive steps. Every path retains
+its own curator, independent reviewer, review date, and source-area attribution;
+cohort audit identities are summaries and never replace the per-path audit.
+
+Selection and review use pinned source only. They do not run CodeStory indexing,
+proof, search, context, packet, Store, or runtime APIs. A positive step records
+the exact caller and target declaration ranges, the exact call-expression
+range, and the complete receipt line range. All ranges name a normalized
+project-relative file, exact file byte length, UTF-8 byte offsets, and the
+SHA-256 of that exact slice. Expression and full-line hashes are intentionally
+independent. The expression must lie within the declared line; the line includes
+LF or CRLF when present and extends to EOF only for an unterminated final line.
+
+Each positive path carries two complete executable negative specifications:
+one replaces a step target and one replaces that step's source. Each mutation
+changes only its declared typed coordinate and carries a source-audited caller,
+target, complete caller body, and `no_direct_call` finding. These negatives may
+produce only `Unknown` in production because this corpus supplies audit truth,
+not extractor-completeness receipts.
+
+`materialize --verify-only` may fetch the four fixed repositories into a new
+staging directory. It uses noninteractive exact-SHA fetches, detached clean
+checkouts, rejects `.gitmodules`, gitlinks, symlinks and untracked/non-regular
+oracle files, and hashes the raw bytes from
+`git ls-tree -r -z --full-tree <commit>` as source-tree identity. It reads each
+tracked source file once, strictly decodes UTF-8, revalidates every declaration,
+expression, receipt-line, and negative-audit range, and repeats the HEAD/clean
+fence after reads. It atomically installs the workspace and a bounded source
+environment descriptor, refuses overwrite, and never creates a cache, index,
+database, result, or proof artifact.
+
+Corpus validation bijects four references to four loaded cohort roots and
+reconciles repository declarations, source trees, canonical hashes, counts,
+length distributions, audit rows, and global totals. Within a cohort, positive
+caller-target pairs are unique, one primary caller file supplies at most six
+cases, and at least five source areas are required when the root declares that
+coverage available. No CodeStory result may influence the frozen paths,
+methodology, or thresholds.
 
 ## Statistical definitions
 

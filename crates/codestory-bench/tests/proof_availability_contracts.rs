@@ -5,85 +5,384 @@ mod contracts;
 
 use clap::Parser;
 use contracts::{
-    ActivationDecisionV1, CandidateFailureV1, CandidateGateV1, CorpusV1, FinalizationTraceV1,
+    ActivationDecisionV1, CandidateFailureV1, CandidateGateV1, ClauseClassificationV1,
+    CohortPathFileV1, CorpusV1, ExactScopeSelectorV1, ExactSymbolSelectorV1, FinalizationTraceV1,
     FunnelOutcomeV1, MAX_CANDIDATE_EDGES_PER_STEP, MAX_OBSERVED_RECEIPTS_PER_CASE,
-    ObservedReceiptV1, ProofQualificationTraceV1, QualificationSummaryV1,
+    ObservedReceiptV1, ProofContractFieldV1, ProofQualificationTraceV1, QualificationSummaryV1,
     ReceiptOracleComparisonV1, SchemaDocument, SelectorGateOutcomeV1, ThresholdsV1,
-    TransportEvidenceV1, canonical_corpus_sha256, canonical_thresholds_sha256,
+    TransportEvidenceV1, canonical_cohort_path_file_sha256, canonical_corpus_sha256,
+    canonical_thresholds_sha256,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const COMMIT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+#[test]
+fn task10a_red_path_file_is_the_closed_thirty_path_root() {
+    let schema = contracts::schema_json(SchemaDocument::Path);
+    assert_eq!(
+        schema["properties"]["schema"]["const"],
+        contracts::PATH_FILE_SCHEMA
+    );
+    assert_eq!(schema["properties"]["paths"]["minItems"], 30);
+    assert_eq!(schema["properties"]["paths"]["maxItems"], 30);
+    assert!(
+        schema["properties"]
+            .get("cohort_path_file_sha256")
+            .is_none()
+    );
+}
+
+#[test]
+fn task10a_red_corpus_identity_uses_external_path_roots() {
+    let path_file =
+        CohortPathFileV1::from_json(cohort_path_file("codestory-rust")).expect("closed path root");
+    let digest = canonical_cohort_path_file_sha256(&path_file).expect("path-file digest");
+    assert_eq!(digest.len(), 64);
+    let frozen = CorpusV1::from_json(corpus()).expect("corpus references only");
+    assert!(
+        serde_json::to_value(&frozen)
+            .unwrap()
+            .get("paths")
+            .is_none()
+    );
+}
+
+#[test]
+fn task10a_contracts_reject_translation_mutation_and_range_drift() {
+    let base = cohort_path_file("codestory-rust");
+
+    let mut quote = base.clone();
+    quote["paths"][0]["clauses"][0]["quote"] = json!("wrong");
+    assert!(CohortPathFileV1::from_json(quote).is_err());
+
+    let mut uncovered = base.clone();
+    uncovered["paths"][0]["clauses"][0]["end_byte_exclusive"] = json!(5);
+    uncovered["paths"][0]["clauses"][0]["quote"] = json!("exact");
+    assert!(CohortPathFileV1::from_json(uncovered).is_err());
+
+    let mut guarded_non_material = base.clone();
+    guarded_non_material["paths"][0]["clauses"][0]["classification"] =
+        json!({"kind":"non_material","reason":"commentary"});
+    assert!(CohortPathFileV1::from_json(guarded_non_material).is_err());
+
+    let mut missing_field = base.clone();
+    missing_field["paths"][0]["clauses"][0]["classification"]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| field["kind"] != "directness");
+    assert!(CohortPathFileV1::from_json(missing_field).is_err());
+
+    let mut out_of_range_field = base.clone();
+    out_of_range_field["paths"][0]["clauses"][0]["classification"]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind":"step_target","step":6}));
+    assert!(CohortPathFileV1::from_json(out_of_range_field).is_err());
+
+    let mut bad_path = base.clone();
+    bad_path["paths"][0]["spec"]["start"]["project_file_components"] =
+        json!(["src", "..", "escape.rs"]);
+    assert!(CohortPathFileV1::from_json(bad_path).is_err());
+
+    let mut bad_source_path = base.clone();
+    bad_source_path["paths"][0]["oracle_steps"][0]["callsite_expression"]["path"] =
+        json!("src/../escape.rs");
+    assert!(CohortPathFileV1::from_json(bad_source_path).is_err());
+
+    let mut unchanged_mutation = base.clone();
+    unchanged_mutation["paths"][0]["negative_mutations"][0]["mutated_spec"] =
+        unchanged_mutation["paths"][0]["spec"].clone();
+    assert!(CohortPathFileV1::from_json(unchanged_mutation).is_err());
+
+    let mut multi_coordinate_mutation = base.clone();
+    multi_coordinate_mutation["paths"][0]["negative_mutations"][0]["mutated_spec"]["exclude_from_projection"] =
+        json!([{"kind":"canonical_id","canonical_id":"extra"}]);
+    assert!(CohortPathFileV1::from_json(multi_coordinate_mutation).is_err());
+
+    let mut expression_outside_line = base;
+    expression_outside_line["paths"][0]["oracle_steps"][0]["callsite_expression"]["start_byte"] =
+        json!(0);
+    assert!(CohortPathFileV1::from_json(expression_outside_line).is_err());
+}
+
+#[test]
+fn task10a_cohort_and_corpus_invariants_are_derived() {
+    let mut file_cap = cohort_path_file("codestory-rust");
+    for path in file_cap["paths"].as_array_mut().unwrap().iter_mut().take(7) {
+        path["oracle_steps"][0]["caller"]["range"]["path"] = json!("src/one.rs");
+    }
+    assert!(CohortPathFileV1::from_json(file_cap).is_err());
+
+    let mut too_few_areas = cohort_path_file("codestory-rust");
+    for path in too_few_areas["paths"].as_array_mut().unwrap() {
+        path["audit"]["source_area"] = json!("one-area");
+    }
+    assert!(CohortPathFileV1::from_json(too_few_areas).is_err());
+
+    let mut unavailable_areas = cohort_path_file("codestory-rust");
+    unavailable_areas["source_area_requirement"] =
+        json!({"kind":"not_available","reason":"upstream has no stable area taxonomy"});
+    for path in unavailable_areas["paths"].as_array_mut().unwrap() {
+        path["audit"]["source_area"] = json!("unclassified");
+    }
+    CohortPathFileV1::from_json(unavailable_areas)
+        .expect("a documented unavailable source-area taxonomy is explicit");
+
+    let mut duplicate_relation = cohort_path_file("codestory-rust");
+    let path = &mut duplicate_relation["paths"][10];
+    let repeated = json!({"kind":"canonical_id","canonical_id":"repeated-relation"});
+    path["spec"]["start"] = repeated.clone();
+    path["spec"]["steps"][0]["target"] = repeated.clone();
+    path["spec"]["steps"][1]["target"] = repeated.clone();
+    for step in path["oracle_steps"].as_array_mut().unwrap() {
+        step["caller"]["selector"] = repeated.clone();
+        step["target"]["selector"] = repeated.clone();
+    }
+    let positive = path["spec"].clone();
+    let alternate_target =
+        path["negative_mutations"][0]["source_audit"]["target"]["selector"].clone();
+    let mut target_mutation = positive.clone();
+    target_mutation["steps"][0]["target"] = alternate_target;
+    path["negative_mutations"][0]["mutated_spec"] = target_mutation;
+    path["negative_mutations"][0]["source_audit"]["caller"]["selector"] = repeated.clone();
+    let alternate_source =
+        path["negative_mutations"][1]["source_audit"]["caller"]["selector"].clone();
+    let mut source_mutation = positive;
+    source_mutation["start"] = alternate_source;
+    path["negative_mutations"][1]["mutated_spec"] = source_mutation;
+    path["negative_mutations"][1]["source_audit"]["target"]["selector"] = repeated;
+    assert!(CohortPathFileV1::from_json(duplicate_relation).is_err());
+
+    let mut root_same_reviewer = cohort_path_file("codestory-rust");
+    root_same_reviewer["reviewer"] = root_same_reviewer["curator"].clone();
+    assert!(CohortPathFileV1::from_json(root_same_reviewer).is_err());
+
+    let mut child_same_reviewer = cohort_path_file("codestory-rust");
+    child_same_reviewer["paths"][0]["audit"]["reviewer"] =
+        child_same_reviewer["paths"][0]["audit"]["curator"].clone();
+    assert!(CohortPathFileV1::from_json(child_same_reviewer).is_err());
+
+    let frozen = CorpusV1::from_json(corpus()).unwrap();
+    let mut files = parsed_path_files();
+    files.pop();
+    assert!(frozen.validate_with_path_files(&files).is_err());
+    let mut files = parsed_path_files();
+    files.push(CohortPathFileV1::from_json(cohort_path_file("gin-go")).unwrap());
+    assert!(frozen.validate_with_path_files(&files).is_err());
+    let mut files = parsed_path_files();
+    files[0].source_tree_sha256 =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into();
+    assert!(frozen.validate_with_path_files(&files).is_err());
+
+    let mut files = parsed_path_files();
+    let duplicate = files[0].paths[0].case_id.clone();
+    files[1].paths[0].case_id = duplicate.clone();
+    for mutation in &mut files[1].paths[0].negative_mutations {
+        mutation.path_id = duplicate.clone();
+    }
+    let mut rebound = frozen.clone();
+    rebound.cohorts[1].path_file_sha256 = canonical_cohort_path_file_sha256(&files[1]).unwrap();
+    assert!(rebound.validate_with_path_files(&files).is_err());
+
+    let mut swapped_hashes = corpus();
+    let left = swapped_hashes["cohorts"][0]["path_file_sha256"].clone();
+    swapped_hashes["cohorts"][0]["path_file_sha256"] =
+        swapped_hashes["cohorts"][1]["path_file_sha256"].clone();
+    swapped_hashes["cohorts"][1]["path_file_sha256"] = left;
+    assert!(
+        CorpusV1::from_json(swapped_hashes)
+            .unwrap()
+            .validate_with_path_files(&parsed_path_files())
+            .is_err()
+    );
+}
+
+#[test]
+fn task10a_overlapping_resolved_anchors_and_individual_audits_are_legal() {
+    let mut value = cohort_path_file("codestory-rust");
+    let source = value["paths"][0]["source_text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    value["paths"][0]["clauses"].as_array_mut().unwrap().push(json!({
+        "clause_id":"overlap","start_byte":6,"end_byte_exclusive":12,
+        "quote":&source[6..12],"classification":{"kind":"resolved_material","fields":[{"kind":"directness","step":0}]}
+    }));
+    value["paths"][0]["clauses"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "clause_id":"overlap-non-material","start_byte":6,"end_byte_exclusive":12,
+            "quote":&source[6..12],"classification":{"kind":"non_material","reason":"commentary"}
+        }));
+    value["paths"][0]["audit"]["curator"] = json!("different-curator@example.invalid");
+    CohortPathFileV1::from_json(value).expect("overlap and per-path audit identity remain legal");
+}
+
+#[test]
+fn task10a_wire_mirrors_keep_all_dark_selector_classification_and_field_variants_closed() {
+    for selector in [
+        json!({"kind":"pinned_node","project_id":"p","core_generation_id":"g","core_run_id":"r","node_id":"1"}),
+        json!({"kind":"canonical_id","canonical_id":"canonical"}),
+        json!({"kind":"qualified_name","qualified_name":"crate::item","project_file_components":["src","lib.rs"]}),
+    ] {
+        serde_json::from_value::<ExactSymbolSelectorV1>(selector.clone()).unwrap();
+        serde_json::from_value::<ExactScopeSelectorV1>(selector).unwrap();
+    }
+    for classification in [
+        json!({"kind":"resolved_material","fields":[{"kind":"start"}]}),
+        json!({"kind":"unresolved_material","reason":"unsupported_interpretation"}),
+        json!({"kind":"non_material","reason":"connector"}),
+    ] {
+        serde_json::from_value::<ClauseClassificationV1>(classification).unwrap();
+    }
+    for field in [
+        json!({"kind":"start"}),
+        json!({"kind":"step_target","step":0}),
+        json!({"kind":"directness","step":0}),
+        json!({"kind":"ordering","step":0}),
+        json!({"kind":"relation","step":0}),
+        json!({"kind":"traversal_prohibition","index":0}),
+        json!({"kind":"projection_exclusion","index":0}),
+    ] {
+        serde_json::from_value::<ProofContractFieldV1>(field).unwrap();
+    }
+}
+
 fn range(start: u64, end: u64) -> Value {
     json!({"path":"src/lib.rs","start_byte":start,"end_byte":end,"file_byte_length":4096,"sha256":SHA})
 }
 
-fn path(case_id: &str, cohort: &str, step_count: u8) -> Value {
+fn range_at(path: &str, start: u64, end: u64) -> Value {
+    json!({"path":path,"start_byte":start,"end_byte":end,"file_byte_length":4096,"sha256":SHA})
+}
+
+fn selector(symbol: &str, path: &str) -> Value {
+    json!({"kind":"qualified_name","qualified_name":symbol,"project_file_components":path.split('/').collect::<Vec<_>>()})
+}
+
+fn declaration(symbol: &str, path: &str, start: u64, end: u64) -> Value {
+    json!({"symbol":symbol,"selector":selector(symbol,path),"range":range_at(path,start,end)})
+}
+
+fn path(case_id: &str, step_count: u8, ordinal: usize) -> Value {
+    let source_path = format!("src/area{}/file{}.rs", ordinal % 5, ordinal % 5);
+    let start_symbol = format!("{case_id}::start");
     let oracle_steps = (0..step_count)
         .map(|index| {
             let start = u64::from(index) * 40;
             let caller_symbol = if index == 0 {
-                "crate::start".to_owned()
+                start_symbol.clone()
             } else {
-                format!("crate::target_{}", index - 1)
+                format!("{case_id}::target_{}", index - 1)
             };
-            let caller_range = if index == 0 {
-                range(0, 10)
-            } else {
-                range(start - 20, start - 8)
-            };
+            let caller_start = if index == 0 { 0 } else { start - 20 };
+            let caller_end = if index == 0 { 10 } else { start - 8 };
             json!({
-              "caller":{"symbol":caller_symbol,"range":caller_range},
+              "caller":declaration(&caller_symbol,&source_path,caller_start,caller_end),
               "callsite_line":index + 1,
-              "callsite":range(start + 11, start + 19),
-              "target":{"symbol":format!("crate::target_{index}"),"range":range(start + 20, start + 32)}
+              "callsite_expression":range_at(&source_path,start + 12,start + 18),
+              "receipt_line_window":range_at(&source_path,start + 11,start + 19),
+              "target":declaration(&format!("{case_id}::target_{index}"),&source_path,start + 20,start + 32)
             })
         })
         .collect::<Vec<_>>();
-    let targets = (0..step_count)
-        .map(|index| format!("crate::target_{index}"))
+    let steps = (0..step_count)
+        .map(|index| json!({"target":selector(&format!("{case_id}::target_{index}"),&source_path)}))
         .collect::<Vec<_>>();
+    let spec = json!({
+        "start":selector(&start_symbol,&source_path),
+        "steps":steps,
+        "prohibit_traversal_through":[],
+        "exclude_from_projection":[]
+    });
+    let mut fields = vec![json!({"kind":"start"})];
+    for step in 0..step_count {
+        for kind in ["step_target", "directness", "ordering", "relation"] {
+            fields.push(json!({"kind":kind,"step":step}));
+        }
+    }
+    let source_text = "exact direct ordered call path";
+    let alternate_target = format!("{case_id}::absent_target");
+    let alternate_source = format!("{case_id}::absent_source");
+    let mut target_spec = spec.clone();
+    target_spec["steps"][0]["target"] = selector(&alternate_target, &source_path);
+    let mut source_spec = spec.clone();
+    source_spec["start"] = selector(&alternate_source, &source_path);
+    let first_target = format!("{case_id}::target_0");
     json!({
-      "schema":"codestory.proof-availability-path/v1", "case_id":case_id, "repository_id":cohort, "language":"rust", "source_text":"exact direct ordered call path",
-      "clauses":[{"clause_id":"c1","text":"start calls target","range":range(0,20)}],
-      "spec":{"start":"crate::start","targets":targets,"expected_step_count":step_count},
+      "case_id":case_id, "language":"rust", "source_text":source_text,
+      "clauses":[{"clause_id":"c1","start_byte":0,"end_byte_exclusive":source_text.len(),"quote":source_text,"classification":{"kind":"resolved_material","fields":fields}}],
+      "spec":spec,
       "oracle_steps":oracle_steps,
       "negative_mutations":[
-        {"mutation_id":format!("{case_id}-missing"),"path_id":case_id,"kind":"remove_expected_relation","step_index":0,"caller":"crate::start","target":"crate::target_0"},
-        {"mutation_id":format!("{case_id}-ambiguous"),"path_id":case_id,"kind":"add_ambiguous_relation","step_index":0,"caller":"crate::start","target":"crate::target_0"}],
-      "audit":{"cohort_path_file":format!("paths/{cohort}.json"),"cohort_path_file_sha256":SHA,"source_tree_sha256":SHA,"source_area":"runtime","curator":"curator@example.invalid","reviewer":"reviewer@example.invalid","review_date":"2026-08-21"}
+        {"mutation_id":format!("{case_id}-target"),"path_id":case_id,"kind":"replace_step_target","step_index":0,"mutated_spec":target_spec,"source_audit":{"caller":declaration(&start_symbol,&source_path,0,10),"target":declaration(&alternate_target,&source_path,300,312),"caller_body":range_at(&source_path,0,320),"finding":"no_direct_call"}},
+        {"mutation_id":format!("{case_id}-source"),"path_id":case_id,"kind":"replace_step_source","step_index":0,"mutated_spec":source_spec,"source_audit":{"caller":declaration(&alternate_source,&source_path,320,332),"target":declaration(&first_target,&source_path,20,32),"caller_body":range_at(&source_path,300,360),"finding":"no_direct_call"}}],
+      "audit":{"source_area":format!("area-{}",ordinal % 5),"curator":"path-curator@example.invalid","reviewer":"path-reviewer@example.invalid","review_date":"2026-08-21"}
     })
 }
 
-fn corpus() -> Value {
-    let ids = ["codestory-rust", "vite-ts-js", "flask-python", "gin-go"];
-    // Thirty paths and 78 steps per cohort; across four cohorts this is the
-    // frozen 120-path / 312-step / 240-mutation corpus.
-    let lengths = [10u8, 7, 5, 3, 3, 2];
-    let paths = ids
+fn registry(id: &str) -> (&'static str, &'static str, &'static str) {
+    contracts::QUALIFICATION_REPOSITORIES
         .iter()
-        .flat_map(|id| {
-            lengths.iter().enumerate().flat_map(move |(length, count)| {
-                (0..*count).map(move |index| {
-                    path(
-                        &format!("{id}-l{}-{index}", length + 1),
-                        id,
-                        (length + 1) as u8,
-                    )
-                })
-            })
+        .find(|entry| entry.0 == id)
+        .map(|entry| (entry.1, entry.2, entry.3))
+        .expect("registry id")
+}
+
+fn cohort_path_file(id: &str) -> Value {
+    let (repository, commit, workspace) = registry(id);
+    let lengths = [10u8, 7, 5, 3, 3, 2];
+    let mut ordinal = 0usize;
+    let paths = lengths
+        .iter()
+        .enumerate()
+        .flat_map(|(length, count)| (0..*count).map(move |index| (length, index)))
+        .map(|(length, index)| {
+            let value = path(
+                &format!("{id}-l{}-{index}", length + 1),
+                (length + 1) as u8,
+                ordinal,
+            );
+            ordinal += 1;
+            value
         })
         .collect::<Vec<_>>();
+    json!({
+        "schema":contracts::PATH_FILE_SCHEMA,"repository_id":id,"repository":repository,
+        "commit":commit,"workspace":workspace,"source_tree_sha256":SHA,
+        "curator":"cohort-curator@example.invalid","reviewer":"cohort-reviewer@example.invalid","review_date":"2026-08-21",
+        "source_area_requirement":{"kind":"required_at_least_five"},"paths":paths
+    })
+}
+
+fn path_files() -> Vec<Value> {
+    ["codestory-rust", "vite-ts-js", "flask-python", "gin-go"]
+        .into_iter()
+        .map(cohort_path_file)
+        .collect()
+}
+
+fn parsed_path_files() -> Vec<CohortPathFileV1> {
+    path_files()
+        .into_iter()
+        .map(|value| CohortPathFileV1::from_json(value).expect("path file"))
+        .collect()
+}
+
+fn corpus() -> Value {
+    let files = parsed_path_files();
     let threshold_hash =
         canonical_thresholds_sha256(&ThresholdsV1::from_json(thresholds()).expect("thresholds"))
             .expect("canonical thresholds hash");
     json!({
       "schema":"codestory.proof-availability-corpus/v1","corpus_id":"proof-availability-v1","thresholds_sha256":threshold_hash,"methodology_sha256":SHA,"curator":"curator@example.invalid","reviewer":"reviewer@example.invalid","review_date":"2026-08-21",
-      "cohorts":ids.iter().map(|id|json!({"repository_id":id,"repository":format!("https://example.invalid/{id}.git"),"commit":COMMIT,"workspace":".","path_file":format!("paths/{id}.json"),"path_file_sha256":SHA,"source_tree_sha256":SHA,"path_count":30,"positive_step_count":78})).collect::<Vec<_>>(),
-      "paths":paths,"positive_request_count":120,"positive_step_count":312,"negative_request_count":240
+      "cohorts":files.iter().map(|file|json!({"repository_id":file.repository_id,"repository":file.repository,"commit":file.commit,"workspace":file.workspace,"path_file":format!("paths/{}.json",file.repository_id),"path_file_sha256":canonical_cohort_path_file_sha256(file).unwrap(),"source_tree_sha256":file.source_tree_sha256,"path_count":30,"positive_step_count":78,"path_length_distribution":[{"path_length":1,"path_count":10},{"path_length":2,"path_count":7},{"path_length":3,"path_count":5},{"path_length":4,"path_count":3},{"path_length":5,"path_count":3},{"path_length":6,"path_count":2}]})).collect::<Vec<_>>(),
+      "positive_request_count":120,"positive_step_count":312,"negative_request_count":240
     })
 }
 
@@ -108,6 +407,7 @@ fn thresholds() -> Value {
 
 fn report() -> Value {
     let frozen = corpus();
+    let files = path_files();
     let threshold_hash = frozen["thresholds_sha256"]
         .as_str()
         .expect("threshold hash")
@@ -121,15 +421,23 @@ fn report() -> Value {
         .iter()
         .map(|cohort| cohort["repository_id"].as_str().expect("repository id"))
         .collect::<Vec<_>>();
-    let cases = frozen["paths"]
-        .as_array()
-        .expect("paths")
+    let oracle_cases = files
         .iter()
+        .flat_map(|file| {
+            let repository_id = file["repository_id"].as_str().expect("repository id");
+            file["paths"]
+                .as_array()
+                .expect("paths")
+                .iter()
+                .map(move |path| (repository_id, path))
+        })
+        .collect::<Vec<_>>();
+    let cases = oracle_cases
+        .into_iter()
         .enumerate()
-        .map(|(case_index, path)| {
-            let attempted = path["spec"]["expected_step_count"].as_u64().expect("step count");
+        .map(|(case_index, (repository_id, path))| {
+            let attempted = path["spec"]["steps"].as_array().expect("steps").len() as u64;
             let case_id = path["case_id"].as_str().expect("case id");
-            let repository_id = path["repository_id"].as_str().expect("repository id");
             let project_id = format!("project-{repository_id}");
             let core_generation_id = format!("generation-{repository_id}");
             let core_run_id = format!("run-{repository_id}");
@@ -152,9 +460,16 @@ fn report() -> Value {
                 .map(|(step_index, step)| {
                     let edge_id = i64::try_from(case_index * 10 + step_index + 1)
                         .expect("fixture edge id");
-                    let callsite = &step["callsite"];
+                    let callsite = &step["receipt_line_window"];
                     let start = callsite["start_byte"].as_u64().expect("callsite start");
                     let end = callsite["end_byte"].as_u64().expect("callsite end");
+                    let source_path = callsite["path"].as_str().expect("source path");
+                    let oracle_step = json!({
+                        "caller_symbol":step["caller"]["symbol"],
+                        "callsite_line":step["callsite_line"],
+                        "receipt_line_window":step["receipt_line_window"],
+                        "target_symbol":step["target"]["symbol"]
+                    });
                     let source_node_id = -(i64::try_from(step_index).expect("step index") + 1);
                     let target_node_id = source_node_id - 1;
                     json!({
@@ -165,13 +480,13 @@ fn report() -> Value {
                             "pinned":{"project_id":project_id,"core_generation_id":core_generation_id,"core_run_id":core_run_id,"node_id":source_node_id.to_string()},
                             "canonical_id":format!("canonical-{case_index}-{source_node_id}"),
                             "qualified_name":step["caller"]["symbol"],
-                            "project_file_components":["src","lib.rs"]
+                            "project_file_components":source_path.split('/').collect::<Vec<_>>()
                         },
                         "target":{
                             "pinned":{"project_id":project_id,"core_generation_id":core_generation_id,"core_run_id":core_run_id,"node_id":target_node_id.to_string()},
                             "canonical_id":format!("canonical-{case_index}-{target_node_id}"),
                             "qualified_name":step["target"]["symbol"],
-                            "project_file_components":["src","lib.rs"]
+                            "project_file_components":source_path.split('/').collect::<Vec<_>>()
                         },
                         "certainty":"certain",
                         "callsite_identity":format!("{file_node_id}:{}:0:{target_node_id}|fixture", step_index + 1),
@@ -179,14 +494,14 @@ fn report() -> Value {
                         "containment":{"file_node_id":file_node_id,"owner_node_id":source_node_id,"start_line":1,"end_line":attempted},
                         "line_window":{
                             "kind":"indexed_line_v1",
-                            "project_file_components":["src","lib.rs"],
+                            "project_file_components":source_path.split('/').collect::<Vec<_>>(),
                             "byte_start":start,
                             "byte_end":end,
                             "indexed_sha256":SHA,
                             "observed_sha256":SHA,
                             "text":"call();\n"
                         },
-                        "oracle_comparison":{"kind":"exact","oracle_step_index":step_index,"oracle_step":step}
+                        "oracle_comparison":{"kind":"exact","oracle_step_index":step_index,"oracle_step":oracle_step}
                     })
                 })
                 .collect::<Vec<_>>();
@@ -206,8 +521,7 @@ fn report() -> Value {
                     "path_id":mutation["path_id"],
                     "kind":mutation["kind"],
                     "step_index":mutation["step_index"],
-                    "caller":mutation["caller"],
-                    "target":mutation["target"],
+                    "mutated_spec":mutation["mutated_spec"],
                     "contract_proven":false
                 }))
                 .collect::<Vec<_>>();
@@ -233,7 +547,7 @@ fn report() -> Value {
     json!({
       "schema":"codestory.proof-availability-report/v1","qualification_id":"20260821T000000Z-0123456789ab",
       "provenance":{"source_commit":COMMIT,"source_tree":COMMIT,"binary_sha256":SHA,"corpus_sha256":corpus_hash,"thresholds_sha256":threshold_hash,"results_sha256":SHA},
-      "environment":{"environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"projects":cohort_ids.iter().map(|id|json!({"repository_id":id,"source_head":COMMIT,"source_tree":SHA,"store_schema":"codestory-store/v1","file_count":10,"node_count":20,"edge_count":30,"freshness":"fresh","database_sha256":SHA,"core_generation":1,"identity":{"project_id":format!("project-{id}"),"core_generation_id":format!("generation-{id}"),"core_run_id":format!("run-{id}")}})).collect::<Vec<_>>()},
+      "environment":{"environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"projects":frozen["cohorts"].as_array().unwrap().iter().map(|cohort|{let id=cohort["repository_id"].as_str().unwrap();json!({"repository_id":id,"source_head":cohort["commit"],"source_tree":SHA,"store_schema":"codestory-store/v1","file_count":10,"node_count":20,"edge_count":30,"freshness":"fresh","database_sha256":SHA,"core_generation":1,"identity":{"project_id":format!("project-{id}"),"core_generation_id":format!("generation-{id}"),"core_run_id":format!("run-{id}")}})}).collect::<Vec<_>>()},
       "inventory":cohort_ids.iter().map(|id|json!({"repository_id":id,"stored_call_rows":"10","effective_endpoint_rows":"10","exact_resolved_rows":"8","admitted_rows":"7","unresolved_placeholder_rows":"2"})).collect::<Vec<_>>(),
       "trails":cohort_ids.iter().map(|id|json!({"repository_id":id,"lengths":[{"length":1,"effective_endpoint":"10","exact_resolved":"8","strictly_admitted":"7"},{"length":2,"effective_endpoint":"9","exact_resolved":"7","strictly_admitted":"6"},{"length":3,"effective_endpoint":"8","exact_resolved":"6","strictly_admitted":"5"},{"length":4,"effective_endpoint":"7","exact_resolved":"5","strictly_admitted":"4"},{"length":5,"effective_endpoint":"6","exact_resolved":"4","strictly_admitted":"3"},{"length":6,"effective_endpoint":"5","exact_resolved":"3","strictly_admitted":"2"}]})).collect::<Vec<_>>(),
       "cases":cases,
@@ -275,28 +589,31 @@ fn rebuild_funnel(value: &mut Value) {
 
 #[test]
 fn frozen_corpus_has_all_oracle_freeze_inputs_and_rejects_semantic_violations() {
-    CorpusV1::from_json(corpus()).expect("maximal frozen corpus");
+    let frozen = CorpusV1::from_json(corpus()).expect("maximal frozen corpus");
+    frozen
+        .validate_with_path_files(&parsed_path_files())
+        .expect("four bound path roots");
     let mut unknown = corpus();
     unknown["unknown"] = json!(true);
     assert!(CorpusV1::from_json(unknown).is_err());
     let mut commit = corpus();
     commit["cohorts"][0]["commit"] = json!("abc");
     assert!(CorpusV1::from_json(commit).is_err());
-    let mut hash = corpus();
-    hash["paths"][0]["oracle_steps"][0]["callsite"]["sha256"] = json!("");
-    assert!(CorpusV1::from_json(hash).is_err());
-    let mut mutations = corpus();
+    let mut hash = cohort_path_file("codestory-rust");
+    hash["paths"][0]["oracle_steps"][0]["receipt_line_window"]["sha256"] = json!("");
+    assert!(CohortPathFileV1::from_json(hash).is_err());
+    let mut mutations = cohort_path_file("codestory-rust");
     mutations["paths"][0]["negative_mutations"]
         .as_array_mut()
         .unwrap()
         .pop();
-    assert!(CorpusV1::from_json(mutations).is_err());
-    let mut missing_path = corpus();
+    assert!(CohortPathFileV1::from_json(mutations).is_err());
+    let mut missing_path = cohort_path_file("codestory-rust");
     missing_path["paths"].as_array_mut().unwrap().pop();
-    assert!(CorpusV1::from_json(missing_path).is_err());
-    let mut duplicate_kind = corpus();
-    duplicate_kind["paths"][0]["negative_mutations"][1]["kind"] = json!("remove_expected_relation");
-    assert!(CorpusV1::from_json(duplicate_kind).is_err());
+    assert!(CohortPathFileV1::from_json(missing_path).is_err());
+    let mut duplicate_kind = cohort_path_file("codestory-rust");
+    duplicate_kind["paths"][0]["negative_mutations"][1]["kind"] = json!("replace_step_target");
+    assert!(CohortPathFileV1::from_json(duplicate_kind).is_err());
 }
 
 #[test]
@@ -346,6 +663,45 @@ fn threshold_identity_is_acyclic_canonical_and_rejects_legacy_corpus_binding() {
 }
 
 #[test]
+fn task10a_refreeze_binds_methodology_thresholds_and_future_corpus() {
+    let methodology = include_bytes!("../../../benchmarks/proof-availability/methodology.md");
+    let threshold_bytes =
+        include_bytes!("../../../benchmarks/proof-availability/thresholds-v1.json");
+    let thresholds = ThresholdsV1::from_json(serde_json::from_slice(threshold_bytes).unwrap())
+        .expect("checked thresholds");
+    let methodology_sha = format!("{:x}", Sha256::digest(methodology));
+    assert_eq!(methodology_sha, thresholds.methodology_sha256);
+    assert_eq!(
+        methodology_sha,
+        "10b00e7073847b024ac23e07242b15f14c42b30d2da5839a7650b7f533dcc43a"
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(threshold_bytes)),
+        "4cd6ce4e8cdd684ccb17b2b354a00fe424c1b7e773407631e52b678593fdc16a"
+    );
+    assert_eq!(
+        canonical_thresholds_sha256(&thresholds).unwrap(),
+        "0e2a174d93284670b7aefb7ce6f015d3e1adeda2f2d2b64c057e7e57a338c7a2"
+    );
+
+    let mut future = corpus();
+    future["thresholds_sha256"] = json!(canonical_thresholds_sha256(&thresholds).unwrap());
+    future["methodology_sha256"] = json!(methodology_sha);
+    let future = CorpusV1::from_json(future).unwrap();
+    future.validate_against_thresholds(&thresholds).unwrap();
+
+    let mut changed_methodology = methodology.to_vec();
+    changed_methodology.push(b'\n');
+    let mut changed = thresholds.clone();
+    changed.methodology_sha256 = format!("{:x}", Sha256::digest(&changed_methodology));
+    assert_ne!(
+        canonical_thresholds_sha256(&thresholds).unwrap(),
+        canonical_thresholds_sha256(&changed).unwrap()
+    );
+    assert!(future.validate_against_thresholds(&changed).is_err());
+}
+
+#[test]
 fn canonical_artifact_seam_uses_rfc8785_number_and_utf16_semantics() {
     let numeric = codestory_agent::proof_qualification_support::canonical_json_bytes(
         &json!({"n": 9_007_199_254_740_993u64}),
@@ -367,19 +723,44 @@ fn canonical_artifact_seam_uses_rfc8785_number_and_utf16_semantics() {
         "{\"\u{10000}\":1,\"\u{e000}\":2}"
     );
 
-    let mut rounded_down = corpus();
-    rounded_down["paths"][0]["oracle_steps"][0]["callsite"]["file_byte_length"] =
+    let mut rounded_down = cohort_path_file("codestory-rust");
+    rounded_down["paths"][0]["oracle_steps"][0]["callsite_expression"]["file_byte_length"] =
         json!(9_007_199_254_740_992u64);
-    let rounded_down = CorpusV1::from_json(rounded_down).expect("safe-integer corpus");
-    let mut rounded_from_unsafe = corpus();
-    rounded_from_unsafe["paths"][0]["oracle_steps"][0]["callsite"]["file_byte_length"] =
+    rounded_down["paths"][0]["oracle_steps"][0]["receipt_line_window"]["file_byte_length"] =
+        json!(9_007_199_254_740_992u64);
+    let rounded_down = CohortPathFileV1::from_json(rounded_down).expect("safe-integer path file");
+    let mut rounded_from_unsafe = cohort_path_file("codestory-rust");
+    rounded_from_unsafe["paths"][0]["oracle_steps"][0]["callsite_expression"]["file_byte_length"] =
+        json!(9_007_199_254_740_993u64);
+    rounded_from_unsafe["paths"][0]["oracle_steps"][0]["receipt_line_window"]["file_byte_length"] =
         json!(9_007_199_254_740_993u64);
     let rounded_from_unsafe =
-        CorpusV1::from_json(rounded_from_unsafe).expect("unsafe-integer corpus");
+        CohortPathFileV1::from_json(rounded_from_unsafe).expect("unsafe-integer path file");
     assert_eq!(
-        canonical_corpus_sha256(&rounded_down).expect("safe-integer digest"),
-        canonical_corpus_sha256(&rounded_from_unsafe).expect("rounded digest"),
+        canonical_cohort_path_file_sha256(&rounded_down).expect("safe-integer digest"),
+        canonical_cohort_path_file_sha256(&rounded_from_unsafe).expect("rounded digest"),
         "artifact identity must use the same RFC 8785 number semantics as the sealed seam"
+    );
+}
+
+#[test]
+fn cohort_path_file_identity_is_order_stable_and_semantically_sensitive() {
+    let path_file =
+        CohortPathFileV1::from_json(cohort_path_file("codestory-rust")).expect("path file");
+    let baseline = canonical_cohort_path_file_sha256(&path_file).unwrap();
+    let reparsed: CohortPathFileV1 = serde_json::from_str(
+        &serde_json::to_string_pretty(&serde_json::to_value(&path_file).unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        baseline,
+        canonical_cohort_path_file_sha256(&reparsed).unwrap()
+    );
+    let mut changed = path_file;
+    changed.paths[0].audit.curator = "another-curator@example.invalid".into();
+    assert_ne!(
+        baseline,
+        canonical_cohort_path_file_sha256(&changed).unwrap()
     );
 }
 
@@ -437,7 +818,8 @@ fn threshold_corpus_summary_digest_dag_rejects_stale_or_mismatched_inputs() {
         .expect_err("declared counts must agree");
 
     let mut altered_corpus = corpus();
-    altered_corpus["paths"][0]["source_text"] = json!("altered but valid source text");
+    altered_corpus["cohorts"][0]["path_file_sha256"] =
+        json!("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
     let altered_corpus = CorpusV1::from_json(altered_corpus).expect("altered valid corpus");
     QualificationSummaryV1::from_json(report())
         .expect("summary")
@@ -523,13 +905,20 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
     let maximal = report();
     let parsed = QualificationSummaryV1::from_json(maximal.clone()).expect("maximal report");
     parsed
-        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
+        .validate_against_oracle(
+            &CorpusV1::from_json(corpus()).expect("frozen corpus"),
+            &parsed_path_files(),
+        )
         .expect("report binds all corpus evidence");
     let mut wrong_mutation_binding = report();
-    wrong_mutation_binding["cases"][0]["negative_mutations"][0]["target"] = json!("wrong");
+    wrong_mutation_binding["cases"][0]["negative_mutations"][0]["mutated_spec"]["steps"][0]["target"] =
+        selector("wrong::target", "src/area0/file0.rs");
     QualificationSummaryV1::from_json(wrong_mutation_binding)
         .expect("summary retains mutation evidence before corpus binding")
-        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
+        .validate_against_oracle(
+            &CorpusV1::from_json(corpus()).expect("frozen corpus"),
+            &parsed_path_files(),
+        )
         .expect_err("corpus binding rejects altered mutation evidence");
     let mut wrong_corpus_hash = report();
     wrong_corpus_hash["provenance"]["corpus_sha256"] = json!(SHA);
@@ -585,9 +974,20 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
 
 #[test]
 fn closed_contracts_reject_hostile_nested_shapes() {
-    let mut too_many_steps = corpus();
-    too_many_steps["paths"][0]["spec"]["expected_step_count"] = json!(7);
-    assert!(CorpusV1::from_json(too_many_steps).is_err());
+    let mut too_many_steps = cohort_path_file("codestory-rust");
+    let extra = too_many_steps["paths"][0]["spec"]["steps"][0].clone();
+    while too_many_steps["paths"][0]["spec"]["steps"]
+        .as_array()
+        .unwrap()
+        .len()
+        < 7
+    {
+        too_many_steps["paths"][0]["spec"]["steps"]
+            .as_array_mut()
+            .unwrap()
+            .push(extra.clone());
+    }
+    assert!(CohortPathFileV1::from_json(too_many_steps).is_err());
 
     let mut invalid_trace = report();
     invalid_trace["cases"][0]["proof_trace"]["steps"][0]["outcome"] = json!({
@@ -705,9 +1105,10 @@ fn closed_contracts_reject_hostile_nested_shapes() {
 
 #[test]
 fn producer_mapping_red_requires_ordered_oracles_and_lossless_task4_errors() {
-    let mut wrong_target_order = corpus();
-    wrong_target_order["paths"][0]["spec"]["targets"] = json!(["crate::wrong_target"]);
-    assert!(CorpusV1::from_json(wrong_target_order).is_err());
+    let mut wrong_target_order = cohort_path_file("codestory-rust");
+    wrong_target_order["paths"][0]["spec"]["steps"][0]["target"] =
+        selector("crate::wrong_target", "src/area0/file0.rs");
+    assert!(CohortPathFileV1::from_json(wrong_target_order).is_err());
 
     let mut task4_serialization = report();
     task4_serialization["cases"][0]["transport"] = json!({
@@ -774,19 +1175,23 @@ fn invariant_table_exhausts_task4_task6_and_corpus_variants() {
             .expect("every finalization failure maps losslessly");
     }
 
-    let mut wrong_chain = corpus();
+    let mut wrong_chain = cohort_path_file("codestory-rust");
     wrong_chain["paths"][10]["oracle_steps"][1]["caller"]["symbol"] = json!("broken");
-    assert!(CorpusV1::from_json(wrong_chain).is_err());
-    let mut wrong_target_count = corpus();
-    wrong_target_count["paths"][0]["spec"]["targets"] =
-        json!(["crate::target_0", "crate::target_1"]);
-    assert!(CorpusV1::from_json(wrong_target_count).is_err());
-    let mut wrong_mutation = corpus();
+    wrong_chain["paths"][10]["oracle_steps"][1]["caller"]["selector"] =
+        selector("broken", "src/area0/file0.rs");
+    assert!(CohortPathFileV1::from_json(wrong_chain).is_err());
+    let mut wrong_target_count = cohort_path_file("codestory-rust");
+    wrong_target_count["paths"][0]["spec"]["steps"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"target":selector("extra::target", "src/area0/file0.rs")}));
+    assert!(CohortPathFileV1::from_json(wrong_target_count).is_err());
+    let mut wrong_mutation = cohort_path_file("codestory-rust");
     wrong_mutation["paths"][0]["negative_mutations"][0]["path_id"] = json!("other");
-    assert!(CorpusV1::from_json(wrong_mutation).is_err());
-    let mut wrong_range = corpus();
-    wrong_range["paths"][0]["oracle_steps"][0]["callsite"]["end_byte"] = json!(4097);
-    assert!(CorpusV1::from_json(wrong_range).is_err());
+    assert!(CohortPathFileV1::from_json(wrong_mutation).is_err());
+    let mut wrong_range = cohort_path_file("codestory-rust");
+    wrong_range["paths"][0]["oracle_steps"][0]["receipt_line_window"]["end_byte"] = json!(4097);
+    assert!(CohortPathFileV1::from_json(wrong_range).is_err());
 }
 
 #[test]
@@ -947,15 +1352,15 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         },
         canonical_id: format!("canonical-{node_id}"),
         qualified_name: qualified_name.into(),
-        project_file_components: vec!["src".into(), "lib.rs".into()],
+        project_file_components: vec!["src".into(), "area0".into(), "file0.rs".into()],
     };
     let task6_receipt = IndexedCallEdgeReceipt {
         receipt: ReceiptRef {
             receipt_id: "indexed-call-edge:fixture".into(),
             edge_id: "-42".into(),
         },
-        source: identity("-1", "crate::start"),
-        target: identity("-2", "crate::target_0"),
+        source: identity("-1", "codestory-rust-l1-0::start"),
+        target: identity("-2", "codestory-rust-l1-0::target_0"),
         certainty: ResolutionCertainty::Certain,
         callsite_identity: "-3:1:0:-2|fixture".into(),
         containment: CallableContainmentEvidence {
@@ -966,7 +1371,7 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         },
         line_window: IndexedLineWindow {
             kind: "indexed_line_v1",
-            project_file_components: vec!["src".into(), "lib.rs".into()],
+            project_file_components: vec!["src".into(), "area0".into(), "file0.rs".into()],
             indexed_sha256: SHA.into(),
             observed_sha256: SHA.into(),
             anchor_line: 1,
@@ -989,8 +1394,11 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
     assert_eq!(observed.source.pinned.core_run_id, "run");
     assert_eq!(observed.source.pinned.node_id, "-1");
     assert_eq!(observed.source.canonical_id, "canonical--1");
-    assert_eq!(observed.source.qualified_name, "crate::start");
-    assert_eq!(observed.source.project_file_components, ["src", "lib.rs"]);
+    assert_eq!(observed.source.qualified_name, "codestory-rust-l1-0::start");
+    assert_eq!(
+        observed.source.project_file_components,
+        ["src", "area0", "file0.rs"]
+    );
     assert_eq!(observed.callsite_line, 1);
     assert_eq!(observed.callsite_identity, "-3:1:0:-2|fixture");
     assert_eq!(observed.certainty, contracts::ReceiptCertaintyV1::Certain);
@@ -1004,8 +1412,14 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
     assert_eq!(observed.target.pinned.core_run_id, "run");
     assert_eq!(observed.target.pinned.node_id, "-2");
     assert_eq!(observed.target.canonical_id, "canonical--2");
-    assert_eq!(observed.target.qualified_name, "crate::target_0");
-    assert_eq!(observed.target.project_file_components, ["src", "lib.rs"]);
+    assert_eq!(
+        observed.target.qualified_name,
+        "codestory-rust-l1-0::target_0"
+    );
+    assert_eq!(
+        observed.target.project_file_components,
+        ["src", "area0", "file0.rs"]
+    );
 
     let mut probable = task6_receipt;
     probable.certainty = ResolutionCertainty::Probable;
@@ -1167,12 +1581,8 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
         "codestory.proof-availability-corpus/v1"
     );
     assert_eq!(
-        contracts::schema_json(SchemaDocument::Path)["properties"]["negative_mutations"]["minItems"],
-        2
-    );
-    assert_eq!(
-        contracts::schema_json(SchemaDocument::Corpus)["properties"]["paths"]["minItems"],
-        120
+        contracts::schema_json(SchemaDocument::Path)["properties"]["paths"]["minItems"],
+        30
     );
     assert_eq!(
         contracts::schema_json(SchemaDocument::Thresholds)["$defs"]["RoleThresholdsV1"]["properties"]
@@ -1180,9 +1590,19 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
         1000
     );
     assert_eq!(
-        contracts::schema_json(SchemaDocument::Path)["$defs"]["CallPathSpecV1"]["properties"]["targets"]
+        contracts::schema_json(SchemaDocument::Path)["$defs"]["CallPathSpecV1"]["properties"]["steps"]
             ["maxItems"],
         6
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Path)["$defs"]["ProofContractFieldV1"]["oneOf"][1]["properties"]
+            ["step"]["maximum"],
+        5
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Path)["$defs"]["ProofContractFieldV1"]["oneOf"][5]["properties"]
+            ["index"]["maximum"],
+        5
     );
     assert_eq!(
         contracts::schema_json(SchemaDocument::Report)["$defs"]["FailureFunnelReportV1"]["properties"]
@@ -1573,16 +1993,22 @@ fn missing_oracle_steps_are_separate_exact_rows() {
     QualificationSummaryV1::from_json(omitted)
         .expect_err("an uncovered oracle step requires separate missing evidence");
     let mut wrong_oracle = value.clone();
-    wrong_oracle["cases"][0]["receipt_evidence"]["missing_oracle_steps"][0]["oracle_step"]["target"]
-        ["symbol"] = json!("crate::wrong_target");
+    wrong_oracle["cases"][0]["receipt_evidence"]["missing_oracle_steps"][0]["oracle_step"]["target_symbol"] =
+        json!("crate::wrong_target");
     QualificationSummaryV1::from_json(wrong_oracle)
         .expect("missing row is structurally closed")
-        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("corpus"))
+        .validate_against_oracle(
+            &CorpusV1::from_json(corpus()).expect("corpus"),
+            &parsed_path_files(),
+        )
         .expect_err("missing row must carry the exact frozen oracle data");
 
     let parsed = QualificationSummaryV1::from_json(value).expect("separate missing oracle row");
     parsed
-        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("corpus"))
+        .validate_against_oracle(
+            &CorpusV1::from_json(corpus()).expect("corpus"),
+            &parsed_path_files(),
+        )
         .expect("missing row carries the exact frozen oracle step");
     let metrics = parsed.cases[0].receipt_metrics().expect("derived metrics");
     assert_eq!(metrics.observed_receipt_count, 0);

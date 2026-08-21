@@ -1,5 +1,38 @@
 {
   "$defs": {
+    "CallPathSpecV1": {
+      "additionalProperties": false,
+      "properties": {
+        "exclude_from_projection": {
+          "items": {
+            "$ref": "#/$defs/ExactScopeSelectorV1"
+          },
+          "type": "array"
+        },
+        "prohibit_traversal_through": {
+          "items": {
+            "$ref": "#/$defs/ExactScopeSelectorV1"
+          },
+          "type": "array"
+        },
+        "start": {
+          "$ref": "#/$defs/ExactSymbolSelectorV1"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/DirectCallStepV1"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "start",
+        "steps",
+        "prohibit_traversal_through",
+        "exclude_from_projection"
+      ],
+      "type": "object"
+    },
     "CallableContainmentEvidenceV1": {
       "additionalProperties": false,
       "properties": {
@@ -211,6 +244,18 @@
       ],
       "type": "string"
     },
+    "DirectCallStepV1": {
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/ExactSymbolSelectorV1"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    },
     "EnvironmentIdentityV1": {
       "additionalProperties": false,
       "properties": {
@@ -271,6 +316,158 @@
         "projects"
       ],
       "type": "object"
+    },
+    "ExactScopeSelectorV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "core_generation_id": {
+              "type": "string"
+            },
+            "core_run_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "pinned_node",
+              "type": "string"
+            },
+            "node_id": {
+              "type": "string"
+            },
+            "project_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "project_id",
+            "core_generation_id",
+            "core_run_id",
+            "node_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "canonical_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "canonical_id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "canonical_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "qualified_name",
+              "type": "string"
+            },
+            "project_file_components": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "qualified_name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "qualified_name"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ExactSymbolSelectorV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "core_generation_id": {
+              "type": "string"
+            },
+            "core_run_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "pinned_node",
+              "type": "string"
+            },
+            "node_id": {
+              "type": "string"
+            },
+            "project_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "project_id",
+            "core_generation_id",
+            "core_run_id",
+            "node_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "canonical_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "canonical_id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "canonical_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "qualified_name",
+              "type": "string"
+            },
+            "project_file_components": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "qualified_name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "qualified_name"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "FailureBucketV1": {
       "additionalProperties": false,
@@ -489,7 +686,7 @@
       "additionalProperties": false,
       "properties": {
         "oracle_step": {
-          "$ref": "#/$defs/OracleStepV1"
+          "$ref": "#/$defs/ReceiptOracleStepV1"
         },
         "step_index": {
           "format": "uint8",
@@ -506,22 +703,22 @@
     },
     "NegativeMutationKindV1": {
       "enum": [
-        "remove_expected_relation",
-        "add_ambiguous_relation"
+        "replace_step_target",
+        "replace_step_source"
       ],
       "type": "string"
     },
     "NegativeMutationResultV1": {
       "additionalProperties": false,
       "properties": {
-        "caller": {
-          "type": "string"
-        },
         "contract_proven": {
           "type": "boolean"
         },
         "kind": {
           "$ref": "#/$defs/NegativeMutationKindV1"
+        },
+        "mutated_spec": {
+          "$ref": "#/$defs/CallPathSpecV1"
         },
         "mutation_id": {
           "type": "string"
@@ -534,9 +731,6 @@
           "maximum": 5,
           "minimum": 0,
           "type": "integer"
-        },
-        "target": {
-          "type": "string"
         }
       },
       "required": [
@@ -544,8 +738,7 @@
         "path_id",
         "kind",
         "step_index",
-        "caller",
-        "target",
+        "mutated_spec",
         "contract_proven"
       ],
       "type": "object"
@@ -663,22 +856,6 @@
       ],
       "type": "object"
     },
-    "OracleDeclarationV1": {
-      "additionalProperties": false,
-      "properties": {
-        "range": {
-          "$ref": "#/$defs/OracleSourceRangeV1"
-        },
-        "symbol": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "symbol",
-        "range"
-      ],
-      "type": "object"
-    },
     "OracleSourceRangeV1": {
       "additionalProperties": false,
       "properties": {
@@ -711,32 +888,6 @@
         "end_byte",
         "file_byte_length",
         "sha256"
-      ],
-      "type": "object"
-    },
-    "OracleStepV1": {
-      "additionalProperties": false,
-      "properties": {
-        "caller": {
-          "$ref": "#/$defs/OracleDeclarationV1"
-        },
-        "callsite": {
-          "$ref": "#/$defs/OracleSourceRangeV1"
-        },
-        "callsite_line": {
-          "format": "uint32",
-          "minimum": 1,
-          "type": "integer"
-        },
-        "target": {
-          "$ref": "#/$defs/OracleDeclarationV1"
-        }
-      },
-      "required": [
-        "caller",
-        "callsite_line",
-        "callsite",
-        "target"
       ],
       "type": "object"
     },
@@ -1013,7 +1164,7 @@
               "type": "string"
             },
             "oracle_step": {
-              "$ref": "#/$defs/OracleStepV1"
+              "$ref": "#/$defs/ReceiptOracleStepV1"
             },
             "oracle_step_index": {
               "format": "uint8",
@@ -1045,7 +1196,7 @@
               "type": "array"
             },
             "oracle_step": {
-              "$ref": "#/$defs/OracleStepV1"
+              "$ref": "#/$defs/ReceiptOracleStepV1"
             },
             "oracle_step_index": {
               "format": "uint8",
@@ -1063,6 +1214,32 @@
           "type": "object"
         }
       ]
+    },
+    "ReceiptOracleStepV1": {
+      "additionalProperties": false,
+      "properties": {
+        "caller_symbol": {
+          "type": "string"
+        },
+        "callsite_line": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "receipt_line_window": {
+          "$ref": "#/$defs/OracleSourceRangeV1"
+        },
+        "target_symbol": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "caller_symbol",
+        "callsite_line",
+        "receipt_line_window",
+        "target_symbol"
+      ],
+      "type": "object"
     },
     "ReceiptReferenceV1": {
       "additionalProperties": false,

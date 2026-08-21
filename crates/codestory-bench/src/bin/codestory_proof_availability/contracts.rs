@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const CORPUS_SCHEMA: &str = "codestory.proof-availability-corpus/v1";
-pub const PATH_SCHEMA: &str = "codestory.proof-availability-path/v1";
+pub const PATH_FILE_SCHEMA: &str = "codestory.proof-availability-path-file/v1";
 pub const REPORT_SCHEMA: &str = "codestory.proof-availability-report/v1";
 pub const THRESHOLDS_SCHEMA: &str = "codestory.proof-availability-thresholds/v1";
 pub const MAX_CANDIDATE_EDGES_PER_STEP: usize =
@@ -65,35 +65,136 @@ pub struct OracleSourceRangeV1 {
 #[serde(deny_unknown_fields)]
 pub struct OracleDeclarationV1 {
     pub symbol: String,
+    pub selector: ExactSymbolSelectorV1,
     pub range: OracleSourceRangeV1,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClauseAnchorV1 {
     pub clause_id: String,
-    pub text: String,
-    pub range: OracleSourceRangeV1,
+    pub start_byte: u32,
+    pub end_byte_exclusive: u32,
+    pub quote: String,
+    pub classification: ClauseClassificationV1,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::enum_variant_names)] // Mirrors the dark wire contract names exactly.
+pub enum ClauseClassificationV1 {
+    ResolvedMaterial { fields: Vec<ProofContractFieldV1> },
+    UnresolvedMaterial { reason: UnresolvedMaterialReasonV1 },
+    NonMaterial { reason: NonMaterialReasonV1 },
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProofContractFieldV1 {
+    Start,
+    StepTarget { step: u8 },
+    Directness { step: u8 },
+    Ordering { step: u8 },
+    Relation { step: u8 },
+    TraversalProhibition { index: u8 },
+    ProjectionExclusion { index: u8 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UnresolvedMaterialReasonV1 {
+    MissingSelectorResolution,
+    AmbiguousSelectorResolution,
+    UnsupportedInterpretation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NonMaterialReasonV1 {
+    Whitespace,
+    Punctuation,
+    Connector,
+    Commentary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExactSymbolSelectorV1 {
+    PinnedNode {
+        project_id: String,
+        core_generation_id: String,
+        core_run_id: String,
+        node_id: String,
+    },
+    CanonicalId {
+        canonical_id: String,
+    },
+    QualifiedName {
+        qualified_name: String,
+        project_file_components: Option<Vec<String>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExactScopeSelectorV1 {
+    PinnedNode {
+        project_id: String,
+        core_generation_id: String,
+        core_run_id: String,
+        node_id: String,
+    },
+    CanonicalId {
+        canonical_id: String,
+    },
+    QualifiedName {
+        qualified_name: String,
+        project_file_components: Option<Vec<String>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DirectCallStepV1 {
+    pub target: ExactSymbolSelectorV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CallPathSpecV1 {
-    pub start: String,
-    pub targets: Vec<String>,
-    pub expected_step_count: u8,
+    pub start: ExactSymbolSelectorV1,
+    pub steps: Vec<DirectCallStepV1>,
+    pub prohibit_traversal_through: Vec<ExactScopeSelectorV1>,
+    pub exclude_from_projection: Vec<ExactScopeSelectorV1>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OracleStepV1 {
     pub caller: OracleDeclarationV1,
     pub callsite_line: u32,
-    pub callsite: OracleSourceRangeV1,
+    pub callsite_expression: OracleSourceRangeV1,
+    pub receipt_line_window: OracleSourceRangeV1,
     pub target: OracleDeclarationV1,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NegativeMutationKindV1 {
-    RemoveExpectedRelation,
-    AddAmbiguousRelation,
+    ReplaceStepTarget,
+    ReplaceStepSource,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NegativeRelationFindingV1 {
+    NoDirectCall,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NegativeRelationAuditV1 {
+    pub caller: OracleDeclarationV1,
+    pub target: OracleDeclarationV1,
+    pub caller_body: OracleSourceRangeV1,
+    pub finding: NegativeRelationFindingV1,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -102,15 +203,12 @@ pub struct NegativeMutationV1 {
     pub path_id: String,
     pub kind: NegativeMutationKindV1,
     pub step_index: u8,
-    pub caller: String,
-    pub target: String,
+    pub mutated_spec: CallPathSpecV1,
+    pub source_audit: NegativeRelationAuditV1,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OracleAuditV1 {
-    pub cohort_path_file: String,
-    pub cohort_path_file_sha256: String,
-    pub source_tree_sha256: String,
     pub source_area: String,
     pub curator: String,
     pub reviewer: String,
@@ -119,9 +217,7 @@ pub struct OracleAuditV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OraclePathV1 {
-    pub schema: String,
     pub case_id: String,
-    pub repository_id: String,
     pub language: String,
     pub source_text: String,
     pub clauses: Vec<ClauseAnchorV1>,
@@ -139,15 +235,13 @@ impl OraclePathV1 {
         Ok(value)
     }
     pub fn validate(&self) -> Result<()> {
-        if self.schema != PATH_SCHEMA
-            || empty(&self.case_id)
-            || empty(&self.repository_id)
+        if empty(&self.case_id)
             || empty(&self.language)
             || empty(&self.source_text)
             || self.clauses.is_empty()
-            || self.spec.expected_step_count == 0
-            || self.spec.expected_step_count > 6
-            || self.oracle_steps.len() != self.spec.expected_step_count as usize
+            || self.spec.steps.is_empty()
+            || self.spec.steps.len() > 6
+            || self.oracle_steps.len() != self.spec.steps.len()
             || self.negative_mutations.len() != 2
             || !unique(self.clauses.iter().map(|v| v.clause_id.as_str()))
             || !unique(
@@ -158,29 +252,30 @@ impl OraclePathV1 {
         {
             bail!("proof_availability_oracle_path_invalid")
         }
-        if empty(&self.spec.start)
-            || self.spec.targets.is_empty()
-            || self.spec.targets.iter().any(|v| empty(v))
-            || self.spec.targets.len() != usize::from(self.spec.expected_step_count)
-        {
-            bail!("proof_availability_oracle_spec_invalid")
-        }
-        for c in &self.clauses {
-            if empty(&c.text) {
-                bail!("proof_availability_clause_invalid")
-            }
-            range(&c.range)?;
-        }
+        validate_oracle_contract(&self.source_text, &self.clauses, &self.spec)?;
         for (index, step) in self.oracle_steps.iter().enumerate() {
             if empty(&step.caller.symbol) || step.callsite_line == 0 || empty(&step.target.symbol) {
                 bail!("proof_availability_oracle_declaration_invalid")
             }
+            validate_declaration(&step.caller)?;
+            validate_declaration(&step.target)?;
             range(&step.caller.range)?;
-            range(&step.callsite)?;
+            range(&step.callsite_expression)?;
+            range(&step.receipt_line_window)?;
             range(&step.target.range)?;
-            if step.target.symbol != self.spec.targets[index]
-                || (index == 0 && step.caller.symbol != self.spec.start)
-                || (index > 0 && step.caller != self.oracle_steps[index - 1].target)
+            if step.callsite_expression.path != step.receipt_line_window.path
+                || step.callsite_expression.file_byte_length
+                    != step.receipt_line_window.file_byte_length
+                || step.callsite_expression.start_byte < step.receipt_line_window.start_byte
+                || step.callsite_expression.end_byte > step.receipt_line_window.end_byte
+                || step
+                    .receipt_line_window
+                    .end_byte
+                    .checked_sub(step.receipt_line_window.start_byte)
+                    .is_none_or(|length| length > 8_192)
+                || step.target.selector != self.spec.steps[index].target
+                || (index == 0 && step.caller.selector != self.spec.start)
+                || (index > 0 && step.caller.selector != self.spec.steps[index - 1].target)
             {
                 bail!("proof_availability_oracle_chain_invalid")
             }
@@ -190,21 +285,17 @@ impl OraclePathV1 {
                 bail!("proof_availability_mutation_invalid")
             };
             if m.path_id != self.case_id
-                || empty(&m.caller)
-                || empty(&m.target)
-                || m.caller != step.caller.symbol
-                || m.target != step.target.symbol
+                || m.mutated_spec == self.spec
+                || validate_spec_shape(&m.mutated_spec).is_err()
             {
                 bail!("proof_availability_mutation_invalid")
             }
+            validate_negative_mutation(&self.spec, step, m)?;
         }
         if self.negative_mutations[0].kind == self.negative_mutations[1].kind {
             bail!("proof_availability_mutation_kinds_not_distinct")
         }
-        if !hash(&self.audit.cohort_path_file_sha256)
-            || !hash(&self.audit.source_tree_sha256)
-            || empty(&self.audit.cohort_path_file)
-            || empty(&self.audit.source_area)
+        if empty(&self.audit.source_area)
             || empty(&self.audit.curator)
             || empty(&self.audit.reviewer)
             || self.audit.curator == self.audit.reviewer
@@ -214,6 +305,530 @@ impl OraclePathV1 {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LengthDistributionEntryV1 {
+    pub path_length: u8,
+    pub path_count: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CohortPathFileV1 {
+    pub schema: String,
+    pub repository_id: String,
+    pub repository: String,
+    pub commit: String,
+    pub workspace: String,
+    pub source_tree_sha256: String,
+    pub curator: String,
+    pub reviewer: String,
+    pub review_date: String,
+    pub source_area_requirement: SourceAreaRequirementV1,
+    pub paths: Vec<OraclePathV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceAreaRequirementV1 {
+    RequiredAtLeastFive,
+    NotAvailable { reason: String },
+}
+
+impl CohortPathFileV1 {
+    pub fn from_json(value: Value) -> Result<Self> {
+        let value: Self = serde_json::from_value(value)?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_with_registry(&QUALIFICATION_REPOSITORIES)
+    }
+
+    pub(crate) fn validate_with_registry(
+        &self,
+        registry: &[(&str, &str, &str, &str)],
+    ) -> Result<()> {
+        if self.schema != PATH_FILE_SCHEMA
+            || !registry_entry_matches(
+                registry,
+                &self.repository_id,
+                &self.repository,
+                &self.commit,
+                &self.workspace,
+            )
+            || !hash(&self.source_tree_sha256)
+            || empty(&self.curator)
+            || empty(&self.reviewer)
+            || self.curator == self.reviewer
+            || !date(&self.review_date)
+            || self.paths.len() != 30
+            || !unique(self.paths.iter().map(|path| path.case_id.as_str()))
+        {
+            bail!("proof_availability_path_file_invalid")
+        }
+        let mut distribution = [0u8; 6];
+        let mut source_areas = BTreeSet::new();
+        let mut primary_files = BTreeMap::<&str, usize>::new();
+        let mut positive_pairs = BTreeSet::new();
+        for path in &self.paths {
+            path.validate()?;
+            distribution[path.spec.steps.len() - 1] += 1;
+            source_areas.insert(path.audit.source_area.as_str());
+            *primary_files
+                .entry(path.oracle_steps[0].caller.range.path.as_str())
+                .or_default() += 1;
+            for step in &path.oracle_steps {
+                let pair =
+                    canonical_artifact_bytes(&(&step.caller.selector, &step.target.selector))?;
+                if !positive_pairs.insert(pair) {
+                    bail!("proof_availability_duplicate_positive_relation")
+                }
+            }
+        }
+        if distribution != [10, 7, 5, 3, 3, 2]
+            || self
+                .paths
+                .iter()
+                .map(|path| path.spec.steps.len())
+                .sum::<usize>()
+                != 78
+            || (matches!(
+                self.source_area_requirement,
+                SourceAreaRequirementV1::RequiredAtLeastFive
+            ) && source_areas.len() < 5)
+            || matches!(&self.source_area_requirement, SourceAreaRequirementV1::NotAvailable { reason } if empty(reason))
+            || primary_files.values().any(|count| *count > 6)
+        {
+            bail!("proof_availability_path_file_distribution_invalid")
+        }
+        Ok(())
+    }
+}
+
+pub const QUALIFICATION_REPOSITORIES: [(&str, &str, &str, &str); 4] = [
+    (
+        "codestory-rust",
+        "https://github.com/TheGreenCedar/CodeStory.git",
+        "74753c1766c80f8cf27873943409bd509bc30350",
+        ".",
+    ),
+    (
+        "vite-ts-js",
+        "https://github.com/vitejs/vite.git",
+        "80a333a23103ced0442d4463d1191433d90f5e19",
+        "packages/vite",
+    ),
+    (
+        "flask-python",
+        "https://github.com/pallets/flask.git",
+        "7fff56f5172c48b6f3aedf17ee14ef5c2533dfd1",
+        ".",
+    ),
+    (
+        "gin-go",
+        "https://github.com/gin-gonic/gin.git",
+        "d75fcd4c9ab260e5225de590f1f0f8c0e0e12d11",
+        ".",
+    ),
+];
+
+fn registry_entry_matches(
+    registry: &[(&str, &str, &str, &str)],
+    id: &str,
+    repository: &str,
+    commit: &str,
+    workspace: &str,
+) -> bool {
+    registry.iter().any(|entry| {
+        entry.0 == id && entry.1 == repository && entry.2 == commit && entry.3 == workspace
+    })
+}
+
+fn validate_declaration(declaration: &OracleDeclarationV1) -> Result<()> {
+    if empty(&declaration.symbol) {
+        bail!("proof_availability_oracle_declaration_invalid")
+    }
+    validate_symbol_selector(&declaration.selector)?;
+    range(&declaration.range)
+}
+
+fn validate_oracle_contract(
+    source_text: &str,
+    clauses: &[ClauseAnchorV1],
+    spec: &CallPathSpecV1,
+) -> Result<()> {
+    validate_spec_shape(spec)?;
+    let mut coverage = vec![(false, false, false); source_text.len()];
+    let mut resolved_fields = BTreeSet::new();
+    let mut classifications = BTreeMap::new();
+    for clause in clauses {
+        if empty(&clause.clause_id)
+            || clause.start_byte >= clause.end_byte_exclusive
+            || usize::try_from(clause.end_byte_exclusive)
+                .ok()
+                .is_none_or(|end| end > source_text.len())
+        {
+            bail!("proof_availability_clause_invalid")
+        }
+        let start = usize::try_from(clause.start_byte)?;
+        let end = usize::try_from(clause.end_byte_exclusive)?;
+        if !source_text.is_char_boundary(start)
+            || !source_text.is_char_boundary(end)
+            || source_text[start..end] != clause.quote
+        {
+            bail!("proof_availability_clause_span_invalid")
+        }
+        let family = match &clause.classification {
+            ClauseClassificationV1::ResolvedMaterial { fields } => {
+                if fields.is_empty() {
+                    bail!("proof_availability_clause_fields_empty")
+                }
+                for field in fields {
+                    validate_contract_field(*field, spec)?;
+                    resolved_fields.insert(*field);
+                }
+                0u8
+            }
+            ClauseClassificationV1::UnresolvedMaterial { .. } => 1,
+            ClauseClassificationV1::NonMaterial { .. } => 2,
+        };
+        let key = (
+            clause.start_byte,
+            clause.end_byte_exclusive,
+            clause.clause_id.as_str(),
+        );
+        if classifications
+            .insert(key, family)
+            .is_some_and(|existing| existing != family)
+        {
+            bail!("proof_availability_clause_classification_conflict")
+        }
+        for byte in &mut coverage[start..end] {
+            match family {
+                0 => byte.0 = true,
+                1 => byte.1 = true,
+                _ => byte.2 = true,
+            }
+        }
+        if matches!(
+            clause.classification,
+            ClauseClassificationV1::UnresolvedMaterial { .. }
+        ) {
+            bail!("proof_availability_oracle_unresolved_material")
+        }
+    }
+    for clause in clauses {
+        if matches!(
+            clause.classification,
+            ClauseClassificationV1::NonMaterial { .. }
+        ) {
+            let start = usize::try_from(clause.start_byte)?;
+            if guarded_material_spans(&clause.quote)
+                .into_iter()
+                .any(|span| {
+                    coverage[start + span.start..start + span.end]
+                        .iter()
+                        .any(|byte| !byte.0 && !byte.1)
+                })
+            {
+                bail!("proof_availability_material_token_misclassified")
+            }
+        }
+    }
+    for (offset, character) in source_text.char_indices() {
+        let end = offset + character.len_utf8();
+        if !character.is_whitespace()
+            && coverage[offset..end]
+                .iter()
+                .any(|byte| !byte.0 && !byte.1 && !byte.2)
+        {
+            bail!("proof_availability_unclassified_source_text")
+        }
+    }
+    let mut required = vec![ProofContractFieldV1::Start];
+    for step in 0..spec.steps.len() {
+        let step = u8::try_from(step)?;
+        required.extend([
+            ProofContractFieldV1::StepTarget { step },
+            ProofContractFieldV1::Directness { step },
+            ProofContractFieldV1::Ordering { step },
+            ProofContractFieldV1::Relation { step },
+        ]);
+    }
+    required.extend((0..spec.prohibit_traversal_through.len()).map(|index| {
+        ProofContractFieldV1::TraversalProhibition {
+            index: u8::try_from(index).expect("bounded scope"),
+        }
+    }));
+    required.extend((0..spec.exclude_from_projection.len()).map(|index| {
+        ProofContractFieldV1::ProjectionExclusion {
+            index: u8::try_from(index).expect("bounded scope"),
+        }
+    }));
+    if required
+        .into_iter()
+        .any(|field| !resolved_fields.contains(&field))
+    {
+        bail!("proof_availability_contract_field_unanchored")
+    }
+    Ok(())
+}
+
+fn validate_spec_shape(spec: &CallPathSpecV1) -> Result<()> {
+    if !(1..=6).contains(&spec.steps.len())
+        || spec.prohibit_traversal_through.len() > 6
+        || spec.exclude_from_projection.len() > 6
+    {
+        bail!("proof_availability_oracle_spec_invalid")
+    }
+    validate_symbol_selector(&spec.start)?;
+    for step in &spec.steps {
+        validate_symbol_selector(&step.target)?;
+    }
+    for scope in spec
+        .prohibit_traversal_through
+        .iter()
+        .chain(&spec.exclude_from_projection)
+    {
+        validate_scope_selector(scope)?;
+    }
+    Ok(())
+}
+
+fn validate_contract_field(field: ProofContractFieldV1, spec: &CallPathSpecV1) -> Result<()> {
+    let in_range = match field {
+        ProofContractFieldV1::Start => true,
+        ProofContractFieldV1::StepTarget { step }
+        | ProofContractFieldV1::Directness { step }
+        | ProofContractFieldV1::Ordering { step }
+        | ProofContractFieldV1::Relation { step } => usize::from(step) < spec.steps.len(),
+        ProofContractFieldV1::TraversalProhibition { index } => {
+            usize::from(index) < spec.prohibit_traversal_through.len()
+        }
+        ProofContractFieldV1::ProjectionExclusion { index } => {
+            usize::from(index) < spec.exclude_from_projection.len()
+        }
+    };
+    if !in_range {
+        bail!("proof_availability_contract_field_out_of_range")
+    }
+    Ok(())
+}
+
+fn validate_symbol_selector(selector: &ExactSymbolSelectorV1) -> Result<()> {
+    match selector {
+        ExactSymbolSelectorV1::PinnedNode {
+            project_id,
+            core_generation_id,
+            core_run_id,
+            node_id,
+        } => {
+            for value in [project_id, core_generation_id, core_run_id, node_id] {
+                validate_identity(value)?;
+            }
+        }
+        ExactSymbolSelectorV1::CanonicalId { canonical_id } => validate_identity(canonical_id)?,
+        ExactSymbolSelectorV1::QualifiedName {
+            qualified_name,
+            project_file_components,
+        } => {
+            validate_qualified_name(qualified_name)?;
+            if let Some(components) = project_file_components {
+                validate_project_file(components)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_scope_selector(selector: &ExactScopeSelectorV1) -> Result<()> {
+    match selector {
+        ExactScopeSelectorV1::PinnedNode {
+            project_id,
+            core_generation_id,
+            core_run_id,
+            node_id,
+        } => {
+            for value in [project_id, core_generation_id, core_run_id, node_id] {
+                validate_identity(value)?;
+            }
+        }
+        ExactScopeSelectorV1::CanonicalId { canonical_id } => validate_identity(canonical_id)?,
+        ExactScopeSelectorV1::QualifiedName {
+            qualified_name,
+            project_file_components,
+        } => {
+            validate_qualified_name(qualified_name)?;
+            if let Some(components) = project_file_components {
+                validate_project_file(components)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_identity(value: &str) -> Result<()> {
+    if empty(value) || value.contains('\0') {
+        bail!("proof_availability_selector_identity_invalid")
+    }
+    Ok(())
+}
+
+fn validate_qualified_name(value: &str) -> Result<()> {
+    validate_identity(value)?;
+    if value.trim() != value
+        || value.chars().any(|character| {
+            character.is_whitespace() || matches!(character, '(' | ')' | '*' | '?')
+        })
+    {
+        bail!("proof_availability_qualified_name_invalid")
+    }
+    Ok(())
+}
+
+pub fn validate_project_file(components: &[String]) -> Result<()> {
+    if components.is_empty()
+        || components.iter().any(|component| {
+            empty(component)
+                || component == "."
+                || component == ".."
+                || component.contains('\0')
+                || component.contains('/')
+                || component.contains('\\')
+                || component.starts_with('~')
+                || component.contains(':')
+        })
+    {
+        bail!("proof_availability_project_file_invalid")
+    }
+    Ok(())
+}
+
+fn guarded_material_spans(value: &str) -> Vec<std::ops::Range<usize>> {
+    const GUARDED_WORDS: &[&str] = &[
+        "after", "before", "call", "calls", "direct", "directly", "exclude", "except", "first",
+        "fourth", "never", "next", "no", "not", "only", "ordered", "ordering", "relation",
+        "second", "sixth", "then", "third", "without",
+    ];
+    let bytes = value.as_bytes();
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        if bytes[offset].is_ascii_alphanumeric() || bytes[offset] == b'_' {
+            let start = offset;
+            offset += 1;
+            while offset < bytes.len()
+                && (bytes[offset].is_ascii_alphanumeric() || bytes[offset] == b'_')
+            {
+                offset += 1;
+            }
+            let word = value[start..offset].to_ascii_lowercase();
+            let numeric_ordinal = word
+                .strip_suffix("st")
+                .or_else(|| word.strip_suffix("nd"))
+                .or_else(|| word.strip_suffix("rd"))
+                .or_else(|| word.strip_suffix("th"))
+                .is_some_and(|number| {
+                    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+                });
+            if GUARDED_WORDS.contains(&word.as_str()) || numeric_ordinal {
+                spans.push(start..offset);
+            }
+            continue;
+        }
+        let remaining = &value[offset..];
+        let width = if remaining.starts_with("->")
+            || remaining.starts_with("=>")
+            || remaining.starts_with("::")
+        {
+            2
+        } else if remaining.starts_with('→') {
+            '→'.len_utf8()
+        } else {
+            value[offset..]
+                .chars()
+                .next()
+                .expect("offset is in bounds")
+                .len_utf8()
+        };
+        if remaining.starts_with("->")
+            || remaining.starts_with("=>")
+            || remaining.starts_with("::")
+            || remaining.starts_with('→')
+            || matches!(bytes[offset], b'`' | b'"' | b'/' | b'\\')
+        {
+            spans.push(offset..offset + width);
+        }
+        offset += width;
+    }
+    spans
+}
+
+fn validate_negative_mutation(
+    positive: &CallPathSpecV1,
+    step: &OracleStepV1,
+    mutation: &NegativeMutationV1,
+) -> Result<()> {
+    let index = usize::from(mutation.step_index);
+    let mut expected = positive.clone();
+    match mutation.kind {
+        NegativeMutationKindV1::ReplaceStepTarget => {
+            expected.steps[index].target = mutation.mutated_spec.steps[index].target.clone();
+            if expected != mutation.mutated_spec
+                || mutation.source_audit.caller.selector != step.caller.selector
+                || mutation.source_audit.target.selector
+                    != mutation.mutated_spec.steps[index].target
+            {
+                bail!("proof_availability_target_mutation_invalid")
+            }
+        }
+        NegativeMutationKindV1::ReplaceStepSource => {
+            let mutated_source = if index == 0 {
+                &mutation.mutated_spec.start
+            } else {
+                &mutation.mutated_spec.steps[index - 1].target
+            };
+            if index == 0 {
+                expected.start = mutated_source.clone();
+            } else {
+                expected.steps[index - 1].target = mutated_source.clone();
+            }
+            if expected != mutation.mutated_spec
+                || mutation.source_audit.caller.selector != *mutated_source
+                || mutation.source_audit.target.selector != step.target.selector
+            {
+                bail!("proof_availability_source_mutation_invalid")
+            }
+        }
+    }
+    validate_declaration(&mutation.source_audit.caller)?;
+    validate_declaration(&mutation.source_audit.target)?;
+    range(&mutation.source_audit.caller_body)?;
+    if mutation.source_audit.caller.range.path != mutation.source_audit.caller_body.path
+        || mutation.source_audit.caller.range.file_byte_length
+            != mutation.source_audit.caller_body.file_byte_length
+        || mutation.source_audit.caller_body.start_byte
+            > mutation.source_audit.caller.range.start_byte
+        || mutation.source_audit.caller_body.end_byte < mutation.source_audit.caller.range.end_byte
+    {
+        bail!("proof_availability_negative_source_audit_invalid")
+    }
+    Ok(())
+}
+
+fn valid_length_distribution(distribution: &[LengthDistributionEntryV1]) -> bool {
+    distribution.len() == 6
+        && distribution
+            .iter()
+            .zip([10u8, 7, 5, 3, 3, 2])
+            .enumerate()
+            .all(|(index, (entry, count))| {
+                entry.path_length == u8::try_from(index + 1).unwrap() && entry.path_count == count
+            })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -228,6 +843,7 @@ pub struct CohortV1 {
     pub source_tree_sha256: String,
     pub path_count: u16,
     pub positive_step_count: u16,
+    pub path_length_distribution: Vec<LengthDistributionEntryV1>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -240,7 +856,6 @@ pub struct CorpusV1 {
     pub reviewer: String,
     pub review_date: String,
     pub cohorts: Vec<CohortV1>,
-    pub paths: Vec<OraclePathV1>,
     pub positive_request_count: u16,
     pub positive_step_count: u16,
     pub negative_request_count: u16,
@@ -252,6 +867,10 @@ impl CorpusV1 {
         Ok(value)
     }
     pub fn validate(&self) -> Result<()> {
+        self.validate_with_registry(&QUALIFICATION_REPOSITORIES)
+    }
+
+    fn validate_with_registry(&self, registry: &[(&str, &str, &str, &str)]) -> Result<()> {
         if self.schema != CORPUS_SCHEMA
             || empty(&self.corpus_id)
             || !hash(&self.thresholds_sha256)
@@ -261,73 +880,98 @@ impl CorpusV1 {
             || self.curator == self.reviewer
             || !date(&self.review_date)
             || self.cohorts.len() != 4
-            || self.paths.len() != 120
             || self.positive_request_count != 120
             || self.positive_step_count != 312
             || self.negative_request_count != 240
             || !unique(self.cohorts.iter().map(|v| v.repository_id.as_str()))
-            || !unique(self.paths.iter().map(|v| v.case_id.as_str()))
         {
             bail!("proof_availability_corpus_invalid")
         }
         for c in &self.cohorts {
-            if empty(&c.repository_id)
-                || empty(&c.repository)
-                || !commit(&c.commit)
-                || empty(&c.workspace)
-                || empty(&c.path_file)
+            if !registry_entry_matches(
+                registry,
+                &c.repository_id,
+                &c.repository,
+                &c.commit,
+                &c.workspace,
+            ) || empty(&c.path_file)
+                || c.path_file != format!("paths/{}.json", c.repository_id)
                 || !hash(&c.path_file_sha256)
                 || !hash(&c.source_tree_sha256)
                 || c.path_count != 30
                 || c.positive_step_count != 78
+                || !valid_length_distribution(&c.path_length_distribution)
             {
                 bail!("proof_availability_cohort_invalid")
             }
-            let cohort_paths = self
+        }
+        Ok(())
+    }
+
+    pub fn validate_with_path_files(&self, path_files: &[CohortPathFileV1]) -> Result<()> {
+        self.validate_with_path_files_and_registry(path_files, &QUALIFICATION_REPOSITORIES)
+    }
+
+    pub(crate) fn validate_with_path_files_and_registry(
+        &self,
+        path_files: &[CohortPathFileV1],
+        registry: &[(&str, &str, &str, &str)],
+    ) -> Result<()> {
+        self.validate_with_registry(registry)?;
+        if path_files.len() != 4
+            || !unique(path_files.iter().map(|file| file.repository_id.as_str()))
+        {
+            bail!("proof_availability_path_file_set_invalid")
+        }
+        let mut total_paths = 0usize;
+        let mut total_steps = 0usize;
+        let mut total_mutations = 0usize;
+        let mut case_ids = BTreeSet::new();
+        for cohort in &self.cohorts {
+            let file = path_files
+                .iter()
+                .find(|file| file.repository_id == cohort.repository_id)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_path_file_missing"))?;
+            file.validate_with_registry(registry)?;
+            if file.repository != cohort.repository
+                || file.commit != cohort.commit
+                || file.workspace != cohort.workspace
+                || file.source_tree_sha256 != cohort.source_tree_sha256
+                || canonical_cohort_path_file_sha256(file)? != cohort.path_file_sha256
+                || file.paths.len() != usize::from(cohort.path_count)
+                || file
+                    .paths
+                    .iter()
+                    .map(|path| path.spec.steps.len())
+                    .sum::<usize>()
+                    != usize::from(cohort.positive_step_count)
+            {
+                bail!("proof_availability_path_file_binding_invalid")
+            }
+            total_paths += file.paths.len();
+            if file
                 .paths
                 .iter()
-                .filter(|path| path.repository_id == c.repository_id)
-                .collect::<Vec<_>>();
-            if cohort_paths.len() != usize::from(c.path_count)
-                || cohort_paths
-                    .iter()
-                    .map(|path| usize::from(path.spec.expected_step_count))
-                    .sum::<usize>()
-                    != usize::from(c.positive_step_count)
+                .any(|path| !case_ids.insert(path.case_id.as_str()))
             {
-                bail!("proof_availability_cohort_actual_totals_invalid")
+                bail!("proof_availability_case_id_duplicate")
             }
-        }
-        if self
-            .paths
-            .iter()
-            .map(|path| usize::from(path.spec.expected_step_count))
-            .sum::<usize>()
-            != usize::from(self.positive_step_count)
-            || self
+            total_steps += file
+                .paths
+                .iter()
+                .map(|path| path.spec.steps.len())
+                .sum::<usize>();
+            total_mutations += file
                 .paths
                 .iter()
                 .map(|path| path.negative_mutations.len())
-                .sum::<usize>()
-                != usize::from(self.negative_request_count)
+                .sum::<usize>();
+        }
+        if total_paths != usize::from(self.positive_request_count)
+            || total_steps != usize::from(self.positive_step_count)
+            || total_mutations != usize::from(self.negative_request_count)
         {
             bail!("proof_availability_corpus_actual_totals_invalid")
-        }
-        for p in &self.paths {
-            p.validate()?;
-            let c = self
-                .cohorts
-                .iter()
-                .find(|c| c.repository_id == p.repository_id)
-                .ok_or_else(|| anyhow::anyhow!("proof_availability_path_cohort_missing"))?;
-            if p.audit.cohort_path_file != c.path_file
-                || p.audit.cohort_path_file_sha256 != c.path_file_sha256
-                || p.audit.source_tree_sha256 != c.source_tree_sha256
-                || p.audit.curator != self.curator
-                || p.audit.reviewer != self.reviewer
-            {
-                bail!("proof_availability_path_freeze_mismatch")
-            }
         }
         Ok(())
     }
@@ -1104,8 +1748,7 @@ pub struct NegativeMutationResultV1 {
     pub path_id: String,
     pub kind: NegativeMutationKindV1,
     pub step_index: u8,
-    pub caller: String,
-    pub target: String,
+    pub mutated_spec: CallPathSpecV1,
     pub contract_proven: bool,
 }
 #[derive(
@@ -1123,11 +1766,11 @@ pub enum ReceiptMismatchFieldV1 {
 pub enum ReceiptOracleComparisonV1 {
     Exact {
         oracle_step_index: u8,
-        oracle_step: OracleStepV1,
+        oracle_step: ReceiptOracleStepV1,
     },
     Mismatched {
         oracle_step_index: u8,
-        oracle_step: OracleStepV1,
+        oracle_step: ReceiptOracleStepV1,
         mismatches: Vec<ReceiptMismatchFieldV1>,
     },
 }
@@ -1143,7 +1786,7 @@ impl ReceiptOracleComparisonV1 {
         }
     }
 
-    fn oracle_step(&self) -> &OracleStepV1 {
+    fn oracle_step(&self) -> &ReceiptOracleStepV1 {
         match self {
             Self::Exact { oracle_step, .. } | Self::Mismatched { oracle_step, .. } => oracle_step,
         }
@@ -1151,6 +1794,25 @@ impl ReceiptOracleComparisonV1 {
 
     fn is_exact(&self) -> bool {
         matches!(self, Self::Exact { .. })
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptOracleStepV1 {
+    pub caller_symbol: String,
+    pub callsite_line: u32,
+    pub receipt_line_window: OracleSourceRangeV1,
+    pub target_symbol: String,
+}
+
+impl From<&OracleStepV1> for ReceiptOracleStepV1 {
+    fn from(value: &OracleStepV1) -> Self {
+        Self {
+            caller_symbol: value.caller.symbol.clone(),
+            callsite_line: value.callsite_line,
+            receipt_line_window: value.receipt_line_window.clone(),
+            target_symbol: value.target.symbol.clone(),
+        }
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1285,7 +1947,7 @@ impl ObservedReceiptV1 {
 #[serde(deny_unknown_fields)]
 pub struct MissingOracleStepV1 {
     pub step_index: u8,
-    pub oracle_step: OracleStepV1,
+    pub oracle_step: ReceiptOracleStepV1,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1792,8 +2454,7 @@ impl QualificationSummaryV1 {
                 || c.negative_mutations.iter().any(|mutation| {
                     mutation.path_id != c.case_id
                         || mutation.step_index >= c.attempted_step_count
-                        || empty(&mutation.caller)
-                        || empty(&mutation.target)
+                        || validate_spec_shape(&mutation.mutated_spec).is_err()
                 })
                 || !valid_receipts(
                     c,
@@ -1948,18 +2609,31 @@ impl QualificationSummaryV1 {
         }) {
             bail!("proof_availability_materialization_corpus_binding_invalid")
         }
-        let paths = corpus
-            .paths
+        Ok(())
+    }
+
+    pub fn validate_against_oracle(
+        &self,
+        corpus: &CorpusV1,
+        path_files: &[CohortPathFileV1],
+    ) -> Result<()> {
+        self.validate_against_corpus(corpus)?;
+        corpus.validate_with_path_files(path_files)?;
+        let paths = path_files
             .iter()
-            .map(|path| (path.case_id.as_str(), path))
+            .flat_map(|file| {
+                file.paths
+                    .iter()
+                    .map(move |path| (path.case_id.as_str(), (file.repository_id.as_str(), path)))
+            })
             .collect::<BTreeMap<_, _>>();
         let mut result_ids = BTreeSet::new();
         for case in &self.cases {
-            let path = paths
+            let (repository_id, path) = paths
                 .get(case.case_id.as_str())
                 .ok_or_else(|| anyhow::anyhow!("proof_availability_case_oracle_missing"))?;
-            if path.repository_id != case.repository_id
-                || case.attempted_step_count != path.spec.expected_step_count
+            if *repository_id != case.repository_id
+                || usize::from(case.attempted_step_count) != path.spec.steps.len()
             {
                 bail!("proof_availability_case_oracle_mismatch")
             }
@@ -1969,7 +2643,7 @@ impl QualificationSummaryV1 {
                     bail!("proof_availability_receipt_oracle_missing")
                 };
                 if receipt.step_index != oracle_step_index
-                    || receipt.oracle_comparison.oracle_step() != step
+                    || receipt.oracle_comparison.oracle_step() != &ReceiptOracleStepV1::from(step)
                 {
                     bail!("proof_availability_receipt_oracle_mismatch")
                 }
@@ -1978,7 +2652,7 @@ impl QualificationSummaryV1 {
                 let Some(step) = path.oracle_steps.get(usize::from(missing.step_index)) else {
                     bail!("proof_availability_receipt_oracle_missing")
                 };
-                if &missing.oracle_step != step {
+                if missing.oracle_step != ReceiptOracleStepV1::from(step) {
                     bail!("proof_availability_receipt_oracle_mismatch")
                 }
             }
@@ -1994,8 +2668,7 @@ impl QualificationSummaryV1 {
                 if result.path_id != mutation.path_id
                     || result.kind != mutation.kind
                     || result.step_index != mutation.step_index
-                    || result.caller != mutation.caller
-                    || result.target != mutation.target
+                    || result.mutated_spec != mutation.mutated_spec
                     || !result_ids.insert(result.mutation_id.as_str())
                 {
                     bail!("proof_availability_mutation_oracle_mismatch")
@@ -2026,17 +2699,28 @@ pub fn canonical_corpus_sha256(corpus: &CorpusV1) -> Result<String> {
     canonical_artifact_sha256(b"codestory.proof-availability-corpus/v1\0", corpus)
 }
 
+pub fn canonical_cohort_path_file_sha256(path_file: &CohortPathFileV1) -> Result<String> {
+    canonical_artifact_sha256(
+        b"codestory.proof-availability-cohort-path-file/v1\0",
+        path_file,
+    )
+}
+
 pub fn canonical_thresholds_sha256(thresholds: &ThresholdsV1) -> Result<String> {
     canonical_artifact_sha256(b"codestory.proof-availability-thresholds/v1\0", thresholds)
 }
 
 fn canonical_artifact_sha256<T: Serialize>(domain: &[u8], value: &T) -> Result<String> {
-    let canonical = codestory_agent::proof_qualification_support::canonical_json_bytes(value)
-        .map_err(|error| anyhow::anyhow!(error))?;
+    let canonical = canonical_artifact_bytes(value)?;
     let mut digest = Sha256::new();
     digest.update(domain);
     digest.update(canonical);
     Ok(format!("{:x}", digest.finalize()))
+}
+
+fn canonical_artifact_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    codestory_agent::proof_qualification_support::canonical_json_bytes(value)
+        .map_err(|error| anyhow::anyhow!(error))
 }
 
 fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
@@ -2323,13 +3007,11 @@ fn valid_disposition_structure(case: &CaseReportV1) -> bool {
             .is_none_or(|gap| case.product_disposition.gaps.contains(gap))
 }
 
-fn valid_oracle_step(step: &OracleStepV1) -> bool {
-    !empty(&step.caller.symbol)
+fn valid_oracle_step(step: &ReceiptOracleStepV1) -> bool {
+    !empty(&step.caller_symbol)
         && step.callsite_line > 0
-        && !empty(&step.target.symbol)
-        && range(&step.caller.range).is_ok()
-        && range(&step.callsite).is_ok()
-        && range(&step.target.range).is_ok()
+        && !empty(&step.target_symbol)
+        && range(&step.receipt_line_window).is_ok()
 }
 
 fn valid_observed_line_window(window: &ObservedLineWindowV1) -> bool {
@@ -2500,24 +3182,24 @@ fn valid_receipt_oracle_comparison(receipt: &ObservedReceiptV1) -> bool {
 
 fn receipt_mismatches(
     receipt: &ObservedReceiptV1,
-    oracle: &OracleStepV1,
+    oracle: &ReceiptOracleStepV1,
 ) -> Vec<ReceiptMismatchFieldV1> {
     let mut mismatches = Vec::new();
-    if receipt.source.qualified_name != oracle.caller.symbol {
+    if receipt.source.qualified_name != oracle.caller_symbol {
         mismatches.push(ReceiptMismatchFieldV1::Caller);
     }
     if receipt.callsite_line != oracle.callsite_line {
         mismatches.push(ReceiptMismatchFieldV1::CallsiteLine);
     }
-    if receipt.line_window.project_file_components.join("/") != oracle.callsite.path
-        || receipt.line_window.indexed_sha256 != oracle.callsite.sha256
-        || receipt.line_window.observed_sha256 != oracle.callsite.sha256
-        || receipt.line_window.byte_start != oracle.callsite.start_byte
-        || receipt.line_window.byte_end != oracle.callsite.end_byte
+    if receipt.line_window.project_file_components.join("/") != oracle.receipt_line_window.path
+        || receipt.line_window.indexed_sha256 != oracle.receipt_line_window.sha256
+        || receipt.line_window.observed_sha256 != oracle.receipt_line_window.sha256
+        || receipt.line_window.byte_start != oracle.receipt_line_window.start_byte
+        || receipt.line_window.byte_end != oracle.receipt_line_window.end_byte
     {
         mismatches.push(ReceiptMismatchFieldV1::CallsiteWindow);
     }
-    if receipt.target.qualified_name != oracle.target.symbol {
+    if receipt.target.qualified_name != oracle.target_symbol {
         mismatches.push(ReceiptMismatchFieldV1::Target);
     }
     mismatches
@@ -2557,7 +3239,7 @@ fn valid_gate_detail(kind: &QualificationGateKindV1, detail: &GateFailureDetailV
 pub fn schema_json(document: SchemaDocument) -> Value {
     let (mut value, id) = match document {
         SchemaDocument::Corpus => (schema::<CorpusV1>(), CORPUS_SCHEMA),
-        SchemaDocument::Path => (schema::<OraclePathV1>(), PATH_SCHEMA),
+        SchemaDocument::Path => (schema::<CohortPathFileV1>(), PATH_FILE_SCHEMA),
         SchemaDocument::Report => (schema::<QualificationSummaryV1>(), REPORT_SCHEMA),
         SchemaDocument::Thresholds => (schema::<ThresholdsV1>(), THRESHOLDS_SCHEMA),
     };
@@ -2577,7 +3259,7 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
     let root = schema.as_object_mut().expect("schema object");
     let id = match document {
         SchemaDocument::Corpus => CORPUS_SCHEMA,
-        SchemaDocument::Path => PATH_SCHEMA,
+        SchemaDocument::Path => PATH_FILE_SCHEMA,
         SchemaDocument::Report => REPORT_SCHEMA,
         SchemaDocument::Thresholds => THRESHOLDS_SCHEMA,
     };
@@ -2670,16 +3352,6 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
             }
         }
     }
-    if document == SchemaDocument::Path
-        && let Some(value) = root
-            .get_mut("properties")
-            .and_then(Value::as_object_mut)
-            .and_then(|properties| properties.get_mut("negative_mutations"))
-            .and_then(Value::as_object_mut)
-    {
-        value.insert("minItems".into(), Value::from(2));
-        value.insert("maxItems".into(), Value::from(2));
-    }
     semantic_contract_bounds(schema, document);
     annotate_transport_bounds(schema);
     annotate_finalization_bounds(schema);
@@ -2696,7 +3368,6 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
     match document {
         SchemaDocument::Corpus => {
             set_bounds(schema, None, "cohorts", Some(4), Some(4));
-            set_bounds(schema, None, "paths", Some(120), Some(120));
             for field in [
                 "positive_request_count",
                 "positive_step_count",
@@ -2716,11 +3387,19 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 "positive_step_count",
                 Value::from(78),
             );
-            set_const(
+        }
+        SchemaDocument::Path => {
+            set_bounds(schema, None, "paths", Some(30), Some(30));
+            set_bounds(schema, Some("CallPathSpecV1"), "steps", Some(1), Some(6));
+            for field in ["prohibit_traversal_through", "exclude_from_projection"] {
+                set_bounds(schema, Some("CallPathSpecV1"), field, Some(0), Some(6));
+            }
+            set_bounds(
                 schema,
                 Some("OraclePathV1"),
-                "schema",
-                Value::String(PATH_SCHEMA.into()),
+                "oracle_steps",
+                Some(1),
+                Some(6),
             );
             set_bounds(
                 schema,
@@ -2731,46 +3410,14 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
             );
             set_bounds(
                 schema,
-                Some("CallPathSpecV1"),
-                "expected_step_count",
-                Some(1),
-                Some(6),
-            );
-            set_bounds(schema, Some("CallPathSpecV1"), "targets", Some(1), Some(6));
-            set_bounds(
-                schema,
-                Some("OraclePathV1"),
-                "oracle_steps",
-                Some(1),
-                Some(6),
-            );
-            set_bounds(
-                schema,
                 Some("NegativeMutationV1"),
                 "step_index",
                 Some(0),
                 Some(5),
             );
             set_bounds(schema, Some("OracleStepV1"), "callsite_line", Some(1), None);
-        }
-        SchemaDocument::Path => {
-            set_bounds(
-                schema,
-                Some("CallPathSpecV1"),
-                "expected_step_count",
-                Some(1),
-                Some(6),
-            );
-            set_bounds(schema, Some("CallPathSpecV1"), "targets", Some(1), Some(6));
-            set_bounds(schema, None, "oracle_steps", Some(1), Some(6));
-            set_bounds(
-                schema,
-                Some("NegativeMutationV1"),
-                "step_index",
-                Some(0),
-                Some(5),
-            );
-            set_bounds(schema, Some("OracleStepV1"), "callsite_line", Some(1), None);
+            set_recursive_field_bounds(schema, "ProofContractFieldV1", "step", Some(0), Some(5));
+            set_recursive_field_bounds(schema, "ProofContractFieldV1", "index", Some(0), Some(5));
         }
         SchemaDocument::Thresholds => {
             for (field, value) in [
@@ -3109,6 +3756,56 @@ fn set_bounds(
     }
 }
 
+fn set_recursive_field_bounds(
+    schema: &mut Value,
+    definition: &str,
+    field: &str,
+    minimum: Option<u64>,
+    maximum: Option<u64>,
+) {
+    let Some(definition) = schema
+        .get_mut("$defs")
+        .and_then(|definitions| definitions.get_mut(definition))
+    else {
+        return;
+    };
+    apply_recursive_field_bounds(definition, field, minimum, maximum);
+}
+
+fn apply_recursive_field_bounds(
+    value: &mut Value,
+    field: &str,
+    minimum: Option<u64>,
+    maximum: Option<u64>,
+) {
+    match value {
+        Value::Object(map) => {
+            if let Some(property) = map
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+                .and_then(|properties| properties.get_mut(field))
+                .and_then(Value::as_object_mut)
+            {
+                if let Some(minimum) = minimum {
+                    property.insert("minimum".into(), Value::from(minimum));
+                }
+                if let Some(maximum) = maximum {
+                    property.insert("maximum".into(), Value::from(maximum));
+                }
+            }
+            for nested in map.values_mut() {
+                apply_recursive_field_bounds(nested, field, minimum, maximum);
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                apply_recursive_field_bounds(nested, field, minimum, maximum);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn set_min_length(schema: &mut Value, definition: &str, field: &str, minimum: u64) {
     if let Some(property) = schema_property(schema, Some(definition), field) {
         property.insert("minLength".into(), Value::from(minimum));
@@ -3312,6 +4009,7 @@ fn date(value: &str) -> bool {
 }
 fn range(value: &OracleSourceRangeV1) -> Result<()> {
     if empty(&value.path)
+        || validate_oracle_source_path(&value.path).is_err()
         || value.start_byte >= value.end_byte
         || value.end_byte > value.file_byte_length
         || !hash(&value.sha256)
@@ -3319,6 +4017,19 @@ fn range(value: &OracleSourceRangeV1) -> Result<()> {
         bail!("proof_availability_range_invalid")
     }
     Ok(())
+}
+
+fn validate_oracle_source_path(path: &str) -> Result<()> {
+    if path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains("//")
+        || path.contains('\\')
+        || path.as_bytes().get(1) == Some(&b':')
+    {
+        bail!("proof_availability_oracle_source_path_invalid")
+    }
+    let components = path.split('/').map(ToOwned::to_owned).collect::<Vec<_>>();
+    validate_project_file(&components)
 }
 fn unique<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
     let mut set = BTreeSet::new();
