@@ -54,6 +54,9 @@ use crate::services::{PublicOperation, PublicOperationService};
 
 const INDEXED_LINE_KIND: &str = "indexed_line_v1";
 const MAX_LINE_WINDOW_BYTES: usize = 8_192;
+pub const MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP: u32 = 128;
+pub const MAX_QUALIFICATION_OBSERVED_RECEIPTS_PER_CASE: usize =
+    MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP as usize * 6;
 const RECEIPT_DOMAIN: &[u8] = b"codestory.indexed-call-edge-receipt.v1\0";
 const CALLABLE_KINDS: [NodeKind; 3] = [NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::MACRO];
 
@@ -124,6 +127,10 @@ pub enum StepQualificationOutcome {
     FirstZeroSurvivor {
         gate: CandidateGate,
         histogram: Vec<CandidateFailureHistogram>,
+    },
+    CandidateLimitExceeded {
+        maximum_candidate_edges: u32,
+        observed_candidate_edges_at_least: u32,
     },
 }
 
@@ -524,9 +531,26 @@ where
         let mut step_unavailable = Vec::new();
         let mut step_gaps = Vec::new();
         let mut containment_failed = false;
-        let edges = store
-            .get_raw_call_edges_by_effective_source(source_id)
+        let bounded_edges = store
+            .get_bounded_raw_call_edges_by_effective_source(
+                source_id,
+                MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP,
+            )
             .map_err(store_error)?;
+        let edges = bounded_edges.edges;
+        if bounded_edges.truncated {
+            steps.push(StepQualificationTrace {
+                step_index,
+                candidate_edge_ids: edges.iter().map(|edge| edge.id).collect(),
+                outcome: StepQualificationOutcome::CandidateLimitExceeded {
+                    maximum_candidate_edges: MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP,
+                    observed_candidate_edges_at_least: MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP
+                        + 1,
+                },
+            });
+            unavailable.push(UnavailableReason::ProofFactsUnavailable);
+            continue;
+        }
         let mut step_trace = StepTraceAccumulator {
             candidate_edge_ids: edges.iter().map(|edge| edge.id).collect(),
             ..StepTraceAccumulator::default()
@@ -1529,6 +1553,28 @@ mod tests {
         }
     }
 
+    fn add_duplicate_call_edges(fixture: &mut Fixture, count: u32) {
+        for offset in 0..count {
+            fixture
+                .store
+                .insert_edge(&Edge {
+                    id: EdgeId(100 + i64::from(offset)),
+                    source: NodeId(2),
+                    target: NodeId(3),
+                    kind: EdgeKind::CALL,
+                    file_node_id: Some(NodeId(1)),
+                    line: Some(1),
+                    resolved_source: Some(NodeId(2)),
+                    resolved_target: Some(NodeId(3)),
+                    confidence: Some(1.0),
+                    certainty: Some(ResolutionCertainty::Certain),
+                    callsite_identity: Some(format!("1:1:{}:3|rust", offset + 1)),
+                    candidate_targets: Vec::new(),
+                })
+                .unwrap();
+        }
+    }
+
     struct SourceBuiltFixture {
         _root: TempDir,
         root: PathBuf,
@@ -1696,6 +1742,63 @@ mod tests {
                     step_index: 1,
                 })]
         ));
+    }
+
+    #[test]
+    fn observed_runtime_builder_bounds_candidate_queries_without_partial_proof() {
+        let mut exact = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        add_duplicate_call_edges(&mut exact, MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP - 1);
+        let exact_observed = build_from_store_observed(
+            &exact.store,
+            &exact.root,
+            &exact.project_id,
+            &exact.publication,
+            &exact.contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(
+            exact_observed.trace.steps[0].candidate_edge_ids.len(),
+            MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP as usize
+        );
+        assert_eq!(
+            exact_observed.built.receipts.len(),
+            MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP as usize
+        );
+        assert!(matches!(
+            &exact_observed.trace.steps[0].outcome,
+            StepQualificationOutcome::Admitted { edge_ids }
+                if edge_ids.len() == MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP as usize
+        ));
+
+        let mut over = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        add_duplicate_call_edges(&mut over, MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP);
+        let over_observed = build_from_store_observed(
+            &over.store,
+            &over.root,
+            &over.project_id,
+            &over.publication,
+            &over.contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(
+            over_observed.trace.steps[0].candidate_edge_ids.len(),
+            MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP as usize
+        );
+        assert_eq!(
+            over_observed.trace.steps[0].outcome,
+            StepQualificationOutcome::CandidateLimitExceeded {
+                maximum_candidate_edges: MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP,
+                observed_candidate_edges_at_least: MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP + 1,
+            }
+        );
+        assert!(over_observed.built.receipts.is_empty());
+        assert!(over_observed.built.facts.is_empty());
+        assert_eq!(
+            over_observed.built.unavailable,
+            vec![UnavailableReason::ProofFactsUnavailable]
+        );
     }
 
     #[test]

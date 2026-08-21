@@ -6,7 +6,8 @@ mod contracts;
 use clap::Parser;
 use contracts::{
     ActivationDecisionV1, CandidateFailureV1, CandidateGateV1, CorpusV1, FinalizationTraceV1,
-    FunnelOutcomeV1, ObservedReceiptV1, ProofQualificationTraceV1, QualificationSummaryV1,
+    FunnelOutcomeV1, MAX_CANDIDATE_EDGES_PER_STEP, MAX_OBSERVED_RECEIPTS_PER_CASE,
+    ObservedReceiptV1, ProofQualificationTraceV1, QualificationSummaryV1,
     ReceiptOracleComparisonV1, SchemaDocument, SelectorGateOutcomeV1, ThresholdsV1,
     TransportEvidenceV1, canonical_corpus_sha256,
 };
@@ -122,6 +123,10 @@ fn report() -> Value {
             let attempted = path["spec"]["expected_step_count"].as_u64().expect("step count");
             let case_id = path["case_id"].as_str().expect("case id");
             let repository_id = path["repository_id"].as_str().expect("repository id");
+            let project_id = format!("project-{repository_id}");
+            let core_generation_id = format!("generation-{repository_id}");
+            let core_run_id = format!("run-{repository_id}");
+            let file_node_id = -(i64::try_from(case_index).expect("case index") + 10_000);
             let steps = (0..attempted)
                 .map(|step_index| {
                     let edge_id = i64::try_from(case_index * 10 + step_index as usize + 1)
@@ -143,13 +148,28 @@ fn report() -> Value {
                     let callsite = &step["callsite"];
                     let start = callsite["start_byte"].as_u64().expect("callsite start");
                     let end = callsite["end_byte"].as_u64().expect("callsite end");
+                    let source_node_id = -(i64::try_from(step_index).expect("step index") + 1);
+                    let target_node_id = source_node_id - 1;
                     json!({
                         "receipt_id":format!("indexed-call-edge:fixture-{case_index}-{step_index}"),
                         "step_index":step_index,
-                        "caller":step["caller"]["symbol"],
                         "edge_id":edge_id,
-                        "callsite_identity":format!("1:{}:0:{}|fixture", step_index + 1, step_index + 2),
+                        "source":{
+                            "pinned":{"project_id":project_id,"core_generation_id":core_generation_id,"core_run_id":core_run_id,"node_id":source_node_id.to_string()},
+                            "canonical_id":format!("canonical-{case_index}-{source_node_id}"),
+                            "qualified_name":step["caller"]["symbol"],
+                            "project_file_components":["src","lib.rs"]
+                        },
+                        "target":{
+                            "pinned":{"project_id":project_id,"core_generation_id":core_generation_id,"core_run_id":core_run_id,"node_id":target_node_id.to_string()},
+                            "canonical_id":format!("canonical-{case_index}-{target_node_id}"),
+                            "qualified_name":step["target"]["symbol"],
+                            "project_file_components":["src","lib.rs"]
+                        },
+                        "certainty":"certain",
+                        "callsite_identity":format!("{file_node_id}:{}:0:{target_node_id}|fixture", step_index + 1),
                         "callsite_line":step_index + 1,
+                        "containment":{"file_node_id":file_node_id,"owner_node_id":source_node_id,"start_line":1,"end_line":attempted},
                         "line_window":{
                             "kind":"indexed_line_v1",
                             "project_file_components":["src","lib.rs"],
@@ -159,7 +179,6 @@ fn report() -> Value {
                             "observed_sha256":SHA,
                             "text":"call();\n"
                         },
-                        "target":step["target"]["symbol"],
                         "oracle_comparison":{"kind":"exact","oracle_step_index":step_index,"oracle_step":step}
                     })
                 })
@@ -207,7 +226,7 @@ fn report() -> Value {
     json!({
       "schema":"codestory.proof-availability-report/v1","qualification_id":"20260821T000000Z-0123456789ab",
       "provenance":{"source_commit":COMMIT,"source_tree":COMMIT,"binary_sha256":SHA,"corpus_sha256":corpus_hash,"thresholds_sha256":SHA,"results_sha256":SHA},
-      "environment":{"environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"projects":cohort_ids.iter().map(|id|json!({"repository_id":id,"source_head":COMMIT,"source_tree":SHA,"store_schema":"codestory-store/v1","file_count":10,"node_count":20,"edge_count":30,"freshness":"fresh","database_sha256":SHA,"core_generation":1,"core_run_id":format!("run-{id}")})).collect::<Vec<_>>()},
+      "environment":{"environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"projects":cohort_ids.iter().map(|id|json!({"repository_id":id,"source_head":COMMIT,"source_tree":SHA,"store_schema":"codestory-store/v1","file_count":10,"node_count":20,"edge_count":30,"freshness":"fresh","database_sha256":SHA,"core_generation":1,"identity":{"project_id":format!("project-{id}"),"core_generation_id":format!("generation-{id}"),"core_run_id":format!("run-{id}")}})).collect::<Vec<_>>()},
       "inventory":cohort_ids.iter().map(|id|json!({"repository_id":id,"stored_call_rows":"10","effective_endpoint_rows":"10","exact_resolved_rows":"8","admitted_rows":"7","unresolved_placeholder_rows":"2"})).collect::<Vec<_>>(),
       "trails":cohort_ids.iter().map(|id|json!({"repository_id":id,"lengths":[{"length":1,"effective_endpoint":"10","exact_resolved":"8","strictly_admitted":"7"},{"length":2,"effective_endpoint":"9","exact_resolved":"7","strictly_admitted":"6"},{"length":3,"effective_endpoint":"8","exact_resolved":"6","strictly_admitted":"5"},{"length":4,"effective_endpoint":"7","exact_resolved":"5","strictly_admitted":"4"},{"length":5,"effective_endpoint":"6","exact_resolved":"4","strictly_admitted":"3"},{"length":6,"effective_endpoint":"5","exact_resolved":"3","strictly_admitted":"2"}]})).collect::<Vec<_>>(),
       "cases":cases,
@@ -225,6 +244,10 @@ fn rebuild_funnel(value: &mut Value) {
             .expect("unclassified")
             .len() as u64;
         for step in case["proof_trace"]["steps"].as_array().expect("steps") {
+            if step["outcome"]["kind"] == "candidate_limit_exceeded" {
+                unclassified += 1;
+                continue;
+            }
             let outcome: FunnelOutcomeV1 =
                 serde_json::from_value(step["outcome"].clone()).expect("closed funnel outcome");
             let key = serde_json::to_string(&outcome).expect("outcome key");
@@ -327,7 +350,7 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
         .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
         .expect_err("provenance and environment share one binary identity");
     let mut wrong_receipt = report();
-    wrong_receipt["cases"][0]["receipt_evidence"]["observed_receipts"][0]["caller"] =
+    wrong_receipt["cases"][0]["receipt_evidence"]["observed_receipts"][0]["source"]["qualified_name"] =
         json!("wrong");
     QualificationSummaryV1::from_json(wrong_receipt)
         .expect_err("an exact receipt cannot contradict its bound oracle caller");
@@ -717,7 +740,7 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         source: identity("-1", "crate::start"),
         target: identity("-2", "crate::target_0"),
         certainty: ResolutionCertainty::Certain,
-        callsite_identity: "1:1:0:2|fixture".into(),
+        callsite_identity: "-3:1:0:-2|fixture".into(),
         containment: CallableContainmentEvidence {
             file_node_id: NodeId(-3),
             owner_node_id: NodeId(-1),
@@ -744,10 +767,38 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         .expect("lossless Task 6 receipt conversion");
     assert_eq!(observed.receipt_id, "indexed-call-edge:fixture");
     assert_eq!(observed.edge_id, -42);
-    assert_eq!(observed.caller, "crate::start");
+    assert_eq!(observed.source.pinned.project_id, "project");
+    assert_eq!(observed.source.pinned.core_generation_id, "generation");
+    assert_eq!(observed.source.pinned.core_run_id, "run");
+    assert_eq!(observed.source.pinned.node_id, "-1");
+    assert_eq!(observed.source.canonical_id, "canonical--1");
+    assert_eq!(observed.source.qualified_name, "crate::start");
+    assert_eq!(observed.source.project_file_components, ["src", "lib.rs"]);
     assert_eq!(observed.callsite_line, 1);
+    assert_eq!(observed.callsite_identity, "-3:1:0:-2|fixture");
+    assert_eq!(observed.certainty, contracts::ReceiptCertaintyV1::Certain);
+    assert_eq!(observed.containment.file_node_id, -3);
+    assert_eq!(observed.containment.owner_node_id, -1);
+    assert_eq!(observed.containment.start_line, 1);
+    assert_eq!(observed.containment.end_line, 1);
     assert_eq!(observed.line_window.byte_start, 11);
-    assert_eq!(observed.target, "crate::target_0");
+    assert_eq!(observed.target.pinned.project_id, "project");
+    assert_eq!(observed.target.pinned.core_generation_id, "generation");
+    assert_eq!(observed.target.pinned.core_run_id, "run");
+    assert_eq!(observed.target.pinned.node_id, "-2");
+    assert_eq!(observed.target.canonical_id, "canonical--2");
+    assert_eq!(observed.target.qualified_name, "crate::target_0");
+    assert_eq!(observed.target.project_file_components, ["src", "lib.rs"]);
+
+    let mut probable = task6_receipt;
+    probable.certainty = ResolutionCertainty::Probable;
+    let comparison: ReceiptOracleComparisonV1 = serde_json::from_value(
+        report()["cases"][0]["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"]
+            .clone(),
+    )
+    .expect("oracle comparison");
+    ObservedReceiptV1::from_task6(0, &probable, comparison)
+        .expect_err("Task 6 receipts must retain and require Certain certainty");
 }
 
 fn assert_valid_first_zero(gate: &str, kind: &str, reason: &str) {
@@ -808,7 +859,7 @@ fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
     }
     let mut mismatched_receipt = report();
     make_non_proven_case(&mut mismatched_receipt, "invalid", None);
-    mismatched_receipt["cases"][0]["receipt_evidence"]["observed_receipts"][0]["target"] =
+    mismatched_receipt["cases"][0]["receipt_evidence"]["observed_receipts"][0]["target"]["qualified_name"] =
         json!("crate::false_positive");
     let oracle = mismatched_receipt["cases"][0]["receipt_evidence"]["observed_receipts"]
         [0]["oracle_comparison"]["oracle_step"]
@@ -951,12 +1002,25 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
             ["missing_oracle_steps"]["maxItems"],
         6
     );
-    assert!(
+    assert_eq!(
         contracts::schema_json(SchemaDocument::Report)["$defs"]["ReceiptEvidenceV1"]["properties"]
-            ["observed_receipts"]
-            .get("maxItems")
-            .is_none(),
-        "Task 6 bounds admitted receipts by the proof budget, not by step count"
+            ["observed_receipts"]["maxItems"],
+        MAX_OBSERVED_RECEIPTS_PER_CASE
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["StepQualificationTraceV1"]["properties"]
+            ["candidate_edge_ids"]["maxItems"],
+        MAX_CANDIDATE_EDGES_PER_STEP
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["StepQualificationOutcomeV1"]["oneOf"]
+            [2]["properties"]["maximum_candidate_edges"]["const"],
+        MAX_CANDIDATE_EDGES_PER_STEP
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["StepQualificationOutcomeV1"]["oneOf"]
+            [2]["properties"]["observed_candidate_edges_at_least"]["const"],
+        MAX_CANDIDATE_EDGES_PER_STEP + 1
     );
     assert_eq!(
         contracts::schema_json(SchemaDocument::Report)["$defs"]["ObservedLineWindowV1"]["properties"]
@@ -1104,8 +1168,13 @@ fn false_positive_extra_edges_remain_observed_without_becoming_authoritative() {
         .as_array_mut()
         .expect("authoritative receipts")
         .push(json!({"receipt_id":extra["receipt_id"],"edge_id":extra["edge_id"]}));
-    QualificationSummaryV1::from_json(falsely_authoritative)
-        .expect_err("a mismatched extra cannot become authoritative ContractProven evidence");
+    let falsely_authoritative = QualificationSummaryV1::from_json(falsely_authoritative)
+        .expect("wrong sealed product outcomes remain reportable evidence");
+    let facts = falsely_authoritative.cases[0]
+        .evaluable_facts()
+        .expect("derived evaluable facts");
+    assert!(facts.false_contract_proven);
+    assert!(!facts.product_disposition_matches_evidence);
 
     let parsed = QualificationSummaryV1::from_json(value)
         .expect("an honest false-positive extra remains concrete diagnostic evidence");
@@ -1120,6 +1189,75 @@ fn false_positive_extra_edges_remain_observed_without_becoming_authoritative() {
 }
 
 #[test]
+fn wrong_contract_proven_with_missing_authoritative_evidence_remains_evaluable() {
+    let mut value = report();
+    let case = &mut value["cases"][0];
+    let reference = case["product_disposition"]["authoritative_receipts"]
+        .as_array_mut()
+        .expect("authoritative receipts")
+        .remove(0);
+    let receipt = case["receipt_evidence"]["observed_receipts"]
+        .as_array()
+        .expect("observed receipts")
+        .iter()
+        .find(|receipt| receipt["receipt_id"] == reference["receipt_id"])
+        .expect("referenced receipt")
+        .clone();
+    case["receipt_evidence"]["missing_oracle_steps"] = json!([{
+        "step_index":receipt["step_index"],
+        "oracle_step":receipt["oracle_comparison"]["oracle_step"]
+    }]);
+
+    let parsed = QualificationSummaryV1::from_json(value)
+        .expect("a false sealed ContractProven result is evidence, not a DTO error");
+    let facts = parsed.cases[0]
+        .evaluable_facts()
+        .expect("derived evaluable facts");
+    assert!(facts.false_contract_proven);
+    assert!(!facts.product_disposition_matches_evidence);
+    assert!(!facts.contract_proven_supported);
+}
+
+#[test]
+fn receipt_provenance_is_bound_to_environment_selectors_and_containment() {
+    let mutations = [
+        (
+            "generation",
+            vec!["source", "pinned", "core_generation_id"],
+            json!("wrong-generation"),
+        ),
+        (
+            "run",
+            vec!["target", "pinned", "core_run_id"],
+            json!("wrong-run"),
+        ),
+        (
+            "node",
+            vec!["source", "pinned", "node_id"],
+            json!("-999999"),
+        ),
+        (
+            "containment",
+            vec!["containment", "owner_node_id"],
+            json!(-999999),
+        ),
+        ("certainty", vec!["certainty"], json!("probable")),
+    ];
+    for (label, path, replacement) in mutations {
+        let mut value = report();
+        let mut slot = &mut value["cases"][0]["receipt_evidence"]["observed_receipts"][0];
+        for component in path {
+            slot = &mut slot[component];
+        }
+        *slot = replacement;
+        assert!(
+            QualificationSummaryV1::from_json(value).is_err(),
+            "{label} provenance mutation must be rejected"
+        );
+    }
+}
+
+#[test]
 fn receipts_unrelated_to_task6_admitted_edges_are_rejected() {
     let mut value = report();
     value["cases"][0]["receipt_evidence"]["observed_receipts"][0]["edge_id"] = json!(999_999);
@@ -1128,6 +1266,12 @@ fn receipts_unrelated_to_task6_admitted_edges_are_rejected() {
 
     QualificationSummaryV1::from_json(value)
         .expect_err("every observed receipt edge must come from the matching admitted step");
+
+    let mut dangling = report();
+    dangling["cases"][0]["product_disposition"]["authoritative_receipts"][0]["receipt_id"] =
+        json!("indexed-call-edge:not-observed");
+    QualificationSummaryV1::from_json(dangling)
+        .expect_err("authoritative receipt references must resolve to concrete observed rows");
 }
 
 #[test]
@@ -1135,7 +1279,9 @@ fn exact_oracle_claims_reject_mismatched_line_window_and_target() {
     let mut line = report();
     line["cases"][0]["receipt_evidence"]["observed_receipts"][0]["callsite_line"] = json!(999);
     line["cases"][0]["receipt_evidence"]["observed_receipts"][0]["callsite_identity"] =
-        json!("1:999:0:2|fixture");
+        json!("-10000:999:0:-2|fixture");
+    line["cases"][0]["receipt_evidence"]["observed_receipts"][0]["containment"]["end_line"] =
+        json!(999);
     QualificationSummaryV1::from_json(line)
         .expect_err("an exact oracle claim cannot carry a mismatched callsite line");
 
@@ -1148,7 +1294,7 @@ fn exact_oracle_claims_reject_mismatched_line_window_and_target() {
         .expect_err("an exact oracle claim cannot carry a mismatched byte window");
 
     let mut target = report();
-    target["cases"][0]["receipt_evidence"]["observed_receipts"][0]["target"] =
+    target["cases"][0]["receipt_evidence"]["observed_receipts"][0]["target"]["qualified_name"] =
         json!("crate::wrong_target");
     QualificationSummaryV1::from_json(target)
         .expect_err("an exact oracle claim cannot carry a mismatched target");
@@ -1253,6 +1399,108 @@ fn all_materialization_freshness_variants_are_closed_and_representable() {
     QualificationSummaryV1::from_json(unknown).expect_err("freshness is a closed enum");
 }
 
+#[test]
+fn candidate_and_observed_receipt_bounds_cover_exact_cap_and_cap_plus_one() {
+    let mut exact = report();
+    expand_six_step_case_to_candidate_cap(&mut exact, 28);
+    let parsed = QualificationSummaryV1::from_json(exact.clone())
+        .expect("the exact producer cap remains a complete classified result");
+    assert_eq!(
+        parsed.cases[28]
+            .receipt_metrics()
+            .unwrap()
+            .observed_receipt_count,
+        u64::try_from(MAX_OBSERVED_RECEIPTS_PER_CASE).unwrap()
+    );
+
+    let rows: Vec<ObservedReceiptV1> =
+        serde_json::from_value(exact["cases"][28]["receipt_evidence"]["observed_receipts"].clone())
+            .expect("bounded receipt rows");
+    assert!(matches!(
+        contracts::ReceiptEvidenceV1::bounded(rows.clone(), vec![]),
+        contracts::ReceiptEvidenceBuildOutcomeV1::Complete(_)
+    ));
+    let mut over_rows = rows;
+    over_rows.push(over_rows[0].clone());
+    assert!(matches!(
+        contracts::ReceiptEvidenceV1::bounded(over_rows, vec![]),
+        contracts::ReceiptEvidenceBuildOutcomeV1::LimitExceeded {
+            maximum_observed_receipts,
+            observed_receipts_at_least,
+        } if maximum_observed_receipts == MAX_OBSERVED_RECEIPTS_PER_CASE
+            && observed_receipts_at_least == MAX_OBSERVED_RECEIPTS_PER_CASE + 1
+    ));
+
+    let mut truncated = report();
+    let case = &mut truncated["cases"][0];
+    let oracle_step =
+        case["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"]["oracle_step"]
+            .clone();
+    case["receipt_evidence"]["observed_receipts"] = json!([]);
+    case["receipt_evidence"]["missing_oracle_steps"] =
+        json!([{"step_index":0,"oracle_step":oracle_step}]);
+    case["product_disposition"]["authoritative_receipts"] = json!([]);
+    case["proof_trace"]["steps"][0]["candidate_edge_ids"] = Value::Array(
+        (1..=MAX_CANDIDATE_EDGES_PER_STEP)
+            .map(|edge| json!(edge))
+            .collect(),
+    );
+    case["proof_trace"]["steps"][0]["outcome"] = json!({
+        "kind":"candidate_limit_exceeded",
+        "maximum_candidate_edges":MAX_CANDIDATE_EDGES_PER_STEP,
+        "observed_candidate_edges_at_least":MAX_CANDIDATE_EDGES_PER_STEP + 1
+    });
+    rebuild_funnel(&mut truncated);
+    let parsed = QualificationSummaryV1::from_json(truncated)
+        .expect("cap + 1 becomes a typed unclassified observation, never a partial proof");
+    assert_eq!(parsed.failure_funnel.classified_positive_steps, 311);
+    assert_eq!(parsed.failure_funnel.unclassified_positive_steps, 1);
+    assert!(
+        parsed.cases[0]
+            .evaluable_facts()
+            .unwrap()
+            .false_contract_proven
+    );
+}
+
+fn expand_six_step_case_to_candidate_cap(value: &mut Value, case_index: usize) {
+    let case = &mut value["cases"][case_index];
+    assert_eq!(case["attempted_step_count"], 6);
+    let templates = case["receipt_evidence"]["observed_receipts"]
+        .as_array()
+        .expect("observed receipts")
+        .clone();
+    let mut observed_receipts = Vec::with_capacity(MAX_OBSERVED_RECEIPTS_PER_CASE);
+    let mut authoritative_receipts = Vec::with_capacity(6);
+    for step_index in 0..6usize {
+        let base = 2_000_000i64
+            + i64::try_from(step_index * MAX_CANDIDATE_EDGES_PER_STEP).expect("edge base");
+        let edge_ids = (0..MAX_CANDIDATE_EDGES_PER_STEP)
+            .map(|offset| base + i64::try_from(offset).expect("edge offset"))
+            .collect::<Vec<_>>();
+        case["proof_trace"]["steps"][step_index]["candidate_edge_ids"] =
+            serde_json::to_value(&edge_ids).expect("candidate ids");
+        case["proof_trace"]["steps"][step_index]["outcome"]["edge_ids"] =
+            serde_json::to_value(&edge_ids).expect("admitted ids");
+        for (offset, edge_id) in edge_ids.into_iter().enumerate() {
+            let mut receipt = templates[step_index].clone();
+            receipt["receipt_id"] = json!(format!(
+                "indexed-call-edge:cap-{case_index}-{step_index}-{offset}"
+            ));
+            receipt["edge_id"] = json!(edge_id);
+            if offset == 0 {
+                authoritative_receipts.push(json!({
+                    "receipt_id":receipt["receipt_id"],
+                    "edge_id":edge_id
+                }));
+            }
+            observed_receipts.push(receipt);
+        }
+    }
+    case["receipt_evidence"]["observed_receipts"] = Value::Array(observed_receipts);
+    case["product_disposition"]["authoritative_receipts"] = Value::Array(authoritative_receipts);
+}
+
 fn add_extra_observed_receipt(value: &mut Value, mismatched: bool) {
     let case = &mut value["cases"][0];
     let step = &mut case["proof_trace"]["steps"][0];
@@ -1269,19 +1517,27 @@ fn add_extra_observed_receipt(value: &mut Value, mismatched: bool) {
         .expect("admitted ids")
         .push(json!(extra_edge));
     let mut extra = case["receipt_evidence"]["observed_receipts"][0].clone();
+    let file_node_id = extra["containment"]["file_node_id"]
+        .as_i64()
+        .expect("file node id");
+    let target_node_id = extra["target"]["pinned"]["node_id"]
+        .as_str()
+        .expect("target node id")
+        .to_owned();
     extra["receipt_id"] = json!(format!("indexed-call-edge:extra-{extra_edge}"));
     extra["edge_id"] = json!(extra_edge);
-    extra["callsite_identity"] = json!("1:1:0:2|extra");
+    extra["callsite_identity"] = json!(format!("{file_node_id}:1:0:{target_node_id}|extra"));
     if mismatched {
-        extra["caller"] = json!("crate::false_caller");
         extra["callsite_line"] = json!(99);
-        extra["callsite_identity"] = json!("1:99:0:2|extra");
-        extra["line_window"]["project_file_components"] = json!(["other.rs"]);
-        extra["target"] = json!("crate::false_positive");
+        extra["callsite_identity"] = json!(format!("{file_node_id}:99:0:{target_node_id}|extra"));
+        extra["containment"]["end_line"] = json!(99);
+        extra["line_window"]["byte_start"] = json!(12);
+        extra["line_window"]["byte_end"] = json!(19);
+        extra["line_window"]["text"] = json!("all();\n");
         let oracle = extra["oracle_comparison"]["oracle_step"].clone();
         extra["oracle_comparison"] = json!({
             "kind":"mismatched","oracle_step_index":0,"oracle_step":oracle,
-            "mismatches":["caller","callsite_line","callsite_window","target"]
+            "mismatches":["callsite_line","callsite_window"]
         });
     }
     case["receipt_evidence"]["observed_receipts"]

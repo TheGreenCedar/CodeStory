@@ -86,6 +86,12 @@ const RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL: &str = "SELECT e.id, e.source_node
        AND e.source_node_id = ?1
        AND e.resolved_source_node_id IS NULL
      ORDER BY id ASC";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundedRawCallEdges {
+    pub edges: Vec<Edge>,
+    pub truncated: bool,
+}
 pub const BUILD_EDGE_SEED_BATCH_SIZE: usize = 200;
 const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = BUILD_EDGE_SEED_BATCH_SIZE;
 const NODE_LOOKUP_BATCH_SIZE: usize = 200;
@@ -6969,6 +6975,33 @@ impl Storage {
             edges.push(Self::edge_from_row(row)?);
         }
         Ok(edges)
+    }
+
+    /// Reads at most `maximum` raw CALL edges and detects one additional row.
+    ///
+    /// Callers that use this for proof construction must treat `truncated` as
+    /// an unclassified result. The retained prefix is diagnostic evidence, not
+    /// authorization to prove over a partial candidate set.
+    pub fn get_bounded_raw_call_edges_by_effective_source(
+        &self,
+        source_node_id: NodeId,
+        maximum: u32,
+    ) -> Result<BoundedRawCallEdges, StorageError> {
+        let sql = format!("{RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL} LIMIT ?3");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let query_limit = i64::from(maximum) + 1;
+        let mut rows = stmt.query(params![
+            source_node_id.0,
+            EdgeKind::CALL as i32,
+            query_limit
+        ])?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next()? {
+            edges.push(Self::edge_from_row(row)?);
+        }
+        let truncated = edges.len() > maximum as usize;
+        edges.truncate(maximum as usize);
+        Ok(BoundedRawCallEdges { edges, truncated })
     }
 
     pub fn get_edges_for_node_ids(

@@ -9,6 +9,11 @@ pub const CORPUS_SCHEMA: &str = "codestory.proof-availability-corpus/v1";
 pub const PATH_SCHEMA: &str = "codestory.proof-availability-path/v1";
 pub const REPORT_SCHEMA: &str = "codestory.proof-availability-report/v1";
 pub const THRESHOLDS_SCHEMA: &str = "codestory.proof-availability-thresholds/v1";
+pub const MAX_CANDIDATE_EDGES_PER_STEP: usize =
+    codestory_runtime::proof_qualification_support::MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP
+        as usize;
+pub const MAX_OBSERVED_RECEIPTS_PER_CASE: usize =
+    codestory_runtime::proof_qualification_support::MAX_QUALIFICATION_OBSERVED_RECEIPTS_PER_CASE;
 const SHA256: &str = "^[0-9a-f]{64}$";
 const COMMIT: &str = "^[0-9a-f]{40}$";
 
@@ -607,6 +612,10 @@ pub enum StepQualificationOutcomeV1 {
         gate: CandidateGateV1,
         histogram: Vec<CandidateFailureHistogramV1>,
     },
+    CandidateLimitExceeded {
+        maximum_candidate_edges: u32,
+        observed_candidate_edges_at_least: u32,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -757,6 +766,7 @@ impl From<codestory_runtime::proof_qualification_support::StepQualificationOutco
         match value {
             codestory_runtime::proof_qualification_support::StepQualificationOutcome::Admitted { edge_ids } => Self::Admitted { edge_ids: edge_ids.into_iter().map(|id| id.0).collect() },
             codestory_runtime::proof_qualification_support::StepQualificationOutcome::FirstZeroSurvivor { gate, histogram } => Self::FirstZeroSurvivor { gate: gate.into(), histogram: histogram.into_iter().map(Into::into).collect() },
+            codestory_runtime::proof_qualification_support::StepQualificationOutcome::CandidateLimitExceeded { maximum_candidate_edges, observed_candidate_edges_at_least } => Self::CandidateLimitExceeded { maximum_candidate_edges, observed_candidate_edges_at_least },
         }
     }
 }
@@ -769,7 +779,7 @@ impl TryFrom<codestory_runtime::proof_qualification_support::StepQualificationTr
     fn try_from(
         value: codestory_runtime::proof_qualification_support::StepQualificationTrace,
     ) -> Result<Self> {
-        Ok(Self {
+        let converted = Self {
             step_index: u64::try_from(value.step_index)
                 .map_err(|_| anyhow::anyhow!("proof_availability_step_index_overflow"))?,
             candidate_edge_ids: value
@@ -778,7 +788,11 @@ impl TryFrom<codestory_runtime::proof_qualification_support::StepQualificationTr
                 .map(|id| id.0)
                 .collect(),
             outcome: value.outcome.into(),
-        })
+        };
+        if !valid_step_trace(&converted) {
+            bail!("proof_availability_step_trace_invalid")
+        }
+        Ok(converted)
     }
 }
 
@@ -860,6 +874,13 @@ pub enum MaterializationFreshnessV1 {
     Stale,
     Missing,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentIdentityV1 {
+    pub project_id: String,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectMaterializationEvidenceV1 {
@@ -873,7 +894,7 @@ pub struct ProjectMaterializationEvidenceV1 {
     pub freshness: MaterializationFreshnessV1,
     pub database_sha256: String,
     pub core_generation: u64,
-    pub core_run_id: String,
+    pub identity: EnvironmentIdentityV1,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1127,17 +1148,75 @@ pub struct ObservedLineWindowV1 {
     pub byte_end: u64,
     pub text: String,
 }
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedNodeIdentityV1 {
+    pub project_id: String,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    pub node_id: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedNodeIdentityV1 {
+    pub pinned: PinnedNodeIdentityV1,
+    pub canonical_id: String,
+    pub qualified_name: String,
+    pub project_file_components: Vec<String>,
+}
+impl From<&codestory_agent::proof_qualification_support::ResolvedNodeIdentity>
+    for ResolvedNodeIdentityV1
+{
+    fn from(value: &codestory_agent::proof_qualification_support::ResolvedNodeIdentity) -> Self {
+        Self {
+            pinned: PinnedNodeIdentityV1 {
+                project_id: value.pinned.project_id.clone(),
+                core_generation_id: value.pinned.core_generation_id.clone(),
+                core_run_id: value.pinned.core_run_id.clone(),
+                node_id: value.pinned.node_id.clone(),
+            },
+            canonical_id: value.canonical_id.clone(),
+            qualified_name: value.qualified_name.clone(),
+            project_file_components: value.project_file_components.clone(),
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReceiptCertaintyV1 {
+    Certain,
+}
+impl TryFrom<codestory_contracts::graph::ResolutionCertainty> for ReceiptCertaintyV1 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: codestory_contracts::graph::ResolutionCertainty) -> Result<Self> {
+        match value {
+            codestory_contracts::graph::ResolutionCertainty::Certain => Ok(Self::Certain),
+            _ => bail!("proof_availability_receipt_certainty_invalid"),
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CallableContainmentEvidenceV1 {
+    pub file_node_id: i64,
+    pub owner_node_id: i64,
+    pub start_line: u32,
+    pub end_line: u32,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedReceiptV1 {
     pub receipt_id: String,
     pub step_index: u8,
     pub edge_id: i64,
-    pub caller: String,
+    pub source: ResolvedNodeIdentityV1,
+    pub target: ResolvedNodeIdentityV1,
+    pub certainty: ReceiptCertaintyV1,
     pub callsite_identity: String,
     pub callsite_line: u32,
+    pub containment: CallableContainmentEvidenceV1,
     pub line_window: ObservedLineWindowV1,
-    pub target: String,
     pub oracle_comparison: ReceiptOracleComparisonV1,
 }
 impl ObservedReceiptV1 {
@@ -1154,9 +1233,17 @@ impl ObservedReceiptV1 {
                 .edge_id
                 .parse()
                 .map_err(|_| anyhow::anyhow!("proof_availability_receipt_edge_id_invalid"))?,
-            caller: receipt.source.qualified_name.clone(),
+            source: (&receipt.source).into(),
+            target: (&receipt.target).into(),
+            certainty: receipt.certainty.try_into()?,
             callsite_identity: receipt.callsite_identity.clone(),
             callsite_line: receipt.line_window.anchor_line,
+            containment: CallableContainmentEvidenceV1 {
+                file_node_id: receipt.containment.file_node_id.0,
+                owner_node_id: receipt.containment.owner_node_id.0,
+                start_line: receipt.containment.start_line,
+                end_line: receipt.containment.end_line,
+            },
             line_window: ObservedLineWindowV1 {
                 kind: receipt.line_window.kind.to_owned(),
                 project_file_components: receipt.line_window.project_file_components.clone(),
@@ -1168,11 +1255,10 @@ impl ObservedReceiptV1 {
                     .map_err(|_| anyhow::anyhow!("proof_availability_receipt_window_overflow"))?,
                 text: receipt.line_window.text.clone(),
             },
-            target: receipt.target.qualified_name.clone(),
             oracle_comparison,
         };
         if observed.oracle_comparison.oracle_step_index() != step_index
-            || !valid_observed_receipt(&observed)
+            || !valid_observed_receipt_shape(&observed)
         {
             bail!("proof_availability_receipt_oracle_comparison_invalid")
         }
@@ -1190,6 +1276,31 @@ pub struct MissingOracleStepV1 {
 pub struct ReceiptEvidenceV1 {
     pub observed_receipts: Vec<ObservedReceiptV1>,
     pub missing_oracle_steps: Vec<MissingOracleStepV1>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiptEvidenceBuildOutcomeV1 {
+    Complete(ReceiptEvidenceV1),
+    LimitExceeded {
+        maximum_observed_receipts: usize,
+        observed_receipts_at_least: usize,
+    },
+}
+impl ReceiptEvidenceV1 {
+    pub fn bounded(
+        observed_receipts: Vec<ObservedReceiptV1>,
+        missing_oracle_steps: Vec<MissingOracleStepV1>,
+    ) -> ReceiptEvidenceBuildOutcomeV1 {
+        if observed_receipts.len() > MAX_OBSERVED_RECEIPTS_PER_CASE {
+            return ReceiptEvidenceBuildOutcomeV1::LimitExceeded {
+                maximum_observed_receipts: MAX_OBSERVED_RECEIPTS_PER_CASE,
+                observed_receipts_at_least: observed_receipts.len(),
+            };
+        }
+        ReceiptEvidenceBuildOutcomeV1::Complete(Self {
+            observed_receipts,
+            missing_oracle_steps,
+        })
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1222,6 +1333,12 @@ pub struct CaseReceiptMetricsV1 {
     pub proven_step_recall_milli: u16,
     pub proven_prefix_length: u8,
     pub diagnostic_candidate_count: u64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CaseEvaluableFactsV1 {
+    pub contract_proven_supported: bool,
+    pub false_contract_proven: bool,
+    pub product_disposition_matches_evidence: bool,
 }
 impl CaseReportV1 {
     pub fn receipt_metrics(&self) -> Result<CaseReceiptMetricsV1> {
@@ -1298,6 +1415,35 @@ impl CaseReportV1 {
                     total.checked_add(u64::try_from(step.candidate_edge_ids.len()).ok()?)
                 })
                 .ok_or_else(|| anyhow::anyhow!("proof_availability_candidate_count_overflow"))?,
+        })
+    }
+
+    pub fn evaluable_facts(&self) -> Result<CaseEvaluableFactsV1> {
+        let metrics = self.receipt_metrics()?;
+        let contract_proven_supported = self.product_disposition.gaps.is_empty()
+            && self.actionable_exact_gap.is_none()
+            && metrics.authoritative_receipt_count > 0
+            && metrics.oracle_receipts_exact
+            && metrics.proven_prefix_length == self.attempted_step_count;
+        let product_disposition_matches_evidence = match self.product_disposition.kind {
+            ProductDispositionKindV1::ContractProven => contract_proven_supported,
+            ProductDispositionKindV1::Unknown => {
+                metrics.proven_prefix_length < self.attempted_step_count
+                    && (!self.product_disposition.gaps.is_empty()
+                        || self.actionable_exact_gap.is_some())
+            }
+            ProductDispositionKindV1::CertifiedAbsence => {
+                metrics.authoritative_receipt_count == 0 && metrics.proven_prefix_length == 0
+            }
+            ProductDispositionKindV1::Invalid => !metrics.oracle_receipts_exact,
+        };
+        Ok(CaseEvaluableFactsV1 {
+            contract_proven_supported,
+            false_contract_proven: matches!(
+                self.product_disposition.kind,
+                ProductDispositionKindV1::ContractProven
+            ) && !contract_proven_supported,
+            product_disposition_matches_evidence,
         })
     }
 }
@@ -1504,6 +1650,20 @@ impl QualificationSummaryV1 {
                     .iter()
                     .map(|project| project.repository_id.as_str()),
             )
+            || self
+                .environment
+                .projects
+                .iter()
+                .map(|project| {
+                    (
+                        project.identity.project_id.as_str(),
+                        project.identity.core_generation_id.as_str(),
+                        project.identity.core_run_id.as_str(),
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.environment.projects.len()
             || self.inventory.len() != 4
             || self.trails.len() != 4
             || self.cases.len() != 120
@@ -1534,7 +1694,9 @@ impl QualificationSummaryV1 {
                 || !hash(&project.source_tree)
                 || empty(&project.store_schema)
                 || !hash(&project.database_sha256)
-                || empty(&project.core_run_id)
+                || empty(&project.identity.project_id)
+                || empty(&project.identity.core_generation_id)
+                || empty(&project.identity.core_run_id)
             {
                 bail!("proof_availability_materialization_invalid")
             }
@@ -1571,9 +1733,10 @@ impl QualificationSummaryV1 {
         let mut attempted_total = 0u16;
         let mut expected_funnel = BTreeMap::<String, u128>::new();
         let mut expected_unclassified = 0u16;
+        let mut expected_classified = 0u16;
         let mut mutation_ids = BTreeSet::new();
         for c in &self.cases {
-            let receipt_metrics = c.receipt_metrics()?;
+            c.receipt_metrics()?;
             if empty(&c.case_id)
                 || empty(&c.repository_id)
                 || c.negative_mutations.len() != 2
@@ -1616,8 +1779,14 @@ impl QualificationSummaryV1 {
                         || empty(&mutation.caller)
                         || empty(&mutation.target)
                 })
-                || !valid_receipts(c)
-                || !valid_disposition(c, &receipt_metrics)
+                || !valid_receipts(
+                    c,
+                    self.environment
+                        .projects
+                        .iter()
+                        .find(|project| project.repository_id == c.repository_id),
+                )
+                || !valid_disposition_structure(c)
             {
                 bail!("proof_availability_case_invalid")
             }
@@ -1640,16 +1809,27 @@ impl QualificationSummaryV1 {
             }
             for step in &c.proof_trace.steps {
                 let outcome = match &step.outcome {
-                    StepQualificationOutcomeV1::Admitted { .. } => FunnelOutcomeV1::Admitted,
+                    StepQualificationOutcomeV1::Admitted { .. } => Some(FunnelOutcomeV1::Admitted),
                     StepQualificationOutcomeV1::FirstZeroSurvivor { gate, histogram } => {
-                        FunnelOutcomeV1::FirstZeroSurvivor {
+                        Some(FunnelOutcomeV1::FirstZeroSurvivor {
                             gate: gate.clone(),
                             histogram: histogram.clone(),
-                        }
+                        })
                     }
+                    StepQualificationOutcomeV1::CandidateLimitExceeded { .. } => None,
                 };
-                let key = serde_json::to_string(&outcome)?;
-                *expected_funnel.entry(key).or_default() += 1;
+                if let Some(outcome) = outcome {
+                    expected_classified = expected_classified
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("proof_availability_classified_overflow"))?;
+                    let key = serde_json::to_string(&outcome)?;
+                    *expected_funnel.entry(key).or_default() += 1;
+                } else {
+                    expected_unclassified =
+                        expected_unclassified.checked_add(1).ok_or_else(|| {
+                            anyhow::anyhow!("proof_availability_unclassified_overflow")
+                        })?;
+                }
             }
         }
         if !self
@@ -1661,6 +1841,7 @@ impl QualificationSummaryV1 {
                 .any(|id| cases_per_project.get(id).copied() != Some(30))
             || attempted_total != 312
             || mutation_ids.len() != 240
+            || expected_classified != self.failure_funnel.classified_positive_steps
             || expected_unclassified != self.failure_funnel.unclassified_positive_steps
         {
             bail!("proof_availability_report_evidence_totals_invalid")
@@ -1818,7 +1999,9 @@ pub fn canonical_corpus_sha256(corpus: &CorpusV1) -> Result<String> {
 }
 
 fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
-    if !strictly_ascending(&trace.candidate_edge_ids) {
+    if trace.candidate_edge_ids.len() > MAX_CANDIDATE_EDGES_PER_STEP
+        || !strictly_ascending(&trace.candidate_edge_ids)
+    {
         return false;
     }
     let candidates = trace
@@ -1872,6 +2055,16 @@ fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
                                 )
                             )
                     }))
+        }
+        StepQualificationOutcomeV1::CandidateLimitExceeded {
+            maximum_candidate_edges,
+            observed_candidate_edges_at_least,
+        } => {
+            trace.candidate_edge_ids.len() == MAX_CANDIDATE_EDGES_PER_STEP
+                && usize::try_from(*maximum_candidate_edges).ok()
+                    == Some(MAX_CANDIDATE_EDGES_PER_STEP)
+                && usize::try_from(*observed_candidate_edges_at_least).ok()
+                    == MAX_CANDIDATE_EDGES_PER_STEP.checked_add(1)
         }
     }
 }
@@ -1966,9 +2159,13 @@ fn valid_case_finalization(case: &CaseReportV1) -> bool {
     }
 }
 
-fn valid_receipts(case: &CaseReportV1) -> bool {
+fn valid_receipts(case: &CaseReportV1, project: Option<&ProjectMaterializationEvidenceV1>) -> bool {
+    let Some(project) = project else {
+        return false;
+    };
     let evidence = &case.receipt_evidence;
     if case.product_disposition.authoritative_receipts.len() > 6
+        || evidence.observed_receipts.len() > MAX_OBSERVED_RECEIPTS_PER_CASE
         || evidence.missing_oracle_steps.len() > usize::from(case.attempted_step_count)
         || !unique(
             evidence
@@ -2013,8 +2210,27 @@ fn valid_receipts(case: &CaseReportV1) -> bool {
     if admitted_edges != observed_edges {
         return false;
     }
+    let mut resolved_nodes = BTreeMap::<u8, &ResolvedNodeIdentityV1>::new();
     for receipt in &evidence.observed_receipts {
-        if receipt.step_index >= case.attempted_step_count || !valid_observed_receipt(receipt) {
+        let Some(source_node_id) =
+            resolved_selector_node_id(&case.proof_trace, u64::from(receipt.step_index))
+        else {
+            return false;
+        };
+        let Some(target_node_id) =
+            resolved_selector_node_id(&case.proof_trace, u64::from(receipt.step_index) + 1)
+        else {
+            return false;
+        };
+        if receipt.step_index >= case.attempted_step_count
+            || !valid_observed_receipt(receipt, &project.identity, source_node_id, target_node_id)
+            || !consistent_resolved_node(&mut resolved_nodes, receipt.step_index, &receipt.source)
+            || !consistent_resolved_node(
+                &mut resolved_nodes,
+                receipt.step_index + 1,
+                &receipt.target,
+            )
+        {
             return false;
         }
     }
@@ -2058,33 +2274,12 @@ fn valid_receipts(case: &CaseReportV1) -> bool {
         })
 }
 
-fn valid_disposition(case: &CaseReportV1, metrics: &CaseReceiptMetricsV1) -> bool {
-    if !unique_typed_gaps(case.product_disposition.gaps.iter().copied())
-        || case
+fn valid_disposition_structure(case: &CaseReportV1) -> bool {
+    unique_typed_gaps(case.product_disposition.gaps.iter().copied())
+        && case
             .actionable_exact_gap
             .as_ref()
-            .is_some_and(|gap| !case.product_disposition.gaps.contains(gap))
-    {
-        return false;
-    }
-    match case.product_disposition.kind {
-        ProductDispositionKindV1::ContractProven => {
-            case.product_disposition.gaps.is_empty()
-                && case.actionable_exact_gap.is_none()
-                && metrics.authoritative_receipt_count > 0
-                && metrics.oracle_receipts_exact
-                && metrics.proven_prefix_length == case.attempted_step_count
-        }
-        ProductDispositionKindV1::Unknown => {
-            metrics.proven_prefix_length < case.attempted_step_count
-                && (!case.product_disposition.gaps.is_empty()
-                    || case.actionable_exact_gap.is_some())
-        }
-        ProductDispositionKindV1::CertifiedAbsence => {
-            metrics.authoritative_receipt_count == 0 && metrics.proven_prefix_length == 0
-        }
-        ProductDispositionKindV1::Invalid => !metrics.oracle_receipts_exact,
-    }
+            .is_none_or(|gap| case.product_disposition.gaps.contains(gap))
 }
 
 fn valid_oracle_step(step: &OracleStepV1) -> bool {
@@ -2115,11 +2310,44 @@ fn valid_observed_line_window(window: &ObservedLineWindowV1) -> bool {
             })
 }
 
-fn valid_observed_receipt(receipt: &ObservedReceiptV1) -> bool {
+fn valid_observed_receipt(
+    receipt: &ObservedReceiptV1,
+    environment: &EnvironmentIdentityV1,
+    source_selector_node_id: i64,
+    target_selector_node_id: i64,
+) -> bool {
+    valid_observed_receipt_shape(receipt)
+        && pinned_matches_environment(&receipt.source.pinned, environment)
+        && pinned_matches_environment(&receipt.target.pinned, environment)
+        && parse_node_id(&receipt.source.pinned.node_id) == Some(source_selector_node_id)
+        && parse_node_id(&receipt.target.pinned.node_id) == Some(target_selector_node_id)
+}
+
+fn valid_observed_receipt_shape(receipt: &ObservedReceiptV1) -> bool {
+    let Some(source_node_id) = valid_resolved_node_identity(&receipt.source) else {
+        return false;
+    };
+    let Some(target_node_id) = valid_resolved_node_identity(&receipt.target) else {
+        return false;
+    };
+    let Some((file_node_id, callsite_line, _, callsite_target_node_id)) =
+        parse_callsite_identity(&receipt.callsite_identity)
+    else {
+        return false;
+    };
     valid_receipt_id(&receipt.receipt_id)
-        && !empty(&receipt.caller)
-        && !empty(&receipt.target)
-        && valid_callsite_identity_line(&receipt.callsite_identity, receipt.callsite_line)
+        && receipt.certainty == ReceiptCertaintyV1::Certain
+        && receipt.source.pinned.project_id == receipt.target.pinned.project_id
+        && receipt.source.pinned.core_generation_id == receipt.target.pinned.core_generation_id
+        && receipt.source.pinned.core_run_id == receipt.target.pinned.core_run_id
+        && callsite_line == receipt.callsite_line
+        && file_node_id == receipt.containment.file_node_id
+        && callsite_target_node_id == target_node_id
+        && receipt.containment.owner_node_id == source_node_id
+        && receipt.containment.start_line > 0
+        && receipt.containment.start_line <= receipt.callsite_line
+        && receipt.callsite_line <= receipt.containment.end_line
+        && receipt.line_window.project_file_components == receipt.source.project_file_components
         && receipt.oracle_comparison.oracle_step_index() == receipt.step_index
         && valid_receipt_oracle_comparison(receipt)
 }
@@ -2130,9 +2358,9 @@ fn valid_receipt_id(receipt_id: &str) -> bool {
         .is_some_and(|suffix| !empty(suffix))
 }
 
-fn valid_callsite_identity_line(identity: &str, line: u32) -> bool {
-    if empty(identity) || line == 0 {
-        return false;
+fn parse_callsite_identity(identity: &str) -> Option<(i64, u32, u32, i64)> {
+    if empty(identity) {
+        return None;
     }
     let pre_marker = identity
         .split_once('|')
@@ -2145,11 +2373,71 @@ fn valid_callsite_identity_line(identity: &str, line: u32) -> bool {
         fields.next().and_then(|value| value.parse::<i64>().ok()),
     );
     let (Some(file), Some(parsed_line), Some(column_or_ordinal), Some(target)) = parsed else {
-        return false;
+        return None;
     };
-    fields.next().is_none()
-        && parsed_line == line
-        && format!("{file}:{parsed_line}:{column_or_ordinal}:{target}") == pre_marker
+    (fields.next().is_none()
+        && parsed_line > 0
+        && format!("{file}:{parsed_line}:{column_or_ordinal}:{target}") == pre_marker)
+        .then_some((file, parsed_line, column_or_ordinal, target))
+}
+
+fn valid_resolved_node_identity(identity: &ResolvedNodeIdentityV1) -> Option<i64> {
+    (!empty(&identity.pinned.project_id)
+        && !empty(&identity.pinned.core_generation_id)
+        && !empty(&identity.pinned.core_run_id)
+        && !empty(&identity.canonical_id)
+        && !empty(&identity.qualified_name)
+        && valid_project_file_components(&identity.project_file_components))
+    .then(|| parse_node_id(&identity.pinned.node_id))
+    .flatten()
+}
+
+fn parse_node_id(value: &str) -> Option<i64> {
+    let parsed = value.parse::<i64>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
+fn valid_project_file_components(components: &[String]) -> bool {
+    !components.is_empty()
+        && components
+            .iter()
+            .all(|component| !empty(component) && component != "." && component != "..")
+}
+
+fn pinned_matches_environment(
+    pinned: &PinnedNodeIdentityV1,
+    environment: &EnvironmentIdentityV1,
+) -> bool {
+    pinned.project_id == environment.project_id
+        && pinned.core_generation_id == environment.core_generation_id
+        && pinned.core_run_id == environment.core_run_id
+}
+
+fn resolved_selector_node_id(
+    trace: &ProofQualificationTraceV1,
+    selector_index: u64,
+) -> Option<i64> {
+    trace
+        .selectors
+        .iter()
+        .find(|selector| selector.selector_index == selector_index)
+        .and_then(|selector| match &selector.outcome {
+            SelectorGateOutcomeV1::Resolved { node_id } => Some(*node_id),
+            SelectorGateOutcomeV1::Failed { .. } | SelectorGateOutcomeV1::Unavailable { .. } => {
+                None
+            }
+        })
+}
+
+fn consistent_resolved_node<'a>(
+    nodes: &mut BTreeMap<u8, &'a ResolvedNodeIdentityV1>,
+    selector_index: u8,
+    identity: &'a ResolvedNodeIdentityV1,
+) -> bool {
+    match nodes.insert(selector_index, identity) {
+        Some(existing) => existing == identity,
+        None => true,
+    }
 }
 
 fn valid_receipt_oracle_comparison(receipt: &ObservedReceiptV1) -> bool {
@@ -2174,7 +2462,7 @@ fn receipt_mismatches(
     oracle: &OracleStepV1,
 ) -> Vec<ReceiptMismatchFieldV1> {
     let mut mismatches = Vec::new();
-    if receipt.caller != oracle.caller.symbol {
+    if receipt.source.qualified_name != oracle.caller.symbol {
         mismatches.push(ReceiptMismatchFieldV1::Caller);
     }
     if receipt.callsite_line != oracle.callsite_line {
@@ -2188,7 +2476,7 @@ fn receipt_mismatches(
     {
         mismatches.push(ReceiptMismatchFieldV1::CallsiteWindow);
     }
-    if receipt.target != oracle.target.symbol {
+    if receipt.target.qualified_name != oracle.target.symbol {
         mismatches.push(ReceiptMismatchFieldV1::Target);
     }
     mismatches
@@ -2551,6 +2839,15 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 Some(1),
                 None,
             );
+            for field in ["start_line", "end_line"] {
+                set_bounds(
+                    schema,
+                    Some("CallableContainmentEvidenceV1"),
+                    field,
+                    Some(1),
+                    None,
+                );
+            }
             set_bounds(
                 schema,
                 Some("MissingOracleStepV1"),
@@ -2584,7 +2881,7 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 Some("ReceiptEvidenceV1"),
                 "observed_receipts",
                 Some(0),
-                None,
+                Some(MAX_OBSERVED_RECEIPTS_PER_CASE as u64),
             );
             set_bounds(
                 schema,
@@ -2599,6 +2896,29 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 "project_file_components",
                 Some(1),
                 None,
+            );
+            for definition in ["ResolvedNodeIdentityV1", "ObservedLineWindowV1"] {
+                set_bounds(
+                    schema,
+                    Some(definition),
+                    "project_file_components",
+                    Some(1),
+                    None,
+                );
+            }
+            set_bounds(
+                schema,
+                Some("StepQualificationTraceV1"),
+                "candidate_edge_ids",
+                Some(0),
+                Some(MAX_CANDIDATE_EDGES_PER_STEP as u64),
+            );
+            set_bounds(
+                schema,
+                Some("CandidateFailureHistogramV1"),
+                "edge_ids",
+                Some(1),
+                Some(MAX_CANDIDATE_EDGES_PER_STEP as u64),
             );
             set_const(
                 schema,
@@ -2645,7 +2965,7 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 schema,
                 Some("FailureFunnelReportV1"),
                 "buckets",
-                Some(1),
+                Some(0),
                 Some(312),
             );
             set_bounds(
@@ -2665,11 +2985,18 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
             for (definition, field) in [
                 ("ReceiptReferenceV1", "receipt_id"),
                 ("ObservedReceiptV1", "receipt_id"),
-                ("ObservedReceiptV1", "caller"),
                 ("ObservedReceiptV1", "callsite_identity"),
-                ("ObservedReceiptV1", "target"),
                 ("ObservedLineWindowV1", "kind"),
                 ("ObservedLineWindowV1", "text"),
+                ("EnvironmentIdentityV1", "project_id"),
+                ("EnvironmentIdentityV1", "core_generation_id"),
+                ("EnvironmentIdentityV1", "core_run_id"),
+                ("PinnedNodeIdentityV1", "project_id"),
+                ("PinnedNodeIdentityV1", "core_generation_id"),
+                ("PinnedNodeIdentityV1", "core_run_id"),
+                ("PinnedNodeIdentityV1", "node_id"),
+                ("ResolvedNodeIdentityV1", "canonical_id"),
+                ("ResolvedNodeIdentityV1", "qualified_name"),
             ] {
                 set_min_length(schema, definition, field, 1);
             }
@@ -2692,8 +3019,21 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 "callsite_identity",
                 "^-?(0|[1-9][0-9]*):[1-9][0-9]*:(0|[1-9][0-9]*):-?(0|[1-9][0-9]*)(\\|.*)?$",
             );
+            set_pattern(
+                schema,
+                "PinnedNodeIdentityV1",
+                "node_id",
+                "^-?(0|[1-9][0-9]*)$",
+            );
             set_array_item_min_length(schema, "ObservedLineWindowV1", "project_file_components", 1);
+            set_array_item_min_length(
+                schema,
+                "ResolvedNodeIdentityV1",
+                "project_file_components",
+                1,
+            );
             annotate_receipt_comparison_bounds(schema);
+            annotate_candidate_outcome_bounds(schema);
         }
     }
 }
@@ -2781,6 +3121,55 @@ fn annotate_receipt_comparison_bounds(value: &mut Value) {
         Value::Array(values) => values
             .iter_mut()
             .for_each(annotate_receipt_comparison_bounds),
+        _ => {}
+    }
+}
+
+fn annotate_candidate_outcome_bounds(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let kind = map
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|properties| properties.get("kind"))
+                .and_then(Value::as_object)
+                .and_then(|kind| kind.get("const"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(properties) = map.get_mut("properties").and_then(Value::as_object_mut) {
+                if kind.as_deref() == Some("admitted")
+                    && let Some(edge_ids) = properties
+                        .get_mut("edge_ids")
+                        .and_then(Value::as_object_mut)
+                {
+                    edge_ids.insert("minItems".into(), Value::from(1));
+                    edge_ids.insert("maxItems".into(), Value::from(MAX_CANDIDATE_EDGES_PER_STEP));
+                }
+                if kind.as_deref() == Some("candidate_limit_exceeded") {
+                    if let Some(maximum) = properties
+                        .get_mut("maximum_candidate_edges")
+                        .and_then(Value::as_object_mut)
+                    {
+                        maximum.insert("const".into(), Value::from(MAX_CANDIDATE_EDGES_PER_STEP));
+                    }
+                    if let Some(observed) = properties
+                        .get_mut("observed_candidate_edges_at_least")
+                        .and_then(Value::as_object_mut)
+                    {
+                        observed.insert(
+                            "const".into(),
+                            Value::from(MAX_CANDIDATE_EDGES_PER_STEP + 1),
+                        );
+                    }
+                }
+            }
+            for value in map.values_mut() {
+                annotate_candidate_outcome_bounds(value);
+            }
+        }
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(annotate_candidate_outcome_bounds),
         _ => {}
     }
 }

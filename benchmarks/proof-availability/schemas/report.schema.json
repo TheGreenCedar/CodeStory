@@ -1,5 +1,35 @@
 {
   "$defs": {
+    "CallableContainmentEvidenceV1": {
+      "additionalProperties": false,
+      "properties": {
+        "end_line": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "file_node_id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "owner_node_id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "start_line": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_node_id",
+        "owner_node_id",
+        "start_line",
+        "end_line"
+      ],
+      "type": "object"
+    },
     "CandidateFailureHistogramV1": {
       "additionalProperties": false,
       "properties": {
@@ -8,6 +38,8 @@
             "format": "int64",
             "type": "integer"
           },
+          "maxItems": 128,
+          "minItems": 1,
           "type": "array"
         },
         "reason": {
@@ -179,6 +211,29 @@
       ],
       "type": "string"
     },
+    "EnvironmentIdentityV1": {
+      "additionalProperties": false,
+      "properties": {
+        "core_generation_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "core_run_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "project_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "core_generation_id",
+        "core_run_id"
+      ],
+      "type": "object"
+    },
     "EnvironmentReportV1": {
       "additionalProperties": false,
       "properties": {
@@ -249,7 +304,7 @@
             "$ref": "#/$defs/FailureBucketV1"
           },
           "maxItems": 312,
-          "minItems": 1,
+          "minItems": 0,
           "type": "array"
         },
         "classified_positive_steps": {
@@ -549,10 +604,6 @@
     "ObservedReceiptV1": {
       "additionalProperties": false,
       "properties": {
-        "caller": {
-          "minLength": 1,
-          "type": "string"
-        },
         "callsite_identity": {
           "minLength": 1,
           "pattern": "^-?(0|[1-9][0-9]*):[1-9][0-9]*:(0|[1-9][0-9]*):-?(0|[1-9][0-9]*)(\\|.*)?$",
@@ -562,6 +613,12 @@
           "format": "uint32",
           "minimum": 1,
           "type": "integer"
+        },
+        "certainty": {
+          "$ref": "#/$defs/ReceiptCertaintyV1"
+        },
+        "containment": {
+          "$ref": "#/$defs/CallableContainmentEvidenceV1"
         },
         "edge_id": {
           "format": "int64",
@@ -578,6 +635,9 @@
           "pattern": "^indexed-call-edge:.+$",
           "type": "string"
         },
+        "source": {
+          "$ref": "#/$defs/ResolvedNodeIdentityV1"
+        },
         "step_index": {
           "format": "uint8",
           "maximum": 5,
@@ -585,19 +645,20 @@
           "type": "integer"
         },
         "target": {
-          "minLength": 1,
-          "type": "string"
+          "$ref": "#/$defs/ResolvedNodeIdentityV1"
         }
       },
       "required": [
         "receipt_id",
         "step_index",
         "edge_id",
-        "caller",
+        "source",
+        "target",
+        "certainty",
         "callsite_identity",
         "callsite_line",
+        "containment",
         "line_window",
-        "target",
         "oracle_comparison"
       ],
       "type": "object"
@@ -679,6 +740,35 @@
       ],
       "type": "object"
     },
+    "PinnedNodeIdentityV1": {
+      "additionalProperties": false,
+      "properties": {
+        "core_generation_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "core_run_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "node_id": {
+          "minLength": 1,
+          "pattern": "^-?(0|[1-9][0-9]*)$",
+          "type": "string"
+        },
+        "project_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "core_generation_id",
+        "core_run_id",
+        "node_id"
+      ],
+      "type": "object"
+    },
     "ProductDispositionKindV1": {
       "enum": [
         "contract_proven",
@@ -726,9 +816,6 @@
           "minimum": 0,
           "type": "integer"
         },
-        "core_run_id": {
-          "type": "string"
-        },
         "database_sha256": {
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
@@ -745,6 +832,9 @@
         },
         "freshness": {
           "$ref": "#/$defs/MaterializationFreshnessV1"
+        },
+        "identity": {
+          "$ref": "#/$defs/EnvironmentIdentityV1"
         },
         "node_count": {
           "format": "uint64",
@@ -777,7 +867,7 @@
         "freshness",
         "database_sha256",
         "core_generation",
-        "core_run_id"
+        "identity"
       ],
       "type": "object"
     },
@@ -872,6 +962,12 @@
       ],
       "type": "string"
     },
+    "ReceiptCertaintyV1": {
+      "enum": [
+        "certain"
+      ],
+      "type": "string"
+    },
     "ReceiptEvidenceV1": {
       "additionalProperties": false,
       "properties": {
@@ -887,6 +983,7 @@
           "items": {
             "$ref": "#/$defs/ObservedReceiptV1"
           },
+          "maxItems": 768,
           "minItems": 0,
           "type": "array"
         }
@@ -983,6 +1080,37 @@
       "required": [
         "receipt_id",
         "edge_id"
+      ],
+      "type": "object"
+    },
+    "ResolvedNodeIdentityV1": {
+      "additionalProperties": false,
+      "properties": {
+        "canonical_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "pinned": {
+          "$ref": "#/$defs/PinnedNodeIdentityV1"
+        },
+        "project_file_components": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "qualified_name": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pinned",
+        "canonical_id",
+        "qualified_name",
+        "project_file_components"
       ],
       "type": "object"
     },
@@ -1111,6 +1239,8 @@
                 "format": "int64",
                 "type": "integer"
               },
+              "maxItems": 128,
+              "minItems": 1,
               "type": "array"
             },
             "kind": {
@@ -1147,6 +1277,33 @@
             "histogram"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "candidate_limit_exceeded",
+              "type": "string"
+            },
+            "maximum_candidate_edges": {
+              "const": 128,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observed_candidate_edges_at_least": {
+              "const": 129,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "maximum_candidate_edges",
+            "observed_candidate_edges_at_least"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1158,6 +1315,8 @@
             "format": "int64",
             "type": "integer"
           },
+          "maxItems": 128,
+          "minItems": 0,
           "type": "array"
         },
         "outcome": {
