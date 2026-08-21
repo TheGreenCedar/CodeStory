@@ -8881,6 +8881,35 @@ version = "0.11.20"
     }
 
     #[test]
+    fn native_v2_transcript_fixture_freezes_private_result_renderers() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../scripts/tests/fixtures/codestory-v2-transcripts.json"
+        ))
+        .expect("v2 transcript fixture");
+        let native = &fixture["native_v2"];
+        assert_eq!(
+            stdio_tool_call_success("status", json!({"state": "ready"})),
+            native["success"],
+        );
+        for (input, expected) in [
+            (
+                json!({"code":"codestory_preparing","message":"CodeStory is preparing managed search.","state":"preparing","retry_after_ms":250}),
+                &native["preparing"],
+            ),
+            (
+                json!({"code":"codestory_unavailable","message":"CodeStory is unavailable."}),
+                &native["unavailable"],
+            ),
+            (
+                json!({"code":"project_required","message":"An absolute repository root is required.","tool":"ground"}),
+                &native["tool_error"],
+            ),
+        ] {
+            assert_eq!(stdio_tool_call_error(&input), *expected);
+        }
+    }
+
+    #[test]
     fn compact_stdio_status_keeps_full_publication_class_when_live_not_ready() {
         let (_project, _cache, runtime) = stdio_inspect_only_runtime();
         let status = json!({

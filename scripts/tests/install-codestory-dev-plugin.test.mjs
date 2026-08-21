@@ -28,6 +28,9 @@ const contract = require(path.join(sourcePlugin, "scripts", "codestory-dev-cli-c
 const version = JSON.parse(
   await readFile(path.join(sourcePlugin, ".codex-plugin", "plugin.json"), "utf8"),
 ).version;
+const cliVersion = JSON.parse(
+  await readFile(path.join(sourcePlugin, "cli-version.json"), "utf8"),
+).cli_version;
 
 function digest(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -115,7 +118,7 @@ async function fixture() {
   await symlink(stagingRoot, marketplacePlugin, "dir");
   await mkdir(pluginData, { recursive: true });
   await writeFile(path.join(pluginData, "sentinel"), "keep", "utf8");
-  await writeFakeCli(cli);
+  await writeFakeCli(cli, cliVersion);
   await writeFakeCodex(codex);
   const options = {
     cli,
@@ -210,20 +213,45 @@ test("CodeStoryDev installer stages and refreshes an exact receipt while preserv
     assert.equal(first.plugin_data_preserved, true);
     assert.equal(
       contract.validateDevCliReceipt(first.installed_plugin_root, {
+        expectedCliVersion: cliVersion,
         expectedPluginVersion: version,
       }).state,
       "verified",
     );
 
-    await writeFakeCli(value.cli, version, "# second exact build");
+    await writeFakeCli(value.cli, cliVersion, "# second exact build");
     const second = install(value);
     assert.notEqual(second.cli.sha256, first.cli.sha256);
     assert.equal(await readFile(path.join(value.pluginData, "sentinel"), "utf8"), "keep");
     assert.equal(
       contract.validateDevCliReceipt(second.installed_plugin_root, {
+        expectedCliVersion: cliVersion,
         expectedPluginVersion: version,
       }).sha256,
       second.cli.sha256,
+    );
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("CodeStoryDev installer keeps the plugin version independent from its pinned CLI version", {
+  skip: process.platform === "win32" ? "fixture uses a POSIX executable" : false,
+}, async () => {
+  const value = await fixture();
+  try {
+    await writeFakeCli(value.cli, cliVersion);
+
+    const installed = install(value);
+
+    assert.equal(installed.plugin_version, version);
+    assert.equal(installed.cli.version, cliVersion);
+    assert.equal(
+      contract.validateDevCliReceipt(installed.installed_plugin_root, {
+        expectedCliVersion: cliVersion,
+        expectedPluginVersion: version,
+      }).state,
+      "verified",
     );
   } finally {
     await rm(value.root, { recursive: true, force: true });

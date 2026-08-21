@@ -58,7 +58,9 @@ function usage(text) {
 
 function mcpCatalog() {
   const requests = [
-    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "catalog-generator", version: "1" } } },
+    // Omit an offered revision so the binary's compiled default, rather than
+    // this caller, selects the catalog's preferred protocol revision.
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { capabilities: {}, clientInfo: { name: "catalog-generator", version: "1" } } },
     { jsonrpc: "2.0", id: 2, method: "tools/list" },
     { jsonrpc: "2.0", id: 3, method: "resources/list" },
     { jsonrpc: "2.0", id: 4, method: "resources/templates/list" },
