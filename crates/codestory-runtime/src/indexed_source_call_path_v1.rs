@@ -601,7 +601,7 @@ struct BoundSource {
 enum SourceObservation {
     Bound(BoundSource),
     Unavailable,
-    InvalidUtf8,
+    InvalidUtf8 { observed_sha256: String },
 }
 
 enum BindSourceError {
@@ -633,22 +633,25 @@ where
     if !cache.contains_key(&identity) {
         let observation = match read_source(&absolute) {
             Err(_) => SourceObservation::Unavailable,
-            Ok(bytes) if std::str::from_utf8(&bytes).is_err() => SourceObservation::InvalidUtf8,
             Ok(bytes) => {
                 let observed_sha256 = sha256_hex(&bytes);
-                let Some(project_file_components) = relative
-                    .iter()
-                    .map(|part| part.to_str().map(str::to_owned))
-                    .collect::<Option<Vec<_>>>()
-                else {
-                    cache.insert(identity.clone(), SourceObservation::Unavailable);
-                    return Err(BindSourceError::Unavailable);
-                };
-                SourceObservation::Bound(BoundSource {
-                    bytes,
-                    observed_sha256,
-                    project_file_components,
-                })
+                if std::str::from_utf8(&bytes).is_err() {
+                    SourceObservation::InvalidUtf8 { observed_sha256 }
+                } else {
+                    let Some(project_file_components) = relative
+                        .iter()
+                        .map(|part| part.to_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        cache.insert(identity.clone(), SourceObservation::Unavailable);
+                        return Err(BindSourceError::Unavailable);
+                    };
+                    SourceObservation::Bound(BoundSource {
+                        bytes,
+                        observed_sha256,
+                        project_file_components,
+                    })
+                }
             }
         };
         cache.insert(identity.clone(), observation);
@@ -661,7 +664,10 @@ where
         SourceObservation::Bound(_) | SourceObservation::Unavailable => {
             Err(BindSourceError::Unavailable)
         }
-        SourceObservation::InvalidUtf8 => Err(BindSourceError::InvalidUtf8),
+        SourceObservation::InvalidUtf8 { observed_sha256 } if observed_sha256 != indexed_hash => {
+            Err(BindSourceError::Unavailable)
+        }
+        SourceObservation::InvalidUtf8 { .. } => Err(BindSourceError::InvalidUtf8),
     }
 }
 
@@ -1112,6 +1118,51 @@ mod tests {
             vec![FactBuildGap::InvalidUtf8 { step_index: 0 }]
         );
         assert!(utf8_result.facts.is_empty());
+    }
+
+    #[test]
+    fn hash_mismatch_precedes_invalid_utf8_and_is_cached_without_reread() {
+        let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        fixture
+            .store
+            .insert_edge(&Edge {
+                id: EdgeId(15),
+                source: NodeId(2),
+                target: NodeId(3),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(1)),
+                line: Some(1),
+                resolved_source: Some(NodeId(2)),
+                resolved_target: Some(NodeId(3)),
+                confidence: Some(1.0),
+                certainty: Some(ResolutionCertainty::Certain),
+                callsite_identity: Some("1:1:1:3|second-callsite".to_owned()),
+                candidate_targets: Vec::new(),
+            })
+            .unwrap();
+        fs::write(&fixture.source_path, [0xff, b'\n']).unwrap();
+        let reads = Cell::new(0);
+
+        let built = build_from_store(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &fixture.contract,
+            |path| {
+                reads.set(reads.get() + 1);
+                fs::read(path)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(reads.get(), 1);
+        assert_eq!(
+            built.unavailable,
+            vec![UnavailableReason::SourceNotBoundToPublication]
+        );
+        assert!(built.gaps.is_empty());
+        assert!(built.facts.is_empty());
     }
 
     #[test]
