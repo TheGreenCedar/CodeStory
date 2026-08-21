@@ -115,11 +115,11 @@ class NativeProcessProducer(EventProducer):
 
     def _gone(self) -> str | None:
         """A description of how the exact pinned process ended, or None."""
-        # Start identity alone cannot see a Linux process that exited but has
-        # not been reaped: /proc keeps answering with an unchanged start time,
-        # so the probe would report a dead producer as running for as long as
-        # the wait lasts. Ask for a terminated state first so the message this
-        # produces is never a false statement about a live process.
+        # Start identity alone cannot reliably classify an exited-but-unreaped
+        # Unix process: Linux keeps the same /proc start time, while macOS may
+        # stop returning a complete proc_pidinfo record before the PID is
+        # reaped. Ask for a terminated state first so this never reports a dead
+        # producer as running.
         terminated = terminated_process_state(self.pid)
         if terminated is not None:
             return f"exited: pid {self.pid} {terminated}"
