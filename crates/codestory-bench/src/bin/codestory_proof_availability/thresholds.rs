@@ -595,7 +595,7 @@ mod tests {
     use super::super::contracts::{
         IntegrationDependencyTestKindV1, IntegrationDependencyTestStatusV1,
         IntegrationDependencyTestV1, OracleSourceRangeV1, SourceDependencyKindV1,
-        canonical_thresholds_sha256,
+        canonical_thresholds_sha256, results_evidence_sha256_from_json,
     };
     use super::*;
     use sha2::{Digest, Sha256};
@@ -635,6 +635,11 @@ mod tests {
             transport_errors: 0,
             product_disposition_mismatches: 0,
         }
+    }
+
+    fn refresh_results_digest(report: &mut serde_json::Value) {
+        let digest = results_evidence_sha256_from_json(report).expect("recomputed results digest");
+        report["provenance"]["results_sha256"] = serde_json::json!(digest);
     }
     fn threshold_role(full: u16, cohort: u16, lower: u16, cohort_lower: u16) -> RoleThresholdsV1 {
         RoleThresholdsV1 {
@@ -996,7 +1001,7 @@ mod tests {
             canonical_thresholds_sha256(&thresholds).expect("canonical threshold identity");
         assert_eq!(
             original_identity,
-            "113cd31a352573636f6b3e6ebbe63ea4e2f1fcaa9ed6e24dec99149a608b56be"
+            "bc9882f2896c43758b361fb1c5c2a570f37a86548101dc07a55e2d7d76b23f7e"
         );
         let mut value = serde_json::to_value(&thresholds).expect("threshold JSON");
         value["automatic"]["minimum_full_proofs"] = serde_json::json!(95);
@@ -1027,6 +1032,7 @@ mod tests {
     fn public_evaluator_counts_false_proof_and_disposition_mismatch_hard_failures() {
         let (mut report, corpus, thresholds) = accepted_fixture::values();
         report["cases"][0]["negative_mutations"][0]["contract_proven"] = serde_json::json!(true);
+        refresh_results_digest(&mut report);
         let summary = QualificationSummaryV1::from_json(report).expect("false-proof summary");
         let corpus = CorpusV1::from_json(corpus).expect("accepted corpus");
         let thresholds = ThresholdsV1::from_json(thresholds).expect("accepted thresholds");
@@ -1044,9 +1050,22 @@ mod tests {
         );
 
         let (mut report, corpus, thresholds) = accepted_fixture::values();
-        report["cases"][0]["product_disposition"]["kind"] = serde_json::json!("unknown");
-        report["cases"][0]["product_disposition"]["gaps"] = serde_json::json!(["relation_missing"]);
-        report["cases"][0]["actionable_exact_gap"] = serde_json::json!("relation_missing");
+        report["cases"][0]["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"]["kind"] =
+            serde_json::json!("mismatched");
+        report["cases"][0]["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"]["oracle_step"]
+            ["target_symbol"] = serde_json::json!("fixture::wrong-target");
+        report["cases"][0]["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"]["mismatches"] =
+            serde_json::json!(["target"]);
+        let step_index =
+            report["cases"][0]["receipt_evidence"]["observed_receipts"][0]["step_index"].clone();
+        let oracle_step = report["cases"][0]["receipt_evidence"]["observed_receipts"][0]
+            ["oracle_comparison"]["oracle_step"]
+            .clone();
+        report["cases"][0]["receipt_evidence"]["missing_oracle_steps"]
+            .as_array_mut()
+            .expect("missing step rows")
+            .push(serde_json::json!({ "step_index": step_index, "oracle_step": oracle_step }));
+        refresh_results_digest(&mut report);
         let summary = QualificationSummaryV1::from_json(report).expect("mismatched summary");
         let corpus = CorpusV1::from_json(corpus).expect("accepted corpus");
         let thresholds = ThresholdsV1::from_json(thresholds).expect("accepted thresholds");
@@ -1062,10 +1081,10 @@ mod tests {
 
     #[test]
     fn public_evaluator_rejects_summary_and_corpus_threshold_identity_mismatch() {
-        let (mut report, corpus, thresholds) = accepted_fixture::values();
-        report["provenance"]["thresholds_sha256"] =
-            serde_json::json!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let summary = QualificationSummaryV1::from_json(report).expect("shaped summary");
+        let (report, corpus, thresholds) = accepted_fixture::values();
+        let mut summary = QualificationSummaryV1::from_json(report).expect("accepted summary");
+        summary.provenance.thresholds_sha256 =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
         let corpus = CorpusV1::from_json(corpus).expect("accepted corpus");
         let thresholds = ThresholdsV1::from_json(thresholds).expect("accepted thresholds");
         evaluate_activation_decision(&summary, &corpus, &thresholds, None)

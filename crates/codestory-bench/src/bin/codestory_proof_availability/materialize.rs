@@ -1,15 +1,23 @@
 use super::cli::MaterializeArgs;
 use super::contracts::{
-    CohortPathFileV1, OraclePathV1, OracleSourceRangeV1, QUALIFICATION_REPOSITORIES,
-    canonical_cohort_path_file_sha256, canonical_corpus_sha256, validate_project_file,
+    CohortPathFileV1, EnvironmentIdentityV1, EnvironmentReportV1, MaterializationFreshnessV1,
+    OraclePathV1, OracleSourceRangeV1, ProjectMaterializationEvidenceV1,
+    QUALIFICATION_REPOSITORIES, QualificationInvocationIdentityV1, QualificationOperationV1,
+    QualificationProfileV1, canonical_cohort_path_file_sha256, canonical_corpus_sha256,
+    validate_project_file,
 };
 use super::corpus::LoadedCorpusV1;
 use anyhow::{Context, Result, bail};
+use codestory_contracts::workspace::SourceIndexPolicy;
+use codestory_runtime::{
+    RetrievalProcessDefaults, RetrievalRuntimeDefaults, RetrievalRuntimeOverrides, Runtime,
+    RuntimeProcessConfig, RuntimeRetrievalConfig, RuntimeRetrievalProfile,
+};
 use codestory_workspace::{
     WorkspacePathIdentity, WorkspacePathLexicalIdentity, workspace_path_identity,
     workspace_path_lexical_identity,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -21,6 +29,9 @@ use std::process::{Command, Output};
 const SOURCE_ENVIRONMENT_SCHEMA: &str = "codestory.proof-availability-source-environment/v1";
 const SOURCE_STAGING_OWNER_SCHEMA: &str = "codestory.proof-availability-source-staging-owner/v1";
 const MAX_DESCRIPTOR_BYTES: usize = 65_536;
+const INDEXED_ENVIRONMENT_SCHEMA: &str = "codestory.proof-availability-operational-environment/v1";
+const INDEXED_CACHE_OWNER_SCHEMA: &str = "codestory.proof-availability-cache-owner/v1";
+const MAX_INDEXED_DESCRIPTOR_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaterializationFailurePhase {
@@ -119,6 +130,50 @@ struct VerifiedSourceRepositoryV1 {
     verified_file_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperationalEnvironmentV1 {
+    pub(crate) schema: String,
+    pub(crate) corpus_sha256: String,
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) cache_root: PathBuf,
+    pub(crate) environment: EnvironmentReportV1,
+    pub(crate) repositories: Vec<OperationalRepositoryV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperationalRepositoryV1 {
+    pub(crate) repository_id: String,
+    pub(crate) checkout_root: PathBuf,
+    pub(crate) project_root: PathBuf,
+    pub(crate) database_path: PathBuf,
+    pub(crate) path_file_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct QualificationBinaryIdentity {
+    binary_sha256: String,
+    source_commit: String,
+    source_tree: String,
+    recorded_at: String,
+    rust_host: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IndexedCacheOwnerV1<'a> {
+    schema: &'static str,
+    corpus_sha256: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IndexedCacheOwnerV1Owned {
+    schema: String,
+    corpus_sha256: String,
+}
+
 #[derive(Debug, Clone)]
 struct TreeEntry {
     mode: String,
@@ -194,6 +249,256 @@ impl DestinationPlan {
 
 pub fn verify_only(arguments: &MaterializeArgs, loaded: &LoadedCorpusV1) -> Result<()> {
     verify_only_with_registry(arguments, loaded, &QUALIFICATION_REPOSITORIES, false)
+}
+
+pub(crate) fn materialize_indexed(
+    arguments: &MaterializeArgs,
+    loaded: &LoadedCorpusV1,
+) -> Result<()> {
+    materialize_indexed_with_registry(
+        arguments,
+        loaded,
+        &QUALIFICATION_REPOSITORIES,
+        false,
+        qualification_binary_identity()?,
+    )
+}
+
+fn materialize_indexed_with_registry(
+    arguments: &MaterializeArgs,
+    loaded: &LoadedCorpusV1,
+    registry: &[(&str, &str, &str, &str)],
+    allow_local_repositories: bool,
+    qualification: QualificationBinaryIdentity,
+) -> Result<()> {
+    if arguments.verify_only {
+        bail!("proof_availability_indexed_materialization_rejects_verify_only")
+    }
+    loaded
+        .corpus
+        .validate_with_path_files_and_registry(&loaded.path_files, registry)?;
+    let destinations = DestinationPlan::observe(arguments)?;
+    ensure_absent(&destinations.cache.real_path)?;
+    let corpus_sha256 = canonical_corpus_sha256(&loaded.corpus)?;
+
+    let staging = tempfile::Builder::new()
+        .prefix(".codestory-proof-indexed-")
+        .disable_cleanup(true)
+        .tempdir_in(&destinations.workspace_parent.real_path)?;
+    let staging_path = staging.path().to_path_buf();
+    let execution = (|| -> Result<()> {
+        write_private_json_noclobber(
+            &staging_path.join("owner.json"),
+            &SourceStagingOwnerV1 {
+                schema: SOURCE_STAGING_OWNER_SCHEMA,
+                workspace: destinations.workspace.real_path.display().to_string(),
+                output: destinations.out.real_path.display().to_string(),
+            },
+        )?;
+        let staged_workspaces = staging_path.join("workspaces");
+        fs::create_dir(&staged_workspaces)?;
+        let hooks = staging_path.join("empty-hooks");
+        fs::create_dir(&hooks)?;
+
+        for path_file in &loaded.path_files {
+            let cohort = loaded
+                .corpus
+                .cohorts
+                .iter()
+                .find(|cohort| cohort.repository_id == path_file.repository_id)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_materialize_cohort_missing"))?;
+            if !allow_local_repositories && !path_file.repository.starts_with("https://") {
+                bail!("proof_availability_repository_transport_invalid")
+            }
+            let checkout = staged_workspaces.join(&path_file.repository_id);
+            let (tree_digest, tree) =
+                stage_repository(&path_file.repository, &path_file.commit, &checkout, &hooks)?;
+            if tree_digest != path_file.source_tree_sha256
+                || tree_digest != cohort.source_tree_sha256
+            {
+                bail!("proof_availability_source_tree_mismatch")
+            }
+            let project_root = resolve_workspace(&checkout, &path_file.workspace)?;
+            verify_oracle_sources(path_file, &project_root, &tree)?;
+            require_head_and_clean(&checkout, &path_file.commit, &hooks)?;
+        }
+        destinations.revalidate(arguments)?;
+        let staged_identity = workspace_path_identity(&staged_workspaces)?;
+        rename_directory_noreplace(&staged_workspaces, &destinations.workspace.real_path)?;
+        if workspace_path_identity(&destinations.workspace.real_path)? != staged_identity {
+            bail!("proof_availability_materialize_installed_identity_mismatch")
+        }
+
+        create_private_directory(&destinations.cache.real_path)?;
+        write_private_json_noclobber(
+            &destinations.cache.real_path.join("owner.json"),
+            &IndexedCacheOwnerV1 {
+                schema: INDEXED_CACHE_OWNER_SCHEMA,
+                corpus_sha256: &corpus_sha256,
+            },
+        )?;
+        let database_root = destinations.cache.real_path.join("databases");
+        create_private_directory(&database_root)?;
+
+        let mut projects = Vec::with_capacity(loaded.path_files.len());
+        let mut repositories = Vec::with_capacity(loaded.path_files.len());
+        for path_file in &loaded.path_files {
+            let checkout_root = destinations
+                .workspace
+                .real_path
+                .join(&path_file.repository_id);
+            let project_root = resolve_workspace(&checkout_root, &path_file.workspace)?;
+            revalidate_repository(path_file, &checkout_root, &project_root, &hooks)?;
+            let database_path = database_root.join(format!("{}.sqlite3", path_file.repository_id));
+            let runtime =
+                core_only_runtime(&project_root, &destinations.cache.real_path.join("runtime"));
+            runtime
+                .project_service()
+                .open_project_summary_with_storage_path(project_root.clone(), database_path.clone())
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            runtime
+                .index_service()
+                .run_indexing_blocking_without_runtime_refresh(
+                    codestory_contracts::api::IndexMode::Full,
+                )
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            let summary = runtime
+                .project_service()
+                .open_project_summary_with_storage_path(project_root.clone(), database_path.clone())
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            let freshness = match summary.freshness.as_ref().map(|value| value.status) {
+                Some(codestory_contracts::api::IndexFreshnessStatusDto::Fresh) => {
+                    MaterializationFreshnessV1::Fresh
+                }
+                Some(codestory_contracts::api::IndexFreshnessStatusDto::Stale) => {
+                    MaterializationFreshnessV1::Stale
+                }
+                None | Some(codestory_contracts::api::IndexFreshnessStatusDto::NotChecked) => {
+                    MaterializationFreshnessV1::Missing
+                }
+            };
+            if !matches!(freshness, MaterializationFreshnessV1::Fresh) {
+                bail!("proof_availability_materialized_index_not_fresh")
+            }
+            drop(runtime);
+            revalidate_repository(path_file, &checkout_root, &project_root, &hooks)?;
+
+            let store = codestory_store::Store::open_observational(&database_path)
+                .context("open materialized proof store observationally")?;
+            let publication_before = store
+                .get_complete_index_publication()?
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_core_publication_missing"))?;
+            let schema =
+                codestory_store::Store::database_schema_version_observational(&database_path)?;
+            if schema != codestory_store::CURRENT_SCHEMA_VERSION {
+                bail!("proof_availability_store_schema_mismatch")
+            }
+            let file_count = u64::try_from(store.get_files()?.len())?;
+            let node_count = u64::try_from(store.get_node_count()?)?;
+            let edge_count = u64::try_from(store.get_edge_count()?)?;
+            let project_identity = codestory_workspace::project_identity_v3(&project_root);
+            if store
+                .get_retrieval_index_publication(&project_identity.project_id)?
+                .is_some()
+            {
+                bail!("proof_availability_retrieval_publication_forbidden")
+            }
+            drop(store);
+            let database_sha256 = sha256(&fs::read(&database_path)?);
+            let store = codestory_store::Store::open_observational(&database_path)
+                .context("reopen materialized proof store observationally")?;
+            let publication_after = store
+                .get_complete_index_publication()?
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_core_publication_missing"))?;
+            drop(store);
+            if publication_before != publication_after {
+                bail!("proof_availability_mixed_core_generation")
+            }
+            projects.push(ProjectMaterializationEvidenceV1 {
+                repository_id: path_file.repository_id.clone(),
+                source_head: path_file.commit.clone(),
+                source_tree: path_file.source_tree_sha256.clone(),
+                store_schema: schema.to_string(),
+                file_count,
+                node_count,
+                edge_count,
+                freshness,
+                database_sha256,
+                core_generation: publication_before.generation,
+                identity: EnvironmentIdentityV1 {
+                    project_id: project_identity.project_id,
+                    core_generation_id: publication_before.generation_id,
+                    core_run_id: publication_before.run_id,
+                },
+            });
+            repositories.push(OperationalRepositoryV1 {
+                repository_id: path_file.repository_id.clone(),
+                checkout_root,
+                project_root,
+                database_path,
+                path_file_sha256: canonical_cohort_path_file_sha256(path_file)?,
+            });
+        }
+        projects.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
+        repositories.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
+        let environment_id = domain_sha256(
+            b"codestory.proof-availability-environment/v1\0",
+            format!(
+                "{}\0{}\0{}\0{}",
+                qualification.binary_sha256,
+                qualification.source_commit,
+                qualification.source_tree,
+                corpus_sha256
+            )
+            .as_bytes(),
+        );
+        let environment = EnvironmentReportV1 {
+            environment_id,
+            os: std::env::consts::OS.to_owned(),
+            architecture: std::env::consts::ARCH.to_owned(),
+            rust_host: qualification.rust_host,
+            binary_sha256: qualification.binary_sha256,
+            qualification_source_commit: qualification.source_commit,
+            qualification_source_tree: qualification.source_tree,
+            recorded_at: qualification.recorded_at,
+            invocation: QualificationInvocationIdentityV1 {
+                binary_name: "codestory-proof-availability".to_owned(),
+                operation: QualificationOperationV1::Run,
+                profile: QualificationProfileV1::LocalCoreOnly,
+                corpus_sha256: corpus_sha256.clone(),
+                thresholds_sha256: loaded.corpus.thresholds_sha256.clone(),
+            },
+            projects,
+        };
+        let descriptor = OperationalEnvironmentV1 {
+            schema: INDEXED_ENVIRONMENT_SCHEMA.to_owned(),
+            corpus_sha256,
+            workspace_root: destinations.workspace.real_path.clone(),
+            cache_root: destinations.cache.real_path.clone(),
+            environment,
+            repositories,
+        };
+        destinations.revalidate_output_parent()?;
+        write_private_json_noclobber(&destinations.out.real_path, &descriptor)?;
+        Ok(())
+    })();
+    execution.map_err(|cause| {
+        let workspace_published = fs::symlink_metadata(&destinations.workspace.real_path).is_ok();
+        materialization_recovery_error(
+            "proof_availability_indexed_materialization_failed",
+            if workspace_published {
+                MaterializationFailurePhase::AfterPublication
+            } else {
+                MaterializationFailurePhase::BeforePublication
+            },
+            &staging_path,
+            workspace_published.then_some(destinations.workspace.real_path.as_path()),
+            fs::symlink_metadata(&destinations.out.real_path)
+                .is_ok()
+                .then_some(destinations.out.real_path.as_path()),
+            cause,
+        )
+    })
 }
 
 fn verify_only_with_registry(
@@ -434,6 +739,307 @@ fn ensure_absent(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+pub(crate) fn load_operational_environment(path: &Path) -> Result<OperationalEnvironmentV1> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("proof_availability_operational_environment_not_regular")
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("proof_availability_operational_environment_not_private")
+        }
+    }
+    let bytes = fs::read(path).context("read proof availability operational environment")?;
+    if bytes.len() > MAX_INDEXED_DESCRIPTOR_BYTES {
+        bail!("proof_availability_operational_environment_too_large")
+    }
+    let descriptor: OperationalEnvironmentV1 = serde_json::from_slice(&bytes)
+        .context("parse proof availability operational environment")?;
+    if descriptor.schema != INDEXED_ENVIRONMENT_SCHEMA {
+        bail!("proof_availability_operational_environment_schema_mismatch")
+    }
+    if !descriptor.workspace_root.is_absolute()
+        || !descriptor.cache_root.is_absolute()
+        || descriptor.repositories.iter().any(|repository| {
+            !repository.checkout_root.is_absolute()
+                || !repository.project_root.is_absolute()
+                || !repository.database_path.is_absolute()
+        })
+    {
+        bail!("proof_availability_operational_environment_path_invalid")
+    }
+    Ok(descriptor)
+}
+
+pub(crate) fn validate_operational_environment(
+    loaded: &LoadedCorpusV1,
+    descriptor: &OperationalEnvironmentV1,
+) -> Result<()> {
+    validate_operational_environment_with_identity(
+        loaded,
+        descriptor,
+        &qualification_binary_identity()?,
+        &QUALIFICATION_REPOSITORIES,
+    )
+}
+
+fn validate_operational_environment_with_identity(
+    loaded: &LoadedCorpusV1,
+    descriptor: &OperationalEnvironmentV1,
+    qualification: &QualificationBinaryIdentity,
+    registry: &[(&str, &str, &str, &str)],
+) -> Result<()> {
+    loaded
+        .corpus
+        .validate_with_path_files_and_registry(&loaded.path_files, registry)?;
+    let corpus_sha256 = canonical_corpus_sha256(&loaded.corpus)?;
+    if descriptor.corpus_sha256 != corpus_sha256
+        || descriptor.environment.invocation.corpus_sha256 != corpus_sha256
+        || descriptor.repositories.len() != loaded.path_files.len()
+        || descriptor.environment.projects.len() != loaded.path_files.len()
+    {
+        bail!("proof_availability_operational_environment_binding_invalid")
+    }
+    let workspace_identity =
+        workspace_path_lexical_identity(&descriptor.workspace_root.canonicalize()?)?;
+    let cache_identity = workspace_path_lexical_identity(&descriptor.cache_root.canonicalize()?)?;
+    let cache_owner: IndexedCacheOwnerV1Owned =
+        serde_json::from_slice(&fs::read(descriptor.cache_root.join("owner.json"))?)?;
+    if cache_owner.schema != INDEXED_CACHE_OWNER_SCHEMA
+        || cache_owner.corpus_sha256 != corpus_sha256
+    {
+        bail!("proof_availability_cache_owner_mismatch")
+    }
+    if descriptor.environment.binary_sha256 != qualification.binary_sha256
+        || descriptor.environment.qualification_source_commit != qualification.source_commit
+        || descriptor.environment.qualification_source_tree != qualification.source_tree
+    {
+        bail!("proof_availability_qualification_binary_mismatch")
+    }
+    for path_file in &loaded.path_files {
+        let repository = descriptor
+            .repositories
+            .iter()
+            .find(|repository| repository.repository_id == path_file.repository_id)
+            .ok_or_else(|| anyhow::anyhow!("proof_availability_operational_repository_missing"))?;
+        let project = descriptor
+            .environment
+            .projects
+            .iter()
+            .find(|project| project.repository_id == path_file.repository_id)
+            .ok_or_else(|| anyhow::anyhow!("proof_availability_environment_project_missing"))?;
+        if repository.path_file_sha256 != canonical_cohort_path_file_sha256(path_file)?
+            || project.source_head != path_file.commit
+            || project.source_tree != path_file.source_tree_sha256
+            || !matches!(project.freshness, MaterializationFreshnessV1::Fresh)
+        {
+            bail!("proof_availability_operational_repository_binding_invalid")
+        }
+        if !workspace_path_lexical_identity(&repository.checkout_root.canonicalize()?)?
+            .is_within(&workspace_identity)
+            || !workspace_path_lexical_identity(&repository.project_root.canonicalize()?)?
+                .is_within(&workspace_identity)
+            || !workspace_path_lexical_identity(&repository.database_path.canonicalize()?)?
+                .is_within(&cache_identity)
+        {
+            bail!("proof_availability_operational_repository_path_invalid")
+        }
+        revalidate_case_source(
+            path_file,
+            &repository.checkout_root,
+            &repository.project_root,
+        )?;
+        if sha256(&fs::read(&repository.database_path)?) != project.database_sha256 {
+            bail!("proof_availability_database_mismatch")
+        }
+        let schema = codestory_store::Store::database_schema_version_observational(
+            &repository.database_path,
+        )?;
+        if schema.to_string() != project.store_schema
+            || schema != codestory_store::CURRENT_SCHEMA_VERSION
+        {
+            bail!("proof_availability_store_schema_mismatch")
+        }
+        let store = codestory_store::Store::open_observational(&repository.database_path)?;
+        let publication = store
+            .get_complete_index_publication()?
+            .ok_or_else(|| anyhow::anyhow!("proof_availability_core_publication_missing"))?;
+        if publication.generation != project.core_generation
+            || publication.generation_id != project.identity.core_generation_id
+            || publication.run_id != project.identity.core_run_id
+            || codestory_workspace::project_identity_v3(&repository.project_root).project_id
+                != project.identity.project_id
+            || store.get_files()?.len() as u64 != project.file_count
+            || store.get_node_count()? as u64 != project.node_count
+            || store.get_edge_count()? as u64 != project.edge_count
+        {
+            bail!("proof_availability_core_publication_mismatch")
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn core_only_runtime(project_root: &Path, cache_root: &Path) -> Runtime {
+    let defaults = RetrievalProcessDefaults::new(
+        cache_root.to_path_buf(),
+        RetrievalRuntimeDefaults::default(),
+    );
+    let retrieval = RuntimeRetrievalConfig::for_project_profile_with_process_defaults(
+        Some(project_root),
+        RuntimeRetrievalProfile::Local,
+        None,
+        &defaults,
+        &RetrievalRuntimeOverrides::default(),
+    );
+    Runtime::new_with_process_config(RuntimeProcessConfig::new_with_retrieval_config(
+        retrieval,
+        SourceIndexPolicy::default(),
+    ))
+}
+
+pub(crate) fn revalidate_case_source(
+    path_file: &CohortPathFileV1,
+    checkout_root: &Path,
+    project_root: &Path,
+) -> Result<()> {
+    let hooks = checkout_root
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join(".qualification-empty-hooks"))
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_checkout_layout_invalid"))?;
+    if !hooks.exists() {
+        fs::create_dir_all(&hooks)?;
+    }
+    revalidate_repository(path_file, checkout_root, project_root, &hooks)
+}
+
+fn revalidate_repository(
+    path_file: &CohortPathFileV1,
+    checkout_root: &Path,
+    project_root: &Path,
+    hooks: &Path,
+) -> Result<()> {
+    require_head_and_clean(checkout_root, &path_file.commit, hooks)?;
+    let raw_tree = git(
+        Some(checkout_root),
+        hooks,
+        ["ls-tree", "-r", "-z", "--full-tree", &path_file.commit],
+    )?
+    .stdout;
+    if sha256(&raw_tree) != path_file.source_tree_sha256 {
+        bail!("proof_availability_source_tree_mismatch")
+    }
+    let tree = parse_tree(&raw_tree)?;
+    let resolved = resolve_workspace(checkout_root, &path_file.workspace)?;
+    if workspace_path_identity(&resolved)? != workspace_path_identity(project_root)? {
+        bail!("proof_availability_project_identity_changed")
+    }
+    verify_oracle_sources(path_file, project_root, &tree)?;
+    Ok(())
+}
+
+fn qualification_binary_identity() -> Result<QualificationBinaryIdentity> {
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let binary_sha256 = sha256(&fs::read(executable)?);
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_repository_root_missing"))?;
+    let hooks = tempfile::tempdir()?;
+    let source_commit = String::from_utf8(
+        git(
+            Some(repository),
+            hooks.path(),
+            ["rev-parse", "HEAD^{commit}"],
+        )?
+        .stdout,
+    )?
+    .trim()
+    .to_owned();
+    let source_tree = String::from_utf8(
+        git(Some(repository), hooks.path(), ["rev-parse", "HEAD^{tree}"])?.stdout,
+    )?
+    .trim()
+    .to_owned();
+    require_head_and_clean(repository, &source_commit, hooks.path())?;
+    let rustc = Command::new("rustc")
+        .args(["--version", "--verbose"])
+        .output()?;
+    if !rustc.status.success() {
+        bail!("proof_availability_rustc_identity_unavailable")
+    }
+    let rust_host = String::from_utf8(rustc.stdout)?
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_rust_host_missing"))?
+        .to_owned();
+    let date = Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()?;
+    if !date.status.success() {
+        bail!("proof_availability_recorded_at_unavailable")
+    }
+    Ok(QualificationBinaryIdentity {
+        binary_sha256,
+        source_commit,
+        source_tree,
+        recorded_at: String::from_utf8(date.stdout)?.trim().to_owned(),
+        rust_host,
+    })
+}
+
+fn create_private_directory(path: &Path) -> Result<()> {
+    fs::create_dir(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn write_private_json_noclobber<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_INDEXED_DESCRIPTOR_BYTES {
+        bail!("proof_availability_operational_environment_too_large")
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_output_parent_missing"))?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".proof-availability-output-")
+        .tempfile_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    temporary.write_all(&bytes)?;
+    temporary.as_file_mut().sync_all()?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| error.error)?;
+    sync_parent(parent)?;
+    Ok(())
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn domain_sha256(domain: &[u8], bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
 }
 
 fn observe_existing_directory(path: &Path) -> Result<ObservedDestination> {
@@ -1647,20 +2253,154 @@ mod tests {
         let source = include_str!("materialize.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         for forbidden in [
-            "codestory_runtime",
-            "codestory_indexer",
-            "codestory_store",
-            "IndexService",
             "proof_qualification_support",
             "execute_observed",
-            "Store::",
-            "Runtime::",
             "remove_dir_all",
+            "RuntimeRetrievalProfile::Agent",
+            "run_observed_call_path_public_operation",
         ] {
             assert!(
                 !production.contains(forbidden),
                 "forbidden source dependency {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn non_verify_materialization_builds_a_fresh_core_only_index() {
+        let (origin, commit, raw_tree) = cohort_repository();
+        let tree_sha256 = sha256(&raw_tree);
+        let (loaded, owned_registry) =
+            local_inputs(origin.path().to_str().unwrap(), &commit, &tree_sha256);
+        let registry = owned_registry
+            .iter()
+            .map(|(id, repository, commit, workspace)| {
+                (
+                    id.as_str(),
+                    repository.as_str(),
+                    commit.as_str(),
+                    workspace.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let root = tempfile::tempdir().unwrap();
+        let arguments = MaterializeArgs {
+            corpus: root.path().join("unused-corpus.json"),
+            workspace: root.path().join("workspace"),
+            cache_root: root.path().join("cache"),
+            out: root.path().join("environment.json"),
+            verify_only: false,
+        };
+        let qualification = QualificationBinaryIdentity {
+            binary_sha256: "1".repeat(64),
+            source_commit: "2".repeat(40),
+            source_tree: "3".repeat(40),
+            recorded_at: "2026-08-21T12:00:00Z".into(),
+            rust_host: "aarch64-apple-darwin".into(),
+        };
+
+        materialize_indexed_with_registry(
+            &arguments,
+            &loaded,
+            &registry,
+            true,
+            qualification.clone(),
+        )
+        .unwrap();
+
+        let descriptor = load_operational_environment(&arguments.out).unwrap();
+        validate_operational_environment_with_identity(
+            &loaded,
+            &descriptor,
+            &qualification,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(descriptor.repositories.len(), 4);
+        assert_eq!(descriptor.environment.projects.len(), 4);
+        assert!(
+            descriptor
+                .environment
+                .projects
+                .iter()
+                .all(|project| matches!(project.freshness, MaterializationFreshnessV1::Fresh))
+        );
+        for repository in &descriptor.repositories {
+            let store =
+                codestory_store::Store::open_observational(&repository.database_path).unwrap();
+            assert!(store.get_complete_index_publication().unwrap().is_some());
+        }
+
+        let mut wrong_binary = descriptor.clone();
+        wrong_binary.environment.binary_sha256 = "f".repeat(64);
+        assert!(
+            validate_operational_environment_with_identity(
+                &loaded,
+                &wrong_binary,
+                &qualification,
+                &registry,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("qualification_binary_mismatch")
+        );
+        let mut stale = descriptor.clone();
+        stale.environment.projects[0].freshness = MaterializationFreshnessV1::Stale;
+        assert!(
+            validate_operational_environment_with_identity(
+                &loaded,
+                &stale,
+                &qualification,
+                &registry,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("repository_binding_invalid")
+        );
+        let checkout = &descriptor.repositories[0].checkout_root;
+        fs::write(checkout.join("src/area0/file.rs"), b"dirty\n").unwrap();
+        assert!(
+            validate_operational_environment_with_identity(
+                &loaded,
+                &descriptor,
+                &qualification,
+                &registry,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("checkout_dirty")
+        );
+        run_git(
+            checkout,
+            &["checkout", "--quiet", "--", "src/area0/file.rs"],
+        );
+        let mut mixed_generation = descriptor.clone();
+        mixed_generation.environment.projects[0].core_generation += 1;
+        assert!(
+            validate_operational_environment_with_identity(
+                &loaded,
+                &mixed_generation,
+                &qualification,
+                &registry,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("core_publication_mismatch")
+        );
+        let database = &descriptor.repositories[0].database_path;
+        let mut bytes = fs::read(database).unwrap();
+        bytes.push(0);
+        fs::write(database, bytes).unwrap();
+        assert!(
+            validate_operational_environment_with_identity(
+                &loaded,
+                &descriptor,
+                &qualification,
+                &registry,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("database_mismatch")
+        );
     }
 }

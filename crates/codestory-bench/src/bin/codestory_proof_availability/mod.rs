@@ -1,9 +1,9 @@
 //! Closed artifact contracts and inert command parsing for proof availability.
 //!
-//! This binary deliberately does not register a product route. Later benchmark
-//! tasks own source materialization, execution, and report production.
+//! This binary deliberately does not register a product route. It owns only the
+//! fixture and frozen-corpus qualification lifecycle.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 pub mod cli;
 #[allow(dead_code)] // Later qualification tasks consume the full closed artifact surface.
@@ -12,6 +12,8 @@ mod corpus;
 #[allow(dead_code)] // Task 11 consumes the completed qualification inventory.
 mod inventory;
 mod materialize;
+mod report;
+mod runner;
 #[allow(dead_code)] // Tasks 11 and 13 consume the frozen decision evaluator.
 mod thresholds;
 #[allow(dead_code)] // Task 11 consumes the completed qualification denominators.
@@ -21,33 +23,62 @@ mod util;
 pub fn execute(cli: cli::Cli) -> Result<()> {
     match cli.command {
         cli::Command::Materialize(arguments) => {
+            let loaded = corpus::load_complete(&arguments.corpus)?;
             if arguments.verify_only {
-                let loaded = corpus::load_complete(&arguments.corpus)?;
                 return materialize::verify_only(&arguments, &loaded);
             }
-            let corpus = corpus::load(&arguments.corpus)?;
-            corpus
-                .validate()
-                .context("validate proof availability corpus")?;
             util::refuse_existing_output(&arguments.out)?;
-            bail!("proof_availability_materialize_not_implemented")
+            materialize::materialize_indexed(&arguments, &loaded)
         }
         cli::Command::Run(arguments) => {
-            let corpus = corpus::load(&arguments.corpus)?;
+            let loaded = corpus::load_complete(&arguments.corpus)?;
             let thresholds = corpus::load_thresholds(&arguments.thresholds)?;
-            corpus
+            loaded
+                .corpus
                 .validate_against_thresholds(&thresholds)
                 .context("validate proof availability corpus against thresholds")?;
             util::refuse_existing_output(&arguments.out)?;
-            bail!("proof_availability_run_not_implemented")
+            let operational = materialize::load_operational_environment(&arguments.environment)?;
+            let input = runner::run_qualification(&loaded, &thresholds, &operational)?;
+            let summary = report::build_summary(input, &loaded.corpus, &thresholds)?;
+            let leak_policy = report::PublicLeakPolicy::new(
+                std::iter::once(operational.workspace_root.display().to_string())
+                    .chain(std::iter::once(
+                        operational.cache_root.display().to_string(),
+                    ))
+                    .chain(operational.repositories.iter().flat_map(|repository| {
+                        [
+                            repository.checkout_root.display().to_string(),
+                            repository.project_root.display().to_string(),
+                            repository.database_path.display().to_string(),
+                        ]
+                    })),
+            );
+            report::build_and_publish(
+                &arguments.out,
+                &summary,
+                &loaded.corpus,
+                &thresholds,
+                &leak_policy,
+            )?;
+            Ok(())
         }
         cli::Command::Verify(arguments) => {
+            let loaded = corpus::load_complete(&arguments.corpus)?;
             let thresholds = corpus::load_thresholds(&arguments.thresholds)?;
-            thresholds
-                .validate()
-                .context("validate proof availability thresholds")?;
+            loaded
+                .corpus
+                .validate_against_thresholds(&thresholds)
+                .context("validate proof availability corpus against thresholds")?;
             // Verify is intentionally read-only. It neither creates an output
             // directory nor starts indexing or proof execution.
+            report::verify_published(
+                &arguments.results,
+                &loaded.corpus,
+                &thresholds,
+                &loaded.path_files,
+                &report::PublicLeakPolicy::new(std::iter::empty::<String>()),
+            )?;
             Ok(())
         }
     }
