@@ -1,8 +1,25 @@
 # Release runbook
 
-Use this page to move one accepted CodeStory tree through freeze, promotion,
-publication, and closeout. It owns operator sequence and authority boundaries,
-not the changing proof matrix.
+Use this page to understand freeze, promotion, publication, and closeout. It
+owns sequence and authority boundaries, not the changing proof matrix. The
+operator interface is `scripts/codestory-release.mjs`; do not assemble a
+release-driver receipt by hand.
+
+```sh
+node scripts/codestory-release.mjs start --version <version> --lane native
+node scripts/codestory-release.mjs status
+node scripts/codestory-release.mjs advance
+node scripts/codestory-release.mjs resume
+```
+
+`status` reconstructs phase from GitHub. `advance` dispatches only the next
+permitted workflow and is a no-op while that workflow is in flight. Promotion
+and publication require `--record-approval --approver <name>`. Rehearse the
+machine against live GitHub without tagging or `publish_release: true`:
+
+```sh
+node scripts/codestory-release.mjs start --version <version> --lane native --rehearse
+```
 
 The [repository release rules](../../AGENTS.md#release-rules) own policy, the
 [testing matrix](testing-matrix.md#workflow-and-release-automation) owns proof
@@ -134,15 +151,14 @@ inventory.
 
 ## Evidence handoff
 
-Keep one release record. Initialize it once, record each field group from a JSON
-file or inline JSON, and inspect it without reconstructing state from workflow
-pages:
+Keep one GitHub-backed release record. The coordinator writes
+`codestory.release-driver-receipt/v1` groups onto the release issue or release
+PR so an interrupted agent can `resume` without copying run IDs. The receipt
+CLI remains the storage schema, not the operator interface:
 
 ```sh
-node .github/scripts/release-driver-receipt.mjs init \
-  --version 0.17.0 --receipt release-driver-receipt.json
-node .github/scripts/release-driver-receipt.mjs record <field-group> \
-  --receipt release-driver-receipt.json --data-file <field-group>.json
+node scripts/codestory-release.mjs start --version <version> --lane native
+node scripts/codestory-release.mjs status
 node .github/scripts/release-driver-receipt.mjs show \
   --receipt release-driver-receipt.json
 ```
