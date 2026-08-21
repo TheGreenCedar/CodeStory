@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 
 const SHA256 = /^[0-9a-f]{64}$/u;
 
@@ -18,18 +18,26 @@ function cleanRepository(repoRoot) {
   if (status) throw new Error(`source_build_repository_not_clean:${status.split(/\r?\n/u)[0]}`);
 }
 
-export function recordSourceBuildProvenance({ artifact, buildCommand, repoRoot }) {
+export function recordSourceBuildProvenance({ artifact, buildCommand, repoRoot, runBuild }) {
   const root = path.resolve(repoRoot);
   const artifactPath = path.resolve(artifact);
   if (!Array.isArray(buildCommand) || buildCommand.length === 0 || !buildCommand.includes("--locked")) {
     throw new Error("source_build_command_must_be_locked");
   }
-  if (!fs.statSync(artifactPath).isFile()) throw new Error("source_build_artifact_not_file");
   const relative = path.relative(root, artifactPath);
   if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new Error("source_build_artifact_outside_repository");
   }
   cleanRepository(root);
+  const completed = (runBuild || ((command, options) => spawnSync(command[0], command.slice(1), {
+    ...options,
+    encoding: "utf8",
+    shell: false,
+  })))(buildCommand, { cwd: root });
+  if (completed.error || completed.status !== 0) throw new Error("source_build_command_failed");
+  if (!fs.existsSync(artifactPath) || !fs.statSync(artifactPath).isFile()) {
+    throw new Error("source_build_artifact_not_file");
+  }
   const metadata = fs.statSync(artifactPath);
   return {
     schema_version: 1,
@@ -48,7 +56,25 @@ export function recordSourceBuildProvenance({ artifact, buildCommand, repoRoot }
 }
 
 export function compareSourceBuildProvenance(record, { installerSha256, liveSha256 }) {
-  if (record?.purpose !== "codestory-source-build-provenance" || !SHA256.test(record?.artifact?.sha256 || "")) {
+  const command = record?.build?.command;
+  const artifactPath = record?.artifact?.path;
+  if (
+    record?.schema_version !== 1
+    || record?.purpose !== "codestory-source-build-provenance"
+    || !/^[0-9a-f]{40}$/u.test(record?.source?.head || "")
+    || !/^[0-9a-f]{40}$/u.test(record?.source?.tree || "")
+    || !Array.isArray(command)
+    || command.length === 0
+    || !command.every((part) => typeof part === "string" && part.length > 0)
+    || !command.includes("--locked")
+    || typeof artifactPath !== "string"
+    || artifactPath.length === 0
+    || artifactPath.startsWith("../")
+    || path.posix.isAbsolute(artifactPath)
+    || !Number.isSafeInteger(record?.artifact?.bytes)
+    || record.artifact.bytes <= 0
+    || !SHA256.test(record?.artifact?.sha256 || "")
+  ) {
     return { state: "invalid_record" };
   }
   if (!SHA256.test(installerSha256 || "") || !SHA256.test(liveSha256 || "")) {

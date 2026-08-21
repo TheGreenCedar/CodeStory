@@ -681,6 +681,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn maximal_samples_cover_every_current_output_schema_field() {
+        let catalog = crate::stdio_catalog::tools_list_json();
+        let tools = catalog["result"]["tools"]
+            .as_array()
+            .expect("published tools");
+        for tool in tools {
+            let Some(schema) = tool.get("outputSchema") else {
+                continue;
+            };
+            let sample = maximal_schema_sample(schema);
+            assert!(
+                validate_structured_content(schema, &sample).is_ok(),
+                "{} maximal output sample must satisfy its current schema: {sample}; schema={schema}",
+                tool["name"]
+            );
+        }
+    }
+
+    fn maximal_schema_sample(schema: &Value) -> Value {
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            return values.first().cloned().unwrap_or(Value::Null);
+        }
+        if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
+            return maximal_schema_sample(variants.first().expect("oneOf variant"));
+        }
+        if let Some(constraints) = schema.get("allOf").and_then(Value::as_array) {
+            let mut members = serde_json::Map::new();
+            for constraint in constraints {
+                if let Value::Object(sample) = maximal_schema_sample(constraint) {
+                    members.extend(sample);
+                }
+            }
+            return Value::Object(members);
+        }
+        match schema.get("type").and_then(Value::as_str) {
+            Some("object") => schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|properties| {
+                    Value::Object(
+                        properties
+                            .iter()
+                            .map(|(name, property)| (name.clone(), maximal_schema_sample(property)))
+                            .collect(),
+                    )
+                })
+                .unwrap_or_else(|| json!({})),
+            Some("array") => {
+                let count = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0);
+                let item = schema
+                    .get("items")
+                    .map(maximal_schema_sample)
+                    .unwrap_or(Value::Null);
+                Value::Array((0..count).map(|_| item.clone()).collect())
+            }
+            Some("boolean") => json!(true),
+            Some("integer") => json!(schema.get("minimum").and_then(Value::as_i64).unwrap_or(0)),
+            Some("number") => json!(schema.get("minimum").and_then(Value::as_f64).unwrap_or(0.0)),
+            Some("string") => json!("fixture"),
+            _ => Value::Null,
+        }
+    }
+
     fn codes_from_output(schema: &Value, structured_content: Value) -> Vec<&'static str> {
         match validate_structured_content(schema, &structured_content) {
             Ok(()) => Vec::new(),
