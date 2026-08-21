@@ -580,7 +580,25 @@ const AGENT_PLANNING_MODULES: [&str; 27] = [
 ///   `agent_eval_hooks_stay_on_for_runtime_tests_and_off_for_product_builds`
 ///   pins how it compiles. Listing it as a planning module would hand the
 ///   import-DAG guard a file no product build links.
-const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 2] = ["lib.rs", "eval_probes.rs"];
+/// - `indexed_source_call_path_v1.rs` is the dark v3 proof kernel. Task 2 keeps
+///   it behind the same test-support gate until the atomic public v3 cut.
+const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 3] =
+    ["lib.rs", "eval_probes.rs", "indexed_source_call_path_v1.rs"];
+
+#[test]
+fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
+    let lib = read("crates/codestory-agent/src/lib.rs");
+    assert!(
+        lib.contains(
+            "#[cfg(any(test, feature = \"test-support\"))]\n#[doc(hidden)]\npub mod indexed_source_call_path_v1;"
+        ),
+        "the dark call-path kernel must remain test-support-only until the atomic v3 cut"
+    );
+    assert!(
+        AGENT_MODULE_ALLOWLIST_EXCLUSIONS.contains(&"indexed_source_call_path_v1.rs"),
+        "the dark proof kernel must not be counted as a production packet-planning module"
+    );
+}
 
 /// Packet planning lives in `codestory-agent`, and the crate DAG is what keeps
 /// it from growing the powers it was extracted away from.
