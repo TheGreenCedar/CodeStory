@@ -605,8 +605,66 @@ const AGENT_PLANNING_MODULES: [&str; 27] = [
 ///   import-DAG guard a file no product build links.
 /// - `indexed_source_call_path_v1.rs` is the dark v3 proof kernel. Task 2 keeps
 ///   it behind the same test-support gate until the atomic public v3 cut.
-const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 3] =
-    ["lib.rs", "eval_probes.rs", "indexed_source_call_path_v1.rs"];
+/// - `packet_execution_plan_v3.rs` is the dark v3 evidence-planning ledger.
+///   Task 3A keeps its callable surface behind the same test-support gate; it
+///   is not one of the 27 production packet-planning modules.
+const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 4] = [
+    "lib.rs",
+    "eval_probes.rs",
+    "indexed_source_call_path_v1.rs",
+    "packet_execution_plan_v3.rs",
+];
+
+#[test]
+fn dark_packet_execution_plan_v3_stays_inert_and_unshipped() {
+    let agent_lib = read("crates/codestory-agent/src/lib.rs");
+    assert!(
+        agent_lib.contains(
+            "#[cfg(any(test, feature = \"test-support\"))]\n#[doc(hidden)]\npub mod packet_execution_plan_v3;"
+        ),
+        "the v3 evidence planner must remain test-support-only until the atomic v3 cut"
+    );
+    assert!(
+        AGENT_MODULE_ALLOWLIST_EXCLUSIONS.contains(&"packet_execution_plan_v3.rs"),
+        "the dark v3 evidence planner must not count as a production planning module"
+    );
+
+    let surfaces = [
+        (
+            "runtime source",
+            read_source_tree("crates/codestory-runtime/src"),
+        ),
+        ("CLI source", read_source_tree("crates/codestory-cli/src")),
+        (
+            "current public API DTO source",
+            format!(
+                "{}\n{}",
+                read("crates/codestory-contracts/src/api.rs"),
+                read_source_tree("crates/codestory-contracts/src/api")
+            ),
+        ),
+        (
+            "current wire source",
+            read("crates/codestory-contracts/src/wire.rs"),
+        ),
+        (
+            "generated MCP catalog",
+            read("plugins/codestory/generated-mcp-catalog.json"),
+        ),
+    ];
+    for (surface, source) in surfaces {
+        for forbidden in [
+            "packet_execution_plan_v3",
+            "PacketExecutionPlanV3",
+            "PacketProjectionV3Dto",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{surface} references dark Task-3A vocabulary via {forbidden}"
+            );
+        }
+    }
+}
 
 #[test]
 fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
