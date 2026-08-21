@@ -72,6 +72,13 @@ pub struct IndexedCallEdgeReceipt {
     pub line_window: IndexedLineWindow,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalCorePublicationIdentity {
+    pub project_id: String,
+    pub generation_id: String,
+    pub run_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FactBuildGap {
     SelectorMissing { selector_index: usize },
@@ -87,6 +94,7 @@ pub enum FactBuildGap {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltCallPathFacts {
+    pub publication: InternalCorePublicationIdentity,
     pub facts: Vec<VerifiedProofFact>,
     pub receipts: Vec<IndexedCallEdgeReceipt>,
     pub gaps: Vec<FactBuildGap>,
@@ -1159,6 +1167,19 @@ fn compute_hashes(
     domain: DigestDomain<'_>,
 ) -> Result<ProofHashes, ValidationError> {
     let source_text_sha256 = sha256_hex(source_text.as_bytes());
+    let contract_digest = compute_contract_digest(&source_text_sha256, clauses, spec, domain)?;
+    Ok(ProofHashes {
+        source_text_sha256,
+        contract_digest,
+    })
+}
+
+fn compute_contract_digest(
+    source_text_sha256: &str,
+    clauses: &[NormalizedClause],
+    spec: &CallPathSpec,
+    domain: DigestDomain<'_>,
+) -> Result<String, ValidationError> {
     let digest_document = json!({
         "schema_version": domain.schema_version,
         "proof_domain": domain.proof_domain,
@@ -1172,10 +1193,7 @@ fn compute_hashes(
     let mut digest_bytes = Vec::with_capacity(DIGEST_DOMAIN_SEPARATOR.len() + canonical.len());
     digest_bytes.extend_from_slice(DIGEST_DOMAIN_SEPARATOR);
     digest_bytes.extend_from_slice(&canonical);
-    Ok(ProofHashes {
-        source_text_sha256,
-        contract_digest: sha256_hex(&digest_bytes),
-    })
+    Ok(sha256_hex(&digest_bytes))
 }
 
 fn normalized_clause_json(clause: &NormalizedClause) -> Value {
@@ -1371,6 +1389,7 @@ pub enum ProofDisposition {
     Unknown {
         contract_digest: String,
         gaps: Vec<ProofGap>,
+        connected_receipts: Vec<ReceiptRef>,
     },
     Unavailable {
         contract_digest: String,
@@ -1390,11 +1409,13 @@ pub enum Refutation {
         step_index: usize,
         extractor_capability_receipt_id: String,
         untruncated_enumeration_receipt_id: String,
+        connected_receipts: Vec<ReceiptRef>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProofGap {
+    FactBuild(FactBuildGap),
     MissingDirectCallReceipt { step_index: usize },
     ReceiptOrEdgeAlreadyUsed { step_index: usize },
     ProjectionExclusionConflictsWithRequiredReceipt { step_index: usize },
@@ -1460,6 +1481,10 @@ pub fn check_call_path(
         return ProofDisposition::Unknown {
             contract_digest: hashes.contract_digest.clone(),
             gaps: vec![ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index }],
+            connected_receipts: path[..step_index]
+                .iter()
+                .map(|fact| fact.receipt.clone())
+                .collect(),
         };
     }
     let mut reachable = reachable_prefixes(contract, &direct_facts);
@@ -1520,9 +1545,20 @@ pub fn check_call_path(
         return ProofDisposition::Unknown {
             contract_digest: hashes.contract_digest.clone(),
             gaps: vec![ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index }],
+            connected_receipts: longest_clean_prefix(&reachable),
         };
     }
-    for state in reachable.iter().rev() {
+    let mut clean_states = reachable
+        .iter()
+        .filter(|state| state.projection_conflict_step.is_none())
+        .collect::<Vec<_>>();
+    clean_states.sort_by(|left, right| {
+        right
+            .step_index
+            .cmp(&left.step_index)
+            .then_with(|| left.connected_receipts.cmp(&right.connected_receipts))
+    });
+    for state in clean_states {
         if state.step_index >= contract.spec.steps.len() || state.projection_conflict_step.is_some()
         {
             continue;
@@ -1552,6 +1588,7 @@ pub fn check_call_path(
                     untruncated_enumeration_receipt_id: absence
                         .untruncated_enumeration_receipt_id
                         .clone(),
+                    connected_receipts: state.connected_receipts.clone(),
                 },
             };
         }
@@ -1571,6 +1608,7 @@ pub fn check_call_path(
         return ProofDisposition::Unknown {
             contract_digest: hashes.contract_digest.clone(),
             gaps: vec![ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index }],
+            connected_receipts: longest_clean_prefix(&reachable),
         };
     }
     let step_index = reachable
@@ -1600,6 +1638,7 @@ pub fn check_call_path(
         } else {
             ProofGap::MissingDirectCallReceipt { step_index }
         }],
+        connected_receipts: longest_clean_prefix(&reachable),
     }
 }
 
@@ -1783,22 +1822,294 @@ fn reachable_prefixes(
     all
 }
 
+fn longest_clean_prefix(states: &[PrefixState]) -> Vec<ReceiptRef> {
+    states
+        .iter()
+        .filter(|state| state.projection_conflict_step.is_none())
+        .map(|state| state.connected_receipts.clone())
+        .min_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)))
+        .unwrap_or_default()
+}
+
 pub const INTERNAL_PROOF_CAP_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InternalCorePublicationIdentity {
-    pub project_id: String,
-    pub generation_id: String,
-    pub run_id: String,
+pub struct CheckedBuiltCallPathIntegration {
+    contract: ValidatedCallPathContract,
+    hashes: ProofHashes,
+    rendering: ValidatedContractRendering,
+    built: BuiltCallPathFacts,
+    disposition: ProofDisposition,
+    authoritative_receipts: Vec<IndexedCallEdgeReceipt>,
 }
 
-pub struct InternalProjectionInput<'a> {
-    pub contract: &'a ValidatedCallPathContract,
-    pub hashes: &'a ProofHashes,
-    pub rendering: &'a ValidatedContractRendering,
-    pub publication: InternalCorePublicationIdentity,
-    pub disposition: &'a ProofDisposition,
-    pub receipts: &'a [IndexedCallEdgeReceipt],
+impl CheckedBuiltCallPathIntegration {
+    pub fn built_facts(&self) -> &BuiltCallPathFacts {
+        &self.built
+    }
+
+    pub fn disposition(&self) -> &ProofDisposition {
+        &self.disposition
+    }
+
+    pub fn authoritative_receipts(&self) -> &[IndexedCallEdgeReceipt] {
+        &self.authoritative_receipts
+    }
+
+    pub fn publication(&self) -> &InternalCorePublicationIdentity {
+        &self.built.publication
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckedIntegrationError {
+    ValidatedContractHashMismatch,
+    ContractDigestMismatch,
+    CanonicalJson(String),
+    PublicationBindingMismatch,
+    FactReceiptMismatch,
+    DuplicateFactReceipt,
+    DuplicateAuthoritativeReceipt,
+}
+
+pub fn check_built_call_path_integration(
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    rendering: &ValidatedContractRendering,
+    built: BuiltCallPathFacts,
+) -> Result<CheckedBuiltCallPathIntegration, CheckedIntegrationError> {
+    if hashes != &contract.bound_hashes {
+        return Err(CheckedIntegrationError::ValidatedContractHashMismatch);
+    }
+    let recomputed_digest = compute_contract_digest(
+        &hashes.source_text_sha256,
+        &rendering.normalized_clauses,
+        &contract.spec,
+        DigestDomain::default(),
+    )
+    .map_err(|error| CheckedIntegrationError::CanonicalJson(format!("{error:?}")))?;
+    if recomputed_digest != hashes.contract_digest {
+        return Err(CheckedIntegrationError::ContractDigestMismatch);
+    }
+    validate_built_publication_and_receipts(&built)?;
+
+    let disposition = integrate_built_disposition(contract, hashes, &built);
+    let authoritative_refs = authoritative_receipt_refs(&disposition);
+    let mut seen = BTreeSet::new();
+    let mut authoritative_receipts = Vec::with_capacity(authoritative_refs.len());
+    for receipt_ref in authoritative_refs {
+        if !seen.insert(receipt_ref.clone()) {
+            return Err(CheckedIntegrationError::DuplicateAuthoritativeReceipt);
+        }
+        let mut matches = built
+            .receipts
+            .iter()
+            .filter(|receipt| receipt.receipt == *receipt_ref);
+        let Some(receipt) = matches.next() else {
+            return Err(CheckedIntegrationError::FactReceiptMismatch);
+        };
+        if matches.next().is_some() {
+            return Err(CheckedIntegrationError::DuplicateFactReceipt);
+        }
+        authoritative_receipts.push(receipt.clone());
+    }
+
+    Ok(CheckedBuiltCallPathIntegration {
+        contract: contract.clone(),
+        hashes: hashes.clone(),
+        rendering: rendering.clone(),
+        built,
+        disposition,
+        authoritative_receipts,
+    })
+}
+
+fn validate_built_publication_and_receipts(
+    built: &BuiltCallPathFacts,
+) -> Result<(), CheckedIntegrationError> {
+    let publication = &built.publication;
+    if publication.project_id.is_empty()
+        || publication.generation_id.is_empty()
+        || publication.run_id.is_empty()
+    {
+        return Err(CheckedIntegrationError::PublicationBindingMismatch);
+    }
+    let direct_facts = built
+        .facts
+        .iter()
+        .filter_map(|fact| match fact {
+            VerifiedProofFact::DirectCall(fact) => Some(fact),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for fact in &built.facts {
+        let nodes = match fact {
+            VerifiedProofFact::DirectCall(fact) => vec![&fact.source, &fact.target],
+            #[cfg(any(test, feature = "test-support"))]
+            VerifiedProofFact::CertifiedAbsence(fact) => vec![&fact.source],
+            VerifiedProofFact::Unavailable(_) => Vec::new(),
+        };
+        if nodes
+            .iter()
+            .any(|node| !node_matches_publication(node, publication))
+        {
+            return Err(CheckedIntegrationError::PublicationBindingMismatch);
+        }
+    }
+    for receipt in &built.receipts {
+        if receipt.certainty != ResolutionCertainty::Certain
+            || !node_matches_publication(&receipt.source, publication)
+            || !node_matches_publication(&receipt.target, publication)
+        {
+            return Err(CheckedIntegrationError::PublicationBindingMismatch);
+        }
+    }
+    for fact in &direct_facts {
+        let count = built
+            .receipts
+            .iter()
+            .filter(|receipt| indexed_receipt_matches_fact(receipt, fact))
+            .count();
+        match count {
+            1 => {}
+            0 => return Err(CheckedIntegrationError::FactReceiptMismatch),
+            _ => return Err(CheckedIntegrationError::DuplicateFactReceipt),
+        }
+    }
+    for receipt in &built.receipts {
+        let count = direct_facts
+            .iter()
+            .filter(|fact| indexed_receipt_matches_fact(receipt, fact))
+            .count();
+        match count {
+            1 => {}
+            0 => return Err(CheckedIntegrationError::FactReceiptMismatch),
+            _ => return Err(CheckedIntegrationError::DuplicateFactReceipt),
+        }
+    }
+    Ok(())
+}
+
+fn node_matches_publication(
+    node: &ResolvedNodeIdentity,
+    publication: &InternalCorePublicationIdentity,
+) -> bool {
+    node.pinned.project_id == publication.project_id
+        && node.pinned.core_generation_id == publication.generation_id
+        && node.pinned.core_run_id == publication.run_id
+}
+
+fn indexed_receipt_matches_fact(
+    receipt: &IndexedCallEdgeReceipt,
+    fact: &VerifiedDirectCallFact,
+) -> bool {
+    receipt.receipt == fact.receipt
+        && receipt.source == fact.source
+        && receipt.target == fact.target
+}
+
+fn integrate_built_disposition(
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    built: &BuiltCallPathFacts,
+) -> ProofDisposition {
+    let mut facts = built.facts.clone();
+    facts.extend(
+        built
+            .unavailable
+            .iter()
+            .cloned()
+            .map(|reason| VerifiedProofFact::Unavailable(UnavailableProofFact { reason })),
+    );
+    let raw = check_call_path(contract, hashes, &facts);
+    if matches!(
+        raw,
+        ProofDisposition::Unavailable { .. } | ProofDisposition::ContractRefuted { .. }
+    ) || built.gaps.is_empty()
+    {
+        return raw;
+    }
+
+    let (mut gaps, mut connected_receipts) = match raw {
+        ProofDisposition::ContractProven { receipts, .. } => (Vec::new(), receipts),
+        ProofDisposition::Unknown {
+            gaps,
+            connected_receipts,
+            ..
+        } => (gaps, connected_receipts),
+        _ => unreachable!("unavailable and refuted dispositions returned above"),
+    };
+    let exact_builder_gaps = built
+        .gaps
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let explained_steps = exact_builder_gaps
+        .iter()
+        .filter_map(|gap| fact_build_gap_step(gap, contract.spec.steps.len()))
+        .collect::<BTreeSet<_>>();
+    gaps.retain(|gap| {
+        !matches!(
+            gap,
+            ProofGap::MissingDirectCallReceipt { step_index }
+                if explained_steps.contains(step_index)
+        )
+    });
+    gaps.extend(exact_builder_gaps.into_iter().map(ProofGap::FactBuild));
+    gaps.sort();
+    gaps.dedup();
+    if let Some(first_blocked_step) = explained_steps.iter().next().copied() {
+        connected_receipts.truncate(first_blocked_step);
+    }
+    ProofDisposition::Unknown {
+        contract_digest: hashes.contract_digest.clone(),
+        gaps,
+        connected_receipts,
+    }
+}
+
+fn fact_build_gap_step(gap: &FactBuildGap, step_count: usize) -> Option<usize> {
+    match gap {
+        FactBuildGap::SelectorMissing { selector_index }
+        | FactBuildGap::SelectorAmbiguous { selector_index }
+        | FactBuildGap::NonCallableSelector { selector_index } => match selector_index {
+            0 => Some(0),
+            index if *index <= step_count => Some(index - 1),
+            _ => None,
+        },
+        FactBuildGap::DirectCallMissing { step_index }
+        | FactBuildGap::RecursiveCallNotRepresentable { step_index }
+        | FactBuildGap::SourceWindowTooLarge { step_index }
+        | FactBuildGap::InvalidUtf8 { step_index }
+        | FactBuildGap::SourceLineOutOfRange { step_index }
+        | FactBuildGap::EdgeContainmentUnproven { step_index } => Some(*step_index),
+    }
+}
+
+fn authoritative_receipt_refs(disposition: &ProofDisposition) -> &[ReceiptRef] {
+    match disposition {
+        ProofDisposition::ContractProven { receipts, .. } => receipts,
+        ProofDisposition::ContractRefuted {
+            refutation:
+                Refutation::ProhibitedScopeTraversal {
+                    connected_receipts, ..
+                },
+            ..
+        }
+        | ProofDisposition::ContractRefuted {
+            refutation:
+                Refutation::CertifiedAbsence {
+                    connected_receipts, ..
+                },
+            ..
+        } => connected_receipts,
+        ProofDisposition::Unknown {
+            connected_receipts, ..
+        } => connected_receipts,
+        ProofDisposition::Unavailable { .. } => &[],
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1816,10 +2127,6 @@ pub enum InternalProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InternalProjectionError {
-    MissingAuthoritativeReceipt {
-        receipt_id: String,
-        edge_id: String,
-    },
     Serialization(String),
     FallbackExceedsCap {
         cap_bytes: usize,
@@ -1828,17 +2135,16 @@ pub enum InternalProjectionError {
 }
 
 pub fn project_internal_call_path_result(
-    input: InternalProjectionInput<'_>,
+    integration: &CheckedBuiltCallPathIntegration,
 ) -> Result<InternalProjection, InternalProjectionError> {
-    project_internal_call_path_result_with_cap(input, INTERNAL_PROOF_CAP_BYTES)
+    project_internal_call_path_result_with_cap(integration, INTERNAL_PROOF_CAP_BYTES)
 }
 
 fn project_internal_call_path_result_with_cap(
-    input: InternalProjectionInput<'_>,
+    integration: &CheckedBuiltCallPathIntegration,
     cap_bytes: usize,
 ) -> Result<InternalProjection, InternalProjectionError> {
-    validate_authoritative_receipts(input.disposition, input.receipts)?;
-    let complete = complete_projection_json(&input);
+    let complete = complete_projection_json(integration);
     let required_complete_size = serialized_json_size(&complete)?;
     if required_complete_size <= cap_bytes {
         return Ok(InternalProjection::Complete {
@@ -1853,12 +2159,12 @@ fn project_internal_call_path_result_with_cap(
         "domain": PROOF_DOMAIN,
         "contract_interpretation": "host_supplied",
         "guard_version": CLAUSE_GUARD_VERSION,
-        "source_text_sha256": input.hashes.source_text_sha256,
-        "contract_digest": input.hashes.contract_digest,
-        "core_publication": publication_json(&input.publication),
+        "source_text_sha256": integration.hashes.source_text_sha256,
+        "contract_digest": integration.hashes.contract_digest,
+        "core_publication": publication_json(&integration.built.publication),
         "disposition": {
             "kind": "unknown",
-            "contract_digest": input.hashes.contract_digest,
+            "contract_digest": integration.hashes.contract_digest,
             "gaps": [{ "kind": "output_budget_exceeded" }],
         },
         "cap_bytes": cap_bytes,
@@ -1878,55 +2184,30 @@ fn project_internal_call_path_result_with_cap(
     })
 }
 
-fn validate_authoritative_receipts(
-    disposition: &ProofDisposition,
-    receipts: &[IndexedCallEdgeReceipt],
-) -> Result<(), InternalProjectionError> {
-    let required = match disposition {
-        ProofDisposition::ContractProven { receipts, .. } => receipts.as_slice(),
-        ProofDisposition::ContractRefuted {
-            refutation:
-                Refutation::ProhibitedScopeTraversal {
-                    connected_receipts, ..
-                },
-            ..
-        } => connected_receipts.as_slice(),
-        _ => &[],
-    };
-    for receipt in required {
-        if !receipts
-            .iter()
-            .any(|candidate| candidate.receipt == *receipt)
-        {
-            return Err(InternalProjectionError::MissingAuthoritativeReceipt {
-                receipt_id: receipt.receipt_id.clone(),
-                edge_id: receipt.edge_id.clone(),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn complete_projection_json(input: &InternalProjectionInput<'_>) -> Value {
+fn complete_projection_json(integration: &CheckedBuiltCallPathIntegration) -> Value {
     json!({
         "kind": "complete",
         "schema_version": PROOF_CONTRACT_SCHEMA_VERSION,
         "domain": PROOF_DOMAIN,
         "contract_interpretation": "host_supplied",
         "guard_version": CLAUSE_GUARD_VERSION,
-        "source_text_sha256": input.hashes.source_text_sha256,
-        "contract_digest": input.hashes.contract_digest,
-        "core_publication": publication_json(&input.publication),
-        "spec": spec_json(&input.contract.spec),
-        "clauses": input
+        "source_text_sha256": integration.hashes.source_text_sha256,
+        "contract_digest": integration.hashes.contract_digest,
+        "core_publication": publication_json(&integration.built.publication),
+        "spec": spec_json(&integration.contract.spec),
+        "clauses": integration
             .rendering
             .normalized_clauses
             .iter()
             .map(normalized_clause_json)
             .collect::<Vec<_>>(),
-        "disposition": disposition_json(input.disposition),
-        "steps": step_results_json(input.contract, input.disposition),
-        "receipts": input.receipts.iter().map(indexed_receipt_json).collect::<Vec<_>>(),
+        "disposition": disposition_json(&integration.disposition),
+        "steps": step_results_json(&integration.contract, &integration.disposition),
+        "receipts": integration
+            .authoritative_receipts
+            .iter()
+            .map(indexed_receipt_json)
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -1959,10 +2240,15 @@ fn disposition_json(disposition: &ProofDisposition) -> Value {
         ProofDisposition::Unknown {
             contract_digest,
             gaps,
+            connected_receipts,
         } => json!({
             "kind": "unknown",
             "contract_digest": contract_digest,
             "gaps": gaps.iter().map(proof_gap_json).collect::<Vec<_>>(),
+            "connected_receipts": connected_receipts
+                .iter()
+                .map(receipt_ref_json)
+                .collect::<Vec<_>>(),
         }),
         ProofDisposition::Unavailable {
             contract_digest,
@@ -1995,17 +2281,23 @@ fn refutation_json(refutation: &Refutation) -> Value {
             step_index,
             extractor_capability_receipt_id,
             untruncated_enumeration_receipt_id,
+            connected_receipts,
         } => json!({
             "kind": "certified_absence",
             "step_index": step_index,
             "extractor_capability_receipt_id": extractor_capability_receipt_id,
             "untruncated_enumeration_receipt_id": untruncated_enumeration_receipt_id,
+            "connected_receipts": connected_receipts
+                .iter()
+                .map(receipt_ref_json)
+                .collect::<Vec<_>>(),
         }),
     }
 }
 
 fn proof_gap_json(gap: &ProofGap) -> Value {
     match gap {
+        ProofGap::FactBuild(gap) => fact_build_gap_json(gap),
         ProofGap::MissingDirectCallReceipt { step_index } => {
             json!({ "kind": "missing_direct_call_receipt", "step_index": step_index })
         }
@@ -2016,6 +2308,39 @@ fn proof_gap_json(gap: &ProofGap) -> Value {
             "kind": "projection_exclusion_conflicts_with_required_receipt",
             "step_index": step_index,
         }),
+    }
+}
+
+fn fact_build_gap_json(gap: &FactBuildGap) -> Value {
+    match gap {
+        FactBuildGap::SelectorMissing { selector_index } => {
+            json!({ "kind": "selector_missing", "selector_index": selector_index })
+        }
+        FactBuildGap::SelectorAmbiguous { selector_index } => {
+            json!({ "kind": "selector_ambiguous", "selector_index": selector_index })
+        }
+        FactBuildGap::NonCallableSelector { selector_index } => {
+            json!({ "kind": "non_callable_selector", "selector_index": selector_index })
+        }
+        FactBuildGap::DirectCallMissing { step_index } => {
+            json!({ "kind": "direct_call_missing", "step_index": step_index })
+        }
+        FactBuildGap::RecursiveCallNotRepresentable { step_index } => json!({
+            "kind": "recursive_call_not_representable",
+            "step_index": step_index,
+        }),
+        FactBuildGap::SourceWindowTooLarge { step_index } => {
+            json!({ "kind": "source_window_too_large", "step_index": step_index })
+        }
+        FactBuildGap::InvalidUtf8 { step_index } => {
+            json!({ "kind": "invalid_utf8", "step_index": step_index })
+        }
+        FactBuildGap::SourceLineOutOfRange { step_index } => {
+            json!({ "kind": "source_line_out_of_range", "step_index": step_index })
+        }
+        FactBuildGap::EdgeContainmentUnproven { step_index } => {
+            json!({ "kind": "edge_containment_unproven", "step_index": step_index })
+        }
     }
 }
 
@@ -2032,36 +2357,70 @@ fn step_results_json(
     contract: &ValidatedCallPathContract,
     disposition: &ProofDisposition,
 ) -> Vec<Value> {
-    let receipts = match disposition {
-        ProofDisposition::ContractProven { receipts, .. } => receipts.as_slice(),
-        ProofDisposition::ContractRefuted {
-            refutation:
-                Refutation::ProhibitedScopeTraversal {
-                    connected_receipts, ..
-                },
-            ..
-        } => connected_receipts.as_slice(),
-        _ => &[],
-    };
     contract
         .spec
         .steps
         .iter()
         .enumerate()
         .map(|(step_index, step)| {
-            let status = match disposition {
-                ProofDisposition::ContractProven { .. } => "proven",
-                ProofDisposition::ContractRefuted { .. } if step_index < receipts.len() => {
-                    "positive_contradiction"
+            let (status, receipt) = match disposition {
+                ProofDisposition::ContractProven { receipts, .. } => {
+                    ("proven", receipts.get(step_index))
                 }
-                ProofDisposition::Unavailable { .. } => "unavailable",
-                _ => "unknown",
+                ProofDisposition::Unknown {
+                    connected_receipts, ..
+                } if step_index < connected_receipts.len() => {
+                    ("proven", connected_receipts.get(step_index))
+                }
+                ProofDisposition::ContractRefuted {
+                    refutation:
+                        Refutation::ProhibitedScopeTraversal {
+                            step_index: refutation_step,
+                            connected_receipts,
+                            ..
+                        },
+                    ..
+                } if step_index < *refutation_step => {
+                    ("proven", connected_receipts.get(step_index))
+                }
+                ProofDisposition::ContractRefuted {
+                    refutation:
+                        Refutation::ProhibitedScopeTraversal {
+                            step_index: refutation_step,
+                            connected_receipts,
+                            ..
+                        },
+                    ..
+                } if step_index == *refutation_step => {
+                    ("positive_contradiction", connected_receipts.get(step_index))
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                ProofDisposition::ContractRefuted {
+                    refutation:
+                        Refutation::CertifiedAbsence {
+                            step_index: absence_step,
+                            connected_receipts,
+                            ..
+                        },
+                    ..
+                } if step_index < *absence_step => ("proven", connected_receipts.get(step_index)),
+                #[cfg(any(test, feature = "test-support"))]
+                ProofDisposition::ContractRefuted {
+                    refutation:
+                        Refutation::CertifiedAbsence {
+                            step_index: absence_step,
+                            ..
+                        },
+                    ..
+                } if step_index == *absence_step => ("certified_absence", None),
+                ProofDisposition::Unavailable { .. } => ("unavailable", None),
+                _ => ("unknown", None),
             };
             json!({
                 "step_index": step_index,
                 "target": symbol_selector_json(&step.target),
                 "status": status,
-                "receipt": receipts.get(step_index).map(receipt_ref_json),
+                "receipt": receipt.map(receipt_ref_json),
             })
         })
         .collect()
@@ -2269,6 +2628,403 @@ mod tests {
         }
     }
 
+    fn publication() -> InternalCorePublicationIdentity {
+        InternalCorePublicationIdentity {
+            project_id: "project".to_owned(),
+            generation_id: "generation".to_owned(),
+            run_id: "run".to_owned(),
+        }
+    }
+
+    fn built_from_receipts(
+        receipts: Vec<IndexedCallEdgeReceipt>,
+        gaps: Vec<FactBuildGap>,
+        unavailable: Vec<UnavailableReason>,
+    ) -> BuiltCallPathFacts {
+        let facts = receipts
+            .iter()
+            .map(|receipt| {
+                VerifiedProofFact::DirectCall(VerifiedDirectCallFact {
+                    receipt: receipt.receipt.clone(),
+                    source: receipt.source.clone(),
+                    target: receipt.target.clone(),
+                })
+            })
+            .collect();
+        BuiltCallPathFacts {
+            publication: publication(),
+            facts,
+            receipts,
+            gaps,
+            unavailable,
+        }
+    }
+
+    fn validated_with_policies(
+        targets: &[&str],
+        prohibitions: &[&str],
+        exclusions: &[&str],
+    ) -> (
+        ValidatedCallPathContract,
+        ProofHashes,
+        ValidatedContractRendering,
+    ) {
+        let mut input = valid_input(targets);
+        input.spec.prohibit_traversal_through = prohibitions
+            .iter()
+            .map(|scope| canonical_scope(scope))
+            .collect();
+        input.spec.exclude_from_projection = exclusions
+            .iter()
+            .map(|scope| canonical_scope(scope))
+            .collect();
+        for (index, _) in prohibitions.iter().enumerate() {
+            input.clauses.push(ClauseAnchor {
+                clause_id: format!("prohibition-{index}"),
+                start: 0,
+                end: input.source_text.len(),
+                quote: input.source_text.clone(),
+                classification: ClauseClassification::ResolvedMaterial {
+                    fields: vec![ProofContractField::TraversalProhibition {
+                        index: u8::try_from(index).unwrap(),
+                    }],
+                },
+            });
+        }
+        for (index, _) in exclusions.iter().enumerate() {
+            input.clauses.push(ClauseAnchor {
+                clause_id: format!("exclusion-{index}"),
+                start: 0,
+                end: input.source_text.len(),
+                quote: input.source_text.clone(),
+                classification: ClauseClassification::ResolvedMaterial {
+                    fields: vec![ProofContractField::ProjectionExclusion {
+                        index: u8::try_from(index).unwrap(),
+                    }],
+                },
+            });
+        }
+        match validate_contract(input).unwrap() {
+            ValidationOutcome::Validated {
+                contract,
+                hashes,
+                rendering,
+            } => (*contract, hashes, rendering),
+            other => panic!("expected validated contract, got {other:?}"),
+        }
+    }
+
+    fn checked_integration(
+        contract: &ValidatedCallPathContract,
+        hashes: &ProofHashes,
+        rendering: &ValidatedContractRendering,
+        built: BuiltCallPathFacts,
+    ) -> CheckedBuiltCallPathIntegration {
+        check_built_call_path_integration(contract, hashes, rendering, built).unwrap()
+    }
+
+    #[test]
+    fn checked_integration_preserves_all_builder_gaps_exactly_and_unavailable_wins() {
+        let (contract, hashes, rendering) = validate_for_projection(&["B"]);
+        let receipt = indexed_receipt(0, "A", "B", "A calls B();\n".to_owned());
+        let all_gaps = vec![
+            FactBuildGap::EdgeContainmentUnproven { step_index: 0 },
+            FactBuildGap::SelectorMissing { selector_index: 0 },
+            FactBuildGap::InvalidUtf8 { step_index: 0 },
+            FactBuildGap::SelectorAmbiguous { selector_index: 1 },
+            FactBuildGap::DirectCallMissing { step_index: 0 },
+            FactBuildGap::NonCallableSelector { selector_index: 1 },
+            FactBuildGap::SourceLineOutOfRange { step_index: 0 },
+            FactBuildGap::RecursiveCallNotRepresentable { step_index: 0 },
+            FactBuildGap::SourceWindowTooLarge { step_index: 0 },
+            FactBuildGap::DirectCallMissing { step_index: 0 },
+        ];
+        let integrated = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(vec![receipt.clone()], all_gaps.clone(), Vec::new()),
+        );
+        assert_eq!(
+            integrated.disposition(),
+            &ProofDisposition::Unknown {
+                contract_digest: hashes.contract_digest().to_owned(),
+                connected_receipts: Vec::new(),
+                gaps: vec![
+                    ProofGap::FactBuild(FactBuildGap::SelectorMissing { selector_index: 0 }),
+                    ProofGap::FactBuild(FactBuildGap::SelectorAmbiguous { selector_index: 1 }),
+                    ProofGap::FactBuild(FactBuildGap::NonCallableSelector { selector_index: 1 }),
+                    ProofGap::FactBuild(FactBuildGap::DirectCallMissing { step_index: 0 }),
+                    ProofGap::FactBuild(FactBuildGap::RecursiveCallNotRepresentable {
+                        step_index: 0,
+                    }),
+                    ProofGap::FactBuild(FactBuildGap::SourceWindowTooLarge { step_index: 0 }),
+                    ProofGap::FactBuild(FactBuildGap::InvalidUtf8 { step_index: 0 }),
+                    ProofGap::FactBuild(FactBuildGap::SourceLineOutOfRange { step_index: 0 }),
+                    ProofGap::FactBuild(FactBuildGap::EdgeContainmentUnproven { step_index: 0 }),
+                ],
+            }
+        );
+
+        let unavailable = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(
+                vec![receipt],
+                all_gaps,
+                vec![UnavailableReason::SourceNotBoundToPublication],
+            ),
+        );
+        assert_eq!(
+            unavailable.disposition(),
+            &ProofDisposition::Unavailable {
+                contract_digest: hashes.contract_digest().to_owned(),
+                reasons: vec![UnavailableReason::SourceNotBoundToPublication],
+            }
+        );
+        assert!(unavailable.authoritative_receipts().is_empty());
+    }
+
+    #[test]
+    fn unknown_projection_keeps_the_longest_clean_prefix_and_exact_gap_only() {
+        let (contract, hashes, rendering) = validate_for_projection(&["B", "C", "D"]);
+        let r0 = indexed_receipt(0, "A", "B", "A calls B();\n".to_owned());
+        let r1 = indexed_receipt(1, "B", "C", "B calls C();\n".to_owned());
+        let unused = indexed_receipt(9, "X", "Y", "X calls Y();\n".to_owned());
+        let integrated = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(
+                vec![r0.clone(), r1.clone(), unused],
+                vec![FactBuildGap::DirectCallMissing { step_index: 2 }],
+                Vec::new(),
+            ),
+        );
+        assert_eq!(
+            integrated.disposition(),
+            &ProofDisposition::Unknown {
+                contract_digest: hashes.contract_digest().to_owned(),
+                connected_receipts: vec![r0.receipt.clone(), r1.receipt.clone()],
+                gaps: vec![ProofGap::FactBuild(FactBuildGap::DirectCallMissing {
+                    step_index: 2,
+                })],
+            }
+        );
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&integrated).unwrap()
+        else {
+            panic!("small checked integration fits")
+        };
+        assert_eq!(
+            root["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|step| step["status"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["proven", "proven", "unknown"]
+        );
+        assert_eq!(
+            root["disposition"]["gaps"],
+            json!([{ "kind": "direct_call_missing", "step_index": 2 }])
+        );
+        assert_eq!(
+            root["receipts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|receipt| receipt["receipt"]["receipt_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["receipt-0", "receipt-1"]
+        );
+    }
+
+    #[test]
+    fn unknown_prefix_ties_choose_the_smallest_receipt_sequence() {
+        let (contract, hashes) = validate(&["B", "C"]);
+        let facts = [
+            call("receipt-b", "edge-a", "A", "B"),
+            call("receipt-a", "edge-z", "A", "B"),
+        ];
+        assert_eq!(
+            check_call_path(&contract, &hashes, &facts),
+            ProofDisposition::Unknown {
+                contract_digest: hashes.contract_digest().to_owned(),
+                gaps: vec![ProofGap::MissingDirectCallReceipt { step_index: 1 }],
+                connected_receipts: vec![ReceiptRef {
+                    receipt_id: "receipt-a".to_owned(),
+                    edge_id: "edge-z".to_owned(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn prohibited_projection_marks_only_the_refuting_step_and_drops_later_candidates() {
+        let (contract, hashes, rendering) = validated_with_policies(&["B", "C", "D"], &["C"], &[]);
+        let r0 = indexed_receipt(0, "A", "B", "A calls B();\n".to_owned());
+        let r1 = indexed_receipt(1, "B", "C", "B calls C();\n".to_owned());
+        let later = indexed_receipt(2, "C", "D", "C calls D();\n".to_owned());
+        let integrated = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(vec![r0, r1, later], Vec::new(), Vec::new()),
+        );
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&integrated).unwrap()
+        else {
+            panic!("small checked integration fits")
+        };
+        assert_eq!(
+            root["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|step| step["status"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["proven", "positive_contradiction", "unknown"]
+        );
+        assert_eq!(
+            root["receipts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|receipt| receipt["receipt"]["receipt_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["receipt-0", "receipt-1"]
+        );
+    }
+
+    #[test]
+    fn certified_absence_projection_keeps_only_the_proven_prefix_receipts() {
+        let (contract, hashes, rendering) = validate_for_projection(&["B", "C", "D"]);
+        let r0 = indexed_receipt(0, "A", "B", "A calls B();\n".to_owned());
+        let r1 = indexed_receipt(1, "B", "C", "B calls C();\n".to_owned());
+        let unused = indexed_receipt(9, "X", "Y", "X calls Y();\n".to_owned());
+        let mut built = built_from_receipts(vec![r0, r1, unused], Vec::new(), Vec::new());
+        built
+            .facts
+            .push(VerifiedProofFact::CertifiedAbsence(CertifiedAbsenceFact {
+                source: node("C"),
+                expected_target: ExactSymbolSelector::CanonicalId("D".to_owned()),
+                extractor_capability_receipt_id: "capability".to_owned(),
+                untruncated_enumeration_receipt_id: "enumeration".to_owned(),
+            }));
+        let integrated = checked_integration(&contract, &hashes, &rendering, built);
+        assert!(matches!(
+            integrated.disposition(),
+            ProofDisposition::ContractRefuted {
+                refutation: Refutation::CertifiedAbsence {
+                    step_index: 2,
+                    connected_receipts,
+                    ..
+                },
+                ..
+            } if connected_receipts.iter().map(|receipt| receipt.receipt_id.as_str()).collect::<Vec<_>>() == ["receipt-0", "receipt-1"]
+        ));
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&integrated).unwrap()
+        else {
+            panic!("small checked integration fits")
+        };
+        assert_eq!(
+            root["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|step| step["status"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["proven", "proven", "certified_absence"]
+        );
+        assert_eq!(
+            root["receipts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|receipt| receipt["receipt"]["receipt_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["receipt-0", "receipt-1"]
+        );
+    }
+
+    #[test]
+    fn checked_integration_rejects_every_mixable_projection_binding() {
+        type CheckedBoundary =
+            fn(
+                &ValidatedCallPathContract,
+                &ProofHashes,
+                &ValidatedContractRendering,
+                BuiltCallPathFacts,
+            ) -> Result<CheckedBuiltCallPathIntegration, CheckedIntegrationError>;
+        type ProjectionBoundary = fn(
+            &CheckedBuiltCallPathIntegration,
+        )
+            -> Result<InternalProjection, InternalProjectionError>;
+        let _checked_boundary: CheckedBoundary = check_built_call_path_integration;
+        let _projection_boundary: ProjectionBoundary = project_internal_call_path_result;
+
+        let (contract, hashes, rendering) = validate_for_projection(&["B"]);
+        let receipt = indexed_receipt(0, "A", "B", "A calls B();\n".to_owned());
+
+        let mut foreign_input = valid_input(&["B"]);
+        foreign_input.source_text.push('!');
+        for clause in &mut foreign_input.clauses {
+            clause.end += 1;
+            clause.quote.push('!');
+        }
+        let foreign_rendering = match validate_contract(foreign_input).unwrap() {
+            ValidationOutcome::Validated { rendering, .. } => rendering,
+            other => panic!("expected validated foreign rendering, got {other:?}"),
+        };
+        assert!(matches!(
+            check_built_call_path_integration(
+                &contract,
+                &hashes,
+                &foreign_rendering,
+                built_from_receipts(vec![receipt.clone()], Vec::new(), Vec::new()),
+            ),
+            Err(CheckedIntegrationError::ContractDigestMismatch)
+        ));
+
+        let mut forged_hashes = hashes.clone();
+        forged_hashes.contract_digest = "forged".to_owned();
+        assert!(matches!(
+            check_built_call_path_integration(
+                &contract,
+                &forged_hashes,
+                &rendering,
+                built_from_receipts(vec![receipt.clone()], Vec::new(), Vec::new()),
+            ),
+            Err(CheckedIntegrationError::ValidatedContractHashMismatch)
+        ));
+
+        let mut wrong_publication =
+            built_from_receipts(vec![receipt.clone()], Vec::new(), Vec::new());
+        wrong_publication.publication.run_id = "other-run".to_owned();
+        assert!(matches!(
+            check_built_call_path_integration(&contract, &hashes, &rendering, wrong_publication,),
+            Err(CheckedIntegrationError::PublicationBindingMismatch)
+        ));
+
+        let mut mismatched_receipt =
+            built_from_receipts(vec![receipt.clone()], Vec::new(), Vec::new());
+        mismatched_receipt.receipts[0].receipt.edge_id = "other-edge".to_owned();
+        assert!(matches!(
+            check_built_call_path_integration(&contract, &hashes, &rendering, mismatched_receipt,),
+            Err(CheckedIntegrationError::FactReceiptMismatch)
+        ));
+
+        let mut duplicate = built_from_receipts(vec![receipt], Vec::new(), Vec::new());
+        duplicate.receipts.push(duplicate.receipts[0].clone());
+        assert!(matches!(
+            check_built_call_path_integration(&contract, &hashes, &rendering, duplicate),
+            Err(CheckedIntegrationError::DuplicateFactReceipt)
+        ));
+    }
+
     fn six_step_projection_fixture(
         texts: Vec<String>,
     ) -> (
@@ -2276,7 +3032,6 @@ mod tests {
         ProofHashes,
         ValidatedContractRendering,
         Vec<IndexedCallEdgeReceipt>,
-        ProofDisposition,
     ) {
         assert_eq!(texts.len(), 6);
         let names = ["A", "B", "C", "D", "E", "F", "G"];
@@ -2290,37 +3045,20 @@ mod tests {
             receipt.line_window.byte_start = 0;
             receipt.line_window.byte_end = MAX_SOURCE_RECEIPT_LINE_BYTES;
         }
-        let disposition = ProofDisposition::ContractProven {
-            contract_digest: hashes.contract_digest().to_owned(),
-            receipts: receipts
-                .iter()
-                .map(|receipt| receipt.receipt.clone())
-                .collect(),
-        };
-        (contract, hashes, rendering, receipts, disposition)
+        (contract, hashes, rendering, receipts)
     }
 
     #[test]
     fn internal_projection_is_a_complete_tagged_root_with_every_authoritative_receipt() {
         let (contract, hashes, rendering) = validate_for_projection(&["B"]);
         let receipts = vec![indexed_receipt(0, "A", "B", "A calls B();\n".to_owned())];
-        let disposition = ProofDisposition::ContractProven {
-            contract_digest: hashes.contract_digest().to_owned(),
-            receipts: vec![receipts[0].receipt.clone()],
-        };
-        let projected = project_internal_call_path_result(InternalProjectionInput {
-            contract: &contract,
-            hashes: &hashes,
-            rendering: &rendering,
-            publication: InternalCorePublicationIdentity {
-                project_id: "project".to_owned(),
-                generation_id: "generation".to_owned(),
-                run_id: "run".to_owned(),
-            },
-            disposition: &disposition,
-            receipts: &receipts,
-        })
-        .unwrap();
+        let integration = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(receipts, Vec::new(), Vec::new()),
+        );
+        let projected = project_internal_call_path_result(&integration).unwrap();
 
         let InternalProjection::Complete {
             root,
@@ -2341,24 +3079,16 @@ mod tests {
 
     #[test]
     fn internal_projection_accepts_exactly_64_kib_and_replaces_64_kib_plus_one_whole() {
-        let (contract, hashes, rendering, mut receipts, mut disposition) =
+        let (contract, hashes, rendering, mut receipts) =
             six_step_projection_fixture(vec![String::new(); 6]);
-        let baseline = project_internal_call_path_result_with_cap(
-            InternalProjectionInput {
-                contract: &contract,
-                hashes: &hashes,
-                rendering: &rendering,
-                publication: InternalCorePublicationIdentity {
-                    project_id: "project".to_owned(),
-                    generation_id: "generation".to_owned(),
-                    run_id: "run".to_owned(),
-                },
-                disposition: &disposition,
-                receipts: &receipts,
-            },
-            usize::MAX,
-        )
-        .unwrap();
+        let baseline_integration = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(receipts.clone(), Vec::new(), Vec::new()),
+        );
+        let baseline =
+            project_internal_call_path_result_with_cap(&baseline_integration, usize::MAX).unwrap();
         let InternalProjection::Complete {
             serialized_size: baseline_size,
             ..
@@ -2378,19 +3108,13 @@ mod tests {
         }
         assert_eq!(remaining, 0, "six bounded lines can reach the exact cap");
 
-        let exact = project_internal_call_path_result(InternalProjectionInput {
-            contract: &contract,
-            hashes: &hashes,
-            rendering: &rendering,
-            publication: InternalCorePublicationIdentity {
-                project_id: "project".to_owned(),
-                generation_id: "generation".to_owned(),
-                run_id: "run".to_owned(),
-            },
-            disposition: &disposition,
-            receipts: &receipts,
-        })
-        .unwrap();
+        let exact_integration = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(receipts.clone(), Vec::new(), Vec::new()),
+        );
+        let exact = project_internal_call_path_result(&exact_integration).unwrap();
         assert!(matches!(
             exact,
             InternalProjection::Complete {
@@ -2406,31 +3130,13 @@ mod tests {
             .line_window
             .text
             .push('x');
-        let required_receipts = receipts
-            .iter()
-            .map(|receipt| receipt.receipt.clone())
-            .collect::<Vec<_>>();
-        let ProofDisposition::ContractProven {
-            receipts: disposition_receipts,
-            ..
-        } = &mut disposition
-        else {
-            unreachable!()
-        };
-        *disposition_receipts = required_receipts;
-        let plus_one = project_internal_call_path_result(InternalProjectionInput {
-            contract: &contract,
-            hashes: &hashes,
-            rendering: &rendering,
-            publication: InternalCorePublicationIdentity {
-                project_id: "project".to_owned(),
-                generation_id: "generation".to_owned(),
-                run_id: "run".to_owned(),
-            },
-            disposition: &disposition,
-            receipts: &receipts,
-        })
-        .unwrap();
+        let plus_one_integration = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(receipts, Vec::new(), Vec::new()),
+        );
+        let plus_one = project_internal_call_path_result(&plus_one_integration).unwrap();
         let InternalProjection::BudgetExceeded {
             root,
             required_complete_size,
@@ -2461,67 +3167,33 @@ mod tests {
         let escape_heavy = escape_unit.repeat(MAX_SOURCE_RECEIPT_LINE_BYTES / escape_unit.len());
         assert!(escape_heavy.len() <= MAX_SOURCE_RECEIPT_LINE_BYTES);
         assert!(escape_heavy.contains('é'));
-        let (contract, hashes, rendering, receipts, disposition) =
+        let (contract, hashes, rendering, receipts) =
             six_step_projection_fixture(vec![escape_heavy; 6]);
-        let projected = project_internal_call_path_result(InternalProjectionInput {
-            contract: &contract,
-            hashes: &hashes,
-            rendering: &rendering,
-            publication: InternalCorePublicationIdentity {
-                project_id: "project".to_owned(),
-                generation_id: "generation".to_owned(),
-                run_id: "run".to_owned(),
-            },
-            disposition: &disposition,
-            receipts: &receipts,
-        })
-        .unwrap();
+        let integration = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(receipts, Vec::new(), Vec::new()),
+        );
+        let projected = project_internal_call_path_result(&integration).unwrap();
         let InternalProjection::BudgetExceeded { root, .. } = projected else {
             panic!("escaped receipt JSON must be measured after escaping")
         };
         assert!(root.get("receipts").is_none());
         assert!(root.get("steps").is_none());
-
-        let mut missing = receipts.clone();
-        let omitted = missing.pop().unwrap();
-        assert_eq!(
-            project_internal_call_path_result(InternalProjectionInput {
-                contract: &contract,
-                hashes: &hashes,
-                rendering: &rendering,
-                publication: InternalCorePublicationIdentity {
-                    project_id: "project".to_owned(),
-                    generation_id: "generation".to_owned(),
-                    run_id: "run".to_owned(),
-                },
-                disposition: &disposition,
-                receipts: &missing,
-            }),
-            Err(InternalProjectionError::MissingAuthoritativeReceipt {
-                receipt_id: omitted.receipt.receipt_id,
-                edge_id: omitted.receipt.edge_id,
-            })
-        );
     }
 
     #[test]
     fn six_maximum_lines_are_kept_complete_or_replaced_as_one_and_tiny_fallbacks_error() {
         let maximum = "x".repeat(MAX_SOURCE_RECEIPT_LINE_BYTES);
-        let (contract, hashes, rendering, receipts, disposition) =
-            six_step_projection_fixture(vec![maximum; 6]);
-        let projected = project_internal_call_path_result(InternalProjectionInput {
-            contract: &contract,
-            hashes: &hashes,
-            rendering: &rendering,
-            publication: InternalCorePublicationIdentity {
-                project_id: "project".to_owned(),
-                generation_id: "generation".to_owned(),
-                run_id: "run".to_owned(),
-            },
-            disposition: &disposition,
-            receipts: &receipts,
-        })
-        .unwrap();
+        let (contract, hashes, rendering, receipts) = six_step_projection_fixture(vec![maximum; 6]);
+        let integration = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(receipts, Vec::new(), Vec::new()),
+        );
+        let projected = project_internal_call_path_result(&integration).unwrap();
         match projected {
             InternalProjection::Complete {
                 root,
@@ -2537,21 +3209,7 @@ mod tests {
         }
 
         assert!(matches!(
-            project_internal_call_path_result_with_cap(
-                InternalProjectionInput {
-                    contract: &contract,
-                    hashes: &hashes,
-                    rendering: &rendering,
-                    publication: InternalCorePublicationIdentity {
-                        project_id: "project".to_owned(),
-                        generation_id: "generation".to_owned(),
-                        run_id: "run".to_owned(),
-                    },
-                    disposition: &disposition,
-                    receipts: &receipts,
-                },
-                1,
-            ),
+            project_internal_call_path_result_with_cap(&integration, 1),
             Err(InternalProjectionError::FallbackExceedsCap { cap_bytes: 1, .. })
         ));
     }

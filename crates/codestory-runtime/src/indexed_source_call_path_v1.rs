@@ -19,11 +19,11 @@ use std::sync::atomic::AtomicBool;
 use codestory_agent::indexed_source_call_path_v1::{
     AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence, ExactScopeSelector,
     ExactSymbolSelector, FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow,
-    InternalCorePublicationIdentity, InternalProjection, InternalProjectionInput, PROOF_DOMAIN,
-    PinnedNodeIdentity, ProofDisposition, ProofHashes, RawCallEdgeAdmission, ReceiptRef,
-    ResolvedNodeIdentity, UnavailableProofFact, UnavailableReason, ValidatedCallPathContract,
-    ValidatedContractRendering, VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
-    check_call_path, project_internal_call_path_result,
+    InternalCorePublicationIdentity, InternalProjection, PROOF_DOMAIN, PinnedNodeIdentity,
+    ProofHashes, RawCallEdgeAdmission, ReceiptRef, ResolvedNodeIdentity, UnavailableReason,
+    ValidatedCallPathContract, ValidatedContractRendering, VerifiedDirectCallFact,
+    VerifiedProofFact, admit_raw_call_edge, check_built_call_path_integration,
+    project_internal_call_path_result,
 };
 use codestory_contracts::api::ApiError;
 use codestory_contracts::graph::{Node, NodeId, NodeKind, ResolutionCertainty};
@@ -74,6 +74,11 @@ fn build_from_store<R>(
 where
     R: FnMut(&Path) -> io::Result<Vec<u8>>,
 {
+    let proof_publication = InternalCorePublicationIdentity {
+        project_id: project_id.to_owned(),
+        generation_id: publication.generation_id.clone(),
+        run_id: publication.run_id.clone(),
+    };
     let files = store.files().inventory().map_err(store_error)?;
     let file_rows = store.files().get_files().map_err(store_error)?;
     let mut path_identities = OperationPathIdentityResolver::native();
@@ -138,6 +143,7 @@ where
         gaps.sort();
         gaps.dedup();
         return Ok(BuiltCallPathFacts {
+            publication: proof_publication,
             facts: Vec::new(),
             receipts: Vec::new(),
             gaps,
@@ -314,6 +320,7 @@ where
     unavailable.sort();
     unavailable.dedup();
     Ok(BuiltCallPathFacts {
+        publication: proof_publication,
         facts,
         receipts,
         gaps,
@@ -322,14 +329,8 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IntegratedCallPathResult {
-    pub built: BuiltCallPathFacts,
-    pub disposition: ProofDisposition,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IntegratedProjectedCallPathResult {
-    pub integrated: IntegratedCallPathResult,
+    pub integration: codestory_agent::indexed_source_call_path_v1::CheckedBuiltCallPathIntegration,
     pub projection: InternalProjection,
 }
 
@@ -342,34 +343,29 @@ pub(crate) fn run_integrated_projected_public_operation(
     cancelled: Arc<AtomicBool>,
 ) -> Result<PublicOperation<IntegratedProjectedCallPathResult>, ApiError> {
     service.run_with_cancel(PROOF_DOMAIN, cancelled, || {
-        let publication = controller.active_core_publication().ok_or_else(|| {
-            ApiError::internal("indexed call-path projection requires an active core publication")
-        })?;
-        let project_root = controller.require_project_root()?;
         let built = build_indexed_source_call_path_facts(controller, contract)?;
-        let integrated = integrate_built_facts(contract, hashes, built);
-        let projection = project_internal_call_path_result(InternalProjectionInput {
-            contract,
-            hashes,
-            rendering,
-            publication: InternalCorePublicationIdentity {
-                project_id: project_identity_v3(&project_root).project_id,
-                generation_id: publication.generation_id,
-                run_id: publication.run_id,
-            },
-            disposition: &integrated.disposition,
-            receipts: &integrated.built.receipts,
-        })
-        .map_err(|error| {
+        let integration = check_built_call_path_integration(contract, hashes, rendering, built)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "indexed call-path checked integration failed: {error:?}"
+                ))
+            })?;
+        let projection = project_internal_call_path_result(&integration).map_err(|error| {
             ApiError::internal(format!(
                 "indexed call-path projection construction failed: {error:?}"
             ))
         })?;
         Ok(IntegratedProjectedCallPathResult {
-            integrated,
+            integration,
             projection,
         })
     })
+}
+
+struct CheckedIntegrationInputs<'a> {
+    contract: &'a ValidatedCallPathContract,
+    hashes: &'a ProofHashes,
+    rendering: &'a ValidatedContractRendering,
 }
 
 fn evaluate_from_store<R>(
@@ -377,10 +373,9 @@ fn evaluate_from_store<R>(
     project_root: &Path,
     project_id: &str,
     publication: &IndexPublicationRecord,
-    contract: &ValidatedCallPathContract,
-    hashes: &ProofHashes,
+    inputs: CheckedIntegrationInputs<'_>,
     read_source: R,
-) -> Result<IntegratedCallPathResult, ApiError>
+) -> Result<codestory_agent::indexed_source_call_path_v1::CheckedBuiltCallPathIntegration, ApiError>
 where
     R: FnMut(&Path) -> io::Result<Vec<u8>>,
 {
@@ -389,27 +384,15 @@ where
         project_root,
         project_id,
         publication,
-        contract,
+        inputs.contract,
         read_source,
     )?;
-    Ok(integrate_built_facts(contract, hashes, built))
-}
-
-fn integrate_built_facts(
-    contract: &ValidatedCallPathContract,
-    hashes: &ProofHashes,
-    built: BuiltCallPathFacts,
-) -> IntegratedCallPathResult {
-    let mut facts = built.facts.clone();
-    facts.extend(
-        built
-            .unavailable
-            .iter()
-            .cloned()
-            .map(|reason| VerifiedProofFact::Unavailable(UnavailableProofFact { reason })),
-    );
-    let disposition = check_call_path(contract, hashes, &facts);
-    IntegratedCallPathResult { built, disposition }
+    check_built_call_path_integration(inputs.contract, inputs.hashes, inputs.rendering, built)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "indexed call-path checked integration failed: {error:?}"
+            ))
+        })
 }
 
 #[derive(Debug)]
@@ -868,10 +851,10 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use codestory_agent::indexed_source_call_path_v1::{
-        ClauseAnchor, ClauseClassification, ProofContractField, UnvalidatedCallPathContract,
-        UnvalidatedCallPathSpec, UnvalidatedDirectCallStep, UnvalidatedExactScopeSelector,
-        UnvalidatedExactSymbolSelector, ValidatedContractRendering, ValidationOutcome,
-        validate_contract,
+        ClauseAnchor, ClauseClassification, ProofContractField, ProofDisposition,
+        UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
+        UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector, ValidatedContractRendering,
+        ValidationOutcome, check_call_path, validate_contract,
     };
     use codestory_contracts::api::IndexMode;
     use codestory_contracts::events::EventBus;
@@ -1229,26 +1212,30 @@ mod tests {
         );
         let caller = source_callable(&one.store, "caller");
         let callee = source_callable(&one.store, "callee");
-        let (one_contract, one_hashes, _) =
+        let (one_contract, one_hashes, one_rendering) =
             validated_contract(canonical_id(&caller), &[canonical_id(&callee)]);
         let one_result = evaluate_from_store(
             &one.store,
             &one.root,
             &one.project_id,
             &one.publication,
-            &one_contract,
-            &one_hashes,
+            CheckedIntegrationInputs {
+                contract: &one_contract,
+                hashes: &one_hashes,
+                rendering: &one_rendering,
+            },
             |path| fs::read(path),
         )
         .unwrap();
 
         assert_eq!(source_built_census(&one.store), (1, 1));
         eprintln!("source-built admission census: raw_call_rows=1 admitted_rows=1");
-        assert_eq!(one_result.built.facts.len(), 1);
-        assert_eq!(one_result.built.receipts.len(), 1);
-        assert!(one_result.built.gaps.is_empty());
-        assert!(one_result.built.unavailable.is_empty());
-        let receipt = &one_result.built.receipts[0];
+        let one_built = one_result.built_facts();
+        assert_eq!(one_built.facts.len(), 1);
+        assert_eq!(one_built.receipts.len(), 1);
+        assert!(one_built.gaps.is_empty());
+        assert!(one_built.unavailable.is_empty());
+        let receipt = &one_built.receipts[0];
         let raw_edge = one
             .store
             .get_edges()
@@ -1288,8 +1275,8 @@ mod tests {
         );
         assert!(receipt.receipt.receipt_id.starts_with("indexed-call-edge:"));
         assert_eq!(
-            one_result.disposition,
-            ProofDisposition::ContractProven {
+            one_result.disposition(),
+            &ProofDisposition::ContractProven {
                 contract_digest: one_hashes.contract_digest().to_owned(),
                 receipts: vec![receipt.receipt.clone()],
             }
@@ -1308,50 +1295,52 @@ mod tests {
             .map(|index| source_callable(&six.store, &format!("step{index}")))
             .collect::<Vec<_>>();
         let target_ids = nodes[1..].iter().map(canonical_id).collect::<Vec<_>>();
-        let (six_contract, six_hashes, _) =
+        let (six_contract, six_hashes, six_rendering) =
             validated_contract(canonical_id(&nodes[0]), &target_ids);
         let six_result = evaluate_from_store(
             &six.store,
             &six.root,
             &six.project_id,
             &six.publication,
-            &six_contract,
-            &six_hashes,
+            CheckedIntegrationInputs {
+                contract: &six_contract,
+                hashes: &six_hashes,
+                rendering: &six_rendering,
+            },
             |path| fs::read(path),
         )
         .unwrap();
 
         assert_eq!(source_built_census(&six.store), (6, 6));
         eprintln!("source-built admission census: raw_call_rows=6 admitted_rows=6");
-        assert_eq!(six_result.built.facts.len(), 6);
-        assert_eq!(six_result.built.receipts.len(), 6);
-        let receipt_ids = six_result
-            .built
+        let six_built = six_result.built_facts();
+        assert_eq!(six_built.facts.len(), 6);
+        assert_eq!(six_built.receipts.len(), 6);
+        let receipt_ids = six_built
             .receipts
             .iter()
             .map(|receipt| receipt.receipt.receipt_id.as_str())
             .collect::<BTreeSet<_>>();
-        let edge_ids = six_result
-            .built
+        let edge_ids = six_built
             .receipts
             .iter()
             .map(|receipt| receipt.receipt.edge_id.as_str())
             .collect::<BTreeSet<_>>();
         assert_eq!(receipt_ids.len(), 6);
         assert_eq!(edge_ids.len(), 6);
-        for (index, receipt) in six_result.built.receipts.iter().enumerate() {
+        for (index, receipt) in six_built.receipts.iter().enumerate() {
             assert_eq!(receipt.source.pinned.node_id, nodes[index].id.0.to_string());
             assert_eq!(
                 receipt.target.pinned.node_id,
                 nodes[index + 1].id.0.to_string()
             );
-            if let Some(next) = six_result.built.receipts.get(index + 1) {
+            if let Some(next) = six_built.receipts.get(index + 1) {
                 assert_eq!(receipt.target, next.source);
             }
         }
         assert!(matches!(
-            six_result.disposition,
-            ProofDisposition::ContractProven { ref receipts, .. } if receipts.len() == 6
+            six_result.disposition(),
+            ProofDisposition::ContractProven { receipts, .. } if receipts.len() == 6
         ));
     }
 
@@ -1370,38 +1359,42 @@ mod tests {
             .map(|index| source_callable(&six.store, &format!("step{index}")))
             .collect::<Vec<_>>();
         let targets = nodes[1..].iter().map(canonical_id).collect::<Vec<_>>();
-        let (contract, hashes, _) = validated_contract(canonical_id(&nodes[0]), &targets);
+        let (contract, hashes, rendering) = validated_contract(canonical_id(&nodes[0]), &targets);
         let integrated = evaluate_from_store(
             &six.store,
             &six.root,
             &six.project_id,
             &six.publication,
-            &contract,
-            &hashes,
+            CheckedIntegrationInputs {
+                contract: &contract,
+                hashes: &hashes,
+                rendering: &rendering,
+            },
             |path| fs::read(path),
         )
         .unwrap();
         assert!(matches!(
-            integrated.disposition,
+            integrated.disposition(),
             ProofDisposition::ContractProven { .. }
         ));
 
-        let mut reversed = integrated.built.facts.clone();
+        let built = integrated.built_facts();
+        let mut reversed = built.facts.clone();
         for fact in &mut reversed {
             if let VerifiedProofFact::DirectCall(fact) = fact {
                 std::mem::swap(&mut fact.source, &mut fact.target);
             }
         }
-        let omitted = integrated.built.facts[..5].to_vec();
-        let mut changed_target = integrated.built.facts.clone();
+        let omitted = built.facts[..5].to_vec();
+        let mut changed_target = built.facts.clone();
         let VerifiedProofFact::DirectCall(first_changed) = &mut changed_target[0] else {
             panic!("source-built fact is direct")
         };
-        first_changed.target = match &integrated.built.facts[1] {
+        first_changed.target = match &built.facts[1] {
             VerifiedProofFact::DirectCall(next) => next.target.clone(),
             _ => panic!("source-built fact is direct"),
         };
-        let mut reused = integrated.built.facts.clone();
+        let mut reused = built.facts.clone();
         let first_receipt = match &reused[0] {
             VerifiedProofFact::DirectCall(fact) => fact.receipt.clone(),
             _ => panic!("source-built fact is direct"),
@@ -1432,7 +1425,7 @@ mod tests {
         let caller = source_callable(&intermediate.store, "caller");
         let middle = source_callable(&intermediate.store, "middle");
         let callee = source_callable(&intermediate.store, "callee");
-        let (chain_contract, chain_hashes, _) = validated_contract(
+        let (chain_contract, chain_hashes, chain_rendering) = validated_contract(
             canonical_id(&caller),
             &[canonical_id(&middle), canonical_id(&callee)],
         );
@@ -1441,8 +1434,11 @@ mod tests {
             &intermediate.root,
             &intermediate.project_id,
             &intermediate.publication,
-            &chain_contract,
-            &chain_hashes,
+            CheckedIntegrationInputs {
+                contract: &chain_contract,
+                hashes: &chain_hashes,
+                rendering: &chain_rendering,
+            },
             |path| fs::read(path),
         )
         .unwrap();
@@ -1450,7 +1446,7 @@ mod tests {
             validated_contract(canonical_id(&caller), &[canonical_id(&callee)]);
         assert!(
             !matches!(
-                check_call_path(&direct_contract, &direct_hashes, &chain.built.facts),
+                check_call_path(&direct_contract, &direct_hashes, &chain.built_facts().facts,),
                 ProofDisposition::ContractProven { .. }
             ),
             "two source-built edges through an intermediate are not one direct fact"
@@ -1474,7 +1470,7 @@ mod tests {
             );
             let rejected_edge_id = edge.id.0.to_string();
             let facts_after_admission = integrated
-                .built
+                .built_facts()
                 .facts
                 .iter()
                 .filter(|fact| match fact {
@@ -1498,17 +1494,20 @@ mod tests {
             &six.root,
             &six.project_id,
             &six.publication,
-            &contract,
-            &hashes,
+            CheckedIntegrationInputs {
+                contract: &contract,
+                hashes: &hashes,
+                rendering: &rendering,
+            },
             |path| fs::read(path),
         )
         .unwrap();
         assert_eq!(
-            drifted.built.unavailable,
+            drifted.built_facts().unavailable,
             vec![UnavailableReason::SourceNotBoundToPublication]
         );
         assert!(!matches!(
-            drifted.disposition,
+            drifted.disposition(),
             ProofDisposition::ContractProven { .. }
         ));
     }
@@ -1523,7 +1522,7 @@ mod tests {
             "use crate::recursive as again;\npub fn recursive() { again(); }\n",
         );
         let recursive_node = source_callable(&recursive.store, "recursive");
-        let (recursive_contract, recursive_hashes, _) = validated_contract(
+        let (recursive_contract, recursive_hashes, recursive_rendering) = validated_contract(
             canonical_id(&recursive_node),
             &[canonical_id(&recursive_node)],
         );
@@ -1532,17 +1531,20 @@ mod tests {
             &recursive.root,
             &recursive.project_id,
             &recursive.publication,
-            &recursive_contract,
-            &recursive_hashes,
+            CheckedIntegrationInputs {
+                contract: &recursive_contract,
+                hashes: &recursive_hashes,
+                rendering: &recursive_rendering,
+            },
             |path| fs::read(path),
         )
         .unwrap();
         assert_eq!(
-            recursive_result.built.gaps,
+            recursive_result.built_facts().gaps,
             vec![FactBuildGap::RecursiveCallNotRepresentable { step_index: 0 }]
         );
         assert!(matches!(
-            recursive_result.disposition,
+            recursive_result.disposition(),
             ProofDisposition::Unknown { .. }
         ));
 
@@ -1568,18 +1570,21 @@ mod tests {
             &fixture.root,
             &fixture.project_id,
             &fixture.publication,
-            &prohibited,
-            &prohibited_hashes,
+            CheckedIntegrationInputs {
+                contract: &prohibited,
+                hashes: &prohibited_hashes,
+                rendering: &prohibited_rendering,
+            },
             |path| fs::read(path),
         )
         .unwrap();
-        let expected_chain = refuted.built.receipts[..2]
+        let expected_chain = refuted.built_facts().receipts[..2]
             .iter()
             .map(|receipt| receipt.receipt.clone())
             .collect::<Vec<_>>();
         assert_eq!(
-            refuted.disposition,
-            ProofDisposition::ContractRefuted {
+            refuted.disposition(),
+            &ProofDisposition::ContractRefuted {
                 contract_digest: prohibited_hashes.contract_digest().to_owned(),
                 refutation: codestory_agent::indexed_source_call_path_v1::Refutation::ProhibitedScopeTraversal {
                     step_index: 1,
@@ -1588,19 +1593,7 @@ mod tests {
                 },
             }
         );
-        let refuted_projection = project_internal_call_path_result(InternalProjectionInput {
-            contract: &prohibited,
-            hashes: &prohibited_hashes,
-            rendering: &prohibited_rendering,
-            publication: InternalCorePublicationIdentity {
-                project_id: fixture.project_id.clone(),
-                generation_id: fixture.publication.generation_id.clone(),
-                run_id: fixture.publication.run_id.clone(),
-            },
-            disposition: &refuted.disposition,
-            receipts: &refuted.built.receipts,
-        })
-        .unwrap();
+        let refuted_projection = project_internal_call_path_result(&refuted).unwrap();
         let InternalProjection::Complete { root, .. } = refuted_projection else {
             panic!("small positive contradiction projection fits")
         };
@@ -1617,7 +1610,7 @@ mod tests {
             )
         );
 
-        let (excluded, excluded_hashes, _) = validated_contract_with_policies(
+        let (excluded, excluded_hashes, excluded_rendering) = validated_contract_with_policies(
             canonical_id(&nodes[0]),
             &targets,
             &[],
@@ -1628,16 +1621,110 @@ mod tests {
             &fixture.root,
             &fixture.project_id,
             &fixture.publication,
-            &excluded,
-            &excluded_hashes,
+            CheckedIntegrationInputs {
+                contract: &excluded,
+                hashes: &excluded_hashes,
+                rendering: &excluded_rendering,
+            },
             |path| fs::read(path),
         )
         .unwrap();
         assert!(matches!(
-            excluded_result.disposition,
-            ProofDisposition::Unknown { ref gaps, .. }
+            excluded_result.disposition(),
+            ProofDisposition::Unknown { gaps, .. }
                 if gaps == &[codestory_agent::indexed_source_call_path_v1::ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index: 1 }]
         ));
+    }
+
+    #[test]
+    fn source_built_partial_and_recursive_results_project_exact_builder_gaps() {
+        let recursive = source_built_fixture(
+            "use crate::recursive as again;\npub fn recursive() { again(); }\n",
+        );
+        let recursive_node = source_callable(&recursive.store, "recursive");
+        let (recursive_contract, recursive_hashes, recursive_rendering) = validated_contract(
+            canonical_id(&recursive_node),
+            &[canonical_id(&recursive_node)],
+        );
+        let recursive_result = evaluate_from_store(
+            &recursive.store,
+            &recursive.root,
+            &recursive.project_id,
+            &recursive.publication,
+            CheckedIntegrationInputs {
+                contract: &recursive_contract,
+                hashes: &recursive_hashes,
+                rendering: &recursive_rendering,
+            },
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert!(matches!(
+            recursive_result.disposition(),
+            ProofDisposition::Unknown { gaps, .. }
+                if gaps == &[codestory_agent::indexed_source_call_path_v1::ProofGap::FactBuild(
+                    FactBuildGap::RecursiveCallNotRepresentable { step_index: 0 }
+                )]
+        ));
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&recursive_result).unwrap()
+        else {
+            panic!("small recursive Unknown projection fits")
+        };
+        assert_eq!(
+            root["disposition"]["gaps"],
+            json!([{ "kind": "recursive_call_not_representable", "step_index": 0 }])
+        );
+        assert!(root["receipts"].as_array().unwrap().is_empty());
+
+        let partial = source_built_fixture(
+            "pub fn step0() { step1(); }\npub fn step1() {}\npub fn step2() {}\n",
+        );
+        let step0 = source_callable(&partial.store, "step0");
+        let step1 = source_callable(&partial.store, "step1");
+        let step2 = source_callable(&partial.store, "step2");
+        let (partial_contract, partial_hashes, partial_rendering) = validated_contract(
+            canonical_id(&step0),
+            &[canonical_id(&step1), canonical_id(&step2)],
+        );
+        let partial_result = evaluate_from_store(
+            &partial.store,
+            &partial.root,
+            &partial.project_id,
+            &partial.publication,
+            CheckedIntegrationInputs {
+                contract: &partial_contract,
+                hashes: &partial_hashes,
+                rendering: &partial_rendering,
+            },
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert!(matches!(
+            partial_result.disposition(),
+            ProofDisposition::Unknown {
+                gaps,
+                connected_receipts,
+                ..
+            } if gaps == &[codestory_agent::indexed_source_call_path_v1::ProofGap::FactBuild(
+                FactBuildGap::DirectCallMissing { step_index: 1 }
+            )] && connected_receipts.len() == 1
+        ));
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&partial_result).unwrap()
+        else {
+            panic!("small partial Unknown projection fits")
+        };
+        assert_eq!(
+            root["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|step| step["status"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["proven", "unknown"]
+        );
+        assert_eq!(root["receipts"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -1686,7 +1773,7 @@ mod tests {
         assert_eq!(operation.retrieval_publication, None);
         assert_eq!(retrieval_pin_calls.get(), 0);
         assert!(matches!(
-            operation.value.integrated.disposition,
+            operation.value.integration.disposition(),
             ProofDisposition::ContractProven { .. }
         ));
         assert!(matches!(
