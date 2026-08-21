@@ -34,10 +34,9 @@ pub fn wilson_score_interval(
     let half_width = z * (p * (1.0 - p) / n + z_squared / (4.0 * n * n)).sqrt() / adjustment;
     let lower = (center - half_width).clamp(0.0, 1.0);
     let upper = (center + half_width).clamp(0.0, 1.0);
-    // Section 8 states whole-percentage Wilson gates. Preserve the raw
-    // numerator/denominator and full interval while comparing that published
-    // percentage using half-up whole-point rounding.
-    let lower_milli = (lower * 100.0).round().clamp(0.0, 100.0) as u16 * 10;
+    // This scaled value is presentation only. Gate comparisons use `lower`
+    // directly so rounding can never turn a statistical miss into a pass.
+    let lower_milli = (lower * 1_000.0).floor().clamp(0.0, 1_000.0) as u16;
     Ok(WilsonScoreInterval {
         numerator,
         denominator,
@@ -437,19 +436,21 @@ fn role_failures(
         observations.full_proofs,
         u64::from(thresholds.minimum_full_proofs),
     );
-    minimum(
-        &mut failures,
-        format!("{prefix}.full_proofs.wilson_lower_milli"),
-        kind.clone(),
-        u64::from(overall.lower_milli),
-        u64::from(thresholds.minimum_full_proof_wilson_lower_milli),
-    );
+    if overall.lower < f64::from(thresholds.minimum_full_proof_wilson_lower_milli) / 1_000.0 {
+        failures.push(count_failure(
+            format!("{prefix}.full_proofs.wilson_lower_milli"),
+            kind.clone(),
+            u64::from(overall.lower_milli),
+            u64::from(thresholds.minimum_full_proof_wilson_lower_milli),
+        ));
+    }
 
     let mut passing_cohorts = 0usize;
     for (repository_id, observed) in &observations.full_proofs_by_cohort {
         let interval = wilson_score_interval(*observed, 30, wilson_z)?;
         let count_pass = *observed >= u64::from(thresholds.minimum_full_proofs_per_cohort);
-        let wilson_pass = interval.lower_milli >= thresholds.minimum_cohort_wilson_lower_milli;
+        let wilson_pass =
+            interval.lower >= f64::from(thresholds.minimum_cohort_wilson_lower_milli) / 1_000.0;
         if count_pass && wilson_pass {
             passing_cohorts += 1;
         }
@@ -661,16 +662,16 @@ mod tests {
     #[test]
     fn wilson_boundaries_preserve_raw_counts() {
         for (n, d, expected) in [
-            (96, 120, 720),
+            (96, 120, 719),
             (95, 120, 710),
-            (60, 120, 410),
-            (59, 120, 400),
-            (24, 120, 140),
-            (23, 120, 130),
-            (21, 30, 520),
-            (20, 30, 490),
-            (12, 30, 250),
-            (11, 30, 220),
+            (60, 120, 411),
+            (59, 120, 403),
+            (24, 120, 138),
+            (23, 120, 131),
+            (21, 30, 521),
+            (20, 30, 487),
+            (12, 30, 245),
+            (11, 30, 218),
         ] {
             let interval = wilson_score_interval(n, d, WILSON_Z).expect("interval");
             assert_eq!(
@@ -682,17 +683,23 @@ mod tests {
                 (n, d, expected)
             );
         }
+        let automatic = wilson_score_interval(96, 120, WILSON_Z).expect("automatic boundary");
+        assert!((automatic.lower - 0.719_633_264_937_180_5).abs() < 1e-15);
+        let experimental = wilson_score_interval(24, 120, WILSON_Z).expect("experimental boundary");
+        assert!((experimental.lower - 0.138_244_764_788_402_56).abs() < 1e-15);
     }
 
     #[test]
     fn point_and_cohort_boundaries_are_exact() {
         for (count, required, lower, pass) in [
             (95, 96, 720, false),
-            (96, 96, 720, true),
+            (96, 96, 720, false),
+            (97, 96, 720, true),
             (59, 60, 410, false),
             (60, 60, 410, true),
             (23, 24, 140, false),
-            (24, 24, 140, true),
+            (24, 24, 140, false),
+            (25, 24, 140, true),
         ] {
             let result = role_failures(
                 "role",
@@ -901,7 +908,7 @@ mod tests {
         assert_eq!(stable.automatic_thresholds_met, Some(false));
 
         let experimental =
-            decision_from_observations(&observed(24, [12, 4, 4, 4]), &thresholds, None)
+            decision_from_observations(&observed(25, [12, 5, 4, 4]), &thresholds, None)
                 .expect("experimental B");
         assert!(matches!(
             experimental.outcome,
@@ -989,7 +996,7 @@ mod tests {
             canonical_thresholds_sha256(&thresholds).expect("canonical threshold identity");
         assert_eq!(
             original_identity,
-            "1437261e018ca1931fddeb282a168462209c0bb92ea93b6435565602bafe5fbb"
+            "113cd31a352573636f6b3e6ebbe63ea4e2f1fcaa9ed6e24dec99149a608b56be"
         );
         let mut value = serde_json::to_value(&thresholds).expect("threshold JSON");
         value["automatic"]["minimum_full_proofs"] = serde_json::json!(95);

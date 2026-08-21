@@ -18,11 +18,14 @@ The evaluator validates all three inputs before calculating a decision.
 
 Full-proof rates use a two-sided 95% Wilson score interval with
 `z = 1.959963984540054`. Every interval retains its raw numerator and
-denominator and full floating-point bounds. Section 8 publishes whole-percent
-lower-bound gates, so comparison rounds the lower bound to the nearest whole
-percentage point; the corresponding DTO value is that percentage multiplied
-by ten (`72% = 720`). This makes the frozen count boundaries 96/120, 60/120,
-24/120, 21/30, and 12/30 behave as stated.
+denominator and full floating-point bounds. Gate comparison uses the unrounded
+lower bound against the exact threshold ratio (`720` means `0.720`). A scaled
+floor-to-thousandths value may be rendered in failed-gate diagnostics, but it
+never decides the gate. Consequently 96/120 passes the 96-count gate but its
+71.9633% lower bound misses 72%; 97/120 is the nearest automatic overall pass.
+Likewise 24/120 misses the exact 14% Wilson gate and 25/120 is the nearest
+experimental overall pass. The stable 60/120, automatic cohort 21/30, and
+stable cohort 12/30 lower bounds clear their exact thresholds.
 
 Ratios use integer half-up rounding to thousandths. P95 uses nearest rank:
 sort ascending and select rank `ceil(0.95 * n)`. An empty latency or size set is
