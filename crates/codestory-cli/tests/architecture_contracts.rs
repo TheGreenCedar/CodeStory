@@ -179,6 +179,27 @@ fn read_source_tree(dir: &str) -> String {
         .join("\n")
 }
 
+fn read_source_tree_excluding_many(dir: &str, excluded_suffixes: &[&str]) -> String {
+    let root = repo_root().join(dir);
+    let mut files = Vec::new();
+    collect_rs_files(&root, &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .filter(|path| {
+            let relative = path
+                .strip_prefix(&root)
+                .expect("source file stays below source root")
+                .to_string_lossy();
+            !excluded_suffixes
+                .iter()
+                .any(|suffix| relative.ends_with(suffix))
+        })
+        .map(|path| fs::read_to_string(path).expect("read source"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn production_source_prefix(source: &str) -> &str {
     source
         .split_once("#[cfg(test)]\nmod tests {")
@@ -605,8 +626,227 @@ const AGENT_PLANNING_MODULES: [&str; 27] = [
 ///   import-DAG guard a file no product build links.
 /// - `indexed_source_call_path_v1.rs` is the dark v3 proof kernel. Task 2 keeps
 ///   it behind the same test-support gate until the atomic public v3 cut.
-const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 3] =
-    ["lib.rs", "eval_probes.rs", "indexed_source_call_path_v1.rs"];
+/// - `packet_execution_plan_v3.rs` is the dark v3 evidence-planning ledger.
+///   Task 3A keeps its callable surface behind the same test-support gate; it
+///   is not one of the 27 production packet-planning modules.
+const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 4] = [
+    "lib.rs",
+    "eval_probes.rs",
+    "indexed_source_call_path_v1.rs",
+    "packet_execution_plan_v3.rs",
+];
+
+#[test]
+fn dark_packet_execution_plan_v3_stays_inert_and_unshipped() {
+    let agent_lib = read("crates/codestory-agent/src/lib.rs");
+    assert!(
+        agent_lib.contains(
+            "#[cfg(any(test, feature = \"test-support\"))]\n#[doc(hidden)]\npub mod packet_execution_plan_v3;"
+        ),
+        "the v3 evidence planner must remain test-support-only until the atomic v3 cut"
+    );
+    assert!(
+        AGENT_MODULE_ALLOWLIST_EXCLUSIONS.contains(&"packet_execution_plan_v3.rs"),
+        "the dark v3 evidence planner must not count as a production planning module"
+    );
+
+    let surfaces = [
+        (
+            "runtime source",
+            read_source_tree_excluding_many(
+                "crates/codestory-runtime/src",
+                &[
+                    "agent/packet_execution_record_v3.rs",
+                    "agent/packet_projection_v3.rs",
+                ],
+            ),
+        ),
+        ("CLI source", read_source_tree("crates/codestory-cli/src")),
+        (
+            "current public API DTO source",
+            format!(
+                "{}\n{}",
+                read("crates/codestory-contracts/src/api.rs"),
+                read_source_tree("crates/codestory-contracts/src/api")
+            ),
+        ),
+        (
+            "current wire source",
+            read("crates/codestory-contracts/src/wire.rs"),
+        ),
+        (
+            "generated MCP catalog",
+            read("plugins/codestory/generated-mcp-catalog.json"),
+        ),
+    ];
+    for (surface, source) in surfaces {
+        for forbidden in [
+            "packet_execution_plan_v3",
+            "PacketExecutionPlanV3",
+            "PacketProjectionV3Dto",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{surface} references dark Task-3A vocabulary via {forbidden}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
+    let runtime_agent_modules = read("crates/codestory-runtime/src/agent/mod.rs");
+    assert!(
+        runtime_agent_modules.contains(
+            "#[cfg(any(test, feature = \"test-support\"))]\npub(crate) mod packet_execution_record_v3;"
+        ),
+        "the runtime-owned v3 record must remain test-support-only until the atomic v3 cut"
+    );
+    assert!(
+        runtime_agent_modules.contains(
+            "#[cfg(any(test, feature = \"test-support\"))]\npub(crate) mod packet_projection_v3;"
+        ),
+        "the runtime-owned v3 projector must remain test-support-only until the atomic v3 cut"
+    );
+
+    let record_path = "crates/codestory-runtime/src/agent/packet_execution_record_v3.rs";
+    let record = production_source(&read(record_path));
+    assert_eq!(
+        record.matches(".active_publication()").count(),
+        1,
+        "the record builder must capture the already-active publication exactly once"
+    );
+    for forbidden in [
+        "AgentPacketDto",
+        "enforce_packet_output_budget",
+        "serde_json::Value",
+        "ToolSpec",
+        "run_with_cancel",
+        "with_pinned_retrieval",
+        "retrieval_primary",
+        "DiagnosticsCapabilityV3Dto",
+        "SystemTime",
+        "Instant",
+        "include_evidence",
+        "operation_id",
+        "published_at_epoch_ms",
+        "capability_uri",
+        "session_secret",
+        "ClaimDisposition",
+        "evaluate_execution_plan_v3",
+        "Supported",
+    ] {
+        assert!(
+            !record.contains(forbidden),
+            "the dark record source crosses a forbidden execution/serialization boundary via {forbidden}"
+        );
+    }
+
+    let projector_path = "crates/codestory-runtime/src/agent/packet_projection_v3.rs";
+    let projector = production_source(&read(projector_path));
+    for forbidden in [
+        "AgentPacketDto",
+        "AgentAnswerDto",
+        "SearchResultsDto",
+        "ToolSpec",
+        "run_with_cancel",
+        ".active_publication()",
+        "with_pinned_retrieval",
+        "retrieval_primary",
+        "include_evidence",
+        "operation_id",
+        "published_at_epoch_ms",
+        "capability_uri",
+        "session_secret",
+        "Hmac",
+        "SystemTime",
+        "Instant",
+        ".question()",
+        "source_text",
+        "ClaimDisposition",
+        "CompleteQueryNegative",
+        "Supported",
+        "Proven",
+        "eligible_for_sufficiency",
+    ] {
+        assert!(
+            !projector.contains(forbidden),
+            "the dark projector source crosses a forbidden execution/authority boundary via {forbidden}"
+        );
+    }
+
+    let surfaces = [
+        (
+            "runtime source outside the gated record/projector and their module declarations",
+            read_source_tree_excluding_many(
+                "crates/codestory-runtime/src",
+                &[
+                    "agent/packet_execution_record_v3.rs",
+                    "agent/packet_projection_v3.rs",
+                ],
+            )
+            .replace("pub(crate) mod packet_execution_record_v3;", "")
+            .replace("pub(crate) mod packet_projection_v3;", ""),
+        ),
+        ("CLI source", read_source_tree("crates/codestory-cli/src")),
+        (
+            "current public API DTO source",
+            format!(
+                "{}\n{}",
+                read("crates/codestory-contracts/src/api.rs"),
+                read_source_tree("crates/codestory-contracts/src/api")
+            ),
+        ),
+        (
+            "current wire source",
+            read("crates/codestory-contracts/src/wire.rs"),
+        ),
+        (
+            "generated MCP catalog",
+            read("plugins/codestory/generated-mcp-catalog.json"),
+        ),
+        (
+            "generated grounding syntax",
+            read("plugins/codestory/skills/codestory-grounding/references/generated-mcp-syntax.md"),
+        ),
+        (
+            "plugin launcher",
+            format!(
+                "{}\n{}",
+                read("plugins/codestory/scripts/codestory-mcp.cjs"),
+                read("plugins/codestory/hooks/codestory-runtime.cjs")
+            ),
+        ),
+    ];
+    for (surface, source) in surfaces {
+        for forbidden in [
+            "PacketExecutionRecordV3",
+            "PacketRequestFingerprintV3",
+            "build_packet_execution_record_v3",
+            "packet_projection_v3",
+            "build_packet_projection_v3",
+            "build_context_projection_v3",
+            "build_search_projection_v3",
+            "build_diagnostic_artifact_v3",
+            "DiagnosticArtifactBuildV3",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{surface} references dark Task-3B vocabulary via {forbidden}"
+            );
+        }
+    }
+
+    let current_dto = read("crates/codestory-contracts/src/api/dto.rs");
+    assert!(
+        current_dto.contains("pub include_evidence: bool"),
+        "current packet include_evidence must remain present throughout PR 3"
+    );
+    assert!(
+        current_dto.contains("pub const PACKET_OBLIGATION_PLAN_VERSION: u32 = 1;"),
+        "the current packet obligation plan must remain version 1 throughout PR 3"
+    );
+}
 
 #[test]
 fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {

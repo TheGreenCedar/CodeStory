@@ -30,6 +30,9 @@ pub mod packet_evidence;
 pub mod packet_evidence_carriers;
 pub mod packet_evidence_roles;
 pub mod packet_execution_graphs;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod packet_execution_plan_v3;
 pub mod packet_flow_requirements;
 pub mod packet_freshness;
 pub mod packet_obligations;
