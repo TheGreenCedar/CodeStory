@@ -166,7 +166,7 @@ test("optional evaluation does not delay a standard native claim", async () => {
   host.forcePhase("qualification");
   host.runs.push({
     id: 900,
-    workflow: "frozen-candidate-quality.yml",
+    workflow: "optional-evaluation",
     headSha: F,
     status: "in_progress",
     conclusion: null,
