@@ -5,12 +5,16 @@ use super::contracts::{
 };
 use super::corpus::LoadedCorpusV1;
 use anyhow::{Context, Result, bail};
+use codestory_workspace::{
+    WorkspacePathIdentity, WorkspacePathLexicalIdentity, workspace_path_identity,
+    workspace_path_lexical_identity,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
 const SOURCE_ENVIRONMENT_SCHEMA: &str = "codestory.proof-availability-source-environment/v1";
@@ -46,6 +50,73 @@ struct TreeEntry {
     kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedDestination {
+    real_path: PathBuf,
+    lexical_identity: WorkspacePathLexicalIdentity,
+    existing_ancestor_identity: WorkspacePathIdentity,
+    suffix_identity: WorkspacePathLexicalIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DestinationPlan {
+    workspace: ObservedDestination,
+    cache: ObservedDestination,
+    out: ObservedDestination,
+    workspace_parent: ObservedDestination,
+    output_parent: ObservedDestination,
+}
+
+impl DestinationPlan {
+    fn observe(arguments: &MaterializeArgs) -> Result<Self> {
+        let workspace = observe_destination(&arguments.workspace)?;
+        let cache = observe_destination(&arguments.cache_root)?;
+        let out = observe_destination(&arguments.out)?;
+        ensure_absent(&workspace.real_path)?;
+        ensure_absent(&out.real_path)?;
+        if destinations_overlap(&workspace, &cache)
+            || destinations_overlap(&workspace, &out)
+            || destinations_overlap(&cache, &out)
+        {
+            bail!("proof_availability_materialize_path_overlap")
+        }
+        let workspace_parent = observe_existing_directory(
+            workspace
+                .real_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_workspace_parent_missing"))?,
+        )?;
+        let output_parent = observe_existing_directory(
+            out.real_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_output_parent_missing"))?,
+        )?;
+        Ok(Self {
+            workspace,
+            cache,
+            out,
+            workspace_parent,
+            output_parent,
+        })
+    }
+
+    fn revalidate(&self, arguments: &MaterializeArgs) -> Result<()> {
+        let current = Self::observe(arguments)?;
+        if current != *self {
+            bail!("proof_availability_materialize_destination_changed")
+        }
+        Ok(())
+    }
+
+    fn revalidate_output_parent(&self) -> Result<()> {
+        let current = observe_existing_directory(&self.output_parent.real_path)?;
+        if current != self.output_parent {
+            bail!("proof_availability_materialize_destination_changed")
+        }
+        ensure_absent(&self.out.real_path)
+    }
+}
+
 pub fn verify_only(arguments: &MaterializeArgs, loaded: &LoadedCorpusV1) -> Result<()> {
     verify_only_with_registry(arguments, loaded, &QUALIFICATION_REPOSITORIES, false)
 }
@@ -62,30 +133,11 @@ fn verify_only_with_registry(
     loaded
         .corpus
         .validate_with_path_files_and_registry(&loaded.path_files, registry)?;
-    ensure_absent(&arguments.workspace)?;
-    ensure_absent(&arguments.out)?;
-    if arguments.workspace == arguments.out
-        || arguments.workspace.starts_with(&arguments.cache_root)
-        || arguments.out.starts_with(&arguments.cache_root)
-        || arguments.cache_root.starts_with(&arguments.workspace)
-    {
-        bail!("proof_availability_materialize_path_overlap")
-    }
-    let workspace_parent = arguments
-        .workspace
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("proof_availability_workspace_parent_missing"))?;
-    let output_parent = arguments
-        .out
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("proof_availability_output_parent_missing"))?;
-    if !workspace_parent.is_dir() || !output_parent.is_dir() {
-        bail!("proof_availability_materialize_parent_missing")
-    }
+    let destinations = DestinationPlan::observe(arguments)?;
 
     let staging = tempfile::Builder::new()
         .prefix(".codestory-proof-source-")
-        .tempdir_in(workspace_parent)?;
+        .tempdir_in(&destinations.workspace_parent.real_path)?;
     let staged_workspaces = staging.path().join("workspaces");
     fs::create_dir(&staged_workspaces)?;
     let hooks = staging.path().join("empty-hooks");
@@ -116,13 +168,15 @@ fn verify_only_with_registry(
             repository: path_file.repository.clone(),
             commit: path_file.commit.clone(),
             workspace: path_file.workspace.clone(),
-            checkout_root: arguments
+            checkout_root: destinations
                 .workspace
+                .real_path
                 .join(&path_file.repository_id)
                 .display()
                 .to_string(),
-            project_root: arguments
+            project_root: destinations
                 .workspace
+                .real_path
                 .join(&path_file.repository_id)
                 .join(workspace_suffix(&path_file.workspace)?)
                 .display()
@@ -137,14 +191,15 @@ fn verify_only_with_registry(
     let descriptor = SourceEnvironmentDescriptorV1 {
         schema: SOURCE_ENVIRONMENT_SCHEMA,
         corpus_sha256: canonical_corpus_sha256(&loaded.corpus)?,
-        workspace_root: arguments.workspace.display().to_string(),
+        workspace_root: destinations.workspace.real_path.display().to_string(),
         repositories,
     };
     let bytes = serde_json::to_vec_pretty(&descriptor)?;
     if bytes.len() > MAX_DESCRIPTOR_BYTES {
         bail!("proof_availability_source_descriptor_too_large")
     }
-    let mut output = tempfile::NamedTempFile::new_in(output_parent)?;
+    destinations.revalidate(arguments)?;
+    let mut output = tempfile::NamedTempFile::new_in(&destinations.output_parent.real_path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -156,12 +211,17 @@ fn verify_only_with_registry(
     output.write_all(b"\n")?;
     output.as_file_mut().sync_all()?;
 
-    fs::rename(&staged_workspaces, &arguments.workspace)?;
-    if let Err(error) = output.persist_noclobber(&arguments.out) {
-        fs::remove_dir_all(&arguments.workspace).with_context(|| {
+    destinations.revalidate(arguments)?;
+    fs::rename(&staged_workspaces, &destinations.workspace.real_path)?;
+    if let Err(error) = destinations.revalidate_output_parent() {
+        fs::remove_dir_all(&destinations.workspace.real_path)?;
+        return Err(error);
+    }
+    if let Err(error) = output.persist_noclobber(&destinations.out.real_path) {
+        fs::remove_dir_all(&destinations.workspace.real_path).with_context(|| {
             format!(
                 "remove newly installed source workspace {} after output failure",
-                arguments.workspace.display()
+                destinations.workspace.real_path.display()
             )
         })?;
         return Err(error.error.into());
@@ -175,6 +235,90 @@ fn ensure_absent(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn observe_existing_directory(path: &Path) -> Result<ObservedDestination> {
+    let observation = observe_destination(path)?;
+    if !fs::metadata(&observation.real_path)?.is_dir() {
+        bail!("proof_availability_materialize_parent_missing")
+    }
+    Ok(observation)
+}
+
+fn observe_destination(path: &Path) -> Result<ObservedDestination> {
+    let normalized = normalized_absolute_destination(path)?;
+    let mut current = PathBuf::new();
+    let mut existing_ancestor = None;
+    let mut missing_seen = false;
+    for component in normalized.components() {
+        current.push(component.as_os_str());
+        if missing_seen {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() && !is_platform_root_alias(&current) {
+                    bail!("proof_availability_materialize_destination_alias")
+                }
+                existing_ancestor = Some(current.clone());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing_seen = true;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let existing_ancestor = existing_ancestor
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_materialize_ancestor_missing"))?;
+    let suffix = normalized.strip_prefix(&existing_ancestor)?.to_path_buf();
+    let canonical_ancestor = existing_ancestor.canonicalize()?;
+    let real_path = canonical_ancestor.join(&suffix);
+    Ok(ObservedDestination {
+        lexical_identity: workspace_path_lexical_identity(&real_path)?,
+        existing_ancestor_identity: workspace_path_identity(&canonical_ancestor)?,
+        suffix_identity: workspace_path_lexical_identity(&suffix)?,
+        real_path,
+    })
+}
+
+fn normalized_absolute_destination(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        bail!("proof_availability_materialize_destination_invalid")
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::ParentDir => {
+                bail!("proof_availability_materialize_destination_parent_component")
+            }
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    if !normalized.is_absolute() {
+        bail!("proof_availability_materialize_destination_invalid")
+    }
+    Ok(normalized)
+}
+
+fn is_platform_root_alias(path: &Path) -> bool {
+    path.parent()
+        .is_some_and(|parent| parent.parent().is_none())
+}
+
+fn destinations_overlap(left: &ObservedDestination, right: &ObservedDestination) -> bool {
+    left.lexical_identity.is_within(&right.lexical_identity)
+        || right.lexical_identity.is_within(&left.lexical_identity)
+        || (left.existing_ancestor_identity == right.existing_ancestor_identity
+            && (left.suffix_identity.is_within(&right.suffix_identity)
+                || right.suffix_identity.is_within(&left.suffix_identity)))
 }
 
 fn stage_repository(
@@ -922,6 +1066,105 @@ mod tests {
         assert!(!failed.workspace.exists());
         assert!(!failed.out.exists());
         assert!(!failed.cache_root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_symlink_parents_and_cache_aliases_fail_before_artifact_creation() {
+        use std::os::unix::fs::symlink;
+
+        let (origin, commit, raw_tree) = cohort_repository();
+        let tree_sha256 = sha256(&raw_tree);
+        for case in ["workspace-parent", "output-parent", "cache-alias"] {
+            let (loaded, owned_registry) =
+                local_inputs(origin.path().to_str().unwrap(), &commit, &tree_sha256);
+            let registry = owned_registry
+                .iter()
+                .map(|(id, repository, commit, workspace)| {
+                    (
+                        id.as_str(),
+                        repository.as_str(),
+                        commit.as_str(),
+                        workspace.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let root = tempfile::tempdir().unwrap();
+            let real_workspace_parent = root.path().join("real-workspace-parent");
+            let real_output_parent = root.path().join("real-output-parent");
+            let real_cache_root = root.path().join("real-cache-root");
+            fs::create_dir(&real_workspace_parent).unwrap();
+            fs::create_dir(&real_output_parent).unwrap();
+            fs::create_dir(&real_cache_root).unwrap();
+            let workspace_alias = root.path().join("workspace-parent-alias");
+            let output_alias = root.path().join("output-parent-alias");
+            let cache_alias = root.path().join("cache-alias");
+            symlink(&real_workspace_parent, &workspace_alias).unwrap();
+            symlink(&real_output_parent, &output_alias).unwrap();
+            symlink(&real_workspace_parent, &cache_alias).unwrap();
+
+            let workspace = if case == "workspace-parent" {
+                workspace_alias.join("workspace")
+            } else {
+                real_workspace_parent.join("workspace")
+            };
+            let out = if case == "output-parent" {
+                output_alias.join("source-environment.json")
+            } else {
+                real_output_parent.join("source-environment.json")
+            };
+            let cache_root = if case == "cache-alias" {
+                cache_alias.clone()
+            } else {
+                real_cache_root.clone()
+            };
+            let arguments = MaterializeArgs {
+                corpus: root.path().join("unused-corpus.json"),
+                workspace: workspace.clone(),
+                cache_root,
+                out: out.clone(),
+                verify_only: true,
+            };
+
+            let error = verify_only_with_registry(&arguments, &loaded, &registry, true)
+                .expect_err("destination alias must fail closed");
+            assert!(
+                format!("{error:#}").contains("proof_availability_materialize_destination_alias"),
+                "unexpected {case} error: {error:#}"
+            );
+            assert!(!workspace.exists(), "{case} left a workspace");
+            assert!(!out.exists(), "{case} left a descriptor");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_overlap_detects_platform_root_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let spelled_root = root.path().to_path_buf();
+        let canonical_root = spelled_root.canonicalize().unwrap();
+        if spelled_root == canonical_root {
+            return;
+        }
+
+        let workspace = spelled_root.join("workspace");
+        let out = spelled_root.join("source-environment.json");
+        let arguments = MaterializeArgs {
+            corpus: spelled_root.join("unused-corpus.json"),
+            workspace: workspace.clone(),
+            cache_root: canonical_root,
+            out: out.clone(),
+            verify_only: true,
+        };
+
+        let error = DestinationPlan::observe(&arguments)
+            .expect_err("native aliases must not evade overlap detection");
+        assert!(
+            format!("{error:#}").contains("proof_availability_materialize_path_overlap"),
+            "unexpected alias-overlap error: {error:#}"
+        );
+        assert!(!workspace.exists());
+        assert!(!out.exists());
     }
 
     #[test]
