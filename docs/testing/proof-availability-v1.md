@@ -59,6 +59,11 @@ and its two frozen mutations through the accepted validator and the single
 Runtime-owned core-pinned proof operation. No semantic retrieval publication is
 created or required.
 
+A product finalization failure remains an `Invalid` case row rather than
+aborting the report. It retains the actual trace and both completed mutation
+rows, records every oracle step as missing, and carries no projection or receipt
+claim.
+
 The public result directory contains exactly:
 
 ```text
@@ -76,6 +81,9 @@ JSON files use canonical compact JSON followed by one newline. The private
 environment descriptor, absolute paths, environment variables, source logs, and
 unbounded source text are excluded. The decision is recomputed from the complete
 case rows and the explicitly supplied thresholds; it is not an input to the run.
+`findings.md` separates reproduced measurements from labeled inferences, records
+the frozen hard gates and role thresholds used by the evaluator, and presents the
+decision with its failed gates, provenance hashes, and explicit nonclaims.
 
 ## Read-only verification
 

@@ -1,15 +1,16 @@
 use super::contracts::{
     ActivationDecisionV1, ActualProductResultV1, CaseReportV1, CohortPathFileV1, CorpusV1,
     EnvironmentReportV1, FailureFunnelReportV1, FunnelOutcomeV1, InventoryReportV1,
-    ProductRefutationBasisV1, ProjectedReceiptReferenceV1, ProvenanceV1, QualificationSummaryV1,
-    REPORT_SCHEMA, ReceiptOracleComparisonV1, StepQualificationOutcomeV1, ThresholdsV1,
-    TrailReportV1, TransportEvidenceV1, canonical_corpus_sha256, canonical_thresholds_sha256,
-    results_evidence_sha256,
+    ProductDispositionKindV1, ProductRefutationBasisV1, ProjectedReceiptReferenceV1, ProvenanceV1,
+    QualificationSummaryV1, REPORT_SCHEMA, ReceiptOracleComparisonV1, RoleThresholdsV1,
+    StepQualificationOutcomeV1, ThresholdsV1, TrailReportV1, TransportErrorV1, TransportEvidenceV1,
+    canonical_corpus_sha256, canonical_thresholds_sha256, results_evidence_sha256,
 };
 use super::thresholds::evaluate_activation_decision;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -188,7 +189,7 @@ pub(crate) fn build_public_artifacts(
 ) -> Result<PublicArtifactBundle> {
     summary.validate_against_inputs(corpus, thresholds)?;
     let decision = evaluate_activation_decision(summary, corpus, thresholds, None)?;
-    let findings = render_findings(summary, &decision)?;
+    let findings = render_findings(summary, thresholds, &decision)?;
     let bundle = PublicArtifactBundle {
         environment: serde_json::to_value(&summary.environment)?,
         inventory: serde_json::to_value(&summary.inventory)?,
@@ -438,29 +439,341 @@ fn sort_actual_product_result(result: &mut ActualProductResultV1) {
     }
 }
 
+#[derive(Debug)]
+struct FindingsRoleThresholdV1 {
+    role: String,
+    minimum_full_proofs: u16,
+    minimum_full_proofs_per_cohort: u16,
+    minimum_full_proof_wilson_lower_milli: u16,
+    minimum_cohort_wilson_lower_milli: u16,
+    minimum_positive_step_recall_milli: u16,
+    minimum_full_or_useful_partial_milli: u16,
+    minimum_actionable_exact_gap_milli: u16,
+    maximum_unknown_p95_ms: u64,
+    maximum_transport_p95_ms: u64,
+    maximum_complete_response_p95_bytes: u64,
+    maximum_unknown_response_p95_bytes: u64,
+    maximum_response_bytes: u64,
+}
+
+impl FindingsRoleThresholdV1 {
+    fn from_threshold(role: &str, threshold: &RoleThresholdsV1) -> Self {
+        Self {
+            role: role.to_owned(),
+            minimum_full_proofs: threshold.minimum_full_proofs,
+            minimum_full_proofs_per_cohort: threshold.minimum_full_proofs_per_cohort,
+            minimum_full_proof_wilson_lower_milli: threshold.minimum_full_proof_wilson_lower_milli,
+            minimum_cohort_wilson_lower_milli: threshold.minimum_cohort_wilson_lower_milli,
+            minimum_positive_step_recall_milli: threshold.minimum_positive_step_recall_milli,
+            minimum_full_or_useful_partial_milli: threshold.minimum_full_or_useful_partial_milli,
+            minimum_actionable_exact_gap_milli: threshold.minimum_actionable_exact_gap_milli,
+            maximum_unknown_p95_ms: threshold.maximum_unknown_p95_ms,
+            maximum_transport_p95_ms: threshold.maximum_transport_p95_ms,
+            maximum_complete_response_p95_bytes: threshold.maximum_complete_response_p95_bytes,
+            maximum_unknown_response_p95_bytes: threshold.maximum_unknown_response_p95_bytes,
+            maximum_response_bytes: threshold.maximum_response_bytes,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FindingsDocumentV1 {
+    qualification_id: String,
+    source_commit: String,
+    source_tree: String,
+    binary_sha256: String,
+    corpus_sha256: String,
+    thresholds_sha256: String,
+    results_sha256: String,
+    positive_requests: u64,
+    attempted_positive_steps: u16,
+    exact_positive_steps: u16,
+    contract_proven_cases: u64,
+    negative_contract_proven: u64,
+    authoritative_receipts: u64,
+    exact_authoritative_receipts: u64,
+    unclassified_positive_steps: u16,
+    maximum_response_bytes: u64,
+    cohort_full_proofs: Vec<(String, u64)>,
+    inventory: Vec<InventoryReportV1>,
+    trails: Vec<TrailReportV1>,
+    thresholds_id: String,
+    methodology_sha256: String,
+    hard_gate_summary: String,
+    roles: Vec<FindingsRoleThresholdV1>,
+    outcome: String,
+    automatic_thresholds_met: Option<bool>,
+    failed_gates: Vec<(String, String)>,
+}
+
 fn render_findings(
     summary: &QualificationSummaryV1,
+    thresholds: &ThresholdsV1,
     decision: &ActivationDecisionV1,
 ) -> Result<String> {
-    let outcome = serde_json::to_value(&decision.outcome)?
+    let receipt_metrics = summary.receipt_metrics()?;
+    let mut cohort_full_proofs = summary
+        .environment
+        .projects
+        .iter()
+        .map(|project| (project.repository_id.clone(), 0u64))
+        .collect::<BTreeMap<_, _>>();
+    let mut contract_proven_cases = 0u64;
+    let mut negative_contract_proven = 0u64;
+    let mut maximum_response_bytes = 0u64;
+    for case in &summary.cases {
+        let full = case.evaluable_facts()?.contract_proven_supported
+            && matches!(
+                case.product_disposition.kind,
+                ProductDispositionKindV1::ContractProven
+            );
+        if full {
+            contract_proven_cases = contract_proven_cases
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_findings_count_overflow"))?;
+            *cohort_full_proofs
+                .get_mut(&case.repository_id)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_findings_cohort_missing"))? += 1;
+        }
+        negative_contract_proven = negative_contract_proven
+            .checked_add(u64::try_from(
+                case.negative_mutations
+                    .iter()
+                    .filter(|mutation| mutation.contract_proven)
+                    .count(),
+            )?)
+            .ok_or_else(|| anyhow::anyhow!("proof_availability_findings_count_overflow"))?;
+        maximum_response_bytes = maximum_response_bytes.max(case.complete_projection_bytes);
+        match &case.transport {
+            TransportEvidenceV1::Measurements { measurements } => {
+                for measurement in &measurements.measurements {
+                    maximum_response_bytes = maximum_response_bytes.max(measurement.actual_bytes);
+                }
+            }
+            TransportEvidenceV1::Error {
+                error:
+                    TransportErrorV1::ResultExceedsBudget {
+                        maximum_bytes,
+                        actual_bytes,
+                    },
+            } => {
+                maximum_response_bytes = maximum_response_bytes
+                    .max(*maximum_bytes)
+                    .max(*actual_bytes);
+            }
+            TransportEvidenceV1::Error { .. } => {}
+        }
+    }
+    let hard = &thresholds.hard_gates;
+    let mut inventory = summary.inventory.clone();
+    inventory.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
+    let mut trails = summary.trails.clone();
+    trails.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
+    let document = FindingsDocumentV1 {
+        qualification_id: summary.qualification_id.clone(),
+        source_commit: summary.provenance.source_commit.clone(),
+        source_tree: summary.provenance.source_tree.clone(),
+        binary_sha256: summary.provenance.binary_sha256.clone(),
+        corpus_sha256: summary.provenance.corpus_sha256.clone(),
+        thresholds_sha256: summary.provenance.thresholds_sha256.clone(),
+        results_sha256: summary.provenance.results_sha256.clone(),
+        positive_requests: u64::try_from(summary.cases.len())?,
+        attempted_positive_steps: summary.failure_funnel.attempted_positive_steps,
+        exact_positive_steps: receipt_metrics.exact_oracle_step_count,
+        contract_proven_cases,
+        negative_contract_proven,
+        authoritative_receipts: receipt_metrics.authoritative_receipt_count,
+        exact_authoritative_receipts: receipt_metrics.authoritative_exact_receipt_count,
+        unclassified_positive_steps: summary.failure_funnel.unclassified_positive_steps,
+        maximum_response_bytes,
+        cohort_full_proofs: cohort_full_proofs.into_iter().collect(),
+        inventory,
+        trails,
+        thresholds_id: thresholds.thresholds_id.clone(),
+        methodology_sha256: thresholds.methodology_sha256.clone(),
+        hard_gate_summary: format!(
+            "false_proofs<={}; exact_receipts={}; certified_absence<={}; complete_funnel={}; complete_provenance={}; invalid<={}; over_cap<={}; transport_errors<={}; maximum_bytes<={}; each_cohort={}; disposition_match={}",
+            hard.maximum_false_contract_proven,
+            hard.require_exact_receipt_matches,
+            hard.maximum_certified_absence,
+            hard.require_complete_failure_funnel,
+            hard.require_complete_provenance,
+            hard.maximum_invalid_results,
+            hard.maximum_over_cap_results,
+            hard.maximum_transport_errors,
+            hard.maximum_proof_bytes,
+            hard.require_each_cohort,
+            hard.require_product_disposition_match,
+        ),
+        roles: vec![
+            FindingsRoleThresholdV1::from_threshold("automatic", &thresholds.automatic),
+            FindingsRoleThresholdV1::from_threshold("stable_explicit", &thresholds.stable_explicit),
+            FindingsRoleThresholdV1::from_threshold("experimental", &thresholds.experimental),
+        ],
+        outcome: closed_enum_name(&decision.outcome)?,
+        automatic_thresholds_met: decision.automatic_thresholds_met,
+        failed_gates: decision
+            .failed_gates
+            .iter()
+            .map(|gate| Ok((gate.gate_id.clone(), closed_enum_name(&gate.kind)?)))
+            .collect::<Result<_>>()?,
+    };
+    render_findings_document(&document)
+}
+
+fn render_findings_document(document: &FindingsDocumentV1) -> Result<String> {
+    for value in [
+        &document.qualification_id,
+        &document.source_commit,
+        &document.source_tree,
+        &document.binary_sha256,
+        &document.corpus_sha256,
+        &document.thresholds_sha256,
+        &document.results_sha256,
+        &document.thresholds_id,
+        &document.methodology_sha256,
+        &document.outcome,
+    ] {
+        require_findings_atom(value)?;
+    }
+    for (repository, _) in &document.cohort_full_proofs {
+        require_findings_atom(repository)?;
+    }
+    for inventory in &document.inventory {
+        require_findings_atom(&inventory.repository_id)?;
+    }
+    for trail in &document.trails {
+        require_findings_atom(&trail.repository_id)?;
+    }
+    for role in &document.roles {
+        require_findings_atom(&role.role)?;
+    }
+    for (gate_id, kind) in &document.failed_gates {
+        require_findings_atom(gate_id)?;
+        require_findings_atom(kind)?;
+    }
+
+    let mut text = format!(
+        "# Proof availability findings\n\nQualification: `{}`\n\n## Reproduced measurements\n\n| Measurement | Observed |\n| --- | ---: |\n| Positive requests | {} |\n| ContractProven cases with exact authoritative evidence | {} / {} |\n| Exact positive steps | {} / {} |\n| Negative mutations reaching ContractProven | {} |\n| Exact authoritative receipts | {} / {} |\n| Unclassified positive steps | {} |\n| Maximum response bytes | {} |\n",
+        document.qualification_id,
+        document.positive_requests,
+        document.contract_proven_cases,
+        document.positive_requests,
+        document.exact_positive_steps,
+        document.attempted_positive_steps,
+        document.negative_contract_proven,
+        document.exact_authoritative_receipts,
+        document.authoritative_receipts,
+        document.unclassified_positive_steps,
+        document.maximum_response_bytes,
+    );
+    text.push_str("\n### Raw CALL inventory\n\n| Cohort | Stored | Effective endpoints | Exact resolved | Strictly admitted | Unresolved placeholders |\n| --- | ---: | ---: | ---: | ---: | ---: |\n");
+    for inventory in &document.inventory {
+        text.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} |\n",
+            inventory.repository_id,
+            inventory.stored_call_rows,
+            inventory.effective_endpoint_rows,
+            inventory.exact_resolved_rows,
+            inventory.admitted_rows,
+            inventory.unresolved_placeholder_rows,
+        ));
+    }
+    text.push_str("\n### Raw edge-distinct trails\n\n| Cohort | Length | Effective endpoints | Exact resolved | Strictly admitted |\n| --- | ---: | ---: | ---: | ---: |\n");
+    for trail in &document.trails {
+        for counts in &trail.lengths {
+            text.push_str(&format!(
+                "| `{}` | {} | {} | {} | {} |\n",
+                trail.repository_id,
+                counts.length,
+                counts.effective_endpoint,
+                counts.exact_resolved,
+                counts.strictly_admitted,
+            ));
+        }
+    }
+    text.push_str(
+        "\n### Full proofs by cohort\n\n| Cohort | ContractProven cases |\n| --- | ---: |\n",
+    );
+    for (repository, count) in &document.cohort_full_proofs {
+        text.push_str(&format!("| `{repository}` | {count} |\n"));
+    }
+    let incomplete = document
+        .positive_requests
+        .checked_sub(document.contract_proven_cases)
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_findings_count_invalid"))?;
+    text.push_str(&format!(
+        "\n## Inferences\n\n- The evaluator selected `{}` from these reproduced measurements and the frozen thresholds below.\n- {} of {} cases satisfy the report contract's evidence-backed full-proof predicate.\n- {} cases do not satisfy that predicate.\n\n## Frozen thresholds\n\nThreshold set: `{}`  \nMethodology SHA-256: `{}`\n\nHard gates: `{}`\n\n| Role | Full proofs min | Cohort min | Full Wilson min milli | Cohort Wilson min milli | Step recall min milli | Full/useful min milli | Actionable gap min milli | Unknown p95 max ms | Transport p95 max ms | Complete p95 max bytes | Unknown p95 max bytes | Absolute max bytes |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        document.outcome,
+        document.contract_proven_cases,
+        document.positive_requests,
+        incomplete,
+        document.thresholds_id,
+        document.methodology_sha256,
+        document.hard_gate_summary,
+    ));
+    for role in &document.roles {
+        text.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            role.role,
+            role.minimum_full_proofs,
+            role.minimum_full_proofs_per_cohort,
+            role.minimum_full_proof_wilson_lower_milli,
+            role.minimum_cohort_wilson_lower_milli,
+            role.minimum_positive_step_recall_milli,
+            role.minimum_full_or_useful_partial_milli,
+            role.minimum_actionable_exact_gap_milli,
+            role.maximum_unknown_p95_ms,
+            role.maximum_transport_p95_ms,
+            role.maximum_complete_response_p95_bytes,
+            role.maximum_unknown_response_p95_bytes,
+            role.maximum_response_bytes,
+        ));
+    }
+    let automatic = document
+        .automatic_thresholds_met
+        .map_or("not_applicable", |met| if met { "true" } else { "false" });
+    text.push_str(&format!(
+        "\n## Decision\n\nOutcome: `{}`  \nAutomatic thresholds met: `{automatic}`\n\n### Failed gates\n\n",
+        document.outcome,
+    ));
+    if document.failed_gates.is_empty() {
+        text.push_str("None.\n");
+    } else {
+        text.push_str("| Gate | Kind |\n| --- | --- |\n");
+        for (gate_id, kind) in &document.failed_gates {
+            text.push_str(&format!("| `{gate_id}` | `{kind}` |\n"));
+        }
+    }
+    text.push_str(&format!(
+        "\n### Provenance\n\n| Identity | Value |\n| --- | --- |\n| Source commit | `{}` |\n| Source tree | `{}` |\n| Binary SHA-256 | `{}` |\n| Corpus SHA-256 | `{}` |\n| Thresholds SHA-256 | `{}` |\n| Results SHA-256 | `{}` |\n\n### Nonclaims\n\n- This qualification does not prove runtime execution, temporal order, arbitrary reachability, ownership, data flow, extraction completeness, or subsystem non-participation.\n- It is source-built benchmark evidence for the dark exact-call-path kernel. It is not installed-host qualification, public proof availability, or release evidence.\n",
+        document.source_commit,
+        document.source_tree,
+        document.binary_sha256,
+        document.corpus_sha256,
+        document.thresholds_sha256,
+        document.results_sha256,
+    ));
+    Ok(text)
+}
+
+fn require_findings_atom(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        bail!("proof_availability_findings_atom_invalid")
+    }
+    Ok(())
+}
+
+fn closed_enum_name<T: Serialize>(value: &T) -> Result<String> {
+    serde_json::to_value(value)?
         .as_str()
         .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("proof_availability_decision_outcome_invalid"))?;
-    let metrics = summary.receipt_metrics()?;
-    let mut text = format!(
-        "# Proof availability findings\n\nQualification: `{}`\n\nDecision: `{outcome}`\n\nExact positive steps: {}/312\n\nFailed gates: {}\n",
-        summary.qualification_id,
-        metrics.exact_oracle_step_count,
-        decision.failed_gates.len()
-    );
-    for gate in &decision.failed_gates {
-        let kind = serde_json::to_value(&gate.kind)?
-            .as_str()
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| anyhow::anyhow!("proof_availability_gate_kind_invalid"))?;
-        text.push_str(&format!("\n- `{}` ({kind})\n", gate.gate_id));
-    }
-    Ok(text)
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_findings_enum_invalid"))
 }
 
 fn canonical_json_file<T: Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -963,5 +1276,84 @@ mod tests {
         let error = publish_bundle(&root.path().join("result"), &bundle, &policy).unwrap_err();
         assert_eq!(error.code, "proof_availability_public_forbidden_value");
         assert!(!error.to_string().contains("private-database-location"));
+    }
+
+    #[test]
+    fn findings_separate_measurements_inferences_thresholds_and_decision() {
+        let document = FindingsDocumentV1 {
+            qualification_id: "qualification-1".into(),
+            source_commit: "a".repeat(40),
+            source_tree: "b".repeat(40),
+            binary_sha256: "c".repeat(64),
+            corpus_sha256: "d".repeat(64),
+            thresholds_sha256: "e".repeat(64),
+            results_sha256: "f".repeat(64),
+            positive_requests: 120,
+            attempted_positive_steps: 312,
+            exact_positive_steps: 250,
+            contract_proven_cases: 60,
+            negative_contract_proven: 0,
+            authoritative_receipts: 250,
+            exact_authoritative_receipts: 250,
+            unclassified_positive_steps: 0,
+            maximum_response_bytes: 32_768,
+            cohort_full_proofs: vec![("a".into(), 10), ("b".into(), 20)],
+            inventory: vec![InventoryReportV1 {
+                repository_id: "a".into(),
+                stored_call_rows: 10,
+                effective_endpoint_rows: 10,
+                exact_resolved_rows: 8,
+                admitted_rows: 7,
+                unresolved_placeholder_rows: 2,
+            }],
+            trails: vec![TrailReportV1 {
+                repository_id: "a".into(),
+                lengths: vec![super::super::contracts::TrailLengthCountsV1 {
+                    length: 1,
+                    effective_endpoint: 10,
+                    exact_resolved: 8,
+                    strictly_admitted: 7,
+                }],
+            }],
+            thresholds_id: "thresholds-v1".into(),
+            methodology_sha256: "1".repeat(64),
+            hard_gate_summary: "false_proofs<=0; exact_receipts=true; certified_absence<=0; complete_funnel=true; complete_provenance=true; invalid<=0; over_cap<=0; transport_errors<=0; maximum_bytes<=65536; each_cohort=true; disposition_match=true".into(),
+            roles: vec![FindingsRoleThresholdV1 {
+                role: "automatic".into(),
+                minimum_full_proofs: 96,
+                minimum_full_proofs_per_cohort: 21,
+                minimum_full_proof_wilson_lower_milli: 720,
+                minimum_cohort_wilson_lower_milli: 500,
+                minimum_positive_step_recall_milli: 900,
+                minimum_full_or_useful_partial_milli: 950,
+                minimum_actionable_exact_gap_milli: 950,
+                maximum_unknown_p95_ms: 500,
+                maximum_transport_p95_ms: 1_500,
+                maximum_complete_response_p95_bytes: 32_768,
+                maximum_unknown_response_p95_bytes: 16_384,
+                maximum_response_bytes: 65_536,
+            }],
+            outcome: "public_exact_verifier".into(),
+            automatic_thresholds_met: Some(true),
+            failed_gates: vec![("stable.full_proofs".into(), "stable_threshold".into())],
+        };
+        let findings = render_findings_document(&document).unwrap();
+        let section_positions = [
+            "## Reproduced measurements",
+            "## Inferences",
+            "## Frozen thresholds",
+            "## Decision",
+        ]
+        .map(|section| findings.find(section).expect(section));
+        assert!(section_positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(findings.contains("| Exact positive steps | 250 / 312 |"));
+        assert!(findings.contains("| `a` | 10 | 10 | 8 | 7 | 2 |"));
+        assert!(findings.contains("| `a` | 1 | 10 | 8 | 7 |"));
+        assert!(findings.contains("| automatic | 96 | 21 | 720 | 500 | 900 | 950 | 950 | 500 | 1500 | 32768 | 16384 | 65536 |"));
+        assert!(findings.contains("The evaluator selected `public_exact_verifier`"));
+        assert!(findings.contains("| `stable.full_proofs` | `stable_threshold` |"));
+        assert!(findings.contains("### Provenance"));
+        assert!(findings.contains("### Nonclaims"));
+        assert!(findings.contains("does not prove runtime execution"));
     }
 }
