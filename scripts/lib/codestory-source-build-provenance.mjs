@@ -9,8 +9,15 @@ function git(repoRoot, ...args) {
   return execFileSync("git", args, { cwd: repoRoot, encoding: "utf8" }).trim();
 }
 
-function sha256(file) {
-  return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+function artifactIdentityMatches(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function artifactMetadataMatches(left, right) {
+  return artifactIdentityMatches(left, right)
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
 }
 
 function cleanRepository(repoRoot) {
@@ -42,14 +49,14 @@ function directArtifactMetadata(root, relative) {
   let current = root;
   for (const component of relative.split("/")) {
     current = path.join(current, component);
-    const entry = fs.lstatSync(current);
+    const entry = fs.lstatSync(current, { bigint: true });
     if (entry.isSymbolicLink()) throw new Error("source_build_artifact_not_direct_regular_file");
     if (component !== "codestory-cli" && !entry.isDirectory()) throw new Error("source_build_artifact_not_direct_regular_file");
-    if (component === "codestory-cli" && (!entry.isFile() || entry.nlink !== 1)) {
+    if (component === "codestory-cli" && (!entry.isFile() || entry.nlink !== 1n)) {
       throw new Error("source_build_artifact_not_direct_regular_file");
     }
   }
-  return fs.lstatSync(current);
+  return fs.lstatSync(current, { bigint: true });
 }
 
 export function recordSourceBuildProvenance({ artifact, buildCommand, repoRoot, runBuild }) {
@@ -70,30 +77,54 @@ export function recordSourceBuildProvenance({ artifact, buildCommand, repoRoot, 
     shell: false,
   })))(buildCommand, { cwd: root });
   if (completed.error || completed.status !== 0) throw new Error("source_build_command_failed");
-  let metadata;
-  try { metadata = directArtifactMetadata(root, normalizedRelative); } catch (error) {
+  let pathnameMetadata;
+  try { pathnameMetadata = directArtifactMetadata(root, normalizedRelative); } catch (error) {
     if (error?.code === "ENOENT") throw new Error("source_build_artifact_not_file");
     throw error;
   }
-  if (!metadata.isFile()) {
+  if (!pathnameMetadata.isFile()) {
     throw new Error("source_build_artifact_not_file");
   }
-  const after = { head: git(root, "rev-parse", "HEAD"), tree: git(root, "rev-parse", "HEAD^{tree}") };
-  if (before.head !== after.head || before.tree !== after.tree) throw new Error("source_build_source_changed");
-  cleanRepository(root);
-  return {
-    schema_version: 1,
-    purpose: "codestory-source-build-provenance",
-    source: {
-      ...before,
-    },
-    build: { command: [...buildCommand] },
-    artifact: {
-      path: normalizedRelative,
-      bytes: metadata.size,
-      sha256: sha256(artifactPath),
-    },
-  };
+  let descriptor;
+  try {
+    descriptor = fs.openSync(artifactPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const openedMetadata = fs.fstatSync(descriptor, { bigint: true });
+    if (!openedMetadata.isFile() || openedMetadata.nlink !== 1n || !artifactIdentityMatches(pathnameMetadata, openedMetadata)) {
+      throw new Error("source_build_artifact_changed");
+    }
+    const after = { head: git(root, "rev-parse", "HEAD"), tree: git(root, "rev-parse", "HEAD^{tree}") };
+    if (before.head !== after.head || before.tree !== after.tree) throw new Error("source_build_source_changed");
+    cleanRepository(root);
+    const contents = fs.readFileSync(descriptor);
+    const hashedMetadata = fs.fstatSync(descriptor, { bigint: true });
+    let finalPathnameMetadata;
+    try { finalPathnameMetadata = directArtifactMetadata(root, normalizedRelative); } catch (error) {
+      if (error?.code === "ENOENT") throw new Error("source_build_artifact_changed");
+      throw error;
+    }
+    if (
+      !artifactMetadataMatches(openedMetadata, hashedMetadata)
+      || !artifactIdentityMatches(hashedMetadata, finalPathnameMetadata)
+      || BigInt(contents.byteLength) !== hashedMetadata.size
+    ) {
+      throw new Error("source_build_artifact_changed");
+    }
+    return {
+      schema_version: 1,
+      purpose: "codestory-source-build-provenance",
+      source: {
+        ...before,
+      },
+      build: { command: [...buildCommand] },
+      artifact: {
+        path: normalizedRelative,
+        bytes: contents.byteLength,
+        sha256: createHash("sha256").update(contents).digest("hex"),
+      },
+    };
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
 }
 
 export function compareSourceBuildProvenance(record, { installerSha256, liveSha256, expectedSource, expectedBuildCommand }) {

@@ -192,3 +192,55 @@ test("source-build provenance rejects forged commands, paths, outputs, and incom
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("source-build provenance rejects artifact replacement between validation and hashing", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-source-build-swap-"));
+  const originalReadFileSync = fs.readFileSync;
+  const originalReadSync = fs.readSync;
+  try {
+    await writeFile(path.join(root, "Cargo.toml"), "[workspace]\n", "utf8");
+    await writeFile(path.join(root, ".gitignore"), "target/\n", "utf8");
+    git(root, "init", "-q");
+    git(root, "config", "user.email", "fixture@example.invalid");
+    git(root, "config", "user.name", "Fixture");
+    git(root, "add", ".");
+    git(root, "commit", "-qm", "fixture");
+    const artifact = path.join(root, "target", "release", "codestory-cli");
+    const replacement = path.join(root, "target", "release", "replacement");
+    const command = ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"];
+    let replaced = false;
+    const replaceArtifact = () => {
+      if (replaced) return;
+      fs.writeFileSync(replacement, "replacement bytes");
+      fs.renameSync(replacement, artifact);
+      replaced = true;
+    };
+    fs.readFileSync = function readFileSyncWithReplacement(file, ...args) {
+      if ((typeof file === "number" || path.resolve(file) === artifact) && !replaced) replaceArtifact();
+      return originalReadFileSync.call(this, file, ...args);
+    };
+    fs.readSync = function readSyncWithReplacement(...args) {
+      replaceArtifact();
+      return originalReadSync.apply(this, args);
+    };
+
+    assert.throws(
+      () => recordSourceBuildProvenance({
+        artifact,
+        buildCommand: command,
+        repoRoot: root,
+        runBuild: () => {
+          fs.mkdirSync(path.dirname(artifact), { recursive: true });
+          fs.writeFileSync(artifact, "runner-produced bytes");
+          return { status: 0 };
+        },
+      }),
+      /source_build_artifact_changed/u,
+    );
+    assert.equal(replaced, true, "the hostile replacement must run during artifact hashing");
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+    fs.readSync = originalReadSync;
+    await rm(root, { recursive: true, force: true });
+  }
+});
