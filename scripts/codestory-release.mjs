@@ -1082,19 +1082,11 @@ export function createDefaultHost({ repository = "TheGreenCedar/CodeStory" } = {
     marketplace: { state: "unpublished" },
     assets: [...NATIVE_ASSETS],
     createIssue({ title, body }) {
-      const created = JSON.parse(gh([
-        "issue",
-        "create",
-        "--repo",
-        repository,
-        "--title",
-        title,
-        "--body",
-        body,
-        "--json",
-        "number,title",
-      ]));
-      return created;
+      const created = JSON.parse(gh(
+        ["api", "--method", "POST", `repos/${repository}/issues`, "--input", "-"],
+        { input: JSON.stringify({ title, body }) },
+      ));
+      return { number: created.number, title: created.title };
     },
     listOpenCoordinatorIssues() {
       const rows = JSON.parse(gh([
@@ -1119,13 +1111,13 @@ export function createDefaultHost({ repository = "TheGreenCedar/CodeStory" } = {
     },
     createIssueComment(number, body) {
       return JSON.parse(gh(
-        ["api", "--method", "POST", `repos/${repository}/issues/${number}/comments`],
+        ["api", "--method", "POST", `repos/${repository}/issues/${number}/comments`, "--input", "-"],
         { input: JSON.stringify({ body }) },
       ));
     },
     updateIssueComment(id, body) {
       return JSON.parse(gh(
-        ["api", "--method", "PATCH", `repos/${repository}/issues/comments/${id}`],
+        ["api", "--method", "PATCH", `repos/${repository}/issues/comments/${id}`, "--input", "-"],
         { input: JSON.stringify({ body }) },
       ));
     },
