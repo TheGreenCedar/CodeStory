@@ -45,12 +45,12 @@
           },
           "type": "array"
         },
-        "failure": {
+        "reason": {
           "$ref": "#/$defs/CandidateFailureV1"
         }
       },
       "required": [
-        "failure",
+        "reason",
         "edge_ids"
       ],
       "type": "object"
@@ -107,57 +107,6 @@
             "reason"
           ],
           "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "line",
-              "type": "string"
-            },
-            "reason": {
-              "$ref": "#/$defs/LineFailureV1"
-            }
-          },
-          "required": [
-            "kind",
-            "reason"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "receipt",
-              "type": "string"
-            },
-            "reason": {
-              "$ref": "#/$defs/FinalizationFailureV1"
-            }
-          },
-          "required": [
-            "kind",
-            "reason"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "projection",
-              "type": "string"
-            },
-            "reason": {
-              "$ref": "#/$defs/FinalizationFailureV1"
-            }
-          },
-          "required": [
-            "kind",
-            "reason"
-          ],
-          "type": "object"
         }
       ]
     },
@@ -202,8 +151,10 @@
         "case_id": {
           "type": "string"
         },
-        "complete_projection": {
-          "$ref": "#/$defs/TransportOutcomeV1"
+        "complete_projection_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "diagnostic_candidate_count": {
           "format": "uint64",
@@ -249,8 +200,8 @@
         "stage_durations_ms": {
           "$ref": "#/$defs/StageDurationsV1"
         },
-        "tool_result_transport": {
-          "$ref": "#/$defs/ToolResultTransportV1"
+        "transport": {
+          "$ref": "#/$defs/TransportEvidenceV1"
         },
         "warm_end_to_end_ms": {
           "format": "uint64",
@@ -272,8 +223,8 @@
         "warm_end_to_end_ms",
         "stage_durations_ms",
         "attempted_step_count",
-        "complete_projection",
-        "tool_result_transport",
+        "complete_projection_bytes",
+        "transport",
         "negative_mutations",
         "proof_trace"
       ],
@@ -358,12 +309,12 @@
           "pattern": "^(0|[1-9][0-9]*)$",
           "type": "string"
         },
-        "failure": {
-          "$ref": "#/$defs/CandidateFailureV1"
+        "outcome": {
+          "$ref": "#/$defs/FunnelOutcomeV1"
         }
       },
       "required": [
-        "failure",
+        "outcome",
         "count"
       ],
       "type": "object"
@@ -386,13 +337,13 @@
         },
         "classified_positive_steps": {
           "format": "uint16",
-          "maximum": 65535,
+          "maximum": 312,
           "minimum": 0,
           "type": "integer"
         },
         "unclassified_positive_steps": {
           "format": "uint16",
-          "maximum": 65535,
+          "maximum": 312,
           "minimum": 0,
           "type": "integer"
         }
@@ -437,7 +388,6 @@
             },
             "projection_bytes": {
               "format": "uint64",
-              "maximum": 65536,
               "minimum": 0,
               "type": "integer"
             }
@@ -462,6 +412,64 @@
           "required": [
             "kind",
             "failure"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "FunnelOutcomeV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "admitted",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "selector_early_return",
+              "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/$defs/SelectorGateOutcomeV1"
+            }
+          },
+          "required": [
+            "kind",
+            "outcome"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "gate": {
+              "$ref": "#/$defs/CandidateGateV1"
+            },
+            "histogram": {
+              "items": {
+                "$ref": "#/$defs/CandidateFailureHistogramV1"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "first_zero_survivor",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "gate",
+            "histogram"
           ],
           "type": "object"
         }
@@ -518,21 +526,17 @@
         {
           "additionalProperties": false,
           "properties": {
+            "evidence": {
+              "$ref": "#/$defs/TransportEvidenceV1"
+            },
             "kind": {
               "const": "transport",
               "type": "string"
-            },
-            "outcome": {
-              "$ref": "#/$defs/TransportOutcomeV1"
-            },
-            "profile": {
-              "$ref": "#/$defs/TransportProfileV1"
             }
           },
           "required": [
             "kind",
-            "profile",
-            "outcome"
+            "evidence"
           ],
           "type": "object"
         },
@@ -554,6 +558,39 @@
           "type": "object"
         }
       ]
+    },
+    "IntegrationDependencyTestKindV1": {
+      "enum": [
+        "packet_v3_requires_proof",
+        "transport_cannot_represent_keep_dark"
+      ],
+      "type": "string"
+    },
+    "IntegrationDependencyTestStatusV1": {
+      "enum": [
+        "passed"
+      ],
+      "type": "string"
+    },
+    "IntegrationDependencyTestV1": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/IntegrationDependencyTestKindV1"
+        },
+        "status": {
+          "$ref": "#/$defs/IntegrationDependencyTestStatusV1"
+        },
+        "test_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "test_id",
+        "kind",
+        "status"
+      ],
+      "type": "object"
     },
     "InventoryReportV1": {
       "additionalProperties": false,
@@ -592,10 +629,12 @@
       ],
       "type": "object"
     },
-    "LineFailureV1": {
+    "McpRevisionV1": {
       "enum": [
-        "missing",
-        "over_limit"
+        "2024-11-05",
+        "2025-03-26",
+        "2025-06-18",
+        "2025-11-25"
       ],
       "type": "string"
     },
@@ -623,6 +662,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "file_byte_length": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
         "path": {
           "type": "string"
         },
@@ -640,6 +684,7 @@
         "path",
         "start_byte",
         "end_byte",
+        "file_byte_length",
         "sha256"
       ],
       "type": "object"
@@ -880,6 +925,9 @@
         "dependency": {
           "$ref": "#/$defs/SourceDependencyKindV1"
         },
+        "passing_test": {
+          "$ref": "#/$defs/IntegrationDependencyTestV1"
+        },
         "source_path": {
           "type": "string"
         },
@@ -895,7 +943,8 @@
         "source_path",
         "source_range",
         "source_sha256",
-        "dependency"
+        "dependency",
+        "passing_test"
       ],
       "type": "object"
     },
@@ -1004,30 +1053,6 @@
       ],
       "type": "object"
     },
-    "ToolResultTransportV1": {
-      "additionalProperties": false,
-      "properties": {
-        "v2024_11_05": {
-          "$ref": "#/$defs/TransportOutcomeV1"
-        },
-        "v2025_03_26": {
-          "$ref": "#/$defs/TransportOutcomeV1"
-        },
-        "v2025_06_18": {
-          "$ref": "#/$defs/TransportOutcomeV1"
-        },
-        "v2025_11_25": {
-          "$ref": "#/$defs/TransportOutcomeV1"
-        }
-      },
-      "required": [
-        "v2024_11_05",
-        "v2025_03_26",
-        "v2025_06_18",
-        "v2025_11_25"
-      ],
-      "type": "object"
-    },
     "TrailLengthCountsV1": {
       "additionalProperties": false,
       "properties": {
@@ -1080,33 +1105,98 @@
       "type": "object"
     },
     "TransportErrorV1": {
-      "enum": [
-        "facade_unavailable",
-        "serialization",
-        "invalid_result",
-        "budget_exceeded"
-      ],
-      "type": "string"
-    },
-    "TransportOutcomeV1": {
       "oneOf": [
         {
           "additionalProperties": false,
           "properties": {
-            "bytes": {
-              "format": "uint64",
-              "maximum": 65536,
-              "minimum": 0,
-              "type": "integer"
-            },
             "kind": {
-              "const": "success",
+              "const": "serialization",
+              "type": "string"
+            },
+            "message": {
               "type": "string"
             }
           },
           "required": [
             "kind",
-            "bytes"
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "invalid_projection",
+              "type": "string"
+            },
+            "projection": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "projection"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "output_schema_violation",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "actual_bytes": {
+              "format": "uint64",
+              "minimum": 65537,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "result_exceeds_budget",
+              "type": "string"
+            },
+            "maximum_bytes": {
+              "const": 65536,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "maximum_bytes",
+            "actual_bytes"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "TransportEvidenceV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "measurements",
+              "type": "string"
+            },
+            "measurements": {
+              "$ref": "#/$defs/TransportMeasurementSetV1"
+            }
+          },
+          "required": [
+            "kind",
+            "measurements"
           ],
           "type": "object"
         },
@@ -1126,43 +1216,42 @@
             "error"
           ],
           "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "bytes": {
-              "format": "uint64",
-              "minimum": 65537,
-              "type": "integer"
-            },
-            "cap_bytes": {
-              "const": 65536,
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "kind": {
-              "const": "over_cap",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "bytes",
-            "cap_bytes"
-          ],
-          "type": "object"
         }
       ]
     },
-    "TransportProfileV1": {
-      "enum": [
-        "v2024_11_05",
-        "v2025_03_26",
-        "v2025_06_18",
-        "v2025_11_25"
+    "TransportMeasurementSetV1": {
+      "additionalProperties": false,
+      "properties": {
+        "measurements": {
+          "items": {
+            "$ref": "#/$defs/TransportMeasurementV1"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "measurements"
       ],
-      "type": "string"
+      "type": "object"
+    },
+    "TransportMeasurementV1": {
+      "additionalProperties": false,
+      "properties": {
+        "actual_bytes": {
+          "format": "uint64",
+          "maximum": 65536,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "$ref": "#/$defs/McpRevisionV1"
+        }
+      },
+      "required": [
+        "revision",
+        "actual_bytes"
+      ],
+      "type": "object"
     },
     "TypedGapV1": {
       "enum": [

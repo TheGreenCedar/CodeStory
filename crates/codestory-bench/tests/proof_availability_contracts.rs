@@ -11,28 +11,41 @@ const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const COMMIT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 fn range(start: u64, end: u64) -> Value {
-    json!({"path":"src/lib.rs","start_byte":start,"end_byte":end,"sha256":SHA})
+    json!({"path":"src/lib.rs","start_byte":start,"end_byte":end,"file_byte_length":4096,"sha256":SHA})
 }
 
 fn path(case_id: &str, cohort: &str, step_count: u8) -> Value {
     let oracle_steps = (0..step_count)
         .map(|index| {
             let start = u64::from(index) * 40;
+            let caller_symbol = if index == 0 {
+                "crate::start".to_owned()
+            } else {
+                format!("crate::target_{}", index - 1)
+            };
+            let caller_range = if index == 0 {
+                range(0, 10)
+            } else {
+                range(start - 20, start - 8)
+            };
             json!({
-              "caller":{"symbol":format!("crate::caller_{index}"),"range":range(start, start + 10)},
+              "caller":{"symbol":caller_symbol,"range":caller_range},
               "callsite":range(start + 11, start + 19),
               "target":{"symbol":format!("crate::target_{index}"),"range":range(start + 20, start + 32)}
             })
         })
         .collect::<Vec<_>>();
+    let targets = (0..step_count)
+        .map(|index| format!("crate::target_{index}"))
+        .collect::<Vec<_>>();
     json!({
       "schema":"codestory.proof-availability-path/v1", "case_id":case_id, "repository_id":cohort, "language":"rust", "source_text":"exact direct ordered call path",
       "clauses":[{"clause_id":"c1","text":"start calls target","range":range(0,20)}],
-      "spec":{"start":"crate::start","targets":["crate::target"],"expected_step_count":step_count},
+      "spec":{"start":"crate::start","targets":targets,"expected_step_count":step_count},
       "oracle_steps":oracle_steps,
       "negative_mutations":[
-        {"mutation_id":format!("{case_id}-missing"),"kind":"remove_expected_relation","step_index":0,"caller":"crate::start","target":"crate::target"},
-        {"mutation_id":format!("{case_id}-ambiguous"),"kind":"add_ambiguous_relation","step_index":0,"caller":"crate::start","target":"crate::target"}],
+        {"mutation_id":format!("{case_id}-missing"),"path_id":case_id,"kind":"remove_expected_relation","step_index":0,"caller":"crate::start","target":"crate::target_0"},
+        {"mutation_id":format!("{case_id}-ambiguous"),"path_id":case_id,"kind":"add_ambiguous_relation","step_index":0,"caller":"crate::start","target":"crate::target_0"}],
       "audit":{"cohort_path_file":format!("paths/{cohort}.json"),"cohort_path_file_sha256":SHA,"source_tree_sha256":SHA,"source_area":"runtime","curator":"curator@example.invalid","reviewer":"reviewer@example.invalid","review_date":"2026-08-21"}
     })
 }
@@ -89,8 +102,8 @@ fn report() -> Value {
       "environment":{"environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"core_generation":1,"core_run_id":"run-1","database_sha256":SHA},
       "inventory":[{"repository_id":"codestory-rust","stored_call_rows":"10","effective_endpoint_rows":"10","exact_resolved_rows":"8","admitted_rows":"7","unresolved_placeholder_rows":"2"}],
       "trails":[{"repository_id":"codestory-rust","lengths":[{"length":1,"effective_endpoint":"10","exact_resolved":"8","strictly_admitted":"7"},{"length":2,"effective_endpoint":"9","exact_resolved":"7","strictly_admitted":"6"},{"length":3,"effective_endpoint":"8","exact_resolved":"6","strictly_admitted":"5"},{"length":4,"effective_endpoint":"7","exact_resolved":"5","strictly_admitted":"4"},{"length":5,"effective_endpoint":"6","exact_resolved":"4","strictly_admitted":"3"},{"length":6,"effective_endpoint":"5","exact_resolved":"3","strictly_admitted":"2"}]}],
-      "cases":[{"case_id":"codestory-rust-path","repository_id":"codestory-rust","product_disposition":{"kind":"contract_proven","gaps":[]},"authoritative_receipt_count":1,"oracle_receipts_exact":true,"proven_step_precision_milli":1000,"proven_step_recall_milli":1000,"proven_prefix_length":1,"actionable_exact_gap":null,"diagnostic_candidate_count":0,"authoritative_receipt_evidence_count":1,"warm_end_to_end_ms":12,"stage_durations_ms":{"validation":1,"operation":2},"attempted_step_count":1,"complete_projection":{"kind":"success","bytes":128},"tool_result_transport":{"v2024_11_05":{"kind":"success","bytes":128},"v2025_03_26":{"kind":"success","bytes":128},"v2025_06_18":{"kind":"success","bytes":128},"v2025_11_25":{"kind":"success","bytes":128}},"negative_mutations":[{"mutation_id":"negative-1","contract_proven":false},{"mutation_id":"negative-2","contract_proven":false}],"proof_trace":{"selectors":[{"selector_index":0,"outcome":{"kind":"resolved","node_id":1}}],"selector_early_return":false,"steps":[{"step_index":0,"candidate_edge_ids":[1],"outcome":{"kind":"admitted","edge_ids":[1]}}],"finalization":{"kind":"complete","projection_bytes":128}}}],
-      "failure_funnel":{"attempted_positive_steps":312,"classified_positive_steps":312,"unclassified_positive_steps":0,"buckets":[{"failure":{"kind":"raw_admission","reason":"certainty_probable"},"count":"1"}]},
+      "cases":[{"case_id":"codestory-rust-path","repository_id":"codestory-rust","product_disposition":{"kind":"contract_proven","gaps":[]},"authoritative_receipt_count":1,"oracle_receipts_exact":true,"proven_step_precision_milli":1000,"proven_step_recall_milli":1000,"proven_prefix_length":1,"actionable_exact_gap":null,"diagnostic_candidate_count":0,"authoritative_receipt_evidence_count":1,"warm_end_to_end_ms":12,"stage_durations_ms":{"validation":1,"operation":2},"attempted_step_count":1,"complete_projection_bytes":128,"transport":{"kind":"measurements","measurements":{"measurements":[{"revision":"2024-11-05","actual_bytes":128},{"revision":"2025-03-26","actual_bytes":128},{"revision":"2025-06-18","actual_bytes":128},{"revision":"2025-11-25","actual_bytes":128}]}},"negative_mutations":[{"mutation_id":"negative-1","contract_proven":false},{"mutation_id":"negative-2","contract_proven":false}],"proof_trace":{"selectors":[{"selector_index":0,"outcome":{"kind":"resolved","node_id":1}}],"selector_early_return":false,"steps":[{"step_index":0,"candidate_edge_ids":[1],"outcome":{"kind":"admitted","edge_ids":[1]}}],"finalization":{"kind":"complete","projection_bytes":128}}}],
+      "failure_funnel":{"attempted_positive_steps":312,"classified_positive_steps":312,"unclassified_positive_steps":0,"buckets":[{"outcome":{"kind":"admitted"},"count":"311"},{"outcome":{"kind":"first_zero_survivor","gate":"raw_admission","histogram":[{"reason":{"kind":"raw_admission","reason":"certainty_probable"},"edge_ids":[9]}]},"count":"1"}]},
       "decision":{"outcome":"keep_proof_dark","failed_gates":[{"gate_id":"experimental-usefulness-1","kind":"experimental_usefulness","detail":{"kind":"count","observed":"1","required":"24"}}],"automatic_thresholds_met":false}
     })
 }
@@ -142,7 +155,8 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
         .pop();
     assert!(QualificationSummaryV1::from_json(lengths).is_err());
     let mut reason = report();
-    reason["failure_funnel"]["buckets"][0]["failure"]["reason"] = json!("free form");
+    reason["failure_funnel"]["buckets"][1]["outcome"]["histogram"][0]["reason"]["reason"] =
+        json!("free form");
     assert!(QualificationSummaryV1::from_json(reason).is_err());
     let mut gate = report();
     gate["decision"]["failed_gates"][0]["kind"] = json!("free form");
@@ -150,10 +164,14 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
     let mut hard_failure = report();
     hard_failure["failure_funnel"]["classified_positive_steps"] = json!(311);
     hard_failure["failure_funnel"]["unclassified_positive_steps"] = json!(1);
-    hard_failure["cases"][0]["tool_result_transport"]["v2025_03_26"] =
-        json!({"kind":"over_cap","bytes":65537,"cap_bytes":65536});
-    hard_failure["cases"][0]["tool_result_transport"]["v2025_06_18"] =
-        json!({"kind":"error","error":"facade_unavailable"});
+    hard_failure["failure_funnel"]["buckets"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    hard_failure["cases"][0]["transport"] = json!({
+        "kind":"error",
+        "error":{"kind":"result_exceeds_budget","maximum_bytes":65536,"actual_bytes":65537}
+    });
     QualificationSummaryV1::from_json(hard_failure).expect("failure evidence is representable");
 }
 
@@ -167,13 +185,15 @@ fn closed_contracts_reject_hostile_nested_shapes() {
     invalid_trace["cases"][0]["proof_trace"]["steps"][0]["outcome"] = json!({
         "kind":"first_zero_survivor",
         "gate":"line",
-        "histogram":[{"failure":{"kind":"raw_admission","reason":"certainty_probable"},"edge_ids":[1]}]
+        "histogram":[{"reason":{"kind":"raw_admission","reason":"certainty_probable"},"edge_ids":[1]}]
     });
     assert!(QualificationSummaryV1::from_json(invalid_trace).is_err());
 
     let mut invalid_transport = report();
-    invalid_transport["cases"][0]["tool_result_transport"]["v2024_11_05"] =
-        json!({"kind":"over_cap","bytes":65537,"cap_bytes":1});
+    invalid_transport["cases"][0]["transport"] = json!({
+        "kind":"error",
+        "error":{"kind":"result_exceeds_budget","maximum_bytes":1,"actual_bytes":65537}
+    });
     assert!(QualificationSummaryV1::from_json(invalid_transport).is_err());
 
     let mut noncanonical_u128 = report();
@@ -181,8 +201,8 @@ fn closed_contracts_reject_hostile_nested_shapes() {
     assert!(QualificationSummaryV1::from_json(noncanonical_u128).is_err());
 
     let mut unknown_variant_field = report();
-    unknown_variant_field["cases"][0]["complete_projection"] =
-        json!({"kind":"success","bytes":1,"surprise":true});
+    unknown_variant_field["cases"][0]["transport"] =
+        json!({"kind":"error","error":{"kind":"output_schema_violation","surprise":true}});
     assert!(QualificationSummaryV1::from_json(unknown_variant_field).is_err());
 
     let mut duplicate_kind = report();
@@ -199,10 +219,192 @@ fn closed_contracts_reject_hostile_nested_shapes() {
     delayed_with_evidence["decision"] = json!({
         "outcome":"delay_full_v3_cut",
         "automatic_thresholds_met":null,
-        "failed_gates":[{"gate_id":"packet-proof-dependency","kind":"integration_dependency","detail":{"kind":"source_dependency","evidence":{"source_path":"crates/codestory-runtime/src/packet.rs","source_range":range(0,10),"source_sha256":SHA,"dependency":"v3_packet_requires_proof"}}}]
+        "failed_gates":[{"gate_id":"packet-proof-dependency","kind":"integration_dependency","detail":{"kind":"source_dependency","evidence":{"source_path":"src/lib.rs","source_range":range(0,10),"source_sha256":SHA,"dependency":"v3_packet_requires_proof","passing_test":{"test_id":"packet_v3_requires_proof","kind":"packet_v3_requires_proof","status":"passed"}}}}]
     });
     QualificationSummaryV1::from_json(delayed_with_evidence)
         .expect("outcome D uses closed source evidence");
+    let mut wrong_dependency_gate = report();
+    wrong_dependency_gate["decision"]["failed_gates"][0]["detail"] = json!({
+        "kind":"source_dependency",
+        "evidence":{"source_path":"src/lib.rs","source_range":range(0,10),"source_sha256":SHA,"dependency":"v3_packet_requires_proof","passing_test":{"test_id":"packet_v3_requires_proof","kind":"packet_v3_requires_proof","status":"passed"}}
+    });
+    assert!(QualificationSummaryV1::from_json(wrong_dependency_gate).is_err());
+}
+
+#[test]
+fn producer_mapping_red_requires_ordered_oracles_and_lossless_task4_errors() {
+    let mut wrong_target_order = corpus();
+    wrong_target_order["paths"][0]["spec"]["targets"] = json!(["crate::wrong_target"]);
+    assert!(CorpusV1::from_json(wrong_target_order).is_err());
+
+    let mut task4_serialization = report();
+    task4_serialization["cases"][0]["transport"] = json!({
+        "kind":"error",
+        "error":{"kind":"serialization","message":"exact encoder failure"}
+    });
+    QualificationSummaryV1::from_json(task4_serialization)
+        .expect("Task 4 producer error must remain representable");
+}
+
+#[test]
+fn invariant_table_exhausts_task4_task6_and_corpus_variants() {
+    for error in [
+        json!({"kind":"serialization","message":"encode failed"}),
+        json!({"kind":"invalid_projection","projection":"root"}),
+        json!({"kind":"output_schema_violation"}),
+        json!({"kind":"result_exceeds_budget","maximum_bytes":65536,"actual_bytes":65537}),
+    ] {
+        let mut value = report();
+        value["cases"][0]["transport"] = json!({"kind":"error","error":error});
+        QualificationSummaryV1::from_json(value).expect("every Task 4 error maps losslessly");
+    }
+
+    for reason in [
+        "wrong_kind",
+        "certainty_absent",
+        "certainty_probable",
+        "certainty_uncertain",
+        "wrong_effective_source",
+        "wrong_effective_target",
+        "missing_exact_resolved_target",
+        "candidate_alternatives_retained",
+        "missing_file_node",
+        "missing_line",
+        "invalid_or_legacy_callsite_identity",
+        "callsite_file_mismatch",
+        "callsite_line_mismatch",
+        "callsite_raw_target_mismatch",
+    ] {
+        assert_valid_first_zero("raw_admission", "raw_admission", reason);
+    }
+    for reason in ["edge_source_file_mismatch", "missing", "ambiguous"] {
+        assert_valid_first_zero("containment", "containment", reason);
+    }
+    for reason in [
+        "file_incomplete",
+        "stored_hash_absent",
+        "working_tree_read_failed",
+        "working_tree_hash_mismatch",
+        "invalid_utf8",
+    ] {
+        assert_valid_first_zero("source_binding", "source_binding", reason);
+    }
+    for reason in ["line_missing", "line_over_limit"] {
+        assert_valid_first_zero("line", "source_binding", reason);
+    }
+
+    for outcome in [
+        json!({"kind":"failed","reason":"missing"}),
+        json!({"kind":"failed","reason":"ambiguous"}),
+        json!({"kind":"failed","reason":"non_callable"}),
+        json!({"kind":"unavailable","reason":"validated_contract_hash_mismatch"}),
+        json!({"kind":"unavailable","reason":"publication_pin_mismatch"}),
+        json!({"kind":"unavailable","reason":"source_not_bound_to_publication"}),
+        json!({"kind":"unavailable","reason":"proof_facts_unavailable"}),
+    ] {
+        let mut value = report();
+        value["cases"][0]["attempted_step_count"] = json!(0);
+        value["cases"][0]["proof_trace"] = json!({
+            "selectors":[{"selector_index":0,"outcome":outcome}],
+            "selector_early_return":true,
+            "steps":[],
+            "finalization":{"kind":"not_run"}
+        });
+        QualificationSummaryV1::from_json(value).expect("every selector outcome maps losslessly");
+    }
+
+    for failure in ["receipt_integration", "receipt_budget", "projection_budget"] {
+        let mut value = report();
+        value["cases"][0]["proof_trace"]["finalization"] =
+            json!({"kind":"failed","failure":failure});
+        QualificationSummaryV1::from_json(value)
+            .expect("every finalization failure maps losslessly");
+    }
+
+    let mut wrong_chain = corpus();
+    wrong_chain["paths"][10]["oracle_steps"][1]["caller"]["symbol"] = json!("broken");
+    assert!(CorpusV1::from_json(wrong_chain).is_err());
+    let mut wrong_target_count = corpus();
+    wrong_target_count["paths"][0]["spec"]["targets"] =
+        json!(["crate::target_0", "crate::target_1"]);
+    assert!(CorpusV1::from_json(wrong_target_count).is_err());
+    let mut wrong_mutation = corpus();
+    wrong_mutation["paths"][0]["negative_mutations"][0]["path_id"] = json!("other");
+    assert!(CorpusV1::from_json(wrong_mutation).is_err());
+    let mut wrong_range = corpus();
+    wrong_range["paths"][0]["oracle_steps"][0]["callsite"]["end_byte"] = json!(4097);
+    assert!(CorpusV1::from_json(wrong_range).is_err());
+}
+
+fn assert_valid_first_zero(gate: &str, kind: &str, reason: &str) {
+    let mut value = report();
+    value["cases"][0]["proof_trace"]["steps"][0]["outcome"] = json!({
+        "kind":"first_zero_survivor",
+        "gate":gate,
+        "histogram":[{"reason":{"kind":kind,"reason":reason},"edge_ids":[1]}]
+    });
+    QualificationSummaryV1::from_json(value).expect("mapped first-zero outcome");
+}
+
+#[test]
+fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
+    for disposition in ["unknown", "certified_absence", "invalid"] {
+        let mut value = report();
+        value["cases"][0]["product_disposition"] = json!({"kind":disposition,"gaps":[]});
+        QualificationSummaryV1::from_json(value).expect("closed product disposition");
+    }
+    for gap in [
+        "selector_missing",
+        "selector_ambiguous",
+        "relation_missing",
+        "recursion",
+        "source_binding",
+        "projection_budget",
+    ] {
+        let mut value = report();
+        value["cases"][0]["product_disposition"] = json!({"kind":"unknown","gaps":[gap]});
+        QualificationSummaryV1::from_json(value).expect("closed actionable gap");
+    }
+    for gate in [
+        "false_contract_proven",
+        "receipt_mismatch",
+        "certified_absence",
+        "failure_funnel",
+        "provenance",
+        "response_size",
+        "cohort_failure",
+        "product_disposition_mismatch",
+        "automatic_threshold",
+        "stable_threshold",
+        "experimental_usefulness",
+    ] {
+        let mut value = report();
+        value["decision"]["failed_gates"][0]["kind"] = json!(gate);
+        QualificationSummaryV1::from_json(value).expect("closed qualification gate");
+    }
+    for outcome in [
+        "public_exact_verifier",
+        "experimental_manual_verifier",
+        "keep_proof_dark",
+    ] {
+        let mut value = report();
+        value["decision"]["outcome"] = json!(outcome);
+        QualificationSummaryV1::from_json(value).expect("closed activation outcome");
+    }
+    let mut selector_funnel = report();
+    selector_funnel["failure_funnel"]["buckets"] = json!([
+        {"outcome":{"kind":"selector_early_return","outcome":{"kind":"failed","reason":"missing"}},"count":"312"}
+    ]);
+    QualificationSummaryV1::from_json(selector_funnel).expect("selector funnel outcome");
+
+    let mut transport_dependency = report();
+    transport_dependency["decision"] = json!({
+        "outcome":"delay_full_v3_cut",
+        "automatic_thresholds_met":null,
+        "failed_gates":[{"gate_id":"transport-keep-dark-dependency","kind":"integration_dependency","detail":{"kind":"source_dependency","evidence":{"source_path":"src/lib.rs","source_range":range(0,10),"source_sha256":SHA,"dependency":"transport_cannot_represent_keep_dark","passing_test":{"test_id":"transport_cannot_represent_keep_dark","kind":"transport_cannot_represent_keep_dark","status":"passed"}}}}]
+    });
+    QualificationSummaryV1::from_json(transport_dependency)
+        .expect("second source dependency variant");
 }
 
 #[test]
@@ -241,6 +443,21 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
         contracts::schema_json(SchemaDocument::Thresholds)["$defs"]["RoleThresholdsV1"]["properties"]
             ["minimum_positive_step_recall_milli"]["maximum"],
         1000
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Path)["$defs"]["CallPathSpecV1"]["properties"]["targets"]
+            ["maxItems"],
+        6
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["FailureFunnelReportV1"]["properties"]
+            ["classified_positive_steps"]["maximum"],
+        312
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["TransportMeasurementV1"]["properties"]
+            ["actual_bytes"]["maximum"],
+        65536
     );
 }
 

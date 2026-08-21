@@ -46,21 +46,22 @@ pub enum SchemaDocument {
     Thresholds,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OracleSourceRangeV1 {
     pub path: String,
     pub start_byte: u64,
     pub end_byte: u64,
+    pub file_byte_length: u64,
     pub sha256: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OracleDeclarationV1 {
     pub symbol: String,
     pub range: OracleSourceRangeV1,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClauseAnchorV1 {
     pub clause_id: String,
@@ -91,6 +92,7 @@ pub enum NegativeMutationKindV1 {
 #[serde(deny_unknown_fields)]
 pub struct NegativeMutationV1 {
     pub mutation_id: String,
+    pub path_id: String,
     pub kind: NegativeMutationKindV1,
     pub step_index: u8,
     pub caller: String,
@@ -152,6 +154,7 @@ impl OraclePathV1 {
         if empty(&self.spec.start)
             || self.spec.targets.is_empty()
             || self.spec.targets.iter().any(|v| empty(v))
+            || self.spec.targets.len() != usize::from(self.spec.expected_step_count)
         {
             bail!("proof_availability_oracle_spec_invalid")
         }
@@ -161,16 +164,29 @@ impl OraclePathV1 {
             }
             range(&c.range)?;
         }
-        for step in &self.oracle_steps {
+        for (index, step) in self.oracle_steps.iter().enumerate() {
             if empty(&step.caller.symbol) || empty(&step.target.symbol) {
                 bail!("proof_availability_oracle_declaration_invalid")
             }
             range(&step.caller.range)?;
             range(&step.callsite)?;
             range(&step.target.range)?;
+            if step.target.symbol != self.spec.targets[index]
+                || (index == 0 && step.caller.symbol != self.spec.start)
+                || (index > 0 && step.caller != self.oracle_steps[index - 1].target)
+            {
+                bail!("proof_availability_oracle_chain_invalid")
+            }
         }
         for m in &self.negative_mutations {
-            if empty(&m.caller) || empty(&m.target) || m.step_index >= self.spec.expected_step_count
+            let Some(step) = self.oracle_steps.get(usize::from(m.step_index)) else {
+                bail!("proof_availability_mutation_invalid")
+            };
+            if m.path_id != self.case_id
+                || empty(&m.caller)
+                || empty(&m.target)
+                || m.caller != step.caller.symbol
+                || m.target != step.target.symbol
             {
                 bail!("proof_availability_mutation_invalid")
             }
@@ -491,25 +507,16 @@ pub enum CandidateGateV1 {
     Line,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum LineFailureV1 {
-    Missing,
-    OverLimit,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CandidateFailureV1 {
     RawAdmission { reason: RawAdmissionFailureV1 },
     Containment { reason: ContainmentFailureV1 },
     SourceBinding { reason: SourceBindingFailureV1 },
-    Line { reason: LineFailureV1 },
-    Receipt { reason: FinalizationFailureV1 },
-    Projection { reason: FinalizationFailureV1 },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateFailureHistogramV1 {
-    pub failure: CandidateFailureV1,
+    pub reason: CandidateFailureV1,
     pub edge_ids: Vec<u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -638,35 +645,51 @@ pub struct StageDurationsV1 {
     pub operation: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum TransportProfileV1 {
-    V2024_11_05,
-    V2025_03_26,
-    V2025_06_18,
-    V2025_11_25,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum TransportErrorV1 {
-    FacadeUnavailable,
-    Serialization,
-    InvalidResult,
-    BudgetExceeded,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum TransportOutcomeV1 {
-    Success { bytes: u64 },
-    Error { error: TransportErrorV1 },
-    OverCap { bytes: u64, cap_bytes: u64 },
+#[serde(deny_unknown_fields)]
+pub struct TransportMeasurementV1 {
+    pub revision: McpRevisionV1,
+    pub actual_bytes: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ToolResultTransportV1 {
-    pub v2024_11_05: TransportOutcomeV1,
-    pub v2025_03_26: TransportOutcomeV1,
-    pub v2025_06_18: TransportOutcomeV1,
-    pub v2025_11_25: TransportOutcomeV1,
+pub struct TransportMeasurementSetV1 {
+    pub measurements: Vec<TransportMeasurementV1>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum McpRevisionV1 {
+    #[serde(rename = "2024-11-05")]
+    V2024_11_05,
+    #[serde(rename = "2025-03-26")]
+    V2025_03_26,
+    #[serde(rename = "2025-06-18")]
+    V2025_06_18,
+    #[serde(rename = "2025-11-25")]
+    V2025_11_25,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TransportErrorV1 {
+    Serialization {
+        message: String,
+    },
+    InvalidProjection {
+        projection: String,
+    },
+    OutputSchemaViolation {},
+    ResultExceedsBudget {
+        maximum_bytes: u64,
+        actual_bytes: u64,
+    },
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TransportEvidenceV1 {
+    Measurements {
+        measurements: TransportMeasurementSetV1,
+    },
+    Error {
+        error: TransportErrorV1,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -691,18 +714,30 @@ pub struct CaseReportV1 {
     pub warm_end_to_end_ms: u64,
     pub stage_durations_ms: StageDurationsV1,
     pub attempted_step_count: u8,
-    pub complete_projection: TransportOutcomeV1,
-    pub tool_result_transport: ToolResultTransportV1,
+    pub complete_projection_bytes: u64,
+    pub transport: TransportEvidenceV1,
     pub negative_mutations: Vec<NegativeMutationResultV1>,
     pub proof_trace: ProofQualificationTraceV1,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FailureBucketV1 {
-    pub failure: CandidateFailureV1,
+    pub outcome: FunnelOutcomeV1,
     #[serde(with = "u128_decimal")]
     #[schemars(with = "String")]
     pub count: u128,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FunnelOutcomeV1 {
+    Admitted,
+    SelectorEarlyReturn {
+        outcome: SelectorGateOutcomeV1,
+    },
+    FirstZeroSurvivor {
+        gate: CandidateGateV1,
+        histogram: Vec<CandidateFailureHistogramV1>,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -743,12 +778,31 @@ pub enum SourceDependencyKindV1 {
     TransportCannotRepresentKeepDark,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum IntegrationDependencyTestKindV1 {
+    PacketV3RequiresProof,
+    TransportCannotRepresentKeepDark,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum IntegrationDependencyTestStatusV1 {
+    Passed,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationDependencyTestV1 {
+    pub test_id: String,
+    pub kind: IntegrationDependencyTestKindV1,
+    pub status: IntegrationDependencyTestStatusV1,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SourceDependencyEvidenceV1 {
     pub source_path: String,
     pub source_range: OracleSourceRangeV1,
     pub source_sha256: String,
     pub dependency: SourceDependencyKindV1,
+    pub passing_test: IntegrationDependencyTestV1,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -771,8 +825,7 @@ pub enum GateFailureDetailV1 {
         required: u128,
     },
     Transport {
-        profile: TransportProfileV1,
-        outcome: TransportOutcomeV1,
+        evidence: TransportEvidenceV1,
     },
     SourceDependency {
         evidence: SourceDependencyEvidenceV1,
@@ -832,7 +885,19 @@ impl QualificationSummaryV1 {
             || self.failure_funnel.unclassified_positive_steps > 312
             || u32::from(self.failure_funnel.classified_positive_steps)
                 + u32::from(self.failure_funnel.unclassified_positive_steps)
-                > 312
+                != 312
+            || self
+                .failure_funnel
+                .buckets
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<u128>()
+                != u128::from(self.failure_funnel.classified_positive_steps)
+            || !self
+                .failure_funnel
+                .buckets
+                .iter()
+                .all(|bucket| valid_funnel_outcome(&bucket.outcome))
         {
             bail!("proof_availability_summary_invalid")
         }
@@ -859,6 +924,7 @@ impl QualificationSummaryV1 {
                     .iter()
                     .enumerate()
                     .all(|(index, selector)| selector.selector_index == index as u8)
+                || !valid_selector_trace(&c.proof_trace)
                 || !c
                     .proof_trace
                     .steps
@@ -866,17 +932,10 @@ impl QualificationSummaryV1 {
                     .enumerate()
                     .all(|(index, step)| step.step_index == index as u8 && valid_step_trace(step))
                 || !valid_finalization(&c.proof_trace.finalization)
-                || !valid_transport(&c.complete_projection)
-                || ![
-                    &c.tool_result_transport.v2024_11_05,
-                    &c.tool_result_transport.v2025_03_26,
-                    &c.tool_result_transport.v2025_06_18,
-                    &c.tool_result_transport.v2025_11_25,
-                ]
-                .iter()
-                .all(|outcome| valid_transport(outcome))
+                || !valid_transport(&c.transport)
                 || (c.proof_trace.selector_early_return
                     != matches!(c.proof_trace.finalization, FinalizationTraceV1::NotRun))
+                || (c.proof_trace.selector_early_return && c.attempted_step_count != 0)
             {
                 bail!("proof_availability_case_invalid")
             }
@@ -890,7 +949,7 @@ impl QualificationSummaryV1 {
             bail!("proof_availability_decision_invalid")
         }
         for gate in &self.decision.failed_gates {
-            if !valid_gate_detail(&gate.detail) {
+            if !valid_gate_detail(&gate.kind, &gate.detail) {
                 bail!("proof_availability_gate_detail_invalid")
             }
         }
@@ -924,7 +983,7 @@ fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
                         !bucket.edge_ids.is_empty()
                             && strictly_ascending(&bucket.edge_ids)
                             && matches!(
-                                (&gate, &bucket.failure),
+                                (&gate, &bucket.reason),
                                 (
                                     CandidateGateV1::RawAdmission,
                                     CandidateFailureV1::RawAdmission { .. },
@@ -933,11 +992,37 @@ fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
                                     CandidateFailureV1::Containment { .. },
                                 ) | (
                                     CandidateGateV1::SourceBinding,
-                                    CandidateFailureV1::SourceBinding { .. },
-                                ) | (CandidateGateV1::Line, CandidateFailureV1::Line { .. })
+                                    CandidateFailureV1::SourceBinding {
+                                        reason: SourceBindingFailureV1::FileIncomplete
+                                            | SourceBindingFailureV1::StoredHashAbsent
+                                            | SourceBindingFailureV1::WorkingTreeReadFailed
+                                            | SourceBindingFailureV1::WorkingTreeHashMismatch
+                                            | SourceBindingFailureV1::InvalidUtf8,
+                                    },
+                                ) | (
+                                    CandidateGateV1::Line,
+                                    CandidateFailureV1::SourceBinding {
+                                        reason: SourceBindingFailureV1::LineMissing
+                                            | SourceBindingFailureV1::LineOverLimit,
+                                    },
+                                )
                             )
                     }))
         }
+    }
+}
+
+fn valid_selector_trace(trace: &ProofQualificationTraceV1) -> bool {
+    if trace.selector_early_return {
+        matches!(
+            trace.selectors.last().map(|selector| &selector.outcome),
+            Some(SelectorGateOutcomeV1::Failed { .. } | SelectorGateOutcomeV1::Unavailable { .. })
+        )
+    } else {
+        trace
+            .selectors
+            .iter()
+            .all(|selector| matches!(selector.outcome, SelectorGateOutcomeV1::Resolved { .. }))
     }
 }
 
@@ -945,33 +1030,86 @@ fn strictly_ascending(values: &[u64]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
-fn valid_transport(outcome: &TransportOutcomeV1) -> bool {
+fn valid_funnel_outcome(outcome: &FunnelOutcomeV1) -> bool {
     match outcome {
-        TransportOutcomeV1::Success { bytes } => *bytes <= 65_536,
-        TransportOutcomeV1::Error { .. } => true,
-        TransportOutcomeV1::OverCap { bytes, cap_bytes } => {
-            *cap_bytes == 65_536 && *bytes > *cap_bytes
+        FunnelOutcomeV1::Admitted => true,
+        FunnelOutcomeV1::SelectorEarlyReturn { outcome } => {
+            !matches!(outcome, SelectorGateOutcomeV1::Resolved { .. })
         }
+        FunnelOutcomeV1::FirstZeroSurvivor { gate, histogram } => {
+            valid_step_trace(&StepQualificationTraceV1 {
+                step_index: 0,
+                candidate_edge_ids: Vec::new(),
+                outcome: StepQualificationOutcomeV1::FirstZeroSurvivor {
+                    gate: gate.clone(),
+                    histogram: histogram.clone(),
+                },
+            })
+        }
+    }
+}
+
+fn valid_transport(evidence: &TransportEvidenceV1) -> bool {
+    match evidence {
+        TransportEvidenceV1::Measurements { measurements } => {
+            let revisions = [
+                McpRevisionV1::V2024_11_05,
+                McpRevisionV1::V2025_03_26,
+                McpRevisionV1::V2025_06_18,
+                McpRevisionV1::V2025_11_25,
+            ];
+            measurements.measurements.len() == revisions.len()
+                && measurements
+                    .measurements
+                    .iter()
+                    .zip(revisions)
+                    .all(|(measurement, revision)| {
+                        measurement.revision == revision && measurement.actual_bytes <= 65_536
+                    })
+        }
+        TransportEvidenceV1::Error { error } => match error {
+            TransportErrorV1::Serialization { message } => !empty(message),
+            TransportErrorV1::InvalidProjection { projection } => !empty(projection),
+            TransportErrorV1::OutputSchemaViolation {} => true,
+            TransportErrorV1::ResultExceedsBudget {
+                maximum_bytes,
+                actual_bytes,
+            } => *maximum_bytes == 65_536 && *actual_bytes > *maximum_bytes,
+        },
     }
 }
 
 fn valid_finalization(finalization: &FinalizationTraceV1) -> bool {
     match finalization {
         FinalizationTraceV1::NotRun => true,
-        FinalizationTraceV1::Complete { projection_bytes } => *projection_bytes <= 65_536,
+        FinalizationTraceV1::Complete { .. } => true,
         FinalizationTraceV1::Failed { .. } => true,
     }
 }
 
-fn valid_gate_detail(detail: &GateFailureDetailV1) -> bool {
+fn valid_gate_detail(kind: &QualificationGateKindV1, detail: &GateFailureDetailV1) -> bool {
     match detail {
         GateFailureDetailV1::Count { .. } => true,
         GateFailureDetailV1::Cohort { repository_id, .. } => !empty(repository_id),
-        GateFailureDetailV1::Transport { outcome, .. } => valid_transport(outcome),
+        GateFailureDetailV1::Transport { evidence } => valid_transport(evidence),
         GateFailureDetailV1::SourceDependency { evidence } => {
-            !empty(&evidence.source_path)
+            matches!(kind, QualificationGateKindV1::IntegrationDependency)
+                && !empty(&evidence.source_path)
                 && hash(&evidence.source_sha256)
                 && range(&evidence.source_range).is_ok()
+                && evidence.source_path == evidence.source_range.path
+                && evidence.source_sha256 == evidence.source_range.sha256
+                && !empty(&evidence.passing_test.test_id)
+                && matches!(
+                    (&evidence.dependency, &evidence.passing_test.kind),
+                    (
+                        SourceDependencyKindV1::V3PacketRequiresProof,
+                        IntegrationDependencyTestKindV1::PacketV3RequiresProof,
+                    ) | (
+                        SourceDependencyKindV1::TransportCannotRepresentKeepDark,
+                        IntegrationDependencyTestKindV1::TransportCannotRepresentKeepDark,
+                    )
+                )
         }
     }
 }
@@ -1097,6 +1235,13 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
 }
 
 fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
+    set_bounds(
+        schema,
+        Some("OracleSourceRangeV1"),
+        "file_byte_length",
+        Some(1),
+        None,
+    );
     match document {
         SchemaDocument::Corpus => {
             set_bounds(schema, None, "cohorts", Some(4), Some(4));
@@ -1140,12 +1285,20 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 Some(1),
                 Some(6),
             );
+            set_bounds(schema, Some("CallPathSpecV1"), "targets", Some(1), Some(6));
             set_bounds(
                 schema,
                 Some("OraclePathV1"),
                 "oracle_steps",
                 Some(1),
                 Some(6),
+            );
+            set_bounds(
+                schema,
+                Some("NegativeMutationV1"),
+                "step_index",
+                Some(0),
+                Some(5),
             );
         }
         SchemaDocument::Path => {
@@ -1156,7 +1309,15 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 Some(1),
                 Some(6),
             );
+            set_bounds(schema, Some("CallPathSpecV1"), "targets", Some(1), Some(6));
             set_bounds(schema, None, "oracle_steps", Some(1), Some(6));
+            set_bounds(
+                schema,
+                Some("NegativeMutationV1"),
+                "step_index",
+                Some(0),
+                Some(5),
+            );
         }
         SchemaDocument::Thresholds => {
             for (field, value) in [
@@ -1206,6 +1367,15 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 "attempted_positive_steps",
                 Value::from(312),
             );
+            for field in ["classified_positive_steps", "unclassified_positive_steps"] {
+                set_bounds(
+                    schema,
+                    Some("FailureFunnelReportV1"),
+                    field,
+                    Some(0),
+                    Some(312),
+                );
+            }
             set_bounds(schema, Some("TrailReportV1"), "lengths", Some(6), Some(6));
             set_bounds(
                 schema,
@@ -1223,6 +1393,13 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 "steps",
                 Some(0),
                 Some(6),
+            );
+            set_bounds(
+                schema,
+                Some("TransportMeasurementV1"),
+                "actual_bytes",
+                Some(0),
+                Some(65_536),
             );
         }
     }
@@ -1281,26 +1458,20 @@ fn annotate_transport_bounds(value: &mut Value) {
                 .and_then(|kind| kind.get("const"))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            if let Some(properties) = map.get_mut("properties").and_then(Value::as_object_mut) {
-                if let Some(projection) = properties
-                    .get_mut("projection_bytes")
+            if let Some(properties) = map.get_mut("properties").and_then(Value::as_object_mut)
+                && kind.as_deref() == Some("result_exceeds_budget")
+            {
+                if let Some(maximum) = properties
+                    .get_mut("maximum_bytes")
                     .and_then(Value::as_object_mut)
                 {
-                    projection.insert("maximum".into(), Value::from(65_536));
+                    maximum.insert("const".into(), Value::from(65_536));
                 }
-                if let Some(cap) = properties
-                    .get_mut("cap_bytes")
+                if let Some(actual) = properties
+                    .get_mut("actual_bytes")
                     .and_then(Value::as_object_mut)
                 {
-                    cap.insert("const".into(), Value::from(65_536));
-                }
-                if let Some(bytes) = properties.get_mut("bytes").and_then(Value::as_object_mut) {
-                    if kind.as_deref() == Some("success") {
-                        bytes.insert("maximum".into(), Value::from(65_536));
-                    }
-                    if kind.as_deref() == Some("over_cap") {
-                        bytes.insert("minimum".into(), Value::from(65_537));
-                    }
+                    actual.insert("minimum".into(), Value::from(65_537));
                 }
             }
             for value in map.values_mut() {
@@ -1332,7 +1503,11 @@ fn date(value: &str) -> bool {
         && value.as_bytes().get(7) == Some(&b'-')
 }
 fn range(value: &OracleSourceRangeV1) -> Result<()> {
-    if empty(&value.path) || value.start_byte >= value.end_byte || !hash(&value.sha256) {
+    if empty(&value.path)
+        || value.start_byte >= value.end_byte
+        || value.end_byte > value.file_byte_length
+        || !hash(&value.sha256)
+    {
         bail!("proof_availability_range_invalid")
     }
     Ok(())

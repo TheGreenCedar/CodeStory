@@ -16,6 +16,8 @@
           "items": {
             "type": "string"
           },
+          "maxItems": 6,
+          "minItems": 1,
           "type": "array"
         }
       },
@@ -120,9 +122,12 @@
         "mutation_id": {
           "type": "string"
         },
+        "path_id": {
+          "type": "string"
+        },
         "step_index": {
           "format": "uint8",
-          "maximum": 255,
+          "maximum": 5,
           "minimum": 0,
           "type": "integer"
         },
@@ -132,6 +137,7 @@
       },
       "required": [
         "mutation_id",
+        "path_id",
         "kind",
         "step_index",
         "caller",
@@ -263,6 +269,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "file_byte_length": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
         "path": {
           "type": "string"
         },
@@ -280,6 +291,7 @@
         "path",
         "start_byte",
         "end_byte",
+        "file_byte_length",
         "sha256"
       ],
       "type": "object"
