@@ -1157,13 +1157,60 @@ process.stdout.write(JSON.stringify(
 }
 
 #[test]
+fn proof_qualification_facades_seal_the_kernel_and_preserve_transport_errors() {
+    let agent_lib = read("crates/codestory-agent/src/lib.rs");
+    assert!(
+        agent_lib.contains("mod indexed_source_call_path_v1;")
+            && !agent_lib.contains("pub mod indexed_source_call_path_v1;"),
+        "proof qualification must not make the dark agent kernel directly reachable"
+    );
+    for required in [
+        "AdmittedRawCallEdge",
+        "BuiltCallPathFacts",
+        "ValidatedCallPathContract",
+        "check_built_call_path_integration",
+        "project_internal_call_path_result",
+    ] {
+        assert!(
+            agent_lib.contains(required),
+            "the sealed agent facade must name the runtime-required {required} API explicitly"
+        );
+    }
+
+    let cli_lib = read("crates/codestory-cli/src/lib.rs");
+    assert!(
+        !cli_lib.contains("Result<Vec<RevisionNativeToolResultMeasurement>, String>"),
+        "the CLI qualification facade must not erase transport failures into String"
+    );
+    for required in [
+        "pub enum ProofQualificationTransportError",
+        "Serialization(String)",
+        "InvalidProjection(String)",
+        "OutputSchemaViolation",
+        "ResultExceedsBudget {",
+        "maximum_bytes: usize",
+        "actual_bytes: usize",
+        "impl From<crate::stdio_v3::StdioV3InternalError>",
+    ] {
+        assert!(
+            cli_lib.contains(required),
+            "the CLI qualification facade must preserve {required}"
+        );
+    }
+}
+
+#[test]
 fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
     let lib = read("crates/codestory-agent/src/lib.rs");
     assert!(
         lib.contains(
-            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\n#[doc(hidden)]\npub mod indexed_source_call_path_v1;"
+            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\n#[doc(hidden)]\nmod indexed_source_call_path_v1;"
         ),
-        "the dark call-path kernel must remain test-support-only until the atomic v3 cut"
+        "the dark call-path kernel must remain private behind test or sealed qualification support"
+    );
+    assert!(
+        !lib.contains("pub mod indexed_source_call_path_v1;"),
+        "the dark call-path kernel must never become a qualification-visible module"
     );
     assert!(
         AGENT_MODULE_ALLOWLIST_EXCLUSIONS.contains(&"indexed_source_call_path_v1.rs"),

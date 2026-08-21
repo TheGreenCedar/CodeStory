@@ -22,10 +22,20 @@ pub mod eval_probes;
     feature = "proof-qualification-support"
 ))]
 #[doc(hidden)]
-pub mod indexed_source_call_path_v1;
-#[cfg(feature = "proof-qualification-support")]
+mod indexed_source_call_path_v1;
+#[cfg(any(feature = "test-support", feature = "proof-qualification-support"))]
 #[doc(hidden)]
 pub mod proof_qualification_support {
+    pub use super::indexed_source_call_path_v1::{
+        AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
+        CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
+        IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity,
+        InternalProjection, PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawCallEdgeAdmission,
+        ReceiptRef, ResolvedNodeIdentity, UnavailableReason, ValidatedCallPathContract,
+        ValidatedContractRendering, VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
+        check_built_call_path_integration, project_internal_call_path_result,
+    };
+
     /// Identifies the sealed request domain observed by benchmark qualification.
     pub fn proof_domain() -> &'static str {
         super::indexed_source_call_path_v1::PROOF_DOMAIN

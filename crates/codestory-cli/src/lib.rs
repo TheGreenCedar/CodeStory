@@ -51,10 +51,45 @@ pub mod proof_qualification_support {
         pub byte_length: usize,
     }
 
+    /// Closed transport failures preserved from the revision-native builder.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ProofQualificationTransportError {
+        Serialization(String),
+        InvalidProjection(String),
+        OutputSchemaViolation,
+        ResultExceedsBudget {
+            maximum_bytes: usize,
+            actual_bytes: usize,
+        },
+    }
+
+    impl From<crate::stdio_v3::StdioV3InternalError> for ProofQualificationTransportError {
+        fn from(error: crate::stdio_v3::StdioV3InternalError) -> Self {
+            match error {
+                crate::stdio_v3::StdioV3InternalError::Serialization(message) => {
+                    Self::Serialization(message)
+                }
+                crate::stdio_v3::StdioV3InternalError::InvalidProjection(message) => {
+                    Self::InvalidProjection(message)
+                }
+                crate::stdio_v3::StdioV3InternalError::OutputSchemaViolation => {
+                    Self::OutputSchemaViolation
+                }
+                crate::stdio_v3::StdioV3InternalError::ResultExceedsBudget {
+                    maximum_bytes,
+                    actual_bytes,
+                } => Self::ResultExceedsBudget {
+                    maximum_bytes,
+                    actual_bytes,
+                },
+            }
+        }
+    }
+
     /// Build the exact proof result bytes for every supported dark revision.
     pub fn measure_revision_native_proof_result(
         root: &Value,
-    ) -> Result<Vec<RevisionNativeToolResultMeasurement>, String> {
+    ) -> Result<Vec<RevisionNativeToolResultMeasurement>, ProofQualificationTransportError> {
         crate::stdio_v3::measure_revision_native_proof_result_v3(root)
             .map(|measurements| {
                 measurements
@@ -66,7 +101,7 @@ pub mod proof_qualification_support {
                     })
                     .collect()
             })
-            .map_err(|error| format!("{error:?}"))
+            .map_err(ProofQualificationTransportError::from)
     }
 
     /// Rust-generated discovery identities for the inert launcher handshake.
@@ -78,6 +113,42 @@ pub mod proof_qualification_support {
                 (revision.as_str().to_owned(), identity.sha256)
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn transport_errors_preserve_every_revision_native_variant() {
+            let cases = [
+                (
+                    crate::stdio_v3::StdioV3InternalError::Serialization("encode".into()),
+                    ProofQualificationTransportError::Serialization("encode".into()),
+                ),
+                (
+                    crate::stdio_v3::StdioV3InternalError::InvalidProjection("root".into()),
+                    ProofQualificationTransportError::InvalidProjection("root".into()),
+                ),
+                (
+                    crate::stdio_v3::StdioV3InternalError::OutputSchemaViolation,
+                    ProofQualificationTransportError::OutputSchemaViolation,
+                ),
+                (
+                    crate::stdio_v3::StdioV3InternalError::ResultExceedsBudget {
+                        maximum_bytes: 64,
+                        actual_bytes: 65,
+                    },
+                    ProofQualificationTransportError::ResultExceedsBudget {
+                        maximum_bytes: 64,
+                        actual_bytes: 65,
+                    },
+                ),
+            ];
+            for (internal, expected) in cases {
+                assert_eq!(ProofQualificationTransportError::from(internal), expected);
+            }
+        }
     }
 }
 

@@ -5,7 +5,7 @@
 //! complete core snapshot used for every Store read below.
 
 // The complete adapter stays dark until the atomic v3 surface cut. Building
-// `codestory-runtime` as a dependency with `test-support` must not turn that
+// `codestory-runtime` with either sealed support feature must not turn that
 // deliberate lack of production callers into warning noise.
 #![allow(dead_code)]
 
@@ -16,14 +16,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use codestory_agent::indexed_source_call_path_v1::{
-    AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence, ExactScopeSelector,
-    ExactSymbolSelector, FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow,
-    InternalCorePublicationIdentity, InternalProjection, PROOF_DOMAIN, PinnedNodeIdentity,
-    ProofHashes, RawCallEdgeAdmission, ReceiptRef, ResolvedNodeIdentity, UnavailableReason,
-    ValidatedCallPathContract, ValidatedContractRendering, VerifiedDirectCallFact,
-    VerifiedProofFact, admit_raw_call_edge, check_built_call_path_integration,
-    project_internal_call_path_result,
+use codestory_agent::proof_qualification_support::{
+    AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
+    CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
+    IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
+    PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawCallEdgeAdmission, ReceiptRef,
+    ResolvedNodeIdentity, UnavailableReason, ValidatedCallPathContract, ValidatedContractRendering,
+    VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
+    check_built_call_path_integration, project_internal_call_path_result,
 };
 use codestory_contracts::api::ApiError;
 use codestory_contracts::graph::{Node, NodeId, NodeKind, ResolutionCertainty};
@@ -330,7 +330,7 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IntegratedProjectedCallPathResult {
-    pub integration: codestory_agent::indexed_source_call_path_v1::CheckedBuiltCallPathIntegration,
+    pub integration: CheckedBuiltCallPathIntegration,
     pub projection: InternalProjection,
 }
 
@@ -375,7 +375,7 @@ fn evaluate_from_store<R>(
     publication: &IndexPublicationRecord,
     inputs: CheckedIntegrationInputs<'_>,
     read_source: R,
-) -> Result<codestory_agent::indexed_source_call_path_v1::CheckedBuiltCallPathIntegration, ApiError>
+) -> Result<CheckedBuiltCallPathIntegration, ApiError>
 where
     R: FnMut(&Path) -> io::Result<Vec<u8>>,
 {
