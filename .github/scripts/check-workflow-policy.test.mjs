@@ -5957,6 +5957,19 @@ test("post-publish proof uses an immutable real Codex marketplace install", asyn
     ({ name }) => name === "Prove the catalog-resolved published runtime",
   );
   const mutations = [
+    ["caller-bound closeout harness is removed", workflow => {
+      workflow.jobs.smoke.steps = workflow.jobs.smoke.steps.filter(
+        ({ name }) => name !== "Stage caller-bound closeout harness",
+      );
+    }, /stage the caller-bound closeout harness/u],
+    ["install step returns to the release-tag harness", workflow => {
+      installStep(workflow).env.CLOSEOUT_HELPER =
+        "${{ github.workspace }}/.github/scripts/install-codestory-marketplace-proof.mjs";
+    }, /must bind CLOSEOUT_HELPER/u],
+    ["runtime proof returns to the release-tag harness", workflow => {
+      proofStep(workflow).env.PROOF_HELPER =
+        "${{ github.workspace }}/.github/scripts/check-packaged-agent-proof.py";
+    }, /must bind PROOF_HELPER/u],
     ["Codex CLI pin drifts", workflow => {
       workflow.env.CODEX_CLI_VERSION = "latest";
     }, /pin the Codex CLI/u],

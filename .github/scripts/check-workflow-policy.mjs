@@ -4937,6 +4937,33 @@ function validatePostPublish(workflows, violations, graph) {
     add(violations, closeoutInput.type === "string", `${file} ${event} pre_publish_closeout_artifact must be a string`);
   }
   const job = object(object(workflow.jobs).smoke);
+  const closeoutHarnessName = "Stage caller-bound closeout harness";
+  const closeoutHarness = namedStep(job, closeoutHarnessName);
+  add(
+    violations,
+    closeoutHarness?.id === "closeout-harness"
+      && closeoutHarness?.shell === "bash"
+      && closeoutHarness?.if === undefined
+      && closeoutHarness?.["continue-on-error"] === undefined,
+    `${file} must stage the caller-bound closeout harness fail closed`,
+  );
+  requireStepRun(violations, file, job, closeoutHarnessName, [
+    `printf '%s' "$GITHUB_SHA" | grep -Eq '^[0-9a-f]{40}$'`,
+    'git archive "$GITHUB_SHA"',
+    ".github/scripts/install-codestory-marketplace-proof.mjs",
+    ".github/scripts/marketplace-delivery-identity.mjs",
+    ".github/scripts/check-packaged-agent-proof.py",
+    ".github/scripts/packaged_agent_proof",
+    '| tar -x -C "$harness_root"',
+    'echo "helper=$harness_root/.github/scripts/install-codestory-marketplace-proof.mjs" >> "$GITHUB_OUTPUT"',
+    'echo "proof=$harness_root/.github/scripts/check-packaged-agent-proof.py" >> "$GITHUB_OUTPUT"',
+  ]);
+  add(
+    violations,
+    stepIndex(job, closeoutHarnessName)
+      < stepIndex(job, "Bind this smoke to the published release"),
+    `${file} must stage the closeout harness immediately after the tag checkout`,
+  );
   const pythonSetup = namedStep(job, "Install pinned Python");
   add(
     violations,
@@ -5296,6 +5323,7 @@ function validatePostPublish(workflows, violations, graph) {
   // The install arguments arrive as variables, so the command text no longer says which delivery
   // state produced them. Each variable is bound back to the step that resolved it.
   requireStepEnv(violations, file, job, resolveStepName, {
+    CLOSEOUT_HELPER: "${{ steps.closeout-harness.outputs.helper }}",
     MARKETPLACE_REVISION: "${{ steps.delivery.outputs.marketplace_revision }}",
     MARKETPLACE_SOURCE: "${{ steps.delivery.outputs.marketplace_source }}",
     LOCAL_FIXTURE: "${{ steps.delivery.outputs.local_fixture }}",
@@ -5359,7 +5387,7 @@ function validatePostPublish(workflows, violations, graph) {
   );
   const installedRun = executableRunText(String(installed?.run ?? ""));
   for (const fragment of [
-    "python .github/scripts/check-packaged-agent-proof.py",
+    'python "$PROOF_HELPER"',
     '--archive "$ASSET_ARCHIVE"',
     "--plugin-handoff",
     "--engine-policy accelerated",
@@ -5389,6 +5417,7 @@ function validatePostPublish(workflows, violations, graph) {
     CATALOG_DELIVERY_STATE: "${{ steps.delivery.outputs.state }}",
     DELIVERED_INSTALLER: "${{ steps.delivery.outputs.installer }}",
     EXPECTED_BACKEND: "${{ matrix.backend }}",
+    PROOF_HELPER: "${{ steps.closeout-harness.outputs.proof }}",
   });
   add(
     violations,
@@ -5402,6 +5431,7 @@ function validatePostPublish(workflows, violations, graph) {
       "INSTALLED_ATTESTATION",
       "INSTALLED_PLUGIN_DATA",
       "INSTALLED_PLUGIN_ROOT",
+      "PROOF_HELPER",
       "RELEASE_VERSION",
     ]),
     `${file} installed runtime restart proof must bind only the reviewed package, install, delivery, and backend identities`,
@@ -5415,7 +5445,7 @@ function validatePostPublish(workflows, violations, graph) {
   add(
     violations,
     occurrenceCount(installedRun, "common=(") === 1
-      && occurrenceCount(installedCommon, "python .github/scripts/check-packaged-agent-proof.py") === 1
+      && occurrenceCount(installedCommon, 'python "$PROOF_HELPER"') === 1
       && [
         '--archive "$ASSET_ARCHIVE"',
         '--checksum-file "$ASSET_CHECKSUM"',

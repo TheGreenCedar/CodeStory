@@ -3271,7 +3271,7 @@
         "step": "Prove the catalog-resolved published runtime",
         "fragments": [
           "common=(",
-          "python .github/scripts/check-packaged-agent-proof.py",
+          "python \"$PROOF_HELPER\"",
           "--expected-backend \"$EXPECTED_BACKEND\"",
           "\"${common[@]}\" --out-dir \"$proof_root/session-1\"",
           "\"${common[@]}\" --out-dir \"$proof_root/session-2\"",

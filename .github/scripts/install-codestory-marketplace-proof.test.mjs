@@ -15,12 +15,29 @@ import process from "node:process";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { commandPlan } from "./install-codestory-marketplace-proof.mjs";
+import {
+  commandPlan,
+  directoryDigest,
+} from "./install-codestory-marketplace-proof.mjs";
 
 const scriptRoot = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptRoot, "..", "..");
 const helper = path.join(scriptRoot, "install-codestory-marketplace-proof.mjs");
 const codexVersion = "0.144.5";
+const orderingContractDigest =
+  "9c8a732ad11364c4eb6a36b16fd856f5b63e31ab01ad41e5782bdafdbf7dd34d";
+
+test("plugin directory digest sorts normalized paths bytewise", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "codestory-directory-contract-"));
+  try {
+    mkdirSync(path.join(root, "a"));
+    writeFileSync(path.join(root, "a", "child.txt"), "nested");
+    writeFileSync(path.join(root, "a0.txt"), "flat");
+    assert.equal(directoryDigest(root), orderingContractDigest);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("Windows invokes native executables directly and wraps only command shims", () => {
   const comspec = "C:\\Windows\\System32\\cmd.exe";
@@ -45,10 +62,31 @@ test("Windows invokes native executables directly and wraps only command shims",
         "/d",
         "/s",
         "/c",
-        '"C:\\tools\\codex.cmd" "plugin" "list" "--json"',
+        '""C:\\tools\\codex.cmd" "plugin" "list" "--json""',
       ],
+      spawnOptions: { windowsVerbatimArguments: true },
     },
   );
+});
+
+test("Windows executes a command shim whose path and arguments contain spaces", {
+  skip: process.platform !== "win32",
+}, () => {
+  const root = mkdtempSync(path.join(tmpdir(), "codestory command shim "));
+  try {
+    const shim = path.join(root, "shim directory", "probe.cmd");
+    mkdirSync(path.dirname(shim), { recursive: true });
+    writeFileSync(shim, "@echo off\r\necho [%~1][%~2]\r\n");
+    const plan = commandPlan(shim, ["first", "two words"]);
+    const result = spawnSync(plan.command, plan.commandArgs, {
+      ...plan.spawnOptions,
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "[first][two words]");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 function run(executable, args, options = {}) {

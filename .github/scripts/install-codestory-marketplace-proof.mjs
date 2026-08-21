@@ -55,18 +55,24 @@ export function commandPlan(
       if (/[\r\n"]/u.test(value)) fail("Codex command arguments must be single-line");
       return `"${value.replaceAll("%", "%%")}"`;
     };
+    const commandLine = [executable, ...args].map(quote).join(" ");
     return {
       command: comspec,
-      commandArgs: ["/d", "/s", "/c", [executable, ...args].map(quote).join(" ")],
+      // With /s, cmd.exe removes the first and last quotes from the command
+      // string. Keep an outer pair so the quoted shim path survives intact,
+      // and stop Node from escaping that raw cmd.exe command string again.
+      commandArgs: ["/d", "/s", "/c", `"${commandLine}"`],
+      spawnOptions: { windowsVerbatimArguments: true },
     };
   }
   return { command: executable, commandArgs: args };
 }
 
 function run(executable, args, options = {}) {
-  const { command, commandArgs } = commandPlan(executable, args);
+  const { command, commandArgs, spawnOptions = {} } = commandPlan(executable, args);
   const result = spawnSync(command, commandArgs, {
     ...options,
+    ...spawnOptions,
     encoding: "utf8",
   });
   if (result.status !== 0) {
@@ -92,12 +98,19 @@ function filesUnder(root, relative = "") {
   });
 }
 
-function directoryDigest(root) {
+export function directoryDigest(root) {
   const digest = createHash("sha256");
-  const files = filesUnder(root).sort();
+  const files = filesUnder(root)
+    .map((relative) => ({
+      relative,
+      normalized: relative.split(path.sep).join("/"),
+    }))
+    .sort((left, right) => Buffer.compare(
+      Buffer.from(left.normalized),
+      Buffer.from(right.normalized),
+    ));
   if (files.length === 0) fail("installed plugin package is empty");
-  for (const relative of files) {
-    const normalized = relative.split(path.sep).join("/");
+  for (const { relative, normalized } of files) {
     const name = Buffer.from(normalized);
     const payload = readFileSync(path.join(root, relative));
     const nameLength = Buffer.alloc(8);

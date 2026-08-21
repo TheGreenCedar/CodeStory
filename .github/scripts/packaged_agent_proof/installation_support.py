@@ -21,14 +21,18 @@ from .foundation import (
 def directory_contract_sha256(root: Path) -> str:
     require(root.is_dir(), f"plugin package root does not exist: {root}")
     digest = hashlib.sha256()
-    files = sorted(path for path in root.rglob("*") if path.is_file())
+    files = [
+        (path.relative_to(root).as_posix().encode("utf-8"), path)
+        for path in root.rglob("*")
+        if path.is_file()
+    ]
+    files.sort(key=lambda entry: entry[0])
     require(files, "plugin package root is empty")
-    for path in files:
+    for relative, path in files:
         require(
             not path.is_symlink(),
             f"installed plugin package contains a symlink: {path}",
         )
-        relative = path.relative_to(root).as_posix().encode("utf-8")
         payload = path.read_bytes()
         digest.update(len(relative).to_bytes(8, "little"))
         digest.update(relative)
