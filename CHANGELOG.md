@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+Cursor still dropped `files`, `snippet`, and preparing `packet`/`search`/`context` results: empty `policy_exclusions` were omitted, batched snippets used a ranges document, and the shared `codestory_preparing` envelope was undeclared.
+
 ## 0.17.4
 
 Cursor marketplace MCP tool results match the schemas Cursor validates. After the server started, Cursor rejected `status`, `packet`, and `files` because the advertised output schema forbade extra compact-status fields, typed packet `support` as an object, and omitted `files.coverage_gaps`.
