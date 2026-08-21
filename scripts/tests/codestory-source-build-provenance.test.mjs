@@ -19,6 +19,7 @@ test("source-build provenance binds a clean exact tree to artifact installer and
   const root = await mkdtemp(path.join(os.tmpdir(), "codestory-source-build-"));
   try {
     await writeFile(path.join(root, "Cargo.toml"), "[workspace]\n", "utf8");
+    await writeFile(path.join(root, ".gitignore"), "target/\n", "utf8");
     const artifact = path.join(root, "target", "release", "codestory-cli");
     git(root, "init", "-q");
     git(root, "config", "user.email", "fixture@example.invalid");
@@ -49,6 +50,8 @@ test("source-build provenance binds a clean exact tree to artifact installer and
       compareSourceBuildProvenance(record, {
         installerSha256: record.artifact.sha256,
         liveSha256: record.artifact.sha256,
+        expectedSource: record.source,
+        expectedBuildCommand: record.build.command,
       }),
       { state: "bound" },
     );
@@ -89,6 +92,7 @@ test("source-build provenance rejects forged commands, paths, outputs, and incom
   const root = await mkdtemp(path.join(os.tmpdir(), "codestory-source-build-hostile-"));
   try {
     await writeFile(path.join(root, "Cargo.toml"), "[workspace]\n", "utf8");
+    await writeFile(path.join(root, ".gitignore"), "target/\n", "utf8");
     git(root, "init", "-q");
     git(root, "config", "user.email", "fixture@example.invalid");
     git(root, "config", "user.name", "Fixture");
@@ -109,6 +113,34 @@ test("source-build provenance rejects forged commands, paths, outputs, and incom
       () => recordSourceBuildProvenance({ artifact, buildCommand: command, repoRoot: root, runBuild: () => ({ status: 0 }) }),
       /source_build_artifact_not_file/u,
     );
+    assert.throws(
+      () => recordSourceBuildProvenance({ artifact, buildCommand: command, repoRoot: root, runBuild: () => {
+        fs.mkdirSync(path.dirname(artifact), { recursive: true });
+        fs.symlinkSync(path.join(root, "Cargo.toml"), artifact);
+        return { status: 0 };
+      } }),
+      /source_build_artifact_not_direct_regular_file/u,
+    );
+    await rm(artifact);
+    assert.throws(
+      () => recordSourceBuildProvenance({ artifact, buildCommand: command, repoRoot: root, runBuild: () => {
+        fs.linkSync(path.join(root, "Cargo.toml"), artifact);
+        return { status: 0 };
+      } }),
+      /source_build_artifact_not_direct_regular_file/u,
+    );
+    await rm(artifact);
+    assert.throws(
+      () => recordSourceBuildProvenance({ artifact, buildCommand: command, repoRoot: root, runBuild: () => {
+        fs.mkdirSync(path.dirname(artifact), { recursive: true });
+        fs.writeFileSync(artifact, "runner-produced bytes");
+        fs.writeFileSync(path.join(root, "Cargo.toml"), "[workspace]\n# changed\n");
+        return { status: 0 };
+      } }),
+      /source_build_repository_not_clean/u,
+    );
+    git(root, "checkout", "--", "Cargo.toml");
+    await rm(artifact);
 
     const record = recordSourceBuildProvenance({
       artifact,
@@ -120,7 +152,12 @@ test("source-build provenance rejects forged commands, paths, outputs, and incom
         return { status: 0 };
       },
     });
-    const boundInputs = { installerSha256: record.artifact.sha256, liveSha256: record.artifact.sha256 };
+    const boundInputs = {
+      installerSha256: record.artifact.sha256,
+      liveSha256: record.artifact.sha256,
+      expectedSource: record.source,
+      expectedBuildCommand: record.build.command,
+    };
     for (const mutation of [
       { schema_version: 2 },
       { source: { ...record.source, head: "not-a-head" } },
@@ -136,12 +173,20 @@ test("source-build provenance rejects forged commands, paths, outputs, and incom
       );
     }
     assert.deepEqual(
-      compareSourceBuildProvenance(record, { installerSha256: "a".repeat(64), liveSha256: record.artifact.sha256 }),
+      compareSourceBuildProvenance(record, { ...boundInputs, installerSha256: "a".repeat(64) }),
       { state: "installer_mismatch" },
     );
     assert.deepEqual(
-      compareSourceBuildProvenance(record, { installerSha256: record.artifact.sha256, liveSha256: "b".repeat(64) }),
+      compareSourceBuildProvenance(record, { ...boundInputs, liveSha256: "b".repeat(64) }),
       { state: "live_mismatch" },
+    );
+    assert.deepEqual(
+      compareSourceBuildProvenance(record, { ...boundInputs, expectedSource: { ...record.source, head: "a".repeat(40) } }),
+      { state: "source_mismatch" },
+    );
+    assert.deepEqual(
+      compareSourceBuildProvenance(record, { ...boundInputs, expectedBuildCommand: ["cargo", "test", "--locked"] }),
+      { state: "build_command_mismatch" },
     );
   } finally {
     await rm(root, { recursive: true, force: true });

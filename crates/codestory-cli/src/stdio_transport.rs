@@ -2172,23 +2172,6 @@ fn stdio_tool_call_success(
     response
 }
 
-/// Exposes the existing native renderer to the compatibility harness without
-/// participating in request dispatch or protocol negotiation.
-#[doc(hidden)]
-pub fn compatibility_render_stdio_tool_success(
-    tool_name: &str,
-    structured_content: serde_json::Value,
-) -> serde_json::Value {
-    stdio_tool_call_success(tool_name, structured_content)
-}
-
-/// Exposes the existing native error renderer to the compatibility harness
-/// without enabling output validation in v2.
-#[doc(hidden)]
-pub fn compatibility_render_stdio_tool_error(error: serde_json::Value) -> serde_json::Value {
-    stdio_tool_call_error(&error)
-}
-
 fn stdio_tool_text(tool_name: &str, value: &serde_json::Value) -> String {
     if stdio_is_packet(value) {
         return stdio_packet_text(value);
@@ -8895,6 +8878,35 @@ version = "0.11.20"
             error["structuredContent"]["code"],
             json!("codestory_unavailable")
         );
+    }
+
+    #[test]
+    fn native_v2_transcript_fixture_freezes_private_result_renderers() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../scripts/tests/fixtures/codestory-v2-transcripts.json"
+        ))
+        .expect("v2 transcript fixture");
+        let native = &fixture["native_v2"];
+        assert_eq!(
+            stdio_tool_call_success("status", json!({"state": "ready"})),
+            native["success"],
+        );
+        for (input, expected) in [
+            (
+                json!({"code":"codestory_preparing","message":"CodeStory is preparing managed search.","state":"preparing","retry_after_ms":250}),
+                &native["preparing"],
+            ),
+            (
+                json!({"code":"codestory_unavailable","message":"CodeStory is unavailable."}),
+                &native["unavailable"],
+            ),
+            (
+                json!({"code":"project_required","message":"An absolute repository root is required.","tool":"ground"}),
+                &native["tool_error"],
+            ),
+        ] {
+            assert_eq!(stdio_tool_call_error(&input), *expected);
+        }
     }
 
     #[test]

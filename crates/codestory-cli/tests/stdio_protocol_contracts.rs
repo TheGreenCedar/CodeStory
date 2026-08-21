@@ -104,38 +104,6 @@ fn compatibility_profile_fixture_keeps_future_revisions_unselectable_in_v2() {
     );
 }
 
-#[test]
-fn native_v2_transcript_fixture_freezes_real_result_renderers() {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "../../../scripts/tests/fixtures/codestory-v2-transcripts.json"
-    ))
-    .expect("v2 transcript fixture");
-    let native = &fixture["native_v2"];
-    assert_eq!(
-        codestory_cli::compatibility_render_stdio_tool_success("status", json!({"state": "ready"})),
-        native["success"],
-    );
-    for (input, expected) in [
-        (
-            json!({"code": "codestory_preparing", "message": "CodeStory is preparing managed search.", "state": "preparing", "retry_after_ms": 250}),
-            &native["preparing"],
-        ),
-        (
-            json!({"code": "codestory_unavailable", "message": "CodeStory is unavailable."}),
-            &native["unavailable"],
-        ),
-        (
-            json!({"code": "project_required", "message": "An absolute repository root is required.", "tool": "ground"}),
-            &native["tool_error"],
-        ),
-    ] {
-        assert_eq!(
-            codestory_cli::compatibility_render_stdio_tool_error(input),
-            *expected
-        );
-    }
-}
-
 struct StdioFixture {
     workspace: TempDir,
     cache_dir: TempDir,

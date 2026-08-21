@@ -31,6 +31,27 @@ function safeArtifactRelative(relative) {
     && components.every((component) => component && component !== "." && component !== ".." && !component.includes("\\"));
 }
 
+function artifactEntryExists(file) {
+  try { fs.lstatSync(file); return true; } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function directArtifactMetadata(root, relative) {
+  let current = root;
+  for (const component of relative.split("/")) {
+    current = path.join(current, component);
+    const entry = fs.lstatSync(current);
+    if (entry.isSymbolicLink()) throw new Error("source_build_artifact_not_direct_regular_file");
+    if (component !== "codestory-cli" && !entry.isDirectory()) throw new Error("source_build_artifact_not_direct_regular_file");
+    if (component === "codestory-cli" && (!entry.isFile() || entry.nlink !== 1)) {
+      throw new Error("source_build_artifact_not_direct_regular_file");
+    }
+  }
+  return fs.lstatSync(current);
+}
+
 export function recordSourceBuildProvenance({ artifact, buildCommand, repoRoot, runBuild }) {
   const root = path.resolve(repoRoot);
   const artifactPath = path.resolve(artifact);
@@ -40,7 +61,7 @@ export function recordSourceBuildProvenance({ artifact, buildCommand, repoRoot, 
   if (!safeArtifactRelative(normalizedRelative)) {
     throw new Error("source_build_artifact_outside_repository");
   }
-  if (fs.existsSync(artifactPath)) throw new Error("source_build_artifact_must_be_absent");
+  if (artifactEntryExists(artifactPath)) throw new Error("source_build_artifact_must_be_absent");
   cleanRepository(root);
   const before = { head: git(root, "rev-parse", "HEAD"), tree: git(root, "rev-parse", "HEAD^{tree}") };
   const completed = (runBuild || ((command, options) => spawnSync(command[0], command.slice(1), {
@@ -49,12 +70,17 @@ export function recordSourceBuildProvenance({ artifact, buildCommand, repoRoot, 
     shell: false,
   })))(buildCommand, { cwd: root });
   if (completed.error || completed.status !== 0) throw new Error("source_build_command_failed");
-  if (!fs.existsSync(artifactPath) || !fs.statSync(artifactPath).isFile()) {
+  let metadata;
+  try { metadata = directArtifactMetadata(root, normalizedRelative); } catch (error) {
+    if (error?.code === "ENOENT") throw new Error("source_build_artifact_not_file");
+    throw error;
+  }
+  if (!metadata.isFile()) {
     throw new Error("source_build_artifact_not_file");
   }
   const after = { head: git(root, "rev-parse", "HEAD"), tree: git(root, "rev-parse", "HEAD^{tree}") };
   if (before.head !== after.head || before.tree !== after.tree) throw new Error("source_build_source_changed");
-  const metadata = fs.statSync(artifactPath);
+  cleanRepository(root);
   return {
     schema_version: 1,
     purpose: "codestory-source-build-provenance",
@@ -70,7 +96,7 @@ export function recordSourceBuildProvenance({ artifact, buildCommand, repoRoot, 
   };
 }
 
-export function compareSourceBuildProvenance(record, { installerSha256, liveSha256 }) {
+export function compareSourceBuildProvenance(record, { installerSha256, liveSha256, expectedSource, expectedBuildCommand }) {
   const command = record?.build?.command;
   const artifactPath = record?.artifact?.path;
   if (
@@ -88,6 +114,11 @@ export function compareSourceBuildProvenance(record, { installerSha256, liveSha2
   ) {
     return { state: "invalid_record" };
   }
+  if (!expectedSource || !/^[0-9a-f]{40}$/u.test(expectedSource.head || "") || !/^[0-9a-f]{40}$/u.test(expectedSource.tree || "")) {
+    return { state: "expected_identity_unavailable" };
+  }
+  if (record.source.head !== expectedSource.head || record.source.tree !== expectedSource.tree) return { state: "source_mismatch" };
+  if (!Array.isArray(expectedBuildCommand) || command.join("\0") !== expectedBuildCommand.join("\0")) return { state: "build_command_mismatch" };
   if (!SHA256.test(installerSha256 || "") || !SHA256.test(liveSha256 || "")) {
     return { state: "identity_unavailable" };
   }
