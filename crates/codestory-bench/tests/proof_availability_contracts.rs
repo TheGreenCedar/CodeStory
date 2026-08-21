@@ -5,9 +5,10 @@ mod contracts;
 
 use clap::Parser;
 use contracts::{
-    CandidateFailureV1, CandidateGateV1, CorpusV1, FinalizationTraceV1, FunnelOutcomeV1,
-    ProofQualificationTraceV1, QualificationSummaryV1, SchemaDocument, SelectorGateOutcomeV1,
-    ThresholdsV1, TransportEvidenceV1, canonical_corpus_sha256,
+    ActivationDecisionV1, CandidateFailureV1, CandidateGateV1, CorpusV1, FinalizationTraceV1,
+    FunnelOutcomeV1, ObservedReceiptV1, ProofQualificationTraceV1, QualificationSummaryV1,
+    ReceiptOracleComparisonV1, SchemaDocument, SelectorGateOutcomeV1, ThresholdsV1,
+    TransportEvidenceV1, canonical_corpus_sha256,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -35,6 +36,7 @@ fn path(case_id: &str, cohort: &str, step_count: u8) -> Value {
             };
             json!({
               "caller":{"symbol":caller_symbol,"range":caller_range},
+              "callsite_line":index + 1,
               "callsite":range(start + 11, start + 19),
               "target":{"symbol":format!("crate::target_{index}"),"range":range(start + 20, start + 32)}
             })
@@ -130,26 +132,44 @@ fn report() -> Value {
             let selectors = (0..=attempted)
                 .map(|selector_index| json!({"selector_index":selector_index,"outcome":{"kind":"resolved","node_id":-(selector_index as i64 + 1)}}))
                 .collect::<Vec<_>>();
-            let receipt_comparisons = path["oracle_steps"]
+            let observed_receipts = path["oracle_steps"]
                 .as_array()
                 .expect("oracle steps")
                 .iter()
                 .enumerate()
                 .map(|(step_index, step)| {
+                    let edge_id = i64::try_from(case_index * 10 + step_index + 1)
+                        .expect("fixture edge id");
                     let callsite = &step["callsite"];
                     let start = callsite["start_byte"].as_u64().expect("callsite start");
                     let end = callsite["end_byte"].as_u64().expect("callsite end");
                     json!({
-                        "oracle_step_index":step_index,
+                        "receipt_id":format!("indexed-call-edge:fixture-{case_index}-{step_index}"),
+                        "step_index":step_index,
                         "caller":step["caller"]["symbol"],
-                        "edge_id":-(step_index as i64 + 1),
-                        "callsite_id":format!("src/lib.rs:{start}:{end}"),
-                        "exact_line":step_index + 1,
-                        "exact_window":callsite,
+                        "edge_id":edge_id,
+                        "callsite_identity":format!("1:{}:0:{}|fixture", step_index + 1, step_index + 2),
+                        "callsite_line":step_index + 1,
+                        "line_window":{
+                            "kind":"indexed_line_v1",
+                            "project_file_components":["src","lib.rs"],
+                            "byte_start":start,
+                            "byte_end":end,
+                            "indexed_sha256":SHA,
+                            "observed_sha256":SHA,
+                            "text":"call();\n"
+                        },
                         "target":step["target"]["symbol"],
-                        "result":"exact"
+                        "oracle_comparison":{"kind":"exact","oracle_step_index":step_index,"oracle_step":step}
                     })
                 })
+                .collect::<Vec<_>>();
+            let authoritative_receipts = observed_receipts
+                .iter()
+                .map(|receipt| json!({
+                    "receipt_id":receipt["receipt_id"],
+                    "edge_id":receipt["edge_id"]
+                }))
                 .collect::<Vec<_>>();
             let negative_mutations = path["negative_mutations"]
                 .as_array()
@@ -167,14 +187,11 @@ fn report() -> Value {
                 .collect::<Vec<_>>();
             json!({
                 "case_id":case_id,"repository_id":repository_id,
-                "product_disposition":{"kind":"contract_proven","gaps":[]},
-                "authoritative_receipt_count":attempted,"oracle_receipts_exact":true,
-                "proven_step_precision_milli":1000,"proven_step_recall_milli":1000,
-                "proven_prefix_length":attempted,"actionable_exact_gap":null,
-                "diagnostic_candidate_count":attempted,"authoritative_receipt_evidence_count":attempted,
+                "product_disposition":{"kind":"contract_proven","gaps":[],"authoritative_receipts":authoritative_receipts},
+                "actionable_exact_gap":null,
                 "warm_end_to_end_ms":12,"stage_durations_ms":{"validation":1,"operation":2},
                 "attempted_step_count":attempted,"unclassified_step_indices":[],
-                "receipt_comparisons":receipt_comparisons,
+                "receipt_evidence":{"observed_receipts":observed_receipts,"missing_oracle_steps":[]},
                 "complete_projection_bytes":128,
                 "transport":{"kind":"measurements","measurements":{"measurements":[
                     {"revision":"2024-11-05","actual_bytes":128},
@@ -194,8 +211,7 @@ fn report() -> Value {
       "inventory":cohort_ids.iter().map(|id|json!({"repository_id":id,"stored_call_rows":"10","effective_endpoint_rows":"10","exact_resolved_rows":"8","admitted_rows":"7","unresolved_placeholder_rows":"2"})).collect::<Vec<_>>(),
       "trails":cohort_ids.iter().map(|id|json!({"repository_id":id,"lengths":[{"length":1,"effective_endpoint":"10","exact_resolved":"8","strictly_admitted":"7"},{"length":2,"effective_endpoint":"9","exact_resolved":"7","strictly_admitted":"6"},{"length":3,"effective_endpoint":"8","exact_resolved":"6","strictly_admitted":"5"},{"length":4,"effective_endpoint":"7","exact_resolved":"5","strictly_admitted":"4"},{"length":5,"effective_endpoint":"6","exact_resolved":"4","strictly_admitted":"3"},{"length":6,"effective_endpoint":"5","exact_resolved":"3","strictly_admitted":"2"}]})).collect::<Vec<_>>(),
       "cases":cases,
-      "failure_funnel":{"attempted_positive_steps":312,"classified_positive_steps":312,"unclassified_positive_steps":0,"buckets":[{"outcome":{"kind":"admitted"},"count":"312"}]},
-      "decision":{"outcome":"keep_proof_dark","failed_gates":[{"gate_id":"experimental-usefulness-1","kind":"experimental_usefulness","detail":{"kind":"count","observed":"1","required":"24"}}],"automatic_thresholds_met":false}
+      "failure_funnel":{"attempted_positive_steps":312,"classified_positive_steps":312,"unclassified_positive_steps":0,"buckets":[{"outcome":{"kind":"admitted"},"count":"312"}]}
     })
 }
 
@@ -262,6 +278,12 @@ fn frozen_thresholds_cover_all_role_and_hard_gate_semantics() {
     let mut invalid = thresholds();
     invalid["automatic"]["minimum_full_proof_wilson_lower_milli"] = json!(1001);
     assert!(ThresholdsV1::from_json(invalid).is_err());
+    let mut tuned_after_results = thresholds();
+    tuned_after_results["automatic"]["minimum_full_proofs"] = json!(95);
+    assert!(
+        ThresholdsV1::from_json(tuned_after_results).is_err(),
+        "in-range threshold tuning must not change the Section 8 freeze"
+    );
 }
 
 #[test]
@@ -283,6 +305,13 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
         .expect("shape remains valid")
         .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
         .expect_err("provenance binds the supplied corpus bytes");
+    let mut wrong_threshold_hash = report();
+    wrong_threshold_hash["provenance"]["thresholds_sha256"] =
+        json!("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    QualificationSummaryV1::from_json(wrong_threshold_hash)
+        .expect("shape remains valid")
+        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
+        .expect_err("provenance binds the corpus-frozen threshold identity");
     let mut wrong_project = report();
     wrong_project["environment"]["projects"][0]["source_head"] =
         json!("cccccccccccccccccccccccccccccccccccccccc");
@@ -298,11 +327,10 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
         .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
         .expect_err("provenance and environment share one binary identity");
     let mut wrong_receipt = report();
-    wrong_receipt["cases"][0]["receipt_comparisons"][0]["caller"] = json!("wrong");
+    wrong_receipt["cases"][0]["receipt_evidence"]["observed_receipts"][0]["caller"] =
+        json!("wrong");
     QualificationSummaryV1::from_json(wrong_receipt)
-        .expect("shape remains valid")
-        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
-        .expect_err("receipt comparison binds oracle caller and callsite");
+        .expect_err("an exact receipt cannot contradict its bound oracle caller");
     let mut lengths = report();
     lengths["trails"][0]["lengths"]
         .as_array_mut()
@@ -315,18 +343,11 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
         "histogram":[{"reason":{"kind":"raw_admission","reason":"free form"},"edge_ids":[1]}]
     });
     assert!(QualificationSummaryV1::from_json(reason).is_err());
-    let mut gate = report();
-    gate["decision"]["failed_gates"][0]["kind"] = json!("free form");
-    assert!(QualificationSummaryV1::from_json(gate).is_err());
     let mut hard_failure = report();
-    hard_failure["cases"][0]["proof_trace"]["steps"] = json!([]);
-    hard_failure["cases"][0]["unclassified_step_indices"] = json!([0]);
-    hard_failure["cases"][0]["diagnostic_candidate_count"] = json!(0);
     hard_failure["cases"][0]["transport"] = json!({
         "kind":"error",
         "error":{"kind":"result_exceeds_budget","maximum_bytes":65536,"actual_bytes":65537}
     });
-    rebuild_funnel(&mut hard_failure);
     QualificationSummaryV1::from_json(hard_failure).expect("failure evidence is representable");
 }
 
@@ -356,7 +377,10 @@ fn closed_contracts_reject_hostile_nested_shapes() {
     assert!(QualificationSummaryV1::from_json(non_candidate_edge).is_err());
 
     let mut receipt_count_mismatch = report();
-    receipt_count_mismatch["cases"][0]["authoritative_receipt_count"] = json!(0);
+    receipt_count_mismatch["cases"][0]["product_disposition"]["authoritative_receipts"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
     assert!(QualificationSummaryV1::from_json(receipt_count_mismatch).is_err());
 
     let mut failed_finalization_bytes = report();
@@ -391,37 +415,52 @@ fn closed_contracts_reject_hostile_nested_shapes() {
         json!({"kind":"error","error":{"kind":"output_schema_violation","surprise":true}});
     assert!(QualificationSummaryV1::from_json(unknown_variant_field).is_err());
 
-    let mut duplicate_kind = report();
-    duplicate_kind["decision"]["failed_gates"] = json!([
-        {"gate_id":"one","kind":"cohort_failure","detail":{"kind":"cohort","repository_id":"rust","observed":"1","required":"30"}},
-        {"gate_id":"two","kind":"cohort_failure","detail":{"kind":"cohort","repository_id":"typescript","observed":"1","required":"30"}}
-    ]);
-    QualificationSummaryV1::from_json(duplicate_kind).expect("each failed gate has a stable id");
+    let duplicate_kind: ActivationDecisionV1 = serde_json::from_value(json!({
+        "outcome":"keep_proof_dark","automatic_thresholds_met":false,
+        "failed_gates":[
+            {"gate_id":"one","kind":"cohort_failure","detail":{"kind":"cohort","repository_id":"rust","observed":"1","required":"30"}},
+            {"gate_id":"two","kind":"cohort_failure","detail":{"kind":"cohort","repository_id":"typescript","observed":"1","required":"30"}}
+        ]
+    }))
+    .expect("closed decision DTO");
+    duplicate_kind
+        .validate()
+        .expect("each failed gate has a stable id");
 
-    let mut delayed_without_evidence = report();
-    delayed_without_evidence["decision"]["outcome"] = json!("delay_full_v3_cut");
-    assert!(QualificationSummaryV1::from_json(delayed_without_evidence).is_err());
-    let mut delayed_with_evidence = report();
-    delayed_with_evidence["decision"] = json!({
+    let delayed_without_evidence: ActivationDecisionV1 = serde_json::from_value(json!({
+        "outcome":"delay_full_v3_cut","automatic_thresholds_met":null,"failed_gates":[]
+    }))
+    .expect("closed decision DTO");
+    assert!(delayed_without_evidence.validate().is_err());
+    let delayed_with_evidence: ActivationDecisionV1 = serde_json::from_value(json!({
         "outcome":"delay_full_v3_cut",
         "automatic_thresholds_met":null,
         "failed_gates":[{"gate_id":"packet-proof-dependency","kind":"integration_dependency","detail":{"kind":"source_dependency","evidence":{"source_path":"src/lib.rs","source_range":range(0,10),"source_sha256":SHA,"dependency":"v3_packet_requires_proof","passing_test":{"test_id":"packet_v3_requires_proof","kind":"packet_v3_requires_proof","status":"passed"}}}}]
-    });
-    QualificationSummaryV1::from_json(delayed_with_evidence)
+    }))
+    .expect("closed decision DTO");
+    delayed_with_evidence
+        .validate()
         .expect("outcome D uses closed source evidence");
-    let mut wrong_dependency_gate = report();
-    wrong_dependency_gate["decision"]["failed_gates"][0]["detail"] = json!({
-        "kind":"source_dependency",
-        "evidence":{"source_path":"src/lib.rs","source_range":range(0,10),"source_sha256":SHA,"dependency":"v3_packet_requires_proof","passing_test":{"test_id":"packet_v3_requires_proof","kind":"packet_v3_requires_proof","status":"passed"}}
-    });
-    assert!(QualificationSummaryV1::from_json(wrong_dependency_gate).is_err());
+    let wrong_dependency_gate: ActivationDecisionV1 = serde_json::from_value(json!({
+        "outcome":"keep_proof_dark","automatic_thresholds_met":false,
+        "failed_gates":[{"gate_id":"wrong","kind":"response_size","detail":{
+            "kind":"source_dependency",
+            "evidence":{"source_path":"src/lib.rs","source_range":range(0,10),"source_sha256":SHA,"dependency":"v3_packet_requires_proof","passing_test":{"test_id":"packet_v3_requires_proof","kind":"packet_v3_requires_proof","status":"passed"}}
+        }}]
+    }))
+    .expect("closed decision DTO");
+    assert!(wrong_dependency_gate.validate().is_err());
 
-    let mut transport_gate = report();
-    transport_gate["decision"]["failed_gates"] = json!([{
-        "gate_id":"transport-over-cap","kind":"response_size",
-        "detail":{"kind":"transport","evidence":{"kind":"error","error":{"kind":"result_exceeds_budget","maximum_bytes":65536,"actual_bytes":65537}}}
-    }]);
-    QualificationSummaryV1::from_json(transport_gate)
+    let transport_gate: ActivationDecisionV1 = serde_json::from_value(json!({
+        "outcome":"keep_proof_dark","automatic_thresholds_met":false,
+        "failed_gates":[{
+            "gate_id":"transport-over-cap","kind":"response_size",
+            "detail":{"kind":"transport","evidence":{"kind":"error","error":{"kind":"result_exceeds_budget","maximum_bytes":65536,"actual_bytes":65537}}}
+        }]
+    }))
+    .expect("closed decision DTO");
+    transport_gate
+        .validate()
         .expect("transport gate evidence is closed and representable");
 }
 
@@ -513,8 +552,11 @@ fn invariant_table_exhausts_task4_task6_and_corpus_variants() {
 
 #[test]
 fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
-    use codestory_agent::proof_qualification_support::UnavailableReason;
-    use codestory_contracts::graph::NodeId;
+    use codestory_agent::proof_qualification_support::{
+        CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
+        ReceiptRef, ResolvedNodeIdentity, UnavailableReason,
+    };
+    use codestory_contracts::graph::{NodeId, ResolutionCertainty};
     use codestory_runtime::proof_qualification_support::{
         CandidateFailure, CandidateGate, ContainmentFailure, FinalizationFailure,
         FinalizationTrace, ProofQualificationTrace, SelectorFailure, SelectorGateOutcome,
@@ -655,11 +697,74 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         .unwrap(),
         TransportEvidenceV1::Measurements { .. }
     ));
+
+    let identity = |node_id: &str, qualified_name: &str| ResolvedNodeIdentity {
+        pinned: PinnedNodeIdentity {
+            project_id: "project".into(),
+            core_generation_id: "generation".into(),
+            core_run_id: "run".into(),
+            node_id: node_id.into(),
+        },
+        canonical_id: format!("canonical-{node_id}"),
+        qualified_name: qualified_name.into(),
+        project_file_components: vec!["src".into(), "lib.rs".into()],
+    };
+    let task6_receipt = IndexedCallEdgeReceipt {
+        receipt: ReceiptRef {
+            receipt_id: "indexed-call-edge:fixture".into(),
+            edge_id: "-42".into(),
+        },
+        source: identity("-1", "crate::start"),
+        target: identity("-2", "crate::target_0"),
+        certainty: ResolutionCertainty::Certain,
+        callsite_identity: "1:1:0:2|fixture".into(),
+        containment: CallableContainmentEvidence {
+            file_node_id: NodeId(-3),
+            owner_node_id: NodeId(-1),
+            start_line: 1,
+            end_line: 1,
+        },
+        line_window: IndexedLineWindow {
+            kind: "indexed_line_v1",
+            project_file_components: vec!["src".into(), "lib.rs".into()],
+            indexed_sha256: SHA.into(),
+            observed_sha256: SHA.into(),
+            anchor_line: 1,
+            byte_start: 11,
+            byte_end: 19,
+            text: "call();\n".into(),
+        },
+    };
+    let comparison: ReceiptOracleComparisonV1 = serde_json::from_value(
+        report()["cases"][0]["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"]
+            .clone(),
+    )
+    .expect("oracle comparison");
+    let observed = ObservedReceiptV1::from_task6(0, &task6_receipt, comparison)
+        .expect("lossless Task 6 receipt conversion");
+    assert_eq!(observed.receipt_id, "indexed-call-edge:fixture");
+    assert_eq!(observed.edge_id, -42);
+    assert_eq!(observed.caller, "crate::start");
+    assert_eq!(observed.callsite_line, 1);
+    assert_eq!(observed.line_window.byte_start, 11);
+    assert_eq!(observed.target, "crate::target_0");
 }
 
 fn assert_valid_first_zero(gate: &str, kind: &str, reason: &str) {
     let mut value = report();
-    value["cases"][0]["proof_trace"]["steps"][0]["outcome"] = json!({
+    let case = &mut value["cases"][0];
+    let observed = case["receipt_evidence"]["observed_receipts"]
+        .as_array_mut()
+        .expect("observed receipts")
+        .remove(0);
+    case["product_disposition"] = json!({
+        "kind":"unknown","gaps":["relation_missing"],"authoritative_receipts":[]
+    });
+    case["actionable_exact_gap"] = json!("relation_missing");
+    case["receipt_evidence"]["missing_oracle_steps"] = json!([{
+        "step_index":0,"oracle_step":observed["oracle_comparison"]["oracle_step"]
+    }]);
+    case["proof_trace"]["steps"][0]["outcome"] = json!({
         "kind":"first_zero_survivor",
         "gate":gate,
         "histogram":[{"reason":{"kind":kind,"reason":reason},"edge_ids":[1]}]
@@ -670,12 +775,23 @@ fn assert_valid_first_zero(gate: &str, kind: &str, reason: &str) {
 
 fn make_non_proven_case(value: &mut Value, disposition: &str, gap: Option<&str>) {
     let case = &mut value["cases"][0];
-    case["receipt_comparisons"][0]["result"] = json!("missing");
-    case["authoritative_receipt_count"] = json!(0);
-    case["oracle_receipts_exact"] = json!(false);
-    case["proven_prefix_length"] = json!(0);
-    case["product_disposition"] =
-        json!({"kind":disposition,"gaps":gap.into_iter().collect::<Vec<_>>()});
+    let missing = case["receipt_evidence"]["observed_receipts"]
+        .as_array()
+        .expect("observed receipts")
+        .iter()
+        .map(|receipt| {
+            json!({
+                "step_index":receipt["step_index"],
+                "oracle_step":receipt["oracle_comparison"]["oracle_step"]
+            })
+        })
+        .collect::<Vec<_>>();
+    case["receipt_evidence"]["missing_oracle_steps"] = Value::Array(missing);
+    case["product_disposition"] = json!({
+        "kind":disposition,
+        "gaps":gap.into_iter().collect::<Vec<_>>(),
+        "authoritative_receipts":[]
+    });
     case["actionable_exact_gap"] = gap.map(Value::from).unwrap_or(Value::Null);
 }
 
@@ -692,9 +808,17 @@ fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
     }
     let mut mismatched_receipt = report();
     make_non_proven_case(&mut mismatched_receipt, "invalid", None);
-    mismatched_receipt["cases"][0]["receipt_comparisons"][0]["result"] = json!("mismatched");
+    mismatched_receipt["cases"][0]["receipt_evidence"]["observed_receipts"][0]["target"] =
+        json!("crate::false_positive");
+    let oracle = mismatched_receipt["cases"][0]["receipt_evidence"]["observed_receipts"]
+        [0]["oracle_comparison"]["oracle_step"]
+        .clone();
+    mismatched_receipt["cases"][0]["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"] = json!({
+        "kind":"mismatched","oracle_step_index":0,"oracle_step":oracle,
+        "mismatches":["target"]
+    });
     QualificationSummaryV1::from_json(mismatched_receipt)
-        .expect("closed mismatched receipt result");
+        .expect("closed mismatched receipt comparison");
     for gap in [
         "selector_missing",
         "selector_ambiguous",
@@ -720,26 +844,33 @@ fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
         "stable_threshold",
         "experimental_usefulness",
     ] {
-        let mut value = report();
-        value["decision"]["failed_gates"][0]["kind"] = json!(gate);
-        QualificationSummaryV1::from_json(value).expect("closed qualification gate");
+        let value: ActivationDecisionV1 = serde_json::from_value(json!({
+            "outcome":"keep_proof_dark","automatic_thresholds_met":false,
+            "failed_gates":[{"gate_id":format!("{gate}-gate"),"kind":gate,
+                "detail":{"kind":"count","observed":"1","required":"1"}}]
+        }))
+        .expect("closed qualification gate");
+        value.validate().expect("valid count gate detail");
     }
     for outcome in [
         "public_exact_verifier",
         "experimental_manual_verifier",
         "keep_proof_dark",
     ] {
-        let mut value = report();
-        value["decision"]["outcome"] = json!(outcome);
-        QualificationSummaryV1::from_json(value).expect("closed activation outcome");
+        let value: ActivationDecisionV1 = serde_json::from_value(json!({
+            "outcome":outcome,"automatic_thresholds_met":false,"failed_gates":[]
+        }))
+        .expect("closed activation outcome");
+        value.validate().expect("non-delay outcome");
     }
-    let mut transport_dependency = report();
-    transport_dependency["decision"] = json!({
+    let transport_dependency: ActivationDecisionV1 = serde_json::from_value(json!({
         "outcome":"delay_full_v3_cut",
         "automatic_thresholds_met":null,
         "failed_gates":[{"gate_id":"transport-keep-dark-dependency","kind":"integration_dependency","detail":{"kind":"source_dependency","evidence":{"source_path":"src/lib.rs","source_range":range(0,10),"source_sha256":SHA,"dependency":"transport_cannot_represent_keep_dark","passing_test":{"test_id":"transport_cannot_represent_keep_dark","kind":"transport_cannot_represent_keep_dark","status":"passed"}}}}]
-    });
-    QualificationSummaryV1::from_json(transport_dependency)
+    }))
+    .expect("second source dependency variant");
+    transport_dependency
+        .validate()
         .expect("second source dependency variant");
 }
 
@@ -796,14 +927,57 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
         65536
     );
     assert_eq!(
-        contracts::schema_json(SchemaDocument::Report)["$defs"]["CaseReportV1"]["properties"]["receipt_comparisons"]
-            ["minItems"],
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["ProductDispositionV1"]["properties"]
+            ["authoritative_receipts"]["maxItems"],
+        6
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["ObservedReceiptV1"]["properties"]
+            ["step_index"]["maximum"],
+        5
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["MissingOracleStepV1"]["properties"]
+            ["step_index"]["maximum"],
+        5
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["ObservedReceiptV1"]["properties"]
+            ["receipt_id"]["minLength"],
         1
     );
-    assert!(contracts::schema_json(SchemaDocument::Report)["$defs"]["ActivationDecisionV1"]
-        ["properties"]["failed_gates"]
-        .get("maxItems")
-        .is_none());
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["ReceiptEvidenceV1"]["properties"]
+            ["missing_oracle_steps"]["maxItems"],
+        6
+    );
+    assert!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["ReceiptEvidenceV1"]["properties"]
+            ["observed_receipts"]
+            .get("maxItems")
+            .is_none(),
+        "Task 6 bounds admitted receipts by the proof budget, not by step count"
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["ObservedLineWindowV1"]["properties"]
+            ["kind"]["const"],
+        "indexed_line_v1"
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["ObservedLineWindowV1"]["properties"]
+            ["text"]["maxLength"],
+        8192
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["ReceiptOracleComparisonV1"]["oneOf"]
+            [1]["properties"]["mismatches"]["maxItems"],
+        4
+    );
+    assert!(
+        contracts::schema_json(SchemaDocument::Report)["properties"]
+            .get("decision")
+            .is_none()
+    );
 }
 
 #[test]
@@ -892,4 +1066,226 @@ fn write_checked_in_schemas() {
             serde_json::to_string_pretty(&contracts::schema_json(document)).expect("render");
         std::fs::write(root.join(name), format!("{rendered}\n")).expect("write");
     }
+}
+
+#[test]
+fn producer_receipts_allow_multiple_rows_per_step_and_derive_metrics() {
+    let mut value = report();
+    add_extra_observed_receipt(&mut value, false);
+
+    let parsed = QualificationSummaryV1::from_json(value)
+        .expect("Task 6 may admit multiple receipt-bearing edges for one step");
+    parsed
+        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("corpus"))
+        .expect("both rows bind the same frozen oracle step");
+    let case = parsed.cases[0]
+        .receipt_metrics()
+        .expect("derived case metrics");
+    assert_eq!(case.observed_receipt_count, 2);
+    assert_eq!(case.authoritative_receipt_count, 1);
+    assert_eq!(case.proven_step_precision_milli, 1000);
+    assert_eq!(case.proven_step_recall_milli, 1000);
+    let aggregate = parsed.receipt_metrics().expect("derived aggregate metrics");
+    assert_eq!(aggregate.observed_receipt_count, 313);
+    assert_eq!(aggregate.authoritative_receipt_count, 312);
+    assert_eq!(aggregate.positive_step_precision_milli, 1000);
+    assert_eq!(aggregate.positive_step_recall_milli, 1000);
+}
+
+#[test]
+fn false_positive_extra_edges_remain_observed_without_becoming_authoritative() {
+    let mut value = report();
+    add_extra_observed_receipt(&mut value, true);
+
+    let mut falsely_authoritative = value.clone();
+    let extra =
+        falsely_authoritative["cases"][0]["receipt_evidence"]["observed_receipts"][1].clone();
+    falsely_authoritative["cases"][0]["product_disposition"]["authoritative_receipts"]
+        .as_array_mut()
+        .expect("authoritative receipts")
+        .push(json!({"receipt_id":extra["receipt_id"],"edge_id":extra["edge_id"]}));
+    QualificationSummaryV1::from_json(falsely_authoritative)
+        .expect_err("a mismatched extra cannot become authoritative ContractProven evidence");
+
+    let parsed = QualificationSummaryV1::from_json(value)
+        .expect("an honest false-positive extra remains concrete diagnostic evidence");
+    parsed
+        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("corpus"))
+        .expect("the mismatched comparison binds the exact frozen oracle row");
+    let metrics = parsed.cases[0].receipt_metrics().expect("derived metrics");
+    assert_eq!(metrics.observed_receipt_count, 2);
+    assert_eq!(metrics.false_positive_receipt_count, 1);
+    assert_eq!(metrics.authoritative_receipt_count, 1);
+    assert!(metrics.all_authoritative_receipts_exact);
+}
+
+#[test]
+fn receipts_unrelated_to_task6_admitted_edges_are_rejected() {
+    let mut value = report();
+    value["cases"][0]["receipt_evidence"]["observed_receipts"][0]["edge_id"] = json!(999_999);
+    value["cases"][0]["product_disposition"]["authoritative_receipts"][0]["edge_id"] =
+        json!(999_999);
+
+    QualificationSummaryV1::from_json(value)
+        .expect_err("every observed receipt edge must come from the matching admitted step");
+}
+
+#[test]
+fn exact_oracle_claims_reject_mismatched_line_window_and_target() {
+    let mut line = report();
+    line["cases"][0]["receipt_evidence"]["observed_receipts"][0]["callsite_line"] = json!(999);
+    line["cases"][0]["receipt_evidence"]["observed_receipts"][0]["callsite_identity"] =
+        json!("1:999:0:2|fixture");
+    QualificationSummaryV1::from_json(line)
+        .expect_err("an exact oracle claim cannot carry a mismatched callsite line");
+
+    let mut window = report();
+    window["cases"][0]["receipt_evidence"]["observed_receipts"][0]["line_window"]["byte_start"] =
+        json!(12);
+    window["cases"][0]["receipt_evidence"]["observed_receipts"][0]["line_window"]["text"] =
+        json!("all();\n");
+    QualificationSummaryV1::from_json(window)
+        .expect_err("an exact oracle claim cannot carry a mismatched byte window");
+
+    let mut target = report();
+    target["cases"][0]["receipt_evidence"]["observed_receipts"][0]["target"] =
+        json!("crate::wrong_target");
+    QualificationSummaryV1::from_json(target)
+        .expect_err("an exact oracle claim cannot carry a mismatched target");
+}
+
+#[test]
+fn missing_oracle_steps_are_separate_exact_rows() {
+    let mut value = report();
+    let case = &mut value["cases"][0];
+    let observed = case["receipt_evidence"]["observed_receipts"]
+        .as_array_mut()
+        .expect("observed receipts")
+        .remove(0);
+    case["product_disposition"]["authoritative_receipts"]
+        .as_array_mut()
+        .expect("authoritative receipts")
+        .remove(0);
+    case["receipt_evidence"]["missing_oracle_steps"] = json!([{
+        "step_index":0,
+        "oracle_step":observed["oracle_comparison"]["oracle_step"]
+    }]);
+    case["product_disposition"] = json!({
+        "kind":"unknown","gaps":["relation_missing"],"authoritative_receipts":[]
+    });
+    case["actionable_exact_gap"] = json!("relation_missing");
+    case["proof_trace"]["steps"][0]["outcome"] = json!({
+        "kind":"first_zero_survivor","gate":"raw_admission",
+        "histogram":[{"reason":{"kind":"raw_admission","reason":"wrong_kind"},"edge_ids":[1]}]
+    });
+    rebuild_funnel(&mut value);
+
+    let mut omitted = value.clone();
+    omitted["cases"][0]["receipt_evidence"]["missing_oracle_steps"] = json!([]);
+    QualificationSummaryV1::from_json(omitted)
+        .expect_err("an uncovered oracle step requires separate missing evidence");
+    let mut wrong_oracle = value.clone();
+    wrong_oracle["cases"][0]["receipt_evidence"]["missing_oracle_steps"][0]["oracle_step"]["target"]
+        ["symbol"] = json!("crate::wrong_target");
+    QualificationSummaryV1::from_json(wrong_oracle)
+        .expect("missing row is structurally closed")
+        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("corpus"))
+        .expect_err("missing row must carry the exact frozen oracle data");
+
+    let parsed = QualificationSummaryV1::from_json(value).expect("separate missing oracle row");
+    parsed
+        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("corpus"))
+        .expect("missing row carries the exact frozen oracle step");
+    let metrics = parsed.cases[0].receipt_metrics().expect("derived metrics");
+    assert_eq!(metrics.observed_receipt_count, 0);
+    assert_eq!(metrics.missing_oracle_step_count, 1);
+    assert_eq!(metrics.proven_step_recall_milli, 0);
+}
+
+#[test]
+fn caller_supplied_metrics_and_precomputed_activation_outcomes_are_rejected() {
+    let mut empty_receipt = report();
+    empty_receipt["cases"][0]["receipt_evidence"]["observed_receipts"][0]["receipt_id"] = json!("");
+    empty_receipt["cases"][0]["product_disposition"]["authoritative_receipts"][0]["receipt_id"] =
+        json!("");
+    QualificationSummaryV1::from_json(empty_receipt)
+        .expect_err("receipt IDs are producer identities, never empty strings");
+
+    for field in [
+        "authoritative_receipt_count",
+        "oracle_receipts_exact",
+        "proven_step_precision_milli",
+        "proven_step_recall_milli",
+        "proven_prefix_length",
+        "diagnostic_candidate_count",
+        "authoritative_receipt_evidence_count",
+    ] {
+        let mut value = report();
+        value["cases"][0][field] = json!(1000);
+        QualificationSummaryV1::from_json(value)
+            .expect_err("derived metrics are not accepted report inputs");
+    }
+
+    let mut value = report();
+    value["decision"] = json!({
+        "outcome": "public_exact_verifier",
+        "failed_gates": [{
+            "gate_id": "hard-receipt-mismatch",
+            "kind": "receipt_mismatch",
+            "detail": {"kind": "count", "observed": "1", "required": "0"}
+        }],
+        "automatic_thresholds_met": true
+    });
+
+    QualificationSummaryV1::from_json(value)
+        .expect_err("Task 9 owns activation decisions; Task 7 must not accept a contradiction");
+}
+
+#[test]
+fn all_materialization_freshness_variants_are_closed_and_representable() {
+    for freshness in ["fresh", "stale", "missing"] {
+        let mut value = report();
+        value["environment"]["projects"][0]["freshness"] = json!(freshness);
+        QualificationSummaryV1::from_json(value).expect("closed freshness variant");
+    }
+    let mut unknown = report();
+    unknown["environment"]["projects"][0]["freshness"] = json!("unknown");
+    QualificationSummaryV1::from_json(unknown).expect_err("freshness is a closed enum");
+}
+
+fn add_extra_observed_receipt(value: &mut Value, mismatched: bool) {
+    let case = &mut value["cases"][0];
+    let step = &mut case["proof_trace"]["steps"][0];
+    let original_edge = step["candidate_edge_ids"][0]
+        .as_i64()
+        .expect("fixture edge id");
+    let extra_edge = original_edge + 1_000_000;
+    step["candidate_edge_ids"]
+        .as_array_mut()
+        .expect("candidate ids")
+        .push(json!(extra_edge));
+    step["outcome"]["edge_ids"]
+        .as_array_mut()
+        .expect("admitted ids")
+        .push(json!(extra_edge));
+    let mut extra = case["receipt_evidence"]["observed_receipts"][0].clone();
+    extra["receipt_id"] = json!(format!("indexed-call-edge:extra-{extra_edge}"));
+    extra["edge_id"] = json!(extra_edge);
+    extra["callsite_identity"] = json!("1:1:0:2|extra");
+    if mismatched {
+        extra["caller"] = json!("crate::false_caller");
+        extra["callsite_line"] = json!(99);
+        extra["callsite_identity"] = json!("1:99:0:2|extra");
+        extra["line_window"]["project_file_components"] = json!(["other.rs"]);
+        extra["target"] = json!("crate::false_positive");
+        let oracle = extra["oracle_comparison"]["oracle_step"].clone();
+        extra["oracle_comparison"] = json!({
+            "kind":"mismatched","oracle_step_index":0,"oracle_step":oracle,
+            "mismatches":["caller","callsite_line","callsite_window","target"]
+        });
+    }
+    case["receipt_evidence"]["observed_receipts"]
+        .as_array_mut()
+        .expect("observed receipts")
+        .push(extra);
 }

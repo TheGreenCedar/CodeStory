@@ -76,10 +76,11 @@ pub struct CallPathSpecV1 {
     pub targets: Vec<String>,
     pub expected_step_count: u8,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OracleStepV1 {
     pub caller: OracleDeclarationV1,
+    pub callsite_line: u32,
     pub callsite: OracleSourceRangeV1,
     pub target: OracleDeclarationV1,
 }
@@ -166,7 +167,7 @@ impl OraclePathV1 {
             range(&c.range)?;
         }
         for (index, step) in self.oracle_steps.iter().enumerate() {
-            if empty(&step.caller.symbol) || empty(&step.target.symbol) {
+            if empty(&step.caller.symbol) || step.callsite_line == 0 || empty(&step.target.symbol) {
                 bail!("proof_availability_oracle_declaration_invalid")
             }
             range(&step.caller.range)?;
@@ -327,7 +328,7 @@ impl CorpusV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HardGatesV1 {
     pub maximum_false_contract_proven: u16,
@@ -342,7 +343,7 @@ pub struct HardGatesV1 {
     pub require_each_cohort: bool,
     pub require_product_disposition_match: bool,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RoleThresholdsV1 {
     pub minimum_full_proofs: u16,
@@ -402,29 +403,46 @@ impl ThresholdsV1 {
             || self.hard_gates.maximum_proof_bytes != 65536
             || !self.hard_gates.require_each_cohort
             || !self.hard_gates.require_product_disposition_match
+            || self.automatic
+                != frozen_role_thresholds(96, 21, 720, 500, 900, 950, 950, 500, 1500, 32768, 16384)
+            || self.stable_explicit
+                != frozen_role_thresholds(60, 12, 410, 240, 750, 800, 900, 1000, 2000, 32768, 16384)
+            || self.experimental
+                != frozen_role_thresholds(24, 12, 140, 0, 500, 600, 800, 2000, 3000, 49152, 24576)
         {
             bail!("proof_availability_thresholds_invalid")
         }
-        for role in [&self.automatic, &self.stable_explicit, &self.experimental] {
-            if role.minimum_full_proofs > 120
-                || role.minimum_full_proofs_per_cohort > 30
-                || [
-                    role.minimum_full_proof_wilson_lower_milli,
-                    role.minimum_cohort_wilson_lower_milli,
-                    role.minimum_positive_step_recall_milli,
-                    role.minimum_full_or_useful_partial_milli,
-                    role.minimum_actionable_exact_gap_milli,
-                ]
-                .iter()
-                .any(|v| *v > 1000)
-                || role.maximum_response_bytes != 65536
-                || role.maximum_complete_response_p95_bytes > 65536
-                || role.maximum_unknown_response_p95_bytes > 65536
-            {
-                bail!("proof_availability_role_threshold_invalid")
-            }
-        }
         Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn frozen_role_thresholds(
+    minimum_full_proofs: u16,
+    minimum_full_proofs_per_cohort: u16,
+    minimum_full_proof_wilson_lower_milli: u16,
+    minimum_cohort_wilson_lower_milli: u16,
+    minimum_positive_step_recall_milli: u16,
+    minimum_full_or_useful_partial_milli: u16,
+    minimum_actionable_exact_gap_milli: u16,
+    maximum_unknown_p95_ms: u64,
+    maximum_transport_p95_ms: u64,
+    maximum_complete_response_p95_bytes: u64,
+    maximum_unknown_response_p95_bytes: u64,
+) -> RoleThresholdsV1 {
+    RoleThresholdsV1 {
+        minimum_full_proofs,
+        minimum_full_proofs_per_cohort,
+        minimum_full_proof_wilson_lower_milli,
+        minimum_cohort_wilson_lower_milli,
+        minimum_positive_step_recall_milli,
+        minimum_full_or_useful_partial_milli,
+        minimum_actionable_exact_gap_milli,
+        maximum_unknown_p95_ms,
+        maximum_transport_p95_ms,
+        maximum_complete_response_p95_bytes,
+        maximum_unknown_response_p95_bytes,
+        maximum_response_bytes: 65_536,
     }
 }
 
@@ -910,8 +928,17 @@ pub enum ProductDispositionKindV1 {
 pub struct ProductDispositionV1 {
     pub kind: ProductDispositionKindV1,
     pub gaps: Vec<TypedGapV1>,
+    pub authoritative_receipts: Vec<ReceiptReferenceV1>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptReferenceV1 {
+    pub receipt_id: String,
+    pub edge_id: i64,
+}
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TypedGapV1 {
     SelectorMissing,
@@ -1044,24 +1071,125 @@ pub struct NegativeMutationResultV1 {
     pub target: String,
     pub contract_proven: bool,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum ReceiptMatchResultV1 {
-    Exact,
-    Missing,
-    Mismatched,
+pub enum ReceiptMismatchFieldV1 {
+    Caller,
+    CallsiteLine,
+    CallsiteWindow,
+    Target,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReceiptOracleComparisonV1 {
+    Exact {
+        oracle_step_index: u8,
+        oracle_step: OracleStepV1,
+    },
+    Mismatched {
+        oracle_step_index: u8,
+        oracle_step: OracleStepV1,
+        mismatches: Vec<ReceiptMismatchFieldV1>,
+    },
+}
+impl ReceiptOracleComparisonV1 {
+    fn oracle_step_index(&self) -> u8 {
+        match self {
+            Self::Exact {
+                oracle_step_index, ..
+            }
+            | Self::Mismatched {
+                oracle_step_index, ..
+            } => *oracle_step_index,
+        }
+    }
+
+    fn oracle_step(&self) -> &OracleStepV1 {
+        match self {
+            Self::Exact { oracle_step, .. } | Self::Mismatched { oracle_step, .. } => oracle_step,
+        }
+    }
+
+    fn is_exact(&self) -> bool {
+        matches!(self, Self::Exact { .. })
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ReceiptComparisonV1 {
-    pub oracle_step_index: u8,
-    pub caller: String,
+pub struct ObservedLineWindowV1 {
+    pub kind: String,
+    pub project_file_components: Vec<String>,
+    pub indexed_sha256: String,
+    pub observed_sha256: String,
+    pub byte_start: u64,
+    pub byte_end: u64,
+    pub text: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedReceiptV1 {
+    pub receipt_id: String,
+    pub step_index: u8,
     pub edge_id: i64,
-    pub callsite_id: String,
-    pub exact_line: u64,
-    pub exact_window: OracleSourceRangeV1,
+    pub caller: String,
+    pub callsite_identity: String,
+    pub callsite_line: u32,
+    pub line_window: ObservedLineWindowV1,
     pub target: String,
-    pub result: ReceiptMatchResultV1,
+    pub oracle_comparison: ReceiptOracleComparisonV1,
+}
+impl ObservedReceiptV1 {
+    pub fn from_task6(
+        step_index: u8,
+        receipt: &codestory_agent::proof_qualification_support::IndexedCallEdgeReceipt,
+        oracle_comparison: ReceiptOracleComparisonV1,
+    ) -> Result<Self> {
+        let observed = Self {
+            receipt_id: receipt.receipt.receipt_id.clone(),
+            step_index,
+            edge_id: receipt
+                .receipt
+                .edge_id
+                .parse()
+                .map_err(|_| anyhow::anyhow!("proof_availability_receipt_edge_id_invalid"))?,
+            caller: receipt.source.qualified_name.clone(),
+            callsite_identity: receipt.callsite_identity.clone(),
+            callsite_line: receipt.line_window.anchor_line,
+            line_window: ObservedLineWindowV1 {
+                kind: receipt.line_window.kind.to_owned(),
+                project_file_components: receipt.line_window.project_file_components.clone(),
+                indexed_sha256: receipt.line_window.indexed_sha256.clone(),
+                observed_sha256: receipt.line_window.observed_sha256.clone(),
+                byte_start: u64::try_from(receipt.line_window.byte_start)
+                    .map_err(|_| anyhow::anyhow!("proof_availability_receipt_window_overflow"))?,
+                byte_end: u64::try_from(receipt.line_window.byte_end)
+                    .map_err(|_| anyhow::anyhow!("proof_availability_receipt_window_overflow"))?,
+                text: receipt.line_window.text.clone(),
+            },
+            target: receipt.target.qualified_name.clone(),
+            oracle_comparison,
+        };
+        if observed.oracle_comparison.oracle_step_index() != step_index
+            || !valid_observed_receipt(&observed)
+        {
+            bail!("proof_availability_receipt_oracle_comparison_invalid")
+        }
+        Ok(observed)
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MissingOracleStepV1 {
+    pub step_index: u8,
+    pub oracle_step: OracleStepV1,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptEvidenceV1 {
+    pub observed_receipts: Vec<ObservedReceiptV1>,
+    pub missing_oracle_steps: Vec<MissingOracleStepV1>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1069,23 +1197,123 @@ pub struct CaseReportV1 {
     pub case_id: String,
     pub repository_id: String,
     pub product_disposition: ProductDispositionV1,
-    pub authoritative_receipt_count: u64,
-    pub oracle_receipts_exact: bool,
-    pub proven_step_precision_milli: u16,
-    pub proven_step_recall_milli: u16,
-    pub proven_prefix_length: u8,
     pub actionable_exact_gap: Option<TypedGapV1>,
-    pub diagnostic_candidate_count: u64,
-    pub authoritative_receipt_evidence_count: u64,
     pub warm_end_to_end_ms: u64,
     pub stage_durations_ms: StageDurationsV1,
     pub attempted_step_count: u8,
     pub unclassified_step_indices: Vec<u8>,
-    pub receipt_comparisons: Vec<ReceiptComparisonV1>,
+    pub receipt_evidence: ReceiptEvidenceV1,
     pub complete_projection_bytes: u64,
     pub transport: TransportEvidenceV1,
     pub negative_mutations: Vec<NegativeMutationResultV1>,
     pub proof_trace: ProofQualificationTraceV1,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CaseReceiptMetricsV1 {
+    pub observed_receipt_count: u64,
+    pub authoritative_receipt_count: u64,
+    pub authoritative_exact_receipt_count: u64,
+    pub false_positive_receipt_count: u64,
+    pub missing_oracle_step_count: u8,
+    pub exact_oracle_step_count: u8,
+    pub all_authoritative_receipts_exact: bool,
+    pub oracle_receipts_exact: bool,
+    pub proven_step_precision_milli: u16,
+    pub proven_step_recall_milli: u16,
+    pub proven_prefix_length: u8,
+    pub diagnostic_candidate_count: u64,
+}
+impl CaseReportV1 {
+    pub fn receipt_metrics(&self) -> Result<CaseReceiptMetricsV1> {
+        let authoritative = self
+            .product_disposition
+            .authoritative_receipts
+            .iter()
+            .map(|reference| {
+                self.receipt_evidence
+                    .observed_receipts
+                    .iter()
+                    .find(|receipt| {
+                        receipt.receipt_id == reference.receipt_id
+                            && receipt.edge_id == reference.edge_id
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("proof_availability_authoritative_receipt_missing")
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let exact_authoritative = authoritative
+            .iter()
+            .filter(|receipt| receipt.oracle_comparison.is_exact())
+            .copied()
+            .collect::<Vec<_>>();
+        let exact_steps = exact_authoritative
+            .iter()
+            .map(|receipt| receipt.step_index)
+            .collect::<BTreeSet<_>>();
+        let mut proven_prefix_length = 0u8;
+        while proven_prefix_length < self.attempted_step_count
+            && exact_steps.contains(&proven_prefix_length)
+        {
+            proven_prefix_length += 1;
+        }
+        let authoritative_receipt_count = u64::try_from(authoritative.len())?;
+        let authoritative_exact_receipt_count = u64::try_from(exact_authoritative.len())?;
+        let exact_oracle_step_count = u8::try_from(exact_steps.len())?;
+        let missing_oracle_step_count =
+            u8::try_from(self.receipt_evidence.missing_oracle_steps.len())?;
+        let all_authoritative_receipts_exact =
+            authoritative_receipt_count == authoritative_exact_receipt_count;
+        Ok(CaseReceiptMetricsV1 {
+            observed_receipt_count: u64::try_from(self.receipt_evidence.observed_receipts.len())?,
+            authoritative_receipt_count,
+            authoritative_exact_receipt_count,
+            false_positive_receipt_count: u64::try_from(
+                self.receipt_evidence
+                    .observed_receipts
+                    .iter()
+                    .filter(|receipt| !receipt.oracle_comparison.is_exact())
+                    .count(),
+            )?,
+            missing_oracle_step_count,
+            exact_oracle_step_count,
+            all_authoritative_receipts_exact,
+            oracle_receipts_exact: all_authoritative_receipts_exact
+                && exact_oracle_step_count == self.attempted_step_count
+                && missing_oracle_step_count == 0,
+            proven_step_precision_milli: ratio_milli(
+                authoritative_exact_receipt_count,
+                authoritative_receipt_count,
+            )?,
+            proven_step_recall_milli: ratio_milli(
+                u64::from(exact_oracle_step_count),
+                u64::from(self.attempted_step_count),
+            )?,
+            proven_prefix_length,
+            diagnostic_candidate_count: self
+                .proof_trace
+                .steps
+                .iter()
+                .try_fold(0u64, |total, step| {
+                    total.checked_add(u64::try_from(step.candidate_edge_ids.len()).ok()?)
+                })
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_candidate_count_overflow"))?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct QualificationReceiptMetricsV1 {
+    pub observed_receipt_count: u64,
+    pub authoritative_receipt_count: u64,
+    pub authoritative_exact_receipt_count: u64,
+    pub false_positive_receipt_count: u64,
+    pub missing_oracle_step_count: u16,
+    pub exact_oracle_step_count: u16,
+    pub all_authoritative_receipts_exact: bool,
+    pub positive_step_precision_milli: u16,
+    pub positive_step_recall_milli: u16,
+    pub proven_prefix_step_count: u16,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1210,6 +1438,23 @@ pub struct ActivationDecisionV1 {
     pub failed_gates: Vec<FailedGateV1>,
     pub automatic_thresholds_met: Option<bool>,
 }
+impl ActivationDecisionV1 {
+    pub fn validate(&self) -> Result<()> {
+        if !unique(self.failed_gates.iter().map(|gate| gate.gate_id.as_str()))
+            || self
+                .failed_gates
+                .iter()
+                .any(|gate| empty(&gate.gate_id) || !valid_gate_detail(&gate.kind, &gate.detail))
+            || (matches!(self.outcome, ActivationOutcomeV1::DelayFullV3Cut)
+                && !self.failed_gates.iter().any(|gate| {
+                    matches!(gate.detail, GateFailureDetailV1::SourceDependency { .. })
+                }))
+        {
+            bail!("proof_availability_decision_invalid")
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationSummaryV1 {
@@ -1221,7 +1466,6 @@ pub struct QualificationSummaryV1 {
     pub trails: Vec<TrailReportV1>,
     pub cases: Vec<CaseReportV1>,
     pub failure_funnel: FailureFunnelReportV1,
-    pub decision: ActivationDecisionV1,
 }
 impl QualificationSummaryV1 {
     pub fn from_json(value: Value) -> Result<Self> {
@@ -1329,14 +1573,14 @@ impl QualificationSummaryV1 {
         let mut expected_unclassified = 0u16;
         let mut mutation_ids = BTreeSet::new();
         for c in &self.cases {
-            if c.negative_mutations.len() != 2
-                || c.proven_step_precision_milli > 1000
-                || c.proven_step_recall_milli > 1000
+            let receipt_metrics = c.receipt_metrics()?;
+            if empty(&c.case_id)
+                || empty(&c.repository_id)
+                || c.negative_mutations.len() != 2
+                || c.attempted_step_count == 0
                 || c.attempted_step_count > 6
-                || c.proven_prefix_length > c.attempted_step_count
                 || usize::from(c.attempted_step_count)
                     != c.proof_trace.steps.len() + c.unclassified_step_indices.len()
-                || c.receipt_comparisons.len() != usize::from(c.attempted_step_count)
                 || !c
                     .proof_trace
                     .selectors
@@ -1373,19 +1617,13 @@ impl QualificationSummaryV1 {
                         || empty(&mutation.target)
                 })
                 || !valid_receipts(c)
-                || !valid_disposition(c)
+                || !valid_disposition(c, &receipt_metrics)
             {
                 bail!("proof_availability_case_invalid")
             }
             *cases_per_project
                 .entry(c.repository_id.as_str())
                 .or_default() += 1;
-            let candidate_count = c.proof_trace.steps.iter().try_fold(0u64, |total, step| {
-                total.checked_add(u64::try_from(step.candidate_edge_ids.len()).ok()?)
-            });
-            if candidate_count != Some(c.diagnostic_candidate_count) {
-                bail!("proof_availability_candidate_count_invalid")
-            }
             attempted_total = attempted_total
                 .checked_add(u16::from(c.attempted_step_count))
                 .ok_or_else(|| anyhow::anyhow!("proof_availability_attempted_steps_overflow"))?;
@@ -1437,35 +1675,65 @@ impl QualificationSummaryV1 {
         if expected_funnel != actual_funnel {
             bail!("proof_availability_funnel_evidence_mismatch")
         }
-        if !unique(
-            self.decision
-                .failed_gates
-                .iter()
-                .map(|g| g.gate_id.as_str()),
-        ) {
-            bail!("proof_availability_decision_invalid")
-        }
-        for gate in &self.decision.failed_gates {
-            if !valid_gate_detail(&gate.kind, &gate.detail) {
-                bail!("proof_availability_gate_detail_invalid")
-            }
-        }
-        if matches!(self.decision.outcome, ActivationOutcomeV1::DelayFullV3Cut)
-            && !self
-                .decision
-                .failed_gates
-                .iter()
-                .any(|gate| matches!(gate.detail, GateFailureDetailV1::SourceDependency { .. }))
-        {
-            bail!("proof_availability_delay_dependency_missing")
-        }
         Ok(())
+    }
+
+    pub fn receipt_metrics(&self) -> Result<QualificationReceiptMetricsV1> {
+        let mut observed_receipt_count = 0u64;
+        let mut authoritative_receipt_count = 0u64;
+        let mut authoritative_exact_receipt_count = 0u64;
+        let mut false_positive_receipt_count = 0u64;
+        let mut missing_oracle_step_count = 0u16;
+        let mut exact_oracle_step_count = 0u16;
+        let mut proven_prefix_step_count = 0u16;
+        let mut all_authoritative_receipts_exact = true;
+        for case in &self.cases {
+            let metrics = case.receipt_metrics()?;
+            observed_receipt_count = observed_receipt_count
+                .checked_add(metrics.observed_receipt_count)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_receipt_count_overflow"))?;
+            authoritative_receipt_count = authoritative_receipt_count
+                .checked_add(metrics.authoritative_receipt_count)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_receipt_count_overflow"))?;
+            authoritative_exact_receipt_count = authoritative_exact_receipt_count
+                .checked_add(metrics.authoritative_exact_receipt_count)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_receipt_count_overflow"))?;
+            false_positive_receipt_count = false_positive_receipt_count
+                .checked_add(metrics.false_positive_receipt_count)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_receipt_count_overflow"))?;
+            missing_oracle_step_count = missing_oracle_step_count
+                .checked_add(u16::from(metrics.missing_oracle_step_count))
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_receipt_count_overflow"))?;
+            exact_oracle_step_count = exact_oracle_step_count
+                .checked_add(u16::from(metrics.exact_oracle_step_count))
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_receipt_count_overflow"))?;
+            proven_prefix_step_count = proven_prefix_step_count
+                .checked_add(u16::from(metrics.proven_prefix_length))
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_receipt_count_overflow"))?;
+            all_authoritative_receipts_exact &= metrics.all_authoritative_receipts_exact;
+        }
+        Ok(QualificationReceiptMetricsV1 {
+            observed_receipt_count,
+            authoritative_receipt_count,
+            authoritative_exact_receipt_count,
+            false_positive_receipt_count,
+            missing_oracle_step_count,
+            exact_oracle_step_count,
+            all_authoritative_receipts_exact,
+            positive_step_precision_milli: ratio_milli(
+                authoritative_exact_receipt_count,
+                authoritative_receipt_count,
+            )?,
+            positive_step_recall_milli: ratio_milli(u64::from(exact_oracle_step_count), 312)?,
+            proven_prefix_step_count,
+        })
     }
 
     pub fn validate_against_corpus(&self, corpus: &CorpusV1) -> Result<()> {
         self.validate()?;
         corpus.validate()?;
         if self.provenance.corpus_sha256 != canonical_corpus_sha256(corpus)?
+            || self.provenance.thresholds_sha256 != corpus.thresholds_sha256
             || self.provenance.binary_sha256 != self.environment.binary_sha256
         {
             bail!("proof_availability_provenance_corpus_binding_invalid")
@@ -1498,18 +1766,22 @@ impl QualificationSummaryV1 {
             {
                 bail!("proof_availability_case_oracle_mismatch")
             }
-            for receipt in &case.receipt_comparisons {
-                let Some(step) = path
-                    .oracle_steps
-                    .get(usize::from(receipt.oracle_step_index))
-                else {
+            for receipt in &case.receipt_evidence.observed_receipts {
+                let oracle_step_index = receipt.oracle_comparison.oracle_step_index();
+                let Some(step) = path.oracle_steps.get(usize::from(oracle_step_index)) else {
                     bail!("proof_availability_receipt_oracle_missing")
                 };
-                if receipt.caller != step.caller.symbol
-                    || receipt.target != step.target.symbol
-                    || receipt.exact_window != step.callsite
-                    || receipt.callsite_id != callsite_identity(&step.callsite)
+                if receipt.step_index != oracle_step_index
+                    || receipt.oracle_comparison.oracle_step() != step
                 {
+                    bail!("proof_availability_receipt_oracle_mismatch")
+                }
+            }
+            for missing in &case.receipt_evidence.missing_oracle_steps {
+                let Some(step) = path.oracle_steps.get(usize::from(missing.step_index)) else {
+                    bail!("proof_availability_receipt_oracle_missing")
+                };
+                if &missing.oracle_step != step {
                     bail!("proof_availability_receipt_oracle_mismatch")
                 }
             }
@@ -1543,10 +1815,6 @@ impl QualificationSummaryV1 {
 pub fn canonical_corpus_sha256(corpus: &CorpusV1) -> Result<String> {
     let bytes = serde_json::to_vec(corpus)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
-}
-
-fn callsite_identity(range: &OracleSourceRangeV1) -> String {
-    format!("{}:{}:{}", range.path, range.start_byte, range.end_byte)
 }
 
 fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
@@ -1699,51 +1967,235 @@ fn valid_case_finalization(case: &CaseReportV1) -> bool {
 }
 
 fn valid_receipts(case: &CaseReportV1) -> bool {
-    if !unique_u8(
-        case.receipt_comparisons
-            .iter()
-            .map(|receipt| receipt.oracle_step_index),
-    ) || case.receipt_comparisons.iter().any(|receipt| {
-        receipt.oracle_step_index >= case.attempted_step_count
-            || empty(&receipt.caller)
-            || empty(&receipt.callsite_id)
-            || receipt.exact_line == 0
-            || empty(&receipt.target)
-            || range(&receipt.exact_window).is_err()
-    }) {
+    let evidence = &case.receipt_evidence;
+    if case.product_disposition.authoritative_receipts.len() > 6
+        || evidence.missing_oracle_steps.len() > usize::from(case.attempted_step_count)
+        || !unique(
+            evidence
+                .observed_receipts
+                .iter()
+                .map(|receipt| receipt.receipt_id.as_str()),
+        )
+        || !unique_receipt_edges(
+            evidence
+                .observed_receipts
+                .iter()
+                .map(|receipt| (receipt.step_index, receipt.edge_id)),
+        )
+        || !unique_receipt_references(&case.product_disposition.authoritative_receipts)
+        || !unique_u8(
+            evidence
+                .missing_oracle_steps
+                .iter()
+                .map(|missing| missing.step_index),
+        )
+    {
         return false;
     }
-    let exact_count = case
-        .receipt_comparisons
+    let mut admitted_edges = BTreeSet::new();
+    for step in &case.proof_trace.steps {
+        if let StepQualificationOutcomeV1::Admitted { edge_ids } = &step.outcome {
+            let Ok(step_index) = u8::try_from(step.step_index) else {
+                return false;
+            };
+            for edge_id in edge_ids {
+                if !admitted_edges.insert((step_index, *edge_id)) {
+                    return false;
+                }
+            }
+        }
+    }
+    let observed_edges = evidence
+        .observed_receipts
         .iter()
-        .filter(|receipt| matches!(receipt.result, ReceiptMatchResultV1::Exact))
-        .count();
-    u64::try_from(exact_count).ok() == Some(case.authoritative_receipt_count)
-        && u64::try_from(case.receipt_comparisons.len()).ok()
-            == Some(case.authoritative_receipt_evidence_count)
-        && case.oracle_receipts_exact == (exact_count == case.receipt_comparisons.len())
+        .map(|receipt| (receipt.step_index, receipt.edge_id))
+        .collect::<BTreeSet<_>>();
+    if admitted_edges != observed_edges {
+        return false;
+    }
+    for receipt in &evidence.observed_receipts {
+        if receipt.step_index >= case.attempted_step_count || !valid_observed_receipt(receipt) {
+            return false;
+        }
+    }
+    if case
+        .product_disposition
+        .authoritative_receipts
+        .iter()
+        .any(|reference| {
+            !evidence.observed_receipts.iter().any(|receipt| {
+                receipt.receipt_id == reference.receipt_id && receipt.edge_id == reference.edge_id
+            })
+        })
+    {
+        return false;
+    }
+    let exact_authoritative_steps = case
+        .product_disposition
+        .authoritative_receipts
+        .iter()
+        .filter_map(|reference| {
+            evidence.observed_receipts.iter().find(|receipt| {
+                receipt.receipt_id == reference.receipt_id
+                    && receipt.edge_id == reference.edge_id
+                    && receipt.oracle_comparison.is_exact()
+            })
+        })
+        .map(|receipt| receipt.step_index)
+        .collect::<BTreeSet<_>>();
+    let expected_missing = (0..case.attempted_step_count)
+        .filter(|step_index| !exact_authoritative_steps.contains(step_index))
+        .collect::<BTreeSet<_>>();
+    let actual_missing = evidence
+        .missing_oracle_steps
+        .iter()
+        .map(|missing| missing.step_index)
+        .collect::<BTreeSet<_>>();
+    expected_missing == actual_missing
+        && evidence.missing_oracle_steps.iter().all(|missing| {
+            missing.step_index < case.attempted_step_count
+                && valid_oracle_step(&missing.oracle_step)
+        })
 }
 
-fn valid_disposition(case: &CaseReportV1) -> bool {
+fn valid_disposition(case: &CaseReportV1, metrics: &CaseReceiptMetricsV1) -> bool {
+    if !unique_typed_gaps(case.product_disposition.gaps.iter().copied())
+        || case
+            .actionable_exact_gap
+            .as_ref()
+            .is_some_and(|gap| !case.product_disposition.gaps.contains(gap))
+    {
+        return false;
+    }
     match case.product_disposition.kind {
         ProductDispositionKindV1::ContractProven => {
             case.product_disposition.gaps.is_empty()
                 && case.actionable_exact_gap.is_none()
-                && case.oracle_receipts_exact
-                && case.proven_prefix_length == case.attempted_step_count
+                && metrics.authoritative_receipt_count > 0
+                && metrics.oracle_receipts_exact
+                && metrics.proven_prefix_length == case.attempted_step_count
         }
         ProductDispositionKindV1::Unknown => {
-            case.proven_prefix_length < case.attempted_step_count
+            metrics.proven_prefix_length < case.attempted_step_count
                 && (!case.product_disposition.gaps.is_empty()
                     || case.actionable_exact_gap.is_some())
         }
         ProductDispositionKindV1::CertifiedAbsence => {
-            case.authoritative_receipt_count == 0 && case.proven_prefix_length == 0
+            metrics.authoritative_receipt_count == 0 && metrics.proven_prefix_length == 0
         }
-        ProductDispositionKindV1::Invalid => {
-            !case.oracle_receipts_exact || case.proven_prefix_length < case.attempted_step_count
+        ProductDispositionKindV1::Invalid => !metrics.oracle_receipts_exact,
+    }
+}
+
+fn valid_oracle_step(step: &OracleStepV1) -> bool {
+    !empty(&step.caller.symbol)
+        && step.callsite_line > 0
+        && !empty(&step.target.symbol)
+        && range(&step.caller.range).is_ok()
+        && range(&step.callsite).is_ok()
+        && range(&step.target.range).is_ok()
+}
+
+fn valid_observed_line_window(window: &ObservedLineWindowV1) -> bool {
+    window.kind == "indexed_line_v1"
+        && !window.project_file_components.is_empty()
+        && window
+            .project_file_components
+            .iter()
+            .all(|component| !empty(component) && component != "." && component != "..")
+        && hash(&window.indexed_sha256)
+        && hash(&window.observed_sha256)
+        && window.byte_start < window.byte_end
+        && !empty(&window.text)
+        && window
+            .byte_end
+            .checked_sub(window.byte_start)
+            .is_some_and(|length| {
+                length <= 8_192 && u64::try_from(window.text.len()).ok() == Some(length)
+            })
+}
+
+fn valid_observed_receipt(receipt: &ObservedReceiptV1) -> bool {
+    valid_receipt_id(&receipt.receipt_id)
+        && !empty(&receipt.caller)
+        && !empty(&receipt.target)
+        && valid_callsite_identity_line(&receipt.callsite_identity, receipt.callsite_line)
+        && receipt.oracle_comparison.oracle_step_index() == receipt.step_index
+        && valid_receipt_oracle_comparison(receipt)
+}
+
+fn valid_receipt_id(receipt_id: &str) -> bool {
+    receipt_id
+        .strip_prefix("indexed-call-edge:")
+        .is_some_and(|suffix| !empty(suffix))
+}
+
+fn valid_callsite_identity_line(identity: &str, line: u32) -> bool {
+    if empty(identity) || line == 0 {
+        return false;
+    }
+    let pre_marker = identity
+        .split_once('|')
+        .map_or(identity, |(identity, _)| identity);
+    let mut fields = pre_marker.split(':');
+    let parsed = (
+        fields.next().and_then(|value| value.parse::<i64>().ok()),
+        fields.next().and_then(|value| value.parse::<u32>().ok()),
+        fields.next().and_then(|value| value.parse::<u32>().ok()),
+        fields.next().and_then(|value| value.parse::<i64>().ok()),
+    );
+    let (Some(file), Some(parsed_line), Some(column_or_ordinal), Some(target)) = parsed else {
+        return false;
+    };
+    fields.next().is_none()
+        && parsed_line == line
+        && format!("{file}:{parsed_line}:{column_or_ordinal}:{target}") == pre_marker
+}
+
+fn valid_receipt_oracle_comparison(receipt: &ObservedReceiptV1) -> bool {
+    if !valid_observed_line_window(&receipt.line_window)
+        || !valid_oracle_step(receipt.oracle_comparison.oracle_step())
+    {
+        return false;
+    }
+    let expected = receipt_mismatches(receipt, receipt.oracle_comparison.oracle_step());
+    match &receipt.oracle_comparison {
+        ReceiptOracleComparisonV1::Exact { .. } => expected.is_empty(),
+        ReceiptOracleComparisonV1::Mismatched { mismatches, .. } => {
+            !mismatches.is_empty()
+                && strictly_ascending_mismatch_fields(mismatches)
+                && mismatches == &expected
         }
     }
+}
+
+fn receipt_mismatches(
+    receipt: &ObservedReceiptV1,
+    oracle: &OracleStepV1,
+) -> Vec<ReceiptMismatchFieldV1> {
+    let mut mismatches = Vec::new();
+    if receipt.caller != oracle.caller.symbol {
+        mismatches.push(ReceiptMismatchFieldV1::Caller);
+    }
+    if receipt.callsite_line != oracle.callsite_line {
+        mismatches.push(ReceiptMismatchFieldV1::CallsiteLine);
+    }
+    if receipt.line_window.project_file_components.join("/") != oracle.callsite.path
+        || receipt.line_window.indexed_sha256 != oracle.callsite.sha256
+        || receipt.line_window.observed_sha256 != oracle.callsite.sha256
+        || receipt.line_window.byte_start != oracle.callsite.start_byte
+        || receipt.line_window.byte_end != oracle.callsite.end_byte
+    {
+        mismatches.push(ReceiptMismatchFieldV1::CallsiteWindow);
+    }
+    if receipt.target != oracle.target.symbol {
+        mismatches.push(ReceiptMismatchFieldV1::Target);
+    }
+    mismatches
+}
+
+fn strictly_ascending_mismatch_fields(values: &[ReceiptMismatchFieldV1]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn valid_gate_detail(kind: &QualificationGateKindV1, detail: &GateFailureDetailV1) -> bool {
@@ -1857,6 +2309,8 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
                         | "source_sha256"
                         | "source_tree_sha256"
                         | "database_sha256"
+                        | "indexed_sha256"
+                        | "observed_sha256"
                 ) {
                     property.insert("pattern".into(), Value::String(SHA256.into()));
                 }
@@ -1968,6 +2422,7 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 Some(0),
                 Some(5),
             );
+            set_bounds(schema, Some("OracleStepV1"), "callsite_line", Some(1), None);
         }
         SchemaDocument::Path => {
             set_bounds(
@@ -1986,6 +2441,7 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 Some(0),
                 Some(5),
             );
+            set_bounds(schema, Some("OracleStepV1"), "callsite_line", Some(1), None);
         }
         SchemaDocument::Thresholds => {
             for (field, value) in [
@@ -2026,6 +2482,7 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
             }
         }
         SchemaDocument::Report => {
+            set_bounds(schema, Some("OracleStepV1"), "callsite_line", Some(1), None);
             set_bounds(schema, None, "inventory", Some(4), Some(4));
             set_bounds(schema, None, "trails", Some(4), Some(4));
             set_bounds(schema, None, "cases", Some(120), Some(120));
@@ -2054,33 +2511,100 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
             set_bounds(schema, Some("TrailReportV1"), "lengths", Some(6), Some(6));
             set_bounds(
                 schema,
+                Some("TrailLengthCountsV1"),
+                "length",
+                Some(1),
+                Some(6),
+            );
+            set_bounds(
+                schema,
                 Some("CaseReportV1"),
                 "attempted_step_count",
                 Some(1),
                 Some(6),
             );
-            for field in ["proven_step_precision_milli", "proven_step_recall_milli"] {
-                set_bounds(schema, Some("CaseReportV1"), field, Some(0), Some(1000));
-            }
             set_bounds(
                 schema,
-                Some("CaseReportV1"),
-                "proven_prefix_length",
+                Some("ProductDispositionV1"),
+                "authoritative_receipts",
                 Some(0),
                 Some(6),
             );
-            for field in [
-                "authoritative_receipt_count",
-                "authoritative_receipt_evidence_count",
-            ] {
-                set_bounds(schema, Some("CaseReportV1"), field, Some(0), Some(6));
-            }
             set_bounds(
                 schema,
-                Some("ReceiptComparisonV1"),
-                "exact_line",
+                Some("ProductDispositionV1"),
+                "gaps",
+                Some(0),
+                Some(6),
+            );
+            set_bounds(
+                schema,
+                Some("ObservedReceiptV1"),
+                "step_index",
+                Some(0),
+                Some(5),
+            );
+            set_bounds(
+                schema,
+                Some("ObservedReceiptV1"),
+                "callsite_line",
                 Some(1),
                 None,
+            );
+            set_bounds(
+                schema,
+                Some("MissingOracleStepV1"),
+                "step_index",
+                Some(0),
+                Some(5),
+            );
+            set_bounds(
+                schema,
+                Some("NegativeMutationResultV1"),
+                "step_index",
+                Some(0),
+                Some(5),
+            );
+            set_bounds(
+                schema,
+                Some("StepQualificationTraceV1"),
+                "step_index",
+                Some(0),
+                Some(5),
+            );
+            set_bounds(
+                schema,
+                Some("SelectorQualificationTraceV1"),
+                "selector_index",
+                Some(0),
+                Some(6),
+            );
+            set_bounds(
+                schema,
+                Some("ReceiptEvidenceV1"),
+                "observed_receipts",
+                Some(0),
+                None,
+            );
+            set_bounds(
+                schema,
+                Some("ReceiptEvidenceV1"),
+                "missing_oracle_steps",
+                Some(0),
+                Some(6),
+            );
+            set_bounds(
+                schema,
+                Some("ObservedLineWindowV1"),
+                "project_file_components",
+                Some(1),
+                None,
+            );
+            set_const(
+                schema,
+                Some("ObservedLineWindowV1"),
+                "kind",
+                Value::String("indexed_line_v1".into()),
             );
             set_bounds(
                 schema,
@@ -2126,13 +2650,6 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
             );
             set_bounds(
                 schema,
-                Some("CaseReportV1"),
-                "receipt_comparisons",
-                Some(1),
-                Some(6),
-            );
-            set_bounds(
-                schema,
                 Some("TransportMeasurementSetV1"),
                 "measurements",
                 Some(4),
@@ -2145,6 +2662,38 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 Some(0),
                 Some(65_536),
             );
+            for (definition, field) in [
+                ("ReceiptReferenceV1", "receipt_id"),
+                ("ObservedReceiptV1", "receipt_id"),
+                ("ObservedReceiptV1", "caller"),
+                ("ObservedReceiptV1", "callsite_identity"),
+                ("ObservedReceiptV1", "target"),
+                ("ObservedLineWindowV1", "kind"),
+                ("ObservedLineWindowV1", "text"),
+            ] {
+                set_min_length(schema, definition, field, 1);
+            }
+            set_max_length(schema, "ObservedLineWindowV1", "text", 8_192);
+            set_pattern(
+                schema,
+                "ReceiptReferenceV1",
+                "receipt_id",
+                "^indexed-call-edge:.+$",
+            );
+            set_pattern(
+                schema,
+                "ObservedReceiptV1",
+                "receipt_id",
+                "^indexed-call-edge:.+$",
+            );
+            set_pattern(
+                schema,
+                "ObservedReceiptV1",
+                "callsite_identity",
+                "^-?(0|[1-9][0-9]*):[1-9][0-9]*:(0|[1-9][0-9]*):-?(0|[1-9][0-9]*)(\\|.*)?$",
+            );
+            set_array_item_min_length(schema, "ObservedLineWindowV1", "project_file_components", 1);
+            annotate_receipt_comparison_bounds(schema);
         }
     }
 }
@@ -2176,6 +2725,63 @@ fn set_bounds(
                 Value::from(maximum),
             );
         }
+    }
+}
+
+fn set_min_length(schema: &mut Value, definition: &str, field: &str, minimum: u64) {
+    if let Some(property) = schema_property(schema, Some(definition), field) {
+        property.insert("minLength".into(), Value::from(minimum));
+    }
+}
+
+fn set_max_length(schema: &mut Value, definition: &str, field: &str, maximum: u64) {
+    if let Some(property) = schema_property(schema, Some(definition), field) {
+        property.insert("maxLength".into(), Value::from(maximum));
+    }
+}
+
+fn set_pattern(schema: &mut Value, definition: &str, field: &str, pattern: &str) {
+    if let Some(property) = schema_property(schema, Some(definition), field) {
+        property.insert("pattern".into(), Value::String(pattern.into()));
+    }
+}
+
+fn set_array_item_min_length(schema: &mut Value, definition: &str, field: &str, minimum: u64) {
+    if let Some(items) = schema_property(schema, Some(definition), field)
+        .and_then(|property| property.get_mut("items"))
+        .and_then(Value::as_object_mut)
+    {
+        items.insert("minLength".into(), Value::from(minimum));
+    }
+}
+
+fn annotate_receipt_comparison_bounds(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(properties) = map.get_mut("properties").and_then(Value::as_object_mut) {
+                if let Some(step_index) = properties
+                    .get_mut("oracle_step_index")
+                    .and_then(Value::as_object_mut)
+                {
+                    step_index.insert("minimum".into(), Value::from(0));
+                    step_index.insert("maximum".into(), Value::from(5));
+                }
+                if let Some(mismatches) = properties
+                    .get_mut("mismatches")
+                    .and_then(Value::as_object_mut)
+                {
+                    mismatches.insert("minItems".into(), Value::from(1));
+                    mismatches.insert("maxItems".into(), Value::from(4));
+                }
+            }
+            for value in map.values_mut() {
+                annotate_receipt_comparison_bounds(value);
+            }
+        }
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(annotate_receipt_comparison_bounds),
+        _ => {}
     }
 }
 
@@ -2302,4 +2908,35 @@ fn unique_u8(mut values: impl Iterator<Item = u8>) -> bool {
 fn unique_i64(mut values: impl Iterator<Item = i64>) -> bool {
     let mut set = BTreeSet::new();
     values.all(|value| set.insert(value))
+}
+
+fn unique_typed_gaps(mut values: impl Iterator<Item = TypedGapV1>) -> bool {
+    let mut set = BTreeSet::new();
+    values.all(|value| set.insert(value))
+}
+
+fn unique_receipt_edges(mut values: impl Iterator<Item = (u8, i64)>) -> bool {
+    let mut set = BTreeSet::new();
+    values.all(|value| set.insert(value))
+}
+
+fn unique_receipt_references(values: &[ReceiptReferenceV1]) -> bool {
+    let mut receipt_ids = BTreeSet::new();
+    let mut references = BTreeSet::new();
+    values.iter().all(|reference| {
+        valid_receipt_id(&reference.receipt_id)
+            && receipt_ids.insert(reference.receipt_id.as_str())
+            && references.insert((reference.receipt_id.as_str(), reference.edge_id))
+    })
+}
+
+fn ratio_milli(numerator: u64, denominator: u64) -> Result<u16> {
+    if denominator == 0 {
+        return Ok(0);
+    }
+    let scaled = numerator
+        .checked_mul(1000)
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_metric_overflow"))?
+        / denominator;
+    u16::try_from(scaled).map_err(Into::into)
 }

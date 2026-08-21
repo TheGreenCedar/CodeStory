@@ -1,39 +1,5 @@
 {
   "$defs": {
-    "ActivationDecisionV1": {
-      "additionalProperties": false,
-      "properties": {
-        "automatic_thresholds_met": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "failed_gates": {
-          "items": {
-            "$ref": "#/$defs/FailedGateV1"
-          },
-          "type": "array"
-        },
-        "outcome": {
-          "$ref": "#/$defs/ActivationOutcomeV1"
-        }
-      },
-      "required": [
-        "outcome",
-        "failed_gates"
-      ],
-      "type": "object"
-    },
-    "ActivationOutcomeV1": {
-      "enum": [
-        "public_exact_verifier",
-        "experimental_manual_verifier",
-        "keep_proof_dark",
-        "delay_full_v3_cut"
-      ],
-      "type": "string"
-    },
     "CandidateFailureHistogramV1": {
       "additionalProperties": false,
       "properties": {
@@ -137,29 +103,12 @@
           "minimum": 1,
           "type": "integer"
         },
-        "authoritative_receipt_count": {
-          "format": "uint64",
-          "maximum": 6,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "authoritative_receipt_evidence_count": {
-          "format": "uint64",
-          "maximum": 6,
-          "minimum": 0,
-          "type": "integer"
-        },
         "case_id": {
           "type": "string"
         },
         "complete_projection_bytes": {
           "format": "uint64",
           "maximum": 65536,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "diagnostic_candidate_count": {
-          "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
@@ -171,40 +120,14 @@
           "minItems": 2,
           "type": "array"
         },
-        "oracle_receipts_exact": {
-          "type": "boolean"
-        },
         "product_disposition": {
           "$ref": "#/$defs/ProductDispositionV1"
         },
         "proof_trace": {
           "$ref": "#/$defs/ProofQualificationTraceV1"
         },
-        "proven_prefix_length": {
-          "format": "uint8",
-          "maximum": 6,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "proven_step_precision_milli": {
-          "format": "uint16",
-          "maximum": 1000,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "proven_step_recall_milli": {
-          "format": "uint16",
-          "maximum": 1000,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "receipt_comparisons": {
-          "items": {
-            "$ref": "#/$defs/ReceiptComparisonV1"
-          },
-          "maxItems": 6,
-          "minItems": 1,
-          "type": "array"
+        "receipt_evidence": {
+          "$ref": "#/$defs/ReceiptEvidenceV1"
         },
         "repository_id": {
           "type": "string"
@@ -236,18 +159,11 @@
         "case_id",
         "repository_id",
         "product_disposition",
-        "authoritative_receipt_count",
-        "oracle_receipts_exact",
-        "proven_step_precision_milli",
-        "proven_step_recall_milli",
-        "proven_prefix_length",
-        "diagnostic_candidate_count",
-        "authoritative_receipt_evidence_count",
         "warm_end_to_end_ms",
         "stage_durations_ms",
         "attempted_step_count",
         "unclassified_step_indices",
-        "receipt_comparisons",
+        "receipt_evidence",
         "complete_projection_bytes",
         "transport",
         "negative_mutations",
@@ -298,26 +214,6 @@
         "rust_host",
         "binary_sha256",
         "projects"
-      ],
-      "type": "object"
-    },
-    "FailedGateV1": {
-      "additionalProperties": false,
-      "properties": {
-        "detail": {
-          "$ref": "#/$defs/GateFailureDetailV1"
-        },
-        "gate_id": {
-          "type": "string"
-        },
-        "kind": {
-          "$ref": "#/$defs/QualificationGateKindV1"
-        }
-      },
-      "required": [
-        "gate_id",
-        "kind",
-        "detail"
       ],
       "type": "object"
     },
@@ -480,123 +376,6 @@
         }
       ]
     },
-    "GateFailureDetailV1": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "count",
-              "type": "string"
-            },
-            "observed": {
-              "type": "string"
-            },
-            "required": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "observed",
-            "required"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "cohort",
-              "type": "string"
-            },
-            "observed": {
-              "type": "string"
-            },
-            "repository_id": {
-              "type": "string"
-            },
-            "required": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "repository_id",
-            "observed",
-            "required"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "evidence": {
-              "$ref": "#/$defs/TransportEvidenceV1"
-            },
-            "kind": {
-              "const": "transport",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "evidence"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "evidence": {
-              "$ref": "#/$defs/SourceDependencyEvidenceV1"
-            },
-            "kind": {
-              "const": "source_dependency",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "evidence"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "IntegrationDependencyTestKindV1": {
-      "enum": [
-        "packet_v3_requires_proof",
-        "transport_cannot_represent_keep_dark"
-      ],
-      "type": "string"
-    },
-    "IntegrationDependencyTestStatusV1": {
-      "enum": [
-        "passed"
-      ],
-      "type": "string"
-    },
-    "IntegrationDependencyTestV1": {
-      "additionalProperties": false,
-      "properties": {
-        "kind": {
-          "$ref": "#/$defs/IntegrationDependencyTestKindV1"
-        },
-        "status": {
-          "$ref": "#/$defs/IntegrationDependencyTestStatusV1"
-        },
-        "test_id": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "test_id",
-        "kind",
-        "status"
-      ],
-      "type": "object"
-    },
     "InventoryReportV1": {
       "additionalProperties": false,
       "properties": {
@@ -651,6 +430,25 @@
       ],
       "type": "string"
     },
+    "MissingOracleStepV1": {
+      "additionalProperties": false,
+      "properties": {
+        "oracle_step": {
+          "$ref": "#/$defs/OracleStepV1"
+        },
+        "step_index": {
+          "format": "uint8",
+          "maximum": 5,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "step_index",
+        "oracle_step"
+      ],
+      "type": "object"
+    },
     "NegativeMutationKindV1": {
       "enum": [
         "remove_expected_relation",
@@ -678,7 +476,7 @@
         },
         "step_index": {
           "format": "uint8",
-          "maximum": 255,
+          "maximum": 5,
           "minimum": 0,
           "type": "integer"
         },
@@ -694,6 +492,129 @@
         "caller",
         "target",
         "contract_proven"
+      ],
+      "type": "object"
+    },
+    "ObservedLineWindowV1": {
+      "additionalProperties": false,
+      "properties": {
+        "byte_end": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "byte_start": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "indexed_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "kind": {
+          "const": "indexed_line_v1",
+          "minLength": 1,
+          "type": "string"
+        },
+        "observed_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "project_file_components": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "text": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "project_file_components",
+        "indexed_sha256",
+        "observed_sha256",
+        "byte_start",
+        "byte_end",
+        "text"
+      ],
+      "type": "object"
+    },
+    "ObservedReceiptV1": {
+      "additionalProperties": false,
+      "properties": {
+        "caller": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "callsite_identity": {
+          "minLength": 1,
+          "pattern": "^-?(0|[1-9][0-9]*):[1-9][0-9]*:(0|[1-9][0-9]*):-?(0|[1-9][0-9]*)(\\|.*)?$",
+          "type": "string"
+        },
+        "callsite_line": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "edge_id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "line_window": {
+          "$ref": "#/$defs/ObservedLineWindowV1"
+        },
+        "oracle_comparison": {
+          "$ref": "#/$defs/ReceiptOracleComparisonV1"
+        },
+        "receipt_id": {
+          "minLength": 1,
+          "pattern": "^indexed-call-edge:.+$",
+          "type": "string"
+        },
+        "step_index": {
+          "format": "uint8",
+          "maximum": 5,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "target": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "receipt_id",
+        "step_index",
+        "edge_id",
+        "caller",
+        "callsite_identity",
+        "callsite_line",
+        "line_window",
+        "target",
+        "oracle_comparison"
+      ],
+      "type": "object"
+    },
+    "OracleDeclarationV1": {
+      "additionalProperties": false,
+      "properties": {
+        "range": {
+          "$ref": "#/$defs/OracleSourceRangeV1"
+        },
+        "symbol": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol",
+        "range"
       ],
       "type": "object"
     },
@@ -732,6 +653,32 @@
       ],
       "type": "object"
     },
+    "OracleStepV1": {
+      "additionalProperties": false,
+      "properties": {
+        "caller": {
+          "$ref": "#/$defs/OracleDeclarationV1"
+        },
+        "callsite": {
+          "$ref": "#/$defs/OracleSourceRangeV1"
+        },
+        "callsite_line": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "target": {
+          "$ref": "#/$defs/OracleDeclarationV1"
+        }
+      },
+      "required": [
+        "caller",
+        "callsite_line",
+        "callsite",
+        "target"
+      ],
+      "type": "object"
+    },
     "ProductDispositionKindV1": {
       "enum": [
         "contract_proven",
@@ -744,10 +691,20 @@
     "ProductDispositionV1": {
       "additionalProperties": false,
       "properties": {
+        "authoritative_receipts": {
+          "items": {
+            "$ref": "#/$defs/ReceiptReferenceV1"
+          },
+          "maxItems": 6,
+          "minItems": 0,
+          "type": "array"
+        },
         "gaps": {
           "items": {
             "$ref": "#/$defs/TypedGapV1"
           },
+          "maxItems": 6,
+          "minItems": 0,
           "type": "array"
         },
         "kind": {
@@ -756,7 +713,8 @@
       },
       "required": [
         "kind",
-        "gaps"
+        "gaps",
+        "authoritative_receipts"
       ],
       "type": "object"
     },
@@ -895,23 +853,6 @@
       ],
       "type": "object"
     },
-    "QualificationGateKindV1": {
-      "enum": [
-        "false_contract_proven",
-        "receipt_mismatch",
-        "certified_absence",
-        "failure_funnel",
-        "provenance",
-        "response_size",
-        "cohort_failure",
-        "product_disposition_mismatch",
-        "automatic_threshold",
-        "stable_threshold",
-        "experimental_usefulness",
-        "integration_dependency"
-      ],
-      "type": "string"
-    },
     "RawAdmissionFailureV1": {
       "enum": [
         "wrong_kind",
@@ -931,59 +872,119 @@
       ],
       "type": "string"
     },
-    "ReceiptComparisonV1": {
+    "ReceiptEvidenceV1": {
       "additionalProperties": false,
       "properties": {
-        "caller": {
-          "type": "string"
+        "missing_oracle_steps": {
+          "items": {
+            "$ref": "#/$defs/MissingOracleStepV1"
+          },
+          "maxItems": 6,
+          "minItems": 0,
+          "type": "array"
         },
-        "callsite_id": {
-          "type": "string"
+        "observed_receipts": {
+          "items": {
+            "$ref": "#/$defs/ObservedReceiptV1"
+          },
+          "minItems": 0,
+          "type": "array"
+        }
+      },
+      "required": [
+        "observed_receipts",
+        "missing_oracle_steps"
+      ],
+      "type": "object"
+    },
+    "ReceiptMismatchFieldV1": {
+      "enum": [
+        "caller",
+        "callsite_line",
+        "callsite_window",
+        "target"
+      ],
+      "type": "string"
+    },
+    "ReceiptOracleComparisonV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "exact",
+              "type": "string"
+            },
+            "oracle_step": {
+              "$ref": "#/$defs/OracleStepV1"
+            },
+            "oracle_step_index": {
+              "format": "uint8",
+              "maximum": 5,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "oracle_step_index",
+            "oracle_step"
+          ],
+          "type": "object"
         },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "mismatched",
+              "type": "string"
+            },
+            "mismatches": {
+              "items": {
+                "$ref": "#/$defs/ReceiptMismatchFieldV1"
+              },
+              "maxItems": 4,
+              "minItems": 1,
+              "type": "array"
+            },
+            "oracle_step": {
+              "$ref": "#/$defs/OracleStepV1"
+            },
+            "oracle_step_index": {
+              "format": "uint8",
+              "maximum": 5,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "oracle_step_index",
+            "oracle_step",
+            "mismatches"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ReceiptReferenceV1": {
+      "additionalProperties": false,
+      "properties": {
         "edge_id": {
           "format": "int64",
           "type": "integer"
         },
-        "exact_line": {
-          "format": "uint64",
-          "minimum": 1,
-          "type": "integer"
-        },
-        "exact_window": {
-          "$ref": "#/$defs/OracleSourceRangeV1"
-        },
-        "oracle_step_index": {
-          "format": "uint8",
-          "maximum": 255,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "result": {
-          "$ref": "#/$defs/ReceiptMatchResultV1"
-        },
-        "target": {
+        "receipt_id": {
+          "minLength": 1,
+          "pattern": "^indexed-call-edge:.+$",
           "type": "string"
         }
       },
       "required": [
-        "oracle_step_index",
-        "caller",
-        "edge_id",
-        "callsite_id",
-        "exact_line",
-        "exact_window",
-        "target",
-        "result"
+        "receipt_id",
+        "edge_id"
       ],
       "type": "object"
-    },
-    "ReceiptMatchResultV1": {
-      "enum": [
-        "exact",
-        "missing",
-        "mismatched"
-      ],
-      "type": "string"
     },
     "SelectorFailureV1": {
       "enum": [
@@ -1057,6 +1058,7 @@
         },
         "selector_index": {
           "format": "uint64",
+          "maximum": 6,
           "minimum": 0,
           "type": "integer"
         }
@@ -1076,42 +1078,6 @@
         "invalid_utf8",
         "line_missing",
         "line_over_limit"
-      ],
-      "type": "string"
-    },
-    "SourceDependencyEvidenceV1": {
-      "additionalProperties": false,
-      "properties": {
-        "dependency": {
-          "$ref": "#/$defs/SourceDependencyKindV1"
-        },
-        "passing_test": {
-          "$ref": "#/$defs/IntegrationDependencyTestV1"
-        },
-        "source_path": {
-          "type": "string"
-        },
-        "source_range": {
-          "$ref": "#/$defs/OracleSourceRangeV1"
-        },
-        "source_sha256": {
-          "pattern": "^[0-9a-f]{64}$",
-          "type": "string"
-        }
-      },
-      "required": [
-        "source_path",
-        "source_range",
-        "source_sha256",
-        "dependency",
-        "passing_test"
-      ],
-      "type": "object"
-    },
-    "SourceDependencyKindV1": {
-      "enum": [
-        "v3_packet_requires_proof",
-        "transport_cannot_represent_keep_dark"
       ],
       "type": "string"
     },
@@ -1199,6 +1165,7 @@
         },
         "step_index": {
           "format": "uint64",
+          "maximum": 5,
           "minimum": 0,
           "type": "integer"
         }
@@ -1223,8 +1190,8 @@
         },
         "length": {
           "format": "uint8",
-          "maximum": 255,
-          "minimum": 0,
+          "maximum": 6,
+          "minimum": 1,
           "type": "integer"
         },
         "strictly_admitted": {
@@ -1445,9 +1412,6 @@
       "minItems": 120,
       "type": "array"
     },
-    "decision": {
-      "$ref": "#/$defs/ActivationDecisionV1"
-    },
     "environment": {
       "$ref": "#/$defs/EnvironmentReportV1"
     },
@@ -1489,8 +1453,7 @@
     "inventory",
     "trails",
     "cases",
-    "failure_funnel",
-    "decision"
+    "failure_funnel"
   ],
   "title": "QualificationSummaryV1",
   "type": "object"

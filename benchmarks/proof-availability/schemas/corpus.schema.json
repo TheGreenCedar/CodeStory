@@ -305,12 +305,18 @@
         "callsite": {
           "$ref": "#/$defs/OracleSourceRangeV1"
         },
+        "callsite_line": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
         "target": {
           "$ref": "#/$defs/OracleDeclarationV1"
         }
       },
       "required": [
         "caller",
+        "callsite_line",
         "callsite",
         "target"
       ],
