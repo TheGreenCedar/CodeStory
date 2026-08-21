@@ -12485,6 +12485,65 @@ mod tests {
     }
 
     #[test]
+    fn flask_shaped_request_path_survives_production_packet_ranking() {
+        let question = "Trace request handling through the application.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("FlaskApp.handle_request", "src/flask/app.py", 0.8),
+                test_packet_citation("NativeApp.handle_request", "src/native/app.rs", 0.8),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut answer);
+
+        assert_eq!(
+            answer.citations[0].file_path.as_deref(),
+            Some("src/flask/app.py")
+        );
+    }
+
+    #[test]
+    fn mixed_language_formatting_suppression_requires_a_replacement() {
+        let question = "Explain how formatting arguments reach output.";
+        let mut without_replacement = packet_answer_fixture(
+            question,
+            vec![test_packet_citation(
+                "format_arguments",
+                "src/formatting.py",
+                0.8,
+            )],
+        );
+
+        rank_packet_evidence(question, &mut without_replacement);
+
+        assert_eq!(without_replacement.citations.len(), 1);
+        assert_eq!(
+            without_replacement.citations[0].file_path.as_deref(),
+            Some("src/formatting.py")
+        );
+
+        let mut with_replacement = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("format_arguments", "src/formatting.py", 0.8),
+                test_packet_citation("format_arguments", "src/formatting.rs", 0.8),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut with_replacement);
+
+        assert_eq!(
+            with_replacement
+                .citations
+                .iter()
+                .filter_map(|citation| citation.file_path.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["src/formatting.rs"]
+        );
+    }
+
+    #[test]
     fn packet_follow_up_commands_single_quote_shell_sensitive_questions() {
         let question = "Inspect $env:SECRET and $(Get-ChildItem) and 'literal'";
         let quoted = quote_packet_command_value(question);
