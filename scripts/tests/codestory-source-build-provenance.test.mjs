@@ -11,152 +11,217 @@ import {
   recordSourceBuildProvenance,
 } from "../lib/codestory-source-build-provenance.mjs";
 
+const BUILD_ARGUMENTS = ["build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"];
+
 function git(root, ...args) {
   return execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
 }
 
-test("source-build provenance binds a clean exact tree to artifact installer and live hashes", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-source-build-"));
-  try {
-    await writeFile(path.join(root, "Cargo.toml"), "[workspace]\n", "utf8");
-    await writeFile(path.join(root, ".gitignore"), "target/\n", "utf8");
-    const artifact = path.join(root, "target", "release", "codestory-cli");
-    git(root, "init", "-q");
-    git(root, "config", "user.email", "fixture@example.invalid");
-    git(root, "config", "user.name", "Fixture");
-    git(root, "add", ".");
-    git(root, "commit", "-qm", "fixture");
+function nativeArtifact(root) {
+  return path.join(root, "target", "release", process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli");
+}
 
-    let buildRuns = 0;
-    const record = recordSourceBuildProvenance({
-      artifact,
-      buildCommand: ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"],
-      repoRoot: root,
-      runBuild(command, options) {
-        buildRuns += 1;
-        assert.deepEqual(command, ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"]);
-        assert.equal(options.cwd, root);
-        fs.mkdirSync(path.dirname(artifact), { recursive: true });
-        fs.writeFileSync(artifact, "exact source build");
-        return { status: 0 };
-      },
+function installFakeCargo(harnessRoot) {
+  const bin = path.join(harnessRoot, "fake-bin");
+  const source = path.join(bin, "fake-cargo.rs");
+  const executable = path.join(bin, process.platform === "win32" ? "cargo.exe" : "cargo");
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(source, String.raw`
+use std::{env, fs, path::PathBuf, process};
+
+fn main() {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    let trace = PathBuf::from(env::var_os("CODESTORY_FAKE_CARGO_TRACE").expect("trace path"));
+    fs::write(&trace, args.join("\n")).expect("write argument trace");
+    fs::write(format!("{}.cwd", trace.display()), env::current_dir().expect("cwd").display().to_string())
+        .expect("write cwd trace");
+    let mode = env::var("CODESTORY_FAKE_CARGO_MODE").unwrap_or_else(|_| "success".to_string());
+    if mode == "fail" {
+        process::exit(17);
+    }
+    let target_index = args.iter().position(|arg| arg == "--target-dir").expect("target-dir argument");
+    let release_dir = env::current_dir()
+        .expect("cwd")
+        .join(&args[target_index + 1])
+        .join("release");
+    fs::create_dir_all(&release_dir).expect("create release directory");
+    let artifact = release_dir.join(if cfg!(windows) { "codestory-cli.exe" } else { "codestory-cli" });
+    if mode == "missing" {
+        return;
+    }
+    if mode == "wrong" {
+        fs::write(release_dir.join("not-codestory-cli"), b"wrong artifact").expect("write wrong artifact");
+        return;
+    }
+    if mode == "symlink" {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(env::current_dir().unwrap().join("Cargo.toml"), &artifact).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(env::current_dir().unwrap().join("Cargo.toml"), &artifact).unwrap();
+        return;
+    }
+    if mode == "hardlink" {
+        fs::hard_link(env::current_dir().unwrap().join("Cargo.toml"), &artifact).unwrap();
+        return;
+    }
+    fs::write(&artifact, b"exact source build").expect("write artifact");
+    if mode == "mutate_source" {
+        fs::write(env::current_dir().unwrap().join("Cargo.toml"), b"[workspace]\n# changed\n").unwrap();
+    }
+}
+`, "utf8");
+  execFileSync("rustc", [source, "-o", executable]);
+  return bin;
+}
+
+function installGitOnlyPath(harnessRoot) {
+  const bin = path.join(harnessRoot, "git-only-bin");
+  const resolver = process.platform === "win32" ? "where.exe" : "which";
+  const gitExecutable = execFileSync(resolver, ["git"], { encoding: "utf8" }).trim().split(/\r?\n/u)[0];
+  fs.mkdirSync(bin, { recursive: true });
+  if (process.platform === "win32") {
+    fs.writeFileSync(path.join(bin, "git.cmd"), `@"${gitExecutable}" %*\r\n`, "utf8");
+  } else {
+    fs.symlinkSync(gitExecutable, path.join(bin, "git"));
+  }
+  return bin;
+}
+
+async function sourceFixture(prefix) {
+  const harnessRoot = await mkdtemp(path.join(os.tmpdir(), prefix));
+  const root = path.join(harnessRoot, "repository");
+  fs.mkdirSync(root);
+  await writeFile(path.join(root, "Cargo.toml"), "[workspace]\n", "utf8");
+  await writeFile(path.join(root, ".gitignore"), "target/\n", "utf8");
+  git(root, "init", "-q");
+  git(root, "config", "user.email", "fixture@example.invalid");
+  git(root, "config", "user.name", "Fixture");
+  git(root, "add", ".");
+  git(root, "commit", "-qm", "fixture");
+  return {
+    harnessRoot,
+    root,
+    fakeCargoBin: installFakeCargo(harnessRoot),
+    gitOnlyBin: installGitOnlyPath(harnessRoot),
+  };
+}
+
+function withFakeCargo({ harnessRoot, fakeCargoBin }, mode, callback) {
+  const originalPath = process.env.PATH;
+  const originalMode = process.env.CODESTORY_FAKE_CARGO_MODE;
+  const originalTrace = process.env.CODESTORY_FAKE_CARGO_TRACE;
+  const trace = path.join(harnessRoot, `cargo-${mode}-${Date.now()}-${Math.random()}.json`);
+  process.env.PATH = `${fakeCargoBin}${path.delimiter}${originalPath || ""}`;
+  process.env.CODESTORY_FAKE_CARGO_MODE = mode;
+  process.env.CODESTORY_FAKE_CARGO_TRACE = trace;
+  try {
+    return callback(trace);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    if (originalMode === undefined) delete process.env.CODESTORY_FAKE_CARGO_MODE;
+    else process.env.CODESTORY_FAKE_CARGO_MODE = originalMode;
+    if (originalTrace === undefined) delete process.env.CODESTORY_FAKE_CARGO_TRACE;
+    else process.env.CODESTORY_FAKE_CARGO_TRACE = originalTrace;
+  }
+}
+
+test("source-build provenance executes the fixed Cargo build and binds its artifact", async () => {
+  const fixture = await sourceFixture("codestory-source-build-");
+  const artifact = nativeArtifact(fixture.root);
+  try {
+    const record = withFakeCargo(fixture, "success", (trace) => {
+      const value = recordSourceBuildProvenance({ repoRoot: fixture.root });
+      assert.deepEqual(fs.readFileSync(trace, "utf8").split("\n"), BUILD_ARGUMENTS);
+      assert.equal(fs.readFileSync(`${trace}.cwd`, "utf8"), fs.realpathSync(fixture.root));
+      return value;
     });
-    assert.equal(buildRuns, 1);
-    assert.equal(record.source.head, git(root, "rev-parse", "HEAD"));
-    assert.equal(record.source.tree, git(root, "rev-parse", "HEAD^{tree}"));
-    assert.equal(record.artifact.path, "target/release/codestory-cli");
-    assert.equal(record.build.command.join(" "), "cargo build --locked -p codestory-cli --profile release --target-dir target");
+    assert.equal(record.source.head, git(fixture.root, "rev-parse", "HEAD"));
+    assert.equal(record.source.tree, git(fixture.root, "rev-parse", "HEAD^{tree}"));
+    assert.equal(
+      record.artifact.path,
+      process.platform === "win32" ? "target/release/codestory-cli.exe" : "target/release/codestory-cli",
+    );
+    assert.deepEqual(record.build.command, ["cargo", ...BUILD_ARGUMENTS]);
     assert.deepEqual(
       compareSourceBuildProvenance(record, {
         installerSha256: record.artifact.sha256,
         liveSha256: record.artifact.sha256,
         expectedSource: record.source,
-        expectedBuildCommand: record.build.command,
       }),
       { state: "bound" },
     );
-    assert.throws(
-      () => recordSourceBuildProvenance({
-        artifact,
-        buildCommand: ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"],
-        repoRoot: root,
-        runBuild: () => ({ status: 0 }),
-      }),
-      /source_build_artifact_must_be_absent/u,
-      "the artifact must be created by this build invocation",
-    );
-    assert.deepEqual(
-      compareSourceBuildProvenance({
-        purpose: "codestory-source-build-provenance",
-        artifact: { sha256: record.artifact.sha256 },
-      }, {
-        installerSha256: record.artifact.sha256,
-        liveSha256: record.artifact.sha256,
-      }),
-      { state: "invalid_record" },
-      "an artifact hash plus a claimed purpose is not source-build provenance",
-    );
+
+    withFakeCargo(fixture, "success", (trace) => {
+      assert.throws(
+        () => recordSourceBuildProvenance({ repoRoot: fixture.root }),
+        /source_build_artifact_must_be_absent/u,
+      );
+      assert.equal(fs.existsSync(trace), false, "a pre-existing artifact must stop before Cargo executes");
+    });
 
     await rm(artifact);
-    await writeFile(path.join(root, "dirty"), "not clean", "utf8");
+    let callerRunnerInvoked = false;
     assert.throws(
-      () => recordSourceBuildProvenance({ artifact, buildCommand: ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"], repoRoot: root }),
-      /source_build_repository_not_clean/u,
+      () => withFakeCargo(fixture, "fail", () => recordSourceBuildProvenance({
+        repoRoot: fixture.root,
+        runBuild() {
+          callerRunnerInvoked = true;
+          fs.mkdirSync(path.dirname(artifact), { recursive: true });
+          fs.writeFileSync(artifact, "forged callback bytes");
+          return { status: 0 };
+        },
+      })),
+      /source_build_command_failed/u,
+      "a production caller cannot replace Cargo execution",
     );
+    assert.equal(callerRunnerInvoked, false);
+    assert.equal(fs.existsSync(artifact), false);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = fixture.gitOnlyBin;
+    try {
+      assert.throws(
+        () => recordSourceBuildProvenance({ repoRoot: fixture.root }),
+        /source_build_command_failed/u,
+        "a Cargo executable that cannot be resolved must not produce a record",
+      );
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+    assert.equal(fs.existsSync(artifact), false);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(fixture.harnessRoot, { recursive: true, force: true });
   }
 });
 
-test("source-build provenance rejects forged commands, paths, outputs, and incomplete bindings", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-source-build-hostile-"));
+test("source-build provenance rejects failed commands, wrong outputs, source drift, and incomplete bindings", async () => {
+  const fixture = await sourceFixture("codestory-source-build-hostile-");
+  const artifact = nativeArtifact(fixture.root);
   try {
-    await writeFile(path.join(root, "Cargo.toml"), "[workspace]\n", "utf8");
-    await writeFile(path.join(root, ".gitignore"), "target/\n", "utf8");
-    git(root, "init", "-q");
-    git(root, "config", "user.email", "fixture@example.invalid");
-    git(root, "config", "user.name", "Fixture");
-    git(root, "add", ".");
-    git(root, "commit", "-qm", "fixture");
-    const artifact = path.join(root, "target", "release", "codestory-cli");
-    const command = ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"];
+    for (const [mode, error] of [
+      ["fail", /source_build_command_failed/u],
+      ["missing", /source_build_artifact_not_file/u],
+      ["wrong", /source_build_artifact_not_file/u],
+      ["symlink", /source_build_artifact_not_direct_regular_file/u],
+      ["hardlink", /source_build_artifact_not_direct_regular_file/u],
+      ["mutate_source", /source_build_repository_not_clean/u],
+    ]) {
+      assert.throws(
+        () => withFakeCargo(fixture, mode, () => recordSourceBuildProvenance({ repoRoot: fixture.root })),
+        error,
+        mode,
+      );
+      await rm(artifact, { force: true });
+      if (mode === "mutate_source") git(fixture.root, "checkout", "--", "Cargo.toml");
+    }
 
-    assert.throws(
-      () => recordSourceBuildProvenance({ artifact, buildCommand: ["true", "--locked"], repoRoot: root, runBuild: () => ({ status: 0 }) }),
-      /source_build_command_not_exact/u,
-    );
-    assert.throws(
-      () => recordSourceBuildProvenance({ artifact: path.join(root, "target", "..", "..", "escape"), buildCommand: command, repoRoot: root, runBuild: () => ({ status: 0 }) }),
-      /source_build_artifact_outside_repository/u,
-    );
-    assert.throws(
-      () => recordSourceBuildProvenance({ artifact, buildCommand: command, repoRoot: root, runBuild: () => ({ status: 0 }) }),
-      /source_build_artifact_not_file/u,
-    );
-    assert.throws(
-      () => recordSourceBuildProvenance({ artifact, buildCommand: command, repoRoot: root, runBuild: () => {
-        fs.mkdirSync(path.dirname(artifact), { recursive: true });
-        fs.symlinkSync(path.join(root, "Cargo.toml"), artifact);
-        return { status: 0 };
-      } }),
-      /source_build_artifact_not_direct_regular_file/u,
-    );
-    await rm(artifact);
-    assert.throws(
-      () => recordSourceBuildProvenance({ artifact, buildCommand: command, repoRoot: root, runBuild: () => {
-        fs.linkSync(path.join(root, "Cargo.toml"), artifact);
-        return { status: 0 };
-      } }),
-      /source_build_artifact_not_direct_regular_file/u,
-    );
-    await rm(artifact);
-    assert.throws(
-      () => recordSourceBuildProvenance({ artifact, buildCommand: command, repoRoot: root, runBuild: () => {
-        fs.mkdirSync(path.dirname(artifact), { recursive: true });
-        fs.writeFileSync(artifact, "runner-produced bytes");
-        fs.writeFileSync(path.join(root, "Cargo.toml"), "[workspace]\n# changed\n");
-        return { status: 0 };
-      } }),
-      /source_build_repository_not_clean/u,
-    );
-    git(root, "checkout", "--", "Cargo.toml");
-    await rm(artifact);
-
-    const record = recordSourceBuildProvenance({
-      artifact,
-      buildCommand: command,
-      repoRoot: root,
-      runBuild: () => {
-        fs.mkdirSync(path.dirname(artifact), { recursive: true });
-        fs.writeFileSync(artifact, "runner-produced bytes");
-        return { status: 0 };
-      },
-    });
+    const record = withFakeCargo(fixture, "success", () => recordSourceBuildProvenance({ repoRoot: fixture.root }));
     const boundInputs = {
       installerSha256: record.artifact.sha256,
       liveSha256: record.artifact.sha256,
       expectedSource: record.source,
-      expectedBuildCommand: record.build.command,
     };
     for (const mutation of [
       { schema_version: 2 },
@@ -167,10 +232,7 @@ test("source-build provenance rejects forged commands, paths, outputs, and incom
       { artifact: { ...record.artifact, bytes: 0 } },
       { artifact: { ...record.artifact, sha256: "not-a-sha" } },
     ]) {
-      assert.deepEqual(
-        compareSourceBuildProvenance({ ...record, ...mutation }, boundInputs),
-        { state: "invalid_record" },
-      );
+      assert.deepEqual(compareSourceBuildProvenance({ ...record, ...mutation }, boundInputs), { state: "invalid_record" });
     }
     assert.deepEqual(
       compareSourceBuildProvenance(record, { ...boundInputs, installerSha256: "a".repeat(64) }),
@@ -185,30 +247,23 @@ test("source-build provenance rejects forged commands, paths, outputs, and incom
       { state: "source_mismatch" },
     );
     assert.deepEqual(
-      compareSourceBuildProvenance(record, { ...boundInputs, expectedBuildCommand: ["cargo", "test", "--locked"] }),
-      { state: "build_command_mismatch" },
+      compareSourceBuildProvenance({ ...record, artifact: { ...record.artifact, path: "target/release/codestory-cli.exe" } }, boundInputs),
+      { state: "bound" },
+      "the fixed native Windows artifact name is admitted without allowing arbitrary paths",
     );
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(fixture.harnessRoot, { recursive: true, force: true });
   }
 });
 
 test("source-build provenance rejects artifact replacement between validation and hashing", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-source-build-swap-"));
+  const fixture = await sourceFixture("codestory-source-build-swap-");
+  const artifact = nativeArtifact(fixture.root);
+  const replacement = path.join(fixture.root, "target", "release", "replacement");
   const originalReadFileSync = fs.readFileSync;
   const originalReadSync = fs.readSync;
+  let replaced = false;
   try {
-    await writeFile(path.join(root, "Cargo.toml"), "[workspace]\n", "utf8");
-    await writeFile(path.join(root, ".gitignore"), "target/\n", "utf8");
-    git(root, "init", "-q");
-    git(root, "config", "user.email", "fixture@example.invalid");
-    git(root, "config", "user.name", "Fixture");
-    git(root, "add", ".");
-    git(root, "commit", "-qm", "fixture");
-    const artifact = path.join(root, "target", "release", "codestory-cli");
-    const replacement = path.join(root, "target", "release", "replacement");
-    const command = ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"];
-    let replaced = false;
     const replaceArtifact = () => {
       if (replaced) return;
       fs.writeFileSync(replacement, "replacement bytes");
@@ -225,22 +280,13 @@ test("source-build provenance rejects artifact replacement between validation an
     };
 
     assert.throws(
-      () => recordSourceBuildProvenance({
-        artifact,
-        buildCommand: command,
-        repoRoot: root,
-        runBuild: () => {
-          fs.mkdirSync(path.dirname(artifact), { recursive: true });
-          fs.writeFileSync(artifact, "runner-produced bytes");
-          return { status: 0 };
-        },
-      }),
+      () => withFakeCargo(fixture, "success", () => recordSourceBuildProvenance({ repoRoot: fixture.root })),
       /source_build_artifact_changed/u,
     );
     assert.equal(replaced, true, "the hostile replacement must run during artifact hashing");
   } finally {
     fs.readFileSync = originalReadFileSync;
     fs.readSync = originalReadSync;
-    await rm(root, { recursive: true, force: true });
+    await rm(fixture.harnessRoot, { recursive: true, force: true });
   }
 });
