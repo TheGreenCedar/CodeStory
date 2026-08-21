@@ -179,6 +179,25 @@ fn read_source_tree(dir: &str) -> String {
         .join("\n")
 }
 
+fn read_source_tree_excluding(dir: &str, excluded_suffix: &str) -> String {
+    let root = repo_root().join(dir);
+    let mut files = Vec::new();
+    collect_rs_files(&root, &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .filter(|path| {
+            !path
+                .strip_prefix(&root)
+                .expect("source file stays below source root")
+                .to_string_lossy()
+                .ends_with(excluded_suffix)
+        })
+        .map(|path| fs::read_to_string(path).expect("read source"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn production_source_prefix(source: &str) -> &str {
     source
         .split_once("#[cfg(test)]\nmod tests {")
@@ -632,7 +651,10 @@ fn dark_packet_execution_plan_v3_stays_inert_and_unshipped() {
     let surfaces = [
         (
             "runtime source",
-            read_source_tree("crates/codestory-runtime/src"),
+            read_source_tree_excluding(
+                "crates/codestory-runtime/src",
+                "agent/packet_execution_record_v3.rs",
+            ),
         ),
         ("CLI source", read_source_tree("crates/codestory-cli/src")),
         (
@@ -661,6 +683,90 @@ fn dark_packet_execution_plan_v3_stays_inert_and_unshipped() {
             assert!(
                 !source.contains(forbidden),
                 "{surface} references dark Task-3A vocabulary via {forbidden}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
+    let runtime_agent_modules = read("crates/codestory-runtime/src/agent/mod.rs");
+    assert!(
+        runtime_agent_modules.contains(
+            "#[cfg(any(test, feature = \"test-support\"))]\npub(crate) mod packet_execution_record_v3;"
+        ),
+        "the runtime-owned v3 record must remain test-support-only until the atomic v3 cut"
+    );
+
+    let record_path = "crates/codestory-runtime/src/agent/packet_execution_record_v3.rs";
+    let record = production_source(&read(record_path));
+    assert_eq!(
+        record.matches(".active_publication()").count(),
+        1,
+        "the record builder must capture the already-active publication exactly once"
+    );
+    for forbidden in [
+        "AgentPacketDto",
+        "enforce_packet_output_budget",
+        "serde_json::Value",
+        "ToolSpec",
+        "run_with_cancel",
+        "with_pinned_retrieval",
+        "retrieval_primary",
+        "DiagnosticsCapabilityV3Dto",
+        "SystemTime",
+        "Instant",
+        "include_evidence",
+        "operation_id",
+        "published_at_epoch_ms",
+        "capability_uri",
+        "session_secret",
+        "ClaimDisposition",
+        "evaluate_execution_plan_v3",
+        "Supported",
+    ] {
+        assert!(
+            !record.contains(forbidden),
+            "the dark record source crosses a forbidden execution/serialization boundary via {forbidden}"
+        );
+    }
+
+    let surfaces = [
+        (
+            "runtime source outside the gated record and its module declaration",
+            read_source_tree_excluding(
+                "crates/codestory-runtime/src",
+                "agent/packet_execution_record_v3.rs",
+            )
+            .replace("pub(crate) mod packet_execution_record_v3;", ""),
+        ),
+        ("CLI source", read_source_tree("crates/codestory-cli/src")),
+        (
+            "current public API DTO source",
+            format!(
+                "{}\n{}",
+                read("crates/codestory-contracts/src/api.rs"),
+                read_source_tree("crates/codestory-contracts/src/api")
+            ),
+        ),
+        (
+            "current wire source",
+            read("crates/codestory-contracts/src/wire.rs"),
+        ),
+        (
+            "generated MCP catalog",
+            read("plugins/codestory/generated-mcp-catalog.json"),
+        ),
+    ];
+    for (surface, source) in surfaces {
+        for forbidden in [
+            "PacketExecutionRecordV3",
+            "PacketRequestFingerprintV3",
+            "build_packet_execution_record_v3",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{surface} references dark Task-3B vocabulary via {forbidden}"
             );
         }
     }

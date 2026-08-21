@@ -8,8 +8,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use codestory_contracts::api::{PacketClaimObligationDto, PacketClaimObligationKindDto};
+use serde::Serialize;
 
 pub const PACKET_EXECUTION_PLAN_VERSION_V3: u32 = 3;
+
+/// Canonicalize a closed v3 input with the RFC 8785 implementation already
+/// pinned behind this dark module's test-support gate.
+pub fn canonical_json_bytes_v3<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    serde_json_canonicalizer::to_vec(value).map_err(|error| error.to_string())
+}
 
 macro_rules! stable_id {
     ($name:ident) => {

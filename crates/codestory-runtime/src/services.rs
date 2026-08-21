@@ -1898,6 +1898,14 @@ impl PublicOperationService {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn active_project_identity_v3(
+        &self,
+    ) -> Result<codestory_workspace::ProjectIdentityV3, ApiError> {
+        let project_root = self.controller.require_project_root()?;
+        Ok(codestory_workspace::project_identity_v3(&project_root))
+    }
+
     /// Read the project summary from the core snapshot pinned by the current
     /// public operation. This deliberately rejects calls outside a pin so a
     /// response cannot mix a pre-operation summary with pinned graph reads.
@@ -2868,7 +2876,7 @@ mod freshness_gate_tests {
 }
 
 #[cfg(test)]
-mod activation_tests {
+pub(crate) mod activation_tests {
     use super::*;
     use crate::Runtime;
     use crate::search_publication::{
@@ -2877,16 +2885,16 @@ mod activation_tests {
     use crate::test_support::git;
     use std::fs;
 
-    struct ReadyActivationFixture {
-        project: tempfile::TempDir,
+    pub(crate) struct ReadyActivationFixture {
+        pub(crate) project: tempfile::TempDir,
         _cache: tempfile::TempDir,
-        runtime: Runtime,
+        pub(crate) runtime: Runtime,
         storage_path: PathBuf,
         lease: ReadyLease,
         sidecar: codestory_retrieval::SidecarRuntimeConfig,
     }
 
-    fn ready_activation_fixture() -> ReadyActivationFixture {
+    pub(crate) fn ready_activation_fixture() -> ReadyActivationFixture {
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
         let storage_path = cache.path().join("codestory.db");
