@@ -258,12 +258,68 @@ pub struct ProjectionGapRowV3Dto {
     pub message: Option<MessageTextV3>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContinuationStateV3Dto {
     pub continuation_id: IdentityTextV3,
     pub remaining_rounds: u16,
     pub gap_ids: BoundedVecV3<GapIdentityV3Dto, REFERENCE_ROWS_MAX_V3>,
+}
+
+impl ContinuationStateV3Dto {
+    pub fn new(
+        continuation_id: IdentityTextV3,
+        remaining_rounds: u16,
+        gap_ids: BoundedVecV3<GapIdentityV3Dto, REFERENCE_ROWS_MAX_V3>,
+    ) -> Result<Self, ContinuationStateViolationV3> {
+        let value = Self {
+            continuation_id,
+            remaining_rounds,
+            gap_ids,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), ContinuationStateViolationV3> {
+        if self.remaining_rounds == 0 {
+            return Err(ContinuationStateViolationV3::ZeroRemainingRounds);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationStateViolationV3 {
+    ZeroRemainingRounds,
+}
+
+impl fmt::Display for ContinuationStateViolationV3 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroRemainingRounds => {
+                formatter.write_str("continuation remaining_rounds must be positive")
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContinuationStateV3DtoWire {
+    continuation_id: IdentityTextV3,
+    remaining_rounds: u16,
+    gap_ids: BoundedVecV3<GapIdentityV3Dto, REFERENCE_ROWS_MAX_V3>,
+}
+
+impl<'de> Deserialize<'de> for ContinuationStateV3Dto {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ContinuationStateV3DtoWire::deserialize(deserializer)?;
+        Self::new(wire.continuation_id, wire.remaining_rounds, wire.gap_ids)
+            .map_err(D::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,6 +627,69 @@ mod tests {
         assert!(Sha256DigestV3Dto::new("d".repeat(63)).is_err());
         assert!(Sha256DigestV3Dto::new(format!("{}z", "d".repeat(63))).is_err());
         assert!(serde_json::from_value::<Sha256DigestV3Dto>(json!("not-a-digest")).is_err());
+    }
+
+    #[test]
+    fn packet_projection_v3_rejects_zero_round_continuations_everywhere() {
+        assert_eq!(
+            ContinuationStateV3Dto::new(
+                text("continuation-1"),
+                0,
+                list(vec![gap_identity("gap-1")])
+            ),
+            Err(ContinuationStateViolationV3::ZeroRemainingRounds)
+        );
+
+        let packet = PacketProjectionV3Dto::Complete {
+            schema_version: PACKET_PROJECTION_V3_SCHEMA_VERSION,
+            identity: identity(),
+            publication: publication(),
+            status: EvidenceAvailabilityV3Dto::ContinuationAvailable,
+            retrieval: retrieval(RetrievalStateV3Dto::Full),
+            evidence: list(Vec::new()),
+            gaps: list(vec![gap(GapKindV3Dto::ContinuationRequired)]),
+            continuation: Some(continuation()),
+            diagnostics: diagnostics(),
+        };
+        let context = ContextProjectionV3Dto {
+            kind: ContextProjectionKindV3Dto::Complete,
+            schema_version: PACKET_PROJECTION_V3_SCHEMA_VERSION,
+            identity: identity(),
+            publication: publication(),
+            status: EvidenceAvailabilityV3Dto::ContinuationAvailable,
+            target: ContextTargetV3Dto {
+                path: Some(text("src/lib.rs")),
+                symbol_id: None,
+            },
+            evidence: list(Vec::new()),
+            gaps: list(vec![gap(GapKindV3Dto::ContinuationRequired)]),
+            continuation: Some(continuation()),
+            diagnostics: diagnostics(),
+        };
+        let search = SearchProjectionV3Dto {
+            kind: SearchProjectionKindV3Dto::Complete,
+            schema_version: PACKET_PROJECTION_V3_SCHEMA_VERSION,
+            identity: identity(),
+            publication: publication(),
+            status: EvidenceAvailabilityV3Dto::ContinuationAvailable,
+            evidence: list(Vec::new()),
+            gaps: list(vec![gap(GapKindV3Dto::ContinuationRequired)]),
+            continuation: Some(continuation()),
+            retrieval: retrieval(RetrievalStateV3Dto::Full),
+            diagnostics: diagnostics(),
+        };
+
+        let mut packet_json = serde_json::to_value(packet).expect("serialize packet");
+        packet_json["continuation"]["remaining_rounds"] = json!(0);
+        assert!(serde_json::from_value::<PacketProjectionV3Dto>(packet_json).is_err());
+
+        let mut context_json = serde_json::to_value(context).expect("serialize context");
+        context_json["continuation"]["remaining_rounds"] = json!(0);
+        assert!(serde_json::from_value::<ContextProjectionV3Dto>(context_json).is_err());
+
+        let mut search_json = serde_json::to_value(search).expect("serialize search");
+        search_json["continuation"]["remaining_rounds"] = json!(0);
+        assert!(serde_json::from_value::<SearchProjectionV3Dto>(search_json).is_err());
     }
 
     #[test]

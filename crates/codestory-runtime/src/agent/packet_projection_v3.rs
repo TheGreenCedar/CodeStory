@@ -39,6 +39,7 @@ pub(crate) enum ProjectionInputErrorV3 {
     DuplicateEvidenceIdentity(String),
     DuplicateGapIdentity(String),
     DuplicateDiagnosticIdentity(String),
+    ZeroContinuationRounds,
     DuplicateContinuationGapReference(String),
     UnknownContinuationGap(String),
     DuplicateDiagnosticEvidenceReference(String),
@@ -223,12 +224,13 @@ fn packet_complete_candidate_v3(
             row.message = None;
         }
     }
+    let continuation = canonical_continuation_v3(record.continuation(), &gaps)?;
     Ok(PacketProjectionV3Dto::Complete {
         schema_version: PACKET_PROJECTION_V3_SCHEMA_VERSION,
         identity: identity_from_record(record),
         publication: publication_from_record(record),
         status: evidence_availability_v3(
-            record.continuation().is_some(),
+            continuation.is_some(),
             !evidence.is_empty(),
             record.retrieval(),
             &gaps,
@@ -236,7 +238,7 @@ fn packet_complete_candidate_v3(
         retrieval: record.retrieval().clone(),
         evidence: BoundedVecV3::new(evidence).map_err(ProjectionBuildErrorV3::BoundViolation)?,
         gaps: BoundedVecV3::new(gaps).map_err(ProjectionBuildErrorV3::BoundViolation)?,
-        continuation: record.continuation().cloned(),
+        continuation,
         diagnostics,
     })
 }
@@ -357,6 +359,9 @@ fn canonical_continuation_v3(
     let Some(source) = source else {
         return Ok(None);
     };
+    source.validate().map_err(|_| {
+        ProjectionBuildErrorV3::InvalidInput(ProjectionInputErrorV3::ZeroContinuationRounds)
+    })?;
     let gap_ids = gaps
         .iter()
         .map(|gap| gap.identity.gap_id.as_str())
@@ -382,11 +387,12 @@ fn canonical_continuation_v3(
         }
     }
     Ok(Some(
-        codestory_contracts::packet_projection_v3::ContinuationStateV3Dto {
-            continuation_id: source.continuation_id.clone(),
-            remaining_rounds: source.remaining_rounds,
-            gap_ids: BoundedVecV3::new(references).expect("bounded references remain bounded"),
-        },
+        codestory_contracts::packet_projection_v3::ContinuationStateV3Dto::new(
+            source.continuation_id.clone(),
+            source.remaining_rounds,
+            BoundedVecV3::new(references).expect("bounded references remain bounded"),
+        )
+        .expect("validated continuation remains positive"),
     ))
 }
 
@@ -1321,6 +1327,19 @@ mod tests {
             ))
         ));
 
+        let mut zero_round_continuation = context_input.clone();
+        zero_round_continuation
+            .continuation
+            .as_mut()
+            .unwrap()
+            .remaining_rounds = 0;
+        assert_eq!(
+            build_context_projection_v3(&zero_round_continuation),
+            Err(ProjectionBuildErrorV3::InvalidInput(
+                ProjectionInputErrorV3::ZeroContinuationRounds
+            ))
+        );
+
         let mut dangling_diagnostic = context_input.clone();
         dangling_diagnostic.diagnostic_rows[0].evidence_ids =
             BoundedVecV3::new(vec![EvidenceIdentityV3Dto {
@@ -1385,6 +1404,19 @@ mod tests {
                 .map(|row| row.identity.evidence_id.as_str())
                 .collect::<Vec<_>>(),
             ["evidence-a", "evidence-b"]
+        );
+
+        let mut zero_round_continuation = search_input.clone();
+        zero_round_continuation
+            .continuation
+            .as_mut()
+            .unwrap()
+            .remaining_rounds = 0;
+        assert_eq!(
+            build_search_projection_v3(&zero_round_continuation),
+            Err(ProjectionBuildErrorV3::InvalidInput(
+                ProjectionInputErrorV3::ZeroContinuationRounds
+            ))
         );
 
         let mut duplicate_diagnostic_reference = search_input;

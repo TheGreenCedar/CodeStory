@@ -151,6 +151,7 @@ pub(crate) enum RecordValidationErrorV3 {
     DuplicateEvidenceIdentity(String),
     DuplicateGapIdentity(String),
     DuplicateDiagnosticIdentity(String),
+    ZeroContinuationRounds,
     DuplicateContinuationGapReference(String),
     UnknownContinuationGap(String),
     DuplicateDiagnosticEvidenceReference(String),
@@ -642,6 +643,9 @@ fn canonical_continuation(
     gap_ids: &BTreeSet<&str>,
 ) -> Result<ContinuationStateV3Dto, RecordValidationErrorV3> {
     validate_required_identity("continuation_id", continuation.continuation_id.as_str())?;
+    continuation
+        .validate()
+        .map_err(|_| RecordValidationErrorV3::ZeroContinuationRounds)?;
     let mut references = continuation.gap_ids.as_slice().to_vec();
     references.sort();
     for pair in references.windows(2) {
@@ -658,12 +662,13 @@ fn canonical_continuation(
             ));
         }
     }
-    Ok(ContinuationStateV3Dto {
-        continuation_id: continuation.continuation_id.clone(),
-        remaining_rounds: continuation.remaining_rounds,
-        gap_ids: codestory_contracts::packet_projection_v3::BoundedVecV3::new(references)
+    Ok(ContinuationStateV3Dto::new(
+        continuation.continuation_id.clone(),
+        continuation.remaining_rounds,
+        codestory_contracts::packet_projection_v3::BoundedVecV3::new(references)
             .expect("the source bounded vector remains bounded after sorting"),
-    })
+    )
+    .expect("validated continuation remains positive"))
 }
 
 fn canonical_diagnostics(
@@ -1266,6 +1271,13 @@ mod tests {
         assert_eq!(
             build_record_from_captured_v3(&capture_fixture(), &input, &mut ids),
             Err(RecordValidationErrorV3::RequestedRetrievalGenerationMismatch)
+        );
+
+        let mut input = finalized_fixture();
+        input.continuation.as_mut().unwrap().remaining_rounds = 0;
+        assert_eq!(
+            build_record_from_captured_v3(&capture_fixture(), &input, &mut ids),
+            Err(RecordValidationErrorV3::ZeroContinuationRounds)
         );
     }
 
