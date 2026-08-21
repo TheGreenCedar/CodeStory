@@ -146,13 +146,6 @@ pub fn packet_citation_rank(
     if path.contains("/server/") && !packet_terms_contain(terms, "server") {
         score -= 12.0;
     }
-    if path.contains("/collections/")
-        && terms
-            .iter()
-            .any(|term| term.contains("collection") || term.contains("payload"))
-    {
-        score += 4.0;
-    }
     #[cfg(any(test, feature = "test-support"))]
     {
         score = eval_citation_rank_adjustment(&normalized_display, &path, score);
@@ -190,7 +183,6 @@ pub fn packet_citation_rank(
             terms,
         );
         score += packet_runtime_formatting_core_symbol_rank_bonus(&normalized_display, terms);
-        score += packet_unrequested_python_source_rank_bonus(&path, terms);
         score +=
             packet_unrequested_windows_formatting_rank_bonus(&normalized_display, &path, terms);
         score += packet_unrequested_client_adapter_rank_bonus(&path, terms);
@@ -1183,17 +1175,6 @@ fn packet_keyframe_stem_is_named(citation: &AgentCitationDto, named_stems: &[Str
 fn packet_citation_is_markdown_source(citation: &AgentCitationDto) -> bool {
     let path = packet_citation_display_path(citation);
     path.ends_with(".md") || path.ends_with(".markdown") || path.ends_with(".mdx")
-}
-
-fn packet_unrequested_python_source_rank_bonus(path: &str, terms: &[String]) -> f32 {
-    if packet_question_wants_python(terms) {
-        return 0.0;
-    }
-    if path.ends_with(".py") || path.ends_with(".pyi") || path.ends_with(".pyx") {
-        -100.0
-    } else {
-        0.0
-    }
 }
 
 fn packet_runtime_formatting_core_symbol_rank_bonus(
@@ -3308,7 +3289,6 @@ mod tests {
                 &terms,
             ) < 0.0
         );
-        assert!(packet_unrequested_python_source_rank_bonus("docs/cli/docopt.py", &terms) < 0.0);
     }
 
     #[test]

@@ -20,7 +20,14 @@ async function writePluginPackage(root, marker) {
   );
   await writeFile(
     join(root, "scripts", "codestory-mcp.cjs"),
-    `"use strict";\nrequire("fs").writeFileSync(process.env.CODESTORY_CURSOR_MCP_SENTINEL, ${JSON.stringify(marker)});\n`,
+    `"use strict";
+const fs = require("fs");
+if (require.main === module) {
+  fs.writeFileSync(process.env.CODESTORY_CURSOR_MCP_SENTINEL, ${JSON.stringify(marker)});
+} else {
+  module.exports = { _test: { marker: ${JSON.stringify(marker)} } };
+}
+`,
     "utf8",
   );
   return join(root, "scripts", "codestory-mcp.cjs");
@@ -116,6 +123,38 @@ test("Cursor MCP resolve prefers the local plugin package over cache", async () 
   }
 });
 
+test("requiring a main-guarded launcher does not start it", async () => {
+  const home = await mkdtemp(join(tmpdir(), "codestory-cursor-mcp-home-"));
+  const cachePlugin = join(
+    home,
+    ".cursor",
+    "plugins",
+    "cache",
+    "thegreencedar-codestory",
+    "codestory",
+    "deadbeef",
+  );
+  const sentinel = join(home, "sentinel.txt");
+  try {
+    const launcher = await writePluginPackage(cachePlugin, "must-not-start");
+    const result = spawnSync(
+      process.execPath,
+      ["-e", `require(${JSON.stringify(launcher)})`],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CODESTORY_CURSOR_MCP_SENTINEL: sentinel,
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    await assert.rejects(readFile(sentinel, "utf8"), { code: "ENOENT" });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("Cursor mcp.cursor.json inline entry starts the cached launcher from a foreign cwd", async () => {
   const home = await mkdtemp(join(tmpdir(), "codestory-cursor-mcp-home-"));
   const project = await mkdtemp(join(tmpdir(), "codestory-cursor-mcp-project-"));
@@ -142,6 +181,8 @@ test("Cursor mcp.cursor.json inline entry starts the cached launcher from a fore
       JSON.stringify(cursorMcp),
       /\$\{PLUGIN_ROOT\}|\$\{CURSOR_PLUGIN_ROOT\}|\$\{workspaceFolder\}/u,
     );
+    assert.match(INLINE_ENTRY, /Module\.runMain\s*\(/u);
+    assert.doesNotMatch(INLINE_ENTRY, /require\(resolveCodestoryCursorLauncher/u);
 
     const result = spawnSync(process.execPath, cursorMcp.mcpServers.codestory.args, {
       cwd: project,

@@ -434,8 +434,10 @@ pub fn query_vector_from_hex(hex: &str) -> Result<Vec<f32>> {
         bail!("query vector hex must contain complete f32 values");
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_bits(u32::from_le_bytes(chunk.try_into().expect("four bytes"))))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_bits(u32::from_le_bytes(*chunk)))
         .collect())
 }
 

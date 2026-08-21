@@ -48,6 +48,62 @@ const GROUNDING_ORIENTATION_UNCERTAINTY_WIRE_VALUES: [&str; 7] = {
     values
 };
 
+#[test]
+fn compatibility_profile_fixture_keeps_future_revisions_unselectable_in_v2() {
+    let profiles: Value = serde_json::from_str(include_str!("fixtures/mcp_protocol_profiles.json"))
+        .expect("compatibility profile fixture json");
+    let revisions = profiles
+        .get("profiles")
+        .and_then(Value::as_array)
+        .expect("profile array")
+        .iter()
+        .filter_map(|profile| profile.get("revision").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        revisions,
+        vec!["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+        "the compatibility harness must name every planned wire profile"
+    );
+    assert_eq!(
+        codestory_contracts::wire::SUPPORTED_MCP_PROTOCOL_VERSIONS,
+        ["2024-11-05"],
+        "profiles are test data only until the public cut changes negotiation"
+    );
+    let batch_contracts = profiles["profiles"]
+        .as_array()
+        .expect("profile array")
+        .iter()
+        .map(|profile| {
+            (
+                profile["revision"].as_str().expect("revision"),
+                profile["batch"].as_str().expect("batch contract"),
+                profile["result_fields"]
+                    .as_array()
+                    .expect("result fields")
+                    .len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        batch_contracts,
+        vec![
+            (
+                "2024-11-05",
+                "accept_independent_ordered_omit_notifications",
+                2
+            ),
+            (
+                "2025-03-26",
+                "accept_independent_ordered_omit_notifications",
+                2
+            ),
+            ("2025-06-18", "reject_invalid_request", 4),
+            ("2025-11-25", "reject_invalid_request", 4),
+        ],
+        "the fixture owns the future batch and result-form contracts without enabling them"
+    );
+}
+
 struct StdioFixture {
     workspace: TempDir,
     cache_dir: TempDir,
@@ -2441,6 +2497,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
         "references",
         "search",
         "snippet",
+        "status",
         "symbol",
         "symbols",
         "trace",
@@ -2478,11 +2535,27 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 "context outputSchema should not expose answer/prompt DTO names: {tool}"
             );
         }
+        if name == "status" {
+            for field in ["failure", "retrieval_mode", "degraded_reason", "live_ready"] {
+                assert!(
+                    output_schema
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .is_some_and(|properties| properties.contains_key(field)),
+                    "status outputSchema should declare compact field {field}: {tool}"
+                );
+            }
+        }
         if name == "packet" {
             assert_eq!(
                 schema_property(output_schema, "packet_id")["type"],
                 "string",
                 "packet outputSchema should expose a stable packet id: {tool}"
+            );
+            assert_eq!(
+                schema_property(output_schema, "support")["type"],
+                "array",
+                "packet support is a list of compiled units, not an object: {tool}"
             );
             for field in [
                 "plan",
@@ -2548,6 +2621,13 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
             );
         }
         if name == "files" {
+            assert!(
+                output_schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|properties| properties.contains_key("coverage_gaps")),
+                "files outputSchema should declare coverage_gaps: {tool}"
+            );
             for field in [
                 "project_root",
                 "usable",

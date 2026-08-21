@@ -16,6 +16,9 @@
 pub mod citation;
 #[cfg(any(test, feature = "test-support"))]
 pub mod eval_probes;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod indexed_source_call_path_v1;
 pub mod packet_citations;
 pub mod packet_claim_profile_registry;
 pub mod packet_claim_profiles;
@@ -27,6 +30,9 @@ pub mod packet_evidence;
 pub mod packet_evidence_carriers;
 pub mod packet_evidence_roles;
 pub mod packet_execution_graphs;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod packet_execution_plan_v3;
 pub mod packet_flow_requirements;
 pub mod packet_freshness;
 pub mod packet_obligations;

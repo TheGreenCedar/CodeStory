@@ -12212,61 +12212,6 @@ mod tests {
     }
 
     #[test]
-    fn packet_ranking_prefers_payload_collections_over_component_and_preview_fillers() {
-        let question = "Explain how Payload collections, post rendering, comment submission, RSS, and the Elsewhere feed connect.";
-        let mut answer = AgentAnswerDto {
-            source_coverage: Vec::new(),
-            answer_id: "payload-rank-fixture".to_string(),
-            prompt: question.to_string(),
-            summary: "Payload public content flow evidence is covered.".to_string(),
-            freshness: None,
-            sections: Vec::new(),
-            citations: vec![
-                test_packet_citation("PostComments", "src/components/PostComments.tsx", 0.55),
-                test_packet_citation("posts", "src/lib/content-data/preview-content.ts", 0.55),
-                test_packet_citation("Posts", "src/collections/Posts.ts", 0.8),
-                test_packet_citation("Comments", "src/collections/Comments.ts", 0.8),
-            ],
-            subgraph_ids: Vec::new(),
-            retrieval_version: "test".to_string(),
-            graphs: Vec::new(),
-            retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
-                request_id: "payload-rank-fixture".to_string(),
-                retrieval_publication: None,
-                resolved_profile: AgentRetrievalPresetDto::Architecture,
-                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
-                total_latency_ms: 1,
-                sla_target_ms: None,
-                sla_missed: false,
-                semantic_fallback_count: 0,
-                semantic_fallbacks: Vec::new(),
-                semantic_stage_timeout_zero_hits: 0,
-                semantic_abstained_count: 0,
-                annotations: Vec::new(),
-                packet_claim_profile_telemetry: None,
-                source_freshness_telemetry: None,
-                steps: Vec::new(),
-                packet_sidecar_diagnostics: Vec::new(),
-                retrieval_shadow: None,
-            },
-        };
-
-        rank_packet_evidence(question, &mut answer);
-        let top_paths = answer
-            .citations
-            .iter()
-            .take(2)
-            .filter_map(|citation| citation.file_path.as_deref().map(packet_display_path))
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            top_paths,
-            vec!["src/collections/Posts.ts", "src/collections/Comments.ts"],
-            "Payload collection files should outrank nearby rendering/preview fillers: {top_paths:?}"
-        );
-    }
-
-    #[test]
     fn packet_ranking_demotes_test_paths_without_fixture_specific_boosts() {
         let question = "Trace route dispatch through a handler.";
         let mut answer = AgentAnswerDto {
@@ -12481,6 +12426,65 @@ mod tests {
         assert!(
             paths.iter().all(|path| *path != "include/tool/xchar.h"),
             "unrequested wide-char sibling should drop: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn flask_shaped_request_path_survives_production_packet_ranking() {
+        let question = "Trace request handling through the application.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("FlaskApp.handle_request", "src/flask/app.py", 0.8),
+                test_packet_citation("NativeApp.handle_request", "src/native/app.rs", 0.8),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut answer);
+
+        assert_eq!(
+            answer.citations[0].file_path.as_deref(),
+            Some("src/flask/app.py")
+        );
+    }
+
+    #[test]
+    fn mixed_language_formatting_suppression_requires_a_replacement() {
+        let question = "Explain how formatting arguments reach output.";
+        let mut without_replacement = packet_answer_fixture(
+            question,
+            vec![test_packet_citation(
+                "format_arguments",
+                "src/formatting.py",
+                0.8,
+            )],
+        );
+
+        rank_packet_evidence(question, &mut without_replacement);
+
+        assert_eq!(without_replacement.citations.len(), 1);
+        assert_eq!(
+            without_replacement.citations[0].file_path.as_deref(),
+            Some("src/formatting.py")
+        );
+
+        let mut with_replacement = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("format_arguments", "src/formatting.py", 0.8),
+                test_packet_citation("format_arguments", "src/formatting.rs", 0.8),
+            ],
+        );
+
+        rank_packet_evidence(question, &mut with_replacement);
+
+        assert_eq!(
+            with_replacement
+                .citations
+                .iter()
+                .filter_map(|citation| citation.file_path.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["src/formatting.rs"]
         );
     }
 

@@ -85,7 +85,7 @@ fn cap_citations_with_priorities(
     let mut kept: Vec<AgentCitationDto> = Vec::new();
     let mut deferred = Vec::new();
 
-    let mut candidates = answer.citations.drain(..).collect::<Vec<_>>();
+    let mut candidates = std::mem::take(&mut answer.citations);
     let prefer_primary_sources = !query_mentions_non_primary_source(&answer.prompt);
     prioritize_protected_citations(&mut candidates, protected_citation_keys);
     order_citations_by_marginal_utility(

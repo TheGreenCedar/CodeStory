@@ -7056,6 +7056,15 @@ test("portable plugin core and thin host adapters preserve their own contracts",
   assert.equal(fs.existsSync(join(pluginRoot, ".mcp.json")), true);
   assert.equal(fs.existsSync(join(pluginRoot, "mcp.cursor.json")), true);
   assert.equal(fs.existsSync(join(pluginRoot, "scripts", "cursor-mcp-resolve.cjs")), true);
+  const cursorMcp = JSON.parse(await readFile(join(pluginRoot, "mcp.cursor.json"), "utf8"));
+  assert.equal(cursorMcp.mcpServers.codestory.command, "node");
+  assert.equal(cursorMcp.mcpServers.codestory.args[0], "-e");
+  assert.match(cursorMcp.mcpServers.codestory.args[1], /Module\.runMain\s*\(/u);
+  assert.doesNotMatch(
+    cursorMcp.mcpServers.codestory.args[1],
+    /require\(resolveCodestoryCursorLauncher/u,
+  );
+  assert.equal(Object.hasOwn(cursorMcp.mcpServers.codestory, "cwd"), false);
   assert.equal(fs.existsSync(join(pluginRoot, ".cursor", "mcp.json")), false);
   assert.equal(fs.existsSync(join(pluginRoot, ".cursor", "rules", "codestory.mdc")), false);
 });

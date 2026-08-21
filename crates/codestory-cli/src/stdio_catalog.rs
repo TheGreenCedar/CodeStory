@@ -844,6 +844,25 @@ static STATUS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         .nullable(),
         SchemaProperty::string("next_action", "Direct next action for the caller."),
         SchemaProperty::integer("retry_after_ms", "Retry delay while preparing.").nullable(),
+        SchemaProperty::object(
+            "failure",
+            "Structured capability failure when the compact status is not live-ready.",
+        )
+        .nullable(),
+        SchemaProperty::string(
+            "retrieval_mode",
+            "Pinned retrieval publication class; full is eligibility, not live-ready.",
+        )
+        .nullable(),
+        SchemaProperty::string(
+            "degraded_reason",
+            "Why a full publication is not live-ready, when that is known.",
+        )
+        .nullable(),
+        SchemaProperty::boolean(
+            "live_ready",
+            "Whether packet/search may use full retrieval without a degraded reason.",
+        ),
         SchemaProperty::string("diagnostics_uri", "Optional full diagnostic resource URI."),
     ],
     &[
@@ -1046,6 +1065,36 @@ static INDEXED_FILE_SCHEMA: SchemaObject = SchemaObject::object(
     ],
 );
 
+static FILE_COVERAGE_DIAGNOSTIC_SCHEMA: SchemaObject = SchemaObject::object(
+    "File-level coverage limitation or source-integrity failure.",
+    &[
+        SchemaProperty::string("path", "Project-relative file path."),
+        SchemaProperty::string("reason", "Coverage limitation reason.").with_enum(&[
+            "parser_partial",
+            "source_changed",
+            "unreadable",
+            "malformed",
+            "binary",
+            "oversized",
+            "discovery_incomplete",
+            "collector_failure",
+        ]),
+        SchemaProperty::boolean("retryable", "Whether a later index can recover this file."),
+        SchemaProperty::boolean("verified_source", "Whether source bytes were verified."),
+        SchemaProperty::boolean(
+            "projection_available",
+            "Whether a usable projection remains.",
+        ),
+    ],
+    &[
+        "path",
+        "reason",
+        "retryable",
+        "verified_source",
+        "projection_available",
+    ],
+);
+
 static SOURCE_POLICY_EXCLUSION_SCHEMA: SchemaObject = SchemaObject::object(
     "Verified source intentionally excluded from parser scheduling without graph or semantic coverage.",
     &[
@@ -1092,6 +1141,11 @@ static INDEXED_FILES_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::boolean("usable", "Whether the index has usable files."),
         SchemaProperty::object("summary", "Indexed file summary DTO."),
         SchemaProperty::array("files", "Indexed file rows.", &INDEXED_FILE_SCHEMA),
+        SchemaProperty::array(
+            "coverage_gaps",
+            "File-level coverage limitations or source-integrity failures.",
+            &FILE_COVERAGE_DIAGNOSTIC_SCHEMA,
+        ),
         SchemaProperty::array(
             "policy_exclusions",
             "Verified policy exclusions without graph or semantic coverage.",
@@ -1619,6 +1673,30 @@ static CONTEXT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
     ],
 );
 
+static SUPPORT_UNIT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Compiled evidence atom the agent judges.",
+    &[
+        SchemaProperty::string("id", "Stable support unit id."),
+        SchemaProperty::string("kind", "Support unit kind.").with_enum(&[
+            "symbol_location",
+            "source_range",
+            "typed_graph_edge",
+            "complete_query_negative",
+        ]),
+        SchemaProperty::string("summary", "Evidence summary."),
+        SchemaProperty::string("path", "Project-relative file path."),
+        SchemaProperty::string("symbol_id", "Stable symbol id."),
+        SchemaProperty::integer("start_line", "1-based start line."),
+        SchemaProperty::integer("end_line", "1-based end line."),
+        SchemaProperty::string("snippet", "Optional source excerpt."),
+        SchemaProperty::string("edge_kind", "Typed graph edge kind."),
+        SchemaProperty::string("from_symbol", "Edge source symbol."),
+        SchemaProperty::string("to_symbol", "Edge target symbol."),
+        SchemaProperty::string("query", "Complete-query negative text."),
+    ],
+    &["id", "kind", "summary"],
+);
+
 static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
     "CodeStory broad task packet DTO with compiled support units and a machine stop or one-round drill disposition.",
     &[
@@ -1630,9 +1708,10 @@ static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::object("plan", "Packet planner trace."),
         SchemaProperty::object("answer", "Underlying DB-first answer packet."),
         SchemaProperty::object("budget", "Budget limits, usage, and truncation metadata."),
-        SchemaProperty::object(
+        SchemaProperty::array(
             "support",
             "Compiled evidence atoms: symbol locations, source ranges, typed graph edges, and complete-query negatives.",
+            &SUPPORT_UNIT_SCHEMA,
         ),
         SchemaProperty::object(
             "disposition",

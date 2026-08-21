@@ -27,6 +27,7 @@ from .event_producer_liveness import (
 from .foundation import REPOSITORY_ROOT, ProofFailure, require
 from .process_identity import (
     linux_terminated_state,
+    macos_terminated_state,
     process_start_identity,
     terminated_process_state,
 )
@@ -314,6 +315,20 @@ def _an_unreaped_process_is_never_reported_as_running() -> None:
         and linux_terminated_state("") is None,
         "an unreadable process state was reported as a termination",
     )
+    for state, terminated in (
+        ("Z", True),
+        ("Z+", True),
+        ("R", False),
+        ("Ss", False),
+        ("", False),
+        ("not a state", False),
+        ("Z\nR", False),
+    ):
+        observed = macos_terminated_state(state)
+        require(
+            (observed is not None) == terminated,
+            f"macOS process state {state!r} was classified wrong: {observed!r}",
+        )
     require(
         terminated_process_state(os.getpid()) is None,
         "this live self-test process was reported as terminated",

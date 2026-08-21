@@ -83,18 +83,27 @@ function resolveCodestoryCursorLauncher(env, home, fs, path) {
     })();
 }
 
-const INLINE_ENTRY = `'use strict';const fs=require('fs');const os=require('os');const path=require('path');${resolveCodestoryCursorLauncher.toString()}require(resolveCodestoryCursorLauncher(process.env,os.homedir(),fs,path));`;
+function runCodestoryCursorLauncher(env, home, fs, path) {
+  const launcher = resolveCodestoryCursorLauncher(env, home, fs, path);
+  const extra = process.argv[1] === "-e" ? process.argv.slice(3) : process.argv.slice(2);
+  process.argv = [process.execPath, launcher, ...extra];
+  const Module = require("module");
+  Module.runMain();
+}
+
+const INLINE_ENTRY = `'use strict';const fs=require('fs');const os=require('os');const path=require('path');${resolveCodestoryCursorLauncher.toString()}${runCodestoryCursorLauncher.toString()}runCodestoryCursorLauncher(process.env,os.homedir(),fs,path);`;
 
 if (require.main === module) {
-  require(resolveCodestoryCursorLauncher(
+  runCodestoryCursorLauncher(
     process.env,
     require("os").homedir(),
     require("fs"),
     require("path"),
-  ));
+  );
 }
 
 module.exports = {
   INLINE_ENTRY,
   resolveCodestoryCursorLauncher,
+  runCodestoryCursorLauncher,
 };

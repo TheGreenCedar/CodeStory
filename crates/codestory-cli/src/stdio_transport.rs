@@ -7011,6 +7011,108 @@ mod tests {
     use serde_json::json;
     use std::process::Command;
 
+    fn fixture_json_sha256(value: &serde_json::Value) -> String {
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(value).expect("serialize v2 fixture"))
+        )
+    }
+
+    #[test]
+    fn v2_packet_context_search_projection_bytes() {
+        let packet = stdio_packet_tool_call_success(
+            json!({
+                "packet_id": "packet-v2-fixture",
+                "question": "Explain dispatch.",
+                "answer": {"sections": [], "citations": [], "graphs": []},
+                "support": [],
+                "disposition": {"kind": "supported", "reason": "grounded"},
+                "budget": {
+                    "requested": "compact",
+                    "truncated": false,
+                    "omitted_sections": []
+                }
+            }),
+            &json!(["packet_stdio_phase label=fixture duration_ms=7"]),
+            &json!({
+                "operation": {"operation_id": "operation-v2-fixture"},
+                "core_publication": {
+                    "generation_id": "core-v2-fixture",
+                    "run_id": "run-v2-fixture"
+                }
+            }),
+        );
+
+        let context_answer = codestory_contracts::api::AgentAnswerDto {
+            answer_id: "context-v2-fixture".to_string(),
+            prompt: "AppController".to_string(),
+            summary: "Dispatch context.".to_string(),
+            freshness: None,
+            source_coverage: Vec::new(),
+            sections: Vec::new(),
+            citations: Vec::new(),
+            subgraph_ids: Vec::new(),
+            retrieval_version: "v2-fixture".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: serde_json::from_value(json!({
+                "request_id": "request-v2-fixture",
+                "resolved_profile": "architecture",
+                "policy_mode": "latency_first",
+                "total_latency_ms": 0,
+                "steps": []
+            }))
+            .expect("minimal context retrieval trace"),
+        };
+        let context = stdio_tool_call_success("context", context_packet_json(&context_answer));
+
+        let search_result = codestory_contracts::api::SearchResultsDto {
+            query: "AppController".to_string(),
+            retrieval_publication: None,
+            retrieval: codestory_contracts::api::RetrievalStateDto {
+                mode: codestory_contracts::api::RetrievalModeDto::Hybrid,
+                hybrid_configured: true,
+                semantic_ready: true,
+                semantic_mode: codestory_contracts::api::SemanticModeDto::Enabled,
+                semantic_doc_count: 1,
+                embedding_model: None,
+                current_embedding: None,
+                stored_embedding: None,
+                fallback_reason: None,
+                fallback_message: None,
+            },
+            retrieval_shadow: None,
+            freshness: None,
+            limit_per_source: 5,
+            repo_text_mode: SearchRepoTextMode::Off,
+            repo_text_enabled: false,
+            query_assessment: None,
+            search_plan: None,
+            repo_text_stats: None,
+            suggestions: Vec::new(),
+            indexed_symbol_hits: Vec::new(),
+            repo_text_hits: Vec::new(),
+            hits: Vec::new(),
+        };
+        let search = stdio_tool_call_success(
+            "search",
+            enrich_stdio_search_result(search_result, "project-v2-fixture", Path::new("/repo")),
+        );
+
+        let hashes = [
+            fixture_json_sha256(&packet),
+            fixture_json_sha256(&context),
+            fixture_json_sha256(&search),
+        ];
+        assert_eq!(
+            hashes,
+            [
+                "52f98c63f1a321bee9031cb7a990c58abf23859c73cde25c6948af1a4becdd5d".to_string(),
+                "b30f84585275d2423f7b3cca8350a7ed226bc5d8db2e647e2338cc1d7f711630".to_string(),
+                "07cf60cf7eed630b4d95b99ca1eec407ca025c64de76e219e9fcc2b061e1f4ee".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn published_guidance_calls_satisfy_the_generated_catalog() {
         fn walk(value: &serde_json::Value, checked: &mut usize) {
@@ -8881,6 +8983,35 @@ version = "0.11.20"
     }
 
     #[test]
+    fn native_v2_transcript_fixture_freezes_private_result_renderers() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../scripts/tests/fixtures/codestory-v2-transcripts.json"
+        ))
+        .expect("v2 transcript fixture");
+        let native = &fixture["native_v2"];
+        assert_eq!(
+            stdio_tool_call_success("status", json!({"state": "ready"})),
+            native["success"],
+        );
+        for (input, expected) in [
+            (
+                json!({"code":"codestory_preparing","message":"CodeStory is preparing managed search.","state":"preparing","retry_after_ms":250}),
+                &native["preparing"],
+            ),
+            (
+                json!({"code":"codestory_unavailable","message":"CodeStory is unavailable."}),
+                &native["unavailable"],
+            ),
+            (
+                json!({"code":"project_required","message":"An absolute repository root is required.","tool":"ground"}),
+                &native["tool_error"],
+            ),
+        ] {
+            assert_eq!(stdio_tool_call_error(&input), *expected);
+        }
+    }
+
+    #[test]
     fn compact_stdio_status_keeps_full_publication_class_when_live_not_ready() {
         let (_project, _cache, runtime) = stdio_inspect_only_runtime();
         let status = json!({
@@ -8906,6 +9037,28 @@ version = "0.11.20"
             compact["live_ready"],
             json!(true),
             "full publication class must not read as packet-ready when degraded: {compact}"
+        );
+        let schema = stdio_tools_list_json()["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "status")
+            .expect("status tool")["outputSchema"]
+            .clone();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("status outputSchema properties");
+        let undeclared = compact
+            .as_object()
+            .expect("compact status is an object")
+            .keys()
+            .filter(|key| !properties.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            undeclared.is_empty(),
+            "Cursor validates status structuredContent against additionalProperties: false, \
+             but compact status emits {undeclared:?}"
         );
     }
 

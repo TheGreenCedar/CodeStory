@@ -300,6 +300,42 @@ def _observed_exit_test(target_os: str) -> None:
     )
 
 
+def _macos_unreaped_exit_test(target_os: str) -> None:
+    if target_os != "macos":
+        return
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(write_fd)
+        try:
+            os.read(read_fd, 1)
+        finally:
+            os.close(read_fd)
+        os._exit(0)
+
+    os.close(read_fd)
+    waiter = None
+    try:
+        start_id = process_start_identity(pid)
+        waiter = ExactProcessExitWaiter(pid, start_id, target_os)
+        os.write(write_fd, b"x")
+        os.close(write_fd)
+        write_fd = -1
+        evidence = waiter.wait(5_000, require_clean_exit=False)
+        require(
+            evidence["status"] == "observed_exit"
+            and evidence["pid"] == pid
+            and evidence["process_start_id"] == start_id,
+            "macOS exited-but-unreaped process was not proven terminated",
+        )
+    finally:
+        if write_fd >= 0:
+            os.close(write_fd)
+        if waiter is not None:
+            waiter.close()
+        os.waitpid(pid, 0)
+
+
 def _constructor_unknown_then_exit_test(target_os: str) -> None:
     if target_os == "windows":
         return
@@ -703,6 +739,7 @@ def run_process_exit_self_tests() -> None:
     target_os = _target_os()
     _unix_exit_deadline_tests()
     _observed_exit_test(target_os)
+    _macos_unreaped_exit_test(target_os)
     _constructor_unknown_then_exit_test(target_os)
     _retained_exit_tests(_exit_budget_tests())
     _cleanup_project_tests()

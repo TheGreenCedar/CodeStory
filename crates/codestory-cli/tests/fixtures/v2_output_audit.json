@@ -1,0 +1,60 @@
+{
+  "success_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["state", "result"],
+    "properties": {
+      "state": {"type": "string", "enum": ["ready"]},
+      "result": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "files", "complete"],
+            "properties": {
+              "kind": {"type": "string", "enum": ["ground"]},
+              "files": {"type": "integer", "minimum": 0},
+              "complete": {"type": "boolean"}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "hits"],
+            "properties": {
+              "kind": {"type": "string", "enum": ["search"]},
+              "hits": {"type": "array", "minItems": 0, "items": {"type": "string"}}
+            }
+          }
+        ]
+      }
+    }
+  },
+  "cases": [
+    {
+      "name": "maximal-success-ground",
+      "outcome": "valid",
+      "structuredContent": {"state": "ready", "result": {"kind": "ground", "files": 7, "complete": true}}
+    },
+    {
+      "name": "maximal-success-search",
+      "outcome": "valid",
+      "structuredContent": {"state": "ready", "result": {"kind": "search", "hits": ["node:1", "node:2"]}}
+    },
+    {
+      "name": "native-preparing-outside-success-schema",
+      "outcome": "intentionally_nonconforming",
+      "structuredContent": {"code": "codestory_preparing", "state": "preparing", "retry_after_ms": 250, "operation": {"phase": "publication"}}
+    },
+    {
+      "name": "launcher-unavailable-outside-success-schema",
+      "outcome": "intentionally_nonconforming",
+      "structuredContent": {"code": "codestory_unavailable", "message": "CodeStory is unavailable.", "failure": "managed_cli_missing"}
+    },
+    {
+      "name": "tool-error-outside-success-schema",
+      "outcome": "intentionally_nonconforming",
+      "structuredContent": {"code": "project_required", "tool": "ground", "message": "An absolute repository root is required."}
+    }
+  ]
+}

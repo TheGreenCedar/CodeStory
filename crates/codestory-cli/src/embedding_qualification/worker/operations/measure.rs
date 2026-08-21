@@ -795,8 +795,10 @@ fn validate_vector_response(
     }
     for row in payload.chunks_exact(columns as usize * std::mem::size_of::<f32>()) {
         let norm = row
-            .chunks_exact(std::mem::size_of::<f32>())
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .try_fold(0.0_f64, |sum, value| {
                 if value.is_finite() {
                     Ok(sum + f64::from(value) * f64::from(value))

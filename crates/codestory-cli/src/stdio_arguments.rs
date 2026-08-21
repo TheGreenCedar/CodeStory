@@ -116,6 +116,32 @@ pub(crate) fn validate_tool_arguments(
     }
 }
 
+/// Validate a tool result's `structuredContent` against its declared output
+/// schema. This is intentionally an audit boundary for now: v2 still emits
+/// fail-open launcher and error payloads that are outside success schemas.
+///
+/// Keeping the interpreter shared with input validation means the catalog's
+/// closed schema subset has one implementation before a later protocol cut
+/// turns this observation into an enforced result boundary.
+#[allow(dead_code)]
+pub(crate) fn validate_structured_content(
+    schema: &Value,
+    structured_content: &Value,
+) -> Result<(), Vec<ArgumentViolation>> {
+    let mut violations = Vec::new();
+    validate_value(
+        schema,
+        structured_content,
+        "/structuredContent",
+        &mut violations,
+    );
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
 fn validate_value(schema: &Value, value: &Value, pointer: &str, out: &mut Vec<ArgumentViolation>) {
     let Some(schema) = schema.as_object() else {
         return;
@@ -586,6 +612,523 @@ mod tests {
                 Some(&json!(false)),
                 "{tool} must deny undeclared arguments"
             );
+        }
+    }
+
+    #[test]
+    fn structured_content_validator_admits_a_closed_tagged_output_union() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["state", "payload"],
+            "properties": {
+                "state": {"type": "string", "enum": ["ready", "preparing"]},
+                "payload": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["files"],
+                            "properties": {"files": {"type": "integer", "minimum": 0}}
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["retry_after_ms"],
+                            "properties": {"retry_after_ms": {"type": "integer", "minimum": 1}}
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            validate_structured_content(
+                &schema,
+                &json!({
+                    "state": "preparing",
+                    "payload": {"retry_after_ms": 250}
+                })
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            codes_from_output(
+                &schema,
+                json!({
+                    "state": "ready",
+                    "payload": {"files": -1, "unexpected": true},
+                    "extra": true
+                })
+            ),
+            vec!["unknown_property", "invalid_selector"]
+        );
+    }
+
+    #[test]
+    fn v2_output_audit_fixture_locks_success_and_intentionally_nonconforming_shapes() {
+        let audit: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/v2_output_audit.json"))
+                .expect("v2 output audit fixture");
+        let schema = &audit["success_schema"];
+        for case in audit["cases"].as_array().expect("audit cases") {
+            let actual = validate_structured_content(schema, &case["structuredContent"]);
+            match case["outcome"].as_str().expect("audit outcome") {
+                "valid" => assert!(actual.is_ok(), "{}: {actual:?}", case["name"]),
+                "intentionally_nonconforming" => assert!(actual.is_err(), "{}", case["name"]),
+                other => panic!("unknown audit outcome {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn maximal_samples_cover_every_current_output_schema_field() {
+        let catalog = crate::stdio_catalog::tools_list_json();
+        let tools = catalog["result"]["tools"]
+            .as_array()
+            .expect("published tools");
+        for tool in tools {
+            let Some(schema) = tool.get("outputSchema") else {
+                continue;
+            };
+            let samples = exhaustive_schema_samples(schema);
+            assert!(
+                !samples.is_empty(),
+                "{} must produce audit samples",
+                tool["name"]
+            );
+            for sample in samples {
+                assert!(
+                    validate_structured_content(schema, &sample).is_ok(),
+                    "{} exhaustive output sample must satisfy its current schema: {sample}; schema={schema}",
+                    tool["name"]
+                );
+            }
+            let gaps = schema_coverage_gaps(schema, &exhaustive_schema_samples(schema));
+            assert!(
+                gaps.is_empty(),
+                "{} output audit missed declared schema elements: {gaps:?}",
+                tool["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustive_samples_cover_zero_minimum_arrays_nullable_types_and_union_branches() {
+        let schemas = [
+            json!({
+                "type": "array",
+                "minItems": 0,
+                "items": {
+                    "oneOf": [
+                        {"type": "string", "enum": ["first", "second"]},
+                        {"type": "integer", "minimum": 1}
+                    ]
+                }
+            }),
+            json!({"type": ["string", "null"]}),
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "left": {"type": "string", "enum": ["left-a", "left-b"]},
+                    "right": {"type": "integer", "minimum": 1}
+                },
+                "anyOf": [
+                    {"required": ["left"]},
+                    {"required": ["right"]}
+                ]
+            }),
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "left": {"type": "string"},
+                    "right": {"type": "boolean"}
+                },
+                "allOf": [
+                    {"required": ["left"]},
+                    {"required": ["right"]}
+                ]
+            }),
+        ];
+
+        for schema in &schemas {
+            let samples = exhaustive_schema_samples(schema);
+            assert!(
+                samples
+                    .iter()
+                    .all(|sample| validate_structured_content(schema, sample).is_ok()),
+                "every generated sample must validate: {samples:?}"
+            );
+            let gaps = schema_coverage_gaps(schema, &samples);
+            assert!(
+                gaps.is_empty(),
+                "declared schema elements were not sampled: {gaps:?}; samples={samples:?}"
+            );
+        }
+
+        let independent_any_of = &schemas[2];
+        let samples = exhaustive_schema_samples(independent_any_of);
+        for branch in 0..2 {
+            assert!(
+                samples.iter().any(|sample| {
+                    matching_union_branches(independent_any_of, "anyOf", sample) == vec![branch]
+                }),
+                "anyOf branch {branch} needs an independent witness: {samples:?}"
+            );
+        }
+    }
+
+    /// A bounded audit corpus: one minimal valid base plus one substitution for
+    /// each declared property, enum member, union branch, type alternative, and
+    /// array-item variant. It avoids a Cartesian product, while the independent
+    /// coverage ratchet below proves that every declared element has a witness.
+    fn exhaustive_schema_samples(schema: &Value) -> Vec<Value> {
+        let mut samples = raw_schema_samples(schema)
+            .into_iter()
+            .filter(|sample| accepts(schema, sample))
+            .collect::<Vec<_>>();
+        samples.sort_by_key(Value::to_string);
+        samples.dedup();
+        samples
+    }
+
+    fn raw_schema_samples(schema: &Value) -> Vec<Value> {
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            let mut samples = values.clone();
+            if schema
+                .get("type")
+                .and_then(Value::as_array)
+                .is_some_and(|types| types.contains(&json!("null")))
+                && !samples.contains(&Value::Null)
+            {
+                samples.push(Value::Null);
+            }
+            return samples;
+        }
+        for keyword in ["oneOf", "anyOf"] {
+            let Some(variants) = schema.get(keyword).and_then(Value::as_array) else {
+                continue;
+            };
+            let outer = schema_without(schema, keyword);
+            return variants
+                .iter()
+                .flat_map(|variant| raw_schema_samples(&merge_schema_constraints(&outer, variant)))
+                .collect();
+        }
+        if let Some(constraints) = schema.get("allOf").and_then(Value::as_array) {
+            let mut composed = schema_without(schema, "allOf");
+            for constraint in constraints {
+                composed = merge_schema_constraints(&composed, constraint);
+            }
+            return raw_schema_samples(&composed);
+        }
+        let declared_types = match schema.get("type") {
+            Some(Value::String(name)) => vec![name.as_str()],
+            Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).collect(),
+            _ if schema.get("properties").is_some() || schema.get("required").is_some() => {
+                vec!["object"]
+            }
+            _ if schema.get("items").is_some() => vec!["array"],
+            _ => Vec::new(),
+        };
+        let mut samples = Vec::new();
+        for declared_type in declared_types {
+            samples.extend(samples_for_type(schema, declared_type));
+        }
+        if samples.is_empty() {
+            samples.push(Value::Null);
+        }
+        samples
+    }
+
+    fn samples_for_type(schema: &Value, declared_type: &str) -> Vec<Value> {
+        match declared_type {
+            "object" => object_schema_samples(schema),
+            "array" => {
+                let minimum = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0);
+                let count = minimum.max(1);
+                if schema
+                    .get("maxItems")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|maximum| count > maximum)
+                {
+                    return vec![Value::Array(Vec::new())];
+                }
+                let choices = schema
+                    .get("items")
+                    .map(raw_schema_samples)
+                    .unwrap_or_else(|| vec![Value::Null]);
+                choices
+                    .into_iter()
+                    .map(|item| Value::Array((0..count).map(|_| item.clone()).collect()))
+                    .collect()
+            }
+            "boolean" => vec![json!(true), json!(false)],
+            "integer" => vec![json!(
+                schema.get("minimum").and_then(Value::as_i64).unwrap_or(0)
+            )],
+            "number" => vec![json!(
+                schema.get("minimum").and_then(Value::as_f64).unwrap_or(0.0)
+            )],
+            "string" => {
+                let minimum = schema.get("minLength").and_then(Value::as_u64).unwrap_or(1);
+                let maximum = schema.get("maxLength").and_then(Value::as_u64);
+                let length = maximum.map_or(minimum.max(1), |bound| minimum.max(1).min(bound));
+                vec![Value::String("x".repeat(length as usize))]
+            }
+            "null" => vec![Value::Null],
+            _ => Vec::new(),
+        }
+    }
+
+    fn object_schema_samples(schema: &Value) -> Vec<Value> {
+        schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|properties| {
+                let choices = properties
+                    .iter()
+                    .map(|(name, property)| (name, raw_schema_samples(property)))
+                    .collect::<Vec<_>>();
+                let required = schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let mut base = serde_json::Map::new();
+                for name in &required {
+                    let value = choices
+                        .iter()
+                        .find(|(candidate, _)| candidate.as_str() == *name)
+                        .and_then(|(_, values)| values.first())
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    base.insert((*name).to_string(), value);
+                }
+                let mut samples = vec![Value::Object(base.clone())];
+                for (name, values) in choices {
+                    for value in values {
+                        let mut sample = base.clone();
+                        sample.insert(name.clone(), value);
+                        samples.push(Value::Object(sample));
+                    }
+                }
+                samples
+            })
+            .unwrap_or_else(|| vec![json!({})])
+    }
+
+    fn schema_without(schema: &Value, keyword: &str) -> Value {
+        let mut outer = schema.as_object().cloned().unwrap_or_default();
+        outer.remove(keyword);
+        Value::Object(outer)
+    }
+
+    fn merge_schema_constraints(base: &Value, constraint: &Value) -> Value {
+        let (Some(base), Some(constraint)) = (base.as_object(), constraint.as_object()) else {
+            return constraint.clone();
+        };
+        let mut merged = base.clone();
+        for (key, value) in constraint {
+            match key.as_str() {
+                "required" => {
+                    let mut names = merged
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    for name in value.as_array().into_iter().flatten() {
+                        if !names.contains(name) {
+                            names.push(name.clone());
+                        }
+                    }
+                    merged.insert(key.clone(), Value::Array(names));
+                }
+                "properties" => {
+                    let mut properties = merged
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    for (name, property) in value.as_object().into_iter().flatten() {
+                        let composed = properties.get(name).map_or_else(
+                            || property.clone(),
+                            |current| merge_schema_constraints(current, property),
+                        );
+                        properties.insert(name.clone(), composed);
+                    }
+                    merged.insert(key.clone(), Value::Object(properties));
+                }
+                "minimum" | "minItems" | "minLength" => {
+                    let selected = merged.get(key).and_then(Value::as_f64).map_or_else(
+                        || value.clone(),
+                        |current| {
+                            if value.as_f64().is_some_and(|incoming| incoming > current) {
+                                value.clone()
+                            } else {
+                                merged[key].clone()
+                            }
+                        },
+                    );
+                    merged.insert(key.clone(), selected);
+                }
+                "maximum" | "maxItems" | "maxLength" => {
+                    let selected = merged.get(key).and_then(Value::as_f64).map_or_else(
+                        || value.clone(),
+                        |current| {
+                            if value.as_f64().is_some_and(|incoming| incoming < current) {
+                                value.clone()
+                            } else {
+                                merged[key].clone()
+                            }
+                        },
+                    );
+                    merged.insert(key.clone(), selected);
+                }
+                "additionalProperties" if value == &Value::Bool(false) => {
+                    merged.insert(key.clone(), Value::Bool(false));
+                }
+                _ => {
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        Value::Object(merged)
+    }
+
+    fn matching_union_branches(schema: &Value, keyword: &str, sample: &Value) -> Vec<usize> {
+        schema
+            .get(keyword)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(index, branch)| accepts(branch, sample).then_some(index))
+            .collect()
+    }
+
+    fn schema_coverage_gaps(schema: &Value, samples: &[Value]) -> Vec<String> {
+        let mut declared = std::collections::BTreeSet::new();
+        collect_declared_schema_coverage(schema, "#", &mut declared);
+        let mut covered = std::collections::BTreeSet::new();
+        for sample in samples {
+            collect_sample_schema_coverage(schema, sample, "#", &mut covered);
+        }
+        declared.difference(&covered).cloned().collect()
+    }
+
+    fn collect_declared_schema_coverage(
+        schema: &Value,
+        path: &str,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        if let Some(types) = schema.get("type").and_then(Value::as_array) {
+            for (index, _) in types.iter().enumerate() {
+                out.insert(format!("{path}/type/{index}"));
+            }
+        }
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            for (index, _) in values.iter().enumerate() {
+                out.insert(format!("{path}/enum/{index}"));
+            }
+        }
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (name, property) in properties {
+                let property_path = format!("{path}/properties/{name}");
+                out.insert(property_path.clone());
+                collect_declared_schema_coverage(property, &property_path, out);
+            }
+        }
+        if let Some(items) = schema.get("items") {
+            let item_path = format!("{path}/items");
+            out.insert(item_path.clone());
+            collect_declared_schema_coverage(items, &item_path, out);
+        }
+        for keyword in ["oneOf", "anyOf", "allOf"] {
+            if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
+                for (index, branch) in branches.iter().enumerate() {
+                    let branch_path = format!("{path}/{keyword}/{index}");
+                    out.insert(branch_path.clone());
+                    collect_declared_schema_coverage(branch, &branch_path, out);
+                }
+            }
+        }
+    }
+
+    fn collect_sample_schema_coverage(
+        schema: &Value,
+        sample: &Value,
+        path: &str,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        if let Some(types) = schema.get("type").and_then(Value::as_array) {
+            for (index, name) in types.iter().filter_map(Value::as_str).enumerate() {
+                if matches_type_name(name, sample) {
+                    out.insert(format!("{path}/type/{index}"));
+                }
+            }
+        }
+        if let Some(values) = schema.get("enum").and_then(Value::as_array)
+            && let Some(index) = values.iter().position(|value| value == sample)
+        {
+            out.insert(format!("{path}/enum/{index}"));
+        }
+        if let (Some(properties), Some(members)) = (
+            schema.get("properties").and_then(Value::as_object),
+            sample.as_object(),
+        ) {
+            for (name, property) in properties {
+                let Some(member) = members.get(name) else {
+                    continue;
+                };
+                let property_path = format!("{path}/properties/{name}");
+                out.insert(property_path.clone());
+                collect_sample_schema_coverage(property, member, &property_path, out);
+            }
+        }
+        if let (Some(items), Some(members)) = (schema.get("items"), sample.as_array())
+            && !members.is_empty()
+        {
+            let item_path = format!("{path}/items");
+            out.insert(item_path.clone());
+            for member in members {
+                collect_sample_schema_coverage(items, member, &item_path, out);
+            }
+        }
+        for keyword in ["oneOf", "anyOf"] {
+            let matches = matching_union_branches(schema, keyword, sample);
+            if keyword == "anyOf" && matches.len() != 1 {
+                continue;
+            }
+            for index in matches {
+                let branch_path = format!("{path}/{keyword}/{index}");
+                out.insert(branch_path.clone());
+                collect_sample_schema_coverage(&schema[keyword][index], sample, &branch_path, out);
+            }
+        }
+        if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+            for (index, branch) in branches.iter().enumerate() {
+                if !accepts(branch, sample) {
+                    continue;
+                }
+                let branch_path = format!("{path}/allOf/{index}");
+                out.insert(branch_path.clone());
+                collect_sample_schema_coverage(branch, sample, &branch_path, out);
+            }
+        }
+    }
+
+    fn codes_from_output(schema: &Value, structured_content: Value) -> Vec<&'static str> {
+        match validate_structured_content(schema, &structured_content) {
+            Ok(()) => Vec::new(),
+            Err(violations) => violations
+                .iter()
+                .map(super::ArgumentViolation::code)
+                .collect(),
         }
     }
 

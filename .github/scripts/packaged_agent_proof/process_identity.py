@@ -155,28 +155,54 @@ def linux_terminated_state(stat: str) -> str | None:
     return None
 
 
+def macos_terminated_state(state_output: str) -> str | None:
+    """The terminated state named by one macOS ``ps`` row, or None."""
+    rows = state_output.splitlines()
+    if len(rows) != 1:
+        return None
+    state = rows[0].strip()
+    # Darwin reports `Z` for an exited-but-unreaped process. State modifiers
+    # may follow the primary state character, so accept only the documented
+    # modifier alphabet and fail closed on every other shape.
+    if re.fullmatch(r"Z[+<>NLsE]*", state):
+        return "is in state Z: it has terminated and is waiting to be reaped"
+    return None
+
+
 def terminated_process_state(pid: int) -> str | None:
     """How ``pid`` is provably no longer running, or None if it may still be.
 
-    Only Linux needs this. A process that has exited but has not yet been reaped
-    keeps a readable ``/proc/<pid>/stat`` whose start time never changes, so a
-    liveness probe built on start identity alone calls a dead process running
-    until its parent reaps it. macOS ``proc_pidinfo`` already fails outright for
-    a zombie, and Windows ``GetExitCodeProcess`` already reports its real exit
-    code, so both answer correctly without this.
+    Linux keeps a zombie's readable ``/proc/<pid>/stat`` and macOS keeps its PID
+    present while ``proc_pidinfo`` no longer returns a complete start identity.
+    Both therefore need an explicit terminated-state observation. Windows
+    ``GetExitCodeProcess`` already reports the real exit code.
 
-    Observational only: an unreadable or unparsable ``/proc`` entry answers
-    None, because "cannot tell" must never be reported as "has exited".
+    Observational only: unreadable, failed, or unparsable state inspection
+    answers None, because "cannot tell" must never be reported as "has exited".
     """
-    if sys.platform != "linux":
+    if sys.platform == "linux":
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except (FileNotFoundError, ProcessLookupError):
+            return "no longer exists"
+        except OSError:
+            return None
+        return linux_terminated_state(stat)
+    if sys.platform != "darwin":
         return None
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except (FileNotFoundError, ProcessLookupError):
-        return "no longer exists"
-    except OSError:
+        completed = subprocess.run(
+            ["/bin/ps", "-o", "state=", "-p", str(pid)],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
         return None
-    return linux_terminated_state(stat)
+    if completed.returncode != 0:
+        return None
+    return macos_terminated_state(completed.stdout)
 
 
 def _macos_process_start_identity(pid: int) -> str:
