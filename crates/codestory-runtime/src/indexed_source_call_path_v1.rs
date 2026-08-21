@@ -4,16 +4,26 @@
 //! be inside `PublicOperationService::run_with_cancel`, which installs the
 //! complete core snapshot used for every Store read below.
 
+// The complete adapter stays dark until the atomic v3 surface cut. Building
+// `codestory-runtime` as a dependency with `test-support` must not turn that
+// deliberate lack of production callers into warning noise.
+#![allow(dead_code)]
+
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use codestory_agent::indexed_source_call_path_v1::{
     AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence, ExactScopeSelector,
     ExactSymbolSelector, FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow,
-    PinnedNodeIdentity, RawCallEdgeAdmission, ReceiptRef, ResolvedNodeIdentity, UnavailableReason,
-    ValidatedCallPathContract, VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
+    InternalCorePublicationIdentity, InternalProjection, InternalProjectionInput, PROOF_DOMAIN,
+    PinnedNodeIdentity, ProofDisposition, ProofHashes, RawCallEdgeAdmission, ReceiptRef,
+    ResolvedNodeIdentity, UnavailableProofFact, UnavailableReason, ValidatedCallPathContract,
+    ValidatedContractRendering, VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
+    check_call_path, project_internal_call_path_result,
 };
 use codestory_contracts::api::ApiError;
 use codestory_contracts::graph::{Node, NodeId, NodeKind, ResolutionCertainty};
@@ -26,13 +36,13 @@ use sha2::{Digest, Sha256};
 
 use crate::AppController;
 use crate::path_identity::OperationPathIdentityResolver;
+use crate::services::{PublicOperation, PublicOperationService};
 
 const INDEXED_LINE_KIND: &str = "indexed_line_v1";
 const MAX_LINE_WINDOW_BYTES: usize = 8_192;
 const RECEIPT_DOMAIN: &[u8] = b"codestory.indexed-call-edge-receipt.v1\0";
 const CALLABLE_KINDS: [NodeKind; 3] = [NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::MACRO];
 
-#[allow(dead_code)] // Task 2C wires the accepted dark contract into this leaf.
 pub(crate) fn build_indexed_source_call_path_facts(
     controller: &AppController,
     contract: &ValidatedCallPathContract,
@@ -309,6 +319,97 @@ where
         gaps,
         unavailable,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IntegratedCallPathResult {
+    pub built: BuiltCallPathFacts,
+    pub disposition: ProofDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IntegratedProjectedCallPathResult {
+    pub integrated: IntegratedCallPathResult,
+    pub projection: InternalProjection,
+}
+
+pub(crate) fn run_integrated_projected_public_operation(
+    service: &PublicOperationService,
+    controller: &AppController,
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    rendering: &ValidatedContractRendering,
+    cancelled: Arc<AtomicBool>,
+) -> Result<PublicOperation<IntegratedProjectedCallPathResult>, ApiError> {
+    service.run_with_cancel(PROOF_DOMAIN, cancelled, || {
+        let publication = controller.active_core_publication().ok_or_else(|| {
+            ApiError::internal("indexed call-path projection requires an active core publication")
+        })?;
+        let project_root = controller.require_project_root()?;
+        let built = build_indexed_source_call_path_facts(controller, contract)?;
+        let integrated = integrate_built_facts(contract, hashes, built);
+        let projection = project_internal_call_path_result(InternalProjectionInput {
+            contract,
+            hashes,
+            rendering,
+            publication: InternalCorePublicationIdentity {
+                project_id: project_identity_v3(&project_root).project_id,
+                generation_id: publication.generation_id,
+                run_id: publication.run_id,
+            },
+            disposition: &integrated.disposition,
+            receipts: &integrated.built.receipts,
+        })
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "indexed call-path projection construction failed: {error:?}"
+            ))
+        })?;
+        Ok(IntegratedProjectedCallPathResult {
+            integrated,
+            projection,
+        })
+    })
+}
+
+fn evaluate_from_store<R>(
+    store: &Store,
+    project_root: &Path,
+    project_id: &str,
+    publication: &IndexPublicationRecord,
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    read_source: R,
+) -> Result<IntegratedCallPathResult, ApiError>
+where
+    R: FnMut(&Path) -> io::Result<Vec<u8>>,
+{
+    let built = build_from_store(
+        store,
+        project_root,
+        project_id,
+        publication,
+        contract,
+        read_source,
+    )?;
+    Ok(integrate_built_facts(contract, hashes, built))
+}
+
+fn integrate_built_facts(
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    built: BuiltCallPathFacts,
+) -> IntegratedCallPathResult {
+    let mut facts = built.facts.clone();
+    facts.extend(
+        built
+            .unavailable
+            .iter()
+            .cloned()
+            .map(|reason| VerifiedProofFact::Unavailable(UnavailableProofFact { reason })),
+    );
+    let disposition = check_call_path(contract, hashes, &facts);
+    IntegratedCallPathResult { built, disposition }
 }
 
 #[derive(Debug)]
@@ -762,16 +863,25 @@ fn store_error(error: codestory_store::StorageError) -> ApiError {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use codestory_agent::indexed_source_call_path_v1::{
         ClauseAnchor, ClauseClassification, ProofContractField, UnvalidatedCallPathContract,
-        UnvalidatedCallPathSpec, UnvalidatedDirectCallStep, UnvalidatedExactSymbolSelector,
-        ValidationOutcome, validate_contract,
+        UnvalidatedCallPathSpec, UnvalidatedDirectCallStep, UnvalidatedExactScopeSelector,
+        UnvalidatedExactSymbolSelector, ValidatedContractRendering, ValidationOutcome,
+        validate_contract,
     };
+    use codestory_contracts::api::IndexMode;
+    use codestory_contracts::events::EventBus;
     use codestory_contracts::graph::{
         CallableProjectionState, Edge, EdgeId, EdgeKind, Node, ResolutionCertainty,
     };
+    use codestory_indexer::WorkspaceIndexer;
     use codestory_store::{FileInfo, FileRole, IndexPublicationMode};
+    use codestory_workspace::{BuildMode, RefreshInfo};
+    use serde_json::json;
     use tempfile::TempDir;
 
     struct Fixture {
@@ -788,7 +898,27 @@ mod tests {
         UnvalidatedExactSymbolSelector::CanonicalId(value.to_owned())
     }
 
-    fn contract(start: &str, targets: &[&str]) -> ValidatedCallPathContract {
+    fn validated_contract(
+        start: &str,
+        targets: &[&str],
+    ) -> (
+        ValidatedCallPathContract,
+        ProofHashes,
+        ValidatedContractRendering,
+    ) {
+        validated_contract_with_policies(start, targets, &[], &[])
+    }
+
+    fn validated_contract_with_policies(
+        start: &str,
+        targets: &[&str],
+        traversal_prohibitions: &[&str],
+        projection_exclusions: &[&str],
+    ) -> (
+        ValidatedCallPathContract,
+        ProofHashes,
+        ValidatedContractRendering,
+    ) {
         let source = "exact direct ordered call path";
         let mut clauses = vec![ClauseAnchor {
             clause_id: "start".to_owned(),
@@ -816,6 +946,32 @@ mod tests {
                 },
             });
         }
+        for (index, _) in traversal_prohibitions.iter().enumerate() {
+            clauses.push(ClauseAnchor {
+                clause_id: format!("traversal-{index}"),
+                start: 0,
+                end: source.len(),
+                quote: source.to_owned(),
+                classification: ClauseClassification::ResolvedMaterial {
+                    fields: vec![ProofContractField::TraversalProhibition {
+                        index: u8::try_from(index).unwrap(),
+                    }],
+                },
+            });
+        }
+        for (index, _) in projection_exclusions.iter().enumerate() {
+            clauses.push(ClauseAnchor {
+                clause_id: format!("projection-{index}"),
+                start: 0,
+                end: source.len(),
+                quote: source.to_owned(),
+                classification: ClauseClassification::ResolvedMaterial {
+                    fields: vec![ProofContractField::ProjectionExclusion {
+                        index: u8::try_from(index).unwrap(),
+                    }],
+                },
+            });
+        }
         let input = UnvalidatedCallPathContract::new(
             source,
             clauses,
@@ -827,14 +983,28 @@ mod tests {
                         target: canonical(target),
                     })
                     .collect(),
-                prohibit_traversal_through: Vec::new(),
-                exclude_from_projection: Vec::new(),
+                prohibit_traversal_through: traversal_prohibitions
+                    .iter()
+                    .map(|scope| UnvalidatedExactScopeSelector::CanonicalId((*scope).to_owned()))
+                    .collect(),
+                exclude_from_projection: projection_exclusions
+                    .iter()
+                    .map(|scope| UnvalidatedExactScopeSelector::CanonicalId((*scope).to_owned()))
+                    .collect(),
             },
         );
         match validate_contract(input).unwrap() {
-            ValidationOutcome::Validated { contract, .. } => *contract,
+            ValidationOutcome::Validated {
+                contract,
+                hashes,
+                rendering,
+            } => (*contract, hashes, rendering),
             other => panic!("expected validated contract, got {other:?}"),
         }
+    }
+
+    fn contract(start: &str, targets: &[&str]) -> ValidatedCallPathContract {
+        validated_contract(start, targets).0
     }
 
     fn node(
@@ -959,6 +1129,592 @@ mod tests {
             contract: contract("source-id", &["target-id"]),
             source_path,
         }
+    }
+
+    struct SourceBuiltFixture {
+        _root: TempDir,
+        root: PathBuf,
+        source_path: PathBuf,
+        store: Store,
+        publication: IndexPublicationRecord,
+        project_id: String,
+    }
+
+    fn source_built_fixture(source: &str) -> SourceBuiltFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let source_path = root.join("src/lib.rs");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, source).unwrap();
+        let mut store = Store::new_in_memory().unwrap();
+        WorkspaceIndexer::new(root.clone())
+            .run_incremental(
+                &mut store,
+                &RefreshInfo {
+                    mode: BuildMode::Incremental,
+                    files_to_index: vec![source_path.clone()],
+                    files_to_remove: Vec::new(),
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )
+            .unwrap();
+        SourceBuiltFixture {
+            _root: temp,
+            root: root.clone(),
+            source_path,
+            store,
+            publication: IndexPublicationRecord {
+                generation: 1,
+                generation_id: "source-built-generation-1".to_owned(),
+                run_id: "source-built-run-1".to_owned(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            },
+            project_id: project_identity_v3(&root).project_id,
+        }
+    }
+
+    fn source_callable(store: &Store, terminal_name: &str) -> Node {
+        let nodes = store.get_nodes().unwrap();
+        let mut matches = nodes
+            .iter()
+            .filter(|node| {
+                is_callable(node.kind)
+                    && (node.serialized_name == terminal_name
+                        || node.qualified_name.as_deref().is_some_and(|qualified| {
+                            qualified.rsplit("::").next() == Some(terminal_name)
+                        }))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "source fixture must have one exact callable named {terminal_name}: matches={matches:?}, nodes={nodes:?}"
+        );
+        matches.remove(0)
+    }
+
+    fn canonical_id(node: &Node) -> &str {
+        node.canonical_id
+            .as_deref()
+            .expect("source-built callable has a canonical ID")
+    }
+
+    fn source_built_census(store: &Store) -> (usize, usize) {
+        let call_rows = store
+            .get_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL)
+            .collect::<Vec<_>>();
+        let admitted = call_rows
+            .iter()
+            .filter(|edge| {
+                matches!(
+                    admit_raw_call_edge(edge, edge.effective_source(), edge.effective_target()),
+                    RawCallEdgeAdmission::Admitted(_)
+                )
+            })
+            .count();
+        (call_rows.len(), admitted)
+    }
+
+    #[test]
+    fn source_built_one_and_six_step_paths_integrate_exact_receipts_and_stable_census() {
+        let one = source_built_fixture(
+            "pub fn callee() -> i32 { 1 }\npub fn caller() -> i32 { callee(); 1 }\n",
+        );
+        let caller = source_callable(&one.store, "caller");
+        let callee = source_callable(&one.store, "callee");
+        let (one_contract, one_hashes, _) =
+            validated_contract(canonical_id(&caller), &[canonical_id(&callee)]);
+        let one_result = evaluate_from_store(
+            &one.store,
+            &one.root,
+            &one.project_id,
+            &one.publication,
+            &one_contract,
+            &one_hashes,
+            |path| fs::read(path),
+        )
+        .unwrap();
+
+        assert_eq!(source_built_census(&one.store), (1, 1));
+        eprintln!("source-built admission census: raw_call_rows=1 admitted_rows=1");
+        assert_eq!(one_result.built.facts.len(), 1);
+        assert_eq!(one_result.built.receipts.len(), 1);
+        assert!(one_result.built.gaps.is_empty());
+        assert!(one_result.built.unavailable.is_empty());
+        let receipt = &one_result.built.receipts[0];
+        let raw_edge = one
+            .store
+            .get_edges()
+            .unwrap()
+            .into_iter()
+            .find(|edge| edge.kind == EdgeKind::CALL)
+            .expect("one source-built raw call edge");
+        assert_eq!(receipt.source.pinned.node_id, caller.id.0.to_string());
+        assert_eq!(receipt.target.pinned.node_id, callee.id.0.to_string());
+        assert_eq!(receipt.receipt.edge_id, raw_edge.id.0.to_string());
+        assert_eq!(
+            receipt.callsite_identity,
+            raw_edge.callsite_identity.as_deref().unwrap()
+        );
+        assert_eq!(receipt.containment.owner_node_id, caller.id);
+        assert_eq!(
+            receipt.line_window.indexed_sha256,
+            sha256_hex(&fs::read(&one.source_path).unwrap())
+        );
+        assert_eq!(
+            receipt.line_window.observed_sha256,
+            receipt.line_window.indexed_sha256
+        );
+        assert_eq!(
+            receipt.line_window.text,
+            "pub fn caller() -> i32 { callee(); 1 }\n"
+        );
+        assert_eq!(
+            receipt
+                .callsite_identity
+                .split('|')
+                .next()
+                .unwrap()
+                .split(':')
+                .count(),
+            4
+        );
+        assert!(receipt.receipt.receipt_id.starts_with("indexed-call-edge:"));
+        assert_eq!(
+            one_result.disposition,
+            ProofDisposition::ContractProven {
+                contract_digest: one_hashes.contract_digest().to_owned(),
+                receipts: vec![receipt.receipt.clone()],
+            }
+        );
+
+        let six = source_built_fixture(
+            "pub fn step0() { step1(); }\n\
+             pub fn step1() { step2(); }\n\
+             pub fn step2() { step3(); }\n\
+             pub fn step3() { step4(); }\n\
+             pub fn step4() { step5(); }\n\
+             pub fn step5() { step6(); }\n\
+             pub fn step6() {}\n",
+        );
+        let nodes = (0..=6)
+            .map(|index| source_callable(&six.store, &format!("step{index}")))
+            .collect::<Vec<_>>();
+        let target_ids = nodes[1..].iter().map(canonical_id).collect::<Vec<_>>();
+        let (six_contract, six_hashes, _) =
+            validated_contract(canonical_id(&nodes[0]), &target_ids);
+        let six_result = evaluate_from_store(
+            &six.store,
+            &six.root,
+            &six.project_id,
+            &six.publication,
+            &six_contract,
+            &six_hashes,
+            |path| fs::read(path),
+        )
+        .unwrap();
+
+        assert_eq!(source_built_census(&six.store), (6, 6));
+        eprintln!("source-built admission census: raw_call_rows=6 admitted_rows=6");
+        assert_eq!(six_result.built.facts.len(), 6);
+        assert_eq!(six_result.built.receipts.len(), 6);
+        let receipt_ids = six_result
+            .built
+            .receipts
+            .iter()
+            .map(|receipt| receipt.receipt.receipt_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let edge_ids = six_result
+            .built
+            .receipts
+            .iter()
+            .map(|receipt| receipt.receipt.edge_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(receipt_ids.len(), 6);
+        assert_eq!(edge_ids.len(), 6);
+        for (index, receipt) in six_result.built.receipts.iter().enumerate() {
+            assert_eq!(receipt.source.pinned.node_id, nodes[index].id.0.to_string());
+            assert_eq!(
+                receipt.target.pinned.node_id,
+                nodes[index + 1].id.0.to_string()
+            );
+            if let Some(next) = six_result.built.receipts.get(index + 1) {
+                assert_eq!(receipt.target, next.source);
+            }
+        }
+        assert!(matches!(
+            six_result.disposition,
+            ProofDisposition::ContractProven { ref receipts, .. } if receipts.len() == 6
+        ));
+    }
+
+    #[test]
+    fn source_built_hostile_mutations_never_preserve_a_proven_contract() {
+        let six = source_built_fixture(
+            "pub fn step0() { step1(); }\n\
+             pub fn step1() { step2(); }\n\
+             pub fn step2() { step3(); }\n\
+             pub fn step3() { step4(); }\n\
+             pub fn step4() { step5(); }\n\
+             pub fn step5() { step6(); }\n\
+             pub fn step6() {}\n",
+        );
+        let nodes = (0..=6)
+            .map(|index| source_callable(&six.store, &format!("step{index}")))
+            .collect::<Vec<_>>();
+        let targets = nodes[1..].iter().map(canonical_id).collect::<Vec<_>>();
+        let (contract, hashes, _) = validated_contract(canonical_id(&nodes[0]), &targets);
+        let integrated = evaluate_from_store(
+            &six.store,
+            &six.root,
+            &six.project_id,
+            &six.publication,
+            &contract,
+            &hashes,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert!(matches!(
+            integrated.disposition,
+            ProofDisposition::ContractProven { .. }
+        ));
+
+        let mut reversed = integrated.built.facts.clone();
+        for fact in &mut reversed {
+            if let VerifiedProofFact::DirectCall(fact) = fact {
+                std::mem::swap(&mut fact.source, &mut fact.target);
+            }
+        }
+        let omitted = integrated.built.facts[..5].to_vec();
+        let mut changed_target = integrated.built.facts.clone();
+        let VerifiedProofFact::DirectCall(first_changed) = &mut changed_target[0] else {
+            panic!("source-built fact is direct")
+        };
+        first_changed.target = match &integrated.built.facts[1] {
+            VerifiedProofFact::DirectCall(next) => next.target.clone(),
+            _ => panic!("source-built fact is direct"),
+        };
+        let mut reused = integrated.built.facts.clone();
+        let first_receipt = match &reused[0] {
+            VerifiedProofFact::DirectCall(fact) => fact.receipt.clone(),
+            _ => panic!("source-built fact is direct"),
+        };
+        let VerifiedProofFact::DirectCall(last) = reused.last_mut().unwrap() else {
+            panic!("source-built fact is direct")
+        };
+        last.receipt = first_receipt;
+
+        for (mutation, facts) in [
+            ("reverse", reversed),
+            ("omit", omitted),
+            ("target", changed_target),
+            ("reuse", reused),
+        ] {
+            assert!(
+                !matches!(
+                    check_call_path(&contract, &hashes, &facts),
+                    ProofDisposition::ContractProven { .. }
+                ),
+                "{mutation} mutation must not preserve ContractProven"
+            );
+        }
+
+        let intermediate = source_built_fixture(
+            "pub fn callee() {}\npub fn middle() { callee(); }\npub fn caller() { middle(); }\n",
+        );
+        let caller = source_callable(&intermediate.store, "caller");
+        let middle = source_callable(&intermediate.store, "middle");
+        let callee = source_callable(&intermediate.store, "callee");
+        let (chain_contract, chain_hashes, _) = validated_contract(
+            canonical_id(&caller),
+            &[canonical_id(&middle), canonical_id(&callee)],
+        );
+        let chain = evaluate_from_store(
+            &intermediate.store,
+            &intermediate.root,
+            &intermediate.project_id,
+            &intermediate.publication,
+            &chain_contract,
+            &chain_hashes,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let (direct_contract, direct_hashes, _) =
+            validated_contract(canonical_id(&caller), &[canonical_id(&callee)]);
+        assert!(
+            !matches!(
+                check_call_path(&direct_contract, &direct_hashes, &chain.built.facts),
+                ProofDisposition::ContractProven { .. }
+            ),
+            "two source-built edges through an intermediate are not one direct fact"
+        );
+
+        let raw_edge = six
+            .store
+            .get_edges()
+            .unwrap()
+            .into_iter()
+            .find(|edge| edge.kind == EdgeKind::CALL)
+            .unwrap();
+        let mut uncertain = raw_edge.clone();
+        uncertain.certainty = Some(ResolutionCertainty::Uncertain);
+        let mut ambiguous = raw_edge.clone();
+        ambiguous.candidate_targets = vec![nodes[2].id];
+        for (mutation, edge) in [("uncertain", &uncertain), ("ambiguous", &ambiguous)] {
+            assert_eq!(
+                admit_raw_call_edge(edge, edge.effective_source(), edge.effective_target()),
+                RawCallEdgeAdmission::Rejected
+            );
+            let rejected_edge_id = edge.id.0.to_string();
+            let facts_after_admission = integrated
+                .built
+                .facts
+                .iter()
+                .filter(|fact| match fact {
+                    VerifiedProofFact::DirectCall(fact) => fact.receipt.edge_id != rejected_edge_id,
+                    _ => true,
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(
+                !matches!(
+                    check_call_path(&contract, &hashes, &facts_after_admission),
+                    ProofDisposition::ContractProven { .. }
+                ),
+                "{mutation} source-built row is rejected before proof and cannot preserve ContractProven"
+            );
+        }
+
+        fs::write(&six.source_path, "pub fn changed() {}\n").unwrap();
+        let drifted = evaluate_from_store(
+            &six.store,
+            &six.root,
+            &six.project_id,
+            &six.publication,
+            &contract,
+            &hashes,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(
+            drifted.built.unavailable,
+            vec![UnavailableReason::SourceNotBoundToPublication]
+        );
+        assert!(!matches!(
+            drifted.disposition,
+            ProofDisposition::ContractProven { .. }
+        ));
+    }
+
+    #[test]
+    fn source_built_recursion_and_policy_closure_keep_exact_fail_closed_outcomes() {
+        // The alias keeps the call placeholder's source identity distinct from
+        // the declaration while resolution still targets the same callable.
+        // The producer then suppresses the self-edge, leaving the exact
+        // recursive step unrepresentable.
+        let recursive = source_built_fixture(
+            "use crate::recursive as again;\npub fn recursive() { again(); }\n",
+        );
+        let recursive_node = source_callable(&recursive.store, "recursive");
+        let (recursive_contract, recursive_hashes, _) = validated_contract(
+            canonical_id(&recursive_node),
+            &[canonical_id(&recursive_node)],
+        );
+        let recursive_result = evaluate_from_store(
+            &recursive.store,
+            &recursive.root,
+            &recursive.project_id,
+            &recursive.publication,
+            &recursive_contract,
+            &recursive_hashes,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(
+            recursive_result.built.gaps,
+            vec![FactBuildGap::RecursiveCallNotRepresentable { step_index: 0 }]
+        );
+        assert!(matches!(
+            recursive_result.disposition,
+            ProofDisposition::Unknown { .. }
+        ));
+
+        let fixture = source_built_fixture(
+            "pub fn step0() { step1(); }\n\
+             pub fn step1() { step2(); }\n\
+             pub fn step2() { step3(); }\n\
+             pub fn step3() {}\n",
+        );
+        let nodes = (0..=3)
+            .map(|index| source_callable(&fixture.store, &format!("step{index}")))
+            .collect::<Vec<_>>();
+        let targets = nodes[1..].iter().map(canonical_id).collect::<Vec<_>>();
+        let (prohibited, prohibited_hashes, prohibited_rendering) =
+            validated_contract_with_policies(
+                canonical_id(&nodes[0]),
+                &targets,
+                &[canonical_id(&nodes[2])],
+                &[],
+            );
+        let refuted = evaluate_from_store(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &prohibited,
+            &prohibited_hashes,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let expected_chain = refuted.built.receipts[..2]
+            .iter()
+            .map(|receipt| receipt.receipt.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            refuted.disposition,
+            ProofDisposition::ContractRefuted {
+                contract_digest: prohibited_hashes.contract_digest().to_owned(),
+                refutation: codestory_agent::indexed_source_call_path_v1::Refutation::ProhibitedScopeTraversal {
+                    step_index: 1,
+                    prohibition_index: 0,
+                    connected_receipts: expected_chain.clone(),
+                },
+            }
+        );
+        let refuted_projection = project_internal_call_path_result(InternalProjectionInput {
+            contract: &prohibited,
+            hashes: &prohibited_hashes,
+            rendering: &prohibited_rendering,
+            publication: InternalCorePublicationIdentity {
+                project_id: fixture.project_id.clone(),
+                generation_id: fixture.publication.generation_id.clone(),
+                run_id: fixture.publication.run_id.clone(),
+            },
+            disposition: &refuted.disposition,
+            receipts: &refuted.built.receipts,
+        })
+        .unwrap();
+        let InternalProjection::Complete { root, .. } = refuted_projection else {
+            panic!("small positive contradiction projection fits")
+        };
+        assert_eq!(
+            root["disposition"]["refutation"]["connected_receipts"],
+            json!(
+                expected_chain
+                    .iter()
+                    .map(|receipt| json!({
+                        "receipt_id": receipt.receipt_id,
+                        "edge_id": receipt.edge_id,
+                    }))
+                    .collect::<Vec<_>>()
+            )
+        );
+
+        let (excluded, excluded_hashes, _) = validated_contract_with_policies(
+            canonical_id(&nodes[0]),
+            &targets,
+            &[],
+            &[canonical_id(&nodes[2])],
+        );
+        let excluded_result = evaluate_from_store(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &excluded,
+            &excluded_hashes,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert!(matches!(
+            excluded_result.disposition,
+            ProofDisposition::Unknown { ref gaps, .. }
+                if gaps == &[codestory_agent::indexed_source_call_path_v1::ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index: 1 }]
+        ));
+    }
+
+    #[test]
+    fn integrated_execution_uses_the_existing_core_pin_without_retrieval_or_inner_retry() {
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("src/lib.rs");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        let source = b"pub fn callee() -> i32 { 1 }\npub fn caller() -> i32 { callee(); 1 }\n";
+        fs::write(&source_path, source).unwrap();
+        let storage_path = project.path().join(".codestory-test/codestory.db");
+        let controller = AppController::new_with_config(crate::test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap();
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        let store = Store::open(&storage_path).unwrap();
+        let caller = source_callable(&store, "caller");
+        let callee = source_callable(&store, "callee");
+        let (contract, hashes, rendering) =
+            validated_contract(canonical_id(&caller), &[canonical_id(&callee)]);
+        drop(store);
+
+        let retrieval_pin_calls = Rc::new(Cell::new(0));
+        let observed_retrieval_pin_calls = Rc::clone(&retrieval_pin_calls);
+        crate::set_before_retrieval_pin_test_hook(move || {
+            observed_retrieval_pin_calls.set(observed_retrieval_pin_calls.get() + 1);
+        });
+        let service = crate::services::PublicOperationService::new(controller.clone());
+        let operation = run_integrated_projected_public_operation(
+            &service,
+            &controller,
+            &contract,
+            &hashes,
+            &rendering,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(operation.attempt, 1);
+        assert!(operation.core_publication.is_some());
+        assert_eq!(operation.retrieval_publication, None);
+        assert_eq!(retrieval_pin_calls.get(), 0);
+        assert!(matches!(
+            operation.value.integrated.disposition,
+            ProofDisposition::ContractProven { .. }
+        ));
+        assert!(matches!(
+            operation.value.projection,
+            codestory_agent::indexed_source_call_path_v1::InternalProjection::Complete { .. }
+        ));
+        assert_eq!(
+            Store::open(&storage_path)
+                .unwrap()
+                .get_retrieval_index_publication(&project_identity_v3(project.path()).project_id)
+                .unwrap(),
+            None
+        );
+
+        let builds = Cell::new(0_usize);
+        let refusal = service
+            .run_with_cancel(PROOF_DOMAIN, Arc::new(AtomicBool::new(false)), || {
+                builds.set(builds.get() + 1);
+                let built = build_indexed_source_call_path_facts(&controller, &contract)?;
+                let mut changed = source.to_vec();
+                let byte = changed.iter().position(|byte| *byte == b'1').unwrap();
+                changed[byte] = b'2';
+                fs::write(&source_path, changed).unwrap();
+                Ok(built)
+            })
+            .expect_err("post-build source drift must consume the one bounded retry and refuse");
+        assert_eq!(refusal.code, "project_unavailable");
+        assert_eq!(builds.get(), 1);
     }
 
     #[test]
