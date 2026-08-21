@@ -34,11 +34,36 @@
       "name": "status",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "project",
+              "state",
+              "capabilities",
+              "next_action",
+              "diagnostics_uri"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "Compact capability state. Read codestory://status{?project} with the same absolute project root when full diagnostics are needed.",
         "properties": {
           "capabilities": {
             "description": "Local navigation and broad-search states.",
             "type": "object"
+          },
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
           },
           "current_operation": {
             "description": "Current managed preparation operation.",
@@ -51,6 +76,13 @@
             "description": "Why a full publication is not live-ready, when that is known.",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -69,13 +101,55 @@
             "description": "Whether packet/search may use full retrieval without a degraded reason.",
             "type": "boolean"
           },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
           "next_action": {
             "description": "Direct next action for the caller.",
             "type": "string"
           },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "project": {
             "description": "Requested repository root.",
             "type": "string"
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           },
           "retrieval_mode": {
             "description": "Pinned retrieval publication class; full is eligibility, not live-ready.",
@@ -91,6 +165,13 @@
               "null"
             ]
           },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "state": {
             "description": "Overall capability state.",
             "enum": [
@@ -101,15 +182,13 @@
               "unavailable"
             ],
             "type": "string"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
           }
         },
-        "required": [
-          "project",
-          "state",
-          "capabilities",
-          "next_action",
-          "diagnostics_uri"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -665,6 +744,26 @@
       "name": "packet",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "packet_id",
+              "question",
+              "plan",
+              "answer",
+              "budget",
+              "support",
+              "disposition",
+              "retrieval_trace_summary"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "CodeStory broad task packet DTO with compiled support units and a machine stop or one-round drill disposition.",
         "properties": {
           "answer": {
@@ -675,9 +774,43 @@
             "description": "Budget limits, usage, and truncation metadata.",
             "type": "object"
           },
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
+          },
           "disposition": {
             "description": "Machine stop or one-round drill decision: supported, drill_once, not_established, or unavailable.",
             "type": "object"
+          },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "packet_id": {
             "description": "Stable packet id.",
@@ -691,9 +824,58 @@
             "description": "Packet question.",
             "type": "string"
           },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "retrieval_trace_summary": {
             "description": "Compact retrieval trace telemetry summary.",
             "type": "object"
+          },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
           },
           "support": {
             "description": "Compiled evidence atoms: symbol locations, source ranges, typed graph edges, and complete-query negatives.",
@@ -780,18 +962,13 @@
               "string",
               "null"
             ]
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
           }
         },
-        "required": [
-          "packet_id",
-          "question",
-          "plan",
-          "answer",
-          "budget",
-          "support",
-          "disposition",
-          "retrieval_trace_summary"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -876,6 +1053,10 @@
         ],
         "description": "CodeStory discovery results DTO. Treat broad structural questions as packet-first; search rows select candidates for proof-bearing graph/source follow-up.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
           "code": {
             "description": "Typed API error code.",
             "type": "string"
@@ -890,6 +1071,10 @@
               "object",
               "null"
             ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
           },
           "hits": {
             "description": "Merged hit list.",
@@ -1060,6 +1245,17 @@
             "description": "Human-readable API error message.",
             "type": "string"
           },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "query": {
             "description": "Search query.",
             "type": "string"
@@ -1070,6 +1266,37 @@
               "object",
               "null"
             ]
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           },
           "repo_text_enabled": {
             "description": "Whether repo text search was enabled.",
@@ -1094,6 +1321,28 @@
           "retrieval": {
             "description": "Retrieval readiness.",
             "type": "object"
+          },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
           }
         },
         "required": [],
@@ -1148,6 +1397,26 @@
       "name": "ground",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "root",
+              "budget",
+              "generated_at_epoch_ms",
+              "stats",
+              "coverage",
+              "orientation",
+              "root_symbols",
+              "files"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "CodeStory grounding snapshot DTO for compact repository orientation.",
         "properties": {
           "budget": {
@@ -1157,6 +1426,14 @@
               "balanced",
               "max"
             ],
+            "type": "string"
+          },
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
             "type": "string"
           },
           "coverage": {
@@ -1174,6 +1451,17 @@
             },
             "type": "array"
           },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
+          },
           "files": {
             "description": "File digests.",
             "items": {
@@ -1189,12 +1477,27 @@
             "description": "Snapshot generation time.",
             "type": "integer"
           },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
           "notes": {
             "description": "Grounding notes.",
             "items": {
               "type": "string"
             },
             "type": "array"
+          },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "orientation": {
             "additionalProperties": false,
@@ -1262,12 +1565,57 @@
             ],
             "type": "object"
           },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "recommended_queries": {
             "description": "Suggested follow-up queries.",
             "items": {
               "type": "string"
             },
             "type": "array"
+          },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "root": {
             "description": "Project root.",
@@ -1284,21 +1632,20 @@
             },
             "type": "array"
           },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
           "stats": {
             "description": "Indexed project stats.",
             "type": "object"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
           }
         },
-        "required": [
-          "root",
-          "budget",
-          "generated_at_epoch_ms",
-          "stats",
-          "coverage",
-          "orientation",
-          "root_symbols",
-          "files"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -1385,6 +1732,10 @@
         ],
         "description": "Indexed file inventory and coverage summary.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
           "code": {
             "description": "Typed API error code.",
             "type": "string"
@@ -1444,6 +1795,10 @@
               "null"
             ]
           },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
+          },
           "files": {
             "description": "Indexed file rows.",
             "items": {
@@ -1501,6 +1856,17 @@
           "message": {
             "description": "Human-readable API error message.",
             "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "policy_exclusions": {
             "description": "Verified policy exclusions without graph or semantic coverage.",
@@ -1596,9 +1962,62 @@
             "description": "Project root.",
             "type": "string"
           },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
           "summary": {
             "description": "Indexed file summary DTO.",
             "type": "object"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
           },
           "usable": {
             "description": "Whether the index has usable files.",
@@ -1812,6 +2231,10 @@
             ],
             "type": "object"
           },
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
           "change_records": {
             "description": "Normalized changed file records.",
             "items": {
@@ -1938,6 +2361,10 @@
               "object",
               "null"
             ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
           },
           "follow_ups": {
             "description": "Evidence-derived follow-up actions with optional structured invocations.",
@@ -2109,6 +2536,10 @@
             "description": "Human-readable API error message.",
             "type": "string"
           },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
           "notes": {
             "description": "Additional analysis notes.",
             "items": {
@@ -2116,8 +2547,68 @@
             },
             "type": "array"
           },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "project_root": {
             "description": "Project root.",
+            "type": "string"
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
             "type": "string"
           },
           "truncated": {
@@ -2315,8 +2806,28 @@
       "name": "symbol",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "node",
+              "children",
+              "related_hits",
+              "edge_digest"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "CodeStory symbol context DTO.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
           "children": {
             "description": "Child symbol summaries.",
             "items": {
@@ -2358,6 +2869,21 @@
             },
             "type": "array"
           },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
+          },
           "edge_digest": {
             "description": "Readable edge digest entries.",
             "items": {
@@ -2365,9 +2891,55 @@
             },
             "type": "array"
           },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
           "node": {
             "description": "Node details DTO.",
             "type": "object"
+          },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           },
           "related_hits": {
             "description": "Related search hits.",
@@ -2530,20 +3102,37 @@
             },
             "type": "array"
           },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
           "summary": {
             "description": "Optional generated summary.",
             "type": [
               "string",
               "null"
             ]
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
           }
         },
-        "required": [
-          "node",
-          "children",
-          "related_hits",
-          "edge_digest"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -2642,11 +3231,108 @@
       "name": "trail",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "focus",
+              "trail"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "CodeStory trail context DTO.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
+          },
           "focus": {
             "description": "Focused node details DTO.",
             "type": "object"
+          },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
           },
           "story": {
             "description": "Optional readable trail story DTO.",
@@ -2655,15 +3341,16 @@
               "null"
             ]
           },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
+          },
           "trail": {
             "description": "Graph response DTO.",
             "type": "object"
           }
         },
-        "required": [
-          "focus",
-          "trail"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -2747,10 +3434,47 @@
       "name": "callers",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "certainty",
+              "file_refs",
+              "limits",
+              "node_count",
+              "edge_count",
+              "truncated"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "Bounded CodeStory graph primitive output.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
           "certainty": {
             "description": "Overall certainty note.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
             "type": "string"
           },
           "edge_count": {
@@ -2779,6 +3503,14 @@
             "description": "Applied bounds for this graph primitive.",
             "type": "object"
           },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
           "node": {
             "description": "Node details DTO.",
             "type": [
@@ -2790,6 +3522,44 @@
             "description": "Returned node count.",
             "type": "integer"
           },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "resolution": {
             "description": "Optional query resolution metadata.",
             "type": [
@@ -2797,19 +3567,34 @@
               "null"
             ]
           },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
+          },
           "truncated": {
             "description": "Whether the graph result was truncated.",
             "type": "boolean"
           }
         },
-        "required": [
-          "certainty",
-          "file_refs",
-          "limits",
-          "node_count",
-          "edge_count",
-          "truncated"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -2893,10 +3678,47 @@
       "name": "callees",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "certainty",
+              "file_refs",
+              "limits",
+              "node_count",
+              "edge_count",
+              "truncated"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "Bounded CodeStory graph primitive output.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
           "certainty": {
             "description": "Overall certainty note.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
             "type": "string"
           },
           "edge_count": {
@@ -2925,6 +3747,14 @@
             "description": "Applied bounds for this graph primitive.",
             "type": "object"
           },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
           "node": {
             "description": "Node details DTO.",
             "type": [
@@ -2936,6 +3766,44 @@
             "description": "Returned node count.",
             "type": "integer"
           },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "resolution": {
             "description": "Optional query resolution metadata.",
             "type": [
@@ -2943,19 +3811,34 @@
               "null"
             ]
           },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
+          },
           "truncated": {
             "description": "Whether the graph result was truncated.",
             "type": "boolean"
           }
         },
-        "required": [
-          "certainty",
-          "file_refs",
-          "limits",
-          "node_count",
-          "edge_count",
-          "truncated"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -3054,11 +3937,108 @@
       "name": "trace",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "focus",
+              "trail"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "CodeStory trail context DTO.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
+          },
           "focus": {
             "description": "Focused node details DTO.",
             "type": "object"
+          },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
           },
           "story": {
             "description": "Optional readable trail story DTO.",
@@ -3067,15 +4047,16 @@
               "null"
             ]
           },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
+          },
           "trail": {
             "description": "Graph response DTO.",
             "type": "object"
           }
         },
-        "required": [
-          "focus",
-          "trail"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -3145,10 +4126,47 @@
       "name": "get_node",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "certainty",
+              "file_refs",
+              "limits",
+              "node_count",
+              "edge_count",
+              "truncated"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "Bounded CodeStory graph primitive output.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
           "certainty": {
             "description": "Overall certainty note.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
             "type": "string"
           },
           "edge_count": {
@@ -3177,6 +4195,14 @@
             "description": "Applied bounds for this graph primitive.",
             "type": "object"
           },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
           "node": {
             "description": "Node details DTO.",
             "type": [
@@ -3188,6 +4214,44 @@
             "description": "Returned node count.",
             "type": "integer"
           },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "resolution": {
             "description": "Optional query resolution metadata.",
             "type": [
@@ -3195,19 +4259,34 @@
               "null"
             ]
           },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
+          },
           "truncated": {
             "description": "Whether the graph result was truncated.",
             "type": "boolean"
           }
         },
-        "required": [
-          "certainty",
-          "file_refs",
-          "limits",
-          "node_count",
-          "edge_count",
-          "truncated"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -3301,10 +4380,47 @@
       "name": "neighbors",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "certainty",
+              "file_refs",
+              "limits",
+              "node_count",
+              "edge_count",
+              "truncated"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "Bounded CodeStory graph primitive output.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
           "certainty": {
             "description": "Overall certainty note.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
             "type": "string"
           },
           "edge_count": {
@@ -3333,6 +4449,14 @@
             "description": "Applied bounds for this graph primitive.",
             "type": "object"
           },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
           "node": {
             "description": "Node details DTO.",
             "type": [
@@ -3344,6 +4468,44 @@
             "description": "Returned node count.",
             "type": "integer"
           },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "resolution": {
             "description": "Optional query resolution metadata.",
             "type": [
@@ -3351,19 +4513,34 @@
               "null"
             ]
           },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
+          },
           "truncated": {
             "description": "Whether the graph result was truncated.",
             "type": "boolean"
           }
         },
-        "required": [
-          "certainty",
-          "file_refs",
-          "limits",
-          "node_count",
-          "edge_count",
-          "truncated"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -3431,10 +4608,47 @@
       "name": "shortest_path",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "certainty",
+              "file_refs",
+              "limits",
+              "node_count",
+              "edge_count",
+              "truncated"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "Bounded CodeStory graph primitive output.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
           "certainty": {
             "description": "Overall certainty note.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
             "type": "string"
           },
           "edge_count": {
@@ -3463,6 +4677,14 @@
             "description": "Applied bounds for this graph primitive.",
             "type": "object"
           },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
           "node": {
             "description": "Node details DTO.",
             "type": [
@@ -3474,6 +4696,44 @@
             "description": "Returned node count.",
             "type": "integer"
           },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "resolution": {
             "description": "Optional query resolution metadata.",
             "type": [
@@ -3481,19 +4741,34 @@
               "null"
             ]
           },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
+          },
           "truncated": {
             "description": "Whether the graph result was truncated.",
             "type": "boolean"
           }
         },
-        "required": [
-          "certainty",
-          "file_refs",
-          "limits",
-          "node_count",
-          "edge_count",
-          "truncated"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -3587,10 +4862,47 @@
       "name": "query_subgraph",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "certainty",
+              "file_refs",
+              "limits",
+              "node_count",
+              "edge_count",
+              "truncated"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "Bounded CodeStory graph primitive output.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
           "certainty": {
             "description": "Overall certainty note.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
             "type": "string"
           },
           "edge_count": {
@@ -3619,6 +4931,14 @@
             "description": "Applied bounds for this graph primitive.",
             "type": "object"
           },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
           "node": {
             "description": "Node details DTO.",
             "type": [
@@ -3630,6 +4950,44 @@
             "description": "Returned node count.",
             "type": "integer"
           },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "resolution": {
             "description": "Optional query resolution metadata.",
             "type": [
@@ -3637,19 +4995,34 @@
               "null"
             ]
           },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
+          },
           "truncated": {
             "description": "Whether the graph result was truncated.",
             "type": "boolean"
           }
         },
-        "required": [
-          "certainty",
-          "file_refs",
-          "limits",
-          "node_count",
-          "edge_count",
-          "truncated"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -3719,11 +5092,45 @@
       "name": "definition",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "resolution",
+              "definition",
+              "symbol"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "CodeStory definition tool output.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
           "definition": {
             "description": "Resolved definition search hit.",
             "type": "object"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
           },
           "links": {
             "description": "Continuation resource links for the resolved definition.",
@@ -3752,20 +5159,84 @@
             },
             "type": "array"
           },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "resolution": {
             "description": "Query resolution metadata.",
             "type": "object"
           },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
           "symbol": {
             "description": "Symbol context DTO.",
             "type": "object"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
           }
         },
-        "required": [
-          "resolution",
-          "definition",
-          "symbol"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -3835,11 +5306,108 @@
       "name": "references",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "focus",
+              "trail"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "CodeStory trail context DTO.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
+          },
           "focus": {
             "description": "Focused node details DTO.",
             "type": "object"
+          },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
           },
           "story": {
             "description": "Optional readable trail story DTO.",
@@ -3848,15 +5416,16 @@
               "null"
             ]
           },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
+          },
           "trail": {
             "description": "Graph response DTO.",
             "type": "object"
           }
         },
-        "required": [
-          "focus",
-          "trail"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -3910,15 +5479,114 @@
       "name": "symbols",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "symbols",
+              "returned_count",
+              "limit",
+              "truncated"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "CodeStory symbol list output.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
+          },
           "limit": {
             "description": "Applied result limit.",
             "type": "integer"
           },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "returned_count": {
             "description": "Symbol rows included in this response.",
             "type": "integer"
+          },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
           },
           "symbols": {
             "description": "Root or child symbol summaries.",
@@ -3961,17 +5629,16 @@
             },
             "type": "array"
           },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
+          },
           "truncated": {
             "description": "Whether matching symbols exceeded the limit.",
             "type": "boolean"
           }
         },
-        "required": [
-          "symbols",
-          "returned_count",
-          "limit",
-          "truncated"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -4172,8 +5839,52 @@
       "name": "snippet",
       "outputSchema": {
         "additionalProperties": false,
-        "description": "CodeStory snippet context DTO.",
+        "anyOf": [
+          {
+            "required": [
+              "node",
+              "path",
+              "line",
+              "snippet",
+              "scope",
+              "requested_context",
+              "snippet_truncated"
+            ]
+          },
+          {
+            "required": [
+              "ranges",
+              "max_total_bytes"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
+        "description": "CodeStory snippet context DTO, or a batched paths result.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
+          },
           "fallback_reason": {
             "description": "Reason function-body selection fell back to line context, when applicable.",
             "type": "string"
@@ -4189,9 +5900,28 @@
               "null"
             ]
           },
+          "max_total_bytes": {
+            "description": "Total byte cap for a batched paths call.",
+            "type": "integer"
+          },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
           "node": {
             "description": "Node details DTO.",
             "type": "object"
+          },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "path": {
             "description": "Project-relative file path.",
@@ -4201,9 +5931,92 @@
             "description": "Source of the selected function-body range, when available.",
             "type": "string"
           },
+          "ranges": {
+            "description": "Requested source ranges from a batched paths call.",
+            "items": {
+              "additionalProperties": false,
+              "description": "One requested source range from a batched snippet.paths call.",
+              "properties": {
+                "end_line": {
+                  "description": "1-based last line.",
+                  "type": "integer"
+                },
+                "path": {
+                  "description": "Project-relative file path.",
+                  "type": "string"
+                },
+                "snippet": {
+                  "description": "Source snippet text.",
+                  "type": "string"
+                },
+                "snippet_truncated": {
+                  "description": "Whether this range hit a byte cap.",
+                  "type": "boolean"
+                },
+                "start_line": {
+                  "description": "1-based first line.",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path",
+                "start_line",
+                "end_line",
+                "snippet",
+                "snippet_truncated"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "requested_context": {
             "description": "Requested context line count.",
             "type": "integer"
+          },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "scope": {
             "description": "Snippet scope.",
@@ -4221,20 +6034,20 @@
             "description": "Whether the snippet hit a byte cap.",
             "type": "boolean"
           },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
+          },
           "truncation_guidance": {
             "description": "Follow-up guidance when the snippet hit its byte cap.",
             "type": "string"
           }
         },
-        "required": [
-          "node",
-          "path",
-          "line",
-          "snippet",
-          "scope",
-          "requested_context",
-          "snippet_truncated"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
@@ -4320,8 +6133,33 @@
       "name": "context",
       "outputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "packet_id",
+              "target",
+              "summary",
+              "sections",
+              "citations",
+              "subgraph_ids",
+              "retrieval_version",
+              "graphs",
+              "retrieval_trace"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
         "description": "CodeStory context packet DTO.",
         "properties": {
+          "cause_code": {
+            "description": "Underlying activation or cache cause code.",
+            "type": "string"
+          },
           "citations": {
             "description": "Evidence citations.",
             "items": {
@@ -4469,6 +6307,21 @@
             },
             "type": "array"
           },
+          "code": {
+            "description": "Typed stdio retry or unavailable code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
+          },
           "freshness": {
             "description": "Index freshness observation, when one was made.",
             "type": "object"
@@ -4484,9 +6337,55 @@
             },
             "type": "array"
           },
+          "message": {
+            "description": "Human-readable retry or unavailable message.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "packet_id": {
             "description": "Stable context packet id.",
             "type": "string"
+          },
+          "recommended_next_calls": {
+            "description": "Host-executable retries of the intended tool.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Host-executable retry of the same tool after a preparing delay.",
+              "properties": {
+                "after_ms": {
+                  "description": "Delay before retry.",
+                  "type": "integer"
+                },
+                "arguments": {
+                  "description": "Original tool arguments.",
+                  "type": "object"
+                },
+                "method": {
+                  "description": "JSON-RPC method.",
+                  "type": "string"
+                },
+                "tool": {
+                  "description": "Tool to retry.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "method",
+                "tool"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           },
           "retrieval_trace": {
             "description": "Retrieval trace and summary.",
@@ -4495,6 +6394,20 @@
           "retrieval_version": {
             "description": "Retrieval version.",
             "type": "string"
+          },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_tool": {
+            "description": "Tool to retry when the envelope is preparing.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "sections": {
             "description": "Context sections.",
@@ -4518,6 +6431,10 @@
             },
             "type": "array"
           },
+          "state": {
+            "description": "preparing, unavailable, or cancelled.",
+            "type": "string"
+          },
           "subgraph_ids": {
             "description": "Related graph ids.",
             "items": {
@@ -4532,19 +6449,13 @@
           "target": {
             "description": "Resolved retrieval target label.",
             "type": "string"
+          },
+          "tool": {
+            "description": "Tool that produced this envelope.",
+            "type": "string"
           }
         },
-        "required": [
-          "packet_id",
-          "target",
-          "summary",
-          "sections",
-          "citations",
-          "subgraph_ids",
-          "retrieval_version",
-          "graphs",
-          "retrieval_trace"
-        ],
+        "required": [],
         "type": "object"
       },
       "safety": {
