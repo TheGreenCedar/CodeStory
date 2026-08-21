@@ -1,0 +1,241 @@
+{
+  "$defs": {
+    "CorpusMutationV1": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/MutationKindV1"
+        },
+        "mutation_id": {
+          "type": "string"
+        },
+        "path_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mutation_id",
+        "kind",
+        "path_id"
+      ],
+      "type": "object"
+    },
+    "ExpectedPathOutcomeV1": {
+      "enum": [
+        "proven",
+        "partial",
+        "rejected"
+      ],
+      "type": "string"
+    },
+    "MutationKindV1": {
+      "enum": [
+        "remove_expected_edge",
+        "add_ambiguous_edge"
+      ],
+      "type": "string"
+    },
+    "OraclePathV1": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_outcome": {
+          "$ref": "#/$defs/ExpectedPathOutcomeV1"
+        },
+        "expected_step_count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "notes": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path_id": {
+          "type": "string"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/OracleStepV1"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema",
+        "path_id",
+        "source_id",
+        "expected_step_count",
+        "steps",
+        "expected_outcome"
+      ],
+      "type": "object"
+    },
+    "OracleStepV1": {
+      "additionalProperties": false,
+      "properties": {
+        "selector": {
+          "type": "string"
+        },
+        "source_range": {
+          "$ref": "#/$defs/SourceRangeV1"
+        },
+        "step_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id",
+        "selector",
+        "source_range"
+      ],
+      "type": "object"
+    },
+    "SourceHashV1": {
+      "additionalProperties": false,
+      "properties": {
+        "byte_length": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "byte_length"
+      ],
+      "type": "object"
+    },
+    "SourceRangeV1": {
+      "additionalProperties": false,
+      "properties": {
+        "end_byte": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "start_byte": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "start_byte",
+        "end_byte",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "SourceRevisionV1": {
+      "additionalProperties": false,
+      "properties": {
+        "commit": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "source_hashes": {
+          "items": {
+            "$ref": "#/$defs/SourceHashV1"
+          },
+          "type": "array"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "tree": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "repository",
+        "commit",
+        "tree",
+        "source_hashes"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "codestory.proof-availability-corpus/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "corpus_id": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "methodology_sha256": {
+      "type": "string"
+    },
+    "mutation_count": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "mutations": {
+      "items": {
+        "$ref": "#/$defs/CorpusMutationV1"
+      },
+      "type": "array"
+    },
+    "path_count": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "paths": {
+      "items": {
+        "$ref": "#/$defs/OraclePathV1"
+      },
+      "type": "array"
+    },
+    "schema": {
+      "type": "string"
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/$defs/SourceRevisionV1"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema",
+    "corpus_id",
+    "sources",
+    "path_count",
+    "paths",
+    "mutation_count",
+    "mutations",
+    "methodology_sha256",
+    "created_at"
+  ],
+  "title": "CorpusV1",
+  "type": "object"
+}

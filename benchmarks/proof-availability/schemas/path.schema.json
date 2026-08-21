@@ -1,0 +1,104 @@
+{
+  "$defs": {
+    "ExpectedPathOutcomeV1": {
+      "enum": [
+        "proven",
+        "partial",
+        "rejected"
+      ],
+      "type": "string"
+    },
+    "OracleStepV1": {
+      "additionalProperties": false,
+      "properties": {
+        "selector": {
+          "type": "string"
+        },
+        "source_range": {
+          "$ref": "#/$defs/SourceRangeV1"
+        },
+        "step_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id",
+        "selector",
+        "source_range"
+      ],
+      "type": "object"
+    },
+    "SourceRangeV1": {
+      "additionalProperties": false,
+      "properties": {
+        "end_byte": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "start_byte": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "start_byte",
+        "end_byte",
+        "sha256"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "codestory.proof-availability-path/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "expected_outcome": {
+      "$ref": "#/$defs/ExpectedPathOutcomeV1"
+    },
+    "expected_step_count": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "notes": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "path_id": {
+      "type": "string"
+    },
+    "schema": {
+      "type": "string"
+    },
+    "source_id": {
+      "type": "string"
+    },
+    "steps": {
+      "items": {
+        "$ref": "#/$defs/OracleStepV1"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema",
+    "path_id",
+    "source_id",
+    "expected_step_count",
+    "steps",
+    "expected_outcome"
+  ],
+  "title": "OraclePathV1",
+  "type": "object"
+}

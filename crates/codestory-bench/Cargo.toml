@@ -17,9 +17,14 @@ tempfile = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+schemars = { workspace = true }
 clap = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
+
+[[bin]]
+name = "codestory-proof-availability"
+path = "src/bin/codestory_proof_availability.rs"
 
 [dev-dependencies]
 codestory-retrieval = { workspace = true, features = ["benchmark-support"] }

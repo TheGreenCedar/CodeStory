@@ -1,0 +1,120 @@
+{
+  "$defs": {
+    "AutomaticThresholdsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "minimum_proven_path_ratio_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "minimum_proven_path_ratio_milli"
+      ],
+      "type": "object"
+    },
+    "ExperimentalThresholdsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "minimum_actionable_partial_ratio_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimum_proven_step_ratio_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "minimum_proven_step_ratio_milli",
+        "minimum_actionable_partial_ratio_milli"
+      ],
+      "type": "object"
+    },
+    "HardGatesV1": {
+      "additionalProperties": false,
+      "properties": {
+        "all_corpus_sources_materialized": {
+          "type": "boolean"
+        },
+        "all_oracle_ranges_verified": {
+          "type": "boolean"
+        },
+        "no_unclassified_failures": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "all_corpus_sources_materialized",
+        "all_oracle_ranges_verified",
+        "no_unclassified_failures"
+      ],
+      "type": "object"
+    },
+    "StableExplicitThresholdsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "minimum_proven_path_ratio_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimum_proven_step_ratio_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "minimum_proven_path_ratio_milli",
+        "minimum_proven_step_ratio_milli"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "codestory.proof-availability-thresholds/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "automatic": {
+      "$ref": "#/$defs/AutomaticThresholdsV1"
+    },
+    "experimental": {
+      "$ref": "#/$defs/ExperimentalThresholdsV1"
+    },
+    "hard_gates": {
+      "$ref": "#/$defs/HardGatesV1"
+    },
+    "methodology_sha256": {
+      "type": "string"
+    },
+    "schema": {
+      "type": "string"
+    },
+    "stable_explicit": {
+      "$ref": "#/$defs/StableExplicitThresholdsV1"
+    },
+    "thresholds_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "thresholds_id",
+    "hard_gates",
+    "experimental",
+    "stable_explicit",
+    "automatic",
+    "methodology_sha256"
+  ],
+  "title": "ThresholdsV1",
+  "type": "object"
+}

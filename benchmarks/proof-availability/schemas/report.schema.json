@@ -1,0 +1,288 @@
+{
+  "$defs": {
+    "ActivationDecisionV1": {
+      "additionalProperties": false,
+      "properties": {
+        "automatic_thresholds_met": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "outcome": {
+          "$ref": "#/$defs/ActivationOutcomeV1"
+        },
+        "rationale": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "outcome",
+        "rationale"
+      ],
+      "type": "object"
+    },
+    "ActivationOutcomeV1": {
+      "enum": [
+        "public_exact_verifier",
+        "experimental_manual_verifier",
+        "keep_proof_dark",
+        "delay_full_v3_cut"
+      ],
+      "type": "string"
+    },
+    "CaseDispositionV1": {
+      "enum": [
+        "passed",
+        "failed_hard_gate",
+        "failed_experimental",
+        "failed_stable",
+        "dependency_blocked"
+      ],
+      "type": "string"
+    },
+    "CaseReportV1": {
+      "additionalProperties": false,
+      "properties": {
+        "case_id": {
+          "type": "string"
+        },
+        "disposition": {
+          "$ref": "#/$defs/CaseDispositionV1"
+        },
+        "measurement_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "trail": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TrailReportV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "case_id",
+        "source_id",
+        "disposition"
+      ],
+      "type": "object"
+    },
+    "EnvironmentReportV1": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {
+          "type": "string"
+        },
+        "codestory_version": {
+          "type": "string"
+        },
+        "command_sha256": {
+          "type": "string"
+        },
+        "environment_id": {
+          "type": "string"
+        },
+        "os": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "environment_id",
+        "os",
+        "architecture",
+        "codestory_version",
+        "command_sha256"
+      ],
+      "type": "object"
+    },
+    "FailureBucketV1": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_steps": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failed_steps": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "gate": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gate",
+        "expected_steps",
+        "failed_steps"
+      ],
+      "type": "object"
+    },
+    "FailureFunnelReportV1": {
+      "additionalProperties": false,
+      "properties": {
+        "buckets": {
+          "items": {
+            "$ref": "#/$defs/FailureBucketV1"
+          },
+          "type": "array"
+        },
+        "unclassified_failures": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "buckets",
+        "unclassified_failures"
+      ],
+      "type": "object"
+    },
+    "InventoryReportV1": {
+      "additionalProperties": false,
+      "properties": {
+        "observed_files": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_hashes_verified": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/InventoryStatusV1"
+        }
+      },
+      "required": [
+        "source_id",
+        "status",
+        "observed_files",
+        "source_hashes_verified"
+      ],
+      "type": "object"
+    },
+    "InventoryStatusV1": {
+      "enum": [
+        "complete",
+        "incomplete",
+        "unavailable"
+      ],
+      "type": "string"
+    },
+    "TrailOutcomeV1": {
+      "enum": [
+        "proven",
+        "partial",
+        "rejected",
+        "unavailable"
+      ],
+      "type": "string"
+    },
+    "TrailReportV1": {
+      "additionalProperties": false,
+      "properties": {
+        "first_failure_gate": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observed_step_count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "outcome": {
+          "$ref": "#/$defs/TrailOutcomeV1"
+        },
+        "path_id": {
+          "type": "string"
+        },
+        "proven_step_count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path_id",
+        "outcome",
+        "proven_step_count",
+        "observed_step_count"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "codestory.proof-availability-report/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cases": {
+      "items": {
+        "$ref": "#/$defs/CaseReportV1"
+      },
+      "type": "array"
+    },
+    "corpus_sha256": {
+      "type": "string"
+    },
+    "decision": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ActivationDecisionV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "environment": {
+      "$ref": "#/$defs/EnvironmentReportV1"
+    },
+    "failure_funnel": {
+      "$ref": "#/$defs/FailureFunnelReportV1"
+    },
+    "inventory": {
+      "items": {
+        "$ref": "#/$defs/InventoryReportV1"
+      },
+      "type": "array"
+    },
+    "schema": {
+      "type": "string"
+    },
+    "thresholds_sha256": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "corpus_sha256",
+    "thresholds_sha256",
+    "environment",
+    "inventory",
+    "cases",
+    "failure_funnel"
+  ],
+  "title": "QualificationSummaryV1",
+  "type": "object"
+}
