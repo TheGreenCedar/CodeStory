@@ -2172,6 +2172,23 @@ fn stdio_tool_call_success(
     response
 }
 
+/// Exposes the existing native renderer to the compatibility harness without
+/// participating in request dispatch or protocol negotiation.
+#[doc(hidden)]
+pub fn compatibility_render_stdio_tool_success(
+    tool_name: &str,
+    structured_content: serde_json::Value,
+) -> serde_json::Value {
+    stdio_tool_call_success(tool_name, structured_content)
+}
+
+/// Exposes the existing native error renderer to the compatibility harness
+/// without enabling output validation in v2.
+#[doc(hidden)]
+pub fn compatibility_render_stdio_tool_error(error: serde_json::Value) -> serde_json::Value {
+    stdio_tool_call_error(&error)
+}
+
 fn stdio_tool_text(tool_name: &str, value: &serde_json::Value) -> String {
     if stdio_is_packet(value) {
         return stdio_packet_text(value);

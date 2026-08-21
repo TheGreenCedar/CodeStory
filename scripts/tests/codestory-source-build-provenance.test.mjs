@@ -19,7 +19,7 @@ test("source-build provenance binds a clean exact tree to artifact installer and
   const root = await mkdtemp(path.join(os.tmpdir(), "codestory-source-build-"));
   try {
     await writeFile(path.join(root, "Cargo.toml"), "[workspace]\n", "utf8");
-    const artifact = path.join(root, "target", "codestory-cli");
+    const artifact = path.join(root, "target", "release", "codestory-cli");
     git(root, "init", "-q");
     git(root, "config", "user.email", "fixture@example.invalid");
     git(root, "config", "user.name", "Fixture");
@@ -29,11 +29,11 @@ test("source-build provenance binds a clean exact tree to artifact installer and
     let buildRuns = 0;
     const record = recordSourceBuildProvenance({
       artifact,
-      buildCommand: ["cargo", "build", "--locked", "-p", "codestory-cli"],
+      buildCommand: ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"],
       repoRoot: root,
       runBuild(command, options) {
         buildRuns += 1;
-        assert.deepEqual(command, ["cargo", "build", "--locked", "-p", "codestory-cli"]);
+        assert.deepEqual(command, ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"]);
         assert.equal(options.cwd, root);
         fs.mkdirSync(path.dirname(artifact), { recursive: true });
         fs.writeFileSync(artifact, "exact source build");
@@ -43,14 +43,24 @@ test("source-build provenance binds a clean exact tree to artifact installer and
     assert.equal(buildRuns, 1);
     assert.equal(record.source.head, git(root, "rev-parse", "HEAD"));
     assert.equal(record.source.tree, git(root, "rev-parse", "HEAD^{tree}"));
-    assert.equal(record.artifact.path, "target/codestory-cli");
-    assert.equal(record.build.command.join(" "), "cargo build --locked -p codestory-cli");
+    assert.equal(record.artifact.path, "target/release/codestory-cli");
+    assert.equal(record.build.command.join(" "), "cargo build --locked -p codestory-cli --profile release --target-dir target");
     assert.deepEqual(
       compareSourceBuildProvenance(record, {
         installerSha256: record.artifact.sha256,
         liveSha256: record.artifact.sha256,
       }),
       { state: "bound" },
+    );
+    assert.throws(
+      () => recordSourceBuildProvenance({
+        artifact,
+        buildCommand: ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"],
+        repoRoot: root,
+        runBuild: () => ({ status: 0 }),
+      }),
+      /source_build_artifact_must_be_absent/u,
+      "the artifact must be created by this build invocation",
     );
     assert.deepEqual(
       compareSourceBuildProvenance({
@@ -64,10 +74,74 @@ test("source-build provenance binds a clean exact tree to artifact installer and
       "an artifact hash plus a claimed purpose is not source-build provenance",
     );
 
+    await rm(artifact);
     await writeFile(path.join(root, "dirty"), "not clean", "utf8");
     assert.throws(
-      () => recordSourceBuildProvenance({ artifact, buildCommand: ["cargo", "build", "--locked"], repoRoot: root }),
+      () => recordSourceBuildProvenance({ artifact, buildCommand: ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"], repoRoot: root }),
       /source_build_repository_not_clean/u,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("source-build provenance rejects forged commands, paths, outputs, and incomplete bindings", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-source-build-hostile-"));
+  try {
+    await writeFile(path.join(root, "Cargo.toml"), "[workspace]\n", "utf8");
+    git(root, "init", "-q");
+    git(root, "config", "user.email", "fixture@example.invalid");
+    git(root, "config", "user.name", "Fixture");
+    git(root, "add", ".");
+    git(root, "commit", "-qm", "fixture");
+    const artifact = path.join(root, "target", "release", "codestory-cli");
+    const command = ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"];
+
+    assert.throws(
+      () => recordSourceBuildProvenance({ artifact, buildCommand: ["true", "--locked"], repoRoot: root, runBuild: () => ({ status: 0 }) }),
+      /source_build_command_not_exact/u,
+    );
+    assert.throws(
+      () => recordSourceBuildProvenance({ artifact: path.join(root, "target", "..", "..", "escape"), buildCommand: command, repoRoot: root, runBuild: () => ({ status: 0 }) }),
+      /source_build_artifact_outside_repository/u,
+    );
+    assert.throws(
+      () => recordSourceBuildProvenance({ artifact, buildCommand: command, repoRoot: root, runBuild: () => ({ status: 0 }) }),
+      /source_build_artifact_not_file/u,
+    );
+
+    const record = recordSourceBuildProvenance({
+      artifact,
+      buildCommand: command,
+      repoRoot: root,
+      runBuild: () => {
+        fs.mkdirSync(path.dirname(artifact), { recursive: true });
+        fs.writeFileSync(artifact, "runner-produced bytes");
+        return { status: 0 };
+      },
+    });
+    const boundInputs = { installerSha256: record.artifact.sha256, liveSha256: record.artifact.sha256 };
+    for (const mutation of [
+      { schema_version: 2 },
+      { source: { ...record.source, head: "not-a-head" } },
+      { source: { ...record.source, tree: "not-a-tree" } },
+      { build: { command: ["cargo", "test", "--locked"] } },
+      { artifact: { ...record.artifact, path: "target/../../escape" } },
+      { artifact: { ...record.artifact, bytes: 0 } },
+      { artifact: { ...record.artifact, sha256: "not-a-sha" } },
+    ]) {
+      assert.deepEqual(
+        compareSourceBuildProvenance({ ...record, ...mutation }, boundInputs),
+        { state: "invalid_record" },
+      );
+    }
+    assert.deepEqual(
+      compareSourceBuildProvenance(record, { installerSha256: "a".repeat(64), liveSha256: record.artifact.sha256 }),
+      { state: "installer_mismatch" },
+    );
+    assert.deepEqual(
+      compareSourceBuildProvenance(record, { installerSha256: record.artifact.sha256, liveSha256: "b".repeat(64) }),
+      { state: "live_mismatch" },
     );
   } finally {
     await rm(root, { recursive: true, force: true });

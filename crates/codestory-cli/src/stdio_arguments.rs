@@ -691,57 +691,134 @@ mod tests {
             let Some(schema) = tool.get("outputSchema") else {
                 continue;
             };
-            let sample = maximal_schema_sample(schema);
+            let samples = exhaustive_schema_samples(schema);
             assert!(
-                validate_structured_content(schema, &sample).is_ok(),
-                "{} maximal output sample must satisfy its current schema: {sample}; schema={schema}",
+                !samples.is_empty(),
+                "{} must produce audit samples",
                 tool["name"]
             );
+            for sample in samples {
+                assert!(
+                    validate_structured_content(schema, &sample).is_ok(),
+                    "{} exhaustive output sample must satisfy its current schema: {sample}; schema={schema}",
+                    tool["name"]
+                );
+            }
         }
     }
 
-    fn maximal_schema_sample(schema: &Value) -> Value {
+    /// A bounded audit corpus: a maximal base object plus one substitution for
+    /// every declared enum and union branch.  It deliberately avoids a full
+    /// Cartesian product while still making a newly added wire variant fail the
+    /// shadow audit until the subset validator admits it.
+    fn exhaustive_schema_samples(schema: &Value) -> Vec<Value> {
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-            return values.first().cloned().unwrap_or(Value::Null);
+            return values.clone();
         }
-        if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
-            return maximal_schema_sample(variants.first().expect("oneOf variant"));
+        if let Some(variants) = schema
+            .get("oneOf")
+            .or_else(|| schema.get("anyOf"))
+            .and_then(Value::as_array)
+        {
+            let outer_samples = if schema.get("type").and_then(Value::as_str) == Some("object") {
+                object_schema_samples(schema)
+            } else {
+                vec![Value::Null]
+            };
+            return variants
+                .iter()
+                .flat_map(|variant| {
+                    exhaustive_schema_samples(variant)
+                        .into_iter()
+                        .flat_map(|choice| {
+                            outer_samples
+                                .iter()
+                                .map(move |outer| merge_schema_samples(outer, choice.clone()))
+                        })
+                })
+                .collect();
         }
         if let Some(constraints) = schema.get("allOf").and_then(Value::as_array) {
-            let mut members = serde_json::Map::new();
+            let mut samples = vec![Value::Object(serde_json::Map::new())];
             for constraint in constraints {
-                if let Value::Object(sample) = maximal_schema_sample(constraint) {
-                    members.extend(sample);
-                }
+                let choices = exhaustive_schema_samples(constraint);
+                samples = samples
+                    .into_iter()
+                    .flat_map(|base| {
+                        choices
+                            .iter()
+                            .cloned()
+                            .map(move |choice| merge_schema_samples(&base, choice))
+                    })
+                    .collect();
             }
-            return Value::Object(members);
+            return samples;
         }
         match schema.get("type").and_then(Value::as_str) {
-            Some("object") => schema
-                .get("properties")
-                .and_then(Value::as_object)
-                .map(|properties| {
-                    Value::Object(
-                        properties
-                            .iter()
-                            .map(|(name, property)| (name.clone(), maximal_schema_sample(property)))
-                            .collect(),
-                    )
-                })
-                .unwrap_or_else(|| json!({})),
+            Some("object") => object_schema_samples(schema),
             Some("array") => {
                 let count = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0);
-                let item = schema
+                let choices = schema
                     .get("items")
-                    .map(maximal_schema_sample)
-                    .unwrap_or(Value::Null);
-                Value::Array((0..count).map(|_| item.clone()).collect())
+                    .map(exhaustive_schema_samples)
+                    .unwrap_or_else(|| vec![Value::Null]);
+                choices
+                    .into_iter()
+                    .map(|item| Value::Array((0..count).map(|_| item.clone()).collect()))
+                    .collect()
             }
-            Some("boolean") => json!(true),
-            Some("integer") => json!(schema.get("minimum").and_then(Value::as_i64).unwrap_or(0)),
-            Some("number") => json!(schema.get("minimum").and_then(Value::as_f64).unwrap_or(0.0)),
-            Some("string") => json!("fixture"),
-            _ => Value::Null,
+            Some("boolean") => vec![json!(true)],
+            Some("integer") => vec![json!(
+                schema.get("minimum").and_then(Value::as_i64).unwrap_or(0)
+            )],
+            Some("number") => vec![json!(
+                schema.get("minimum").and_then(Value::as_f64).unwrap_or(0.0)
+            )],
+            Some("string") => vec![json!("fixture")],
+            _ => vec![Value::Null],
+        }
+    }
+
+    fn object_schema_samples(schema: &Value) -> Vec<Value> {
+        schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|properties| {
+                let choices = properties
+                    .iter()
+                    .map(|(name, property)| (name, exhaustive_schema_samples(property)))
+                    .collect::<Vec<_>>();
+                let base = choices
+                    .iter()
+                    .map(|(name, values)| {
+                        (
+                            (*name).clone(),
+                            values.first().cloned().unwrap_or(Value::Null),
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                let mut samples = vec![Value::Object(base.clone())];
+                for (name, values) in choices {
+                    for value in values.into_iter().skip(1) {
+                        let mut sample = base.clone();
+                        sample.insert(name.clone(), value);
+                        samples.push(Value::Object(sample));
+                    }
+                }
+                samples
+            })
+            .unwrap_or_else(|| vec![json!({})])
+    }
+
+    fn merge_schema_samples(base: &Value, choice: Value) -> Value {
+        match (base, choice) {
+            (Value::Object(base), Value::Object(choice)) => {
+                let mut merged = base.clone();
+                merged.extend(choice);
+                Value::Object(merged)
+            }
+            (Value::Object(base), Value::Null) => Value::Object(base.clone()),
+            (_, choice) => choice,
         }
     }
 

@@ -18,17 +18,31 @@ function cleanRepository(repoRoot) {
   if (status) throw new Error(`source_build_repository_not_clean:${status.split(/\r?\n/u)[0]}`);
 }
 
+function exactBuildCommand(command) {
+  const expected = ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"];
+  if (!Array.isArray(command) || command.length !== expected.length || command.some((entry, index) => entry !== expected[index])) {
+    throw new Error("source_build_command_not_exact");
+  }
+}
+
+function safeArtifactRelative(relative) {
+  const components = relative.split("/");
+  return relative === "target/release/codestory-cli"
+    && components.every((component) => component && component !== "." && component !== ".." && !component.includes("\\"));
+}
+
 export function recordSourceBuildProvenance({ artifact, buildCommand, repoRoot, runBuild }) {
   const root = path.resolve(repoRoot);
   const artifactPath = path.resolve(artifact);
-  if (!Array.isArray(buildCommand) || buildCommand.length === 0 || !buildCommand.includes("--locked")) {
-    throw new Error("source_build_command_must_be_locked");
-  }
+  exactBuildCommand(buildCommand);
   const relative = path.relative(root, artifactPath);
-  if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+  const normalizedRelative = relative.split(path.sep).join("/");
+  if (!safeArtifactRelative(normalizedRelative)) {
     throw new Error("source_build_artifact_outside_repository");
   }
+  if (fs.existsSync(artifactPath)) throw new Error("source_build_artifact_must_be_absent");
   cleanRepository(root);
+  const before = { head: git(root, "rev-parse", "HEAD"), tree: git(root, "rev-parse", "HEAD^{tree}") };
   const completed = (runBuild || ((command, options) => spawnSync(command[0], command.slice(1), {
     ...options,
     encoding: "utf8",
@@ -38,17 +52,18 @@ export function recordSourceBuildProvenance({ artifact, buildCommand, repoRoot, 
   if (!fs.existsSync(artifactPath) || !fs.statSync(artifactPath).isFile()) {
     throw new Error("source_build_artifact_not_file");
   }
+  const after = { head: git(root, "rev-parse", "HEAD"), tree: git(root, "rev-parse", "HEAD^{tree}") };
+  if (before.head !== after.head || before.tree !== after.tree) throw new Error("source_build_source_changed");
   const metadata = fs.statSync(artifactPath);
   return {
     schema_version: 1,
     purpose: "codestory-source-build-provenance",
     source: {
-      head: git(root, "rev-parse", "HEAD"),
-      tree: git(root, "rev-parse", "HEAD^{tree}"),
+      ...before,
     },
     build: { command: [...buildCommand] },
     artifact: {
-      path: relative.split(path.sep).join("/"),
+      path: normalizedRelative,
       bytes: metadata.size,
       sha256: sha256(artifactPath),
     },
@@ -64,13 +79,9 @@ export function compareSourceBuildProvenance(record, { installerSha256, liveSha2
     || !/^[0-9a-f]{40}$/u.test(record?.source?.head || "")
     || !/^[0-9a-f]{40}$/u.test(record?.source?.tree || "")
     || !Array.isArray(command)
-    || command.length === 0
-    || !command.every((part) => typeof part === "string" && part.length > 0)
-    || !command.includes("--locked")
+    || command.join("\0") !== ["cargo", "build", "--locked", "-p", "codestory-cli", "--profile", "release", "--target-dir", "target"].join("\0")
     || typeof artifactPath !== "string"
-    || artifactPath.length === 0
-    || artifactPath.startsWith("../")
-    || path.posix.isAbsolute(artifactPath)
+    || !safeArtifactRelative(artifactPath)
     || !Number.isSafeInteger(record?.artifact?.bytes)
     || record.artifact.bytes <= 0
     || !SHA256.test(record?.artifact?.sha256 || "")

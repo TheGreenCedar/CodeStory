@@ -47,6 +47,10 @@ pub(crate) use app::{
     attach_complete_publication, local_refresh_output_from_summary, packet_sufficiency_label,
     preflight_output_file,
 };
+#[doc(hidden)]
+pub use stdio_transport::{
+    compatibility_render_stdio_tool_error, compatibility_render_stdio_tool_success,
+};
 
 /// Install the native same-user embedding client transport for this executable.
 pub fn install_native_embedding_client_transport() -> Result<()> {

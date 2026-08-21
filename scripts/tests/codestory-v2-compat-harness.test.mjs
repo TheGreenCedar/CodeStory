@@ -16,6 +16,16 @@ const generatedCatalogPath = path.join(pluginRoot, "generated-mcp-catalog.json")
 const nativeCli = path.join(repoRoot, "target", "debug", "codestory-cli");
 const launcher = createRequire(import.meta.url)(path.join(pluginRoot, "scripts", "codestory-mcp.cjs"))._test;
 
+function materializeProjectFixture(value) {
+  if (Array.isArray(value)) return value.map(materializeProjectFixture);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, materializeProjectFixture(child)]));
+  }
+  if (value === "<project_root>") return repoRoot;
+  if (value === "<project_status_uri>") return `codestory://status?project=${encodeURIComponent(repoRoot)}`;
+  return value;
+}
+
 test("v2 compatibility transcripts pin semantic fields while normalizing only declared volatility", async () => {
   const fixture = JSON.parse(await readFile(fixturePath, "utf8"));
   for (const surface of [fixture.native_v2, fixture.launcher_fail_open_v2]) {
@@ -73,19 +83,40 @@ test("native and launcher-v2 fixtures freeze real catalog and fail-open result b
   });
   assert.equal(native.status, 0, native.stderr);
   const responses = native.stdout.trim().split(/\r?\n/u).map(JSON.parse);
-  assert.equal(responses[0].result.protocolVersion, fixture.native_v2.initialize.protocolVersion);
+  assert.deepEqual(responses[0].result, fixture.native_v2.initialize);
   assert.deepEqual(responses[1].result.tools, catalog.tools);
   assert.deepEqual(responses[2].result.resources, catalog.resources);
   assert.deepEqual(responses[3].result.resourceTemplates, catalog.resourceTemplates);
   assert.deepEqual(responses[4].result.prompts, catalog.prompts);
   assert.deepEqual(launcher.failOpenToolCatalog(), catalog.tools);
 
+  const launcherProcess = spawnSync(process.execPath, [path.join(pluginRoot, "scripts", "codestory-mcp.cjs")], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      CODESTORY_PLUGIN_DISABLE_PROVISION: "1",
+      CODESTORY_PLUGIN_DATA: path.join(repoRoot, "target", "v2-compat-launcher-data"),
+    },
+    input: `${requests.map(JSON.stringify).join("\n")}\n`,
+    timeout: 10_000,
+  });
+  assert.equal(launcherProcess.status, 0, launcherProcess.stderr);
+  const launcherResponses = launcherProcess.stdout.trim().split(/\r?\n/u).map(JSON.parse);
+  assert.deepEqual(launcherResponses[0].result, fixture.launcher_fail_open_v2.initialize);
+  assert.deepEqual(launcherResponses[1].result, { tools: catalog.tools });
+  assert.deepEqual(launcherResponses[2].result, { resources: catalog.resources.filter(({ uri }) => uri === "codestory://agent-guide") });
+  assert.deepEqual(launcherResponses[3].result, { resourceTemplates: catalog.resourceTemplates.filter(({ uriTemplate }) => uriTemplate === "codestory://status{?project}") });
+  assert.deepEqual(launcherResponses[4].result, { prompts: [] });
+
+  const success = launcher.failOpenToolResult("status", { state: "ready" }, { project: repoRoot });
   const preparing = launcher.failOpenToolResult("ground", { managed_retrieval: { state: "preparing" } }, { project: repoRoot });
   const unavailable = launcher.failOpenToolResult("ground", {}, { project: repoRoot });
   const toolError = launcher.failOpenToolResult("ground", {}, {});
-  assert.equal(preparing.structuredContent.code, fixture.launcher_fail_open_v2.preparing.structuredContent.code);
-  assert.equal(unavailable.structuredContent.code, fixture.launcher_fail_open_v2.unavailable.structuredContent.code);
-  assert.equal(toolError.structuredContent.code, fixture.launcher_fail_open_v2.tool_error.structuredContent.code);
+  assert.deepEqual(success, materializeProjectFixture(fixture.launcher_fail_open_v2.success));
+  assert.deepEqual(preparing, materializeProjectFixture(fixture.launcher_fail_open_v2.preparing));
+  assert.deepEqual(unavailable, materializeProjectFixture(fixture.launcher_fail_open_v2.unavailable));
+  assert.deepEqual(toolError, fixture.launcher_fail_open_v2.tool_error);
 });
 
 test("future protocol fixtures execute revision-native result and batch contracts without enabling v2", async () => {

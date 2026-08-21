@@ -6,27 +6,27 @@
   "native_v2": {
     "identity": "native-v2",
     "catalog_sha256": "e96a7049922552198cc65270aeb7d4ee1c8d3d8b6974224f3c8305398bb6b7b6",
-    "initialize": {"protocolVersion": "2024-11-05", "serverInfo": {"name": "codestory"}, "_meta": {"codestory_protocol": {"supported": ["2024-11-05"], "negotiated": "2024-11-05"}}},
+    "initialize": {"_meta": {"codestory_protocol": {"compatible": true, "negotiated": "2024-11-05", "requested": "2024-11-05", "status": "agreed", "supported": ["2024-11-05"]}, "codestory_publication": {"contract_runtime": {"cli_sha256": null, "cli_source": "direct_cli_launch", "cli_version": "0.17.1", "known_override_skew_channel": false, "pinned_pair_matches": null, "plugin_cli_version": null, "plugin_version": null}, "core_publication": null, "minimum_compatible_schema_version": 2, "operation": {"attempt": null, "operation_id": null}, "publication": null, "retrieval_publication": null, "schema_version": 2, "served_from": "contract_only"}}, "capabilities": {"prompts": {"listChanged": false}, "resources": {"listChanged": false, "subscribe": false}, "tools": {"listChanged": false}}, "name": "codestory", "protocolVersion": "2024-11-05", "serverInfo": {"name": "codestory", "version": "0.17.1"}, "version": "0.17.1"},
     "tools_list": {"catalog_ref": "plugins/codestory/generated-mcp-catalog.json#/tools"},
     "resources_list": {"catalog_ref": "plugins/codestory/generated-mcp-catalog.json#/resources"},
     "resource_templates_list": {"catalog_ref": "plugins/codestory/generated-mcp-catalog.json#/resourceTemplates"},
     "prompts_list": {"catalog_ref": "plugins/codestory/generated-mcp-catalog.json#/prompts"},
-    "success": {"isError": false, "content": [{"type": "text", "text": "{\"state\":\"ready\"}"}], "structuredContent": {"state": "ready"}},
-    "preparing": {"isError": false, "structuredContent": {"code": "codestory_preparing", "state": "preparing", "retry_after_ms": 250}},
-    "unavailable": {"isError": true, "structuredContent": {"code": "codestory_unavailable", "message": "CodeStory is unavailable."}},
-    "tool_error": {"isError": true, "structuredContent": {"code": "project_required", "message": "An absolute repository root is required."}}
+    "success": {"content": [{"type": "text", "text": "tool: status\nstate: ready\nstructuredContent: available\n"}], "structuredContent": {"state": "ready"}},
+    "preparing": {"content": [{"type": "text", "text": "CodeStory is preparing managed search."}], "structuredContent": {"code": "codestory_preparing", "message": "CodeStory is preparing managed search.", "state": "preparing", "retry_after_ms": 250}},
+    "unavailable": {"content": [{"type": "text", "text": "CodeStory is unavailable."}], "structuredContent": {"code": "codestory_unavailable", "message": "CodeStory is unavailable."}, "isError": true},
+    "tool_error": {"content": [{"type": "text", "text": "An absolute repository root is required."}], "structuredContent": {"code": "project_required", "message": "An absolute repository root is required.", "tool": "ground"}, "isError": true}
   },
   "launcher_fail_open_v2": {
     "identity": "launcher-fail-open-v2",
     "catalog_sha256": "e96a7049922552198cc65270aeb7d4ee1c8d3d8b6974224f3c8305398bb6b7b6",
-    "initialize": {"protocolVersion": "2024-11-05", "serverInfo": {"name": "codestory"}, "_meta": {"codestory_protocol": {"supported": ["2024-11-05"], "negotiated": "2024-11-05"}}},
+    "initialize": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {"listChanged": true}, "resources": {"subscribe": false, "listChanged": true}, "prompts": {"listChanged": true}}, "serverInfo": {"name": "codestory", "version": "0.17.3"}, "_meta": {"codestory_publication": {"schema_version": 2, "minimum_compatible_schema_version": 2, "served_from": "contract_only", "publication": null, "core_publication": null, "retrieval_publication": null, "contract_runtime": {"cli_version": null, "plugin_version": "0.17.3", "plugin_cli_version": "0.17.3", "cli_sha256": null, "cli_source": "managed_unavailable", "pinned_pair_matches": null, "known_override_skew_channel": false}, "operation": {"operation_id": null, "attempt": null}}, "codestory_protocol": {"requested": "2024-11-05", "negotiated": "2024-11-05", "supported": ["2024-11-05"], "status": "agreed", "compatible": true}}},
     "tools_list": {"catalog_ref": "plugins/codestory/generated-mcp-catalog.json#/tools"},
     "resources_list": {"catalog_ref": "plugins/codestory/generated-mcp-catalog.json#/resources"},
     "resource_templates_list": {"catalog_ref": "plugins/codestory/generated-mcp-catalog.json#/resourceTemplates"},
     "prompts_list": {"catalog_ref": "plugins/codestory/generated-mcp-catalog.json#/prompts"},
-    "success": {"isError": false, "content": [{"type": "text", "text": "state: ready\nresult: structured\n"}], "structuredContent": {"state": "ready"}},
-    "preparing": {"isError": false, "structuredContent": {"code": "codestory_preparing", "state": "preparing", "retry_after_ms": 250}},
-    "unavailable": {"isError": true, "structuredContent": {"code": "codestory_unavailable", "message": "CodeStory is unavailable."}},
-    "tool_error": {"isError": true, "structuredContent": {"code": "project_required", "message": "An absolute repository root is required."}}
+    "success": {"content": [{"type": "text", "text": "state: unavailable\nresult: structured\n"}], "structuredContent": {"project": "<project_root>", "state": "unavailable", "degraded_reason": "runtime_unavailable", "capabilities": {"local_navigation": "unavailable", "broad_search": "unavailable"}, "current_operation": null, "failure": "runtime_unavailable", "failure_context": null, "hint": null, "next_action": "use_source_inspection", "retry_after_ms": null, "diagnostics_uri": "<project_status_uri>"}},
+    "preparing": {"content": [{"type": "text", "text": "CodeStory is preparing: downloading the runtime. Retry the same tool shortly."}], "structuredContent": {"code": "codestory_preparing", "message": "CodeStory is preparing: downloading the runtime. Retry the same tool shortly.", "tool": "ground", "project": "<project_root>", "state": "preparing", "retry_tool": "ground", "retry_after_ms": 1500, "operation": {"operation_id": "managed-runtime-provisioning", "state": "preparing", "stage": "downloading_runtime", "attempt": 1, "retry_after_ms": 1500, "failure": null, "progress": null}, "diagnostics_uri": "<project_status_uri>"}},
+    "unavailable": {"content": [{"type": "text", "text": "CodeStory is unavailable. Continue with focused source inspection."}], "structuredContent": {"code": "codestory_unavailable", "message": "CodeStory is unavailable. Continue with focused source inspection.", "tool": "ground", "project": "<project_root>", "state": "unavailable", "failure": "runtime_unavailable", "failure_context": null, "diagnostics_uri": "<project_status_uri>"}, "isError": true},
+    "tool_error": {"content": [{"type": "text", "text": "Pass the caller's absolute repository root in the `project` argument."}], "structuredContent": {"code": "project_required", "message": "Pass the caller's absolute repository root in the `project` argument.", "tool": "ground", "project": null, "state": "no_project"}, "isError": true}
   }
 }
