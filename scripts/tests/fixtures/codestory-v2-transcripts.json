@@ -1,0 +1,30 @@
+{
+  "normalization": {
+    "volatile_classes": ["operation_id", "packet_id", "timestamp", "timing", "runtime_binary_hash", "source_identity", "build_identity"],
+    "forbidden": ["semantic_fields", "field_order", "schemas", "constants", "payload_vocabulary"]
+  },
+  "native_v2": {
+    "identity": "native-v2",
+    "initialize": {"protocolVersion": "2024-11-05", "serverInfo": {"name": "codestory"}, "_meta": {"codestory_protocol": {"supported": ["2024-11-05"], "negotiated": "2024-11-05"}}},
+    "tools_list": {"tools": [{"name": "ground", "description": "", "inputSchema": {"type": "object"}}]},
+    "resources_list": {"resources": [{"uri": "codestory://agent-guide", "name": "CodeStory agent guide", "mimeType": "text/markdown"}]},
+    "resource_templates_list": {"resourceTemplates": [{"uriTemplate": "codestory://status{?project}", "name": "CodeStory status", "mimeType": "application/json"}]},
+    "prompts_list": {"prompts": [{"name": "explain_symbol", "description": "Explain a symbol using definition, references, and snippet context."}]},
+    "success": {"isError": false, "content": [{"type": "text", "text": "{\"state\":\"ready\"}"}], "structuredContent": {"state": "ready"}},
+    "preparing": {"isError": false, "structuredContent": {"code": "codestory_preparing", "state": "preparing", "retry_after_ms": 250}},
+    "unavailable": {"isError": true, "structuredContent": {"code": "codestory_unavailable", "message": "CodeStory is unavailable."}},
+    "tool_error": {"isError": true, "structuredContent": {"code": "project_required", "message": "An absolute repository root is required."}}
+  },
+  "launcher_fail_open_v2": {
+    "identity": "launcher-fail-open-v2",
+    "initialize": {"protocolVersion": "2024-11-05", "serverInfo": {"name": "codestory"}, "_meta": {"codestory_protocol": {"supported": ["2024-11-05"], "negotiated": "2024-11-05"}}},
+    "tools_list": {"tools": [{"name": "ground", "description": "", "inputSchema": {"type": "object"}}]},
+    "resources_list": {"resources": [{"uri": "codestory://agent-guide", "name": "CodeStory agent guide", "mimeType": "text/markdown"}]},
+    "resource_templates_list": {"resourceTemplates": [{"uriTemplate": "codestory://status{?project}", "name": "CodeStory status", "mimeType": "application/json"}]},
+    "prompts_list": {"prompts": [{"name": "explain_symbol", "description": "Explain a symbol using definition, references, and snippet context."}]},
+    "success": {"isError": false, "content": [{"type": "text", "text": "state: ready\nresult: structured\n"}], "structuredContent": {"state": "ready"}},
+    "preparing": {"isError": false, "structuredContent": {"code": "codestory_preparing", "state": "preparing", "retry_after_ms": 250}},
+    "unavailable": {"isError": true, "structuredContent": {"code": "codestory_unavailable", "message": "CodeStory is unavailable."}},
+    "tool_error": {"isError": true, "structuredContent": {"code": "project_required", "message": "An absolute repository root is required."}}
+  }
+}

@@ -665,6 +665,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v2_output_audit_fixture_locks_success_and_intentionally_nonconforming_shapes() {
+        let audit: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/v2_output_audit.json"))
+                .expect("v2 output audit fixture");
+        let schema = &audit["success_schema"];
+        for case in audit["cases"].as_array().expect("audit cases") {
+            let actual = validate_structured_content(schema, &case["structuredContent"]);
+            match case["outcome"].as_str().expect("audit outcome") {
+                "valid" => assert!(actual.is_ok(), "{}: {actual:?}", case["name"]),
+                "intentionally_nonconforming" => assert!(actual.is_err(), "{}", case["name"]),
+                other => panic!("unknown audit outcome {other}"),
+            }
+        }
+    }
+
     fn codes_from_output(schema: &Value, structured_content: Value) -> Vec<&'static str> {
         match validate_structured_content(schema, &structured_content) {
             Ok(()) => Vec::new(),
