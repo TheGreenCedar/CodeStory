@@ -16,7 +16,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+#[cfg(all(
+    not(any(test, feature = "test-support")),
+    feature = "proof-qualification-support"
+))]
 use codestory_agent::proof_qualification_support::{
+    AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
+    CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
+    IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
+    PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawCallEdgeAdmission, ReceiptRef,
+    ResolvedNodeIdentity, UnavailableReason, ValidatedCallPathContract, ValidatedContractRendering,
+    VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
+    check_built_call_path_integration, project_internal_call_path_result,
+};
+#[cfg(any(test, feature = "test-support"))]
+use codestory_agent::proof_qualification_test_support::{
     AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
     CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
     IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
@@ -850,11 +864,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    use codestory_agent::indexed_source_call_path_v1::{
-        ClauseAnchor, ClauseClassification, ProofContractField, ProofDisposition,
-        UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
-        UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector, ValidatedContractRendering,
-        ValidationOutcome, check_call_path, validate_contract,
+    use codestory_agent::proof_qualification_test_support::{
+        ClauseAnchor, ClauseClassification, ProofContractField, ProofDisposition, ProofGap,
+        Refutation, UnvalidatedCallPathContract, UnvalidatedCallPathSpec,
+        UnvalidatedDirectCallStep, UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector,
+        ValidatedContractRendering, ValidationOutcome, check_call_path, validate_contract,
     };
     use codestory_contracts::api::IndexMode;
     use codestory_contracts::events::EventBus;
@@ -1586,7 +1600,7 @@ mod tests {
             refuted.disposition(),
             &ProofDisposition::ContractRefuted {
                 contract_digest: prohibited_hashes.contract_digest().to_owned(),
-                refutation: codestory_agent::indexed_source_call_path_v1::Refutation::ProhibitedScopeTraversal {
+                refutation: Refutation::ProhibitedScopeTraversal {
                     step_index: 1,
                     prohibition_index: 0,
                     connected_receipts: expected_chain.clone(),
@@ -1632,7 +1646,7 @@ mod tests {
         assert!(matches!(
             excluded_result.disposition(),
             ProofDisposition::Unknown { gaps, .. }
-                if gaps == &[codestory_agent::indexed_source_call_path_v1::ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index: 1 }]
+                if gaps == &[ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index: 1 }]
         ));
     }
 
@@ -1662,7 +1676,7 @@ mod tests {
         assert!(matches!(
             recursive_result.disposition(),
             ProofDisposition::Unknown { gaps, .. }
-                if gaps == &[codestory_agent::indexed_source_call_path_v1::ProofGap::FactBuild(
+                if gaps == &[ProofGap::FactBuild(
                     FactBuildGap::RecursiveCallNotRepresentable { step_index: 0 }
                 )]
         ));
@@ -1706,7 +1720,7 @@ mod tests {
                 gaps,
                 connected_receipts,
                 ..
-            } if gaps == &[codestory_agent::indexed_source_call_path_v1::ProofGap::FactBuild(
+            } if gaps == &[ProofGap::FactBuild(
                 FactBuildGap::DirectCallMissing { step_index: 1 }
             )] && connected_receipts.len() == 1
         ));
@@ -1778,7 +1792,7 @@ mod tests {
         ));
         assert!(matches!(
             operation.value.projection,
-            codestory_agent::indexed_source_call_path_v1::InternalProjection::Complete { .. }
+            InternalProjection::Complete { .. }
         ));
         assert_eq!(
             Store::open(&storage_path)

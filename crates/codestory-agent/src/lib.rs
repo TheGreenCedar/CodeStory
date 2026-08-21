@@ -23,7 +23,7 @@ pub mod eval_probes;
 ))]
 #[doc(hidden)]
 mod indexed_source_call_path_v1;
-#[cfg(any(feature = "test-support", feature = "proof-qualification-support"))]
+#[cfg(feature = "proof-qualification-support")]
 #[doc(hidden)]
 pub mod proof_qualification_support {
     pub use super::indexed_source_call_path_v1::{
@@ -40,6 +40,23 @@ pub mod proof_qualification_support {
     pub fn proof_domain() -> &'static str {
         super::indexed_source_call_path_v1::PROOF_DOMAIN
     }
+}
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod proof_qualification_test_support {
+    pub use super::indexed_source_call_path_v1::{
+        AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
+        CheckedBuiltCallPathIntegration, ClauseAnchor, ClauseClassification, ExactScopeSelector,
+        ExactSymbolSelector, FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow,
+        InternalCorePublicationIdentity, InternalProjection, PROOF_DOMAIN, PinnedNodeIdentity,
+        ProofContractField, ProofDisposition, ProofGap, ProofHashes, RawCallEdgeAdmission,
+        ReceiptRef, Refutation, ResolvedNodeIdentity, UnavailableReason,
+        UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
+        UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector, ValidatedCallPathContract,
+        ValidatedContractRendering, ValidationOutcome, VerifiedDirectCallFact, VerifiedProofFact,
+        admit_raw_call_edge, check_built_call_path_integration, check_call_path,
+        project_internal_call_path_result, validate_contract,
+    };
 }
 pub mod packet_citations;
 pub mod packet_claim_profile_registry;

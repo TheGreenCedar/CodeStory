@@ -1200,6 +1200,27 @@ fn proof_qualification_facades_seal_the_kernel_and_preserve_transport_errors() {
 }
 
 #[test]
+fn runtime_test_support_never_reaches_the_private_agent_kernel() {
+    for surface in [
+        "crates/codestory-runtime/src/indexed_source_call_path_v1.rs",
+        "crates/codestory-runtime/src/services.rs",
+    ] {
+        let source = read(surface);
+        assert!(
+            !source.contains("codestory_agent::indexed_source_call_path_v1"),
+            "{surface} reaches the private agent kernel instead of its explicit test-support facade"
+        );
+    }
+    let agent_lib = read("crates/codestory-agent/src/lib.rs");
+    assert!(
+        agent_lib.contains(
+            "#[cfg(any(test, feature = \"test-support\"))]\n#[doc(hidden)]\npub mod proof_qualification_test_support"
+        ),
+        "runtime tests need an explicit test-support-only facade rather than kernel access"
+    );
+}
+
+#[test]
 fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
     let lib = read("crates/codestory-agent/src/lib.rs");
     assert!(
