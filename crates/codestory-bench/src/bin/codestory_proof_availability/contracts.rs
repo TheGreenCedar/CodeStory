@@ -3460,7 +3460,9 @@ fn valid_transport(evidence: &TransportEvidenceV1) -> bool {
 fn valid_finalization(finalization: &FinalizationTraceV1) -> bool {
     match finalization {
         FinalizationTraceV1::NotRun => true,
-        FinalizationTraceV1::Complete { projection_bytes } => *projection_bytes <= 65_536,
+        FinalizationTraceV1::Complete { projection_bytes } => {
+            (1..=65_536).contains(projection_bytes)
+        }
         FinalizationTraceV1::Failed { .. } => true,
     }
 }
@@ -3469,27 +3471,85 @@ fn valid_case_finalization(case: &CaseReportV1) -> bool {
     match case.proof_trace.finalization {
         FinalizationTraceV1::NotRun => false,
         FinalizationTraceV1::Complete { projection_bytes } => {
-            case.complete_projection_bytes == projection_bytes && projection_bytes <= 65_536
+            projection_bytes > 0
+                && case.complete_projection_bytes == projection_bytes
+                && projection_bytes <= 65_536
+                && successful_non_budget_result(&case.product_disposition.actual)
+                && !product_tool_failure_transport(&case.transport)
         }
-        FinalizationTraceV1::Failed { .. } => {
-            case.complete_projection_bytes == 0
-                && match &case.product_disposition.actual {
-                    ActualProductResultV1::Invalid {
-                        failure:
-                            ProductToolFailureV1 {
-                                stage: ProductFailureStageV1::ToolExecution,
-                                ..
-                            },
-                    } => matches!(
-                        &case.transport,
-                        TransportEvidenceV1::Error {
-                            error: TransportErrorV1::InvalidProjection { projection }
-                        } if projection == "product_tool_failure"
-                    ),
-                    _ => true,
-                }
-        }
+        FinalizationTraceV1::Failed {
+            failure:
+                FinalizationFailureV1::ReceiptIntegration | FinalizationFailureV1::ProjectionBudget,
+        } => valid_tool_failure_pair(case),
+        FinalizationTraceV1::Failed {
+            failure: FinalizationFailureV1::ReceiptBudget,
+        } => valid_receipt_budget_pair(case),
     }
+}
+
+fn successful_non_budget_result(actual: &ActualProductResultV1) -> bool {
+    match actual {
+        ActualProductResultV1::Invalid { .. } => false,
+        ActualProductResultV1::Unknown { gaps, .. } => {
+            !gaps.contains(&ActualProofGapV1::OutputBudgetExceeded)
+        }
+        _ => true,
+    }
+}
+
+fn product_tool_failure_transport(transport: &TransportEvidenceV1) -> bool {
+    matches!(
+        transport,
+        TransportEvidenceV1::Error {
+            error: TransportErrorV1::InvalidProjection { projection }
+        } if projection == "product_tool_failure"
+    )
+}
+
+fn valid_tool_failure_pair(case: &CaseReportV1) -> bool {
+    let expected_missing = (0..case.attempted_step_count).collect::<BTreeSet<_>>();
+    let actual_missing = case
+        .receipt_evidence
+        .missing_oracle_steps
+        .iter()
+        .map(|missing| missing.step_index)
+        .collect::<BTreeSet<_>>();
+    case.complete_projection_bytes == 0
+        && matches!(
+            case.product_disposition.actual,
+            ActualProductResultV1::Invalid {
+                failure: ProductToolFailureV1 {
+                    stage: ProductFailureStageV1::ToolExecution,
+                    ..
+                }
+            }
+        )
+        && case.product_disposition.kind == ProductDispositionKindV1::Invalid
+        && case.product_disposition.gaps.is_empty()
+        && case.product_disposition.authoritative_receipts.is_empty()
+        && case.actionable_exact_gap.is_none()
+        && case.receipt_evidence.observed_receipts.is_empty()
+        && actual_missing == expected_missing
+        && product_tool_failure_transport(&case.transport)
+}
+
+fn valid_receipt_budget_pair(case: &CaseReportV1) -> bool {
+    case.complete_projection_bytes > 0
+        && case.complete_projection_bytes <= 65_536
+        && matches!(
+            &case.product_disposition.actual,
+            ActualProductResultV1::Unknown {
+                gaps,
+                connected_receipts,
+                ..
+            } if gaps.as_slice() == [ActualProofGapV1::OutputBudgetExceeded]
+                && connected_receipts.is_empty()
+        )
+        && case.product_disposition.kind == ProductDispositionKindV1::Unknown
+        && case.product_disposition.gaps == [TypedGapV1::ProjectionBudget]
+        && case.product_disposition.authoritative_receipts.is_empty()
+        && case.actionable_exact_gap == Some(TypedGapV1::ProjectionBudget)
+        && !product_tool_failure_transport(&case.transport)
 }
 
 fn valid_receipts(case: &CaseReportV1, project: Option<&ProjectMaterializationEvidenceV1>) -> bool {
@@ -3523,16 +3583,11 @@ fn valid_receipts(case: &CaseReportV1, project: Option<&ProjectMaterializationEv
         return false;
     }
     if matches!(
-        case.product_disposition.actual,
-        ActualProductResultV1::Invalid {
-            failure: ProductToolFailureV1 {
-                stage: ProductFailureStageV1::ToolExecution,
-                ..
-            }
-        }
-    ) && matches!(
         case.proof_trace.finalization,
-        FinalizationTraceV1::Failed { .. }
+        FinalizationTraceV1::Failed {
+            failure: FinalizationFailureV1::ReceiptIntegration
+                | FinalizationFailureV1::ProjectionBudget
+        }
     ) {
         let expected_missing = (0..case.attempted_step_count).collect::<BTreeSet<_>>();
         let actual_missing = evidence

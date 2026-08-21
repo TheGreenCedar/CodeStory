@@ -347,15 +347,18 @@ fn receipt_evidence(
     if receipts.len() != step_by_edge.len() {
         bail!("proof_availability_receipt_trace_binding_incomplete")
     }
-    let authoritative = result
-        .integration
-        .authoritative_receipts()
-        .iter()
-        .map(|receipt| {
-            let edge = receipt.receipt.edge_id.parse::<i64>()?;
-            Ok((receipt.receipt.receipt_id.clone(), edge))
-        })
-        .collect::<Result<BTreeSet<_>>>()?;
+    let authoritative = match &result.projection {
+        InternalProjection::Complete { .. } => result
+            .integration
+            .authoritative_receipts()
+            .iter()
+            .map(|receipt| {
+                let edge = receipt.receipt.edge_id.parse::<i64>()?;
+                Ok((receipt.receipt.receipt_id.clone(), edge))
+            })
+            .collect::<Result<BTreeSet<_>>>()?,
+        InternalProjection::BudgetExceeded { .. } => BTreeSet::new(),
+    };
     let exact_authoritative_steps = receipts
         .iter()
         .filter(|receipt| {

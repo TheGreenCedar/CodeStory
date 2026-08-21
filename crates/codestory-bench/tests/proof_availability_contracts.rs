@@ -1451,8 +1451,29 @@ fn summary_rejects_inventory_and_length_one_trail_equation_violations() {
 
 #[test]
 fn finalization_tool_failure_retains_trace_without_claiming_receipts() {
-    let mut value = report();
-    let case = &mut value["cases"][0];
+    for failure in ["receipt_integration", "projection_budget"] {
+        let mut value = report();
+        set_tool_failure_case(&mut value["cases"][0], failure);
+        rebind_results_digest(&mut value);
+
+        let parsed = QualificationSummaryV1::from_json(value)
+            .expect("tool failure remains a valid immutable case row");
+        assert!(matches!(
+            parsed.cases[0].product_disposition.actual,
+            ActualProductResultV1::Invalid { .. }
+        ));
+        assert!(!parsed.cases[0].proof_trace.steps.is_empty());
+        assert!(
+            parsed.cases[0]
+                .receipt_evidence
+                .observed_receipts
+                .is_empty()
+        );
+        assert_eq!(parsed.cases[0].negative_mutations.len(), 2);
+    }
+}
+
+fn set_tool_failure_case(case: &mut Value, failure: &str) {
     let missing = case["receipt_evidence"]["observed_receipts"]
         .as_array()
         .expect("observed receipts")
@@ -1473,28 +1494,197 @@ fn finalization_tool_failure_retains_trace_without_claiming_receipts() {
     case["actionable_exact_gap"] = Value::Null;
     case["receipt_evidence"]["observed_receipts"] = json!([]);
     case["receipt_evidence"]["missing_oracle_steps"] = Value::Array(missing);
-    case["proof_trace"]["finalization"] = json!({"kind":"failed","failure":"receipt_integration"});
+    case["proof_trace"]["finalization"] = json!({"kind":"failed","failure":failure});
     case["complete_projection_bytes"] = json!(0);
     case["transport"] = json!({
         "kind":"error",
         "error":{"kind":"invalid_projection","projection":"product_tool_failure"}
     });
-    rebind_results_digest(&mut value);
+}
 
-    let parsed = QualificationSummaryV1::from_json(value)
-        .expect("tool failure remains a valid immutable case row");
-    assert!(matches!(
-        parsed.cases[0].product_disposition.actual,
-        ActualProductResultV1::Invalid { .. }
-    ));
-    assert!(!parsed.cases[0].proof_trace.steps.is_empty());
-    assert!(
-        parsed.cases[0]
-            .receipt_evidence
-            .observed_receipts
-            .is_empty()
+fn set_receipt_budget_case(case: &mut Value) {
+    let missing = case["receipt_evidence"]["observed_receipts"]
+        .as_array()
+        .expect("observed receipts")
+        .iter()
+        .map(|receipt| {
+            json!({
+                "step_index":receipt["step_index"],
+                "oracle_step":receipt["oracle_comparison"]["oracle_step"]
+            })
+        })
+        .collect::<Vec<_>>();
+    case["product_disposition"] = json!({
+        "kind":"unknown",
+        "gaps":["projection_budget"],
+        "authoritative_receipts":[],
+        "actual":{
+            "kind":"unknown",
+            "contract_digest":SHA,
+            "gaps":[{"kind":"output_budget_exceeded"}],
+            "connected_receipts":[]
+        }
+    });
+    case["actionable_exact_gap"] = json!("projection_budget");
+    case["receipt_evidence"]["missing_oracle_steps"] = Value::Array(missing);
+    case["proof_trace"]["finalization"] = json!({"kind":"failed","failure":"receipt_budget"});
+    case["complete_projection_bytes"] = json!(128);
+}
+
+fn assert_rebound_report_rejected(mut value: Value, expectation: &str) {
+    rebind_results_digest(&mut value);
+    QualificationSummaryV1::from_json(value).expect_err(expectation);
+}
+
+#[test]
+fn finalization_pairings_form_a_closed_state_matrix() {
+    QualificationSummaryV1::from_json(report()).expect("complete successful result");
+
+    for failure in ["receipt_integration", "projection_budget"] {
+        let mut value = report();
+        set_tool_failure_case(&mut value["cases"][0], failure);
+        rebind_results_digest(&mut value);
+        QualificationSummaryV1::from_json(value).expect("finalization tool failure pairing");
+    }
+
+    let mut receipt_budget = report();
+    set_receipt_budget_case(&mut receipt_budget["cases"][0]);
+    rebind_results_digest(&mut receipt_budget);
+    QualificationSummaryV1::from_json(receipt_budget)
+        .expect("successful output-budget fallback pairing");
+
+    for error in [
+        json!({"kind":"serialization","message":"fallback encode failed"}),
+        json!({"kind":"invalid_projection","projection":"fallback"}),
+        json!({"kind":"output_schema_violation"}),
+        json!({"kind":"result_exceeds_budget","maximum_bytes":65536,"actual_bytes":65537}),
+    ] {
+        let mut fallback_transport_error = report();
+        set_receipt_budget_case(&mut fallback_transport_error["cases"][0]);
+        fallback_transport_error["cases"][0]["transport"] = json!({"kind":"error","error":error});
+        rebind_results_digest(&mut fallback_transport_error);
+        QualificationSummaryV1::from_json(fallback_transport_error)
+            .expect("Task 4 transport errors remain exact fallback evidence");
+    }
+}
+
+#[test]
+fn finalization_pairings_reject_crossed_or_incomplete_states() {
+    for failure in ["receipt_integration", "receipt_budget", "projection_budget"] {
+        let mut proven_failed = report();
+        proven_failed["cases"][0]["proof_trace"]["finalization"] =
+            json!({"kind":"failed","failure":failure});
+        proven_failed["cases"][0]["complete_projection_bytes"] = json!(0);
+        assert_rebound_report_rejected(
+            proven_failed,
+            "ContractProven and receipts cannot pair with failed finalization",
+        );
+    }
+
+    let mut invalid_receipt_budget = report();
+    set_tool_failure_case(&mut invalid_receipt_budget["cases"][0], "receipt_budget");
+    assert_rebound_report_rejected(
+        invalid_receipt_budget,
+        "receipt budget is a successful fallback, not a tool failure",
     );
-    assert_eq!(parsed.cases[0].negative_mutations.len(), 2);
+
+    let mut tool_failure_with_receipt = report();
+    let observed =
+        tool_failure_with_receipt["cases"][0]["receipt_evidence"]["observed_receipts"][0].clone();
+    set_tool_failure_case(
+        &mut tool_failure_with_receipt["cases"][0],
+        "receipt_integration",
+    );
+    tool_failure_with_receipt["cases"][0]["receipt_evidence"]["observed_receipts"] =
+        json!([observed]);
+    assert_rebound_report_rejected(
+        tool_failure_with_receipt,
+        "tool failure cannot retain a receipt comparison",
+    );
+
+    for failure in ["receipt_integration", "projection_budget"] {
+        let mut fallback_as_tool_failure = report();
+        set_receipt_budget_case(&mut fallback_as_tool_failure["cases"][0]);
+        fallback_as_tool_failure["cases"][0]["proof_trace"]["finalization"] =
+            json!({"kind":"failed","failure":failure});
+        fallback_as_tool_failure["cases"][0]["complete_projection_bytes"] = json!(0);
+        assert_rebound_report_rejected(
+            fallback_as_tool_failure,
+            "tool failures cannot carry a successful budget fallback",
+        );
+    }
+
+    let mut zero_fallback = report();
+    set_receipt_budget_case(&mut zero_fallback["cases"][0]);
+    zero_fallback["cases"][0]["complete_projection_bytes"] = json!(0);
+    assert_rebound_report_rejected(zero_fallback, "budget fallback bytes are exact and nonzero");
+
+    let mut fallback_receipt_subset = report();
+    set_receipt_budget_case(&mut fallback_receipt_subset["cases"][0]);
+    let observed = &fallback_receipt_subset["cases"][0]["receipt_evidence"]["observed_receipts"][0];
+    let receipt_id = observed["receipt_id"].clone();
+    let edge_id = observed["edge_id"].clone();
+    let projected_edge_id = edge_id.as_i64().expect("fixture edge id").to_string();
+    fallback_receipt_subset["cases"][0]["product_disposition"]["authoritative_receipts"] =
+        json!([{"receipt_id":receipt_id,"edge_id":edge_id}]);
+    fallback_receipt_subset["cases"][0]["product_disposition"]["actual"]["connected_receipts"] =
+        json!([{"receipt_id":receipt_id,"edge_id":projected_edge_id}]);
+    assert_rebound_report_rejected(
+        fallback_receipt_subset,
+        "budget fallback cannot claim an authoritative receipt subset",
+    );
+
+    let mut wrong_budget_gap = report();
+    set_receipt_budget_case(&mut wrong_budget_gap["cases"][0]);
+    wrong_budget_gap["cases"][0]["product_disposition"]["actual"]["gaps"] =
+        json!([{"kind":"direct_call_missing","step_index":0}]);
+    wrong_budget_gap["cases"][0]["product_disposition"]["gaps"] = json!(["relation_missing"]);
+    wrong_budget_gap["cases"][0]["actionable_exact_gap"] = json!("relation_missing");
+    assert_rebound_report_rejected(
+        wrong_budget_gap,
+        "receipt budget requires the output-budget gap",
+    );
+
+    let mut fallback_as_product_failure = report();
+    set_receipt_budget_case(&mut fallback_as_product_failure["cases"][0]);
+    fallback_as_product_failure["cases"][0]["transport"] = json!({
+        "kind":"error",
+        "error":{"kind":"invalid_projection","projection":"product_tool_failure"}
+    });
+    assert_rebound_report_rejected(
+        fallback_as_product_failure,
+        "successful fallback cannot use the tool-failure transport sentinel",
+    );
+
+    let mut zero_complete = report();
+    zero_complete["cases"][0]["proof_trace"]["finalization"] =
+        json!({"kind":"complete","projection_bytes":0});
+    zero_complete["cases"][0]["complete_projection_bytes"] = json!(0);
+    assert_rebound_report_rejected(zero_complete, "complete projection bytes are nonzero");
+
+    let mut fallback_marked_complete = report();
+    set_receipt_budget_case(&mut fallback_marked_complete["cases"][0]);
+    fallback_marked_complete["cases"][0]["proof_trace"]["finalization"] =
+        json!({"kind":"complete","projection_bytes":128});
+    assert_rebound_report_rejected(
+        fallback_marked_complete,
+        "output-budget fallback cannot be marked complete",
+    );
+
+    let mut tool_failure_marked_complete = report();
+    let complete_transport = tool_failure_marked_complete["cases"][0]["transport"].clone();
+    set_tool_failure_case(
+        &mut tool_failure_marked_complete["cases"][0],
+        "projection_budget",
+    );
+    tool_failure_marked_complete["cases"][0]["proof_trace"]["finalization"] =
+        json!({"kind":"complete","projection_bytes":128});
+    tool_failure_marked_complete["cases"][0]["complete_projection_bytes"] = json!(128);
+    tool_failure_marked_complete["cases"][0]["transport"] = complete_transport;
+    assert_rebound_report_rejected(
+        tool_failure_marked_complete,
+        "Complete requires a successful product result",
+    );
 }
 
 #[test]
@@ -1560,16 +1750,6 @@ fn invariant_table_exhausts_task4_task6_and_corpus_variants() {
     }
     for reason in ["line_missing", "line_over_limit"] {
         assert_valid_first_zero("line", "source_binding", reason);
-    }
-
-    for failure in ["receipt_integration", "receipt_budget", "projection_budget"] {
-        let mut value = report();
-        value["cases"][0]["proof_trace"]["finalization"] =
-            json!({"kind":"failed","failure":failure});
-        value["cases"][0]["complete_projection_bytes"] = json!(0);
-        rebind_results_digest(&mut value);
-        QualificationSummaryV1::from_json(value)
-            .expect("every finalization failure maps losslessly");
     }
 
     let mut wrong_chain = cohort_path_file("codestory-rust");
@@ -1969,7 +2149,7 @@ fn make_non_proven_case(value: &mut Value, disposition: &str, gap: Option<&str>)
 
 #[test]
 fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
-    for disposition in ["unknown", "certified_absence", "unavailable", "invalid"] {
+    for disposition in ["unknown", "certified_absence", "unavailable"] {
         let mut value = report();
         make_non_proven_case(
             &mut value,
@@ -1979,6 +2159,10 @@ fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
         rebind_results_digest(&mut value);
         QualificationSummaryV1::from_json(value).expect("closed product disposition");
     }
+    let mut invalid = report();
+    set_tool_failure_case(&mut invalid["cases"][0], "receipt_integration");
+    rebind_results_digest(&mut invalid);
+    QualificationSummaryV1::from_json(invalid).expect("closed invalid product disposition");
     let mut unavailable_as_proven = report();
     make_non_proven_case(&mut unavailable_as_proven, "unavailable", None);
     unavailable_as_proven["cases"][0]["product_disposition"]["kind"] = json!("contract_proven");
@@ -1986,7 +2170,7 @@ fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
     QualificationSummaryV1::from_json(unavailable_as_proven)
         .expect_err("Unavailable cannot flatten into ContractProven");
     let mut mismatched_receipt = report();
-    make_non_proven_case(&mut mismatched_receipt, "invalid", None);
+    make_non_proven_case(&mut mismatched_receipt, "unknown", Some("relation_missing"));
     mismatched_receipt["cases"][0]["receipt_evidence"]["observed_receipts"][0]["target"]["qualified_name"] =
         json!("crate::false_positive");
     let oracle = mismatched_receipt["cases"][0]["receipt_evidence"]["observed_receipts"]
@@ -2005,13 +2189,17 @@ fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
         "relation_missing",
         "recursion",
         "source_binding",
-        "projection_budget",
     ] {
         let mut value = report();
         make_non_proven_case(&mut value, "unknown", Some(gap));
         rebind_results_digest(&mut value);
         QualificationSummaryV1::from_json(value).expect("closed actionable gap");
     }
+    let mut projection_budget = report();
+    set_receipt_budget_case(&mut projection_budget["cases"][0]);
+    rebind_results_digest(&mut projection_budget);
+    QualificationSummaryV1::from_json(projection_budget)
+        .expect("projection budget uses the closed receipt-budget fallback pairing");
     for gate in [
         "false_contract_proven",
         "receipt_mismatch",
