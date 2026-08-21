@@ -11,6 +11,8 @@ pub mod contracts;
 mod corpus;
 #[allow(dead_code)] // Task 11 consumes the completed qualification inventory.
 mod inventory;
+#[allow(dead_code)] // Tasks 11 and 13 consume the frozen decision evaluator.
+mod thresholds;
 #[allow(dead_code)] // Task 11 consumes the completed qualification denominators.
 mod trails;
 mod util;
