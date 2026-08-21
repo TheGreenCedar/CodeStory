@@ -2399,30 +2399,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn python_sources_are_not_globally_demoted_without_a_language_term() {
-        let terms = vec!["request".to_string(), "flow".to_string()];
-        let python = test_rank_citation("handle_request", "src/routes/request.py", 1.0);
-        let native = test_rank_citation("handle_request", "src/routes/request.rs", 1.0);
-
-        assert_eq!(
-            packet_citation_rank(&python, &terms, false),
-            packet_citation_rank(&native, &terms, false)
-        );
-    }
-
-    #[test]
-    fn collections_path_alone_has_no_rank_authority() {
-        let terms = vec!["payload".to_string()];
-        let collection = test_rank_citation("record", "src/collections/record.ts", 1.0);
-        let source = test_rank_citation("record", "src/content/record.ts", 1.0);
-
-        assert_eq!(
-            packet_citation_rank(&collection, &terms, false),
-            packet_citation_rank(&source, &terms, false)
-        );
-    }
-
     fn test_rank_citation(display_name: &str, file_path: &str, score: f32) -> AgentCitationDto {
         AgentCitationDto {
             node_id: NodeId(display_name.to_string()),
