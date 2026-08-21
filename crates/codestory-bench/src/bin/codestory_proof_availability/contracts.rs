@@ -102,7 +102,9 @@ pub enum ProofContractFieldV1 {
     ProjectionExclusion { index: u8 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum UnresolvedMaterialReasonV1 {
     MissingSelectorResolution,
@@ -682,6 +684,42 @@ fn to_product_scope_selector(
             project_file_components: project_file_components.clone(),
         },
     }
+}
+
+pub(crate) fn oracle_path_product_contract(
+    path: &OraclePathV1,
+) -> Result<product_proof::UnvalidatedCallPathContract> {
+    path.validate()?;
+    Ok(product_proof::UnvalidatedCallPathContract::new(
+        &path.source_text,
+        path.clauses
+            .iter()
+            .map(to_product_clause)
+            .collect::<Result<Vec<_>>>()?,
+        to_product_spec(&path.spec),
+    ))
+}
+
+pub(crate) fn negative_mutation_product_contract(
+    path: &OraclePathV1,
+    mutation: &NegativeMutationV1,
+) -> Result<product_proof::UnvalidatedCallPathContract> {
+    path.validate()?;
+    if !path
+        .negative_mutations
+        .iter()
+        .any(|candidate| candidate.mutation_id == mutation.mutation_id)
+    {
+        bail!("proof_availability_mutation_oracle_missing")
+    }
+    Ok(product_proof::UnvalidatedCallPathContract::new(
+        &path.source_text,
+        path.clauses
+            .iter()
+            .map(to_product_clause)
+            .collect::<Result<Vec<_>>>()?,
+        to_product_spec(&mutation.mutated_spec),
+    ))
 }
 
 pub fn validate_project_file(components: &[String]) -> Result<()> {
@@ -1457,7 +1495,30 @@ pub struct EnvironmentReportV1 {
     pub architecture: String,
     pub rust_host: String,
     pub binary_sha256: String,
+    pub qualification_source_commit: String,
+    pub qualification_source_tree: String,
+    pub recorded_at: String,
+    pub invocation: QualificationInvocationIdentityV1,
     pub projects: Vec<ProjectMaterializationEvidenceV1>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationInvocationIdentityV1 {
+    pub binary_name: String,
+    pub operation: QualificationOperationV1,
+    pub profile: QualificationProfileV1,
+    pub corpus_sha256: String,
+    pub thresholds_sha256: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationOperationV1 {
+    Run,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationProfileV1 {
+    LocalCoreOnly,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -1528,7 +1589,7 @@ pub struct TrailReportV1 {
     pub repository_id: String,
     pub lengths: Vec<TrailLengthCountsV1>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProductDispositionKindV1 {
     ContractProven,
@@ -1536,12 +1597,328 @@ pub enum ProductDispositionKindV1 {
     CertifiedAbsence,
     Invalid,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActualProductResultV1 {
+    ContractProven {
+        contract_digest: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        receipts: Vec<ProjectedReceiptReferenceV1>,
+    },
+    ContractRefuted {
+        contract_digest: String,
+        basis: ProductRefutationBasisV1,
+    },
+    Unknown {
+        contract_digest: String,
+        gaps: Vec<ActualProofGapV1>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        connected_receipts: Vec<ProjectedReceiptReferenceV1>,
+    },
+    Unavailable {
+        contract_digest: String,
+        reasons: Vec<ProductUnavailableReasonV1>,
+    },
+    Invalid {
+        failure: ProductToolFailureV1,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProductRefutationBasisV1 {
+    PositiveContradiction {
+        step_index: u8,
+        prohibition_index: u8,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        connected_receipts: Vec<ProjectedReceiptReferenceV1>,
+    },
+    CertifiedAbsence {
+        step_index: u8,
+        extractor_capability_receipt_id: String,
+        enumeration_receipt_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        connected_receipts: Vec<ProjectedReceiptReferenceV1>,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectedReceiptReferenceV1 {
+    pub receipt_id: String,
+    pub edge_id: String,
+}
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActualProofGapV1 {
+    SelectorMissing { selector_index: u8 },
+    SelectorAmbiguous { selector_index: u8 },
+    NonCallableSelector { selector_index: u8 },
+    DirectCallMissing { step_index: u8 },
+    RecursiveCallNotRepresentable { step_index: u8 },
+    SourceWindowTooLarge { step_index: u8 },
+    InvalidUtf8 { step_index: u8 },
+    SourceLineOutOfRange { step_index: u8 },
+    EdgeContainmentUnproven { step_index: u8 },
+    MissingDirectCallReceipt { step_index: u8 },
+    ReceiptOrEdgeAlreadyUsed { step_index: u8 },
+    ProjectionExclusionConflictsWithRequiredReceipt { step_index: u8 },
+    OutputBudgetExceeded,
+}
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductUnavailableReasonV1 {
+    ValidatedContractHashMismatch,
+    PublicationPinMismatch,
+    SourceNotBoundToPublication,
+    ProofFactsUnavailable,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductFailureStageV1 {
+    ContractValidation,
+    ToolExecution,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProductToolFailureV1 {
+    pub stage: ProductFailureStageV1,
+    pub code: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProductDispositionV1 {
+    /// Task-9 compatibility summary. Threshold evaluation consumes this only
+    /// after validation proves it is the deterministic coarse projection of
+    /// `actual`; it must never infer an exact refutation basis from this field.
     pub kind: ProductDispositionKindV1,
     pub gaps: Vec<TypedGapV1>,
     pub authoritative_receipts: Vec<ReceiptReferenceV1>,
+    pub actual: ActualProductResultV1,
+}
+
+pub(crate) fn observed_product_disposition_to_report(
+    observed: &codestory_runtime::proof_qualification_support::ObservedIntegratedProjectedCallPathResult,
+) -> Result<ProductDispositionV1> {
+    let result = match &observed.result {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(ProductDispositionV1 {
+                kind: ProductDispositionKindV1::Invalid,
+                gaps: Vec::new(),
+                authoritative_receipts: Vec::new(),
+                actual: ActualProductResultV1::Invalid {
+                    failure: ProductToolFailureV1 {
+                        stage: ProductFailureStageV1::ToolExecution,
+                        code: error.code.clone(),
+                    },
+                },
+            });
+        }
+    };
+    let root = match &result.projection {
+        product_proof::InternalProjection::Complete { root, .. }
+        | product_proof::InternalProjection::BudgetExceeded { root, .. } => root,
+    };
+    product_disposition_from_projection(root)
+}
+
+pub(crate) fn invalid_contract_report(code: impl Into<String>) -> ProductDispositionV1 {
+    ProductDispositionV1 {
+        kind: ProductDispositionKindV1::Invalid,
+        gaps: Vec::new(),
+        authoritative_receipts: Vec::new(),
+        actual: ActualProductResultV1::Invalid {
+            failure: ProductToolFailureV1 {
+                stage: ProductFailureStageV1::ContractValidation,
+                code: code.into(),
+            },
+        },
+    }
+}
+
+pub(crate) fn product_disposition_from_projection(root: &Value) -> Result<ProductDispositionV1> {
+    let disposition = root
+        .get("disposition")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_product_disposition_missing"))?;
+    let contract_digest = disposition
+        .get("contract_digest")
+        .and_then(Value::as_str)
+        .filter(|value| hash(value))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_contract_digest_invalid"))?;
+    let kind = disposition
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_product_disposition_kind_missing"))?;
+    let actual = match kind {
+        "contract_proven" => ActualProductResultV1::ContractProven {
+            contract_digest,
+            receipts: projected_receipts(disposition.get("receipts"))?,
+        },
+        "contract_refuted" => {
+            let refutation = disposition
+                .get("refutation")
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_refutation_missing"))?;
+            let step_index = projected_u8(refutation, "step_index")?;
+            let connected_receipts = projected_receipts(refutation.get("connected_receipts"))?;
+            let basis = match refutation.get("kind").and_then(Value::as_str) {
+                Some("prohibited_scope_traversal") => {
+                    ProductRefutationBasisV1::PositiveContradiction {
+                        step_index,
+                        prohibition_index: projected_u8(refutation, "prohibition_index")?,
+                        connected_receipts,
+                    }
+                }
+                Some("certified_absence") => ProductRefutationBasisV1::CertifiedAbsence {
+                    step_index,
+                    extractor_capability_receipt_id: projected_string(
+                        refutation,
+                        "extractor_capability_receipt_id",
+                    )?,
+                    enumeration_receipt_id: projected_string(
+                        refutation,
+                        "untruncated_enumeration_receipt_id",
+                    )?,
+                    connected_receipts,
+                },
+                _ => bail!("proof_availability_refutation_kind_invalid"),
+            };
+            ActualProductResultV1::ContractRefuted {
+                contract_digest,
+                basis,
+            }
+        }
+        "unknown" => ActualProductResultV1::Unknown {
+            contract_digest,
+            gaps: disposition
+                .get("gaps")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
+            connected_receipts: projected_receipts(disposition.get("connected_receipts"))?,
+        },
+        "unavailable" => ActualProductResultV1::Unavailable {
+            contract_digest,
+            reasons: disposition
+                .get("reasons")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
+        },
+        _ => bail!("proof_availability_product_disposition_kind_invalid"),
+    };
+    let projected = match &actual {
+        ActualProductResultV1::ContractProven { receipts, .. } => receipts.clone(),
+        ActualProductResultV1::ContractRefuted { basis, .. } => match basis {
+            ProductRefutationBasisV1::PositiveContradiction {
+                connected_receipts, ..
+            }
+            | ProductRefutationBasisV1::CertifiedAbsence {
+                connected_receipts, ..
+            } => connected_receipts.clone(),
+        },
+        ActualProductResultV1::Unknown {
+            connected_receipts, ..
+        } => connected_receipts.clone(),
+        ActualProductResultV1::Unavailable { .. } | ActualProductResultV1::Invalid { .. } => {
+            Vec::new()
+        }
+    };
+    let authoritative_receipts = projected
+        .into_iter()
+        .map(|reference| {
+            Ok(ReceiptReferenceV1 {
+                receipt_id: reference.receipt_id,
+                edge_id: reference
+                    .edge_id
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("proof_availability_receipt_edge_id_invalid"))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (summary_kind, gaps) = match &actual {
+        ActualProductResultV1::ContractProven { .. } => {
+            (ProductDispositionKindV1::ContractProven, Vec::new())
+        }
+        ActualProductResultV1::ContractRefuted {
+            basis: ProductRefutationBasisV1::CertifiedAbsence { .. },
+            ..
+        } => (ProductDispositionKindV1::CertifiedAbsence, Vec::new()),
+        ActualProductResultV1::ContractRefuted { .. } => {
+            (ProductDispositionKindV1::Unknown, Vec::new())
+        }
+        ActualProductResultV1::Unknown { gaps, .. } => (
+            ProductDispositionKindV1::Unknown,
+            gaps.iter()
+                .map(coarse_gap)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        ),
+        ActualProductResultV1::Unavailable { .. } => {
+            (ProductDispositionKindV1::Unknown, Vec::new())
+        }
+        ActualProductResultV1::Invalid { .. } => (ProductDispositionKindV1::Invalid, Vec::new()),
+    };
+    Ok(ProductDispositionV1 {
+        kind: summary_kind,
+        gaps,
+        authoritative_receipts,
+        actual,
+    })
+}
+
+fn projected_receipts(value: Option<&Value>) -> Result<Vec<ProjectedReceiptReferenceV1>> {
+    value
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+        .map_err(Into::into)
+}
+
+fn projected_u8(object: &serde_json::Map<String, Value>, field: &str) -> Result<u8> {
+    u8::try_from(
+        object
+            .get(field)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("proof_availability_projection_field_invalid"))?,
+    )
+    .map_err(Into::into)
+}
+
+fn projected_string(object: &serde_json::Map<String, Value>, field: &str) -> Result<String> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !empty(value))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_projection_field_invalid"))
+}
+
+fn coarse_gap(gap: &ActualProofGapV1) -> TypedGapV1 {
+    match gap {
+        ActualProofGapV1::SelectorMissing { .. } => TypedGapV1::SelectorMissing,
+        ActualProofGapV1::SelectorAmbiguous { .. } => TypedGapV1::SelectorAmbiguous,
+        ActualProofGapV1::DirectCallMissing { .. }
+        | ActualProofGapV1::MissingDirectCallReceipt { .. } => TypedGapV1::RelationMissing,
+        ActualProofGapV1::RecursiveCallNotRepresentable { .. }
+        | ActualProofGapV1::ReceiptOrEdgeAlreadyUsed { .. } => TypedGapV1::Recursion,
+        ActualProofGapV1::NonCallableSelector { .. }
+        | ActualProofGapV1::SourceWindowTooLarge { .. }
+        | ActualProofGapV1::InvalidUtf8 { .. }
+        | ActualProofGapV1::SourceLineOutOfRange { .. }
+        | ActualProofGapV1::EdgeContainmentUnproven { .. } => TypedGapV1::SourceBinding,
+        ActualProofGapV1::ProjectionExclusionConflictsWithRequiredReceipt { .. }
+        | ActualProofGapV1::OutputBudgetExceeded => TypedGapV1::ProjectionBudget,
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1877,6 +2254,58 @@ impl ObservedReceiptV1 {
         Ok(observed)
     }
 }
+
+pub(crate) fn compare_task6_receipt_to_oracle(
+    step_index: u8,
+    receipt: &codestory_agent::proof_qualification_support::IndexedCallEdgeReceipt,
+    oracle: &OracleStepV1,
+) -> Result<ReceiptOracleComparisonV1> {
+    let oracle_step = ReceiptOracleStepV1::from(oracle);
+    let mut mismatches = Vec::new();
+    if receipt.source.qualified_name != oracle_step.caller_symbol {
+        mismatches.push(ReceiptMismatchFieldV1::Caller);
+    }
+    if receipt.line_window.anchor_line != oracle_step.callsite_line {
+        mismatches.push(ReceiptMismatchFieldV1::CallsiteLine);
+    }
+    let observed_start = u64::try_from(receipt.line_window.byte_start)?;
+    let observed_end = u64::try_from(receipt.line_window.byte_end)?;
+    if receipt.line_window.project_file_components.join("/") != oracle_step.receipt_line_window.path
+        || receipt.line_window.indexed_sha256 != oracle_step.receipt_line_window.sha256
+        || receipt.line_window.observed_sha256 != oracle_step.receipt_line_window.sha256
+        || observed_start != oracle_step.receipt_line_window.start_byte
+        || observed_end != oracle_step.receipt_line_window.end_byte
+    {
+        mismatches.push(ReceiptMismatchFieldV1::CallsiteWindow);
+    }
+    if receipt.target.qualified_name != oracle_step.target_symbol {
+        mismatches.push(ReceiptMismatchFieldV1::Target);
+    }
+    Ok(if mismatches.is_empty() {
+        ReceiptOracleComparisonV1::Exact {
+            oracle_step_index: step_index,
+            oracle_step,
+        }
+    } else {
+        ReceiptOracleComparisonV1::Mismatched {
+            oracle_step_index: step_index,
+            oracle_step,
+            mismatches,
+        }
+    })
+}
+
+pub(crate) fn observed_receipt_from_task6(
+    step_index: u8,
+    receipt: &codestory_agent::proof_qualification_support::IndexedCallEdgeReceipt,
+    oracle: &OracleStepV1,
+) -> Result<ObservedReceiptV1> {
+    ObservedReceiptV1::from_task6(
+        step_index,
+        receipt,
+        compare_task6_receipt_to_oracle(step_index, receipt, oracle)?,
+    )
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MissingOracleStepV1 {
@@ -2037,17 +2466,22 @@ impl CaseReportV1 {
             && metrics.authoritative_receipt_count > 0
             && metrics.oracle_receipts_exact
             && metrics.proven_prefix_length == self.attempted_step_count;
-        let product_disposition_matches_evidence = match self.product_disposition.kind {
-            ProductDispositionKindV1::ContractProven => contract_proven_supported,
-            ProductDispositionKindV1::Unknown => {
+        let product_disposition_matches_evidence = match &self.product_disposition.actual {
+            ActualProductResultV1::ContractProven { .. } => contract_proven_supported,
+            ActualProductResultV1::Unknown { .. } => {
                 metrics.proven_prefix_length < self.attempted_step_count
                     && (!self.product_disposition.gaps.is_empty()
                         || self.actionable_exact_gap.is_some())
             }
-            ProductDispositionKindV1::CertifiedAbsence => {
-                metrics.authoritative_receipt_count == 0 && metrics.proven_prefix_length == 0
-            }
-            ProductDispositionKindV1::Invalid => !metrics.oracle_receipts_exact,
+            ActualProductResultV1::ContractRefuted { basis, .. } => match basis {
+                ProductRefutationBasisV1::PositiveContradiction { step_index, .. } => {
+                    metrics.authoritative_receipt_count > 0
+                        && metrics.proven_prefix_length >= *step_index
+                }
+                ProductRefutationBasisV1::CertifiedAbsence { .. } => true,
+            },
+            ActualProductResultV1::Unavailable { reasons, .. } => !reasons.is_empty(),
+            ActualProductResultV1::Invalid { failure } => !empty(&failure.code),
         };
         Ok(CaseEvaluableFactsV1 {
             contract_proven_supported,
@@ -2255,6 +2689,16 @@ impl QualificationSummaryV1 {
             .iter()
             .all(|v| hash(v))
             || !hash(&self.environment.binary_sha256)
+            || self.environment.binary_sha256 != self.provenance.binary_sha256
+            || self.environment.qualification_source_commit != self.provenance.source_commit
+            || self.environment.qualification_source_tree != self.provenance.source_tree
+            || !rfc3339_utc(&self.environment.recorded_at)
+            || self.environment.invocation.binary_name != "codestory-proof-availability"
+            || self.environment.invocation.operation != QualificationOperationV1::Run
+            || self.environment.invocation.profile != QualificationProfileV1::LocalCoreOnly
+            || self.environment.invocation.corpus_sha256 != self.provenance.corpus_sha256
+            || self.environment.invocation.thresholds_sha256 != self.provenance.thresholds_sha256
+            || !sanitized_environment(&self.environment)
             || self.environment.projects.len() != 4
             || !unique(
                 self.environment
@@ -2300,6 +2744,17 @@ impl QualificationSummaryV1 {
                 .all(|bucket| valid_funnel_outcome(&bucket.outcome))
         {
             bail!("proof_availability_summary_invalid")
+        }
+        if self.provenance.results_sha256
+            != results_evidence_sha256(
+                &self.environment,
+                &self.inventory,
+                &self.trails,
+                &self.cases,
+                &self.failure_funnel,
+            )?
+        {
+            bail!("proof_availability_results_digest_invalid")
         }
         for project in &self.environment.projects {
             if !commit(&project.source_head)
@@ -2644,6 +3099,72 @@ pub fn canonical_thresholds_sha256(thresholds: &ThresholdsV1) -> Result<String> 
     canonical_artifact_sha256(b"codestory.proof-availability-thresholds/v1\0", thresholds)
 }
 
+#[derive(Serialize)]
+struct ResultsEvidenceV1<'a> {
+    environment: &'a EnvironmentReportV1,
+    inventory: &'a [InventoryReportV1],
+    trails: &'a [TrailReportV1],
+    cases: &'a [CaseReportV1],
+    failure_funnel: &'a FailureFunnelReportV1,
+}
+
+pub(crate) fn results_evidence_sha256(
+    environment: &EnvironmentReportV1,
+    inventory: &[InventoryReportV1],
+    trails: &[TrailReportV1],
+    cases: &[CaseReportV1],
+    failure_funnel: &FailureFunnelReportV1,
+) -> Result<String> {
+    let mut environment = environment.clone();
+    environment
+        .projects
+        .sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
+    let mut inventory = inventory.to_vec();
+    inventory.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
+    let mut trails = trails.to_vec();
+    trails.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
+    let mut cases = cases.to_vec();
+    cases.sort_by(|left, right| left.case_id.cmp(&right.case_id));
+    let mut failure_funnel = failure_funnel.clone();
+    failure_funnel.buckets.sort_by(|left, right| {
+        canonical_artifact_bytes(&left.outcome)
+            .expect("closed funnel outcome serializes")
+            .cmp(
+                &canonical_artifact_bytes(&right.outcome)
+                    .expect("closed funnel outcome serializes"),
+            )
+    });
+    canonical_artifact_sha256(
+        b"codestory.proof-availability-results-evidence/v1\0",
+        &ResultsEvidenceV1 {
+            environment: &environment,
+            inventory: &inventory,
+            trails: &trails,
+            cases: &cases,
+            failure_funnel: &failure_funnel,
+        },
+    )
+}
+
+pub(crate) fn results_evidence_sha256_from_json(value: &Value) -> Result<String> {
+    #[derive(Deserialize)]
+    struct EvidenceFields {
+        environment: EnvironmentReportV1,
+        inventory: Vec<InventoryReportV1>,
+        trails: Vec<TrailReportV1>,
+        cases: Vec<CaseReportV1>,
+        failure_funnel: FailureFunnelReportV1,
+    }
+    let evidence: EvidenceFields = serde_json::from_value(value.clone())?;
+    results_evidence_sha256(
+        &evidence.environment,
+        &evidence.inventory,
+        &evidence.trails,
+        &evidence.cases,
+        &evidence.failure_funnel,
+    )
+}
+
 fn canonical_artifact_sha256<T: Serialize>(domain: &[u8], value: &T) -> Result<String> {
     let canonical = canonical_artifact_bytes(value)?;
     let mut digest = Sha256::new();
@@ -2655,6 +3176,72 @@ fn canonical_artifact_sha256<T: Serialize>(domain: &[u8], value: &T) -> Result<S
 fn canonical_artifact_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     codestory_agent::proof_qualification_support::canonical_json_bytes(value)
         .map_err(|error| anyhow::anyhow!(error))
+}
+
+fn rfc3339_utc(value: &str) -> bool {
+    let Some(without_z) = value.strip_suffix('Z') else {
+        return false;
+    };
+    let Some((date_part, time_part)) = without_z.split_once('T') else {
+        return false;
+    };
+    if !date(date_part) {
+        return false;
+    }
+    let (whole_time, fraction) = time_part
+        .split_once('.')
+        .map_or((time_part, None), |(whole, fraction)| {
+            (whole, Some(fraction))
+        });
+    let mut fields = whole_time.split(':');
+    let parsed = (
+        fields.next().and_then(|value| value.parse::<u8>().ok()),
+        fields.next().and_then(|value| value.parse::<u8>().ok()),
+        fields.next().and_then(|value| value.parse::<u8>().ok()),
+    );
+    let (Some(hour), Some(minute), Some(second)) = parsed else {
+        return false;
+    };
+    fields.next().is_none()
+        && hour <= 23
+        && minute <= 59
+        && second <= 60
+        && fraction.is_none_or(|fraction| {
+            !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn sanitized_environment(environment: &EnvironmentReportV1) -> bool {
+    sanitized_atom(&environment.environment_id)
+        && sanitized_atom(&environment.os)
+        && sanitized_atom(&environment.architecture)
+        && sanitized_atom(&environment.rust_host)
+        && environment.projects.iter().all(|project| {
+            sanitized_atom(&project.repository_id)
+                && sanitized_schema_id(&project.store_schema)
+                && sanitized_atom(&project.identity.project_id)
+                && sanitized_atom(&project.identity.core_generation_id)
+                && sanitized_atom(&project.identity.core_run_id)
+        })
+}
+
+fn sanitized_atom(value: &str) -> bool {
+    !empty(value)
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn sanitized_schema_id(value: &str) -> bool {
+    !empty(value)
+        && value.len() <= 128
+        && !value.starts_with('/')
+        && !value.starts_with('~')
+        && !value.contains("..")
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':')
+        })
 }
 
 fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
@@ -2939,6 +3526,193 @@ fn valid_disposition_structure(case: &CaseReportV1) -> bool {
             .actionable_exact_gap
             .as_ref()
             .is_none_or(|gap| case.product_disposition.gaps.contains(gap))
+        && valid_actual_product_result(&case.product_disposition.actual)
+        && disposition_summary_matches_actual(&case.product_disposition)
+}
+
+fn valid_actual_product_result(actual: &ActualProductResultV1) -> bool {
+    match actual {
+        ActualProductResultV1::ContractProven {
+            contract_digest,
+            receipts,
+        } => hash(contract_digest) && valid_projected_receipts(receipts),
+        ActualProductResultV1::ContractRefuted {
+            contract_digest,
+            basis,
+        } => {
+            hash(contract_digest)
+                && match basis {
+                    ProductRefutationBasisV1::PositiveContradiction {
+                        step_index,
+                        prohibition_index,
+                        connected_receipts,
+                    } => {
+                        *step_index < 6
+                            && *prohibition_index < 6
+                            && !connected_receipts.is_empty()
+                            && valid_projected_receipts(connected_receipts)
+                    }
+                    ProductRefutationBasisV1::CertifiedAbsence {
+                        step_index,
+                        extractor_capability_receipt_id,
+                        enumeration_receipt_id,
+                        connected_receipts,
+                    } => {
+                        *step_index < 6
+                            && !empty(extractor_capability_receipt_id)
+                            && sanitized_atom(extractor_capability_receipt_id)
+                            && !empty(enumeration_receipt_id)
+                            && sanitized_atom(enumeration_receipt_id)
+                            && valid_projected_receipts(connected_receipts)
+                    }
+                }
+        }
+        ActualProductResultV1::Unknown {
+            contract_digest,
+            gaps,
+            connected_receipts,
+        } => {
+            hash(contract_digest)
+                && (1..=6).contains(&gaps.len())
+                && gaps.iter().copied().collect::<BTreeSet<_>>().len() == gaps.len()
+                && gaps.iter().all(valid_actual_gap)
+                && valid_projected_receipts(connected_receipts)
+        }
+        ActualProductResultV1::Unavailable {
+            contract_digest,
+            reasons,
+        } => {
+            hash(contract_digest)
+                && (1..=4).contains(&reasons.len())
+                && reasons.iter().copied().collect::<BTreeSet<_>>().len() == reasons.len()
+        }
+        ActualProductResultV1::Invalid { failure } => {
+            !empty(&failure.code) && sanitized_atom(&failure.code)
+        }
+    }
+}
+
+fn valid_actual_gap(gap: &ActualProofGapV1) -> bool {
+    match gap {
+        ActualProofGapV1::SelectorMissing { selector_index }
+        | ActualProofGapV1::SelectorAmbiguous { selector_index }
+        | ActualProofGapV1::NonCallableSelector { selector_index } => *selector_index < 7,
+        ActualProofGapV1::DirectCallMissing { step_index }
+        | ActualProofGapV1::RecursiveCallNotRepresentable { step_index }
+        | ActualProofGapV1::SourceWindowTooLarge { step_index }
+        | ActualProofGapV1::InvalidUtf8 { step_index }
+        | ActualProofGapV1::SourceLineOutOfRange { step_index }
+        | ActualProofGapV1::EdgeContainmentUnproven { step_index }
+        | ActualProofGapV1::MissingDirectCallReceipt { step_index }
+        | ActualProofGapV1::ReceiptOrEdgeAlreadyUsed { step_index }
+        | ActualProofGapV1::ProjectionExclusionConflictsWithRequiredReceipt { step_index } => {
+            *step_index < 6
+        }
+        ActualProofGapV1::OutputBudgetExceeded => true,
+    }
+}
+
+fn valid_projected_receipts(receipts: &[ProjectedReceiptReferenceV1]) -> bool {
+    receipts.len() <= 6
+        && unique(
+            receipts
+                .iter()
+                .map(|reference| reference.receipt_id.as_str()),
+        )
+        && unique(receipts.iter().map(|reference| reference.edge_id.as_str()))
+        && receipts.iter().all(|reference| {
+            valid_receipt_id(&reference.receipt_id)
+                && reference
+                    .edge_id
+                    .parse::<i64>()
+                    .is_ok_and(|edge_id| edge_id.to_string() == reference.edge_id)
+        })
+}
+
+fn disposition_summary_matches_actual(disposition: &ProductDispositionV1) -> bool {
+    let projected = match &disposition.actual {
+        ActualProductResultV1::ContractProven { receipts, .. } => {
+            if disposition.kind != ProductDispositionKindV1::ContractProven
+                || !disposition.gaps.is_empty()
+            {
+                return false;
+            }
+            receipts
+        }
+        ActualProductResultV1::ContractRefuted { basis, .. } => match basis {
+            ProductRefutationBasisV1::PositiveContradiction {
+                connected_receipts, ..
+            } => {
+                if disposition.kind != ProductDispositionKindV1::Unknown
+                    || !disposition.gaps.is_empty()
+                {
+                    return false;
+                }
+                connected_receipts
+            }
+            ProductRefutationBasisV1::CertifiedAbsence {
+                extractor_capability_receipt_id,
+                enumeration_receipt_id,
+                connected_receipts,
+                ..
+            } => {
+                if disposition.kind != ProductDispositionKindV1::CertifiedAbsence
+                    || !disposition.gaps.is_empty()
+                    || empty(extractor_capability_receipt_id)
+                    || empty(enumeration_receipt_id)
+                {
+                    return false;
+                }
+                connected_receipts
+            }
+        },
+        ActualProductResultV1::Unknown {
+            gaps,
+            connected_receipts,
+            ..
+        } => {
+            let expected = gaps
+                .iter()
+                .map(coarse_gap)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if disposition.kind != ProductDispositionKindV1::Unknown
+                || gaps.is_empty()
+                || disposition.gaps != expected
+            {
+                return false;
+            }
+            connected_receipts
+        }
+        ActualProductResultV1::Unavailable { reasons, .. } => {
+            return disposition.kind == ProductDispositionKindV1::Unknown
+                && disposition.gaps.is_empty()
+                && disposition.authoritative_receipts.is_empty()
+                && !reasons.is_empty();
+        }
+        ActualProductResultV1::Invalid { failure } => {
+            return disposition.kind == ProductDispositionKindV1::Invalid
+                && disposition.gaps.is_empty()
+                && disposition.authoritative_receipts.is_empty()
+                && !empty(&failure.code)
+                && sanitized_atom(&failure.code);
+        }
+    };
+    let converted = projected
+        .iter()
+        .map(|reference| {
+            reference
+                .edge_id
+                .parse::<i64>()
+                .ok()
+                .map(|edge_id| ReceiptReferenceV1 {
+                    receipt_id: reference.receipt_id.clone(),
+                    edge_id,
+                })
+        })
+        .collect::<Option<Vec<_>>>();
+    converted.as_ref() == Some(&disposition.authoritative_receipts)
 }
 
 fn valid_oracle_step(step: &ReceiptOracleStepV1) -> bool {
@@ -3223,7 +3997,12 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
             }
             if matches!(
                 name.as_str(),
-                "commit" | "source_commit" | "source_tree" | "source_head"
+                "commit"
+                    | "source_commit"
+                    | "source_tree"
+                    | "source_head"
+                    | "qualification_source_commit"
+                    | "qualification_source_tree"
             ) {
                 property.insert("pattern".into(), Value::String(COMMIT.into()));
             }
@@ -3263,7 +4042,12 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
                     property.insert("pattern".into(), Value::String(SHA256.into()));
                 } else if matches!(
                     name.as_str(),
-                    "commit" | "source_commit" | "source_tree" | "source_head"
+                    "commit"
+                        | "source_commit"
+                        | "source_tree"
+                        | "source_head"
+                        | "qualification_source_commit"
+                        | "qualification_source_tree"
                 ) {
                     property.insert("pattern".into(), Value::String(COMMIT.into()));
                 }
@@ -3437,6 +4221,59 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 schema,
                 Some("ProductDispositionV1"),
                 "authoritative_receipts",
+                Some(0),
+                Some(6),
+            );
+            set_pattern(
+                schema,
+                "EnvironmentReportV1",
+                "recorded_at",
+                "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+            );
+            set_recursive_field_pattern(schema, "ActualProductResultV1", "contract_digest", SHA256);
+            set_recursive_field_bounds(
+                schema,
+                "ActualProductResultV1",
+                "receipts",
+                Some(0),
+                Some(6),
+            );
+            set_recursive_field_bounds(
+                schema,
+                "ActualProductResultV1",
+                "connected_receipts",
+                Some(0),
+                Some(6),
+            );
+            set_recursive_field_bounds(schema, "ActualProductResultV1", "gaps", Some(1), Some(6));
+            set_recursive_field_bounds(
+                schema,
+                "ActualProductResultV1",
+                "reasons",
+                Some(1),
+                Some(4),
+            );
+            set_recursive_field_bounds(
+                schema,
+                "ProductRefutationBasisV1",
+                "connected_receipts",
+                Some(0),
+                Some(6),
+            );
+            for definition in ["ActualProductResultV1", "ProductRefutationBasisV1"] {
+                set_recursive_field_bounds(schema, definition, "step_index", Some(0), Some(5));
+                set_recursive_field_bounds(
+                    schema,
+                    definition,
+                    "prohibition_index",
+                    Some(0),
+                    Some(5),
+                );
+            }
+            set_recursive_field_bounds(
+                schema,
+                "ActualProductResultV1",
+                "selector_index",
                 Some(0),
                 Some(6),
             );
@@ -3619,6 +4456,9 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 ("PinnedNodeIdentityV1", "node_id"),
                 ("ResolvedNodeIdentityV1", "canonical_id"),
                 ("ResolvedNodeIdentityV1", "qualified_name"),
+                ("ProjectedReceiptReferenceV1", "receipt_id"),
+                ("ProjectedReceiptReferenceV1", "edge_id"),
+                ("ProductToolFailureV1", "code"),
             ] {
                 set_min_length(schema, definition, field, 1);
             }
@@ -3645,6 +4485,18 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 schema,
                 "PinnedNodeIdentityV1",
                 "node_id",
+                "^-?(0|[1-9][0-9]*)$",
+            );
+            set_pattern(
+                schema,
+                "ProjectedReceiptReferenceV1",
+                "receipt_id",
+                "^indexed-call-edge:.+$",
+            );
+            set_pattern(
+                schema,
+                "ProjectedReceiptReferenceV1",
+                "edge_id",
                 "^-?(0|[1-9][0-9]*)$",
             );
             set_array_item_min_length(schema, "ObservedLineWindowV1", "project_file_components", 1);
@@ -3720,11 +4572,18 @@ fn apply_recursive_field_bounds(
                 .and_then(|properties| properties.get_mut(field))
                 .and_then(Value::as_object_mut)
             {
+                let array = property.get("type").and_then(Value::as_str) == Some("array");
                 if let Some(minimum) = minimum {
-                    property.insert("minimum".into(), Value::from(minimum));
+                    property.insert(
+                        if array { "minItems" } else { "minimum" }.into(),
+                        Value::from(minimum),
+                    );
                 }
                 if let Some(maximum) = maximum {
-                    property.insert("maximum".into(), Value::from(maximum));
+                    property.insert(
+                        if array { "maxItems" } else { "maximum" }.into(),
+                        Value::from(maximum),
+                    );
                 }
             }
             for nested in map.values_mut() {
@@ -3734,6 +4593,40 @@ fn apply_recursive_field_bounds(
         Value::Array(values) => {
             for nested in values {
                 apply_recursive_field_bounds(nested, field, minimum, maximum);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn set_recursive_field_pattern(schema: &mut Value, definition: &str, field: &str, pattern: &str) {
+    let Some(definition) = schema
+        .get_mut("$defs")
+        .and_then(|definitions| definitions.get_mut(definition))
+    else {
+        return;
+    };
+    apply_recursive_field_pattern(definition, field, pattern);
+}
+
+fn apply_recursive_field_pattern(value: &mut Value, field: &str, pattern: &str) {
+    match value {
+        Value::Object(map) => {
+            if let Some(property) = map
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+                .and_then(|properties| properties.get_mut(field))
+                .and_then(Value::as_object_mut)
+            {
+                property.insert("pattern".into(), Value::String(pattern.into()));
+            }
+            for nested in map.values_mut() {
+                apply_recursive_field_pattern(nested, field, pattern);
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                apply_recursive_field_pattern(nested, field, pattern);
             }
         }
         _ => {}

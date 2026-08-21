@@ -1,5 +1,393 @@
 {
   "$defs": {
+    "ActualProductResultV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "contract_digest": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "contract_proven",
+              "type": "string"
+            },
+            "receipts": {
+              "items": {
+                "$ref": "#/$defs/ProjectedReceiptReferenceV1"
+              },
+              "maxItems": 6,
+              "minItems": 0,
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "contract_digest"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "basis": {
+              "$ref": "#/$defs/ProductRefutationBasisV1"
+            },
+            "contract_digest": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "contract_refuted",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "contract_digest",
+            "basis"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "connected_receipts": {
+              "items": {
+                "$ref": "#/$defs/ProjectedReceiptReferenceV1"
+              },
+              "maxItems": 6,
+              "minItems": 0,
+              "type": "array"
+            },
+            "contract_digest": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "gaps": {
+              "items": {
+                "$ref": "#/$defs/ActualProofGapV1"
+              },
+              "maxItems": 6,
+              "minItems": 1,
+              "type": "array"
+            },
+            "kind": {
+              "const": "unknown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "contract_digest",
+            "gaps"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "contract_digest": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "unavailable",
+              "type": "string"
+            },
+            "reasons": {
+              "items": {
+                "$ref": "#/$defs/ProductUnavailableReasonV1"
+              },
+              "maxItems": 4,
+              "minItems": 1,
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "contract_digest",
+            "reasons"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "failure": {
+              "$ref": "#/$defs/ProductToolFailureV1"
+            },
+            "kind": {
+              "const": "invalid",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "failure"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ActualProofGapV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "selector_missing",
+              "type": "string"
+            },
+            "selector_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "selector_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "selector_ambiguous",
+              "type": "string"
+            },
+            "selector_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "selector_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "non_callable_selector",
+              "type": "string"
+            },
+            "selector_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "selector_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "direct_call_missing",
+              "type": "string"
+            },
+            "step_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "recursive_call_not_representable",
+              "type": "string"
+            },
+            "step_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "source_window_too_large",
+              "type": "string"
+            },
+            "step_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "invalid_utf8",
+              "type": "string"
+            },
+            "step_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "source_line_out_of_range",
+              "type": "string"
+            },
+            "step_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "edge_containment_unproven",
+              "type": "string"
+            },
+            "step_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "missing_direct_call_receipt",
+              "type": "string"
+            },
+            "step_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "receipt_or_edge_already_used",
+              "type": "string"
+            },
+            "step_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "projection_exclusion_conflicts_with_required_receipt",
+              "type": "string"
+            },
+            "step_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "output_budget_exceeded",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "CallPathSpecV1": {
       "additionalProperties": false,
       "properties": {
@@ -292,6 +680,9 @@
         "environment_id": {
           "type": "string"
         },
+        "invocation": {
+          "$ref": "#/$defs/QualificationInvocationIdentityV1"
+        },
         "os": {
           "type": "string"
         },
@@ -303,6 +694,18 @@
           "minItems": 4,
           "type": "array"
         },
+        "qualification_source_commit": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "qualification_source_tree": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "recorded_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+          "type": "string"
+        },
         "rust_host": {
           "type": "string"
         }
@@ -313,6 +716,10 @@
         "architecture",
         "rust_host",
         "binary_sha256",
+        "qualification_source_commit",
+        "qualification_source_tree",
+        "recorded_at",
+        "invocation",
         "projects"
       ],
       "type": "object"
@@ -932,6 +1339,9 @@
     "ProductDispositionV1": {
       "additionalProperties": false,
       "properties": {
+        "actual": {
+          "$ref": "#/$defs/ActualProductResultV1"
+        },
         "authoritative_receipts": {
           "items": {
             "$ref": "#/$defs/ReceiptReferenceV1"
@@ -949,15 +1359,125 @@
           "type": "array"
         },
         "kind": {
-          "$ref": "#/$defs/ProductDispositionKindV1"
+          "$ref": "#/$defs/ProductDispositionKindV1",
+          "description": "Task-9 compatibility summary. Threshold evaluation consumes this only\nafter validation proves it is the deterministic coarse projection of\n`actual`; it must never infer an exact refutation basis from this field."
         }
       },
       "required": [
         "kind",
         "gaps",
-        "authoritative_receipts"
+        "authoritative_receipts",
+        "actual"
       ],
       "type": "object"
+    },
+    "ProductFailureStageV1": {
+      "enum": [
+        "contract_validation",
+        "tool_execution"
+      ],
+      "type": "string"
+    },
+    "ProductRefutationBasisV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "connected_receipts": {
+              "items": {
+                "$ref": "#/$defs/ProjectedReceiptReferenceV1"
+              },
+              "maxItems": 6,
+              "minItems": 0,
+              "type": "array"
+            },
+            "kind": {
+              "const": "positive_contradiction",
+              "type": "string"
+            },
+            "prohibition_index": {
+              "format": "uint8",
+              "maximum": 5,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "step_index": {
+              "format": "uint8",
+              "maximum": 5,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index",
+            "prohibition_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "connected_receipts": {
+              "items": {
+                "$ref": "#/$defs/ProjectedReceiptReferenceV1"
+              },
+              "maxItems": 6,
+              "minItems": 0,
+              "type": "array"
+            },
+            "enumeration_receipt_id": {
+              "type": "string"
+            },
+            "extractor_capability_receipt_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "certified_absence",
+              "type": "string"
+            },
+            "step_index": {
+              "format": "uint8",
+              "maximum": 5,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index",
+            "extractor_capability_receipt_id",
+            "enumeration_receipt_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ProductToolFailureV1": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "stage": {
+          "$ref": "#/$defs/ProductFailureStageV1"
+        }
+      },
+      "required": [
+        "stage",
+        "code"
+      ],
+      "type": "object"
+    },
+    "ProductUnavailableReasonV1": {
+      "enum": [
+        "validated_contract_hash_mismatch",
+        "publication_pin_mismatch",
+        "source_not_bound_to_publication",
+        "proof_facts_unavailable"
+      ],
+      "type": "string"
     },
     "ProjectMaterializationEvidenceV1": {
       "additionalProperties": false,
@@ -1019,6 +1539,26 @@
         "database_sha256",
         "core_generation",
         "identity"
+      ],
+      "type": "object"
+    },
+    "ProjectedReceiptReferenceV1": {
+      "additionalProperties": false,
+      "properties": {
+        "edge_id": {
+          "minLength": 1,
+          "pattern": "^-?(0|[1-9][0-9]*)$",
+          "type": "string"
+        },
+        "receipt_id": {
+          "minLength": 1,
+          "pattern": "^indexed-call-edge:.+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "receipt_id",
+        "edge_id"
       ],
       "type": "object"
     },
@@ -1093,6 +1633,48 @@
         "results_sha256"
       ],
       "type": "object"
+    },
+    "QualificationInvocationIdentityV1": {
+      "additionalProperties": false,
+      "properties": {
+        "binary_name": {
+          "type": "string"
+        },
+        "corpus_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "operation": {
+          "$ref": "#/$defs/QualificationOperationV1"
+        },
+        "profile": {
+          "$ref": "#/$defs/QualificationProfileV1"
+        },
+        "thresholds_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "binary_name",
+        "operation",
+        "profile",
+        "corpus_sha256",
+        "thresholds_sha256"
+      ],
+      "type": "object"
+    },
+    "QualificationOperationV1": {
+      "enum": [
+        "run"
+      ],
+      "type": "string"
+    },
+    "QualificationProfileV1": {
+      "enum": [
+        "local_core_only"
+      ],
+      "type": "string"
     },
     "RawAdmissionFailureV1": {
       "enum": [
