@@ -26,6 +26,8 @@ mod indexed_source_call_path_v1;
 #[cfg(feature = "proof-qualification-support")]
 #[doc(hidden)]
 pub mod proof_qualification_support {
+    use serde::Serialize;
+
     pub use super::indexed_source_call_path_v1::{
         AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
         CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
@@ -40,6 +42,12 @@ pub mod proof_qualification_support {
     /// Identifies the sealed request domain observed by benchmark qualification.
     pub fn proof_domain() -> &'static str {
         super::indexed_source_call_path_v1::PROOF_DOMAIN
+    }
+
+    /// Serialize a qualification artifact with the repository-pinned RFC 8785
+    /// implementation without exposing that dependency to the benchmark crate.
+    pub fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+        serde_json_canonicalizer::to_vec(value).map_err(|error| error.to_string())
     }
 }
 #[cfg(any(test, feature = "test-support"))]

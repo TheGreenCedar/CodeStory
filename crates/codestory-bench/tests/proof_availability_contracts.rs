@@ -346,6 +346,44 @@ fn threshold_identity_is_acyclic_canonical_and_rejects_legacy_corpus_binding() {
 }
 
 #[test]
+fn canonical_artifact_seam_uses_rfc8785_number_and_utf16_semantics() {
+    let numeric = codestory_agent::proof_qualification_support::canonical_json_bytes(
+        &json!({"n": 9_007_199_254_740_993u64}),
+    )
+    .expect("canonical number");
+    assert_eq!(
+        String::from_utf8(numeric).expect("UTF-8"),
+        r#"{"n":9007199254740992}"#
+    );
+
+    let mut keys = serde_json::Map::new();
+    keys.insert("\u{e000}".into(), json!(2));
+    keys.insert("\u{10000}".into(), json!(1));
+    let utf16 =
+        codestory_agent::proof_qualification_support::canonical_json_bytes(&Value::Object(keys))
+            .expect("canonical keys");
+    assert_eq!(
+        String::from_utf8(utf16).expect("UTF-8"),
+        "{\"\u{10000}\":1,\"\u{e000}\":2}"
+    );
+
+    let mut rounded_down = corpus();
+    rounded_down["paths"][0]["oracle_steps"][0]["callsite"]["file_byte_length"] =
+        json!(9_007_199_254_740_992u64);
+    let rounded_down = CorpusV1::from_json(rounded_down).expect("safe-integer corpus");
+    let mut rounded_from_unsafe = corpus();
+    rounded_from_unsafe["paths"][0]["oracle_steps"][0]["callsite"]["file_byte_length"] =
+        json!(9_007_199_254_740_993u64);
+    let rounded_from_unsafe =
+        CorpusV1::from_json(rounded_from_unsafe).expect("unsafe-integer corpus");
+    assert_eq!(
+        canonical_corpus_sha256(&rounded_down).expect("safe-integer digest"),
+        canonical_corpus_sha256(&rounded_from_unsafe).expect("rounded digest"),
+        "artifact identity must use the same RFC 8785 number semantics as the sealed seam"
+    );
+}
+
+#[test]
 fn threshold_corpus_summary_digest_dag_rejects_stale_or_mismatched_inputs() {
     let threshold = ThresholdsV1::from_json(thresholds()).expect("thresholds");
     let frozen_corpus = CorpusV1::from_json(corpus()).expect("corpus");

@@ -2031,46 +2031,12 @@ pub fn canonical_thresholds_sha256(thresholds: &ThresholdsV1) -> Result<String> 
 }
 
 fn canonical_artifact_sha256<T: Serialize>(domain: &[u8], value: &T) -> Result<String> {
-    let value = serde_json::to_value(value)?;
-    let mut canonical = Vec::new();
-    write_canonical_json(&value, &mut canonical)?;
+    let canonical = codestory_agent::proof_qualification_support::canonical_json_bytes(value)
+        .map_err(|error| anyhow::anyhow!(error))?;
     let mut digest = Sha256::new();
     digest.update(domain);
     digest.update(canonical);
     Ok(format!("{:x}", digest.finalize()))
-}
-
-fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<()> {
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-            serde_json::to_writer(output, value)?;
-        }
-        Value::Array(values) => {
-            output.push(b'[');
-            for (index, value) in values.iter().enumerate() {
-                if index > 0 {
-                    output.push(b',');
-                }
-                write_canonical_json(value, output)?;
-            }
-            output.push(b']');
-        }
-        Value::Object(values) => {
-            output.push(b'{');
-            let mut entries = values.iter().collect::<Vec<_>>();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-            for (index, (key, value)) in entries.into_iter().enumerate() {
-                if index > 0 {
-                    output.push(b',');
-                }
-                serde_json::to_writer(&mut *output, key)?;
-                output.push(b':');
-                write_canonical_json(value, output)?;
-            }
-            output.push(b'}');
-        }
-    }
-    Ok(())
 }
 
 fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
