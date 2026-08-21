@@ -30,6 +30,8 @@ mod status_wire_test_support;
 mod stdio_arguments;
 mod stdio_catalog;
 mod stdio_transport;
+#[cfg(test)]
+mod stdio_v3;
 
 use anyhow::Result;
 
