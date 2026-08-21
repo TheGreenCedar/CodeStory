@@ -5,8 +5,8 @@
       "properties": {
         "expected_step_count": {
           "format": "uint8",
-          "maximum": 255,
-          "minimum": 0,
+          "maximum": 6,
+          "minimum": 1,
           "type": "integer"
         },
         "start": {
@@ -54,6 +54,7 @@
           "type": "string"
         },
         "path_count": {
+          "const": 30,
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
@@ -67,6 +68,7 @@
           "type": "string"
         },
         "positive_step_count": {
+          "const": 78,
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
@@ -144,6 +146,7 @@
           "type": "string"
         },
         "cohort_path_file_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
         "curator": {
@@ -212,18 +215,23 @@
           "items": {
             "$ref": "#/$defs/NegativeMutationV1"
           },
+          "maxItems": 2,
+          "minItems": 2,
           "type": "array"
         },
         "oracle_steps": {
           "items": {
             "$ref": "#/$defs/OracleStepV1"
           },
+          "maxItems": 6,
+          "minItems": 1,
           "type": "array"
         },
         "repository_id": {
           "type": "string"
         },
         "schema": {
+          "const": "codestory.proof-availability-path/v1",
           "type": "string"
         },
         "source_text": {
@@ -305,6 +313,8 @@
       "items": {
         "$ref": "#/$defs/CohortV1"
       },
+      "maxItems": 4,
+      "minItems": 4,
       "type": "array"
     },
     "corpus_id": {
@@ -318,6 +328,7 @@
       "type": "string"
     },
     "negative_request_count": {
+      "const": 240,
       "format": "uint16",
       "maximum": 65535,
       "minimum": 0,
@@ -327,15 +338,19 @@
       "items": {
         "$ref": "#/$defs/OraclePathV1"
       },
+      "maxItems": 120,
+      "minItems": 120,
       "type": "array"
     },
     "positive_request_count": {
+      "const": 120,
       "format": "uint16",
       "maximum": 65535,
       "minimum": 0,
       "type": "integer"
     },
     "positive_step_count": {
+      "const": 312,
       "format": "uint16",
       "maximum": 65535,
       "minimum": 0,

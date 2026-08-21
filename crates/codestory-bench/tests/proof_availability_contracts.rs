@@ -14,12 +14,22 @@ fn range(start: u64, end: u64) -> Value {
     json!({"path":"src/lib.rs","start_byte":start,"end_byte":end,"sha256":SHA})
 }
 
-fn path(case_id: &str, cohort: &str) -> Value {
+fn path(case_id: &str, cohort: &str, step_count: u8) -> Value {
+    let oracle_steps = (0..step_count)
+        .map(|index| {
+            let start = u64::from(index) * 40;
+            json!({
+              "caller":{"symbol":format!("crate::caller_{index}"),"range":range(start, start + 10)},
+              "callsite":range(start + 11, start + 19),
+              "target":{"symbol":format!("crate::target_{index}"),"range":range(start + 20, start + 32)}
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
       "schema":"codestory.proof-availability-path/v1", "case_id":case_id, "repository_id":cohort, "language":"rust", "source_text":"exact direct ordered call path",
       "clauses":[{"clause_id":"c1","text":"start calls target","range":range(0,20)}],
-      "spec":{"start":"crate::start","targets":["crate::target"],"expected_step_count":1},
-      "oracle_steps":[{"caller":{"symbol":"crate::start","range":range(0,10)},"callsite":range(11,19),"target":{"symbol":"crate::target","range":range(20,32)}}],
+      "spec":{"start":"crate::start","targets":["crate::target"],"expected_step_count":step_count},
+      "oracle_steps":oracle_steps,
       "negative_mutations":[
         {"mutation_id":format!("{case_id}-missing"),"kind":"remove_expected_relation","step_index":0,"caller":"crate::start","target":"crate::target"},
         {"mutation_id":format!("{case_id}-ambiguous"),"kind":"add_ambiguous_relation","step_index":0,"caller":"crate::start","target":"crate::target"}],
@@ -29,10 +39,27 @@ fn path(case_id: &str, cohort: &str) -> Value {
 
 fn corpus() -> Value {
     let ids = ["codestory-rust", "vite-ts-js", "flask-python", "gin-go"];
+    // Thirty paths and 78 steps per cohort; across four cohorts this is the
+    // frozen 120-path / 312-step / 240-mutation corpus.
+    let lengths = [10u8, 7, 5, 3, 3, 2];
+    let paths = ids
+        .iter()
+        .flat_map(|id| {
+            lengths.iter().enumerate().flat_map(move |(length, count)| {
+                (0..*count).map(move |index| {
+                    path(
+                        &format!("{id}-l{}-{index}", length + 1),
+                        id,
+                        (length + 1) as u8,
+                    )
+                })
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
       "schema":"codestory.proof-availability-corpus/v1","corpus_id":"proof-availability-v1","thresholds_sha256":SHA,"methodology_sha256":SHA,"curator":"curator@example.invalid","reviewer":"reviewer@example.invalid","review_date":"2026-08-21",
       "cohorts":ids.iter().map(|id|json!({"repository_id":id,"repository":format!("https://example.invalid/{id}.git"),"commit":COMMIT,"workspace":".","path_file":format!("paths/{id}.json"),"path_file_sha256":SHA,"source_tree_sha256":SHA,"path_count":30,"positive_step_count":78})).collect::<Vec<_>>(),
-      "paths":ids.iter().map(|id|path(&format!("{id}-path"),id)).collect::<Vec<_>>(),"positive_request_count":120,"positive_step_count":312,"negative_request_count":240
+      "paths":paths,"positive_request_count":120,"positive_step_count":312,"negative_request_count":240
     })
 }
 
@@ -52,7 +79,7 @@ fn role(
 }
 
 fn thresholds() -> Value {
-    json!({"schema":"codestory.proof-availability-thresholds/v1","thresholds_id":"proof-availability-v1","corpus_sha256":SHA,"methodology_sha256":SHA,"wilson_z":1.959963984540054,"expected_cohort_count":4,"expected_positive_requests":120,"expected_positive_steps":312,"expected_negative_requests":240,"hard_gates":{"maximum_false_contract_proven":0,"require_exact_receipt_matches":true,"maximum_certified_absence":0,"require_complete_failure_funnel":true,"require_complete_provenance":true,"maximum_proof_bytes":65536,"require_each_cohort":true,"require_product_disposition_match":true},"automatic":role(96,21,900,950,950,500,1500,32768,16384),"stable_explicit":role(60,12,750,800,900,1000,2000,32768,16384),"experimental":role(24,12,500,600,800,2000,3000,49152,24576)})
+    json!({"schema":"codestory.proof-availability-thresholds/v1","thresholds_id":"proof-availability-v1","corpus_sha256":SHA,"methodology_sha256":SHA,"wilson_z":1.959963984540054,"expected_cohort_count":4,"expected_positive_requests":120,"expected_positive_steps":312,"expected_negative_requests":240,"hard_gates":{"maximum_false_contract_proven":0,"require_exact_receipt_matches":true,"maximum_certified_absence":0,"require_complete_failure_funnel":true,"require_complete_provenance":true,"maximum_invalid_results":0,"maximum_over_cap_results":0,"maximum_transport_errors":0,"maximum_proof_bytes":65536,"require_each_cohort":true,"require_product_disposition_match":true},"automatic":role(96,21,900,950,950,500,1500,32768,16384),"stable_explicit":role(60,12,750,800,900,1000,2000,32768,16384),"experimental":role(24,12,500,600,800,2000,3000,49152,24576)})
 }
 
 fn report() -> Value {
@@ -60,11 +87,11 @@ fn report() -> Value {
       "schema":"codestory.proof-availability-report/v1","qualification_id":"20260821T000000Z-0123456789ab",
       "provenance":{"source_commit":COMMIT,"source_tree":COMMIT,"binary_sha256":SHA,"corpus_sha256":SHA,"thresholds_sha256":SHA,"results_sha256":SHA},
       "environment":{"environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"core_generation":1,"core_run_id":"run-1","database_sha256":SHA},
-      "inventory":[{"repository_id":"codestory-rust","stored_call_rows":10,"effective_endpoint_rows":10,"exact_resolved_rows":8,"admitted_rows":7,"unresolved_placeholder_rows":2}],
-      "trails":[{"repository_id":"codestory-rust","lengths":[{"length":1,"effective_endpoint":10,"exact_resolved":8,"strictly_admitted":7},{"length":2,"effective_endpoint":9,"exact_resolved":7,"strictly_admitted":6},{"length":3,"effective_endpoint":8,"exact_resolved":6,"strictly_admitted":5},{"length":4,"effective_endpoint":7,"exact_resolved":5,"strictly_admitted":4},{"length":5,"effective_endpoint":6,"exact_resolved":4,"strictly_admitted":3},{"length":6,"effective_endpoint":5,"exact_resolved":3,"strictly_admitted":2}]}],
-      "cases":[{"case_id":"codestory-rust-path","repository_id":"codestory-rust","product_disposition":{"kind":"contract_proven","gaps":[]},"authoritative_receipt_count":1,"oracle_receipts_exact":true,"proven_step_precision_milli":1000,"proven_step_recall_milli":1000,"proven_prefix_length":1,"actionable_exact_gap":null,"diagnostic_candidate_count":0,"authoritative_receipt_evidence_count":1,"warm_end_to_end_ms":12,"stage_durations_ms":{"validation":1,"operation":2},"complete_projection_bytes":128,"tool_result_bytes":{"v2024_11_05":128,"v2025_03_26":128,"v2025_06_18":128,"v2025_11_25":128},"negative_mutations":[{"mutation_id":"negative-1","contract_proven":false},{"mutation_id":"negative-2","contract_proven":false}],"first_failure":{"kind":"admitted","edge_ids":[1],"histogram":[],"finalization":null}}],
-      "failure_funnel":{"attempted_positive_steps":312,"classified_positive_steps":312,"unclassified_positive_steps":0,"buckets":[{"failure":{"kind":"raw_admission","reason":"certainty_probable","edge_ids":[9],"histogram":[{"reason":"certainty_probable","edge_ids":[9]}],"finalization":null},"count":1}]},
-      "decision":{"outcome":"keep_proof_dark","failed_gates":[{"kind":"experimental_usefulness","detail":"below threshold"}],"automatic_thresholds_met":false}
+      "inventory":[{"repository_id":"codestory-rust","stored_call_rows":"10","effective_endpoint_rows":"10","exact_resolved_rows":"8","admitted_rows":"7","unresolved_placeholder_rows":"2"}],
+      "trails":[{"repository_id":"codestory-rust","lengths":[{"length":1,"effective_endpoint":"10","exact_resolved":"8","strictly_admitted":"7"},{"length":2,"effective_endpoint":"9","exact_resolved":"7","strictly_admitted":"6"},{"length":3,"effective_endpoint":"8","exact_resolved":"6","strictly_admitted":"5"},{"length":4,"effective_endpoint":"7","exact_resolved":"5","strictly_admitted":"4"},{"length":5,"effective_endpoint":"6","exact_resolved":"4","strictly_admitted":"3"},{"length":6,"effective_endpoint":"5","exact_resolved":"3","strictly_admitted":"2"}]}],
+      "cases":[{"case_id":"codestory-rust-path","repository_id":"codestory-rust","product_disposition":{"kind":"contract_proven","gaps":[]},"authoritative_receipt_count":1,"oracle_receipts_exact":true,"proven_step_precision_milli":1000,"proven_step_recall_milli":1000,"proven_prefix_length":1,"actionable_exact_gap":null,"diagnostic_candidate_count":0,"authoritative_receipt_evidence_count":1,"warm_end_to_end_ms":12,"stage_durations_ms":{"validation":1,"operation":2},"attempted_step_count":1,"complete_projection":{"kind":"success","bytes":128},"tool_result_transport":{"v2024_11_05":{"kind":"success","bytes":128},"v2025_03_26":{"kind":"success","bytes":128},"v2025_06_18":{"kind":"success","bytes":128},"v2025_11_25":{"kind":"success","bytes":128}},"negative_mutations":[{"mutation_id":"negative-1","contract_proven":false},{"mutation_id":"negative-2","contract_proven":false}],"proof_trace":{"selectors":[{"selector_index":0,"outcome":{"kind":"resolved","node_id":1}}],"selector_early_return":false,"steps":[{"step_index":0,"candidate_edge_ids":[1],"outcome":{"kind":"admitted","edge_ids":[1]}}],"finalization":{"kind":"complete","projection_bytes":128}}}],
+      "failure_funnel":{"attempted_positive_steps":312,"classified_positive_steps":312,"unclassified_positive_steps":0,"buckets":[{"failure":{"kind":"raw_admission","reason":"certainty_probable"},"count":"1"}]},
+      "decision":{"outcome":"keep_proof_dark","failed_gates":[{"gate_id":"experimental-usefulness-1","kind":"experimental_usefulness","detail":{"kind":"count","observed":"1","required":"24"}}],"automatic_thresholds_met":false}
     })
 }
 
@@ -86,6 +113,12 @@ fn frozen_corpus_has_all_oracle_freeze_inputs_and_rejects_semantic_violations() 
         .unwrap()
         .pop();
     assert!(CorpusV1::from_json(mutations).is_err());
+    let mut missing_path = corpus();
+    missing_path["paths"].as_array_mut().unwrap().pop();
+    assert!(CorpusV1::from_json(missing_path).is_err());
+    let mut duplicate_kind = corpus();
+    duplicate_kind["paths"][0]["negative_mutations"][1]["kind"] = json!("remove_expected_relation");
+    assert!(CorpusV1::from_json(duplicate_kind).is_err());
 }
 
 #[test]
@@ -114,6 +147,62 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
     let mut gate = report();
     gate["decision"]["failed_gates"][0]["kind"] = json!("free form");
     assert!(QualificationSummaryV1::from_json(gate).is_err());
+    let mut hard_failure = report();
+    hard_failure["failure_funnel"]["classified_positive_steps"] = json!(311);
+    hard_failure["failure_funnel"]["unclassified_positive_steps"] = json!(1);
+    hard_failure["cases"][0]["tool_result_transport"]["v2025_03_26"] =
+        json!({"kind":"over_cap","bytes":65537,"cap_bytes":65536});
+    hard_failure["cases"][0]["tool_result_transport"]["v2025_06_18"] =
+        json!({"kind":"error","error":"facade_unavailable"});
+    QualificationSummaryV1::from_json(hard_failure).expect("failure evidence is representable");
+}
+
+#[test]
+fn closed_contracts_reject_hostile_nested_shapes() {
+    let mut too_many_steps = corpus();
+    too_many_steps["paths"][0]["spec"]["expected_step_count"] = json!(7);
+    assert!(CorpusV1::from_json(too_many_steps).is_err());
+
+    let mut invalid_trace = report();
+    invalid_trace["cases"][0]["proof_trace"]["steps"][0]["outcome"] = json!({
+        "kind":"first_zero_survivor",
+        "gate":"line",
+        "histogram":[{"failure":{"kind":"raw_admission","reason":"certainty_probable"},"edge_ids":[1]}]
+    });
+    assert!(QualificationSummaryV1::from_json(invalid_trace).is_err());
+
+    let mut invalid_transport = report();
+    invalid_transport["cases"][0]["tool_result_transport"]["v2024_11_05"] =
+        json!({"kind":"over_cap","bytes":65537,"cap_bytes":1});
+    assert!(QualificationSummaryV1::from_json(invalid_transport).is_err());
+
+    let mut noncanonical_u128 = report();
+    noncanonical_u128["inventory"][0]["stored_call_rows"] = json!("01");
+    assert!(QualificationSummaryV1::from_json(noncanonical_u128).is_err());
+
+    let mut unknown_variant_field = report();
+    unknown_variant_field["cases"][0]["complete_projection"] =
+        json!({"kind":"success","bytes":1,"surprise":true});
+    assert!(QualificationSummaryV1::from_json(unknown_variant_field).is_err());
+
+    let mut duplicate_kind = report();
+    duplicate_kind["decision"]["failed_gates"] = json!([
+        {"gate_id":"one","kind":"cohort_failure","detail":{"kind":"cohort","repository_id":"rust","observed":"1","required":"30"}},
+        {"gate_id":"two","kind":"cohort_failure","detail":{"kind":"cohort","repository_id":"typescript","observed":"1","required":"30"}}
+    ]);
+    QualificationSummaryV1::from_json(duplicate_kind).expect("each failed gate has a stable id");
+
+    let mut delayed_without_evidence = report();
+    delayed_without_evidence["decision"]["outcome"] = json!("delay_full_v3_cut");
+    assert!(QualificationSummaryV1::from_json(delayed_without_evidence).is_err());
+    let mut delayed_with_evidence = report();
+    delayed_with_evidence["decision"] = json!({
+        "outcome":"delay_full_v3_cut",
+        "automatic_thresholds_met":null,
+        "failed_gates":[{"gate_id":"packet-proof-dependency","kind":"integration_dependency","detail":{"kind":"source_dependency","evidence":{"source_path":"crates/codestory-runtime/src/packet.rs","source_range":range(0,10),"source_sha256":SHA,"dependency":"v3_packet_requires_proof"}}}]
+    });
+    QualificationSummaryV1::from_json(delayed_with_evidence)
+        .expect("outcome D uses closed source evidence");
 }
 
 #[test]
@@ -143,6 +232,15 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
     assert_eq!(
         contracts::schema_json(SchemaDocument::Path)["properties"]["negative_mutations"]["minItems"],
         2
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Corpus)["properties"]["paths"]["minItems"],
+        120
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Thresholds)["$defs"]["RoleThresholdsV1"]["properties"]
+            ["minimum_positive_step_recall_milli"]["maximum"],
+        1000
     );
 }
 

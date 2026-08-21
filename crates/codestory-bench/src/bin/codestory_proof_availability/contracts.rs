@@ -11,6 +11,33 @@ pub const THRESHOLDS_SCHEMA: &str = "codestory.proof-availability-thresholds/v1"
 const SHA256: &str = "^[0-9a-f]{64}$";
 const COMMIT: &str = "^[0-9a-f]{40}$";
 
+mod u128_decimal {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value.is_empty()
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+            || (value.len() > 1 && value.starts_with('0'))
+        {
+            return Err(serde::de::Error::custom(
+                "proof_availability_u128_decimal_invalid",
+            ));
+        }
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaDocument {
     Corpus,
@@ -54,8 +81,8 @@ pub struct OracleStepV1 {
     pub callsite: OracleSourceRangeV1,
     pub target: OracleDeclarationV1,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NegativeMutationKindV1 {
     RemoveExpectedRelation,
     AddAmbiguousRelation,
@@ -148,6 +175,9 @@ impl OraclePathV1 {
                 bail!("proof_availability_mutation_invalid")
             }
         }
+        if self.negative_mutations[0].kind == self.negative_mutations[1].kind {
+            bail!("proof_availability_mutation_kinds_not_distinct")
+        }
         if !hash(&self.audit.cohort_path_file_sha256)
             || !hash(&self.audit.source_tree_sha256)
             || empty(&self.audit.cohort_path_file)
@@ -208,6 +238,7 @@ impl CorpusV1 {
             || self.curator == self.reviewer
             || !date(&self.review_date)
             || self.cohorts.len() != 4
+            || self.paths.len() != 120
             || self.positive_request_count != 120
             || self.positive_step_count != 312
             || self.negative_request_count != 240
@@ -216,8 +247,6 @@ impl CorpusV1 {
         {
             bail!("proof_availability_corpus_invalid")
         }
-        let mut paths = 0u16;
-        let mut steps = 0u16;
         for c in &self.cohorts {
             if empty(&c.repository_id)
                 || empty(&c.repository)
@@ -231,11 +260,35 @@ impl CorpusV1 {
             {
                 bail!("proof_availability_cohort_invalid")
             }
-            paths += c.path_count;
-            steps += c.positive_step_count;
+            let cohort_paths = self
+                .paths
+                .iter()
+                .filter(|path| path.repository_id == c.repository_id)
+                .collect::<Vec<_>>();
+            if cohort_paths.len() != usize::from(c.path_count)
+                || cohort_paths
+                    .iter()
+                    .map(|path| usize::from(path.spec.expected_step_count))
+                    .sum::<usize>()
+                    != usize::from(c.positive_step_count)
+            {
+                bail!("proof_availability_cohort_actual_totals_invalid")
+            }
         }
-        if paths != self.positive_request_count || steps != self.positive_step_count {
-            bail!("proof_availability_corpus_totals_invalid")
+        if self
+            .paths
+            .iter()
+            .map(|path| usize::from(path.spec.expected_step_count))
+            .sum::<usize>()
+            != usize::from(self.positive_step_count)
+            || self
+                .paths
+                .iter()
+                .map(|path| path.negative_mutations.len())
+                .sum::<usize>()
+                != usize::from(self.negative_request_count)
+        {
+            bail!("proof_availability_corpus_actual_totals_invalid")
         }
         for p in &self.paths {
             p.validate()?;
@@ -265,6 +318,9 @@ pub struct HardGatesV1 {
     pub maximum_certified_absence: u16,
     pub require_complete_failure_funnel: bool,
     pub require_complete_provenance: bool,
+    pub maximum_invalid_results: u16,
+    pub maximum_over_cap_results: u16,
+    pub maximum_transport_errors: u16,
     pub maximum_proof_bytes: u64,
     pub require_each_cohort: bool,
     pub require_product_disposition_match: bool,
@@ -323,6 +379,9 @@ impl ThresholdsV1 {
             || self.hard_gates.maximum_certified_absence != 0
             || !self.hard_gates.require_complete_failure_funnel
             || !self.hard_gates.require_complete_provenance
+            || self.hard_gates.maximum_invalid_results != 0
+            || self.hard_gates.maximum_over_cap_results != 0
+            || self.hard_gates.maximum_transport_errors != 0
             || self.hard_gates.maximum_proof_bytes != 65536
             || !self.hard_gates.require_each_cohort
             || !self.hard_gates.require_product_disposition_match
@@ -353,14 +412,35 @@ impl ThresholdsV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SelectorFailureV1 {
     Missing,
     Ambiguous,
     NonCallable,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum UnavailableReasonV1 {
+    ValidatedContractHashMismatch,
+    PublicationPinMismatch,
+    SourceNotBoundToPublication,
+    ProofFactsUnavailable,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SelectorGateOutcomeV1 {
+    Resolved { node_id: u64 },
+    Failed { reason: SelectorFailureV1 },
+    Unavailable { reason: UnavailableReasonV1 },
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SelectorQualificationTraceV1 {
+    pub selector_index: u8,
+    pub outcome: SelectorGateOutcomeV1,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RawAdmissionFailureV1 {
     WrongKind,
     CertaintyAbsent,
@@ -378,14 +458,14 @@ pub enum RawAdmissionFailureV1 {
     CallsiteRawTargetMismatch,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContainmentFailureV1 {
     EdgeSourceFileMismatch,
     Missing,
     Ambiguous,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceBindingFailureV1 {
     FileIncomplete,
     StoredHashAbsent,
@@ -396,56 +476,74 @@ pub enum SourceBindingFailureV1 {
     LineOverLimit,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum FinalizationFailureV1 {
     ReceiptIntegration,
     ReceiptBudget,
     ProjectionBudget,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum StepFailureV1 {
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateGateV1 {
+    RawAdmission,
+    Containment,
+    SourceBinding,
+    Line,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum LineFailureV1 {
+    Missing,
+    OverLimit,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateFailureV1 {
+    RawAdmission { reason: RawAdmissionFailureV1 },
+    Containment { reason: ContainmentFailureV1 },
+    SourceBinding { reason: SourceBindingFailureV1 },
+    Line { reason: LineFailureV1 },
+    Receipt { reason: FinalizationFailureV1 },
+    Projection { reason: FinalizationFailureV1 },
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateFailureHistogramV1 {
+    pub failure: CandidateFailureV1,
+    pub edge_ids: Vec<u64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StepQualificationOutcomeV1 {
     Admitted {
         edge_ids: Vec<u64>,
-        histogram: Vec<FailureHistogramV1>,
-        finalization: Option<FinalizationFailureV1>,
     },
-    Selector {
-        reason: SelectorFailureV1,
-        edge_ids: Vec<u64>,
-        histogram: Vec<FailureHistogramV1>,
-        finalization: Option<FinalizationFailureV1>,
-    },
-    RawAdmission {
-        reason: RawAdmissionFailureV1,
-        edge_ids: Vec<u64>,
-        histogram: Vec<FailureHistogramV1>,
-        finalization: Option<FinalizationFailureV1>,
-    },
-    Containment {
-        reason: ContainmentFailureV1,
-        edge_ids: Vec<u64>,
-        histogram: Vec<FailureHistogramV1>,
-        finalization: Option<FinalizationFailureV1>,
-    },
-    SourceBinding {
-        reason: SourceBindingFailureV1,
-        edge_ids: Vec<u64>,
-        histogram: Vec<FailureHistogramV1>,
-        finalization: Option<FinalizationFailureV1>,
-    },
-    Finalization {
-        reason: FinalizationFailureV1,
-        edge_ids: Vec<u64>,
-        histogram: Vec<FailureHistogramV1>,
-        finalization: Option<FinalizationFailureV1>,
+    FirstZeroSurvivor {
+        gate: CandidateGateV1,
+        histogram: Vec<CandidateFailureHistogramV1>,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct FailureHistogramV1 {
-    pub reason: RawAdmissionFailureV1,
-    pub edge_ids: Vec<u64>,
+pub struct StepQualificationTraceV1 {
+    pub step_index: u8,
+    pub candidate_edge_ids: Vec<u64>,
+    pub outcome: StepQualificationOutcomeV1,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FinalizationTraceV1 {
+    NotRun,
+    Complete { projection_bytes: u64 },
+    Failed { failure: FinalizationFailureV1 },
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProofQualificationTraceV1 {
+    pub selectors: Vec<SelectorQualificationTraceV1>,
+    pub selector_early_return: bool,
+    pub steps: Vec<StepQualificationTraceV1>,
+    pub finalization: FinalizationTraceV1,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -473,18 +571,34 @@ pub struct EnvironmentReportV1 {
 #[serde(deny_unknown_fields)]
 pub struct InventoryReportV1 {
     pub repository_id: String,
+    #[serde(with = "u128_decimal")]
+    #[schemars(with = "String")]
     pub stored_call_rows: u128,
+    #[serde(with = "u128_decimal")]
+    #[schemars(with = "String")]
     pub effective_endpoint_rows: u128,
+    #[serde(with = "u128_decimal")]
+    #[schemars(with = "String")]
     pub exact_resolved_rows: u128,
+    #[serde(with = "u128_decimal")]
+    #[schemars(with = "String")]
     pub admitted_rows: u128,
+    #[serde(with = "u128_decimal")]
+    #[schemars(with = "String")]
     pub unresolved_placeholder_rows: u128,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TrailLengthCountsV1 {
     pub length: u8,
+    #[serde(with = "u128_decimal")]
+    #[schemars(with = "String")]
     pub effective_endpoint: u128,
+    #[serde(with = "u128_decimal")]
+    #[schemars(with = "String")]
     pub exact_resolved: u128,
+    #[serde(with = "u128_decimal")]
+    #[schemars(with = "String")]
     pub strictly_admitted: u128,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -494,7 +608,7 @@ pub struct TrailReportV1 {
     pub lengths: Vec<TrailLengthCountsV1>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProductDispositionKindV1 {
     ContractProven,
     Unknown,
@@ -508,7 +622,7 @@ pub struct ProductDispositionV1 {
     pub gaps: Vec<TypedGapV1>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TypedGapV1 {
     SelectorMissing,
     SelectorAmbiguous,
@@ -524,12 +638,35 @@ pub struct StageDurationsV1 {
     pub operation: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum TransportProfileV1 {
+    V2024_11_05,
+    V2025_03_26,
+    V2025_06_18,
+    V2025_11_25,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum TransportErrorV1 {
+    FacadeUnavailable,
+    Serialization,
+    InvalidResult,
+    BudgetExceeded,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TransportOutcomeV1 {
+    Success { bytes: u64 },
+    Error { error: TransportErrorV1 },
+    OverCap { bytes: u64, cap_bytes: u64 },
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ToolResultBytesV1 {
-    pub v2024_11_05: u64,
-    pub v2025_03_26: u64,
-    pub v2025_06_18: u64,
-    pub v2025_11_25: u64,
+pub struct ToolResultTransportV1 {
+    pub v2024_11_05: TransportOutcomeV1,
+    pub v2025_03_26: TransportOutcomeV1,
+    pub v2025_06_18: TransportOutcomeV1,
+    pub v2025_11_25: TransportOutcomeV1,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -553,15 +690,18 @@ pub struct CaseReportV1 {
     pub authoritative_receipt_evidence_count: u64,
     pub warm_end_to_end_ms: u64,
     pub stage_durations_ms: StageDurationsV1,
-    pub complete_projection_bytes: u64,
-    pub tool_result_bytes: ToolResultBytesV1,
+    pub attempted_step_count: u8,
+    pub complete_projection: TransportOutcomeV1,
+    pub tool_result_transport: ToolResultTransportV1,
     pub negative_mutations: Vec<NegativeMutationResultV1>,
-    pub first_failure: StepFailureV1,
+    pub proof_trace: ProofQualificationTraceV1,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FailureBucketV1 {
-    pub failure: StepFailureV1,
+    pub failure: CandidateFailureV1,
+    #[serde(with = "u128_decimal")]
+    #[schemars(with = "String")]
     pub count: u128,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -573,7 +713,7 @@ pub struct FailureFunnelReportV1 {
     pub buckets: Vec<FailureBucketV1>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActivationOutcomeV1 {
     PublicExactVerifier,
     ExperimentalManualVerifier,
@@ -581,7 +721,7 @@ pub enum ActivationOutcomeV1 {
     DelayFullV3Cut,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum QualificationGateKindV1 {
     FalseContractProven,
     ReceiptMismatch,
@@ -597,10 +737,53 @@ pub enum QualificationGateKindV1 {
     IntegrationDependency,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceDependencyKindV1 {
+    V3PacketRequiresProof,
+    TransportCannotRepresentKeepDark,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceDependencyEvidenceV1 {
+    pub source_path: String,
+    pub source_range: OracleSourceRangeV1,
+    pub source_sha256: String,
+    pub dependency: SourceDependencyKindV1,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GateFailureDetailV1 {
+    Count {
+        #[serde(with = "u128_decimal")]
+        #[schemars(with = "String")]
+        observed: u128,
+        #[serde(with = "u128_decimal")]
+        #[schemars(with = "String")]
+        required: u128,
+    },
+    Cohort {
+        repository_id: String,
+        #[serde(with = "u128_decimal")]
+        #[schemars(with = "String")]
+        observed: u128,
+        #[serde(with = "u128_decimal")]
+        #[schemars(with = "String")]
+        required: u128,
+    },
+    Transport {
+        profile: TransportProfileV1,
+        outcome: TransportOutcomeV1,
+    },
+    SourceDependency {
+        evidence: SourceDependencyEvidenceV1,
+    },
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FailedGateV1 {
+    pub gate_id: String,
     pub kind: QualificationGateKindV1,
-    pub detail: String,
+    pub detail: GateFailureDetailV1,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -645,8 +828,11 @@ impl QualificationSummaryV1 {
             || !hash(&self.environment.database_sha256)
             || empty(&self.environment.core_run_id)
             || self.failure_funnel.attempted_positive_steps != 312
-            || self.failure_funnel.classified_positive_steps != 312
-            || self.failure_funnel.unclassified_positive_steps != 0
+            || self.failure_funnel.classified_positive_steps > 312
+            || self.failure_funnel.unclassified_positive_steps > 312
+            || u32::from(self.failure_funnel.classified_positive_steps)
+                + u32::from(self.failure_funnel.unclassified_positive_steps)
+                > 312
         {
             bail!("proof_availability_summary_invalid")
         }
@@ -665,15 +851,32 @@ impl QualificationSummaryV1 {
             if c.negative_mutations.len() != 2
                 || c.proven_step_precision_milli > 1000
                 || c.proven_step_recall_milli > 1000
-                || c.complete_projection_bytes > 65536
-                || [
-                    c.tool_result_bytes.v2024_11_05,
-                    c.tool_result_bytes.v2025_03_26,
-                    c.tool_result_bytes.v2025_06_18,
-                    c.tool_result_bytes.v2025_11_25,
+                || c.attempted_step_count > 6
+                || c.proof_trace.steps.len() != usize::from(c.attempted_step_count)
+                || !c
+                    .proof_trace
+                    .selectors
+                    .iter()
+                    .enumerate()
+                    .all(|(index, selector)| selector.selector_index == index as u8)
+                || !c
+                    .proof_trace
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .all(|(index, step)| step.step_index == index as u8 && valid_step_trace(step))
+                || !valid_finalization(&c.proof_trace.finalization)
+                || !valid_transport(&c.complete_projection)
+                || ![
+                    &c.tool_result_transport.v2024_11_05,
+                    &c.tool_result_transport.v2025_03_26,
+                    &c.tool_result_transport.v2025_06_18,
+                    &c.tool_result_transport.v2025_11_25,
                 ]
                 .iter()
-                .any(|v| *v > 65536)
+                .all(|outcome| valid_transport(outcome))
+                || (c.proof_trace.selector_early_return
+                    != matches!(c.proof_trace.finalization, FinalizationTraceV1::NotRun))
             {
                 bail!("proof_availability_case_invalid")
             }
@@ -682,14 +885,94 @@ impl QualificationSummaryV1 {
             self.decision
                 .failed_gates
                 .iter()
-                .map(|g| format!("{:?}", g.kind))
-                .collect::<Vec<_>>()
-                .iter()
-                .map(|v| v.as_str()),
+                .map(|g| g.gate_id.as_str()),
         ) {
             bail!("proof_availability_decision_invalid")
         }
+        for gate in &self.decision.failed_gates {
+            if !valid_gate_detail(&gate.detail) {
+                bail!("proof_availability_gate_detail_invalid")
+            }
+        }
+        if matches!(self.decision.outcome, ActivationOutcomeV1::DelayFullV3Cut)
+            && !self
+                .decision
+                .failed_gates
+                .iter()
+                .any(|gate| matches!(gate.detail, GateFailureDetailV1::SourceDependency { .. }))
+        {
+            bail!("proof_availability_delay_dependency_missing")
+        }
         Ok(())
+    }
+}
+
+fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
+    if !strictly_ascending(&trace.candidate_edge_ids) {
+        return false;
+    }
+    match &trace.outcome {
+        StepQualificationOutcomeV1::Admitted { edge_ids } => {
+            !edge_ids.is_empty() && strictly_ascending(edge_ids)
+        }
+        StepQualificationOutcomeV1::FirstZeroSurvivor { gate, histogram } => {
+            (histogram.is_empty()
+                && matches!(gate, CandidateGateV1::RawAdmission)
+                && trace.candidate_edge_ids.is_empty())
+                || (!histogram.is_empty()
+                    && histogram.iter().all(|bucket| {
+                        !bucket.edge_ids.is_empty()
+                            && strictly_ascending(&bucket.edge_ids)
+                            && matches!(
+                                (&gate, &bucket.failure),
+                                (
+                                    CandidateGateV1::RawAdmission,
+                                    CandidateFailureV1::RawAdmission { .. },
+                                ) | (
+                                    CandidateGateV1::Containment,
+                                    CandidateFailureV1::Containment { .. },
+                                ) | (
+                                    CandidateGateV1::SourceBinding,
+                                    CandidateFailureV1::SourceBinding { .. },
+                                ) | (CandidateGateV1::Line, CandidateFailureV1::Line { .. })
+                            )
+                    }))
+        }
+    }
+}
+
+fn strictly_ascending(values: &[u64]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn valid_transport(outcome: &TransportOutcomeV1) -> bool {
+    match outcome {
+        TransportOutcomeV1::Success { bytes } => *bytes <= 65_536,
+        TransportOutcomeV1::Error { .. } => true,
+        TransportOutcomeV1::OverCap { bytes, cap_bytes } => {
+            *cap_bytes == 65_536 && *bytes > *cap_bytes
+        }
+    }
+}
+
+fn valid_finalization(finalization: &FinalizationTraceV1) -> bool {
+    match finalization {
+        FinalizationTraceV1::NotRun => true,
+        FinalizationTraceV1::Complete { projection_bytes } => *projection_bytes <= 65_536,
+        FinalizationTraceV1::Failed { .. } => true,
+    }
+}
+
+fn valid_gate_detail(detail: &GateFailureDetailV1) -> bool {
+    match detail {
+        GateFailureDetailV1::Count { .. } => true,
+        GateFailureDetailV1::Cohort { repository_id, .. } => !empty(repository_id),
+        GateFailureDetailV1::Transport { outcome, .. } => valid_transport(outcome),
+        GateFailureDetailV1::SourceDependency { evidence } => {
+            !empty(&evidence.source_path)
+                && hash(&evidence.source_sha256)
+                && range(&evidence.source_range).is_ok()
+        }
     }
 }
 
@@ -770,6 +1053,8 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
                         | "results_sha256"
                         | "methodology_sha256"
                         | "path_file_sha256"
+                        | "cohort_path_file_sha256"
+                        | "source_sha256"
                         | "source_tree_sha256"
                         | "database_sha256"
                 ) {
@@ -777,6 +1062,22 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
                 }
                 if matches!(name.as_str(), "commit" | "source_commit" | "source_tree") {
                     property.insert("pattern".into(), Value::String(COMMIT.into()));
+                }
+                if matches!(
+                    name.as_str(),
+                    "stored_call_rows"
+                        | "effective_endpoint_rows"
+                        | "exact_resolved_rows"
+                        | "admitted_rows"
+                        | "unresolved_placeholder_rows"
+                        | "effective_endpoint"
+                        | "exact_resolved"
+                        | "strictly_admitted"
+                        | "count"
+                        | "observed"
+                        | "required"
+                ) {
+                    property.insert("pattern".into(), Value::String("^(0|[1-9][0-9]*)$".into()));
                 }
             }
         }
@@ -790,6 +1091,224 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
     {
         value.insert("minItems".into(), Value::from(2));
         value.insert("maxItems".into(), Value::from(2));
+    }
+    semantic_contract_bounds(schema, document);
+    annotate_transport_bounds(schema);
+}
+
+fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
+    match document {
+        SchemaDocument::Corpus => {
+            set_bounds(schema, None, "cohorts", Some(4), Some(4));
+            set_bounds(schema, None, "paths", Some(120), Some(120));
+            for field in [
+                "positive_request_count",
+                "positive_step_count",
+                "negative_request_count",
+            ] {
+                let value = match field {
+                    "positive_request_count" => 120,
+                    "positive_step_count" => 312,
+                    _ => 240,
+                };
+                set_const(schema, None, field, Value::from(value));
+            }
+            set_const(schema, Some("CohortV1"), "path_count", Value::from(30));
+            set_const(
+                schema,
+                Some("CohortV1"),
+                "positive_step_count",
+                Value::from(78),
+            );
+            set_const(
+                schema,
+                Some("OraclePathV1"),
+                "schema",
+                Value::String(PATH_SCHEMA.into()),
+            );
+            set_bounds(
+                schema,
+                Some("OraclePathV1"),
+                "negative_mutations",
+                Some(2),
+                Some(2),
+            );
+            set_bounds(
+                schema,
+                Some("CallPathSpecV1"),
+                "expected_step_count",
+                Some(1),
+                Some(6),
+            );
+            set_bounds(
+                schema,
+                Some("OraclePathV1"),
+                "oracle_steps",
+                Some(1),
+                Some(6),
+            );
+        }
+        SchemaDocument::Path => {
+            set_bounds(
+                schema,
+                Some("CallPathSpecV1"),
+                "expected_step_count",
+                Some(1),
+                Some(6),
+            );
+            set_bounds(schema, None, "oracle_steps", Some(1), Some(6));
+        }
+        SchemaDocument::Thresholds => {
+            for (field, value) in [
+                ("expected_cohort_count", 4),
+                ("expected_positive_requests", 120),
+                ("expected_positive_steps", 312),
+                ("expected_negative_requests", 240),
+            ] {
+                set_const(schema, None, field, Value::from(value));
+            }
+            set_const(
+                schema,
+                Some("HardGatesV1"),
+                "maximum_proof_bytes",
+                Value::from(65_536),
+            );
+            for field in [
+                "minimum_full_proof_wilson_lower_milli",
+                "minimum_cohort_wilson_lower_milli",
+                "minimum_positive_step_recall_milli",
+                "minimum_full_or_useful_partial_milli",
+                "minimum_actionable_exact_gap_milli",
+            ] {
+                set_bounds(schema, Some("RoleThresholdsV1"), field, Some(0), Some(1000));
+            }
+            for field in [
+                "maximum_complete_response_p95_bytes",
+                "maximum_unknown_response_p95_bytes",
+                "maximum_response_bytes",
+            ] {
+                set_bounds(
+                    schema,
+                    Some("RoleThresholdsV1"),
+                    field,
+                    Some(0),
+                    Some(65_536),
+                );
+            }
+        }
+        SchemaDocument::Report => {
+            set_bounds(schema, None, "inventory", Some(1), None);
+            set_bounds(schema, None, "trails", Some(1), None);
+            set_bounds(schema, None, "cases", Some(1), None);
+            set_const(
+                schema,
+                Some("FailureFunnelReportV1"),
+                "attempted_positive_steps",
+                Value::from(312),
+            );
+            set_bounds(schema, Some("TrailReportV1"), "lengths", Some(6), Some(6));
+            set_bounds(
+                schema,
+                Some("CaseReportV1"),
+                "attempted_step_count",
+                Some(0),
+                Some(6),
+            );
+            for field in ["proven_step_precision_milli", "proven_step_recall_milli"] {
+                set_bounds(schema, Some("CaseReportV1"), field, Some(0), Some(1000));
+            }
+            set_bounds(
+                schema,
+                Some("ProofQualificationTraceV1"),
+                "steps",
+                Some(0),
+                Some(6),
+            );
+        }
+    }
+}
+
+fn set_const(schema: &mut Value, definition: Option<&str>, field: &str, constant: Value) {
+    if let Some(property) = schema_property(schema, definition, field) {
+        property.insert("const".into(), constant);
+    }
+}
+
+fn set_bounds(
+    schema: &mut Value,
+    definition: Option<&str>,
+    field: &str,
+    minimum: Option<u64>,
+    maximum: Option<u64>,
+) {
+    if let Some(property) = schema_property(schema, definition, field) {
+        let array = property.get("type").and_then(Value::as_str) == Some("array");
+        if let Some(minimum) = minimum {
+            property.insert(
+                if array { "minItems" } else { "minimum" }.into(),
+                Value::from(minimum),
+            );
+        }
+        if let Some(maximum) = maximum {
+            property.insert(
+                if array { "maxItems" } else { "maximum" }.into(),
+                Value::from(maximum),
+            );
+        }
+    }
+}
+
+fn schema_property<'a>(
+    schema: &'a mut Value,
+    definition: Option<&str>,
+    field: &str,
+) -> Option<&'a mut serde_json::Map<String, Value>> {
+    let owner = match definition {
+        Some(definition) => schema.get_mut("$defs")?.get_mut(definition)?,
+        None => schema,
+    };
+    owner.get_mut("properties")?.get_mut(field)?.as_object_mut()
+}
+
+fn annotate_transport_bounds(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let kind = map
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|properties| properties.get("kind"))
+                .and_then(Value::as_object)
+                .and_then(|kind| kind.get("const"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(properties) = map.get_mut("properties").and_then(Value::as_object_mut) {
+                if let Some(projection) = properties
+                    .get_mut("projection_bytes")
+                    .and_then(Value::as_object_mut)
+                {
+                    projection.insert("maximum".into(), Value::from(65_536));
+                }
+                if let Some(cap) = properties
+                    .get_mut("cap_bytes")
+                    .and_then(Value::as_object_mut)
+                {
+                    cap.insert("const".into(), Value::from(65_536));
+                }
+                if let Some(bytes) = properties.get_mut("bytes").and_then(Value::as_object_mut) {
+                    if kind.as_deref() == Some("success") {
+                        bytes.insert("maximum".into(), Value::from(65_536));
+                    }
+                    if kind.as_deref() == Some("over_cap") {
+                        bytes.insert("minimum".into(), Value::from(65_537));
+                    }
+                }
+            }
+            for value in map.values_mut() {
+                annotate_transport_bounds(value);
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(annotate_transport_bounds),
+        _ => {}
     }
 }
 fn empty(value: &str) -> bool {

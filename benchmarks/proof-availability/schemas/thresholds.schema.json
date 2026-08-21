@@ -15,8 +15,27 @@
           "minimum": 0,
           "type": "integer"
         },
+        "maximum_invalid_results": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximum_over_cap_results": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
         "maximum_proof_bytes": {
+          "const": 65536,
           "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximum_transport_errors": {
+          "format": "uint16",
+          "maximum": 65535,
           "minimum": 0,
           "type": "integer"
         },
@@ -42,6 +61,9 @@
         "maximum_certified_absence",
         "require_complete_failure_funnel",
         "require_complete_provenance",
+        "maximum_invalid_results",
+        "maximum_over_cap_results",
+        "maximum_transport_errors",
         "maximum_proof_bytes",
         "require_each_cohort",
         "require_product_disposition_match"
@@ -53,11 +75,13 @@
       "properties": {
         "maximum_complete_response_p95_bytes": {
           "format": "uint64",
+          "maximum": 65536,
           "minimum": 0,
           "type": "integer"
         },
         "maximum_response_bytes": {
           "format": "uint64",
+          "maximum": 65536,
           "minimum": 0,
           "type": "integer"
         },
@@ -73,30 +97,31 @@
         },
         "maximum_unknown_response_p95_bytes": {
           "format": "uint64",
+          "maximum": 65536,
           "minimum": 0,
           "type": "integer"
         },
         "minimum_actionable_exact_gap_milli": {
           "format": "uint16",
-          "maximum": 65535,
+          "maximum": 1000,
           "minimum": 0,
           "type": "integer"
         },
         "minimum_cohort_wilson_lower_milli": {
           "format": "uint16",
-          "maximum": 65535,
+          "maximum": 1000,
           "minimum": 0,
           "type": "integer"
         },
         "minimum_full_or_useful_partial_milli": {
           "format": "uint16",
-          "maximum": 65535,
+          "maximum": 1000,
           "minimum": 0,
           "type": "integer"
         },
         "minimum_full_proof_wilson_lower_milli": {
           "format": "uint16",
-          "maximum": 65535,
+          "maximum": 1000,
           "minimum": 0,
           "type": "integer"
         },
@@ -114,7 +139,7 @@
         },
         "minimum_positive_step_recall_milli": {
           "format": "uint16",
-          "maximum": 65535,
+          "maximum": 1000,
           "minimum": 0,
           "type": "integer"
         }
@@ -148,24 +173,28 @@
       "type": "string"
     },
     "expected_cohort_count": {
+      "const": 4,
       "format": "uint8",
       "maximum": 255,
       "minimum": 0,
       "type": "integer"
     },
     "expected_negative_requests": {
+      "const": 240,
       "format": "uint16",
       "maximum": 65535,
       "minimum": 0,
       "type": "integer"
     },
     "expected_positive_requests": {
+      "const": 120,
       "format": "uint16",
       "maximum": 65535,
       "minimum": 0,
       "type": "integer"
     },
     "expected_positive_steps": {
+      "const": 312,
       "format": "uint16",
       "maximum": 65535,
       "minimum": 0,

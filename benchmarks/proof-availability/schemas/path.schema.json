@@ -5,8 +5,8 @@
       "properties": {
         "expected_step_count": {
           "format": "uint8",
-          "maximum": 255,
-          "minimum": 0,
+          "maximum": 6,
+          "minimum": 1,
           "type": "integer"
         },
         "start": {
@@ -91,6 +91,7 @@
           "type": "string"
         },
         "cohort_path_file_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
         "curator": {
@@ -218,6 +219,8 @@
       "items": {
         "$ref": "#/$defs/OracleStepV1"
       },
+      "maxItems": 6,
+      "minItems": 1,
       "type": "array"
     },
     "repository_id": {
