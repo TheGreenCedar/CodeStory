@@ -30,10 +30,11 @@ pub mod proof_qualification_support {
         AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
         CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
         IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity,
-        InternalProjection, PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawCallEdgeAdmission,
-        ReceiptRef, ResolvedNodeIdentity, UnavailableReason, ValidatedCallPathContract,
-        ValidatedContractRendering, VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
-        check_built_call_path_integration, project_internal_call_path_result,
+        InternalProjection, PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawAdmissionFailure,
+        RawCallEdgeAdmission, ReceiptRef, ResolvedNodeIdentity, UnavailableReason,
+        ValidatedCallPathContract, ValidatedContractRendering, VerifiedDirectCallFact,
+        VerifiedProofFact, admit_raw_call_edge, check_built_call_path_integration,
+        diagnose_raw_call_edge, project_internal_call_path_result,
     };
 
     /// Identifies the sealed request domain observed by benchmark qualification.
@@ -49,13 +50,13 @@ pub mod proof_qualification_test_support {
         CheckedBuiltCallPathIntegration, ClauseAnchor, ClauseClassification, ExactScopeSelector,
         ExactSymbolSelector, FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow,
         InternalCorePublicationIdentity, InternalProjection, PROOF_DOMAIN, PinnedNodeIdentity,
-        ProofContractField, ProofDisposition, ProofGap, ProofHashes, RawCallEdgeAdmission,
-        ReceiptRef, Refutation, ResolvedNodeIdentity, UnavailableReason,
+        ProofContractField, ProofDisposition, ProofGap, ProofHashes, RawAdmissionFailure,
+        RawCallEdgeAdmission, ReceiptRef, Refutation, ResolvedNodeIdentity, UnavailableReason,
         UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
         UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector, ValidatedCallPathContract,
         ValidatedContractRendering, ValidationOutcome, VerifiedDirectCallFact, VerifiedProofFact,
         admit_raw_call_edge, check_built_call_path_integration, check_call_path,
-        project_internal_call_path_result, validate_contract,
+        diagnose_raw_call_edge, project_internal_call_path_result, validate_contract,
     };
 }
 pub mod packet_citations;

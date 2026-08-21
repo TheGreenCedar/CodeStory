@@ -43,6 +43,24 @@ pub enum RawCallEdgeAdmission {
     Rejected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RawAdmissionFailure {
+    WrongKind,
+    CertaintyAbsent,
+    CertaintyProbable,
+    CertaintyUncertain,
+    WrongEffectiveSource,
+    WrongEffectiveTarget,
+    MissingExactResolvedTarget,
+    CandidateAlternativesRetained,
+    MissingFileNode,
+    MissingLine,
+    InvalidOrLegacyCallsiteIdentity,
+    CallsiteFileMismatch,
+    CallsiteLineMismatch,
+    CallsiteRawTargetMismatch,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallableContainmentEvidence {
     pub file_node_id: NodeId,
@@ -110,25 +128,54 @@ pub fn admit_raw_call_edge(
     expected_source: NodeId,
     expected_target: NodeId,
 ) -> RawCallEdgeAdmission {
-    if edge.kind != EdgeKind::CALL
-        || edge.certainty != Some(ResolutionCertainty::Certain)
-        || edge.effective_source() != expected_source
-        || edge.effective_target() != expected_target
-        || edge.resolved_target != Some(expected_target)
-        || !edge.candidate_targets.is_empty()
-    {
-        return RawCallEdgeAdmission::Rejected;
+    match diagnose_raw_call_edge(edge, expected_source, expected_target) {
+        Ok(admitted) => RawCallEdgeAdmission::Admitted(admitted),
+        Err(_) => RawCallEdgeAdmission::Rejected,
     }
-    let (Some(file_node_id), Some(line), Some(callsite_identity)) = (
-        edge.file_node_id,
-        edge.line.filter(|line| *line >= 1),
-        edge.callsite_identity.as_deref(),
-    ) else {
-        return RawCallEdgeAdmission::Rejected;
-    };
-    if callsite_identity.is_empty() {
-        return RawCallEdgeAdmission::Rejected;
+}
+
+pub fn diagnose_raw_call_edge(
+    edge: &Edge,
+    expected_source: NodeId,
+    expected_target: NodeId,
+) -> Result<AdmittedRawCallEdge, RawAdmissionFailure> {
+    if edge.kind != EdgeKind::CALL {
+        return Err(RawAdmissionFailure::WrongKind);
     }
+    match edge.certainty {
+        Some(ResolutionCertainty::Certain) => {}
+        None => return Err(RawAdmissionFailure::CertaintyAbsent),
+        Some(ResolutionCertainty::Probable) => {
+            return Err(RawAdmissionFailure::CertaintyProbable);
+        }
+        Some(ResolutionCertainty::Uncertain) => {
+            return Err(RawAdmissionFailure::CertaintyUncertain);
+        }
+    }
+    if edge.effective_source() != expected_source {
+        return Err(RawAdmissionFailure::WrongEffectiveSource);
+    }
+    if edge.effective_target() != expected_target {
+        return Err(RawAdmissionFailure::WrongEffectiveTarget);
+    }
+    if edge.resolved_target != Some(expected_target) {
+        return Err(RawAdmissionFailure::MissingExactResolvedTarget);
+    }
+    if !edge.candidate_targets.is_empty() {
+        return Err(RawAdmissionFailure::CandidateAlternativesRetained);
+    }
+    let file_node_id = edge
+        .file_node_id
+        .ok_or(RawAdmissionFailure::MissingFileNode)?;
+    let line = edge
+        .line
+        .filter(|line| *line >= 1)
+        .ok_or(RawAdmissionFailure::MissingLine)?;
+    let callsite_identity = edge
+        .callsite_identity
+        .as_deref()
+        .filter(|identity| !identity.is_empty())
+        .ok_or(RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity)?;
     let pre_marker = callsite_identity
         .split_once('|')
         .map_or(callsite_identity, |(identity, _)| identity);
@@ -140,21 +187,26 @@ pub fn admit_raw_call_edge(
         fields.next().and_then(|value| value.parse::<i64>().ok()),
     );
     if fields.next().is_some() {
-        return RawCallEdgeAdmission::Rejected;
+        return Err(RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity);
     }
     let (Some(parsed_file), Some(parsed_line), Some(column_or_ordinal), Some(parsed_target)) =
         parsed
     else {
-        return RawCallEdgeAdmission::Rejected;
+        return Err(RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity);
     };
-    if parsed_file != file_node_id.0
-        || parsed_line != line
-        || parsed_target != edge.target.0
-        || format!("{parsed_file}:{parsed_line}:{column_or_ordinal}:{parsed_target}") != pre_marker
-    {
-        return RawCallEdgeAdmission::Rejected;
+    if parsed_file != file_node_id.0 {
+        return Err(RawAdmissionFailure::CallsiteFileMismatch);
     }
-    RawCallEdgeAdmission::Admitted(AdmittedRawCallEdge {
+    if parsed_line != line {
+        return Err(RawAdmissionFailure::CallsiteLineMismatch);
+    }
+    if parsed_target != edge.target.0 {
+        return Err(RawAdmissionFailure::CallsiteRawTargetMismatch);
+    }
+    if format!("{parsed_file}:{parsed_line}:{column_or_ordinal}:{parsed_target}") != pre_marker {
+        return Err(RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity);
+    }
+    Ok(AdmittedRawCallEdge {
         edge_id: edge.id,
         file_node_id,
         line,
@@ -194,6 +246,8 @@ pub struct ClauseAnchor {
     pub classification: ClauseClassification,
 }
 
+// The dark contract's wire-facing variant names are intentionally stable.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ClauseClassification {
     ResolvedMaterial { fields: Vec<ProofContractField> },
@@ -1370,6 +1424,8 @@ pub struct UnavailableProofFact {
     pub reason: UnavailableReason,
 }
 
+// The dark domain fact layout is intentionally stable across qualification.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifiedProofFact {
     DirectCall(VerifiedDirectCallFact),
@@ -3261,6 +3317,144 @@ mod tests {
             admit_raw_call_edge(&probable, NodeId(11), NodeId(23)),
             RawCallEdgeAdmission::Rejected
         );
+    }
+
+    #[test]
+    fn raw_admission_diagnostics_share_the_product_leaf() {
+        type HostileCase = (
+            &'static str,
+            RawAdmissionFailure,
+            Box<dyn Fn(&mut Edge, &mut NodeId, &mut NodeId)>,
+        );
+
+        let lawful = Edge {
+            id: EdgeId(41),
+            source: NodeId(7),
+            target: NodeId(19),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(-3)),
+            line: Some(12),
+            resolved_source: Some(NodeId(11)),
+            resolved_target: Some(NodeId(23)),
+            confidence: Some(1.0),
+            certainty: Some(ResolutionCertainty::Certain),
+            callsite_identity: Some("-3:12:0:19|collector-marker".to_owned()),
+            candidate_targets: Vec::new(),
+        };
+        let admitted = AdmittedRawCallEdge {
+            edge_id: EdgeId(41),
+            file_node_id: NodeId(-3),
+            line: 12,
+            column_or_ordinal: 0,
+            raw_target: NodeId(19),
+            callsite_identity: "-3:12:0:19|collector-marker".to_owned(),
+        };
+        assert_eq!(
+            diagnose_raw_call_edge(&lawful, NodeId(11), NodeId(23)),
+            Ok(admitted.clone())
+        );
+        assert_eq!(
+            admit_raw_call_edge(&lawful, NodeId(11), NodeId(23)),
+            RawCallEdgeAdmission::Admitted(admitted)
+        );
+
+        let cases: Vec<HostileCase> = vec![
+            (
+                "wrong kind",
+                RawAdmissionFailure::WrongKind,
+                Box::new(|edge, _, _| edge.kind = EdgeKind::USAGE),
+            ),
+            (
+                "certainty absent",
+                RawAdmissionFailure::CertaintyAbsent,
+                Box::new(|edge, _, _| edge.certainty = None),
+            ),
+            (
+                "certainty probable",
+                RawAdmissionFailure::CertaintyProbable,
+                Box::new(|edge, _, _| edge.certainty = Some(ResolutionCertainty::Probable)),
+            ),
+            (
+                "certainty uncertain",
+                RawAdmissionFailure::CertaintyUncertain,
+                Box::new(|edge, _, _| edge.certainty = Some(ResolutionCertainty::Uncertain)),
+            ),
+            (
+                "wrong effective source",
+                RawAdmissionFailure::WrongEffectiveSource,
+                Box::new(|edge, _, _| edge.resolved_source = Some(NodeId(12))),
+            ),
+            (
+                "wrong effective target",
+                RawAdmissionFailure::WrongEffectiveTarget,
+                Box::new(|edge, _, _| edge.resolved_target = Some(NodeId(24))),
+            ),
+            (
+                "missing exact resolved target",
+                RawAdmissionFailure::MissingExactResolvedTarget,
+                Box::new(|edge, _, _| {
+                    edge.target = NodeId(23);
+                    edge.resolved_target = None;
+                    edge.callsite_identity = Some("-3:12:0:23|collector-marker".to_owned());
+                }),
+            ),
+            (
+                "candidate alternatives retained",
+                RawAdmissionFailure::CandidateAlternativesRetained,
+                Box::new(|edge, _, _| edge.candidate_targets = vec![NodeId(24)]),
+            ),
+            (
+                "missing file node",
+                RawAdmissionFailure::MissingFileNode,
+                Box::new(|edge, _, _| edge.file_node_id = None),
+            ),
+            (
+                "missing line",
+                RawAdmissionFailure::MissingLine,
+                Box::new(|edge, _, _| edge.line = None),
+            ),
+            (
+                "invalid or legacy callsite identity",
+                RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity,
+                Box::new(|edge, _, _| edge.callsite_identity = Some("opaque-legacy-id".to_owned())),
+            ),
+            (
+                "callsite file mismatch",
+                RawAdmissionFailure::CallsiteFileMismatch,
+                Box::new(|edge, _, _| {
+                    edge.callsite_identity = Some("-4:12:0:19|collector-marker".to_owned())
+                }),
+            ),
+            (
+                "callsite line mismatch",
+                RawAdmissionFailure::CallsiteLineMismatch,
+                Box::new(|edge, _, _| {
+                    edge.callsite_identity = Some("-3:13:0:19|collector-marker".to_owned())
+                }),
+            ),
+            (
+                "callsite raw target mismatch",
+                RawAdmissionFailure::CallsiteRawTargetMismatch,
+                Box::new(|edge, _, _| edge.target = NodeId(18)),
+            ),
+        ];
+
+        for (label, expected_reason, mutate) in cases {
+            let mut edge = lawful.clone();
+            let mut expected_source = NodeId(11);
+            let mut expected_target = NodeId(23);
+            mutate(&mut edge, &mut expected_source, &mut expected_target);
+            assert_eq!(
+                diagnose_raw_call_edge(&edge, expected_source, expected_target),
+                Err(expected_reason),
+                "{label}"
+            );
+            assert_eq!(
+                admit_raw_call_edge(&edge, expected_source, expected_target),
+                RawCallEdgeAdmission::Rejected,
+                "{label}"
+            );
+        }
     }
 
     #[test]

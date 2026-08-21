@@ -9,7 +9,7 @@
 // deliberate lack of production callers into warning noise.
 #![allow(dead_code)]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,20 +24,20 @@ use codestory_agent::proof_qualification_support::{
     AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
     CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
     IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
-    PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawCallEdgeAdmission, ReceiptRef,
+    PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawAdmissionFailure, ReceiptRef,
     ResolvedNodeIdentity, UnavailableReason, ValidatedCallPathContract, ValidatedContractRendering,
-    VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
-    check_built_call_path_integration, project_internal_call_path_result,
+    VerifiedDirectCallFact, VerifiedProofFact, check_built_call_path_integration,
+    diagnose_raw_call_edge, project_internal_call_path_result,
 };
 #[cfg(any(test, feature = "test-support"))]
 use codestory_agent::proof_qualification_test_support::{
     AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
     CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
     IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
-    PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawCallEdgeAdmission, ReceiptRef,
-    ResolvedNodeIdentity, UnavailableReason, ValidatedCallPathContract, ValidatedContractRendering,
-    VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
-    check_built_call_path_integration, project_internal_call_path_result,
+    PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawAdmissionFailure, RawCallEdgeAdmission,
+    ReceiptRef, ResolvedNodeIdentity, UnavailableReason, ValidatedCallPathContract,
+    ValidatedContractRendering, VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
+    check_built_call_path_integration, diagnose_raw_call_edge, project_internal_call_path_result,
 };
 use codestory_contracts::api::ApiError;
 use codestory_contracts::graph::{Node, NodeId, NodeKind, ResolutionCertainty};
@@ -57,17 +57,244 @@ const MAX_LINE_WINDOW_BYTES: usize = 8_192;
 const RECEIPT_DOMAIN: &[u8] = b"codestory.indexed-call-edge-receipt.v1\0";
 const CALLABLE_KINDS: [NodeKind; 3] = [NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::MACRO];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SelectorFailure {
+    Missing,
+    Ambiguous,
+    NonCallable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectorGateOutcome {
+    Resolved { node_id: NodeId },
+    Failed(SelectorFailure),
+    Unavailable(UnavailableReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectorQualificationTrace {
+    pub selector_index: usize,
+    pub outcome: SelectorGateOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ContainmentFailure {
+    EdgeSourceFileMismatch,
+    Missing,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SourceBindingFailure {
+    FileIncomplete,
+    StoredHashAbsent,
+    WorkingTreeReadFailed,
+    WorkingTreeHashMismatch,
+    InvalidUtf8,
+    LineMissing,
+    LineOverLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CandidateFailure {
+    RawAdmission(RawAdmissionFailure),
+    Containment(ContainmentFailure),
+    SourceBinding(SourceBindingFailure),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateFailureHistogram {
+    pub reason: CandidateFailure,
+    pub edge_ids: Vec<codestory_contracts::graph::EdgeId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateGate {
+    RawAdmission,
+    Containment,
+    SourceBinding,
+    Line,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepQualificationOutcome {
+    Admitted {
+        edge_ids: Vec<codestory_contracts::graph::EdgeId>,
+    },
+    FirstZeroSurvivor {
+        gate: CandidateGate,
+        histogram: Vec<CandidateFailureHistogram>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepQualificationTrace {
+    pub step_index: usize,
+    pub candidate_edge_ids: Vec<codestory_contracts::graph::EdgeId>,
+    pub outcome: StepQualificationOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizationFailure {
+    ReceiptIntegration,
+    ReceiptBudget,
+    ProjectionBudget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizationTrace {
+    NotRun,
+    Complete { projection_bytes: usize },
+    Failed(FinalizationFailure),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofQualificationTrace {
+    pub selectors: Vec<SelectorQualificationTrace>,
+    pub selector_early_return: bool,
+    pub steps: Vec<StepQualificationTrace>,
+    pub finalization: FinalizationTrace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedBuiltCallPathFacts {
+    pub built: BuiltCallPathFacts,
+    pub trace: ProofQualificationTrace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedIntegratedProjectedCallPathResult {
+    pub result: Result<IntegratedProjectedCallPathResult, ApiError>,
+    pub trace: ProofQualificationTrace,
+}
+
+#[derive(Default)]
+struct StepTraceAccumulator {
+    candidate_edge_ids: Vec<codestory_contracts::graph::EdgeId>,
+    raw_survivors: Vec<codestory_contracts::graph::EdgeId>,
+    containment_survivors: Vec<codestory_contracts::graph::EdgeId>,
+    source_survivors: Vec<codestory_contracts::graph::EdgeId>,
+    admitted: Vec<codestory_contracts::graph::EdgeId>,
+    raw_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
+    containment_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
+    source_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
+    line_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
+}
+
+impl StepTraceAccumulator {
+    fn reject_raw(
+        &mut self,
+        edge_id: codestory_contracts::graph::EdgeId,
+        reason: RawAdmissionFailure,
+    ) {
+        self.raw_failures
+            .entry(CandidateFailure::RawAdmission(reason))
+            .or_default()
+            .push(edge_id);
+    }
+
+    fn reject_containment(
+        &mut self,
+        edge_id: codestory_contracts::graph::EdgeId,
+        reason: ContainmentFailure,
+    ) {
+        self.containment_failures
+            .entry(CandidateFailure::Containment(reason))
+            .or_default()
+            .push(edge_id);
+    }
+
+    fn reject_source(
+        &mut self,
+        edge_id: codestory_contracts::graph::EdgeId,
+        reason: SourceBindingFailure,
+    ) {
+        self.source_failures
+            .entry(CandidateFailure::SourceBinding(reason))
+            .or_default()
+            .push(edge_id);
+    }
+
+    fn reject_line(
+        &mut self,
+        edge_id: codestory_contracts::graph::EdgeId,
+        reason: SourceBindingFailure,
+    ) {
+        self.line_failures
+            .entry(CandidateFailure::SourceBinding(reason))
+            .or_default()
+            .push(edge_id);
+    }
+
+    fn finish(mut self, step_index: usize) -> StepQualificationTrace {
+        self.candidate_edge_ids.sort();
+        self.candidate_edge_ids.dedup();
+        self.admitted.sort();
+        self.admitted.dedup();
+        let outcome = if self.raw_survivors.is_empty() {
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::RawAdmission,
+                histogram: failure_histogram(self.raw_failures),
+            }
+        } else if self.containment_survivors.is_empty() {
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::Containment,
+                histogram: failure_histogram(self.containment_failures),
+            }
+        } else if self.source_survivors.is_empty() {
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::SourceBinding,
+                histogram: failure_histogram(self.source_failures),
+            }
+        } else if self.admitted.is_empty() {
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::Line,
+                histogram: failure_histogram(self.line_failures),
+            }
+        } else {
+            StepQualificationOutcome::Admitted {
+                edge_ids: self.admitted,
+            }
+        };
+        StepQualificationTrace {
+            step_index,
+            candidate_edge_ids: self.candidate_edge_ids,
+            outcome,
+        }
+    }
+}
+
+fn failure_histogram(
+    failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
+) -> Vec<CandidateFailureHistogram> {
+    failures
+        .into_iter()
+        .map(|(reason, mut edge_ids)| {
+            edge_ids.sort();
+            edge_ids.dedup();
+            CandidateFailureHistogram { reason, edge_ids }
+        })
+        .collect()
+}
+
 pub(crate) fn build_indexed_source_call_path_facts(
     controller: &AppController,
     contract: &ValidatedCallPathContract,
 ) -> Result<BuiltCallPathFacts, ApiError> {
+    Ok(build_observed_indexed_source_call_path_facts(controller, contract)?.built)
+}
+
+pub(crate) fn build_observed_indexed_source_call_path_facts(
+    controller: &AppController,
+    contract: &ValidatedCallPathContract,
+) -> Result<ObservedBuiltCallPathFacts, ApiError> {
     let publication = controller.active_core_publication().ok_or_else(|| {
         ApiError::internal("indexed call-path proof requires an active core publication")
     })?;
     let project_root = controller.require_project_root()?;
     let project_id = project_identity_v3(&project_root).project_id;
     let storage = controller.open_storage_read_only()?;
-    build_from_store(
+    build_from_store_observed(
         &storage,
         &project_root,
         &project_id,
@@ -83,8 +310,30 @@ fn build_from_store<R>(
     project_id: &str,
     publication: &IndexPublicationRecord,
     contract: &ValidatedCallPathContract,
-    mut read_source: R,
+    read_source: R,
 ) -> Result<BuiltCallPathFacts, ApiError>
+where
+    R: FnMut(&Path) -> io::Result<Vec<u8>>,
+{
+    Ok(build_from_store_observed(
+        store,
+        project_root,
+        project_id,
+        publication,
+        contract,
+        read_source,
+    )?
+    .built)
+}
+
+fn build_from_store_observed<R>(
+    store: &Store,
+    project_root: &Path,
+    project_id: &str,
+    publication: &IndexPublicationRecord,
+    contract: &ValidatedCallPathContract,
+    mut read_source: R,
+) -> Result<ObservedBuiltCallPathFacts, ApiError>
 where
     R: FnMut(&Path) -> io::Result<Vec<u8>>,
 {
@@ -99,6 +348,7 @@ where
     let mut resolved = Vec::with_capacity(contract.spec().steps().len() + 1);
     let mut gaps = Vec::new();
     let mut unavailable = Vec::new();
+    let mut selectors = Vec::new();
     let selector_context = SelectorContext {
         store,
         project_root,
@@ -112,17 +362,46 @@ where
         .enumerate()
     {
         match resolve_symbol_selector(&selector_context, selector, &mut path_identities)? {
-            SelectorResolution::Resolved(node) => resolved.push(node),
+            SelectorResolution::Resolved(node) => {
+                let node_id = parse_pinned_node_id(&node.pinned).ok_or_else(|| {
+                    ApiError::internal(
+                        "resolved call-path selector lost its numeric publication pin",
+                    )
+                })?;
+                selectors.push(SelectorQualificationTrace {
+                    selector_index,
+                    outcome: SelectorGateOutcome::Resolved { node_id },
+                });
+                resolved.push(node);
+            }
             SelectorResolution::Missing => {
-                gaps.push(FactBuildGap::SelectorMissing { selector_index })
+                gaps.push(FactBuildGap::SelectorMissing { selector_index });
+                selectors.push(SelectorQualificationTrace {
+                    selector_index,
+                    outcome: SelectorGateOutcome::Failed(SelectorFailure::Missing),
+                });
             }
             SelectorResolution::Ambiguous => {
-                gaps.push(FactBuildGap::SelectorAmbiguous { selector_index })
+                gaps.push(FactBuildGap::SelectorAmbiguous { selector_index });
+                selectors.push(SelectorQualificationTrace {
+                    selector_index,
+                    outcome: SelectorGateOutcome::Failed(SelectorFailure::Ambiguous),
+                });
             }
             SelectorResolution::NonCallable => {
-                gaps.push(FactBuildGap::NonCallableSelector { selector_index })
+                gaps.push(FactBuildGap::NonCallableSelector { selector_index });
+                selectors.push(SelectorQualificationTrace {
+                    selector_index,
+                    outcome: SelectorGateOutcome::Failed(SelectorFailure::NonCallable),
+                });
             }
-            SelectorResolution::Unavailable(reason) => unavailable.push(reason),
+            SelectorResolution::Unavailable(reason) => {
+                unavailable.push(reason.clone());
+                selectors.push(SelectorQualificationTrace {
+                    selector_index,
+                    outcome: SelectorGateOutcome::Unavailable(reason),
+                });
+            }
         }
     }
 
@@ -134,17 +413,49 @@ where
             .chain(contract.spec().projection_exclusions()),
     ) {
         match resolve_scope_selector(&selector_context, selector, &mut path_identities)? {
-            SelectorResolution::Resolved(_) => {}
-            SelectorResolution::Missing => gaps.push(FactBuildGap::SelectorMissing {
-                selector_index: scope_index,
-            }),
-            SelectorResolution::Ambiguous => gaps.push(FactBuildGap::SelectorAmbiguous {
-                selector_index: scope_index,
-            }),
-            SelectorResolution::NonCallable => gaps.push(FactBuildGap::NonCallableSelector {
-                selector_index: scope_index,
-            }),
-            SelectorResolution::Unavailable(reason) => unavailable.push(reason),
+            SelectorResolution::Resolved(node) => {
+                let node_id = parse_pinned_node_id(&node.pinned).ok_or_else(|| {
+                    ApiError::internal("resolved call-path scope lost its numeric publication pin")
+                })?;
+                selectors.push(SelectorQualificationTrace {
+                    selector_index: scope_index,
+                    outcome: SelectorGateOutcome::Resolved { node_id },
+                });
+            }
+            SelectorResolution::Missing => {
+                gaps.push(FactBuildGap::SelectorMissing {
+                    selector_index: scope_index,
+                });
+                selectors.push(SelectorQualificationTrace {
+                    selector_index: scope_index,
+                    outcome: SelectorGateOutcome::Failed(SelectorFailure::Missing),
+                });
+            }
+            SelectorResolution::Ambiguous => {
+                gaps.push(FactBuildGap::SelectorAmbiguous {
+                    selector_index: scope_index,
+                });
+                selectors.push(SelectorQualificationTrace {
+                    selector_index: scope_index,
+                    outcome: SelectorGateOutcome::Failed(SelectorFailure::Ambiguous),
+                });
+            }
+            SelectorResolution::NonCallable => {
+                gaps.push(FactBuildGap::NonCallableSelector {
+                    selector_index: scope_index,
+                });
+                selectors.push(SelectorQualificationTrace {
+                    selector_index: scope_index,
+                    outcome: SelectorGateOutcome::Failed(SelectorFailure::NonCallable),
+                });
+            }
+            SelectorResolution::Unavailable(reason) => {
+                unavailable.push(reason.clone());
+                selectors.push(SelectorQualificationTrace {
+                    selector_index: scope_index,
+                    outcome: SelectorGateOutcome::Unavailable(reason),
+                });
+            }
         }
     }
 
@@ -156,12 +467,20 @@ where
     {
         gaps.sort();
         gaps.dedup();
-        return Ok(BuiltCallPathFacts {
-            publication: proof_publication,
-            facts: Vec::new(),
-            receipts: Vec::new(),
-            gaps,
-            unavailable,
+        return Ok(ObservedBuiltCallPathFacts {
+            built: BuiltCallPathFacts {
+                publication: proof_publication,
+                facts: Vec::new(),
+                receipts: Vec::new(),
+                gaps,
+                unavailable,
+            },
+            trace: ProofQualificationTrace {
+                selectors,
+                selector_early_return: true,
+                steps: Vec::new(),
+                finalization: FinalizationTrace::NotRun,
+            },
         });
     }
 
@@ -176,6 +495,7 @@ where
     let mut source_cache = HashMap::<WorkspacePathIdentity, SourceObservation>::new();
     let mut facts = Vec::new();
     let mut receipts = Vec::new();
+    let mut steps = Vec::with_capacity(contract.spec().steps().len());
 
     for (step_index, pair) in resolved.windows(2).enumerate() {
         let source = &pair[0];
@@ -204,48 +524,70 @@ where
         let mut step_unavailable = Vec::new();
         let mut step_gaps = Vec::new();
         let mut containment_failed = false;
-        for edge in store
+        let edges = store
             .get_raw_call_edges_by_effective_source(source_id)
-            .map_err(store_error)?
-        {
-            let RawCallEdgeAdmission::Admitted(admitted) =
-                admit_raw_call_edge(&edge, source_id, target_id)
-            else {
-                continue;
+            .map_err(store_error)?;
+        let mut step_trace = StepTraceAccumulator {
+            candidate_edge_ids: edges.iter().map(|edge| edge.id).collect(),
+            ..StepTraceAccumulator::default()
+        };
+        for edge in edges {
+            let admitted = match diagnose_raw_call_edge(&edge, source_id, target_id) {
+                Ok(admitted) => {
+                    step_trace.raw_survivors.push(edge.id);
+                    admitted
+                }
+                Err(reason) => {
+                    step_trace.reject_raw(edge.id, reason);
+                    continue;
+                }
             };
             if !is_callable(source_node.kind) || !is_callable(target_node.kind) {
+                step_trace.reject_containment(edge.id, ContainmentFailure::Missing);
                 continue;
             }
             let Some(source_file_id) = source_node.file_node_id else {
+                step_trace.reject_containment(edge.id, ContainmentFailure::EdgeSourceFileMismatch);
                 continue;
             };
             if admitted.file_node_id != source_file_id {
+                step_trace.reject_containment(edge.id, ContainmentFailure::EdgeSourceFileMismatch);
                 continue;
             }
-            let Some(containment) = authenticate_containment(
+            let containment = match authenticate_containment(
                 store,
                 &source_node,
                 admitted.file_node_id,
                 admitted.line,
-            )?
-            else {
-                containment_failed = true;
-                continue;
+            )? {
+                Ok(containment) => {
+                    step_trace.containment_survivors.push(edge.id);
+                    containment
+                }
+                Err(reason) => {
+                    containment_failed = true;
+                    step_trace.reject_containment(edge.id, reason);
+                    continue;
+                }
             };
             let Some(file) = files_by_id.get(&admitted.file_node_id.0) else {
                 step_unavailable.push(UnavailableReason::SourceNotBoundToPublication);
+                step_trace.reject_source(edge.id, SourceBindingFailure::FileIncomplete);
                 continue;
             };
             if !file.indexed || !file.complete {
                 step_unavailable.push(UnavailableReason::SourceNotBoundToPublication);
+                step_trace.reject_source(edge.id, SourceBindingFailure::FileIncomplete);
                 continue;
             }
             let Some(file_row) = rows_by_id.get(&file.id) else {
                 step_unavailable.push(UnavailableReason::SourceNotBoundToPublication);
+                step_trace.reject_source(edge.id, SourceBindingFailure::FileIncomplete);
                 continue;
             };
             let Some(indexed_hash) = file.content_hash.as_deref() else {
                 step_unavailable.push(UnavailableReason::SourceNotBoundToPublication);
+                step_trace.reject_source(edge.id, SourceBindingFailure::StoredHashAbsent);
                 continue;
             };
             let bound = match bind_source_once(
@@ -257,22 +599,26 @@ where
                 &mut read_source,
             ) {
                 Ok(bound) => bound,
-                Err(BindSourceError::Unavailable) => {
-                    step_unavailable.push(UnavailableReason::SourceNotBoundToPublication);
-                    continue;
-                }
-                Err(BindSourceError::InvalidUtf8) => {
-                    step_gaps.push(FactBuildGap::InvalidUtf8 { step_index });
+                Err(reason) => {
+                    step_trace.reject_source(edge.id, reason);
+                    if reason == SourceBindingFailure::InvalidUtf8 {
+                        step_gaps.push(FactBuildGap::InvalidUtf8 { step_index });
+                    } else {
+                        step_unavailable.push(UnavailableReason::SourceNotBoundToPublication);
+                    }
                     continue;
                 }
             };
+            step_trace.source_survivors.push(edge.id);
             let Some((byte_start, byte_end, text)) = complete_line(&bound.bytes, admitted.line)
             else {
                 step_gaps.push(FactBuildGap::SourceLineOutOfRange { step_index });
+                step_trace.reject_line(edge.id, SourceBindingFailure::LineMissing);
                 continue;
             };
             if byte_end - byte_start > MAX_LINE_WINDOW_BYTES {
                 step_gaps.push(FactBuildGap::SourceWindowTooLarge { step_index });
+                step_trace.reject_line(edge.id, SourceBindingFailure::LineOverLimit);
                 continue;
             }
             let line_window = IndexedLineWindow {
@@ -312,7 +658,9 @@ where
                 target: target.clone(),
             }));
             admitted_any = true;
+            step_trace.admitted.push(edge.id);
         }
+        steps.push(step_trace.finish(step_index));
         if admitted_any {
             continue;
         }
@@ -333,19 +681,77 @@ where
     gaps.dedup();
     unavailable.sort();
     unavailable.dedup();
-    Ok(BuiltCallPathFacts {
-        publication: proof_publication,
-        facts,
-        receipts,
-        gaps,
-        unavailable,
+    Ok(ObservedBuiltCallPathFacts {
+        built: BuiltCallPathFacts {
+            publication: proof_publication,
+            facts,
+            receipts,
+            gaps,
+            unavailable,
+        },
+        trace: ProofQualificationTrace {
+            selectors,
+            selector_early_return: false,
+            steps,
+            finalization: FinalizationTrace::NotRun,
+        },
     })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IntegratedProjectedCallPathResult {
+pub struct IntegratedProjectedCallPathResult {
     pub integration: CheckedBuiltCallPathIntegration,
     pub projection: InternalProjection,
+}
+
+pub(crate) fn finalize_observed_call_path(
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    rendering: &ValidatedContractRendering,
+    observed: ObservedBuiltCallPathFacts,
+) -> ObservedIntegratedProjectedCallPathResult {
+    let ObservedBuiltCallPathFacts { built, mut trace } = observed;
+    let integration = match check_built_call_path_integration(contract, hashes, rendering, built) {
+        Ok(integration) => integration,
+        Err(error) => {
+            trace.finalization = FinalizationTrace::Failed(FinalizationFailure::ReceiptIntegration);
+            return ObservedIntegratedProjectedCallPathResult {
+                result: Err(ApiError::internal(format!(
+                    "indexed call-path checked integration failed: {error:?}"
+                ))),
+                trace,
+            };
+        }
+    };
+    let projection = match project_internal_call_path_result(&integration) {
+        Ok(projection) => projection,
+        Err(error) => {
+            trace.finalization = FinalizationTrace::Failed(FinalizationFailure::ProjectionBudget);
+            return ObservedIntegratedProjectedCallPathResult {
+                result: Err(ApiError::internal(format!(
+                    "indexed call-path projection construction failed: {error:?}"
+                ))),
+                trace,
+            };
+        }
+    };
+    trace.finalization = match &projection {
+        InternalProjection::Complete {
+            serialized_size, ..
+        } => FinalizationTrace::Complete {
+            projection_bytes: *serialized_size,
+        },
+        InternalProjection::BudgetExceeded { .. } => {
+            FinalizationTrace::Failed(FinalizationFailure::ReceiptBudget)
+        }
+    };
+    ObservedIntegratedProjectedCallPathResult {
+        result: Ok(IntegratedProjectedCallPathResult {
+            integration,
+            projection,
+        }),
+        trace,
+    }
 }
 
 pub(crate) fn run_integrated_projected_public_operation(
@@ -640,7 +1046,7 @@ fn authenticate_containment(
     selected_source: &Node,
     file_node_id: NodeId,
     line: u32,
-) -> Result<Option<CallableContainmentEvidence>, ApiError> {
+) -> Result<Result<CallableContainmentEvidence, ContainmentFailure>, ApiError> {
     let projections = store
         .get_callable_projection_states_for_file(file_node_id.0)
         .map_err(store_error)?;
@@ -668,7 +1074,7 @@ fn authenticate_containment(
         )
     });
     let Some(smallest) = candidates.first() else {
-        return Ok(None);
+        return Ok(Err(ContainmentFailure::Missing));
     };
     let smallest_span = smallest.end_line.saturating_sub(smallest.start_line);
     if candidates
@@ -680,9 +1086,9 @@ fn authenticate_containment(
         != 1
         || smallest.node_id != selected_source.id
     {
-        return Ok(None);
+        return Ok(Err(ContainmentFailure::Ambiguous));
     }
-    Ok(Some(CallableContainmentEvidence {
+    Ok(Ok(CallableContainmentEvidence {
         file_node_id,
         owner_node_id: smallest.node_id,
         start_line: smallest.start_line,
@@ -698,13 +1104,8 @@ struct BoundSource {
 
 enum SourceObservation {
     Bound(BoundSource),
-    Unavailable,
+    ReadFailed,
     InvalidUtf8 { observed_sha256: String },
-}
-
-enum BindSourceError {
-    Unavailable,
-    InvalidUtf8,
 }
 
 fn bind_source_once<'a, R>(
@@ -714,23 +1115,24 @@ fn bind_source_once<'a, R>(
     identities: &mut OperationPathIdentityResolver,
     cache: &'a mut HashMap<WorkspacePathIdentity, SourceObservation>,
     read_source: &mut R,
-) -> Result<&'a BoundSource, BindSourceError>
+) -> Result<&'a BoundSource, SourceBindingFailure>
 where
     R: FnMut(&Path) -> io::Result<Vec<u8>>,
 {
-    let absolute = stored_absolute(project_root, &file.path).ok_or(BindSourceError::Unavailable)?;
+    let absolute = stored_absolute(project_root, &file.path)
+        .ok_or(SourceBindingFailure::WorkingTreeReadFailed)?;
     let ProjectRelativePathResolution::Existing { absolute, relative } =
         resolve_project_relative_path(project_root, &absolute)
-            .map_err(|_| BindSourceError::Unavailable)?
+            .map_err(|_| SourceBindingFailure::WorkingTreeReadFailed)?
     else {
-        return Err(BindSourceError::Unavailable);
+        return Err(SourceBindingFailure::WorkingTreeReadFailed);
     };
     let identity = identities
         .resolve(&absolute)
-        .map_err(|_| BindSourceError::Unavailable)?;
+        .map_err(|_| SourceBindingFailure::WorkingTreeReadFailed)?;
     if !cache.contains_key(&identity) {
         let observation = match read_source(&absolute) {
-            Err(_) => SourceObservation::Unavailable,
+            Err(_) => SourceObservation::ReadFailed,
             Ok(bytes) => {
                 let observed_sha256 = sha256_hex(&bytes);
                 if std::str::from_utf8(&bytes).is_err() {
@@ -741,8 +1143,8 @@ where
                         .map(|part| part.to_str().map(str::to_owned))
                         .collect::<Option<Vec<_>>>()
                     else {
-                        cache.insert(identity.clone(), SourceObservation::Unavailable);
-                        return Err(BindSourceError::Unavailable);
+                        cache.insert(identity.clone(), SourceObservation::ReadFailed);
+                        return Err(SourceBindingFailure::WorkingTreeReadFailed);
                     };
                     SourceObservation::Bound(BoundSource {
                         bytes,
@@ -755,17 +1157,16 @@ where
         cache.insert(identity.clone(), observation);
     }
     let Some(observation) = cache.get(&identity) else {
-        return Err(BindSourceError::Unavailable);
+        return Err(SourceBindingFailure::WorkingTreeReadFailed);
     };
     match observation {
         SourceObservation::Bound(bound) if bound.observed_sha256 == indexed_hash => Ok(bound),
-        SourceObservation::Bound(_) | SourceObservation::Unavailable => {
-            Err(BindSourceError::Unavailable)
-        }
+        SourceObservation::Bound(_) => Err(SourceBindingFailure::WorkingTreeHashMismatch),
+        SourceObservation::ReadFailed => Err(SourceBindingFailure::WorkingTreeReadFailed),
         SourceObservation::InvalidUtf8 { observed_sha256 } if observed_sha256 != indexed_hash => {
-            Err(BindSourceError::Unavailable)
+            Err(SourceBindingFailure::WorkingTreeHashMismatch)
         }
-        SourceObservation::InvalidUtf8 { .. } => Err(BindSourceError::InvalidUtf8),
+        SourceObservation::InvalidUtf8 { .. } => Err(SourceBindingFailure::InvalidUtf8),
     }
 }
 
@@ -1217,6 +1618,413 @@ mod tests {
             })
             .count();
         (call_rows.len(), admitted)
+    }
+
+    #[test]
+    fn observed_runtime_builder_preserves_source_built_product_results_and_prefixes() {
+        let fixture = source_built_fixture(
+            "pub fn step0() { step1(); }\npub fn step1() {}\npub fn step2() {}\n",
+        );
+        let step0 = source_callable(&fixture.store, "step0");
+        let step1 = source_callable(&fixture.store, "step1");
+        let step2 = source_callable(&fixture.store, "step2");
+        let (contract, hashes, rendering) = validated_contract(
+            canonical_id(&step0),
+            &[canonical_id(&step1), canonical_id(&step2)],
+        );
+
+        let product_built = build_from_store(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let observed = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(observed.built, product_built);
+        assert!(!observed.trace.selector_early_return);
+        assert_eq!(observed.trace.steps.len(), 2);
+        assert!(matches!(
+            &observed.trace.steps[0].outcome,
+            StepQualificationOutcome::Admitted { edge_ids } if edge_ids.len() == 1
+        ));
+        assert_eq!(
+            observed.trace.steps[1].outcome,
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::RawAdmission,
+                histogram: Vec::new(),
+            }
+        );
+
+        let product_integration =
+            check_built_call_path_integration(&contract, &hashes, &rendering, product_built)
+                .unwrap();
+        let product_projection = project_internal_call_path_result(&product_integration).unwrap();
+        let finalized = finalize_observed_call_path(&contract, &hashes, &rendering, observed);
+        assert_eq!(
+            finalized.trace.finalization,
+            FinalizationTrace::Complete {
+                projection_bytes: match &product_projection {
+                    InternalProjection::Complete {
+                        serialized_size, ..
+                    } => *serialized_size,
+                    other => panic!("partial fixture must fit: {other:?}"),
+                },
+            }
+        );
+        let observed_result = finalized.result.unwrap();
+        assert_eq!(observed_result.integration, product_integration);
+        assert_eq!(observed_result.projection, product_projection);
+        assert!(matches!(
+            observed_result.integration.disposition(),
+            ProofDisposition::Unknown {
+                connected_receipts,
+                gaps,
+                ..
+            } if connected_receipts.len() == 1
+                && gaps == &[ProofGap::FactBuild(FactBuildGap::DirectCallMissing {
+                    step_index: 1,
+                })]
+        ));
+    }
+
+    #[test]
+    fn observed_runtime_trace_reports_selector_and_first_zero_survivor_gates() {
+        let selector_fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        let selector_contract = contract("missing-id", &["target-id"]);
+        let selector_product = build_from_store(
+            &selector_fixture.store,
+            &selector_fixture.root,
+            &selector_fixture.project_id,
+            &selector_fixture.publication,
+            &selector_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let selector_observed = build_from_store_observed(
+            &selector_fixture.store,
+            &selector_fixture.root,
+            &selector_fixture.project_id,
+            &selector_fixture.publication,
+            &selector_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(selector_observed.built, selector_product);
+        assert!(selector_observed.trace.selector_early_return);
+        assert_eq!(
+            selector_observed.trace.selectors[0].outcome,
+            SelectorGateOutcome::Failed(SelectorFailure::Missing)
+        );
+        assert!(selector_observed.trace.steps.is_empty());
+
+        let mut raw_fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        raw_fixture
+            .store
+            .insert_node(&node(4, NodeKind::FUNCTION, "other", "other-id", 1, 2, 2))
+            .unwrap();
+        raw_fixture
+            .store
+            .upsert_callable_projection_states(&[projection(1, 4, 2, 2)])
+            .unwrap();
+        for edge in [
+            Edge {
+                id: EdgeId(30),
+                source: NodeId(2),
+                target: NodeId(4),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(1)),
+                line: Some(1),
+                resolved_source: Some(NodeId(2)),
+                resolved_target: Some(NodeId(4)),
+                confidence: Some(1.0),
+                certainty: Some(ResolutionCertainty::Certain),
+                callsite_identity: Some("1:1:0:4|alternatives".to_owned()),
+                candidate_targets: vec![NodeId(3)],
+            },
+            Edge {
+                id: EdgeId(20),
+                source: NodeId(2),
+                target: NodeId(4),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(1)),
+                line: Some(1),
+                resolved_source: Some(NodeId(2)),
+                resolved_target: Some(NodeId(4)),
+                confidence: Some(0.7),
+                certainty: Some(ResolutionCertainty::Probable),
+                callsite_identity: Some("1:1:0:4|probable".to_owned()),
+                candidate_targets: Vec::new(),
+            },
+        ] {
+            raw_fixture.store.insert_edge(&edge).unwrap();
+        }
+        let raw_contract = contract("source-id", &["other-id"]);
+        let raw_product = build_from_store(
+            &raw_fixture.store,
+            &raw_fixture.root,
+            &raw_fixture.project_id,
+            &raw_fixture.publication,
+            &raw_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let raw_observed = build_from_store_observed(
+            &raw_fixture.store,
+            &raw_fixture.root,
+            &raw_fixture.project_id,
+            &raw_fixture.publication,
+            &raw_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(raw_observed.built, raw_product);
+        assert_eq!(
+            raw_observed.trace.steps[0],
+            StepQualificationTrace {
+                step_index: 0,
+                candidate_edge_ids: vec![EdgeId(10), EdgeId(20), EdgeId(30)],
+                outcome: StepQualificationOutcome::FirstZeroSurvivor {
+                    gate: CandidateGate::RawAdmission,
+                    histogram: vec![
+                        CandidateFailureHistogram {
+                            reason: CandidateFailure::RawAdmission(
+                                RawAdmissionFailure::CertaintyProbable,
+                            ),
+                            edge_ids: vec![EdgeId(20)],
+                        },
+                        CandidateFailureHistogram {
+                            reason: CandidateFailure::RawAdmission(
+                                RawAdmissionFailure::WrongEffectiveTarget,
+                            ),
+                            edge_ids: vec![EdgeId(10)],
+                        },
+                        CandidateFailureHistogram {
+                            reason: CandidateFailure::RawAdmission(
+                                RawAdmissionFailure::CandidateAlternativesRetained,
+                            ),
+                            edge_ids: vec![EdgeId(30)],
+                        },
+                    ],
+                },
+            }
+        );
+
+        let mut containment_fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        containment_fixture
+            .store
+            .insert_node(&node(4, NodeKind::METHOD, "inner", "inner-id", 1, 1, 1))
+            .unwrap();
+        containment_fixture
+            .store
+            .upsert_callable_projection_states(&[projection(1, 2, 1, 1), projection(1, 4, 1, 1)])
+            .unwrap();
+        let containment_product = build_from_store(
+            &containment_fixture.store,
+            &containment_fixture.root,
+            &containment_fixture.project_id,
+            &containment_fixture.publication,
+            &containment_fixture.contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let containment_observed = build_from_store_observed(
+            &containment_fixture.store,
+            &containment_fixture.root,
+            &containment_fixture.project_id,
+            &containment_fixture.publication,
+            &containment_fixture.contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(containment_observed.built, containment_product);
+        assert_eq!(
+            containment_observed.trace.steps[0].outcome,
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::Containment,
+                histogram: vec![CandidateFailureHistogram {
+                    reason: CandidateFailure::Containment(ContainmentFailure::Ambiguous),
+                    edge_ids: vec![EdgeId(10)],
+                }],
+            }
+        );
+
+        let source_fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        let file = source_fixture.store.files().get_files().unwrap().remove(0);
+        source_fixture
+            .store
+            .update_file_metadata(&file, None)
+            .unwrap();
+        let source_product = build_from_store(
+            &source_fixture.store,
+            &source_fixture.root,
+            &source_fixture.project_id,
+            &source_fixture.publication,
+            &source_fixture.contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let source_observed = build_from_store_observed(
+            &source_fixture.store,
+            &source_fixture.root,
+            &source_fixture.project_id,
+            &source_fixture.publication,
+            &source_fixture.contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(source_observed.built, source_product);
+        assert_eq!(
+            source_observed.trace.steps[0].outcome,
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::SourceBinding,
+                histogram: vec![CandidateFailureHistogram {
+                    reason: CandidateFailure::SourceBinding(SourceBindingFailure::StoredHashAbsent,),
+                    edge_ids: vec![EdgeId(10)],
+                }],
+            }
+        );
+
+        let mut line_fixture = fixture(b"fn source() { target(); }\nfn target() {}");
+        line_fixture
+            .store
+            .insert_node(&node(4, NodeKind::FUNCTION, "other", "other-id", 1, 2, 2))
+            .unwrap();
+        line_fixture
+            .store
+            .insert_edge(&Edge {
+                id: EdgeId(14),
+                source: NodeId(2),
+                target: NodeId(4),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(1)),
+                line: Some(3),
+                resolved_source: Some(NodeId(2)),
+                resolved_target: Some(NodeId(4)),
+                confidence: Some(1.0),
+                certainty: Some(ResolutionCertainty::Certain),
+                callsite_identity: Some("1:3:0:4|out-of-range".to_owned()),
+                candidate_targets: Vec::new(),
+            })
+            .unwrap();
+        line_fixture
+            .store
+            .upsert_callable_projection_states(&[projection(1, 2, 1, 3), projection(1, 4, 2, 2)])
+            .unwrap();
+        let line_contract = contract("source-id", &["other-id"]);
+        let line_product = build_from_store(
+            &line_fixture.store,
+            &line_fixture.root,
+            &line_fixture.project_id,
+            &line_fixture.publication,
+            &line_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let line_observed = build_from_store_observed(
+            &line_fixture.store,
+            &line_fixture.root,
+            &line_fixture.project_id,
+            &line_fixture.publication,
+            &line_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(line_observed.built, line_product);
+        assert_eq!(
+            line_observed.trace.steps[0].outcome,
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::Line,
+                histogram: vec![CandidateFailureHistogram {
+                    reason: CandidateFailure::SourceBinding(SourceBindingFailure::LineMissing),
+                    edge_ids: vec![EdgeId(14)],
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn observed_runtime_trace_reports_receipt_and_projection_finalization_failures() {
+        let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        let (contract, hashes, rendering) = validated_contract("source-id", &["target-id"]);
+        let observed = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+
+        let mut receipt_integration = observed.clone();
+        receipt_integration.built.receipts[0].receipt.edge_id = "hostile-edge".to_owned();
+        assert!(
+            check_built_call_path_integration(
+                &contract,
+                &hashes,
+                &rendering,
+                receipt_integration.built.clone(),
+            )
+            .is_err()
+        );
+        let receipt_integration =
+            finalize_observed_call_path(&contract, &hashes, &rendering, receipt_integration);
+        assert!(receipt_integration.result.is_err());
+        assert_eq!(
+            receipt_integration.trace.finalization,
+            FinalizationTrace::Failed(FinalizationFailure::ReceiptIntegration)
+        );
+
+        let mut receipt_budget = observed.clone();
+        receipt_budget.built.receipts[0].callsite_identity = "x".repeat(70_000);
+        let receipt_budget =
+            finalize_observed_call_path(&contract, &hashes, &rendering, receipt_budget);
+        assert!(matches!(
+            receipt_budget.result,
+            Ok(IntegratedProjectedCallPathResult {
+                projection: InternalProjection::BudgetExceeded { .. },
+                ..
+            })
+        ));
+        assert_eq!(
+            receipt_budget.trace.finalization,
+            FinalizationTrace::Failed(FinalizationFailure::ReceiptBudget)
+        );
+
+        let (missing_contract, missing_hashes, missing_rendering) =
+            validated_contract("missing-id", &["target-id"]);
+        let mut projection_budget = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &missing_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        projection_budget.built.publication.project_id = "x".repeat(70_000);
+        let projection_budget = finalize_observed_call_path(
+            &missing_contract,
+            &missing_hashes,
+            &missing_rendering,
+            projection_budget,
+        );
+        assert!(projection_budget.result.is_err());
+        assert_eq!(
+            projection_budget.trace.finalization,
+            FinalizationTrace::Failed(FinalizationFailure::ProjectionBudget)
+        );
     }
 
     #[test]
