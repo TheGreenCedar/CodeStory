@@ -241,6 +241,29 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     &tail[..end_index]
 }
 
+fn redact_braced_rust_item(source: &mut String, header: &str) {
+    let masked = mask_comments_and_strings(source);
+    let start = masked.find(header).expect("item header exists");
+    let open = start + masked[start..].find('{').expect("item body starts");
+    let mut depth = 0_usize;
+    let mut end = None;
+    for (offset, byte) in masked.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(open + offset + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end.expect("item body closes");
+    source.replace_range(start..end, &" ".repeat(end - start));
+}
+
 #[test]
 fn cli_sidecar_construction_stays_behind_test_safe_gateway() {
     let source_root = repo_root().join("crates/codestory-cli/src");
@@ -580,7 +603,176 @@ const AGENT_PLANNING_MODULES: [&str; 27] = [
 ///   `agent_eval_hooks_stay_on_for_runtime_tests_and_off_for_product_builds`
 ///   pins how it compiles. Listing it as a planning module would hand the
 ///   import-DAG guard a file no product build links.
-const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 2] = ["lib.rs", "eval_probes.rs"];
+/// - `indexed_source_call_path_v1.rs` is the dark v3 proof kernel. Task 2 keeps
+///   it behind the same test-support gate until the atomic public v3 cut.
+const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 3] =
+    ["lib.rs", "eval_probes.rs", "indexed_source_call_path_v1.rs"];
+
+#[test]
+fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
+    let lib = read("crates/codestory-agent/src/lib.rs");
+    assert!(
+        lib.contains(
+            "#[cfg(any(test, feature = \"test-support\"))]\n#[doc(hidden)]\npub mod indexed_source_call_path_v1;"
+        ),
+        "the dark call-path kernel must remain test-support-only until the atomic v3 cut"
+    );
+    assert!(
+        AGENT_MODULE_ALLOWLIST_EXCLUSIONS.contains(&"indexed_source_call_path_v1.rs"),
+        "the dark proof kernel must not be counted as a production packet-planning module"
+    );
+
+    let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
+    assert!(
+        runtime_lib.contains(
+            "#[cfg(any(test, feature = \"test-support\"))]\nmod indexed_source_call_path_v1;"
+        ),
+        "the dark Store/source adapter must remain test-support-only until the atomic v3 cut"
+    );
+    let adapter = production_source(&read(
+        "crates/codestory-runtime/src/indexed_source_call_path_v1.rs",
+    ));
+    for forbidden in [
+        "GraphEdgeDto",
+        "with_effective_endpoints",
+        "Occurrence",
+        "source_text",
+        "codestory_retrieval",
+        "nucleo",
+        "ToolSpec",
+        "pub fn ",
+        "pub use ",
+    ] {
+        assert!(
+            !adapter.contains(forbidden),
+            "dark raw-edge adapter crossed a forbidden boundary via {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn dark_call_path_raw_source_text_stays_out_of_the_proof_boundary() {
+    let module = production_source(&read(
+        "crates/codestory-agent/src/indexed_source_call_path_v1.rs",
+    ));
+    let mut outside_allowed_regions = module.clone();
+    for item in [
+        "pub struct UnvalidatedCallPathContract",
+        "impl UnvalidatedCallPathContract",
+        "fn validate_contract_with_domain",
+        "fn validate_and_normalize_clauses",
+        "fn classify_translation_gaps",
+        "fn compute_hashes",
+    ] {
+        redact_braced_rust_item(&mut outside_allowed_regions, item);
+    }
+    assert!(
+        !contains_word(&outside_allowed_regions, "source_text"),
+        "raw source_text must stay confined to unvalidated input, clause validation, translation diagnostics, and hashing; it must not enter validated specs/contracts, verified facts, selector matching, path search/checking, ranking, search, or source matching:\n{outside_allowed_regions}"
+    );
+}
+
+fn dark_call_path_release_surface_violations() -> Vec<String> {
+    const DARK_TOKENS: [&str; 6] = [
+        "indexed_source_call_path_v1",
+        "ValidatedCallPathContract",
+        "InternalProjection",
+        "InternalCorePublicationIdentity",
+        "IntegratedProjectedCallPathResult",
+        "output_budget_exceeded",
+    ];
+    let mut surfaces = vec![
+        (
+            "cli command/dispatcher/ToolSpec/HTTP/serializer source",
+            read_source_tree("crates/codestory-cli/src"),
+        ),
+        (
+            "public API DTO source",
+            format!(
+                "{}\n{}",
+                read("crates/codestory-contracts/src/api.rs"),
+                read_source_tree("crates/codestory-contracts/src/api")
+            ),
+        ),
+        (
+            "generated MCP catalog",
+            read("plugins/codestory/generated-mcp-catalog.json"),
+        ),
+        ("plugin manifest", read("plugins/codestory/plugin.json")),
+        (
+            "Codex plugin manifest",
+            read("plugins/codestory/.codex-plugin/plugin.json"),
+        ),
+        (
+            "Cursor plugin manifest",
+            read("plugins/codestory/.cursor-plugin/plugin.json"),
+        ),
+        (
+            "Claude plugin manifest",
+            read("plugins/codestory/.claude-plugin/plugin.json"),
+        ),
+        (
+            "grounding skill syntax",
+            read("plugins/codestory/skills/codestory-grounding/SKILL.md"),
+        ),
+        (
+            "generated MCP skill syntax",
+            read("plugins/codestory/skills/codestory-grounding/references/generated-mcp-syntax.md"),
+        ),
+    ];
+    let gate = "#[cfg(any(test, feature = \"test-support\"))]\nmod indexed_source_call_path_v1;";
+    let runtime_facade = read("crates/codestory-runtime/src/lib.rs").replace(gate, "");
+    surfaces.push(("public runtime facade", runtime_facade));
+    surfaces.push((
+        "public runtime services",
+        production_source(&read("crates/codestory-runtime/src/services.rs")),
+    ));
+
+    let mut violations = Vec::new();
+    for (surface, source) in surfaces {
+        for token in DARK_TOKENS {
+            if source.contains(token) {
+                violations.push(format!("{surface}: {token}"));
+            }
+        }
+    }
+
+    let adapter = production_source(&read(
+        "crates/codestory-runtime/src/indexed_source_call_path_v1.rs",
+    ));
+    if contains_word(&adapter, "source_text") {
+        violations.push("dark runtime adapter: raw source_text".to_owned());
+    }
+
+    for consumer in [
+        "crates/codestory-runtime/Cargo.toml",
+        "crates/codestory-cli/Cargo.toml",
+        "crates/codestory-bench/Cargo.toml",
+    ] {
+        let consumer_manifest = manifest(consumer);
+        let features = consumer_manifest
+            .get("dependencies")
+            .and_then(|table| table.get("codestory-agent"))
+            .and_then(|entry| entry.get("features"))
+            .and_then(Value::as_array)
+            .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if features.contains(&"test-support") {
+            violations.push(format!("{consumer}: ships codestory-agent/test-support"));
+        }
+    }
+    violations
+}
+
+#[test]
+fn dark_call_path_release_surfaces_remain_v2_only_and_test_support_unshipped() {
+    let violations = dark_call_path_release_surface_violations();
+    assert!(
+        violations.is_empty(),
+        "dark v3 call-path symbols reached a production route, DTO, serializer, manifest, skill, or shipping feature edge:\n{}",
+        violations.join("\n")
+    );
+}
 
 /// Packet planning lives in `codestory-agent`, and the crate DAG is what keeps
 /// it from growing the powers it was extracted away from.

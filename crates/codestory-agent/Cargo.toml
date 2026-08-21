@@ -6,12 +6,16 @@ edition = "2024"
 [features]
 # Compiles the eval/holdout probe hooks for downstream unit tests. No product
 # build enables it.
-test-support = []
+test-support = ["dep:serde_json_canonicalizer", "dep:sha2"]
 
 [dependencies]
 codestory-contracts = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
+serde_json_canonicalizer = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }

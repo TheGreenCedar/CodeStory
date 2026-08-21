@@ -16,6 +16,9 @@
 pub mod citation;
 #[cfg(any(test, feature = "test-support"))]
 pub mod eval_probes;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod indexed_source_call_path_v1;
 pub mod packet_citations;
 pub mod packet_claim_profile_registry;
 pub mod packet_claim_profiles;

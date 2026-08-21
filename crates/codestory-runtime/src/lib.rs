@@ -71,6 +71,8 @@ mod index_freshness;
 mod index_full;
 mod index_incremental;
 mod index_timings;
+#[cfg(any(test, feature = "test-support"))]
+mod indexed_source_call_path_v1;
 mod publication;
 mod repo_text;
 mod root_rank;
