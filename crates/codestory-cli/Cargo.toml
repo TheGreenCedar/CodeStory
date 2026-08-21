@@ -17,6 +17,9 @@ path = "src/main.rs"
 name = "codestory-cli-runtime"
 path = "src/runtime_main.rs"
 
+[features]
+proof-qualification-support = ["codestory-runtime/proof-qualification-support"]
+
 [dependencies]
 codestory-contracts = { workspace = true }
 codestory-llama-sys = { workspace = true }

@@ -852,8 +852,8 @@ fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
 fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
     let cli_lib = read("crates/codestory-cli/src/lib.rs");
     assert!(
-        cli_lib.contains("#[cfg(test)]\nmod stdio_v3;"),
-        "the revision-native transport facade must stay test-only until the sealed benchmark feature lands"
+        cli_lib.contains("#[cfg(any(test, feature = \"proof-qualification-support\"))]\n#[allow(dead_code)]\nmod stdio_v3;"),
+        "the revision-native transport facade must stay behind the sealed benchmark feature"
     );
 
     let facade = read_source_tree("crates/codestory-cli/src/stdio_v3");
@@ -871,6 +871,7 @@ fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
     let production_cli = read_source_tree_excluding_many(
         "crates/codestory-cli/src",
         &[
+            "lib.rs",
             "stdio_v3/catalog.rs",
             "stdio_v3/mod.rs",
             "stdio_v3/profile.rs",
@@ -891,8 +892,6 @@ fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
     }
 
     for surface in [
-        "crates/codestory-cli/Cargo.toml",
-        "crates/codestory-bench/Cargo.toml",
         "crates/codestory-cli/src/args.rs",
         "crates/codestory-cli/src/http_transport.rs",
         "plugins/codestory/generated-mcp-catalog.json",
@@ -902,7 +901,6 @@ fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
         for forbidden in [
             "measure_revision_native_proof_result_v3",
             "RevisionNativeToolResultMeasurementV3",
-            "proof-qualification-support",
             "prove_call_path",
         ] {
             assert!(
@@ -941,11 +939,229 @@ fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
 }
 
 #[test]
+fn proof_qualification_support_is_bench_only_and_never_a_product_feature() {
+    const SUPPORT_FEATURE: &str = "proof-qualification-support";
+    const BENCHMARK_FEATURE: &str = "benchmark-support";
+
+    for crate_manifest in [
+        "crates/codestory-agent/Cargo.toml",
+        "crates/codestory-runtime/Cargo.toml",
+        "crates/codestory-cli/Cargo.toml",
+    ] {
+        let crate_manifest_value = manifest(crate_manifest);
+        let features = crate_manifest_value
+            .get("features")
+            .and_then(Value::as_table)
+            .expect("qualification crate must declare features");
+        assert!(
+            features.contains_key(SUPPORT_FEATURE),
+            "{crate_manifest} must declare the sealed {SUPPORT_FEATURE} feature"
+        );
+    }
+
+    let agent_lib = read("crates/codestory-agent/src/lib.rs");
+    assert!(
+        agent_lib.contains("feature = \"proof-qualification-support\"")
+            && agent_lib.contains("pub mod proof_qualification_support"),
+        "the agent qualification facade must be feature-gated rather than public by default"
+    );
+    let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
+    assert!(
+        runtime_lib.contains("feature = \"proof-qualification-support\"")
+            && runtime_lib.contains("pub mod proof_qualification_support;"),
+        "the runtime qualification facade must be feature-gated rather than public by default"
+    );
+    let cli_lib = read("crates/codestory-cli/src/lib.rs");
+    assert!(
+        cli_lib.contains("feature = \"proof-qualification-support\"")
+            && cli_lib.contains("pub mod proof_qualification_support"),
+        "the CLI qualification facade must be feature-gated rather than public by default"
+    );
+
+    let bench = manifest("crates/codestory-bench/Cargo.toml");
+    let dependencies = bench
+        .get("dependencies")
+        .and_then(Value::as_table)
+        .expect("qualification dependencies must be normal benchmark dependencies");
+    for required in [
+        "codestory-agent",
+        "codestory-runtime",
+        "codestory-cli",
+        "codestory-store",
+        "codestory-indexer",
+        "codestory-contracts",
+    ] {
+        assert!(
+            dependencies.contains_key(required),
+            "{required} must be a normal codestory-bench dependency"
+        );
+    }
+    for (dependency, expected) in [
+        ("codestory-agent", BTreeSet::from([SUPPORT_FEATURE])),
+        (
+            "codestory-runtime",
+            BTreeSet::from([SUPPORT_FEATURE, BENCHMARK_FEATURE]),
+        ),
+        ("codestory-cli", BTreeSet::from([SUPPORT_FEATURE])),
+    ] {
+        let enabled = dependencies
+            .get(dependency)
+            .and_then(Value::as_table)
+            .and_then(|entry| entry.get("features"))
+            .and_then(Value::as_array)
+            .expect("qualification dependency must declare its enabled features")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            enabled.contains(SUPPORT_FEATURE),
+            "{dependency} must receive the sealed qualification feature from codestory-bench"
+        );
+        assert!(
+            !enabled.contains("test-support"),
+            "{dependency} must not receive test-support from codestory-bench"
+        );
+        assert_eq!(
+            enabled, expected,
+            "{dependency} must enable exactly the sealed benchmark features"
+        );
+    }
+
+    for crate_manifest in [
+        "crates/codestory-agent/Cargo.toml",
+        "crates/codestory-runtime/Cargo.toml",
+        "crates/codestory-cli/Cargo.toml",
+    ] {
+        for table in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            let crate_manifest_value = manifest(crate_manifest);
+            let Some(entries) = crate_manifest_value.get(table).and_then(Value::as_table) else {
+                continue;
+            };
+            for (dependency, entry) in entries {
+                let enabled = entry
+                    .as_table()
+                    .and_then(|entry| entry.get("features"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str);
+                assert!(
+                    !enabled.clone().any(|feature| feature == SUPPORT_FEATURE),
+                    "{crate_manifest} enables {SUPPORT_FEATURE} for {dependency}; only codestory-bench may do that"
+                );
+            }
+        }
+    }
+
+    let runtime_manifest = manifest("crates/codestory-runtime/Cargo.toml");
+    let runtime_features = runtime_manifest
+        .get("features")
+        .and_then(Value::as_table)
+        .expect("runtime features");
+    assert!(
+        runtime_features
+            .get(SUPPORT_FEATURE)
+            .is_some_and(|feature| feature
+                .to_string()
+                .contains("codestory-agent/proof-qualification-support")),
+        "runtime qualification support must carry the sealed agent feature"
+    );
+    let cli_manifest = manifest("crates/codestory-cli/Cargo.toml");
+    let cli_features = cli_manifest
+        .get("features")
+        .and_then(Value::as_table)
+        .expect("CLI features");
+    assert!(
+        cli_features
+            .get(SUPPORT_FEATURE)
+            .is_some_and(|feature| feature
+                .to_string()
+                .contains("codestory-runtime/proof-qualification-support")),
+        "CLI qualification support must carry the sealed runtime feature"
+    );
+
+    for surface in [
+        "crates/codestory-cli/src/args.rs",
+        "crates/codestory-cli/src/http_transport.rs",
+        "plugins/codestory/generated-mcp-catalog.json",
+        "plugins/codestory/skills/codestory-grounding/references/generated-mcp-syntax.md",
+        "plugins/codestory/plugin.json",
+        "plugins/codestory/.codex-plugin/plugin.json",
+        "plugins/codestory/.cursor-plugin/plugin.json",
+        "plugins/codestory/.claude-plugin/plugin.json",
+        "plugins/codestory/.github/plugin/plugin.json",
+    ] {
+        let source = read(surface);
+        for forbidden in [
+            SUPPORT_FEATURE,
+            "proof_qualification_support",
+            "prove_call_path",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{surface} exposes qualification-only behavior via {forbidden}"
+            );
+        }
+    }
+
+    let launcher = read("plugins/codestory/scripts/codestory-mcp.cjs");
+    let launcher_revisions = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+    for revision in launcher_revisions {
+        assert!(
+            launcher.contains(revision),
+            "the inert launcher discovery session lost Rust's {revision} revision"
+        );
+    }
+    assert!(
+        launcher.contains("publicationSchemaVersion: 3"),
+        "the inert launcher discovery session must preserve the Rust discovery schema"
+    );
+}
+
+#[cfg(feature = "proof-qualification-support")]
+#[test]
+fn sealed_discovery_contracts_drive_the_inert_launcher_session() {
+    use std::process::Command;
+
+    let contracts = codestory_cli::proof_qualification_support::discovery_contracts();
+    let launcher = repo_root().join("plugins/codestory/scripts/codestory-mcp.cjs");
+    let script = r#"
+const launcher = require(process.argv[1]);
+const contracts = JSON.parse(process.argv[2]);
+process.stdout.write(JSON.stringify(
+  launcher._test.darkV3LauncherSession('2025-06-18', contracts),
+));
+"#;
+    let output = Command::new("node")
+        .args([
+            "-e",
+            script,
+            &launcher.display().to_string(),
+            &serde_json::to_string(&contracts).expect("serialize Rust discovery contracts"),
+        ])
+        .output()
+        .expect("run the inert launcher session");
+    assert!(
+        output.status.success(),
+        "launcher session failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let session: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("launcher session JSON");
+    assert_eq!(session["negotiated"], "2025-06-18");
+    assert_eq!(
+        session["discoveryContractSha256"], contracts["2025-06-18"],
+        "the launcher must retain Rust's discovery digest without substituting one"
+    );
+    assert_eq!(session["publicationSchemaVersion"], 3);
+}
+
+#[test]
 fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
     let lib = read("crates/codestory-agent/src/lib.rs");
     assert!(
         lib.contains(
-            "#[cfg(any(test, feature = \"test-support\"))]\n#[doc(hidden)]\npub mod indexed_source_call_path_v1;"
+            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\n#[doc(hidden)]\npub mod indexed_source_call_path_v1;"
         ),
         "the dark call-path kernel must remain test-support-only until the atomic v3 cut"
     );
@@ -957,9 +1173,9 @@ fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     assert!(
         runtime_lib.contains(
-            "#[cfg(any(test, feature = \"test-support\"))]\nmod indexed_source_call_path_v1;"
+            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\nmod indexed_source_call_path_v1;"
         ),
-        "the dark Store/source adapter must remain test-support-only until the atomic v3 cut"
+        "the dark Store/source adapter must remain behind test or sealed qualification support"
     );
     let adapter = production_source(&read(
         "crates/codestory-runtime/src/indexed_source_call_path_v1.rs",
@@ -1062,7 +1278,7 @@ fn dark_call_path_release_surface_violations() -> Vec<String> {
             read("plugins/codestory/skills/codestory-grounding/references/generated-mcp-syntax.md"),
         ),
     ];
-    let gate = "#[cfg(any(test, feature = \"test-support\"))]\nmod indexed_source_call_path_v1;";
+    let gate = "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\nmod indexed_source_call_path_v1;";
     let runtime_facade = read("crates/codestory-runtime/src/lib.rs").replace(gate, "");
     surfaces.push(("public runtime facade", runtime_facade));
     surfaces.push((

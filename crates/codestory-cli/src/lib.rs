@@ -30,8 +30,56 @@ mod status_wire_test_support;
 mod stdio_arguments;
 mod stdio_catalog;
 mod stdio_transport;
-#[cfg(test)]
+#[cfg(any(test, feature = "proof-qualification-support"))]
+#[allow(dead_code)]
 mod stdio_v3;
+
+/// Benchmark-only proof qualification observations. This module is not part of
+/// the default CLI module graph and registers no command, transport, or tool.
+#[cfg(feature = "proof-qualification-support")]
+#[doc(hidden)]
+pub mod proof_qualification_support {
+    use std::collections::BTreeMap;
+
+    use serde_json::Value;
+
+    /// Exact revision-native `CallToolResult` bytes observed by qualification.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RevisionNativeToolResultMeasurement {
+        pub revision: String,
+        pub call_tool_result_bytes: Vec<u8>,
+        pub byte_length: usize,
+    }
+
+    /// Build the exact proof result bytes for every supported dark revision.
+    pub fn measure_revision_native_proof_result(
+        root: &Value,
+    ) -> Result<Vec<RevisionNativeToolResultMeasurement>, String> {
+        crate::stdio_v3::measure_revision_native_proof_result_v3(root)
+            .map(|measurements| {
+                measurements
+                    .into_iter()
+                    .map(|measurement| RevisionNativeToolResultMeasurement {
+                        revision: measurement.revision.as_str().to_owned(),
+                        call_tool_result_bytes: measurement.call_tool_result_bytes,
+                        byte_length: measurement.byte_length,
+                    })
+                    .collect()
+            })
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    /// Rust-generated discovery identities for the inert launcher handshake.
+    pub fn discovery_contracts() -> BTreeMap<String, String> {
+        crate::stdio_v3::McpRevisionV3::all()
+            .iter()
+            .map(|revision| {
+                let identity = crate::stdio_v3::discovery_contract_v3(*revision);
+                (revision.as_str().to_owned(), identity.sha256)
+            })
+            .collect()
+    }
+}
 
 use anyhow::Result;
 

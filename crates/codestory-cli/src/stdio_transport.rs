@@ -107,7 +107,7 @@ const STDIO_PANIC_EVICTION_BUDGET: Duration = Duration::from_millis(250);
 const STDIO_DETACHED_EVICTION_BUDGET: Duration = Duration::from_secs(30);
 const DIRTY_MARKER_SCHEMA_VERSION: u32 = 1;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "proof-qualification-support"))]
 pub(crate) fn v3_serialize_call_tool_result(
     result: &serde_json::Value,
 ) -> Result<Vec<u8>, serde_json::Error> {

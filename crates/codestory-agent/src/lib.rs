@@ -16,9 +16,21 @@
 pub mod citation;
 #[cfg(any(test, feature = "test-support"))]
 pub mod eval_probes;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(
+    test,
+    feature = "test-support",
+    feature = "proof-qualification-support"
+))]
 #[doc(hidden)]
 pub mod indexed_source_call_path_v1;
+#[cfg(feature = "proof-qualification-support")]
+#[doc(hidden)]
+pub mod proof_qualification_support {
+    /// Identifies the sealed request domain observed by benchmark qualification.
+    pub fn proof_domain() -> &'static str {
+        super::indexed_source_call_path_v1::PROOF_DOMAIN
+    }
+}
 pub mod packet_citations;
 pub mod packet_claim_profile_registry;
 pub mod packet_claim_profiles;

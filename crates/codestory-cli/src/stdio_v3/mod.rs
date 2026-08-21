@@ -4,6 +4,7 @@ mod discovery;
 mod profile;
 mod transport;
 
+pub(crate) use discovery::discovery_contract_v3;
 pub(crate) use profile::McpRevisionV3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

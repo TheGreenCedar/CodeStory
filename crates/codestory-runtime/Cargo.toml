@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 benchmark-support = []
+proof-qualification-support = ["codestory-agent/proof-qualification-support"]
 # The runtime test hooks now partly live in codestory-agent (fresh_index_observation
 # moved with packet_freshness), so turning this on has to turn the agent crate's
 # hooks on too. Only dev/test edges enable it; no product build does.

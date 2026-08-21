@@ -7,6 +7,9 @@ edition = "2024"
 # Compiles the eval/holdout probe hooks for downstream unit tests. No product
 # build enables it.
 test-support = ["dep:serde_json_canonicalizer", "dep:sha2"]
+# Compiles the sealed proof-qualification facade for codestory-bench. No
+# product dependency enables it.
+proof-qualification-support = ["dep:serde_json_canonicalizer", "dep:sha2"]
 
 [dependencies]
 codestory-contracts = { workspace = true }

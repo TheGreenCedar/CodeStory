@@ -2528,7 +2528,7 @@ pub(crate) fn tools_list_json() -> Value {
 ///
 /// The projector owns revision-native field selection; this accessor keeps it
 /// from copying the v2 schemas or reaching the live `tools/list` response.
-#[cfg(test)]
+#[cfg(any(test, feature = "proof-qualification-support"))]
 pub(crate) fn v3_tool_source_json() -> Vec<Value> {
     TOOLS.iter().map(|tool| tool.to_json()).collect()
 }

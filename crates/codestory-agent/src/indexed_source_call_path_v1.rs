@@ -1354,7 +1354,11 @@ pub struct VerifiedDirectCallFact {
     pub target: ResolvedNodeIdentity,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(
+    test,
+    feature = "test-support",
+    feature = "proof-qualification-support"
+))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertifiedAbsenceFact {
     pub source: ResolvedNodeIdentity,
@@ -1371,7 +1375,11 @@ pub struct UnavailableProofFact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifiedProofFact {
     DirectCall(VerifiedDirectCallFact),
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(
+        test,
+        feature = "test-support",
+        feature = "proof-qualification-support"
+    ))]
     CertifiedAbsence(CertifiedAbsenceFact),
     Unavailable(UnavailableProofFact),
 }
@@ -1404,7 +1412,11 @@ pub enum Refutation {
         prohibition_index: usize,
         connected_receipts: Vec<ReceiptRef>,
     },
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(
+        test,
+        feature = "test-support",
+        feature = "proof-qualification-support"
+    ))]
     CertifiedAbsence {
         step_index: usize,
         extractor_capability_receipt_id: String,
@@ -1489,7 +1501,11 @@ pub fn check_call_path(
     }
     let mut reachable = reachable_prefixes(contract, &direct_facts);
     for source in facts.iter().filter_map(|fact| match fact {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(any(
+            test,
+            feature = "test-support",
+            feature = "proof-qualification-support"
+        ))]
         VerifiedProofFact::CertifiedAbsence(fact) => Some(&fact.source),
         _ => None,
     }) {
@@ -1564,7 +1580,11 @@ pub fn check_call_path(
             continue;
         }
         let target = &contract.spec.steps[state.step_index].target;
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(any(
+            test,
+            feature = "test-support",
+            feature = "proof-qualification-support"
+        ))]
         if let Some(absence) = facts
             .iter()
             .filter_map(|fact| match fact {
@@ -1945,7 +1965,11 @@ fn validate_built_publication_and_receipts(
     for fact in &built.facts {
         let nodes = match fact {
             VerifiedProofFact::DirectCall(fact) => vec![&fact.source, &fact.target],
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(any(
+                test,
+                feature = "test-support",
+                feature = "proof-qualification-support"
+            ))]
             VerifiedProofFact::CertifiedAbsence(fact) => vec![&fact.source],
             VerifiedProofFact::Unavailable(_) => Vec::new(),
         };
@@ -2276,7 +2300,11 @@ fn refutation_json(refutation: &Refutation) -> Value {
                 .map(receipt_ref_json)
                 .collect::<Vec<_>>(),
         }),
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(any(
+            test,
+            feature = "test-support",
+            feature = "proof-qualification-support"
+        ))]
         Refutation::CertifiedAbsence {
             step_index,
             extractor_capability_receipt_id,
@@ -2394,7 +2422,11 @@ fn step_results_json(
                 } if step_index == *refutation_step => {
                     ("positive_contradiction", connected_receipts.get(step_index))
                 }
-                #[cfg(any(test, feature = "test-support"))]
+                #[cfg(any(
+                    test,
+                    feature = "test-support",
+                    feature = "proof-qualification-support"
+                ))]
                 ProofDisposition::ContractRefuted {
                     refutation:
                         Refutation::CertifiedAbsence {
@@ -2404,7 +2436,11 @@ fn step_results_json(
                         },
                     ..
                 } if step_index < *absence_step => ("proven", connected_receipts.get(step_index)),
-                #[cfg(any(test, feature = "test-support"))]
+                #[cfg(any(
+                    test,
+                    feature = "test-support",
+                    feature = "proof-qualification-support"
+                ))]
                 ProofDisposition::ContractRefuted {
                     refutation:
                         Refutation::CertifiedAbsence {
