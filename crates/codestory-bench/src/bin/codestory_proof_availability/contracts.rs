@@ -3183,7 +3183,7 @@ fn rfc3339_utc(value: &str) -> bool {
     let Some((date_part, time_part)) = without_z.split_once('T') else {
         return false;
     };
-    if !date(date_part) {
+    if !rfc3339_calendar_date(date_part) {
         return false;
     }
     let (whole_time, fraction) = time_part
@@ -3191,22 +3191,65 @@ fn rfc3339_utc(value: &str) -> bool {
         .map_or((time_part, None), |(whole, fraction)| {
             (whole, Some(fraction))
         });
-    let mut fields = whole_time.split(':');
-    let parsed = (
-        fields.next().and_then(|value| value.parse::<u8>().ok()),
-        fields.next().and_then(|value| value.parse::<u8>().ok()),
-        fields.next().and_then(|value| value.parse::<u8>().ok()),
-    );
-    let (Some(hour), Some(minute), Some(second)) = parsed else {
+    if whole_time.len() != 8
+        || whole_time.as_bytes().get(2) != Some(&b':')
+        || whole_time.as_bytes().get(5) != Some(&b':')
+    {
+        return false;
+    }
+    let Some(hour) = decimal_component(whole_time, 0, 2) else {
         return false;
     };
-    fields.next().is_none()
-        && hour <= 23
+    let Some(minute) = decimal_component(whole_time, 3, 5) else {
+        return false;
+    };
+    let Some(second) = decimal_component(whole_time, 6, 8) else {
+        return false;
+    };
+    hour <= 23
         && minute <= 59
-        && second <= 60
+        && second <= 59
         && fraction.is_none_or(|fraction| {
             !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
         })
+}
+
+fn rfc3339_calendar_date(value: &str) -> bool {
+    if value.len() != 10
+        || value.as_bytes().get(4) != Some(&b'-')
+        || value.as_bytes().get(7) != Some(&b'-')
+    {
+        return false;
+    }
+    let Some(year) = decimal_component(value, 0, 4) else {
+        return false;
+    };
+    let Some(month) = decimal_component(value, 5, 7) else {
+        return false;
+    };
+    let Some(day) = decimal_component(value, 8, 10) else {
+        return false;
+    };
+    let maximum_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year(year) => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=maximum_day).contains(&day)
+}
+
+fn decimal_component(value: &str, start: usize, end: usize) -> Option<u32> {
+    let component = value.get(start..end)?;
+    if !component.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    component.parse().ok()
+}
+
+fn leap_year(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
 }
 
 fn sanitized_environment(environment: &EnvironmentReportV1) -> bool {

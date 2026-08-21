@@ -147,6 +147,32 @@ fn task11a_environment_identity_is_closed_sanitized_and_bound_to_provenance() {
             "leak {forbidden}"
         );
     }
+    let mut leap_day = value.clone();
+    leap_day["environment"]["recorded_at"] = json!("2024-02-29T23:59:59.123Z");
+    rebind_results_digest(&mut leap_day);
+    QualificationSummaryV1::from_json(leap_day).expect("valid leap-day RFC3339 UTC timestamp");
+
+    for invalid in [
+        "2023-02-29T12:34:56Z",
+        "2024-02-30T12:34:56Z",
+        "2026-04-31T12:34:56Z",
+        "2026-00-21T12:34:56Z",
+        "2026-13-21T12:34:56Z",
+        "2026-08-00T12:34:56Z",
+        "2026-08-21T24:00:00Z",
+        "2026-08-21T23:60:00Z",
+        "2026-08-21T23:59:60Z",
+        "2026-08-21T1:02:03Z",
+        "2026-08-21T12:34:56+00:00",
+    ] {
+        let mut malformed = value.clone();
+        malformed["environment"]["recorded_at"] = json!(invalid);
+        rebind_results_digest(&mut malformed);
+        assert!(
+            QualificationSummaryV1::from_json(malformed).is_err(),
+            "invalid RFC3339 UTC timestamp {invalid}"
+        );
+    }
 }
 
 #[test]
