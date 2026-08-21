@@ -18,30 +18,6 @@ pub use crate::indexed_source_call_path_v1::{
     StepQualificationOutcome, StepQualificationTrace,
 };
 
-/// Builds the same product facts plus benchmark-only observations. The caller
-/// must already be inside the existing core-pinned public operation.
-pub fn build_observed_indexed_source_call_path_facts(
-    controller: &crate::AppController,
-    contract: &codestory_agent::proof_qualification_support::ValidatedCallPathContract,
-) -> Result<ObservedBuiltCallPathFacts, codestory_contracts::api::ApiError> {
-    crate::indexed_source_call_path_v1::build_observed_indexed_source_call_path_facts(
-        controller, contract,
-    )
-}
-
-/// Runs the existing checked integration and projection over observed facts,
-/// retaining a typed finalization failure for qualification reports.
-pub fn finalize_observed_call_path(
-    contract: &codestory_agent::proof_qualification_support::ValidatedCallPathContract,
-    hashes: &codestory_agent::proof_qualification_support::ProofHashes,
-    rendering: &codestory_agent::proof_qualification_support::ValidatedContractRendering,
-    observed: ObservedBuiltCallPathFacts,
-) -> ObservedIntegratedProjectedCallPathResult {
-    crate::indexed_source_call_path_v1::finalize_observed_call_path(
-        contract, hashes, rendering, observed,
-    )
-}
-
 /// Executes one observed proof through the runtime's existing core-only public
 /// operation. The benchmark cannot obtain the controller or add a second
 /// publication retry around this call.
@@ -56,10 +32,15 @@ pub fn run_observed_call_path_public_operation(
         .public_operation_service()
         .run_with_cancel(proof_domain(), cancelled, || {
             let observed =
-                build_observed_indexed_source_call_path_facts(&runtime.controller, contract)?;
-            Ok(finalize_observed_call_path(
-                contract, hashes, rendering, observed,
-            ))
+                crate::indexed_source_call_path_v1::build_observed_indexed_source_call_path_facts(
+                    &runtime.controller,
+                    contract,
+                )?;
+            Ok(
+                crate::indexed_source_call_path_v1::finalize_observed_call_path(
+                    contract, hashes, rendering, observed,
+                ),
+            )
         })
 }
 
@@ -170,6 +151,19 @@ mod tests {
         root["disposition"]["kind"]
             .as_str()
             .expect("disposition kind")
+    }
+
+    #[test]
+    fn qualification_facade_exposes_only_runtime_owned_execution() {
+        let source = include_str!("proof_qualification_support.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        assert!(!production.contains("pub fn build_observed_indexed_source_call_path_facts"));
+        assert!(!production.contains("pub fn finalize_observed_call_path"));
+        assert!(!production.contains("AppController"));
+        assert!(production.contains("pub fn run_observed_call_path_public_operation"));
     }
 
     #[test]
