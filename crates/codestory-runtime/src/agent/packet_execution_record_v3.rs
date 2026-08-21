@@ -782,6 +782,48 @@ fn digest_v3(bytes: &[u8]) -> Result<Sha256DigestV3Dto, RecordValidationErrorV3>
 }
 
 #[cfg(test)]
+pub(crate) fn build_packet_execution_record_fixture_v3(
+    input: &FinalizedPacketExecutionInputV3,
+    with_retrieval_publication: bool,
+) -> Result<PacketExecutionRecordV3, RecordValidationErrorV3> {
+    struct FixedPacketIdSourceV3;
+
+    impl PacketIdSourceV3 for FixedPacketIdSourceV3 {
+        fn next_packet_id(&mut self) -> String {
+            "00000000-0000-4000-8000-000000000001".to_owned()
+        }
+    }
+
+    let project = ProjectIdentityV3 {
+        project_identity_schema_version: 3,
+        project_id: "project-1".to_owned(),
+        workspace_id: "workspace-1".to_owned(),
+        artifact_scope_id: "artifact-1".to_owned(),
+        canonical_repository_id: Some("repository-1".to_owned()),
+        legacy_canonical_repository_id: None,
+        legacy_raw_root_project_id: None,
+        normalized_root_project_id_alias: None,
+        portable_reuse_eligible: true,
+        portable_reuse_reason: "test fixture".to_owned(),
+    };
+    let capture = CapturedPacketPublicationV3 {
+        core_project_id: project.project_id.clone(),
+        core_generation_id: "core-generation-1".to_owned(),
+        core_run_id: "core-run-1".to_owned(),
+        project,
+        retrieval: with_retrieval_publication.then(|| EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: "core-generation-1".to_owned(),
+            core_run_id: "core-run-1".to_owned(),
+            retrieval_generation: "retrieval-generation-1".to_owned(),
+            retrieval_input_hash:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            semantic_generation: "semantic-generation-1".to_owned(),
+        }),
+    };
+    build_record_from_captured_v3(&capture, input, &mut FixedPacketIdSourceV3)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;

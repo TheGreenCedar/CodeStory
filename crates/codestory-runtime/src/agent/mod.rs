@@ -44,6 +44,9 @@ pub(crate) mod packet_follow_up;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod packet_execution_record_v3;
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod packet_projection_v3;
+
 pub(crate) mod packet_probe;
 pub(crate) mod packet_search;
 pub(crate) mod packet_trace;

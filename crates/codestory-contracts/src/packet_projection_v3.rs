@@ -396,6 +396,7 @@ pub enum DiagnosticCategoryV3Dto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticRowV3Dto {
+    pub diagnostic_id: IdentityTextV3,
     pub category: DiagnosticCategoryV3Dto,
     pub code: DiagnosticCodeTextV3,
     pub evidence_ids: BoundedVecV3<EvidenceIdentityV3Dto, REFERENCE_ROWS_MAX_V3>,
@@ -643,6 +644,7 @@ mod tests {
             packet_id: text("packet-1"),
             publication: publication(),
             rows: list(vec![DiagnosticRowV3Dto {
+                diagnostic_id: text("diagnostic-row-1"),
                 category: DiagnosticCategoryV3Dto::Coverage,
                 code: text("coverage_gap"),
                 evidence_ids: list(vec![evidence_identity("evidence-1")]),

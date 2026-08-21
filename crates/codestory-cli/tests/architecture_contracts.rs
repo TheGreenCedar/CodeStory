@@ -179,7 +179,7 @@ fn read_source_tree(dir: &str) -> String {
         .join("\n")
 }
 
-fn read_source_tree_excluding(dir: &str, excluded_suffix: &str) -> String {
+fn read_source_tree_excluding_many(dir: &str, excluded_suffixes: &[&str]) -> String {
     let root = repo_root().join(dir);
     let mut files = Vec::new();
     collect_rs_files(&root, &mut files);
@@ -187,11 +187,13 @@ fn read_source_tree_excluding(dir: &str, excluded_suffix: &str) -> String {
     files
         .into_iter()
         .filter(|path| {
-            !path
+            let relative = path
                 .strip_prefix(&root)
                 .expect("source file stays below source root")
-                .to_string_lossy()
-                .ends_with(excluded_suffix)
+                .to_string_lossy();
+            !excluded_suffixes
+                .iter()
+                .any(|suffix| relative.ends_with(suffix))
         })
         .map(|path| fs::read_to_string(path).expect("read source"))
         .collect::<Vec<_>>()
@@ -651,9 +653,12 @@ fn dark_packet_execution_plan_v3_stays_inert_and_unshipped() {
     let surfaces = [
         (
             "runtime source",
-            read_source_tree_excluding(
+            read_source_tree_excluding_many(
                 "crates/codestory-runtime/src",
-                "agent/packet_execution_record_v3.rs",
+                &[
+                    "agent/packet_execution_record_v3.rs",
+                    "agent/packet_projection_v3.rs",
+                ],
             ),
         ),
         ("CLI source", read_source_tree("crates/codestory-cli/src")),
@@ -697,6 +702,12 @@ fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
         ),
         "the runtime-owned v3 record must remain test-support-only until the atomic v3 cut"
     );
+    assert!(
+        runtime_agent_modules.contains(
+            "#[cfg(any(test, feature = \"test-support\"))]\npub(crate) mod packet_projection_v3;"
+        ),
+        "the runtime-owned v3 projector must remain test-support-only until the atomic v3 cut"
+    );
 
     let record_path = "crates/codestory-runtime/src/agent/packet_execution_record_v3.rs";
     let record = production_source(&read(record_path));
@@ -731,14 +742,51 @@ fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
         );
     }
 
+    let projector_path = "crates/codestory-runtime/src/agent/packet_projection_v3.rs";
+    let projector = production_source(&read(projector_path));
+    for forbidden in [
+        "AgentPacketDto",
+        "AgentAnswerDto",
+        "SearchResultsDto",
+        "ToolSpec",
+        "run_with_cancel",
+        ".active_publication()",
+        "with_pinned_retrieval",
+        "retrieval_primary",
+        "include_evidence",
+        "operation_id",
+        "published_at_epoch_ms",
+        "capability_uri",
+        "session_secret",
+        "Hmac",
+        "SystemTime",
+        "Instant",
+        ".question()",
+        "source_text",
+        "ClaimDisposition",
+        "CompleteQueryNegative",
+        "Supported",
+        "Proven",
+        "eligible_for_sufficiency",
+    ] {
+        assert!(
+            !projector.contains(forbidden),
+            "the dark projector source crosses a forbidden execution/authority boundary via {forbidden}"
+        );
+    }
+
     let surfaces = [
         (
-            "runtime source outside the gated record and its module declaration",
-            read_source_tree_excluding(
+            "runtime source outside the gated record/projector and their module declarations",
+            read_source_tree_excluding_many(
                 "crates/codestory-runtime/src",
-                "agent/packet_execution_record_v3.rs",
+                &[
+                    "agent/packet_execution_record_v3.rs",
+                    "agent/packet_projection_v3.rs",
+                ],
             )
-            .replace("pub(crate) mod packet_execution_record_v3;", ""),
+            .replace("pub(crate) mod packet_execution_record_v3;", "")
+            .replace("pub(crate) mod packet_projection_v3;", ""),
         ),
         ("CLI source", read_source_tree("crates/codestory-cli/src")),
         (
@@ -757,12 +805,30 @@ fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
             "generated MCP catalog",
             read("plugins/codestory/generated-mcp-catalog.json"),
         ),
+        (
+            "generated grounding syntax",
+            read("plugins/codestory/skills/codestory-grounding/references/generated-mcp-syntax.md"),
+        ),
+        (
+            "plugin launcher",
+            format!(
+                "{}\n{}",
+                read("plugins/codestory/scripts/codestory-mcp.cjs"),
+                read("plugins/codestory/hooks/codestory-runtime.cjs")
+            ),
+        ),
     ];
     for (surface, source) in surfaces {
         for forbidden in [
             "PacketExecutionRecordV3",
             "PacketRequestFingerprintV3",
             "build_packet_execution_record_v3",
+            "packet_projection_v3",
+            "build_packet_projection_v3",
+            "build_context_projection_v3",
+            "build_search_projection_v3",
+            "build_diagnostic_artifact_v3",
+            "DiagnosticArtifactBuildV3",
         ] {
             assert!(
                 !source.contains(forbidden),
@@ -770,6 +836,16 @@ fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
             );
         }
     }
+
+    let current_dto = read("crates/codestory-contracts/src/api/dto.rs");
+    assert!(
+        current_dto.contains("pub include_evidence: bool"),
+        "current packet include_evidence must remain present throughout PR 3"
+    );
+    assert!(
+        current_dto.contains("pub const PACKET_OBLIGATION_PLAN_VERSION: u32 = 1;"),
+        "the current packet obligation plan must remain version 1 throughout PR 3"
+    );
 }
 
 #[test]
