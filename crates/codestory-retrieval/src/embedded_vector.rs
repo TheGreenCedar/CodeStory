@@ -747,12 +747,10 @@ impl EmbeddedVectorIndex {
                 bail!("duplicate reusable embedded vector anchor {node_id}");
             }
             let vector = bytes
-                .chunks_exact(4)
-                .map(|chunk| {
-                    f32::from_bits(u32::from_le_bytes(
-                        chunk.try_into().expect("four-byte vector chunk"),
-                    ))
-                })
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_bits(u32::from_le_bytes(*chunk)))
                 .collect::<Vec<_>>();
             vectors.insert((node_id, document_hash), vector);
         }
@@ -1346,11 +1344,11 @@ fn validate_vector_bytes(node_id: &str, bytes: &[u8], embedding_dim: usize) -> R
     }
     validate_vector_values(
         node_id,
-        bytes.chunks_exact(4).map(|chunk| {
-            f32::from_bits(u32::from_le_bytes(
-                chunk.try_into().expect("four-byte vector chunk"),
-            ))
-        }),
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_bits(u32::from_le_bytes(*chunk))),
     )
 }
 
@@ -1455,12 +1453,10 @@ pub(crate) fn read_published_vectors_for_benchmark(
         vectors.push((
             node_id,
             bytes
-                .chunks_exact(4)
-                .map(|chunk| {
-                    f32::from_bits(u32::from_le_bytes(
-                        chunk.try_into().expect("four-byte vector chunk"),
-                    ))
-                })
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_bits(u32::from_le_bytes(*chunk)))
                 .collect(),
         ));
     }
@@ -1702,8 +1698,8 @@ fn cosine_similarity_bytes(query: &[f32], query_norm: f64, bytes: &[u8]) -> Resu
     }
     let mut dot = 0.0_f64;
     let mut vector_norm = 0.0_f64;
-    for (query_value, chunk) in query.iter().zip(bytes.chunks_exact(4)) {
-        let value = f32::from_bits(u32::from_le_bytes(chunk.try_into().expect("four bytes")));
+    for (query_value, chunk) in query.iter().zip(bytes.as_chunks::<4>().0) {
+        let value = f32::from_bits(u32::from_le_bytes(*chunk));
         if !value.is_finite() {
             bail!("embedded vector contains a non-finite value during search");
         }
