@@ -82,6 +82,12 @@ const managedCliProbeForceKillGraceMs = 1000;
 // catalog must not also lose the skew detector.
 const managedCliMcpProtocolVersion = '2024-11-05';
 const supportedMcpProtocolVersions = Object.freeze(['2024-11-05']);
+const darkV3SupportedMcpProtocolVersions = Object.freeze([
+  '2024-11-05',
+  '2025-03-26',
+  '2025-06-18',
+  '2025-11-25',
+]);
 const publicationStampSchemaVersion = 2;
 const minimumCompatiblePublicationStampSchemaVersion = 2;
 const runtimeStderrObservedBytesCap = 16 * 1024 * 1024;
@@ -2325,6 +2331,40 @@ function runtimeWireContractSkew(response, negotiatedProtocolVersion) {
   if (!isPlainObject(result)) return 'initialize_result_invalid';
   if (result.protocolVersion !== negotiatedProtocolVersion) return 'protocol_version_skew';
   return publicationStampSkew(result._meta?.codestory_publication);
+}
+
+function darkV3LauncherSession(requested, discoveryContracts) {
+  const asked = typeof requested === 'string' ? requested.trim() : '';
+  const negotiated = darkV3SupportedMcpProtocolVersions.includes(asked)
+    ? asked
+    : darkV3SupportedMcpProtocolVersions.at(-1);
+  const discoveryContractSha256 = discoveryContracts?.[negotiated];
+  if (!/^[0-9a-f]{64}$/u.test(String(discoveryContractSha256 || ''))) {
+    throw new Error('dark_v3_discovery_contract_missing');
+  }
+  return Object.freeze({
+    requested: asked || null,
+    negotiated,
+    discoveryContractSha256,
+    publicationSchemaVersion: 3,
+  });
+}
+
+function darkV3RuntimeWireContractSkew(response, session) {
+  if (!isPlainObject(response)) return 'initialize_response_invalid';
+  if (response.error !== undefined) return 'initialize_rejected';
+  const result = response.result;
+  if (!isPlainObject(result)) return 'initialize_result_invalid';
+  if (result.protocolVersion !== session?.negotiated) return 'protocol_version_skew';
+  if (result._meta?.codestory_protocol?.discovery_contract_sha256
+      !== session.discoveryContractSha256) {
+    return 'discovery_contract_skew';
+  }
+  if (result._meta?.codestory_publication?.schema_version
+      !== session.publicationSchemaVersion) {
+    return 'publication_schema_skew';
+  }
+  return null;
 }
 
 function probeManagedCliStdio(cliPath, timeoutMs = 5000, options = {}) {
@@ -4775,6 +4815,8 @@ if (require.main === module) {
       failOpenPublicationStamp,
       publicationStampSkew,
       runtimeWireContractSkew,
+      darkV3LauncherSession,
+      darkV3RuntimeWireContractSkew,
       supportedMcpProtocolVersions,
       managedCliMcpProtocolVersion,
       publicationStampSchemaVersion,
