@@ -9,6 +9,10 @@ pub mod cli;
 #[allow(dead_code)] // Later qualification tasks consume the full closed artifact surface.
 pub mod contracts;
 mod corpus;
+#[allow(dead_code)] // Task 11 consumes the completed qualification inventory.
+mod inventory;
+#[allow(dead_code)] // Task 11 consumes the completed qualification denominators.
+mod trails;
 mod util;
 
 pub fn execute(cli: cli::Cli) -> Result<()> {
