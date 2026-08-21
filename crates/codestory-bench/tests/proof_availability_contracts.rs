@@ -253,6 +253,45 @@ fn task10a_wire_mirrors_keep_all_dark_selector_classification_and_field_variants
     }
 }
 
+#[test]
+fn task10a_oracle_validation_uses_every_product_clause_guard_family() {
+    for guarded in [
+        "'Alpha'",
+        "invokes",
+        "immediately",
+        "fifth 12th",
+        "only",
+        "prohibits avoid",
+        "lib.ts",
+        "package.Symbol",
+    ] {
+        let mut value = cohort_path_file("codestory-rust");
+        let fields = value["paths"][0]["clauses"][0]["classification"]["fields"].clone();
+        let source = format!("x {guarded}");
+        value["paths"][0]["source_text"] = json!(source);
+        value["paths"][0]["clauses"] = json!([
+            {
+                "clause_id":"resolved-fields",
+                "start_byte":0,
+                "end_byte_exclusive":1,
+                "quote":"x",
+                "classification":{"kind":"resolved_material","fields":fields},
+            },
+            {
+                "clause_id":"reviewer-example",
+                "start_byte":1,
+                "end_byte_exclusive":source.len(),
+                "quote":&source[1..],
+                "classification":{"kind":"non_material","reason":"commentary"},
+            },
+        ]);
+        assert!(
+            CohortPathFileV1::from_json(value).is_err(),
+            "product guard family accepted as non-material: {guarded:?}"
+        );
+    }
+}
+
 fn range(start: u64, end: u64) -> Value {
     json!({"path":"src/lib.rs","start_byte":start,"end_byte":end,"file_byte_length":4096,"sha256":SHA})
 }

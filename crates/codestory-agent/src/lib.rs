@@ -30,13 +30,17 @@ pub mod proof_qualification_support {
 
     pub use super::indexed_source_call_path_v1::{
         AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
-        CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
-        IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity,
-        InternalProjection, PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawAdmissionFailure,
+        CheckedBuiltCallPathIntegration, ClauseAnchor, ClauseClassification, ExactScopeSelector,
+        ExactSymbolSelector, FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow,
+        InternalCorePublicationIdentity, InternalProjection, NonMaterialKind, PROOF_DOMAIN,
+        PinnedNodeIdentity, ProofContractField, ProofHashes, RawAdmissionFailure,
         RawCallEdgeAdmission, ReceiptRef, ResolvedNodeIdentity, UnavailableReason,
-        ValidatedCallPathContract, ValidatedContractRendering, VerifiedDirectCallFact,
-        VerifiedProofFact, admit_raw_call_edge, check_built_call_path_integration,
-        diagnose_raw_call_edge, project_internal_call_path_result,
+        UnresolvedMaterialReason, UnvalidatedCallPathContract, UnvalidatedCallPathSpec,
+        UnvalidatedDirectCallStep, UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector,
+        ValidatedCallPathContract, ValidatedContractRendering, ValidationOutcome,
+        VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
+        check_built_call_path_integration, diagnose_raw_call_edge,
+        project_internal_call_path_result, validate_contract,
     };
 
     /// Identifies the sealed request domain observed by benchmark qualification.

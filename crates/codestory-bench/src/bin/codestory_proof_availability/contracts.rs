@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use codestory_agent::proof_qualification_support as product_proof;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -291,6 +292,7 @@ impl OraclePathV1 {
                 bail!("proof_availability_mutation_invalid")
             }
             validate_negative_mutation(&self.spec, step, m)?;
+            validate_oracle_contract(&self.source_text, &self.clauses, &m.mutated_spec)?;
         }
         if self.negative_mutations[0].kind == self.negative_mutations[1].kind {
             bail!("proof_availability_mutation_kinds_not_distinct")
@@ -452,7 +454,6 @@ fn validate_declaration(declaration: &OracleDeclarationV1) -> Result<()> {
     if empty(&declaration.symbol) {
         bail!("proof_availability_oracle_declaration_invalid")
     }
-    validate_symbol_selector(&declaration.selector)?;
     range(&declaration.range)
 }
 
@@ -462,120 +463,14 @@ fn validate_oracle_contract(
     spec: &CallPathSpecV1,
 ) -> Result<()> {
     validate_spec_shape(spec)?;
-    let mut coverage = vec![(false, false, false); source_text.len()];
-    let mut resolved_fields = BTreeSet::new();
-    let mut classifications = BTreeMap::new();
-    for clause in clauses {
-        if empty(&clause.clause_id)
-            || clause.start_byte >= clause.end_byte_exclusive
-            || usize::try_from(clause.end_byte_exclusive)
-                .ok()
-                .is_none_or(|end| end > source_text.len())
-        {
-            bail!("proof_availability_clause_invalid")
-        }
-        let start = usize::try_from(clause.start_byte)?;
-        let end = usize::try_from(clause.end_byte_exclusive)?;
-        if !source_text.is_char_boundary(start)
-            || !source_text.is_char_boundary(end)
-            || source_text[start..end] != clause.quote
-        {
-            bail!("proof_availability_clause_span_invalid")
-        }
-        let family = match &clause.classification {
-            ClauseClassificationV1::ResolvedMaterial { fields } => {
-                if fields.is_empty() {
-                    bail!("proof_availability_clause_fields_empty")
-                }
-                for field in fields {
-                    validate_contract_field(*field, spec)?;
-                    resolved_fields.insert(*field);
-                }
-                0u8
-            }
-            ClauseClassificationV1::UnresolvedMaterial { .. } => 1,
-            ClauseClassificationV1::NonMaterial { .. } => 2,
-        };
-        let key = (
-            clause.start_byte,
-            clause.end_byte_exclusive,
-            clause.clause_id.as_str(),
-        );
-        if classifications
-            .insert(key, family)
-            .is_some_and(|existing| existing != family)
-        {
-            bail!("proof_availability_clause_classification_conflict")
-        }
-        for byte in &mut coverage[start..end] {
-            match family {
-                0 => byte.0 = true,
-                1 => byte.1 = true,
-                _ => byte.2 = true,
-            }
-        }
-        if matches!(
-            clause.classification,
-            ClauseClassificationV1::UnresolvedMaterial { .. }
-        ) {
-            bail!("proof_availability_oracle_unresolved_material")
-        }
-    }
-    for clause in clauses {
-        if matches!(
-            clause.classification,
-            ClauseClassificationV1::NonMaterial { .. }
-        ) {
-            let start = usize::try_from(clause.start_byte)?;
-            if guarded_material_spans(&clause.quote)
-                .into_iter()
-                .any(|span| {
-                    coverage[start + span.start..start + span.end]
-                        .iter()
-                        .any(|byte| !byte.0 && !byte.1)
-                })
-            {
-                bail!("proof_availability_material_token_misclassified")
-            }
-        }
-    }
-    for (offset, character) in source_text.char_indices() {
-        let end = offset + character.len_utf8();
-        if !character.is_whitespace()
-            && coverage[offset..end]
-                .iter()
-                .any(|byte| !byte.0 && !byte.1 && !byte.2)
-        {
-            bail!("proof_availability_unclassified_source_text")
-        }
-    }
-    let mut required = vec![ProofContractFieldV1::Start];
-    for step in 0..spec.steps.len() {
-        let step = u8::try_from(step)?;
-        required.extend([
-            ProofContractFieldV1::StepTarget { step },
-            ProofContractFieldV1::Directness { step },
-            ProofContractFieldV1::Ordering { step },
-            ProofContractFieldV1::Relation { step },
-        ]);
-    }
-    required.extend((0..spec.prohibit_traversal_through.len()).map(|index| {
-        ProofContractFieldV1::TraversalProhibition {
-            index: u8::try_from(index).expect("bounded scope"),
-        }
-    }));
-    required.extend((0..spec.exclude_from_projection.len()).map(|index| {
-        ProofContractFieldV1::ProjectionExclusion {
-            index: u8::try_from(index).expect("bounded scope"),
-        }
-    }));
-    if required
-        .into_iter()
-        .any(|field| !resolved_fields.contains(&field))
-    {
-        bail!("proof_availability_contract_field_unanchored")
-    }
-    Ok(())
+    require_product_validated(product_proof::UnvalidatedCallPathContract::new(
+        source_text,
+        clauses
+            .iter()
+            .map(to_product_clause)
+            .collect::<Result<Vec<_>>>()?,
+        to_product_spec(spec),
+    ))
 }
 
 fn validate_spec_shape(spec: &CallPathSpecV1) -> Result<()> {
@@ -585,109 +480,208 @@ fn validate_spec_shape(spec: &CallPathSpecV1) -> Result<()> {
     {
         bail!("proof_availability_oracle_spec_invalid")
     }
-    validate_symbol_selector(&spec.start)?;
-    for step in &spec.steps {
-        validate_symbol_selector(&step.target)?;
-    }
-    for scope in spec
-        .prohibit_traversal_through
-        .iter()
-        .chain(&spec.exclude_from_projection)
-    {
-        validate_scope_selector(scope)?;
-    }
-    Ok(())
+    let fields = required_product_fields(spec)?;
+    require_product_validated(product_proof::UnvalidatedCallPathContract::new(
+        "x",
+        vec![product_proof::ClauseAnchor {
+            clause_id: "benchmark-shape".into(),
+            start: 0,
+            end: 1,
+            quote: "x".into(),
+            classification: product_proof::ClauseClassification::ResolvedMaterial { fields },
+        }],
+        to_product_spec(spec),
+    ))
 }
 
-fn validate_contract_field(field: ProofContractFieldV1, spec: &CallPathSpecV1) -> Result<()> {
-    let in_range = match field {
-        ProofContractFieldV1::Start => true,
-        ProofContractFieldV1::StepTarget { step }
-        | ProofContractFieldV1::Directness { step }
-        | ProofContractFieldV1::Ordering { step }
-        | ProofContractFieldV1::Relation { step } => usize::from(step) < spec.steps.len(),
+fn require_product_validated(input: product_proof::UnvalidatedCallPathContract) -> Result<()> {
+    match product_proof::validate_contract(input) {
+        Ok(product_proof::ValidationOutcome::Validated { .. }) => Ok(()),
+        Ok(product_proof::ValidationOutcome::Unknown { gaps, .. }) => {
+            bail!("proof_availability_product_contract_unknown: {gaps:?}")
+        }
+        Err(error) => bail!("proof_availability_product_contract_invalid: {error:?}"),
+    }
+}
+
+fn to_product_clause(clause: &ClauseAnchorV1) -> Result<product_proof::ClauseAnchor> {
+    Ok(product_proof::ClauseAnchor {
+        clause_id: clause.clause_id.clone(),
+        start: usize::try_from(clause.start_byte)?,
+        end: usize::try_from(clause.end_byte_exclusive)?,
+        quote: clause.quote.clone(),
+        classification: match &clause.classification {
+            ClauseClassificationV1::ResolvedMaterial { fields } => {
+                product_proof::ClauseClassification::ResolvedMaterial {
+                    fields: fields.iter().copied().map(to_product_field).collect(),
+                }
+            }
+            ClauseClassificationV1::UnresolvedMaterial { reason } => {
+                product_proof::ClauseClassification::UnresolvedMaterial {
+                    reason: match reason {
+                        UnresolvedMaterialReasonV1::MissingSelectorResolution => {
+                            product_proof::UnresolvedMaterialReason::MissingSelectorResolution
+                        }
+                        UnresolvedMaterialReasonV1::AmbiguousSelectorResolution => {
+                            product_proof::UnresolvedMaterialReason::AmbiguousSelectorResolution
+                        }
+                        UnresolvedMaterialReasonV1::UnsupportedInterpretation => {
+                            product_proof::UnresolvedMaterialReason::UnsupportedInterpretation
+                        }
+                    },
+                }
+            }
+            ClauseClassificationV1::NonMaterial { reason } => {
+                product_proof::ClauseClassification::NonMaterial {
+                    kind: match reason {
+                        NonMaterialReasonV1::Whitespace => {
+                            product_proof::NonMaterialKind::Whitespace
+                        }
+                        NonMaterialReasonV1::Punctuation => {
+                            product_proof::NonMaterialKind::Punctuation
+                        }
+                        NonMaterialReasonV1::Connector => product_proof::NonMaterialKind::Connector,
+                        NonMaterialReasonV1::Commentary => {
+                            product_proof::NonMaterialKind::Commentary
+                        }
+                    },
+                }
+            }
+        },
+    })
+}
+
+fn to_product_field(field: ProofContractFieldV1) -> product_proof::ProofContractField {
+    match field {
+        ProofContractFieldV1::Start => product_proof::ProofContractField::Start,
+        ProofContractFieldV1::StepTarget { step } => {
+            product_proof::ProofContractField::StepTarget { step }
+        }
+        ProofContractFieldV1::Directness { step } => {
+            product_proof::ProofContractField::Directness { step }
+        }
+        ProofContractFieldV1::Ordering { step } => {
+            product_proof::ProofContractField::Ordering { step }
+        }
+        ProofContractFieldV1::Relation { step } => {
+            product_proof::ProofContractField::Relation { step }
+        }
         ProofContractFieldV1::TraversalProhibition { index } => {
-            usize::from(index) < spec.prohibit_traversal_through.len()
+            product_proof::ProofContractField::TraversalProhibition { index }
         }
         ProofContractFieldV1::ProjectionExclusion { index } => {
-            usize::from(index) < spec.exclude_from_projection.len()
+            product_proof::ProofContractField::ProjectionExclusion { index }
         }
-    };
-    if !in_range {
-        bail!("proof_availability_contract_field_out_of_range")
     }
-    Ok(())
 }
 
-fn validate_symbol_selector(selector: &ExactSymbolSelectorV1) -> Result<()> {
+fn required_product_fields(
+    spec: &CallPathSpecV1,
+) -> Result<Vec<product_proof::ProofContractField>> {
+    let mut fields = vec![product_proof::ProofContractField::Start];
+    for step in 0..spec.steps.len() {
+        let step = u8::try_from(step)?;
+        fields.extend([
+            product_proof::ProofContractField::StepTarget { step },
+            product_proof::ProofContractField::Directness { step },
+            product_proof::ProofContractField::Ordering { step },
+            product_proof::ProofContractField::Relation { step },
+        ]);
+    }
+    fields.extend((0..spec.prohibit_traversal_through.len()).map(|index| {
+        product_proof::ProofContractField::TraversalProhibition {
+            index: u8::try_from(index).expect("benchmark scope count is bounded"),
+        }
+    }));
+    fields.extend((0..spec.exclude_from_projection.len()).map(|index| {
+        product_proof::ProofContractField::ProjectionExclusion {
+            index: u8::try_from(index).expect("benchmark scope count is bounded"),
+        }
+    }));
+    Ok(fields)
+}
+
+fn to_product_spec(spec: &CallPathSpecV1) -> product_proof::UnvalidatedCallPathSpec {
+    product_proof::UnvalidatedCallPathSpec {
+        start: to_product_symbol_selector(&spec.start),
+        steps: spec
+            .steps
+            .iter()
+            .map(|step| product_proof::UnvalidatedDirectCallStep {
+                target: to_product_symbol_selector(&step.target),
+            })
+            .collect(),
+        prohibit_traversal_through: spec
+            .prohibit_traversal_through
+            .iter()
+            .map(to_product_scope_selector)
+            .collect(),
+        exclude_from_projection: spec
+            .exclude_from_projection
+            .iter()
+            .map(to_product_scope_selector)
+            .collect(),
+    }
+}
+
+fn to_product_symbol_selector(
+    selector: &ExactSymbolSelectorV1,
+) -> product_proof::UnvalidatedExactSymbolSelector {
     match selector {
         ExactSymbolSelectorV1::PinnedNode {
             project_id,
             core_generation_id,
             core_run_id,
             node_id,
-        } => {
-            for value in [project_id, core_generation_id, core_run_id, node_id] {
-                validate_identity(value)?;
-            }
+        } => product_proof::UnvalidatedExactSymbolSelector::PinnedNode(
+            product_proof::PinnedNodeIdentity {
+                project_id: project_id.clone(),
+                core_generation_id: core_generation_id.clone(),
+                core_run_id: core_run_id.clone(),
+                node_id: node_id.clone(),
+            },
+        ),
+        ExactSymbolSelectorV1::CanonicalId { canonical_id } => {
+            product_proof::UnvalidatedExactSymbolSelector::CanonicalId(canonical_id.clone())
         }
-        ExactSymbolSelectorV1::CanonicalId { canonical_id } => validate_identity(canonical_id)?,
         ExactSymbolSelectorV1::QualifiedName {
             qualified_name,
             project_file_components,
-        } => {
-            validate_qualified_name(qualified_name)?;
-            if let Some(components) = project_file_components {
-                validate_project_file(components)?;
-            }
-        }
+        } => product_proof::UnvalidatedExactSymbolSelector::QualifiedName {
+            qualified_name: qualified_name.clone(),
+            project_file_components: project_file_components.clone(),
+        },
     }
-    Ok(())
 }
 
-fn validate_scope_selector(selector: &ExactScopeSelectorV1) -> Result<()> {
+fn to_product_scope_selector(
+    selector: &ExactScopeSelectorV1,
+) -> product_proof::UnvalidatedExactScopeSelector {
     match selector {
         ExactScopeSelectorV1::PinnedNode {
             project_id,
             core_generation_id,
             core_run_id,
             node_id,
-        } => {
-            for value in [project_id, core_generation_id, core_run_id, node_id] {
-                validate_identity(value)?;
-            }
+        } => product_proof::UnvalidatedExactScopeSelector::PinnedNode(
+            product_proof::PinnedNodeIdentity {
+                project_id: project_id.clone(),
+                core_generation_id: core_generation_id.clone(),
+                core_run_id: core_run_id.clone(),
+                node_id: node_id.clone(),
+            },
+        ),
+        ExactScopeSelectorV1::CanonicalId { canonical_id } => {
+            product_proof::UnvalidatedExactScopeSelector::CanonicalId(canonical_id.clone())
         }
-        ExactScopeSelectorV1::CanonicalId { canonical_id } => validate_identity(canonical_id)?,
         ExactScopeSelectorV1::QualifiedName {
             qualified_name,
             project_file_components,
-        } => {
-            validate_qualified_name(qualified_name)?;
-            if let Some(components) = project_file_components {
-                validate_project_file(components)?;
-            }
-        }
+        } => product_proof::UnvalidatedExactScopeSelector::QualifiedName {
+            qualified_name: qualified_name.clone(),
+            project_file_components: project_file_components.clone(),
+        },
     }
-    Ok(())
-}
-
-fn validate_identity(value: &str) -> Result<()> {
-    if empty(value) || value.contains('\0') {
-        bail!("proof_availability_selector_identity_invalid")
-    }
-    Ok(())
-}
-
-fn validate_qualified_name(value: &str) -> Result<()> {
-    validate_identity(value)?;
-    if value.trim() != value
-        || value.chars().any(|character| {
-            character.is_whitespace() || matches!(character, '(' | ')' | '*' | '?')
-        })
-    {
-        bail!("proof_availability_qualified_name_invalid")
-    }
-    Ok(())
 }
 
 pub fn validate_project_file(components: &[String]) -> Result<()> {
@@ -706,66 +700,6 @@ pub fn validate_project_file(components: &[String]) -> Result<()> {
         bail!("proof_availability_project_file_invalid")
     }
     Ok(())
-}
-
-fn guarded_material_spans(value: &str) -> Vec<std::ops::Range<usize>> {
-    const GUARDED_WORDS: &[&str] = &[
-        "after", "before", "call", "calls", "direct", "directly", "exclude", "except", "first",
-        "fourth", "never", "next", "no", "not", "only", "ordered", "ordering", "relation",
-        "second", "sixth", "then", "third", "without",
-    ];
-    let bytes = value.as_bytes();
-    let mut spans = Vec::new();
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        if bytes[offset].is_ascii_alphanumeric() || bytes[offset] == b'_' {
-            let start = offset;
-            offset += 1;
-            while offset < bytes.len()
-                && (bytes[offset].is_ascii_alphanumeric() || bytes[offset] == b'_')
-            {
-                offset += 1;
-            }
-            let word = value[start..offset].to_ascii_lowercase();
-            let numeric_ordinal = word
-                .strip_suffix("st")
-                .or_else(|| word.strip_suffix("nd"))
-                .or_else(|| word.strip_suffix("rd"))
-                .or_else(|| word.strip_suffix("th"))
-                .is_some_and(|number| {
-                    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
-                });
-            if GUARDED_WORDS.contains(&word.as_str()) || numeric_ordinal {
-                spans.push(start..offset);
-            }
-            continue;
-        }
-        let remaining = &value[offset..];
-        let width = if remaining.starts_with("->")
-            || remaining.starts_with("=>")
-            || remaining.starts_with("::")
-        {
-            2
-        } else if remaining.starts_with('→') {
-            '→'.len_utf8()
-        } else {
-            value[offset..]
-                .chars()
-                .next()
-                .expect("offset is in bounds")
-                .len_utf8()
-        };
-        if remaining.starts_with("->")
-            || remaining.starts_with("=>")
-            || remaining.starts_with("::")
-            || remaining.starts_with('→')
-            || matches!(bytes[offset], b'`' | b'"' | b'/' | b'\\')
-        {
-            spans.push(offset..offset + width);
-        }
-        offset += width;
-    }
-    spans
 }
 
 fn validate_negative_mutation(
