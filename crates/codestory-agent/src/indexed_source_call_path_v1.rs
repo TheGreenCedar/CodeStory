@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId, ResolutionCertainty};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -23,6 +24,135 @@ const DIGEST_DOMAIN_SEPARATOR: &[u8] = b"codestory.proof-contract.digest.v1\0";
 const MIN_STEPS: usize = 1;
 const MAX_STEPS: usize = 6;
 const MAX_INDEXED_SCOPES: usize = u8::MAX as usize + 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedRawCallEdge {
+    pub edge_id: EdgeId,
+    pub file_node_id: NodeId,
+    pub line: u32,
+    pub column_or_ordinal: u32,
+    pub raw_target: NodeId,
+    pub callsite_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawCallEdgeAdmission {
+    Admitted(AdmittedRawCallEdge),
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallableContainmentEvidence {
+    pub file_node_id: NodeId,
+    pub owner_node_id: NodeId,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedLineWindow {
+    pub kind: &'static str,
+    pub project_file_components: Vec<String>,
+    pub indexed_sha256: String,
+    pub observed_sha256: String,
+    pub anchor_line: u32,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedCallEdgeReceipt {
+    pub receipt: ReceiptRef,
+    pub source: ResolvedNodeIdentity,
+    pub target: ResolvedNodeIdentity,
+    pub certainty: ResolutionCertainty,
+    pub callsite_identity: String,
+    pub containment: CallableContainmentEvidence,
+    pub line_window: IndexedLineWindow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FactBuildGap {
+    SelectorMissing { selector_index: usize },
+    SelectorAmbiguous { selector_index: usize },
+    NonCallableSelector { selector_index: usize },
+    DirectCallMissing { step_index: usize },
+    RecursiveCallNotRepresentable { step_index: usize },
+    SourceWindowTooLarge { step_index: usize },
+    InvalidUtf8 { step_index: usize },
+    SourceLineOutOfRange { step_index: usize },
+    EdgeContainmentUnproven { step_index: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltCallPathFacts {
+    pub facts: Vec<VerifiedProofFact>,
+    pub receipts: Vec<IndexedCallEdgeReceipt>,
+    pub gaps: Vec<FactBuildGap>,
+    pub unavailable: Vec<UnavailableReason>,
+}
+
+/// Admit one persisted edge as direct-call evidence without rewriting either
+/// endpoint or deriving certainty from its diagnostic confidence score.
+pub fn admit_raw_call_edge(
+    edge: &Edge,
+    expected_source: NodeId,
+    expected_target: NodeId,
+) -> RawCallEdgeAdmission {
+    if edge.kind != EdgeKind::CALL
+        || edge.certainty != Some(ResolutionCertainty::Certain)
+        || edge.effective_source() != expected_source
+        || edge.effective_target() != expected_target
+        || edge.resolved_target != Some(expected_target)
+        || !edge.candidate_targets.is_empty()
+    {
+        return RawCallEdgeAdmission::Rejected;
+    }
+    let (Some(file_node_id), Some(line), Some(callsite_identity)) = (
+        edge.file_node_id,
+        edge.line.filter(|line| *line >= 1),
+        edge.callsite_identity.as_deref(),
+    ) else {
+        return RawCallEdgeAdmission::Rejected;
+    };
+    if callsite_identity.is_empty() {
+        return RawCallEdgeAdmission::Rejected;
+    }
+    let pre_marker = callsite_identity
+        .split_once('|')
+        .map_or(callsite_identity, |(identity, _)| identity);
+    let mut fields = pre_marker.split(':');
+    let parsed = (
+        fields.next().and_then(|value| value.parse::<i64>().ok()),
+        fields.next().and_then(|value| value.parse::<u32>().ok()),
+        fields.next().and_then(|value| value.parse::<u32>().ok()),
+        fields.next().and_then(|value| value.parse::<i64>().ok()),
+    );
+    if fields.next().is_some() {
+        return RawCallEdgeAdmission::Rejected;
+    }
+    let (Some(parsed_file), Some(parsed_line), Some(column_or_ordinal), Some(parsed_target)) =
+        parsed
+    else {
+        return RawCallEdgeAdmission::Rejected;
+    };
+    if parsed_file != file_node_id.0
+        || parsed_line != line
+        || parsed_target != edge.target.0
+        || format!("{parsed_file}:{parsed_line}:{column_or_ordinal}:{parsed_target}") != pre_marker
+    {
+        return RawCallEdgeAdmission::Rejected;
+    }
+    RawCallEdgeAdmission::Admitted(AdmittedRawCallEdge {
+        edge_id: edge.id,
+        file_node_id,
+        line,
+        column_or_ordinal,
+        raw_target: NodeId(parsed_target),
+        callsite_identity: callsite_identity.to_owned(),
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnvalidatedCallPathContract {
@@ -1273,6 +1403,7 @@ pub enum ProofGap {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnavailableReason {
     ValidatedContractHashMismatch,
+    PublicationPinMismatch,
     SourceNotBoundToPublication,
     ProofFactsUnavailable,
 }
@@ -1655,6 +1786,7 @@ fn reachable_prefixes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId, ResolutionCertainty};
 
     fn canonical_selector(name: &str) -> UnvalidatedExactSymbolSelector {
         UnvalidatedExactSymbolSelector::CanonicalId(name.to_owned())
@@ -1754,6 +1886,154 @@ mod tests {
             validate_contract(valid_input(&["B"])),
             Ok(ValidationOutcome::Validated { .. })
         ));
+    }
+
+    #[test]
+    fn raw_call_edge_admission_requires_the_persisted_certain_canonical_identity() {
+        let edge = Edge {
+            id: EdgeId(41),
+            source: NodeId(7),
+            target: NodeId(19),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(-3)),
+            line: Some(12),
+            resolved_source: Some(NodeId(11)),
+            resolved_target: Some(NodeId(23)),
+            confidence: Some(1.0),
+            certainty: Some(ResolutionCertainty::Certain),
+            callsite_identity: Some("-3:12:0:19|collector-marker".to_owned()),
+            candidate_targets: Vec::new(),
+        };
+
+        assert_eq!(
+            admit_raw_call_edge(&edge, NodeId(11), NodeId(23)),
+            RawCallEdgeAdmission::Admitted(AdmittedRawCallEdge {
+                edge_id: EdgeId(41),
+                file_node_id: NodeId(-3),
+                line: 12,
+                column_or_ordinal: 0,
+                raw_target: NodeId(19),
+                callsite_identity: "-3:12:0:19|collector-marker".to_owned(),
+            })
+        );
+
+        let mut probable = edge;
+        probable.certainty = Some(ResolutionCertainty::Probable);
+        assert_eq!(
+            admit_raw_call_edge(&probable, NodeId(11), NodeId(23)),
+            RawCallEdgeAdmission::Rejected
+        );
+    }
+
+    #[test]
+    fn raw_call_edge_admission_rejects_each_hostile_mutation() {
+        type EdgeMutation = (&'static str, Box<dyn Fn(&mut Edge)>);
+
+        let lawful = Edge {
+            id: EdgeId(41),
+            source: NodeId(7),
+            target: NodeId(19),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(-3)),
+            line: Some(12),
+            resolved_source: Some(NodeId(11)),
+            resolved_target: Some(NodeId(23)),
+            confidence: Some(1.0),
+            certainty: Some(ResolutionCertainty::Certain),
+            callsite_identity: Some("-3:12:0:19|collector-marker".to_owned()),
+            candidate_targets: Vec::new(),
+        };
+        let mut mutations: Vec<EdgeMutation> = vec![
+            ("wrong kind", Box::new(|edge| edge.kind = EdgeKind::USAGE)),
+            ("missing certainty", Box::new(|edge| edge.certainty = None)),
+            (
+                "probable certainty",
+                Box::new(|edge| edge.certainty = Some(ResolutionCertainty::Probable)),
+            ),
+            (
+                "wrong raw source",
+                Box::new(|edge| {
+                    edge.source = NodeId(12);
+                    edge.resolved_source = None;
+                }),
+            ),
+            (
+                "wrong raw target",
+                Box::new(|edge| edge.target = NodeId(18)),
+            ),
+            (
+                "wrong effective source",
+                Box::new(|edge| edge.resolved_source = Some(NodeId(12))),
+            ),
+            (
+                "wrong resolved target",
+                Box::new(|edge| edge.resolved_target = Some(NodeId(24))),
+            ),
+            (
+                "missing resolved target",
+                Box::new(|edge| edge.resolved_target = None),
+            ),
+            (
+                "candidates present",
+                Box::new(|edge| edge.candidate_targets = vec![NodeId(23)]),
+            ),
+            ("file absent", Box::new(|edge| edge.file_node_id = None)),
+            ("line absent", Box::new(|edge| edge.line = None)),
+            ("line zero", Box::new(|edge| edge.line = Some(0))),
+        ];
+        for identity in [
+            "",
+            " ",
+            "|marker",
+            "-3:12:19",
+            "-3:12:0:19:5",
+            "x:12:0:19",
+            "-3:x:0:19",
+            "-3:12:x:19",
+            "-3:12:0:x",
+            " -3:12:0:19",
+            "-03:12:0:19",
+            "-3:012:0:19",
+            "-3:12:00:19",
+            "-3:12:0:+19",
+            "opaque-legacy-id",
+            "-3:12:0:18",
+        ] {
+            let identity = identity.to_owned();
+            mutations.push((
+                "malformed identity",
+                Box::new(move |edge| {
+                    edge.callsite_identity = Some(identity.clone());
+                }),
+            ));
+        }
+        mutations.push((
+            "identity absent",
+            Box::new(|edge| edge.callsite_identity = None),
+        ));
+
+        for (label, mutate) in mutations {
+            let mut edge = lawful.clone();
+            mutate(&mut edge);
+            assert_eq!(
+                admit_raw_call_edge(&edge, NodeId(11), NodeId(23)),
+                RawCallEdgeAdmission::Rejected,
+                "{label}"
+            );
+        }
+
+        let mut same_display_different_resolution = lawful;
+        same_display_different_resolution.resolved_target = Some(NodeId(24));
+        assert_eq!(
+            same_display_different_resolution
+                .callsite_identity
+                .as_deref(),
+            Some("-3:12:0:19|collector-marker")
+        );
+        assert_eq!(
+            admit_raw_call_edge(&same_display_different_resolution, NodeId(11), NodeId(23)),
+            RawCallEdgeAdmission::Rejected
+        );
     }
 
     #[test]

@@ -621,6 +621,31 @@ fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
         AGENT_MODULE_ALLOWLIST_EXCLUSIONS.contains(&"indexed_source_call_path_v1.rs"),
         "the dark proof kernel must not be counted as a production packet-planning module"
     );
+
+    let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
+    assert!(
+        runtime_lib.contains(
+            "#[cfg(any(test, feature = \"test-support\"))]\nmod indexed_source_call_path_v1;"
+        ),
+        "the dark Store/source adapter must remain test-support-only until the atomic v3 cut"
+    );
+    let adapter = read("crates/codestory-runtime/src/indexed_source_call_path_v1.rs");
+    for forbidden in [
+        "GraphEdgeDto",
+        "with_effective_endpoints",
+        "Occurrence",
+        "source_text",
+        "codestory_retrieval",
+        "nucleo",
+        "ToolSpec",
+        "pub fn ",
+        "pub use ",
+    ] {
+        assert!(
+            !adapter.contains(forbidden),
+            "dark raw-edge adapter crossed a forbidden boundary via {forbidden}"
+        );
+    }
 }
 
 #[test]
