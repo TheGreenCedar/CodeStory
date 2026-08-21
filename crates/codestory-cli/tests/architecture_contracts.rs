@@ -241,6 +241,29 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     &tail[..end_index]
 }
 
+fn redact_braced_rust_item(source: &mut String, header: &str) {
+    let masked = mask_comments_and_strings(source);
+    let start = masked.find(header).expect("item header exists");
+    let open = start + masked[start..].find('{').expect("item body starts");
+    let mut depth = 0_usize;
+    let mut end = None;
+    for (offset, byte) in masked.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(open + offset + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end.expect("item body closes");
+    source.replace_range(start..end, &" ".repeat(end - start));
+}
+
 #[test]
 fn cli_sidecar_construction_stays_behind_test_safe_gateway() {
     let source_root = repo_root().join("crates/codestory-cli/src");
@@ -597,6 +620,28 @@ fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
     assert!(
         AGENT_MODULE_ALLOWLIST_EXCLUSIONS.contains(&"indexed_source_call_path_v1.rs"),
         "the dark proof kernel must not be counted as a production packet-planning module"
+    );
+}
+
+#[test]
+fn dark_call_path_raw_source_text_stays_out_of_the_proof_boundary() {
+    let module = production_source(&read(
+        "crates/codestory-agent/src/indexed_source_call_path_v1.rs",
+    ));
+    let mut outside_allowed_regions = module.clone();
+    for item in [
+        "pub struct UnvalidatedCallPathContract",
+        "impl UnvalidatedCallPathContract",
+        "fn validate_contract_with_domain",
+        "fn validate_and_normalize_clauses",
+        "fn classify_translation_gaps",
+        "fn compute_hashes",
+    ] {
+        redact_braced_rust_item(&mut outside_allowed_regions, item);
+    }
+    assert!(
+        !contains_word(&outside_allowed_regions, "source_text"),
+        "raw source_text must stay confined to unvalidated input, clause validation, translation diagnostics, and hashing; it must not enter validated specs/contracts, verified facts, selector matching, path search/checking, ranking, search, or source matching:\n{outside_allowed_regions}"
     );
 }
 

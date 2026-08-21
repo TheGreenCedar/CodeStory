@@ -22,6 +22,7 @@ pub const CLAUSE_GUARD_VERSION: &str = "clause_guard_v1";
 const DIGEST_DOMAIN_SEPARATOR: &[u8] = b"codestory.proof-contract.digest.v1\0";
 const MIN_STEPS: usize = 1;
 const MAX_STEPS: usize = 6;
+const MAX_INDEXED_SCOPES: usize = u8::MAX as usize + 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnvalidatedCallPathContract {
@@ -63,24 +64,41 @@ pub enum ClauseClassification {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProofContractField {
     Start,
-    StepTarget,
-    Directness,
-    Ordering,
-    Relation,
-    TraversalProhibition,
-    ProjectionExclusion,
+    StepTarget { step: u8 },
+    Directness { step: u8 },
+    Ordering { step: u8 },
+    Relation { step: u8 },
+    TraversalProhibition { index: u8 },
+    ProjectionExclusion { index: u8 },
 }
 
 impl ProofContractField {
     fn canonical_name(self) -> &'static str {
         match self {
             Self::Start => "start",
-            Self::StepTarget => "step_target",
-            Self::Directness => "directness",
-            Self::Ordering => "ordering",
-            Self::Relation => "relation",
-            Self::TraversalProhibition => "traversal_prohibition",
-            Self::ProjectionExclusion => "projection_exclusion",
+            Self::StepTarget { .. } => "step_target",
+            Self::Directness { .. } => "directness",
+            Self::Ordering { .. } => "ordering",
+            Self::Relation { .. } => "relation",
+            Self::TraversalProhibition { .. } => "traversal_prohibition",
+            Self::ProjectionExclusion { .. } => "projection_exclusion",
+        }
+    }
+
+    fn canonical_json(self) -> Value {
+        match self {
+            Self::Start => json!({ "kind": self.canonical_name() }),
+            Self::StepTarget { step }
+            | Self::Directness { step }
+            | Self::Ordering { step }
+            | Self::Relation { step } => json!({
+                "kind": self.canonical_name(),
+                "step": step,
+            }),
+            Self::TraversalProhibition { index } | Self::ProjectionExclusion { index } => json!({
+                "kind": self.canonical_name(),
+                "index": index,
+            }),
         }
     }
 }
@@ -300,6 +318,10 @@ pub enum ValidationError {
     StepCountOutOfRange {
         actual: usize,
     },
+    ScopeCountOutOfRange {
+        field: ProofContractField,
+        actual: usize,
+    },
     InvalidSelector(SelectorValidationError),
     InvalidScope(SelectorValidationError),
     EmptyClauseId,
@@ -325,6 +347,9 @@ pub enum ValidationError {
         field: ProofContractField,
         required: usize,
         found: usize,
+    },
+    OutOfRangeFieldReference {
+        field: ProofContractField,
     },
     CanonicalJson(String),
 }
@@ -416,6 +441,18 @@ fn validate_spec(spec: UnvalidatedCallPathSpec) -> Result<CallPathSpec, Validati
             actual: spec.steps.len(),
         });
     }
+    if spec.prohibit_traversal_through.len() > MAX_INDEXED_SCOPES {
+        return Err(ValidationError::ScopeCountOutOfRange {
+            field: ProofContractField::TraversalProhibition { index: u8::MAX },
+            actual: spec.prohibit_traversal_through.len(),
+        });
+    }
+    if spec.exclude_from_projection.len() > MAX_INDEXED_SCOPES {
+        return Err(ValidationError::ScopeCountOutOfRange {
+            field: ProofContractField::ProjectionExclusion { index: u8::MAX },
+            actual: spec.exclude_from_projection.len(),
+        });
+    }
     let start = validate_symbol_selector(spec.start).map_err(ValidationError::InvalidSelector)?;
     let steps = spec
         .steps
@@ -426,22 +463,18 @@ fn validate_spec(spec: UnvalidatedCallPathSpec) -> Result<CallPathSpec, Validati
                 .map_err(ValidationError::InvalidSelector)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut prohibit_traversal_through = spec
+    let prohibit_traversal_through = spec
         .prohibit_traversal_through
         .into_iter()
         .map(validate_scope_selector)
         .collect::<Result<Vec<_>, _>>()
         .map_err(ValidationError::InvalidScope)?;
-    let mut exclude_from_projection = spec
+    let exclude_from_projection = spec
         .exclude_from_projection
         .into_iter()
         .map(validate_scope_selector)
         .collect::<Result<Vec<_>, _>>()
         .map_err(ValidationError::InvalidScope)?;
-    prohibit_traversal_through.sort();
-    prohibit_traversal_through.dedup();
-    exclude_from_projection.sort();
-    exclude_from_projection.dedup();
     Ok(CallPathSpec {
         start,
         steps,
@@ -679,30 +712,58 @@ fn validate_required_field_coverage(
     clauses: &[NormalizedClause],
     spec: &CallPathSpec,
 ) -> Result<(), ValidationError> {
-    let requirements = [
-        (ProofContractField::Start, 1),
-        (ProofContractField::StepTarget, spec.steps.len()),
-        (ProofContractField::Directness, 1),
-        (ProofContractField::Ordering, 1),
-        (ProofContractField::Relation, 1),
-        (
-            ProofContractField::TraversalProhibition,
-            spec.prohibit_traversal_through.len(),
-        ),
-        (
-            ProofContractField::ProjectionExclusion,
-            spec.exclude_from_projection.len(),
-        ),
-    ];
-    for (field, required) in requirements {
+    let fields = clauses
+        .iter()
+        .filter_map(|clause| clause.field)
+        .collect::<Vec<_>>();
+    for field in &fields {
+        let in_range = match field {
+            ProofContractField::Start => true,
+            ProofContractField::StepTarget { step }
+            | ProofContractField::Directness { step }
+            | ProofContractField::Ordering { step }
+            | ProofContractField::Relation { step } => usize::from(*step) < spec.steps.len(),
+            ProofContractField::TraversalProhibition { index } => {
+                usize::from(*index) < spec.prohibit_traversal_through.len()
+            }
+            ProofContractField::ProjectionExclusion { index } => {
+                usize::from(*index) < spec.exclude_from_projection.len()
+            }
+        };
+        if !in_range {
+            return Err(ValidationError::OutOfRangeFieldReference { field: *field });
+        }
+    }
+
+    let mut requirements = vec![ProofContractField::Start];
+    for step in 0..spec.steps.len() {
+        let step = u8::try_from(step).expect("step count is bounded below u8::MAX");
+        requirements.extend([
+            ProofContractField::StepTarget { step },
+            ProofContractField::Directness { step },
+            ProofContractField::Ordering { step },
+            ProofContractField::Relation { step },
+        ]);
+    }
+    requirements.extend((0..spec.prohibit_traversal_through.len()).map(|index| {
+        ProofContractField::TraversalProhibition {
+            index: u8::try_from(index).expect("scope count was validated"),
+        }
+    }));
+    requirements.extend((0..spec.exclude_from_projection.len()).map(|index| {
+        ProofContractField::ProjectionExclusion {
+            index: u8::try_from(index).expect("scope count was validated"),
+        }
+    }));
+    for field in requirements {
         let found = clauses
             .iter()
             .filter(|clause| clause.field == Some(field))
             .count();
-        if found < required {
+        if found == 0 {
             return Err(ValidationError::MissingResolvedMaterialAnchor {
                 field,
-                required,
+                required: 1,
                 found,
             });
         }
@@ -741,14 +802,21 @@ fn classify_translation_gaps(
                 });
             }
             NormalizedClauseClassification::Ignored(_) => {
-                let guard_families = clause_guard_families(&clause.quote);
-                let disappears_as_only_non_material = (clause.start..clause.end).any(|offset| {
-                    coverage[offset].non_material
-                        && !coverage[offset].resolved
-                        && !coverage[offset].unresolved
-                        && !source_text.as_bytes()[offset].is_ascii_whitespace()
-                });
-                if !guard_families.is_empty() && disappears_as_only_non_material {
+                let guard_families = clause_guard_spans(&clause.quote)
+                    .into_iter()
+                    .filter(|span| {
+                        (clause.start + span.start..clause.start + span.end).any(|offset| {
+                            coverage[offset].non_material
+                                && !coverage[offset].resolved
+                                && !coverage[offset].unresolved
+                                && !source_text.as_bytes()[offset].is_ascii_whitespace()
+                        })
+                    })
+                    .map(|span| span.family)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if !guard_families.is_empty() {
                     gaps.insert(TranslationGap::MaterialTokenMisclassified {
                         clause_id: clause.clause_id.clone(),
                         guard_families,
@@ -783,40 +851,56 @@ pub enum ClauseGuardFamily {
     QualifiedSymbolNotation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ClauseGuardSpan {
+    start: usize,
+    end: usize,
+    family: ClauseGuardFamily,
+}
+
 pub fn clause_guard_families(text: &str) -> Vec<ClauseGuardFamily> {
-    let mut families = BTreeSet::new();
-    let lower = text.to_lowercase();
-    let words = lower
-        .split(|character: char| !character.is_alphanumeric() && character != '_')
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-    if contains_nonempty_quoted(text, '`')
-        || contains_nonempty_quoted(text, '"')
-        || contains_nonempty_quoted(text, '\'')
-    {
-        families.insert(ClauseGuardFamily::QuotedOrBacktickedIdentifier);
+    clause_guard_spans(text)
+        .into_iter()
+        .map(|span| span.family)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn clause_guard_spans(text: &str) -> Vec<ClauseGuardSpan> {
+    let mut spans = BTreeSet::new();
+    for delimiter in ['`', '"', '\''] {
+        for (start, end) in nonempty_quoted_spans(text, delimiter) {
+            spans.insert(ClauseGuardSpan {
+                start,
+                end,
+                family: ClauseGuardFamily::QuotedOrBacktickedIdentifier,
+            });
+        }
     }
-    if text.contains("->")
-        || text.contains("=>")
-        || text.contains('→')
-        || words.iter().any(|word| {
-            matches!(
-                *word,
-                "call" | "calls" | "called" | "invoke" | "invokes" | "invoked"
-            )
-        })
-    {
-        families.insert(ClauseGuardFamily::ArrowOrRelationNotation);
+    for notation in ["->", "=>", "→"] {
+        for (start, _) in text.match_indices(notation) {
+            spans.insert(ClauseGuardSpan {
+                start,
+                end: start + notation.len(),
+                family: ClauseGuardFamily::ArrowOrRelationNotation,
+            });
+        }
     }
-    if words
-        .iter()
-        .any(|word| matches!(*word, "direct" | "directly" | "immediate" | "immediately"))
-    {
-        families.insert(ClauseGuardFamily::Directness);
-    }
-    if words.iter().any(|word| {
-        matches!(
-            *word,
+    for (start, end) in word_spans(text) {
+        let word = text[start..end].to_ascii_lowercase();
+        let family = if matches!(
+            word.as_str(),
+            "call" | "calls" | "called" | "invoke" | "invokes" | "invoked"
+        ) {
+            Some(ClauseGuardFamily::ArrowOrRelationNotation)
+        } else if matches!(
+            word.as_str(),
+            "direct" | "directly" | "immediate" | "immediately"
+        ) {
+            Some(ClauseGuardFamily::Directness)
+        } else if matches!(
+            word.as_str(),
             "first"
                 | "second"
                 | "third"
@@ -828,16 +912,13 @@ pub fn clause_guard_families(text: &str) -> Vec<ClauseGuardFamily> {
                 | "after"
                 | "ordered"
                 | "order"
-        ) || has_ordinal_suffix(word)
-    }) {
-        families.insert(ClauseGuardFamily::OrderingOrOrdinal);
-    }
-    if words.contains(&"only") {
-        families.insert(ClauseGuardFamily::Only);
-    }
-    if words.iter().any(|word| {
-        matches!(
-            *word,
+        ) || has_ordinal_suffix(&word)
+        {
+            Some(ClauseGuardFamily::OrderingOrOrdinal)
+        } else if word == "only" {
+            Some(ClauseGuardFamily::Only)
+        } else if matches!(
+            word.as_str(),
             "no" | "not"
                 | "never"
                 | "without"
@@ -849,32 +930,79 @@ pub fn clause_guard_families(text: &str) -> Vec<ClauseGuardFamily> {
                 | "prohibit"
                 | "prohibits"
                 | "avoid"
-        )
-    }) {
-        families.insert(ClauseGuardFamily::NegationOrExclusion);
+        ) {
+            Some(ClauseGuardFamily::NegationOrExclusion)
+        } else {
+            None
+        };
+        if let Some(family) = family {
+            spans.insert(ClauseGuardSpan { start, end, family });
+        }
     }
-    if text.contains('/')
-        || text.contains('\\')
-        || [".rs", ".ts", ".tsx", ".js", ".py", ".go", ".java"]
-            .iter()
-            .any(|extension| lower.contains(extension))
-    {
-        families.insert(ClauseGuardFamily::PathLikeString);
+    for (start, end) in token_spans(text) {
+        let token = &text[start..end];
+        let lower = token.to_ascii_lowercase();
+        if token.contains('/')
+            || token.contains('\\')
+            || [".rs", ".ts", ".tsx", ".js", ".py", ".go", ".java"]
+                .iter()
+                .any(|extension| lower.contains(extension))
+        {
+            spans.insert(ClauseGuardSpan {
+                start,
+                end,
+                family: ClauseGuardFamily::PathLikeString,
+            });
+        }
+        if token.contains("::") || contains_dotted_qualified_name(token) {
+            spans.insert(ClauseGuardSpan {
+                start,
+                end,
+                family: ClauseGuardFamily::QualifiedSymbolNotation,
+            });
+        }
     }
-    if text.contains("::") || contains_dotted_qualified_name(text) {
-        families.insert(ClauseGuardFamily::QualifiedSymbolNotation);
-    }
-    families.into_iter().collect()
+    spans.into_iter().collect()
 }
 
-fn contains_nonempty_quoted(text: &str, delimiter: char) -> bool {
+fn nonempty_quoted_spans(text: &str, delimiter: char) -> Vec<(usize, usize)> {
     let positions = text
         .match_indices(delimiter)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     positions
         .chunks_exact(2)
-        .any(|pair| pair[0] + delimiter.len_utf8() < pair[1])
+        .filter(|pair| pair[0] + delimiter.len_utf8() < pair[1])
+        .map(|pair| (pair[0], pair[1] + delimiter.len_utf8()))
+        .collect()
+}
+
+fn word_spans(text: &str) -> Vec<(usize, usize)> {
+    delimited_spans(text, |character| {
+        character.is_alphanumeric() || character == '_'
+    })
+}
+
+fn token_spans(text: &str) -> Vec<(usize, usize)> {
+    delimited_spans(text, |character| {
+        !character.is_whitespace() && !matches!(character, ',' | ';' | '(' | ')' | '[' | ']')
+    })
+}
+
+fn delimited_spans(text: &str, keep: impl Fn(char) -> bool) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (offset, character) in text.char_indices() {
+        if keep(character) {
+            start.get_or_insert(offset);
+        } else if let Some(start) = start.take() {
+            spans.push((start, offset));
+        }
+    }
+    if let Some(start) = start {
+        spans.push((start, text.len()));
+    }
+    spans
 }
 
 fn has_ordinal_suffix(word: &str) -> bool {
@@ -932,7 +1060,7 @@ fn normalized_clause_json(clause: &NormalizedClause) -> Value {
         "clause_id": clause.clause_id,
         "quote": clause.quote,
         "classification": clause.classification.canonical_name(),
-        "field": clause.field.map(ProofContractField::canonical_name),
+        "field": clause.field.map(ProofContractField::canonical_json),
         "reason": reason,
         "non_material_kind": non_material_kind,
     })
@@ -1078,21 +1206,6 @@ pub struct VerifiedDirectCallFact {
     pub target: ResolvedNodeIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PositiveContradictionFact {
-    pub receipt_id: String,
-    pub source: ResolvedNodeIdentity,
-    pub expected_target: ExactSymbolSelector,
-    pub kind: PositiveContradictionKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PositiveContradictionKind {
-    RelationIsNotDirectCall,
-    DirectionIsNotOutgoing,
-    ResolvedTargetDiffers,
-}
-
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertifiedAbsenceFact {
@@ -1110,7 +1223,6 @@ pub struct UnavailableProofFact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifiedProofFact {
     DirectCall(VerifiedDirectCallFact),
-    PositiveContradiction(PositiveContradictionFact),
     #[cfg(any(test, feature = "test-support"))]
     CertifiedAbsence(CertifiedAbsenceFact),
     Unavailable(UnavailableProofFact),
@@ -1138,14 +1250,10 @@ pub enum ProofDisposition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refutation {
-    PositiveContradiction {
+    ProhibitedScopeTraversal {
         step_index: usize,
-        receipt_id: String,
-        kind: PositiveContradictionKind,
-    },
-    TraversalProhibitionViolated {
-        step_index: usize,
-        receipt: ReceiptRef,
+        prohibition_index: usize,
+        connected_receipts: Vec<ReceiptRef>,
     },
     #[cfg(any(test, feature = "test-support"))]
     CertifiedAbsence {
@@ -1223,24 +1331,8 @@ pub fn check_call_path(
             gaps: vec![ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index }],
         };
     }
-    if let Some((path, step_index)) = find_path(
-        contract,
-        &direct_facts,
-        PathPolicy::AllowTraversalProhibitions,
-    )
-    .and_then(|path| first_traversal_prohibition(contract, &path).map(|index| (path, index)))
-    {
-        return ProofDisposition::ContractRefuted {
-            contract_digest: hashes.contract_digest.clone(),
-            refutation: Refutation::TraversalProhibitionViolated {
-                step_index,
-                receipt: path[step_index].receipt.clone(),
-            },
-        };
-    }
     let mut reachable = reachable_prefixes(contract, &direct_facts);
     for source in facts.iter().filter_map(|fact| match fact {
-        VerifiedProofFact::PositiveContradiction(fact) => Some(&fact.source),
         #[cfg(any(test, feature = "test-support"))]
         VerifiedProofFact::CertifiedAbsence(fact) => Some(&fact.source),
         _ => None,
@@ -1255,35 +1347,56 @@ pub fn check_call_path(
                 current: source.clone(),
                 used_receipts: BTreeSet::new(),
                 used_edges: BTreeSet::new(),
+                connected_receipts: Vec::new(),
+                projection_conflict_step: None,
             });
         }
     }
+    if let Some((state, prohibition_index)) = reachable.iter().find_map(|state| {
+        (state.step_index > 0
+            && state.step_index < contract.spec.steps.len()
+            && state.projection_conflict_step.is_none())
+        .then(|| {
+            contract
+                .spec
+                .prohibit_traversal_through
+                .iter()
+                .position(|scope| scope_selector_matches(scope, &state.current))
+                .map(|index| (state, index))
+        })
+        .flatten()
+    }) {
+        return ProofDisposition::ContractRefuted {
+            contract_digest: hashes.contract_digest.clone(),
+            refutation: Refutation::ProhibitedScopeTraversal {
+                step_index: state.step_index - 1,
+                prohibition_index,
+                connected_receipts: state.connected_receipts.clone(),
+            },
+        };
+    }
+    if let Some(step_index) = reachable.iter().find_map(|state| {
+        (state.step_index > 0
+            && state.step_index < contract.spec.steps.len()
+            && contract
+                .spec
+                .prohibit_traversal_through
+                .iter()
+                .any(|scope| scope_selector_matches(scope, &state.current)))
+        .then_some(state.projection_conflict_step)
+        .flatten()
+    }) {
+        return ProofDisposition::Unknown {
+            contract_digest: hashes.contract_digest.clone(),
+            gaps: vec![ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index }],
+        };
+    }
     for state in reachable.iter().rev() {
-        if state.step_index >= contract.spec.steps.len() {
+        if state.step_index >= contract.spec.steps.len() || state.projection_conflict_step.is_some()
+        {
             continue;
         }
         let target = &contract.spec.steps[state.step_index].target;
-        if let Some(contradiction) = facts
-            .iter()
-            .filter_map(|fact| match fact {
-                VerifiedProofFact::PositiveContradiction(fact) => Some(fact),
-                _ => None,
-            })
-            .find(|fact| {
-                fact.source == state.current
-                    && &fact.expected_target == target
-                    && !fact.receipt_id.is_empty()
-            })
-        {
-            return ProofDisposition::ContractRefuted {
-                contract_digest: hashes.contract_digest.clone(),
-                refutation: Refutation::PositiveContradiction {
-                    step_index: state.step_index,
-                    receipt_id: contradiction.receipt_id.clone(),
-                    kind: contradiction.kind.clone(),
-                },
-            };
-        }
         #[cfg(any(test, feature = "test-support"))]
         if let Some(absence) = facts
             .iter()
@@ -1312,14 +1425,33 @@ pub fn check_call_path(
             };
         }
     }
+    let furthest_clean_step = reachable
+        .iter()
+        .filter(|state| state.projection_conflict_step.is_none())
+        .map(|state| state.step_index)
+        .max()
+        .unwrap_or(0);
+    if let Some(step_index) = reachable
+        .iter()
+        .filter(|state| state.step_index > furthest_clean_step)
+        .filter_map(|state| state.projection_conflict_step)
+        .min()
+    {
+        return ProofDisposition::Unknown {
+            contract_digest: hashes.contract_digest.clone(),
+            gaps: vec![ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index }],
+        };
+    }
     let step_index = reachable
         .iter()
+        .filter(|state| state.projection_conflict_step.is_none())
         .map(|state| state.step_index)
         .max()
         .unwrap_or(0)
         .min(contract.spec.steps.len() - 1);
     let reuse_blocked = reachable.iter().any(|state| {
         state.step_index == step_index
+            && state.projection_conflict_step.is_none()
             && direct_facts.iter().any(|fact| {
                 fact.source == state.current
                     && symbol_selector_matches(
@@ -1344,7 +1476,6 @@ pub fn check_call_path(
 enum PathPolicy {
     Strict,
     AllowProjectionExclusions,
-    AllowTraversalProhibitions,
 }
 
 fn find_path<'a>(
@@ -1399,8 +1530,7 @@ fn search_path<'a>(
         {
             continue;
         }
-        if policy != PathPolicy::AllowTraversalProhibitions
-            && step_index + 1 < contract.spec.steps.len()
+        if step_index + 1 < contract.spec.steps.len()
             && contract
                 .spec
                 .prohibit_traversal_through
@@ -1448,33 +1578,22 @@ fn first_projection_conflict(
         .position(|fact| receipt_hits_projection_exclusion(contract, fact))
 }
 
-fn first_traversal_prohibition(
-    contract: &ValidatedCallPathContract,
-    path: &[&VerifiedDirectCallFact],
-) -> Option<usize> {
-    path.iter().enumerate().find_map(|(step_index, fact)| {
-        (step_index + 1 < path.len()
-            && contract
-                .spec
-                .prohibit_traversal_through
-                .iter()
-                .any(|scope| scope_selector_matches(scope, &fact.target)))
-        .then_some(step_index)
-    })
-}
-
 #[derive(Debug, Clone)]
 struct PrefixState {
     step_index: usize,
     current: ResolvedNodeIdentity,
     used_receipts: BTreeSet<String>,
     used_edges: BTreeSet<String>,
+    connected_receipts: Vec<ReceiptRef>,
+    projection_conflict_step: Option<usize>,
 }
 
 fn reachable_prefixes(
     contract: &ValidatedCallPathContract,
     facts: &[&VerifiedDirectCallFact],
 ) -> Vec<PrefixState> {
+    let mut facts = facts.to_vec();
+    facts.sort_by(|left, right| left.receipt.cmp(&right.receipt));
     let initial_nodes = facts
         .iter()
         .filter(|fact| symbol_selector_matches(&contract.spec.start, &fact.source))
@@ -1487,13 +1606,15 @@ fn reachable_prefixes(
             current,
             used_receipts: BTreeSet::new(),
             used_edges: BTreeSet::new(),
+            connected_receipts: Vec::new(),
+            projection_conflict_step: None,
         })
         .collect::<Vec<_>>();
     let mut all = states.clone();
     for step_index in 0..contract.spec.steps.len() {
         let mut next = Vec::new();
         for state in states {
-            for fact in facts {
+            for fact in &facts {
                 if fact.source != state.current
                     || !symbol_selector_matches(
                         &contract.spec.steps[step_index].target,
@@ -1506,13 +1627,19 @@ fn reachable_prefixes(
                 }
                 let mut used_receipts = state.used_receipts.clone();
                 let mut used_edges = state.used_edges.clone();
+                let mut connected_receipts = state.connected_receipts.clone();
                 used_receipts.insert(fact.receipt.receipt_id.clone());
                 used_edges.insert(fact.receipt.edge_id.clone());
+                connected_receipts.push(fact.receipt.clone());
                 next.push(PrefixState {
                     step_index: step_index + 1,
                     current: fact.target.clone(),
                     used_receipts,
                     used_edges,
+                    connected_receipts,
+                    projection_conflict_step: state.projection_conflict_step.or_else(|| {
+                        receipt_hits_projection_exclusion(contract, fact).then_some(step_index)
+                    }),
                 });
             }
         }
@@ -1551,37 +1678,35 @@ mod tests {
         }
     }
 
-    fn full_anchor(
-        source: &str,
-        extra_fields: impl IntoIterator<Item = ProofContractField>,
-    ) -> ClauseAnchor {
-        let mut fields = vec![
-            ProofContractField::Start,
-            ProofContractField::Directness,
-            ProofContractField::Ordering,
-            ProofContractField::Relation,
-        ];
-        fields.extend(extra_fields);
+    fn start_anchor(source: &str) -> ClauseAnchor {
         ClauseAnchor {
             clause_id: "whole".to_owned(),
             start: 0,
             end: source.len(),
             quote: source.to_owned(),
-            classification: ClauseClassification::ResolvedMaterial { fields },
+            classification: ClauseClassification::ResolvedMaterial {
+                fields: vec![ProofContractField::Start],
+            },
         }
     }
 
     fn valid_input(targets: &[&str]) -> UnvalidatedCallPathContract {
         let source = "exact direct ordered call path";
-        let mut clauses = vec![full_anchor(source, [])];
+        let mut clauses = vec![start_anchor(source)];
         for (index, _) in targets.iter().enumerate() {
+            let step = u8::try_from(index).expect("test step index fits u8");
             clauses.push(ClauseAnchor {
                 clause_id: format!("target-{index}"),
                 start: 0,
                 end: source.len(),
                 quote: source.to_owned(),
                 classification: ClauseClassification::ResolvedMaterial {
-                    fields: vec![ProofContractField::StepTarget],
+                    fields: vec![
+                        ProofContractField::StepTarget { step },
+                        ProofContractField::Directness { step },
+                        ProofContractField::Ordering { step },
+                        ProofContractField::Relation { step },
+                    ],
                 },
             });
         }
@@ -1779,7 +1904,7 @@ mod tests {
             end: 12,
             quote: input.source_text[6..12].to_owned(),
             classification: ClauseClassification::ResolvedMaterial {
-                fields: vec![ProofContractField::Directness],
+                fields: vec![ProofContractField::Directness { step: 0 }],
             },
         });
         assert!(matches!(
@@ -1802,9 +1927,9 @@ mod tests {
                 classification: ClauseClassification::ResolvedMaterial {
                     fields: vec![
                         ProofContractField::Start,
-                        ProofContractField::Directness,
-                        ProofContractField::Ordering,
-                        ProofContractField::Relation,
+                        ProofContractField::Directness { step: 0 },
+                        ProofContractField::Ordering { step: 0 },
+                        ProofContractField::Relation { step: 0 },
                     ],
                 },
             },
@@ -1814,7 +1939,7 @@ mod tests {
                 end: 3,
                 quote: "B".to_owned(),
                 classification: ClauseClassification::ResolvedMaterial {
-                    fields: vec![ProofContractField::StepTarget],
+                    fields: vec![ProofContractField::StepTarget { step: 0 }],
                 },
             },
         ];
@@ -1826,10 +1951,10 @@ mod tests {
         input.clauses[0].classification = ClauseClassification::ResolvedMaterial {
             fields: vec![
                 ProofContractField::Start,
-                ProofContractField::StepTarget,
-                ProofContractField::Directness,
-                ProofContractField::Ordering,
-                ProofContractField::Relation,
+                ProofContractField::StepTarget { step: 0 },
+                ProofContractField::Directness { step: 0 },
+                ProofContractField::Ordering { step: 0 },
+                ProofContractField::Relation { step: 0 },
             ],
         };
         assert!(matches!(
@@ -1848,10 +1973,71 @@ mod tests {
         assert_eq!(
             validate_contract(input),
             Err(ValidationError::MissingResolvedMaterialAnchor {
-                field: ProofContractField::StepTarget,
+                field: ProofContractField::StepTarget { step: 0 },
                 required: 1,
                 found: 0,
             })
+        );
+    }
+
+    #[test]
+    fn duplicate_step_zero_anchors_cannot_cover_step_one() {
+        let mut input = valid_input(&["B", "C"]);
+        input.clauses[2].classification = ClauseClassification::ResolvedMaterial {
+            fields: vec![
+                ProofContractField::StepTarget { step: 0 },
+                ProofContractField::Directness { step: 0 },
+                ProofContractField::Ordering { step: 0 },
+                ProofContractField::Relation { step: 0 },
+            ],
+        };
+        assert_eq!(
+            validate_contract(input),
+            Err(ValidationError::MissingResolvedMaterialAnchor {
+                field: ProofContractField::StepTarget { step: 1 },
+                required: 1,
+                found: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_or_unpopulated_indexed_field_references() {
+        for field in [
+            ProofContractField::Relation { step: 1 },
+            ProofContractField::TraversalProhibition { index: 0 },
+            ProofContractField::ProjectionExclusion { index: 0 },
+        ] {
+            let mut input = valid_input(&["B"]);
+            input.clauses.push(ClauseAnchor {
+                clause_id: format!("out-of-range-{field:?}"),
+                start: 0,
+                end: input.source_text.len(),
+                quote: input.source_text.clone(),
+                classification: ClauseClassification::ResolvedMaterial {
+                    fields: vec![field],
+                },
+            });
+            assert_eq!(
+                validate_contract(input),
+                Err(ValidationError::OutOfRangeFieldReference { field })
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_clause_json_commits_the_typed_field_index() {
+        let clause = NormalizedClause {
+            start: 0,
+            end: 1,
+            clause_id: "target".to_owned(),
+            classification: NormalizedClauseClassification::Resolved,
+            field: Some(ProofContractField::StepTarget { step: 2 }),
+            quote: "B".to_owned(),
+        };
+        assert_eq!(
+            normalized_clause_json(&clause)["field"],
+            json!({ "kind": "step_target", "step": 2 })
         );
     }
 
@@ -1938,10 +2124,10 @@ mod tests {
                 classification: ClauseClassification::ResolvedMaterial {
                     fields: vec![
                         ProofContractField::Start,
-                        ProofContractField::StepTarget,
-                        ProofContractField::Directness,
-                        ProofContractField::Ordering,
-                        ProofContractField::Relation,
+                        ProofContractField::StepTarget { step: 0 },
+                        ProofContractField::Directness { step: 0 },
+                        ProofContractField::Ordering { step: 0 },
+                        ProofContractField::Relation { step: 0 },
                     ],
                 },
             },
@@ -1962,6 +2148,43 @@ mod tests {
                     clause_id: "guarded".to_owned(),
                     guard_families: vec![ClauseGuardFamily::Only],
                 })
+        ));
+    }
+
+    #[test]
+    fn resolved_guard_span_wins_over_a_broader_non_material_anchor() {
+        let source = "only x";
+        let mut input = valid_input(&["B"]);
+        input.source_text = source.to_owned();
+        input.clauses = vec![
+            ClauseAnchor {
+                clause_id: "resolved-guard".to_owned(),
+                start: 0,
+                end: 4,
+                quote: "only".to_owned(),
+                classification: ClauseClassification::ResolvedMaterial {
+                    fields: vec![
+                        ProofContractField::Start,
+                        ProofContractField::StepTarget { step: 0 },
+                        ProofContractField::Directness { step: 0 },
+                        ProofContractField::Ordering { step: 0 },
+                        ProofContractField::Relation { step: 0 },
+                    ],
+                },
+            },
+            ClauseAnchor {
+                clause_id: "broad-commentary".to_owned(),
+                start: 0,
+                end: source.len(),
+                quote: source.to_owned(),
+                classification: ClauseClassification::NonMaterial {
+                    kind: NonMaterialKind::Commentary,
+                },
+            },
+        ];
+        assert!(matches!(
+            validate_contract(input),
+            Ok(ValidationOutcome::Validated { .. })
         ));
     }
 
@@ -2026,6 +2249,30 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         };
         assert_ne!(baseline.contract_digest(), reordered_spec.contract_digest());
+    }
+
+    #[test]
+    fn scope_input_order_is_committed_to_the_contract_digest() {
+        let mut first = valid_input(&["B"]);
+        first.spec.prohibit_traversal_through = vec![canonical_scope("B"), canonical_scope("C")];
+        for index in 0..2_u8 {
+            first.clauses.push(ClauseAnchor {
+                clause_id: format!("prohibition-{index}"),
+                start: 0,
+                end: first.source_text.len(),
+                quote: first.source_text.clone(),
+                classification: ClauseClassification::ResolvedMaterial {
+                    fields: vec![ProofContractField::TraversalProhibition { index }],
+                },
+            });
+        }
+        let mut second = first.clone();
+        second.spec.prohibit_traversal_through.reverse();
+        let digest = |input| match validate_contract(input).unwrap() {
+            ValidationOutcome::Validated { hashes, .. } => hashes.contract_digest,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_ne!(digest(first), digest(second));
     }
 
     #[test]
@@ -2107,21 +2354,33 @@ mod tests {
     }
 
     #[test]
-    fn positive_contradiction_and_fixture_absence_are_receipt_backed() {
+    fn wrong_relation_direction_or_target_cannot_refute_a_required_direct_edge() {
+        enum NonDirectObservation {
+            OtherRelation,
+            ReversedDirection,
+            DifferentTarget,
+        }
         let (contract, hashes) = validate(&["B"]);
-        let contradiction = VerifiedProofFact::PositiveContradiction(PositiveContradictionFact {
-            receipt_id: "contradiction-receipt".to_owned(),
-            source: node("A"),
-            expected_target: ExactSymbolSelector::CanonicalId("B".to_owned()),
-            kind: PositiveContradictionKind::ResolvedTargetDiffers,
-        });
-        assert!(matches!(
-            check_call_path(&contract, &hashes, &[contradiction]),
-            ProofDisposition::ContractRefuted {
-                refutation: Refutation::PositiveContradiction { .. },
-                ..
-            }
-        ));
+        for observation in [
+            NonDirectObservation::OtherRelation,
+            NonDirectObservation::ReversedDirection,
+            NonDirectObservation::DifferentTarget,
+        ] {
+            let admitted_facts = match observation {
+                NonDirectObservation::OtherRelation => Vec::new(),
+                NonDirectObservation::ReversedDirection => vec![call("r", "e", "B", "A")],
+                NonDirectObservation::DifferentTarget => vec![call("r", "e", "A", "C")],
+            };
+            assert!(matches!(
+                check_call_path(&contract, &hashes, &admitted_facts),
+                ProofDisposition::Unknown { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn fixture_absence_requires_both_completeness_receipts() {
+        let (contract, hashes) = validate(&["B"]);
         let absence = VerifiedProofFact::CertifiedAbsence(CertifiedAbsenceFact {
             source: node("A"),
             expected_target: ExactSymbolSelector::CanonicalId("B".to_owned()),
@@ -2181,7 +2440,7 @@ mod tests {
             end: input.source_text.len(),
             quote: input.source_text.clone(),
             classification: ClauseClassification::ResolvedMaterial {
-                fields: vec![ProofContractField::ProjectionExclusion],
+                fields: vec![ProofContractField::ProjectionExclusion { index: 0 }],
             },
         });
         let (contract, hashes) = match validate_contract(input).unwrap() {
@@ -2198,16 +2457,16 @@ mod tests {
     }
 
     #[test]
-    fn traversal_prohibition_is_receipt_backed_positive_refutation() {
+    fn fixture_absence_reached_only_through_an_excluded_receipt_stays_unknown() {
         let mut input = valid_input(&["B", "C"]);
-        input.spec.prohibit_traversal_through = vec![canonical_scope("B")];
+        input.spec.exclude_from_projection = vec![canonical_scope("B")];
         input.clauses.push(ClauseAnchor {
-            clause_id: "prohibition".to_owned(),
+            clause_id: "projection".to_owned(),
             start: 0,
             end: input.source_text.len(),
             quote: input.source_text.clone(),
             classification: ClauseClassification::ResolvedMaterial {
-                fields: vec![ProofContractField::TraversalProhibition],
+                fields: vec![ProofContractField::ProjectionExclusion { index: 0 }],
             },
         });
         let (contract, hashes) = match validate_contract(input).unwrap() {
@@ -2216,13 +2475,61 @@ mod tests {
             } => (contract, hashes),
             other => panic!("unexpected {other:?}"),
         };
-        let facts = [call("r1", "e1", "A", "B"), call("r2", "e2", "B", "C")];
+        let facts = [
+            call("r1", "e1", "A", "B"),
+            VerifiedProofFact::CertifiedAbsence(CertifiedAbsenceFact {
+                source: node("B"),
+                expected_target: ExactSymbolSelector::CanonicalId("C".to_owned()),
+                extractor_capability_receipt_id: "capability".to_owned(),
+                untruncated_enumeration_receipt_id: "enumeration".to_owned(),
+            }),
+        ];
+        assert!(matches!(
+            check_call_path(&contract, &hashes, &facts),
+            ProofDisposition::Unknown { gaps, .. }
+                if gaps == [ProofGap::ProjectionExclusionConflictsWithRequiredReceipt {
+                    step_index: 0,
+                }]
+        ));
+    }
+
+    #[test]
+    fn traversal_prohibition_is_receipt_backed_positive_refutation() {
+        let mut input = valid_input(&["B", "C", "D"]);
+        input.spec.prohibit_traversal_through = vec![canonical_scope("C")];
+        input.clauses.push(ClauseAnchor {
+            clause_id: "prohibition".to_owned(),
+            start: 0,
+            end: input.source_text.len(),
+            quote: input.source_text.clone(),
+            classification: ClauseClassification::ResolvedMaterial {
+                fields: vec![ProofContractField::TraversalProhibition { index: 0 }],
+            },
+        });
+        let (contract, hashes) = match validate_contract(input).unwrap() {
+            ValidationOutcome::Validated {
+                contract, hashes, ..
+            } => (contract, hashes),
+            other => panic!("unexpected {other:?}"),
+        };
+        let facts = [
+            call("r1", "e1", "A", "B"),
+            call("r2", "e2", "B", "C"),
+            call("r3", "e3", "C", "D"),
+        ];
         assert!(matches!(
             check_call_path(&contract, &hashes, &facts),
             ProofDisposition::ContractRefuted {
-                refutation: Refutation::TraversalProhibitionViolated { step_index: 0, .. },
+                refutation: Refutation::ProhibitedScopeTraversal {
+                    step_index: 1,
+                    prohibition_index: 0,
+                    connected_receipts,
+                },
                 ..
-            }
+            } if connected_receipts == [
+                ReceiptRef { receipt_id: "r1".to_owned(), edge_id: "e1".to_owned() },
+                ReceiptRef { receipt_id: "r2".to_owned(), edge_id: "e2".to_owned() },
+            ]
         ));
     }
 
